@@ -80,6 +80,9 @@ struct Capacity {
     read: Option<(Instant, Option<u64>)>,
     /// Until when the hot tier is taken to be full, after it said so.
     full_until: Option<Instant>,
+    /// When the usage object read last was published, by the clock of the reconciler: none if
+    /// it was missing or unreadable. Unlike the bytes of `read`, it is kept whatever the age.
+    published: Option<u64>,
 }
 
 /// One journal object being filled, and the outcome of writing it.
@@ -173,7 +176,9 @@ fn refuse_reserved(key: &str) -> Result<(), Error> {
 ///
 /// **Capacity.** The proxy reads the usage that the reconciler publishes (`_tiering/usage`,
 /// at most every [`ProxyConfig::usage_refresh`]); a usage that is missing, unreadable or
-/// older than [`ProxyConfig::usage_stale_after`] counts as not full. Above
+/// older than [`ProxyConfig::usage_stale_after`] counts as not full (a dead reconciler thus
+/// leaves puts unrestrained: [`Proxy::usage_age`] is how a caller sees it, and the server's
+/// `/usagez` reports it). Above
 /// [`ProxyConfig::critical`] of the budget a put waits [`ProxyConfig::back_pressure`] first.
 /// At the budget, or when the hot tier answers a put (of the object, or of the journal object
 /// that holds its entry) with [`Error::Full`], puts go straight to the cold tier, create-only
@@ -298,6 +303,17 @@ impl Proxy {
             inner: Arc::new(inner),
         })
     }
+
+    /// How long ago the reconciler published the usage object (`_tiering/usage`), by the clock
+    /// of the proxy, as of a read that is at most [`ProxyConfig::usage_refresh`] old. None if the
+    /// object is missing or cannot be read.
+    ///
+    /// A usage older than [`ProxyConfig::usage_stale_after`] is ignored by the puts, so a
+    /// reconciler that has stopped means a hot tier that is never taken to be full; this is the
+    /// age that tells it, whatever it is.
+    pub async fn usage_age(&self) -> Option<Duration> {
+        self.inner.usage_age().await
+    }
 }
 
 impl Inner {
@@ -385,9 +401,28 @@ impl Inner {
     async fn refresh_usage(&self, now: Instant) -> Option<u64> {
         let fetched = self.hot.get(USAGE_KEY, None).await.ok();
         let usage = fetched.and_then(|body| serde_json::from_slice::<Usage>(&body).ok());
+        let published = usage.as_ref().map(|u| u.time);
         let hot_bytes = usage.filter(|u| self.is_fresh(u)).map(|u| u.hot_bytes);
-        locked(&self.capacity).read = Some((now, hot_bytes));
+        let mut capacity = locked(&self.capacity);
+        capacity.read = Some((now, hot_bytes));
+        capacity.published = published;
         hot_bytes
+    }
+
+    /// The bytes of the usage object, as of a read that is at most `usage_refresh` old.
+    async fn cached_hot_bytes(&self, now: Instant) -> Option<u64> {
+        let read = locked(&self.capacity).read;
+        match read {
+            Some((at, bytes)) if now.duration_since(at) < self.config.usage_refresh => bytes,
+            _ => self.refresh_usage(now).await,
+        }
+    }
+
+    async fn usage_age(&self) -> Option<Duration> {
+        self.cached_hot_bytes(Instant::now()).await;
+        let published = locked(&self.capacity).published?;
+        let age = self.config.clock.now().saturating_sub(published);
+        Some(Duration::from_millis(age))
     }
 
     fn classify(&self, hot_bytes: Option<u64>) -> Level {
@@ -402,17 +437,11 @@ impl Inner {
 
     async fn level(&self) -> Level {
         let now = Instant::now();
-        let (full_until, read) = {
-            let capacity = locked(&self.capacity);
-            (capacity.full_until, capacity.read)
-        };
+        let full_until = locked(&self.capacity).full_until;
         if full_until.is_some_and(|until| now < until) {
             return Level::Full;
         }
-        let hot_bytes = match read {
-            Some((at, bytes)) if now.duration_since(at) < self.config.usage_refresh => bytes,
-            _ => self.refresh_usage(now).await,
-        };
+        let hot_bytes = self.cached_hot_bytes(now).await;
         self.classify(hot_bytes)
     }
 
