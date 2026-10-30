@@ -524,8 +524,15 @@ What the code does today:
   (`kbf-book-cpus`, `kbf-book-mem-gib`) is read and recorded but not booked. An own-limit
   memory kill has no larger rung (see "Memory kills"): the operation finishes
   `Failed(OutOfMemory)` and leaves no memory floor. The control log has no field for the
-  request's `whole_worker`, so a restart reads a queued operation back as an ordinary
-  action. The server logs `exclusive-actions: on` at start when the flag is on. Both
+  request's `whole_worker`, so recovery reads every operation back with it false. A queued
+  operation is then an ordinary action. A running one is recovered by booking its request
+  as stored (`recover.rs`: `book` with `worker.booking(request)`, the request's own
+  resources, and a load charge from the recorded grant cost, which is the admission
+  charge of that booking; the worker-wide charge is made only in the scheduler's memory at
+  grant), so it holds the front's small booking and ordinary actions can be placed
+  beside it, and if it is lost or requeued it reruns as an ordinary action, up the memory
+  ladder, without owning the worker. A run that depends on one action per worker must not
+  restart the server. The server logs `exclusive-actions: on` at start when the flag is on. Both
   scheduler cores take the request unchanged.
 - Each request carries its lease kind (`kbf-lease`: `action` or `whole_machine`). A
   worker is feasible for it only if its node report lists a driver that serves the

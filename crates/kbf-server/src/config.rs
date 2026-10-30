@@ -321,9 +321,12 @@ pub struct Args {
     /// no larger booking to climb to, so `--memory-ladder-gib` has no further rung to give
     /// it: it finishes out-of-memory, as an action that already books the largest node does,
     /// and its memory floor is not raised. A worker books by what it reported at
-    /// registration. The setting is not kept in the state store: after a restart an
-    /// operation that was queued books as an action does with the flag off, until it ends.
-    /// Off by default
+    /// registration. The setting is not kept in the state store, so a server restart
+    /// ends it for the operations the store holds: one that was queued is read back as
+    /// an ordinary action, and one that was running is recovered holding only the booking
+    /// the front computed for it, not the worker, so ordinary actions can be placed
+    /// beside it and, if it is lost or requeued, it runs again as an ordinary action. A
+    /// run that needs one action per worker must not restart the server. Off by default
     #[arg(long, default_value_t = false)]
     pub exclusive_actions: bool,
     /// The cores a node that reports VM slots (`vm.slots`) keeps for the host itself:

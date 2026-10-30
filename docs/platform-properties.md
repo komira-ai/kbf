@@ -191,9 +191,14 @@ they were. The lease's memory limit and CPU weight come from the booking, so the
 use the worker's whole memory. An action killed for passing its own memory limit has no
 larger booking to climb to: it finishes `FAILED_PRECONDITION` (out of memory) at once, as
 one that already books the largest node does, and its key's memory floor is not raised.
-The setting is not kept in the state store: after a server restart an operation that was
-queued books as an `action` does with the setting off, until it ends. It works on both
-scheduler cores.
+The setting is not kept in the state store, so a server restart ends it for the operations
+the store holds. An operation that was queued is read back as an ordinary `action`. One that
+was running is recovered holding only the booking the front computed for it (by default one
+core and the first memory rung), not the worker, so the scheduler may place ordinary
+actions beside it; and if that lease is later lost or requeued, the operation runs again as
+an ordinary `action`, climbing the memory ladder, with no claim on a worker. A run that
+needs exactly one action per worker (a benchmark) must not restart the server, and
+a restart during one invalidates it. The setting works on both scheduler cores.
 
 The booking also sets the memory the action may use. The native driver (Macs) kills an
 action whose processes together hold more than 150% of its booked memory plus 512 MiB:
