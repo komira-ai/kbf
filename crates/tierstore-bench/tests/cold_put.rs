@@ -93,6 +93,20 @@ async fn a_level_writes_n_objects_under_the_run_prefix_and_reports_n_latencies()
         result.notes.iter().any(|n| n.contains("200=12")),
         "{result:?}"
     );
+    // The host's own /proc is not marked as foreign.
+    assert!(!result.notes.iter().any(|n| n.contains("not the host")));
+    // The client's share is reported, and the time spent making bodies is part of the wall time
+    // (all workers share one thread), so it cannot be more.
+    let note = result
+        .notes
+        .iter()
+        .find(|n| n.starts_with("client work: bodies generated in "))
+        .expect("a client work note");
+    let words: Vec<&str> = note.split_whitespace().collect();
+    let generating: u64 = words[5].parse().unwrap();
+    let wall: u64 = words[8].parse().unwrap();
+    assert!(generating <= wall, "{note}");
+    assert_eq!(wall, pass.elapsed_us);
 }
 
 /// Catches levels that share a name space (a second level overwriting or colliding with the
@@ -915,6 +929,13 @@ async fn the_cell_reads_the_load_from_the_proc_it_is_given() {
     assert_eq!(results[0].passes[0].requests, 4);
     let notes = results[0].notes.join("\n");
     assert!(notes.contains("psi_io_avg10=1.50"), "{notes}");
+    // A load read from a made-up tree says so in the result, naming both directories.
+    assert!(
+        notes.contains("not the host's /proc and /sys/block"),
+        "{notes}"
+    );
+    assert!(notes.contains(calm_proc.to_str().unwrap()), "{notes}");
+    assert!(notes.contains(sys.to_str().unwrap()), "{notes}");
 
     let busy_args = args(&busy_proc);
     let b = rig(

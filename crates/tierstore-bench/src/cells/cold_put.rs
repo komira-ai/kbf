@@ -35,7 +35,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -205,6 +205,35 @@ fn status_counts(counts: &BTreeMap<Option<u16>, u32>) -> String {
     parts.join(" ")
 }
 
+/// The note (and warning) for a load gate pointed away from the host, `None` for the host's own.
+fn foreign_load_note(proc_dir: &Path, sys_block_dir: &Path) -> Option<String> {
+    if proc_dir == Path::new("/proc") && sys_block_dir == Path::new("/sys/block") {
+        return None;
+    }
+    Some(format!(
+        "load read from {} and {}, not the host's /proc and /sys/block: the load gate does not judge this machine",
+        proc_dir.display(),
+        sys_block_dir.display()
+    ))
+}
+
+/// What share of a level's wall time the client spent making bodies, for a reader judging
+/// whether the client bounded the rate. Hashing and signing happen inside the puts and are not
+/// separated, so the figure is a floor of the client's own work.
+fn client_note(generating_us: u64, elapsed_us: u64) -> String {
+    let share = if elapsed_us == 0 {
+        "n/a".to_owned()
+    } else {
+        format!(
+            "{}%",
+            u128::from(generating_us) * 100 / u128::from(elapsed_us)
+        )
+    };
+    format!(
+        "client work: bodies generated in {generating_us} us of {elapsed_us} us wall ({share}); all workers share one thread and hashing and signing are inside the puts, so this is a floor of the client's share"
+    )
+}
+
 fn load_line(label: &str, sample: &LoadSample) -> String {
     format!(
         "load {label}: loadavg_1m={:.2} psi_cpu_avg10={:.2} psi_io_avg10={:.2} disk_util_pct={:.1}",
@@ -314,6 +343,8 @@ struct Level {
     in_flight: AtomicU32,
     stopped: AtomicBool,
     stop: Mutex<Option<Stop>>,
+    /// Microseconds the workers spent making bodies, all added.
+    generating_us: AtomicU64,
 }
 
 impl Level {
@@ -368,7 +399,10 @@ async fn worker(lv: Arc<Level>) -> Result<Vec<Sample>, BenchError> {
             break;
         }
         lv.pacer.wait().await;
+        let made = Instant::now();
         let payload = body(lv.seed, lv.level, index, lv.size);
+        let made_us = u64::try_from(made.elapsed().as_micros()).unwrap_or(u64::MAX);
+        lv.generating_us.fetch_add(made_us, Ordering::Relaxed);
         let key = format!("{}{index:08}", lv.key_prefix);
         let in_flight = lv.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         let sent = lv.s3.put(&key, payload).await;
@@ -526,6 +560,8 @@ struct Run<'a, W> {
     s3: Arc<BenchS3>,
     source: Arc<dyn LoadSource>,
     wait: W,
+    /// Set when the load is read from somewhere other than the host's `/proc` and `/sys/block`.
+    load_note: Option<String>,
     provenance: Provenance,
     samples_out: SampleWriter,
     under: String,
@@ -538,8 +574,9 @@ impl<W: ReleaseWait> Run<'_, W> {
         arm: String,
         started_unix_ms: u64,
         pass: PassResult,
-        notes: Vec<String>,
+        mut notes: Vec<String>,
     ) -> CellResult {
+        notes.extend(self.load_note.clone());
         CellResult {
             schema_version: SCHEMA_VERSION,
             cell: CellId::ColdPut,
@@ -638,6 +675,7 @@ impl<W: ReleaseWait> Run<'_, W> {
             in_flight: AtomicU32::new(0),
             stopped: AtomicBool::new(false),
             stop: Mutex::new(None),
+            generating_us: AtomicU64::new(0),
         });
         let clock = Instant::now();
         let mut samples = Vec::new();
@@ -662,6 +700,10 @@ impl<W: ReleaseWait> Run<'_, W> {
         self.samples_out.append(&self.provenance, &samples)?;
         let (pass, summary) = summarize(&samples, config.window, gate_tripped, elapsed_us);
         notes.extend(summary);
+        notes.push(client_note(
+            lv.generating_us.load(Ordering::Relaxed),
+            elapsed_us,
+        ));
         notes.push(format!(
             "ended by: {}",
             stop.as_ref()
@@ -871,12 +913,17 @@ pub async fn run_levels_with(
         "tierstore-bench".to_owned(),
         env!("CARGO_PKG_VERSION").to_owned(),
     );
+    let load_note = foreign_load_note(&cp.proc_dir, &cp.sys_block_dir);
+    if let Some(note) = &load_note {
+        eprintln!("tierstore-bench: warning: {note}");
+    }
     let mut run = Run {
         ctx,
         plan,
         s3,
         source: Arc::new(source),
         wait,
+        load_note,
         provenance,
         samples_out: SampleWriter::open(&ctx.config.result_dir)?,
         under,
@@ -1026,6 +1073,31 @@ mod tests {
         assert_eq!(winner_text(Some(true), 1), "yes");
         assert_eq!(winner_text(Some(false), 1), "no");
         assert_eq!(winner_text(None, 2), "n/a (2 winners here)");
+    }
+
+    /// Catches a load gate pointed at a made-up tree going unmarked, and the host's own being
+    /// marked: either directory away from the host's is named in the note, both at home is none.
+    #[test]
+    fn a_load_read_away_from_the_host_is_noted_and_the_hosts_own_is_not() {
+        let host = (Path::new("/proc"), Path::new("/sys/block"));
+        assert_eq!(foreign_load_note(host.0, host.1), None);
+        let proc_away = foreign_load_note(Path::new("/x/proc"), host.1).unwrap();
+        assert!(proc_away.contains("/x/proc and /sys/block"), "{proc_away}");
+        assert!(proc_away.contains("not the host's"), "{proc_away}");
+        let sys_away = foreign_load_note(host.0, Path::new("/x/sys")).unwrap();
+        assert!(sys_away.contains("/proc and /x/sys"), "{sys_away}");
+    }
+
+    /// Catches the client's share of a level computed wrongly or dividing by zero: 250 us of
+    /// 1,000 us is 25%, more than the wall time (a rounding of the clock) is over 100%, and a
+    /// level with no wall time has no share.
+    #[test]
+    fn the_clients_share_of_a_level_is_its_body_time_over_the_wall_time() {
+        assert!(client_note(250, 1000).contains("generated in 250 us of 1000 us wall (25%)"));
+        assert!(client_note(1000, 1000).contains("(100%)"));
+        assert!(client_note(0, 1000).contains("(0%)"));
+        assert!(client_note(5, 0).contains("(n/a)"));
+        assert!(client_note(1, 1).contains("floor of the client's share"));
     }
 
     /// Catches a stop's name or its reach changing: which endings stop the whole run and which

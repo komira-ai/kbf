@@ -17,6 +17,13 @@ the result of the level written). `--same-key --in-flight 16` instead sends 16 c
 create-only puts of different bytes to one key and reports the status counts and whether the
 stored bytes are the winner's. Rates and latencies are reported raw, with no verdict.
 
+The workers of a level share one thread. Each level's notes say how much of its wall time went to
+making bodies (`client work: ...`); hashing and signing are inside the puts and are not separated,
+so that share is a floor of the client's own work. A high share at large objects or high rates
+means the client, not the store, may be bounding the PUT/s. The hidden `--proc-dir` and
+`--sys-block-dir` point the load gate at a made-up tree for tests; a run that uses them says so in
+its notes and on standard error.
+
 `cleanup --run-id ID` deletes the keys the run's `requests.jsonl` lists as written (answered 200,
 or sent and not answered), nothing else, and prints the counts written and deleted and the objects
 still under the run prefix.
