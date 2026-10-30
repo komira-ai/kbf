@@ -46,8 +46,9 @@ fn is_open(line: &str) -> bool {
 /// # Errors
 /// [`BenchError::Ops`] if `map_json` is not an array of entries with a `paper_line`.
 pub fn scan(page: &str, map_json: &str) -> Result<PaperScan, BenchError> {
-    let entries: Vec<Entry> =
-        serde_json::from_str(map_json).map_err(|e| BenchError::Ops(format!("paper map: {e}")))?;
+    let entries: Vec<Entry> = serde_json::from_str(map_json).map_err(|_| {
+        BenchError::Ops("the paper map is not a JSON array of entries with a paper_line".to_owned())
+    })?;
     let mapped: BTreeSet<u32> = entries.iter().map(|e| e.paper_line).collect();
     let marked: BTreeSet<u32> = (1..)
         .zip(page.lines())

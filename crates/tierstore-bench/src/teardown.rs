@@ -23,7 +23,7 @@ use std::path::Path;
 
 use crate::config::{RunConfig, StoreSpec};
 use crate::error::BenchError;
-use crate::preflight::host::{Host, SystemHost, read_text};
+use crate::preflight::host::{Host, SystemHost};
 use crate::preflight::ops::{OpsFile, read_key_pair};
 use crate::preflight::{Snapshot, all_passed, check, live, print_checks, why, write_json};
 use crate::provision::SHARED_ROLES;
@@ -37,6 +37,15 @@ pub const CHECKS_FILE: &str = "teardown.json";
 
 /// The request log of the result directory, which `run` writes.
 pub const REQUEST_LOG: &str = "requests.jsonl";
+
+/// The text of one of the tool's own files in the result directory, read from disk: unlike the
+/// node's files these are not behind the [`Host`].
+fn read_own(path: &Path) -> Result<String, BenchError> {
+    std::fs::read_to_string(path).map_err(|source| BenchError::Io {
+        path: path.to_owned(),
+        source,
+    })
+}
 
 /// `Ok` if the before-snapshot's `key` equals what is read now.
 fn unchanged(before: &Snapshot, key: &str, now: Result<String, String>) -> Result<String, String> {
@@ -53,9 +62,9 @@ fn unchanged(before: &Snapshot, key: &str, now: Result<String, String>) -> Resul
 }
 
 /// Reads the request log: every record must name the test bucket of its role.
-fn log_check(host: &dyn Host, config: &RunConfig) -> Result<String, String> {
+fn log_check(config: &RunConfig) -> Result<String, String> {
     let path = config.result_dir.join(REQUEST_LOG);
-    let text = read_text(host, &path).map_err(|e| why(&e))?;
+    let text = read_own(&path).map_err(|e| why(&e))?;
     let (mut total, mut outside, mut unreadable) = (0_usize, 0_usize, 0_usize);
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         total += 1;
@@ -192,7 +201,7 @@ pub async fn gather(
     ops: &OpsFile,
     before: &Path,
 ) -> Result<Vec<Check>, BenchError> {
-    let text = read_text(host, before)?;
+    let text = read_own(before)?;
     let snapshot: Snapshot = serde_json::from_str(&text)
         .map_err(|e| BenchError::Ops(format!("before-snapshot: {e}")))?;
     let mut checks = Vec::new();
@@ -201,10 +210,7 @@ pub async fn gather(
             checks.extend(store_checks(host, ops, role, spec).await);
         }
     }
-    checks.push(check(
-        "request-log-test-buckets-only",
-        log_check(host, config),
-    ));
+    checks.push(check("request-log-test-buckets-only", log_check(config)));
     checks.extend(node_checks(host, ops, &snapshot));
     Ok(checks)
 }

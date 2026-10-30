@@ -211,10 +211,6 @@ fn the_paper_scan_compares_marked_lines_with_mapped_lines() {
 #[test]
 fn admin_info_is_read_for_the_version_and_the_healing_drives() {
     let info = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
-    assert_eq!(
-        server_version(&info(&info_json("RELEASE.x", false))).as_deref(),
-        None
-    );
     let value = info(&info_json("RELEASE.x", false));
     assert_eq!(server_version(&value).as_deref(), Some("RELEASE.x"));
     assert!(!any_drive_healing(&value));
