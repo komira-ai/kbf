@@ -345,9 +345,9 @@ impl HostWorker {
     }
 
     /// The host refused a start because its scratch quota is out of order: it takes no more
-    /// work, and is held out for [`Config::quota_hold`] from `now`.
+    /// work, and is held out for [`Config::held_out_for`] from `now`.
     pub(super) fn quota_unavailable(&mut self, ctx: &Ctx<'_>, now: Instant) {
-        self.begin_drain(ctx, Drain::Quota(now + ctx.cfg.quota_hold));
+        self.begin_drain(ctx, Drain::Quota(now + ctx.cfg.held_out_for()));
     }
 
     /// Starts the drain when the lease nears the end of its wall time, and ends the worker

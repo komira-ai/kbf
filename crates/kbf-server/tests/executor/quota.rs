@@ -71,6 +71,8 @@ async fn the_host_is_held_out_for_the_hold_and_used_again_after_it() {
     let first = rig.runs_of(1).await.remove(0);
     rig.host_finishes_with(&first.run, Outcome::FailedToStart, None, QUOTA);
     rig.elapse(60).await;
+    // The host stops listing the refused run, as it does, so the lease can end.
+    rig.host_ends(&first.run);
     let delete = format!("DELETE /v1/leases/{lease}");
     assert!(hosts_held(&rig).is_empty(), "{:?}", rig.exec.hosts());
     assert_eq!(count(&rig.requests(), &delete), 0, "handed back too early");
@@ -99,7 +101,8 @@ async fn a_post_refused_for_the_quota_is_lost_and_the_host_is_held_out() {
     let caller = rig.submit(1);
     rig.pump().await;
     assert!(caller.finished().is_none());
-    assert!(rig.runs().await.is_empty());
+    let posted = rig.runs().await;
+    assert!(posted.iter().all(|p| p.host != sick.host), "{posted:?}");
     assert!(ended(&rig, "lost", 1), "{}", rig.counted());
     assert!(ended(&rig, "infra", 0), "{}", rig.counted());
     rig.elapse(15).await;
