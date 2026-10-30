@@ -2,9 +2,10 @@
 //! walk and the reads of blobs share.
 //!
 //! The walk reads the Action and then the Directories under its input root a level at a time,
-//! and keeps only the digests they name: a Directory is dropped as soon as its entries are in
-//! the scope, so what a level holds is bounded by [`super::Limits::scope_digests`] and not by the
-//! sizes of the Directories. Each read takes its blob's size from the budget first, and a blob
+//! and keeps only the digests they name: a Directory is dropped as soon as it is read, so what a
+//! level holds is the digests it names and not the Directories (each of at most
+//! [`MAX_SCOPE_BLOB_BYTES`]); the bound [`super::Limits::scope_digests`] is checked after each level.
+//! Each read takes its blob's size from the budget first, and a blob
 //! over [`MAX_SCOPE_BLOB_BYTES`] is refused before it is charged or read.
 
 use std::collections::HashSet;
@@ -100,22 +101,23 @@ pub(super) async fn walk(
     let mut seen = HashSet::from([root]);
     let mut level = vec![root];
     while !level.is_empty() {
-        let mut next = Vec::new();
-        let mut entries = stream::iter(level)
+        let entries: Vec<Entries> = stream::iter(level)
             .map(|digest| directory(source, budget, digest))
-            .buffer_unordered(DIRECTORIES_IN_FLIGHT);
-        while let Some((files, directories)) = entries.try_next().await? {
+            .buffer_unordered(DIRECTORIES_IN_FLIGHT)
+            .try_collect()
+            .await?;
+        level = Vec::new();
+        for (files, directories) in entries {
             seen.extend(files);
             for digest in directories {
                 if seen.insert(digest) {
-                    next.push(digest);
+                    level.push(digest);
                 }
             }
-            if seen.len() > most {
-                return Err(ScopeError::Unusable);
-            }
         }
-        level = next;
+        if seen.len() > most {
+            return Err(ScopeError::Unusable);
+        }
     }
     Ok(Scope::new(action, command, seen))
 }
