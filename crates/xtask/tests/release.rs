@@ -1707,11 +1707,10 @@ fn check_wants_the_facts_of_the_task_image_and_the_previous_release_may_lack_the
 #[test]
 fn check_takes_only_the_facts_of_the_task_image_for_the_commit() {
     // Catches: any file ending `.facts.json` taken as an asset: facts of a frontend image, of
-    // the Mac, of another commit, or under another binary's name.
+    // the Mac, or under another binary's name; and facts (with their image) of another commit.
     for bad in [
         format!("kbf-frontend-image-{COMMIT}-linux-arm64.facts.json"),
         format!("kbf-task-image-{COMMIT}-darwin-arm64.facts.json"),
-        "kbf-task-image-89abcdef0123456789abcdef0123456789abcdef-linux-arm64.facts.json".to_owned(),
         format!("kbf-task-{COMMIT}-linux-arm64.facts.json"),
     ] {
         let root = scratch("check-bad-task-facts");
@@ -1720,6 +1719,22 @@ fn check_takes_only_the_facts_of_the_task_image_for_the_commit() {
         assert_eq!(code, Some(1), "{out}");
         assert_eq!(err, format!("xtask: {bad}: not an asset of {COMMIT}\n"));
     }
+    let other = "89abcdef0123456789abcdef0123456789abcdef";
+    let root = scratch("check-other-commit-task-facts");
+    let d = dist(&root, COMMIT);
+    let facts = format!("kbf-task-image-{other}-linux-arm64.facts.json");
+    add_deb(
+        &d,
+        &format!("kbf-task-image-{other}-linux-arm64.oci.tar"),
+        true,
+    );
+    add_deb(&d, &facts, false);
+    let (code, out, err) = check(&d, COMMIT);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        err.contains(&format!("{facts}: not an asset of {COMMIT}\n")),
+        "{err}"
+    );
 }
 
 /// A `dist` of the commit with the x86_64 frontend image listed and no bundle for it: the
