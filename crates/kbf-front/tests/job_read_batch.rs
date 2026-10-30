@@ -168,6 +168,8 @@ impl BlobSource for Source {
 
 struct World {
     action: Digest,
+    /// Another Action, whose tree holds `alpha` only.
+    other: Digest,
     names: HashMap<String, Digest>,
     held: HashMap<Digest, Bytes>,
     fails: HashSet<Digest>,
@@ -198,16 +200,23 @@ fn world() -> World {
         names.insert(name.clone(), *digest);
         in_tree.push((name.clone(), *digest));
     }
-    let files = in_tree
-        .iter()
-        .map(|(name, digest)| FileNode {
-            name: name.clone(),
-            digest: Some(digest_to_proto(digest)),
-            ..FileNode::default()
-        })
-        .collect();
+    let file_nodes = |only: Option<&str>| -> Vec<FileNode> {
+        in_tree
+            .iter()
+            .filter(|(name, _)| only.is_none_or(|only| only == name))
+            .map(|(name, digest)| FileNode {
+                name: name.clone(),
+                digest: Some(digest_to_proto(digest)),
+                ..FileNode::default()
+            })
+            .collect()
+    };
     let root = Directory {
-        files,
+        files: file_nodes(None),
+        ..Directory::default()
+    };
+    let alpha_only = Directory {
+        files: file_nodes(Some("alpha")),
         ..Directory::default()
     };
     let mut put = |bytes: Vec<u8>| {
@@ -223,8 +232,16 @@ fn world() -> World {
         ..Action::default()
     };
     let action = put(action.encode_to_vec());
+    let alpha_only = put(alpha_only.encode_to_vec());
+    let other = Action {
+        command_digest: Some(digest_to_proto(&command)),
+        input_root_digest: Some(digest_to_proto(&alpha_only)),
+        ..Action::default()
+    };
+    let other = put(other.encode_to_vec());
     World {
         action,
+        other,
         names,
         held,
         fails,
@@ -627,4 +644,20 @@ async fn the_metrics_count_each_batch_outcome_and_each_blob_status() {
     ] {
         has_line(&out, line);
     }
+}
+
+/// Catches: a grant for one Action reading what only another Action's scope holds: with a token
+/// for an Action whose tree has `alpha` alone, `alpha` is served and `beta` and `secret`, which
+/// are in the first Action's tree or in none, are out of scope and are not read.
+#[tokio::test]
+async fn a_token_for_another_action_is_scoped_to_that_actions_tree() {
+    let w = world();
+    let rig = rig(&w, None, Limits::default());
+    let token = rig.token(w.other);
+    let body = body_of(&[w.t("alpha"), w.t("beta"), w.t("secret")]);
+    let reply = rig.batch(&body, Some(&token)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let expected = [frame(0, b"alpha"), frame(2, b""), frame(2, b"")].concat();
+    assert_eq!(&reply.body[..], &expected[..]);
+    assert_eq!(rig.source.reads_of(&w.d("beta")), 0);
 }

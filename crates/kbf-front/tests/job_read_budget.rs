@@ -5,7 +5,7 @@
 //! records the most reads, and the most bytes of them, that were ever open at once.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
@@ -13,8 +13,8 @@ use futures::future::{BoxFuture, join_all};
 use futures::{StreamExt as _, stream};
 use kbf_front::digest_to_proto;
 use kbf_front::grants::{GrantKey, Grants, MIN_SECRET_LEN};
-use kbf_front::job_read::{BATCH_PATH, BlobSource, JobRead, Limits, Reply};
-use kbf_proto::reapi::{Action, Directory, FileNode};
+use kbf_front::job_read::{BATCH_PATH, BlobSource, HELD_CHUNK_BYTES, JobRead, Limits, Reply};
+use kbf_proto::reapi::{Action, Directory, DirectoryNode, FileNode};
 use kbf_storage::{ReadStream, StorageError};
 use kbf_types::Digest;
 use prost::Message as _;
@@ -37,6 +37,10 @@ struct Source {
     open: Mutex<Open>,
     reads: Mutex<Vec<Digest>>,
     many: Mutex<Vec<Vec<Digest>>>,
+    /// The `read_many` calls open now, and the most there ever were.
+    many_open: Mutex<(usize, usize)>,
+    /// Answers `read_many` with its first answer only.
+    short_many: AtomicBool,
     gate: Option<(Digest, Semaphore)>,
 }
 
@@ -100,8 +104,29 @@ impl BlobSource for Source {
             {
                 gate.acquire().await.expect("the gate is open").forget();
             }
+            {
+                let mut open = self
+                    .many_open
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                open.0 += 1;
+                open.1 = open.1.max(open.0);
+            }
+            for _ in 0..30 {
+                tokio::task::yield_now().await;
+            }
+            self.many_open
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .0 -= 1;
+            let take = if self.short_many.load(Ordering::SeqCst) {
+                1
+            } else {
+                digests.len()
+            };
             digests
                 .iter()
+                .take(take)
                 .map(|d| self.blobs.get(d).cloned().ok_or(StorageError::NotFound(*d)))
                 .collect()
         })
@@ -192,6 +217,8 @@ fn rig(blobs: HashMap<Digest, Bytes>, gate: Option<Digest>, limits: Limits) -> R
         open: Mutex::new(Open::default()),
         reads: Mutex::new(Vec::new()),
         many: Mutex::new(Vec::new()),
+        many_open: Mutex::new((0, 0)),
+        short_many: AtomicBool::new(false),
         gate: gate.map(|digest| (digest, Semaphore::new(0))),
     });
     let read = JobRead::new(source.clone(), Arc::clone(&grants), limits);
@@ -468,4 +495,287 @@ async fn a_batch_with_nothing_to_read_does_not_ask_the_source() {
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     assert!(many.is_empty(), "{many:?}");
+}
+
+/// Catches: the budget being given back when the bytes are read, while the reply still holds
+/// them and a client that does not read keeps them there (256 connections of 64 MiB are far
+/// more than the budget): with a budget of 4000 bytes, a reply of 3000 that is not sent keeps
+/// a second read of 3000 waiting, and a batch reply does the same; each goes on when the reply
+/// is dropped.
+#[tokio::test]
+async fn a_reply_that_is_not_sent_keeps_its_bytes_charged_to_the_budget() {
+    let mut blobs = HashMap::new();
+    let contents: Vec<Vec<u8>> = (0..2).map(|i| pattern(i, 3000)).collect();
+    let t = build(&mut blobs, "a", &contents, 0);
+    let limits = Limits {
+        read_budget_bytes: 4000,
+        ..Limits::default()
+    };
+    let rig = rig(blobs, None, limits);
+    let token = rig.token(t.action);
+    let held = rig.get(&t.files[0], &token).await;
+    assert_eq!(held.body.len(), 3000);
+    let mut second = Box::pin(rig.get(&t.files[1], &token));
+    assert!(
+        futures::poll!(second.as_mut()).is_pending(),
+        "a GET reply is charged"
+    );
+    drop(held);
+    assert_eq!(second.await.status, StatusCode::OK);
+
+    let held = rig.batch(&[t.files[0]], &token).await;
+    assert_eq!(held.status, StatusCode::OK);
+    let mut second = Box::pin(rig.get(&t.files[1], &token));
+    assert!(
+        futures::poll!(second.as_mut()).is_pending(),
+        "a batch reply is charged"
+    );
+    drop(held);
+    assert_eq!(second.await.status, StatusCode::OK);
+}
+
+/// Catches: a body handed to the connection whole (a 64 MiB copy into the connection's write
+/// buffer while the budget is already given back) and a budget given back before the last byte
+/// is taken: `held_stream` cuts the body into chunks of at most [`HELD_CHUNK_BYTES`], gives
+/// all of its bytes in order, holds the budget until the stream ends, and is none for a
+/// reply that holds nothing (a refusal).
+#[tokio::test]
+async fn a_held_body_is_sent_in_chunks_and_the_budget_comes_back_when_it_ends() {
+    let mut blobs = HashMap::new();
+    let big = pattern(1, 3 * HELD_CHUNK_BYTES + 100);
+    let t = build(&mut blobs, "a", &[big.clone(), pattern(2, 3000)], 0);
+    let limits = Limits {
+        read_budget_bytes: 4 * HELD_CHUNK_BYTES as u64,
+        ..Limits::default()
+    };
+    let rig = rig(blobs, None, limits);
+    let token = rig.token(t.action);
+    let mut reply = rig.get(&t.files[0], &token).await;
+    let stream = reply.held_stream().expect("a reply that holds its bytes");
+    assert!(reply.body.is_empty() && reply.held_stream().is_none());
+    assert_eq!(stream.size, big.len() as u64);
+    let mut chunks = stream.chunks;
+    let first = chunks.next().await.expect("a chunk").expect("ok");
+    assert_eq!(first.len(), HELD_CHUNK_BYTES);
+    // The open stream holds the budget: a read of the same size waits.
+    let mut second = Box::pin(rig.get(&t.files[0], &token));
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    let mut got = first.to_vec();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.expect("ok");
+        assert!(chunk.len() <= HELD_CHUNK_BYTES);
+        got.extend_from_slice(&chunk);
+    }
+    assert_eq!(got, big);
+    drop(chunks);
+    assert_eq!(second.await.body.len(), big.len());
+    let nowhere = Digest::new(kbf_types::DigestFunction::Sha256, [1; 32], 4);
+    let mut refused = rig.get(&nowhere, &token).await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    assert!(refused.held_stream().is_none());
+}
+
+/// Catches: the scope walk taking budget, and reading, for the size a tenant wrote into a
+/// Directory or an Action entry (10^12 bytes would take the whole budget and stall every
+/// request): a child Directory, a root and an Action of over the cap give no scope, and none of
+/// them is read.
+#[tokio::test]
+async fn a_directory_or_action_blob_over_the_cap_gives_no_scope_and_is_not_read() {
+    let mut blobs = HashMap::new();
+    let huge = Digest::new(
+        kbf_types::DigestFunction::Sha256,
+        [7; 32],
+        1_000_000_000_000,
+    );
+    let child = DirectoryNode {
+        name: "child".to_owned(),
+        digest: Some(digest_to_proto(&huge)),
+    };
+    let root = Directory {
+        directories: vec![child],
+        ..Directory::default()
+    };
+    let root = put(&mut blobs, root.encode_to_vec());
+    let command = put(&mut blobs, b"the command".to_vec());
+    let action_of = |root: &Digest| Action {
+        command_digest: Some(digest_to_proto(&command)),
+        input_root_digest: Some(digest_to_proto(root)),
+        ..Action::default()
+    };
+    let by_child = put(&mut blobs, action_of(&root).encode_to_vec());
+    let by_root = put(&mut blobs, action_of(&huge).encode_to_vec());
+    let limits = Limits {
+        read_budget_bytes: 1024,
+        ..Limits::default()
+    };
+    let rig = rig(blobs, None, limits);
+    for action in [by_child, by_root, huge] {
+        let reply = rig.get(&command, &rig.token(action)).await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{action}");
+        assert_eq!(&reply.body[..], b"no_scope\n", "{action}");
+    }
+    assert_eq!(rig.source.reads_of(&huge), 0);
+}
+
+/// Catches: a batch that does not take the budget for its read (a mutant that drops the take
+/// leaves every other test green): with a budget of 4000, two batches of one 3000-byte blob each
+/// never have their reads open together.
+#[tokio::test]
+async fn a_batch_takes_its_budget_for_the_whole_read() {
+    let mut blobs = HashMap::new();
+    let contents: Vec<Vec<u8>> = (0..2).map(|i| pattern(i, 3000)).collect();
+    let t = build(&mut blobs, "a", &contents, 0);
+    let limits = Limits {
+        read_budget_bytes: 4000,
+        ..Limits::default()
+    };
+    let rig = rig(blobs, None, limits);
+    let token = rig.token(t.action);
+    assert_eq!(rig.get(&t.command, &token).await.status, StatusCode::OK);
+    let (a, b) = tokio::join!(
+        rig.batch(&t.files[..1], &token),
+        rig.batch(&t.files[1..], &token)
+    );
+    assert_eq!((a.status, b.status), (StatusCode::OK, StatusCode::OK));
+    let most = rig
+        .source
+        .many_open
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .1;
+    assert_eq!(most, 1, "the second batch waits for room");
+}
+
+/// Catches: a batch larger than the whole budget waiting for ever (it takes all of it instead),
+/// and a batch that is charged its blobs' sizes only, when the bytes it holds pin the gaps
+/// between blobs that the pack layer reads through: two blobs of 3000 bytes are charged 3000 +
+/// 3000 + 64 KiB, so with a budget of 100 KiB two such batches are never open together.
+#[tokio::test]
+async fn a_batch_is_charged_its_gaps_and_one_over_the_budget_is_served() {
+    let mut blobs = HashMap::new();
+    let contents: Vec<Vec<u8>> = (0..4).map(|i| pattern(i, 3000)).collect();
+    let t = build(&mut blobs, "a", &contents, 0);
+    let small = Limits {
+        read_budget_bytes: 1024,
+        ..Limits::default()
+    };
+    let rig_small = rig(blobs.clone(), None, small);
+    let token = rig_small.token(t.action);
+    let reply = rig_small.batch(&t.files[..2], &token).await;
+    assert_eq!(
+        reply.status,
+        StatusCode::OK,
+        "a batch over the budget takes all of it"
+    );
+    let limits = Limits {
+        read_budget_bytes: 100 * 1024,
+        ..Limits::default()
+    };
+    let rig = rig(blobs, None, limits);
+    let token = rig.token(t.action);
+    assert_eq!(rig.get(&t.command, &token).await.status, StatusCode::OK);
+    let (a, b) = tokio::join!(
+        rig.batch(&t.files[..2], &token),
+        rig.batch(&t.files[2..], &token)
+    );
+    assert_eq!((a.status, b.status), (StatusCode::OK, StatusCode::OK));
+    let most = rig
+        .source
+        .many_open
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .1;
+    assert_eq!(most, 1, "the gaps are charged");
+}
+
+/// Catches: a batch that takes every read place (a batch of at least `reads_in_flight` blobs
+/// queued behind one slow streamed read, and every GET queued behind it): with four places a
+/// batch of four blobs that is held open takes at most two, and a GET goes on meanwhile.
+#[tokio::test]
+async fn a_batch_takes_at_most_half_the_read_places() {
+    let mut blobs = HashMap::new();
+    let contents: Vec<Vec<u8>> = (0..5).map(|i| pattern(i, 100)).collect();
+    let t = build(&mut blobs, "a", &contents, 0);
+    let limits = Limits {
+        reads_in_flight: 4,
+        ..Limits::default()
+    };
+    let rig = rig(blobs, Some(t.files[0]), limits);
+    let token = rig.token(t.action);
+    let batch = rig.batch(&t.files[..4], &token);
+    let driver = async {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let get = rig.get(&t.files[4], &token);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(20), get).await;
+        assert_eq!(
+            got.expect("the GET is not queued behind the batch").status,
+            StatusCode::OK
+        );
+        let (_, gate) = rig.source.gate.as_ref().expect("a gate");
+        gate.add_permits(1);
+    };
+    let (batch, ()) = tokio::join!(batch, driver);
+    assert_eq!(batch.status, StatusCode::OK);
+}
+
+/// Catches: a source that answers a `read_many` with fewer answers than blobs asked for
+/// panicking the request: the blob with no answer is `store_unavailable`, the one with an
+/// answer is served.
+#[tokio::test]
+async fn a_source_with_too_few_answers_leaves_store_unavailable_not_a_panic() {
+    let mut blobs = HashMap::new();
+    let t = build(&mut blobs, "a", &[b"alpha".to_vec(), b"beta".to_vec()], 0);
+    let rig = rig(blobs, None, Limits::default());
+    rig.source.short_many.store(true, Ordering::SeqCst);
+    let token = rig.token(t.action);
+    let reply = rig.batch(&t.files, &token).await;
+    let expected = [frame(0, b"alpha"), vec![4, 0, 0, 0, 0, 0, 0, 0, 0]].concat();
+    assert_eq!(&reply.body[..], &expected[..]);
+}
+
+/// Catches: a walk in progress being dropped when the memory of scopes is at its bound (a
+/// second request for the Action would walk it again, and a farm of many Actions would walk
+/// each many times): with a bound of one, the Action whose walk is open is asked for again
+/// after another Action arrived, and is read once.
+#[tokio::test]
+async fn a_walk_in_progress_survives_the_bound_of_the_scope_memory() {
+    let mut blobs = HashMap::new();
+    let a = build(&mut blobs, "a", &[b"alpha".to_vec()], 0);
+    let b = build(&mut blobs, "b", &[b"beta".to_vec()], 0);
+    let limits = Limits {
+        scopes: 1,
+        ..Limits::default()
+    };
+    let rig = rig(blobs, Some(a.action), limits);
+    let (ta, tb) = (rig.token(a.action), rig.token(b.action));
+    let first = rig.get(&a.files[0], &ta);
+    let other = async {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        rig.get(&b.files[0], &tb).await
+    };
+    let again = async {
+        for _ in 0..60 {
+            tokio::task::yield_now().await;
+        }
+        rig.get(&a.files[0], &ta).await
+    };
+    let driver = async {
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(rig.source.reads_of(&a.action), 1, "the open walk is shared");
+        let (_, gate) = rig.source.gate.as_ref().expect("a gate");
+        gate.add_permits(1);
+    };
+    let (x, y, z, ()) = tokio::join!(first, other, again, driver);
+    assert!(
+        [x.status, y.status, z.status]
+            .iter()
+            .all(|s| *s == StatusCode::OK)
+    );
+    assert_eq!(rig.source.reads_of(&a.action), 1);
 }
