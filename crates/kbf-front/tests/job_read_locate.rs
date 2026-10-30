@@ -725,6 +725,21 @@ async fn a_full_memory_drops_the_oldest_answer_and_keeps_the_rest() {
             .iter()
             .all(|f| again[&f.to_string()]["large"].is_object())
     );
+    // The first Action asked again is checked once, for the one answer that was dropped, and
+    // for no other: the answers it still had were taken from the memory before it changed.
+    let first = table(&rig.locate(&rig.token(a.action)).await);
+    assert!(
+        a.files
+            .iter()
+            .all(|f| first[&f.to_string()]["large"].is_object())
+    );
+    assert_eq!(heads(&rig), 6);
+    let twice = a
+        .files
+        .iter()
+        .filter(|f| rig.source.heads_of(f) == 2)
+        .count();
+    assert_eq!(twice, 1, "only the oldest answer was lost");
 }
 
 /// Catches: presence checks that are limited for each request and not for all: two requests that
@@ -881,4 +896,80 @@ async fn the_table_is_charged_to_the_budget_before_it_is_built() {
     );
     drop(first);
     assert_eq!(second.await.status, StatusCode::OK);
+}
+
+/// Catches: a deadline that covers a check but not the wait for a place among all requests'
+/// checks, so that a store that never answers keeps a request (and its reads place) for as long
+/// as the queue takes: with one reads place, 40 large blobs and a store that never answers, the
+/// request ends at its deadline on a paused clock with every large blob `absent`, only the
+/// places' worth of checks ever started, a GET is then served (the place was given back), and
+/// the next locate, with the store answering, finds the blobs (the stuck checks gave their
+/// places back).
+#[tokio::test(start_paused = true)]
+async fn the_deadline_covers_the_wait_for_a_place_and_a_get_is_served_after() {
+    let source = Source::default();
+    let mut contents: Vec<Vec<u8>> = (0..40).map(|i| vec![i; 2000 + usize::from(i)]).collect();
+    contents.push(b"small".to_vec());
+    let a = build(&source, "a", &contents);
+    for file in &a.files[..40] {
+        source.large.lock().unwrap().insert(*file, file.size_bytes);
+    }
+    source.head_hang.store(true, Ordering::SeqCst);
+    let limits = Limits {
+        reads_in_flight: 1,
+        locate_head_timeout: Duration::from_secs(5),
+        ..small()
+    };
+    let rig = rig(source, limits);
+    let token = rig.token(a.action);
+    let reply = rig.locate(&token).await;
+    let first = table(&reply);
+    assert!(
+        a.files[..40]
+            .iter()
+            .all(|f| first[&f.to_string()]["absent"] == true)
+    );
+    assert_eq!(rig.source.heads.lock().unwrap().len(), HEADS_IN_FLIGHT);
+    drop(reply);
+
+    let header = format!("Bearer {token}");
+    let got = rig
+        .read
+        .respond(&Method::GET, &format!("/{}", a.files[40]), Some(&header))
+        .await;
+    assert_eq!(got.status, StatusCode::OK);
+    assert_eq!(&got.body[..], b"small");
+
+    rig.source.head_hang.store(false, Ordering::SeqCst);
+    let again = table(&rig.locate(&token).await);
+    assert!(
+        a.files[..40]
+            .iter()
+            .all(|f| again[&f.to_string()]["large"].is_object())
+    );
+}
+
+/// Catches: an index ask that names every digest of a scope (a Directory can name a million):
+/// with a cap of three, five packed blobs are three pack entries and two `absent`, and the index
+/// was asked about three.
+#[tokio::test]
+async fn a_request_asks_the_index_about_at_most_the_cap() {
+    let source = Source::default();
+    let contents: Vec<Vec<u8>> = (0..5).map(|i| vec![i; 10 + usize::from(i)]).collect();
+    let a = build(&source, "a", &contents);
+    // Every digest of the scope has a span, so which three are asked about does not matter.
+    for digest in a.scope() {
+        pack(&source, &digest, span("cas/f/w/1", 0, digest.size_bytes));
+    }
+    let limits = Limits {
+        locate_packed_per_request: 3,
+        ..small()
+    };
+    let rig = rig(source, limits);
+    let table = table(&rig.locate(&rig.token(a.action)).await);
+    let packed = table.values().filter(|l| l["pack"].is_object()).count();
+    assert_eq!(packed, 3);
+    let asked = rig.source.asked();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].len(), 3);
 }

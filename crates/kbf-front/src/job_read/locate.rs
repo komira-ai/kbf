@@ -21,13 +21,16 @@
 //! object gone): that is by design.
 //!
 //! **Bounds.** The digests of a scope are client-declared, so the work a request makes is
-//! bounded without trusting them: at most [`super::Limits::locate_heads_per_request`] large
-//! digests are checked in tierstore (the rest are `absent`, which is always safe), the checks of
-//! all requests together run at most [`HEADS_IN_FLIGHT`] at a time, and one that is not answered
-//! within [`super::Limits::locate_head_timeout`] is `absent` for that request and not
-//! remembered. The table is charged to the read budget before any of it is built, at
+//! bounded without trusting them: at most [`super::Limits::locate_packed_per_request`] digests
+//! are asked of the index and [`super::Limits::locate_heads_per_request`] large digests checked
+//! in tierstore (the rest are `absent`, which is always safe), the checks of all requests
+//! together run at most [`HEADS_IN_FLIGHT`] at a time, and the whole check phase of a request,
+//! the wait for a place included, has one deadline, [`super::Limits::locate_head_timeout`]: what
+//! is not answered by then is `absent` for that request and not remembered, so a request holds
+//! its reads place for that long at most. The table is charged to the read budget before any of it is built, at
 //! [`MAX_LOCATE_LINE_BYTES`] for each digest (the longest line there can be), and a request takes
-//! one of the reads in flight while it asks the stores. A span whose length is not the digest's
+//! one of the reads in flight while it asks the stores. Each digest is charged
+//! [`MAX_LOCATE_LINE_BYTES`] and the 256 bytes it costs while the table is made. A span whose length is not the digest's
 //! size, or whose pack key is longer than an object key can be, is `absent`.
 //!
 //! [`super::Limits::stream_over`] must equal the pack store's `max_blob_bytes`: a blob between
@@ -45,7 +48,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt as _};
 use kbf_types::Digest;
 use serde_json::json;
 use tokio::sync::Semaphore;
@@ -80,6 +83,14 @@ pub fn large_key(digest: &Digest) -> String {
 /// key can be (1024 bytes), digests and offsets at their widest. Each digest of a scope is
 /// charged to the read budget at this, before the table is built.
 pub const MAX_LOCATE_LINE_BYTES: u64 = 1208;
+
+/// What each digest of a scope is charged to the read budget, before any of it is built: the
+/// longest line ([`MAX_LOCATE_LINE_BYTES`]) and 256 bytes for what a digest costs while the
+/// table is made (its place in the three vectors and the map of entries, at most 248 bytes).
+const LOCATE_CHARGE_BYTES: u64 = MAX_LOCATE_LINE_BYTES + 256;
+
+/// The lines of a table built between two yields to the runtime.
+const LINES_PER_YIELD: usize = 1024;
 
 /// The longest pack key a line carries: the most an object key can be.
 const MAX_PACK_KEY_BYTES: usize = 1024;
@@ -212,7 +223,7 @@ impl JobRead {
         let place = Arc::clone(&self.reads).acquire_owned().await;
         let room = self
             .budget
-            .take(scope.most_digests() as u64 * MAX_LOCATE_LINE_BYTES)
+            .take(scope.most_digests() as u64 * LOCATE_CHARGE_BYTES)
             .await;
         let digests = scope.digests();
         let entries = self.entries_of(&digests).await;
@@ -221,7 +232,10 @@ impl JobRead {
             return self.refuse_locate(Outcome::Unavailable, "store_unavailable");
         };
         let mut body = String::new();
-        for (digest, entry) in digests.iter().zip(&entries) {
+        for (at, (digest, entry)) in digests.iter().zip(&entries).enumerate() {
+            if at % LINES_PER_YIELD == LINES_PER_YIELD - 1 {
+                tokio::task::yield_now().await;
+            }
             let (kind, line) = match entry {
                 Entry::Pack(at) => (
                     0,
@@ -263,6 +277,7 @@ impl JobRead {
         let packed: Vec<Digest> = digests
             .iter()
             .filter(|d| d.size_bytes <= over && !is_empty_blob(d))
+            .take(self.limits.locate_packed_per_request)
             .copied()
             .collect();
         let spans = self.source.locate_packed(&packed).await.map_err(|_| ())?;
@@ -272,7 +287,7 @@ impl JobRead {
             .take(self.limits.locate_heads_per_request)
             .copied()
             .collect();
-        let held = join_all(large.iter().map(|d| self.large_object(d))).await;
+        let held = self.large_objects(&large).await?;
         // What the source did not answer for is absent: the task asks the listener for it.
         let mut entries: HashMap<Digest, Entry> = HashMap::new();
         for (digest, at) in packed.iter().zip(spans) {
@@ -286,12 +301,12 @@ impl JobRead {
             };
             entries.insert(*digest, entry);
         }
-        for (digest, length) in large.iter().zip(held) {
-            let entry = match length? {
+        for (digest, length) in held {
+            let entry = match length {
                 Some(size) if size == digest.size_bytes => Entry::Large(size),
                 _ => Entry::Absent,
             };
-            entries.insert(*digest, entry);
+            entries.insert(digest, entry);
         }
         Ok(digests
             .iter()
@@ -299,24 +314,40 @@ impl JobRead {
             .collect())
     }
 
-    /// The length of the large object of `digest` if tierstore holds it, from what was found out
-    /// lately or else a HEAD. A failed check is not remembered.
-    async fn large_object(&self, digest: &Digest) -> Result<Option<u64>, ()> {
-        match self.locate.recalled(digest) {
-            Some(true) => return Ok(Some(digest.size_bytes)),
-            Some(false) => return Ok(None),
-            None => {}
+    /// The length of the object of each of `large` that tierstore holds, for those that were
+    /// answered: what was found out lately is taken from the memory first (before any check can
+    /// change it), and the rest are checked together under one deadline,
+    /// [`Limits::locate_head_timeout`], that covers the wait for a place among the checks of all
+    /// requests as well as the checks. A digest not answered by then is left out (it is
+    /// `absent` for this request) and nothing is remembered for it. `Err` when a check failed.
+    async fn large_objects(&self, large: &[Digest]) -> Result<Vec<(Digest, Option<u64>)>, ()> {
+        let mut held = Vec::with_capacity(large.len());
+        let mut unknown = Vec::new();
+        for digest in large {
+            match self.locate.recalled(digest) {
+                Some(present) => held.push((*digest, present.then_some(digest.size_bytes))),
+                None => unknown.push(digest),
+            }
         }
-        // A place among the checks of all requests, and a deadline for the check itself.
+        let deadline = Instant::now() + self.limits.locate_head_timeout;
+        let mut checks: FuturesUnordered<_> = unknown
+            .into_iter()
+            .map(|digest| async move { (*digest, self.large_object(digest).await) })
+            .collect();
+        while let Ok(Some((digest, length))) =
+            tokio::time::timeout_at(deadline, checks.next()).await
+        {
+            held.push((digest, length?));
+        }
+        Ok(held)
+    }
+
+    /// The length of the large object of `digest` if tierstore holds it (a HEAD, after a place
+    /// among the checks of all requests), remembered when it is known. A failed check is not
+    /// remembered.
+    async fn large_object(&self, digest: &Digest) -> Result<Option<u64>, ()> {
         let _place = self.locate.heads.acquire().await;
-        let probe = tokio::time::timeout(
-            self.limits.locate_head_timeout,
-            self.source.large_len(digest),
-        )
-        .await;
-        // Not answered in time: not known, so absent for this request and not remembered.
-        let Ok(answer) = probe else { return Ok(None) };
-        let length = answer.map_err(|_| ())?;
+        let length = self.source.large_len(digest).await.map_err(|_| ())?;
         // What is remembered as present is an object of the digest's length only.
         self.locate
             .remember(*digest, length == Some(digest.size_bytes));

@@ -143,8 +143,8 @@ pub struct Limits {
     /// is read.
     pub max_blob_bytes: u64,
     /// The size over which a blob is streamed, not read whole. Not a flag: it is the bound of
-    /// the whole-blob read ([`STREAM_OVER_BYTES`]), a test lowers it to stream small blobs. It must equal the pack store's `max_blob_bytes`:
-    /// `GET /locate` asks the index for the blobs up to it.
+    /// the whole-blob read ([`STREAM_OVER_BYTES`]), a test lowers it to stream small blobs. It must equal the pack store's
+    /// `max_blob_bytes`: `GET /locate` asks the index for the blobs up to it.
     pub stream_over: u64,
     /// The most digests a scope may hold: an input tree past it gives its Action no scope.
     pub scope_digests: usize,
@@ -163,8 +163,11 @@ pub struct Limits {
     pub locate_remembered: usize,
     /// The most large digests one `GET /locate` checks in tierstore; the others are `absent`.
     pub locate_heads_per_request: usize,
-    /// How long a presence check may take before its blob is answered `absent` (and the answer
-    /// not remembered).
+    /// The most digests one `GET /locate` asks the pack index about; the others are `absent`.
+    pub locate_packed_per_request: usize,
+    /// How long the presence checks of one `GET /locate` may take together, the wait for a
+    /// place among all requests' checks included: a blob not answered by then is `absent` (and
+    /// the answer not remembered).
     pub locate_head_timeout: Duration,
 }
 
@@ -183,6 +186,7 @@ impl Default for Limits {
             locate_absent_for: std::time::Duration::from_secs(2),
             locate_remembered: 4096,
             locate_heads_per_request: 256,
+            locate_packed_per_request: 1 << 16,
             locate_head_timeout: Duration::from_secs(10),
         }
     }
