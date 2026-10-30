@@ -965,6 +965,10 @@ fn a_base_is_a_manifest_whose_digest_is_the_hash_of_its_bytes() {
             "not a sha256 digest",
         ),
         (br#"{"layers":[{"size":3}]}"#, "not a sha256 digest"),
+        (
+            br#"{"layers":[{"digest":"sha256:ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"}]}"#,
+            "not a sha256 digest",
+        ),
         (b"not json", "not JSON"),
     ] {
         let err = Base::parse(bytes).expect_err(why);
@@ -1064,6 +1068,8 @@ fn the_facts_file_is_named_after_its_task_image() {
         format!("kbf-task-image-{COMMIT}-darwin-arm64.oci.tar"),
         format!("kbf-task-image-{COMMIT}-linux-arm64.tar.gz"),
         "kbf-task-image-nothex-linux-arm64.oci.tar".to_owned(),
+        format!("kbf-task-image-{COMMIT}.oci.tar"),
+        format!("kbf-task-image-{COMMIT}-linux-riscv64.oci.tar"),
     ] {
         assert_eq!(facts_of(&not), None, "{not}");
     }
@@ -1194,6 +1200,82 @@ fn only_an_image_with_a_base_gets_facts() {
         vec![
             format!("SHA256SUMS.linux-x86_64"),
             format!("kbf-coordinator-image-{COMMIT}-linux-x86_64.oci.tar"),
+        ]
+    );
+}
+
+/// Asserts the failures around the facts file that a good run does not reach: a pinned manifest
+/// that is not one is named with the image and platform, facts already listed stop the run, a
+/// facts path that cannot be read is an error and not a pass, and the verify job's check with no
+/// build file (no reference) says what it checked.
+#[test]
+fn the_facts_failures_name_what_is_wrong() {
+    let err = Image::Task
+        .pinned(Platform::LinuxArm64, b"{}")
+        .expect_err("not a manifest")
+        .to_string();
+    assert_eq!(
+        err,
+        "the pinned base manifest of the task image for linux-arm64 lists no layers"
+    );
+
+    let fix = task();
+    let base = fix.base();
+    let dir = scratch("facts-failures");
+    let binary = dir.join("kbf-task");
+    std::fs::write(&binary, &fix.kbf).expect("binary");
+    let image = dir.join("image.oci.tar");
+    std::fs::write(&image, fix.image()).expect("image");
+    let c = Check {
+        image: Image::Task,
+        platform: Platform::LinuxX86_64,
+        reference: Some(Reference::Binary(&binary)),
+        base: Some(&base),
+    };
+    let facts_name = format!("kbf-task-image-{COMMIT}-linux-x86_64.facts.json");
+    let out = dir.join("dist");
+    std::fs::create_dir_all(&out).expect("dist");
+    let listed = format!("{}  {facts_name}\n", Sha256::of(b"earlier"));
+    std::fs::write(out.join("SHA256SUMS.linux-x86_64"), &listed).expect("sums");
+    let err = asset(&image, COMMIT, &Mode::Add(&out), &c)
+        .expect_err("listed")
+        .to_string();
+    assert!(
+        err.ends_with(&format!("already lists {facts_name}")),
+        "{err}"
+    );
+
+    // The signed directory: the image under its name, a directory where the facts should be.
+    let signed = dir.join("signed");
+    std::fs::create_dir_all(signed.join(&facts_name)).expect("dir");
+    let name = format!("kbf-task-image-{COMMIT}-linux-x86_64.oci.tar");
+    std::fs::copy(&image, signed.join(&name)).expect("copy");
+    let err = asset(&signed.join(&name), COMMIT, &Mode::VerifyOnly, &c)
+        .expect_err("unreadable facts")
+        .to_string();
+    assert!(err.starts_with("read "), "{err}");
+
+    // With no reference only the structure is checked, as the verify job does.
+    let alone = Check {
+        reference: None,
+        ..c
+    };
+    std::fs::remove_dir(signed.join(&facts_name)).expect("rmdir");
+    let facts = facts_text(
+        &fix.image(),
+        Image::Task,
+        COMMIT,
+        Platform::LinuxX86_64,
+        &base,
+    )
+    .expect("facts");
+    std::fs::write(signed.join(&facts_name), facts).expect("facts");
+    let printed = asset(&signed.join(&name), COMMIT, &Mode::VerifyOnly, &alone).expect("verified");
+    assert_eq!(
+        printed,
+        vec![
+            format!("{name}: a linux-x86_64 task image"),
+            format!("{facts_name}: the facts of the image"),
         ]
     );
 }

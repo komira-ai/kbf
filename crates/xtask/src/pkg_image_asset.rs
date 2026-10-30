@@ -146,11 +146,15 @@ impl Image {
     /// # Errors
     /// The committed manifest is not one ([`Base::parse`]).
     pub fn base(self, platform: Platform) -> Result<Option<Base>, Error> {
-        let bytes = match (self, platform) {
-            (Image::Task, Platform::LinuxX86_64) => BASE_LINUX_X86_64,
-            (Image::Task, Platform::LinuxArm64) => BASE_LINUX_ARM64,
-            _ => return Ok(None),
-        };
+        match (self, platform) {
+            (Image::Task, Platform::LinuxX86_64) => self.pinned(platform, BASE_LINUX_X86_64),
+            (Image::Task, Platform::LinuxArm64) => self.pinned(platform, BASE_LINUX_ARM64),
+            _ => Ok(None),
+        }
+    }
+
+    /// The base the committed manifest `bytes` is, for the image of `platform`.
+    fn pinned(self, platform: Platform, bytes: &[u8]) -> Result<Option<Base>, Error> {
         Base::parse(bytes).map(Some).map_err(|e| {
             Error::Failed(format!(
                 "the pinned base manifest of the {} image for {} {e}",
