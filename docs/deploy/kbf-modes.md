@@ -334,23 +334,27 @@ given together, and takes two more that have defaults:
   broken response). A client that reads is not cut off however long its response takes in all; one
   that opens a response and never reads it holds budget for this long and no longer. The scope
   of an Action is worked out once however many tasks ask for it at the same time.
+- The tee that copies a large blob to tierstore while it is streamed buffers up to 32 MiB for each
+  live put (64 MiB in all at the default concurrency of two). That buffer is outside
+  `--job-read-budget-bytes`, which counts what a read and its reply hold.
 
 The answers are 200 with the blob and its `Content-Length`; 401 for a missing, malformed, forged,
 expired or revoked grant (with `WWW-Authenticate: Bearer`); 403 for a digest outside the grant's
 scope, or a grant whose Action has no readable inputs in the store; 404 for a blob that is not
 held, an unknown path, and 405 (with `Allow: GET`) for another method; 413 for a blob over
-`--job-max-blob-bytes`, without reading it; and 503 when the store cannot answer. A body carries a reason code
-(`missing_token`, `invalid_token`, `expired`, `revoked`, `out_of_scope`, `no_scope`, `too_large`,
-`not_found`, `method_not_allowed`, `store_unavailable`) and nothing else. A blob is read as the
-REAPI listener's reads are (the pack index first, then the storage nodes, checked against its
-digest). A blob of at most 64 MiB is read whole and sent whole. A larger one is streamed from the
-storage nodes through SHA-256, one chunk at a time with the last held back until the whole has
-hashed to its digest, so a response never holds more than a few MiB of it; a blob whose bytes are
-not its digest's ends its response short of its `Content-Length` (the client sees a broken
-response and refuses it) and is counted in `kbf_job_read_stream_ended_early_total`. At most
-`--job-reads-in-flight` reads are open at once (a streamed one until its response ends), at most 256 connections are open, a client has 10 seconds to send a request's headers, and a
-connection lives at most 10 minutes. The listener's socket is closed the moment a drain begins; the
-connections open finish their request. `GET /metrics` of the operator API gains
+`--job-max-blob-bytes`, without reading it; and 503 when the store cannot answer. A body carries a
+reason code (`missing_token`, `invalid_token`, `expired`, `revoked`, `out_of_scope`, `no_scope`,
+`too_large`, `not_found`, `method_not_allowed`, `store_unavailable`) and nothing else. A blob is
+read as the REAPI listener's reads are (the pack index first, then the storage nodes, checked
+against its digest). A blob of at most 64 MiB is read whole and sent whole. A larger one is
+streamed from the storage nodes through SHA-256, one chunk at a time with the last held back until
+the whole has hashed to its digest, so a response never holds more than a few MiB of it; a blob
+whose bytes are not its digest's ends its response short of its `Content-Length` (the client sees
+a broken response and refuses it) and is counted in `kbf_job_read_stream_ended_early_total`. At
+most `--job-reads-in-flight` reads are open at once (a streamed one until its response ends), at
+most 256 connections are open, a client has 10 seconds to send a request's headers, and a
+connection lives at most 10 minutes. The listener's socket is closed the moment a drain begins;
+the connections open finish their request. `GET /metrics` of the operator API gains
 `kbf_job_read_requests_total` (by `outcome`), `kbf_job_read_bytes_total` and
 `kbf_job_read_stream_ended_early_total` (by `reason`: `digest_mismatch` or `store_error`), and
 `kbf_tls_reloads_total` a `listener="job"` series. Where the jobs run must be allowed to reach
