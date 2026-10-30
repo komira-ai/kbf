@@ -241,6 +241,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "job-grant-secret-file",
             "job-listen",
             "job-max-blob-bytes",
+            "job-read-budget-bytes",
             "job-reads-in-flight",
             "job-tls-cert",
             "job-tls-key",

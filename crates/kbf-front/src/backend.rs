@@ -77,6 +77,13 @@ trait Plane: Send + Sync {
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Answer<Vec<Digest>>>;
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<bytes::Bytes>>;
     fn read_stream<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<ReadStream>>;
+    /// Each blob of `digests` read as [`Plane::read_blob`] reads one; a plane with packs
+    /// reads the packed ones together.
+    fn read_many<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Vec<Answer<bytes::Bytes>>> {
+        Box::pin(futures::future::join_all(
+            digests.iter().map(|digest| self.read_blob(digest)),
+        ))
+    }
     fn action_result<'a>(
         &'a self,
         action: &'a Digest,
@@ -171,6 +178,14 @@ impl Backend {
     /// the first chunk is an error item of the stream.
     pub async fn read_stream(&self, digest: &Digest) -> Result<ReadStream, StorageError> {
         self.0.read_stream(digest).await
+    }
+
+    /// The blobs `digests`, one answer each in the order asked, each as
+    /// [`Backend::read_blob`] answers one. With packs, the blobs in them are read together
+    /// (the index is asked once, and blobs that lie close in a pack are one ranged read of the
+    /// store) and only the rest are read from the storage nodes, one by one.
+    pub async fn read_many(&self, digests: &[Digest]) -> Vec<Result<bytes::Bytes, StorageError>> {
+        self.0.read_many(digests).await
     }
 
     pub(crate) async fn action_result(
@@ -361,6 +376,18 @@ impl Plane for Remote {
         self.storage.read_range(digest, 0, 0)
     }
 
+    fn read_many<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Vec<Answer<bytes::Bytes>>> {
+        match &self.packs {
+            None => Box::pin(futures::future::join_all(
+                digests.iter().map(|digest| self.storage.read_blob(digest)),
+            )),
+            Some(packs) => Box::pin(async move {
+                let held = Held(&*self.storage);
+                Layered { packs, rest: &held }.read_many(digests).await
+            }),
+        }
+    }
+
     fn action_result<'a>(
         &'a self,
         action: &'a Digest,
@@ -498,6 +525,23 @@ impl Plane for RoutedPlane {
         match self.routing() {
             Some(router) => Box::pin(router.read_range(digest, 0, 0)),
             None => self.bootstrap.read_stream(digest),
+        }
+    }
+
+    fn read_many<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Vec<Answer<bytes::Bytes>>> {
+        match (self.routing(), &self.packs) {
+            (Some(router), None) => Box::pin(futures::future::join_all(
+                digests.iter().map(|digest| router.read_blob(digest)),
+            )),
+            (Some(router), Some(packs)) => Box::pin(async move {
+                let primary = Primary(router);
+                let layered = Layered {
+                    packs,
+                    rest: &primary,
+                };
+                layered.read_many(digests).await
+            }),
+            (None, _) => self.bootstrap.read_many(digests),
         }
     }
 

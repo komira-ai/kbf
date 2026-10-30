@@ -214,6 +214,11 @@ given together, and takes two more that have defaults:
   any frontend. It is never a flag.
 - `--job-max-blob-bytes` (default 536870912, 512 MiB): the largest blob a response carries.
 - `--job-reads-in-flight` (default 32): the blob reads open at once.
+- `--job-read-budget-bytes` (default 1073741824, 1 GiB): the bytes of blob reads open at once. A
+  read takes its blob's size first (a streamed blob a bounded window of 16 MiB, a batch the sizes
+  of its blobs together, and the reads of the scope walk their own sizes); one over the budget
+  waits for room and never fails, and a blob larger than the whole budget is read alone. The scope
+  of an Action is worked out once however many tasks ask for it at the same time.
 
 The answers are 200 with the blob and its `Content-Length`; 401 for a missing, malformed, forged,
 expired or revoked grant (with `WWW-Authenticate: Bearer`); 403 for a digest outside the grant's
@@ -249,7 +254,9 @@ over 4194304 bytes is not added, it is answered `too_large` below). Otherwise it
 not_found, 2 out_of_scope, 3 too_large (use GET), 4 store_unavailable), the length as 8 bytes
 big-endian (the blob's size when ok, else 0), and the bytes. Each digest is checked against the
 grant's scope, each read counts against `--job-reads-in-flight`, and the frontend hashes every ok
-blob against its digest. A GET of `/batch` is 405 with `Allow: POST`. The golden request and
+blob against its digest. The blobs of a batch are read together: with packs, those in a pack are
+read with few ranged reads of the object store (one for blobs that lie close together), and only
+the others from the storage nodes. A GET of `/batch` is 405 with `Allow: POST`. The golden request and
 response bytes are `crates/kbf-front/tests/data/job_read_batch.golden`. `/metrics` gains
 `kbf_job_batch_requests_total` (by `outcome`) and `kbf_job_batch_blobs_total` (by `status`).
 

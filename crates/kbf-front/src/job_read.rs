@@ -83,6 +83,13 @@ pub const BATCH_MAX_BYTES: u64 = 4 << 20;
 /// of at most 90 bytes each), so that no body of any size is held.
 pub const MAX_BATCH_REQUEST_BYTES: usize = 64 << 10;
 
+/// The default of [`Limits::read_budget_bytes`]: 1 GiB.
+pub const DEFAULT_READ_BUDGET_BYTES: u64 = 1 << 30;
+
+/// The default of [`Limits::stream_window`]: what a streamed blob holds at a time (the read
+/// window of the store, 8 MiB, and the chunk being sent) with some to spare.
+pub const STREAM_WINDOW_BYTES: u64 = 16 << 20;
+
 /// The default of [`Limits::max_blob_bytes`]: 512 MiB, over the largest input a compile reads
 /// (a 165 MiB toolchain binary).
 pub const DEFAULT_MAX_BLOB_BYTES: u64 = 512 << 20;
@@ -106,6 +113,19 @@ pub trait BlobSource: Send + Sync {
         &'a self,
         digest: &'a Digest,
     ) -> BoxFuture<'a, Result<ReadStream, StorageError>>;
+
+    /// The blobs `digests`, one answer each in the order asked, as [`BlobSource::read_blob`]
+    /// answers: for a batch, so that a source that can read blobs together (the packs a
+    /// frontend keeps, where blobs that lie close are one ranged read) does. The default reads
+    /// them one by one, all at once.
+    fn read_many<'a>(
+        &'a self,
+        digests: &'a [Digest],
+    ) -> BoxFuture<'a, Vec<Result<Bytes, StorageError>>> {
+        Box::pin(futures::future::join_all(
+            digests.iter().map(|digest| self.read_blob(digest)),
+        ))
+    }
 }
 
 impl BlobSource for Backend {
@@ -119,6 +139,13 @@ impl BlobSource for Backend {
     ) -> BoxFuture<'a, Result<ReadStream, StorageError>> {
         Box::pin(Backend::read_stream(self, digest))
     }
+
+    fn read_many<'a>(
+        &'a self,
+        digests: &'a [Digest],
+    ) -> BoxFuture<'a, Vec<Result<Bytes, StorageError>>> {
+        Box::pin(Backend::read_many(self, digests))
+    }
 }
 
 /// The bounds of a [`JobRead`].
@@ -127,6 +154,14 @@ pub struct Limits {
     /// The reads of blobs open at once (at least 1), a streamed one until its response ends;
     /// a request over it waits for one to end.
     pub reads_in_flight: usize,
+    /// The bytes of reads open at once, in all (at least 1 KiB): a read takes its blob's size
+    /// first (a streamed blob [`Limits::stream_window`] of it, the scope walk's reads their
+    /// own sizes, a batch the sizes of its blobs together), one over the budget waits for room
+    /// and never fails, and a read larger than the whole budget takes the whole of it.
+    pub read_budget_bytes: u64,
+    /// What a streamed blob takes from the budget, at most its size. Not a flag; a test
+    /// lowers it.
+    pub stream_window: u64,
     /// The most bytes of one blob a response carries: a blob of more is 413, before anything
     /// is read.
     pub max_blob_bytes: u64,
@@ -144,6 +179,8 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             reads_in_flight: 32,
+            read_budget_bytes: DEFAULT_READ_BUDGET_BYTES,
+            stream_window: STREAM_WINDOW_BYTES,
             max_blob_bytes: DEFAULT_MAX_BLOB_BYTES,
             stream_over: STREAM_OVER_BYTES,
             scope_digests: 1 << 20,
@@ -303,6 +340,34 @@ impl From<StorageError> for ScopeError {
     }
 }
 
+/// The bytes of reads open at once ([`Limits::read_budget_bytes`]), in units of 1 KiB.
+struct Budget {
+    room: Arc<Semaphore>,
+    units: u32,
+}
+
+/// The size of a unit of the budget.
+const UNIT: u64 = 1024;
+
+impl Budget {
+    fn new(bytes: u64) -> Self {
+        let units = u32::try_from((bytes / UNIT).max(1)).unwrap_or(u32::MAX);
+        Self {
+            room: Arc::new(Semaphore::new(units as usize)),
+            units,
+        }
+    }
+
+    /// Room for `bytes` (rounded up to a unit, and at most the whole budget), waited for as
+    /// long as it takes; given back when the permit is dropped.
+    async fn take(&self, bytes: u64) -> Result<OwnedSemaphorePermit, AcquireError> {
+        let want = u32::try_from(bytes.div_ceil(UNIT).max(1)).unwrap_or(u32::MAX);
+        Arc::clone(&self.room)
+            .acquire_many_owned(want.min(self.units))
+            .await
+    }
+}
+
 /// The scope of each Action worked out, each in a cell that is filled by the first ask.
 type Cells = HashMap<Digest, Arc<OnceCell<Arc<Scope>>>>;
 
@@ -313,6 +378,7 @@ pub struct JobRead {
     limits: Limits,
     scopes: Mutex<Cells>,
     reads: Arc<Semaphore>,
+    budget: Budget,
     requests: Tally,
     batches: Tally,
     blobs: [Counter; BLOB_STATUSES.len()],
@@ -328,6 +394,7 @@ impl JobRead {
             source,
             grants,
             reads: Arc::new(Semaphore::new(limits.reads_in_flight.max(1))),
+            budget: Budget::new(limits.read_budget_bytes),
             limits,
             scopes: Mutex::new(HashMap::new()),
             requests: Default::default(),
@@ -389,11 +456,16 @@ impl JobRead {
         }
         let place = Arc::clone(&self.reads).acquire_owned().await;
         if digest.size_bytes > self.limits.stream_over {
+            let room = self
+                .budget
+                .take(digest.size_bytes.min(self.limits.stream_window))
+                .await;
             return match self.source.read_stream(&digest).await {
-                Ok(read) => self.serve_stream(digest, read, place),
+                Ok(read) => self.serve_stream(digest, read, (place, room)),
                 Err(error) => self.unreadable(&error),
             };
         }
+        let _room = self.budget.take(digest.size_bytes).await;
         match self.source.read_blob(&digest).await {
             Ok(bytes) => self.serve(bytes),
             Err(error) => self.unreadable(&error),
@@ -424,9 +496,7 @@ impl JobRead {
                 return self.refuse_batch(Outcome::Unavailable, "store_unavailable");
             }
         };
-        let answers =
-            futures::future::join_all(digests.iter().map(|digest| self.batch_blob(&scope, digest)))
-                .await;
+        let answers = self.batch_blobs(&scope, &digests).await;
         let mut frames = Vec::new();
         for (status, bytes) in answers {
             self.blobs[status as usize].add(1);
@@ -438,24 +508,55 @@ impl JobRead {
         self.tally(&self.batches, Outcome::Ok, Bytes::from(frames))
     }
 
-    /// One blob of a batch: how it is answered, and its bytes when that is ok.
-    async fn batch_blob(&self, scope: &Scope, digest: &Digest) -> (BlobStatus, Bytes) {
-        if !scope.allows(digest) {
-            return (BlobStatus::OutOfScope, Bytes::new());
+    /// How each of `digests` is answered, in order, and the bytes of the ok ones. The blobs
+    /// that need a read are read together, each once, with [`BlobSource::read_many`], under one
+    /// take of the reads in flight (as many places as blobs, at most all of them) and of the
+    /// budget (their sizes together).
+    async fn batch_blobs(&self, scope: &Scope, digests: &[Digest]) -> Vec<(BlobStatus, Bytes)> {
+        let readable = |digest: &Digest| {
+            scope.allows(digest) && digest.size_bytes <= BATCH_MAX_BYTES && !is_empty_blob(digest)
+        };
+        let mut wanted: Vec<Digest> = Vec::new();
+        for digest in digests.iter().filter(|digest| readable(digest)) {
+            if !wanted.contains(digest) {
+                wanted.push(*digest);
+            }
         }
-        if digest.size_bytes > BATCH_MAX_BYTES {
-            return (BlobStatus::TooLarge, Bytes::new());
+        let mut read: HashMap<Digest, (BlobStatus, Bytes)> = HashMap::new();
+        if !wanted.is_empty() {
+            let places = wanted.len().min(self.limits.reads_in_flight.max(1));
+            let _places = Arc::clone(&self.reads)
+                .acquire_many_owned(u32::try_from(places).unwrap_or(u32::MAX))
+                .await;
+            let _room = self
+                .budget
+                .take(wanted.iter().map(|digest| digest.size_bytes).sum())
+                .await;
+            let answers = self.source.read_many(&wanted).await;
+            for (digest, answer) in wanted.iter().zip(answers) {
+                let status = match answer {
+                    Ok(bytes) if kbf_segments::sha256(&bytes) == *digest => (BlobStatus::Ok, bytes),
+                    Ok(_) => (BlobStatus::StoreUnavailable, Bytes::new()),
+                    Err(StorageError::NotFound(_)) => (BlobStatus::NotFound, Bytes::new()),
+                    Err(_) => (BlobStatus::StoreUnavailable, Bytes::new()),
+                };
+                read.insert(*digest, status);
+            }
         }
-        if is_empty_blob(digest) {
-            return (BlobStatus::Ok, Bytes::new());
-        }
-        let _place = self.reads.acquire().await;
-        match self.source.read_blob(digest).await {
-            Ok(bytes) if kbf_segments::sha256(&bytes) == *digest => (BlobStatus::Ok, bytes),
-            Ok(_) => (BlobStatus::StoreUnavailable, Bytes::new()),
-            Err(StorageError::NotFound(_)) => (BlobStatus::NotFound, Bytes::new()),
-            Err(_) => (BlobStatus::StoreUnavailable, Bytes::new()),
-        }
+        digests
+            .iter()
+            .map(|digest| {
+                if !scope.allows(digest) {
+                    (BlobStatus::OutOfScope, Bytes::new())
+                } else if digest.size_bytes > BATCH_MAX_BYTES {
+                    (BlobStatus::TooLarge, Bytes::new())
+                } else if is_empty_blob(digest) {
+                    (BlobStatus::Ok, Bytes::new())
+                } else {
+                    read[digest].clone()
+                }
+            })
+            .collect()
     }
 
     fn refuse_batch(&self, outcome: Outcome, reason: &'static str) -> Reply {
@@ -492,9 +593,14 @@ impl JobRead {
         };
         let scope = cell
             .get_or_try_init(|| async {
-                walk(&*self.source, action, self.limits.scope_digests)
-                    .await
-                    .map(Arc::new)
+                walk(
+                    &*self.source,
+                    &self.budget,
+                    action,
+                    self.limits.scope_digests,
+                )
+                .await
+                .map(Arc::new)
             })
             .await?;
         Ok(Arc::clone(scope))
@@ -511,7 +617,10 @@ impl JobRead {
         &self,
         digest: Digest,
         read: ReadStream,
-        place: Result<OwnedSemaphorePermit, AcquireError>,
+        held: (
+            Result<OwnedSemaphorePermit, AcquireError>,
+            Result<OwnedSemaphorePermit, AcquireError>,
+        ),
     ) -> Reply {
         let state = Streaming {
             read,
@@ -522,7 +631,7 @@ impl JobRead {
             finished: false,
             bytes: Arc::clone(&self.bytes),
             ended_early: Arc::clone(&self.ended_early),
-            _place: place,
+            _held: held,
         };
         let chunks = stream::unfold(Some(state), |state| async move {
             let mut state = state?;
@@ -644,8 +753,12 @@ struct Streaming {
     finished: bool,
     bytes: Arc<Counter>,
     ended_early: Arc<EndedEarly>,
-    /// The read's place among [`Limits::reads_in_flight`], given back when the stream is dropped.
-    _place: Result<OwnedSemaphorePermit, AcquireError>,
+    /// The read's place among [`Limits::reads_in_flight`] and its window of the budget, given
+    /// back when the stream is dropped.
+    _held: (
+        Result<OwnedSemaphorePermit, AcquireError>,
+        Result<OwnedSemaphorePermit, AcquireError>,
+    ),
 }
 
 /// What one step of a [`Streaming`] came to.
@@ -736,16 +849,24 @@ fn digest_of(path: &str) -> Option<Digest> {
 
 /// The scope of `action`: the Action, its Command, and the Directory blobs and files of the
 /// tree under its input root, read from `source` a level at a time.
-async fn walk(source: &dyn BlobSource, action: Digest, most: usize) -> Result<Scope, ScopeError> {
-    let decoded = reapi::Action::decode(source.read_blob(&action).await?)
-        .map_err(|_| ScopeError::Unusable)?;
+async fn walk(
+    source: &dyn BlobSource,
+    budget: &Budget,
+    action: Digest,
+    most: usize,
+) -> Result<Scope, ScopeError> {
+    let bytes = {
+        let _room = budget.take(action.size_bytes).await;
+        source.read_blob(&action).await?
+    };
+    let decoded = reapi::Action::decode(bytes).map_err(|_| ScopeError::Unusable)?;
     let command = proto(decoded.command_digest.as_ref())?;
     let root = proto(decoded.input_root_digest.as_ref())?;
     let mut seen = HashSet::from([root]);
     let mut level = vec![root];
     while !level.is_empty() {
         let directories: Vec<reapi::Directory> = stream::iter(level)
-            .map(|digest| directory(source, digest))
+            .map(|digest| directory(source, budget, digest))
             .buffer_unordered(DIRECTORIES_IN_FLIGHT)
             .try_collect()
             .await?;
@@ -768,12 +889,17 @@ async fn walk(source: &dyn BlobSource, action: Digest, most: usize) -> Result<Sc
 /// The Directory blob `digest`, decoded; the empty blob is the empty Directory.
 async fn directory(
     source: &dyn BlobSource,
+    budget: &Budget,
     digest: Digest,
 ) -> Result<reapi::Directory, ScopeError> {
     if is_empty_blob(&digest) {
         return Ok(reapi::Directory::default());
     }
-    reapi::Directory::decode(source.read_blob(&digest).await?).map_err(|_| ScopeError::Unusable)
+    let bytes = {
+        let _room = budget.take(digest.size_bytes).await;
+        source.read_blob(&digest).await?
+    };
+    reapi::Directory::decode(bytes).map_err(|_| ScopeError::Unusable)
 }
 
 fn files_of(directory: &reapi::Directory) -> Result<Vec<Digest>, ScopeError> {

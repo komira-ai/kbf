@@ -61,6 +61,7 @@ const TLS_KEY: &str = "job_tls_key";
 const GRANT_SECRET: &str = "job_grant_secret_file";
 const MAX_BLOB: &str = "job_max_blob_bytes";
 const READS: &str = "job_reads_in_flight";
+const BUDGET: &str = "job_read_budget_bytes";
 
 /// The default of `--job-max-blob-bytes`, as clap takes a default (a string); a test parses
 /// it back and compares it with [`Limits::default`].
@@ -68,6 +69,9 @@ const DEFAULT_MAX_BLOB: &str = "536870912";
 
 /// The default of `--job-reads-in-flight`, likewise.
 const DEFAULT_READS: &str = "32";
+
+/// The default of `--job-read-budget-bytes`, likewise (1 GiB).
+const DEFAULT_BUDGET: &str = "1073741824";
 
 /// The most bytes the grant secret's file may hold, surrounding whitespace included.
 const MAX_SECRET_FILE_BYTES: usize = 4096;
@@ -78,7 +82,7 @@ pub(super) const MAX_CONNECTIONS: usize = 256;
 /// The label of the listener's TLS files in `kbf_tls_reloads_total`.
 const TLS_LABEL: &str = "job";
 
-/// The job-facing read's flags: the first four, or none; the last two have defaults.
+/// The job-facing read's flags: the first four, or none; the last three have defaults.
 #[derive(Clone, Debug)]
 pub struct JobReadFlags {
     /// `--job-listen`: where the listener listens.
@@ -93,10 +97,12 @@ pub struct JobReadFlags {
     pub max_blob_bytes: u64,
     /// `--job-reads-in-flight`: the blob reads open at once.
     pub reads_in_flight: u32,
+    /// `--job-read-budget-bytes`: the bytes of blob reads open at once.
+    pub read_budget_bytes: u64,
 }
 
-/// The six flags.
-pub(super) fn args() -> [Arg; 6] {
+/// The seven flags.
+pub(super) fn args() -> [Arg; 7] {
     [
         Arg::new(LISTEN)
             .long("job-listen")
@@ -171,6 +177,19 @@ pub(super) fn args() -> [Arg; 6] {
                  holds its place until its response ends, and a request over the bound waits \
                  for one to end. Needs `--job-listen`",
             ),
+        Arg::new(BUDGET)
+            .long("job-read-budget-bytes")
+            .value_name("BYTES")
+            .value_parser(clap::value_parser!(u64).range(1..))
+            .default_value(DEFAULT_BUDGET)
+            .requires(LISTEN)
+            .help(
+                "The bytes of blob reads this listener has open at once, at least 1: a read \
+                 takes its blob's size (a streamed blob a bounded window of it, and the scope \
+                 walk's reads their own sizes) and a request over the budget waits for room, it \
+                 never fails; a blob larger than the whole budget is read alone. Needs \
+                 `--job-listen`",
+            ),
     ]
 }
 
@@ -190,6 +209,7 @@ pub(super) fn from_matches(m: &ArgMatches) -> Option<JobReadFlags> {
         grant_secret_file: path(GRANT_SECRET),
         max_blob_bytes: *m.get_one::<u64>(MAX_BLOB).expect("clap gives it a default"),
         reads_in_flight: *m.get_one::<u32>(READS).expect("clap gives it a default"),
+        read_budget_bytes: *m.get_one::<u64>(BUDGET).expect("clap gives it a default"),
     })
 }
 
@@ -297,6 +317,7 @@ impl Prepared {
         let limits = Limits {
             reads_in_flight: usize::try_from(flags.reads_in_flight).unwrap_or(usize::MAX),
             max_blob_bytes: flags.max_blob_bytes,
+            read_budget_bytes: flags.read_budget_bytes,
             ..Limits::default()
         };
         Ok(Self {
