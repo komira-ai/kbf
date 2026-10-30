@@ -44,10 +44,12 @@ use futures::future::BoxFuture;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
+use kbf_front::Packs;
 use kbf_front::grants::{GrantKey, Grants, KeyError};
 use kbf_front::job_read::{
     BATCH_PATH, BlobSource, JobRead, Limits, MAX_BATCH_REQUEST_BYTES, Reply,
 };
+use kbf_front::large_backfill::LargeBackfill;
 use kbf_tls::{Alpn, Conn, TlsError, TlsFiles, TlsSource};
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 
@@ -275,6 +277,8 @@ pub(super) struct Prepared {
     grants: Arc<Grants>,
     /// What the flags bound: the reads open at once and the largest blob served.
     limits: Limits,
+    /// The copy of large blobs to tierstore, when there are packs to take it from.
+    backfill: Option<LargeBackfill>,
 }
 
 /// The waits that bound a client of the listener.
@@ -346,7 +350,20 @@ impl Prepared {
             tls,
             grants,
             limits,
+            backfill: None,
         })
+    }
+
+    /// This listener, copying the large blobs it streams to the packs' store through `packs`
+    /// ([`kbf_front::large_backfill`]); `None` copies nothing.
+    pub(super) fn with_backfill(mut self, packs: Option<Packs>) -> Self {
+        self.backfill = packs.map(|packs| {
+            LargeBackfill::new(
+                Arc::new(packs),
+                kbf_front::large_backfill::DEFAULT_CONCURRENCY,
+            )
+        });
+        self
     }
 
     /// Where the listener listens.
@@ -363,7 +380,8 @@ impl Prepared {
         source: Arc<dyn BlobSource>,
         timeouts: Timeouts,
     ) -> Result<Serving, JobReadError> {
-        let read = Arc::new(JobRead::new(source, self.grants, self.limits));
+        let read =
+            Arc::new(JobRead::new(source, self.grants, self.limits).with_backfill(self.backfill));
         let (incoming, latch) = self.socket.grpc(Some(self.tls.clone()))?;
         let task = accept(
             incoming,

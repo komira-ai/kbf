@@ -25,3 +25,4 @@ mod untrusted;
 mod untrusted_mint;
 mod untrusted_multi;
 mod untrusted_task;
+mod untrusted_writethrough;

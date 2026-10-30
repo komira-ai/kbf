@@ -69,7 +69,7 @@ pub use self::commit::{
     UntrustedLimits, ingest, ingest_set,
 };
 pub(in crate::proxy) use self::hit::held;
-pub use self::metrics::PackMetrics;
+pub use self::metrics::{LargeWriteThrough, PackMetrics};
 pub use self::room::DEFAULT_INFLIGHT_BYTES;
 pub use self::store::{
     DEFAULT_UPLOAD_IDLE_TIMEOUT, MAX_PACKED_BLOB_BYTES, MAX_UPLOAD_IDLE_TIMEOUT, PackSettings,

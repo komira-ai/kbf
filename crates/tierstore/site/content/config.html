@@ -1,0 +1,171 @@
+<h1>Configuration</h1>
+<p class="lede">tierstore is configured by flags or by one TOML file given with <code>--config</code>. The two make the same settings and run the same code. A file holds no secret, only the paths of key files.</p>
+<div class="notice notice-warn"><p><strong>The configuration file is not in a release yet.</strong> <code>--config</code> and <code>--print-config</code> are on main only: no released tierstore reads a TOML file. The command-line flags work with every released tierstore; the sections below that use <code>--config</code> or <code>--print-config</code> need a build of main, and will be in the first release after v0.0.38.</p></div>
+<p class="toc">On this page: <a href="#file">the file</a> <a href="#flags">flags and keys</a> <a href="#refused">what the loader refuses</a> <a href="#migrate">from flags to a file</a> <a href="#keys">key files and roles</a></p>
+
+<h2 id="file">The file <span class="tag tag-planned">on main, next release</span></h2>
+<p><code>tierstore --config &lt;path&gt;</code> reads one TOML file in place of the flags that describe the data path (the listen address, the tiers, the key files, the limits and the reconciler's settings). This release reads the storage-node shape: <code>[server]</code>, <code>[hot_store]</code> and <code>[cold_store]</code>, and an optional <code>[[policy]]</code>. A file for a storage node:</p>
+<div class="code"><pre>[server]
+listen              = "192.0.2.10:9000"
+proxy_id            = "tierstore-1"
+bucket              = "tierstore"
+region              = "us-east-1"
+max_request_bytes   = 268435456
+access_key_file     = "/etc/tierstore/access.key"
+read_only_key_files = ["/etc/tierstore/daemons.key"]
+presign_key_files   = ["/etc/tierstore/pack-presign.key"]
+gc_key_files        = ["/etc/tierstore/pack-gc.key"]
+
+[hot_store]
+kind              = "s3"
+bucket            = "tierstore-hot"
+endpoint          = "http://s3-hot.example:9000"
+region            = "us-east-1"
+credentials_file  = "/etc/tierstore/hot.credentials"
+budget            = "1TiB"
+high_water        = 80
+low_water         = 70
+critical          = 95
+copy_parallel     = 16
+lease_ttl         = "30s"
+reconcile_interval = "5s"
+usage_stale_after = "2m"
+journal_linger    = "20ms"
+journal_retention = "24h"
+
+[cold_store]
+kind             = "s3"
+bucket           = "tierstore-cold"
+endpoint         = "http://s3-cold.example:9000"
+credentials_file = "/etc/tierstore/cold.credentials"
+skip_checks      = []</pre></div>
+<p>A key that is left out has the default of its flag (<code>tierstore --help</code> lists them). <code>listen</code>, <code>proxy_id</code>, <code>bucket</code> and <code>access_key_file</code> of <code>[server]</code>, <code>kind</code> of each tier and <code>budget</code> of <code>[hot_store]</code> are needed. Durations are a whole number and <code>ms</code>, <code>s</code>, <code>m</code> or <code>h</code>, as in the flags. The water marks are percents, 1 to 100. A number above 9223372036854775807 (the largest TOML integer) cannot go in a file.</p>
+<p class="source-note">The values are examples: <code>192.0.2.10</code> is a documentation address and <code>s3-hot.example</code> is not a host. From <code>packaging/tierstore/README.md</code>, "The configuration file".</p>
+<p>A message about a file repeats no value except a <code>[[policy]]</code> prefix: a syntax refusal names the line, the column and the key; any other refusal names the key. A refusal of the file or the flags exits 2.</p>
+
+<h2 id="flags">Which key each flag has</h2>
+<p>The flags are in every released tierstore; the keys are for the file, which is not released yet.</p>
+<p>Every flag that describes the data path has the key or keys below, and no other has one. A flag that takes a list (<code>--read-only-key-file</code>, given once for each key) is a list in the file. A tier flag is a <code>kind</code> and the key its kind needs: <code>--hot dir:&lt;path&gt;</code> is <code>kind = "dir"</code> and <code>path</code>, <code>--hot s3:&lt;bucket&gt;</code> is <code>kind = "s3"</code> and <code>bucket</code>. The keys of the reconciler, the journal and the lease are in <code>[hot_store]</code>, since only a process with a hot tier has them. The crate's tests walk the flags of the binary against this table, so a flag added without a key fails them.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Flag</th><th>Key</th><th>What</th></tr></thead>
+<tbody>
+<tr><td><code>--listen</code></td><td><code>server.listen</code></td><td>the address the S3 API, <code>/healthz</code>, <code>/readyz</code> and <code>/usagez</code> are served on</td></tr>
+<tr><td><code>--proxy-id</code></td><td><code>server.proxy_id</code></td><td>names the journal and the lease of this process</td></tr>
+<tr><td><code>--hot</code></td><td><code>hot_store.kind</code>, <code>hot_store.path</code>, <code>hot_store.bucket</code></td><td>the hot tier: <code>kind</code> is <code>memory</code>, <code>dir</code> (with <code>path</code>) or <code>s3</code> (with <code>bucket</code>, <code>endpoint</code> and <code>credentials_file</code>); in a flag, <code>memory</code>, <code>dir:&lt;path&gt;</code> or <code>s3:&lt;bucket&gt;</code></td></tr>
+<tr><td><code>--cold</code></td><td><code>cold_store.kind</code>, <code>cold_store.path</code>, <code>cold_store.bucket</code></td><td>the cold tier, in the same three kinds</td></tr>
+<tr><td><code>--hot-endpoint</code></td><td><code>hot_store.endpoint</code></td><td><code>http://host[:port]</code> of an <code>s3</code> hot tier</td></tr>
+<tr><td><code>--hot-region</code></td><td><code>hot_store.region</code></td><td>the signing region of an <code>s3</code> hot tier</td></tr>
+<tr><td><code>--hot-credentials-file</code></td><td><code>hot_store.credentials_file</code></td><td>the key file of an <code>s3</code> hot tier</td></tr>
+<tr><td><code>--cold-endpoint</code></td><td><code>cold_store.endpoint</code></td><td><code>http://host[:port]</code> of an <code>s3</code> cold tier</td></tr>
+<tr><td><code>--cold-region</code></td><td><code>cold_store.region</code></td><td>the signing region of an <code>s3</code> cold tier</td></tr>
+<tr><td><code>--cold-credentials-file</code></td><td><code>cold_store.credentials_file</code></td><td>the key file of an <code>s3</code> cold tier</td></tr>
+<tr><td><code>--s3-request-timeout</code></td><td><code>server.s3_request_timeout</code></td><td>the limit on a request to an <code>s3</code> tier (both tiers)</td></tr>
+<tr><td><code>--hot-bytes</code></td><td><code>hot_store.budget</code></td><td>the bytes the hot tier is meant to hold: a number, or a string such as <code>"500GiB"</code></td></tr>
+<tr><td><code>--high-water</code></td><td><code>hot_store.high_water</code></td><td>percent of the budget above which eviction begins</td></tr>
+<tr><td><code>--low-water</code></td><td><code>hot_store.low_water</code></td><td>percent of the budget eviction goes down to</td></tr>
+<tr><td><code>--critical</code></td><td><code>hot_store.critical</code></td><td>percent of the budget above which a put waits and a cold read is not copied back</td></tr>
+<tr><td><code>--bucket</code></td><td><code>server.bucket</code></td><td>the name of the bucket served</td></tr>
+<tr><td><code>--region</code></td><td><code>server.region</code></td><td>the region of a request's signature</td></tr>
+<tr><td><code>--access-key-file</code></td><td><code>server.access_key_file</code></td><td>the full key file</td></tr>
+<tr><td><code>--read-only-key-file</code></td><td><code>server.read_only_key_files</code></td><td>a list of read-only key files</td></tr>
+<tr><td><code>--presign-key-file</code></td><td><code>server.presign_key_files</code></td><td>a list of presigning key files</td></tr>
+<tr><td><code>--gc-key-file</code></td><td><code>server.gc_key_files</code></td><td>a list of GC key files</td></tr>
+<tr><td><code>--scoped-key-file</code></td><td><code>server.scoped_key_files</code></td><td>a list of scoped key files</td></tr>
+<tr><td><code>--presign-max-expires</code></td><td><code>server.presign_max_expires</code></td><td>the longest expiry of any presigned URL</td></tr>
+<tr><td><code>--journal-linger</code></td><td><code>hot_store.journal_linger</code></td><td>how long a batch of journal entries waits for more</td></tr>
+<tr><td><code>--journal-retention</code></td><td><code>hot_store.journal_retention</code></td><td>how long an applied journal object is kept</td></tr>
+<tr><td><code>--copy-parallel</code></td><td><code>hot_store.copy_parallel</code></td><td>the most objects the reconciler copies at once</td></tr>
+<tr><td><code>--lease-ttl</code></td><td><code>hot_store.lease_ttl</code></td><td>how long the reconciler's lease lasts without a renewal</td></tr>
+<tr><td><code>--reconcile-interval</code></td><td><code>hot_store.reconcile_interval</code></td><td>how often the reconciler works</td></tr>
+<tr><td><code>--usage-stale-after</code></td><td><code>hot_store.usage_stale_after</code></td><td>how old the published usage may be before <code>/usagez</code> says 503</td></tr>
+<tr><td><code>--max-request-bytes</code></td><td><code>server.max_request_bytes</code></td><td>the longest body of a request</td></tr>
+<tr><td><code>--max-concurrent-puts</code></td><td><code>server.max_concurrent_puts</code></td><td>the most put bodies and parts taken at once</td></tr>
+<tr><td><code>--put-min-bytes-per-sec</code></td><td><code>server.put_min_bytes_per_sec</code></td><td>the least average rate of a body (0 turns it off)</td></tr>
+<tr><td><code>--put-rate-grace</code></td><td><code>server.put_rate_grace</code></td><td>the time waiting for the client before that rate is held</td></tr>
+<tr><td><code>--body-idle-timeout</code></td><td><code>server.body_idle_timeout</code></td><td>how long a body or an answer may go without a byte</td></tr>
+<tr><td><code>--skip-backend-check</code></td><td><code>cold_store.skip_checks</code></td><td>a list of <code>CHECK=REASON</code> texts: the start-up check that is left out, with its reason (only <code>multipart-conditional</code>; it runs on the cold tier)</td></tr>
+<tr><td><code>--backend-check-wait</code></td><td><code>server.backend_check_wait</code></td><td>how long the start-up self-test asks again of a tier that does not answer</td></tr>
+</tbody></table></div>
+<p>These stay flags, since they describe one run and not the data path: <code>--config</code>, <code>--print-config</code>, <code>--drain-lb-wait</code> and <code>--drain-deadline</code>. A start that gives <code>--config</code> and any other flag is refused with status 2 and a message that names the flags (<code>--drain-lb-wait</code> and <code>--drain-deadline</code> may go with it).</p>
+<p>Defaults of the flags used on this site, from the binary: <code>--high-water</code> 80, <code>--low-water</code> 70, <code>--critical</code> 95, <code>--copy-parallel</code> 16, <code>--lease-ttl</code> 30s, <code>--reconcile-interval</code> 5s, <code>--journal-linger</code> 20ms, <code>--journal-retention</code> 24h, <code>--usage-stale-after</code> 2m, <code>--drain-lb-wait</code> 10s, <code>--drain-deadline</code> 15m, <code>--backend-check-wait</code> 5m, <code>--presign-max-expires</code> 15m, <code>--region</code> <code>us-east-1</code>. <code>--hot-bytes</code> has no default.</p>
+
+<h2 id="refused">What the loader refuses</h2>
+<p>Each of these exits with status 2 and names the file and the key:</p>
+<ul>
+<li>a key or a table the format does not have (the file is a closed set), and a value of the wrong type;</li>
+<li>a key that holds a secret: keys and credentials are paths of files, whose names end in <code>_file</code> or <code>_files</code>; <code>secret_access_key</code>, <code>access_key_id</code>, <code>password</code>, a name with <code>token</code> in it and the like are refused wherever they are;</li>
+<li><code>[local_cache]</code>, which is reserved for a later release and refused as not supported yet, and a file without both <code>[hot_store]</code> and <code>[cold_store]</code>;</li>
+<li>a key of a tier that its <code>kind</code> does not take (<code>path</code> for a <code>memory</code> tier, <code>endpoint</code> for a <code>dir</code> tier), a <code>dir</code> tier without <code>path</code>, an <code>s3</code> tier without <code>bucket</code>, <code>endpoint</code> or <code>credentials_file</code>, and a key only one tier has in the other (<code>budget</code> and the reconciler's keys are <code>[hot_store]</code>'s; <code>skip_checks</code> is <code>[cold_store]</code>'s);</li>
+<li>a water mark outside 1 to 100, and a budget, a count or a limit of zero;</li>
+<li>a <code>[[policy]]</code> prefix that is listed twice, that lies inside another listed prefix (or holds one), that does not end in <code>/</code>, or that is under <code>_journal/</code> or <code>_tiering/</code>, which tierstore keeps for itself.</li>
+</ul>
+<p><code>[[policy]]</code> has a <code>prefix</code> (empty for all the rest) and <code>cache</code>. In this release a policy is read and checked and has no effect, since nothing is cached yet; <code>cache = true</code> is refused as not supported yet.</p>
+
+<h2 id="migrate">From flags to a file <span class="tag tag-planned">on main, next release</span></h2>
+<p><code>tierstore --print-config</code> with the flags of a unit (without <code>--config</code>) prints the equivalent file on stdout and exits 0 without starting anything. It prints the key files by path, never what is in them, and loads the file back before printing it. A <code>--print-config</code> that cannot write its output exits 1.</p>
+<div class="code"><pre><span class="p">$</span> /usr/libexec/kbf/tierstore --print-config --listen 192.0.2.10:9000 ... &gt; /etc/tierstore/tierstore.toml</pre></div>
+<p>Then change <code>ExecStart=</code> of the unit to:</p>
+<div class="code"><pre>ExecStart=/usr/libexec/kbf/tierstore --config /etc/tierstore/tierstore.toml --drain-lb-wait 10s --drain-deadline 15m</pre></div>
+<p>The flags and the file are both accepted in this release. The README says the flags are to go in the release after, and <code>--config</code> is then the way to configure the data path.</p>
+
+<h2 id="keys">Key files and roles</h2>
+<p>Every key file (access, read-only, hot and cold credentials, presigning, GC and scoped) is read by path and must be mode 0600 or 0400; a file others or the group can read is refused at start. The access key ids of all the keys of one server must differ, or the start exits 2. A <code>--read-only-key-file</code>, a <code>--presign-key-file</code>, a <code>--gc-key-file</code> and a <code>--scoped-key-file</code> may each be given once for each key.</p>
+<p>A key file for <code>--access-key-file</code>, <code>--read-only-key-file</code> and the credentials flags holds its key in one of two forms; the process tells them apart by the first byte that is not white space (<code>{</code> is JSON):</p>
+<div class="code"><pre>{"access_key_id": "AKIDEXAMPLE", "secret_access_key": "the secret"}</pre></div>
+<div class="code"><pre>AKIDEXAMPLE
+the secret</pre></div>
+<p>tierstore needs exactly those two fields in the JSON form, both non-empty strings, and refuses a file with another field or an empty value.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Role</th><th>Flag</th><th>May do</th></tr></thead>
+<tbody>
+<tr><td>full</td><td><code>--access-key-file</code></td><td>everything the front serves: put, get, head, list, delete and the calls of a multipart upload</td></tr>
+<tr><td>read-only</td><td><code>--read-only-key-file</code></td><td>get, head and list (objects and open multipart uploads); every write, delete and multipart call is 403 <code>AccessDenied</code>, before its body is read</td></tr>
+<tr><td>presigning</td><td><code>--presign-key-file</code></td><td>sign presigned PUT URLs for one object each under a prefix</td></tr>
+<tr><td>GC</td><td><code>--gc-key-file</code></td><td>list, head, delete and abort uploads under one prefix</td></tr>
+<tr><td>scoped</td><td><code>--scoped-key-file</code></td><td>read, create and delete under the prefixes of three lists</td></tr>
+</tbody></table></div>
+<p>A role belongs to a key, not to a prefix: a read-only key may read every object of the bucket.</p>
+
+<h3 id="presign">Presigned PUT URLs</h3>
+<p>A client that holds a presigned URL writes one object with a plain <code>PUT</code> of the URL. The server checks SigV4 query-string authentication (payload <code>UNSIGNED-PAYLOAD</code>, <code>host</code> signed). Only a presigning key can sign a URL, and the file holds the key and its ceiling, all required:</p>
+<div class="code"><pre>{"access_key_id": "pack-presign", "secret_access_key": "the secret",
+ "ceiling": {"prefix": "cas/b/", "max_expires_secs": 600, "max_object_bytes": 134217728}}</pre></div>
+<p>A URL is good for one <code>PUT</code> of a key that starts with the prefix (never <code>_journal/</code> or <code>_tiering/</code>), with an <code>X-Amz-Expires</code> of at most the smaller of <code>max_expires_secs</code> and <code>--presign-max-expires</code>, and a body of at most <code>max_object_bytes</code> (5 GiB at most), held to <code>--max-request-bytes</code> too (256 MiB by default). The object appears only after a complete body; a second <code>PUT</code> of the key is 412; no multipart call, <code>If-Match</code>, read, list or delete is allowed. The signature does not cover the body, so the reader of the object must check its content.</p>
+
+<h3 id="gc">GC keys</h3>
+<p>A GC key file is JSON of <code>access_key_id</code>, <code>secret_access_key</code> and <code>prefix</code>. It signs in the header only and may do these, only for a key that starts with its prefix (which ends in <code>/</code>) and is longer than it:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Call</th><th>Allowed</th></tr></thead>
+<tbody>
+<tr><td>ListObjectsV2</td><td>with a <code>prefix</code> inside the key's; a list with no prefix or another is 403, not filtered</td></tr>
+<tr><td>ListMultipartUploads</td><td>with a <code>prefix</code> inside the key's, the open uploads under it; no prefix or another is 403, not filtered</td></tr>
+<tr><td>HeadObject</td><td>yes</td></tr>
+<tr><td>DeleteObject</td><td>yes: from both tiers, journaled as for any delete</td></tr>
+<tr><td>AbortMultipartUpload</td><td>of an upload of such a key</td></tr>
+<tr><td>GetObject</td><td>no: a GC key never reads a body</td></tr>
+<tr><td>put, part, start or completion of an upload, copy, CreateBucket, HeadBucket</td><td>no</td></tr>
+<tr><td><code>_journal/</code>, <code>_tiering/</code>, any key outside the prefix, the prefix itself</td><td>no</td></tr>
+</tbody></table></div>
+
+<h3 id="scoped">Scoped keys</h3>
+<p>A scoped key reads, creates and deletes under prefixes that its file lists, and does nothing else. The file is JSON of exactly five fields, all required:</p>
+<div class="code"><pre>{"access_key_id": "frontend-packs", "secret_access_key": "the secret",
+ "read_prefixes": ["cas/"],
+ "write_prefixes": ["cas/f/frontend/"],
+ "delete_prefixes": []}</pre></div>
+<p>Every prefix ends in <code>/</code> and is not empty. None may be <code>_journal/</code> or <code>_tiering/</code>, be under one, be a prefix of one, or have one as a segment. A list may be empty, but a key whose three lists are all empty is refused. A key or a listing <code>prefix</code> that has <code>..</code> anywhere in it is refused.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Call</th><th>List</th><th>Allowed</th></tr></thead>
+<tbody>
+<tr><td>GetObject, HeadObject</td><td><code>read_prefixes</code></td><td>yes, whole or by range</td></tr>
+<tr><td>ListObjectsV2</td><td><code>read_prefixes</code></td><td>with a <code>prefix</code> parameter inside a read prefix; no prefix or another is 403, not filtered</td></tr>
+<tr><td>ListMultipartUploads</td><td><code>read_prefixes</code></td><td>the same rule: a <code>prefix</code> inside a read prefix</td></tr>
+<tr><td>PutObject</td><td><code>write_prefixes</code></td><td>create-only: no <code>If-Match</code>, and <code>If-None-Match</code> absent or <code>*</code>; a key that exists is <code>412 PreconditionFailed</code></td></tr>
+<tr><td>CreateMultipartUpload, UploadPart, CompleteMultipartUpload</td><td><code>write_prefixes</code></td><td>of a key inside a write prefix, each call checked</td></tr>
+<tr><td>AbortMultipartUpload</td><td><code>write_prefixes</code></td><td>of an upload of such a key (a delete prefix does not allow an abort)</td></tr>
+<tr><td>DeleteObject</td><td><code>delete_prefixes</code></td><td>from both tiers, journaled as for any delete</td></tr>
+<tr><td>a put with <code>If-Match</code> or any other <code>If-None-Match</code>, a copy (<code>x-amz-copy-source</code>, also on a part)</td><td>none</td><td>no: a scoped key never replaces or copies</td></tr>
+<tr><td>the calls on the bucket (CreateBucket, HeadBucket, delete) and the root, any other method</td><td>none</td><td>no</td></tr>
+<tr><td><code>_journal/</code>, <code>_tiering/</code>, any key outside the list the call needs</td><td>none</td><td>no</td></tr>
+</tbody></table></div>
+<p class="source-note">Tables and rules from <code>packaging/tierstore/README.md</code> ("Scoped keys", "GC keys", "Presigned PUT URLs") and <code>crates/tierstore/README.md</code>.</p>

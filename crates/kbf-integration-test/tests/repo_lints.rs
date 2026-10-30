@@ -38,6 +38,8 @@
 //!   built, and again on the packaged tarball with `build-commit check-asset`), signing and
 //!   `darwin-asset`-checking every macOS binary, or docs/artifacts.md describing
 //!   another set (module `release_artifacts`);
+//! - a workflow, release asset list or docs/artifacts.md that ships a darwin `kbf-task` asset, package or image,
+//!   or a workflow that enables the test-only feature `unconfined-for-tests` of `kbf-task` (`no_darwin_task.rs`);
 //! - the push-to-main pipeline drifting from its shape (`ci` and `beta` together, `artifacts` after `ci`,
 //!   `smoke` on those artifacts after `artifacts`, `passed` needing all four, and the `watch` job that
 //!   cancels the run when a job fails), a called workflow gaining a push
@@ -57,6 +59,8 @@
 //!   does not leak (module `scratch_dirs`, whose docs say what it misses);
 //! - a `.rs` file under `crates/` whose comments or names narrate how a test was checked
 //!   instead of the defect it catches (module `test_wording`, whose docs state the rule);
+//! - a test that opens a `file://` cold store without naming its
+//!   free-space floor (module `store_floor`, whose docs say what it misses);
 //! - the scans passing vacuously because git listed nothing, no Markdown file was
 //!   scanned or the workflows moved;
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
@@ -72,6 +76,7 @@ mod pipeline_workflow;
 mod release_artifacts;
 mod release_workflow;
 mod scratch_dirs;
+mod store_floor;
 mod test_spawns;
 mod test_wording;
 mod workflows;

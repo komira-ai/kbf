@@ -2,7 +2,9 @@
 //! loopback, requests signed by hand, the drain, and the `tierstore` process.
 
 mod binary;
+mod cache_node;
 mod client;
+mod config_file;
 mod drain;
 mod files;
 mod idle;

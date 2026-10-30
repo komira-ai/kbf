@@ -5196,16 +5196,21 @@ dependencies = [
  "kbf-testkit",
  "md-5 0.11.0",
  "percent-encoding",
+ "rcgen",
  "reqwest",
  "ring",
  "roxmltree",
  "rustix",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
  "tierstore",
  "tokio",
+ "tokio-rustls",
+ "toml",
+ "x509-parser",
 ]
 
 [[package]]

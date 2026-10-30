@@ -18,8 +18,8 @@ build.
 
 ## Pull request labels
 
-A pull request runs the two jobs of `ci.yml` (`lint`, and `test` on the fast set) and nothing
-else; the full suite, the macOS jobs and the packages run on a push to `main`
+A pull request runs `ci.yml` (the checks `lint` and `test`, which gates the coverage of the fast set
+run in the `test-shard` matrix beside it) and nothing else; the full suite, the macOS jobs and the packages run on a push to `main`
 (`beta.yml`). One label opts a pull request in to more, to spare the small
 macOS runner pool. Adding it to an open pull request starts a run.
 
@@ -91,6 +91,8 @@ binary, which runs it, and `cargo xtask static-elf`, which refuses it unless it 
 interpreter and no needed library. The task image
 carries the same file. It writes its pack with `kbf-task-pack` (`crates/kbf-task-pack`), the task pack types
 the frontend ingests with, a crate of pure Rust that does not link the pack index or the object store client.
+
+There is no `kbf-task` asset or image for a Mac. Where no confine is built (anywhere but Linux) `kbf-task` refuses a Command that is to be denied the network (exit 15), so no workflow may package one until the Mac confine exists; a repository lint fails on such an asset, package line or image, on a `cargo build` for a Mac target that would produce it (any job), on a Mac runner job that names it or builds the whole workspace without `--exclude kbf-task`, and on a workflow that names the test-only feature `unconfined-for-tests`; a `cargo check` or `clippy` of it for a Mac target, which ships nothing, is allowed. The backstop is the pin of the release set (the asset table here and the workflow must agree, so a `kbf-task` asset for a Mac needs an edit of this file, which the lint catches); the lint's text match of workflow jobs is a tripwire.
 
 `tierstore` is the hot and cold S3 object store proxy (`crates/tierstore`): an S3 server over two
 tiers that copies new objects to the cold tier and frees the hot one when it fills. It is built with

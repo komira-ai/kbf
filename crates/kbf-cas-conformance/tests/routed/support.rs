@@ -60,6 +60,12 @@ pub struct Fake {
     pause: Mutex<Option<(usize, Arc<tokio::sync::Semaphore>)>>,
     /// How many reads were asked of it.
     pub reads: AtomicUsize,
+    /// Notified when a read is asked of it.
+    pub asked: Arc<tokio::sync::Notify>,
+    /// Notified when a read has passed its chunks and waits at the pause.
+    pub paused: Arc<tokio::sync::Notify>,
+    /// Notified for each chunk a read sends after the pause.
+    pub served: Arc<tokio::sync::Notify>,
 }
 
 impl Fake {
@@ -78,6 +84,9 @@ impl Fake {
             gate: Mutex::default(),
             pause: Mutex::default(),
             reads: AtomicUsize::new(0),
+            asked: Arc::default(),
+            paused: Arc::default(),
+            served: Arc::default(),
         })
     }
 
@@ -165,6 +174,7 @@ impl Storage for Fake {
     ) -> Answer<'a, ReadStream> {
         Box::pin(async move {
             self.reads.fetch_add(1, Ordering::SeqCst);
+            self.asked.notify_one();
             let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
             let gate = self.gate.lock().expect("lock").clone();
@@ -193,13 +203,16 @@ impl Storage for Fake {
                 return Ok(stream::iter(chunks).boxed());
             };
             let rest = chunks.split_off(after.min(chunks.len()));
+            let paused = Arc::clone(&self.paused);
+            let served = Arc::clone(&self.served);
             let wait = stream::once(async move {
+                paused.notify_one();
                 gate.acquire().await.expect("an open semaphore").forget();
             })
             .filter_map(|()| async { None });
             Ok(stream::iter(chunks)
                 .chain(wait)
-                .chain(stream::iter(rest))
+                .chain(stream::iter(rest).inspect(move |_| served.notify_one()))
                 .boxed())
         })
     }
