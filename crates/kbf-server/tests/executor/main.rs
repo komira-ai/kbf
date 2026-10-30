@@ -13,6 +13,7 @@ mod classes;
 mod driver;
 mod keys;
 mod pool;
+mod quota;
 mod real_prep;
 mod recovery;
 mod rig;
