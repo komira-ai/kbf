@@ -237,4 +237,32 @@ mod tests {
         let err = run(&ctx, &plan(&[])).await.unwrap_err();
         assert!(matches!(err, BenchError::Setup(_)), "{err}");
     }
+
+    /// Catches a request of the cell whose record cannot be written being taken for a good one,
+    /// at any of its requests (a put, a part, a delete, a listing of uploads): the log refuses
+    /// from its n-th write, for every n, until a run is long enough not to meet it.
+    #[tokio::test]
+    async fn a_log_that_fails_at_any_request_stops_the_run() {
+        let mut finished = false;
+        for taken in 0..400 {
+            let dir = temp("tb-cold-put-log");
+            let (cold, instance) = (FakeS3::start().await, FakeS3::start().await);
+            let stores = [
+                (Role::Cold, cold.endpoint()),
+                (Role::Instance, instance.endpoint()),
+            ];
+            let log = Arc::new(crate::requestlog::RequestLog::to_writer(
+                testkit::FailAfter(taken),
+            ));
+            let ctx = testkit::ctx_with_log(dir.path(), &stores, Window::Busy, log);
+            match run_with(&ctx, &plan(&[4096]), Script::calm(), None, Some(1)).await {
+                Ok(_) => {
+                    finished = true;
+                    break;
+                }
+                Err(e) => assert!(matches!(e, BenchError::Log(_)), "{taken}: {e}"),
+            }
+        }
+        assert!(finished);
+    }
 }

@@ -81,6 +81,35 @@ pub const CAPS: ByteCaps = ByteCaps {
 /// A context over `stores` (role and endpoint), results in `dir`, in `window`, with the request
 /// log in the directory. The rate caps are high, so a test does not wait for them.
 pub fn ctx(dir: &Path, stores: &[(Role, &str)], window: Window) -> CellContext {
+    std::fs::create_dir_all(dir).unwrap();
+    let log = Arc::new(RequestLog::create(&dir.join("requests.jsonl")).unwrap());
+    ctx_with_log(dir, stores, window, log)
+}
+
+/// A writer that takes `n` writes and then refuses, as a disk that fills up does.
+pub struct FailAfter(pub usize);
+
+impl std::io::Write for FailAfter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.0 == 0 {
+            return Err(std::io::Error::other("disk full"));
+        }
+        self.0 -= 1;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// [`ctx`] with the request log given.
+pub fn ctx_with_log(
+    dir: &Path,
+    stores: &[(Role, &str)],
+    window: Window,
+    log: Arc<RequestLog>,
+) -> CellContext {
     let config = RunConfig {
         result_dir: dir.to_owned(),
         stores: stores
@@ -102,10 +131,9 @@ pub fn ctx(dir: &Path, stores: &[(Role, &str)], window: Window) -> CellContext {
         },
         bytes: CAPS,
     };
-    std::fs::create_dir_all(dir).unwrap();
     CellContext {
         config,
-        log: Arc::new(RequestLog::create(&dir.join("requests.jsonl")).unwrap()),
+        log,
         provenance: Provenance {
             run_id: "test-run".to_owned(),
             ..Provenance::unrecorded()

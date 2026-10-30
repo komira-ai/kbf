@@ -158,6 +158,10 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
             let config = RunConfig::load(&args.config)?;
             teardown::run(&config, &args.before).await.map(|_| ())
         }
-        Command::Report(args) => report::render(&args.result_dir).map(|_| ()),
+        Command::Report(args) => {
+            let table = report::render(&args.result_dir)?;
+            print!("{table}");
+            Ok(())
+        }
     }
 }

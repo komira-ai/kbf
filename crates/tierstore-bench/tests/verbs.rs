@@ -44,10 +44,6 @@ async fn every_verb_reaches_its_module_and_a_stub_says_so() {
         not_yet(run(&["verify-teardown", "--result-dir", out, "--before", snapshot]).await),
         "verify-teardown"
     );
-    assert_eq!(
-        not_yet(run(&["report", "--result-dir", out]).await),
-        "report"
-    );
     let proxy = [
         "fault-proxy",
         "--listen",
@@ -60,31 +56,23 @@ async fn every_verb_reaches_its_module_and_a_stub_says_so() {
     assert_eq!(not_yet(run(&latency).await), "fault-proxy");
 }
 
-/// Catches a cell flag that runs another cell, and the request log not being made where a run's
-/// results go.
+/// Catches the request log not being made where a run's results go, and a run of a cell with no
+/// store configured going on: the cell says what it needs, and the log is there.
 #[tokio::test]
-async fn each_cell_flag_runs_its_own_cell_and_the_run_makes_its_request_log() {
+async fn the_run_makes_its_request_log_and_the_cell_says_what_it_needs() {
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-cells");
     let out = dir.path().join("out");
-    for (cell, name) in [
-        ("cold-put", "cell cold-put"),
-        ("cold-read", "cell cold-read"),
-        ("a1", "cell a1"),
-        ("b", "cell b"),
-        ("c", "cell c"),
-        ("g", "cell g"),
-    ] {
-        let args = [
-            "run",
-            "--result-dir",
-            out.to_str().unwrap(),
-            "--cell",
-            cell,
-            "--passes",
-            "3",
-        ];
-        assert_eq!(not_yet(run(&args).await), name);
-    }
+    let args = [
+        "run",
+        "--result-dir",
+        out.to_str().unwrap(),
+        "--cell",
+        "a1",
+        "--passes",
+        "3",
+    ];
+    let err = run(&args).await.unwrap_err();
+    assert!(matches!(err, BenchError::Setup(_)), "{err}");
     assert!(out.join("requests.jsonl").is_file());
 }
 

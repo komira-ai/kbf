@@ -1294,4 +1294,143 @@ mod tests {
         );
         assert_eq!((s.cold_write, s.label, s.in_flight), (5, ".x", 0));
     }
+
+    /// Catches a cleanup that does not run after the last pass, runs when the gate has cut the
+    /// run (the objects of a cell must go whatever happened), has its notes lost, or has its
+    /// failure swallowed.
+    #[tokio::test]
+    async fn the_cleanup_runs_once_at_the_end_whatever_ended_the_run() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counting = |fail: bool| {
+            let ran = ran.clone();
+            hook(move |pass| {
+                let ran = ran.clone();
+                async move {
+                    assert_eq!(pass, 0);
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    if fail {
+                        Err(BenchError::Request("cleanup"))
+                    } else {
+                        Ok(vec!["cleanup note".to_owned()])
+                    }
+                }
+            })
+        };
+        let seen = Arc::new(Mutex::new(vec![]));
+        let dir = temp("tb-engine-cleanup");
+        let env = env(dir.path(), Window::Busy, Script::calm());
+        let results = run_cell(
+            &env,
+            CellId::G,
+            vec![arm("a", 1, 1, &seen)],
+            2,
+            Some(counting(false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        assert!(results[0].notes.contains(&"cleanup note".to_owned()));
+
+        let env = env_with(dir.path(), Script::of(vec![Some(busy())]));
+        let err = run_cell(
+            &env,
+            CellId::G,
+            vec![arm("a", 1, 1, &seen)],
+            2,
+            Some(counting(false)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, BenchError::Gate(_)));
+        assert_eq!(ran.load(Ordering::SeqCst), 2);
+
+        let env = env_with(dir.path(), Script::calm());
+        let err = run_cell(
+            &env,
+            CellId::G,
+            vec![arm("a", 1, 1, &seen)],
+            2,
+            Some(counting(true)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, BenchError::Request("cleanup")));
+
+        let mut failing = arm("a", 1, 1, &seen);
+        failing.work = work(|_| async { Err(BenchError::Request("work")) });
+        let err = run_cell(&env, CellId::G, vec![failing], 2, Some(counting(true)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BenchError::Request("work")),
+            "the first error is the one reported"
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 4);
+    }
+
+    /// Catches the bytes an arm's setup writes once being left out of the admission of the cell
+    /// (two arms of 150 each are over a cell cap of 250), or counted against a pass twice, and
+    /// the handle a setup charges through not reaching the ledger.
+    #[tokio::test]
+    async fn the_setup_bytes_of_an_arm_are_part_of_what_a_cell_costs() {
+        let dir = temp("tb-engine-once");
+        let mut ctx = testkit::ctx(dir.path(), &[], Window::Busy);
+        ctx.config.bytes = crate::config::ByteCaps {
+            campaign: 1000,
+            pass: 200,
+            cell: 250,
+        };
+        let env = Env::new(&ctx, Script::calm()).unwrap();
+        let seen = Arc::new(Mutex::new(vec![]));
+        let once = |label, bytes| {
+            let mut a = arm(label, 1, 1, &seen);
+            a.cold_bytes_once = bytes;
+            a
+        };
+        let err = run_cell(
+            &env,
+            CellId::ColdRead,
+            vec![once("a", 150), once("b", 150)],
+            2,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cell cap is 250 bytes and the cell needs 300"),
+            "{err}"
+        );
+        let err = run_cell(&env, CellId::ColdRead, vec![once("a", 201)], 2, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("pass cap is 200"), "{err}");
+        run_cell(&env, CellId::ColdRead, vec![once("a", 150)], 2, None)
+            .await
+            .unwrap();
+        env.charger().charge(150).unwrap();
+        assert_eq!(env.spent(), 150);
+    }
+
+    /// Catches a streamed read counted good when it gave the wrong number of bytes, or when it
+    /// failed, and a step that does not carry its read.
+    #[test]
+    fn a_streamed_read_is_good_only_if_it_gave_every_byte() {
+        let read = |bytes, error| Streamed {
+            started_unix_ms: 9,
+            ttfb: Some(Duration::from_micros(5)),
+            total: Duration::from_micros(70),
+            bytes,
+            status: Some(200),
+            error,
+        };
+        let whole = Step::streamed(Role::Cold, Op::Get, 100, &read(100, None));
+        assert!(whole.ok);
+        assert_eq!(
+            (whole.bytes, whole.latency_us, whole.started_unix_ms),
+            (100, 70, 9)
+        );
+        assert!(!Step::streamed(Role::Cold, Op::Get, 100, &read(99, None)).ok);
+        assert!(!Step::streamed(Role::Cold, Op::Get, 100, &read(100, Some("body"))).ok);
+    }
 }

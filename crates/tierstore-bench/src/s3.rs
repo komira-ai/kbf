@@ -396,8 +396,19 @@ impl BenchS3 {
     /// [`BenchError`] if the prefix is malformed or the log cannot be written; a failed listing
     /// ends the sweep with what was found so far.
     pub async fn abort_uploads(&self, prefix: &str) -> Result<u64, BenchError> {
+        self.abort_uploads_in_pages(prefix, PageSize::MAX).await
+    }
+
+    /// [`BenchS3::abort_uploads`] listing `page_size` uploads at a time.
+    ///
+    /// # Errors
+    /// As [`BenchS3::abort_uploads`].
+    pub async fn abort_uploads_in_pages(
+        &self,
+        prefix: &str,
+        page_size: PageSize,
+    ) -> Result<u64, BenchError> {
         let prefix = KeyPrefix::new(prefix)?;
-        let page_size = PageSize::MAX;
         let mut found = 0;
         let mut after: Option<(ObjectKey, String)> = None;
         loop {

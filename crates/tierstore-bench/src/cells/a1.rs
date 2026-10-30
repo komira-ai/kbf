@@ -118,4 +118,37 @@ mod tests {
         };
         assert!(matches!(run(&ctx, &plan).await, Err(BenchError::Setup(_))));
     }
+
+    /// Catches a request of the cell whose record cannot be written being taken for a good one:
+    /// the log refuses from its n-th write, for every n, until a run is long enough not to meet
+    /// it.
+    #[tokio::test]
+    async fn a_log_that_fails_at_any_request_stops_the_run() {
+        let mut finished = false;
+        for taken in 0..400 {
+            let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "tb-a1-log");
+            let (hot, instance) = (FakeS3::start().await, FakeS3::start().await);
+            let stores = [
+                (Role::Hot, hot.endpoint()),
+                (Role::Instance, instance.endpoint()),
+            ];
+            let log = Arc::new(crate::requestlog::RequestLog::to_writer(
+                testkit::FailAfter(taken),
+            ));
+            let ctx = testkit::ctx_with_log(dir.path(), &stores, Window::Busy, log);
+            let plan = CellPlan {
+                passes: 2,
+                in_flight: vec![1],
+                object_bytes: vec![4096],
+            };
+            match run_with(&ctx, &plan, Script::calm(), None, Some(1)).await {
+                Ok(_) => {
+                    finished = true;
+                    break;
+                }
+                Err(e) => assert!(matches!(e, BenchError::Log(_)), "{taken}: {e}"),
+            }
+        }
+        assert!(finished);
+    }
 }

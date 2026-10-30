@@ -164,3 +164,82 @@ pub fn read_modes(faults: bool) -> Vec<Mode> {
         stopped("blackhole", FaultMode::Blackhole, 30),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(size: u64, in_flight: u32) -> u64 {
+        size + u64::from(in_flight)
+    }
+
+    /// Catches a mode that is run at a size it should not be, or not run at one it should: all,
+    /// the listed, and the smallest of the run only.
+    #[test]
+    fn a_mode_wants_the_sizes_it_names() {
+        let modes = read_modes(true);
+        let by_name = |name: &str| modes.iter().find(|m| m.name == name).unwrap();
+        assert!(by_name("proxy-pass").wants(1, 1));
+        assert!(by_name("latency-50ms").wants(MIB, 4096));
+        assert!(!by_name("latency-50ms").wants(4096, 4096));
+        assert!(by_name("refused").wants(4096, 4096));
+        assert!(!by_name("refused").wants(MIB, 4096));
+    }
+
+    /// Catches a count taken from the wrong place: the plan's function, a fixed count, and the
+    /// first row of a table whose size is at least the arm's (a size past the last row gets
+    /// none).
+    #[test]
+    fn a_mode_counts_requests_by_the_plan_a_number_or_a_table() {
+        let modes = put_modes(true);
+        let by_name = |name: &str| modes.iter().find(|m| m.name == name).unwrap();
+        assert_eq!(by_name("proxy-pass").requests(100, 7, plan), 107);
+        assert_eq!(by_name("blackhole").requests(100, 7, plan), 30);
+        let latency = by_name("latency-50ms");
+        assert_eq!(latency.requests(4096, 1, plan), 200);
+        assert_eq!(latency.requests(MIB, 1, plan), 100);
+        assert_eq!(latency.requests(16 * MIB, 1, plan), 20);
+        let table = Mode {
+            counts: Counts::BySize(&[(10, 1)]),
+            ..put_modes(true).remove(0)
+        };
+        assert_eq!(table.requests(11, 1, plan), 0);
+    }
+
+    /// Catches a run without a proxy getting a faulted mode, and the tables drifting from the
+    /// plan's names: healthy alone; six modes of the put cells, five of the read cells.
+    #[test]
+    fn the_tables_have_the_plans_modes() {
+        let names = |modes: Vec<Mode>| modes.iter().map(|m| m.name).collect::<Vec<_>>();
+        assert_eq!(names(put_modes(false)), ["healthy"]);
+        assert_eq!(names(read_modes(false)), ["healthy"]);
+        assert_eq!(
+            names(put_modes(true)),
+            [
+                "proxy-pass",
+                "latency-50ms",
+                "latency-500ms",
+                "bandwidth-10mib-s",
+                "refused",
+                "blackhole"
+            ]
+        );
+        assert_eq!(
+            names(read_modes(true)),
+            [
+                "proxy-pass",
+                "latency-50ms",
+                "latency-500ms",
+                "refused",
+                "blackhole"
+            ]
+        );
+        assert!(put_modes(false)[0].fault.is_none());
+        assert_eq!(
+            put_modes(true)[3].fault,
+            Some(FaultMode::Bandwidth {
+                bytes_per_sec: 10 * MIB
+            })
+        );
+    }
+}
