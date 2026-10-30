@@ -364,12 +364,7 @@ fn the_read_url_scheme_is_the_one_the_job_listener_serves() {
 #[test]
 fn a_plain_job_listener_is_accepted_beside_the_daemon_executor() {
     let flags = parsed(argv(
-        &[
-            "--executor",
-            "--job-tls-cert",
-            "--job-tls-key",
-            "--task-read-url",
-        ],
+        &["--executor", "--job-tls-cert", "--job-tls-key"],
         &["--executor=kbf-daemon", "--job-plain-http"],
     ))
     .expect("accepted");
