@@ -311,6 +311,17 @@ pub struct Args {
         default_values_t = kbf_sched::MemoryLadder::DEFAULT_GIB
     )]
     pub memory_ladder_gib: Vec<u64>,
+    /// Keeps an action's memory booking where it started. An action that passes its own
+    /// memory limit is not run again on the next rung of `--memory-ladder-gib`: the kill
+    /// finishes it, FAILED_PRECONDITION with reason `ACTION_OUT_OF_MEMORY`, as a kill at the
+    /// largest node does, and its attempt is recorded with `memory_kill` `own_limit`. A
+    /// booking is therefore the first rung, or the GiB the action names in
+    /// `kbf-book-mem-gib`. No floor is raised, so with `--learned-sizes on` an own-limit
+    /// kill leaves none either. A kill the node made under memory pressure is not the
+    /// action's: it runs again with the same booking, as it does without this flag. Needs
+    /// `--scheduler-core legacy`; a server given it with `js` refuses to start (exit status 2)
+    #[arg(long)]
+    pub no_memory_climb: bool,
     /// The cores a node that reports VM slots (`vm.slots`) keeps for the host itself:
     /// subtracted from the CPUs placement may book on it, so that guests cannot take the
     /// host's own share. A node that reports none books the whole machine.
@@ -797,6 +808,14 @@ pub enum ConfigError {
          shadow or off, or --scheduler-core legacy"
     )]
     LearnedSizesOnUnderJs,
+    /// `--no-memory-climb` was given with `--scheduler-core js`, whose scheduler is built
+    /// inside the core with no setting for it: the climb would stay on while the flag says
+    /// otherwise.
+    #[error(
+        "--no-memory-climb is not supported with --scheduler-core js yet; use --scheduler-core \
+         legacy, or leave the flag out"
+    )]
+    NoMemoryClimbUnderJs,
 }
 
 impl Args {
@@ -805,10 +824,14 @@ impl Args {
     ///
     /// # Errors
     /// [`ConfigError::LearnedSizesOnUnderJs`]: the core is `js` and `--learned-sizes` is `on`.
+    /// [`ConfigError::NoMemoryClimbUnderJs`]: the core is `js` and `--no-memory-climb` is set.
     pub fn check_scheduler_core(&self) -> Result<(), ConfigError> {
         let js = self.scheduler_core == crate::SchedulerCore::Js;
         if js && self.learned_sizes == crate::LearnedSizes::On {
             return Err(ConfigError::LearnedSizesOnUnderJs);
+        }
+        if js && self.no_memory_climb {
+            return Err(ConfigError::NoMemoryClimbUnderJs);
         }
         Ok(())
     }
@@ -940,6 +963,7 @@ impl Args {
             default_platform: self.default_platform,
             qos_allowed: self.qos_allowed,
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
+            memory_climb: !self.no_memory_climb,
             vm_host_floor: HostFloor::new(self.vm_host_floor_cpus, self.vm_host_floor_mem_gib),
             learned_sizes: self.learned_sizes,
             scheduler_core: self.scheduler_core,

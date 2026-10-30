@@ -369,6 +369,23 @@ impl Farm {
         self
     }
 
+    /// This farm, whose scheduler finishes an action that passes its own memory limit with
+    /// `Failed(OutOfMemory)` at its booking if `climb` is `false` (`--no-memory-climb`), instead
+    /// of running it again one rung up. Legacy core only: the js core builds its own scheduler
+    /// and ignores this.
+    #[must_use]
+    pub fn with_memory_climb(mut self, climb: bool) -> Self {
+        self.settings.climb = climb;
+        self.driver.set_climb(&self.settings);
+        self
+    }
+
+    /// Whether an own-limit kill runs the action again one rung up (the default) or finishes it.
+    #[must_use]
+    pub(crate) const fn memory_climb(&self) -> bool {
+        self.settings.climb
+    }
+
     /// This farm, keeping at most `bound` memory floors (instead of
     /// [`kbf_sched::MEMORY_FLOORS`]); past that, the one raised longest ago is forgotten
     /// first. Set before the farm takes a state store over.

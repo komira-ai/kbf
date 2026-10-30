@@ -175,6 +175,50 @@ async fn kill_at_the_largest_node(cell: Cell) {
     );
 }
 
+/// Catches `--no-memory-climb` leaving the attempt that its own-limit kill ended without
+/// its kill, booking or cap in the invocation record: with the climb off the first attempt
+/// is also the last, `Failed(OutOfMemory)` at the first booking, with `own_limit` as its kill
+/// and no requeue before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_the_climb_the_one_attempt_keeps_its_own_limit_kill() {
+    let cell = Cell::start_no_climb(
+        kbf_server::LearnedSizes::Off,
+        kbf_server::MemoryLadder::from_gib(&[1, 2, 4]).expect("a ladder"),
+        None,
+    )
+    .await;
+    let mut daemon = cell.daemon("node-n", 4, 8).await;
+    let job = Job::new("fixed", &[]);
+    upload(&cell, BUILD, &job.blobs()).await;
+    let mut ops = execute(&cell, BUILD, &job.action).await;
+    let start = daemon.start().await;
+    let killed = worker::Result {
+        memory_kill: MemoryKill::OwnLimit as i32,
+        ..failed(start.lease_id, Code::ResourceExhausted)
+    };
+    assert!(daemon.report(killed).await.accepted);
+    let status = crate::support::response(&done(&mut ops).await)
+        .status
+        .expect("a status");
+    assert_eq!(status.code, Code::FailedPrecondition as i32);
+
+    let inv = record(&cell, BUILD).await;
+    let [row] = inv.rows() else {
+        panic!("one row");
+    };
+    let [only] = row.attempts.as_slice() else {
+        panic!("one attempt: {:?}", row.attempts);
+    };
+    assert!(matches!(
+        only.end,
+        Some(AttemptEnd::Failed(Failure::OutOfMemory, _))
+    ));
+    let run = only.run.as_deref().expect("the run");
+    assert_eq!(run.booked_memory_bytes, Some(GIB));
+    assert_eq!(run.cap_bytes, Some(8 * GIB));
+    assert_eq!(only.memory_kill(), Some(Kill::OwnLimit));
+}
+
 /// Catches (review of ui-data 9): a run killed under node memory pressure recorded
 /// without its booking, on a requeued attempt or on the one that ends the operation
 /// (plant: drop `| Failure::NodeMemoryPressure` from the `killed` match in

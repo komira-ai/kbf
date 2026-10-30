@@ -167,6 +167,122 @@ async fn an_own_limit_kill_climbs_the_ladder_then_tells_the_client() {
     assert_eq!(response(&done(&mut again).await).result, Some(result));
 }
 
+/// Catches `--no-memory-climb` not reaching the scheduler (an own-limit kill still run
+/// again one rung up), a kill answered with another code or without the `ErrorInfo`, a
+/// booking raised or a floor left behind by the kill (the next Execute must book the first
+/// rung again), and a kill answered with the climb on's wording of a spent ladder. The kill is
+/// the one a node of 64 GiB could still have raised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_the_climb_an_own_limit_kill_fails_at_the_first_booking() {
+    let cell =
+        Cell::start_no_climb(kbf_server::LearnedSizes::Off, MemoryLadder::default(), None).await;
+    let mut daemon = cell.daemon("fixed-node", 4, 64).await;
+    let job = Job::new("fixed slot", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let first = daemon.start().await;
+    assert_eq!(first.memory_bytes, 4 * GIB, "the first rung");
+    let ack = daemon
+        .report(killed(first.lease_id, MemoryKill::OwnLimit))
+        .await;
+    assert!(ack.accepted, "{ack:?}");
+
+    let status = response(&done(&mut ops).await).status.expect("a status");
+    assert_eq!(status.code, Code::FailedPrecondition as i32, "{status:?}");
+    assert_eq!(
+        status.message,
+        "kbf: the action needs more memory than any node offers: it passed its memory \
+         limit with 4 GiB booked on fixed-node, the largest node for its platform. Runs: 1 \
+         (4 GiB on fixed-node)."
+    );
+    let [detail] = &status.details[..] else {
+        panic!("{status:?}");
+    };
+    let info = ErrorInfo::decode(detail.value.as_slice()).expect("an ErrorInfo");
+    assert_eq!(info.reason, "ACTION_OUT_OF_MEMORY");
+    assert_eq!(info.metadata["booked_bytes"], (4 * GIB).to_string());
+    daemon.no_work().await;
+
+    // No floor: the next Execute of the action books the first rung again.
+    let _again = cell.execute(&job.action).await;
+    assert_eq!(daemon.start().await.memory_bytes, 4 * GIB);
+}
+
+/// Catches `--no-memory-climb` taking a node-pressure kill for an own-limit one (answered
+/// at once, or run again higher): the kill is the node's, so the action runs again with the
+/// same booking, and then fails at once on an own-limit kill.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_the_climb_a_node_pressure_kill_still_reruns_at_the_same_booking() {
+    let cell =
+        Cell::start_no_climb(kbf_server::LearnedSizes::Off, MemoryLadder::default(), None).await;
+    let mut daemon = cell.daemon("pressed-node", 4, 64).await;
+    let job = Job::new("pressed, then too big", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let first = daemon.start().await;
+    let second = rerun(&mut daemon, &first, MemoryKill::NodePressure, 4).await;
+    let ack = daemon
+        .report(killed(second.lease_id, MemoryKill::OwnLimit))
+        .await;
+    assert!(ack.accepted);
+    let status = response(&done(&mut ops).await).status.expect("a status");
+    assert_eq!(status.code, Code::FailedPrecondition as i32, "{status:?}");
+    assert!(
+        status.message.ends_with(
+            "Runs: 2 (4 GiB on pressed-node, node memory pressure, 4 GiB on pressed-node)."
+        ),
+        "{status:?}"
+    );
+    daemon.no_work().await;
+}
+
+/// Catches `--no-memory-climb` read once at construction but lost when the scheduler takes
+/// a state store's rows over: a second server started over the store the first wrote to
+/// (a restart) must also fail an own-limit kill at the first booking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_the_climb_a_restarted_server_still_does_not_climb() {
+    let store = std::sync::Arc::new(kbf_state::fake::Fake::with_flaw(
+        std::sync::Arc::new(kbf_state::ManualClock::default()),
+        kbf_state::fake::Flaw::None,
+    ));
+    let state = || kbf_server::StateStore {
+        store: store.clone(),
+        epoch: kbf_server::EpochPolicy::Keep,
+        members: Default::default(),
+        history: None,
+    };
+    for (round, node) in ["first-run-node", "second-run-node"]
+        .into_iter()
+        .enumerate()
+    {
+        let cell = Cell::start_no_climb(
+            kbf_server::LearnedSizes::Off,
+            MemoryLadder::default(),
+            Some(state()),
+        )
+        .await;
+        let mut daemon = cell.daemon(node, 4, 64).await;
+        let job = Job::new(&format!("restart {round}"), &[]);
+        cell.upload(&job.blobs()).await;
+        let mut ops = cell.execute(&job.action).await;
+        let start = daemon.start().await;
+        assert_eq!(start.memory_bytes, 4 * GIB, "round {round}");
+        assert!(
+            daemon
+                .report(killed(start.lease_id, MemoryKill::OwnLimit))
+                .await
+                .accepted
+        );
+        let status = response(&done(&mut ops).await).status.expect("a status");
+        assert_eq!(
+            status.code,
+            Code::FailedPrecondition as i32,
+            "round {round}"
+        );
+        daemon.no_work().await;
+    }
+}
+
 /// Catches a ladder that does not reach both halves of the server (`Listeners.
 /// memory_ladder`, the flag): with rungs 2 and 8 GiB an action that names no size must
 /// book 2 GiB (the front's first rung, not its own default of 4), climb to 8 (the
