@@ -767,6 +767,36 @@ fn tierstore_links_the_s3_client_only_with_its_s3_or_server_feature() {
     }
 }
 
+/// Asserts that the S3 client and the object store trait (`objstore-s3`) link no other crate of
+/// this workspace, with its loopback S3 service (feature `testkit`) on, so that it can move to
+/// a repository of its own with `tierstore`; that the walk sees its dependencies (it reaches
+/// `reqwest`), so the check does not pass on an empty walk; and that `kbf-objstore` is built on
+/// it, so there is one S3 client and not two.
+#[test]
+fn the_s3_client_links_no_other_workspace_crate() {
+    let g = load_graph();
+    let (_, root) = g
+        .members
+        .get("objstore-s3")
+        .expect("objstore-s3 is a workspace member");
+    assert!(root.is_some(), "objstore-s3 must have a library target");
+    let linked = linked_with("objstore-s3", "testkit");
+    assert!(
+        linked.contains("reqwest"),
+        "objstore-s3's tree must hold reqwest, or this walk proves nothing: {linked:?}"
+    );
+    let violations = workspace_crates_beyond(&g, &linked, &["objstore-s3"]);
+    assert!(
+        violations.is_empty(),
+        "objstore-s3 links another crate of this workspace: {violations:?}"
+    );
+    let objstore = linked_by("kbf-objstore");
+    assert!(
+        objstore.contains("objstore-s3"),
+        "kbf-objstore must re-export the client of objstore-s3: {objstore:?}"
+    );
+}
+
 /// The workspace crates among `linked`, other than those in `allowed`.
 fn workspace_crates_beyond<'a>(
     g: &'a Graph,
