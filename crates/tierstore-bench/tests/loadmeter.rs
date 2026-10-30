@@ -3,7 +3,8 @@
 
 mod common;
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::proc_tree;
 use kbf_testkit::dir::TestDir;
@@ -26,7 +27,13 @@ fn diskstats(rows: &[(&str, u64)]) -> String {
 fn the_load_is_read_from_the_files_and_only_whole_disks_count() {
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-load-ok");
     let (proc, sys) = proc_tree(dir.path(), "0.50");
-    let load = ProcLoad::at(proc.clone(), sys);
+    // The clock is the test's: each read is a second after the one before, with no waiting.
+    let now = Arc::new(AtomicU64::new(0));
+    let clock = {
+        let now = now.clone();
+        Arc::new(move || now.load(Ordering::SeqCst))
+    };
+    let load = ProcLoad::with_clock(proc.clone(), sys, clock);
 
     let first = load.sample().unwrap();
     assert!((first.loadavg_1m - 0.5).abs() < 1e-9);
@@ -36,7 +43,7 @@ fn the_load_is_read_from_the_files_and_only_whole_disks_count() {
 
     let others = [("sda", 1000), ("loop0", 9_000_000), ("ram0", 9_000_000)];
     let more = [("zram0", 9_000_000), ("ghost", 9_000_000)];
-    std::thread::sleep(Duration::from_millis(10));
+    now.store(1000, Ordering::SeqCst);
     std::fs::write(
         proc.join("diskstats"),
         diskstats(&[&others[..], &more[..]].concat()),
@@ -49,14 +56,26 @@ fn the_load_is_read_from_the_files_and_only_whole_disks_count() {
         second.disk_util_pct
     );
 
-    std::thread::sleep(Duration::from_millis(10));
-    let busy = [("sda", 9_000_000), ("loop0", 9_000_000)];
-    std::fs::write(proc.join("diskstats"), diskstats(&busy)).unwrap();
+    // Half a second of the disk's second busy: 50 percent.
+    now.store(2000, Ordering::SeqCst);
+    let half = [("sda", 1500), ("loop0", 9_000_000)];
+    std::fs::write(proc.join("diskstats"), diskstats(&half)).unwrap();
     let third = load.sample().unwrap();
     assert!(
-        (third.disk_util_pct - 100.0).abs() < 1e-9,
+        (third.disk_util_pct - 50.0).abs() < 1e-9,
         "{}",
         third.disk_util_pct
+    );
+
+    // More busy time than the interval holds is 100, not more.
+    now.store(3000, Ordering::SeqCst);
+    let over = [("sda", 9_000_000), ("loop0", 9_000_000)];
+    std::fs::write(proc.join("diskstats"), diskstats(&over)).unwrap();
+    let fourth = load.sample().unwrap();
+    assert!(
+        (fourth.disk_util_pct - 100.0).abs() < 1e-9,
+        "{}",
+        fourth.disk_util_pct
     );
 }
 

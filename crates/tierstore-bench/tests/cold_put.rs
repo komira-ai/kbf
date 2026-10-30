@@ -4,16 +4,19 @@
 
 mod common;
 
+use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::{Refusing, Script, TouchOn, Unreadable, calm, proc_tree, rig};
 use kbf_testkit::dir::TestDir;
+use tierstore_bench::cells::cold_put::ReleaseWait;
 use tierstore_bench::cells::{self, CellId, cold_put};
 use tierstore_bench::error::BenchError;
 use tierstore_bench::gate::LoadSample;
 use tierstore_bench::requestlog::RequestLog;
 use tierstore_bench::result::{CellResult, Window};
-use tierstore_bench::s3::unix_ms;
 
 fn busy_io() -> LoadSample {
     LoadSample {
@@ -697,32 +700,78 @@ async fn a_same_key_check_against_a_store_that_is_gone_reports_no_winner_and_no_
     assert!(notes.contains("n/a (0 winners here)"), "{notes}");
 }
 
-/// Catches the shared start time being ignored or breaking a start time already past: with a
-/// start in the past the writers go at once, with one a little ahead they go after it, and
-/// either way one writer wins.
-#[tokio::test]
-async fn the_same_key_writers_can_be_released_at_a_given_time() {
-    for (n, start) in [1u64, unix_ms() + 30].into_iter().enumerate() {
-        let r = rig(
-            &format!("tierstore-bench-sk-start-{n}"),
-            &[
-                "--same-key",
-                "--in-flight",
-                "4",
-                "--object-bytes",
-                "64",
-                "--start-at-unix-ms",
-                &start.to_string(),
-            ],
-        )
-        .await;
-        let run = cold_put::run_levels(&r.ctx, &r.plan, Script::calm())
-            .await
-            .unwrap();
-        let report = run.same_key.expect("a report");
-        assert_eq!(report.winners.len(), 1, "start {start}");
-        assert_eq!(report.stored_equals_winner, Some(true));
+/// Stands in for the wait until the start time: remembers the time it was asked for and, when it
+/// returns, checks that the writers had sent and recorded nothing yet.
+struct Recorder {
+    asked: Arc<AtomicU64>,
+    log: PathBuf,
+}
+
+impl ReleaseWait for Recorder {
+    fn until(&self, at: u64) -> impl Future<Output = ()> {
+        self.asked.store(at, Ordering::SeqCst);
+        let log = self.log.clone();
+        async move {
+            assert_eq!(std::fs::read_to_string(log).unwrap(), "");
+        }
     }
+}
+
+/// Catches the shared start time being ignored: the writers wait for the time the plan names,
+/// and none has sent or recorded a request when the wait ends; then one of them wins.
+#[tokio::test]
+async fn the_same_key_writers_are_released_after_the_wait_for_their_start_time() {
+    let r = rig(
+        "tierstore-bench-sk-start",
+        &[
+            "--same-key",
+            "--in-flight",
+            "4",
+            "--object-bytes",
+            "64",
+            "--start-at-unix-ms",
+            "5000",
+        ],
+    )
+    .await;
+    let asked = Arc::new(AtomicU64::new(0));
+    let wait = Recorder {
+        asked: asked.clone(),
+        log: r.out.join("requests.jsonl"),
+    };
+    let run = cold_put::run_levels_with(&r.ctx, &r.plan, Script::calm(), wait)
+        .await
+        .unwrap();
+    assert_eq!(asked.load(Ordering::SeqCst), 5000);
+    let report = run.same_key.expect("a report");
+    assert_eq!(report.winners.len(), 1);
+    assert_eq!(report.stored_equals_winner, Some(true));
+    assert!(r.log_records().len() >= 4);
+}
+
+/// Catches a start time already past stopping the race: with the real clock the writers are
+/// released at once and one wins. (A start time ahead is the wait of the test above.)
+#[tokio::test]
+async fn a_start_time_in_the_past_releases_the_same_key_writers_at_once() {
+    let r = rig(
+        "tierstore-bench-sk-past",
+        &[
+            "--same-key",
+            "--in-flight",
+            "4",
+            "--object-bytes",
+            "64",
+            "--start-at-unix-ms",
+            "1",
+        ],
+    )
+    .await;
+    let run = cold_put::run_levels(&r.ctx, &r.plan, Script::calm())
+        .await
+        .unwrap();
+    let report = run.same_key.expect("a report");
+    assert_eq!(report.winners.len(), 1);
+    assert_eq!(report.stored_equals_winner, Some(true));
 }
 
 /// Catches a request log that cannot be written being survived: the run stops with the log's

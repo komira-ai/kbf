@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use crate::error::BenchError;
@@ -85,7 +85,9 @@ fn counted_device(sys_block: &Path, name: &str) -> bool {
 pub struct ProcLoad {
     root: PathBuf,
     sys_block: PathBuf,
-    previous: Mutex<Option<(Instant, BTreeMap<String, u64>)>>,
+    /// Milliseconds on a monotonic clock; the disk figure is a share of the time between two reads.
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    previous: Mutex<Option<(u64, BTreeMap<String, u64>)>>,
 }
 
 impl ProcLoad {
@@ -99,9 +101,26 @@ impl ProcLoad {
     /// a `/sys/block` that are under other directories.
     #[must_use]
     pub fn at(root: PathBuf, sys_block: PathBuf) -> Self {
+        let start = Instant::now();
+        Self::with_clock(
+            root,
+            sys_block,
+            Arc::new(move || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)),
+        )
+    }
+
+    /// As [`ProcLoad::at`], with the clock given: milliseconds on a monotonic clock. A test
+    /// moves it between two reads instead of waiting.
+    #[must_use]
+    pub fn with_clock(
+        root: PathBuf,
+        sys_block: PathBuf,
+        clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self {
         Self {
             root,
             sys_block,
+            clock,
             previous: Mutex::new(None),
         }
     }
@@ -126,18 +145,14 @@ impl LoadSource for ProcLoad {
             parse_psi_some_avg10(&self.read("pressure/cpu")?).ok_or_else(unreadable)?;
         let psi_io_avg10 =
             parse_psi_some_avg10(&self.read("pressure/io")?).ok_or_else(unreadable)?;
-        let now_at = Instant::now();
+        let now_at = (self.clock)();
         let now: Vec<(String, u64)> = parse_diskstats(&self.read("diskstats")?)
             .into_iter()
             .filter(|(name, _)| counted_device(&self.sys_block, name))
             .collect();
         let mut previous = self.previous.lock().unwrap_or_else(PoisonError::into_inner);
         let disk_util_pct = match previous.as_ref() {
-            Some((then, before)) => {
-                let wall_ms =
-                    u64::try_from(now_at.duration_since(*then).as_millis()).unwrap_or(u64::MAX);
-                busiest_disk_pct(before, &now, wall_ms)
-            }
+            Some((then, before)) => busiest_disk_pct(before, &now, now_at.saturating_sub(*then)),
             None => 0.0,
         };
         *previous = Some((now_at, now.into_iter().collect()));

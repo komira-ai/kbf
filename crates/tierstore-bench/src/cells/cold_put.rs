@@ -34,6 +34,7 @@
 //! Not built: the `instance` arm, the slow and stopped store (fault proxy), open loop.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -502,19 +503,36 @@ fn winner_text(check: Option<bool>, winners: usize) -> String {
     }
 }
 
+/// What the concurrent-create check waits on before it releases its writers at a given time.
+pub trait ReleaseWait {
+    /// Returns when the wall clock reads `at` (milliseconds since the Unix epoch), or at once if
+    /// it already does.
+    fn until(&self, at: u64) -> impl Future<Output = ()>;
+}
+
+/// The real thing: sleeps until the wall clock reaches the time.
+pub struct WallClock;
+
+impl ReleaseWait for WallClock {
+    async fn until(&self, at: u64) {
+        sleep(Duration::from_millis(at.saturating_sub(unix_ms()))).await;
+    }
+}
+
 /// Shared pieces of the run, built once.
-struct Run<'a> {
+struct Run<'a, W> {
     ctx: &'a CellContext,
     plan: &'a CellPlan,
     s3: Arc<BenchS3>,
     source: Arc<dyn LoadSource>,
+    wait: W,
     provenance: Provenance,
     samples_out: SampleWriter,
     under: String,
     size: u64,
 }
 
-impl Run<'_> {
+impl<W: ReleaseWait> Run<'_, W> {
     fn result(
         &self,
         arm: String,
@@ -719,9 +737,10 @@ impl Run<'_> {
             }
         }));
         let start_at = cp.start_at_unix_ms;
+        let wait = &self.wait;
         let starter = async {
             if let Some(at) = start_at {
-                sleep(Duration::from_millis(at.saturating_sub(unix_ms()))).await;
+                wait.until(at).await;
             }
             let released = Instant::now();
             release.wait().await;
@@ -796,6 +815,20 @@ pub async fn run_levels(
     plan: &CellPlan,
     source: impl LoadSource + 'static,
 ) -> Result<ColdPutRun, BenchError> {
+    run_levels_with(ctx, plan, source, WallClock).await
+}
+
+/// [`run_levels`] with the wait for a `--start-at-unix-ms` time given, so a test can see when
+/// the writers are released without waiting for a wall clock.
+///
+/// # Errors
+/// As [`run_levels`].
+pub async fn run_levels_with(
+    ctx: &CellContext,
+    plan: &CellPlan,
+    source: impl LoadSource + 'static,
+    wait: impl ReleaseWait,
+) -> Result<ColdPutRun, BenchError> {
     let cp = &plan.cold_put;
     let under = run_prefix(&cp.prefix, &cp.run_id)?;
     let size = match plan.object_bytes.as_slice() {
@@ -843,6 +876,7 @@ pub async fn run_levels(
         plan,
         s3,
         source: Arc::new(source),
+        wait,
         provenance,
         samples_out: SampleWriter::open(&ctx.config.result_dir)?,
         under,
