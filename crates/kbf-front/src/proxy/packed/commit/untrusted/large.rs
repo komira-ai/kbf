@@ -34,8 +34,22 @@ pub(super) const WINDOW_BYTES: u64 = 8 << 20;
 /// write is not held up longer than this by the object store the copy goes to.
 const COPY_STALL: Duration = Duration::from_secs(30);
 
-/// A window of the copy to the object store, or the reason the copy must not be completed.
-type CopyPiece = Result<Bytes, ObjectStoreError>;
+/// How long the write-through may take to finish once the CAS write has ended (the length
+/// question, the last part, the completion, the store client's own retries) before it is
+/// abandoned and counted failed: the ingest does not wait on the copy longer than this.
+const COPY_FINISH: Duration = Duration::from_secs(120);
+
+/// What the CAS side tells the write-through. A body that ends is complete only after [`Done`],
+/// which is sent once the bytes have hashed to the digest: a channel that closes without it (the
+/// CAS side stopped polling, the ingest was cancelled, the bytes were not the blob) fails the write.
+///
+/// [`Done`]: CopyPiece::Done
+enum CopyPiece {
+    /// The next window of the object.
+    Window(Bytes),
+    /// Every byte was sent and they hash to the digest.
+    Done,
+}
 
 /// How a pass over the object ended.
 enum Ended {
@@ -104,9 +118,15 @@ impl<'a> Large<'a> {
         let open = || self.open();
         let stored = backend.put_streamed(&self.digest, &open).await;
         let wrote = locked(&self.pass).wrote.take();
-        if let Some(wrote) = wrote {
-            // The copy ends with the stream it was fed from; its result is counted by its task.
-            let _ = wrote.await;
+        if let Some(mut wrote) = wrote {
+            // The copy ends with the stream it was fed from; its result is counted by its task. A
+            // copy that does not end in time is abandoned (a dropped upload is aborted).
+            if tokio::time::timeout(COPY_FINISH, &mut wrote).await.is_err() {
+                wrote.abort();
+                tracing::warn!(object = %self.object, "the write-through of a large object did not finish in time");
+                let failed = &self.packs.metrics.ingest_large_writethrough;
+                failed[LargeWriteThrough::Failed as usize].add(1);
+            }
         }
         let ended = locked(&self.pass).ended.take();
         match (ended, stored) {
@@ -152,7 +172,14 @@ impl<'a> Large<'a> {
         let key = ObjectKey::new(format!("cas/l/{hex}")).ok()?;
         let (send, windows) = mpsc::channel::<CopyPiece>(1);
         let body = stream::unfold(windows, |mut windows| async move {
-            windows.recv().await.map(|piece| (piece, windows))
+            match windows.recv().await {
+                Some(CopyPiece::Window(bytes)) => Some((Ok(bytes), windows)),
+                Some(CopyPiece::Done) => None,
+                None => {
+                    let given_up = ObjectStoreError::Body("the write was given up".to_owned());
+                    Some((Err(given_up), windows))
+                }
+            }
         })
         .boxed();
         let store = Arc::clone(&self.packs.store);
@@ -211,9 +238,10 @@ impl Reading {
                 pass.ended = Some(Ended::Read(seen));
                 seen
             };
-            if let Some(tee) = self.tee.take().filter(|_| seen != self.digest) {
-                let refused = ObjectStoreError::Body("the bytes are not the blob".to_owned());
-                let _ = tee.send(Err(refused)).await;
+            // The end is said only for the blob's own bytes; anything else leaves the channel to
+            // close, which fails the write.
+            if let Some(tee) = self.tee.take().filter(|_| seen == self.digest) {
+                let _ = tee.send(CopyPiece::Done).await;
             }
             return Ok(None);
         }
@@ -241,7 +269,8 @@ impl Reading {
     /// store keeps nothing) if it has ended or does not take the window in time.
     async fn copy(&mut self, window: &Bytes) {
         let Some(tee) = &self.tee else { return };
-        let sent = tokio::time::timeout(COPY_STALL, tee.send(Ok(window.clone()))).await;
+        let sent =
+            tokio::time::timeout(COPY_STALL, tee.send(CopyPiece::Window(window.clone()))).await;
         if !matches!(sent, Ok(Ok(()))) {
             self.tee = None;
         }

@@ -303,3 +303,21 @@ async fn a_503_and_a_507_from_the_store_are_failures_that_leave_the_ingest_alone
         assert!(farm.rig.store.held(&key_of(digest)).await.is_none());
     }
 }
+
+/// Asserts that the ingest does not wait on a write-through that never finishes: the store takes
+/// every byte and then stalls, the clock is paused so the bound passes without a real wait, and the
+/// ingest is still cached with the write counted `failed`, nothing under the key.
+#[tokio::test]
+async fn a_write_through_that_never_finishes_is_given_up_and_counted_failed() {
+    let farm = farm_with_large().await;
+    let (_, digest) = large();
+    farm.rig.store.stall_streams();
+    tokio::time::pause();
+
+    let got = farm.run().await;
+
+    assert!(matches!(got, Ingested::Ran { cached: true, .. }), "{got:?}");
+    assert_eq!(count(&farm, LargeWriteThrough::Failed), 1);
+    assert_eq!(count(&farm, LargeWriteThrough::Ok), 0);
+    assert!(farm.rig.store.held(&key_of(digest)).await.is_none());
+}
