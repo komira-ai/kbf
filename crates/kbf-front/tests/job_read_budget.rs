@@ -446,3 +446,25 @@ async fn a_batch_holds_a_read_place_while_its_blobs_are_read() {
     assert_eq!(get.status, StatusCode::OK);
     assert_eq!(&get.body[..], b"beta");
 }
+
+/// Catches: a batch with nothing to read (the empty blob, a digest outside the scope, a blob
+/// too large for a batch) taking places and calling the source for nothing: it is answered
+/// from its digests alone, and the source is not asked.
+#[tokio::test]
+async fn a_batch_with_nothing_to_read_does_not_ask_the_source() {
+    let mut blobs = HashMap::new();
+    let t = build(&mut blobs, "a", &[vec![]], 0);
+    let other = build(&mut blobs, "b", &[b"gamma".to_vec()], 0);
+    let rig = rig(blobs, None, Limits::default());
+    let token = rig.token(t.action);
+    let reply = rig.batch(&[t.files[0], other.files[0]], &token).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let expected = [frame(0, b""), frame(2, b"")].concat();
+    assert_eq!(&reply.body[..], &expected[..]);
+    let many = rig
+        .source
+        .many
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    assert!(many.is_empty(), "{many:?}");
+}
