@@ -147,7 +147,7 @@ impl HostWorker {
             next_beat: now,
             last_ack: now,
             server_ok: now,
-            renew_at: third_of(expires_at, now),
+            renew_at: renew_after(ctx, expires_at, now),
             expires_at,
             ends_at,
             draining: None,
@@ -269,7 +269,7 @@ impl HostWorker {
         self.draining = None;
     }
 
-    /// Renews the lease when a third of its ttl has passed, or at once if `due`.
+    /// Renews the lease when a third of its ttl (or [`Config::renew_every`]) has passed, or at once if `due`.
     pub(super) async fn renew(
         &mut self,
         ctx: &Ctx<'_>,
@@ -286,7 +286,7 @@ impl HostWorker {
                 // A third of what the server granted, which is at most its own maximum,
                 // not of what was asked.
                 self.expires_at = ctx.clock.local(renewed.expires_at_ms, now);
-                self.renew_at = third_of(self.expires_at, now);
+                self.renew_at = renew_after(ctx, self.expires_at, now);
             }
             Err(e) if lease_gone(&e) => return ControlFlow::Break(Retire::Gone),
             Err(e) => tracing::warn!(worker = %self.id, error = %e, "renewing the lease failed"),
@@ -389,9 +389,11 @@ impl HostWorker {
     }
 }
 
-/// A third of the time from `now` to `expires_at`: when the lease is renewed.
-fn third_of(expires_at: Instant, now: Instant) -> Instant {
-    now + expires_at.saturating_duration_since(now) / 3
+/// When the lease is renewed: a third of the time from `now` to `expires_at`, and at the
+/// latest [`Config::renew_every`] from `now`.
+fn renew_after(ctx: &Ctx<'_>, expires_at: Instant, now: Instant) -> Instant {
+    let third = expires_at.saturating_duration_since(now) / 3;
+    now + third.min(ctx.cfg.renew_every)
 }
 
 /// Registers a worker with the farm: the `Hello` a real node would send, the `Welcome` the
