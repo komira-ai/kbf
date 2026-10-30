@@ -35,7 +35,8 @@ tierstore &lt;version&gt; listen=127.0.0.1:9000</span></pre></div>
 <span class="o">draining</span></pre></div>
 <p class="source-note">Both requests are made inside the <code>--drain-lb-wait</code> window (give the flag a few seconds to try this). The status and the body are those of <code>/readyz</code> in <code>server/mod.rs</code>; the exit status 0 is documented in <code>server/cli.rs</code> and <code>packaging/tierstore/README.md</code>, "Stopping it".</p>
 
-<h2 id="print-config">4. From flags to a file</h2>
+<h2 id="print-config">4. From flags to a file <span class="tag tag-planned">on main, next release</span></h2>
+<div class="notice notice-warn"><p><strong>This step needs a build of main.</strong> <code>--print-config</code> and <code>--config</code> are not in any released tierstore; they will be in the first release after v0.0.38. Steps 1 to 3 use flags only and work with a released binary.</p></div>
 <p><code>--print-config</code>, given the flags of a start, prints the TOML file that is equivalent and exits 0 without starting anything. It names key files by path and never prints what is in them.</p>
 <div class="code transcript"><pre><span class="p">$</span> tierstore --print-config --listen 127.0.0.1:9000 --proxy-id tierstore-1 --bucket tierstore \
     --access-key-file access.key --hot dir:./hot --cold dir:./cold --hot-bytes 1073741824

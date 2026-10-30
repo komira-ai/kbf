@@ -18,6 +18,9 @@ const PUBLIC_HOSTS = new Set(['tierstore.dev', 'kbf.dev', 'github.com', 'buck2.b
 /** Placeholders and loopback the configuration reference uses as examples. */
 const EXAMPLE_HOSTS = new Set(['host', 'localhost', '127.0.0.1', 'frontend', 'FRONTEND', 'bucket', 's3-hot.example', 's3-cold.example', 'tierstore.example']);
 
+/** The only 40-hex string a page may carry: the example SHA of the install page and docs/artifacts.md. */
+const EXAMPLE_SHA = '0123456789abcdef0123456789abcdef01234567';
+
 function scanText(text: string, code = false): string[] {
   const found: string[] = [];
   for (const m of text.matchAll(/\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b/g)) {
@@ -39,6 +42,9 @@ function scanText(text: string, code = false): string[] {
   for (const m of text.matchAll(/arn:aws[\w-]*:\S+/g)) found.push(`a cloud resource name, ${m[0]}`);
   for (const m of text.matchAll(new RegExp('komira-' + 'internal', 'g'))) found.push(`an internal repository name, ${m[0]}`);
   for (const m of text.matchAll(/\b(20(?:[01]\d|2[0-5])-\d\d-\d\d|2026-0[1-8]-\d\d)\b/g)) found.push(`a date before the project was public, ${m[1]}`);
+  if (/\bCEO\b/.test(text)) found.push('an internal role, CEO');
+  for (const m of text.matchAll(/\b(?:node-0\d|spoolr-[\w-]*|broadwell\d*|m3ultra\d*)\b/gi)) found.push(`an internal node name, ${m[0]}`);
+  for (const m of text.matchAll(/\b[0-9a-f]{40}\b/g)) if (m[0] !== EXAMPLE_SHA) found.push(`a commit SHA, ${m[0]}`);
   return found;
 }
 
@@ -63,9 +69,14 @@ test('the scan finds each kind of leak (it can fail)', () => {
     ['arn:aws:iam::123456789012:role/x', /a cloud resource name/],
     ['komira-' + 'internal#12', /an internal repository name/],
     ['on ' + '2026-0' + '3-14 we', /a date before/],
+    ['the C' + 'EO said', /an internal role/],
+    ['on node' + '-06 and spoolr' + '-1', /an internal node name, node-06/],
+    ['a broad' + 'well1 box', /an internal node name, broadwell1/],
+    ['an m3ul' + 'tra1 Mac', /an internal node name, m3ultra1/],
+    ['at ' + 'abcdef0123456789abcdef0123456789abcdef01', /a commit SHA/],
   ];
   for (const [text, why] of cases) assert.match(scanText(text).join('\n'), why, text);
-  assert.deepEqual(scanText('https://github.com/komira-ai/kbf and http://127.0.0.1:8990 and 2026-10-01'), []);
+  assert.deepEqual(scanText('https://github.com/komira-ai/kbf and http://127.0.0.1:8990 and 2026-10-01 and ' + EXAMPLE_SHA), []);
 });
 
 test('a leak in the recorded data or in the page copy is found in the built tree', () => {

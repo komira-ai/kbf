@@ -7,6 +7,9 @@
   <li>
     <h3>Take the tarball of your architecture <span class="tag tag-ok">works today</span></h3>
     <p>A <a href="https://github.com/komira-ai/kbf/releases">kbf release</a> lists <code>tierstore-&lt;commit&gt;-linux-x86_64.tar.gz</code> and <code>tierstore-&lt;commit&gt;-linux-arm64.tar.gz</code>, each with a <code>.sigstore.json</code> bundle, and all of them in <code>SHA256SUMS</code>. Take the one for the host by its digest.</p>
+    <p><code>&lt;commit&gt;</code> is the full 40-hex SHA of the commit the release was built from. Find it in the release's asset list, or in <code>SHA256SUMS</code>, where each line is a digest and a file name, so the name of a tierstore tarball carries it. For instance, with the example SHA <code>0123456789abcdef0123456789abcdef01234567</code>:</p>
+    <div class="code"><pre>tierstore-0123456789abcdef0123456789abcdef01234567-linux-x86_64.tar.gz
+tierstore-0123456789abcdef0123456789abcdef01234567-linux-arm64.tar.gz</pre></div>
   </li>
   <li>
     <h3>Verify it <span class="tag tag-ok">works today</span></h3>

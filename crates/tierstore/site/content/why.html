@@ -27,7 +27,7 @@
 <p>The copy-back means the hot tier also works as a read cache of what was used lately. That is the only caching in the shipped binary.</p>
 
 <h2 id="cache">The per-node read-through cache is not in the binary</h2>
-<p>The crate has a <code>CachedStore</code>, a read cache in RAM for any backend, meant to run in front of a proxy on the node a client runs on. The <code>tierstore</code> binary does not use it. Its configuration file reserves a <code>[local_cache]</code> table and a <code>cache</code> setting on <code>[[policy]]</code>, reads and checks them, and refuses <code>cache = true</code> as not supported yet. A policy has no effect in this release.</p>
+<p>The crate has a <code>CachedStore</code>, a read cache in RAM for any backend, meant to run in front of a proxy on the node a client runs on. The <code>tierstore</code> binary does not use it. The configuration file (on main, not yet in a release) reserves a <code>[local_cache]</code> table and a <code>cache</code> setting on <code>[[policy]]</code>, reads and checks them, and refuses <code>cache = true</code> as not supported yet. A policy has no effect in this release.</p>
 
 <h2 id="guards">What keeps it honest</h2>
 <ul>

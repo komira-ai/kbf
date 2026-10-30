@@ -1,8 +1,9 @@
 <h1>Configuration</h1>
 <p class="lede">tierstore is configured by flags or by one TOML file given with <code>--config</code>. The two make the same settings and run the same code. A file holds no secret, only the paths of key files.</p>
+<div class="notice notice-warn"><p><strong>The configuration file is not in a release yet.</strong> <code>--config</code> and <code>--print-config</code> are on main only: no released tierstore reads a TOML file. The command-line flags work with every released tierstore; the sections below that use <code>--config</code> or <code>--print-config</code> need a build of main, and will be in the first release after v0.0.38.</p></div>
 <p class="toc">On this page: <a href="#file">the file</a> <a href="#flags">flags and keys</a> <a href="#refused">what the loader refuses</a> <a href="#migrate">from flags to a file</a> <a href="#keys">key files and roles</a></p>
 
-<h2 id="file">The file</h2>
+<h2 id="file">The file <span class="tag tag-planned">on main, next release</span></h2>
 <p><code>tierstore --config &lt;path&gt;</code> reads one TOML file in place of the flags that describe the data path (the listen address, the tiers, the key files, the limits and the reconciler's settings). This release reads the storage-node shape: <code>[server]</code>, <code>[hot_store]</code> and <code>[cold_store]</code>, and an optional <code>[[policy]]</code>. A file for a storage node:</p>
 <div class="code"><pre>[server]
 listen              = "192.0.2.10:9000"
@@ -43,6 +44,7 @@ skip_checks      = []</pre></div>
 <p>A message about a file repeats no value except a <code>[[policy]]</code> prefix: a syntax refusal names the line, the column and the key; any other refusal names the key. A refusal of the file or the flags exits 2.</p>
 
 <h2 id="flags">Which key each flag has</h2>
+<p>The flags are in every released tierstore; the keys are for the file, which is not released yet.</p>
 <p>Every flag that describes the data path has the key or keys below, and no other has one. A flag that takes a list (<code>--read-only-key-file</code>, given once for each key) is a list in the file. A tier flag is a <code>kind</code> and the key its kind needs: <code>--hot dir:&lt;path&gt;</code> is <code>kind = "dir"</code> and <code>path</code>, <code>--hot s3:&lt;bucket&gt;</code> is <code>kind = "s3"</code> and <code>bucket</code>. The keys of the reconciler, the journal and the lease are in <code>[hot_store]</code>, since only a process with a hot tier has them. The crate's tests walk the flags of the binary against this table, so a flag added without a key fails them.</p>
 <div class="table-wrap"><table>
 <thead><tr><th>Flag</th><th>Key</th><th>What</th></tr></thead>
@@ -99,7 +101,7 @@ skip_checks      = []</pre></div>
 </ul>
 <p><code>[[policy]]</code> has a <code>prefix</code> (empty for all the rest) and <code>cache</code>. In this release a policy is read and checked and has no effect, since nothing is cached yet; <code>cache = true</code> is refused as not supported yet.</p>
 
-<h2 id="migrate">From flags to a file</h2>
+<h2 id="migrate">From flags to a file <span class="tag tag-planned">on main, next release</span></h2>
 <p><code>tierstore --print-config</code> with the flags of a unit (without <code>--config</code>) prints the equivalent file on stdout and exits 0 without starting anything. It prints the key files by path, never what is in them, and loads the file back before printing it. A <code>--print-config</code> that cannot write its output exits 1.</p>
 <div class="code"><pre><span class="p">$</span> /usr/libexec/kbf/tierstore --print-config --listen 192.0.2.10:9000 ... &gt; /etc/tierstore/tierstore.toml</pre></div>
 <p>Then change <code>ExecStart=</code> of the unit to:</p>

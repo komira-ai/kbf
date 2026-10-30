@@ -30,7 +30,7 @@ repository needs that file too, or the policy copied beside the site.
 | `static/site.css` | this site's own rules, loaded after the theme |
 | `src/copy.ts` | copy buttons on command blocks |
 | `tools/` | `pages.ts` (routes, titles, the white-paper URL), `layout.ts` (the page shell, with the `> tierstore` mark), `build.ts`, `check-dist.ts`, `links.ts`, `csp.ts` |
-| `test/` | golden output, links, Content-Security-Policy, theme digest, the white-paper slot, public-repo scan, supply-chain policy |
+| `test/` | golden output, links, Content-Security-Policy, theme digest, the white-paper slot, the "not built" statements and demo strings held to the crate source (`claims.test.ts`), public-repo scan, supply-chain policy |
 
 ## The demo
 
