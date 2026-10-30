@@ -541,7 +541,13 @@ fn looks_secret(key: &str) -> bool {
 }
 
 /// The keys of `[local_cache]` that are in no flag, and so not in [`KEYS`].
-const LOCAL_CACHE_KEYS: &[&str] = &["path", "layout", "max_concurrent_fills", "scrub_rate"];
+const LOCAL_CACHE_KEYS: &[&str] = &[
+    "path",
+    "layout",
+    "max_concurrent_fills",
+    "whole_fill_limit",
+    "scrub_rate",
+];
 
 /// Whether `key` is a name some table of the file holds: the last part of a key in [`KEYS`], a
 /// `[local_cache]` key or a `[[policy]]` key.

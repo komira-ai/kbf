@@ -380,6 +380,22 @@ fn a_build_node_file_is_refused_when_it_cannot_be_run() {
     assert!(!why.contains("fast"), "{why}");
 }
 
+/// Asserts that a `whole_fill_limit` that is not a size is refused naming its key and without the
+/// value, as a `budget` is: the key is one a refusal may name.
+#[test]
+fn a_whole_fill_limit_that_is_not_a_size_is_refused_naming_the_key_and_not_the_value() {
+    for bad in ["\"huge\"", "-5"] {
+        let text = LEAST.replacen(
+            "budget = 1000",
+            &format!("budget = 1000\nwhole_fill_limit = {bad}"),
+            1,
+        );
+        let why = refusal(&text);
+        assert!(why.contains("whole_fill_limit"), "{bad}: {why}");
+        assert!(!why.contains("huge"), "{bad}: {why}");
+    }
+}
+
 /// Asserts the edges of the water marks: a low water mark one under the high one, a high one
 /// equal to the critical one and a free floor of 99 are accepted; a low water mark equal to the
 /// high one, a high one over the critical one, a high or low water mark of 0 and a floor of 100
