@@ -102,9 +102,10 @@ fn gives_up_and_stops_for_a_failed_shard() {
 }
 
 /// Catches: a run GitHub does not know (HTTP 404) read as no artifacts yet, which would
-/// wait out every look.
+/// wait out every look; it is asked about a few times (a bad reply is tried again) and then
+/// the wait fails.
 #[test]
-fn a_missing_run_fails_at_once() {
+fn a_missing_run_fails_after_a_few_looks() {
     let f = fx("missing", &json!({}));
     let (code, _, err) = f.run("5");
     assert_eq!(code, Some(1));

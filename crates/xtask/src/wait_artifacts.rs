@@ -23,6 +23,9 @@ use serde_json::Value;
 use crate::Error;
 use crate::advisories::{Call, Method, Process, Tools};
 
+/// How many looks in a row may fail (GitHub answers an error) before the wait fails with the last error.
+pub const FAILED_LOOKS: u32 = 4;
+
 /// The arguments of `wait-artifacts`.
 #[derive(clap::Args)]
 pub struct Args {

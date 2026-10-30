@@ -8,7 +8,10 @@ struct Script {
     looks: Vec<(Value, Value)>,
     asked: Vec<String>,
     pauses: usize,
+    /// Always fail.
     fail: bool,
+    /// Whether each call, in order, fails; the calls after the list succeed.
+    flaky: Vec<bool>,
 }
 
 impl Script {
@@ -18,13 +21,14 @@ impl Script {
             asked: Vec::new(),
             pauses: 0,
             fail: false,
+            flaky: Vec::new(),
         }
     }
 }
 
 impl Github for Script {
     fn get(&mut self, path: &str) -> Result<Value, Error> {
-        if self.fail {
+        if self.fail || (!self.flaky.is_empty() && self.flaky.remove(0)) {
             return Err(Error::Failed("gh api: down".to_owned()));
         }
         self.asked.push(path.to_owned());
@@ -207,11 +211,39 @@ fn every_shard_finished_without_an_artifact_ends_the_wait() {
     }
 }
 
-/// Catches: a failed call to GitHub read as an empty answer.
+/// Catches: a failed call to GitHub read as an empty answer, and a call that keeps failing
+/// waited out to the end of the looks (the run holds a runner) instead of ending the wait.
 #[test]
-fn a_call_that_fails_fails_the_wait() {
+fn a_call_that_keeps_failing_fails_the_wait() {
     let mut s = Script::new(vec![(running(), made(&[]))]);
     s.fail = true;
-    let e = wait(&mut s, &args(&WANTED, 3)).expect_err("down");
+    let e = wait(&mut s, &args(&WANTED, 20)).expect_err("down");
     assert_eq!(e.to_string(), "gh api: down");
+    assert_eq!(s.pauses, FAILED_LOOKS as usize - 1);
+}
+
+/// Catches: one bad reply from GitHub (a 502 failed a run of the gate that was an hour from its
+/// artifacts) ending the wait; the limit on failed looks in a row not being a limit; and the
+/// count of failed looks not starting again after a look that worked.
+#[test]
+fn a_look_that_fails_is_tried_again() {
+    let few = FAILED_LOOKS as usize - 1;
+    let mut s = Script::new(vec![(running(), made(&WANTED))]);
+    s.flaky = vec![true; few];
+    wait(&mut s, &args(&WANTED, 20)).expect("the look after the failed ones works");
+    assert_eq!(s.pauses, few);
+
+    let mut s = Script::new(vec![(running(), made(&WANTED))]);
+    s.flaky = vec![true; few + 1];
+    let e = wait(&mut s, &args(&WANTED, 20)).expect_err("too many in a row");
+    assert_eq!(e.to_string(), "gh api: down");
+
+    // Failures, a look that works but finds an artifact missing, and failures again: no more
+    // than the limit in a row at any time, though more in all.
+    let mut flaky = vec![true; few];
+    flaky.extend([false, false]);
+    flaky.extend(vec![true; few]);
+    let mut s = Script::new(vec![(running(), made(&[])), (running(), made(&WANTED))]);
+    s.flaky = flaky;
+    wait(&mut s, &args(&WANTED, 20)).expect("never too many in a row");
 }
