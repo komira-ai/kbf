@@ -147,6 +147,10 @@
 //! Without [`ServerConfig::proxy`] it is 200 and says the usage is not watched. A bucket cannot
 //! be called `usagez` either.
 //!
+//! `GET /metricz` is 200 with the counters of the OCI read front ([`oci`]) in the Prometheus text
+//! format, or a line that says the front is not enabled; it is not signed either, and a bucket
+//! cannot be called `metricz`.
+//!
 //! # Drain
 //!
 //! [`Server::begin_drain`], which the binary calls on SIGTERM or SIGINT, starts a sequence that
@@ -169,6 +173,7 @@ mod handover;
 mod idle;
 mod keys;
 mod launch;
+pub mod oci;
 mod ops;
 pub mod presign;
 mod reply;
@@ -330,6 +335,9 @@ pub struct ServerConfig {
     /// long without finding any usage object is judged the same way. Longer than the lease and
     /// the pass interval of the reconciler, so that a takeover of the lease does not show.
     pub usage_stale_after: Duration,
+    /// The counters of the OCI read front, which `GET /metricz` shows; none by default, and then
+    /// `/metricz` says the front is not enabled. The binary sets them when it runs the front.
+    pub oci_metrics: Option<Arc<oci::OciMetrics>>,
     /// The time, for the age of a signature and of the usage object.
     pub clock: Arc<dyn Clock>,
     /// The time, for the rate of a request body (`put_min_bytes_per_sec`). It is a clock that
@@ -371,6 +379,7 @@ impl ServerConfig {
             drain_deadline: Duration::from_secs(900),
             proxy: None,
             usage_stale_after: Duration::from_secs(120),
+            oci_metrics: None,
             clock,
             rate_clock: Arc::new(MonotonicClock::new()),
         }
@@ -750,10 +759,19 @@ impl Server {
             (true, "/readyz", true) => (StatusCode::OK, "ready".to_owned()),
             (true, "/readyz", false) => (StatusCode::SERVICE_UNAVAILABLE, "draining".to_owned()),
             (true, "/usagez", _) => self.usage_probe().await,
+            (true, "/metricz", _) => (StatusCode::OK, self.metrics_probe()),
             _ => return None,
         };
         let headers = [("content-type", "text/plain".to_owned())];
         Some(answer(status, &headers, Bytes::from(text)))
+    }
+
+    /// The text of `/metricz`: the counters of the OCI front, or a line that says it is off.
+    fn metrics_probe(&self) -> String {
+        match &self.config.oci_metrics {
+            Some(metrics) => metrics.render(),
+            None => "# the OCI read front is not enabled\n".to_owned(),
+        }
     }
 
     /// The answer of `/usagez`: 200 and the age of the usage object of the reconciler while it is
