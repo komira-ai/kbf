@@ -108,6 +108,10 @@ pub struct Counters {
     pub(super) upstream_gets: AtomicU64,
     /// The HEAD calls the cache made to the upstream.
     pub(super) upstream_heads: AtomicU64,
+    /// The listing calls (`list` and each page of `list_page`) the cache made to the upstream.
+    pub(super) upstream_lists: AtomicU64,
+    /// The calls of `list_uploads` the cache made to the upstream.
+    pub(super) upstream_list_uploads: AtomicU64,
     /// The bytes the upstream gave to fills and pass-through reads.
     pub(super) upstream_bytes_read: AtomicU64,
     /// The HEADs of clients answered from the index.
@@ -254,7 +258,13 @@ impl Counters {
                 "tierstore_cache_fill_failures_total{{reason=\"{label}\"}} {value}"
             );
         }
-        for (op, counter) in [("get", &self.upstream_gets), ("head", &self.upstream_heads)] {
+        let reads = [
+            ("get", &self.upstream_gets),
+            ("head", &self.upstream_heads),
+            ("list", &self.upstream_lists),
+            ("list_uploads", &self.upstream_list_uploads),
+        ];
+        for (op, counter) in reads {
             let value = read(counter);
             let _ = writeln!(
                 text,

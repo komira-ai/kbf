@@ -175,19 +175,105 @@ async fn a_put_a_412_and_a_507_are_each_counted_once() {
     }
     assert_eq!(failures(&rig), [1, 1, 1, 0, 1]);
 
+    // A failure in the middle of the body, under a kept prefix and under one that is not kept:
+    // the upstream read part of the body and then the body failed. Not a put, and no bytes.
+    for key in ["cas/b/mid", "other/mid"] {
+        let items: Vec<Result<Bytes, Error>> = vec![
+            Ok(Bytes::from_static(b"part")),
+            Err(Error::Unavailable("the client went away".to_owned())),
+        ];
+        let cut = rig
+            .cache
+            .put_stream(key, Some(9), stream::iter(items).boxed());
+        assert!(matches!(cut.await, Err(Error::Unavailable(_))), "{key}");
+    }
+    assert_eq!(failures(&rig), [1, 3, 1, 0, 1]);
+    assert_eq!(puts(&rig), (2, 12));
+
     let named = format!("cas/l/{}", digest(b"the name's bytes"));
     let wrong = rig.cache.put_stream(&named, Some(5), whole(b"other"));
     assert_eq!(wrong.await, Err(Error::BadDigest(named.clone())));
-    assert_eq!(failures(&rig), [1, 1, 1, 1, 1]);
+    assert_eq!(failures(&rig), [1, 3, 1, 1, 1]);
     assert_eq!(puts(&rig), (2, 12));
     let text = rig.cache.metrics();
     assert!(text.contains("tierstore_cache_upstream_puts_total 2\n"));
     assert!(text.contains("tierstore_cache_upstream_put_bytes_total 12\n"));
-    for reason in ["exists", "unavailable", "full", "bad_digest", "other"] {
+    let expected = [
+        ("exists", 1),
+        ("unavailable", 3),
+        ("full", 1),
+        ("bad_digest", 1),
+        ("other", 1),
+    ];
+    for (reason, count) in expected {
         let line =
-            format!("tierstore_cache_upstream_put_failures_total{{reason=\"{reason}\"}} 1\n");
+            format!("tierstore_cache_upstream_put_failures_total{{reason=\"{reason}\"}} {count}\n");
         assert!(text.contains(&line), "{reason}");
     }
+
+    // The counts are of the calls the upstream saw: every put it was sent either was taken or
+    // failed, and every GET and HEAD counted is one the fixture saw.
+    let (taken, _) = puts(&rig);
+    let attempts = taken + failures(&rig).iter().sum::<u64>();
+    assert_eq!(rig.calls(Op::Put), attempts);
+    let (gets, heads, _) = reads(&rig);
+    assert_eq!((gets, heads), seen(&rig));
+}
+
+/// Asserts that a put the upstream took without reading the body to its end, for a key named by
+/// its content, is counted as a put (the upstream has the object) and as a `bad_digest` failure
+/// (the client is told so).
+#[tokio::test]
+async fn a_bad_digest_after_the_upstream_took_the_put_counts_as_both() {
+    let rig = Rig::writing("tscache-counters-bad-after");
+    rig.tamper
+        .stop_after
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let key = format!("cas/l/{}", digest(b"shortened!"));
+    let parts: [&'static [u8]; 2] = [b"short", b"ened!"];
+    let items: Vec<Result<Bytes, Error>> = parts
+        .iter()
+        .copied()
+        .map(|part| Ok(Bytes::from_static(part)))
+        .collect();
+    let made = rig
+        .cache
+        .put_stream(&key, Some(10), stream::iter(items).boxed());
+    assert_eq!(made.await, Err(Error::BadDigest(key.clone())));
+    assert_eq!(puts(&rig), (1, 5));
+    assert_eq!(failures(&rig), [0, 0, 0, 1, 0]);
+}
+
+/// Asserts that the listings the cache makes at the upstream are counted: `list` and each page of
+/// `list_page` as `list`, and `list_uploads`, equal to the calls the upstream saw; and that a
+/// listing of a reserved prefix, which the cache answers itself, makes and counts none.
+#[tokio::test]
+async fn the_listings_are_counted_as_upstream_reads() {
+    let rig = Rig::new("tscache-counters-list");
+    rig.put("cas/b/one", b"1").await;
+    rig.put("cas/b/two", b"2").await;
+    let counters = rig.cache.counters();
+    let lists = || {
+        (
+            read(&counters.upstream_lists),
+            read(&counters.upstream_list_uploads),
+        )
+    };
+
+    rig.cache.list("cas/").await.unwrap();
+    assert_eq!(lists(), (1, 0));
+    rig.cache.list_page("cas/", None, 10).await.unwrap();
+    assert_eq!(lists(), (2, 0));
+    rig.cache.list_uploads("cas/", None, 10).await.unwrap();
+    assert_eq!(lists(), (2, 1));
+    assert!(rig.cache.list("_journal/").await.unwrap().is_empty());
+    assert_eq!(lists(), (2, 1));
+
+    assert_eq!(rig.upstream.listed_prefixes().len() as u64, 2);
+    assert_eq!(rig.calls(Op::ListUploads), 1);
+    let text = rig.cache.metrics();
+    assert!(text.contains("tierstore_cache_upstream_reads_total{op=\"list\"} 2\n"));
+    assert!(text.contains("tierstore_cache_upstream_reads_total{op=\"list_uploads\"} 1\n"));
 }
 
 /// Asserts that a multipart upload is one put with the bytes of its parts: two parts of 6 and 5

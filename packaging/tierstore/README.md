@@ -477,24 +477,33 @@ slot taken), `fill_failures_total{reason}` (`hash_mismatch`, `upstream_error`,
 `discarded_at_start_total`, and the gauges `bytes`, `objects`, `fs_free_bytes` and `staging_files`.
 On a storage node it says there is no cache.
 
-What the cache asks of its upstream, and what it does with writes, is counted in these (each call
-once, on every path):
+What the cache asks of its upstream, and what it does with writes, is counted in these. The calls
+counted are the GET, HEAD, list, list_uploads, create-only put and multipart completion calls that
+the cache makes, each in the one place where it makes it. Not counted: delete, the start of an
+upload (`create_upload`), abort, the calls of the start-up probe and self-test, and any retry that a
+`Backend` wrapper of the upstream (the S3 client's, for one) makes inside a call: a counter is of the
+cache's calls, not of the requests on the wire.
 
 | counter | what |
 |---|---|
 | `tierstore_cache_upstream_reads_total{op="get"}` | the GET calls the cache made to the upstream: a fill reads in ranged chunks, so a fill of an object is as many as it has chunks; these are calls, not objects |
 | `tierstore_cache_upstream_reads_total{op="head"}` | the HEAD calls the cache made to the upstream: one for the size of a ranged miss, two for a fill of a key not named by its content (before the first chunk and after the last), one for each HEAD of a client that the index did not answer, and those a put makes (see below) |
+| `tierstore_cache_upstream_reads_total{op="list"}` | the listing calls: `list`, and each page that `list_page` asks of the upstream (a page short of keys that were left out is made up with more pages, each counted) |
+| `tierstore_cache_upstream_reads_total{op="list_uploads"}` | the calls of `list_uploads` to the upstream |
 | `tierstore_cache_upstream_bytes_read_total` | the bytes the upstream gave to fills and pass-through reads. Over `bytes_served_upstream_total` it shows the fill amplification of ranged misses: a 20-byte range of a 350-byte object reads 350 |
 | `tierstore_cache_head_hits_total` | the HEADs of clients answered from the index, with no call to the upstream |
 | `tierstore_cache_head_misses_total` | the HEADs of clients sent to the upstream (a key that is not kept yet, one under a prefix that is not kept, one that is not there) |
 | `tierstore_cache_upstream_puts_total` | the create-only puts and the completions of uploads that the upstream took. A multipart upload is one, counted at its completion. A create-only put makes a HEAD before the body and, under a kept prefix, one after the upstream's acknowledgement; both are in `upstream_reads_total{op="head"}`; a key that the first one finds is answered 412 without a put and is in `write_exists_total` only |
-| `tierstore_cache_upstream_put_bytes_total` | the bytes of the puts the upstream took, and of the parts of uploads that it took: a part counts when it is accepted, so the bytes of an upload that is never completed are in this and its put is not in `upstream_puts_total` |
-| `tierstore_cache_upstream_put_failures_total{reason}` | the puts and completions that reached the upstream and failed: `exists` (its create-only put answered 412), `unavailable`, `full` (507), `bad_digest` (a key named by its content whose body hashes to another name: the upstream stores nothing) and `other`. Puts plus failures are the attempts |
+| `tierstore_cache_upstream_put_bytes_total` | the bytes of the puts the upstream took, and of the parts of uploads that it took: a part counts when it is accepted, so the bytes of an upload that is never completed are in this and its put is not in `upstream_puts_total`, and a client that retries a part the upstream already accepted has the bytes counted twice (the cache keeps no state of an upload to know it is a retry) |
+| `tierstore_cache_upstream_put_failures_total{reason}` | the puts and completions that reached the upstream and failed: `exists` (its create-only put answered 412), `unavailable`, `full` (507), `bad_digest` (a key named by its content whose body hashes to another name: the upstream stores nothing, except when it took the put without reading the body to its end, in which case the put is counted in `upstream_puts_total` and its bytes as well, and the client is still told 400, so it is a failure too) and `other`. Puts plus failures are the attempts, except for that one case, which is in both |
 
 Mapping to the shared scheme of the tier metrics (`tierstore_hits_total{tier,op}` and the others
-of that family): the counters named `tierstore_cache_*` are the series of `tier="local"`, so a
-query over both tiers of a storage node and the build nodes' cache is written against the shared
-names with `tier="local"`, and these counters are the cache-only extras that have no `tier` label.
+of that family): only the counters of what the cache itself serves, `hits_total`, `misses_total`
+and `bytes_served_local_total` (and `bytes_served_upstream_total`, the bytes of the reads that
+were not hits), are the series of `tier="local"`. The `upstream_reads_total`,
+`upstream_bytes_read_total` and `upstream_put*` counters are the traffic of the cache toward its
+upstream, the cold side: they are not `tier="local"` series, and a query that sums the local tier
+over them would count the cache's own reads twice. They have no `tier` label.
 
 ### Which key each flag has
 

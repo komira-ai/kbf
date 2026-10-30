@@ -360,7 +360,11 @@ impl Inner {
             if !keeping.finished {
                 // The upstream took the put without reading the body to its end.
                 if keeping.wanted.is_some() {
-                    return Err(Error::BadDigest(key.to_owned()));
+                    // The upstream took the put, so it is a put (above) and, since the client is
+                    // told it failed, a failure of reason `bad_digest` too.
+                    let error = Error::BadDigest(key.to_owned());
+                    self.counters.put_failed(&error);
+                    return Err(error);
                 }
                 keeping.stage = None;
                 keeping.lost = Some(SkippedKeep::Head);
