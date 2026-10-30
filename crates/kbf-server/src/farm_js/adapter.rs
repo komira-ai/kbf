@@ -51,7 +51,7 @@ use crate::farm::NodeLoads;
 use crate::farm::durable::{named, subject};
 use crate::farm::failed_actions::{Class, FailedActions, class_of};
 use crate::fleet::quarantine_change;
-use crate::machine::{FarmMachine, Platform, Sent, Waiter, stored_name};
+use crate::machine::{Booked, FarmMachine, Platform, Sent, Waiter, stored_name};
 use crate::stamp::Stamp;
 
 /// Where the farm sends a worker's messages: the outbound half of its stream.
@@ -426,6 +426,10 @@ impl Adapter for KbfAdapter {
                     queued: w.queued,
                     started: now,
                 },
+                booked: Some(Booked {
+                    cpu_millis: start.resources.cpu_millis,
+                    memory_bytes: start.resources.memory_bytes,
+                }),
             });
         sent.into_iter()
             .for_each(|sent| self.machine.start(start.lease, sent));

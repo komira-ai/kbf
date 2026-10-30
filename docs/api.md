@@ -1900,7 +1900,8 @@ from its transfer engine, what it read and uploaded (`transfers:`), joined on `l
 ([daemon.md](design/daemon.md#where-a-leases-time-went)). The server logs, per lease
 report that carries usage (an OK run or any failed one the daemon measured, for
 example an out-of-memory kill, a timeout or a lost run), `action usage:` with the same cgroup fields, the action's
-shape `key`, its `cfg`, the `outcome` and the `lease`, and names the `key` on each
+shape `key`, its `cfg`, the `outcome` and the `lease`, then `booked_millicpus` and
+`booked_memory_bytes`, the lease's grant, to set against what it used, and names the `key` on each
 `lease granted` line ([daemon.md](design/daemon.md#the-servers-action-usage-line)).
 
 ## `GET /v1/invocations/{id}` and below
@@ -1969,7 +1970,10 @@ applies and the routes are as described above.
 route) is one attempt: the instance, `lease` (`term.seq`), `worker`, `queued`, `granted`,
 `started` and `ended`, `class` (`ok`, `failed`, `timed_out`, `memory_killed`, `infra`,
 `lost`), `exit_code` for a run that exited, the memory kill and the booking, cap, raised
-booking, memory used and limit of a killed run, the REAPI times and cgroup `usage` the
+booking, memory used and limit of a killed run, `booked_millicpus` and
+`booked_memory_bytes` (what the run's lease was granted, for every run, with the
+meaning and the gaps given for the build pages' attempts above; the two routes show the
+same grant), the REAPI times and cgroup `usage` the
 daemon reported, the digests of the action, command, result and logs, and the `shape`
 (its key, `cfg`, target and whether it is a test). A key the record has no value for is
 left out. The run is read from the in-memory record while it is held and from history
@@ -2113,8 +2117,13 @@ own route; then the keys added since (none of the keys above changed):
   it, so once given they never change; `queue_ms` only grows, by each lease granted
   after a requeue.
 - on each attempt: `memory_kill` once it ended (`none`, `own_limit` or
-  `node_pressure`, read from how it ended); `booked_memory_bytes` for a lease killed
-  for memory (the one that ended the operation too), `cap_bytes` for an own-limit kill
+  `node_pressure`, read from how it ended); `booked_millicpus` and
+  `booked_memory_bytes`, what the lease was granted (its `Start`'s booking, after the
+  memory ladder and the floors, not the client's request), thousandths of a CPU and
+  bytes, for every attempt whose report the scheduler took; each is left out for a
+  lease taken up from the state store, which the server never started, and for a record
+  written before the grant was kept (its `booked_memory_bytes` is then only a
+  memory kill's); `cap_bytes` for an own-limit kill
   (the largest node that could run it), `raised_memory_bytes` for an own-limit
   requeue (the next booking); and, for a lease whose report the scheduler took,
   `reapi_times` (each of REAPI's nine `ExecutedActionMetadata` times it has, by name
