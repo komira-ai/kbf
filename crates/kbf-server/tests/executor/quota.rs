@@ -84,8 +84,12 @@ async fn the_host_is_held_out_for_the_hold_and_used_again_after_it() {
     assert_eq!(hosts_held(&rig), ["node1"], "{back:?}");
     assert!(!back[0].draining);
     let runs = rig.runs_of(1).await;
-    assert_eq!(runs.len(), 2, "not rerun on the recovered host: {runs:?}");
-    rig.host_finishes(&runs[1].run, Outcome::Succeeded, Some(0));
+    // The refused run is not listed any more: the one listed is the rerun, on a new lease
+    // of the recovered host.
+    assert_eq!(runs.len(), 1, "not rerun on the recovered host: {runs:?}");
+    assert_eq!(runs[0].host, "node1");
+    assert_ne!(runs[0].lease, lease);
+    rig.host_finishes(&runs[0].run, Outcome::Succeeded, Some(0));
     assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
 }
 
