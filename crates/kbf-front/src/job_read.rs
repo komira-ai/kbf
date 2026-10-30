@@ -14,16 +14,21 @@
 //! grant never reads a blob outside it, so it cannot read another tenant's bytes.
 //!
 //! The bytes come from a [`BlobSource`], which is the frontend's [`Backend`] in a running
-//! server: the pack index first, then the storage nodes, each read checked against its
-//! digest, as a ByteStream read is. The blob is held whole while it is sent, as that read
-//! holds it, so a response is never larger than [`MAX_BLOB_BYTES`] (413 above it, before
-//! anything is read), and at most [`Limits::reads_in_flight`] reads are open at once; the
-//! others wait for one to end.
+//! server. A blob of at most [`Limits::stream_over`] bytes (64 MiB) is read whole, from the
+//! pack index first and then the storage nodes, each read checked against its digest, as a
+//! ByteStream read is. A larger blob is streamed: the source's chunks are passed on as they
+//! arrive and hashed on the way, so no more than a chunk or two of it is held, whatever its
+//! size. The last chunk is held back until the whole blob has hashed to its digest, so a
+//! source whose bytes are not the blob's ends the response early and without its last chunk
+//! (the response is shorter than its length, and the client's own hash check refuses it); the
+//! end is counted. A response is never larger than [`Limits::max_blob_bytes`] (413 above it,
+//! before anything is read), and at most [`Limits::reads_in_flight`] reads are open at once,
+//! a streamed one until its response ends or is dropped; the others wait for one to end.
 //!
 //! An answer carries a reason code in its body and no other detail: `missing_token`,
 //! `invalid_token`, `expired`, `revoked`, `no_scope`, `out_of_scope`, `too_large`,
-//! `not_found`, `method_not_allowed` or `store_unavailable`. Requests by outcome and the
-//! bytes served are counted ([`JobRead::render_metrics`]).
+//! `not_found`, `method_not_allowed` or `store_unavailable`. Requests by outcome, the
+//! bytes served and the streams that ended early are counted ([`JobRead::render_metrics`]).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -31,12 +36,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use futures::stream::{self, StreamExt as _, TryStreamExt as _};
+use futures::stream::{self, BoxStream, StreamExt as _, TryStreamExt as _};
 use kbf_proto::reapi;
-use kbf_storage::StorageError;
+use kbf_storage::{ReadStream, StorageError};
 use kbf_types::{Digest, DigestFunction};
 use prost::Message as _;
-use tokio::sync::{OnceCell, Semaphore};
+use sha2::{Digest as _, Sha256};
+use tokio::sync::{AcquireError, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::codegen::http::{Method, StatusCode};
 
 use crate::backend::Backend;
@@ -46,9 +52,13 @@ use crate::metrics::{Counter, Families};
 use crate::proxy::MAX_UNTRUSTED_BLOB_BYTES;
 use crate::wire;
 
-/// The most bytes one response carries: the per-blob cap of the packs a task's results are
-/// written into.
-pub const MAX_BLOB_BYTES: u64 = MAX_UNTRUSTED_BLOB_BYTES;
+/// The size above which a blob is streamed and below which (itself included) it is read
+/// whole: the per-blob cap of the packs a task's results are written into.
+pub const STREAM_OVER_BYTES: u64 = MAX_UNTRUSTED_BLOB_BYTES;
+
+/// The default of [`Limits::max_blob_bytes`]: 512 MiB, over the largest input a compile reads
+/// (a 165 MiB toolchain binary).
+pub const DEFAULT_MAX_BLOB_BYTES: u64 = 512 << 20;
 
 /// The Directory blobs of one level of an input tree read at once.
 const DIRECTORIES_IN_FLIGHT: usize = 16;
@@ -60,19 +70,42 @@ const DIRECTORIES_IN_FLIGHT: usize = 16;
 pub trait BlobSource: Send + Sync {
     /// The blob `digest`, read whole and checked against its digest.
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Result<Bytes, StorageError>>;
+
+    /// The blob `digest` as a stream of chunks, for one too large to hold: the answer is
+    /// [`StorageError::NotFound`] when the source holds none, and an error item ends a stream
+    /// that fails part way. The bytes are not trusted to be the blob's: the listener hashes
+    /// them as they pass.
+    fn read_stream<'a>(
+        &'a self,
+        digest: &'a Digest,
+    ) -> BoxFuture<'a, Result<ReadStream, StorageError>>;
 }
 
 impl BlobSource for Backend {
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Result<Bytes, StorageError>> {
         Box::pin(Backend::read_blob(self, digest))
     }
+
+    fn read_stream<'a>(
+        &'a self,
+        digest: &'a Digest,
+    ) -> BoxFuture<'a, Result<ReadStream, StorageError>> {
+        Box::pin(Backend::read_stream(self, digest))
+    }
 }
 
 /// The bounds of a [`JobRead`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// The reads of blobs open at once (at least 1); a request over it waits for one to end.
+    /// The reads of blobs open at once (at least 1), a streamed one until its response ends;
+    /// a request over it waits for one to end.
     pub reads_in_flight: usize,
+    /// The most bytes of one blob a response carries: a blob of more is 413, before anything
+    /// is read.
+    pub max_blob_bytes: u64,
+    /// The size over which a blob is streamed, not read whole. Not a flag: it is the bound of
+    /// the whole-blob read ([`STREAM_OVER_BYTES`]), a test lowers it to stream small blobs.
+    pub stream_over: u64,
     /// The most digests a scope may hold: an input tree past it gives its Action no scope.
     pub scope_digests: usize,
     /// The Actions whose scope is remembered; at the bound the memory is emptied and begins
@@ -84,6 +117,8 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             reads_in_flight: 32,
+            max_blob_bytes: DEFAULT_MAX_BLOB_BYTES,
+            stream_over: STREAM_OVER_BYTES,
             scope_digests: 1 << 20,
             scopes: 256,
         }
@@ -95,8 +130,48 @@ impl Default for Limits {
 pub struct Reply {
     /// The status.
     pub status: StatusCode,
-    /// The blob on 200, else the reason code and a newline.
+    /// The blob on 200 when it is read whole, else the reason code and a newline; empty for a
+    /// streamed blob.
     pub body: Bytes,
+    /// The blob of a 200 that is streamed ([`Limits::stream_over`]), whose `body` is empty.
+    pub stream: Option<BlobStream>,
+}
+
+/// A blob being streamed to a response: its length, and its chunks as they are checked.
+pub struct BlobStream {
+    /// The blob's length, which a response states before its first byte.
+    pub size: u64,
+    /// The chunks, in order. A blob whose bytes are not its digest's ends in an error and
+    /// without its last chunk; a stream that ends cleanly delivered the blob. Dropping it
+    /// gives the read's place back.
+    pub chunks: BoxStream<'static, Result<Bytes, StreamError>>,
+}
+
+impl std::fmt::Debug for BlobStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobStream")
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a streamed response ended before the blob did.
+#[derive(Debug, thiserror::Error)]
+pub enum StreamError {
+    /// The bytes the source gave are not the blob's: they do not hash to its digest, or are
+    /// more or fewer than its size.
+    #[error("the blob's bytes are not its digest's")]
+    Corrupt,
+    /// The source failed part way.
+    #[error("the store failed part way: {0}")]
+    Store(#[from] StorageError),
+}
+
+/// The streams that ended early, by cause.
+#[derive(Default)]
+struct EndedEarly {
+    digest_mismatch: Counter,
+    store_error: Counter,
 }
 
 /// How a request ended, which is how it is counted.
@@ -163,9 +238,10 @@ pub struct JobRead {
     grants: Arc<Grants>,
     limits: Limits,
     scopes: Mutex<Cells>,
-    reads: Semaphore,
+    reads: Arc<Semaphore>,
     requests: [Counter; OUTCOMES.len()],
-    bytes: Counter,
+    bytes: Arc<Counter>,
+    ended_early: Arc<EndedEarly>,
 }
 
 impl JobRead {
@@ -175,11 +251,12 @@ impl JobRead {
         Self {
             source,
             grants,
-            reads: Semaphore::new(limits.reads_in_flight.max(1)),
+            reads: Arc::new(Semaphore::new(limits.reads_in_flight.max(1))),
             limits,
             scopes: Mutex::new(HashMap::new()),
             requests: Default::default(),
-            bytes: Counter::default(),
+            bytes: Arc::default(),
+            ended_early: Arc::default(),
         }
     }
 
@@ -206,17 +283,30 @@ impl JobRead {
         if scope.check(&claims, &[digest]).is_err() {
             return self.refuse(Outcome::Forbidden, "out_of_scope");
         }
-        if digest.size_bytes > MAX_BLOB_BYTES {
+        if digest.size_bytes > self.limits.max_blob_bytes {
             return self.refuse(Outcome::TooLarge, "too_large");
         }
         if is_empty_blob(&digest) {
             return self.serve(Bytes::new());
         }
-        let _read = self.reads.acquire().await;
+        let place = Arc::clone(&self.reads).acquire_owned().await;
+        if digest.size_bytes > self.limits.stream_over {
+            return match self.source.read_stream(&digest).await {
+                Ok(read) => self.serve_stream(digest, read, place),
+                Err(error) => self.unreadable(&error),
+            };
+        }
         match self.source.read_blob(&digest).await {
             Ok(bytes) => self.serve(bytes),
-            Err(StorageError::NotFound(_)) => self.refuse(Outcome::NotFound, "not_found"),
-            Err(_) => self.refuse(Outcome::Unavailable, "store_unavailable"),
+            Err(error) => self.unreadable(&error),
+        }
+    }
+
+    /// The refusal for a blob the source could not give.
+    fn unreadable(&self, error: &StorageError) -> Reply {
+        match error {
+            StorageError::NotFound(_) => self.refuse(Outcome::NotFound, "not_found"),
+            _ => self.refuse(Outcome::Unavailable, "store_unavailable"),
         }
     }
 
@@ -255,6 +345,42 @@ impl JobRead {
         self.answer(Outcome::Ok, body)
     }
 
+    /// A 200 whose body is `read`, passed on as it is hashed; `place` is held until the
+    /// stream ends or is dropped.
+    fn serve_stream(
+        &self,
+        digest: Digest,
+        read: ReadStream,
+        place: Result<OwnedSemaphorePermit, AcquireError>,
+    ) -> Reply {
+        let state = Streaming {
+            read,
+            hasher: Sha256::new(),
+            digest,
+            seen: 0,
+            held: None,
+            finished: false,
+            bytes: Arc::clone(&self.bytes),
+            ended_early: Arc::clone(&self.ended_early),
+            _place: place,
+        };
+        let chunks = stream::unfold(Some(state), |state| async move {
+            let mut state = state?;
+            match state.step().await {
+                Step::Chunk(chunk) => Some((Ok(chunk), Some(state))),
+                Step::Fail(error) => Some((Err(error), None)),
+                Step::Done => None,
+            }
+        })
+        .boxed();
+        let mut reply = self.answer(Outcome::Ok, Bytes::new());
+        reply.stream = Some(BlobStream {
+            size: digest.size_bytes,
+            chunks,
+        });
+        reply
+    }
+
     fn refuse(&self, outcome: Outcome, reason: &'static str) -> Reply {
         self.answer(outcome, Bytes::from(format!("{reason}\n")))
     }
@@ -264,6 +390,7 @@ impl JobRead {
         Reply {
             status: outcome.status(),
             body,
+            stream: None,
         }
     }
 
@@ -289,6 +416,23 @@ impl JobRead {
             "Blob bytes served to jobs",
             self.bytes.get(),
         );
+        let name = "kbf_job_read_stream_ended_early_total";
+        families.head(
+            name,
+            "counter",
+            "Streamed blob responses that ended before the blob did, by cause",
+        );
+        let causes = [
+            ("digest_mismatch", &self.ended_early.digest_mismatch),
+            ("store_error", &self.ended_early.store_error),
+        ];
+        for (reason, counter) in causes {
+            let _ = writeln!(
+                families.0,
+                "{name}{{reason=\"{reason}\"}} {}",
+                counter.get()
+            );
+        }
         *out = families.0;
     }
 
@@ -298,6 +442,81 @@ impl JobRead {
         if let Some(read) = read {
             read.render_metrics(out);
         }
+    }
+}
+
+/// A blob being streamed: what [`Streaming::step`] passes on and what it has seen.
+struct Streaming {
+    read: ReadStream,
+    hasher: Sha256,
+    digest: Digest,
+    /// The bytes the source has given.
+    seen: u64,
+    /// The last chunk given, held until the next arrives or the blob has hashed to its digest.
+    held: Option<Bytes>,
+    finished: bool,
+    bytes: Arc<Counter>,
+    ended_early: Arc<EndedEarly>,
+    /// The read's place among [`Limits::reads_in_flight`], given back when the stream is dropped.
+    _place: Result<OwnedSemaphorePermit, AcquireError>,
+}
+
+/// What one step of a [`Streaming`] came to.
+enum Step {
+    Chunk(Bytes),
+    Fail(StreamError),
+    Done,
+}
+
+impl Streaming {
+    /// The next chunk to pass on. A chunk is passed on when the one after it has arrived, so
+    /// the last is passed on only once the whole has hashed to the digest.
+    async fn step(&mut self) -> Step {
+        if self.finished {
+            return Step::Done;
+        }
+        loop {
+            match self.read.next().await {
+                Some(Ok(chunk)) if chunk.is_empty() => {}
+                Some(Ok(chunk)) => {
+                    self.seen += chunk.len() as u64;
+                    if self.seen > self.digest.size_bytes {
+                        return self.corrupt();
+                    }
+                    self.hasher.update(&chunk);
+                    if let Some(ready) = self.held.replace(chunk) {
+                        self.bytes.add(ready.len() as u64);
+                        return Step::Chunk(ready);
+                    }
+                }
+                Some(Err(StorageError::DigestMismatch { .. } | StorageError::Corrupt { .. })) => {
+                    return self.corrupt();
+                }
+                Some(Err(error)) => {
+                    self.ended_early.store_error.add(1);
+                    return Step::Fail(StreamError::Store(error));
+                }
+                None => return self.end(),
+            }
+        }
+    }
+
+    /// The source has no more: the last chunk is passed on if the whole is the blob.
+    fn end(&mut self) -> Step {
+        let hash: [u8; 32] = self.hasher.clone().finalize().into();
+        if self.seen != self.digest.size_bytes || hash != self.digest.hash {
+            return self.corrupt();
+        }
+        self.finished = true;
+        // Held, as the blob is not empty ([`is_empty_blob`] is served before a read).
+        let last = self.held.take().unwrap_or_default();
+        self.bytes.add(last.len() as u64);
+        Step::Chunk(last)
+    }
+
+    fn corrupt(&self) -> Step {
+        self.ended_early.digest_mismatch.add(1);
+        Step::Fail(StreamError::Corrupt)
     }
 }
 

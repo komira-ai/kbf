@@ -38,6 +38,10 @@ pub struct Config {
     /// This frontend's id: the value of the `kbf-frontend` label on its leases, the prefix
     /// of its workers' instances.
     pub frontend: String,
+    /// Which process of this frontend id this is: the value of the `kbf-instance` label on its
+    /// leases, made up at start. A lease of another process under the same frontend id is never
+    /// taken for this one's while that process renews it.
+    pub instance: String,
     /// How many hosts to hold, a lease each.
     pub hosts: usize,
     /// The class every lease asks for.
@@ -50,6 +54,10 @@ pub struct Config {
     pub slots: u64,
     /// The CPU architecture of the hosts.
     pub arch: String,
+    /// The longest a worker goes between two renewals of its lease, whatever the ttl: a
+    /// process that starts under the same frontend id tells a live executor from a dead one's
+    /// leftovers by a renewal ([`Config::adopt_watch`]).
+    pub renew_every: Duration,
     /// How long a lease lasts without a renewal, asked at each renewal. A run's wall time is
     /// cut to what the lease has left when it is posted, so this must cover the longest run
     /// ([`Config::max_run`] and [`Config::run_margin`]) and two heartbeats more (the server cuts
@@ -154,6 +162,9 @@ pub enum ConfigError {
         "the lease ttl must be at least 30 s, three times the step, and cover the longest run and two heartbeats"
     )]
     Ttl,
+    /// A renewal interval of zero.
+    #[error("the renewal interval must be above zero")]
+    Renew,
     /// A default timeout of zero or over the longest run.
     #[error("the default timeout must be above zero and no more than the longest run")]
     Timeout,
@@ -190,12 +201,14 @@ impl Config {
     ) -> Self {
         Self {
             frontend: frontend.to_owned(),
+            instance: super::Nonce::random().to_string(),
             hosts,
             class: class.to_owned(),
             cpu_millis,
             memory_bytes,
             slots: 8,
             arch: "x86_64".to_owned(),
+            renew_every: Duration::from_secs(30),
             lease_ttl: Duration::from_secs(3600),
             max_wall: Duration::from_secs(6 * 3600),
             drain_before_end: Duration::from_secs(90 * 60),
@@ -224,6 +237,16 @@ impl Config {
             max_blob_bytes: 64 << 20,
             presign_ceiling: PRESIGN_LIMIT,
         }
+    }
+
+    /// How long a process that finds another's leases under its own frontend id watches them
+    /// before it takes them: the longest a live executor goes between two renewals of a lease
+    /// ([`Config::renew_every`]), plus the longest a pass can be held ([`Config::fence_after`]:
+    /// a worker that cannot reach the lease server for longer has fenced itself and is no
+    /// longer a holder), plus a step.
+    #[must_use]
+    pub fn adopt_watch(&self) -> Duration {
+        self.renew_every + self.fence_after + self.poll
     }
 
     /// Checks what the executor's safety rests on.
@@ -277,6 +300,7 @@ impl Config {
                 .all(|ok| ok),
                 ConfigError::Ttl,
             ),
+            (!self.renew_every.is_zero(), ConfigError::Renew),
             (
                 !self.default_timeout.is_zero() && self.default_timeout <= self.max_run,
                 ConfigError::Timeout,
