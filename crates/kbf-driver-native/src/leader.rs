@@ -115,11 +115,11 @@ impl Leader {
 impl Leader {
     /// Kills the leader and, when no wait has started and no reaper is running, reaps it
     /// on a thread of its own. Gives that thread, or `None` when there is nothing to
-    /// start (a wait is running, has finished, or a reaper started before) or the thread
+    /// start (a wait is running or has run, or a reaper started before) or the thread
     /// could not start (the zombie then stays until the daemon exits).
     fn finish(&mut self) -> Option<std::thread::JoinHandle<()>> {
         let _ = self.start_kill();
-        if self.task.is_some() || self.answer.is_some() || self.reaper {
+        if self.task.is_some() || self.reaper {
             return None;
         }
         self.reaper = true;

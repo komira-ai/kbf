@@ -467,3 +467,17 @@ fn what_runs_below_an_orphan_is_added_to_the_reap_too() {
     reap(&mut meter, 10, 4);
     assert_eq!(user_micros(&meter), 7_000_000);
 }
+
+/// Catches: a process whose parent no reading could name (0) taken for an orphan and added
+/// on top of the reap, which may hold it. Read once, alive at the last poll, with 3 s; the
+/// reap (4 s) is the larger of it and the poll (1 s + 3 s), so the total is 4 s, not 7.
+#[test]
+fn a_process_with_an_unknown_parent_is_taken_to_be_in_the_chain() {
+    let mut meter = Meter::default();
+    poll(
+        &mut meter,
+        &[(10, proc_row(S, 0, 1)), (11, proc_row(3 * S, 0, 0))],
+    );
+    reap(&mut meter, 10, 4);
+    assert_eq!(user_micros(&meter), 4_000_000);
+}
