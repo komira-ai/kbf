@@ -11,9 +11,9 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::channel::oneshot;
 use futures::stream;
-use kbf_objstore::s3::fake::{Failure, FakeS3, part_etag};
-use kbf_objstore::s3::{Credentials, OpenUpload, S3Config, S3Store, UploadsPage};
-use kbf_objstore::{
+use objstore_s3::s3::fake::{Failure, FakeS3, part_etag};
+use objstore_s3::s3::{Credentials, OpenUpload, S3Config, S3Store, UploadsPage};
+use objstore_s3::{
     BodyStream, ByteRange, Capabilities, KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError,
     PageSize,
 };
