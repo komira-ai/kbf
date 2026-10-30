@@ -237,6 +237,7 @@ impl Cache {
                     let uid = inner.uid;
                     let checked = blocking(move || stat_check(&path, &key, uid).ok()).await;
                     if let Some(nlink) = checked {
+                        inner.note_hit(&key);
                         let path = inner.path_of(&key);
                         let source = Source::Entry { path, nlink };
                         return Ok(Got { source, hit: true });
@@ -258,6 +259,9 @@ impl Cache {
                 Step::Own(mut slot) => {
                     let settled = self.settle(cas, key, counts).await;
                     slot.error = settled.as_ref().err().cloned();
+                    if settled.as_ref().is_ok_and(|got| got.hit) {
+                        inner.note_hit(&key);
+                    }
                     return settled;
                 }
             }
@@ -345,7 +349,12 @@ impl Cache {
         }
         counts.fetched_bytes.fetch_add(key.size, Ordering::Relaxed);
         let file = file.into_std().await;
-        Ok(self.insert(key, file, tmp).await)
+        let source = self.insert(key, file, tmp).await;
+        if matches!(source, Source::Entry { .. }) {
+            inner.counters.fills.fetch_add(1, Ordering::Relaxed);
+            (inner.counters.fill_bytes).fetch_add(key.size, Ordering::Relaxed);
+        }
+        Ok(source)
     }
 
     /// [`Inner::insert`] on the blocking pool.
@@ -406,6 +415,12 @@ impl Inner {
             return Step::Hit;
         }
         Step::Own(self.take(&mut state, key))
+    }
+
+    /// Counts a lease's use of `key`'s entry, found in the cache.
+    fn note_hit(&self, key: &Key) {
+        bump(&self.counters.hits);
+        (self.counters.hit_bytes).fetch_add(key.size, Ordering::Relaxed);
     }
 
     /// Inserts the bytes written into `file` (named `tmp`) as `key`'s entry (see the
