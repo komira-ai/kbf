@@ -144,8 +144,43 @@ pub fn jobs_of(page: &Value) -> Result<Vec<JobInfo>, Error> {
 
 /// Whether to rerun the failed jobs of the run (see the module doc for every condition).
 pub fn decide(run: &RunInfo, jobs: &[JobInfo]) -> Decision {
-    let _ = (run, jobs);
-    Decision::Nothing("not implemented".to_owned())
+    if run.attempt != 1 {
+        return Decision::Nothing(format!(
+            "attempt {} is not the first: a rerun is made once",
+            run.attempt
+        ));
+    }
+    if run.branch != "main" || run.event != "push" {
+        return Decision::Nothing(format!(
+            "the run is a {} of {}, not a push to main",
+            run.event, run.branch
+        ));
+    }
+    if !matches!(run.conclusion.as_str(), "failure" | "cancelled") {
+        return Decision::Nothing(format!("the run concluded {}", run.conclusion));
+    }
+    let failed: Vec<JobInfo> = jobs
+        .iter()
+        .filter(|j| {
+            j.status == "completed" && matches!(j.conclusion.as_str(), "failure" | "timed_out")
+        })
+        .cloned()
+        .collect();
+    if failed.is_empty() {
+        return Decision::Nothing("no job failed".to_owned());
+    }
+    let others: Vec<&str> = failed
+        .iter()
+        .filter(|j| !rerunnable(&j.name))
+        .map(|j| j.name.as_str())
+        .collect();
+    if !others.is_empty() {
+        return Decision::Nothing(format!(
+            "not a job that builds or moves artifacts: {}; the pipeline stays failed",
+            others.join(", ")
+        ));
+    }
+    Decision::Rerun(failed)
 }
 
 /// The line for the summary of a rerun: the jobs and the logs of their first failure.

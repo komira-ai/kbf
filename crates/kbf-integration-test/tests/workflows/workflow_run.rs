@@ -4,7 +4,8 @@
 //! branch's copy of the file whatever ref the other run was for, and holds this repository's
 //! token and its environments' credentials. The release is the one use: it must outlive a push
 //! that cancels the pipeline run it follows, so it is a workflow of its own started by the
-//! success of the pipeline (`release.yml`; see its header). [`rules`] therefore refuses the
+//! success of the pipeline (`release.yml`; see its header); the rerun of a failed artifact job is the
+//! other (`pipeline-rerun.yml`: the run it follows has completed, which a rerun needs). [`rules`] therefore refuses the
 //! trigger in every form and in every workflow but this: `workflows: [pipeline]`, `types:
 //! [completed]` and `branches: [main]`, nothing else. A repository test
 //! (`only_the_release_workflow_follows_the_pipeline`) holds the trigger to `release.yml` and the
@@ -14,7 +15,7 @@
 use super::*;
 
 /// What a workflow with the trigger in any other shape is told.
-const REFUSED: &str = "triggers on workflow_run, which no workflow may but the release after the pipeline (workflows: [pipeline], types: [completed], branches: [main])";
+const REFUSED: &str = "triggers on workflow_run, which no workflow may but the release and the rerun after the pipeline (workflows: [pipeline], types: [completed], branches: [main])";
 
 /// The filters of the one allowed shape, by key.
 const ALLOWED: [(&str, &str); 3] = [
