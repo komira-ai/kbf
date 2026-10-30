@@ -59,6 +59,9 @@ use crate::s3::{BenchS3, Timeouts, unix_ms};
 /// The object size when `--object-bytes` names none.
 pub const DEFAULT_OBJECT_BYTES: u64 = 1 << 20;
 
+/// The most bytes of bodies one level may have in flight (in flight x object size).
+pub const MAX_IN_FLIGHT_BYTES: u64 = 1 << 30;
+
 /// Requests a quiet window needs before `p99_us` is claimed.
 const P99_MIN_REQUESTS: u64 = 1000;
 
@@ -422,9 +425,26 @@ fn summarize(
         .map(|(_, n)| u64::from(*n))
         .sum();
     let ok = u64::from(counts.get(&Some(200)).copied().unwrap_or(0));
-    let mut latencies: Vec<u64> = samples.iter().map(|s| s.latency_us).collect();
+    // The headline figures are the latencies of the PUTs the store took (200). A 412 is a
+    // lookup, and a request with no answer ends at a timeout; neither says how long a write takes.
+    let mut latencies: Vec<u64> = samples
+        .iter()
+        .filter(|s| s.status == Some(200))
+        .map(|s| s.latency_us)
+        .collect();
     latencies.sort_unstable();
     let max_us = latencies.last().copied().unwrap_or(0);
+    let other_max_us = samples
+        .iter()
+        .filter(|s| s.status != Some(200))
+        .map(|s| s.latency_us)
+        .max();
+    let stored_bytes: u64 = samples
+        .iter()
+        .filter(|s| s.status == Some(200))
+        .map(|s| s.bytes)
+        .sum();
+    let attempted_bytes: u64 = samples.iter().map(|s| s.bytes).sum();
     let window = if gate_tripped.is_some() {
         Window::Busy
     } else {
@@ -433,19 +453,29 @@ fn summarize(
     let percentiles = (!latencies.is_empty()).then(|| Percentiles {
         p50_us: nearest_rank(&latencies, 50),
         p95_us: nearest_rank(&latencies, 95),
-        p99_us: (window == Window::Quiet && requests >= P99_MIN_REQUESTS)
+        p99_us: (window == Window::Quiet && ok >= P99_MIN_REQUESTS)
             .then(|| nearest_rank(&latencies, 99)),
         max_us,
     });
     let mut notes = Vec::new();
-    if !latencies.is_empty() {
+    if requests > 0 {
         notes.push(format!("status counts: {}", status_counts(&counts)));
         notes.push(format!(
-            "raw latency_us over every request, whatever the window: p50={} p90={} p99={} max={max_us}",
-            nearest_rank(&latencies, 50),
-            nearest_rank(&latencies, 90),
-            nearest_rank(&latencies, 99),
+            "bytes = stored by the 200 answers: {stored_bytes}; attempted by every request: {attempted_bytes}"
         ));
+        if !latencies.is_empty() {
+            notes.push(format!(
+                "raw latency_us over the {ok} PUTs answered 200 only (the percentiles of this result), whatever the window: p50={} p90={} p99={} max={max_us}",
+                nearest_rank(&latencies, 50),
+                nearest_rank(&latencies, 90),
+                nearest_rank(&latencies, 99),
+            ));
+        }
+        if let Some(other) = other_max_us {
+            notes.push(format!(
+                "requests not answered 200 are left out of those percentiles; their slowest took latency_us={other}"
+            ));
+        }
         notes.push(format!(
             "raw rate: ok_put_per_s={} all_requests_per_s={} elapsed_us={elapsed_us}",
             per_second(ok, elapsed_us),
@@ -458,7 +488,7 @@ fn summarize(
         discarded: false,
         requests,
         failures,
-        bytes: samples.iter().map(|s| s.bytes).sum(),
+        bytes: stored_bytes,
         elapsed_us,
         percentiles,
         gate_tripped,
@@ -786,6 +816,12 @@ pub async fn run_levels(
     if plan.in_flight.is_empty() || plan.in_flight.contains(&0) {
         return Err(BenchError::Request(
             "requests in flight: at least one level, each at least 1",
+        ));
+    }
+    let widest = u64::from(plan.in_flight.iter().copied().max().unwrap_or(0));
+    if widest.saturating_mul(size) > MAX_IN_FLIGHT_BYTES {
+        return Err(BenchError::Request(
+            "in flight x object bytes is over 1 GiB: the bodies of one level are held in memory",
         ));
     }
     if cp.same_key && plan.in_flight.len() != 1 {

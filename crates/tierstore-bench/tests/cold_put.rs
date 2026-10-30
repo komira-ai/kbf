@@ -274,6 +274,7 @@ async fn a_412_is_counted_as_a_412_and_is_not_an_error() {
     let pass = &run.results[0].passes[0];
     assert_eq!(pass.requests, 8);
     assert_eq!(pass.failures, 0);
+    assert_eq!(pass.bytes, 7 * 256);
     let notes = run.results[0].notes.join("\n");
     assert!(notes.contains("200=7"), "{notes}");
     assert!(notes.contains("412=1"), "{notes}");
@@ -308,6 +309,17 @@ async fn requests_that_get_no_answer_are_failures_with_no_status() {
     let pass = &run.results[0].passes[0];
     assert_eq!(pass.requests, 4);
     assert_eq!(pass.failures, 4);
+    // Nothing was stored, so no bytes and no percentiles; the attempts are in the notes.
+    assert_eq!(pass.bytes, 0);
+    assert!(pass.percentiles.is_none());
+    assert!(
+        run.results[0]
+            .notes
+            .iter()
+            .any(|n| n.contains("attempted by every request: 256")),
+        "{:?}",
+        run.results[0].notes
+    );
     assert!(
         run.results[0].notes.iter().any(|n| n.contains("none=4")),
         "{:?}",
@@ -379,7 +391,13 @@ async fn sixteen_concurrent_creates_of_one_key_have_one_winner() {
     assert_eq!(run.results[0].arm, "direct-same-key-c16");
     assert_eq!(pass.requests, 16);
     assert_eq!(pass.failures, 0);
+    // One object was stored, not sixteen; every request attempted 2048 bytes.
+    assert_eq!(pass.bytes, 2048);
     let notes = run.results[0].notes.join("\n");
+    assert!(
+        notes.contains("attempted by every request: 32768"),
+        "{notes}"
+    );
     assert!(
         notes.contains("200=1") && notes.contains("412=15"),
         "{notes}"
@@ -388,5 +406,110 @@ async fn sixteen_concurrent_creates_of_one_key_have_one_winner() {
         notes.contains("stored bytes equal the winner's: yes"),
         "{notes}"
     );
-    assert_eq!(r.csv_rows().len(), 16);
+    let rows = r.csv_rows();
+    assert_eq!(rows.len(), 16);
+    // The percentiles are the one PUT the store took, not the fifteen refusals.
+    let winner: Vec<u64> = rows
+        .iter()
+        .filter(|row| row[13] == "200")
+        .map(|row| row[12].parse().unwrap())
+        .collect();
+    let p = pass.percentiles.expect("percentiles");
+    assert_eq!(winner.len(), 1);
+    assert_eq!(
+        (p.p50_us, p.p95_us, p.max_us),
+        (winner[0], winner[0], winner[0])
+    );
+    assert!(notes.contains("answered 200 only"), "{notes}");
+}
+
+/// Catches the percentiles of a level mixing in the 412s: with one refused key among eight, the
+/// percentiles are those of the seven PUTs the store took, and `bytes` counts the seven
+/// objects stored, not the eight attempted.
+#[tokio::test]
+async fn percentiles_and_bytes_are_those_of_the_puts_the_store_took() {
+    let r = rig(
+        "tierstore-bench-cp-headline",
+        &["--in-flight", "2", "--puts", "8", "--object-bytes", "256"],
+    )
+    .await;
+    r.put_elsewhere("bench/c1/r1/c2/00000005").await;
+    let run = cold_put::run_levels(&r.ctx, &r.plan, Script::calm())
+        .await
+        .unwrap();
+    let pass = &run.results[0].passes[0];
+    let mut ok: Vec<u64> = r
+        .csv_rows()
+        .iter()
+        .filter(|row| row[13] == "200")
+        .map(|row| row[12].parse().unwrap())
+        .collect();
+    ok.sort_unstable();
+    assert_eq!(ok.len(), 7);
+    let p = pass.percentiles.expect("percentiles");
+    assert_eq!(p.max_us, ok[6]);
+    assert_eq!(p.p50_us, ok[3]);
+    assert_eq!(pass.bytes, 7 * 256);
+    let notes = run.results[0].notes.join("\n");
+    assert!(
+        notes.contains("attempted by every request: 2048"),
+        "{notes}"
+    );
+    assert!(notes.contains("7 PUTs answered 200 only"), "{notes}");
+}
+
+/// Catches a level whose bodies could not fit in memory: in flight x object bytes over 1 GiB
+/// is refused before any request, for a level and for the same-key race; exactly 1 GiB is not.
+#[tokio::test]
+async fn in_flight_times_object_size_over_a_gibibyte_is_refused_before_any_request() {
+    let r = rig(
+        "tierstore-bench-cp-bound",
+        &["--in-flight", "4,16", "--object-bytes", "134217728"],
+    )
+    .await;
+    let err = cold_put::run_levels(&r.ctx, &r.plan, Script::calm())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BenchError::Request(_)), "{err:?}");
+    let race = rig(
+        "tierstore-bench-cp-bound-race",
+        &[
+            "--same-key",
+            "--in-flight",
+            "17",
+            "--object-bytes",
+            "67108864",
+        ],
+    )
+    .await;
+    let err = cold_put::run_levels(&race.ctx, &race.plan, Script::calm())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BenchError::Request(_)), "{err:?}");
+    for refused in [&r, &race] {
+        assert_eq!(refused.ctx.log.count(), 0);
+        assert!(refused.fake.keys().is_empty());
+    }
+    // 8 x 128 MiB is exactly the bound and is allowed to start (no object is sent here: the
+    // stop file is up).
+    let edge = rig(
+        "tierstore-bench-cp-bound-edge",
+        &[
+            "--in-flight",
+            "8",
+            "--object-bytes",
+            "134217728",
+            "--puts",
+            "1",
+        ],
+    )
+    .await;
+    let stop = edge.dir.path().join("stop");
+    std::fs::write(&stop, "").unwrap();
+    let mut plan = edge.plan.clone();
+    plan.cold_put.stop_file = Some(stop);
+    let run = cold_put::run_levels(&edge.ctx, &plan, Script::calm())
+        .await
+        .unwrap();
+    assert_eq!(run.halted.as_deref(), Some("stop-file"));
 }
