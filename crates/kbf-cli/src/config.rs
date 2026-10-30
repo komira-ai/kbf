@@ -235,6 +235,16 @@ const GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        // The frontend's job-facing read listener (`kbf_server::frontend`'s `job_read`).
+        "job-read",
+        &[
+            "job-grant-secret-file",
+            "job-listen",
+            "job-tls-cert",
+            "job-tls-key",
+        ],
+    ),
+    (
         // Preparing the runs of a host executor: `kbf_server::frontend`'s `task_flags`.
         "task-runs",
         &[
