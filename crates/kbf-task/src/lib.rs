@@ -20,7 +20,9 @@
 //! 5. PUTs that object to the presigned URL ([`put`]): one create-only PUT, repeated only after a
 //!    503 (the store's hot tier is full and nothing was stored), at most three more times, each
 //!    after the wait the store's `Retry-After` names (whole seconds, at most 30; 2 s when it names
-//!    none). Every other answer, 412 included, is final.
+//!    none). Every other answer, 412 included, is final. The retries do not look at the URL's
+//!    expiry: they wait at most 90 s in all, and a retry the store gets after the URL expired is
+//!    refused (403), which is final, so the task fails (exit 13) and nothing is stored.
 //!
 //! `js-agent` returns nothing but an exit code, so the manifest travels inside the pack, and the exit
 //! code says only whether the farm did its part: 0 when the action ran and its pack was stored
