@@ -45,12 +45,12 @@
 //!    hashing says the records are those digests. The packs are recorded last pack first, pack 0
 //!    last, so a run that fails midway leaves no row for the pack that holds the manifest.
 //! 10. **The result** is rebuilt from the manifest's now-verified digests, sorted by path, with no
-//!    execution metadata (the task's timings are advisory and not carried). It is written to the
-//!    action cache only if the action exited 0 and its Action does not say `do_not_cache`, by the
-//!    same two calls a daemon's result takes ([`Backend::prepare_action_result`] and
-//!    [`Backend::commit_action_record`]); a failed action is reported and not cached. It is written
-//!    after every pack is recorded and every large object is in the CAS, so a reader never finds a
-//!    result whose blobs cannot be found.
+//!     execution metadata (the task's timings are advisory and not carried). It is written to the
+//!     action cache only if the action exited 0 and its Action does not say `do_not_cache`, by the
+//!     same two calls a daemon's result takes ([`Backend::prepare_action_result`] and
+//!     [`Backend::commit_action_record`]); a failed action is reported and not cached. It is written
+//!     after every pack is recorded and every large object is in the CAS, so a reader never finds a
+//!     result whose blobs cannot be found.
 //!
 //! A refusal at steps 1 to 7 stores and indexes nothing. A refusal at step 8 or 9 can leave what was
 //! stored before it: large objects in the CAS, each under the digest its own bytes hash to, and
