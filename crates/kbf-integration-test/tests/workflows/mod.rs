@@ -191,6 +191,13 @@ const ISSUE_SCOPES: &[&str] = &["issues"];
 /// which the pipeline's watch job uses to cancel its own run when another job has failed.
 const ACTIONS_SCOPES: &[&str] = &["actions"];
 
+/// The second `if:` spelling under which a job may hold [`ACTIONS_SCOPES`] for writing (and only
+/// those): the completed pipeline run of a push to `main` of this repository that failed or was
+/// cancelled (the watch cancels a run for a failed job), in its first attempt. `pipeline-rerun.yml`
+/// reruns the failed jobs of that run once; the attempt test is what stops it looping.
+#[cfg(test)]
+const RERUN_ONLY: &str = "${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}";
+
 /// The one `if:` spelling under which a job may hold [`ISSUE_SCOPES`] for writing: a run
 /// whose ref is `main` (a scheduled run, a push to `main`, a manual run of `main`). A pull
 /// request run's ref is `refs/pull/<n>/merge`, never this.

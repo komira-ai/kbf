@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_release_workflow_follows_the_pipeline() {
+    fn only_the_release_and_the_rerun_workflows_follow_the_pipeline() {
         let dir = crate::repo_root().join(".github/workflows");
         let mut followers = Vec::new();
         let mut pipelines = Vec::new();
@@ -147,9 +147,10 @@ mod tests {
                 pipelines.push(name);
             }
         }
+        followers.sort();
         assert_eq!(
             followers,
-            ["release.yml"],
+            ["pipeline-rerun.yml", "release.yml"],
             "the workflows that follow another"
         );
         assert_eq!(
