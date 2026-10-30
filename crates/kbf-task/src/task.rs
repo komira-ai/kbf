@@ -31,8 +31,8 @@ use clap::{ArgGroup, Parser};
 use kbf_proto::reapi::{self, Action, Command};
 use kbf_segments::sha256;
 use kbf_task_pack::{
-    LargeEntry, OutputDirectory, OutputFile, OutputSymlink, TaskManifest, Timing, Usage,
-    check_build,
+    LargeEntry, MAX_LARGE, MAX_PACKS, OutputDirectory, OutputFile, OutputSymlink, TaskManifest,
+    Timing, Usage, check_build,
 };
 use kbf_types::Digest;
 
@@ -377,13 +377,20 @@ pub async fn execute(
 }
 
 /// [`execute`] within `limits`: the placement limits are a parameter so a test can use small packs.
-/// `limits.packs` and `limits.large` are at most the manifest's maxima (a key set has no more).
+/// A sink or limits with more pack or large slots than a manifest can name (8 of each) is a setup
+/// failure (exit 14) before anything is fetched.
 pub(crate) async fn execute_with(
     cli: &Cli,
     source: &impl BlobSource,
     sink: &impl PackSink,
     limits: &Limits,
 ) -> Result<TaskManifest, Failure> {
+    if limits.packs > usize::from(MAX_PACKS) || limits.large > usize::from(MAX_LARGE) {
+        return Err(Failure::Setup(format!(
+            "{} pack slots and {} large slots; a manifest names at most {MAX_PACKS} and {MAX_LARGE}",
+            limits.packs, limits.large
+        )));
+    }
     let fetching = Instant::now();
     let action_digest = digest::to_reapi(&cli.action);
     let action: Action = fetch_message(source, &action_digest)?;
@@ -500,8 +507,9 @@ fn store_outputs(
         .map(|d| digest_of(Some(&d)).map(|d| (d, d.size_bytes)))
         .collect::<Result<Vec<_>, _>>()?;
     let planned = plan(&sizes, reserve, limits).map_err(PackError::from)?;
-    // At most `limits.packs`, which is at most MAX_PACKS (a key set has no more URLs).
-    manifest.packs = planned.packs.len() as u8;
+    // At most `limits.packs`, which `execute_with` keeps within MAX_PACKS; a count that did not
+    // fit a byte would be refused by the manifest's own check.
+    manifest.packs = u8::try_from(planned.packs.len()).unwrap_or(u8::MAX);
     manifest.large = planned
         .large
         .iter()

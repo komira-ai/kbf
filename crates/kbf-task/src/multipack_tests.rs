@@ -5,6 +5,7 @@ use crate::outputs::collect_outputs;
 use crate::pack::MAX_LARGE_BYTES;
 use crate::task::recording_sink::Put;
 use crate::task::recording_sink::flip_first_byte;
+use kbf_segments::crc32c;
 use kbf_segments::layout::footer_len;
 use kbf_task_pack::{LargeEntry, MAX_RECORD_BYTES, read_manifest_with, write_pack};
 
@@ -391,9 +392,8 @@ fn fixture_pack(name: &str) -> Vec<u8> {
 /// records, index and trailer. The fixture is the shared fixture's manifest followed by the same
 /// six records in ascending digest order (the order the plan gives), with the index laid out as
 /// `kbf-segments` documents it (fan-out, entries sorted by digest, trailer with the CRC-32C of
-/// the index). It was written by a separate program that builds the segment from that layout,
-/// and the same program reproduces the shared fixture byte for byte when given its record order,
-/// so the fixture does not depend on `write_pack` or `SegmentWriter`.
+/// the index), and `the_frozen_pack_is_the_documented_layout` checks that the fixture is exactly
+/// that layout, built here without `write_pack` or `SegmentWriter`.
 #[test]
 fn a_v1_run_is_frozen_byte_for_byte() {
     let shared = fixture_pack("../kbf-task-pack/tests/fixtures/task_pack/task_pack_v1.pack.hex");
@@ -635,4 +635,88 @@ async fn a_large_file_changed_during_its_put_fails_the_task_and_pack_0_is_never_
     assert_eq!(failure.exit_code(), EXIT_PUT);
     assert!(failure.to_string().contains("changed"), "{failure}");
     assert_eq!(sink.tried(), [(true, 0)]);
+}
+
+/// A segment built straight from the `kbf-segments` layout: the records back to back from offset
+/// 0, then the fan-out (cumulative counts by first hash byte), the entries sorted by digest (hash,
+/// size, offset, CRC-32C of the record), the trailer (length of the records, entry count, the
+/// SHA-256 code, CRC-32C of the index so far) and the version and magic.
+fn layout_pack(records: &[&[u8]]) -> Vec<u8> {
+    let mut body = Vec::new();
+    let mut entries = Vec::new();
+    for record in records {
+        let hash = sha256(record).hash;
+        entries.push((hash, record.len() as u64, body.len() as u64, crc32c(record)));
+        body.extend_from_slice(record);
+    }
+    entries.sort();
+    let mut footer = Vec::new();
+    let mut cumulative = 0u32;
+    for first in 0..=255u8 {
+        cumulative += entries.iter().filter(|e| e.0[0] == first).count() as u32;
+        footer.extend_from_slice(&cumulative.to_le_bytes());
+    }
+    for (hash, size, offset, crc) in &entries {
+        footer.extend_from_slice(hash);
+        footer.extend_from_slice(&size.to_le_bytes());
+        footer.extend_from_slice(&offset.to_le_bytes());
+        footer.extend_from_slice(&crc.to_le_bytes());
+    }
+    footer.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    footer.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    footer.extend_from_slice(&[1, 0, 0, 0]);
+    let crc = crc32c(&footer);
+    footer.extend_from_slice(&crc.to_le_bytes());
+    footer.extend_from_slice(&1u32.to_le_bytes());
+    footer.extend_from_slice(b"KBFSEG\r\n");
+    body.extend(footer);
+    body
+}
+
+/// Catches the committed v1 fixture drifting from the segment layout, or being edited by hand:
+/// the shared fixture's manifest followed by its six records in ascending digest order, laid out
+/// by `layout_pack` above, is the fixture's bytes. If the layout legitimately changes, replace
+/// the fixture with `layout_pack`'s output for these records.
+#[test]
+fn the_frozen_pack_is_the_documented_layout() {
+    let shared = fixture_pack("../kbf-task-pack/tests/fixtures/task_pack/task_pack_v1.pack.hex");
+    let json_len = read_manifest(&shared)
+        .expect("manifest")
+        .to_json()
+        .expect("json")
+        .len();
+    let reader = SegmentReader::open(&shared).expect("segment");
+    let mut records: Vec<&[u8]> = reader
+        .footer()
+        .entries()
+        .iter()
+        .filter(|e| e.offset != 0)
+        .map(|e| reader.get(&e.digest).expect("get").expect("record"))
+        .collect();
+    records.sort_by_key(|r| sha256(r));
+    let mut all = vec![&shared[..json_len]];
+    all.extend(records);
+    assert_eq!(
+        layout_pack(&all),
+        fixture_pack("tests/fixtures/v1_digest_order.pack.hex")
+    );
+}
+
+/// Catches a sink reporting more slots than a manifest can name wrapping a count or starting the
+/// run: 9 packs, 9 large and 300 packs are each a setup failure (exit 14) before anything is
+/// fetched or tried.
+#[tokio::test]
+async fn a_sink_with_more_slots_than_a_manifest_names_is_a_setup_failure() {
+    let mem = Mem::default();
+    for (packs, large) in [(9, 0), (1, 9), (300, 300)] {
+        let dir = scratch("multi-many-slots");
+        let sink = Fake::with_slots(packs, large);
+        let failure = execute(&cli(&dir, reapi_of(b"x")), &mem, &sink)
+            .await
+            .expect_err("too many slots");
+        assert_eq!(failure.exit_code(), EXIT_SETUP);
+        assert!(failure.to_string().contains("at most 8"), "{failure}");
+        assert!(sink.tried().is_empty());
+        assert!(!dir.join("in").exists());
+    }
 }
