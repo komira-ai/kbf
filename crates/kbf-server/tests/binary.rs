@@ -1297,6 +1297,32 @@ fn learned_sizes_come_from_their_flag() {
     }
 }
 
+/// Catches: `--exclusive-actions` not parsed into the listeners (a farm that ignores it
+/// books an action as it always did), a default other than off (the flag changes every
+/// booking, so only an operator sets it), a value given to the switch, and the flag
+/// accepted under `--scheduler-core js` being refused (the js core takes the request as
+/// the front sends it).
+#[test]
+fn exclusive_actions_come_from_their_flag() {
+    use clap::Parser;
+    let args = |extra: &[&str]| {
+        kbf_server::Args::try_parse_from(std::iter::once("kbf-server").chain(extra.iter().copied()))
+    };
+    let on = |extra: &[&str]| {
+        args(extra)
+            .expect("flags parse")
+            .listeners()
+            .expect("listeners")
+            .exclusive_actions
+    };
+    assert!(!on(&[]));
+    assert!(on(&["--exclusive-actions"]));
+    assert!(on(&["--exclusive-actions", "--scheduler-core", "js"]));
+    let js = args(&["--exclusive-actions", "--scheduler-core=js"]).expect("flags parse");
+    assert!(js.check_scheduler_core().is_ok());
+    args(&["--exclusive-actions=true"]).expect_err("a switch takes no value");
+}
+
 /// Catches: `--memory-ladder-gib` not parsed into the listeners' ladder (a farm that
 /// ignores it books 4 GiB whatever the operator set), a default other than 4, 16 and
 /// 32 GiB, a comma that does not separate rungs, and a ladder that is not ascending

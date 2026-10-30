@@ -268,6 +268,7 @@ where
             memory: DEFAULT_RESOURCES.memory_bytes,
             platform: DefaultPlatform::NONE,
             qos: QosAllow::DEFAULT,
+            exclusive_actions: false,
         },
     )
 }
@@ -284,6 +285,9 @@ pub struct Defaults {
     /// The levels the `x-kbf-qos` header may name
     /// ([`ExecutionService::with_qos_allow`]).
     pub qos: QosAllow,
+    /// Whether every `action` lease owns the whole worker it lands on
+    /// ([`ExecutionService::with_exclusive_actions`]).
+    pub exclusive_actions: bool,
 }
 
 /// [`routes_with_authorizers`], each call that carries an invocation id sent to
@@ -315,7 +319,8 @@ where
         .with_progress(progress)
         .with_default_memory(defaults.memory)
         .with_default_platform(defaults.platform)
-        .with_qos_allow(defaults.qos),
+        .with_qos_allow(defaults.qos)
+        .with_exclusive_actions(defaults.exclusive_actions),
     )
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -358,7 +363,8 @@ where
             .with_progress(progress)
             .with_default_memory(defaults.memory)
             .with_default_platform(defaults.platform)
-            .with_qos_allow(defaults.qos);
+            .with_qos_allow(defaults.qos)
+            .with_exclusive_actions(defaults.exclusive_actions);
     let execution = ExecutionServer::new(service)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);

@@ -16,6 +16,7 @@ use crate::PlacementLoad;
 use crate::farm::EpochPolicy;
 use crate::state_store::StateStore;
 
+mod exclusive;
 mod hot;
 mod learned;
 

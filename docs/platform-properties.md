@@ -178,6 +178,22 @@ memory-pressure backstop pauses new starts. An action that asks for the whole ho
 memory (the last rung of the ladder) runs alone on its worker. The memory is the limit the
 action runs under, below.
 
+With the server's `--exclusive-actions` on, every `action` lease books the whole worker
+it lands on instead: all of the worker's cores and all of its memory, as the worker reported
+them when it registered, whichever worker that is. Exactly one action then runs per
+worker, and a second waits for it, even on a worker of many cores. The setting is the
+server's, not the action's, so it does not touch the action digest and the action cache is
+shared with a server that has it off. `kbf-book-cpus` and `kbf-book-mem-gib` are still
+checked (a malformed value is still refused) and still recorded as the client's hints, but
+they no longer change what is booked, and `kbf-lease=whole_machine` and `vm` leases are as
+they were. The lease's memory limit and CPU weight come from the booking, so the action may
+use the worker's whole memory. An action killed for passing its own memory limit has no
+larger booking to climb to: it finishes `FAILED_PRECONDITION` (out of memory) at once, as
+one that already books the largest node does, and its key's memory floor is not raised.
+The setting is not kept in the state store: after a server restart an operation that was
+queued books as an `action` does with the setting off, until it ends. It works on both
+scheduler cores.
+
 The booking also sets the memory the action may use. The native driver (Macs) kills an
 action whose processes together hold more than 150% of its booked memory plus 512 MiB:
 6.5 GiB for the default booking, 12.5 GiB for `kbf-book-mem-gib=8`. A large `swiftc` or

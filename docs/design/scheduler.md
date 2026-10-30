@@ -513,6 +513,20 @@ What the code does today:
   its `gpu` count, and what its platform asks of a worker (`Request::needs`). The
   scheduler raises the memory of a new submission to its action key's memory floor,
   if it has one (see "Memory kills" below).
+- With `--exclusive-actions` on, the front sets `Request.whole_worker` on every `action`
+  request (not on a `whole_machine` or `vm` one). The request still carries the booking
+  above, which the front computes as before and which stays the record of what the
+  platform named, but the scheduler resolves it per worker: the request books the
+  worker's full capacity (all its CPUs, memory and GPUs), has room only on a worker that
+  holds no lease, and places no other lease beside it, as a whole-host action does. The
+  `Start` carries that capacity. It is placed by the same round, and while it waits the
+  scheduler holds a reservation for it on a worker. The action digest is untouched. A hint
+  (`kbf-book-cpus`, `kbf-book-mem-gib`) is read and recorded but not booked. An own-limit
+  memory kill has no larger rung (see "Memory kills"): the operation finishes
+  `Failed(OutOfMemory)` and leaves no memory floor. The control log has no field for the
+  request's `whole_worker`, so a restart reads a queued operation back as an ordinary
+  action. The server logs `exclusive-actions: on` at start when the flag is on. Both
+  scheduler cores take the request unchanged.
 - Each request carries its lease kind (`kbf-lease`: `action` or `whole_machine`). A
   worker is feasible for it only if its node report lists a driver that serves the
   kind (`container`, `native`, `fake` or `local` for `action`, `native-whole-machine` for
@@ -709,6 +723,9 @@ turns it into one of two outcomes, and the scheduler decides on the committed re
   the farm: where no live node has the first rung's memory, an action that names no
   size is unservable, as one that names that size would be, and is refused after the
   unservable wait; a farm of small nodes sets a lower first rung.
+- **With `--exclusive-actions` on**, an action already books the whole worker, so it has
+  no rung above: an own-limit kill finishes the operation `Failed(OutOfMemory)` and raises
+  no floor for its key, the same as a kill of a run that booked the cap.
 - **The memory floor.** Each raised booking is kept as the memory floor of the
   action's key (instance name and action digest), and a later submission of that key
   books at least the floor, so a known-big action starts at the rung that ran it

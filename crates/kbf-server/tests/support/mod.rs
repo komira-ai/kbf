@@ -648,6 +648,7 @@ impl Cell {
             memory_ladder: ladder,
             vm_host_floor: kbf_server::HostFloor::default(),
             learned_sizes: learned,
+            exclusive_actions: false,
             scheduler_core: kbf_server::SchedulerCore::under_test(),
             placement_load: kbf_server::PlacementLoad::Off,
             placement_predictions: kbf_server::PlacementPredictions::Off,

@@ -311,6 +311,21 @@ pub struct Args {
         default_values_t = kbf_sched::MemoryLadder::DEFAULT_GIB
     )]
     pub memory_ladder_gib: Vec<u64>,
+    /// Every `action` lease books the whole worker it lands on: all of its CPUs and all of
+    /// its memory, whichever worker that is, so that exactly one action runs per worker
+    /// and a second waits for it. The action digest is the client's and does not change
+    /// (the per-action `kbf-book-cpus` and `kbf-book-mem-gib` properties would split the
+    /// action cache); this is a setting of the server. `kbf-book-cpus` and `kbf-book-mem-gib`
+    /// are still checked, but no longer change what is booked. `kbf-lease=whole_machine` and
+    /// `vm` leases are as they were. An action killed for passing its own memory limit has
+    /// no larger booking to climb to, so `--memory-ladder-gib` has no further rung to give
+    /// it: it finishes out-of-memory, as an action that already books the largest node does,
+    /// and its memory floor is not raised. A worker books by what it reported at
+    /// registration. The setting is not kept in the state store: after a restart an
+    /// operation that was queued books as an action does with the flag off, until it ends.
+    /// Off by default
+    #[arg(long, default_value_t = false)]
+    pub exclusive_actions: bool,
     /// The cores a node that reports VM slots (`vm.slots`) keeps for the host itself:
     /// subtracted from the CPUs placement may book on it, so that guests cannot take the
     /// host's own share. A node that reports none books the whole machine.
@@ -942,6 +957,7 @@ impl Args {
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
             vm_host_floor: HostFloor::new(self.vm_host_floor_cpus, self.vm_host_floor_mem_gib),
             learned_sizes: self.learned_sizes,
+            exclusive_actions: self.exclusive_actions,
             scheduler_core: self.scheduler_core,
             placement_load: self.placement_load,
             placement_predictions: self.placement_predictions,
