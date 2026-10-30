@@ -26,51 +26,20 @@ test-group = 'mac-provision-scratch'
 # to every profile, the pull-request one included. For each setting nextest takes the FIRST
 # matching override, so the specific, longer budgets come first and the general one last.
 
-# The 5 GiB blob tests legitimately take about 15 minutes on a hosted runner.
+# The slowest test of the full run on main, the 5 GiB round trip of kbf-front::large_blobs,
+# takes about 970 seconds on a hosted runner: its binary gets 30 minutes (450 seconds x 4).
 [[profile.default.overrides]]
 filter = 'binary_id(=kbf-front::large_blobs)'
-slow-timeout = { period = "300s", terminate-after = 4 }
+slow-timeout = { period = "450s", terminate-after = 4 }
 
-# The tests with no size cap and with fifteen thousand writes are slow but bounded.
+# The general budget: every other test, of every package, is ended after eight minutes
+# (120 seconds x 4). The slowest of them in the full run on main takes about 240 seconds
+# (kbf-server::frontend, a_frontend_dialing_a_node_with_another_nodes_certificate_is_refused),
+# half the budget. A block for a narrower set of tests (a longer or shorter budget) goes ABOVE
+# this one, because the first match wins: a later block for the same tests would never apply.
 [[profile.default.overrides]]
-filter = '(binary_id(=kbf-front::proxy) & test(=the_proxy_imposes_no_size_cap)) | (binary_id(=kbf-front::write_group) & test(=fifteen_thousand_concurrent_writes_fill_segments_in_turn))'
+filter = 'all()'
 slow-timeout = { period = "120s", terminate-after = 4 }
-
-# These binaries are slow under load, and had in-test guards of 60 to 180 seconds.
-[[profile.default.overrides]]
-filter = 'binary_id(=kbf-server::write_admission) | binary_id(=kbf-server::worker_blobs) | binary_id(=kbf-server::storage_register)'
-slow-timeout = { period = "60s", terminate-after = 4 }
-
-# The harness deadlines (start, join, lease, left, requeue wait: up to 130 seconds) are waited out
-# in real time until the harness takes a clock. Remove this block with the last change that gives
-# it one.
-[[profile.default.overrides]]
-filter = 'package(kbf-integration-test)'
-slow-timeout = { period = "60s", terminate-after = 4 }
-
-# The beta B0 tests run a 100 second real load, and the box tests start whole stacks.
-[[profile.default.overrides]]
-filter = 'binary(beta_b0) | binary(beta_b0_red) | binary(beta_b0_killed) | binary(storage_and_daemon) | binary(storage_and_daemon_behind_frontend) | binary(rehearsal_in_a_box)'
-slow-timeout = { period = "120s", terminate-after = 4 }
-
-# The black-box beta suites, and the spikes that run only with --run-ignored (root, macOS).
-[[profile.default.overrides]]
-filter = 'package(kbf-daemon-test) | binary(mac_pool_spike) | binary(pool_scale_spike) | binary(real_mac) | binary(update_rehearsal) | binary(update_rehearsal_agent) | binary(as_root)'
-slow-timeout = { period = "60s", terminate-after = 4 }
-
-# The general budget: every other test of these packages is ended after two minutes (30 seconds
-# x 4). A block for a narrower set of tests (a longer or shorter budget) goes ABOVE this one,
-# because the first match wins: a later block for the same tests would never apply. kbf-front
-# and kbf-daemon are here whole, and kbf-task whole: a narrower block for some of their tests
-# (a binary or a module) belongs above this block.
-[[profile.default.overrides]]
-filter = '''package(kbf-server) | package(kbf-update) | package(kbf-deploy) | package(xtask)
-  | package(kbf-host-install) | package(kbf-installer) | package(kbf-updater) | package(kbf-mac-session)
-  | package(kbf-driver-container) | package(kbf-guest) | package(kbf-driver-native) | package(kbf-transfer)
-  | package(kbf-route) | package(kbf-node) | package(kbf-cli) | package(kbf-daemon) | package(kbf-tls)
-  | package(kbf-cas-conformance) | package(kbf-storage) | package(tierstore) | package(kbf-front)
-  | package(kbf-task)'''
-slow-timeout = { period = "30s", terminate-after = 4 }
 
 # The pull-request profile (`cargo nextest run --profile pr`, and `cargo llvm-cov nextest
 # --profile pr`): the fast gate. A pull request runs every test except the slow ones named
