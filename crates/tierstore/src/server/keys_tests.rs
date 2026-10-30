@@ -12,6 +12,8 @@ use kbf_testkit::dir::TestDir;
 use crate::TestClock;
 use crate::server::ServerConfig;
 use crate::server::auth::READ_ONLY;
+use crate::server::gc::OUT_OF_SCOPE;
+use crate::server::presign::PUT_ONLY;
 
 use super::{AccessKey, Role, ensure_distinct, read_credentials, read_only_keys};
 
@@ -273,4 +275,40 @@ fn a_read_only_key_may_only_get_and_head() {
         assert_eq!(refused, Err(READ_ONLY), "{method}");
     }
     assert_eq!(READ_ONLY.code, "AccessDenied");
+}
+
+/// Asserts which roles may list the open multipart uploads, under any prefix: the full and the
+/// read-only role may, and a presigning key may not.
+#[test]
+fn only_a_presigning_key_is_refused_the_listing_of_open_uploads() {
+    for prefix in ["", "jobs/", "_journal/"] {
+        assert_eq!(Role::Full.permit_list_uploads(prefix), Ok(()), "{prefix}");
+        assert_eq!(
+            Role::ReadOnly.permit_list_uploads(prefix),
+            Ok(()),
+            "{prefix}"
+        );
+        let refused = Role::PresignPut.permit_list_uploads(prefix);
+        assert_eq!(refused, Err(PUT_ONLY), "{prefix}");
+    }
+}
+
+/// Asserts that a GC key may list the open uploads under its own prefix, at the prefix and
+/// deeper, and only there: no prefix, a prefix outside, a prefix that covers its own, and a
+/// reserved one are out of scope.
+#[test]
+fn a_gc_key_may_list_the_open_uploads_under_its_prefix_only() {
+    let role = Role::Gc("cas/b/".to_owned());
+    for inside in ["cas/b/", "cas/b/jobs/", "cas/b/x"] {
+        assert_eq!(role.permit_list_uploads(inside), Ok(()), "{inside}");
+    }
+    for outside in ["", "cas/", "cas/c/", "cas/b", "_journal/", "_tiering/x"] {
+        let refused = role.permit_list_uploads(outside);
+        assert_eq!(refused, Err(OUT_OF_SCOPE), "{outside}");
+    }
+    let reserved = Role::Gc("_journal/".to_owned());
+    assert_eq!(
+        reserved.permit_list_uploads("_journal/x"),
+        Err(OUT_OF_SCOPE)
+    );
 }

@@ -290,8 +290,9 @@ that runs an action on a worker fetches the action's input files from the fronte
 grant (a token the frontend gives the run, valid until its expiry, for one Action: it reads that
 Action, its Command and its input tree, and no other blob). The task is untrusted code that holds
 no client certificate, so the REAPI listener is not open to it; `--job-listen <addr>` opens
-another, over HTTPS, that serves `GET /<hex>/<size>` with `Authorization: Bearer <read grant>` and
-nothing else (any other path is 404, any other method 405). It needs three more flags, all four
+another, over HTTPS, that serves `GET /<hex>/<size>` and `POST /batch` (below) with
+`Authorization: Bearer <read grant>` and nothing else (any other path is 404, any other method
+405). It needs three more flags, all four
 given together, and takes two more that have defaults:
 
 - `--job-tls-cert` and `--job-tls-key`: the certificate chain and key of the listener (PEM), issued
@@ -332,6 +333,22 @@ connections open finish their request. `GET /metrics` of the operator API gains
 `kbf_tls_reloads_total` a `listener="job"` series. Where the jobs run must be allowed to reach
 this address and port (the egress allowlist of the worker's network), and the listener should be
 on an interface the jobs, and nothing outside the farm, can reach.
+
+`POST /batch` (same grant, `Content-Type: application/json`) answers many small blobs of the
+grant's Action in one request, for a task that would otherwise make thousands of GETs. The body
+is `{"digests":["<64 hex>/<size>", ...]}` with 1 to 256 entries (a repeated digest is answered
+each time) and at most 64 KiB. The whole request is refused, before any blob is read, with the
+reason codes above: 401 and 403 for the grant, 400 `malformed` (bad JSON or digest, no entries or
+more than 256, a body over 64 KiB or one that does not arrive within 10 seconds), and 413
+`too_large` when the sizes asked for add up to more than 4194304 (a digest of a blob that alone is
+over 4194304 bytes is not added, it is answered `too_large` below). Otherwise it is 200
+`application/octet-stream` with one frame per digest in request order: a status byte (0 ok, 1
+not_found, 2 out_of_scope, 3 too_large (use GET), 4 store_unavailable), the length as 8 bytes
+big-endian (the blob's size when ok, else 0), and the bytes. Each digest is checked against the
+grant's scope, each read counts against `--job-reads-in-flight`, and the frontend hashes every ok
+blob against its digest. A GET of `/batch` is 405 with `Allow: POST`. The golden request and
+response bytes are `crates/kbf-front/tests/data/job_read_batch.golden`. `/metrics` gains
+`kbf_job_batch_requests_total` (by `outcome`) and `kbf_job_batch_blobs_total` (by `status`).
 
 **`storage`.** It serves the storage service over gRPC and nothing else: no REAPI, no
 scheduler, no operator API (only `GET /metrics`, on `--metrics-listen`, off unless given).

@@ -27,6 +27,7 @@
 
 pub mod flush;
 pub mod in_flight;
+pub mod legacy;
 pub mod local_cache;
 pub mod repair;
 pub mod replicate;
