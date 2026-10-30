@@ -63,8 +63,9 @@ Everything below describes series that are being added and are not in a released
 names and labels are those of the changes under review and can still change; this page is
 updated when they land. Do not build alerts on them until they are in a release.
 
-The text of these series carries no `# TYPE` line, so Prometheus stores them as untyped.
-`rate()` works on them anyway.
+The text of the cache's series has one `# TYPE` line for each family (a counter, or a gauge for
+the four named as gauges below). The text of the v2 series has no `# TYPE` line, so Prometheus
+stores them as untyped; `rate()` works on them anyway.
 
 ### v1: the build-node cache
 
@@ -77,7 +78,7 @@ tables say which.
 | name | type | labels | increments when |
 |---|---|---|---|
 | `tierstore_cache_hits_total` | counter | none | a GET of an object the cache holds is answered from disk, whole or ranged |
-| `tierstore_cache_misses_total` | counter | none | a GET of a key the cache is set to keep is not answered from disk: the key is not held, or its file could not be read |
+| `tierstore_cache_misses_total` | counter | none | a GET of a key the cache is set to keep is not answered from disk: the key is not held, or its file could not be read. Counted once, right after the lookup and before any call to the upstream |
 | `tierstore_cache_bytes_served_local_total` | counter | none | bytes of the answers that counted as hits |
 | `tierstore_cache_bytes_served_upstream_total` | counter | none | bytes of every answer that was not a hit: a pass-through read, and the read from disk that follows a fill |
 
@@ -88,11 +89,13 @@ What they do not count:
   hit nor a miss.
 - A miss counts once for each reader. Readers that share one fill each count a miss, and the
   fill counts once.
-- A ranged GET of a key that is not held first asks the upstream for the size. If that HEAD
-  fails (the key does not exist, the upstream is down) the GET counts no miss. A GET without a
-  range counts its miss before the fill starts, so a failed fill still shows as a miss.
-- A ranged GET of an object over the whole-object limit is a miss that is passed through: it
-  counts a miss and bytes under `bytes_served_upstream`, and fills nothing.
+- A read of a kept key that the cache does not serve is one miss on every path: a ranged GET
+  whose size HEAD to the upstream then fails, a ranged GET of an object over the whole-object
+  limit (passed through, fills nothing, and counts bytes under `bytes_served_upstream`), and a
+  fill that then fails. The miss is counted before any of those calls, so a failure after it
+  does not remove it.
+- A range past the end of an object the cache holds is an error of the client: it is neither a
+  hit nor a miss.
 - A GET of a missing key never reaches the GET: the HEAD before it answers 404. It shows only in
   the HEAD series below, so the hit and miss counters are rates of GETs that went on to read
   data.
@@ -136,7 +139,8 @@ and a changed object are failures, not skips. `evictions_total` counts objects, 
 `budget` is the share of an eviction pass that brings the cache under its low water mark while
 `floor` is the share that restores the free space of the file system. `pinned_skips_total` goes
 up once for each pinned object on every pass, so it keeps rising while an object stays pinned.
-`discarded_at_start_total` is fixed once the process has started.
+`discarded_at_start_total` is a counter that is set once, when the cache is opened, and stays
+the same for the rest of the process.
 
 #### Gauges
 
@@ -155,8 +159,8 @@ These four are gauges, measured when `/metricz` is read.
 |---|---|---|---|
 | `tierstore_cache_upstream_reads_total` | counter | `op`: `get`, `head`, `list`, `list_uploads` | the cache sends one such call to the upstream |
 | `tierstore_cache_upstream_bytes_read_total` | counter | none | bytes that the cache's upstream GETs brought back |
-| `tierstore_cache_head_hits_total` | counter | none | a HEAD is answered from the cache's index |
-| `tierstore_cache_head_misses_total` | counter | none | a HEAD is sent to the upstream |
+| `tierstore_cache_head_hits_total` | counter | none | a HEAD the cache is asked for is answered from its index: a client's HEAD, or the S3 front's HEAD before a GET |
+| `tierstore_cache_head_misses_total` | counter | none | the same HEADs, sent to the upstream |
 
 What they do not count:
 
@@ -164,8 +168,8 @@ What they do not count:
   of 350 bytes filled in chunks of 100 is four GET calls. It also counts every pass-through read.
 - `op="head"` counts the cache's own HEADs as well as the clients': the size before a ranged
   fill, the two HEADs of a fill, the HEAD before a put, and the HEAD after one is acknowledged.
-  `head_hits_total` and `head_misses_total` count only the HEADs that clients (the S3 front)
-  send to the cache, which includes the HEAD that the front sends before each GET. So
+  `head_hits_total` and `head_misses_total` count only the HEADs the S3 front sends to the
+  cache, which includes the HEAD that the front sends before each GET. So
   `head_hits_total + head_misses_total` is a lookup rate, not a rate of HEAD requests from
   clients.
 - A listing counts as one `list` call, and each page of a paged listing counts as one more.
@@ -205,8 +209,9 @@ What they do not count:
 - Before sending a put, the cache sends the upstream a HEAD. A key the HEAD finds is answered
   "already exists" without a put reaching the upstream: it counts in `write_exists_total` only,
   not as `put_failures` with reason `exists`. That reason counts the races the HEAD did not see.
-- A HEAD before a put that fails with anything but "not found" fails the put and is counted in
-  no put series. It shows in `upstream_reads_total{op="head"}`.
+- A HEAD before a put that fails with anything but "not found" fails the put although no put
+  was sent. It counts under `put_failures` with the reason its error maps to (`unavailable`,
+  `full`, `other`), and in `upstream_reads_total{op="head"}`.
 - A part that fails, a delete, an abort and a part's retry are not failures here. A part that is
   accepted counts its bytes even if the upload is never completed, and a client's retry of an
   accepted part counts them twice.
@@ -438,7 +443,8 @@ Failures per second, by reason:
 sum by (reason) (rate(tierstore_cache_upstream_put_failures_total[5m]))
 ```
 
-As a share of the puts that reached the upstream (accepted or failed):
+As a share of the puts attempted (accepted, or failed at the upstream or at the HEAD before the
+send):
 
 ```promql
 sum by (reason) (rate(tierstore_cache_upstream_put_failures_total[5m]))
@@ -449,8 +455,8 @@ ignoring (reason) group_left
 ```
 
 The denominator counts a bad-digest put that the upstream took twice, once as a put and once as
-a failure, and does not count puts refused by the HEAD before the send (see "Writes through the
-cache"). For the share of puts refused because the key exists, add `write_exists_total`:
+a failure, and does not count puts refused because the HEAD before the send found the key (see
+"Writes through the cache"). For the share of puts refused because the key exists, add `write_exists_total`:
 
 ```promql
 sum(rate(tierstore_cache_write_exists_total[5m]))
