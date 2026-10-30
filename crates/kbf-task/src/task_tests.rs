@@ -276,6 +276,49 @@ async fn an_action_that_cannot_be_read_fails_as_a_fetch_and_stores_nothing() {
     assert!(sink.stored.lock().unwrap().is_empty());
 }
 
+/// Catches an input blob that is gone, or is not the bytes its digest names, ending a task any way
+/// but a fetch failure (exit 10) that stores nothing, and a bad `--fetch-concurrency` being taken.
+#[tokio::test]
+async fn an_input_blob_that_is_missing_or_corrupt_fails_as_a_fetch() {
+    let mut mem = Mem::default();
+    let digest = action(&mut mem, COPY, &["out"]);
+    let data = label(&reapi_of(b"hi\n"));
+    for (name, replacement) in [("missing", None), ("corrupt", Some(b"HI\n".to_vec()))] {
+        let mut broken = Mem(mem.0.clone());
+        broken.0.remove(&data);
+        if let Some(bytes) = replacement {
+            broken.0.insert(data.clone(), bytes);
+        }
+        let sink = Fake::new(false);
+        let dir = scratch(name);
+        let mut flags = cli(&dir, digest.clone());
+        flags.fetch_concurrency = 2;
+        let failure = execute(&flags, &broken, &sink).await.expect_err(name);
+        assert!(matches!(failure, Failure::Fetch(_)), "{name}: {failure}");
+        assert_eq!(failure.exit_code(), EXIT_FETCH);
+        assert!(sink.stored.lock().unwrap().is_empty());
+    }
+    let dir = scratch("default");
+    assert_eq!(cli(&dir, digest).fetch_concurrency, 32);
+}
+
+#[test]
+fn the_fetch_concurrency_flag_takes_one_to_256() {
+    for (value, accepted) in [("0", false), ("1", true), ("256", true), ("257", false)] {
+        let parsed = Cli::try_parse_from([
+            "kbf-task",
+            "--pack-url-file=u",
+            "--grant-url=https://g",
+            "--grant-token-file=t",
+            "--lease=l",
+            "--action=0000000000000000000000000000000000000000000000000000000000000000/0",
+            "--fetch-concurrency",
+            value,
+        ]);
+        assert_eq!(parsed.is_ok(), accepted, "{value}");
+    }
+}
+
 #[tokio::test]
 async fn an_action_without_a_command_or_an_input_root_fails_as_a_fetch() {
     for (command, root, what) in [(false, true, "command"), (true, false, "input root")] {
