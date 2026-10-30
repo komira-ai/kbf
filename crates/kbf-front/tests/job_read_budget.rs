@@ -422,7 +422,8 @@ async fn a_batch_holds_a_read_place_while_its_blobs_are_read() {
     };
     let rig = rig(blobs, Some(t.files[0]), limits);
     let token = rig.token(t.action);
-    let batch = rig.batch(&[t.files[0]], &token);
+    let wanted = [t.files[0]];
+    let batch = rig.batch(&wanted, &token);
     let get = async {
         for _ in 0..50 {
             tokio::task::yield_now().await;
