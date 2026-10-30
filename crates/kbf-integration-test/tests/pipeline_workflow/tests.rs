@@ -514,6 +514,22 @@ fn the_watch_cancels_the_run_from_its_last_step_alone_and_only_for_a_push_to_mai
         ),
         "the job `watch` grants the scopes",
     );
+    red(
+        &plant(
+            "pipeline.yml",
+            "      # The `test` job of ci lists the run's jobs and artifacts to wait for the coverage shards.\n      actions: read\n",
+            "      actions: read\n      packages: read\n",
+        ),
+        "the job `ci` grants the scopes",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "      # The `test` job of ci lists the run's jobs and artifacts to wait for the coverage shards.\n      actions: read\n",
+            "",
+        ),
+        "the job `ci` grants the scopes",
+    );
 }
 
 #[test]
@@ -764,6 +780,14 @@ fn a_called_workflow_never_asks_for_more_than_its_caller_grants() {
             "    uses: ./.github/workflows/beta.yml\n    permissions:\n      contents: read\n",
         ),
         "the job `mixed-version` of beta.yml asks for `attestations: read`",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "      # The `test` job of ci lists the run's jobs and artifacts to wait for the coverage shards.\n      actions: read\n",
+            "",
+        ),
+        "the job `test` of ci.yml asks for `actions: read`",
     );
     // Both calls are checked: GitHub compares the permissions of a called workflow's jobs with
     // the caller's grant whether or not the job runs in that call.
