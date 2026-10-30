@@ -145,14 +145,11 @@ pub trait Presign: Send + Sync {
 /// What the executor reads of an action before it runs one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActionFacts {
-    /// The image to run: `docker://<repo>@sha256:<digest>`, or the same without the scheme.
+    /// The image to launch the run from, pinned by digest, without the `docker://` scheme: the
+    /// kbf image, which keeps the task tool as its `ENTRYPOINT`.
     pub image: String,
     /// The action's timeout; `None` when it names none, and the executor applies its own.
     pub timeout: Option<Duration>,
-    /// Whether the image sets an `ENTRYPOINT`. The lease server appends the task tool's
-    /// arguments to it, so the secrets would go to that program and the tool would not run:
-    /// such an action is refused.
-    pub has_entrypoint: bool,
 }
 
 /// What a task reads its inputs with.
@@ -162,13 +159,16 @@ pub struct ReadGrant {
     pub url: String,
     /// The bearer token.
     pub token: Secret,
+    /// The bytes of the input closure the grant reads (the blobs the task fetches into its
+    /// scratch); `None` when the preparation did not say.
+    pub input_bytes: Option<u64>,
 }
 
 /// Why the inputs of an action could not be had.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputsError {
-    /// The action cannot run here, whatever is tried again: no image, an image without a
-    /// digest. The caller's to fix.
+    /// The action cannot run here, whatever is tried again: an image that is not the
+    /// served base. The caller's to fix.
     Invalid(String),
     /// The CAS or the grant service could not be reached.
     Unavailable(String),

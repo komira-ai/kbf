@@ -70,7 +70,7 @@ use crate::machine::Platform;
 
 mod predict;
 use predict::Predictions;
-pub use predict::{Axis, Fit, Unset};
+pub use predict::{Axis, Fit, Forecast, Unset};
 
 /// What `--learned-sizes` does with the estimator.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]

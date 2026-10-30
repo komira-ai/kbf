@@ -91,7 +91,8 @@ impl Rng {
     fn resources(&mut self) -> Resources {
         let resources = Resources::new(self.number(), self.number())
             .with_gpus(self.number())
-            .with_vms(self.number());
+            .with_vms(self.number())
+            .with_disk_bytes(self.number());
         // A node's lease cap, set half the time: unset (no cap) and zero must round-trip apart.
         if self.below(2) == 0 {
             resources.with_lease_cap(self.number() % 3)
@@ -206,6 +207,7 @@ impl Rng {
             needs: self.needs(),
             hermetic: self.below(2) == 0,
             do_not_cache: self.below(2) == 0,
+            whole_worker: false,
         }
     }
 
@@ -949,6 +951,7 @@ fn a_work_key_that_is_not_an_action_is_not_written() {
         needs: kbf_caps::Request::default(),
         hermetic: true,
         do_not_cache: false,
+        whole_worker: false,
     };
     assert_eq!(
         encode(Format::V1, &batch(FarmInput::Submit(request("job 7")))),

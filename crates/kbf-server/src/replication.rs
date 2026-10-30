@@ -34,6 +34,7 @@ use futures::future::BoxFuture;
 use kbf_mapsync::MapHolder;
 use kbf_storage::Storage;
 use kbf_storage::StorageError;
+use kbf_storage::legacy::LegacyReads;
 use kbf_storage::repair::{JournalError, NoLedger, Options, RepairConfig, RepairWorker, Repairs};
 use kbf_storage::replicate::{Chain, ChainConfig, MapSource, Peers};
 use kbf_storage::service::{CatchUp, InProcess, OpenWrites, StorageService};
@@ -187,6 +188,7 @@ pub(crate) fn bind_node(
     listener: StorageListener,
     registered: Registered,
     storage: Arc<dyn Storage>,
+    legacy_reads: Arc<LegacyReads>,
     repair_dir: &Path,
     shutdown: BoxFuture<'static, ()>,
 ) -> Result<Node, Box<dyn Error>> {
@@ -203,7 +205,8 @@ pub(crate) fn bind_node(
     let service = listener
         .service(Arc::clone(&storage))
         .with_catch_up(catch_up)
-        .with_open_writes(open_writes.clone());
+        .with_open_writes(open_writes.clone())
+        .with_legacy_reads(legacy_reads);
     let (shutdown, stop) = stopping(shutdown);
     let (service, worker, repairs) = if flags.frontend.is_some() {
         let peer_tls = flags.peer_tls()?;

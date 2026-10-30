@@ -217,6 +217,10 @@ pub struct Shape {
     /// The GPU class.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_class: Option<String>,
+    /// Bytes of scratch disk a host books runs against; absent when the server reports none
+    /// (and then it refuses no run for its disk).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
 }
 
 /// Where a host comes from.
@@ -305,6 +309,63 @@ pub struct Host {
     /// When a reservation that is draining a busy host is given up, in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain_deadline_ms: Option<u64>,
+    /// The latest load its agent reported, if its newest heartbeat carried one. Absent for
+    /// a host that has no reading, and for a server that does not send the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load: Option<HostLoad>,
+}
+
+/// The latest reading of a host's actions control group, as `GET /v1/hosts` lists it: what
+/// the agent measured, in the units the field names state. CPU time is a counter, so a rate
+/// is the difference of two readings over the difference of their `mono_usec`. A response
+/// type: a field a newer server adds is ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostLoad {
+    /// The reading's number within the agent's process.
+    pub seq: u64,
+    /// The agent's monotonic clock at the reading, in microseconds.
+    pub mono_usec: u64,
+    /// Cumulative CPU time of the cgroup that holds every action, in microseconds.
+    pub cpu_usage_usec: u64,
+    /// Memory in use by the actions, in bytes.
+    pub memory_working_set_bytes: u64,
+    /// Active file cache, in bytes.
+    pub memory_active_file_bytes: u64,
+    /// Whether the actions cgroup has a CPU limit.
+    pub actions_cpu_limited: bool,
+    /// Leases (`term-seq`) that ran the whole window since the previous reading.
+    #[serde(default)]
+    pub covered: Vec<String>,
+    /// When each running lease started, on the agent's clock.
+    #[serde(default)]
+    pub lease_clocks: Vec<HostLeaseClock>,
+    /// Closed lease-minutes.
+    #[serde(default)]
+    pub minutes: Vec<HostLeaseMinute>,
+}
+
+/// When one running lease started, on the agent's clock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostLeaseClock {
+    /// The lease, `term-seq`.
+    pub lease: String,
+    /// Microseconds on the agent's monotonic clock.
+    pub started_mono_usec: u64,
+}
+
+/// What one lease used in one minute of its life.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostLeaseMinute {
+    /// The lease, `term-seq`.
+    pub lease: String,
+    /// The minute since the lease's start.
+    pub minute: u32,
+    /// Mean CPU over the observed span, in thousandths of a core.
+    pub cpu_mean_millis: u32,
+    /// The highest CPU rate of any window in the minute, in thousandths of a core.
+    pub cpu_peak_window_millis: u32,
+    /// The largest working set seen in the minute, in bytes.
+    pub ws_max_bytes: u64,
 }
 
 impl Host {
@@ -365,6 +426,11 @@ pub struct RunLimits {
     /// uses that time when it is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wall_ms: Option<u64>,
+    /// Bytes of scratch disk the run books on its host (inputs, outputs and the private
+    /// home, tmp and cache). Absent books none; a server that does not know the field is not
+    /// sent it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
 }
 
 /// The body of `POST /v1/leases/{id}/runs`.

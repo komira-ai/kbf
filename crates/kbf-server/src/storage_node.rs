@@ -60,6 +60,7 @@ use kbf_log::FarmLogId;
 use kbf_mapsync::MapHolder;
 use kbf_meta::{NodeWriter, Retention};
 use kbf_objstore::{KeyPrefix, ObjectStore, StillHeld};
+use kbf_storage::legacy::LegacyReads;
 use kbf_storage::repair::{RepairConfig, Repairs};
 use kbf_storage::service::CatchUp;
 use kbf_store::StdFs;
@@ -698,7 +699,11 @@ where
     // `Binder` is not `Send`).
     let (socket, metrics) = bind_node_sockets(listener.listen, flags.metrics, &Binder::new())?;
     let (cache, registered) = open_cache(flags, socket, (meta, cold, prefix, log)).await?;
+    // The reads this node serves from its own copy: the service counts them, the scrape of
+    // the cache renders them.
+    let legacy_reads = Arc::new(LegacyReads::default());
     let cache = cache
+        .with_legacy_reads(Arc::clone(&legacy_reads))
         .with_writes(flags.server.write_config())
         .with_write_pool(flags.server.write_pool_config())
         .with_durable_wait(flags.server.durable_wait())
@@ -743,7 +748,15 @@ where
     let holder = holder_of(&cache);
     let storage = Arc::new(CacheStorage::new(cache, flags.segments()));
     let stop = Box::pin(shutdown()?);
-    let node = bind_node(flags, listener, registered, storage, repair_dir, stop)?;
+    let node = bind_node(
+        flags,
+        listener,
+        registered,
+        storage,
+        legacy_reads,
+        repair_dir,
+        stop,
+    )?;
     Ok(StorageHandle {
         addr: node.addr,
         metrics,

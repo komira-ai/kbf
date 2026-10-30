@@ -362,6 +362,30 @@ async fn the_record_cap_and_the_read_budget_are_checked_before_reading() {
     assert!(recorded.expect("recorded").created);
 }
 
+/// Asserts that a footer whose entry has the manifest's hash and offset but another size is not
+/// the manifest: refused as invalid after its two reads, nothing recorded. Catches a comparison
+/// that stops at the hash and the offset.
+#[tokio::test]
+async fn a_footer_entry_of_another_size_is_not_the_manifest() {
+    let mut shorter = entry(FIRST, 0);
+    shorter.digest.size_bytes -= 1;
+    let (bytes, _) = forged(&[shorter], FIRST.as_bytes());
+    let manifest = listed(&[(FIRST, 0)], bytes.len() as u64);
+    let rig = Rig::new().await;
+    rig.store.seed(KEY, &bytes).await;
+
+    let refused = commit(&rig, manifest).await;
+
+    let refused = refused.expect_err("refused");
+    assert!(matches!(refused, CommitError::Invalid(_)), "{refused:?}");
+    assert!(
+        refused.message().contains("is not the manifest"),
+        "{refused:?}"
+    );
+    assert_eq!(rig.store.ranges().len(), 2);
+    assert!(rig.index.pack(KEY).expect("asked").is_none());
+}
+
 /// Asserts that a footer that is not the manifest is refused as invalid after its two reads and
 /// before any record is read: here the footer swaps the offsets of the two records, and its
 /// entry count is not the manifest's (one fewer, and the largest a trailer can say). Catches a
@@ -578,6 +602,32 @@ async fn a_store_that_fails_makes_the_commit_unavailable() {
 
     let failed = failed.expect_err("the store fails");
     assert!(matches!(failed, CommitError::Unavailable(_)), "{failed:?}");
+    assert!(rig.index.pack(KEY).expect("asked").is_none());
+    assert_eq!(rig.packs.metrics().commit_rejects.get(), 0);
+    let recorded = commit(&rig, manifest).await;
+    assert!(recorded.expect("recorded").created);
+}
+
+/// Asserts that a store that fails while a record is read, after the trailer and the footer were
+/// read, is not the commit's fault either: the commit is unavailable, nothing is recorded and the
+/// refusal counter does not move. Catches a store failure on a record reported as a mismatch of
+/// the pack.
+#[tokio::test]
+async fn a_store_that_fails_on_a_record_makes_the_commit_unavailable() {
+    let (bytes, manifest) = segment_of(&[FIRST]);
+    let rig = Rig::new().await;
+    rig.store.seed(KEY, &bytes).await;
+    rig.store.reject_read_after(2);
+
+    let failed = commit(&rig, manifest.clone()).await;
+
+    let failed = failed.expect_err("the store fails on the record");
+    assert!(matches!(failed, CommitError::Unavailable(_)), "{failed:?}");
+    assert_eq!(
+        rig.store.ranges().len(),
+        3,
+        "the trailer, the footer, the record"
+    );
     assert!(rig.index.pack(KEY).expect("asked").is_none());
     assert_eq!(rig.packs.metrics().commit_rejects.get(), 0);
     let recorded = commit(&rig, manifest).await;

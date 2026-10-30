@@ -120,8 +120,13 @@ fn server(args: &[&str]) -> Cmd {
     );
     let cold = format!("file://{}", base.join("cold").display());
     let mut c = bare(args);
-    c.args(["--cold-store", &cold, "--meta-dir"])
-        .arg(base.join("meta"));
+    c.args([
+        "--cold-store",
+        &cold,
+        "--cold-store-floor-bytes=1",
+        "--meta-dir",
+    ])
+    .arg(base.join("meta"));
     c.dir = Some(base);
     c
 }
@@ -1295,6 +1300,75 @@ fn learned_sizes_come_from_their_flag() {
         let err = parse(&["--learned-sizes", bad]).expect_err(bad);
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{bad}");
     }
+}
+
+/// Catches: `--exclusive-actions` not parsed into the listeners (a farm that ignores it
+/// books an action as it always did), a default other than off (the flag changes every
+/// booking, so only an operator sets it), a value given to the switch, and the flag
+/// accepted under `--scheduler-core js` being refused (the js core takes the request as
+/// the front sends it).
+#[test]
+fn exclusive_actions_come_from_their_flag() {
+    use clap::Parser;
+    let args = |extra: &[&str]| {
+        kbf_server::Args::try_parse_from(std::iter::once("kbf-server").chain(extra.iter().copied()))
+    };
+    let on = |extra: &[&str]| {
+        args(extra)
+            .expect("flags parse")
+            .listeners()
+            .expect("listeners")
+            .exclusive_actions
+    };
+    assert!(!on(&[]));
+    assert!(on(&["--exclusive-actions"]));
+    assert!(on(&["--exclusive-actions", "--scheduler-core", "js"]));
+    let js = args(&["--exclusive-actions", "--scheduler-core=js"]).expect("flags parse");
+    assert!(js.check_scheduler_core().is_ok());
+    args(&["--exclusive-actions=true"]).expect_err("a switch takes no value");
+}
+
+/// Catches `--no-memory-climb` not reaching the listeners (a server that ignores it
+/// climbs), or read the wrong way round (the default must climb), or a ladder lost with it.
+#[test]
+fn the_memory_climb_is_on_unless_its_flag_turns_it_off() {
+    use clap::Parser;
+    let listeners = |args: &[&str]| {
+        kbf_server::Args::parse_from(std::iter::once("kbf-server").chain(args.iter().copied()))
+            .listeners()
+            .expect("listeners")
+    };
+    assert!(listeners(&[]).memory_climb);
+    assert!(!listeners(&["--no-memory-climb"]).memory_climb);
+    // The ladder is still read: the first rung is the booking.
+    assert_eq!(
+        listeners(&["--no-memory-climb", "--memory-ladder-gib=2,8"]).memory_ladder,
+        kbf_server::MemoryLadder::from_gib(&[2, 8]).unwrap()
+    );
+}
+
+/// Catches `--no-memory-climb` accepted with the js core, whose scheduler the flag cannot
+/// reach (the climb would stay on while the flag says off), and the refusal applied to the
+/// combinations the core runs: the flag on the legacy core, and the js core without it.
+#[test]
+fn no_memory_climb_is_refused_with_the_js_core_only() {
+    use clap::Parser;
+    let check = |flags: &[&str]| {
+        kbf_server::Args::parse_from(std::iter::once("kbf-server").chain(flags.iter().copied()))
+            .check_scheduler_core()
+    };
+    let refused = check(&["--scheduler-core=js", "--no-memory-climb"]).expect_err("refused");
+    assert!(matches!(
+        refused,
+        kbf_server::ConfigError::NoMemoryClimbUnderJs
+    ));
+    let said = refused.to_string();
+    assert!(said.contains("--no-memory-climb"), "{said}");
+    assert!(said.contains("--scheduler-core js"), "{said}");
+    check(&["--scheduler-core=legacy", "--no-memory-climb"]).expect("legacy");
+    check(&["--scheduler-core=js"]).expect("js without the flag");
+    // Allowed with learned sizes on: no kill raises a booking floor.
+    check(&["--no-memory-climb", "--learned-sizes=on"]).expect("learned on");
 }
 
 /// Catches: `--memory-ladder-gib` not parsed into the listeners' ladder (a farm that

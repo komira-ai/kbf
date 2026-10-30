@@ -119,8 +119,10 @@ fn start_denying(with_proxy: bool, deny_list: Option<DenyList>) -> Server_ {
         default_platform: kbf_front::DefaultPlatform::NONE,
         qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        memory_climb: true,
         vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
+        exclusive_actions: false,
         scheduler_core: kbf_server::SchedulerCore::under_test(),
         placement_load: kbf_server::PlacementLoad::Off,
         placement_predictions: kbf_server::PlacementPredictions::Off,
@@ -872,6 +874,7 @@ fn binary(name: &str, extra: &[&str]) -> (kbf_testkit::dir::TestDir, std::proces
         .args(["--listen", "127.0.0.1:0", "--worker-listen", "127.0.0.1:0"])
         .arg("--cold-store")
         .arg(format!("file://{}", base.join("cold").display()))
+        .arg("--cold-store-floor-bytes=1")
         .arg("--meta-dir")
         .arg(base.join("meta"))
         .args(extra)

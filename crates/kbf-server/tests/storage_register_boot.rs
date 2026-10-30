@@ -47,8 +47,10 @@ fn frontend() -> (SocketAddr, Arc<Hooked>) {
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        memory_climb: true,
         vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
+        exclusive_actions: false,
         scheduler_core: kbf_server::SchedulerCore::under_test(),
         placement_load: kbf_server::PlacementLoad::Off,
         placement_predictions: kbf_server::PlacementPredictions::Off,
@@ -91,6 +93,7 @@ fn flags(dir: &Path, cold: &str, worker: SocketAddr) -> StorageFlags {
         "storage".to_owned(),
         "--storage-listen=127.0.0.1:0".to_owned(),
         format!("--cold-store=file://{}", dir.join(cold).display()),
+        "--cold-store-floor-bytes=1".to_owned(),
         format!("--meta-dir={}", dir.join("meta").display()),
         format!("--frontend=http://{worker}"),
     ];

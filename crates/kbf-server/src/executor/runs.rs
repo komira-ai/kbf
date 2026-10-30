@@ -21,7 +21,7 @@ use tokio::time::Instant;
 use crate::executor::config::Config;
 use crate::executor::host::{Drain, HostWorker, Retire};
 use crate::executor::metrics::{IngestEnd, Metrics, RunEnd};
-use crate::executor::outcome::{Settled, Verdict, judge, ran, result_of};
+use crate::executor::outcome::{Settled, Verdict, judge, ran, refused_for_quota, result_of};
 use crate::executor::task::{Nonce, PackKey, TaskArgs};
 use crate::executor::traits::{Ingested, InputsError, MintError, PresignError, UntrustedLimits};
 use crate::executor::{Ctx, note};
@@ -338,12 +338,6 @@ impl HostWorker {
         require(timeout <= ctx.cfg.max_run, || {
             format!("the action's timeout {timeout:?} is over the executor's limit")
         })?;
-        // The lease server appends the arguments to the image's entrypoint: with one, the
-        // secrets would go to that program and the task tool would not run.
-        require(!facts.has_entrypoint, || {
-            "the action's image sets an entrypoint, which the task tool cannot be run under"
-                .to_owned()
-        })?;
         let image = pinned(&facts.image)?;
         let wall = ctx.cfg.wall(timeout);
         let nonce = Nonce::random();
@@ -369,36 +363,40 @@ impl HostWorker {
             return Err(Settled::Infra("the pack url is not https".to_owned()));
         }
         let grant = ctx.deps.inputs.read_grant(lease, action, wall).await?;
-        // The bearer token goes into the arguments: not over a scheme that sends it in clear.
-        if !grant.url.starts_with("https://") {
+        // The bearer token goes into the arguments: not over a scheme that sends it in clear,
+        // unless the operator said the job network is trusted for it.
+        if !ctx.cfg.allow_plain_http_grant && !grant.url.starts_with("https://") {
             return Err(Settled::Infra(
                 "the read grant is not served over https".to_owned(),
             ));
         }
-        let (tool, root) = (ctx.cfg.tool_path(), ctx.cfg.root_mount());
         let args = TaskArgs {
-            tool: &tool,
             action,
             lease,
             grant_url: &grant.url,
             grant_token: &grant.token,
             pack_url: &pack,
             deadline: timeout,
-            root_der: root.as_ref().map(|(_, path)| path.as_str()),
             work_dir: ctx.cfg.work_dir.as_deref(),
             allow_plain_http_put: ctx.cfg.allow_plain_http_put,
+            allow_plain_http_grant: ctx.cfg.allow_plain_http_grant,
         };
         let limits = RunLimits {
             cpu_millis: w.millicpus.max(1),
             memory_bytes: Config::hard_memory(w.memory_bytes),
             pids: None,
             wall_ms: Some(u64::try_from(wall.as_millis()).unwrap_or(u64::MAX)),
+            disk_bytes: Some(ctx.cfg.disk_bytes(grant.input_bytes)),
         };
+        if grant.input_bytes.is_none() {
+            tracing::warn!(
+                worker = %self.id,
+                %lease,
+                "the size of the inputs is not known; the run books the allowance and the margin only"
+            );
+        }
         let mut spec = RunSpec::new(image, limits);
         spec.args = args.argv(ctx.cfg.delivery);
-        spec.mounts = std::iter::once(ctx.cfg.tool_mount.clone())
-            .chain(root.map(|(mount, _)| mount))
-            .collect();
         // The labels are listed back with every run and are not secret-safe: the nonce only.
         spec.labels = BTreeMap::from([(RUN_LABEL.to_owned(), nonce.to_string())]);
         Ok(Prepared {
@@ -435,11 +433,31 @@ impl HostWorker {
                 self.begin_drain(ctx, Drain::Tainted);
                 Queued::Settled(Settled::Infra("the host is tainted".to_owned()))
             }
+            Some(ErrorCode::QuotaUnavailable) => {
+                self.quota_unavailable(ctx, ctx.clock.now());
+                Queued::Settled(Settled::Lost(Lost::Fenced))
+            }
             Some(ErrorCode::HostLost | ErrorCode::HostNotRegistered) => {
                 Queued::Retire(Retire::Lost)
             }
             Some(ErrorCode::NotHeld | ErrorCode::UnknownLease | ErrorCode::Expired) => {
                 Queued::Retire(Retire::Gone)
+            }
+            // Every host holds the pool's shape, so a run over it fits no host and rerunning
+            // the action never helps: the action's limits are the caller's to fix.
+            Some(ErrorCode::LimitsExceedShape) => {
+                let limits = &prepared.spec.limits;
+                let disk = limits
+                    .disk_bytes
+                    .map_or_else(|| "none".to_owned(), |bytes| format!("{bytes} bytes"));
+                Queued::Settled(Settled::Invalid(format!(
+                    "the run's limits (cpu {} millis, memory {} bytes, disk {disk}) exceed the \
+                     pool's shape (cpu {} millis, memory {} bytes), which every host shares",
+                    limits.cpu_millis,
+                    limits.memory_bytes,
+                    ctx.cfg.cpu_millis,
+                    ctx.cfg.memory_bytes,
+                )))
             }
             Some(other) => Queued::Settled(Settled::Infra(format!(
                 "the lease server refused the run: {other}"
@@ -515,6 +533,9 @@ impl HostWorker {
         );
         if !ended {
             return;
+        }
+        if refused_for_quota(run) {
+            self.quota_unavailable(ctx, now);
         }
         match judge(run, truncated) {
             Verdict::Settled(settled) => {

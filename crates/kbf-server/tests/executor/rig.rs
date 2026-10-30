@@ -20,6 +20,8 @@ use kbf_types::{ActionKey, LeaseKind, Qos, Resources};
 use tokio::sync::watch;
 
 pub const GIB: u64 = 1 << 30;
+/// The input bytes the fake grant reports: not a whole GiB, so a sum that drops it shows.
+pub const INPUT_BYTES: u64 = 3 * GIB + 4_096;
 pub const IMAGE: &str = "docker://registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -42,11 +44,11 @@ impl FakeInputs {
             facts: Mutex::new(Ok(ActionFacts {
                 image: IMAGE.to_owned(),
                 timeout: Some(Duration::from_secs(60)),
-                has_entrypoint: false,
             })),
             grant: Mutex::new(Ok(ReadGrant {
                 url: "https://grant.test:9400".to_owned(),
                 token: Secret::new("read-token-0001"),
+                input_bytes: Some(INPUT_BYTES),
             })),
             looked_up: Mutex::new(Vec::new()),
             hold: std::sync::atomic::AtomicBool::new(false),
@@ -472,6 +474,7 @@ impl Rig {
             resources: Resources::new(1_000, GIB),
             hermetic: true,
             do_not_cache: false,
+            whole_worker: false,
             needs: kbf_caps::Request::default(),
         };
         let ticket = self
@@ -528,6 +531,18 @@ impl Rig {
             self.fake
                 .finish_run(run, outcome, exit_code, Some("detail"))
         );
+    }
+
+    /// As [`Rig::host_finishes`], with the detail the host gives (a refusal code, for a start).
+    pub fn host_finishes_with(
+        &self,
+        run: &RunId,
+        outcome: Outcome,
+        exit_code: Option<i32>,
+        detail: &str,
+    ) {
+        self.fake.run_started(run);
+        assert!(self.fake.finish_run(run, outcome, exit_code, Some(detail)));
     }
 
     pub fn host_ends(&self, run: &RunId) {

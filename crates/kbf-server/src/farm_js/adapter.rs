@@ -40,6 +40,7 @@ use kbf_types::{
 use tokio::sync::watch;
 use tonic::Code;
 
+use super::ablation::{Ablation, Booking};
 use super::codec::KbfRowCodec;
 use super::facts::WorkerFacts;
 use super::learning::Learning;
@@ -50,7 +51,7 @@ use crate::farm::NodeLoads;
 use crate::farm::durable::{named, subject};
 use crate::farm::failed_actions::{Class, FailedActions, class_of};
 use crate::fleet::quarantine_change;
-use crate::machine::{FarmMachine, Platform, Sent, Waiter, stored_name};
+use crate::machine::{Booked, FarmMachine, Platform, Sent, Waiter, stored_name};
 use crate::stamp::Stamp;
 
 /// Where the farm sends a worker's messages: the outbound half of its stream.
@@ -112,6 +113,8 @@ pub struct KbfAdapter {
     pub(super) hooks: ReportHooks,
     /// What the estimator is shown ([`super::learning`]).
     pub(super) learning: Learning,
+    /// The counts that tell the ablation's rows apart ([`super::ablation`]).
+    ablation: Ablation,
 }
 
 /// The `LeaseId` of the wire.
@@ -175,6 +178,7 @@ impl KbfAdapter {
             unreadable_results: 0,
             hooks: ReportHooks::default(),
             learning: Learning::off(),
+            ablation: Ablation::default(),
         }
     }
 
@@ -196,6 +200,11 @@ impl KbfAdapter {
     /// their callers are told, and those it refused.
     pub(crate) const fn failed_actions(&self) -> FailedActions {
         self.failed
+    }
+
+    /// The counts of the ablation's rows ([`Ablation`]).
+    pub(crate) const fn ablation(&self) -> &Ablation {
+        &self.ablation
     }
 
     /// The first waiter of `operation`: its key and lease kind are the operation's.
@@ -417,11 +426,17 @@ impl Adapter for KbfAdapter {
                     queued: w.queued,
                     started: now,
                 },
+                booked: Some(Booked {
+                    cpu_millis: start.resources.cpu_millis,
+                    memory_bytes: start.resources.memory_bytes,
+                }),
             });
         sent.into_iter()
             .for_each(|sent| self.machine.start(start.lease, sent));
         self.record_started(start);
         self.learning_started(start);
+        let cost = view.sched().lease_cost(start.lease);
+        self.ablation.booked(Booking::of(start.kind, cost));
     }
 
     /// Tells `worker` to stop the run of `lease`. A stream that has just ended drops the
@@ -461,6 +476,7 @@ impl Adapter for KbfAdapter {
     fn requeued(&mut self, requeue: &Requeue) {
         self.record_requeue(requeue);
         self.learning_requeued(requeue);
+        self.ablation.requeued(requeue.reason);
     }
 
     /// Works out what the callers of a finished operation get, and keeps them until the

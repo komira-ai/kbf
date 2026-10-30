@@ -22,8 +22,10 @@
 //! source whose bytes are not the blob's ends the response early and without its last chunk
 //! (the response is shorter than its length, and the client's own hash check refuses it); the
 //! end is counted. A response is never larger than [`Limits::max_blob_bytes`] (413 above it,
-//! before anything is read), and at most [`Limits::reads_in_flight`] reads are open at once,
-//! a streamed one until its response ends or is dropped; the others wait for one to end.
+//! before anything is read), and at most [`Limits::reads_in_flight`] places are taken at once:
+//! a GET takes one, a streamed one until its response ends or is dropped, and a batch takes one
+//! reservation of at most half of them for its whole read (as many as it has blobs to read, not
+//! one per blob); the others wait for room.
 //!
 //! `POST /batch` answers many small blobs of the Action in one request, so that a task is not
 //! held up by the round trips of thousands of GETs. The body is JSON, `{"digests":
@@ -35,8 +37,8 @@
 //! reachable). Otherwise it is 200 `application/octet-stream` with one frame per digest, in
 //! request order: one status byte (0 ok, 1 not_found, 2 out_of_scope, 3 too_large, 4
 //! store_unavailable), the length as eight bytes big-endian (the blob's size when ok, else 0)
-//! and the bytes. Scope is checked for each digest, each read counts against
-//! [`Limits::reads_in_flight`], and an ok blob is hashed against its digest here: bytes that
+//! and the bytes. Scope is checked for each digest, the batch's read takes one reservation of
+//! [`Limits::reads_in_flight`] places (at most half of them, as above), and an ok blob is hashed against its digest here: bytes that
 //! are not the blob's are `store_unavailable`, never an ok frame.
 //!
 //! `GET /locate` answers where the blobs of the grant's Action are, as JSON lines, for the task
@@ -64,6 +66,7 @@ use tonic::codegen::http::{Method, StatusCode};
 use crate::backend::Backend;
 use crate::cache::is_empty_blob;
 use crate::grants::{Claims, GrantError, Grants, Scope};
+use crate::large_backfill::{LargeBackfill, Tee};
 use crate::metrics::{Counter, Families};
 use crate::proxy::MAX_UNTRUSTED_BLOB_BYTES;
 
@@ -215,8 +218,9 @@ impl BlobSource for Backend {
 /// The bounds of a [`JobRead`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// The reads of blobs open at once (at least 1), a streamed one until its response ends;
-    /// a request over it waits for one to end.
+    /// The places for reads of blobs (at least 1): a GET takes one, a streamed one until its
+    /// response ends, and a batch one reservation of at most half of them for its whole read; a
+    /// request over it waits for room.
     pub reads_in_flight: usize,
     /// The bytes of reads open at once, in all (at least 1 KiB): a read takes its blob's size
     /// first (a streamed blob [`Limits::stream_window`] of it, the scope walk's reads their
@@ -471,6 +475,7 @@ pub struct JobRead {
     blobs: [Counter; BLOB_STATUSES.len()],
     bytes: Arc<Counter>,
     ended_early: Arc<EndedEarly>,
+    backfill: Option<LargeBackfill>,
 }
 
 impl JobRead {
@@ -490,7 +495,27 @@ impl JobRead {
             blobs: Default::default(),
             bytes: Arc::default(),
             ended_early: Arc::default(),
+            backfill: None,
         }
+    }
+
+    /// How many Actions the memory of scopes holds now, walks in progress included: at most
+    /// [`Limits::scopes`] once the walks that are done, failed or cancelled are dropped (which
+    /// happens when an Action arrives at the bound).
+    #[must_use]
+    pub fn scopes_held(&self) -> usize {
+        self.scopes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// This read, copying each large blob it streams to tierstore through `backfill` once it
+    /// has hashed to its digest ([`crate::large_backfill`]); `None` copies nothing.
+    #[must_use]
+    pub fn with_backfill(mut self, backfill: Option<LargeBackfill>) -> Self {
+        self.backfill = backfill;
+        self
     }
 
     /// The answer to `method` `path` with the `Authorization` header `authorization`.
@@ -618,6 +643,10 @@ impl JobRead {
     /// a read are read together, each once, with [`BlobSource::read_many`], under a take of at
     /// most half the reads in flight (as many places as blobs) while they are read, and of the
     /// budget: their sizes together and [`BATCH_GAP_BYTES`] for each gap between them.
+    /// A batch takes one reservation of places, not one place per blob. The places bound the
+    /// batches that read at once, not the reads of one: a source reads the
+    /// blobs it does not read together concurrently, up to the batch's size (at most
+    /// [`BATCH_MAX_DIGESTS`]), and what bounds their bytes is the budget.
     async fn batch_blobs(
         &self,
         claims: &Claims,
@@ -707,7 +736,9 @@ impl JobRead {
         let cell = {
             let mut cells = self.scopes.lock().unwrap_or_else(PoisonError::into_inner);
             if cells.len() >= self.limits.scopes {
-                cells.retain(|_, cell| !cell.initialized());
+                // A walk that is done, and one that no one is waiting on (it failed, or was
+                // cancelled), go; one in progress stays, so that a second ask joins it.
+                cells.retain(|_, cell| !cell.initialized() && Arc::strong_count(cell) > 1);
             }
             Arc::clone(cells.entry(action).or_default())
         };
@@ -731,7 +762,7 @@ impl JobRead {
         self.answer(Outcome::Ok, body)
     }
 
-    /// A 200 whose body is `read`, passed on as it is hashed; `place` is held until the
+    /// A 200 whose body is `read`, passed on as it is hashed; `held` is kept until the
     /// stream ends or is dropped.
     fn serve_stream(
         &self,
@@ -751,6 +782,10 @@ impl JobRead {
             finished: false,
             bytes: Arc::clone(&self.bytes),
             ended_early: Arc::clone(&self.ended_early),
+            tee: self
+                .backfill
+                .as_ref()
+                .and_then(|backfill| backfill.tee(&digest)),
             _held: held,
         };
         let chunks = stream::unfold(Some(state), |state| async move {
@@ -852,6 +887,9 @@ impl JobRead {
         }
         self.locate.render_metrics(&mut families);
         *out = families.0;
+        if let Some(backfill) = &self.backfill {
+            backfill.render_metrics(out);
+        }
     }
 
     /// [`JobRead::render_metrics`] when there is a job-facing read, and nothing when there
@@ -875,6 +913,9 @@ struct Streaming {
     finished: bool,
     bytes: Arc<Counter>,
     ended_early: Arc<EndedEarly>,
+    /// The copy of the blob to tierstore, fed what is passed on; dropped on any end but a
+    /// verified one, which abandons the copy.
+    tee: Option<Tee>,
     /// The read's place among [`Limits::reads_in_flight`] and its window of the budget, given
     /// back when the stream is dropped.
     _held: (
@@ -908,6 +949,7 @@ impl Streaming {
                     self.hasher.update(&chunk);
                     if let Some(ready) = self.held.replace(chunk) {
                         self.bytes.add(ready.len() as u64);
+                        self.copy(&ready);
                         return Step::Chunk(ready);
                     }
                 }
@@ -915,6 +957,7 @@ impl Streaming {
                     return self.corrupt();
                 }
                 Some(Err(error)) => {
+                    self.tee = None;
                     self.ended_early.store_error.add(1);
                     return Step::Fail(StreamError::Store(error));
                 }
@@ -933,10 +976,25 @@ impl Streaming {
         // Held, as the blob is not empty ([`is_empty_blob`] is served before a read).
         let last = self.held.take().unwrap_or_default();
         self.bytes.add(last.len() as u64);
+        self.copy(&last);
+        if let Some(tee) = self.tee.take() {
+            tee.finish();
+        }
         Step::Chunk(last)
     }
 
-    fn corrupt(&self) -> Step {
+    /// Hands `chunk`, which the response is given, to the copy; a copy that cannot take it
+    /// is dropped, and the response goes on.
+    fn copy(&mut self, chunk: &Bytes) {
+        if let Some(tee) = &mut self.tee
+            && !tee.send(chunk.clone())
+        {
+            self.tee = None;
+        }
+    }
+
+    fn corrupt(&mut self) -> Step {
+        self.tee = None;
         self.ended_early.digest_mismatch.add(1);
         Step::Fail(StreamError::Corrupt)
     }

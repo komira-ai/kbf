@@ -34,6 +34,8 @@ use tonic::Code;
 use crate::rig::{ClockHold, GIB, settle};
 
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
+const KBF_IMAGE: &str =
+    "registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 const IMAGE: &str = "docker://registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const BUCKET: &str = "packs";
 
@@ -43,9 +45,9 @@ const STEPS: usize = 200;
 
 /// The log of a test, as text.
 #[derive(Clone, Default)]
-struct Log(Arc<Mutex<Vec<u8>>>);
+pub struct Log(Arc<Mutex<Vec<u8>>>);
 
-struct LogWriter(Log);
+pub struct LogWriter(Log);
 
 impl std::io::Write for LogWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -71,7 +73,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Log {
 }
 
 impl Log {
-    fn text(&self) -> String {
+    pub fn text(&self) -> String {
         let bytes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         String::from_utf8_lossy(&bytes).into_owned()
     }
@@ -159,7 +161,8 @@ impl World {
             "--executor-host-memory-gib=16".to_owned(),
             "--executor-host-slots=2".to_owned(),
             "--executor-insecure-argv-secrets".to_owned(),
-            "--executor-images-have-no-entrypoint".to_owned(),
+            format!("--executor-base-image={IMAGE}"),
+            format!("--executor-kbf-image={KBF_IMAGE}"),
             "--executor-allow-plain-http-put".to_owned(),
         ];
         let matches = frontend::command()
@@ -226,6 +229,7 @@ impl World {
                     hermetic: true,
                     do_not_cache: false,
                     needs: kbf_caps::Request::default(),
+                    whole_worker: false,
                 },
                 call: None,
                 described: Described {
@@ -333,6 +337,35 @@ async fn store_action(
 fn arg(args: &[String], name: &str) -> String {
     let at = args.iter().position(|a| a == name).expect("the argument");
     args[at + 1].clone()
+}
+
+/// Catches the real preparation's closure size not reaching the run's disk booking: the run
+/// of an action whose inputs are one 1000-byte file books the bytes of the input tree as the
+/// preparation counts them (the file and the root Directory blob that names it), the default
+/// output allowance and the margin. A grant that carried no size would book the allowance and
+/// the margin only, which this number does not equal.
+#[tokio::test(start_paused = true)]
+async fn the_run_books_the_bytes_of_the_closure_the_real_preparation_found() {
+    use kbf_server::executor::{DEFAULT_OUTPUT_DISK, DISK_MARGIN};
+
+    let content = [7u8; 1000];
+    let (world, actions) = World::start(&[(&content, true)]).await;
+    let _stage = world.submit(actions[0]);
+    let run = world.posted().await;
+    let file = VerifiedBlob::hashed(Bytes::copy_from_slice(&content)).digest();
+    let root = Directory {
+        files: vec![FileNode {
+            name: "in.txt".to_owned(),
+            digest: Some(wire(&file)),
+            ..FileNode::default()
+        }],
+        ..Directory::default()
+    };
+    let inputs = 1000 + root.encode_to_vec().len() as u64;
+    assert_eq!(
+        world.fake.run_disk_bytes(&run),
+        Some(inputs + DEFAULT_OUTPUT_DISK + DISK_MARGIN)
+    );
 }
 
 /// Catches an executor that does not run an action end to end over the real preparation, with

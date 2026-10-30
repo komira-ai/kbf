@@ -313,6 +313,7 @@ pub fn measured(t: u64) -> Run {
             ..RunUsage::default()
         }),
         booked_memory_bytes: None,
+        booked_millicpus: None,
         cap_bytes: None,
     }
 }

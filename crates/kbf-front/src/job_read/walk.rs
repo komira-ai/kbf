@@ -2,9 +2,10 @@
 //! walk and the reads of blobs share.
 //!
 //! The walk reads the Action and then the Directories under its input root a level at a time,
-//! and keeps only the digests they name: a Directory is dropped as soon as its entries are in
-//! the scope, so what a level holds is bounded by [`super::Limits::scope_digests`] and not by the
-//! sizes of the Directories. Each read takes its blob's size from the budget first, and a blob
+//! and keeps only the digests they name: a Directory is dropped as soon as it is read, and the
+//! bound [`super::Limits::scope_digests`] is checked as each Directory is folded in, so the
+//! walk holds the bound, the sixteen Directories being read (each of at most
+//! [`MAX_SCOPE_BLOB_BYTES`]) and the digests of one more. Each read takes its blob's size from the budget first, and a blob
 //! over [`MAX_SCOPE_BLOB_BYTES`] is refused before it is charged or read.
 
 use std::collections::HashSet;
@@ -76,6 +77,14 @@ impl Budget {
     }
 }
 
+/// The Action or Directory blob `digest` names is not over [`MAX_SCOPE_BLOB_BYTES`].
+fn within_cap(digest: &Digest) -> Result<(), ScopeError> {
+    if digest.size_bytes > MAX_SCOPE_BLOB_BYTES {
+        return Err(ScopeError::Unusable);
+    }
+    Ok(())
+}
+
 /// The digests of the files and of the subdirectories one Directory names.
 type Entries = (Vec<Digest>, Vec<Digest>);
 
@@ -87,9 +96,7 @@ pub(super) async fn walk(
     action: Digest,
     most: usize,
 ) -> Result<Scope, ScopeError> {
-    if action.size_bytes > MAX_SCOPE_BLOB_BYTES {
-        return Err(ScopeError::Unusable);
-    }
+    within_cap(&action)?;
     let bytes = {
         let _room = budget.take(action.size_bytes).await;
         source.read_blob(&action).await?
@@ -104,6 +111,8 @@ pub(super) async fn walk(
         let mut entries = stream::iter(level)
             .map(|digest| directory(source, budget, digest))
             .buffer_unordered(DIRECTORIES_IN_FLIGHT);
+        // Each Directory is folded in as it arrives and the bound checked at once, so that what
+        // the walk holds is the bound, the Directories being read and one more.
         while let Some((files, directories)) = entries.try_next().await? {
             seen.extend(files);
             for digest in directories {
@@ -130,9 +139,7 @@ async fn directory(
     if is_empty_blob(&digest) {
         return Ok((Vec::new(), Vec::new()));
     }
-    if digest.size_bytes > MAX_SCOPE_BLOB_BYTES {
-        return Err(ScopeError::Unusable);
-    }
+    within_cap(&digest)?;
     let bytes = {
         let _room = budget.take(digest.size_bytes).await;
         source.read_blob(&digest).await?

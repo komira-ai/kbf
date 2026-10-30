@@ -61,11 +61,13 @@ fn what_the_client_sends_is_what_the_server_reads() {
         memory_bytes: 8 << 30,
         pids: None,
         wall_ms: None,
+        disk_bytes: None,
     };
     assert_eq!(RunSpec::new(support::IMAGE, limits), minimal);
     let full: RunSpec = round_trip("run_request_full");
     assert_eq!(full.isolation, Isolation::Host);
     assert_eq!(full.limits.wall_ms, Some(1_800_000));
+    assert_eq!(full.limits.disk_bytes, Some(10 << 30));
     assert_eq!(
         full.mounts,
         [Mount {
@@ -74,6 +76,24 @@ fn what_the_client_sends_is_what_the_server_reads() {
             ro: true
         }]
     );
+}
+
+/// Asserts that a run's disk is optional on the wire in both directions: a body without
+/// `disk_bytes` (the minimal golden, what an older client sends) reads as no disk and is
+/// written back without the field, and the full golden carries it as the number the server
+/// reads. It catches a client that sends `"disk_bytes": null` to a server that does not take
+/// it, and one that drops the field from a body that has it.
+#[test]
+fn a_runs_disk_is_optional_on_the_wire() {
+    let without: RunSpec = round_trip("run_request_minimal");
+    assert_eq!(without.limits.disk_bytes, None);
+    assert!(
+        !serde_json::to_string(&without)
+            .unwrap()
+            .contains("disk_bytes")
+    );
+    let with: RunSpec = round_trip("run_request_full");
+    assert_eq!(with.limits.disk_bytes, Some(10_737_418_240));
 }
 
 /// Asserts that the server's request bodies refuse an unknown field and so do the client's
@@ -165,6 +185,37 @@ fn what_the_server_sends_reads_now_and_after_it_grows() {
     assert!(only_state.lost.is_none() && only_state.is_lost());
     let live: Host = serde_json::from_value(hosts["hosts"][4].clone()).unwrap();
     assert!(!live.is_lost());
+    // The load is optional: the host with none reads as `None`, and the host with one keeps
+    // every figure in the unit its name states.
+    assert!(first.load.is_none() && second.load.is_none());
+    let load = live.load.as_ref().expect("the live host lists a load");
+    assert_eq!(
+        (load.seq, load.mono_usec, load.cpu_usage_usec),
+        (5, 61_000_000, 125_000_000)
+    );
+    assert_eq!(
+        (load.memory_working_set_bytes, load.memory_active_file_bytes),
+        (7_000_000_000, 250)
+    );
+    assert!(load.actions_cpu_limited);
+    assert_eq!(load.covered, ["3-7"]);
+    assert_eq!(load.lease_clocks[0].started_mono_usec, 500_000);
+    assert_eq!(load.minutes[0].cpu_peak_window_millis, 2000);
+    // A server that grows the load (a field this client has not heard of) is still read.
+    let mut grown = hosts["hosts"][4].clone();
+    grown["load"]["new_figure"] = json!(1);
+    let grown: Host = serde_json::from_value(grown).unwrap();
+    assert_eq!(grown.load.as_ref(), Some(load));
+    // A load with only the figures that are always sent reads, its lists empty.
+    let mut bare = hosts["hosts"][4].clone();
+    for list in ["covered", "lease_clocks", "minutes"] {
+        bare["load"].as_object_mut().unwrap().remove(list);
+    }
+    let bare: Host = serde_json::from_value(bare).unwrap();
+    assert!(
+        bare.load
+            .is_some_and(|l| l.covered.is_empty() && l.minutes.is_empty())
+    );
     for element in hosts["hosts"].as_array().unwrap() {
         let host: Host = serde_json::from_value(element.clone()).unwrap();
         assert_eq!(&serde_json::to_value(&host).unwrap(), element);

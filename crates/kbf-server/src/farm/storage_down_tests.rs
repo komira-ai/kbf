@@ -46,6 +46,7 @@ fn submit(farm: &Farm) -> kbf_front::Ticket {
         hermetic: true,
         do_not_cache: false,
         needs: kbf_caps::Request::default(),
+        whole_worker: false,
     };
     farm.submit(Submission {
         request,

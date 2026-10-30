@@ -469,7 +469,7 @@ fn durations(d: &Durations) -> Value {
 }
 
 /// What an attempt's lease measured, as keys added to its built ones: its memory
-/// kill once it ended, the booking and cap of a memory kill, the raised booking of an
+/// kill once it ended, the booking its lease was granted, the cap of a memory kill, the raised booking of an
 /// own-limit requeue, the REAPI times and the usage of its run. A key not measured is
 /// left out.
 fn measured(a: &Attempt, keys: &mut Map<String, Value>) {
@@ -494,6 +494,9 @@ fn measured(a: &Attempt, keys: &mut Map<String, Value>) {
         if let Some(bytes) = bytes {
             put(key, bytes.into());
         }
+    }
+    if let Some(cpu) = run.and_then(|r| r.booked_millicpus) {
+        put("booked_millicpus", cpu.into());
     }
     if let Some(run) = run {
         put("reapi_times", reapi_times(run));

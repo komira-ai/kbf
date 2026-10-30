@@ -4,7 +4,7 @@
 //! The source yields while a read is open, so that reads that are allowed to overlap do, and
 //! records the most reads, and the most bytes of them, that were ever open at once.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -12,11 +12,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::future::{BoxFuture, join_all};
 use futures::{StreamExt as _, stream};
-use kbf_front::digest_to_proto;
 use kbf_front::grants::{GrantKey, Grants, MIN_SECRET_LEN};
 use kbf_front::job_read::{
     BATCH_PATH, BlobSource, HELD_CHUNK_BYTES, JobRead, Limits, Reply, StreamError,
 };
+use kbf_front::{Backend, Cache, VerifiedBlob, digest_to_proto};
 use kbf_proto::reapi::{Action, Directory, DirectoryNode, FileNode};
 use kbf_storage::{ReadStream, StorageError};
 use kbf_types::Digest;
@@ -44,6 +44,10 @@ struct Source {
     many_open: Mutex<(usize, usize)>,
     /// Answers `read_many` with its first answer only.
     short_many: AtomicBool,
+    /// Digests the store does not hold, though they are in the tree.
+    hidden: Mutex<HashSet<Digest>>,
+    /// The store fails every read it is asked for.
+    broken: AtomicBool,
     gate: Option<(Digest, Semaphore)>,
 }
 
@@ -51,6 +55,29 @@ impl Source {
     fn reads_of(&self, digest: &Digest) -> usize {
         let reads = self.reads.lock().unwrap_or_else(PoisonError::into_inner);
         reads.iter().filter(|read| *read == digest).count()
+    }
+
+    fn hide(&self, digest: Digest) {
+        self.hidden
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(digest);
+    }
+
+    /// What the store answers for `digest`.
+    fn answer(&self, digest: &Digest) -> Result<Bytes, StorageError> {
+        let hidden = self
+            .hidden
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(digest);
+        if self.broken.load(Ordering::SeqCst) {
+            return Err(StorageError::Unreachable(*digest));
+        }
+        match self.blobs.get(digest) {
+            Some(bytes) if !hidden => Ok(bytes.clone()),
+            _ => Err(StorageError::NotFound(*digest)),
+        }
     }
 
     fn most(&self) -> (usize, u64) {
@@ -86,10 +113,7 @@ impl BlobSource for Source {
                 open.now -= 1;
                 open.bytes -= digest.size_bytes;
             }
-            self.blobs
-                .get(digest)
-                .cloned()
-                .ok_or(StorageError::NotFound(*digest))
+            self.answer(digest)
         })
     }
 
@@ -127,11 +151,7 @@ impl BlobSource for Source {
             } else {
                 digests.len()
             };
-            digests
-                .iter()
-                .take(take)
-                .map(|d| self.blobs.get(d).cloned().ok_or(StorageError::NotFound(*d)))
-                .collect()
+            digests.iter().take(take).map(|d| self.answer(d)).collect()
         })
     }
 
@@ -140,10 +160,7 @@ impl BlobSource for Source {
         digest: &'a Digest,
     ) -> BoxFuture<'a, Result<ReadStream, StorageError>> {
         Box::pin(async move {
-            let blob = self
-                .blobs
-                .get(digest)
-                .ok_or(StorageError::NotFound(*digest))?;
+            let blob = self.answer(digest)?;
             let chunks: Vec<Result<Bytes, StorageError>> = blob
                 .chunks(1024)
                 .map(|c| Ok(Bytes::copy_from_slice(c)))
@@ -222,6 +239,8 @@ fn rig(blobs: HashMap<Digest, Bytes>, gate: Option<Digest>, limits: Limits) -> R
         many: Mutex::new(Vec::new()),
         many_open: Mutex::new((0, 0)),
         short_many: AtomicBool::new(false),
+        hidden: Mutex::new(HashSet::new()),
+        broken: AtomicBool::new(false),
         gate: gate.map(|digest| (digest, Semaphore::new(0))),
     });
     let read = JobRead::new(source.clone(), Arc::clone(&grants), limits);
@@ -871,3 +890,52 @@ async fn a_stalled_stream_of_a_large_blob_gives_its_window_back() {
     assert!(third.stream.is_some(), "served after the idle limit");
     assert!(matches!(stalled.next().await, Some(Err(StreamError::Idle))));
 }
+
+/// Catches: the batch read through a [`Backend`] (the source of a running frontend, which reads
+/// a batch with its own `read_many`) answering anything but each blob's own bytes in order, a
+/// missing blob as anything but `not_found`, and a reply of a streamed blob being unprintable
+/// (it is logged when a request fails).
+#[tokio::test]
+async fn a_batch_reads_through_a_backend_and_a_streamed_reply_prints() {
+    let mut blobs = HashMap::new();
+    let contents: Vec<Vec<u8>> = (0..2).map(|i| pattern(i, 3000)).collect();
+    let t = build(&mut blobs, "a", &contents, 0);
+    let shared = rig(blobs.clone(), None, Limits::default());
+    let cache = Arc::new(Cache::memory());
+    let held: Vec<VerifiedBlob> = blobs
+        .iter()
+        .filter(|(digest, _)| **digest != t.files[1])
+        .map(|(digest, bytes)| VerifiedBlob::new(*digest, bytes.clone()).expect("verified"))
+        .collect();
+    cache.store_blobs(held).await.expect("stored");
+    let limits = Limits {
+        stream_over: 1024,
+        ..Limits::default()
+    };
+    let read = JobRead::new(
+        Arc::new(Backend::from(cache)),
+        Arc::clone(&shared.grants),
+        limits,
+    );
+    let header = format!("Bearer {}", shared.token(t.action));
+    let quoted: Vec<String> = t.files.iter().map(|d| format!("\"{d}\"")).collect();
+    let body = format!("{{\"digests\":[{}]}}", quoted.join(","));
+    let reply = read
+        .respond_with_body(&Method::POST, BATCH_PATH, Some(&header), body.as_bytes())
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let expected = [frame(0, &contents[0]), vec![1, 0, 0, 0, 0, 0, 0, 0, 0]].concat();
+    assert_eq!(&reply.body[..], &expected[..]);
+
+    let streamed = read
+        .respond(&Method::GET, &format!("/{}", t.files[0]), Some(&header))
+        .await;
+    let printed = format!("{streamed:?}");
+    assert!(
+        printed.contains("BlobStream") && printed.contains("3000"),
+        "{printed}"
+    );
+}
+
+#[path = "job_read_budget/failures.rs"]
+mod failures;

@@ -448,6 +448,7 @@ fn request(tag: u8) -> Request {
         hermetic: true,
         do_not_cache: false,
         needs: kbf_caps::Request::default(),
+        whole_worker: false,
     }
 }
 
@@ -1279,8 +1280,10 @@ fn listeners() -> Listeners {
         default_platform: kbf_front::DefaultPlatform::NONE,
         qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        memory_climb: true,
         vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
+        exclusive_actions: false,
         scheduler_core: kbf_server::SchedulerCore::under_test(),
         placement_load: kbf_server::PlacementLoad::Off,
         placement_predictions: kbf_server::PlacementPredictions::Off,

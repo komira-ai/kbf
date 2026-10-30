@@ -9,9 +9,9 @@ use serde::Serialize;
 
 use crate::ids::{LeaseId, RunId};
 use crate::wire::{
-    AcquireRequest, Granted, Host, HostList, HostSource, HostState, Lease, LeaseList, LeaseState,
-    Mount, Outcome, PendingLease, ReleaseState, Released, RenewRequest, Renewed, Run, RunAccepted,
-    RunList, RunSpec, RunState, Shape, Taint,
+    AcquireRequest, Granted, Host, HostList, HostLoad, HostSource, HostState, Lease, LeaseList,
+    LeaseState, Mount, Outcome, PendingLease, ReleaseState, Released, RenewRequest, Renewed, Run,
+    RunAccepted, RunList, RunSpec, RunState, Shape, Taint,
 };
 
 /// The ttl of a lease that asks for none (the server's `--default-ttl`).
@@ -52,6 +52,7 @@ impl Pool {
                 memory_bytes,
                 gpus: 0,
                 gpu_class: None,
+                disk_bytes: None,
             },
             capabilities: BTreeMap::from([("os".to_owned(), "linux".to_owned())]),
             hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
@@ -150,6 +151,9 @@ struct HostRow {
     /// Known, and silent since the server restarted.
     awaiting: bool,
     taint: Option<Taint>,
+    /// A code the host refuses every new run with, short of a taint.
+    refusing: Option<&'static str>,
+    load: Option<HostLoad>,
 }
 
 struct RunRow {
@@ -162,7 +166,9 @@ struct RunRow {
     cpu_millis: u64,
     memory_bytes: u64,
     wall_ms: u64,
+    disk_bytes: Option<u64>,
     args: Vec<String>,
+    image: String,
     mounts: Vec<Mount>,
     labels: BTreeMap<String, String>,
 }
@@ -388,6 +394,8 @@ impl State {
                 mark: None,
                 reserved_for: None,
                 drain_deadline_ms: None,
+                // A lost host lists none, as the server does.
+                load: row.load.clone().filter(|_| !row.lost),
             })
             .collect();
         json(200, &HostList { hosts })
@@ -423,8 +431,13 @@ impl State {
             .gpu_indices
             .iter()
             .any(|index| u64::from(*index) >= shape.gpus);
+        let disk_beyond = limits
+            .disk_bytes
+            .zip(shape.disk_bytes)
+            .is_some_and(|(asked, held)| asked > held);
         if limits.cpu_millis > shape.cpu_millis
             || limits.memory_bytes > shape.memory_bytes
+            || disk_beyond
             || gpu_beyond
         {
             return Err(Refusal::new(422, "limits-exceed-shape"));
@@ -434,6 +447,9 @@ impl State {
         }
         if host.taint.is_some() {
             return Err(Refusal::new(409, "host-tainted"));
+        }
+        if let Some(code) = host.refusing {
+            return Err(Refusal::new(409, code));
         }
         let live = self.runs.iter().filter(|run| run.lease == id && run.live());
         let (count, cpu, memory) = live.fold((0, 0, 0), |(count, cpu, memory), run| {
@@ -458,7 +474,9 @@ impl State {
             cpu_millis: limits.cpu_millis,
             memory_bytes: limits.memory_bytes,
             wall_ms: limits.wall_ms.map_or(cap, |asked| asked.min(cap)),
+            disk_bytes: limits.disk_bytes,
             args: spec.args.clone(),
+            image: spec.image.clone(),
             mounts: spec.mounts.clone(),
             labels: spec.labels.clone(),
         };
@@ -566,6 +584,20 @@ impl State {
             .is_some()
     }
 
+    pub(super) fn refuse_posts(&mut self, host: &str, code: Option<&'static str>) -> bool {
+        self.hosts
+            .get_mut(host)
+            .map(|row| row.refusing = code)
+            .is_some()
+    }
+
+    pub(super) fn set_load(&mut self, host: &str, load: Option<HostLoad>) -> bool {
+        self.hosts
+            .get_mut(host)
+            .map(|row| row.load = load)
+            .is_some()
+    }
+
     pub(super) fn taint(&mut self, host: &str, reason: &str) -> bool {
         let taint = Taint {
             reason: reason.to_owned(),
@@ -619,6 +651,13 @@ impl State {
         lease.map(|lease| self.settle(lease)).is_some()
     }
 
+    pub(super) fn run_disk_bytes(&self, run: &RunId) -> Option<u64> {
+        self.runs
+            .iter()
+            .find(|row| row.id == *run)
+            .and_then(|row| row.disk_bytes)
+    }
+
     pub(super) fn run_wall_ms(&self, run: &RunId) -> Option<u64> {
         self.runs
             .iter()
@@ -631,6 +670,13 @@ impl State {
             .iter()
             .find(|row| row.id == *run)
             .map(|row| row.args.clone())
+    }
+
+    pub(super) fn run_image(&self, run: &RunId) -> Option<String> {
+        self.runs
+            .iter()
+            .find(|row| row.id == *run)
+            .map(|row| row.image.clone())
     }
 
     pub(super) fn run_mounts(&self, run: &RunId) -> Option<Vec<Mount>> {

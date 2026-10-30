@@ -10,6 +10,7 @@
 //! - [`enroll`] and [`renew`]: the host's certificate, made once with a token and renewed by the
 //!   agent at half its life;
 //! - [`service_health`]: a service's readiness URL;
+//! - [`cordon`]: which cordons on the node are the updater's own, kept on disk;
 //! - [`status`]: what the heartbeat says;
 //! - [`update`]: one host's A/B, step by step;
 //! - [`run`]: the two threads, and the wiring of the real ports ([`build`]).
@@ -26,6 +27,7 @@ pub mod status;
 pub mod update;
 
 mod build;
+pub mod cordon;
 
 pub use build::{NO_CREDENTIAL, NoCredential, run_agent, run_config};
 pub use run::{Agent, ServicePorts, Stop, World};
@@ -36,6 +38,8 @@ mod build_tests;
 mod container_health_tests;
 #[cfg(test)]
 mod coordinator_tests;
+#[cfg(test)]
+mod cordon_tests;
 #[cfg(test)]
 mod enroll_tests;
 #[cfg(test)]

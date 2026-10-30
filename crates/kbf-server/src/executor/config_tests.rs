@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use kbf_lease_client::Mount;
 use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE, START_GRACE, START_VALIDITY};
 
 use super::{Config, ConfigError, HARD_CAP_PAD, PRESIGN_LIMIT};
@@ -24,6 +23,33 @@ fn the_defaults_are_valid_once_the_operator_allows_argv_secrets() {
     assert!(!defaults.insecure_argv_secrets);
     assert_eq!(defaults.validate(), Err(ConfigError::InsecureArgv));
     assert_eq!(base().validate(), Ok(()));
+}
+
+/// Catches a run booking the wrong scratch: the inputs, the output allowance and the fixed
+/// margin, each counted once, and the allowance and the margin alone when the size of the inputs
+/// is not known. The numbers are not round (so a sum that drops a term cannot match), and the
+/// defaults are the documented 8 GiB and 1 GiB.
+#[test]
+fn a_runs_disk_is_its_inputs_plus_the_allowance_plus_the_margin() {
+    use super::{DEFAULT_OUTPUT_DISK, DISK_MARGIN};
+    assert_eq!(DEFAULT_OUTPUT_DISK, 8 * GIB);
+    assert_eq!(DISK_MARGIN, GIB);
+    let config = Config {
+        output_disk_bytes: 5 * GIB + 7,
+        ..base()
+    };
+    assert_eq!(
+        config.disk_bytes(Some(300)),
+        300 + 5 * GIB + 7 + DISK_MARGIN
+    );
+    assert_eq!(config.disk_bytes(Some(0)), 5 * GIB + 7 + DISK_MARGIN);
+    assert_eq!(config.disk_bytes(None), 5 * GIB + 7 + DISK_MARGIN);
+    assert_eq!(base().disk_bytes(None), DEFAULT_OUTPUT_DISK + DISK_MARGIN);
+    let huge = Config {
+        output_disk_bytes: u64::MAX,
+        ..base()
+    };
+    assert_eq!(huge.disk_bytes(Some(u64::MAX)), u64::MAX, "no wrap");
 }
 
 /// Catches a fence time that lets a silent worker's runs outlive the scheduler's grace
@@ -239,16 +265,6 @@ fn each_unsafe_setting_is_refused_by_name() {
         ),
         (
             Config {
-                tool_mount: Mount {
-                    ro: false,
-                    ..base().tool_mount
-                },
-                ..base()
-            },
-            ConfigError::ToolMount,
-        ),
-        (
-            Config {
                 drain_before_end: Duration::from_secs(3300),
                 ..base()
             },
@@ -356,4 +372,34 @@ fn the_ttl_exceeds_the_longest_run_by_two_heartbeats() {
 fn the_watch_over_earlier_leases_outlasts_a_renewal_and_a_held_pass() {
     let config = base();
     assert!(config.adopt_watch() > config.renew_every + config.fence_after);
+}
+
+/// Catches a hold on a host with a sick quota that is zero (the host would be handed back at
+/// once and leased again), or longer than a lease lasts without renewal (the held-out lease
+/// would expire under the executor): a third of the ttl is the least a renewed lease has
+/// left, so the hold is cut to it and the config stays usable with a short ttl.
+#[test]
+fn the_quota_hold_is_above_zero_and_cut_to_a_third_of_the_ttl() {
+    let with = |quota_hold, lease_ttl| Config {
+        quota_hold,
+        lease_ttl,
+        ..base()
+    };
+    let ttl = base().lease_ttl;
+    assert!(base().quota_hold > Duration::ZERO);
+    assert_eq!(base().held_out_for(), base().quota_hold);
+    assert_eq!(
+        with(Duration::ZERO, ttl).validate(),
+        Err(ConfigError::QuotaHold)
+    );
+    assert_eq!(
+        with(ttl, ttl).held_out_for(),
+        ttl / 3,
+        "a hold over a third of the ttl is cut"
+    );
+    assert_eq!(with(ttl / 3, ttl).held_out_for(), ttl / 3);
+    assert_eq!(
+        with(Duration::from_secs(10), ttl).held_out_for(),
+        Duration::from_secs(10)
+    );
 }
