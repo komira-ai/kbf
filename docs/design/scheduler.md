@@ -846,13 +846,13 @@ What an operator sees with `js`:
   - *Flat-memory guard* (`FLAT_MEMORY_SLACK_PERMILLE` = 0). The flat memory charged to the
     leases of a node, the new lease's own included, stays within the node's memory. With no
     prediction a lease is charged no memory, so the guard counts only the leases that carry
-    one (a retry up the memory ladder, a VM) until predictions give leases a memory; in
-    `--placement-load on` alone it admits nearly everything.
+    one (a retry up the memory ladder, a VM) unless `--placement-predictions on` gives leases
+    a memory; in `--placement-load on` alone it admits nearly everything.
   - *Expected-life delta* (`EXPECTED_LIFE_DELTA_MINUTES` = 2). A new lease is charged until
     the P90 of its key's wall time plus two minutes, not for the whole horizon. The delta
     needs a prediction for the operation and a curve source that knows the key's wall time.
-    This core gives the scheduler neither (`--placement-predictions` is refused with it, and
-    the farm never gives the scheduler a curve source), so the setting is idle today.
+    With `--placement-predictions on` this core gives the scheduler the first, but the farm
+    never gives it a curve source, so the setting is idle today.
   - *Balance scoring.* Nodes are ranked with the scheduler's own balance term, which
     `placement_load.rs` leaves at the scheduler library's value.
 
@@ -863,8 +863,9 @@ What an operator sees with `js`:
   under one core changes nothing there, and `--placement-predictions on` would do nothing for
   small actions on such nodes; a node that has measured and gone stale is not floored. On a
   farm of such nodes `--placement-load on` therefore charges close to the booked rule, and a change
-  in placement is not to be expected from it. `--placement-predictions` is refused with
-  `--scheduler-core js` (see the flag's help).
+  in placement is not to be expected from it. `--placement-predictions` is read under
+  `--scheduler-core js` too (see the flag's help): `on` hands the scheduler the prediction at
+  submit; an operation read back from the state store is charged as with `off`.
 - **Node of another frontend.** The detail of a node that another frontend holds is not
   answered from the store's rows.
 - **Whole-node drain.** A submission's `max_wall` is not given to the scheduler, so a
