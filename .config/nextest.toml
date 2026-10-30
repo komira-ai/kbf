@@ -20,6 +20,12 @@ test-group = 'install-sh-fixture'
 filter = 'package(kbf-mac-provision)'
 test-group = 'mac-provision-scratch'
 
+# The backfill tests wait on the put's own signal, with no deadline of their own, so a put that
+# never ends hangs the test: nextest kills it after 30 s x 4 (the whole test takes milliseconds).
+[[profile.default.overrides]]
+filter = 'package(kbf-front) & (binary(large_backfill) | test(/^large_backfill::tests::/))'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
 # The pull-request profile (`cargo nextest run --profile pr`, and `cargo llvm-cov nextest
 # --profile pr`): the fast gate. A pull request runs every test except the slow ones named
 # below; the push to main runs them all, with the default profile
