@@ -694,15 +694,17 @@ async fn accept_loop(
             _ = stop.changed() => break,
             _ = every.tick() => ticker.lock().await.tick(Instant::now()),
             accepted = listener.accept() => {
-                while connections.try_join_next().is_some() {}
+                // One finished connection is reaped per accept, which keeps the set as small as
+                // the number of connections open.
+                connections.try_join_next();
                 // An accept that failed (descriptor limit) is skipped; the next one retries.
-                if let Ok((stream, _)) = accepted {
+                accepted.into_iter().for_each(|(stream, _)| {
                     if shared.mode_now() == FaultMode::Refuse {
                         shared.bump(&shared.refused, 1);
                     } else {
                         connections.spawn(serve(Arc::clone(&shared), stream));
                     }
-                }
+                });
             }
         }
     }
