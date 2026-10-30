@@ -914,6 +914,78 @@ fn check_waives_the_version_facts_of_a_release_made_before_them_and_only_that() 
     assert!(err.contains("does not match its line"), "{err}");
 }
 
+/// [`dist`] with the task image of `platform` and its bundle, and the facts and the SBOM
+/// beside it as `facts` and `sbom` say.
+fn dist_with_task_image(root: &Path, platform: &str, facts: bool, sbom: bool) -> PathBuf {
+    let d = dist(root, COMMIT);
+    let mut sums = std::fs::read_to_string(d.join("SHA256SUMS")).expect("sums");
+    let image = format!("kbf-task-image-{COMMIT}-{platform}.oci.tar");
+    let mut names = vec![image.clone()];
+    if facts {
+        names.push(format!("kbf-task-image-{COMMIT}-{platform}.facts.json"));
+    }
+    if sbom {
+        names.push(format!("kbf-task-image-{COMMIT}-{platform}.cdx.json"));
+    }
+    for name in names {
+        let bytes = format!("{name} bytes");
+        std::fs::write(d.join(&name), &bytes).expect("file");
+        let sha = sha_of(&bytes);
+        sums.push_str(&format!("{sha}  {name}\n"));
+        if name == image {
+            let bundle = d.join(format!("{name}.sigstore.json"));
+            std::fs::write(bundle, bundle_text(&sha)).expect("bundle");
+        }
+    }
+    std::fs::write(d.join("SHA256SUMS"), sums).expect("sums");
+    d
+}
+
+#[test]
+fn check_takes_the_task_image_with_its_facts_and_its_sbom() {
+    // Catches: the image's CycloneDX SBOM refused as no asset of the commit (it is named like a
+    // tarball's SBOM, `<stem>.cdx.json`, with the image's stem), which would stop every release
+    // once the build jobs list it. Control for the next tests.
+    let root = scratch("check-image-sbom");
+    let d = dist_with_task_image(&root, "linux-arm64", true, true);
+    let (code, out, err) = check(&d, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("is an asset of"), "{out}");
+    assert!(out.contains("and 1 package(s)"), "{out}");
+}
+
+#[test]
+fn check_refuses_a_task_image_without_its_sbom_and_waives_it_for_the_previous_release_only() {
+    // Catches: a release whose task image goes without its SBOM (the Ubuntu base's packages
+    // attested nowhere); the waiver of the previous release (made before the image had an SBOM:
+    // `release check previous --without-version-facts`) refused, which would stop the first
+    // release that has one; the waiver taken for the release being made, or for an SBOM with no
+    // image. The control is the set with both.
+    let root = scratch("check-image-no-sbom");
+    let d = dist_with_task_image(&root, "linux-arm64", true, false);
+    let image = format!("kbf-task-image-{COMMIT}-linux-arm64.oci.tar");
+    let sbom = format!("kbf-task-image-{COMMIT}-linux-arm64.cdx.json");
+    let (code, _, err) = check(&d, COMMIT);
+    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(
+        err,
+        format!("xtask: {image}: its image SBOM {sbom} is not listed in SHA256SUMS\n")
+    );
+    let (code, out, err) = check_without_facts(&d, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("is an asset of"), "{out}");
+    // An SBOM with no image is refused with or without the flag.
+    let orphan_root = scratch("check-image-orphan-sbom");
+    let orphan = dist_with(&orphan_root, &sbom);
+    let want =
+        format!("xtask: {sbom}: the image it describes, {image}, is not listed in SHA256SUMS\n");
+    for run in [check, check_without_facts] {
+        let (code, _, err) = run(&orphan, COMMIT);
+        assert_eq!(code, Some(1), "{err}");
+        assert_eq!(err, want);
+    }
+}
+
 #[test]
 fn check_refuses_version_facts_that_are_not_kbfs_for_the_commit() {
     // Catches: any file ending `.version.json` taken as an asset (another binary's, an
