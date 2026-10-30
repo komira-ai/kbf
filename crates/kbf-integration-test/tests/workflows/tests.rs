@@ -1058,6 +1058,7 @@ fn a_matrix_of_another_shape_is_an_error_not_an_empty_answer() {
         )
         .is_err()
     );
+}
 
 /// The `if:` line under which a job may rerun the failed jobs of a pipeline run (`pipeline-rerun.yml`).
 const RERUN_IF: &str = "    if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}\n";
