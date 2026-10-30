@@ -138,11 +138,11 @@ pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
 pub use crate::operations::OperationsService;
 pub use crate::proxy::{
     CommitError, DEFAULT_INFLIGHT_BYTES, DEFAULT_UPLOAD_IDLE_TIMEOUT, Direction, Ingested,
-    IssuedPackKey, MAX_COMMIT_BLOBS, MAX_PACKED_BLOB_BYTES, MAX_UNTRUSTED_BLOB_BYTES,
-    MAX_UNTRUSTED_MANIFEST_BYTES, MAX_UNTRUSTED_PACK_BYTES, MAX_UNTRUSTED_READ_BYTES,
-    MAX_UPLOAD_IDLE_TIMEOUT, MIN_SECRET_BYTES, Meter, Method, MintError, Owner, Owners,
-    PackKeyMint, PackMetrics, PackSettings, PackStore, Packs, Proxy, RejectReason, StoreError,
-    UntrustedLimits, ingest,
+    IssuedKeySet, IssuedPackKey, MAX_COMMIT_BLOBS, MAX_PACKED_BLOB_BYTES, MAX_UNTRUSTED_BLOB_BYTES,
+    MAX_UNTRUSTED_LARGE_BYTES, MAX_UNTRUSTED_MANIFEST_BYTES, MAX_UNTRUSTED_PACK_BYTES,
+    MAX_UNTRUSTED_READ_BYTES, MAX_UPLOAD_IDLE_TIMEOUT, MIN_SECRET_BYTES, Meter, Method, MintError,
+    Owner, Owners, PackKeyMint, PackMetrics, PackSettings, PackStore, Packs, Proxy, RejectReason,
+    StoreError, UntrustedLimits, ingest, ingest_set,
 };
 pub use crate::qos_header::{BadQosAllow, QOS_HEADER, QosAllow};
 pub use crate::recorder::{

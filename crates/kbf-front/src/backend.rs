@@ -41,12 +41,13 @@ mod layered;
 use std::fmt;
 use std::sync::Arc;
 
+use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use kbf_meta::{ActionRecord, ActionWriteError, Role};
-use kbf_objstore::ObjectStore;
+use kbf_objstore::{ObjectStore, ObjectStoreError};
 use kbf_proto::reapi::ActionResult;
 use kbf_route::Router;
-use kbf_storage::{ReadStream, Storage, StorageError};
+use kbf_storage::{OpenPieces, ReadStream, Storage, StorageError};
 use kbf_types::Digest;
 use prost::Message as _;
 
@@ -91,6 +92,11 @@ trait Plane: Send + Sync {
         record: ActionRecord,
     ) -> BoxFuture<'_, Answer<()>>;
     fn walk_inputs(&self, root: Digest) -> BoxFuture<'_, Answer<Walked>>;
+    fn put_streamed<'a>(
+        &'a self,
+        digest: &'a Digest,
+        open: &'a OpenPieces<'a>,
+    ) -> BoxFuture<'a, Answer<()>>;
     fn metrics(&self) -> &CacheMetrics;
     fn render_metrics(&self) -> String;
     fn leadership(&self) -> Option<Leadership>;
@@ -207,6 +213,25 @@ impl Backend {
         self.0.walk_inputs(root).await
     }
 
+    /// Stores the blob `digest` from the pieces `open` gives, a piece at a time and never held
+    /// whole, on the node (or the first owner of the blob, when the farm has a map) that
+    /// stores it; the node checks that the bytes hash to `digest` and stores nothing if they do
+    /// not. The blob is a large one: a blob that fits in memory is [`Storage::put`]'s.
+    ///
+    /// `open` is called for each attempt and must give the blob from its first byte: a write
+    /// that fails over to another owner sends it again.
+    ///
+    /// # Errors
+    /// [`StorageError::DigestMismatch`] or [`StorageError::Invalid`] for bytes that are not
+    /// `digest`'s, an error of `open`'s pieces, or as the store answers.
+    pub async fn put_streamed(
+        &self,
+        digest: &Digest,
+        open: &OpenPieces<'_>,
+    ) -> Result<(), StorageError> {
+        self.0.put_streamed(digest, open).await
+    }
+
     /// What the service counts: the cache's own metrics, or this frontend's.
     #[must_use]
     pub fn metrics(&self) -> &CacheMetrics {
@@ -296,6 +321,24 @@ impl<M: MetaLog, O: ObjectStore + 'static> Plane for Local<M, O> {
 
     fn walk_inputs(&self, root: Digest) -> BoxFuture<'_, Answer<Walked>> {
         Box::pin(async move { self.0.walk_inputs(root).await.map_err(StorageError::from) })
+    }
+
+    fn put_streamed<'a>(
+        &'a self,
+        digest: &'a Digest,
+        open: &'a OpenPieces<'a>,
+    ) -> BoxFuture<'a, Answer<()>> {
+        Box::pin(async move {
+            let body = open()
+                .map(|piece| piece.map_err(|e| ObjectStoreError::Body(e.to_string())))
+                .boxed();
+            let claim = Box::pin(futures::future::ready(Some(*digest)));
+            let stored = self
+                .0
+                .store_streamed_claimed(digest.size_bytes, body, claim)
+                .await;
+            stored_as(stored.map_err(StorageError::from), digest)
+        })
     }
 
     fn metrics(&self) -> &CacheMetrics {
@@ -412,6 +455,21 @@ impl Plane for Remote {
                 committed.await
             }),
         }
+    }
+
+    fn put_streamed<'a>(
+        &'a self,
+        digest: &'a Digest,
+        open: &'a OpenPieces<'a>,
+    ) -> BoxFuture<'a, Answer<()>> {
+        Box::pin(async move {
+            let claim = Box::pin(futures::future::ready(Some(*digest)));
+            let stored = self
+                .storage
+                .put_streamed(digest.size_bytes, open(), claim)
+                .await;
+            stored_as(stored, digest)
+        })
     }
 
     fn walk_inputs(&self, root: Digest) -> BoxFuture<'_, Answer<Walked>> {
@@ -574,6 +632,17 @@ impl Plane for RoutedPlane {
         }
     }
 
+    fn put_streamed<'a>(
+        &'a self,
+        digest: &'a Digest,
+        open: &'a OpenPieces<'a>,
+    ) -> BoxFuture<'a, Answer<()>> {
+        match self.routing() {
+            Some(router) => Box::pin(router.put_streamed(digest, open)),
+            None => self.bootstrap.put_streamed(digest, open),
+        }
+    }
+
     fn metrics(&self) -> &CacheMetrics {
         self.bootstrap.metrics()
     }
@@ -584,6 +653,17 @@ impl Plane for RoutedPlane {
 
     fn leadership(&self) -> Option<Leadership> {
         None
+    }
+}
+
+/// A streamed put's answer as the write's: the blob is stored when the store says it stored
+/// `digest`; anything else a store answers (a withdrawn claim, another digest) is not.
+fn stored_as(answer: Answer<Option<Digest>>, digest: &Digest) -> Answer<()> {
+    match answer? {
+        Some(stored) if stored == *digest => Ok(()),
+        other => Err(StorageError::Internal(format!(
+            "a store answered {other:?} for the streamed blob {digest}"
+        ))),
     }
 }
 
