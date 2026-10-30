@@ -2,19 +2,10 @@
 //! executor refuses to post at all.
 
 use kbf_front::Finished;
-use kbf_lease_client::Mount;
 use kbf_server::executor::MintError;
 use tonic::Code;
 
 use crate::rig::{Posted, Rig};
-
-fn mount(rel: &str) -> Mount {
-    Mount {
-        root_name: "kbf-tools".to_owned(),
-        rel: rel.to_owned(),
-        ro: true,
-    }
-}
 
 fn code(finished: &Finished) -> Code {
     match finished {
@@ -31,16 +22,16 @@ async fn posted(rig: &mut Rig) -> Posted {
 }
 
 /// Catches a posted run that gives the action more than it should or leaks what it must not:
-/// the task tool is mounted read-only and alone (a writable mount lets the action replace the
-/// tool for the next run on the host), the labels, which every list of runs shows and which
+/// nothing is mounted into the container (the task tool is the kbf image's entrypoint, not a
+/// host file the action could replace), the labels, which every list of runs shows and which
 /// are not secret-safe, hold the run's nonce and nothing else, neither secret appears in any
-/// argument but the flag that carries it, and the optional flags (a plain-http `PUT`, a root
-/// certificate, a working directory) are absent unless the config asks.
+/// argument but the flag that carries it, and the optional flags (a plain-http `PUT`, a working
+/// directory), and the retired `--root-der`, are absent unless the config asks.
 #[tokio::test(start_paused = true)]
-async fn a_run_holds_the_tool_read_only_and_no_secret_outside_its_flags() {
+async fn a_run_mounts_nothing_and_holds_no_secret_outside_its_flags() {
     let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
     let run = posted(&mut rig).await;
-    assert_eq!(rig.fake.run_mounts(&run.run), Some(vec![mount("kbf-task")]));
+    assert_eq!(rig.fake.run_mounts(&run.run), Some(Vec::new()));
     let listed = rig.api.runs(run.lease).await.expect("runs");
     let labels = &listed[0].labels;
     assert_eq!(labels.len(), 1, "{labels:?}");
@@ -74,28 +65,21 @@ async fn a_run_holds_the_tool_read_only_and_no_secret_outside_its_flags() {
     }
 }
 
-/// Catches the config's choices not reaching the run: with a plain-http `PUT`, a root
-/// certificate and a working directory asked for, the flags are passed, and the certificate
-/// is mounted read-only beside the tool at the path the flag names (the agent mounts one path
-/// to one place, so a certificate that is not mounted cannot be read and the tool exits on
-/// every run).
+/// Catches the config's choices not reaching the run: with a plain-http `PUT` and a working
+/// directory asked for, the flags are passed, after the task tool's own, and still nothing is
+/// mounted.
 #[tokio::test(start_paused = true)]
 async fn the_configs_choices_reach_the_run() {
     let mut rig = Rig::start(&["node1"], 1, |cfg| {
         cfg.allow_plain_http_put = true;
-        cfg.root_der = Some("farm-ca.der".to_owned());
         cfg.work_dir = Some("/scratch/work".to_owned());
     })
     .await;
     let run = posted(&mut rig).await;
-    assert_eq!(run.args[0], "/mnt/kbf-tools/kbf-task");
-    assert_eq!(run.arg("--root-der"), Some("/mnt/kbf-tools/farm-ca.der"));
+    assert_eq!(run.args[0], "--action");
     assert_eq!(run.arg("--work-dir"), Some("/scratch/work"));
     assert!(run.args.iter().any(|a| a == "--allow-plain-http-put"));
-    assert_eq!(
-        rig.fake.run_mounts(&run.run),
-        Some(vec![mount("kbf-task"), mount("farm-ca.der")])
-    );
+    assert_eq!(rig.fake.run_mounts(&run.run), Some(Vec::new()));
 }
 
 /// Catches a bearer token sent in clear: a read grant that is not served over https is
@@ -144,26 +128,6 @@ async fn a_pack_url_that_is_not_https_is_posted_only_when_plain_http_is_allowed(
             }
         }
     }
-}
-
-/// Catches an image with an entrypoint being run: the lease server appends the arguments to
-/// it, the secrets go to that program and the task tool never runs. The caller is told the
-/// action cannot run here, and nothing is posted.
-#[tokio::test(start_paused = true)]
-async fn an_image_with_an_entrypoint_is_refused_to_its_caller() {
-    let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
-    rig.pump().await;
-    rig.inputs
-        .facts
-        .lock()
-        .expect("facts")
-        .as_mut()
-        .expect("ok")
-        .has_entrypoint = true;
-    let caller = rig.submit(3);
-    let finished = rig.until_done(&caller, 3).await;
-    assert_eq!(code(&finished), Code::InvalidArgument, "{finished:?}");
-    assert!(rig.runs().await.is_empty());
 }
 
 /// Catches a run the preparation refuses (an input not held, a tree over budget) being rerun as
