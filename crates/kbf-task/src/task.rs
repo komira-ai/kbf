@@ -16,7 +16,7 @@
 //! | 0 | the action ran (whatever its exit code, a timeout included) and its pack was stored |
 //! | 2 | the flags are wrong (clap) |
 //! | 10 | fetch: the Action, the Command or an input could not be read or checked, or laid out |
-//! | 11 | run-start: the Command could not be started (bad paths, no program) |
+//! | 11 | run-start: the Command could not be started (bad paths, no program), or the run's `private/` home, tmp and cache directories could not be made |
 //! | 12 | pack: the outputs could not be collected, did not fit one pack (`output-too-large`), or made a manifest or pack the frontend would refuse (`invalid-manifest`, `invalid-pack`) |
 //! | 13 | put: the pack could not be stored (refused, key already taken, still no room after the retries of a 503, unreachable) |
 //! | 14 | setup: `--lease` is not a build id, a credential or root certificate is unusable, a credential given as a flag value without `--insecure-argv-secrets`, or the runtime did not start |
@@ -106,6 +106,11 @@ pub struct Cli {
     /// The base URL of the read grant: blobs are read from `<base>/<hex>/<size>`.
     #[arg(long)]
     pub grant_url: String,
+    /// The most requests to the read grant in flight at once while the input tree is fetched, 1 to
+    /// 256. The tree is read breadth-first: each level's Directory messages together, then every
+    /// distinct file blob, each streamed to disk.
+    #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u16).range(1..=256))]
+    pub fetch_concurrency: u16,
     /// A file holding the read grant's bearer token (a trailing newline is dropped).
     #[arg(long)]
     pub grant_token_file: Option<PathBuf>,
@@ -131,7 +136,11 @@ pub struct Cli {
     /// The Action to run, as `<64 lowercase hex digits>/<size>`.
     #[arg(long, value_parser = digest::parse)]
     pub action: Digest,
-    /// Where the inputs are laid out (`in/` under it) and the output streams are written.
+    /// Where the inputs are laid out (`in/` under it) and the output streams are written. The
+    /// Command's `HOME`, `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH` name directories
+    /// under `private/` here, made new for the run (an existing `private` is refused) with mode 0700, beside `in/` and so never collected as outputs: a job's
+    /// image root is read-only and its `/tmp` is small and `noexec`. A variable the Command sets
+    /// itself keeps its value.
     #[arg(long, default_value = "/scratch/work")]
     pub work_dir: PathBuf,
     /// The longest the Command may run, in milliseconds: the Action's timeout when it sets a
@@ -238,15 +247,22 @@ pub async fn execute(
         fetch_message(source, &named("command", action.command_digest.as_ref())?)?;
     let input_root = named("input root", action.input_root_digest.as_ref())?;
     let root = cli.work_dir.join("in");
-    materialize(source, &input_root, &root)?;
+    materialize(
+        source,
+        &input_root,
+        &root,
+        usize::from(cli.fetch_concurrency),
+    )?;
     let fetch_ms = millis(fetching.elapsed());
 
     let stdout = cli.work_dir.join("stdout");
     let stderr = cli.work_dir.join("stderr");
+    let private = cli.work_dir.join("private");
     let ran = run(
         &command,
         &Run {
             root: &root,
+            private: &private,
             stdout: &stdout,
             stderr: &stderr,
             deadline: deadline(&action, Duration::from_millis(cli.deadline_ms)),
