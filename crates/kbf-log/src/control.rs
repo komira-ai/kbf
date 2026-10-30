@@ -553,6 +553,7 @@ fn from_resources(
         memory_bytes: r.memory_bytes,
         gpus: r.gpus,
         vms: r.vms,
+        disk_bytes: 0,
         leases: r.leases,
     })
 }
@@ -642,6 +643,7 @@ fn from_request(r: proto::Request) -> Result<Request, DecodeError> {
         needs,
         hermetic: r.hermetic,
         do_not_cache: r.do_not_cache,
+        whole_worker: false,
     })
 }
 

@@ -113,6 +113,7 @@ fn request(tag: u8, resources: Resources) -> Request {
         resources,
         hermetic: true,
         do_not_cache: false,
+        whole_worker: false,
         needs: kbf_caps::Request::default(),
     }
 }
