@@ -129,7 +129,7 @@ fn cold_run_file(dir: &TestDir) -> std::path::PathBuf {
     let path = dir.path().join("run.json");
     std::fs::write(
         &path,
-        r#"{"stores": {"cold": {"endpoint": "http://127.0.0.1:9", "bucket": "b",
+        r#"{"stores": {"cold": {"endpoint": "http://127.0.0.1:9", "bucket": "bench-test",
             "access_key_id": "k", "secret_access_key": "s"}}}"#,
     )
     .unwrap();
