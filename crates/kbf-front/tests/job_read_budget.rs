@@ -4,7 +4,7 @@
 //! The source yields while a read is open, so that reads that are allowed to overlap do, and
 //! records the most reads, and the most bytes of them, that were ever open at once.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -44,6 +44,10 @@ struct Source {
     many_open: Mutex<(usize, usize)>,
     /// Answers `read_many` with its first answer only.
     short_many: AtomicBool,
+    /// Digests the store does not hold, though they are in the tree.
+    hidden: Mutex<HashSet<Digest>>,
+    /// The store fails every read it is asked for.
+    broken: AtomicBool,
     gate: Option<(Digest, Semaphore)>,
 }
 
@@ -51,6 +55,29 @@ impl Source {
     fn reads_of(&self, digest: &Digest) -> usize {
         let reads = self.reads.lock().unwrap_or_else(PoisonError::into_inner);
         reads.iter().filter(|read| *read == digest).count()
+    }
+
+    fn hide(&self, digest: Digest) {
+        self.hidden
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(digest);
+    }
+
+    /// What the store answers for `digest`.
+    fn answer(&self, digest: &Digest) -> Result<Bytes, StorageError> {
+        let hidden = self
+            .hidden
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(digest);
+        if self.broken.load(Ordering::SeqCst) {
+            return Err(StorageError::Unreachable(*digest));
+        }
+        match self.blobs.get(digest) {
+            Some(bytes) if !hidden => Ok(bytes.clone()),
+            _ => Err(StorageError::NotFound(*digest)),
+        }
     }
 
     fn most(&self) -> (usize, u64) {
@@ -86,10 +113,7 @@ impl BlobSource for Source {
                 open.now -= 1;
                 open.bytes -= digest.size_bytes;
             }
-            self.blobs
-                .get(digest)
-                .cloned()
-                .ok_or(StorageError::NotFound(*digest))
+            self.answer(digest)
         })
     }
 
@@ -127,11 +151,7 @@ impl BlobSource for Source {
             } else {
                 digests.len()
             };
-            digests
-                .iter()
-                .take(take)
-                .map(|d| self.blobs.get(d).cloned().ok_or(StorageError::NotFound(*d)))
-                .collect()
+            digests.iter().take(take).map(|d| self.answer(d)).collect()
         })
     }
 
@@ -140,10 +160,7 @@ impl BlobSource for Source {
         digest: &'a Digest,
     ) -> BoxFuture<'a, Result<ReadStream, StorageError>> {
         Box::pin(async move {
-            let blob = self
-                .blobs
-                .get(digest)
-                .ok_or(StorageError::NotFound(*digest))?;
+            let blob = self.answer(digest)?;
             let chunks: Vec<Result<Bytes, StorageError>> = blob
                 .chunks(1024)
                 .map(|c| Ok(Bytes::copy_from_slice(c)))
@@ -222,6 +239,8 @@ fn rig(blobs: HashMap<Digest, Bytes>, gate: Option<Digest>, limits: Limits) -> R
         many: Mutex::new(Vec::new()),
         many_open: Mutex::new((0, 0)),
         short_many: AtomicBool::new(false),
+        hidden: Mutex::new(HashSet::new()),
+        broken: AtomicBool::new(false),
         gate: gate.map(|digest| (digest, Semaphore::new(0))),
     });
     let read = JobRead::new(source.clone(), Arc::clone(&grants), limits);
@@ -917,3 +936,5 @@ async fn a_batch_reads_through_a_backend_and_a_streamed_reply_prints() {
         "{printed}"
     );
 }
+
+mod failures;
