@@ -14,8 +14,10 @@
 //!    temporary directory would otherwise fail; and since outputs are collected relative to the
 //!    input root, nothing written there is packed. A variable the Command sets itself keeps its
 //!    value. A directory that cannot be made fails the run start (exit 11). The Command has no
-//!    network: it and everything it starts can make no socket but a Unix one, and no io_uring
-//!    ([`network`]; the platform property `kbf-network=allow` lifts that for one action, and any
+//!    network: it and everything it starts can make no socket but a Unix one, and no io_uring,
+//!    and it runs in a network namespace of its own where the host allows one; one line says
+//!    which ([`network`]; this tool is non-dumpable from its first instruction, so the Command
+//!    cannot take its sockets; the platform property `kbf-network=allow` lifts that for one action, and any
 //!    other value of it fails the run start before the inputs are fetched);
 //! 3. collects the declared outputs as REAPI does ([`outputs`]): files, directories as Trees,
 //!    symlinks, the executable bit;

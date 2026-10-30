@@ -33,7 +33,7 @@ use tokio::fs;
 use tokio::process::Command as Process;
 
 use crate::fetch;
-use crate::network::{self, Network};
+use crate::network::{self, Layers, Network};
 
 /// The exit code reported for a run the deadline ended: 128 plus SIGKILL.
 pub const TIMED_OUT_EXIT_CODE: i32 = 128 + 9;
@@ -72,6 +72,8 @@ pub struct Ran {
     pub cpu_us: u64,
     /// The largest resident set of any reaped child, in bytes.
     pub peak_rss_bytes: u64,
+    /// The layers that kept the Command off the network ([`network`]).
+    pub layers: Layers,
 }
 
 /// Where a Command runs and where its output streams go.
@@ -143,7 +145,7 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         .stderr(stderr)
         .process_group(0)
         .kill_on_drop(true);
-    network::confine(&mut process, run.network)?;
+    let confinement = network::confine(&mut process, run.network)?;
 
     let cpu_before = children_usage().cpu_us;
     let started = Instant::now();
@@ -152,6 +154,7 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         source,
     };
     let mut child = process.spawn().map_err(spawn_error)?;
+    let layers = confinement.layers();
     // Taken before the wait: the pid is also the id of the group the child leads.
     let group = child.id();
     let waited = tokio::time::timeout(run.deadline, child.wait()).await;
@@ -179,6 +182,7 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         wall_ms,
         cpu_us: usage.cpu_us.saturating_sub(cpu_before),
         peak_rss_bytes: usage.peak_rss_bytes,
+        layers,
     })
 }
 

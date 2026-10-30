@@ -81,6 +81,25 @@ fn the_notice_names_the_action_and_the_property() {
     assert!(!line.contains('\n'));
 }
 
+/// The line operators read to learn which layers confined a run.
+#[test]
+fn the_layers_notice_names_the_action_and_each_layer() {
+    let digest = kbf_segments::sha256(b"an action");
+    let line = |layers| layers_notice(&digest, &layers);
+    assert_eq!(
+        line(Layers::SeccompAndNetns),
+        format!("kbf-task: action {digest}: network: seccomp+netns")
+    );
+    assert_eq!(
+        line(Layers::SeccompOnly {
+            step: "setgroups",
+            errno: 13
+        }),
+        format!("kbf-task: action {digest}: network: seccomp only (netns: setgroups 13)")
+    );
+    assert!(line(Layers::Open).contains("open (kbf-network=allow)"));
+}
+
 /// What the kernel does with a filter: the classic BPF subset the program uses, run on one
 /// system call. Returns the filter's verdict.
 #[cfg(target_os = "linux")]

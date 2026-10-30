@@ -16,7 +16,7 @@ use kbf_proto::reapi::{Action, Command, Digest, Directory, Platform, platform::P
 use kbf_segments::sha256;
 use kbf_task::digest::to_reapi;
 use kbf_task::fetch::{BlobSource, FetchError, label};
-use kbf_task::network::Network;
+use kbf_task::network::{Layers, Network};
 use kbf_task::run::{Ran, Run, run};
 use kbf_task::task::{Cli, EXIT_RUN, Failure, PackSink, execute};
 use kbf_task_pack::read_manifest;
@@ -46,8 +46,8 @@ fn command(args: &[&str]) -> Command {
     }
 }
 
-/// Runs the probe with `args` under `network` and returns its exit code.
-async fn probe_exit(name: &str, network: Network, args: &[&str]) -> i32 {
+/// Runs the probe with `args` under `network`; its exit code and standard output.
+async fn probe_run(name: &str, network: Network, args: &[&str]) -> (Ran, String) {
     let dir = scratch(name);
     let root = dir.join("root");
     std::fs::create_dir_all(&root).expect("root");
@@ -65,7 +65,13 @@ async fn probe_exit(name: &str, network: Network, args: &[&str]) -> i32 {
     .await
     .expect("the probe runs");
     assert!(!ran.timed_out);
-    ran.exit_code
+    let out = std::fs::read_to_string(dir.join("stdout")).expect("stdout");
+    (ran, out)
+}
+
+/// Runs the probe with `args` under `network` and returns its exit code.
+async fn probe_exit(name: &str, network: Network, args: &[&str]) -> i32 {
+    probe_run(name, network, args).await.0.exit_code
 }
 
 /// Catches: a family outside `AF_UNIX` getting a socket by default. IPv4 and IPv6 are the
@@ -298,4 +304,138 @@ async fn any_other_value_or_a_repeat_is_refused_as_a_run_start() {
         assert!(failure.to_string().contains("kbf-network"), "{failure}");
         assert!(sink.0.lock().expect("lock").is_empty());
     }
+}
+
+/// Catches: a 32-bit system call (`int 0x80`, here `getpid`) getting past a filter that compares
+/// system call numbers only: its numbers are another table, where `socketcall` is the one
+/// socket entry. Under the filter the process is killed; without it the call is served.
+#[cfg(target_arch = "x86_64")]
+#[tokio::test]
+async fn a_32_bit_system_call_kills_the_process_unless_the_network_is_allowed() {
+    assert_eq!(
+        probe_exit("int80-denied", Network::Denied, &["int80"]).await,
+        KILLED_BY_SIGSYS
+    );
+    assert_eq!(
+        probe_exit("int80-open", Network::Allowed, &["int80"]).await,
+        0
+    );
+}
+
+/// Catches: the network namespace layer leaving the Command a host interface, or changing the
+/// user it runs as (which would change who owns what it writes). Where the host does not let an
+/// unprivileged user namespace keep its capabilities (AppArmor's
+/// `apparmor_restrict_unprivileged_userns`), the layer reports the step that failed and this
+/// case checks that report instead.
+#[tokio::test]
+async fn the_command_has_a_namespace_of_its_own_with_loopback_only_and_its_own_ids() {
+    let (ran, out) = probe_run("netns-ifaces", Network::Denied, &["ifaces"]).await;
+    let (_, ids) = probe_run("netns-ids", Network::Denied, &["ids"]).await;
+    // SAFETY: no arguments.
+    let own = format!("{} {}\n", unsafe { libc::getuid() }, unsafe {
+        libc::getgid()
+    });
+    match ran.layers {
+        Layers::SeccompAndNetns => {
+            assert_eq!(out.lines().collect::<Vec<_>>(), ["lo"], "{out:?}");
+            assert_eq!(ids, own);
+        }
+        Layers::SeccompOnly { step, errno } => {
+            eprintln!("skipped: this host refuses the namespace layer ({step} {errno})");
+            assert_ne!(errno, 0);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Catches: the layers not being named for a run, in either direction.
+#[tokio::test]
+async fn the_run_says_which_layers_confined_it() {
+    let (ran, _) = probe_run("layers-denied", Network::Denied, &["unix"]).await;
+    let line = ran.layers.to_string();
+    assert!(
+        line == "seccomp+netns" || line.starts_with("seccomp only (netns: "),
+        "{line}"
+    );
+    let (ran, _) = probe_run("layers-open", Network::Allowed, &["unix"]).await;
+    assert_eq!(ran.layers, Layers::Open);
+}
+
+/// What `run_under` printed, `key=value` lines.
+async fn under(name: &str, deny: &str, protect: &str, args: &[&str]) -> (TestDir, String) {
+    let dir = scratch(name);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_run_under"))
+        .arg(dir.join("work"))
+        .args([deny, protect, probe()])
+        .args(args)
+        .output()
+        .expect("run_under starts");
+    let text = String::from_utf8(out.stdout).expect("utf-8");
+    assert!(
+        out.status.success(),
+        "{text} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (dir, text)
+}
+
+/// Catches: a filter that cannot be installed leaving the Command to run with the network
+/// (`let _ = install(..)`): the outer filter answers the `seccomp` call with `EPERM`, the run
+/// must not start, and the program must never have run.
+#[tokio::test]
+async fn a_filter_that_cannot_be_installed_fails_the_run_and_the_command_never_runs() {
+    let marker_dir = scratch("failclosed-marker");
+    let marker = marker_dir.join("marker");
+    let (_, text) = under(
+        "failclosed",
+        "seccomp",
+        "no",
+        &["touch", marker.to_str().expect("utf-8")],
+    )
+    .await;
+    assert!(text.starts_with("error=cannot start "), "{text}");
+    assert!(!text.contains("exit="), "{text}");
+    assert!(!marker.exists(), "the Command ran");
+    // The same run maps to the run-start exit code.
+    let failure = Failure::Run(kbf_task::run::RunError::Invalid(text));
+    assert_eq!(failure.exit_code(), EXIT_RUN);
+}
+
+/// Catches: a namespace step that fails failing the run, or the Command then running without the
+/// filter: with `unshare` refused the Command still runs, under the filter alone, and the
+/// layers say so.
+#[tokio::test]
+async fn a_namespace_that_cannot_be_made_leaves_the_filter_and_says_so() {
+    let marker_dir = scratch("unshare-marker");
+    let marker = marker_dir.join("marker");
+    let (_, text) = under(
+        "unshare",
+        "unshare",
+        "no",
+        &["touch", marker.to_str().expect("utf-8")],
+    )
+    .await;
+    assert_eq!(text, "layers=seccomp only (netns: unshare 1)\nexit=0\n");
+    assert!(marker.exists());
+    let (_, text) = under("unshare-inet", "unshare", "no", &["inet"]).await;
+    assert_eq!(text, "layers=seccomp only (netns: unshare 1)\nexit=1\n");
+}
+
+/// Catches: the tool being open to the Command that runs beside it as the same user: the process
+/// that starts the Command, once made non-dumpable, shows root-owned in `/proc` and refuses
+/// `pidfd_getfd` of the socket it holds. Without it the process is visible as the user's.
+#[tokio::test]
+async fn the_tool_is_non_dumpable_so_the_command_cannot_take_its_sockets() {
+    let (_, text) = under("protect-hidden", "unshare", "yes", &["hidden", "{PID}"]).await;
+    assert!(text.ends_with("exit=0\n"), "{text}");
+    let (_, text) = under(
+        "protect-steal",
+        "unshare",
+        "yes",
+        &["steal", "{PID}", "{FD}"],
+    )
+    .await;
+    assert!(text.ends_with("exit=1\n"), "{text}");
+    let (_, text) = under("unprotected-hidden", "unshare", "no", &["hidden", "{PID}"]).await;
+    assert!(text.ends_with("exit=1\n"), "{text}");
 }

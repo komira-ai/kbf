@@ -266,6 +266,9 @@ pub async fn execute(
         },
     )
     .await?;
+    if network != network::Network::Allowed {
+        eprintln!("{}", network::layers_notice(&cli.action, &ran.layers));
+    }
 
     let packing = Instant::now();
     let paths: Vec<String> = output_paths(&command).into_iter().cloned().collect();

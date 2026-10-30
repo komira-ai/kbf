@@ -428,8 +428,26 @@ property given twice is refused: the action fails without running and `kbf-task`
 (run-start). The name is read in any case. Like every platform property it is part of the
 action digest, so the same action with and without it are two cache entries.
 
-A job that is given a network namespace of its own is a separate, stronger layer and is not
-what this property is about. This property does not reach the Mac driver, which has its own
+Two layers keep the Command off the network. The seccomp filter above is the guarantee. Under
+it, the Command also gets a user and network namespace of its own, with its own user and group
+id inside (`unshare` of `CLONE_NEWUSER|CLONE_NEWNET`, a map of its own ids to themselves, `lo`
+raised), so it sees one interface, `lo`, and has no route. The namespace layer is defence in
+depth: it needs the host to let an unprivileged user namespace keep its capabilities. Where an
+AppArmor setting restricts that (Ubuntu's `apparmor_restrict_unprivileged_userns`, which a
+container profile that allows `userns` lifts) a step fails with `EPERM`, the run goes on under
+the filter alone, and a Command whose maps could not be written sees itself as the overflow
+user (65534). `kbf-task` writes one line per run to standard error:
+
+```
+kbf-task: action <digest>: network: seccomp+netns
+kbf-task: action <digest>: network: seccomp only (netns: <step> <errno>)
+```
+
+where the step is `unshare`, `setgroups`, `uid_map`, `gid_map` or `loopback`. The filter
+refuses `AF_INET` sockets in either case, so `lo` is up and not usable by the Command.
+`kbf-task` also makes itself non-dumpable (`PR_SET_DUMPABLE` 0) before it opens a socket, so
+the Command, which runs as the same user, cannot `ptrace` it, take its sockets with
+`pidfd_getfd` or read its memory through `/proc`. This property does not reach the Mac driver, which has its own
 [`network`](#network) property. Where `kbf-task` is built for a system other than Linux (a developer's machine; the
 release is a Linux build), there is no filter and the tool says so on standard error.
 

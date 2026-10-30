@@ -6,8 +6,14 @@
 //! (a socket of that domain), `pair-inet` or `pair-unix` (`socketpair`), `uring`
 //! (`io_uring_setup`), `x32` (`socket(AF_INET)` under the x32 number, `x86_64` only), or
 //! `child <mode>`: the same, in a copy of this program that this one starts and waits for, to
-//! show that a descendant has the same limits.
+//! show that a descendant has the same limits. Other modes: `touch <path>` makes a file (to show
+//! the program ran), `ifaces` prints the network interfaces it sees, `ids` prints its user and
+//! group id, `int80` (`x86_64`) makes a 32-bit system call, `steal <pid> <fd>` takes a
+//! descriptor out of another process with `pidfd_getfd` (exit 0 if it worked, else the errno),
+//! and `hidden <pid>` exits 0 when `/proc/<pid>/status` is not owned by its own user, which is what a
+//! non-dumpable process looks like.
 
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::{Command, ExitCode};
 
@@ -26,6 +32,12 @@ fn probe(args: &[&str]) -> u8 {
         ["inet"] => socket(libc::AF_INET),
         ["inet6"] => socket(libc::AF_INET6),
         ["unix"] => socket(libc::AF_UNIX),
+        ["touch", path] => u8::from(std::fs::File::create(path).is_err()),
+        ["ifaces"] => ifaces(),
+        ["ids"] => ids(),
+        ["hidden", pid] => hidden(pid),
+        #[cfg(target_arch = "x86_64")]
+        ["int80"] => int80(),
         #[cfg(target_os = "linux")]
         ["netlink"] => socket(libc::AF_NETLINK),
         #[cfg(target_os = "linux")]
@@ -34,6 +46,8 @@ fn probe(args: &[&str]) -> u8 {
         ["pair-unix"] => pair(libc::AF_UNIX),
         #[cfg(target_os = "linux")]
         ["uring"] => uring(),
+        #[cfg(target_os = "linux")]
+        ["steal", pid, fd] => steal(pid, fd),
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         ["x32"] => x32(),
         _ => UNKNOWN_MODE,
@@ -100,4 +114,64 @@ fn child(rest: &[&str]) -> u8 {
             .unwrap_or(UNKNOWN_MODE),
         Err(_) => UNKNOWN_MODE,
     }
+}
+
+/// Prints the interface names of `/proc/net/dev` that this process's network namespace has.
+fn ifaces() -> u8 {
+    let Ok(text) = std::fs::read_to_string("/proc/net/dev") else {
+        return UNKNOWN_MODE;
+    };
+    for line in text.lines().skip(2) {
+        if let Some((name, _)) = line.split_once(':') {
+            println!("{}", name.trim());
+        }
+    }
+    0
+}
+
+fn ids() -> u8 {
+    // SAFETY: no arguments.
+    println!("{} {}", unsafe { libc::getuid() }, unsafe {
+        libc::getgid()
+    });
+    0
+}
+
+fn hidden(pid: &str) -> u8 {
+    let Ok(meta) = std::fs::metadata(format!("/proc/{pid}/status")) else {
+        return UNKNOWN_MODE;
+    };
+    // SAFETY: no arguments.
+    u8::from(meta.uid() == unsafe { libc::getuid() })
+}
+
+#[cfg(target_os = "linux")]
+fn steal(pid: &str, fd: &str) -> u8 {
+    let (Ok(pid), Ok(fd)) = (pid.parse::<libc::c_long>(), fd.parse::<libc::c_long>()) else {
+        return UNKNOWN_MODE;
+    };
+    // SAFETY: integer arguments only.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if pidfd < 0 {
+        return outcome(pidfd);
+    }
+    // SAFETY: integer arguments only.
+    outcome(unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, fd, 0) })
+}
+
+/// `getpid` through the 32-bit entry (`int 0x80`), which the kernel serves for a 32-bit ABI
+/// process and also for a 64-bit one.
+#[cfg(target_arch = "x86_64")]
+fn int80() -> u8 {
+    let result: u64;
+    // SAFETY: the 32-bit `getpid` (20) reads no memory; the registers it changes are declared.
+    unsafe {
+        std::arch::asm!(
+            "int 0x80",
+            inlateout("rax") 20u64 => result,
+            options(nostack),
+        );
+    }
+    // A result in -4095..0 is an error number (negated).
+    u8::from(result > u64::MAX - 4095)
 }

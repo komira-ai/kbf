@@ -17,6 +17,11 @@ name = "socket_probe"
 path = "src/bin/socket_probe.rs"
 test = false
 
+[[bin]]
+name = "run_under"
+path = "src/bin/run_under.rs"
+test = false
+
 [dependencies]
 clap.workspace = true
 hex.workspace = true
