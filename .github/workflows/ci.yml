@@ -274,22 +274,22 @@ jobs:
           - core: legacy
             part: 1
             parts: 3
-            min_free_gb: 80
+            min_free_gb: 60
             args: --workspace --features tierstore/s3
           - core: legacy
             part: 2
             parts: 3
-            min_free_gb: 80
+            min_free_gb: 60
             args: --workspace --features tierstore/s3
           - core: legacy
             part: 3
             parts: 3
-            min_free_gb: 80
+            min_free_gb: 60
             args: --workspace --features tierstore/s3
           - core: js
             part: 1
             parts: 1
-            min_free_gb: 50
+            min_free_gb: 40
             args: -p kbf-server -p kbf-integration-test -p kbf-daemon -p kbf-node --features kbf-server/farm-core-js
     # A throwaway Postgres server for every test that needs one, the same container as
     # beta.yml's jobs use. KBF_TEST_POSTGRES_URL (below) names it; a test that needs it makes a
@@ -326,14 +326,12 @@ jobs:
           persist-credentials: false
           # The merge commit and its first parent, the base branch (no-lowering --base-ref).
           fetch-depth: 2
-      # The restored target/, the instrumented workspace build and its profiles outgrew a
-      # hosted runner's free disk (runs died with "No space left on device", or the runner
-      # was lost mid-test). Remove toolchains the image preinstalls that this job never
-      # uses; the Postgres service container's image is not touched.
+      # A shard builds one core and holds a third of the legacy profiles, so it fits the free
+      # disk of the image as it is (about 87 GB; the legacy build is about 61 GB), and the removal
+      # of the preinstalled toolchains (1 to 4 minutes) is left to `test`, which holds both builds
+      # and every shard's profiles. The step below refuses early when the room is short.
       - name: Free disk before (report)
         run: df -h /
-      - name: Remove preinstalled toolchains this job does not use
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/powershell /usr/share/swift /usr/local/lib/node_modules
       # Images the runner preloads and this job never runs; the Postgres service container's
       # image is in use, so the prune keeps it.
       - name: Remove container images this job does not use
@@ -371,13 +369,6 @@ jobs:
       # is for.
       - name: Drop the workspace's coverage artifacts the cache restored
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
-      # The cache also restored target/debug, a plain (not instrumented) build of the workspace
-      # that this job does not run: the tests build into target/llvm-cov-target. Carried from
-      # run to run it had grown to 53 GB of a 145 GB runner, which left the tests under the
-      # stores' 5% free-space floor ('the store stopped taking the streamed blob'). Dropping it
-      # before the tests gives them that room.
-      - name: Drop the plain debug build the cache restored
-        run: rm -rf target/debug
       # The instrumented build (about 59 GB measured for the legacy core), the tests' temporary
       # files under it and the file store's 5% free-space floor (about 7.5 GB on this disk) need
       # the room below (`min_free_gb` of the matrix). Short here means the restored cache or the
@@ -480,8 +471,6 @@ jobs:
           restore-keys: cargo-coverage-${{ runner.os }}-${{ runner.arch }}-
       - name: Drop the workspace's coverage artifacts the cache restored
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
-      - name: Drop the plain debug build the cache restored
-        run: rm -rf target/debug
       - run: mkdir -p target/coverage
       # The two builds (about 72 GB together, measured) need the room below.
       - name: Refuse early when the disk is short for the builds (80 GiB free)
