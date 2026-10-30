@@ -2,8 +2,11 @@
 //!
 //! [`run`] does what the daemon's local runtime does for one Command: the working directory and
 //! the parent of every declared output are made first (REAPI makes the worker do it), then the
-//! program is started with the inherited environment cleared and only the Command's variables
-//! set, standard input closed, and standard output and error written to files. A program name with
+//! program is started with the inherited environment cleared, standard input closed, and standard
+//! output and error written to files. Its environment is the run's own `HOME`, `TMPDIR`,
+//! `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH` ([`private_vars`]), naming directories made
+//! new for the run (an existing private directory is refused), then the Command's
+//! variables: a variable the Command sets itself is the Command's. A program name with
 //! a slash is resolved from the working directory, a bare name from the Command's own `PATH`.
 //!
 //! The program leads its own process group. When the deadline passes the whole group is killed
@@ -15,6 +18,7 @@
 //! the program and every descendant it waited for, and are exact only while this tool runs one
 //! Command at a time, which it does.
 
+use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
@@ -71,6 +75,9 @@ pub struct Ran {
 pub struct Run<'a> {
     /// The input root, already laid out; the Command's paths are relative to it.
     pub root: &'a Path,
+    /// Where the run's `home`, `tmp` and `cache` directories are made, new for the run: a path
+    /// that already exists is refused. It must not be inside `root`: outputs are collected relative to `root`, and nothing here is.
+    pub private: &'a Path,
     /// Created (it must not be a symlink to anything unexpected: it is created, not followed).
     pub stdout: &'a Path,
     pub stderr: &'a Path,
@@ -83,7 +90,8 @@ pub struct Run<'a> {
 /// # Errors
 /// [`RunError::Invalid`]: no arguments, a working directory or output path that is not relative
 /// and plain, or one the input root made something other than a directory (a symlink or a file).
-/// [`RunError::Io`]: a directory or an output stream file could not be made.
+/// [`RunError::Io`]: a directory (the run's private ones included) or an output stream file could
+/// not be made.
 /// [`RunError::Spawn`]: the program could not be started.
 pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
     let Some(program) = command.arguments.first() else {
@@ -102,6 +110,7 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         let parent = output.rsplit_once('/').map_or("", |(parent, _)| parent);
         real_dirs(&work_dir, parent).await?;
     }
+    let private = private_vars(run.private).await?;
     let stdout = create(run.stdout)?;
     let stderr = create(run.stderr)?;
     let program = if program.contains('/') {
@@ -114,6 +123,7 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         .args(&command.arguments[1..])
         .current_dir(&work_dir)
         .env_clear()
+        .envs(private)
         .envs(
             command
                 .environment_variables
@@ -161,6 +171,48 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         cpu_us: usage.cpu_us.saturating_sub(cpu_before),
         peak_rss_bytes: usage.peak_rss_bytes,
     })
+}
+
+/// The directories made under the run's private directory, parents first.
+const PRIVATE_DIRS: [&str; 5] = [
+    "home",
+    "tmp",
+    "cache",
+    "cache/clang",
+    "cache/clang/ModuleCache",
+];
+
+/// The variable naming each of those directories. The image root of a job is read-only and its
+/// `/tmp` is small and `noexec`, so a tool that writes under `~`, the temporary directory or a
+/// per-user cache (`clang` keeps its module cache there) needs these.
+const PRIVATE_VARS: [(&str, &str); 4] = [
+    ("HOME", "home"),
+    ("TMPDIR", "tmp"),
+    ("XDG_CACHE_HOME", "cache"),
+    ("CLANG_MODULE_CACHE_PATH", "cache/clang/ModuleCache"),
+];
+
+/// Makes `private` and the run's home, temporary and cache directories under it, new for this
+/// run and each readable by this user alone (mode 0700), and returns the variables that name
+/// them. Nothing is created recursively, so a `private` that already exists (a directory with
+/// an earlier run's files, a file, a symlink) is refused rather than reused or followed.
+async fn private_vars(private: &Path) -> Result<Vec<(&'static str, OsString)>, RunError> {
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(private).await.map_err(|e| {
+        io(private)(std::io::Error::new(
+            e.kind(),
+            format!("cannot make the run's private directory (an existing one is refused): {e}"),
+        ))
+    })?;
+    for sub in PRIVATE_DIRS {
+        let path = private.join(sub);
+        builder.create(&path).await.map_err(io(&path))?;
+    }
+    Ok(PRIVATE_VARS
+        .iter()
+        .map(|(name, sub)| (*name, private.join(sub).into_os_string()))
+        .collect())
 }
 
 /// The output paths a Command declares: `output_paths` (REAPI 2.1), else the older
@@ -254,6 +306,8 @@ fn children_usage() -> ChildrenUsage {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
     use kbf_proto::reapi::command::EnvironmentVariable;
     use kbf_testkit::dir::TestDir;
 
@@ -280,12 +334,17 @@ mod tests {
             self.dir.join("root")
         }
 
+        fn private(&self) -> PathBuf {
+            self.dir.join("private")
+        }
+
         async fn run(&self, command: &Command, deadline: Duration) -> Result<Ran, RunError> {
             let root = self.root();
             run(
                 command,
                 &Run {
                     root: &root,
+                    private: &self.private(),
                     stdout: &self.stdout,
                     stderr: &self.stderr,
                     deadline,
@@ -350,13 +409,14 @@ mod tests {
 
     #[tokio::test]
     async fn the_exit_code_is_reported() {
-        let rig = Rig::new("exit");
-        // `env` exits 127 when it cannot find the program it was asked to run.
+        // `env` exits 127 when it cannot find the program it was asked to run. Each run gets its
+        // own work directory: a run refuses a `private` directory an earlier one left.
         for (argv, code) in [
             (vec!["/bin/true"], 0),
             (vec!["/bin/false"], 1),
             (vec!["/usr/bin/env", "./no-such-program"], 127),
         ] {
+            let rig = Rig::new(&format!("exit-{code}"));
             let ran = rig.run(&program(&argv), LONG).await.expect("ran");
             assert_eq!(ran.exit_code, code, "{argv:?}");
             assert!(!ran.timed_out);
@@ -394,7 +454,133 @@ mod tests {
             "{out}"
         );
         assert!(!names.contains(&"KBF_TASK_ONLY_MINE"), "{out}");
-        assert!(!names.contains(&"HOME"), "{out}");
+        // Only the run's own four are added to the Command's.
+        for name in [
+            "HOME",
+            "TMPDIR",
+            "XDG_CACHE_HOME",
+            "CLANG_MODULE_CACHE_PATH",
+        ] {
+            assert!(names.contains(&name), "{name}: {out}");
+        }
+        assert_eq!(names.len(), 5, "{out}");
+    }
+
+    /// Prints the run's environment as a map.
+    async fn env_of(rig: &Rig, command: &Command) -> std::collections::HashMap<String, String> {
+        rig.run(command, LONG).await.expect("ran");
+        rig.out()
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect()
+    }
+
+    /// Catches: a Command that gets no `HOME`, `TMPDIR`, `XDG_CACHE_HOME` or
+    /// `CLANG_MODULE_CACHE_PATH`, or one that names a directory that does not exist or sits
+    /// inside the input root (where a compiler's scratch would be packed as an output).
+    #[tokio::test]
+    async fn the_command_gets_its_own_home_tmp_and_cache_directories_outside_the_root() {
+        let rig = Rig::new("homes");
+        let env = env_of(&rig, &program(&["/usr/bin/env"])).await;
+        let private = rig.private();
+        for (name, sub) in [
+            ("HOME", "home"),
+            ("TMPDIR", "tmp"),
+            ("XDG_CACHE_HOME", "cache"),
+            ("CLANG_MODULE_CACHE_PATH", "cache/clang/ModuleCache"),
+        ] {
+            assert!(env.contains_key(name), "{name} is unset");
+            let value = &env[name];
+            let path = Path::new(value);
+            assert_eq!(path, private.join(sub), "{name}");
+            assert!(path.is_dir(), "{name}={value}");
+            assert!(!path.starts_with(rig.root()), "{name}={value}");
+            assert_eq!(
+                std::fs::metadata(path).expect("meta").permissions().mode() & 0o777,
+                0o700,
+                "{name}"
+            );
+        }
+    }
+
+    /// Catches: the run's directories overriding a variable the Command sets itself (a build
+    /// that points `TMPDIR` at its own scratch would write somewhere else).
+    #[tokio::test]
+    async fn a_variable_the_command_sets_keeps_the_commands_value() {
+        let rig = Rig::new("override");
+        let mut command = program(&["/usr/bin/env"]);
+        command.environment_variables = vec![var("TMPDIR", "/own/tmp"), var("HOME", "/own/home")];
+        let env = env_of(&rig, &command).await;
+        assert_eq!(env["TMPDIR"], "/own/tmp");
+        assert_eq!(env["HOME"], "/own/home");
+        assert_eq!(
+            Path::new(&env["XDG_CACHE_HOME"]),
+            rig.private().join("cache")
+        );
+    }
+
+    /// Catches: a `private` directory left by an earlier run being reused (its stale files
+    /// seen by this Command) or written to, instead of the run failing as a run start.
+    #[tokio::test]
+    async fn an_existing_private_directory_is_refused_and_left_alone() {
+        let rig = Rig::new("stale");
+        std::fs::create_dir(rig.private()).expect("private");
+        std::fs::write(rig.private().join("stale"), b"old").expect("stale");
+        let error = rig
+            .run(&program(&["/bin/true"]), LONG)
+            .await
+            .expect_err("refused");
+        assert!(matches!(error, RunError::Io { .. }), "{error}");
+        assert!(error.to_string().contains("private"), "{error}");
+        assert_eq!(
+            std::fs::read(rig.private().join("stale")).expect("kept"),
+            b"old"
+        );
+        assert_eq!(std::fs::read_dir(rig.private()).expect("dir").count(), 1);
+        assert!(!rig.stdout.exists());
+    }
+
+    /// Catches: a `private` that is a symlink being followed, so the run's directories (and
+    /// whatever the Command writes there) land in the symlink's target.
+    #[tokio::test]
+    async fn a_private_symlink_is_refused_and_its_target_untouched() {
+        let rig = Rig::new("symlink");
+        let target = TestDir::under(std::env::temp_dir(), "kbf-task-run-symlink-target");
+        std::os::unix::fs::symlink(&*target, rig.private()).expect("link");
+        let error = rig
+            .run(&program(&["/bin/true"]), LONG)
+            .await
+            .expect_err("refused");
+        assert!(matches!(error, RunError::Io { .. }), "{error}");
+        assert_eq!(std::fs::read_dir(&*target).expect("dir").count(), 0);
+        assert!(!rig.stdout.exists());
+    }
+
+    /// Catches: an output path into the run's private directory being accepted, which would
+    /// have the pack collect files from outside the input root.
+    #[tokio::test]
+    async fn an_output_path_out_of_the_root_is_refused_before_the_command_runs() {
+        let rig = Rig::new("escape");
+        let mut command = program(&["/bin/true"]);
+        command.output_paths = vec!["../private/tmp/x".into()];
+        let error = rig.run(&command, LONG).await.expect_err("refused");
+        assert!(matches!(error, RunError::Invalid(_)), "{error}");
+        assert!(!rig.private().exists());
+    }
+
+    /// Catches: the run's directories made for a run that cannot have them (a file where the
+    /// private directory must be) and the Command started anyway with variables naming nothing.
+    #[tokio::test]
+    async fn private_directories_that_cannot_be_made_are_an_io_error() {
+        let rig = Rig::new("blocked");
+        std::fs::write(rig.private(), b"in the way").expect("file");
+        let error = rig
+            .run(&program(&["/bin/true"]), LONG)
+            .await
+            .expect_err("refused");
+        assert!(matches!(error, RunError::Io { .. }), "{error}");
+        assert!(!rig.stdout.exists());
     }
 
     #[tokio::test]
@@ -577,6 +763,7 @@ mod tests {
             &program(&["/bin/true"]),
             &Run {
                 root: &root,
+                private: &rig.private(),
                 stdout: &missing,
                 stderr: &rig.stderr,
                 deadline: LONG,
