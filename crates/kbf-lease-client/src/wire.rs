@@ -217,6 +217,10 @@ pub struct Shape {
     /// The GPU class.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_class: Option<String>,
+    /// Bytes of scratch disk a host books runs against; absent when the server reports none
+    /// (and then it refuses no run for its disk).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
 }
 
 /// Where a host comes from.
@@ -422,6 +426,11 @@ pub struct RunLimits {
     /// uses that time when it is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wall_ms: Option<u64>,
+    /// Bytes of scratch disk the run books on its host (inputs, outputs and the private
+    /// home, tmp and cache). Absent books none; a server that does not know the field is not
+    /// sent it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
 }
 
 /// The body of `POST /v1/leases/{id}/runs`.

@@ -14,6 +14,13 @@
 # opt-in fallback the design keeps off hosts: adding `--operator-api http://127.0.0.1:18002
 # --token-file FILE` makes the agent use it instead, and anything running as kbf-updater can
 # then read it.
+# The marks of the cordons the agent makes (one small file per node and unit) are written to
+# --cordon-dir before every drain, so that directory must be writable under ProtectSystem=strict
+# below: here it is the unit's own StateDirectory. An agent given placed certificates instead of
+# --state-dir (--client-cert, --client-key, --ca) needs a directory of its own for them: add
+# `--cordon-dir /var/lib/kbf-updater` (the StateDirectory below), or name a directory the unit may
+# write with ReadWritePaths=. The agent checks the directory at start and does not start with one
+# it cannot write.
 [Unit]
 Description=kbf-updater agent, this host's update agent
 Documentation=https://github.com/komira-ai/kbf/blob/main/docs/design/updates.md
@@ -25,7 +32,7 @@ Type=simple
 User=kbf-updater
 StateDirectory=kbf-updater
 StateDirectoryMode=0700
-ExecStart=/usr/libexec/kbf/kbf-updater agent --coordinator coordinator.farm.example:8443 --frontend frontend.farm.example:8981 --enroll-frontend frontend.farm.example:8444 --state-dir /var/lib/kbf-updater --channel stable
+ExecStart=/usr/libexec/kbf/kbf-updater agent --coordinator coordinator.farm.example:8443 --frontend frontend.farm.example:8981 --enroll-frontend frontend.farm.example:8444 --state-dir /var/lib/kbf-updater --cordon-dir /var/lib/kbf-updater --channel stable
 Restart=always
 RestartSec=5
 NoNewPrivileges=yes

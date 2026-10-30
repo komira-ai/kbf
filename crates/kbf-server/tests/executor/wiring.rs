@@ -14,7 +14,7 @@ use kbf_front::{
     Packs, SegmentsConfig, Stage, Submission, VerifiedBlob,
 };
 use kbf_lease_client::fake::{FakeLeaseServer, Pool, TOKEN};
-use kbf_lease_client::{LeaseState, Mount, Outcome};
+use kbf_lease_client::{LeaseState, Outcome};
 use kbf_objstore::{Capabilities, MemoryStore, ObjectKey, ObjectStore as _};
 use kbf_pack::{PackKeys, Slot, TaskManifest, Timing, Usage, WriterKind, write_pack};
 use kbf_pack_index::PackIndex;
@@ -34,6 +34,8 @@ use prost::Message as _;
 use crate::rig::{ClockHold, GIB, settle};
 
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
+const KBF_IMAGE: &str =
+    "registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 const IMAGE: &str = "docker://registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// Prepares a run as the frontend does: a key minted under the secret the ingest verifies with,
@@ -67,6 +69,7 @@ impl RunPrepare for Preparing {
             grant_url: "https://grant.test:9400".to_owned(),
             grant_token: Secret::new("read-token"),
             not_after: since.as_secs() + wall.as_secs() + 600,
+            input_bytes: None,
         })
     }
 }
@@ -77,8 +80,8 @@ fn wire(digest: &Digest) -> kbf_proto::reapi::Digest {
 
 /// Catches an executor that does not work end to end as the frontend builds it. The flags
 /// become the executor's config; the action is read from the CAS for its image and timeout; the
-/// run is posted with the task tool's command line, the secrets the preparation made, and the
-/// tool and certificate mounted read-only; a pack the task wrote under the issued key is ingested
+/// run is posted with the task tool's command line, the secrets the preparation made, from
+/// the kbf image and with nothing mounted; a pack the task wrote under the issued key is ingested
 /// by the frontend's own code into the result the caller gets; and stopping releases the lease.
 #[tokio::test(start_paused = true)]
 async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams() {
@@ -152,9 +155,9 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         "--executor-host-memory-gib=16".to_owned(),
         "--executor-host-slots=2".to_owned(),
         "--executor-insecure-argv-secrets".to_owned(),
-        "--executor-images-have-no-entrypoint".to_owned(),
+        format!("--executor-base-image={IMAGE}"),
+        format!("--executor-kbf-image={KBF_IMAGE}"),
         "--executor-allow-plain-http-put".to_owned(),
-        "--executor-root-der=farm-ca.der".to_owned(),
         "--executor-work-dir=/scratch".to_owned(),
     ];
     let matches = frontend::command()
@@ -256,7 +259,6 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         .to_owned();
     assert!(pack_key.starts_with(&key), "{pack_key}");
     let expected: Vec<String> = [
-        "/mnt/kbf-tools/kbf-task",
         "--action",
         &format!("{}/{}", action.hash_hex(), action.size_bytes),
         "--lease",
@@ -270,8 +272,6 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         &format!("http://tier.test/{pack_key}?sig=put"),
         "--grant-token",
         "read-token",
-        "--root-der",
-        "/mnt/kbf-tools/farm-ca.der",
         "--work-dir",
         "/scratch",
         "--allow-plain-http-put",
@@ -280,15 +280,10 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
     .map(ToString::to_string)
     .collect();
     assert_eq!(args, expected);
-    let mount = |rel: &str| Mount {
-        root_name: "kbf-tools".to_owned(),
-        rel: rel.to_owned(),
-        ro: true,
-    };
-    assert_eq!(
-        fake.run_mounts(&posted.run_id),
-        Some(vec![mount("kbf-task"), mount("farm-ca.der")])
-    );
+    // The run is launched from the kbf image, not the base the action names, with nothing
+    // mounted: the task tool is that image's entrypoint.
+    assert_eq!(fake.run_image(&posted.run_id).as_deref(), Some(KBF_IMAGE));
+    assert_eq!(fake.run_mounts(&posted.run_id), Some(Vec::new()));
     assert_eq!(fake.run_wall_ms(&posted.run_id), Some(390_000));
 
     // The task writes its pack under the key it was issued, and exits 0: the action ran, and

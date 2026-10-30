@@ -214,7 +214,8 @@ pub trait Runtime: Send + Sync + 'static {
 
     /// Stops a running lease. Returns once its work has stopped; the lease's `run` then
     /// ends with [`RuntimeError::Killed`]. Killing a lease that is not running does
-    /// nothing.
+    /// nothing. The daemon calls it only after the lease's [`Runtime::run`] has been
+    /// polled once, so `run` must register what `kill` stops before its first `.await`.
     fn kill(&self, lease_id: LeaseId) -> impl Future<Output = ()> + Send;
 }
 
