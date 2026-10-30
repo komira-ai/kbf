@@ -29,7 +29,7 @@ use tonic::Status;
 use super::adapter::{KbfAdapter, Wall, wire_lease};
 use super::ext::KbfExt;
 use super::host::{Caller, Connection};
-use super::learning::Sized;
+use super::learning::{Ask, Sized};
 use crate::action_usage::{Measured, Shapes};
 use crate::answer;
 use crate::farm::Reported;
@@ -150,17 +150,33 @@ pub fn submit(
         usage,
         platform: Platform::of(&submission.request.needs),
     };
+    // The prediction (`--placement-predictions`) is asked for in a hold of the core of its own,
+    // before the submit's: the core charges it from the operation's first placement round.
+    // `shadow` hands the core nothing.
+    let (forecast, on) = core.with(|view, adapter| {
+        let ask = Ask {
+            request: &submission.request,
+            instance: &caller.key.instance,
+            platform: &caller.platform,
+            subject: &caller.usage,
+        };
+        (
+            adapter.forecast_submit(view, &sized, ask),
+            adapter.hands_predictions(),
+        )
+    });
+    let prediction = forecast.and_then(Result::ok).filter(|_| on);
     let (sender, stage) = tokio::sync::watch::channel(Stage::Queued);
     let enrol = |adapter: &mut KbfAdapter, admitted: &Admitted| {
         adapter.enrol(admitted, caller, call, sender);
     };
     let admitted = core
-        .submit(now, submission.request, &parcel, enrol)
+        .submit_with(now, submission.request, &parcel, None, prediction, enrol)
         .map_err(unavailable)?;
     // A caller that joined an operation that holds a lease sees it executing.
     core.with(|view, adapter| {
         adapter.mark_joined(view, &admitted);
-        adapter.learn_submit(view, &admitted, &sized);
+        adapter.learn_submit(view, &admitted, &sized, forecast);
     });
     Ok(Ticket {
         name: stored_name(admitted.operation),

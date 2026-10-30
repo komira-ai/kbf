@@ -20,7 +20,8 @@
 //! 52 bytes per index entry and a 32-byte trailer), the same count the segment writer applies,
 //! so a planned pack is never refused by it.
 //!
-//! This is a pure function of its arguments. The run does not call it yet.
+//! This is a pure function of its arguments; the run calls it once the outputs are collected
+//! ([`crate::task`]).
 
 use std::collections::BTreeSet;
 

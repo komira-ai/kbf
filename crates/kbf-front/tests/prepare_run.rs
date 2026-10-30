@@ -27,6 +27,8 @@ use tierstore::server::{PresignRequest, presign_put};
 
 #[path = "prepare_run/faults.rs"]
 mod faults;
+#[path = "prepare_run/keyset.rs"]
+mod keyset;
 #[path = "prepare_run/start.rs"]
 mod start;
 
@@ -332,6 +334,8 @@ fn config() -> RunPrepConfig {
             bucket: BUCKET.to_owned(),
             key: AccessKey::new(KEY_ID, KEY_SECRET),
         },
+        max_packs: 1,
+        large: None,
         read_url: READ_URL.to_owned(),
         run_wall: WALL,
         slack: SLACK,

@@ -44,6 +44,7 @@ fn request(qos: Qos, kind: LeaseKind) -> Request {
         needs: kbf_caps::Request::parse([("arch", "arm64")]).expect("request"),
         hermetic: true,
         do_not_cache: true,
+        whole_worker: false,
     }
 }
 
@@ -504,4 +505,66 @@ fn every_enum_value_has_its_number() {
         &format!("12230a01771200 1a1c0a020801{consumables}").replace(' ', ""),
     );
     check("arch and consumables", &capacity, &hex);
+}
+
+/// The `Capacity` input of the golden set, with `disk_bytes` 7: the resources message gains
+/// `disk_bytes` (field 6, `30 07`) at its end and nothing else moves, so the
+/// capacity (12) is 0x42 bytes, the input (1a) 0x44, the batch 0x4a.
+///
+/// Catches: a disk field with another number or type (a second binary would read the
+/// disk as another dimension), and a disk the encoder drops (a restart would book none).
+#[test]
+fn a_capacity_with_disk_bytes_writes_field_6_of_resources() {
+    let capacity = batch(FarmInput::Capacity {
+        worker: w("w"),
+        capacity: resources().with_disk_bytes(7),
+        caps: caps(),
+    });
+    let hex = batch_hex(
+        0x4a,
+        0x44,
+        &format!("12420a0177120a{RESOURCES_HEX}3007 1a31{CAPS_HEX}").replace(' ', ""),
+    );
+    check("capacity with disk", &capacity, &hex);
+}
+
+/// The bytes of the `Capacity` golden, written before `disk_bytes` existed, decode to a
+/// capacity of disk 0; and a capacity of disk 0 encodes to exactly those bytes.
+///
+/// Catches: a reader that refuses a resources message without field 6, one that takes a
+/// default other than 0, and an encoder that writes a zero disk (every committed row and
+/// log entry would change under a new binary).
+#[test]
+fn bytes_without_a_disk_field_read_as_disk_0_and_disk_0_writes_none() {
+    let old = batch_hex(
+        0x48,
+        0x42,
+        &format!("12400a01771208{RESOURCES_HEX}1a31{CAPS_HEX}"),
+    );
+    let capacity = batch(FarmInput::Capacity {
+        worker: w("w"),
+        capacity: resources(),
+        caps: caps(),
+    });
+    assert_eq!(resources().disk_bytes, 0);
+    check("capacity without disk", &capacity, &old);
+}
+
+/// A request of disk 7 (resources `08 01 10 02 30 07`, 6 bytes) in a batch.
+#[test]
+fn a_request_with_disk_bytes_writes_field_6_of_its_resources() {
+    let mut r = request(Qos::Ci, LeaseKind::Action);
+    r.resources = r.resources.with_disk_bytes(7);
+    let with = enc(&batch(FarmInput::Submit(r.clone())));
+    let without = enc(&batch(FarmInput::Submit(request(
+        Qos::Ci,
+        LeaseKind::Action,
+    ))));
+    // Two bytes longer, in the request (+2), its input (+2) and the batch (+2): the old
+    // resources bytes `220408011002` become `2206080110023007`.
+    let (with_hex, without_hex) = (hex::encode(&with), hex::encode(&without));
+    assert!(without_hex.contains("220408011002"), "{without_hex}");
+    assert!(with_hex.contains("2206080110023007"), "{with_hex}");
+    assert_eq!(with.len(), without.len() + 2);
+    assert_eq!(dec(&with), Ok(batch(FarmInput::Submit(r))));
 }

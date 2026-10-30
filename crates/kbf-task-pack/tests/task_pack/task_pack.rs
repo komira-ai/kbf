@@ -7,8 +7,8 @@ use kbf_segments::{
 };
 use kbf_task_pack::{
     MAX_MANIFEST_BYTES, MAX_PACK_BYTES, MAX_PACK_RECORDS, MAX_RECORD_BYTES, ManifestError,
-    ShapeError, TaskManifest, TaskPackError, WritePackError, check_shape, read_manifest,
-    read_manifest_with, write_pack, write_pack_with,
+    ShapeError, TaskManifest, TaskPackError, WritePackError, check_records, check_shape,
+    read_manifest, read_manifest_with, write_pack, write_pack_with,
 };
 use kbf_types::{Digest, DigestFunction};
 
@@ -331,6 +331,74 @@ fn a_written_pack_reads_back_to_its_manifest() {
     let manifest: TaskManifest = golden();
     let pack = write_pack(&manifest, &[A_O]).expect("writes");
     assert_eq!(read_manifest(&pack).expect("reads"), manifest);
+}
+
+/// Asserts that a pack that holds no manifest (packs 1.. of a run) may start with a record of any
+/// size up to the record cap: `check_records` accepts a first record over the manifest cap and
+/// returns it, where `check_shape` refuses it as a manifest.
+#[test]
+fn a_first_record_over_the_manifest_cap_is_a_record_but_not_a_manifest() {
+    let big = MAX_MANIFEST_BYTES + 1;
+    let f = footer(&[(big, 0), (7, big)], big + 7);
+    let len = big + 7 + layout::footer_len(2);
+
+    let first = check_records(&f, len).expect("records");
+    assert_eq!((first.offset, first.digest.size_bytes), (0, big));
+    assert_eq!(
+        check_shape(&f, len),
+        Err(ShapeError::ManifestTooLarge { size: big })
+    );
+}
+
+/// Asserts that `check_records` keeps every other rule of the shape: no record, too many, a zero
+/// size record, a record over the cap, a gap, records that stop short of the footer, an object
+/// over the cap. A relaxed manifest bound must not relax these.
+#[test]
+fn check_records_keeps_the_layout_rules() {
+    let records = |recs: &[(u64, u64)], end: u64| {
+        let f = footer(recs, end);
+        check_records(&f, end + layout::footer_len(recs.len() as u64)).map(|e| e.offset)
+    };
+    assert_eq!(records(&[], 0), Err(ShapeError::NoRecords));
+    assert_eq!(
+        records(&[(0, 0), (5, 0)], 5),
+        Err(ShapeError::ZeroSizeRecord { offset: 0 })
+    );
+    assert_eq!(
+        records(&[(MAX_RECORD_BYTES + 1, 0)], MAX_RECORD_BYTES + 1),
+        Err(ShapeError::RecordTooLarge {
+            offset: 0,
+            size: MAX_RECORD_BYTES + 1
+        })
+    );
+    assert_eq!(
+        records(&[(5, 0), (5, 6)], 11),
+        Err(ShapeError::NotContiguous {
+            expected: 5,
+            found: 6
+        })
+    );
+    assert_eq!(
+        records(&[(5, 0)], 6),
+        Err(ShapeError::NotContiguous {
+            expected: 5,
+            found: 6
+        })
+    );
+    let many: Vec<(u64, u64)> = (0..=MAX_PACK_RECORDS as u64).map(|i| (1, i)).collect();
+    assert_eq!(
+        records(&many, MAX_PACK_RECORDS as u64 + 1),
+        Err(ShapeError::TooManyRecords {
+            count: MAX_PACK_RECORDS + 1
+        })
+    );
+    let f = footer(&[(5, 0)], 5);
+    assert_eq!(
+        check_records(&f, MAX_PACK_BYTES + 1),
+        Err(ShapeError::TooLarge {
+            len: MAX_PACK_BYTES + 1
+        })
+    );
 }
 
 /// Asserts that a pack whose manifest names two packs is written and read only by the `_with`

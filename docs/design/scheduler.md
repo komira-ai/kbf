@@ -709,6 +709,28 @@ turns it into one of two outcomes, and the scheduler decides on the committed re
   the farm: where no live node has the first rung's memory, an action that names no
   size is unservable, as one that names that size would be, and is refused after the
   unservable wait; a farm of small nodes sets a lower first rung.
+- **`--no-memory-climb`: no rung above the first booking.** With the flag, set on the
+  server (default off; off is the behaviour above), an own-limit kill does not queue the
+  operation again. The scheduler records the kill as a memory run, as it does a kill at
+  the cap, and finishes the operation `Failed(OutOfMemory)` at the booking it ran with:
+  the first rung, or the GiB its `kbf-book-mem-gib` names. Its callers are told
+  FAILED_PRECONDITION with reason `ACTION_OUT_OF_MEMORY`, the message saying the ladder is
+  off, not that no node is large enough (it passed its memory limit with 4 GiB booked on
+  node-a; the memory ladder is off (--no-memory-climb), so it is not run again with more
+  memory. Runs: 1 (4 GiB on node-a)). The server tells the two apart by the last run: a
+  kill below its cap can only end an operation when the climb is off, and its attempt in the invocation record carries
+  `memory_kill` `own_limit`. No booking, floor or key floor is raised, so every
+  submission of the action starts where the first did. A kill the node made under memory
+  pressure is not the action's: it runs again with the same booking and counts against
+  the farm-fault reruns, with the flag as without it. The ladder's rungs still matter
+  for the first booking only (the first rung). `--learned-sizes on` is allowed with the
+  flag: the booking floor the estimator adds comes from a kill that climbs, which the
+  flag never lets happen; the estimator still takes the kill in as a sample of the
+  action, as it takes any kill, but the scheduler holds no floor from it. The flag is
+  held by the legacy core's scheduler, which a restart builds again from the flag. The js
+  core builds its scheduler inside `js-server-core`, whose configuration has no setting
+  for it yet, so a server given `--no-memory-climb` with `--scheduler-core js` refuses to
+  start (exit status 2). A start logs `memory climb: on` or `memory climb: off`.
 - **The memory floor.** Each raised booking is kept as the memory floor of the
   action's key (instance name and action digest), and a later submission of that key
   books at least the floor, so a known-big action starts at the rung that ran it
@@ -830,9 +852,42 @@ What an operator sees with `js`:
   `operations/<id>` name from `js` still finds it on a farm over a state store: `legacy`
   answers that form from the same `op/`, `queue/` and `done/` rows. A farm with no state
   store (tests only) answers no name of that form.
-- **Node load.** The load a daemon reports on its heartbeat is neither kept nor shown on
-  this core (the node view has no load block), and it does not reach placement, so
-  `--placement-load on` has no load to read; keep `--placement-load off` with `js`.
+- **Node load.** `--placement-load` is read on this core as on `legacy`. The farm accepts
+  the load a daemon reports on its heartbeat by the same rule, keeps it in memory, shows it in
+  the node's detail, and hands each accepted reading to the scheduler, which was built with
+  the load configuration of `placement_load.rs`. With `off`, the default, the scheduler books
+  by the CPUs a lease asks for and reads no load. With `on`, the js scheduler's placement by
+  load is switched on as a whole, not only the reading. `placement_load.rs` pins these
+  settings as constants, and its tests hold them:
+  - *Load predicate.* A node is admitted by its measured load and the load a lease is
+    predicted to add, not by its booked CPUs.
+  - *Profile charging* (`PROFILE`, `PROFILE_MEMORY`, floor 750 thousandths). A key with a
+    learned time profile is charged its cores per minute, checked over the next half hour, and
+    its remaining maximum memory. This core gives the scheduler no profile, so the setting
+    is idle today.
+  - *Flat-memory guard* (`FLAT_MEMORY_SLACK_PERMILLE` = 0). The flat memory charged to the
+    leases of a node, the new lease's own included, stays within the node's memory. With no
+    prediction a lease is charged no memory, so the guard counts only the leases that carry
+    one (a retry up the memory ladder, a VM) unless `--placement-predictions on` gives leases
+    a memory; in `--placement-load on` alone it admits nearly everything.
+  - *Expected-life delta* (`EXPECTED_LIFE_DELTA_MINUTES` = 2). A new lease is charged until
+    the P90 of its key's wall time plus two minutes, not for the whole horizon. The delta
+    needs a prediction for the operation and a curve source that knows the key's wall time.
+    With `--placement-predictions on` this core gives the scheduler the first, but the farm
+    never gives it a curve source, so the setting is idle today.
+  - *Balance scoring.* Nodes are ranked with the scheduler's own balance term, which
+    `placement_load.rs` leaves at the scheduler library's value.
+
+  A node with no usable reading is admitted on the sum of its leases' predicted costs, never
+  by the booked rule. A node that has never sent an accepted reading (a daemon or runtime
+  that takes none, or an agent that reports none) is charged at least 1000 m for each lease
+  (the node's whole CPU capacity, if that is less), whatever the prediction, so a prediction
+  under one core changes nothing there, and `--placement-predictions on` would do nothing for
+  small actions on such nodes; a node that has measured and gone stale is not floored. On a
+  farm of such nodes `--placement-load on` therefore charges close to the booked rule, and a change
+  in placement is not to be expected from it. `--placement-predictions` is read under
+  `--scheduler-core js` too (see the flag's help): `on` hands the scheduler the prediction at
+  submit; an operation read back from the state store is charged as with `off`.
 - **Node of another frontend.** The detail of a node that another frontend holds is not
   answered from the store's rows.
 - **Whole-node drain.** A submission's `max_wall` is not given to the scheduler, so a

@@ -22,6 +22,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use hyper::Method;
 use serde::Deserialize;
@@ -32,6 +33,16 @@ use super::ServerConfig;
 use super::auth::{READ_ONLY, Refusal};
 use super::gc::{NOT_ALLOWED, OUT_OF_SCOPE};
 use super::presign::PUT_ONLY;
+use super::scoped::{NOT_ALLOWED as SCOPED_NOT_ALLOWED, Scopes};
+
+/// The methods of the calls a scoped key may make, whichever the call.
+const SCOPED_METHODS: [Method; 5] = [
+    Method::GET,
+    Method::HEAD,
+    Method::PUT,
+    Method::POST,
+    Method::DELETE,
+];
 
 /// The flag whose files hold the read-only keys.
 const READ_ONLY_FLAG: &str = "--read-only-key-file";
@@ -83,6 +94,8 @@ pub(crate) enum Role {
     PresignPut,
     /// A GC key: list, head and delete under this prefix, header-signed (see `gc`).
     Gc(String),
+    /// A scoped key: read, create and delete under the prefixes of its lists (see `scoped`).
+    Scoped(Arc<Scopes>),
 }
 
 impl Role {
@@ -101,6 +114,7 @@ impl Role {
             Self::Gc(_) if !matches!(*method, Method::GET | Method::HEAD | Method::DELETE) => {
                 Err(NOT_ALLOWED)
             }
+            Self::Scoped(_) if !SCOPED_METHODS.contains(method) => Err(SCOPED_NOT_ALLOWED),
             _ => Ok(()),
         }
     }
@@ -124,6 +138,7 @@ impl Role {
             Self::PresignPut => Err(PUT_ONLY),
             Self::Gc(own) if prefix.starts_with(own.as_str()) && !is_reserved(prefix) => Ok(()),
             Self::Gc(_) => Err(OUT_OF_SCOPE),
+            Self::Scoped(scopes) => scopes.may_list(prefix),
         }
     }
 }
@@ -139,8 +154,13 @@ impl ServerConfig {
         if let Some(key) = found {
             return Some((key.secret.as_str(), Role::ReadOnly));
         }
-        self.gc_key(id)
-            .map(|key| (key.secret(), Role::Gc(key.prefix().to_owned())))
+        let gc = self
+            .gc_key(id)
+            .map(|key| (key.secret(), Role::Gc(key.prefix().to_owned())));
+        gc.or_else(|| {
+            let key = self.scoped_key(id)?;
+            Some((key.secret(), Role::Scoped(key.scopes())))
+        })
     }
 }
 

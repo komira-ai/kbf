@@ -50,14 +50,12 @@ use crate::journal::is_reserved;
 use super::ServerConfig;
 use super::auth::Refusal;
 use super::keys::{AccessKey, read_private_text};
+use super::ops::MULTIPART;
 use super::presign::{PresignError, check_name, validate_prefix};
 use super::request::{Query, Target};
 
 /// The flag whose files hold the GC keys.
 const FLAG: &str = "--gc-key-file";
-
-/// The query parameters that make a request part of a multipart upload.
-const MULTIPART: [&str; 3] = ["partNumber", "uploadId", "uploads"];
 
 pub(crate) const NOT_ALLOWED: Refusal = Refusal {
     code: "AccessDenied",
@@ -92,12 +90,7 @@ impl GcKey {
     /// that is not printable ASCII, and a prefix that does not end in `/` or is not a valid
     /// prefix (see [`validate_prefix`]).
     pub fn new(id: &str, secret: &str, prefix: &str) -> Result<Self, PresignError> {
-        let plain = |c: char| c.is_ascii_graphic() && !"/,=".contains(c);
-        if id.is_empty() || secret.is_empty() || !id.chars().all(plain) {
-            return Err(PresignError::Key(
-                "the id or the secret is empty, or the id is odd",
-            ));
-        }
+        check_credentials(id, secret)?;
         if validate_prefix(prefix).is_err() || !prefix.ends_with('/') {
             return Err(PresignError::Key(
                 "the prefix is not a valid prefix ending in /",
@@ -224,14 +217,39 @@ pub(super) fn permit(
 /// # Errors
 /// What is wrong, naming the id (never a secret).
 pub(super) fn ensure_distinct(others: &[&str], gc: &[GcKey]) -> Result<(), String> {
+    ensure_ids_distinct(others, gc.iter().map(GcKey::id))
+}
+
+/// Refuses an id in `ids` that is in `others` or is given twice in `ids`.
+///
+/// # Errors
+/// What is wrong, naming the id (never a secret).
+pub(super) fn ensure_ids_distinct<'a>(
+    others: &[&str],
+    ids: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
     let mut seen: std::collections::BTreeSet<&str> = others.iter().copied().collect();
-    for key in gc {
-        if !seen.insert(key.id()) {
-            let id = key.id();
+    for id in ids {
+        if !seen.insert(id) {
             return Err(format!(
                 "the access key id {id:?} is used twice among the key flags"
             ));
         }
+    }
+    Ok(())
+}
+
+/// Refuses an empty id or secret, and an id with a `/`, `,`, `=` or a character that is not
+/// printable ASCII: an id is part of a credential scope.
+///
+/// # Errors
+/// [`PresignError::Key`].
+pub(super) fn check_credentials(id: &str, secret: &str) -> Result<(), PresignError> {
+    let plain = |c: char| c.is_ascii_graphic() && !"/,=".contains(c);
+    if id.is_empty() || secret.is_empty() || !id.chars().all(plain) {
+        return Err(PresignError::Key(
+            "the id or the secret is empty, or the id is odd",
+        ));
     }
     Ok(())
 }

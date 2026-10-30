@@ -1703,13 +1703,22 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_pack_untrusted_commits_total` | counter | packs a build wrote through a presigned write that the frontend read, hashed to the last byte and recorded in the pack index (a replay of a commit already recorded is not counted again) |
 | `kbf_pack_untrusted_commit_rejects_total` | counter | commits of such a pack refused with nothing recorded, labelled `reason`: `forbidden` (the key was not the one issued), `shape` (the manifest cannot be a pack's: a cap, an order, a gap, an overlap or a record of no bytes), `footer` (the footer is not the manifest), `mismatch` (a record is not its digest or CRC), `missing` (the pack is not in the store as long as said) or `conflict` (the key was recorded with other contents). A store or an index that failed is not counted. Each refusal also moves `kbf_pack_commit_rejects_total` |
 | `kbf_pack_ingests_total` | counter | packs a task wrote through a presigned write that `ingest` turned into an action result: the action ran (any exit code), whether or not the result was written to the action cache |
-| `kbf_pack_ingest_rejects_total` | counter | packs `ingest` refused, labelled `reason`: `missing` (no object under the key), `wrong_key` (the key was not minted for this lease and action, the manifest is for another lease or action, or the key was recorded with another pack), `too_large` (the pack, its record count, a record or the manifest record is over its cap), `malformed` (a damaged footer or trailer, records out of order, overlapping, with a gap, or one of no bytes), `hash_mismatch` (a record is not its digest), `bad_manifest` (the record at offset 0 is not a valid manifest, or an output tree is not a `Tree`) or `incomplete` (a digest the manifest or a tree names is not a record of the pack) |
+| `kbf_pack_ingest_rejects_total` | counter | packs `ingest` refused, labelled `reason`: `missing` (no object under the key of pack 0), `wrong_key` (a key was not minted for this lease and action or is not in the place its slot names, the manifest is for another lease or action, or a key was recorded with another pack), `too_large` (the pack, its record count, a record or the manifest record is over its cap), `malformed` (a damaged footer or trailer, records out of order, overlapping, with a gap, one of no bytes, or a digest in two places), `hash_mismatch` (a record is not its digest, or a large object is not the blob its digest names: another length, or bytes that do not hash to it), `bad_manifest` (the record at offset 0 is not a valid manifest, it names more packs or other large slots than the keys issued, or an output tree is not a `Tree`) or `incomplete` (a pack beyond the first or a large object is not in the store, or a digest the manifest or a tree names is in no pack and no large object) |
 | `kbf_pack_ingest_unavailable_total` | counter | ingests the object store, the pack index or the action cache could not answer; the pack is not judged and the lease is run again |
+| `kbf_pack_ingest_packs_total` | counter | packs of the runs `ingest` turned into an action result (a run of one pack counts 1): divided by `kbf_pack_ingests_total`, the packs per run |
+| `kbf_pack_ingest_large_bytes_total` | counter | bytes of large objects (raw objects over the record cap that a task wrote under `L<i>` keys) that `ingest` streamed into the CAS, for the runs it turned into an action result |
 | `kbf_executor_leases_held` | gauge | host leases the executor holds now (only with `--executor js-agent`; the `kbf_executor_*` families are absent otherwise) |
 | `kbf_executor_runs_total` | counter | runs the executor ended, labelled `outcome` by what the farm was told: `ran` (the frontend rebuilt the action's result), `infra` (an ending the farm runs again), `timeout` (the action's own), `out_of_memory`, `lost` (the host or the lease server) or `invalid` (an action that cannot run here) |
 | `kbf_executor_ingests_total` | counter | what the ingest of a task's pack came to, labelled `result`: `ok`, `unavailable`, `stopped` (the ingest panicked or was cancelled) or `rejected_<reason>` for each reason of `kbf_pack_ingest_rejects_total` |
 | `kbf_executor_late_starts_total` | counter | `Start`s dropped because their window ended before the run was posted; the farm runs the action again |
 | `kbf_executor_stray_leases_released_total` | counter | leases released because none of the executor's slots held them (a lost acquire answer, an undelivered release, a lease beyond the pool's size at a restart) |
+
+**What ingest of a run holds and refuses.** A digest is in one place: a record of one pack or one
+large object. A digest that is a record twice, in two packs or twice in one, is `malformed` (a task builds each pack from distinct blobs, so an honest pack has none; the check now runs across packs and before anything is stored). Large objects are streamed into the CAS before the
+packs are recorded and the result is cached, so a run that fails after that point leaves them
+there: valid blobs, each under the digest its own bytes hash to, that no result names. A hostile
+task can leave up to 8 large objects of the large cap (512 MiB) each, 4 GiB, of such bytes per run,
+until a janitor removes them (komira-ai/kbf#1980).
 
 **Legacy reads, on a storage node's `--metrics-listen`.** `kbf_storage_legacy_read_total{kind,source}`
 (counter) counts the reads a storage node (`kbf storage`, `kbf storage-and-daemon`) serves from its
@@ -1822,6 +1831,18 @@ count since the frontend started (a restart starts them again from 0):
 | `kbf_sched_load_score_evaluations_total`, `kbf_sched_load_scored_total` | counter | slot-resource evaluations of the placement score, and placements the score chose among two or more nodes |
 | `kbf_sched_load_chose_slack_total`, `kbf_sched_load_chose_distrusted_total`, `kbf_sched_load_chose_concentrated_total`, `kbf_sched_load_chose_by_tie_break_total` | counter | of the scored placements: on a node predicted above its capacity; on a distrusted node; on a node concentrated on the lease's key; decided by the last tie-break |
 | `kbf_sched_load_fallback_cpu_limited_nodes` | gauge | live nodes charged by prediction because their newest reading says the actions cgroup has a CPU limit, while `--placement-load` is on: not a running total, and above 0 means a node whose cgroup limit and pool do not match |
+
+The js core also writes the `kbf_ablation_*` families, which split the counts above and a few
+more into the cases a run of the placement ablation is compared on (js alone, `--placement-load
+on`, `--placement-predictions` shadow or on). All are written from the start of a frontend on the
+js core and absent on the farm's own scheduler core:
+
+| Family | Type | Labels | What it measures |
+|---|---|---|---|
+| `kbf_ablation_placements_total` | counter | `decision` | `by_load`: leases admitted by the load rule on a node with a usable reading; `fallback_charge`: leases admitted on a node charged by prediction alone; `refused_over_capacity`: queued requests, once per request per round, that had a node with room apart from the rule and found none it admitted. All 0 while placement does not read the load. The nodes charged by prediction because of a CPU quota are `kbf_placement_cpu_limited_nodes` |
+| `kbf_ablation_charges_total` | counter | `source` | of the leases admitted by load: `profile_cpu` and `profile_memory` charged by their key's learned curve, `curve_flat` whose key has a curve that was not used |
+| `kbf_ablation_bookings_total` | counter | `source` | leases started, by what admission charged them: `prediction` (a learned estimate), `cold` (the cold costs of a key with no estimate), `retry` (a rerun up the memory ladder, charged at its rung), `default` (the request's cores and no memory) |
+| `kbf_ablation_oom_retries_total` | counter | `rung_gib` | leases given up after passing their own memory limit, by the whole GiB they run again at; a series for a rung only once something was retried at it |
 
 Each node that has a load in its view ([Node load](#node-load); `GET /v1/nodes/{id}`) has one
 sample of each of these, labelled `node` (the node id) as the pack families are: at most one series

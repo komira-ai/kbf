@@ -909,3 +909,55 @@ fn the_plain_forms_refuse_a_multi_pack_manifest_and_the_with_forms_take_it() {
     assert!(TaskManifest::parse(&with_inputs).is_ok());
     assert!(TaskManifest::parse_with(&with_inputs, 0).is_ok());
 }
+
+/// Asserts, for every number `InputStats` carries (the thirteen of `inputs` and the four of
+/// `bytes_by_source`), that setting just that field to `i64::MAX + 1` is refused as
+/// `ManifestError::Advisory` naming that field and the value. Catches a number left out of the
+/// check.
+#[test]
+fn every_inputs_number_beyond_i64_is_refused_by_name() {
+    type Set = fn(&mut InputStats, u64);
+    let table: [(&str, Set); 17] = [
+        ("inputs.blobs", |s, v| s.blobs = v),
+        ("inputs.files", |s, v| s.files = v),
+        ("inputs.directories", |s, v| s.directories = v),
+        ("inputs.requests", |s, v| s.requests = v),
+        ("inputs.retries", |s, v| s.retries = v),
+        ("inputs.max_in_flight", |s, v| s.max_in_flight = v),
+        ("inputs.bytes_written_scratch", |s, v| {
+            s.bytes_written_scratch = v;
+        }),
+        ("inputs.walk_ms", |s, v| s.walk_ms = v),
+        ("inputs.fetch_ms", |s, v| s.fetch_ms = v),
+        ("inputs.hash_ms", |s, v| s.hash_ms = v),
+        ("inputs.write_ms", |s, v| s.write_ms = v),
+        ("inputs.request_p50_ms", |s, v| s.request_p50_ms = v),
+        ("inputs.request_p99_ms", |s, v| s.request_p99_ms = v),
+        ("inputs.bytes_by_source.listener_get", |s, v| {
+            s.bytes_by_source.listener_get = v;
+        }),
+        ("inputs.bytes_by_source.listener_batch", |s, v| {
+            s.bytes_by_source.listener_batch = v;
+        }),
+        ("inputs.bytes_by_source.cache_hit", |s, v| {
+            s.bytes_by_source.cache_hit = v;
+        }),
+        ("inputs.bytes_by_source.tierstore_direct", |s, v| {
+            s.bytes_by_source.tierstore_direct = v;
+        }),
+    ];
+    let over = i64::MAX as u64 + 1;
+    for (name, set) in table {
+        let mut inputs = InputStats::default();
+        set(&mut inputs, over);
+        let manifest = TaskManifest {
+            inputs: Some(inputs),
+            ..base()
+        };
+        let got = manifest.validate();
+        assert!(
+            matches!(&got, Err(ManifestError::Advisory { field, value }) if *field == name && *value == over),
+            "{name}: {got:?}"
+        );
+    }
+}
