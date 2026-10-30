@@ -197,6 +197,11 @@ impl Front {
     /// As [`Front::new`], reading the time from `now`.
     #[must_use]
     pub fn with_clock(parts: FrontParts, now: fn() -> SystemTime) -> Self {
+        // The ingest judges the age of a key by the clock the keys are minted by.
+        let parts = FrontParts {
+            packs: parts.packs.with_clock(Arc::new(now)),
+            ..parts
+        };
         Self {
             parts,
             now,
