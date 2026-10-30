@@ -36,6 +36,9 @@ pub enum BenchError {
     /// proves nothing.
     #[error("request log: {0}")]
     Log(#[source] std::io::Error),
+    /// The fault proxy was given an upstream or a mode it will not serve.
+    #[error("fault proxy: {0}")]
+    Proxy(String),
     /// A result file is not JSON of the schema this build writes.
     #[error("result file: {0}")]
     Result(String),

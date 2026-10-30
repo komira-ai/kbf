@@ -27,6 +27,19 @@ tierstore-bench verify-teardown  PASS/FAIL per check against the before-snapshot
 tierstore-bench report           one table from the result JSON and CSV files
 ```
 
+## Fault proxy
+
+`tierstore-bench fault-proxy --listen 127.0.0.1:PORT --upstream http://HOST:PORT` forwards HTTP/1.1
+to the store with every header as received (`Host` too, so a SigV4 signature survives), never
+buffering a body. `--mode` is `pass`, `latency=MS` (or `delay=MS`), `bandwidth=BYTES`, `refuse`,
+`blackhole`, or `skew=SECS` (moves `Date` and `Last-Modified`; refused unless
+`--allow-date-rewrite`). `--ttl-secs N` makes every fault fall back to `pass` after N seconds.
+`--control FILE` holds one line, `MODE [ttl=SECS]`, read every 200 ms and applied when it changes
+(write it whole and move it into place). `--result-dir DIR` gets `proxy-counters.json`: requests,
+body bytes each way, refused and held connections, mode changes, expiries. The verb runs until
+SIGTERM and writes the counters on the way out. A request opens its own connection to the store,
+so run each proxied arm once with `pass` as the control.
+
 ## Results
 
 One JSON per cell (`schema_version`, see `result.rs`) and a CSV of raw samples with the git SHA,

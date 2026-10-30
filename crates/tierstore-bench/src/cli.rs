@@ -4,8 +4,10 @@
 //! usage errors, as clap reports them.
 
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
@@ -86,6 +88,18 @@ pub struct ProxyArgs {
     /// `pass`, `refuse`, `blackhole`, `latency=MS`, `bandwidth=BYTES` or `skew=SECS`.
     #[arg(long, default_value = "pass")]
     pub mode: FaultMode,
+    /// Seconds a fault lasts before the proxy falls back to `pass` (default: until changed).
+    #[arg(long, value_name = "SECS")]
+    pub ttl_secs: Option<NonZeroU64>,
+    /// A file of one line, `MODE [ttl=SECS]`, read every tick and applied when it changes.
+    #[arg(long, value_name = "FILE")]
+    pub control: Option<PathBuf>,
+    /// Where `proxy-counters.json` is written.
+    #[arg(long, value_name = "DIR")]
+    pub result_dir: Option<PathBuf>,
+    /// Allow `skew=SECS`, which shifts `Date` and `Last-Modified` of the answers.
+    #[arg(long)]
+    pub allow_date_rewrite: bool,
 }
 
 /// Flags of `verify-teardown`.
@@ -148,9 +162,12 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
         }
         Command::FaultProxy(args) => {
             proxy::run(ProxyConfig {
-                listen: args.listen,
-                upstream: args.upstream,
                 mode: args.mode,
+                ttl: args.ttl_secs.map(|n| Duration::from_secs(n.get())),
+                control: args.control,
+                result_dir: args.result_dir,
+                allow_date_rewrite: args.allow_date_rewrite,
+                ..ProxyConfig::new(args.listen, args.upstream)
             })
             .await
         }
