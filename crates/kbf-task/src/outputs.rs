@@ -16,13 +16,14 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::Seek;
+use std::io::{Read, Seek};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Mutex;
 
 use kbf_outputs::{OutputsError, Store, StoreError, digest_of, store_file};
 use kbf_proto::reapi::{ActionResult, Digest};
+use sha2::{Digest as _, Sha256};
 
 pub use kbf_outputs::OutputLimits;
 
@@ -58,6 +59,21 @@ impl Blobs {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.blobs.is_empty()
+    }
+
+    /// Blobs of the given bytes held in memory, for tests.
+    #[cfg(test)]
+    pub(crate) fn from_bytes(all: &[&[u8]]) -> Self {
+        let mut blobs = Self::default();
+        for bytes in all {
+            let digest = digest_of(bytes);
+            blobs.bytes += bytes.len() as u64;
+            blobs.blobs.insert(
+                (digest.hash, digest.size_bytes),
+                Blob::Bytes(bytes.to_vec()),
+            );
+        }
+        blobs
     }
 
     /// The sum of the sizes of the distinct blobs.
@@ -100,6 +116,73 @@ impl Blobs {
             }
         }))
     }
+
+    /// A reader over the bytes recorded under `digest`, from the first byte; the blob is not
+    /// loaded.
+    ///
+    /// # Errors
+    /// `NotFound` when `digest` is not recorded.
+    pub fn reader(&self, digest: &Digest) -> std::io::Result<BlobReader<'_>> {
+        let blob = self
+            .blobs
+            .get(&(digest.hash.clone(), digest.size_bytes))
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+        Ok(BlobReader {
+            source: match blob {
+                Blob::Bytes(bytes) => Source::Bytes(bytes),
+                Blob::File { file, start } => Source::File {
+                    file,
+                    next: *start,
+                    end: *start + digest.size_bytes.unsigned_abs(),
+                },
+            },
+            hasher: Sha256::new(),
+        })
+    }
+}
+
+/// A reader over one recorded blob's bytes from the start. A held file is read where it was
+/// recorded with `pread`, never loaded whole, and every [`Blobs::reader`] call starts again from
+/// the first byte, so a retried PUT re-sends the whole blob. The bytes read are hashed as they
+/// pass, so [`BlobReader::matches`] says whether what was streamed is the blob that was recorded.
+#[derive(Debug)]
+pub struct BlobReader<'a> {
+    source: Source<'a>,
+    hasher: Sha256,
+}
+
+#[derive(Debug)]
+enum Source<'a> {
+    /// Bytes held in memory.
+    Bytes(&'a [u8]),
+    /// A held file: the next offset to read and where the blob ends.
+    File { file: &'a File, next: u64, end: u64 },
+}
+
+impl BlobReader<'_> {
+    /// Whether the bytes read so far hash to `digest`. Call it after reading to the end.
+    #[must_use]
+    pub fn matches(self, digest: &Digest) -> bool {
+        hex::encode(self.hasher.finalize()) == digest.hash
+    }
+}
+
+impl Read for BlobReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = match &mut self.source {
+            Source::Bytes(bytes) => bytes.read(buf)?,
+            Source::File { file, next, end } => {
+                let want = buf
+                    .len()
+                    .min(usize::try_from(*end - *next).unwrap_or(usize::MAX));
+                let n = file.read_at(&mut buf[..want], *next)?;
+                *next += n as u64;
+                n
+            }
+        };
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
 }
 
 /// A [`Store`] that keeps what it is given, up to a byte cap, and uploads nothing.
@@ -128,7 +211,7 @@ impl Recorder {
         let size = u64::try_from(digest.size_bytes).unwrap_or(0);
         if blobs.bytes.saturating_add(size) > self.cap {
             return Err(format!(
-                "output-too-large: the outputs do not fit in one pack: they pass {} bytes",
+                "output-too-large: the outputs pass the {} bytes the run's packs and large objects hold",
                 self.cap
             )
             .into());
@@ -393,7 +476,7 @@ mod tests {
             .await
             .expect_err("one byte over");
         assert!(matches!(why, OutputsError::Store { .. }), "{why}");
-        assert!(why.to_string().contains("one pack"), "{why}");
+        assert!(why.to_string().contains("pass the 117 bytes"), "{why}");
         assert!(why.to_string().contains("output-too-large"), "{why}");
     }
 
@@ -427,3 +510,7 @@ mod tests {
         assert_eq!(recorder.in_flight(), IN_FLIGHT);
     }
 }
+
+#[cfg(test)]
+#[path = "outputs_reader_tests.rs"]
+mod reader_tests;
