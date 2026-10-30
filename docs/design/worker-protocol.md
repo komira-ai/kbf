@@ -89,6 +89,18 @@ the heartbeat interval in milliseconds, and its **lease epoch** (see
 `kbf.worker.v1.PackIndex/CommitPack` (see [below](#blobs-on-the-worker-listener)): false
 from a frontend without the pack index and the pack store, and from one that predates the field.
 
+`Welcome.placement_load` (field 6, `optional bool`, additive) says the farm places by the load the
+nodes measure. A server started with `--placement-load=on` sends it as true; with `off` (the
+default) it leaves the field out (absent, never false), so the `Welcome` is
+byte-for-byte the one of a server that predates the field. A daemon reads absent and false alike
+as off. The daemon applies it at every `Welcome`, on every stream: with `--actions-cpu-max=auto`
+(the default) it writes `max 100000` to the actions cgroup's `cpu.max` for true, so the CPU it
+measures can show an overload, and the limit of its reserve (`--reserve-cpus`) otherwise; `on` and
+`off` ignore the field. The write happens off the async workers after the `Welcome` is taken and
+before the stream's first `Heartbeat`, and a failed write is logged and does not end the stream.
+Until the first `Welcome` the limit written at start stays. See
+[linux-build-host.md](../deploy/linux-build-host.md#the-limit-under-placement-by-measured-load---actions-cpu-max).
+
 **Only the first `Hello` of a stream registers the node.** It opens a new session, and
 from then on every `Start` for this node goes to this stream. A `Hello` resent on the
 same stream (the daemon's node report changed) must carry the stream's `node_id`: one
@@ -372,6 +384,14 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
   daemon without the flag, and one built before the field, send none, and a server built before it
   skips the field. The server keeps the newest of each node for `GET /metrics`
   (`kbf_pack_daemon_*`, [api.md](../api.md#get-metrics)).
+- `input_cache` (field 7, optional): the counts of the daemon's input cache since its process
+  started (`InputCacheCounts`: `fills`, `fill_bytes`, `hits`, `hit_bytes`, `evictions`,
+  `evicted_bytes`, and `trees` with the tree store's `builds`, `hits`, `evictions`), present only
+  when the runtime has an input cache open. A runtime without one, and a daemon built before the
+  field, send none (absent is not zero), and a server built before it skips the field. The server
+  keeps the newest of each node for `GET /metrics` (`kbf_node_input_cache_*`) and
+  `GET /v1/nodes/{id}` ([api.md](../api.md#input-cache-counts)); a restarted daemon counts again
+  from 0.
 - `node_load` (optional): one reading of the node's `actions/` cgroup (`NodeLoad`). `seq` counts up
   by one from 1 for each reading within a daemon process; `mono_usec` is the daemon's monotonic
   clock at the read of the CPU counter and `cpu_usage_usec` the cgroup's cumulative CPU time, so a
@@ -384,7 +404,8 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
   runtime takes readings (the container runtime does); a reading that fails leaves it out (logged
   once per failing file), and a daemon or runtime without readings, or one built before the field,
   sends none. A server built before the field skips it. The server accepts and shows readings under
-  the rule of [api.md](../api.md#node-load) and places by none of them yet.
+  the rule of [api.md](../api.md#node-load) and hands each accepted reading to the scheduler, as
+  described below.
 
   Two lists of a reading say when each lease started and what each used, minute by minute:
 
@@ -416,8 +437,31 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
   told by lease and minute, a clock and a `covered` entry by lease). A bad record is dropped alone
   and counted; vetting never fails, and a heartbeat is never refused, nor its acknowledgement
   changed, for its lists. Every list at its cap and every number at its most digits make a load of
-  9,001 bytes and a heartbeat of about 11.5 KB, well under the 17 MiB a message may be. Nothing sends
-  the two lists yet and the server does not read them.
+  9,001 bytes and a heartbeat of about 11.5 KB, well under the 17 MiB a message may be.
+
+  What the daemon sends. The container runtime's one reading per heartbeat lists every running
+  lease with its start and counters, and the daemon bins each lease's counters into minutes with
+  the job scheduler's per-minute binner (`js-agent-usage`): no second read and no timer of its own,
+  so a lease that ran less than about 35 s has no minute, and a window between readings longer
+  than three sampling windows is dropped and counted. The sampling window is the `Welcome`'s
+  heartbeat interval, at least one second. One batch of at most 64 minutes is in flight at a time:
+  a `HeartbeatAck` of `seq` frees the batch sent at `seq` or earlier, and a stream that ends with a
+  batch not acknowledged sends it again on the next stream (a repeat is harmless, above). A server
+  that does not acknowledge keeps the batch in flight; minutes that close meanwhile wait, and the
+  daemon drops those older than ten minutes. A lease's last, partial minute is closed when the
+  lease ends and rides the first heartbeat after it, not its `Result`. A reading that fails or
+  takes more than two seconds sends no `node_load` on that heartbeat and costs the minutes
+  nothing.
+
+  The server vets the lists of each reading it accepts and counts what it dropped, by reason, in
+  the node view ([api.md](../api.md#node-load): `lists`). It counts the minutes of a reading it
+  refuses under the accept rule as refused, and uses them for nothing. It hands the accepted
+  reading, with the lists that passed the vet, to the scheduler (`Event::Heartbeat.load`) on the
+  same heartbeat, under every `--placement-load` mode: the scheduler keeps the readings whether or
+  not it places by them, so the feed is warm before the flag is raised to `on`. A refused reading
+  is not handed over, and a heartbeat is acknowledged as it would be with no load. The conversion
+  is one function (`sched_load` in `kbf-server`) for every path that hands a daemon's load to the
+  scheduler. The server keeps no series of minutes and serves no route for them.
 
 The server acknowledges a heartbeat with `HeartbeatAck { seq }`, but only one from the
 node's newest stream. A heartbeat from a replaced stream is dropped unacknowledged, so

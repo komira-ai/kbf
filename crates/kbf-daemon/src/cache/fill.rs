@@ -245,6 +245,7 @@ impl Cache {
                 }
                 Step::Wait(mut done) => {
                     bump(&counts.fill_waits);
+                    bump(&inner.counters.fill_waits);
                     let failed = done
                         .wait_for(Option::is_some)
                         .await
@@ -345,7 +346,12 @@ impl Cache {
         }
         counts.fetched_bytes.fetch_add(key.size, Ordering::Relaxed);
         let file = file.into_std().await;
-        Ok(self.insert(key, file, tmp).await)
+        let source = self.insert(key, file, tmp).await;
+        if matches!(source, Source::Entry { .. }) {
+            inner.counters.fills.fetch_add(1, Ordering::Relaxed);
+            (inner.counters.fill_bytes).fetch_add(key.size, Ordering::Relaxed);
+        }
+        Ok(source)
     }
 
     /// [`Inner::insert`] on the blocking pool.
@@ -406,6 +412,14 @@ impl Inner {
             return Step::Hit;
         }
         Step::Own(self.take(&mut state, key))
+    }
+
+    /// Counts a lease's use of `key`'s entry, found in the cache: called once the lease has
+    /// placed its names, so a lease that finds the entry gone and settles the key again counts
+    /// the one use, not two.
+    pub(super) fn note_hit(&self, key: &Key) {
+        bump(&self.counters.hits);
+        (self.counters.hit_bytes).fetch_add(key.size, Ordering::Relaxed);
     }
 
     /// Inserts the bytes written into `file` (named `tmp`) as `key`'s entry (see the

@@ -18,16 +18,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use js_server_core::View;
 use kbf_proto::update::UpdateStatus;
-use kbf_proto::worker::{NodeStatus, PackReadCounts, PackWriteCounts};
-use kbf_sched::QueueView;
+use kbf_proto::worker::{InputCacheCounts, NodeStatus, PackReadCounts, PackWriteCounts};
+use kbf_sched::{LoadCounters, QueueView};
 use kbf_types::{MemoryRun, OperationId, WorkerId};
 
 use super::JsFarm;
 use crate::farm::failed_actions::FailedActions;
 use crate::farm::nodes::{detail_of, look_of, node_of};
 use crate::farm::sched_view::{LeaseViews, WholeView, whole_of};
-use crate::farm::{NodeLook, NodeUnread, StreamId};
+use crate::farm::{NodeLook, NodeUnread, StreamId, node_load};
 use crate::farm_js::KbfAdapter;
+use crate::farm_js::ablation::Ablation;
 use crate::fleet::{NodeDetail, NodeView, NodesView};
 
 /// `worker`, which the machine knows, as the node list shows it.
@@ -91,13 +92,16 @@ pub(crate) fn node_detail(
         if !readable && !node.is_some_and(|node| node.connected) {
             return Err(NodeUnread(worker.as_str().to_owned()));
         }
-        // The js core keeps no node load yet: the detail shows none.
         let detail = |_| {
+            let capacity = view.sched().capacity(worker).unwrap_or_default();
+            let load = node_load::shown(adapter.node_loads(), worker, &capacity, js.now());
+            let input_cache = adapter.input_cache_of(worker);
             detail_of(
                 listed(js, view, adapter, worker),
                 view.sched(),
                 worker,
-                None,
+                load,
+                input_cache,
             )
         };
         Ok(node.map(detail))
@@ -153,6 +157,17 @@ pub(crate) fn update_look(js: &JsFarm) -> Vec<NodeLook> {
 /// [`Farm::queue_view`](crate::farm::Farm::queue_view).
 pub(crate) fn queue_view(js: &JsFarm) -> QueueView {
     js.core.with(|view, _| view.sched().queue_snapshot())
+}
+
+/// [`Farm::load_counters`](crate::farm::Farm::load_counters).
+pub(crate) fn load_counters(js: &JsFarm) -> LoadCounters {
+    js.core.with(|view, _| view.sched().load_counters())
+}
+
+/// [`Farm::ablation`](crate::farm::Farm::ablation).
+pub(crate) fn ablation(js: &JsFarm) -> Option<(Ablation, LoadCounters)> {
+    js.core
+        .with(|view, adapter| Some((adapter.ablation().clone(), view.sched().load_counters())))
 }
 
 /// [`Farm::whole_view`](crate::farm::Farm::whole_view).
@@ -251,4 +266,23 @@ pub(crate) fn note_pack_writes(
 /// [`Farm::pack_writes`](crate::farm::Farm::pack_writes).
 pub(crate) fn pack_writes(js: &JsFarm) -> Vec<(WorkerId, PackWriteCounts)> {
     js.core.with(|_, adapter| adapter.pack_writes())
+}
+
+/// [`Farm::note_input_cache`](crate::farm::Farm::note_input_cache).
+pub(crate) fn note_input_cache(
+    js: &JsFarm,
+    worker: &WorkerId,
+    stream: StreamId,
+    counts: Option<InputCacheCounts>,
+) {
+    js.core.with(|_, adapter| {
+        if let Some(stream) = adapter.current_stream(worker, stream.0) {
+            adapter.note_input_cache(worker, stream, counts);
+        }
+    });
+}
+
+/// [`Farm::input_caches`](crate::farm::Farm::input_caches).
+pub(crate) fn input_caches(js: &JsFarm) -> Vec<(WorkerId, InputCacheCounts)> {
+    js.core.with(|_, adapter| adapter.input_caches())
 }

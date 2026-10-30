@@ -1,5 +1,5 @@
 # The pull-request gate: `lint`, and the fast tests under coverage in parts, `test-shard` (a matrix)
-# and `test` (merges the shards' coverage and gates it). GitHub-hosted runners only; the repository
+# and `test` (gates the coverage the parts made together). GitHub-hosted runners only; the repository
 # lints in crates/kbf-integration-test/tests/repo_lints.rs hold every workflow to that, to commit-SHA pinned
 # actions from the set the repository's Actions policy allows (actions/* and
 # tailscale/github-action), and to a top-level `permissions: {}`.
@@ -54,6 +54,9 @@ jobs:
     env:
       DENY_VERSION: 0.20.2
       DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+      # The x86_64-linux tarball of ziglang.org/download/index.json.
+      ZIG_VERSION: 0.14.1
+      ZIG_SHA256: 24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -101,13 +104,117 @@ jobs:
         if: ${{ !cancelled() }}
       - run: cargo test -p kbf-setup --lib --locked no_proxy_tests
         if: ${{ !cancelled() }}
-      # The server's `farm-core-js` feature (the farm on the js scheduler core, off in every
-      # build above and below): the code that only it compiles is linted, and its construction
-      # tests run. Alone in the commands, so that no other package turns the feature on.
+      # The server's test-only `farm-core-js` feature (the tests' default scheduler core is the
+      # js one, off in every build above): the tests that only it compiles are linted. Alone in
+      # the command, so that no other package turns the feature on. The tests run on both cores
+      # in the `test` job's two coverage runs.
       - run: cargo clippy -p kbf-server --all-targets --features farm-core-js --locked -- -D warnings
         if: ${{ !cancelled() }}
-      - run: cargo test -p kbf-server --lib --features farm-core-js --locked farm::js::tests
+      # The crates the Mac jobs build (beta.yml's native-macos and pkg-macos, artifacts.yml's
+      # darwin-arm64), checked for aarch64-apple-darwin on this Linux runner. A Linux-only item
+      # in code macOS compiles is then red on the pull request, not on the Mac job of the push to
+      # main an hour later (a `use` of a Linux-only module in kbf-node failed native-macos on eight
+      # main pushes in a row). `cargo check` does not link, so no macOS SDK is needed; the build
+      # scripts that compile C for the target (ring, the bundled SQLite of libsqlite3-sys) use
+      # Zig's C compiler and archiver, which carry macOS's libc headers: the cc crate reads
+      # `CC_<target>` and `AR_<target>` as a program and its leading arguments. Zig is the release
+      # tarball, checked against its SHA-256 before use and unpacked whole (its compiler needs its
+      # lib directory) into the runner's temporary directory.
+      - name: Fetch Zig (pinned version and checksum), the C compiler for aarch64-apple-darwin
         if: ${{ !cancelled() }}
+        run: cargo xtask fetch --url "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" --sha256 "$ZIG_SHA256" --out "$RUNNER_TEMP/zig.tar.xz"
+      - run: tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+        if: ${{ !cancelled() }}
+      - run: rustup target add aarch64-apple-darwin
+        if: ${{ !cancelled() }}
+      # The targets the macOS jobs of every workflow compile (beta.yml's native-macos,
+      # artifacts.yml's darwin-arm64, mac-provision.yml, host-install-mac.yml, vmm-probe.yml), as
+      # they name them: a crate's other test targets (kbf-cli's harness tests, for one) are
+      # Linux-only and never built on a Mac. Linking and doc tests are not checked: `cargo check`
+      # compiles each crate and stops. The cc crate's own flags include
+      # `--target=arm64-apple-macosx`, which Zig refuses (its compiler-family probe runs the
+      # program without `cc`, so it takes Zig for clang); without them (CRATE_CC_NO_DEFAULTS) Zig
+      # gets its own `-target` and each build script's flags.
+      # The crates a Mac job tests whole: every test target, and the libraries' unit tests.
+      - name: Check for aarch64-apple-darwin the tests of the crates the Mac jobs test whole
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+          # The oldest macOS the binaries support, as artifacts.yml builds them.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo check --locked --target aarch64-apple-darwin --tests --features kbf-setup/proxy -p kbf-outputs -p kbf-driver-native -p kbf-node -p kbf-mac-session -p kbf-installer -p kbf-setup -p kbf-guest -p kbf-mac-provision -p kbf-vmm
+      # The binaries the Mac jobs build and run (`cargo xtask` included) and the darwin artifacts are.
+      - name: Check for aarch64-apple-darwin the binaries the Mac jobs build
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+          # The oldest macOS the binaries support, as artifacts.yml builds them.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo check --locked --target aarch64-apple-darwin --bins -p kbf-node -p kbf-cli -p kbf-deploy -p kbf-installer -p kbf-host-install -p kbf-updater -p kbf-mac-provision -p kbf-guest -p kbf-vmm -p xtask
+      # The test targets the Mac jobs name one by one.
+      - name: Check for aarch64-apple-darwin the test targets the Mac jobs name
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+          # The oldest macOS the binaries support, as artifacts.yml builds them.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo check --locked --target aarch64-apple-darwin -p kbf-cli -p kbf-daemon-test -p xtask -p kbf-host-install --test macos_daemon --test mac_pool_spike --test pkg_macos --test real_mac --test real_drop
+      # kbf-daemon's library with its unit tests (the test profile), and the tests native-macos runs.
+      - name: Check for aarch64-apple-darwin the kbf-daemon library's tests and the tests native-macos runs
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+          # The oldest macOS the binaries support, as artifacts.yml builds them.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo check --locked --target aarch64-apple-darwin --profile test -p kbf-daemon --lib --test suspend --test keeper --test cache_clone --test trees_clone
+      # The kbf binary alone, as artifacts.yml builds it: without the proxy feature of kbf-setup,
+      # which the steps above turn on for kbf-installer and so for every crate built beside it.
+      - name: Check for aarch64-apple-darwin the kbf binary without the proxy feature
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+          # The oldest macOS the binaries support, as artifacts.yml builds them.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo check --locked --target aarch64-apple-darwin -p kbf-cli --bin kbf
+      # The task runner has no confine for a Mac (a Command denied the network is refused there), and
+      # that code path compiles only for a non-Linux target: check it, without building or shipping it.
+      - name: Check for aarch64-apple-darwin the task runner, whose confine is not built there
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo check --locked --target aarch64-apple-darwin --tests -p kbf-task
+      # kbf-task is the one binary the release builds for a static musl target
+      # (artifacts.yml, linux-x86_64 and linux-arm64: it runs in any Linux image). The other
+      # jobs here check glibc, where libc's type aliases differ (`libc::Ioctl` is `c_ulong` on
+      # glibc and `c_int` on musl), so a glibc-only type compiled on the pull request and broke
+      # the release build after the merge. The same musl C compiler as the release job, for ring's
+      # build script; `cargo check` does not link. The Arm target has the same libc types.
+      - name: Refresh the package lists for the musl C compiler
+        if: ${{ !cancelled() }}
+        run: sudo apt-get update
+      - name: Install the musl C compiler ring's build uses for the static target
+        if: ${{ !cancelled() }}
+        run: sudo apt-get install --yes --no-install-recommends musl-tools
+      - run: rustup target add x86_64-unknown-linux-musl
+        if: ${{ !cancelled() }}
+      - name: Check for x86_64-unknown-linux-musl the binary the release builds for the static target
+        if: ${{ !cancelled() }}
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo check --locked --target x86_64-unknown-linux-musl -p kbf-task --bin kbf-task
       # The interpreter budget only shrinks: a pull request may not add a row to it
       # (crates/xtask/src/budget.rs). A pull request is checked out as the merge commit,
       # so HEAD^1 is the base branch it merges into.
@@ -132,14 +239,17 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
-  # One part of the fast tests and its coverage: the `pr` profile of .config/nextest.toml (every
-  # test but the slow ones, which beta.yml runs) under cargo-llvm-cov, the part being a third of
-  # the tests (`--partition count:<n>/3`, the matrix's `shard`). Every part builds the same
-  # instrumented workspace and runs its share. A line's coverage is not the sum of the parts' lcov
-  # reports (llvm-cov counts a line once for each function it is in), so the parts' raw profiles
-  # are what is added up: the others upload theirs, and the last part waits for them, puts them
-  # beside its own and makes the one report; the `test` job below gates it. The fast set includes
-  # the Postgres tests (a throwaway server per part, below): no S3, crun, root or Mac test is in it.
+  # One part of the fast tests and their coverage: the `pr` profile of .config/nextest.toml (every
+  # test but the slow ones, which beta.yml runs) under cargo-llvm-cov, run twice as before (the
+  # legacy scheduler core, then the js core), each run a third of its tests (`--partition
+  # hash:<n>/3`, the matrix's `shard`). Every part builds the same instrumented workspace and runs
+  # its share of both runs. The hash is of a test's name, so a new test joins one part and moves no
+  # other. A line's coverage is not the sum of the parts' lcov reports (llvm-cov counts a line once
+  # for each function it is in), so the parts' raw profiles are what is added up: the others upload
+  # theirs, and the last part waits for them, puts them beside its own and makes the one report
+  # with the binaries it built (a job of its own would have to build the instrumented workspace
+  # again, or be sent its 60 GB); the `test` job below gates it. The fast set includes the
+  # Postgres tests (a throwaway server per part, below): no S3, crun, root or Mac test is in it.
   # Branch coverage (`--branch`, rustc's `-Zcoverage-options=branch`) is unstable, so this
   # job alone builds with a pinned nightly; every other job stays on the toolchain in
   # rust-toolchain.toml. The nightly may warn where stable does not, so `-D warnings` is off
@@ -172,16 +282,16 @@ jobs:
     env:
       KBF_TEST_POSTGRES_URL: postgres://postgres:kbf-ci-throwaway@127.0.0.1:5432/postgres
       RUSTFLAGS: ""
+      SHARD: ${{ matrix.shard }}
+      # The file name of a raw profile: the part's number in it keeps the parts' files apart when
+      # the last part puts them in one directory (the process id alone repeats between machines).
+      LLVM_PROFILE_FILE_NAME: kbf-part${{ matrix.shard }}-%p-%4m.profraw
       COVERAGE_TOOLCHAIN: nightly-2026-10-01
       LLVM_COV_VERSION: 0.9.1
       LLVM_COV_SHA256: b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a
       # `cargo llvm-cov nextest` runs the tests with cargo-nextest, one process per test.
       NEXTEST_VERSION: 0.9.146
       NEXTEST_SHA256: 682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428
-      SHARD: ${{ matrix.shard }}
-      # The file name of a raw profile: the part's number in it keeps the parts' files apart when
-      # the last part puts them in one directory (the process id alone repeats between machines).
-      LLVM_PROFILE_FILE_NAME: kbf-part${{ matrix.shard }}-%p-%4m.profraw
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -263,12 +373,13 @@ jobs:
       - name: Refuse early when the disk is short for the tests (80 GiB free)
         run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --path . --min-free-gb 80
       # `--partition` is a flag of `cargo nextest run`, which cargo-llvm-cov passes on as it does any
-      # flag it does not know. `count` deals the tests out in turn, so the parts are the same size
-      # whatever the tests are named.
+      # flag it does not know. `hash` puts a test in a part by the hash of its binary and name, so
+      # adding or renaming a test moves that test alone (`count` deals them out in turn, and one new
+      # test would move every test after it to another part).
       - name: Run this part of the fast tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --features tierstore/s3 --locked --branch --no-report --no-fail-fast --profile pr "--partition=count:$SHARD/$SHARDS"
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --features tierstore/s3 --locked --branch --no-report --no-fail-fast --profile pr "--partition=hash:$SHARD/$SHARDS"
       # What the test run left on the disk, so a run that ran the runner out of room says
       # which directories grew (the instrumented build, the tests' own temporary files).
       - name: Free disk after the tests (report)
@@ -277,8 +388,35 @@ jobs:
       - name: Disk use under target after the tests (report)
         if: ${{ always() }}
         run: du -xhd 2 target
-      # No step below runs Postgres tests on their own: they are in the run above, which
-      # fails any of them when KBF_TEST_POSTGRES_URL (set for the job) names no server.
+      # No step below runs Postgres tests on their own: they are in the runs above, which
+      # fail any of them when KBF_TEST_POSTGRES_URL (set for the job) names no server.
+      # The fast tests again on the js scheduler core. Both scheduler cores are compiled into
+      # every build, and the tests default to the legacy one; kbf-server's test-only
+      # `farm-core-js` feature makes `SchedulerCore::under_test()` return the js core, so every
+      # farm test of the packages that reach it runs on it. Four packages link kbf-server code:
+      # kbf-server, kbf-integration-test, kbf-daemon, kbf-node. kbf-front has no kbf-server
+      # dependency (the feature does nothing there) and kbf-farm-test links none (it spawns the
+      # release binary; the `pr` profile excludes it), so neither is selected. `tierstore/s3` is
+      # left out: no selected package depends on tierstore, and its tests ran above. The `pr`
+      # profile excludes only the slow tests and the two black-box packages, so it drops
+      # nothing this run needs.
+      #
+      # Disk. Both runs share target/llvm-cov-target. The feature changes the build of kbf-server
+      # and of what depends on it; every other crate, tierstore and all dependencies are reused
+      # from the first run. The second run adds the rebuilt crates, those four packages' test
+      # binaries and its profiles: a fraction of the 59 GB workspace build, not a second one. The
+      # next step refuses early below the room it is expected to need (25 GiB, over the 5%
+      # free-space floor of the file store) and the disk report after the run says how much it
+      # took. A separate job would build the whole instrumented workspace again.
+      - name: Refuse early when the disk is short for the js run (25 GiB free)
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --path . --min-free-gb 25
+      - name: Run this part of the fast tests on the js core under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest -p kbf-server -p kbf-integration-test -p kbf-daemon -p kbf-node --features kbf-server/farm-core-js --locked --branch --no-report --no-fail-fast --profile pr "--partition=hash:$SHARD/$SHARDS"
+      - name: Free disk after the js run (report)
+        if: ${{ always() }}
+        run: df -h /
       - name: Upload this part's raw profiles
         if: ${{ format('{0}', matrix.shard) != env.SHARDS }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -305,7 +443,13 @@ jobs:
           pattern: profraw-part-*
           path: target/llvm-cov-target
           merge-multiple: true
-      - name: Report (all the parts' coverage)
+      # ONE report over all the parts' legacy and js runs. llvm-cov merges the profiles of every
+      # instrumented binary in target/llvm-cov-target, so a line counts once with the hits of
+      # every part and both runs: the js arms of the farm are hit by the js runs, the legacy ones
+      # by the legacy runs, and what only a build with the feature compiles (the tests that name
+      # it) by the run that has it. It must be ONE report: kbf-coverage refuses an lcov that
+      # names a source file twice.
+      - name: Report (all the parts, legacy and js runs merged)
         if: ${{ format('{0}', matrix.shard) == env.SHARDS }}
         env:
           LLVM_COV_FLAGS: -skip-functions
@@ -318,8 +462,9 @@ jobs:
           path: target/coverage/lcov.info
           if-no-files-found: error
           overwrite: true
-      # and the cache it saves holds none of this run's workspace coverage artifacts either; one part
-      # saves it (the parts restore and would save the same key)
+      # The instrumented build is cleaned before the cache is saved, so the cache holds none of
+      # this run's workspace coverage artifacts; one part saves it (the parts restore, and would
+      # save, the same key).
       - if: ${{ github.event_name == 'push' && matrix.shard == 1 && steps.cargo-cache.outputs.cache-hit != 'true' }}
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -363,21 +508,23 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: coverage
-          path: coverage
+          path: target/coverage
       # Fails when a crate is under its threshold; floors that could rise are printed in
       # the log and the job summary (`kbf-coverage raise` lifts them) and do not fail.
       - name: Per-crate table and 99% gate
-        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- --lcov coverage/lcov.info --root "$GITHUB_WORKSPACE" --floors coverage-floors --summary-file "$GITHUB_STEP_SUMMARY"
-      # The base's floors file, checked out beside this one; a base without one (the change
-      # that adds the file) has nothing to compare, and the step says so.
+        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- --lcov target/coverage/lcov.info --root "$GITHUB_WORKSPACE" --floors coverage-floors --summary-file "$GITHUB_STEP_SUMMARY"
+      # The base's floors file, checked out under the ignored `target/` (a checkout at the root
+      # would be an untracked nested repository that the js run's repo lints try to read); a
+      # base without one (the change that adds the file) has nothing to compare, and the step
+      # says so.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         with:
           ref: ${{ github.event.pull_request.base.sha }}
-          path: base
+          path: target/base-floors
           sparse-checkout: coverage-floors
           sparse-checkout-cone-mode: false
           persist-credentials: false
       - name: Floors are not lower than the base's
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
-        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- no-lowering --allow-missing-base --base-ref HEAD^1 --base base/coverage-floors --floors coverage-floors
+        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- no-lowering --allow-missing-base --base-ref HEAD^1 --base target/base-floors/coverage-floors --floors coverage-floors

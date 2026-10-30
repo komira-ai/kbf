@@ -20,14 +20,29 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use hyper::Method;
 use serde::Deserialize;
 
+use crate::journal::is_reserved;
+
 use super::ServerConfig;
 use super::auth::{READ_ONLY, Refusal};
+use super::gc::{NOT_ALLOWED, OUT_OF_SCOPE};
+use super::presign::PUT_ONLY;
+use super::scoped::{NOT_ALLOWED as SCOPED_NOT_ALLOWED, Scopes};
+
+/// The methods of the calls a scoped key may make, whichever the call.
+const SCOPED_METHODS: [Method; 5] = [
+    Method::GET,
+    Method::HEAD,
+    Method::PUT,
+    Method::POST,
+    Method::DELETE,
+];
 
 /// The flag whose files hold the read-only keys.
 const READ_ONLY_FLAG: &str = "--read-only-key-file";
@@ -69,12 +84,18 @@ impl fmt::Debug for AccessKey {
 }
 
 /// What a key may do.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Role {
     /// Everything the front serves.
     Full,
-    /// GetObject, HeadObject, ListObjectsV2 and HeadBucket.
+    /// GetObject, HeadObject, ListObjectsV2, ListMultipartUploads and HeadBucket.
     ReadOnly,
+    /// A presigning key: one presigned `PUT`, as far as its grant goes (see `presign`).
+    PresignPut,
+    /// A GC key: list, head and delete under this prefix, header-signed (see `gc`).
+    Gc(String),
+    /// A scoped key: read, create and delete under the prefixes of its lists (see `scoped`).
+    Scoped(Arc<Scopes>),
 }
 
 impl Role {
@@ -85,11 +106,39 @@ impl Role {
     ///
     /// # Errors
     /// [`READ_ONLY`], for a read-only key and a call that is not a read.
-    pub(crate) fn permit(self, method: &Method) -> Result<(), Refusal> {
+    pub(crate) fn permit(&self, method: &Method) -> Result<(), Refusal> {
         let reads = matches!(*method, Method::GET | Method::HEAD);
-        match (self, reads) {
-            (Self::ReadOnly, false) => Err(READ_ONLY),
+        match self {
+            Self::ReadOnly if !reads => Err(READ_ONLY),
+            Self::PresignPut if *method != Method::PUT => Err(PUT_ONLY),
+            Self::Gc(_) if !matches!(*method, Method::GET | Method::HEAD | Method::DELETE) => {
+                Err(NOT_ALLOWED)
+            }
+            Self::Scoped(_) if !SCOPED_METHODS.contains(method) => Err(SCOPED_NOT_ALLOWED),
             _ => Ok(()),
+        }
+    }
+
+    /// Whether the role may list the open multipart uploads under `prefix` (ListMultipartUploads,
+    /// a `GET`). A presigning key may not ([`PUT_ONLY`]). The full and the read-only role may, for
+    /// any prefix: a read-only key already lists every key of the bucket, and the listing gives
+    /// it upload ids, which let it do nothing, since a part, a completion and an abort are not
+    /// reads. S3 asks for a permission of its own (`s3:ListBucketMultipartUploads`) here.
+    ///
+    /// A GC key may list the uploads under its own prefix, as it may abort them: `prefix` must
+    /// start with the prefix of the key and not be a reserved one. A listing with no prefix, or
+    /// with one outside, is [`OUT_OF_SCOPE`] and is not filtered.
+    ///
+    /// # Errors
+    /// [`PUT_ONLY`] for a presigning key, [`OUT_OF_SCOPE`] for a GC key and a prefix that is not
+    /// inside its own.
+    pub(crate) fn permit_list_uploads(&self, prefix: &str) -> Result<(), Refusal> {
+        match self {
+            Self::Full | Self::ReadOnly => Ok(()),
+            Self::PresignPut => Err(PUT_ONLY),
+            Self::Gc(own) if prefix.starts_with(own.as_str()) && !is_reserved(prefix) => Ok(()),
+            Self::Gc(_) => Err(OUT_OF_SCOPE),
+            Self::Scoped(scopes) => scopes.may_list(prefix),
         }
     }
 }
@@ -102,7 +151,16 @@ impl ServerConfig {
             return Some((self.secret_access_key.as_str(), Role::Full));
         }
         let found = self.read_only_keys.iter().find(|key| key.id == id);
-        found.map(|key| (key.secret.as_str(), Role::ReadOnly))
+        if let Some(key) = found {
+            return Some((key.secret.as_str(), Role::ReadOnly));
+        }
+        let gc = self
+            .gc_key(id)
+            .map(|key| (key.secret(), Role::Gc(key.prefix().to_owned())));
+        gc.or_else(|| {
+            let key = self.scoped_key(id)?;
+            Some((key.secret(), Role::Scoped(key.scopes())))
+        })
     }
 }
 
@@ -170,6 +228,29 @@ fn from_lines(text: &str) -> Result<(String, String), &'static str> {
     }
 }
 
+/// The text of the file that the flag `flag` names, if only its owner can read it.
+///
+/// # Errors
+/// It cannot be read, or a group or other permission bit is set; led by the flag and the path.
+pub(super) fn read_private_text(flag: &str, path: &Path) -> Result<String, String> {
+    let shown = path.display();
+    let fail = |why: &str| format!("{flag} {shown}: {why}");
+    // The link itself, not what it points at: a link is not a key file.
+    let meta = std::fs::symlink_metadata(path);
+    let meta = meta.map_err(|why| fail(&why.to_string()))?;
+    if meta.file_type().is_symlink() {
+        return Err(fail("is a symbolic link; name the file itself"));
+    }
+    if meta.uid() != rustix::process::geteuid().as_raw() {
+        return Err(fail("is not owned by the user the server runs as"));
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        return Err(fail("others can read it; make it mode 0600"));
+    }
+    let text = std::fs::read_to_string(path);
+    text.map_err(|why| fail(&why.to_string()))
+}
+
 /// The access key id and the secret access key in the file that the flag `flag` names, in
 /// either form (see the module docs).
 ///
@@ -177,15 +258,8 @@ fn from_lines(text: &str) -> Result<(String, String), &'static str> {
 /// What is wrong with the file, led by the flag and the path: it cannot be read, a group or
 /// other permission bit is set, or its text is not a key in either form.
 pub(super) fn read_credentials(flag: &str, path: &Path) -> Result<(String, String), String> {
-    let shown = path.display();
-    let fail = |why: &str| format!("{flag} {shown}: {why}");
-    let meta = std::fs::metadata(path);
-    let meta = meta.map_err(|why| fail(&why.to_string()))?;
-    if meta.permissions().mode() & 0o077 != 0 {
-        return Err(fail("others can read it; make it mode 0600"));
-    }
-    let text = std::fs::read_to_string(path);
-    let text = text.map_err(|why| fail(&why.to_string()))?;
+    let fail = |why: &str| format!("{flag} {}: {why}", path.display());
+    let text = read_private_text(flag, path)?;
     let json = text.trim_start().starts_with('{');
     let pair = if json {
         from_json(&text)

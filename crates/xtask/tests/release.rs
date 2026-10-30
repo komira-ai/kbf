@@ -1640,6 +1640,103 @@ fn check_accepts_the_coordinator_image_of_each_linux_arch_and_refuses_it_on_the_
     assert_eq!(err, format!("xtask: {mac}: not an asset of {COMMIT}\n"));
 }
 
+#[test]
+fn check_accepts_the_task_image_of_each_linux_arch_and_refuses_it_on_the_mac() {
+    // Catches: `kbf-task-image-...oci.tar` refused as "not an asset of <commit>" (the release
+    // of the first main push that lists it fails), or accepted for the Mac.
+    let root = scratch("check-task-image");
+    let listed = dist(&root, COMMIT);
+    for platform in ["linux-x86_64", "linux-arm64"] {
+        add_deb(
+            &listed,
+            &format!("kbf-task-image-{COMMIT}-{platform}.oci.tar"),
+            true,
+        );
+        add_deb(
+            &listed,
+            &format!("kbf-task-image-{COMMIT}-{platform}.facts.json"),
+            false,
+        );
+    }
+    let (code, _, err) = check(&listed, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    let mac = format!("kbf-task-image-{COMMIT}-darwin-arm64.oci.tar");
+    let root = scratch("check-task-image-mac");
+    let held = dist(&root, COMMIT);
+    add_deb(&held, &mac, true);
+    let (code, out, err) = check(&held, COMMIT);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(err, format!("xtask: {mac}: not an asset of {COMMIT}\n"));
+}
+
+#[test]
+fn check_wants_the_facts_of_the_task_image_and_the_previous_release_may_lack_them() {
+    // Catches: a release that lists a task image without the facts that carry its manifest and
+    // base digests (the digest a registry pin is checked against would be unattested), facts
+    // listed for no image, and the waiver for the release made before the facts (the previous
+    // release is read with it) skipping more than the missing facts.
+    let root = scratch("check-task-facts");
+    let d = dist(&root, COMMIT);
+    let image = format!("kbf-task-image-{COMMIT}-linux-arm64.oci.tar");
+    let facts = format!("kbf-task-image-{COMMIT}-linux-arm64.facts.json");
+    add_deb(&d, &image, true);
+    let (code, _, err) = check(&d, COMMIT);
+    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(
+        err,
+        format!("xtask: {image}: its image facts {facts} are not listed in SHA256SUMS\n")
+    );
+    let (code, _, err) = check_without_facts(&d, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    add_deb(&d, &facts, false);
+    let (code, _, err) = check(&d, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+
+    let orphan_root = scratch("check-task-facts-orphan");
+    let orphan = dist_with(&orphan_root, &facts);
+    let want = format!(
+        "xtask: {facts}: the image it states the facts of, {image}, is not listed in SHA256SUMS\n"
+    );
+    for run in [check, check_without_facts] {
+        let (code, _, err) = run(&orphan, COMMIT);
+        assert_eq!(code, Some(1), "{err}");
+        assert_eq!(err, want);
+    }
+}
+
+#[test]
+fn check_takes_only_the_facts_of_the_task_image_for_the_commit() {
+    // Catches: any file ending `.facts.json` taken as an asset: facts of a frontend image, of
+    // the Mac, or under another binary's name; and facts (with their image) of another commit.
+    for bad in [
+        format!("kbf-frontend-image-{COMMIT}-linux-arm64.facts.json"),
+        format!("kbf-task-image-{COMMIT}-darwin-arm64.facts.json"),
+        format!("kbf-task-{COMMIT}-linux-arm64.facts.json"),
+    ] {
+        let root = scratch("check-bad-task-facts");
+        let d = dist_with(&root, &bad);
+        let (code, out, err) = check(&d, COMMIT);
+        assert_eq!(code, Some(1), "{out}");
+        assert_eq!(err, format!("xtask: {bad}: not an asset of {COMMIT}\n"));
+    }
+    let other = "89abcdef0123456789abcdef0123456789abcdef";
+    let root = scratch("check-other-commit-task-facts");
+    let d = dist(&root, COMMIT);
+    let facts = format!("kbf-task-image-{other}-linux-arm64.facts.json");
+    add_deb(
+        &d,
+        &format!("kbf-task-image-{other}-linux-arm64.oci.tar"),
+        true,
+    );
+    add_deb(&d, &facts, false);
+    let (code, out, err) = check(&d, COMMIT);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        err.contains(&format!("{facts}: not an asset of {COMMIT}\n")),
+        "{err}"
+    );
+}
+
 /// A `dist` of the commit with the x86_64 frontend image listed and no bundle for it: the
 /// directory and the image's name.
 fn dist_without_bundle(root: &Path) -> (PathBuf, String) {

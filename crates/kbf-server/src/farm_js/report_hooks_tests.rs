@@ -69,7 +69,7 @@ async fn report(
         &rig.core,
         &rig.backend,
         &wall(),
-        || at(0),
+        &|| at(0),
         &WorkerId::new(worker),
         result,
     )
@@ -106,6 +106,18 @@ async fn a_taken_report_logs_one_action_usage_line_and_its_copy_none() {
         "node=usage-node",
     ] {
         assert!(lines[0].contains(part), "{part}: {}", lines[0]);
+    }
+    // The grant is on the line, not the `-` of a lease that was never started here.
+    for field in ["booked_millicpus=", "booked_memory_bytes="] {
+        let value = lines[0]
+            .split(field)
+            .nth(1)
+            .and_then(|r| r.split(' ').next());
+        assert!(
+            value.is_some_and(|v| v.parse::<u64>().is_ok_and(|n| n > 0)),
+            "{field}: {}",
+            lines[0]
+        );
     }
 }
 
@@ -145,11 +157,11 @@ async fn a_run_killed_for_memory_is_recorded_with_its_booking() {
 }
 
 /// Asserts a run of a recorded operation that ended with a result the scheduler took is
-/// recorded without a booking, and a kill by the node's memory pressure is logged for
-/// operators with the node's count. Catches: a booking on a run no kill ended, and no
-/// pressure line.
+/// recorded with the booking its lease was granted and no cap (no kill ended it), and a kill
+/// by the node's memory pressure is logged for operators with the node's count. Catches: a
+/// run recorded without its grant, a cap on a run no kill ended, and no pressure line.
 #[tokio::test(start_paused = true)]
-async fn a_run_that_was_not_killed_has_no_booking_and_a_pressure_kill_is_logged() {
+async fn a_run_that_was_not_killed_has_its_grant_and_no_cap_and_a_pressure_kill_is_logged() {
     let log = capture();
     let (recorder, recording) = Recorder::new(1 << 20, 64);
     tokio::spawn(recording.run());
@@ -172,7 +184,7 @@ async fn a_run_that_was_not_killed_has_no_booking_and_a_pressure_kill_is_logged(
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("kills=1"), "{}", lines[0]);
 
-    // The rerun succeeds: its run has no booking.
+    // The rerun succeeds: its run has the booking of its grant, and no cap.
     rig.core.tick(at(1)).await;
     let rerun = started(&node.sent()).expect("the rerun");
     assert!(report(&rig, "busy-node", measured(rerun)).await.accepted);
@@ -185,7 +197,9 @@ async fn a_run_that_was_not_killed_has_no_booking_and_a_pressure_kill_is_logged(
         .expect("a record");
     let attempts = &record.row(&action).expect("a row").attempts;
     let last = attempts.last().and_then(|a| a.run.clone()).expect("a run");
-    assert_eq!(last.booked_memory_bytes, None);
+    assert!(last.booked_memory_bytes.is_some_and(|b| b > 0), "{last:?}");
+    assert!(last.booked_millicpus.is_some_and(|c| c > 0), "{last:?}");
+    assert_eq!(last.cap_bytes, None);
 }
 
 /// Asserts ending the worker streams sends each open stream the status and counts only the
@@ -249,4 +263,29 @@ async fn a_kill_that_ends_the_operation_is_recorded_with_its_booking() {
         .and_then(|attempt| attempt.run.clone())
         .expect("the last run");
     assert!(last.booked_memory_bytes.is_some(), "{last:?}");
+}
+
+/// Asserts the callers of an operation read `Executing` before its `Start` leaves, as the
+/// farm's own driver orders it: a drain that ends the streams of operations that cannot start
+/// then never ends one whose `Start` is in flight. Catches: the stage shown after the `Start`
+/// is sent.
+#[tokio::test(start_paused = true)]
+async fn the_callers_read_executing_before_the_start_leaves() {
+    let rig = rig();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = std::sync::Arc::clone(&seen);
+    crate::farm::BEFORE_START.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |stages| {
+            record.lock().expect("lock").push(stages);
+        }));
+    });
+    let mut node = register(&rig, "start-node", 0);
+    let _ticket = submit(&rig, 1, 0).expect("queued");
+    crate::farm::BEFORE_START.with(|hook| hook.borrow_mut().take());
+    assert!(started(&node.sent()).is_some());
+    assert_eq!(
+        *seen.lock().expect("lock"),
+        [[kbf_front::Stage::Executing]],
+        "the Start left before its callers read Executing"
+    );
 }

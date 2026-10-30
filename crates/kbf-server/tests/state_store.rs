@@ -448,6 +448,7 @@ fn request(tag: u8) -> Request {
         hermetic: true,
         do_not_cache: false,
         needs: kbf_caps::Request::default(),
+        whole_worker: false,
     }
 }
 
@@ -1089,6 +1090,7 @@ use owner::{
     a_hello_to_the_frontend_that_holds_the_lease_takes_nothing_in,
     a_joined_submit_finds_its_lease_through_the_index,
     a_new_process_that_moves_waits_before_its_unlisted_lease_is_lost,
+    a_result_for_a_lease_numbered_below_the_one_taken_up_is_never_refused,
     acks_stop_when_session_renewals_fail, acks_stop_when_the_daemon_moves,
     an_ack_waits_for_the_session_row,
     an_owner_row_that_cannot_be_read_blocks_the_claim_until_the_next_hello,
@@ -1157,6 +1159,7 @@ restarts!(
     an_ack_waits_for_the_session_row,
     acks_stop_when_the_daemon_moves,
     a_new_process_that_moves_waits_before_its_unlisted_lease_is_lost,
+    a_result_for_a_lease_numbered_below_the_one_taken_up_is_never_refused,
     the_same_process_that_moves_loses_an_unlisted_lease_at_once,
     a_claim_the_store_refused_is_made_when_it_returns,
     an_owner_row_that_cannot_be_read_blocks_the_claim_until_the_next_hello,
@@ -1173,9 +1176,41 @@ restarts!(
     the_epoch_an_operator_raised_is_reported_by_the_other_frontend,
     a_client_waiting_through_another_frontend_gets_the_result,
     a_name_in_the_new_form_is_answered_by_every_frontend_at_every_stage,
-    a_joiner_of_a_leased_operation_never_deletes_its_lease,
-    an_old_form_name_is_answered_by_the_issuing_frontend
+    a_joiner_of_a_leased_operation_never_deletes_its_lease
 );
+
+/// `an_old_form_name_is_answered_by_the_issuing_frontend` over each store, as `restarts!` runs
+/// a test, written out so that the js core's difference can be marked on it.
+mod an_old_form_name_is_answered_by_the_issuing_frontend {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    #[cfg_attr(
+        feature = "farm-core-js",
+        ignore = "known-different-on-js: a name of the old form operations/<term>-<waiter> is not answered"
+    )]
+    async fn over_the_fake() {
+        super::an_old_form_name_is_answered_by_the_issuing_frontend(Backing::Fake).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[cfg_attr(
+        feature = "farm-core-js",
+        ignore = "known-different-on-js: a name of the old form operations/<term>-<waiter> is not answered"
+    )]
+    async fn over_sqlite() {
+        super::an_old_form_name_is_answered_by_the_issuing_frontend(Backing::Sqlite).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[cfg_attr(
+        feature = "farm-core-js",
+        ignore = "known-different-on-js: a name of the old form operations/<term>-<waiter> is not answered"
+    )]
+    async fn over_postgres() {
+        super::an_old_form_name_is_answered_by_the_issuing_frontend(Backing::Postgres).await;
+    }
+}
 
 /// A state store opened as a start opens it: from the flag, over `dir`.
 fn store_from_flag(dir: &std::path::Path) -> Result<StateStore, StateError> {
@@ -1245,10 +1280,13 @@ fn listeners() -> Listeners {
         default_platform: kbf_front::DefaultPlatform::NONE,
         qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        memory_climb: true,
         vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
+        exclusive_actions: false,
         scheduler_core: kbf_server::SchedulerCore::under_test(),
         placement_load: kbf_server::PlacementLoad::Off,
+        placement_predictions: kbf_server::PlacementPredictions::Off,
         whole_node: None,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),

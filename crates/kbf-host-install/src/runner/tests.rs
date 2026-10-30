@@ -248,59 +248,6 @@ fn a_privilege_drop_needs_a_real_uid_of_root() {
     assert!(refuse_setuid_drop(None, 1000, 0).is_ok());
 }
 
-/// A command with no `run_as` is started as it is. One with `run_as` is started by `chroot`
-/// on macOS, which sets the user, the group and the one supplementary group (the program
-/// and its arguments follow the root `/`); elsewhere this process sets the user and group.
-#[test]
-fn a_drop_goes_through_chroot_on_a_mac() {
-    use super::{Identity, Launch, launch};
-    let mut c = cmd("/usr/bin/gh", &["attestation", "verify"]);
-    for through_chroot in [false, true] {
-        assert_eq!(
-            launch(&c, through_chroot).unwrap(),
-            Launch {
-                program: "/usr/bin/gh".into(),
-                args: vec!["attestation".into(), "verify".into()],
-                set_ids: None
-            }
-        );
-    }
-    let id = Identity {
-        uid: 4_294_967_294,
-        gid: 4_294_967_293,
-    };
-    c.run_as = Some(id);
-    assert_eq!(
-        launch(&c, false).unwrap(),
-        Launch {
-            program: "/usr/bin/gh".into(),
-            args: vec!["attestation".into(), "verify".into()],
-            set_ids: Some(id)
-        }
-    );
-    assert_eq!(
-        launch(&c, true).unwrap(),
-        Launch {
-            program: "/usr/sbin/chroot".into(),
-            args: [
-                "-u",
-                "4294967294",
-                "-g",
-                "4294967293",
-                "-G",
-                "4294967293",
-                "/",
-                "/usr/bin/gh",
-                "attestation",
-                "verify"
-            ]
-            .map(str::to_owned)
-            .to_vec(),
-            set_ids: None
-        }
-    );
-}
-
 /// A command that writes `blocks` MiB to `file` with `dd`, held to `max` bytes in `dir`.
 fn writes(dir: &std::path::Path, file: &str, blocks: u32, max: u64) -> Cmd {
     Cmd {
@@ -419,27 +366,26 @@ fn a_cap_works_without_a_time_limit_and_over_a_missing_directory() {
     assert!(SystemRunner.run(&missing).unwrap().success());
 }
 
-/// A drop through `chroot` to uid 0 is refused, so `chroot` never runs a command as root.
+/// A drop with exact groups to uid 0 or gid 0 is refused, so the program never runs as root or
+/// in group 0 (`wheel`) through it; the drop by `Command::uid` and `gid` is not covered by this
+/// check, and no drop at all is not refused.
 #[test]
-fn a_chroot_drop_to_uid_zero_is_refused() {
-    use super::{Identity, launch};
-    let mut c = cmd("/usr/bin/gh", &[]);
-    c.run_as = Some(Identity { uid: 0, gid: 20 });
-    let kind = launch(&c, true).map_err(|e| e.kind());
-    assert_eq!(kind, Err(std::io::ErrorKind::PermissionDenied));
-    // This process's own drop is not covered by this check.
-    assert!(launch(&c, false).is_ok());
-}
-
-/// A drop through `chroot` to gid 0 is refused, so the child never keeps group 0 (`wheel`).
-#[test]
-fn a_chroot_drop_to_gid_zero_is_refused() {
-    use super::{Identity, launch};
-    let mut c = cmd("/usr/bin/gh", &[]);
-    c.run_as = Some(Identity { uid: 501, gid: 0 });
-    let kind = launch(&c, true).map_err(|e| e.kind());
-    assert_eq!(kind, Err(std::io::ErrorKind::PermissionDenied));
-    assert!(launch(&c, false).is_ok());
+fn an_exact_groups_drop_to_uid_or_gid_zero_is_refused() {
+    use super::{Identity, drop_ids};
+    use std::process::Command;
+    for (uid, gid) in [(0, 20), (501, 0), (0, 0)] {
+        let mut command = Command::new("/usr/bin/true");
+        let kind = drop_ids(&mut command, Some(Identity { uid, gid }), true).map_err(|e| e.kind());
+        assert_eq!(
+            kind,
+            Err(std::io::ErrorKind::PermissionDenied),
+            "{uid} {gid}"
+        );
+        assert!(drop_ids(&mut command, Some(Identity { uid, gid }), false).is_ok());
+    }
+    let mut command = Command::new("/usr/bin/true");
+    assert!(drop_ids(&mut command, None, true).is_ok());
+    assert!(drop_ids(&mut command, Some(Identity { uid: 501, gid: 20 }), true).is_ok());
 }
 
 /// The words for how a command ended, from a fixed exit.

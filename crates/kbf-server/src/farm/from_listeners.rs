@@ -11,8 +11,8 @@ use crate::serve::Listeners;
 impl Farm {
     /// A farm over `cache` with the settings `listeners` carries: how long unservable work
     /// waits, how long a finished operation is kept, the memory ladder, the learned sizes
-    /// the placement rule (`--placement-load`) and the whole-node settings
-    /// (`--whole-node-max`). The caller adds what is its own (the
+    /// the placement rule (`--placement-load`), whether it is given predictions
+    /// (`--placement-predictions`) and the whole-node settings (`--whole-node-max`). The caller adds what is its own (the
     /// recorder, the state store).
     #[must_use]
     pub(crate) fn from_listeners(cache: impl Into<Backend>, listeners: &Listeners) -> Self {
@@ -23,8 +23,10 @@ impl Farm {
             listeners.finished_retention,
         )
         .with_memory_ladder(listeners.memory_ladder.clone())
+        .with_memory_climb(listeners.memory_climb)
         .with_learned_sizes(listeners.learned_sizes, listeners.memory_ladder.first())
         .with_placement_load(listeners.placement_load)
+        .with_placement_predictions(listeners.placement_predictions)
         .with_whole_node(listeners.whole_node.clone())
     }
 

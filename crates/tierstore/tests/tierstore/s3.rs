@@ -8,15 +8,17 @@ use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures::{StreamExt, stream};
-use kbf_objstore::s3::fake::{FakeS3, part_etag};
+use kbf_objstore::s3::fake::{Failure, FakeS3, part_etag};
 use tierstore::s3::{Capabilities, Credentials, S3Config};
 use tierstore::{
-    Backend, ByteRange, Clock, Error, PartBody, Proxy, ProxyConfig, Reconciler, ReconcilerConfig,
-    S3Backend, SystemClock,
+    Backend, ByteRange, Check, Clock, Error, PartBody, Proxy, ProxyConfig, Reconciler,
+    ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SystemClock, self_test,
 };
 
 use crate::conformance;
+use crate::list_uploads::contract as uploads_contract;
 use crate::multipart::{contract, large};
 use crate::support::{body, keys, page};
 
@@ -38,6 +40,252 @@ async fn backend() -> (FakeS3, S3Backend) {
     let s3 = FakeS3::start().await;
     let backend = S3Backend::new(config(s3.endpoint())).unwrap();
     (s3, backend)
+}
+
+/// Asserts that the self-test passes over the S3 service, as a hot tier and as a cold tier (the
+/// conditional puts, the range, the head, the paging and the multipart completion of the service
+/// are the ones the test asks for), and leaves no object and no open upload in the bucket.
+#[tokio::test]
+async fn the_self_test_passes_over_the_s3_service_and_leaves_nothing() {
+    let (s3, backend) = backend().await;
+    for multipart in [false, true] {
+        let options = self_test_options("run-1", multipart);
+        self_test(&backend, &options, &|line: String| panic!("{line}"))
+            .await
+            .unwrap();
+    }
+    assert!(s3.keys().is_empty(), "{:?}", s3.keys());
+    assert_eq!(s3.incomplete_uploads(), 0);
+}
+
+/// The options of a self-test that asks a service that does not answer once (a wait of zero); a
+/// test that wants a repeat sets `wait`, and the pause is a millisecond.
+fn self_test_options(run_id: &str, multipart: bool) -> SelfTestOptions<'_> {
+    SelfTestOptions {
+        name: "the service",
+        run_id,
+        multipart,
+        skip: &[],
+        wait: Duration::ZERO,
+        pause: Duration::from_millis(1),
+        max_pause: Duration::from_millis(1),
+    }
+}
+
+/// Asserts that a probe key an earlier start left is deleted when the service's own clock, read
+/// from the time it stamps a key the test writes, says it is over an hour old, as listed with the
+/// time the service stamped it with; and that a key that is not yet an hour old stays.
+#[tokio::test]
+async fn the_self_test_sweeps_probe_keys_of_an_earlier_start_over_the_s3_service() {
+    let (s3, backend) = backend().await;
+    let left = bytes::Bytes::from_static(b"x");
+    s3.set_time(1);
+    backend
+        .put("_tiering/selftest/killed-start/create", left.clone())
+        .await
+        .unwrap();
+    s3.set_time(5_000);
+    backend
+        .put("_tiering/selftest/running-start/create", left)
+        .await
+        .unwrap();
+    let options = self_test_options("run-1", true);
+
+    // 3000 s on the service's clock: the first key is under an hour old.
+    s3.set_time(3_000);
+    self_test(&backend, &options, &|line: String| panic!("{line}"))
+        .await
+        .unwrap();
+    assert_eq!(s3.keys().len(), 2, "{:?}", s3.keys());
+
+    // 4000 s: the first key, written at 1 s, is over an hour old; the second, at 5000 s, is not
+    // older than now.
+    s3.set_time(4_000);
+    self_test(&backend, &options, &|line: String| panic!("{line}"))
+        .await
+        .unwrap();
+    assert_eq!(s3.keys(), ["_tiering/selftest/running-start/create"]);
+}
+
+/// Asserts that a 500 from the service is not a wrong answer: the cold tier's multipart check is
+/// asked again after one 500 and passes with a note for the repeat; and after a 500 in every
+/// attempt the tier is unreachable (a start that exits 1 and is restarted), not a violation.
+#[tokio::test]
+async fn a_500_from_the_service_is_retried_and_then_unreachable_not_a_violation() {
+    let (s3, backend) = backend().await;
+    s3.fail(Failure::Create);
+    let notes = Mutex::new(Vec::new());
+    let note = |line: String| notes.lock().unwrap().push(line);
+    let mut options = self_test_options("run-1", true);
+    options.wait = Duration::from_secs(5);
+    self_test(&backend, &options, &note).await.unwrap();
+    assert_eq!(
+        notes.lock().unwrap().len(),
+        1,
+        "{:?}",
+        notes.lock().unwrap()
+    );
+
+    // With a wait of zero a 500 is not asked again: the tier is unreachable at once.
+    options.wait = Duration::ZERO;
+    s3.fail(Failure::Create);
+    let outcome = self_test(&backend, &options, &note).await;
+    let Err(SelfTestError::Unreachable { error, .. }) = outcome else {
+        panic!("a 500 in every attempt is not unreachable");
+    };
+    assert!(error.contains("starting a multipart upload"), "{error}");
+    assert!(error.contains("500"), "{error}");
+    assert!(s3.keys().is_empty(), "{:?}", s3.keys());
+}
+
+/// Asserts that a service that does not answer is an unreachable tier, not a wrong answer, asked
+/// once for a wait of zero: the closed port of the service of a test that has stopped.
+#[tokio::test]
+async fn the_self_test_calls_a_service_that_does_not_answer_unreachable() {
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let backend = S3Backend::new(config(&endpoint)).unwrap();
+    let notes = Mutex::new(Vec::new());
+    let note = |line: String| notes.lock().unwrap().push(line);
+    let options = self_test_options("run-1", true);
+    let outcome = self_test(&backend, &options, &note).await;
+    let Err(SelfTestError::Unreachable { backend, error }) = outcome else {
+        panic!("not unreachable");
+    };
+    assert_eq!(backend, "the service");
+    assert!(error.contains("create-only"), "{error}");
+    // With a wait of zero the notes are: the time of the store that could not be read (for the
+    // sweep), and the delete of the check's key that failed before the attempt and after the
+    // check; no repeat.
+    let notes = notes.lock().unwrap();
+    let count = |text: &str| notes.iter().filter(|note| note.contains(text)).count();
+    assert_eq!(
+        count("could not read the time of the store"),
+        1,
+        "{notes:?}"
+    );
+    assert_eq!(count("trying again"), 0, "{notes:?}");
+    assert_eq!(count("could not delete the probe key"), 2, "{notes:?}");
+    assert_eq!(notes.len(), 3, "{notes:?}");
+}
+
+/// A service that answers every write (a PUT or a POST) with `status`, a whole HTTP reply, a
+/// DELETE with 204 and anything else with 404. Gives the endpoint and the request line of each
+/// request so far.
+fn refusing_writes(status: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+    const NO_CONTENT: &str =
+        "HTTP/1.1 204 No Content\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
+    const NOT_FOUND: &str =
+        "HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for socket in listener.incoming() {
+            let Ok(mut socket) = socket else { return };
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&chunk[..n]);
+            }
+            let text = String::from_utf8_lossy(&head).into_owned();
+            let line = text.lines().next().unwrap_or("").to_owned();
+            // The body, if there is one, is read before the reply, so the client does not see a
+            // reset while it is still sending.
+            let split = text.find("\r\n\r\n").map_or(text.len(), |at| at + 4);
+            let length = text
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::trim)
+                        .map(str::to_owned)
+                })
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut have = head.len() - split;
+            while have < length {
+                let n = socket.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                have += n;
+            }
+            log.lock().unwrap().push(line.clone());
+            let reply = match line.split(' ').next() {
+                Some("PUT" | "POST") => status,
+                Some("DELETE") => NO_CONTENT,
+                _ => NOT_FOUND,
+            };
+            let _ = socket.write_all(reply.as_bytes());
+        }
+    });
+    (endpoint, seen)
+}
+
+/// Asserts that a 507 from a store, through the real S3 mapping, is a full tier and not a wrong
+/// answer: the hot tier's checks that need a write are each skipped with a note (five), the test
+/// passes, and nothing but writes, deletes were sent (no listing: the time of the store could not
+/// be read).
+#[tokio::test]
+async fn a_507_from_the_store_skips_the_write_checks_through_the_s3_mapping() {
+    let (endpoint, seen) = refusing_writes(
+        "HTTP/1.1 507 Insufficient Storage\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+    );
+    let backend = S3Backend::new(config(&endpoint)).unwrap();
+    let notes = Mutex::new(Vec::new());
+    let note = |line: String| notes.lock().unwrap().push(line);
+    let options = self_test_options("run-1", false);
+    self_test(&backend, &options, &note).await.unwrap();
+    let notes = notes.lock().unwrap();
+    let full = notes
+        .iter()
+        .filter(|note| note.contains("the tier is full"));
+    assert_eq!(full.count(), 5, "{notes:?}");
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().all(|line| !line.starts_with("GET")), "{seen:?}");
+}
+
+/// Asserts that a 501 from a store, through the real S3 mapping, is a wrong answer that is not
+/// asked again: the self-test is refused as the create-only check after one put of the key, and
+/// no repeat is noted.
+#[tokio::test]
+async fn a_501_from_the_store_is_a_violation_asked_once() {
+    let (endpoint, seen) = refusing_writes(
+        "HTTP/1.1 501 Not Implemented\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+    );
+    let backend = S3Backend::new(config(&endpoint)).unwrap();
+    let notes = Mutex::new(Vec::new());
+    let note = |line: String| notes.lock().unwrap().push(line);
+    // A wait of 5 s would allow a repeat, if a 501 were taken for a store that is down.
+    let mut options = self_test_options("run-1", true);
+    options.wait = Duration::from_secs(5);
+    let outcome = self_test(&backend, &options, &note).await;
+    let Err(SelfTestError::Violation(failure)) = outcome else {
+        panic!("a 501 is a violation");
+    };
+    assert_eq!(failure.check, Check::CreateOnly);
+    assert!(failure.observed.contains("501"), "{failure}");
+    let notes = notes.lock().unwrap();
+    assert_eq!(
+        notes
+            .iter()
+            .filter(|note| note.contains("trying again"))
+            .count(),
+        0,
+        "{notes:?}"
+    );
+    let seen = seen.lock().unwrap();
+    let puts = seen
+        .iter()
+        .filter(|line| line.starts_with("PUT") && line.contains("/create"));
+    assert_eq!(puts.count(), 1, "{seen:?}");
 }
 
 /// Asserts that a call failed with `Error::Other`.
@@ -384,6 +632,100 @@ async fn the_s3_backend_does_multipart_uploads() {
     assert_eq!(s3.stats().completed, 2);
 }
 
+/// Asserts that the S3 backend lists the open uploads of the service as the trait says, held to
+/// the same checks as the in-memory and the directory backend (ListMultipartUploads with the
+/// prefix, the page size and the two markers), that the time of a start is the service's in
+/// milliseconds, and that an upload that was completed or aborted is no longer on the service's
+/// list.
+#[tokio::test]
+async fn the_s3_backend_lists_open_uploads() {
+    let (s3, backend) = backend().await;
+    s3.set_time(1_255_369_830);
+    let id = backend.create_upload("when").await.unwrap();
+    let listed = backend.list_uploads("", None, 10).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        (listed[0].key.as_str(), listed[0].id.as_str()),
+        ("when", id.as_str())
+    );
+    assert_eq!(listed[0].initiated, 1_255_369_830_000);
+    backend.abort_upload("when", &id).await.unwrap();
+
+    uploads_contract(&backend).await;
+    assert_eq!(s3.incomplete_uploads(), 2);
+}
+
+/// Asserts that the S3 backend asks for the pages of a listing of uploads until it has the
+/// number asked for or the listing ends, from the markers of each page, leaves the upload id
+/// marker out where the service sends an empty one, and ends with an error, as a listing of
+/// objects does, when a page names the marker it was sent.
+#[tokio::test]
+async fn the_s3_backend_follows_the_pages_of_a_listing_of_uploads() {
+    const FIRST: &str = "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n\
+                         <ListMultipartUploadsResult><IsTruncated>true</IsTruncated>\
+                         <NextKeyMarker>k1</NextKeyMarker><NextUploadIdMarker></NextUploadIdMarker>\
+                         <Upload><Key>k1</Key><UploadId>u1</UploadId>\
+                         <Initiated>2009-10-12T17:50:30.000Z</Initiated></Upload>\
+                         </ListMultipartUploadsResult>";
+    const LAST: &str = "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n\
+                        <ListMultipartUploadsResult><IsTruncated>false</IsTruncated>\
+                        <Upload><Key>k2</Key><UploadId>u2</UploadId>\
+                        <Initiated>2009-10-12T17:50:31.000Z</Initiated></Upload>\
+                        </ListMultipartUploadsResult>";
+    let (endpoint, seen) = scripted(vec![FIRST, LAST]);
+    let backend = S3Backend::new(config(&endpoint)).unwrap();
+    let listed = backend.list_uploads("", None, usize::MAX).await.unwrap();
+    let keys: Vec<(&str, &str)> = listed
+        .iter()
+        .map(|upload| (upload.key.as_str(), upload.id.as_str()))
+        .collect();
+    assert_eq!(keys, [("k1", "u1"), ("k2", "u2")]);
+    {
+        let heads = seen.lock().unwrap();
+        assert_eq!(heads.len(), 2);
+        assert!(!heads[0].contains("key-marker"), "{}", heads[0]);
+        assert!(heads[0].contains("max-uploads=1000"), "{}", heads[0]);
+        assert!(heads[1].contains("key-marker=k1"), "{}", heads[1]);
+        assert!(!heads[1].contains("upload-id-marker"), "{}", heads[1]);
+    }
+
+    const STUCK: &str = "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n\
+                         <ListMultipartUploadsResult><IsTruncated>true</IsTruncated>\
+                         <NextKeyMarker>k</NextKeyMarker><NextUploadIdMarker>u</NextUploadIdMarker>\
+                         </ListMultipartUploadsResult>";
+    let (endpoint, seen) = scripted(vec![STUCK, STUCK]);
+    let backend = S3Backend::new(config(&endpoint)).unwrap();
+    let error = backend.list_uploads("", None, 10).await.unwrap_err();
+    assert!(error.to_string().contains("stalled"), "{error}");
+    assert_other(Err::<(), Error>(error));
+    let heads = seen.lock().unwrap();
+    assert_eq!(heads.len(), 2);
+    assert!(heads[1].contains("key-marker=k"), "{}", heads[1]);
+    assert!(heads[1].contains("upload-id-marker=u"), "{}", heads[1]);
+}
+
+/// Asserts that a listing of uploads that the service refuses, or answers with something that is
+/// not a listing of uploads, or that names a prefix or a marker the client cannot name, is an
+/// `Other` error, as the other calls of the backend give for them, and that the last of these
+/// asks nothing of the service.
+#[tokio::test]
+async fn a_listing_of_uploads_that_fails_is_an_error() {
+    let (endpoint, _) = scripted(vec!["HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n<html/>"]);
+    let store = S3Backend::new(config(&endpoint)).unwrap();
+    assert_other(store.list_uploads("", None, 10).await);
+
+    let refusal = "HTTP/1.1 403 Forbidden\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
+    let (endpoint, _) = scripted(vec![refusal]);
+    let store = S3Backend::new(config(&endpoint)).unwrap();
+    assert_other(store.list_uploads("", None, 10).await);
+
+    let (endpoint, seen) = scripted(vec![]);
+    let store = S3Backend::new(config(&endpoint)).unwrap();
+    assert_other(store.list_uploads("", Some(("", None)), 10).await);
+    assert_other(store.list_uploads("a//b", None, 10).await);
+    assert!(seen.lock().unwrap().is_empty());
+}
+
 /// Asserts that a completion that names a part under the least size S3 takes, before the last
 /// one, is refused as `InvalidPart`, and that the upload is left open.
 #[tokio::test]
@@ -447,4 +789,91 @@ async fn tags_are_given_without_quotes_and_taken_with_or_without() {
     assert!(made.ends_with("-2"), "{made}");
     backend.put("plain", body("abcd")).await.unwrap();
     assert_ne!(backend.head("plain").await.unwrap().tag, made);
+}
+
+/// Asserts that a streamed put to S3 creates the object from its chunks, with the size and the
+/// tag a put of the same bytes gives, whether the length is told or not.
+#[tokio::test]
+async fn a_streamed_put_creates_the_object_from_its_chunks() {
+    let (_s3, backend) = backend().await;
+    conformance::a_streamed_put_creates_the_object_from_its_chunks(&backend).await;
+}
+
+/// Asserts that a streamed put to S3 whose body fails leaves nothing and gives the error.
+#[tokio::test]
+async fn a_streamed_put_that_fails_leaves_nothing() {
+    let (_s3, backend) = backend().await;
+    conformance::a_streamed_put_that_fails_leaves_nothing(&backend).await;
+}
+
+/// Asserts that a streamed put to S3 of an existing key is refused and the first object stays.
+#[tokio::test]
+async fn a_streamed_put_of_an_existing_key_is_refused() {
+    let (_s3, backend) = backend().await;
+    conformance::a_streamed_put_of_an_existing_key_is_refused(&backend).await;
+}
+
+/// The number of bytes in a chunk of a large body.
+const MEBIBYTE: usize = 1 << 20;
+
+/// A body of `count` chunks of a mebibyte, made as they are asked for, that then ends as `end`
+/// says.
+fn generated(count: usize, end: Option<Error>) -> PartBody<'static> {
+    let made = stream::iter(0..count).map(|n| Ok(Bytes::from(vec![n as u8; MEBIBYTE])));
+    let last = stream::iter(end.map(Err));
+    made.chain(last).boxed()
+}
+
+/// Asserts that a body longer than one request carries (17 MiB, over the 16 MiB a request
+/// holds) is stored by S3 as a multipart upload that is completed only after the last chunk:
+/// a body that fails at its last byte leaves no object and no open upload, a key that exists
+/// is refused after the upload was aborted, and a whole body makes one object of its length.
+#[tokio::test]
+async fn a_large_streamed_put_is_completed_only_after_the_last_chunk() {
+    let (s3, backend) = backend().await;
+    let len = Some(17 * MEBIBYTE as u64);
+    let cut = Error::Other("cut".to_owned());
+
+    let failed = backend
+        .put_stream("big", len, generated(17, Some(cut.clone())))
+        .await;
+    assert_eq!(failed, Err(cut));
+    assert_eq!(s3.keys(), Vec::<String>::new());
+    assert_eq!(s3.incomplete_uploads(), 0);
+    assert_eq!(s3.stats().completed, 0);
+
+    backend
+        .put_stream("big", len, generated(17, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.head("big").await.unwrap().size,
+        17 * MEBIBYTE as u64
+    );
+    assert_eq!(s3.stats().completed, 1);
+
+    let again = backend.put_stream("big", len, generated(17, None)).await;
+    assert_eq!(again, Err(Error::AlreadyExists("big".to_owned())));
+    assert_eq!(s3.incomplete_uploads(), 0);
+    assert_eq!(s3.stats().completed, 1);
+}
+
+/// Asserts that the S3 backend says it needs the length of a streamed body, the in-memory
+/// backend does not, and a proxy needs it when either of its tiers does.
+#[tokio::test]
+async fn a_proxy_needs_the_length_of_a_body_when_either_tier_is_s3() {
+    let (_s3, s3) = backend().await;
+    assert!(s3.needs_length());
+    assert!(!tierstore::MemoryBackend::new().needs_length());
+    let s3: Arc<dyn Backend> = Arc::new(s3);
+    let memory = || -> Arc<dyn Backend> { Arc::new(tierstore::MemoryBackend::new()) };
+    let open = |hot: Arc<dyn Backend>, cold: Arc<dyn Backend>| async move {
+        let clock = Arc::new(SystemClock);
+        Proxy::open(hot, cold, ProxyConfig::new("p1", 1000, clock))
+            .await
+            .unwrap()
+    };
+    assert!(open(memory(), s3.clone()).await.needs_length());
+    assert!(open(s3.clone(), memory()).await.needs_length());
+    assert!(!open(memory(), memory()).await.needs_length());
 }

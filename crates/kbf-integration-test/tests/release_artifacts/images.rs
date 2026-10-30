@@ -1,20 +1,21 @@
 //! The images in the pinned release set (docs/artifacts.md): an OCI image tarball of the frontend
-//! and one of the update coordinator for each Linux architecture,
+//! one of the update coordinator and one of the task runner for each Linux architecture,
 //! `kbf-<service>-image-<commit>-<platform>.oci.tar`. The frontend's is built from the `kbf` of
-//! the job's own tarball, the coordinator's (it has no tarball) from the `kbf-coordinator` the job
-//! built. No pull request run attests them, so a step that goes missing would turn `main` red or
-//! release an image nobody checked. [`rules`] reads the workflow and names a job that:
+//! the job's own tarball, the coordinator's and the task runner's (they have no tarball) from the
+//! `kbf-coordinator` and `kbf-task` the job built (the task runner's is the static musl build, which
+//! runs in any Linux image). No pull request run attests them, so a step that goes missing would
+//! turn `main` red or release an image nobody checked. [`rules`] reads the workflow and names a job that:
 //!
 //! - does not make an image an asset exactly once (`cargo xtask pkg-image-asset --service`,
 //!   [`PACKAGES`]), or makes it for another platform than its own;
 //! - gives that line another commit, platform, reference (`--kbf-tarball`, the tarball of this
-//!   job's `kbf`; or `--binary`, the job's `kbf-coordinator`), image or output directory than the
+//!   job's `kbf`; or `--binary`, the job's `kbf-coordinator` or `kbf-task`), image or output directory than the
 //!   ones the rules name, or runs it under `if:` or `continue-on-error:`;
 //! - makes an image an asset without, in steps before it that cannot be skipped, the context
 //!   filled from that reference, the commit's time put in the environment
 //!   (`cargo xtask source-date-epoch`), two `docker buildx build` runs and a `cmp` of their
 //!   two files (the build is reproducible), or before the reference names the commit
-//!   (`build-commit check-asset` of the tarball, `build-commit check` of the coordinator);
+//!   (`build-commit check-asset` of the tarball, `build-commit check` of the coordinator or the task runner);
 //!
 //! and names the verify job when it does not run `pkg-image-asset --verify-only` on each signed
 //! image, with the commit (and for the frontend its tarball), in an unconditional step after the
@@ -34,6 +35,10 @@ struct Service {
     first: &'static str,
     second: &'static str,
     context: &'static str,
+    /// The program the image holds (none for the frontend, whose `kbf` is in the tarball), and
+    /// the path the Linux jobs build it at.
+    program: &'static str,
+    binary: &'static str,
 }
 
 const FRONTEND: Service = Service {
@@ -41,6 +46,8 @@ const FRONTEND: Service = Service {
     first: "target/image-out/1.oci.tar",
     second: "target/image-out/2.oci.tar",
     context: "target/image",
+    program: "kbf",
+    binary: "",
 };
 
 const COORDINATOR: Service = Service {
@@ -48,10 +55,18 @@ const COORDINATOR: Service = Service {
     first: "target/coordinator-image-out/1.oci.tar",
     second: "target/coordinator-image-out/2.oci.tar",
     context: "target/coordinator-image",
+    program: "kbf-coordinator",
+    binary: "target/$TARGET/release/kbf-coordinator",
 };
 
-/// The binary the coordinator image is held to, as the Linux jobs name it.
-const COORDINATOR_BINARY: &str = "target/$TARGET/release/kbf-coordinator";
+const TASK: Service = Service {
+    name: "task",
+    first: "target/task-image-out/1.oci.tar",
+    second: "target/task-image-out/2.oci.tar",
+    context: "target/task-image",
+    program: "kbf-task",
+    binary: "target/$STATIC_TARGET/release/kbf-task",
+};
 
 impl Service {
     /// The `--service` word of `words`.
@@ -66,7 +81,7 @@ impl Service {
                 "--kbf-tarball",
                 format!("dist/kbf-$GITHUB_SHA-{platform}.tar.gz"),
             ),
-            _ => ("--binary", COORDINATOR_BINARY.to_owned()),
+            _ => ("--binary", self.binary.to_owned()),
         }
     }
 }
@@ -75,7 +90,7 @@ impl Service {
 /// after signing. An error when the workflow cannot be read.
 pub fn rules(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
     let made = attested_assets::packaged_images(workflow)?;
-    for service in [FRONTEND, COORDINATOR] {
+    for service in [FRONTEND, COORDINATOR, TASK] {
         for platform in PACKAGES {
             let n = made
                 .iter()
@@ -98,7 +113,10 @@ pub fn rules(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
                 "`cargo xtask pkg-image-asset --platform {platform}` makes an image that is not in `PACKAGES`: add it there and to docs/artifacts.md"
             ));
         }
-        if service != FRONTEND.name && service != COORDINATOR.name {
+        if ![FRONTEND, COORDINATOR, TASK]
+            .iter()
+            .any(|s| s.name == service)
+        {
             out.push(format!(
                 "`cargo xtask pkg-image-asset --service {service}` makes an image that is not in the release set: add it to docs/artifacts.md and to these rules"
             ));
@@ -168,16 +186,17 @@ fn build_job(
                 && l.contains(&format!("-xzf \"{reference}\""))
                 && l.contains(&format!("-C {context} kbf"))
         }
-        _ => l == format!("cp \"{COORDINATOR_BINARY}\" {context}/kbf-coordinator"),
+        _ => l == format!("cp \"{}\" {context}/{}", service.binary, service.program),
     };
     earlier(
         &match service.name {
             "frontend" => format!(
                 "the context taken out of this job's kbf tarball (`tar -xzf` into {context})"
             ),
-            _ => {
-                format!("the context filled with this job's kbf-coordinator (`cp` into {context})")
-            }
+            _ => format!(
+                "the context filled with this job's {} (`cp` into {context})",
+                service.program
+            ),
         },
         first(&steps, 0, filled),
         out,
@@ -247,23 +266,48 @@ fn build_job(
         }
     }
     // The reference must name the commit before the image is made from it. (A frontend tarball
-    // never checked at all is `identity`'s to name; the coordinator is checked only here.)
+    // never checked at all is `identity`'s to name; the coordinator and the task runner are checked only here.)
     let checked = first(&steps, 0, |l| match service.name {
         "frontend" => args(l, "cargo xtask build-commit check-asset ")
             .is_some_and(|a| a.len() == 2 && a[0] == reference && a[1] == "$GITHUB_SHA"),
         _ => args(l, "cargo xtask build-commit check ")
-            .is_some_and(|a| a.len() == 2 && a[0] == COORDINATOR_BINARY && a[1] == "$GITHUB_SHA"),
+            .is_some_and(|a| a.len() == 2 && a[0] == service.binary && a[1] == "$GITHUB_SHA"),
     });
+    if service.name == TASK.name {
+        // The task runner is mounted into the images of other actions, so it is the static build.
+        earlier(
+            "`rustup target add \"$STATIC_TARGET\"`",
+            first(&steps, 0, |l| l == "rustup target add \"$STATIC_TARGET\""),
+            out,
+        );
+        earlier(
+            "a `cargo build` of kbf-task `--target \"$STATIC_TARGET\"`",
+            first(&steps, 0, |l| {
+                l.starts_with("cargo build ")
+                    && l.contains("--target \"$STATIC_TARGET\"")
+                    && l.contains("-p kbf-task")
+            }),
+            out,
+        );
+        earlier(
+            "a `cargo xtask static-elf` check that kbf-task is statically linked",
+            first(&steps, 0, |l| {
+                l.starts_with("cargo xtask static-elf ") && l.contains(service.binary)
+            }),
+            out,
+        );
+    }
     let (verb, of) = match service.name {
-        "frontend" => ("check-asset", "the kbf tarball"),
-        _ => ("check", "the kbf-coordinator"),
+        "frontend" => ("check-asset", "the kbf tarball".to_owned()),
+        _ => ("check", format!("the {}", service.program)),
     };
     match (service.name, checked) {
         (_, Some((at, _))) if at > asset_at => out.push(format!(
             "{who} is made an asset before `cargo xtask build-commit {verb}` of {of}"
         )),
-        ("coordinator", None) => out.push(format!(
-            "{who} is made an asset without `cargo xtask build-commit check` of the kbf-coordinator before it"
+        ("frontend", None) => {}
+        (_, None) => out.push(format!(
+            "{who} is made an asset without `cargo xtask build-commit check` of {of} before it"
         )),
         _ => {}
     }
@@ -277,7 +321,7 @@ fn verify_job(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
         args(l, "cargo xtask verify-assets attestations ").is_some()
     })
     .map_or(usize::MAX, |(at, _)| at);
-    for service in [FRONTEND, COORDINATOR] {
+    for service in [FRONTEND, COORDINATOR, TASK] {
         for platform in PACKAGES {
             let image = format!(
                 "dist/kbf-{}-image-$GITHUB_SHA-{platform}.oci.tar",
@@ -286,7 +330,7 @@ fn verify_job(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
             let tarball = format!("dist/kbf-$GITHUB_SHA-{platform}.tar.gz");
             let found = first(&verify, 0, |l| {
                 args(l, VERB).is_some_and(|a| {
-                    // The coordinator has no tarball and the verify job has not its binary.
+                    // The coordinator and the task runner have no image tarball and the verify job has not its binary.
                     let reference = match service.name {
                         "frontend" => flag(&a, "--kbf-tarball") == Some(tarball.as_str()),
                         _ => flag(&a, "--kbf-tarball").is_none() && flag(&a, "--binary").is_none(),

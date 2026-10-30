@@ -38,32 +38,24 @@ fn the_flag_defaults_to_legacy_and_takes_only_its_two_values() {
         let possible = value.to_possible_value().expect("a value");
         assert_eq!(possible.get_name(), value.name());
     }
-    assert_eq!(SchedulerCore::default(), SchedulerCore::RUNNING);
+    assert_eq!(SchedulerCore::default(), SchedulerCore::Legacy);
 }
 
-/// Catches `js` accepted by the check (a server would start on a core it does not have),
-/// `legacy` refused, a message that does not name the flag and the value, and an exit
-/// status other than the one of a refused flag (2, which systemd does not restart).
+/// Catches `js` refused by the check in a build that has it (every build does: a unit file
+/// naming the js core would not start), and `legacy` refused.
 #[test]
-#[cfg_attr(
-    feature = "farm-core-js",
-    ignore = "a build with farm-core-js has the js core"
-)]
-fn js_is_refused_naming_the_flag_and_exits_as_a_refused_flag_does() {
-    Args::parse_from(["kbf-server"])
-        .check_scheduler_core()
-        .expect("legacy is built");
-    let args = Args::parse_from(["kbf-server", "--scheduler-core=js"]);
-    let refused = args.check_scheduler_core().expect_err("js is not built");
-    assert!(matches!(
-        refused,
-        ConfigError::SchedulerCoreUnavailable(SchedulerCore::Js)
-    ));
-    let said = refused.to_string();
-    assert!(said.contains("--scheduler-core js"), "{said}");
-    assert!(said.contains("not available yet"), "{said}");
-    assert!(said.contains("--scheduler-core legacy"), "{said}");
-    assert_eq!(StartFailure::of(&refused).status(), REFUSED);
+fn both_cores_pass_the_check_in_every_build() {
+    for flags in [
+        &[][..],
+        &["--scheduler-core=legacy"],
+        &["--scheduler-core=js"],
+    ] {
+        let mut argv = vec!["kbf-server"];
+        argv.extend_from_slice(flags);
+        Args::parse_from(argv)
+            .check_scheduler_core()
+            .unwrap_or_else(|e| panic!("{flags:?}: {e}"));
+    }
 }
 
 /// Catches the flag not reaching `Listeners` (a field left at a fixed value whatever the
@@ -120,17 +112,12 @@ fn the_gauge_is_one_for_the_running_core_and_zero_for_the_other() {
     );
 }
 
-/// Catches a start that does not log the core it runs, and a refusal that comes after
-/// anything is opened. A server over a log and store the test opened logs
-/// `scheduler core: legacy` once; `js` is refused by `serve_with` before anything is
-/// logged, and by `start` before it creates any of the store, metadata, state or log
-/// paths it is given.
+/// Catches a start that does not log the core it runs, and one that logs the other core's
+/// name. A server over a log and store the test opened logs `scheduler core: legacy` once
+/// and no `js` line; a second one started with `--scheduler-core=js` logs `scheduler core: js`
+/// once, whatever core the build's tests default to.
 #[tokio::test(flavor = "current_thread")]
-#[cfg_attr(
-    feature = "farm-core-js",
-    ignore = "a build with farm-core-js has the js core"
-)]
-async fn a_start_logs_the_core_and_js_is_refused_before_anything_opens() {
+async fn a_start_logs_the_core_it_runs_for_each_core() {
     let root = crate::test_dir::scratch_dir("kbf-server-scheduler-core");
     let open = |name: &'static str| {
         let root = root.to_path_buf();
@@ -164,16 +151,38 @@ async fn a_start_logs_the_core_and_js_is_refused_before_anything_opens() {
             .into_iter()
             .chain(flags),
     );
-    let refused = serve_with(&args, None, meta, store, prefix, id, || {
+    let server = serve_with(&args, None, meta, store, prefix, id, || {
         Ok(std::future::pending::<()>())
     })
     .await
-    .err()
-    .expect("js is refused");
-    assert!(refused.to_string().starts_with("--scheduler-core js"));
-    assert_eq!(StartFailure::of(&*refused).status(), REFUSED);
+    .expect("js starts");
+    drop(server);
+    let said = log.text();
+    assert_eq!(said.matches("scheduler core: js").count(), 1, "{said}");
+    assert_eq!(said.matches("scheduler core: legacy").count(), 1, "{said}");
+    assert_eq!(said.matches("memory climb: on").count(), 2, "{said}");
+    assert_eq!(said.matches("memory climb: off").count(), 0, "{said}");
 
-    // `start` is given every path it would create; the refusal leaves none of them.
+    let (meta, store, prefix, id) = open("no-climb").await;
+    let args = Args::parse_from(["kbf-server", "--no-memory-climb"].into_iter().chain(flags));
+    let server = serve_with(&args, None, meta, store, prefix, id, || {
+        Ok(std::future::pending::<()>())
+    })
+    .await
+    .expect("legacy without the climb starts");
+    drop(server);
+    let said = log.text();
+    assert_eq!(said.matches("memory climb: off").count(), 1, "{said}");
+    assert_eq!(said.matches("memory climb: on").count(), 2, "{said}");
+}
+
+/// Catches a refusal of `--learned-sizes on` with the js core that comes after anything is
+/// opened: `serve_with` refuses before it logs a core, and `start` before it creates any of
+/// the store, metadata, state or log paths it is given.
+#[tokio::test(flavor = "current_thread")]
+async fn js_with_learned_sizes_on_is_refused_before_anything_opens() {
+    let root = crate::test_dir::scratch_dir("kbf-server-scheduler-core-refused");
+    let log = capture();
     let (cold, hot, meta, state) = (
         root.join("start-cold"),
         root.join("start-hot"),
@@ -183,6 +192,7 @@ async fn a_start_logs_the_core_and_js_is_refused_before_anything_opens() {
     let args = Args::parse_from([
         "kbf-server".to_owned(),
         "--scheduler-core=js".to_owned(),
+        "--learned-sizes=on".to_owned(),
         format!("--cold-store=file://{}", cold.display()),
         format!("--hot-store=file://{}", hot.display()),
         format!("--meta-dir={}", meta.display()),
@@ -192,16 +202,15 @@ async fn a_start_logs_the_core_and_js_is_refused_before_anything_opens() {
     let refused = start(&args, || Ok(std::future::pending::<()>()))
         .await
         .err()
-        .expect("js is refused");
-    assert!(refused.to_string().starts_with("--scheduler-core js"));
+        .expect("js with learned sizes on is refused");
+    assert!(refused.to_string().starts_with("--learned-sizes on"));
     assert_eq!(StartFailure::of(&*refused).status(), REFUSED);
     for path in [&cold, &hot, &meta, &state, &root.join("start-log")] {
         assert!(!path.exists(), "{} was created", path.display());
     }
-    // The `legacy` line above is in this same capture, so the absence is not an empty one.
     assert!(
-        !log.text().contains("scheduler core: js"),
-        "a refused core is never logged as running"
+        !log.text().contains("scheduler core:"),
+        "a refused start logs no core"
     );
 }
 
@@ -223,12 +232,7 @@ fn learned_sizes_on_is_refused_with_the_js_core_only() {
     assert_eq!(StartFailure::of(&refused).status(), REFUSED);
     for mode in ["shadow", "off"] {
         let flag = format!("--learned-sizes={mode}");
-        let checked = check(&["--scheduler-core=js", &flag]);
-        // Whether js is built decides; the learned sizes do not.
-        assert!(
-            !matches!(checked, Err(ConfigError::LearnedSizesOnUnderJs)),
-            "{mode}"
-        );
+        check(&["--scheduler-core=js", &flag]).unwrap_or_else(|e| panic!("{mode}: {e}"));
     }
     check(&["--scheduler-core=legacy", "--learned-sizes=on"]).expect("legacy on");
 }

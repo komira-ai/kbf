@@ -29,23 +29,22 @@ macOS runner pool. Adding it to an open pull request starts a run.
 
 `artifacts.yml` runs on the `labeled` event so that the label starts something. Any label
 added to a pull request therefore starts a whole `artifacts` run, which replaces the pull
-request's earlier run: add labels together, before the run you want to keep. `native-macos`
-and `pkg-macos` run in `beta.yml` on every push and never on a pull request; that is pinned
-by `crates/kbf-integration-test/tests/release_artifacts`.
+request's earlier run: add labels together, before the run you want to keep. The `native-macos` job (which also runs
+the package tests) runs in `beta.yml` on every push and never on a pull request; that is pinned by `crates/kbf-integration-test/tests/release_artifacts`.
 
 ## What is built
 
-22 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
+24 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), two Debian packages of `kbf`
-([below](#the-kbf-package-deb)), one frontend and one update coordinator container image per
+([below](#the-kbf-package-deb)), one frontend, one update coordinator and one task runner container image per
 Linux architecture ([below](#the-frontend-and-coordinator-images-oci)) and one macOS package of `kbf-installer`
 ([below](#the-kbf-installer-package-pkg-macos)), built by one job per platform:
 
 | Asset | Runner | Target |
 |---|---|---|
 | `kbf-<commit>-darwin-arm64.tar.gz`, `kbf-deploy-<commit>-darwin-arm64.tar.gz`, `kbf-installer-<commit>-darwin-arm64.tar.gz`, `kbf-host-install-<commit>-darwin-arm64.tar.gz`, `kbf-updater-<commit>-darwin-arm64.tar.gz`, `kbf-mac-provision-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
-| `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz`, `kbf-host-install-<commit>-linux-x86_64.tar.gz`, `kbf-updater-<commit>-linux-x86_64.tar.gz`, `kbf-signer-<commit>-linux-x86_64.tar.gz`, `tierstore-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
-| `kbf-<commit>-linux-arm64.tar.gz`, `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz`, `kbf-host-install-<commit>-linux-arm64.tar.gz`, `kbf-updater-<commit>-linux-arm64.tar.gz`, `kbf-signer-<commit>-linux-arm64.tar.gz`, `tierstore-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
+| `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz`, `kbf-host-install-<commit>-linux-x86_64.tar.gz`, `kbf-updater-<commit>-linux-x86_64.tar.gz`, `kbf-signer-<commit>-linux-x86_64.tar.gz`, `tierstore-<commit>-linux-x86_64.tar.gz`, `kbf-task-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu`; `kbf-task` is built for `x86_64-unknown-linux-musl` |
+| `kbf-<commit>-linux-arm64.tar.gz`, `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz`, `kbf-host-install-<commit>-linux-arm64.tar.gz`, `kbf-updater-<commit>-linux-arm64.tar.gz`, `kbf-signer-<commit>-linux-arm64.tar.gz`, `tierstore-<commit>-linux-arm64.tar.gz`, `kbf-task-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu`; `kbf-task` is built for `aarch64-unknown-linux-musl` |
 
 `kbf` is the one binary with all five modes (`kbf --mode=daemon`, `kbf --mode=all-in-one`,
 `kbf --mode=storage`, and the two modes not built yet; [cluster.md](design/cluster.md) sections 1
@@ -81,6 +80,20 @@ the guide says. Each tarball holds one member, the binary under its own name. Th
 tarballs only, no package and no container image; it is taken by digest, verified, and placed like the
 two tools above. Its tarball holds one member, the binary under its own name.
 
+`kbf-task` is the runner of one build action inside a job (`crates/kbf-task`). Its Linux tarballs hold
+one member, the binary under its own name, built for the musl target of the architecture, so it is
+statically linked: it needs no libc of the image it runs in. A host does not mount it into any image: the
+kbf image carries it as its `ENTRYPOINT`, and the frontend's js-agent executor runs the kbf image (by digest,
+built from the served base) and gives the tool its flags only (`kbf-task` takes every path as a flag). It is built and
+tested on a native runner of each architecture, which installs the target with `rustup target add` and
+`musl-tools` (ring compiles C for the target with `musl-gcc`); the job runs `build-commit check` on the
+binary, which runs it, and `cargo xtask static-elf`, which refuses it unless it has no program
+interpreter and no needed library. The task image
+carries the same file. It writes its pack with `kbf-task-pack` (`crates/kbf-task-pack`), the task pack types
+the frontend ingests with, a crate of pure Rust that does not link the pack index or the object store client.
+
+There is no `kbf-task` asset or image for a Mac. Where no confine is built (anywhere but Linux) `kbf-task` refuses a Command that is to be denied the network (exit 15), so no workflow may package one until the Mac confine exists; a repository lint fails on such an asset, package line or image, on a `cargo build` for a Mac target that would produce it (any job), on a Mac runner job that names it or builds the whole workspace without `--exclude kbf-task`, and on a workflow that names the test-only feature `unconfined-for-tests`; a `cargo check` or `clippy` of it for a Mac target, which ships nothing, is allowed. The backstop is the pin of the release set (the asset table here and the workflow must agree, so a `kbf-task` asset for a Mac needs an edit of this file, which the lint catches); the lint's text match of workflow jobs is a tripwire.
+
 `tierstore` is the hot and cold S3 object store proxy (`crates/tierstore`): an S3 server over two
 tiers that copies new objects to the cold tier and frees the hot one when it fills. It is built with
 the crate's `server` feature, in a `cargo build` of its own. It has Linux tarballs only, no package
@@ -89,7 +102,7 @@ tools above, and its tarball holds one member, the binary under its own name. Th
 not update it: the farm places it, and the example unit and the flags to fill in are in
 [`packaging/tierstore`](../packaging/tierstore/README.md).
 
-The packages are the two Linux jobs' debs (one each) and container images (two each), and the macOS job's `.pkg`:
+The packages are the two Linux jobs' debs (one each) and container images (three each, and the facts of the task image), and the macOS job's `.pkg`:
 
 | Asset | Built by | Holds |
 |---|---|---|
@@ -99,6 +112,10 @@ The packages are the two Linux jobs' debs (one each) and container images (two e
 | `kbf-frontend-image-<commit>-linux-arm64.oci.tar` | the `linux-arm64` job | the same for arm64 |
 | `kbf-coordinator-image-<commit>-linux-x86_64.oci.tar` | the `linux-x86_64` job (`ubuntu-24.04`, BuildKit) | an OCI image of the `kbf-coordinator` the job built, which runs it as a user that is not root |
 | `kbf-coordinator-image-<commit>-linux-arm64.oci.tar` | the `linux-arm64` job | the same for arm64 |
+| `kbf-task-image-<commit>-linux-x86_64.oci.tar` | the `linux-x86_64` job (`ubuntu-24.04`, BuildKit) | an OCI image of the `kbf-task` the job built as one layer on the pinned Ubuntu 24.04 base of the farm's Linux actions, which runs it as a user that is not root |
+| `kbf-task-image-<commit>-linux-arm64.oci.tar` | the `linux-arm64` job | the same for arm64, on the arm64 manifest of the same base |
+| `kbf-task-image-<commit>-linux-x86_64.facts.json` | the `linux-x86_64` job (`pkg-image-asset`) | the digest of the task image's manifest, of its config and of its layers, and the digest of the base manifest it is built on |
+| `kbf-task-image-<commit>-linux-arm64.facts.json` | the `linux-arm64` job | the same for arm64 |
 | `kbf-installer-<commit>-darwin-arm64.pkg` | the `darwin-arm64` job (`macos-15`, `cargo xtask pkg build`) | the `kbf-installer` of the tarball of the same name, its LaunchDaemon property list, the pinned darwin `gh` and a trust directory |
 
 The set above is pinned: `crates/kbf-integration-test/tests/release_artifacts` fails a pull request
@@ -268,7 +285,7 @@ renamed.
 | Event | What happens |
 |---|---|
 | Pull request, merge queue | A build check: every asset is built, signed, packaged and summed, and `SHA256SUMS` is checked. Nothing is attested, so nothing is published. |
-| Push to `main` | The same, as the second stage of the one pipeline (`pipeline.yml`: `ci` and `beta` (the source tests) together, `artifacts` after `ci`, `smoke` on these files after `artifacts`, then the release; `artifacts.yml` is called by it, and reads the push as its own event), then, per platform group (Linux: `sums-linux`, `attest-linux`, `verify-linux`; macOS: `sums-darwin-arm64`, `attest-darwin-arm64`, `verify-darwin-arm64`, so the Linux files are attested as soon as the Linux builds finish, however long the macOS runners queue), the `attest-*` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`), an SBOM attestation for every tarball (`actions/attest-sbom`) and a build provenance attestation of each tarball alone, whose bundle it saves (artifact `bundles-linux` or `bundles-darwin-arm64`), and nothing else. The `verify-*` job of the group then assembles the group's `SHA256SUMS` (artifact `sha256sums-linux` or `sha256sums-darwin-arm64`, listing only that group's files, each with the same subject as in the commit's one `SHA256SUMS`) again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below, for the branch that was pushed (`--source-ref "$GITHUB_REF"`), and every tarball against its bundle, offline, for the commit (`--commit "$GITHUB_SHA"`). |
+| Push to `main` | The same, as the second stage of the one pipeline (`pipeline.yml`: `ci` and `beta` (the source tests) together, `artifacts` (the builds and sums, `stage: build`) beside them, `artifacts-sign` (the attest and verify jobs, `stage: sign`) after `ci` and `artifacts`, `smoke` on these files after `artifacts-sign`, then the release; `artifacts.yml` is called twice by it, and reads the push as its own event; the attest jobs are in that file because it is the signer identity the installers verify), then, per platform group (Linux: `sums-linux`, `attest-linux`, `verify-linux`; macOS: `sums-darwin-arm64`, `attest-darwin-arm64`, `verify-darwin-arm64`, so the Linux files are attested as soon as the Linux builds finish, however long the macOS runners queue), the `attest-*` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`), an SBOM attestation for every tarball (`actions/attest-sbom`) and a build provenance attestation of each tarball alone, whose bundle it saves (artifact `bundles-linux` or `bundles-darwin-arm64`), and nothing else. The `verify-*` job of the group then assembles the group's `SHA256SUMS` (artifact `sha256sums-linux` or `sha256sums-darwin-arm64`, listing only that group's files, each with the same subject as in the commit's one `SHA256SUMS`) again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below, for the branch that was pushed (`--source-ref "$GITHUB_REF"`), and every tarball against its bundle, offline, for the commit (`--commit "$GITHUB_SHA"`). |
 
 An attestation names the ref it was signed on, and only `refs/heads/main` signs now.
 Until main became the only integration branch, pushes to a development branch,
@@ -526,9 +543,9 @@ is published): it is built and installed in a container by CI, nothing more.
 
 ## The frontend and coordinator images (OCI)
 
-The frontend and the update coordinator ship as container images for each Linux architecture,
+The frontend, the update coordinator and the task runner ship as container images for each Linux architecture,
 release assets like the packages: `kbf-frontend-image-<commit>-linux-x86_64.oci.tar` and
-`kbf-frontend-image-<commit>-linux-arm64.oci.tar`, and the same two for `kbf-coordinator-image`.
+`kbf-frontend-image-<commit>-linux-arm64.oci.tar`, and the same two for `kbf-coordinator-image` and for `kbf-task-image`.
 Each is an OCI image layout in one tar. Nothing is pushed to a registry: load the file where the
 image is to run.
 
@@ -538,9 +555,10 @@ docker image load --input kbf-frontend-image-<commit>-linux-x86_64.oci.tar
 ctr images import kbf-frontend-image-<commit>-linux-x86_64.oci.tar
 ```
 
-The loaded images are named `kbf-frontend:<commit>` and `kbf-coordinator:<commit>`. Each holds one
-binary the job built and checked to name the commit, never a rebuild, on a distroless `cc` base
-pinned by digest (`packaging/container/frontend/Dockerfile` says why that base). Each runs as uid
+The loaded images are named `kbf-frontend:<commit>`, `kbf-coordinator:<commit>` and `kbf-task:<commit>`. Each holds one
+binary the job built and checked to name the commit, never a rebuild, on a base pinned by digest
+(the frontend and the coordinator on a distroless `cc` base, `packaging/container/frontend/Dockerfile`
+says why that base; the task image on Ubuntu 24.04, below). Each runs as uid
 65532 and holds no secret and no address.
 
 - **Frontend.** The `kbf` unpacked from `kbf-<commit>-<platform>.tar.gz` into the build context.
@@ -550,9 +568,26 @@ pinned by digest (`packaging/container/frontend/Dockerfile` says why that base).
   into the build context after `build-commit check` showed it names the commit.
   Its entrypoint is `kbf-coordinator`, with the flags of its mounted files as the default command
   (`packaging/container/kbf-coordinator/Dockerfile`), and it declares the ports 8443 and 8444.
+- **Task.** The `kbf-task` the job built (the same file as its tarball's), copied into the build
+  context after `build-commit check` showed it names the commit. Its entrypoint is `kbf-task`
+  with no default command and no declared port: what a task is given is the arguments of the
+  entrypoint (`packaging/container/kbf-task/Dockerfile`). The binary is the static musl build
+  (the tarball's). The base is the Ubuntu 24.04 image the farm's Linux actions run in
+  (`docker.io/library/ubuntu`, tagged `noble-20260917`: an image index, which the release does not
+  pin), so the Commands the task runs find the glibc, CA roots and tzdata they find in an action's image.
+  Each architecture is pinned by the digest of its own manifest in that index
+  (linux/amd64 `sha256:f610ab94...`, linux/arm64 `sha256:08571ca1...`; the full digests are in the
+  Dockerfile). The two manifests are committed beside the Dockerfile
+  (`packaging/container/kbf-task/base-<platform>.manifest.json`, the bytes the registry serves), so
+  the layer digests the check below compares are a file in the repository whose sha256 is the
+  digest the Dockerfile pins, not a value fetched at build time. The image adds nothing to the base
+  but the one layer that holds `/usr/bin/kbf-task` (the `COPY` is last, so a `kbf-task` change leaves the
+  base layers' digests as they are): no shell tool, no package, no user. It runs as the numeric
+  `65532:65532` like the other two images; a numeric user needs no `/etc/passwd` entry (an entry
+  would be a second changed layer), and `kbf-task` reads no user database.
 
 Both are run as `docs/deploy/containers.md` says. The archives are small, a binary on a distroless
-base: about 34 MB for a frontend image and 13 MB for a coordinator image, about 94 MB for the four,
+base: about 34 MB for a frontend image and 13 MB for a coordinator image,
 and they add that much to every run's artifacts and to every release.
 
 The build is reproducible: the job builds each image twice from the commit's time
@@ -562,19 +597,36 @@ unless:
 
 - `usr/bin/kbf` (frontend) is, in the layers as they stack, byte for byte the `kbf` in the tarball
   `kbf-<commit>-<platform>.tar.gz` that `build-commit check-asset` checked for the commit, mode
-  0755; `usr/bin/kbf-coordinator` is byte for byte the `kbf-coordinator` the job built (`--binary`),
+  0755; `usr/bin/kbf-coordinator` and `usr/bin/kbf-task` are byte for byte the `kbf-coordinator` and
+  the `kbf-task` the job built (`--binary`),
   mode 0755;
 - its config says Linux and the architecture of the platform, the entrypoint
-  `/usr/bin/kbf --mode=frontend` (frontend) or `/usr/bin/kbf-coordinator`, and a user that is not
+  `/usr/bin/kbf --mode=frontend` (frontend), `/usr/bin/kbf-coordinator` or `/usr/bin/kbf-task`, and a user that is not
   root;
-- every blob it names is present and hashes to its digest.
+- every blob it names is present and hashes to its digest;
+- (task image) its layers are the layers of the pinned base manifest of its platform, in order, and
+  exactly one more layer above them, which holds `usr/bin/kbf-task` and no other file. The layers of the
+  base are compared by digest and not opened.
+
+For the task image `pkg-image-asset` also writes `kbf-task-image-<commit>-<platform>.facts.json` beside
+the image and lists it in `SHA256SUMS`: `manifest` (the digest `index.json` names for the image's
+manifest, the digest a registry pin or a pull by digest uses; the manifest blob is hashed to it), `config`,
+every layer digest bottom first, `base` (the digest of the pinned base manifest), the commit and the
+platform. The file is a function of the image: `--verify-only` computes it again from the signed image
+and refuses unless the file beside it is those bytes. `verify-assets sums` refuses a listed task image
+without its facts (the previous release, read with `--without-version-facts`, may lack them) and facts
+without their image, and `verify-assets attestations` checks the facts for build provenance, as it does an
+SBOM. They carry no bundle and no SBOM attestation of their own; the attestation of `SHA256SUMS`
+that covers every other file covers them.
 
 It is attested like a deb: build provenance (one subject of the `SHA256SUMS` attestation, and alone,
 with its bundle `kbf-<service>-image-<commit>-<platform>.oci.tar.sigstore.json` in `bundles-linux`)
 and **no SBOM attestation**. The `kbf` of the frontend image has the SBOM of its tarball. The
-coordinator has no tarball and so no SBOM asset yet. The verify job checks both
+coordinator has no tarball and so no SBOM asset yet; the task runner's SBOM is that of its tarball,
+which describes the binary and not the Ubuntu base the task image carries, so it is not attested as the image's
+(an SBOM of the whole image needs a tool that reads the base's packages; that is not in the release yet). The verify job checks both
 offline and runs `cargo xtask pkg-image-asset --verify-only` on each signed file (for the
-coordinator that makes the checks of the image alone: the verify job has not the binary the build
+coordinator and the task runner that makes the checks of the image alone: the verify job has not the binary the build
 compared it with). Verify one before loading it, as for the `kbf` deb above:
 
 ```text
@@ -679,8 +731,8 @@ rebuilt. Its assets are every tarball and SBOM in the table above, for that comm
 it.
 
 One run of `release.yml` cuts a release; nobody tags. A push to `main` runs one sequential pipeline
-(`pipeline.yml`, [design](design/kbf-cicd.md), section 8.0): `ci` and `beta` (the source tests) together, `artifacts` after `ci`, and `smoke`, which installs and
-tests the `kbf` of the files `artifacts` built in that same run, after `artifacts`; the run fails fast (its `watch` job cancels it when a job has failed). `release.yml`
+(`pipeline.yml`, [design](design/kbf-cicd.md), section 8.0): `ci` and `beta` (the source tests) together, `artifacts` (the builds) beside them, `artifacts-sign` (the attestations) after `ci` and `artifacts`, and `smoke`, which installs and
+tests the `kbf` of the files `artifacts` built and attested in that same run, after `artifacts-sign`; the run fails fast (its `watch` job cancels it when a job has failed). `release.yml`
 is started by the completion of a pipeline run (`workflow_run`, `branches: [main]`) and acts only when that run
 succeeded for a push to `main`; it reads the files from that run's artifacts by the run's id and publishes those same
 files. It is a workflow of its own so that nothing a push does can cancel a

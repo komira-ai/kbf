@@ -21,7 +21,7 @@ use percent_encoding::percent_decode_str;
 use ring::digest::{Context as Sha1Context, SHA1_FOR_LEGACY_USE_ONLY};
 use sha2::{Digest, Sha256};
 
-use crate::{Error, PartBody};
+use crate::{Clock, Error, PartBody};
 
 use super::reply::{PAYLOAD_HEADER, S3Error};
 
@@ -121,11 +121,39 @@ impl Query {
 
 /// A request body, read a piece at a time: it has at most a limit of bytes, and it must not be
 /// idle: a wait for the next piece that takes longer than the idle timeout ends the read. The
-/// time that the whole body takes is not bounded, so a body that is slow and steady is read.
+/// time that the whole body takes is not bounded, so a body that is slow and steady is read, but
+/// a body may be held to a least average rate ([`Reader::with_floor`]).
 pub(crate) struct Reader<B> {
     body: Pin<Box<Limited<B>>>,
     limit: usize,
     idle: Duration,
+    floor: Option<Floor>,
+}
+
+/// The least average rate of a body, counted over the time the reader spent waiting for the
+/// client to send a piece, once that time has passed the grace. Time the reader spent not
+/// waiting for the client (a backend that is slow to take the pieces already read, so that the
+/// queue is full and the reader is not asked for more) is not counted: it is not the client's.
+/// The time is read from the clock of the server, so that a test moves it by hand.
+struct Floor {
+    min_bytes_per_sec: u64,
+    grace_millis: u64,
+    clock: Arc<dyn Clock>,
+    /// The milliseconds spent waiting for the client so far.
+    waited_millis: u64,
+    taken: u64,
+}
+
+impl Floor {
+    /// Counts a piece of `len` bytes, and says whether the body is now slower than the floor.
+    fn too_slow(&mut self, len: usize) -> bool {
+        self.taken = self.taken.saturating_add(len as u64);
+        if self.waited_millis <= self.grace_millis {
+            return false;
+        }
+        let wanted = u128::from(self.min_bytes_per_sec) * u128::from(self.waited_millis);
+        u128::from(self.taken) * 1000 < wanted
+    }
 }
 
 impl<B> Reader<B>
@@ -140,26 +168,59 @@ where
             body: Box::pin(Limited::new(body, limit)),
             limit,
             idle,
+            floor: None,
         }
+    }
+
+    /// The same reader, held to an average of at least `min_bytes_per_sec` over the time it
+    /// waits for the client, once that time has passed `grace` (zero: no floor), by the time
+    /// `clock` tells. A piece that makes the average fall under it ends the read with a
+    /// `RequestTimeout`.
+    pub(crate) fn with_floor(
+        mut self,
+        min_bytes_per_sec: u64,
+        grace: Duration,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        self.floor = (min_bytes_per_sec > 0).then(|| Floor {
+            min_bytes_per_sec,
+            grace_millis: u64::try_from(grace.as_millis()).unwrap_or(u64::MAX),
+            clock,
+            waited_millis: 0,
+            taken: 0,
+        });
+        self
     }
 
     /// The next piece of the body, or `None` at its end.
     ///
     /// # Errors
-    /// `RequestTimeout` for no piece within the idle timeout; `EntityTooLarge` for a body of
+    /// `RequestTimeout` for no piece within the idle timeout, or for a body under its floor;
+    /// `EntityTooLarge` for a body of
     /// more than the limit; `IncompleteBody` for one that could not be read.
     pub(crate) async fn next(&mut self) -> Result<Option<Bytes>, S3Error> {
         loop {
+            let began = self.floor.as_ref().map(|floor| floor.clock.now());
             let waiting = tokio::time::timeout(self.idle, self.body.frame());
             let Ok(frame) = waiting.await else {
                 return Err(S3Error::request_timeout(self.idle));
             };
+            if let (Some(floor), Some(began)) = (&mut self.floor, began) {
+                let spent = floor.clock.now().saturating_sub(began);
+                floor.waited_millis = floor.waited_millis.saturating_add(spent);
+            }
             match frame {
                 None => return Ok(None),
                 Some(Err(error)) => return Err(self.refusal(&error)),
                 Some(Ok(frame)) => {
                     if let Ok(mut data) = frame.into_data() {
-                        return Ok(Some(data.copy_to_bytes(data.remaining())));
+                        let piece = data.copy_to_bytes(data.remaining());
+                        if let Some(floor) = &mut self.floor
+                            && floor.too_slow(piece.len())
+                        {
+                            return Err(S3Error::too_slow(floor.min_bytes_per_sec));
+                        }
+                        return Ok(Some(piece));
                     }
                 }
             }

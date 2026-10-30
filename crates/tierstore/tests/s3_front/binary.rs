@@ -26,7 +26,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_tierstore");
 const SAFETY: Duration = Duration::from_secs(60);
 
 /// Runs the binary to its end: the exit status, stdout and stderr.
-fn run(flags: &[String]) -> (i32, String, String) {
+pub(crate) fn run(flags: &[String]) -> (i32, String, String) {
     let out = Command::new(BIN).args(flags).output().unwrap();
     (
         out.status.code().unwrap(),
@@ -36,7 +36,7 @@ fn run(flags: &[String]) -> (i32, String, String) {
 }
 
 /// A running binary, and the address it said it listens on.
-struct Running {
+pub(crate) struct Running {
     /// None once `exit_code` has taken it to wait for its end.
     child: Option<Reaped>,
     pid: Pid,
@@ -45,7 +45,7 @@ struct Running {
     _stdout: std::io::BufReader<std::process::ChildStdout>,
 }
 
-fn start(flags: &[String]) -> Running {
+pub(crate) fn start(flags: &[String]) -> Running {
     let mut command = Command::new(BIN);
     command
         .args(flags)
@@ -69,7 +69,7 @@ fn start(flags: &[String]) -> Running {
 
 impl Running {
     /// The client of kbf with the key of the key file.
-    fn store(&self) -> S3Store {
+    pub(crate) fn store(&self) -> S3Store {
         self.store_as(BIN_KEY_ID, BIN_SECRET)
     }
 
@@ -91,14 +91,14 @@ impl Running {
         S3Store::new(config).unwrap()
     }
 
-    fn signal(&self, signal: Signal) {
+    pub(crate) fn signal(&self, signal: Signal) {
         kill_process(self.pid, signal).unwrap();
     }
 
     /// The exit code, once the process has exited: a thread of the blocking pool waits for the
     /// process to end. A process that has not ended within `SAFETY` is killed, so that the wait
     /// ends, and the test fails.
-    async fn exit_code(&mut self) -> Option<i32> {
+    pub(crate) async fn exit_code(&mut self) -> Option<i32> {
         let mut child = self.child.take().expect("no process to wait for");
         let waiting = tokio::task::spawn_blocking(move || {
             let status = child.wait();
@@ -395,6 +395,40 @@ async fn it_serves_over_two_s3_tiers_and_lands_a_multipart_upload_in_the_cold_on
 
     running.signal(Signal::TERM);
     assert_eq!(running.exit_code().await, Some(0));
+}
+
+/// Asserts that a start whose cold tier is an S3 store that cannot be reached exits with status
+/// 1 (not 3, which is a store that answered wrongly: the unit restarts a status 1) before it
+/// serves anything: nothing on stdout (no start line), and a last line that says the tier is
+/// unreachable, names the cold tier as the flag gave it and says which check could not be run;
+/// the hot tier, a memory tier, was tested before it and said so.
+#[test]
+fn a_tier_that_cannot_be_reached_by_the_self_test_is_a_start_that_exits_1() {
+    let files = Files::new("bin-selftest-refused");
+    let secret = files.secret("cold-key", "ID\nsecret\n");
+    let key = secret.display().to_string();
+    let described = files.flags(&[
+        "--cold-credentials-file",
+        key.as_str(),
+        "--cold-endpoint",
+        "http://127.0.0.1:1",
+        "--backend-check-wait",
+        "2s",
+    ]);
+    let flags = with(&described, "--cold", "s3:cold-bucket");
+    let (code, out, err) = run(&flags);
+    assert_eq!((code, out.as_str()), (1, ""));
+    // The flag is read: a wait of 2 s allows the first pause (1 s) and not the second (2 s).
+    assert_eq!(err.matches("trying again in 1s").count(), 1, "{err}");
+    assert!(!err.contains("trying again in 2s"), "{err}");
+    assert!(
+        err.contains("tierstore: tested the hot tier memory in "),
+        "{err}"
+    );
+    let last = err.lines().last().unwrap();
+    let want = "tierstore: tier unreachable: cold tier s3:cold-bucket: ";
+    assert!(last.starts_with(want), "{err}");
+    assert!(last.contains("create-only"), "{err}");
 }
 
 /// Asserts that a start with a tier that its flags do not describe exits with status 1 and a

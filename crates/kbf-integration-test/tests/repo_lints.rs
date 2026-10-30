@@ -38,6 +38,8 @@
 //!   built, and again on the packaged tarball with `build-commit check-asset`), signing and
 //!   `darwin-asset`-checking every macOS binary, or docs/artifacts.md describing
 //!   another set (module `release_artifacts`);
+//! - a workflow, release asset list or docs/artifacts.md that ships a darwin `kbf-task` asset, package or image,
+//!   or a workflow that enables the test-only feature `unconfined-for-tests` of `kbf-task` (`no_darwin_task.rs`);
 //! - the push-to-main pipeline drifting from its shape (`ci` and `beta` together, `artifacts` after `ci`,
 //!   `smoke` on those artifacts after `artifacts`, `passed` needing all four, and the `watch` job that
 //!   cancels the run when a job fails), a called workflow gaining a push

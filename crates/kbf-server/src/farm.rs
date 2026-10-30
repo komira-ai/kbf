@@ -69,9 +69,7 @@ pub(crate) mod durable;
 mod engine;
 pub(crate) mod failed_actions;
 mod handover;
-// The core's pieces are read as the groups of methods in `js` are written.
-#[cfg(feature = "farm-core-js")]
-#[allow(dead_code)]
+mod input_cache;
 mod js;
 mod learning;
 mod named;
@@ -104,6 +102,7 @@ use self::driver::Driver;
 pub(crate) use self::driver::Settings;
 use self::durable::Held;
 use self::engine::Engine;
+pub(crate) use self::node_load::NodeLoads;
 use self::report::{Detail, Settled, finished_of, refused_as};
 pub(crate) use self::side::identity;
 use self::side::{Link, Side};
@@ -227,7 +226,7 @@ impl Farm {
     /// new [`process_term`] for both otherwise (see the module docs).
     ///
     /// It runs on the core [`crate::SchedulerCore::under_test`] names: the farm's own, and
-    /// the js core in a build with the `farm-core-js` feature.
+    /// the js core in a build with the `farm-core-js` feature (the tests of the js core).
     #[must_use]
     pub fn new(
         cache: impl Into<Backend>,
@@ -259,14 +258,12 @@ impl Farm {
     }
 
     /// [`Farm::new`] on `core`.
-    #[cfg_attr(not(feature = "farm-core-js"), allow(unused_variables))]
     pub(crate) fn on_core(
         core: crate::SchedulerCore,
         cache: Backend,
         unservable_wait: Duration,
         finished_retention: Duration,
     ) -> Self {
-        #[cfg(feature = "farm-core-js")]
         if core == crate::SchedulerCore::Js {
             return Self::new_js(cache, unservable_wait, finished_retention);
         }
@@ -373,6 +370,23 @@ impl Farm {
         self
     }
 
+    /// This farm, whose scheduler finishes an action that passes its own memory limit with
+    /// `Failed(OutOfMemory)` at its booking if `climb` is `false` (`--no-memory-climb`), instead
+    /// of running it again one rung up. Legacy core only: the js core builds its own scheduler
+    /// and ignores this.
+    #[must_use]
+    pub fn with_memory_climb(mut self, climb: bool) -> Self {
+        self.settings.climb = climb;
+        self.driver.set_climb(&self.settings);
+        self
+    }
+
+    /// Whether an own-limit kill runs the action again one rung up (the default) or finishes it.
+    #[must_use]
+    pub(crate) const fn memory_climb(&self) -> bool {
+        self.settings.climb
+    }
+
     /// This farm, keeping at most `bound` memory floors (instead of
     /// [`kbf_sched::MEMORY_FLOORS`]); past that, the one raised longest ago is forgotten
     /// first. Set before the farm takes a state store over.
@@ -426,6 +440,10 @@ impl Farm {
             .sched_whole
             .set(state.engine.sched.whole_summary().as_ref());
         state.side.learned.publish(&metrics.estimator_shadow);
+        state.side.learned.publish_predictions(&metrics.prediction);
+        metrics
+            .prediction
+            .set_cpu_limited_nodes(self.cpu_limited_nodes(state));
     }
 
     /// Writes the changed size summaries to the state store now, as the tick does once
@@ -811,8 +829,9 @@ impl Dispatch for Farm {
         let name = state
             .side
             .name_of(state.engine.durable.is_some(), waiter, operation);
-        state.learn_submit(
+        let predicted = state.learn_submit(
             waiter,
+            operation,
             &name,
             &submission.request,
             &submission.evidence,
@@ -837,6 +856,11 @@ impl Dispatch for Farm {
         if let Some(key) = size_key.filter(|_| !joined) {
             let next = state.engine.sched.next_operation();
             state.engine.sched.set_size_key(next, key);
+        }
+        // Its predicted cost is given before the submit is fed too (`--placement-predictions
+        // on`; none for a twin joined, which keeps the one it was given).
+        if let Some(prediction) = predicted {
+            state.engine.sched.set_cost(operation, prediction);
         }
         match held {
             Held::Here => state.feed_quiet(
@@ -976,6 +1000,9 @@ mod from_listeners;
 mod learned_tests;
 #[cfg(test)]
 mod placement_tests;
+mod prediction;
+#[cfg(test)]
+mod prediction_tests;
 #[cfg(test)]
 mod storage_down_tests;
 #[cfg(test)]

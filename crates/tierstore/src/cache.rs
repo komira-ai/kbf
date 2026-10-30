@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::{Backend, ByteRange, Error, Listed, Meta, PartBody};
+use crate::{Backend, ByteRange, Error, Listed, Meta, OpenUpload, PartBody, UploadsAfter};
 
 /// What a cached read was asked for: an object, and a range of it or the whole of it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -160,8 +160,32 @@ impl CachedStore {
 
 #[async_trait]
 impl Backend for CachedStore {
+    fn needs_length(&self) -> bool {
+        self.inner.needs_length()
+    }
+
     async fn put(&self, key: &str, body: Bytes) -> Result<(), Error> {
         self.inner.put(key, body).await
+    }
+
+    /// A put does not touch the cache (objects are immutable, and a key that was absent has
+    /// nothing cached), so the stream goes on to the inner store as it is, not held.
+    async fn put_stream(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        self.inner.put_stream(key, len, body).await
+    }
+
+    async fn put_stream_hot_only(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        self.inner.put_stream_hot_only(key, len, body).await
     }
 
     async fn put_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<String, Error> {
@@ -245,5 +269,14 @@ impl Backend for CachedStore {
 
     async fn abort_upload(&self, key: &str, id: &str) -> Result<(), Error> {
         self.inner.abort_upload(key, id).await
+    }
+
+    async fn list_uploads(
+        &self,
+        prefix: &str,
+        after: Option<UploadsAfter<'_>>,
+        max_uploads: usize,
+    ) -> Result<Vec<OpenUpload>, Error> {
+        self.inner.list_uploads(prefix, after, max_uploads).await
     }
 }

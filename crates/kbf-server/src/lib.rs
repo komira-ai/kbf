@@ -85,6 +85,7 @@ pub mod cold_apply;
 pub mod config;
 pub mod drain;
 pub mod enroll;
+pub mod executor;
 pub mod farm;
 pub mod farm_js;
 mod fault;
@@ -102,9 +103,11 @@ mod http_history;
 pub mod http_invocations;
 pub mod http_sched;
 pub mod identity;
+mod input_cache_metrics;
 pub mod join;
 pub mod learned;
 mod listen;
+mod load_metrics;
 mod local;
 pub mod log_file;
 pub mod machine;
@@ -122,6 +125,7 @@ pub mod object_store;
 mod pack_daemon_metrics;
 pub mod pack_locate;
 pub mod placement_load;
+pub mod placement_predictions;
 pub mod proxy_auth;
 pub mod raft_log;
 mod ram_drain;
@@ -173,7 +177,7 @@ pub mod worker_roles;
 pub mod write_tier;
 
 pub use config::{Args, ConfigError, Role, SERVER, s3_store};
-pub use drain::{Drain, DrainStatus};
+pub use drain::{Drain, DrainStatus, Hold};
 pub use farm::{
     ACK_WINDOW, DONE_FLOOR, EpochBump, EpochPolicy, Farm, ID_BLOCK, INTAKE_POLL, ORPHAN_WAIT,
     OWNER_CACHE_TTL, SESSION_RENEWAL, StateError,
@@ -186,6 +190,7 @@ pub use learned::LearnedSizes;
 pub use local::LocalStore;
 pub use node_map::NodeMap;
 pub use placement_load::PlacementLoad;
+pub use placement_predictions::PlacementPredictions;
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use scheduler_core::SchedulerCore;
 pub use serve::{

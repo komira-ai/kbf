@@ -175,6 +175,44 @@ fn a_cache_that_cannot_be_opened_runs_uncached() {
     assert!(!runtime.cached());
 }
 
+/// What `--no-input-cache` gives the driver: no cache in its config. Catches a driver
+/// without a cache that records input statistics, or writes inputs wrong: two actions
+/// with the same input each get its bytes straight from the CAS (the action copies the
+/// input into an output, whose bytes are compared), neither is counted as a cache hit,
+/// and the input is a private file of its own (one link), as a cache link would not be.
+/// The cached counterpart is `inputs_are_links_to_the_cache_and_only_directories_change_owner`.
+#[tokio::test]
+async fn without_a_cache_each_action_gets_its_inputs_from_the_cas() {
+    let fake = Fake::new("no-cache");
+    assert!(!fake.runtime.cached());
+    let mut spec = Spec::new(&image(), "unused");
+    spec.inputs = vec![("src/a.txt", b"input bytes", false)];
+    spec.outputs = vec!["seen".to_owned(), "stat".to_owned()];
+    for seq in [1, 2] {
+        let steps = [
+            "copy",
+            "$UPPER/seen",
+            "$ROOT/src/a.txt",
+            ";",
+            "inode-links",
+            "$UPPER/stat",
+            "$ROOT/src/a.txt",
+        ];
+        let result = fake.run(seq, &spec, &steps).await.expect("run");
+        assert_eq!(result.exit_code, 0, "{result:?}");
+        let seen = blob(&fake.cas, result.output_files[0].digest.as_ref());
+        assert_eq!(seen, b"input bytes");
+        let stat = String::from_utf8(blob(&fake.cas, result.output_files[1].digest.as_ref()))
+            .expect("utf-8");
+        assert!(
+            stat.trim_end().ends_with(" 1"),
+            "linked from somewhere: {stat}"
+        );
+        assert_eq!(fake.runtime.last_inputs(), None);
+        fake.assert_clean(seq);
+    }
+}
+
 /// A fake whose runtime has a cache and a tree store of its own.
 fn treed(name: &str) -> Fake {
     let dir = crate::support::scratch(&format!("fake-trees-{name}"));
@@ -349,4 +387,65 @@ async fn a_corrupt_blob_in_a_tree_fails_the_lease_and_names_no_tree() {
     let result = run(2).await.expect("with the blob right");
     assert_eq!(result.exit_code, 0, "{result:?}");
     assert_eq!(fake.runtime.tree_stats().expect("a store").trees, 1);
+}
+
+/// Catches counts the heartbeat reads that do not follow the cache: a runtime with no
+/// cache reporting counts (zeros would read as "a cache that did nothing"), the first
+/// lease's two inputs not counted as two fills with their bytes, the second lease's not
+/// counted as two hits with theirs (and as fills again), and the tree store's own builds
+/// and hits missing from the same report.
+#[tokio::test]
+async fn the_runtime_reports_the_fills_then_the_hits_of_its_leases() {
+    use kbf_daemon::Runtime as _;
+    let plain = Fake::new("counts-plain");
+    assert_eq!(plain.runtime.input_cache(), None, "no cache, no counts");
+
+    let fake = treed("counts");
+    let mut spec = Spec::new(&image(), "unused");
+    spec.inputs = toolchain_inputs(300);
+    spec.outputs = vec!["seen".to_owned()];
+    let steps = ["copy", "$UPPER/seen", "$ROOT/toolchain/d1/f1"];
+    let key_bytes: u64 = spec
+        .inputs
+        .iter()
+        .map(|(_, bytes, _)| bytes.len() as u64)
+        .sum();
+    assert_eq!(fake.runtime.input_cache().map(|c| c.fills), Some(0));
+
+    fake.run(1, &spec, &steps).await.expect("first");
+    let first = fake.runtime.input_cache().expect("counts");
+    assert_eq!(
+        (first.fills, first.fill_bytes),
+        (301, key_bytes),
+        "{first:?}"
+    );
+    assert_eq!((first.hits, first.hit_bytes), (0, 0), "{first:?}");
+    assert_eq!(
+        first.trees.map(|t| (t.builds, t.hits)),
+        Some((1, 0)),
+        "{first:?}"
+    );
+
+    fake.run(2, &spec, &steps).await.expect("second");
+    let second = fake.runtime.input_cache().expect("counts");
+    assert_eq!(
+        (second.fills, second.fill_bytes),
+        (301, key_bytes),
+        "{second:?}"
+    );
+    assert_eq!(
+        second.hits, 1,
+        "only the small file is the lease's own: {second:?}"
+    );
+    assert_eq!(second.hit_bytes, 5, "{second:?}");
+    assert_eq!(
+        second.trees.map(|t| (t.builds, t.hits)),
+        Some((1, 1)),
+        "{second:?}"
+    );
+    assert_eq!(
+        (second.evictions, second.evicted_bytes),
+        (0, 0),
+        "{second:?}"
+    );
 }

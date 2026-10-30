@@ -256,7 +256,8 @@ async fn a_file_too_short_for_its_content_tag_is_an_error() {
 }
 
 /// Asserts that a directory that cannot be written fails the calls that change it with an error
-/// that names the file, and leaves nothing behind: a put, a put that replaces and a delete.
+/// that names the file, and leaves nothing behind: a put, a streamed put, a put that replaces
+/// and a delete.
 #[tokio::test]
 async fn a_directory_that_cannot_be_written_fails_the_changes_and_leaves_nothing() {
     let (dir, backend) = backend();
@@ -264,11 +265,13 @@ async fn a_directory_that_cannot_be_written_fails_the_changes_and_leaves_nothing
     let tag = backend.head("k").await.unwrap().tag;
     chmod(dir.path(), 0o500);
     let put = backend.put("j", body("two")).await;
+    let streamed = backend.put_stream("s", None, pieces(&["two"])).await;
     let replace = backend.put_if_match("k", body("two"), &tag).await;
     let delete = backend.delete("k").await;
     let listed = names(dir.path());
     chmod(dir.path(), 0o700);
-    for error in [put.unwrap_err(), replace.unwrap_err(), delete.unwrap_err()] {
+    let errors = [put, streamed, replace.map(|_| ()), delete];
+    for error in errors.map(Result::unwrap_err) {
         assert!(matches!(error, Error::Other(_)), "{error}");
     }
     assert_eq!(listed, [".uploads".to_owned(), "k".to_owned()]);
@@ -446,4 +449,84 @@ async fn a_part_that_cannot_be_opened_or_read_fails_the_completion() {
     assert!(matches!(unopened, Err(Error::Other(_))));
     assert!(matches!(unread, Err(Error::Other(_))));
     assert_eq!(names(dir.path()), [".uploads".to_owned()]);
+}
+
+/// Whether the directory holds a temporary file of a put.
+fn has_temporary_file(dir: &Path) -> bool {
+    names(dir).iter().any(|name| name.starts_with(".tmp-"))
+}
+
+/// Asserts that an object put as a stream is not visible while its body is half way (a head finds
+/// nothing, the chunks so far are in a temporary file), is visible after the last chunk with the
+/// bytes and the content tag a put of the same bytes gives, and leaves no temporary file.
+#[tokio::test]
+async fn a_streamed_put_is_visible_only_after_the_last_chunk() {
+    let (dir, backend) = backend();
+    let (started, midway) = oneshot::channel();
+    let (release, resume) = oneshot::channel();
+    let putting = backend.put_stream("k", Some(4), gated("ab", "cd", started, resume));
+    let watching = async {
+        midway.await.unwrap();
+        let absent = backend.head("k").await;
+        assert_eq!(absent.unwrap_err(), Error::NotFound("k".to_owned()));
+        assert!(has_temporary_file(dir.path()));
+        release.send(()).unwrap();
+    };
+    let (put, ()) = tokio::join!(putting, watching);
+    put.unwrap();
+    assert_eq!(backend.get("k", None).await.unwrap(), "abcd");
+    backend.put("whole", body("abcd")).await.unwrap();
+    let (streamed, whole) = (backend.head("k").await, backend.head("whole").await);
+    assert!(streamed.unwrap().same_content(&whole.unwrap()));
+    assert!(!has_temporary_file(dir.path()));
+}
+
+/// Asserts that a body that fails half way, or at once, gives its error and leaves no object and
+/// no temporary file, that the key can be put again, and that a key that exists is refused
+/// after its body was read, with the first object kept and no temporary file left.
+#[tokio::test]
+async fn a_streamed_put_that_fails_or_finds_the_key_taken_leaves_only_what_was_there() {
+    let (dir, backend) = backend();
+    let cut = Error::Other("cut".to_owned());
+    let items = vec![Ok(body("ab")), Err(cut.clone())];
+    let half: PartBody<'static> = stream::iter(items).boxed();
+    assert_eq!(backend.put_stream("k", None, half).await, Err(cut.clone()));
+    let at_once: PartBody<'static> = stream::iter(vec![Err(cut.clone())]).boxed();
+    assert_eq!(backend.put_stream("k", None, at_once).await, Err(cut));
+    assert_eq!(names(dir.path()), [".uploads".to_owned()]);
+
+    backend
+        .put_stream("k", None, pieces(&["one"]))
+        .await
+        .unwrap();
+    let taken = backend.put_stream("k", None, pieces(&["two"])).await;
+    assert_eq!(taken, Err(Error::AlreadyExists("k".to_owned())));
+    assert_eq!(backend.get("k", None).await.unwrap(), "one");
+    assert_eq!(names(dir.path()), [".uploads".to_owned(), "k".to_owned()]);
+}
+
+/// Asserts that a streamed put that is dropped half way (its caller gave up) removes its
+/// temporary file and leaves no object.
+#[tokio::test]
+async fn a_streamed_put_that_is_dropped_half_way_leaves_nothing() {
+    let (dir, backend) = backend();
+    let (started, midway) = oneshot::channel();
+    let (_release, resume) = oneshot::channel::<()>();
+    let putting = backend.put_stream("k", None, gated("ab", "cd", started, resume));
+    tokio::select! {
+        _ = putting => panic!("the body was not given its second chunk"),
+        _ = midway => {}
+    }
+    assert_eq!(names(dir.path()), [".uploads".to_owned()]);
+    let absent = backend.head("k").await;
+    assert_eq!(absent.unwrap_err(), Error::NotFound("k".to_owned()));
+}
+
+/// Asserts that a streamed put of a key that cannot be a file name is refused before the body is
+/// taken.
+#[tokio::test]
+async fn a_streamed_put_of_a_key_that_is_no_file_name_is_refused() {
+    let (_dir, backend) = backend();
+    let refused = backend.put_stream("", None, pieces(&["x"])).await;
+    assert!(matches!(refused, Err(Error::Other(_))));
 }

@@ -569,6 +569,32 @@ async fn a_source_offers_h2_only_unless_made_to_offer_http1_too() {
     assert_eq!(offered(&watched), both);
 }
 
+/// Catches: a source made for plain HTTPS clients that also offers `h2` (a client that
+/// prefers it would then speak HTTP/2 to a server that does not), or that offers nothing, and
+/// one that forgets what it offers after its files are replaced.
+#[tokio::test]
+async fn a_source_can_offer_http1_alone() {
+    let ca = ca("http1 CA");
+    let (old, new) = (server_leaf(&ca), server_leaf(&ca));
+    let http1 = vec![b"http/1.1".to_vec()];
+    let fixed = TlsSource::fixed_alpn(
+        "test",
+        old.cert.as_bytes(),
+        old.key.as_bytes(),
+        None,
+        Alpn::Http1,
+    )
+    .expect("a fixed source");
+    assert_eq!(fixed.config().alpn_protocols, http1);
+    let files = Files::write(&dir("alpn-http1"), &old, None);
+    let watched = TlsSource::files_alpn("test", files.files.clone(), Duration::ZERO, Alpn::Http1)
+        .expect("a file source");
+    assert_eq!(watched.config().alpn_protocols, http1);
+    files.install(&new);
+    assert_eq!(watched.reload(), Outcome::Applied);
+    assert_eq!(watched.config().alpn_protocols, http1);
+}
+
 /// Asserts that a connection is live while its peer is there and gone once the peer
 /// closes, and that a request carries the connection's own flag.
 ///

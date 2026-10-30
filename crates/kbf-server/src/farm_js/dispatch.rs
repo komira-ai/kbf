@@ -29,6 +29,7 @@ use tonic::Status;
 use super::adapter::{KbfAdapter, Wall, wire_lease};
 use super::ext::KbfExt;
 use super::host::{Caller, Connection};
+use super::learning::{Ask, Sized};
 use crate::action_usage::{Measured, Shapes};
 use crate::answer;
 use crate::farm::Reported;
@@ -58,9 +59,11 @@ pub fn register(
     connection: Connection,
 ) -> Result<Stream, Denied> {
     let noted = reported.clone();
+    let named = instance.as_str().to_owned();
     let open = |adapter: &mut KbfAdapter, stream| {
         adapter.attach(worker, stream, connection);
         adapter.note_registered(worker, &noted);
+        adapter.note_instance(worker, &named);
     };
     core.register(
         now,
@@ -126,6 +129,13 @@ pub fn submit(
     // Outside the lock: hashes the action's shape and drops its argv and paths.
     let usage = shapes.subject(std::mem::take(&mut submission.described));
     let shape = submission.call.as_ref().map(|_| usage.recorded());
+    let sized = Sized {
+        kind: submission.request.kind,
+        gpus: submission.request.resources.gpus,
+        memory_bytes: submission.request.resources.memory_bytes,
+        cpu_millis: submission.request.resources.cpu_millis,
+        evidence: submission.evidence,
+    };
     let call = submission
         .call
         .take()
@@ -140,15 +150,34 @@ pub fn submit(
         usage,
         platform: Platform::of(&submission.request.needs),
     };
+    // The prediction (`--placement-predictions`) is asked for in a hold of the core of its own,
+    // before the submit's: the core charges it from the operation's first placement round.
+    // `shadow` hands the core nothing.
+    let (forecast, on) = core.with(|view, adapter| {
+        let ask = Ask {
+            request: &submission.request,
+            instance: &caller.key.instance,
+            platform: &caller.platform,
+            subject: &caller.usage,
+        };
+        (
+            adapter.forecast_submit(view, &sized, ask),
+            adapter.hands_predictions(),
+        )
+    });
+    let prediction = forecast.and_then(Result::ok).filter(|_| on);
     let (sender, stage) = tokio::sync::watch::channel(Stage::Queued);
     let enrol = |adapter: &mut KbfAdapter, admitted: &Admitted| {
         adapter.enrol(admitted, caller, call, sender);
     };
     let admitted = core
-        .submit(now, submission.request, &parcel, enrol)
+        .submit_with(now, submission.request, &parcel, None, prediction, enrol)
         .map_err(unavailable)?;
     // A caller that joined an operation that holds a lease sees it executing.
-    core.with(|view, adapter| adapter.mark_joined(view, &admitted));
+    core.with(|view, adapter| {
+        adapter.mark_joined(view, &admitted);
+        adapter.learn_submit(view, &admitted, &sized, forecast);
+    });
     Ok(Ticket {
         name: stored_name(admitted.operation),
         instance,
@@ -231,7 +260,7 @@ pub async fn report(
     core: &Core<KbfAdapter>,
     cache: &Backend,
     wall: &Wall,
-    now: impl Fn() -> FarmTime,
+    now: &(dyn Fn() -> FarmTime + Sync),
     worker: &WorkerId,
     result: worker::Result,
 ) -> Result<Option<ResultAck>, Denied> {
@@ -256,7 +285,13 @@ pub async fn report(
             adapter.is_recorded(operation),
         )
     });
-    let Some(Sent { action, stamp, .. }) = sent else {
+    let Some(Sent {
+        action,
+        stamp,
+        booked,
+        ..
+    }) = sent
+    else {
         return Ok(Some(refusal(wire, ResultAckReason::UnknownLease)));
     };
     if let Some(named) = &result.action_digest
@@ -269,10 +304,10 @@ pub async fn report(
     let ran_on = (worker, stamp);
     // Read before `outcome`, which drops a failed run's result. What the report measured
     // is kept for the hooks around the feed (`action usage:` line, the invocation record).
-    let measured = Measured::of(&result);
+    let measured = Measured::of(&result).map(|m| m.booked(booked));
     let run = recorded.then(|| {
         let usage = measured.as_ref().map(Measured::usage);
-        run_record::of(&result, usage, stamp, read())
+        run_record::of(&result, usage, stamp, read(), booked)
     });
     let (outcome, detail) = answer::outcome(cache, read, lease, ran_on, result).await;
     let report = Report {
@@ -316,6 +351,7 @@ impl KbfAdapter {
                     queued: waiter.queued,
                     started: waiter.queued,
                 },
+                booked: None,
             })
         })
     }

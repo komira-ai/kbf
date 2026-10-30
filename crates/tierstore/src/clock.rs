@@ -1,6 +1,6 @@
 //! Where the proxy and the reconciler read the time from.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// A source of the time, in milliseconds since the Unix epoch.
 ///
@@ -23,5 +23,35 @@ impl Clock for SystemClock {
         since_epoch
             .map(|elapsed| elapsed.as_millis() as u64)
             .unwrap_or_default()
+    }
+}
+
+/// A clock that only goes forward and does not follow the clock of the machine when it is set:
+/// the milliseconds since it was made. Its times mean nothing outside the process, so it serves
+/// to measure how long something took (the rate of a request body), not to stamp objects.
+#[derive(Clone, Copy, Debug)]
+pub struct MonotonicClock {
+    start: Instant,
+}
+
+impl MonotonicClock {
+    /// A clock that reads zero now.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Default for MonotonicClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for MonotonicClock {
+    fn now(&self) -> u64 {
+        u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 }

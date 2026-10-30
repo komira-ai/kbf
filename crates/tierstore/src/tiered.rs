@@ -1,11 +1,13 @@
 //! The proxy: a store over a hot and a cold backend.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::{StreamExt, stream};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OnceCell};
 use tokio::time::Instant;
 
@@ -13,7 +15,14 @@ use crate::journal::{
     USAGE_KEY, Usage, encode_journal, is_reserved, journal_key, journal_prefix, load_checkpoint,
     proxy_key, seq_of,
 };
-use crate::{Backend, ByteRange, Clock, Error, JournalEntry, JournalOp, Listed, Meta, PartBody};
+use crate::{
+    Backend, ByteRange, Clock, Error, JournalEntry, JournalOp, Listed, Meta, OpenUpload, PartBody,
+    UploadsAfter,
+};
+
+/// The most calls to the cold tier that one listing of uploads makes to fill a page that the
+/// filter of reserved keys cut short.
+const UPLOAD_LISTING_CALLS: u32 = 100;
 
 /// The settings of a [`Proxy`].
 #[derive(Clone)]
@@ -78,6 +87,9 @@ struct Capacity {
     read: Option<(Instant, Option<u64>)>,
     /// Until when the hot tier is taken to be full, after it said so.
     full_until: Option<Instant>,
+    /// When the usage object read last was published, by the clock of the reconciler: none if
+    /// it was missing or unreadable. Unlike the bytes of `read`, it is kept whatever the age.
+    published: Option<u64>,
 }
 
 /// One journal object being filled, and the outcome of writing it.
@@ -123,7 +135,12 @@ fn refuse_reserved(key: &str) -> Result<(), Error> {
 /// - **Head** reads the hot tier, else the cold tier, and copies nothing back.
 /// - **Put** is refused with [`Error::AlreadyExists`] if the key exists in the cold tier (it
 ///   may have been evicted from the hot tier) or in the hot tier. The cold tier is asked
-///   first (a HEAD); then the object is written to the hot tier, create-only; then an entry
+///   first (a HEAD); then the object is written to the hot tier, create-only; then the cold
+///   tier is asked again, and if it now holds the key (a copy to the cold tier and a delete from
+///   the hot tier came between the first ask and the create) the object just created is removed
+///   from the hot tier and the put is refused, since the reconciler copies an object to the cold
+///   tier before it deletes it from the hot tier, so a create that wins the hot tier after that
+///   delete always finds the cold copy; then an entry
 ///   is appended to the journal; then the put is acknowledged. **The acknowledgement waits
 ///   for the journal object that holds the entry to be written to the hot tier**: an object
 ///   that is acknowledged and not journaled would be in no one's list of objects to copy to
@@ -131,6 +148,16 @@ fn refuse_reserved(key: &str) -> Result<(), Error> {
 ///   is not acknowledged, and the object it wrote to the hot tier is removed, best effort:
 ///   left there it would never be copied, and would make a retry of the put fail with
 ///   [`Error::AlreadyExists`].
+/// - **Streamed put** ([`Backend::put_stream`]) is a put whose body arrives as chunks and is
+///   never held whole: the chunks go on to the hot tier's own streamed put (or the cold tier's,
+///   where the hot tier is full), which makes the object visible, create-only, only after the
+///   last chunk, and the journal entry is appended after that. A body that ends with an error
+///   (a checksum that does not match, a connection that was cut) leaves no object in either
+///   tier and no journal entry. The checks of a put (the key exists in either tier, reserved
+///   keys) are made before the first chunk is taken. If the hot tier answers [`Error::Full`]
+///   after it took some of the body, the bytes cannot be offered to the cold tier, so the put
+///   fails with [`Error::Full`] (the tier is latched full, and the client's retry goes to the
+///   cold tier); if it took none, the cold tier gets the whole body as for a held put.
 /// - **Delete** removes the object from the hot tier and from the cold tier, then appends a
 ///   delete entry, which lets the reconciler undo a copy to the cold tier that was under way.
 /// - **List** is the union of both tiers without duplicates (the hot tier's entry where both
@@ -147,6 +174,8 @@ fn refuse_reserved(key: &str) -> Result<(), Error> {
 ///   the object is in the cold tier, so a get, a head, a listing and a delete find it, and the
 ///   reconciler has nothing to copy. It is in the hot tier only after a get copies it back.
 ///   The cold tier must do multipart uploads (the provided methods of [`Backend`] do not).
+///   [`Backend::list_uploads`] lists the cold tier's open uploads, which are the only ones: the
+///   proxy keeps no state of an upload.
 ///
 /// The journal is written in batches of at most [`ProxyConfig::batch_entries`] entries, each
 /// batch after [`ProxyConfig::linger`] at most, as `_journal/<proxy_id>/<seq>`, create-only,
@@ -156,7 +185,9 @@ fn refuse_reserved(key: &str) -> Result<(), Error> {
 ///
 /// **Capacity.** The proxy reads the usage that the reconciler publishes (`_tiering/usage`,
 /// at most every [`ProxyConfig::usage_refresh`]); a usage that is missing, unreadable or
-/// older than [`ProxyConfig::usage_stale_after`] counts as not full. Above
+/// older than [`ProxyConfig::usage_stale_after`] counts as not full (a dead reconciler thus
+/// leaves puts unrestrained: [`Proxy::usage_age`] is how a caller sees it, and the server's
+/// `/usagez` reports it). Above
 /// [`ProxyConfig::critical`] of the budget a put waits [`ProxyConfig::back_pressure`] first.
 /// At the budget, or when the hot tier answers a put (of the object, or of the journal object
 /// that holds its entry) with [`Error::Full`], puts go straight to the cold tier, create-only
@@ -170,14 +201,61 @@ fn refuse_reserved(key: &str) -> Result<(), Error> {
 ///   before its journal object was written leaves the object in the hot tier with no entry:
 ///   it is never copied or evicted, and a retry of the put is refused as existing. Bound the
 ///   calls inside the backends rather than dropping a put.
-/// - The checks and the write of a put are not atomic. Two proxies that put the same key
-///   at once, one to the hot tier and one (the hot tier being full for it) to the cold tier,
-///   may both succeed; the reconciler then counts the cold tier's object as the copy of the
-///   hot tier's, and the object of the cold tier is the one that stays.
+/// - The checks and the write of a put are not atomic. Two puts of the same key at once, one to
+///   the hot tier and one (the hot tier being full for it, or having just said so) to the cold
+///   tier, may both succeed, whether through one proxy or two; a presigned PUT of the S3 front
+///   never takes that path ([`Backend::put_stream_hot_only`] answers [`Error::Full`] instead), so the
+///   hot tier's create-only write alone decides it. For the other keys the race remains: the
+///   reconciler then counts the cold tier's object as the copy of the hot tier's, and the object
+///   of the cold tier is the one that stays.
 /// - A get that copies an object back into the hot tier while it is deleted may put it back
 ///   there, with a put entry after the delete entry.
 pub struct Proxy {
     inner: Arc<Inner>,
+}
+
+/// The body of a streamed put, which more than one tier may be offered in turn: a view of it is
+/// a stream of its chunks, and the next view goes on where the last one stopped. The proxy
+/// counts the bytes that were taken (the size of the object, for the journal), and a tier that
+/// refuses the put before it took a byte is followed by the other tier, which gets the whole
+/// body.
+struct Offered<'a> {
+    /// The rest of the body; `None` once it has ended or failed.
+    rest: AsyncMutex<Option<PartBody<'a>>>,
+    taken: AtomicU64,
+}
+
+impl<'a> Offered<'a> {
+    fn new(body: PartBody<'a>) -> Self {
+        Self {
+            rest: AsyncMutex::new(Some(body)),
+            taken: AtomicU64::new(0),
+        }
+    }
+
+    /// The number of bytes of the body taken so far.
+    fn taken(&self) -> u64 {
+        self.taken.load(Ordering::SeqCst)
+    }
+
+    /// The rest of the body as a stream. It ends after the end of the body or an error of it.
+    fn view(&self) -> PartBody<'_> {
+        stream::unfold(self, |offered| async move {
+            let mut rest = offered.rest.lock().await;
+            let next = rest.as_mut()?.next().await;
+            match &next {
+                Some(Ok(chunk)) => {
+                    offered
+                        .taken
+                        .fetch_add(chunk.len() as u64, Ordering::SeqCst);
+                }
+                Some(Err(_)) | None => *rest = None,
+            }
+            drop(rest);
+            Some((next?, offered))
+        })
+        .boxed()
+    }
 }
 
 struct Inner {
@@ -233,6 +311,17 @@ impl Proxy {
         Ok(Self {
             inner: Arc::new(inner),
         })
+    }
+
+    /// How long ago the reconciler published the usage object (`_tiering/usage`), by the clock
+    /// of the proxy, as of a read that is at most [`ProxyConfig::usage_refresh`] old. None if the
+    /// object is missing or cannot be read.
+    ///
+    /// A usage older than [`ProxyConfig::usage_stale_after`] is ignored by the puts, so a
+    /// reconciler that has stopped means a hot tier that is never taken to be full; this is the
+    /// age that tells it, whatever it is.
+    pub async fn usage_age(&self) -> Option<Duration> {
+        self.inner.usage_age().await
     }
 }
 
@@ -321,9 +410,28 @@ impl Inner {
     async fn refresh_usage(&self, now: Instant) -> Option<u64> {
         let fetched = self.hot.get(USAGE_KEY, None).await.ok();
         let usage = fetched.and_then(|body| serde_json::from_slice::<Usage>(&body).ok());
+        let published = usage.as_ref().map(|u| u.time);
         let hot_bytes = usage.filter(|u| self.is_fresh(u)).map(|u| u.hot_bytes);
-        locked(&self.capacity).read = Some((now, hot_bytes));
+        let mut capacity = locked(&self.capacity);
+        capacity.read = Some((now, hot_bytes));
+        capacity.published = published;
         hot_bytes
+    }
+
+    /// The bytes of the usage object, as of a read that is at most `usage_refresh` old.
+    async fn cached_hot_bytes(&self, now: Instant) -> Option<u64> {
+        let read = locked(&self.capacity).read;
+        match read {
+            Some((at, bytes)) if now.duration_since(at) < self.config.usage_refresh => bytes,
+            _ => self.refresh_usage(now).await,
+        }
+    }
+
+    async fn usage_age(&self) -> Option<Duration> {
+        self.cached_hot_bytes(Instant::now()).await;
+        let published = locked(&self.capacity).published?;
+        let age = self.config.clock.now().saturating_sub(published);
+        Some(Duration::from_millis(age))
     }
 
     fn classify(&self, hot_bytes: Option<u64>) -> Level {
@@ -338,17 +446,11 @@ impl Inner {
 
     async fn level(&self) -> Level {
         let now = Instant::now();
-        let (full_until, read) = {
-            let capacity = locked(&self.capacity);
-            (capacity.full_until, capacity.read)
-        };
+        let full_until = locked(&self.capacity).full_until;
         if full_until.is_some_and(|until| now < until) {
             return Level::Full;
         }
-        let hot_bytes = match read {
-            Some((at, bytes)) if now.duration_since(at) < self.config.usage_refresh => bytes,
-            _ => self.refresh_usage(now).await,
-        };
+        let hot_bytes = self.cached_hot_bytes(now).await;
         self.classify(hot_bytes)
     }
 
@@ -383,10 +485,30 @@ impl Inner {
         self.cold.complete_upload(key, id, parts).await
     }
 
+    /// Asks the cold tier again, after this call created `key` in the hot tier. The first ask
+    /// (before the create) can be stale: the reconciler copies an object to the cold tier before it
+    /// deletes it from the hot tier, so a create that wins the hot tier after that delete finds the
+    /// cold copy here. If the cold tier holds the key, the object this call created is removed from
+    /// the hot tier (best effort) and the put is [`Error::AlreadyExists`]; if the cold tier cannot
+    /// be asked, the object is removed and the put fails with that error, since it cannot be told
+    /// to be the only one.
+    async fn confirm_not_tiered(&self, key: &str) -> Result<(), Error> {
+        let refused = match self.cold.head(key).await {
+            Ok(_) => Error::AlreadyExists(key.to_owned()),
+            Err(Error::NotFound(_)) => return Ok(()),
+            Err(error) => error,
+        };
+        let _ = self.hot.delete(key).await;
+        Err(refused)
+    }
+
     async fn put_hot(&self, key: &str, body: Bytes) -> Result<(), Error> {
         let size = body.len() as u64;
         let stored = match self.hot.put(key, body.clone()).await {
-            Ok(()) => self.journal_put(key, size).await,
+            Ok(()) => match self.confirm_not_tiered(key).await {
+                Ok(()) => self.journal_put(key, size).await,
+                refused => refused,
+            },
             failed => failed,
         };
         match stored {
@@ -412,6 +534,81 @@ impl Inner {
                 self.put_hot(key, body).await
             }
             Level::Open => self.put_hot(key, body).await,
+        }
+    }
+
+    /// Writes the object to the cold tier from the body, create-only, when the hot tier is full.
+    async fn put_cold_stream(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        offered: &Offered<'_>,
+    ) -> Result<(), Error> {
+        self.check_not_in_hot(key).await?;
+        self.cold.put_stream(key, len, offered.view()).await
+    }
+
+    /// Writes the object to the hot tier from the body, then journals it. The object is in the
+    /// hot tier only when the body has ended whole (the backend sees to it), and the journal
+    /// entry comes after that, so a body that fails leaves neither. A hot tier with no room is
+    /// latched full; the body goes to the cold tier instead if the hot tier took none of it,
+    /// and else the put fails with [`Error::Full`], since the bytes taken cannot be offered
+    /// again (the client's retry goes to the cold tier).
+    async fn put_hot_stream(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        offered: &Offered<'_>,
+        hot_only: bool,
+    ) -> Result<(), Error> {
+        let stored = match self.hot.put_stream(key, len, offered.view()).await {
+            Ok(()) => match self.confirm_not_tiered(key).await {
+                Ok(()) => self.journal_put(key, offered.taken()).await,
+                refused => refused,
+            },
+            failed => failed,
+        };
+        match stored {
+            Err(Error::Full(_)) if hot_only => {
+                self.latch_full();
+                Err(Error::Full(key.to_owned()))
+            }
+            Err(Error::Full(_)) if offered.taken() == 0 => {
+                self.latch_full();
+                self.put_cold_stream(key, len, offered).await
+            }
+            Err(error @ Error::Full(_)) => {
+                self.latch_full();
+                Err(error)
+            }
+            other => other,
+        }
+    }
+
+    /// As `put_object`, for a body that arrives as chunks: it goes to the hot tier, or to the
+    /// cold tier where the hot tier is full, without being held.
+    async fn put_object_stream(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        body: PartBody<'_>,
+        hot_only: bool,
+    ) -> Result<(), Error> {
+        refuse_reserved(key)?;
+        match self.cold.head(key).await {
+            Ok(_) => return Err(Error::AlreadyExists(key.to_owned())),
+            Err(Error::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        let offered = Offered::new(body);
+        match self.level().await {
+            Level::Full if hot_only => Err(Error::Full(key.to_owned())),
+            Level::Full => self.put_cold_stream(key, len, &offered).await,
+            Level::Critical => {
+                tokio::time::sleep(self.config.back_pressure).await;
+                self.put_hot_stream(key, len, &offered, hot_only).await
+            }
+            Level::Open => self.put_hot_stream(key, len, &offered, hot_only).await,
         }
     }
 
@@ -525,6 +722,32 @@ impl Backend for Proxy {
         self.inner.put_object(key, body).await
     }
 
+    /// Whether either tier needs the length of a streamed body (the put may go to either).
+    fn needs_length(&self) -> bool {
+        self.inner.hot.needs_length() || self.inner.cold.needs_length()
+    }
+
+    /// A put whose body is not held: the chunks go to the hot tier (or the cold tier of a full
+    /// hot tier) as they arrive, and the object is created, create-only, only after the body has
+    /// ended whole; a body that fails leaves no object and no journal entry. See [`Proxy`].
+    async fn put_stream(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        self.inner.put_object_stream(key, len, body, false).await
+    }
+
+    async fn put_stream_hot_only(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        self.inner.put_object_stream(key, len, body, true).await
+    }
+
     /// The proxy keeps objects immutable: it never replaces one.
     async fn put_if_match(&self, key: &str, _body: Bytes, _etag: &str) -> Result<String, Error> {
         Err(Error::Other(format!("the proxy does not replace {key}")))
@@ -599,5 +822,50 @@ impl Backend for Proxy {
     async fn abort_upload(&self, key: &str, id: &str) -> Result<(), Error> {
         refuse_reserved(key)?;
         self.inner.cold.abort_upload(key, id).await
+    }
+
+    /// The open uploads are the cold tier's own (see the type), so this asks the cold tier, and
+    /// leaves out an upload of a reserved key: none is made through the proxy, but the tier is
+    /// shared with other writers. A page that the filter cut short is made up from the next
+    /// page of the tier, so that a short page is the last, as the trait says.
+    async fn list_uploads(
+        &self,
+        prefix: &str,
+        after: Option<UploadsAfter<'_>>,
+        max_uploads: usize,
+    ) -> Result<Vec<OpenUpload>, Error> {
+        let cold = &self.inner.cold;
+        let mut after = after.map(|(key, id)| (key.to_owned(), id.map(str::to_owned)));
+        let mut found: Vec<OpenUpload> = Vec::new();
+        let mut calls = 0;
+        while found.len() < max_uploads {
+            calls += 1;
+            if calls > UPLOAD_LISTING_CALLS {
+                let text = format!(
+                    "the cold tier's listing of uploads took over {UPLOAD_LISTING_CALLS} calls"
+                );
+                return Err(Error::Unavailable(text));
+            }
+            let want = max_uploads - found.len();
+            let marker = after
+                .as_ref()
+                .map(|(key, id)| (key.as_str(), id.as_deref()));
+            let page = cold.list_uploads(prefix, marker, want).await?;
+            let last = page.last().map(|up| (up.key.clone(), Some(up.id.clone())));
+            let full = page.len() == want;
+            found.extend(page.into_iter().filter(|up| !is_reserved(&up.key)));
+            match last {
+                Some(last) if full => {
+                    // A full page that ends where the last one did would be asked for for ever.
+                    if after.as_ref().is_some_and(|before| last <= *before) {
+                        let text = "the cold tier's listing of uploads did not advance";
+                        return Err(Error::Unavailable(text.to_owned()));
+                    }
+                    after = Some(last);
+                }
+                _ => break,
+            }
+        }
+        Ok(found)
     }
 }

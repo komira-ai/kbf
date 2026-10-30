@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::{Backend, ByteRange, Error, Listed, Meta, PartBody};
+use crate::{Backend, ByteRange, Error, Listed, Meta, OpenUpload, PartBody, UploadsAfter};
 
 /// The kinds of call a [`FaultyBackend`] tells apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -33,6 +33,8 @@ pub enum Op {
     CompleteUpload,
     /// [`Backend::abort_upload`].
     AbortUpload,
+    /// [`Backend::list_uploads`].
+    ListUploads,
 }
 
 /// The error of a call that fails because its backend is down or was told to fail it.
@@ -198,6 +200,32 @@ impl Backend for FaultyBackend {
         self.inner.put(key, body).await
     }
 
+    fn needs_length(&self) -> bool {
+        self.inner.needs_length()
+    }
+
+    /// A streamed put is a call of kind [`Op::Put`], so what is planned for puts applies to it.
+    async fn put_stream(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        self.enter(Op::Put, key).await?;
+        self.inner.put_stream(key, len, body).await
+    }
+
+    /// As `put_stream`, a call of kind [`Op::Put`].
+    async fn put_stream_hot_only(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        self.enter(Op::Put, key).await?;
+        self.inner.put_stream_hot_only(key, len, body).await
+    }
+
     async fn put_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<String, Error> {
         self.enter(Op::PutIfMatch, key).await?;
         self.inner.put_if_match(key, body, etag).await
@@ -268,5 +296,16 @@ impl Backend for FaultyBackend {
     async fn abort_upload(&self, key: &str, id: &str) -> Result<(), Error> {
         self.enter(Op::AbortUpload, key).await?;
         self.inner.abort_upload(key, id).await
+    }
+
+    async fn list_uploads(
+        &self,
+        prefix: &str,
+        after: Option<UploadsAfter<'_>>,
+        max_uploads: usize,
+    ) -> Result<Vec<OpenUpload>, Error> {
+        self.enter(Op::ListUploads, prefix).await?;
+        let listing = self.inner.list_uploads(prefix, after, max_uploads);
+        listing.await
     }
 }

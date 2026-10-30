@@ -40,15 +40,18 @@ use kbf_types::{
 use tokio::sync::watch;
 use tonic::Code;
 
+use super::ablation::{Ablation, Booking};
 use super::codec::KbfRowCodec;
 use super::facts::WorkerFacts;
+use super::learning::Learning;
 use super::report_hooks::ReportHooks;
 use crate::action_usage::Subject;
 use crate::answer::{Detail, Pending, failed, finished_of, refused_as};
+use crate::farm::NodeLoads;
 use crate::farm::durable::{named, subject};
 use crate::farm::failed_actions::{Class, FailedActions, class_of};
 use crate::fleet::quarantine_change;
-use crate::machine::{FarmMachine, Platform, Sent, Waiter, stored_name};
+use crate::machine::{Booked, FarmMachine, Platform, Sent, Waiter, stored_name};
 use crate::stamp::Stamp;
 
 /// Where the farm sends a worker's messages: the outbound half of its stream.
@@ -95,8 +98,12 @@ pub struct KbfAdapter {
     pub(super) recorded: BTreeSet<OperationId>,
     pub(super) pack_reads: BTreeMap<WorkerId, worker::PackReadCounts>,
     pub(super) pack_writes: BTreeMap<WorkerId, worker::PackWriteCounts>,
+    pub(super) input_caches: BTreeMap<WorkerId, worker::InputCacheCounts>,
     /// What each registered worker's newest stream said of itself ([`WorkerFacts`]).
     pub(super) facts: BTreeMap<WorkerId, WorkerFacts>,
+    /// What each node's load readings have come to, under the accept rule the farm's own
+    /// driver uses ([`crate::farm::NodeLoads`]).
+    pub(super) node_loads: NodeLoads,
     /// The operations this adapter settled or refused as failed, per class
     /// (`kbf_execute_failed_actions_total`).
     failed: FailedActions,
@@ -104,6 +111,10 @@ pub struct KbfAdapter {
     unreadable_results: u64,
     /// What the hooks around a report keep between them ([`super::report_hooks`]).
     pub(super) hooks: ReportHooks,
+    /// What the estimator is shown ([`super::learning`]).
+    pub(super) learning: Learning,
+    /// The counts that tell the ablation's rows apart ([`super::ablation`]).
+    ablation: Ablation,
 }
 
 /// The `LeaseId` of the wire.
@@ -160,10 +171,14 @@ impl KbfAdapter {
             recorded: BTreeSet::new(),
             pack_reads: BTreeMap::new(),
             pack_writes: BTreeMap::new(),
+            input_caches: BTreeMap::new(),
             facts: BTreeMap::new(),
+            node_loads: NodeLoads::new(),
             failed: FailedActions::default(),
             unreadable_results: 0,
             hooks: ReportHooks::default(),
+            learning: Learning::off(),
+            ablation: Ablation::default(),
         }
     }
 
@@ -183,9 +198,13 @@ impl KbfAdapter {
 
     /// The operations this adapter finished as failed, per class: those it settled by what
     /// their callers are told, and those it refused.
-    #[cfg_attr(not(feature = "farm-core-js"), allow(dead_code))]
     pub(crate) const fn failed_actions(&self) -> FailedActions {
         self.failed
+    }
+
+    /// The counts of the ablation's rows ([`Ablation`]).
+    pub(crate) const fn ablation(&self) -> &Ablation {
+        &self.ablation
     }
 
     /// The first waiter of `operation`: its key and lease kind are the operation's.
@@ -291,14 +310,18 @@ impl KbfAdapter {
 }
 
 impl Adapter for KbfAdapter {
+    fn clock(&mut self, now: FarmTime) {
+        self.learning_clock(now);
+    }
+
     fn before_report(
         &mut self,
         view: &View<'_>,
         _now: FarmTime,
-        _worker: &WorkerId,
+        worker: &WorkerId,
         report: &Report,
     ) {
-        self.note_report_start(view, report);
+        self.note_report_start(view, worker, report);
     }
 
     fn after_report(
@@ -368,6 +391,13 @@ impl Adapter for KbfAdapter {
             stage.send_replace(Stage::Executing);
         }
         let heartbeat_seq = view.link(&start.worker).map_or(0, |l| l.newest_beat);
+        #[cfg(test)]
+        crate::farm::BEFORE_START.with(|hook| {
+            if let Some(hook) = &*hook.borrow() {
+                let stages = waiters.iter().filter_map(|id| self.stages.get(id));
+                hook(stages.map(|stage| stage.borrow().clone()).collect());
+            }
+        });
         self.send_for(view.sched(), &start.worker, start.operation, |w| {
             server_message::Message::Start(Start {
                 lease_id: Some(wire_lease(start.lease)),
@@ -396,10 +426,17 @@ impl Adapter for KbfAdapter {
                     queued: w.queued,
                     started: now,
                 },
+                booked: Some(Booked {
+                    cpu_millis: start.resources.cpu_millis,
+                    memory_bytes: start.resources.memory_bytes,
+                }),
             });
         sent.into_iter()
             .for_each(|sent| self.machine.start(start.lease, sent));
         self.record_started(start);
+        self.learning_started(start);
+        let cost = view.sched().lease_cost(start.lease);
+        self.ablation.booked(Booking::of(start.kind, cost));
     }
 
     /// Tells `worker` to stop the run of `lease`. A stream that has just ended drops the
@@ -438,6 +475,8 @@ impl Adapter for KbfAdapter {
 
     fn requeued(&mut self, requeue: &Requeue) {
         self.record_requeue(requeue);
+        self.learning_requeued(requeue);
+        self.ablation.requeued(requeue.reason);
     }
 
     /// Works out what the callers of a finished operation get, and keeps them until the

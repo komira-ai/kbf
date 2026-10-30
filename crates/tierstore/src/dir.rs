@@ -13,7 +13,8 @@ use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use crate::{Backend, ByteRange, Error, Listed, Meta, PartBody};
+use crate::backend::upload_page;
+use crate::{Backend, ByteRange, Error, Listed, Meta, OpenUpload, PartBody, UploadsAfter};
 
 /// The length of the content tag that starts the file of an object: the SHA-256 of its body.
 const TAG_LEN: usize = 32;
@@ -33,6 +34,24 @@ const KEY_FILE: &str = "key";
 /// The number of the backends opened in this process, which tells their temporary files apart.
 static OPENED: AtomicU64 = AtomicU64::new(0);
 
+/// Makes the changes to the entries of a directory durable. It is a seam so that a test can see
+/// when the backend syncs a directory, relative to the change and to the acknowledgement.
+#[async_trait]
+trait SyncDir: Send + Sync {
+    /// Returns once the entries of `dir` are on the disk.
+    async fn sync_dir(&self, dir: &Path) -> std::io::Result<()>;
+}
+
+/// Syncs a directory with `fsync` on it.
+struct FsyncDir;
+
+#[async_trait]
+impl SyncDir for FsyncDir {
+    async fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+        File::open(dir).await?.sync_all().await
+    }
+}
+
 /// A bucket kept in a directory.
 ///
 /// An object is one file of the directory. Its name is the key with `/` written as `~`; letters,
@@ -47,7 +66,21 @@ static OPENED: AtomicU64 = AtomicU64::new(0);
 ///   which fails where the name is taken: the object appears whole or not at all, and a put of a
 ///   key that exists leaves it as it was. The directory needs a file system with hard links. A
 ///   crash leaves a `.tmp-` file behind, which is never listed and can be removed when the
-///   process is stopped. The file is synced, the directory is not.
+///   process is stopped. The file is synced before it is linked, and the directory is synced
+///   after the link, so that the name of an object whose put was acknowledged survives a power
+///   loss. A replacement ([`Backend::put_if_match`]), a delete, the placing of a part and the
+///   completion of an upload sync the directory they changed the same way, before they return.
+///   If the sync after a link fails the name is removed again, so that an object that was not
+///   acknowledged is not left visible and a retry can succeed (if the name cannot be removed the
+///   error says it may exist without being durable). A replacement or a delete whose sync fails
+///   cannot be undone, the old body being gone: the call fails and the change may be visible; a
+///   retry of a delete is fine, and the caller of a replacement reads the object to see which
+///   body it holds.
+/// - A streamed put ([`Backend::put_stream`]) writes the chunks to the temporary file as they
+///   arrive, so that the body is never held in memory; the content tag, which starts the file,
+///   is written over reserved room after the last chunk, the file is synced, and only then is it
+///   linked to the name, with the directory synced after the link as for any put. A body that
+///   fails leaves no object and removes the temporary file.
 /// - A multipart upload is a directory `.uploads/<id>` that holds a file with the key and a file
 ///   for each part, written as the chunks of the part arrive, so that a part is never held in
 ///   memory; the completion joins the parts into the new object by streaming them, and removes
@@ -74,6 +107,8 @@ pub struct DirBackend {
     /// Held while a part is moved to its name and the other files of its number are removed, so
     /// that two overlapping uploads of one part number do not remove each other's file.
     placing: Mutex<()>,
+    /// Syncs a directory after a call changed its entries.
+    syncer: Box<dyn SyncDir>,
 }
 
 /// The file name of a key.
@@ -238,11 +273,34 @@ async fn join_files(path: &Path, files: &[PathBuf]) -> Result<[u8; TAG_LEN], Err
             out.write_all(&buffer[..count]).await.map_err(&fail)?;
         }
     }
+    seal(&mut out, hasher).await.map_err(&fail)
+}
+
+/// Writes the chunks of `body` to a new file at `path` behind room for the content tag, then
+/// the tag of the whole, which is known only after the last chunk, and syncs the file. A body
+/// that ends with an error leaves a file that is not an object (the caller removes it). Gives
+/// the tag.
+async fn write_object_stream(path: &Path, body: &mut PartBody<'_>) -> Result<[u8; TAG_LEN], Error> {
+    let fail = io_error(path);
+    let mut out = create_new(path).await.map_err(&fail)?;
+    out.write_all(&[0_u8; TAG_LEN]).await.map_err(&fail)?;
+    let mut hasher = Sha256::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?;
+        hasher.update(&chunk);
+        out.write_all(&chunk).await.map_err(&fail)?;
+    }
+    seal(&mut out, hasher).await.map_err(&fail)
+}
+
+/// Writes the tag of the hash `hasher` has come to over the room at the start of `out`, and
+/// syncs the file. Gives the tag.
+async fn seal(out: &mut File, hasher: Sha256) -> std::io::Result<[u8; TAG_LEN]> {
     let tag = finish(hasher);
-    let sought = out.seek(SeekFrom::Start(0)).await.map(|_| ());
-    let tagged = sought.and(out.write_all(&tag).await);
-    let flushed = tagged.and(out.flush().await);
-    flushed.and(out.sync_all().await).map_err(&fail)?;
+    out.seek(SeekFrom::Start(0)).await?;
+    out.write_all(&tag).await?;
+    out.flush().await?;
+    out.sync_all().await?;
     Ok(tag)
 }
 
@@ -305,7 +363,11 @@ impl DirBackend {
     /// # Errors
     /// [`Error::Other`] if `root` is empty or the directory cannot be made.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, Error> {
-        let root = root.into();
+        Self::open_with(root.into(), Box::new(FsyncDir))
+    }
+
+    /// A bucket in the directory `root` that syncs directories with `syncer`.
+    fn open_with(root: PathBuf, syncer: Box<dyn SyncDir>) -> Result<Self, Error> {
         if root.as_os_str().is_empty() {
             let text = "the directory of a tier has no name";
             return Err(Error::Other(text.to_owned()));
@@ -322,7 +384,14 @@ impl DirBackend {
             counter: AtomicU64::new(0),
             replacing: Mutex::new(()),
             placing: Mutex::new(()),
+            syncer,
         })
+    }
+
+    /// Syncs `dir`, whose entries a call has just changed, so that the call does not return
+    /// before the change survives a power loss.
+    async fn sync(&self, dir: &Path) -> Result<(), Error> {
+        self.syncer.sync_dir(dir).await.map_err(io_error(dir))
     }
 
     /// The path of the file of the object `key`.
@@ -364,12 +433,32 @@ impl DirBackend {
     }
 
     /// Moves the temporary file `temp` to `path` if nothing is there: a hard link fails where
-    /// the name is taken. The temporary file is gone either way.
+    /// the name is taken. The temporary file is gone either way. Where the link was made, the
+    /// directory is synced before this returns. If that sync fails the name is removed again
+    /// (and the directory synced, best effort), so that an object that was not acknowledged is
+    /// not left visible and a retry of the create-only put can succeed; if the name cannot be
+    /// removed the error says that it may exist without being durable.
     async fn publish(&self, temp: &Path, path: &Path, key: &str) -> Result<(), Error> {
         let linked = fs::hard_link(temp, path).await;
         let _ = fs::remove_file(temp).await;
         let taken = ErrorKind::AlreadyExists;
-        linked.map_err(|e| classify(key, path, &e, taken, Error::AlreadyExists))
+        linked.map_err(|e| classify(key, path, &e, taken, Error::AlreadyExists))?;
+        let Err(synced) = self.sync(&self.root).await else {
+            return Ok(());
+        };
+        match fs::remove_file(path).await {
+            Ok(()) => {
+                let _ = self.sync(&self.root).await;
+                Err(synced)
+            }
+            Err(why) => {
+                let text = format!(
+                    "{}: the name may exist without being durable: the directory sync failed ({synced}) and the name could not be removed ({why})",
+                    path.display()
+                );
+                Err(Error::Other(text))
+            }
+        }
     }
 
     /// The directory of the upload `id` of `key`.
@@ -397,6 +486,23 @@ impl Backend for DirBackend {
         self.publish(&temp, &path, key).await
     }
 
+    /// Writes the chunks to a temporary file as they arrive, and links it to the name only
+    /// after the last chunk, when the content tag is known and the file is synced. A body that
+    /// fails, or a call that is dropped half way, removes the temporary file and leaves the
+    /// name as it was.
+    async fn put_stream(
+        &self,
+        key: &str,
+        _len: Option<u64>,
+        mut body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        let path = self.path(key)?;
+        let temp = self.temp(&self.root);
+        let _scratch = Scratch(temp.clone());
+        write_object_stream(&temp, &mut body).await?;
+        self.publish(&temp, &path, key).await
+    }
+
     async fn put_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<String, Error> {
         let _replacing = self.replacing.lock().await;
         let current = self.stored(key).await?;
@@ -406,9 +512,9 @@ impl Backend for DirBackend {
         let (temp, tag) = self.write_temp(body).await?;
         let renamed = fs::rename(&temp, &current.path).await;
         let _ = fs::remove_file(&temp).await;
-        renamed
-            .map(|()| hex::encode(tag))
-            .map_err(io_error(&current.path))
+        renamed.map_err(io_error(&current.path))?;
+        self.sync(&self.root).await?;
+        Ok(hex::encode(tag))
     }
 
     async fn get(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
@@ -445,8 +551,9 @@ impl Backend for DirBackend {
     async fn delete(&self, key: &str) -> Result<(), Error> {
         let path = self.path(key)?;
         match fs::remove_file(&path).await {
+            Ok(()) => self.sync(&self.root).await,
             Err(why) if why.kind() != ErrorKind::NotFound => Err(failed(&path, &why)),
-            _ => Ok(()),
+            Err(_) => Ok(()),
         }
     }
 
@@ -505,6 +612,7 @@ impl Backend for DirBackend {
         let _placing = self.placing.lock().await;
         let renamed = fs::rename(&temp.0, dir.join(&name)).await;
         renamed.map_err(io_error(&dir))?;
+        self.sync(&dir).await?;
         let stored = stored_parts(&dir).await?;
         let others = stored.iter().filter(|part| part.number == number);
         for part in others.filter(|part| part.name != name) {
@@ -550,8 +658,38 @@ impl Backend for DirBackend {
         let dir = self.upload_dir(key, id).await?;
         fs::remove_dir_all(&dir).await.map_err(io_error(&dir))
     }
+
+    async fn list_uploads(
+        &self,
+        prefix: &str,
+        after: Option<UploadsAfter<'_>>,
+        max_uploads: usize,
+    ) -> Result<Vec<OpenUpload>, Error> {
+        let uploads = self.root.join(UPLOADS);
+        let mut entries = fs::read_dir(&uploads).await.map_err(io_error(&uploads))?;
+        let mut open = Vec::new();
+        while let Some(entry) = entries.next_entry().await.map_err(io_error(&uploads))? {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            // An upload that is made, completed or aborted while this is read has no key file
+            // (yet, or any more): it is not open, so it is left out.
+            let named = entry.path().join(KEY_FILE);
+            let Ok(key) = fs::read_to_string(&named).await else {
+                continue;
+            };
+            let started = fs::metadata(&named).await.and_then(|meta| meta.modified());
+            let since = started.map(|time| time.duration_since(UNIX_EPOCH));
+            let elapsed = since.ok().and_then(Result::ok);
+            let initiated = elapsed.map_or(0, |elapsed| elapsed.as_millis() as u64);
+            open.push(OpenUpload { key, id, initiated });
+        }
+        Ok(upload_page(open, prefix, after, max_uploads))
+    }
 }
 
 #[cfg(test)]
 #[path = "dir_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "dir_sync_tests.rs"]
+mod sync_tests;

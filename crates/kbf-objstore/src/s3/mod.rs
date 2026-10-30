@@ -21,7 +21,8 @@
 //! A caller that drives a multipart upload itself has the four calls one at a time
 //! (`parts.rs`): [`S3Store::create_multipart`], [`S3Store::upload_part_stream`] (the part
 //! is sent as it is read from a stream, never held whole), [`S3Store::complete_multipart`]
-//! and [`S3Store::abort_multipart`].
+//! and [`S3Store::abort_multipart`]; [`S3Store::list_multipart_uploads`] lists the uploads
+//! that are neither completed nor aborted.
 //!
 //! Not built yet: TLS (an `https` endpoint is refused).
 
@@ -37,6 +38,7 @@ mod xml;
 pub use multipart::{
     MAX_PART_BYTES, MAX_PARTS, MIN_PART_BYTES, MULTIPART_THRESHOLD, PART_BYTES, part_size,
 };
+pub use parts::{OpenUpload, UploadsPage};
 pub use tagged::{ObjectHead, StampedObject, StampedPage};
 
 use std::fmt;
@@ -608,6 +610,15 @@ impl ObjectStore for S3Store {
             }
         }
         self.get_range_once(key, range).await
+    }
+
+    /// A HEAD: the `Content-Length` of the object, or `None` for a 404.
+    async fn len(&self, key: &ObjectKey) -> Result<Option<u64>, ObjectStoreError> {
+        match self.head(key).await {
+            Ok(head) => Ok(Some(head.size)),
+            Err(ObjectStoreError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {

@@ -23,8 +23,15 @@
 //! answered `created: false`, and one with other contents is [`CommitError::Conflict`]. The
 //! index is written on the blocking pool.
 //!
+//! A pack written by a build that is not trusted (a presigned write) is committed by
+//! [`Packs::commit_untrusted_pack`] instead, which reads the footer and hashes every byte (the
+//! `untrusted` module has the rules). A daemon's commit cannot be made for such a pack: its name
+//! must be under `cas/d/`.
+//!
 //! Every refusal that is the commit's own (not a failure of the store or the index) is counted
-//! in `kbf_pack_commit_rejects_total` and logged.
+//! in `kbf_pack_commit_rejects_total` and logged. A commit of an untrusted pack is counted there
+//! too, and also in `kbf_pack_untrusted_commits_total` and, for a refusal, in
+//! `kbf_pack_untrusted_commit_rejects_total` by `reason`.
 
 use std::sync::Arc;
 
@@ -35,6 +42,15 @@ use kbf_pack_index::{BlobDigest, NewPack, PackBlob, PackIndexError, Recorded};
 use kbf_segments::RecordHasher;
 
 use super::store::{Packs, from_index, offload};
+
+mod untrusted;
+
+pub use self::untrusted::{
+    Ingested, IssuedKeySet, IssuedPackKey, MAX_UNTRUSTED_BLOB_BYTES, MAX_UNTRUSTED_LARGE_BYTES,
+    MAX_UNTRUSTED_MANIFEST_BYTES, MAX_UNTRUSTED_PACK_BYTES, MAX_UNTRUSTED_READ_BYTES,
+    MIN_SECRET_BYTES, MintError, PackKeyMint, RejectReason, StoreError, UntrustedLimits, ingest,
+    ingest_set,
+};
 
 /// The most blobs one commit lists: the most the packer puts in a pack.
 pub const MAX_COMMIT_BLOBS: usize = 16_384;
@@ -143,6 +159,15 @@ impl Packs {
     /// The digest of the bytes of the pack `key` where `blob` says it is, read in ranges of at
     /// most `READ_CHUNK_BYTES` so that a large blob is never held whole.
     async fn hashed(&self, key: &ObjectKey, blob: &PackBlob) -> Result<BlobDigest, CommitError> {
+        Ok(self.hashed_crc(key, blob).await?.0)
+    }
+
+    /// [`Self::hashed`], and the CRC-32C of the bytes as well.
+    async fn hashed_crc(
+        &self,
+        key: &ObjectKey,
+        blob: &PackBlob,
+    ) -> Result<(BlobDigest, u32), CommitError> {
         let mut hasher = RecordHasher::new();
         let end = blob.offset + blob.digest.size;
         let mut at = blob.offset;
@@ -152,11 +177,12 @@ impl Packs {
             hasher.update(&self.fetch(key, range).await?);
             at += take;
         }
-        let (digest, _) = hasher.finish();
-        Ok(BlobDigest {
+        let (digest, crc) = hasher.finish();
+        let digest = BlobDigest {
             hash: digest.hash,
             size: digest.size_bytes,
-        })
+        };
+        Ok((digest, crc))
     }
 
     /// The bytes of `range` of the pack `key`, or why the store has none.

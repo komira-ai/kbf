@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::{StreamExt, stream};
 use tierstore::{
-    Backend, ByteRange, Error, FaultyBackend, JournalEntry, MemoryBackend, Proxy, ProxyConfig,
-    Reconciler, ReconcilerConfig, TestClock, decode_journal,
+    Backend, ByteRange, Error, FaultyBackend, JournalEntry, MemoryBackend, PartBody, Proxy,
+    ProxyConfig, Reconciler, ReconcilerConfig, TestClock, decode_journal,
 };
 
 /// A hot and a cold in-memory backend, each behind a fault injector, with one clock that
@@ -164,4 +165,18 @@ pub async fn check_ranges(backend: &dyn Backend, key: &str) {
     assert_eq!(whole, body("0123456789"));
     let past = backend.get(key, Some(ByteRange::new(11, 1))).await;
     assert!(matches!(past, Err(Error::Other(_))));
+}
+
+/// A body of these chunks, for a streamed put.
+pub fn chunks(texts: &[&'static str]) -> PartBody<'static> {
+    let items: Vec<Result<Bytes, Error>> = texts.iter().map(|text| Ok(body(text))).collect();
+    stream::iter(items).boxed()
+}
+
+/// A body of these chunks that then ends with `error`, as a body does that was cut or whose
+/// checksum did not match.
+pub fn broken(texts: &[&'static str], error: &Error) -> PartBody<'static> {
+    let mut items: Vec<Result<Bytes, Error>> = texts.iter().map(|text| Ok(body(text))).collect();
+    items.push(Err(error.clone()));
+    stream::iter(items).boxed()
 }

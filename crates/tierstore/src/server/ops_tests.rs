@@ -739,7 +739,7 @@ async fn a_put_whose_checksum_matches_is_stored() {
 async fn a_put_whose_checksum_does_not_match_is_refused_and_stores_nothing() {
     let rig = Rig::new(MEBIBYTE).await;
     let before = rig.hot_mem.list("").await.unwrap().len();
-    let puts = rig.hot.calls(Op::Put);
+    let journals = rig.hot_mem.list("_journal/p1/").await.unwrap().len();
     for name in CHECKSUMS {
         let wrong = checksum(name, b"another body");
         let extra = [(name, wrong.as_str())];
@@ -748,7 +748,8 @@ async fn a_put_whose_checksum_does_not_match_is_refused_and_stores_nothing() {
         assert_eq!(reply.code(), "BadDigest", "{name}");
         let message = texts(&reply.body, "Message").concat();
         assert!(message.contains(name), "{name}");
-        assert_eq!(rig.hot.calls(Op::Put), puts, "{name}");
+        let after = rig.hot_mem.list("_journal/p1/").await.unwrap().len();
+        assert_eq!(after, journals, "{name}");
     }
     assert_eq!(rig.hot_mem.list("").await.unwrap().len(), before);
     assert!(rig.cold_mem.list("").await.unwrap().is_empty());
@@ -949,8 +950,8 @@ async fn the_pieces_of_a_part_reach_the_backend_in_one_call() {
 }
 
 /// Asserts that a cold tier that does not do multipart uploads answers every call of one
-/// `NotImplemented` (the provided methods of the backend): a start, a part, a completion and an
-/// abort.
+/// `NotImplemented` (the provided methods of the backend): a start, a part, a completion, an
+/// abort and a listing of the open uploads.
 #[tokio::test(start_paused = true)]
 async fn a_cold_tier_without_multipart_uploads_answers_not_implemented() {
     let clock = Arc::new(TestClock::new());
@@ -964,11 +965,13 @@ async fn a_cold_tier_without_multipart_uploads_answers_not_implemented() {
     let part = "/tier-bucket/k?partNumber=1&uploadId=u";
     let upload = "/tier-bucket/k?uploadId=u";
     let done = completion(&[(1, "x")]).into_bytes();
+    let listing = "/tier-bucket?uploads";
     let calls = [
         ("POST", uploads, Vec::new()),
         ("PUT", part, b"abc".to_vec()),
         ("POST", upload, done),
         ("DELETE", upload, Vec::new()),
+        ("GET", listing, Vec::new()),
     ];
     for (method, uri, body) in calls {
         let request = sign(&settings, method, uri, &[], &body);

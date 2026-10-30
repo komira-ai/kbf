@@ -59,7 +59,7 @@ use crate::api::{
 use crate::inventory::{Host, Inventory, Role};
 use crate::ports::{
     Apply, Clock, Drain, FrontendControl, Health, HealthCheck, InstallAnswer, Installed, Installer,
-    PortError, SafeToStop, Stop, UNBOUNDED_NODE_DRAIN,
+    PortError, SafeToStop, Stop,
 };
 use crate::record::{FORMAT, Record, RollStore, StoreError, roll_id};
 use crate::timing::Timing;
@@ -642,7 +642,7 @@ impl Updater {
         let deadline = self.timing.drain_deadline;
         self.ports
             .drain
-            .drain(host, deadline.unwrap_or(UNBOUNDED_NODE_DRAIN))
+            .drain(host, deadline)
             .map_err(|e| fail("the drain was refused", e))?;
         let start = self.now();
         loop {

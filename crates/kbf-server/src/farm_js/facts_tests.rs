@@ -107,3 +107,23 @@ fn a_forgotten_worker_has_no_facts() {
     assert_eq!(adapter.worker_facts(&worker("a")), None);
     assert!(adapter.worker_facts(&worker("b")).is_some());
 }
+
+/// Asserts that the daemon process of a worker's newest stream is kept, that a new stream
+/// replaces it (and one that names none leaves it empty, as a daemon with no process name
+/// is a new session on each stream), and that a worker that never registered is not made
+/// known by it.
+#[test]
+fn the_daemon_process_of_the_newest_stream_is_kept() {
+    let mut adapter = adapter();
+    let a = worker("a");
+    adapter.note_registered(&a, &reported("linux", "x86_64", Some(3)));
+    assert_eq!(adapter.worker_facts(&a).expect("facts").instance, "");
+
+    adapter.note_instance(&a, "proc-1");
+    adapter.note_instance(&worker("ghost"), "proc-9");
+    assert_eq!(adapter.worker_facts(&a).expect("facts").instance, "proc-1");
+    assert_eq!(adapter.worker_facts(&worker("ghost")), None);
+
+    adapter.note_registered(&a, &reported("linux", "x86_64", Some(3)));
+    assert_eq!(adapter.worker_facts(&a).expect("facts").instance, "");
+}

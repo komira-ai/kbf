@@ -46,6 +46,10 @@ pub(super) enum Taken {
     Held,
     /// The scheduler took it, and the record was dropped unwritten: never acknowledged.
     Dropped,
+    /// It names the operation's current lease, and the scheduler took no answer from it:
+    /// never acknowledged, so the daemon keeps it and sends it again. A refusal would lose
+    /// it, and leave the lease on the node.
+    Unanswered,
 }
 
 impl Taken {
@@ -55,7 +59,43 @@ impl Taken {
         match self {
             Self::Accepted => Some((true, Reason::Accepted)),
             Self::Refused(reason) => Some((false, reason)),
-            Self::Held | Self::Dropped => None,
+            Self::Held | Self::Dropped | Self::Unanswered => None,
+        }
+    }
+}
+
+/// What a `Result` the scheduler gave no answer to is taken as, from what its lease stands
+/// for now (`standing`, `Ok` while it is the operation's current lease) and whether the farm
+/// is fenced.
+///
+/// A current lease the scheduler took no answer from is not acknowledged, so that the daemon
+/// keeps the `Result` and sends it again: a refusal would lose it, and leave the lease on the
+/// node. A fenced farm feeds nothing, so it refuses every `Result` as stale, the current
+/// lease's too, by design.
+pub(super) fn not_answered(
+    standing: Result<(), Verdict>,
+    fenced: bool,
+    operation: OperationId,
+    lease: LeaseId,
+    worker: &WorkerId,
+) -> Taken {
+    match standing {
+        Ok(()) if fenced => {
+            ack::log_refusal(worker, lease, Reason::Stale);
+            Taken::Refused(Reason::Stale)
+        }
+        Ok(()) => {
+            tracing::error!(
+                %operation, %lease, %worker,
+                "the scheduler took no answer from the result of the operation's current lease; not acknowledged, so the daemon sends it again"
+            );
+            Taken::Unanswered
+        }
+        Err(Verdict::Held) => Taken::Held,
+        Err(Verdict::Refused(Reason::Duplicate)) => Taken::Dropped,
+        Err(Verdict::Refused(reason)) => {
+            ack::log_refusal(worker, lease, reason);
+            Taken::Refused(reason)
         }
     }
 }
@@ -90,7 +130,7 @@ impl Farm {
         let wire_lease = result.lease_id?;
         let _taking = self.in_flight();
         let lease = LeaseId::new(wire_lease.term, wire_lease.seq);
-        let (standing, recorded) = {
+        let (standing, recorded, booked) = {
             let mut state = self.lock();
             let standing = state.standing(lease, worker);
             let recorded = standing
@@ -102,7 +142,8 @@ impl Farm {
             if matches!(standing, Err(Verdict::Held)) {
                 state.engine.owed.entry(lease).or_insert(worker.clone());
             }
-            (standing, recorded)
+            let booked = state.side.machine.sent(lease).and_then(|sent| sent.booked);
+            (standing, recorded, booked)
         };
         let (operation, action, stamp) = match standing {
             Ok(holding) => holding,
@@ -126,11 +167,11 @@ impl Farm {
         }
         let ran_on = (worker, stamp);
         // Read before `outcome`, which drops a failed run's result.
-        let measured = Measured::of(&result);
+        let measured = Measured::of(&result).map(|m| m.booked(booked));
         let exit_code = action_usage::exit_code(&result);
         let run = recorded.then(|| {
             let usage = measured.as_ref().map(Measured::usage);
-            run_record::of(&result, usage, stamp, self.ambient.wall())
+            run_record::of(&result, usage, stamp, self.ambient.wall(), booked)
         });
         let wall = || self.ambient.wall();
         let (outcome, detail) = answer::outcome(&self.cache, wall, lease, ran_on, result).await;
@@ -262,22 +303,13 @@ impl State {
         let rerun = self.runs_recorded(operation) > recorded_before;
         let accepted = rerun || answers.iter().any(|a| a.lease == lease);
         // Not answered: refused, or finished by this lease with the finish waiting for the
-        // store, or with its record dropped unwritten (a finish neither held nor answered).
+        // store, or with its record dropped unwritten (a finish neither held nor answered),
+        // or still the current lease, which the scheduler took no answer from.
         let taken = if accepted {
             Taken::Accepted
         } else {
-            let verdict = self
-                .standing(lease, worker)
-                .err()
-                .unwrap_or(Verdict::Refused(Reason::Stale));
-            match verdict {
-                Verdict::Held => Taken::Held,
-                Verdict::Refused(Reason::Duplicate) => Taken::Dropped,
-                Verdict::Refused(reason) => {
-                    ack::log_refusal(worker, lease, reason);
-                    Taken::Refused(reason)
-                }
-            }
+            let standing = self.standing(lease, worker).map(drop);
+            not_answered(standing, self.engine.fenced, operation, lease, worker)
         };
         self.finish_learning(operation, lease, worker, accepted || taken == Taken::Held);
         if accepted && let Some((subject, measured)) = &usage {

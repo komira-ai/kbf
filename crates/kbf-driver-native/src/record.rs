@@ -31,7 +31,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use tokio::process::{Child, Command};
+use std::process::Child;
+
+use tokio::process::Command;
 
 use crate::keeper::Keeper;
 use crate::procs;
@@ -338,15 +340,14 @@ impl Gate {
         c.go_parent.store(go_write.as_raw_fd(), Ordering::SeqCst);
         std::thread::scope(|scope| {
             let recorder = scope.spawn(|| write_record(pid_read, go_write, record, keeper));
-            let child = command.spawn();
+            let child = command.as_std_mut().spawn();
             // The child has its own copies now. Closing these lets the recorder see
             // end-of-file when there was no fork.
             drop((pid_write, go_read));
             let recorded = recorder.join().map_err(recorder_panicked).and_then(|r| r);
             // A child refused for want of its record failed for the recorder's reason.
             let (child, (recorded, keeper)) = recorder_first(child, recorded)?;
-            // A child that has not been waited for always has its pid.
-            let pid = child.id().and_then(|pid| i32::try_from(pid).ok());
+            let pid = i32::try_from(child.id()).ok();
             let pid = pid.ok_or(io::Error::other("the child has no pid"))?;
             same_child(recorded, pid)?;
             Ok(Spawned { child, pid, keeper })
@@ -653,7 +654,7 @@ mod tests {
                 pid,
                 "the keeper's group"
             );
-            let out = child.wait_with_output().await.expect("wait");
+            let out = child.wait_with_output().expect("wait");
             assert!(out.status.success(), "{out:?}");
             let boot = boot_id().expect("boot");
             let expected = format!(
@@ -686,19 +687,19 @@ mod tests {
         let dir = dir("keeper");
         let (mut command, gate) = gated(Path::new("/bin/sleep"), &[Path::new("300")]);
         let Spawned {
-            mut child,
-            mut keeper,
-            ..
+            child, mut keeper, ..
         } = gate
             .spawn(&mut command, &dir.join("lease-1-1"), KeeperFor::Group)
             .expect("spawn");
         keeper.orphan();
-        let waited = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await;
+        let mut leader = crate::leader::Leader::new(child);
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(10), leader.wait()).await;
         // A red run must not leave the sleep behind (a no-op once it was reaped).
-        let _ = child.start_kill();
+        let _ = leader.start_kill();
         let status = waited
             .expect("the action outlived its daemon")
-            .expect("wait");
+            .expect("wait")
+            .status;
         use std::os::unix::process::ExitStatusExt as _;
         assert_eq!(status.signal(), Some(libc::SIGKILL), "{status}");
     }
@@ -806,7 +807,7 @@ mod tests {
             .await
             .expect("spawned once closed");
         closer.await.expect("closer");
-        let out = child.wait_with_output().await.expect("wait");
+        let out = child.wait_with_output().expect("wait");
         assert_eq!(out.status.code(), Some(0), "{out:?}");
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),

@@ -68,6 +68,10 @@ use kbf_front::Described;
 use crate::action_usage::{ShapeKey, Subject};
 use crate::machine::Platform;
 
+mod predict;
+use predict::Predictions;
+pub use predict::{Axis, Fit, Forecast, Unset};
+
 /// What `--learned-sizes` does with the estimator.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum LearnedSizes {
@@ -155,6 +159,9 @@ pub struct Learned {
     /// Key floors the estimator's decay has lowered since they were last taken: the size
     /// key, the floor the summary held before and the one it holds now.
     lowered: Vec<(u64, u64, u64)>,
+    /// The predictions made for new operations, and what became of them
+    /// ([`Learned::predict`]).
+    predictions: Predictions,
 }
 
 impl Learned {
@@ -180,6 +187,7 @@ impl Learned {
             named: BTreeMap::new(),
             names: BTreeMap::new(),
             lowered: Vec::new(),
+            predictions: Predictions::default(),
         }
     }
 
@@ -230,7 +238,7 @@ impl Learned {
     }
 
     /// The day of farm time `now`, on the wall clock the farm was built on.
-    fn day(&self) -> Day {
+    pub(crate) fn day(&self) -> Day {
         let ms = self.epoch_unix_ms.saturating_add(self.now.as_millis());
         Day(u32::try_from(ms / DAY_MS).unwrap_or(u32::MAX))
     }
@@ -347,6 +355,8 @@ impl Learned {
     /// are returned, for the caller to write after the requeue is settled.
     pub fn requeued(&mut self, lease: LeaseId, raised: u64, bounds: &Bounds) -> Vec<Row> {
         self.forget(lease);
+        // A kill is no run to compare: the operation's prediction waits for its next one.
+        self.unstage_prediction(lease);
         let Some(mut attempt) = self.staged.remove(&lease) else {
             return Vec::new();
         };
@@ -363,7 +373,14 @@ impl Learned {
     /// operation, with no requeue), for the caller to write at once.
     pub fn finish(&mut self, lease: LeaseId, taken: bool, bounds: &Bounds) -> Vec<Row> {
         self.forget(lease);
-        let Some(attempt) = self.staged.remove(&lease).filter(|_| taken) else {
+        let compared = self.unstage_prediction(lease).filter(|_| taken);
+        let attempt = self.staged.remove(&lease).filter(|_| taken);
+        if let Some((operation, prediction)) = compared {
+            // A report the scheduler took ends the operation, with or without a run to
+            // compare (a run that named no instrument has no attempt).
+            self.end_prediction(operation, &prediction, attempt.as_ref().map(|a| &a.run));
+        }
+        let Some(attempt) = attempt else {
             return Vec::new();
         };
         self.observe_keyed(&attempt, bounds);
@@ -452,7 +469,11 @@ impl Learned {
         self.tally[level as usize][bucket as usize]
     }
 
-    /// The rows of `keys`, which are no longer dirty.
+    /// The rows of `keys` as the summaries are now, which are no longer dirty.
+    pub fn take_rows(&mut self, keys: BTreeSet<Key>) -> Vec<Row> {
+        self.rows_of(keys)
+    }
+
     fn rows_of(&mut self, keys: BTreeSet<Key>) -> Vec<Row> {
         let mut rows = Vec::new();
         for key in keys {

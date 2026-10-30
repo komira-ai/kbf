@@ -276,6 +276,9 @@ pub struct CacheStats {
     pub evictions: u64,
     /// Entries that failed their lazy re-hash or their stat check.
     pub verify_failures: u64,
+    /// Times a lease found a key's slot held and waited for it, all leases together
+    /// (the sum of their `InputStats::fill_waits`).
+    pub fill_waits: u64,
     /// Free-space rounds that ran out of entries no lease links.
     pub floor_unreachable: u64,
     pub adopted_entries: u64,
@@ -296,7 +299,13 @@ pub struct CacheStats {
 #[derive(Debug, Default)]
 struct Counters {
     evictions: AtomicU64,
+    evicted_bytes: AtomicU64,
+    fills: AtomicU64,
+    fill_bytes: AtomicU64,
+    hits: AtomicU64,
+    hit_bytes: AtomicU64,
     verify_failures: AtomicU64,
+    fill_waits: AtomicU64,
     floor_unreachable: AtomicU64,
     adopted: AtomicU64,
     dropped: AtomicU64,
@@ -491,6 +500,7 @@ impl Cache {
             entries,
             evictions: get(&c.evictions),
             verify_failures: get(&c.verify_failures),
+            fill_waits: get(&c.fill_waits),
             floor_unreachable: get(&c.floor_unreachable),
             adopted_entries: get(&c.adopted),
             dropped_entries: get(&c.dropped),
@@ -500,6 +510,23 @@ impl Cache {
             snapshot_failures: get(&c.snapshot_failures),
             index_discarded: inner.index_discarded,
             index_load_ms: inner.index_load_ms,
+        }
+    }
+
+    /// What the cache has filled, served and evicted since this process opened it, for
+    /// the heartbeat (`Heartbeat.input_cache`). `trees` is left unset.
+    #[must_use]
+    pub fn input_counts(&self) -> kbf_proto::worker::InputCacheCounts {
+        let c = &self.inner.counters;
+        let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        kbf_proto::worker::InputCacheCounts {
+            fills: get(&c.fills),
+            fill_bytes: get(&c.fill_bytes),
+            hits: get(&c.hits),
+            hit_bytes: get(&c.hit_bytes),
+            evictions: get(&c.evictions),
+            evicted_bytes: get(&c.evicted_bytes),
+            trees: None,
         }
     }
 

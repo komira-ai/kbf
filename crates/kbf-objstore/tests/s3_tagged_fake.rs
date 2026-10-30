@@ -220,3 +220,30 @@ async fn a_stamped_listing_pages_with_times_a_start_after_key_and_tokens() {
     assert_eq!(names, ["a/3", "a/4", "a/5"]);
     assert_eq!(rest.next, None);
 }
+
+/// Asserts that `len` is the size a HEAD gives, for a one-byte, an empty and a larger
+/// object, and `None` for a key with no object (a 404 is an answer, not an error), also
+/// after a delete.
+#[tokio::test]
+async fn len_is_the_size_of_a_head_and_none_for_a_missing_key() {
+    let s3 = FakeS3::start().await;
+    let store = s3.store(CONDITIONAL);
+    store
+        .put_new(&key("one"), Bytes::from("x"), None)
+        .await
+        .unwrap();
+    store
+        .put_new(&key("empty"), Bytes::new(), None)
+        .await
+        .unwrap();
+    store
+        .put_new(&key("big"), Bytes::from(vec![9u8; 5000]), None)
+        .await
+        .unwrap();
+    assert_eq!(store.len(&key("one")).await.unwrap(), Some(1));
+    assert_eq!(store.len(&key("empty")).await.unwrap(), Some(0));
+    assert_eq!(store.len(&key("big")).await.unwrap(), Some(5000));
+    assert_eq!(store.len(&key("never")).await.unwrap(), None);
+    store.delete(&key("big")).await.unwrap();
+    assert_eq!(store.len(&key("big")).await.unwrap(), None);
+}

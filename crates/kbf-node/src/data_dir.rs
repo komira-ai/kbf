@@ -54,7 +54,7 @@ pub(crate) struct DataArgs {
     /// native driver on macOS)
     /// `cache/` (the input cache, `docs/design/worker-cache.md`) and `trees/` (shared
     /// read-only input trees, `docs/design/fast-sandbox.md#4-shared-trees`). Made if
-    /// missing; absolute. The cache and trees are on, sized from the filesystem: half
+    /// missing; absolute. The cache and trees are on (unless `--no-input-cache`), sized from the filesystem: half
     /// and a quarter of its size less what it keeps free (5%, at least 1 GiB), and
     /// the cache evicts entries no running lease links to keep that much free. A
     /// directory another daemon owns, or that cannot be used, is left alone: the
@@ -68,6 +68,14 @@ pub(crate) struct DataArgs {
     /// of it), under the filesystem's automatic one.
     #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..))]
     pub data_max_bytes: Option<u64>,
+    /// Switches the host input cache off: no `cache/` and no `trees/`, so every action
+    /// fetches its inputs from the CAS into its own input root and no later action reuses
+    /// them (no hard link or clone from either). Leaves what an earlier start put in
+    /// `<data-dir>/cache` and `<data-dir>/trees` alone. Without a cache a lease reports no
+    /// input statistics (`cache_hits` and the rest exist only with a cache). For
+    /// measuring what the cache saves
+    #[arg(long)]
+    pub no_input_cache: bool,
     /// The node's one cache, when the process runs local storage on the same disk
     /// (`kbf all-in-one`, [`crate::Cli::share_cache`]); no flag sets it.
     #[arg(skip)]
@@ -80,6 +88,12 @@ impl crate::Cli {
     /// (`kbf all-in-one`; see `kbf_storage::local_cache`).
     pub fn share_cache(&mut self, local: std::sync::Arc<kbf_daemon::cache::LocalCache>) {
         self.data.local_cache = Some(local);
+    }
+
+    /// Whether `--no-input-cache` was given.
+    #[must_use]
+    pub fn no_input_cache(&self) -> bool {
+        self.data.no_input_cache
     }
 
     /// `--data-dir`, as the daemon resolves it (`/var/lib/kbf` when it is not given).
@@ -137,8 +151,11 @@ pub(crate) struct Plan {
     /// `--data-dir`.
     pub dir: PathBuf,
     /// Whether a driver that uses them runs (the container driver; the native driver on
-    /// macOS), and so `cache` and `trees` are made.
+    /// macOS) and `--no-input-cache` is not given, and so `cache` and `trees` are made
+    /// and handed to the driver.
     pub cached: bool,
+    /// `--no-input-cache`: the cache and the trees are off though a driver would use them.
+    pub flag_off: bool,
     /// The budgets; `None` for a filesystem too small for a cache.
     pub budgets: Option<Budgets>,
     /// Whether `leases` is searchable by others (the OCI backend, or a native pool's
@@ -189,7 +206,8 @@ impl Plan {
         })?;
         Ok(Self {
             dir,
-            cached,
+            cached: cached && !args.no_input_cache,
+            flag_off: cached && args.no_input_cache,
             budgets: Budgets::of(on, args.data_max_bytes),
             open_leases: false,
         })
@@ -248,6 +266,11 @@ impl Plan {
             self.leases().display()
         )];
         match (self.cached, &self.budgets) {
+            (false, _) if self.flag_off => lines.push(
+                "cache: off:--no-input-cache (every action fetches its inputs from the CAS); \
+                 trees: off:--no-input-cache"
+                    .to_owned(),
+            ),
             (false, _) => lines.push(
                 "cache: off:no driver that uses it (the native driver's actions run as the \
                  daemon's user off macOS and could write the cache); \
@@ -323,7 +346,8 @@ pub(crate) fn given(
     data: &DataArgs,
 ) -> Option<kbf_driver_container::CacheUse> {
     use kbf_daemon::cache::{CacheConfig, Disabled};
-    let plan = plan?;
+    // `--no-input-cache`, or a driver that does not use them: nothing to open.
+    let plan = plan.filter(|plan| plan.cached)?;
     let shown = plan.cache().display().to_string();
     let budgets = plan.budgets.ok_or(Disabled::NoBudget);
     // The helper is this binary, by the path it was started from: after an update
@@ -574,6 +598,39 @@ mod tests {
             .expect("chmod");
         plan.create().expect("again");
         assert_eq!(mode(&plan.leases()), 0o750, "an existing mode is kept");
+    }
+
+    /// Catches `--no-input-cache` ignored, or only half applied: with it, a plan for the
+    /// container driver makes no `cache` directory, hands the driver no cache (so no
+    /// trees either), and says in the start log that the flag is why; without it the same
+    /// plan has both (the second action's hit is
+    /// `inputs_are_links_to_the_cache_and_only_directories_change_owner` in the driver).
+    #[test]
+    fn no_input_cache_makes_no_cache_and_gives_the_driver_none() {
+        let space = Space {
+            total: 200 * GIB,
+            available: 150 * GIB,
+        };
+        assert!(!args(&[]).no_input_cache);
+        let base = crate::tests::scratch("data-dir-no-input-cache");
+        let dir = format!("--data-dir={}", base.display());
+        let data = args(&[&dir, "--no-input-cache"]);
+        assert!(data.no_input_cache);
+        let plan = Plan::new(&data, true, &Fake(space)).expect("plan");
+        assert!(!plan.cached);
+        plan.create().expect("create");
+        assert!(plan.leases().is_dir());
+        assert!(!plan.cache().exists(), "the cache directory was made");
+        assert!(!plan.trees().exists());
+        let lines = plan.describe().join("\n");
+        assert!(lines.contains("cache: off:--no-input-cache"), "{lines}");
+        assert!(lines.contains("trees: off:--no-input-cache"), "{lines}");
+        #[cfg(target_os = "linux")]
+        assert!(super::given(Some(&plan), &data).is_none());
+        let on = Plan::new(&args(&[&dir]), true, &Fake(space)).expect("plan");
+        assert!(on.cached);
+        #[cfg(target_os = "linux")]
+        assert!(super::given(Some(&on), &args(&[&dir])).is_some());
     }
 
     /// Catches the container driver's cache and trees not being the plan's: the cache in

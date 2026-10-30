@@ -8,10 +8,14 @@ mod conformance;
 mod faults;
 mod journal;
 mod lease;
+mod list_uploads;
+mod list_uploads_reserved;
 mod multipart;
+mod recheck;
 mod reconciler;
 mod reconciler_faults;
 #[cfg(feature = "s3")]
 mod s3;
+mod streaming;
 mod support;
 mod tiered;

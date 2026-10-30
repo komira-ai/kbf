@@ -9,11 +9,21 @@ Every "today" claim cites a file on `main` at `d7f25cf` (#524). Every number mar
 `--tree-min-files`, `--tree-max-mounts` and `--scratch`. They are not flags any more: the
 daemon takes one directory, `--data-dir` (default `/var/lib/kbf`), holding `leases/` (what
 `--scratch` was), `cache/` (`--cache-dir`) and `trees/` (`--tree-dir`) on one filesystem,
-and one optional `--data-max-bytes`. The cache and the trees are on by default under the
+and two optional flags, `--data-max-bytes` and `--no-input-cache`. The cache and the trees are on by default under the
 container driver and the native driver on macOS, and their budgets come from the filesystem: the cache may keep half and
 the trees a quarter of its size less a floor of 5% (at least 1 GiB), and the cache's
 `--cache-min-free-bytes` is that floor. The link concurrency (64) and the trees' thresholds
-(256 files, 8 mounts) are constants. Read each flag below as the part of the data directory
+(256 files, 8 mounts) are constants.
+`--no-input-cache` (default off, `[daemon] no-input-cache` in `kbf.toml`) switches both off:
+the daemon makes no `cache/` and opens no `trees/`, leaves what an earlier start put there
+untouched, and logs `cache: off:--no-input-cache` and `trees: off:--no-input-cache`. Each
+action then fetches its inputs from the CAS into its own input root, as under a driver with no
+cache, with no hard link or clone from either directory, and the lease has no `InputStats`
+(no `cache_hits`, `cache_misses` or `inputs:` statistics line; the cached counters exist only
+with a cache). It is for measuring what host-level reuse of inputs saves; `--data-max-bytes`
+only shrinks the budgets. With `kbf all-in-one` or `kbf storage-and-daemon` it also ends the one cache
+shared with the storage half's hot store: the start logs `one cache: off`, and each half keeps
+what it keeps without the other. Read each flag below as the part of the data directory
 it names ([storage-node.md](../deploy/storage-node.md#the-daemons-data-directory)).
 
 This document covers four changes to how a kbf-daemon moves blobs:
@@ -847,6 +857,20 @@ Per node, on the operator API: `cache_bytes`, `cache_entries`, `cache_evictions`
 `fs_free_bytes`, `cache_floor_unreachable`, `cache_output_skips`, `cache_disabled_reason`,
 `cache_index_load_ms`, `cache_index_discarded`, `cache_adopted_entries`, `cache_dropped_entries`,
 `cache_foreign_files`, `cache_index_drift_bytes`.
+
+Per node, as monotonic counters since the daemon process started: the daemon sends
+`Heartbeat.input_cache` (`InputCacheCounts`: `fills`, `fill_bytes`, `hits`, `hit_bytes`,
+`evictions`, `evicted_bytes`, and the tree store's `builds`, `hits`, `evictions` in `trees`) on
+every heartbeat, and a frontend keeps the newest per node and exports it as
+`kbf_node_input_cache_*_total{node}` on `/metrics` and as `input_cache` in
+`GET /v1/nodes/{id}` (`docs/api.md`, "Input cache counts"). The unit is the entry (a blob by
+digest and executable bit), not a file name. The counts are incremented where the events
+happen: a fill after the CAS fetch has been inserted as an entry (an entry copied from its
+sibling is not one), a hit when a lease uses an indexed entry that passed its stat check
+(including a lease that waited for another's fill; the filling lease is a miss), an eviction in
+the evictor's one removal. The field is absent, not zero, from a daemon with no cache open
+(its cache is off, could not be opened, or the runtime has none), and a restarted
+daemon counts again from 0.
 
 The cache's acceptance check is one of these numbers: **a second lease with the same zig
 tree on the same node fetches 0 bytes for the toolchain** and has

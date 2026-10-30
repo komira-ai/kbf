@@ -343,7 +343,9 @@ refuses new Execute calls, which Buck2 retries elsewhere, and keeps every open E
 WaitExecution stream until its action is done, except a stream whose operation was never
 started, that no worker on this frontend can run and that no other frontend can take,
 which ends UNAVAILABLE when the drain begins: Buck2 retries only
-the opening of a call, so an ended stream fails that action); `--shutdown-timeout-secs` is 0, no
+the opening of a call, so an ended stream fails that action; the daemon half of `all-in-one`
+drains after its server half has no execution open and the process exits when its leases have
+ended and been acknowledged, see [kbf-modes.md](kbf-modes.md#stopping-and-draining)); `--shutdown-timeout-secs` is 0, no
 deadline, by default, and a frontend over a state store has no other bound: its
 `--drain-deadline`, when set, only reports. A `--shutdown-timeout-secs` above 0 ends a drain
 that a signal began when it runs out, as a second signal does, and fails the builds still
@@ -356,16 +358,18 @@ runs out, 90 s (`DefaultTimeoutStopSec=`) when the unit gives none. So both unit
 90 s default would cut them), and rule `stop` of the package test refuses either
 missing or changed: it reads `TimeoutSec=` too (it sets the stop timeout as well; the
 last of the two wins) and the drop-ins. It asks for the word `infinity`: `0` means no
-timeout to systemd as well, but reads as "at once" to a person. A daemon is not held for ever:
-it drains on SIGTERM up to `--drain-deadline-secs` (600 by default), then stops, so its
-unit has `KillSignal=SIGTERM` and a finite `TimeoutStopSec=660` (the deadline plus 60 s);
-a hung daemon still lets a reboot through.
+timeout to systemd as well, but reads as "at once" to a person. The daemon unit is the same:
+it drains on SIGTERM until every lease has ended, however long that takes (a drain never
+ends because time ran out; `--drain-deadline-secs`, if set, only logs a warning with the
+number of leases still running), so it has `KillSignal=SIGTERM` and
+`TimeoutStopSec=infinity`. A second SIGTERM, or `systemctl kill`, is the operator's hard
+stop for a drain that must end now.
 
 The three units that run the daemon (`daemon`, `storage-and-daemon`, `all-in-one`) also
 set `KillMode=mixed`. The actions run in sub-cgroups of the unit, and the default
 `control-group` sends SIGTERM to every process in it, so a stop would end them within
-seconds and defeat the drain. With `mixed` SIGTERM goes to the daemon alone; if the
-drain deadline passes, the daemon ends the leases still running itself, and systemd
+seconds and defeat the drain. With `mixed` SIGTERM goes to the daemon alone, which waits
+for the leases; a second signal makes it end the leases still running itself, and systemd
 sends SIGKILL only to what remains after the main process has exited.
 
 ### storage-and-daemon and the cold store's key

@@ -103,6 +103,7 @@ const GROUPS: &[(&str, &[&str])] = &[
         "scheduler",
         &[
             "default-platform",
+            "exclusive-actions",
             "finished-retention-secs",
             "heartbeat-interval-ms",
             "input-tree-cache-bytes",
@@ -110,6 +111,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "input-tree-reads-in-flight",
             "pack-index",
             "placement-load",
+            "placement-predictions",
             "progress-interval-secs",
             "qos-allowed",
             "readyz-store-timeout-ms",
@@ -234,6 +236,67 @@ const GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        // The frontend's job-facing read listener (`kbf_server::frontend`'s `job_read`).
+        "job-read",
+        &[
+            "job-grant-secret-file",
+            "job-listen",
+            "job-max-blob-bytes",
+            "job-reads-in-flight",
+            "job-tls-cert",
+            "job-tls-key",
+        ],
+    ),
+    (
+        // Preparing the runs of a host executor: `kbf_server::frontend`'s `task_flags`.
+        "task-runs",
+        &[
+            "task-closure-max-bytes",
+            "task-closure-max-digests",
+            "task-large-credentials-file",
+            "task-large-max-bytes",
+            "task-max-large",
+            "task-max-packs",
+            "task-put-bucket",
+            "task-put-credentials-file",
+            "task-put-endpoint",
+            "task-put-region",
+            "task-read-url",
+            "task-run-wall-secs",
+            "task-secret-file",
+            "task-url-slack-secs",
+        ],
+    ),
+    (
+        // Where the frontend runs placed actions (`kbf_server::frontend`'s `executor_flags`): the
+        // daemons of the nodes, or hosts leased from the job scheduler's lease server.
+        "executor",
+        &[
+            "executor",
+            "executor-allow-plain-http-put",
+            "executor-arch",
+            "executor-base-image",
+            "executor-call-timeout-secs",
+            "executor-class",
+            "executor-default-timeout-secs",
+            "executor-frontend-id",
+            "executor-host-cpus",
+            "executor-host-memory-gib",
+            "executor-host-slots",
+            "executor-hosts",
+            "executor-insecure-argv-secrets",
+            "executor-kbf-image",
+            "executor-lease-ca-file",
+            "executor-lease-token-file",
+            "executor-lease-ttl-secs",
+            "executor-lease-url",
+            "executor-max-run-secs",
+            "executor-output-disk-bytes",
+            "executor-run-margin-secs",
+            "executor-work-dir",
+        ],
+    ),
+    (
         // Not `enroll` or `frontend`: those tables are the enrollment client's own.
         "enroll-service",
         &[
@@ -278,6 +341,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "driver",
             "image",
             "native-term-grace-ms",
+            "no-input-cache",
             "orders-dir",
             "reconnect-max-ms",
             "reconnect-ms",
@@ -290,6 +354,7 @@ const GROUPS: &[(&str, &[&str])] = &[
     (
         "containers",
         &[
+            "actions-cpu-max",
             "actions-memory-max-gib",
             "cgroup-parent",
             "cgroup-root",
@@ -318,6 +383,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "memory-limit-percent",
             "memory-poll-ms",
             "memory-pressure-pause-percent",
+            "no-memory-climb",
         ],
     ),
     (
