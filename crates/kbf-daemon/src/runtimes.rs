@@ -11,7 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use kbf_proto::reapi::ActionResult;
-use kbf_proto::worker::ResourceUsage;
+use kbf_proto::worker::{InputCacheCounts, ResourceUsage};
 use kbf_types::{LeaseId, LeaseKind};
 
 use crate::runtime::{NodeLoadError, NodeReading, Runtime, RuntimeError, Work};
@@ -26,6 +26,7 @@ pub(crate) trait AnyRuntime: Send + Sync {
     fn run(&self, work: Work) -> Boxed<'_, Result<ActionResult, RuntimeError>>;
     fn failed_usage(&self, lease_id: LeaseId) -> Option<ResourceUsage>;
     fn node_load(&self) -> Boxed<'_, Result<Option<NodeReading>, NodeLoadError>>;
+    fn input_cache(&self) -> Option<InputCacheCounts>;
     fn welcomed_placement_load(&self, on: bool) -> Boxed<'_, ()>;
     fn take_peak_window_millicores(&self, lease_id: LeaseId) -> Option<u64>;
     fn kill(&self, lease_id: LeaseId) -> Boxed<'_, ()>;
@@ -50,6 +51,10 @@ impl<R: Runtime> AnyRuntime for R {
 
     fn node_load(&self) -> Boxed<'_, Result<Option<NodeReading>, NodeLoadError>> {
         Box::pin(Runtime::node_load(self))
+    }
+
+    fn input_cache(&self) -> Option<InputCacheCounts> {
+        Runtime::input_cache(self)
     }
 
     fn welcomed_placement_load(&self, on: bool) -> Boxed<'_, ()> {
@@ -140,6 +145,12 @@ impl Runtimes {
             }
         }
         Ok(None)
+    }
+
+    /// The first input cache counts any runtime gives, in the order they were added; `None`
+    /// when no runtime has an input cache.
+    pub(crate) fn input_cache(&self) -> Option<InputCacheCounts> {
+        self.all.iter().find_map(|runtime| runtime.input_cache())
     }
 
     /// Tells every runtime, in the order they were added, what a Welcome said of placement
