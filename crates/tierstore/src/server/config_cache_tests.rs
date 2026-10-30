@@ -422,7 +422,7 @@ fn a_rate_is_a_size_and_a_per_second() {
     assert_eq!(rate("7B/s").unwrap(), Rate(7));
     for bad in ["50MiB", "x/s", "-1B/s", "/s", "1 B/s"] {
         let why = rate(bad).unwrap_err().to_string();
-        assert!(why.contains("not a rate"), "{bad}: {why}");
+        assert!(why.contains("a rate such as"), "{bad}: {why}");
     }
     let why = serde_json::from_str::<Rate>("5").unwrap_err().to_string();
     assert!(why.contains("a rate such as"), "{why}");
