@@ -1680,6 +1680,15 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_pack_ingest_packs_total` | counter | packs of the runs `ingest` turned into an action result (a run of one pack counts 1): divided by `kbf_pack_ingests_total`, the packs per run |
 | `kbf_pack_ingest_large_bytes_total` | counter | bytes of large objects (raw objects over the record cap that a task wrote under `L<i>` keys) that `ingest` streamed into the CAS, for the runs it turned into an action result |
 
+**What ingest of a run holds and refuses.** A digest is in one place: a record of one pack or one
+large object. A digest that is a record twice, in two packs or twice in one, is `malformed` (a
+repeat inside one pack was accepted until the multi-pack ingest; a task builds each pack from
+distinct blobs, so an honest pack has none). Large objects are streamed into the CAS before the
+packs are recorded and the result is cached, so a run that fails after that point leaves them
+there: valid blobs, each under the digest its own bytes hash to, that no result names. A hostile
+task can leave up to 8 large objects of the large cap (512 MiB) each, 4 GiB, of such bytes per run,
+until a janitor removes them (komira-ai/kbf#1980).
+
 **Job-facing read.** On a frontend given `--job-listen` ([kbf-modes.md](deploy/kbf-modes.md)) the
 listener a task fetches its action's inputs from counts requests and bytes; without the flag these
 are absent. The same scrape has a `listener="job"` series in the `kbf_tls_reloads_total` family.

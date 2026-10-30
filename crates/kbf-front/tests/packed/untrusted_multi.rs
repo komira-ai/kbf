@@ -325,6 +325,8 @@ async fn a_node_that_cannot_take_the_large_blob_is_unavailable() {
     assert!(matches!(got, Ingested::Unavailable(_)), "{got:?}");
     assert_eq!(farm.rig.packs.metrics().ingest_unavailable(), 1);
     farm.nothing_indexed();
+    let cached = farm.cached().await.expect_err("nothing cached");
+    assert_eq!(cached.code(), Code::NotFound);
 }
 
 /// Asserts that a node that takes every byte of the large blob and then fails is `Unavailable`
@@ -343,6 +345,8 @@ async fn a_node_that_fails_after_the_last_byte_is_unavailable() {
     assert!(matches!(got, Ingested::Unavailable(_)), "{got:?}");
     assert_eq!(farm.rig.packs.metrics().ingest_unavailable(), 1);
     farm.nothing_indexed();
+    let cached = farm.cached().await.expect_err("nothing cached");
+    assert_eq!(cached.code(), Code::NotFound);
 }
 
 /// Asserts that a length question about the large object that fails in the object store is
@@ -361,6 +365,8 @@ async fn a_failing_length_of_a_large_object_is_unavailable() {
     let key = farm.large_key(0).key();
     assert!(farm.rig.store.ranges().iter().all(|(k, _, _)| k != key));
     farm.nothing_indexed();
+    let cached = farm.cached().await.expect_err("nothing cached");
+    assert_eq!(cached.code(), Code::NotFound);
 }
 
 /// Asserts that a digest that is a record of two packs is `Malformed` and nothing is indexed: a
@@ -616,4 +622,34 @@ async fn the_advisory_inputs_of_a_manifest_are_accepted_and_ignored() {
         cached: true,
     };
     assert_eq!(got, want);
+}
+
+/// Asserts that the MAC of every key of the set is checked, not only pack 0's: with the right
+/// lease and the right slot, a pack 1 key or an `L0` key whose MAC is wrong is `WrongKey`, and
+/// the store is not read. Pack 0's key is valid in both sets.
+#[tokio::test]
+async fn the_mac_of_a_key_that_is_not_pack_zeros_is_checked() {
+    let farm = Multi::new().await;
+    let (packs, large) = (farm.keys.packs().to_vec(), farm.keys.large().to_vec());
+    let forged = |key: &IssuedPackKey| {
+        let nonce = key.key().rsplit('/').next().expect("a nonce");
+        let first = if nonce.starts_with('0') { '1' } else { '0' };
+        let nonce = format!("{first}{}", &nonce[1..]);
+        IssuedPackKey::new(LEASE, &nonce).expect("a key")
+    };
+    let mut bad_pack = packs.clone();
+    bad_pack[1] = forged(&packs[1]);
+    let mut bad_large = large.clone();
+    bad_large[0] = forged(&large[0]);
+    let sets = [
+        IssuedKeySet::new(bad_pack, large.clone()),
+        IssuedKeySet::new(packs.clone(), bad_large),
+    ];
+
+    for keys in &sets {
+        let got = farm.run_with(keys, &UntrustedLimits::default()).await;
+        assert_eq!(got, Ingested::Reject(RejectReason::WrongKey));
+    }
+
+    assert!(farm.rig.store.ranges().is_empty(), "the store was not read");
 }
