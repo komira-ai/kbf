@@ -18,7 +18,10 @@
 //! The HTTP is one connection one request at a time (HTTP/1.1, keep-alive), and the
 //! listener bounds what an untrusted client can hold: [`MAX_CONNECTIONS`] open connections
 //! (the others wait in the kernel's backlog), a time to send a request's headers, a
-//! lifetime for a connection, and in [`kbf_front::job_read`] the reads open at once. The
+//! lifetime for a connection, and in [`kbf_front::job_read`] the reads open at once
+//! (`--job-reads-in-flight`) and the largest blob served (`--job-max-blob-bytes`). A blob over
+//! 64 MiB is streamed with its content length, and one whose bytes are not its digest's ends
+//! its response short, which the client sees as a broken response. The
 //! listener's socket is closed the moment the drain begins; a connection already open
 //! finishes the request it is answering, within its lifetime.
 
@@ -30,7 +33,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::header::{ALLOW, AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
+use axum::http::header::{ALLOW, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::Response;
 use clap::{Arg, ArgMatches};
@@ -53,6 +56,15 @@ const LISTEN: &str = "job_listen";
 const TLS_CERT: &str = "job_tls_cert";
 const TLS_KEY: &str = "job_tls_key";
 const GRANT_SECRET: &str = "job_grant_secret_file";
+const MAX_BLOB: &str = "job_max_blob_bytes";
+const READS: &str = "job_reads_in_flight";
+
+/// The default of `--job-max-blob-bytes`, as clap takes a default (a string); a test parses
+/// it back and compares it with [`Limits::default`].
+const DEFAULT_MAX_BLOB: &str = "536870912";
+
+/// The default of `--job-reads-in-flight`, likewise.
+const DEFAULT_READS: &str = "32";
 
 /// The most bytes the grant secret's file may hold, surrounding whitespace included.
 const MAX_SECRET_FILE_BYTES: usize = 4096;
@@ -63,7 +75,7 @@ pub(super) const MAX_CONNECTIONS: usize = 256;
 /// The label of the listener's TLS files in `kbf_tls_reloads_total`.
 const TLS_LABEL: &str = "job";
 
-/// The job-facing read's flags: all four or none.
+/// The job-facing read's flags: the first four, or none; the last two have defaults.
 #[derive(Clone, Debug)]
 pub struct JobReadFlags {
     /// `--job-listen`: where the listener listens.
@@ -74,10 +86,14 @@ pub struct JobReadFlags {
     pub tls_key: PathBuf,
     /// `--job-grant-secret-file`: the farm secret the read grants are signed with.
     pub grant_secret_file: PathBuf,
+    /// `--job-max-blob-bytes`: the largest blob a response carries.
+    pub max_blob_bytes: u64,
+    /// `--job-reads-in-flight`: the blob reads open at once.
+    pub reads_in_flight: u32,
 }
 
-/// The four flags.
-pub(super) fn args() -> [Arg; 4] {
+/// The six flags.
+pub(super) fn args() -> [Arg; 6] {
     [
         Arg::new(LISTEN)
             .long("job-listen")
@@ -127,6 +143,30 @@ pub(super) fn args() -> [Arg; 4] {
                  read the same secret. The secret is never a flag: a command line is \
                  world-readable",
             ),
+        Arg::new(MAX_BLOB)
+            .long("job-max-blob-bytes")
+            .value_name("BYTES")
+            .value_parser(clap::value_parser!(u64).range(1..))
+            .default_value(DEFAULT_MAX_BLOB)
+            .requires(LISTEN)
+            .help(
+                "The most bytes of one blob the listener serves, at least 1: a blob of more is \
+                 refused 413 `too_large` before anything is read. A blob of more than 67108864 \
+                 bytes is streamed from the store through SHA-256 and never held whole; one \
+                 whose bytes are not its digest's ends its response early, and is counted. \
+                 Needs `--job-listen`",
+            ),
+        Arg::new(READS)
+            .long("job-reads-in-flight")
+            .value_name("N")
+            .value_parser(clap::value_parser!(u32).range(1..))
+            .default_value(DEFAULT_READS)
+            .requires(LISTEN)
+            .help(
+                "The blob reads this listener has open at once, at least 1: a streamed blob \
+                 holds its place until its response ends, and a request over the bound waits \
+                 for one to end. Needs `--job-listen`",
+            ),
     ]
 }
 
@@ -144,6 +184,8 @@ pub(super) fn from_matches(m: &ArgMatches) -> Option<JobReadFlags> {
         tls_cert: path(TLS_CERT),
         tls_key: path(TLS_KEY),
         grant_secret_file: path(GRANT_SECRET),
+        max_blob_bytes: *m.get_one::<u64>(MAX_BLOB).expect("clap gives it a default"),
+        reads_in_flight: *m.get_one::<u32>(READS).expect("clap gives it a default"),
     })
 }
 
@@ -187,6 +229,8 @@ pub(super) struct Prepared {
     socket: Socket,
     tls: TlsSource,
     grants: Arc<Grants>,
+    /// What the flags bound: the reads open at once and the largest blob served.
+    limits: Limits,
 }
 
 /// The waits that bound a client of the listener.
@@ -246,10 +290,16 @@ impl Prepared {
         };
         let tls = TlsSource::files_alpn(TLS_LABEL, files, reload, Alpn::Http1)?;
         let socket = Socket::bind(flags.listen, binder)?;
+        let limits = Limits {
+            reads_in_flight: usize::try_from(flags.reads_in_flight).unwrap_or(usize::MAX),
+            max_blob_bytes: flags.max_blob_bytes,
+            ..Limits::default()
+        };
         Ok(Self {
             socket,
             tls,
             grants,
+            limits,
         })
     }
 
@@ -267,7 +317,7 @@ impl Prepared {
         source: Arc<dyn BlobSource>,
         timeouts: Timeouts,
     ) -> Result<Serving, JobReadError> {
-        let read = Arc::new(JobRead::new(source, self.grants, Limits::default()));
+        let read = Arc::new(JobRead::new(source, self.grants, self.limits));
         let (incoming, latch) = self.socket.grpc(Some(self.tls.clone()))?;
         let task = accept(incoming, router(Arc::clone(&read)), timeouts).boxed();
         Ok(Serving {
@@ -329,9 +379,18 @@ async fn answer(
 /// a refusal (`WWW-Authenticate` on 401, `Allow` on 405) and a content type.
 fn response(reply: Reply) -> Response {
     let status = reply.status;
-    let mut response = Response::new(Body::from(reply.body));
+    // A streamed blob states its length before its first byte: a response that ends short of
+    // it is a broken one to the client, which is how a blob that fails its digest is refused.
+    let (body, length) = match reply.stream {
+        Some(stream) => (Body::from_stream(stream.chunks), Some(stream.size)),
+        None => (Body::from(reply.body), None),
+    };
+    let mut response = Response::new(body);
     *response.status_mut() = status;
     let headers = response.headers_mut();
+    if let Some(length) = length {
+        headers.insert(CONTENT_LENGTH, HeaderValue::from(length));
+    }
     let kind = if status == StatusCode::OK {
         "application/octet-stream"
     } else {

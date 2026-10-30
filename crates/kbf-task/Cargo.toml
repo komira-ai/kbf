@@ -11,6 +11,18 @@ publish.workspace = true
 name = "kbf-task"
 path = "src/main.rs"
 
+# Helpers for the tests (tests/network.rs), under tests/ like the other crates' helper bins, which
+# the coverage report leaves out; the release builds `--bin kbf-task` only.
+[[bin]]
+name = "socket_probe"
+path = "tests/bin/socket_probe.rs"
+test = false
+
+[[bin]]
+name = "run_under"
+path = "tests/bin/run_under.rs"
+test = false
+
 [dependencies]
 clap.workspace = true
 hex.workspace = true

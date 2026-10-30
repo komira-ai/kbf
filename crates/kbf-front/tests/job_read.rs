@@ -9,12 +9,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
+use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use kbf_front::grants::{GrantKey, Grants, MIN_SECRET_LEN};
-use kbf_front::job_read::{BlobSource, JobRead, Limits, MAX_BLOB_BYTES, Reply};
+use kbf_front::job_read::{BlobSource, JobRead, Limits, Reply, STREAM_OVER_BYTES};
 use kbf_front::{Backend, Cache, VerifiedBlob, digest_to_proto};
 use kbf_proto::reapi::{Action, Directory, DirectoryNode, FileNode};
-use kbf_storage::StorageError;
+use kbf_storage::{ReadStream, StorageError};
 use kbf_types::{Digest, DigestFunction};
 use prost::Message as _;
 use tokio::sync::Semaphore;
@@ -82,6 +83,20 @@ impl BlobSource for Fake {
                 .ok_or(StorageError::NotFound(*digest))
         })
     }
+
+    fn read_stream<'a>(
+        &'a self,
+        digest: &'a Digest,
+    ) -> BoxFuture<'a, Result<ReadStream, StorageError>> {
+        Box::pin(async move {
+            let blob = {
+                let blobs = self.blobs.lock().unwrap_or_else(PoisonError::into_inner);
+                blobs.get(digest).cloned()
+            };
+            let blob = blob.ok_or(StorageError::NotFound(*digest))?;
+            Ok(futures::stream::once(async move { Ok(blob) }).boxed())
+        })
+    }
 }
 
 fn put(blobs: &mut HashMap<Digest, Bytes>, bytes: &[u8]) -> Digest {
@@ -132,8 +147,8 @@ fn tree() -> Tree {
     let b = put(&mut blobs, b"beta, in a subdirectory");
     let empty = kbf_segments::sha256(b"");
     // Held by no one: their size alone decides.
-    let big = Digest::new(DigestFunction::Sha256, [9; 32], MAX_BLOB_BYTES + 1);
-    let at_cap = Digest::new(DigestFunction::Sha256, [8; 32], MAX_BLOB_BYTES);
+    let big = Digest::new(DigestFunction::Sha256, [9; 32], STREAM_OVER_BYTES + 1);
+    let at_cap = Digest::new(DigestFunction::Sha256, [8; 32], STREAM_OVER_BYTES);
     let lib = Directory {
         files: vec![file("b", &b)],
         ..Directory::default()
@@ -218,6 +233,15 @@ impl Rig {
         self.read
             .respond(&Method::GET, path, header.as_deref())
             .await
+    }
+}
+
+/// The bounds under which a blob over [`STREAM_OVER_BYTES`] is too large, as the listener's cap
+/// was before large blobs were streamed.
+fn capped() -> Limits {
+    Limits {
+        max_blob_bytes: STREAM_OVER_BYTES,
+        ..Limits::default()
     }
 }
 
@@ -378,12 +402,12 @@ async fn a_blob_not_in_the_store_is_not_found() {
     assert_eq!(reply.status, StatusCode::OK);
 }
 
-/// Catches: a response over the per-blob cap being read and sent, a cap that is off by one
-/// (a blob of exactly the cap is read), and the check made after the read.
+/// Catches: a response over the cap (here the old 64 MiB) being read and sent, a cap that is
+/// off by one (a blob of exactly the cap is read), and the check made after the read.
 #[tokio::test]
 async fn a_blob_over_the_cap_is_too_large_and_is_not_read() {
     let t = tree();
-    let rig = rig(t.blobs.clone(), None, Limits::default());
+    let rig = rig(t.blobs.clone(), None, capped());
     let token = rig.token(t.action);
     let reply = rig.get(&path(&t.big), Some(&token)).await;
     assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
@@ -624,7 +648,7 @@ async fn the_bound_on_reads_holds_a_second_read_until_the_first_ends() {
 #[tokio::test]
 async fn the_metrics_count_each_outcome_and_the_bytes_served() {
     let t = tree();
-    let rig = rig(t.blobs.clone(), None, Limits::default());
+    let rig = rig(t.blobs.clone(), None, capped());
     let token = rig.token(t.action);
     let uri = path(&t.a);
     let header = format!("Bearer {token}");
