@@ -508,7 +508,7 @@ fn every_enum_value_has_its_number() {
 }
 
 /// The `Capacity` input of the golden set, with `disk_bytes` 7: the resources message gains
-/// `disk_bytes` (field 6, `30 07`) after `leases`' place and nothing else moves, so the
+/// `disk_bytes` (field 6, `30 07`) at its end and nothing else moves, so the
 /// capacity (12) is 0x42 bytes, the input (1a) 0x44, the batch 0x4a.
 ///
 /// Catches: a disk field with another number or type (a second binary would read the
