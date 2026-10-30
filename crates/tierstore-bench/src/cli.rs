@@ -47,6 +47,26 @@ pub enum Command {
     VerifyTeardown(TeardownArgs),
     /// Print one table from the results of a result directory.
     Report(ReportArgs),
+    /// Print `tierstore-bench sha256 <hex>`, the SHA-256 of this executable (CI logs it so the
+    /// binary a run uses can be checked against the build).
+    SelfDigest,
+}
+
+/// The line `self-digest` prints.
+///
+/// # Errors
+/// [`BenchError::Io`] if the executable cannot be found or read.
+pub fn self_digest_line() -> Result<String, BenchError> {
+    use sha2::{Digest as _, Sha256};
+    let path = std::env::current_exe().map_err(|source| BenchError::Io {
+        path: PathBuf::from("current executable"),
+        source,
+    })?;
+    let bytes = std::fs::read(&path).map_err(|source| BenchError::Io { path, source })?;
+    Ok(format!(
+        "tierstore-bench sha256 {}",
+        hex::encode(Sha256::digest(bytes))
+    ))
 }
 
 /// Flags of `provision`.
@@ -267,5 +287,9 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
             Ok(())
         }
         Command::Report(args) => report::render(&args.result_dir).map(|_| ()),
+        Command::SelfDigest => {
+            println!("{}", self_digest_line()?);
+            Ok(())
+        }
     }
 }
