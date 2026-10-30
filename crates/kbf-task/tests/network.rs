@@ -74,18 +74,70 @@ async fn probe_exit(name: &str, network: Network, args: &[&str]) -> i32 {
     probe_run(name, network, args).await.0.exit_code
 }
 
-/// Catches: a family outside `AF_UNIX` getting a socket by default. IPv4 and IPv6 are the
-/// network; netlink and packet sockets read and (with a privilege) change the host's; both
-/// `socket` and `socketpair` are refused, and the answer is `EPERM`.
+const EAFNOSUPPORT: i32 = 97;
+const EOPNOTSUPP: i32 = 95;
+
+/// Whether the namespace layer applied to a run that was to have no network. Any outcome but the
+/// two a denied run can have fails the test: no case passes with a layer it does not know.
+fn netns_applied(layers: &Layers) -> bool {
+    match layers {
+        Layers::SeccompAndNetns => true,
+        Layers::SeccompOnly { .. } | Layers::SeccompOnlyForRoot => false,
+        other => panic!("a denied run reported {other:?}"),
+    }
+}
+
+/// The layers a denied run has on this host.
+async fn layers_here() -> Layers {
+    let layers = probe_run("layers-here", Network::Denied, &["unix"])
+        .await
+        .0
+        .layers;
+    netns_applied(&layers);
+    layers
+}
+
+/// The exit code `socket(AF_INET)` has under `layers`: made in a namespace of the Command's own
+/// (reaching `lo` only), refused by the strict filter otherwise.
+fn inet_exit(layers: &Layers) -> i32 {
+    if netns_applied(layers) { 0 } else { EPERM }
+}
+
+/// Catches: the test infrastructure not seeing which layer applied, and a run with the property
+/// reporting anything but open.
+#[tokio::test]
+async fn the_layer_that_applied_is_always_known() {
+    let first = layers_here().await;
+    assert_eq!(layers_here().await, first);
+    let (ran, _) = probe_run("layers-allowed", Network::Allowed, &["unix"]).await;
+    assert_eq!(ran.layers, Layers::Open);
+}
+
+/// Catches: a family outside `AF_UNIX` getting a socket it should not. Netlink and packet
+/// sockets read and (with a privilege) change the host's network and are refused with `EPERM`
+/// in both modes. IPv4 and IPv6 are refused with `EPERM` by the strict filter, and made in a
+/// namespace of the Command's own (reaching `lo` only); a `socketpair` of the internet family
+/// is then refused by the kernel itself (`EOPNOTSUPP`), not by the filter.
 #[tokio::test]
 async fn by_default_no_socket_but_a_unix_one_can_be_made() {
-    for mode in ["inet", "inet6", "netlink", "packet", "pair-inet"] {
-        assert_eq!(
-            probe_exit("denied", Network::Denied, &[mode]).await,
-            EPERM,
-            "{mode}"
-        );
+    for mode in ["netlink", "packet"] {
+        let (ran, _) = probe_run("denied", Network::Denied, &[mode]).await;
+        netns_applied(&ran.layers);
+        assert_eq!(ran.exit_code, EPERM, "{mode}");
     }
+    let (ran, _) = probe_run("denied-inet", Network::Denied, &["inet"]).await;
+    assert_eq!(ran.exit_code, inet_exit(&ran.layers), "inet");
+    let netns = netns_applied(&ran.layers);
+    let (ran, _) = probe_run("denied-inet6", Network::Denied, &["inet6"]).await;
+    // A host without IPv6 answers `EAFNOSUPPORT` itself.
+    let inet6: &[i32] = if netns { &[0, EAFNOSUPPORT] } else { &[EPERM] };
+    assert!(inet6.contains(&ran.exit_code), "inet6: {}", ran.exit_code);
+    let (ran, _) = probe_run("denied-pair", Network::Denied, &["pair-inet"]).await;
+    assert_eq!(
+        ran.exit_code,
+        if netns { EOPNOTSUPP } else { EPERM },
+        "pair-inet"
+    );
 }
 
 /// Catches: the filter refusing every socket, which would break the local sockets build tools
@@ -112,17 +164,20 @@ async fn by_default_an_io_uring_cannot_be_set_up() {
     );
 }
 
-/// Catches: the filter being installed in the Command only and not inherited by what it starts.
+/// Catches: the confinement being applied to the Command only and not inherited by what it
+/// starts: a child and a grandchild see the same filter (and namespace) as the Command does.
 #[tokio::test]
 async fn a_process_the_command_starts_is_confined_too() {
-    assert_eq!(
-        probe_exit("child-inet", Network::Denied, &["child", "inet"]).await,
-        EPERM
-    );
-    assert_eq!(
-        probe_exit("child-nest", Network::Denied, &["child", "child", "inet6"]).await,
-        EPERM
-    );
+    let (ran, _) = probe_run("child-inet", Network::Denied, &["child", "inet"]).await;
+    assert_eq!(ran.exit_code, inet_exit(&ran.layers));
+    let netns = netns_applied(&ran.layers);
+    let (ran, _) = probe_run("child-nest", Network::Denied, &["child", "child", "inet6"]).await;
+    let inet6: &[i32] = if netns { &[0, EAFNOSUPPORT] } else { &[EPERM] };
+    assert!(inet6.contains(&ran.exit_code), "{}", ran.exit_code);
+    for mode in ["netlink", "packet"] {
+        let (ran, _) = probe_run("child-no", Network::Denied, &["child", "child", mode]).await;
+        assert_eq!(ran.exit_code, EPERM, "{mode}");
+    }
     assert_eq!(
         probe_exit("child-unix", Network::Denied, &["child", "unix"]).await,
         0
@@ -261,22 +316,33 @@ async fn manifest_exit(
     read_manifest(&stored[0]).expect("manifest").exit_code
 }
 
-/// Catches: the property not reaching the filter decision through the whole task: without it an
-/// IPv4 socket is refused, with `kbf-network=allow` (on the Action, on the Command when the
-/// Action has none, and in any case of the name) it is made.
+/// Catches: the property not reaching the filter decision through the whole task. `netlink` is
+/// refused in every denied mode; `inet` is refused by the strict filter and made in a namespace
+/// of the Command's own, so its expected code follows the layer that applied (where the namespace
+/// applies, `inet` alone cannot tell an allowed action from a denied one; the strict mode does). With `kbf-network=allow` (on the Action, on the Command when the Action has
+/// none, and in any case of the name) the Command has no filter: `inet` is made.
 #[tokio::test]
 async fn the_task_runs_the_command_open_only_for_the_allow_property() {
     let allow = || Some(properties(&[("kbf-network", "allow")]));
-    assert_eq!(manifest_exit("t-none", &["inet"], None, false).await, EPERM);
-    assert_eq!(manifest_exit("t-act", &["inet"], allow(), false).await, 0);
-    assert_eq!(manifest_exit("t-cmd", &["inet"], allow(), true).await, 0);
-    let shouted = Some(properties(&[("KBF-Network", "allow")]));
-    assert_eq!(manifest_exit("t-case", &["inet"], shouted, false).await, 0);
-    let other = Some(properties(&[("Pool", "big")]));
-    assert_eq!(
-        manifest_exit("t-other", &["inet"], other, false).await,
-        EPERM
-    );
+    let shouted = || Some(properties(&[("KBF-Network", "allow")]));
+    let other = || Some(properties(&[("Pool", "big")]));
+    let denied_inet = inet_exit(&layers_here().await);
+    for (name, platform, on_command, open) in [
+        ("t-none", None, false, false),
+        ("t-other", other(), false, false),
+        ("t-act", allow(), false, true),
+        ("t-cmd", allow(), true, true),
+        ("t-case", shouted(), false, true),
+    ] {
+        let netlink = manifest_exit(name, &["netlink"], platform.clone(), on_command).await;
+        let inet = manifest_exit(name, &["inet"], platform, on_command).await;
+        if open {
+            assert_eq!(inet, 0, "{name}");
+        } else {
+            assert_eq!(netlink, EPERM, "{name}");
+            assert_eq!(inet, denied_inet, "{name}");
+        }
+    }
 }
 
 /// Catches: a value the property does not take (including `Allow`, `true`, `1` and the empty
