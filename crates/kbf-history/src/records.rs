@@ -368,8 +368,8 @@ pub struct RunRecord {
     /// not read it. Absent is not zero.
     #[prost(uint32, optional, tag = "41")]
     pub node_cpu_pressure_centi: Option<u32>,
-    /// The CPU booked for the lease, in thousandths of a CPU: the daemon's report, else
-    /// the grant the server sent in the `Start`; absent for a lease the server never
+    /// The CPU booked for the lease, in thousandths of a CPU: the grant the server sent in
+    /// the `Start`, else the daemon's report; absent for a lease the server never
     /// started (taken up from the state store) whose daemon reported none.
     #[prost(uint64, optional, tag = "42")]
     pub booked_millicpus: Option<u64>,

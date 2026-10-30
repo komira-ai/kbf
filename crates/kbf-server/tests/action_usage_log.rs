@@ -404,6 +404,43 @@ async fn an_out_of_memory_rung_and_its_rerun_each_log_a_line() {
     assert_eq!(lines("action shape:", key).len(), 1, "described once");
 }
 
+/// Catches: the rerun after an out-of-memory kill logging the first rung's booking (the
+/// request or a remembered value) instead of the raised one its `Start` carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rerun_after_an_out_of_memory_kill_logs_its_raised_booking() {
+    log();
+    let cell = Cell::start().await;
+    let mut node = cell.daemon("node-g", 8, 16).await;
+    let job = Job::new("ladder booking", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let first = node.start().await;
+    let mut killed = failed_with(first.lease_id, Code::ResourceExhausted, &usage());
+    killed.memory_kill = MemoryKill::OwnLimit as i32;
+    assert!(node.report(killed).await.accepted);
+    let rerun = node.start().await;
+    assert!(
+        rerun.memory_bytes > first.memory_bytes,
+        "{first:?} {rerun:?}"
+    );
+    let result = with_usage(output(&cell, "out", 0).await, &usage());
+    assert!(node.report(ran(rerun.lease_id, &result)).await.accepted);
+    done(&mut ops).await;
+
+    let key = job_key("ladder booking");
+    let found = lines("action usage:", key);
+    let [oom, ok] = &found[..] else {
+        panic!("two lines: {found:?}");
+    };
+    for (line, start) in [(oom, &first), (ok, &rerun)] {
+        let want = format!(
+            " booked_millicpus={} booked_memory_bytes={}",
+            start.millicpus, start.memory_bytes
+        );
+        assert!(line.contains(&want), "{want}: {line}");
+    }
+}
+
 /// Catches: a timed-out lease's usage dropped (the partial result keeps only its logs,
 /// so the usage must be read before it is cut), or its CPU fields lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

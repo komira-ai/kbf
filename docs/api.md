@@ -1888,7 +1888,10 @@ applies and the routes are as described above.
 route) is one attempt: the instance, `lease` (`term.seq`), `worker`, `queued`, `granted`,
 `started` and `ended`, `class` (`ok`, `failed`, `timed_out`, `memory_killed`, `infra`,
 `lost`), `exit_code` for a run that exited, the memory kill and the booking, cap, raised
-booking, memory used and limit of a killed run, the REAPI times and cgroup `usage` the
+booking, memory used and limit of a killed run, `booked_millicpus` and
+`booked_memory_bytes` (what the run's lease was granted, for every run, with the
+meaning and the gaps given for the build pages' attempts above; the two routes show the
+same grant), the REAPI times and cgroup `usage` the
 daemon reported, the digests of the action, command, result and logs, and the `shape`
 (its key, `cfg`, target and whether it is a test). A key the record has no value for is
 left out. The run is read from the in-memory record while it is held and from history

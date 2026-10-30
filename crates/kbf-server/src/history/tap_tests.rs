@@ -462,7 +462,7 @@ fn a_memory_kill_keeps_its_booking_cap_and_limit() {
 
 /// Catches: the booking written only for a memory kill (an accepted run's record without
 /// what its lease held), the CPU booking dropped or taken from the wrong place (the daemon's
-/// own report wins, the grant fills in when it reported none), and a booking mistaken for a
+/// grant wins, the daemon's report fills in when none is known), and a booking mistaken for a
 /// kill's limit.
 #[test]
 fn an_accepted_run_records_the_booking_its_lease_was_granted() {
@@ -489,7 +489,25 @@ fn an_accepted_run_records_the_booking_its_lease_was_granted() {
         ..RunUsage::default()
     }));
     let (rec, _) = record_of(&row(vec![reported], None), 0, EndedKind::Finished);
-    assert_eq!(rec.booked_millicpus, Some(2_000));
+    assert_eq!(
+        rec.booked_millicpus,
+        Some(3_000),
+        "the grant wins, as on the build pages"
+    );
+    let mut adopted = attempt(Some(AttemptEnd::Accepted));
+    adopted.run = Some(Box::new(Run {
+        usage: Some(RunUsage {
+            booked_millicpus: Some(2_000),
+            ..RunUsage::default()
+        }),
+        ..Run::default()
+    }));
+    let (rec, _) = record_of(&row(vec![adopted], None), 0, EndedKind::Finished);
+    assert_eq!(
+        rec.booked_millicpus,
+        Some(2_000),
+        "no grant known: the daemon's report"
+    );
 }
 
 /// Catches: NUMA bytes that do not follow node numbers, or a huge node number sizing a
