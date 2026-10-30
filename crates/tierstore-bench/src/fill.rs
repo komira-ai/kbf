@@ -1,0 +1,1427 @@
+//! `fill-paper`: writes the measured numbers into the paper's HTML.
+//!
+//! The paper marks each figure it quotes with an element carrying `data-cell="<id>"`. A mapping
+//! file says what each id stands for (a cell, an arm, a metric, a unit); the result directory
+//! holds the numbers. [`fill`] replaces the content of each marked element with the formatted
+//! value and records where it came from in `data-source="<file>#<metric>"` and `data-label`
+//! (`test instance` or `farm`). Everything outside the replaced element contents and the
+//! attributes this module owns (`data-source`, `data-label`, `data-note`) is copied byte for byte:
+//! the HTML is scanned, never re-serialised.
+//!
+//! The mapping, a JSON array of
+//! `{id, cell, metric, unit, condition, size, blocked}` (`size` and `blocked` optional, `label`
+//! optional):
+//! - `cell` is a cell id (`cold-put`, ...) and `condition` the arm. With a `size`, the arm
+//!   `<condition>-<size>` is tried first, then `<condition>`.
+//! - `metric` is one of `p50`, `p95`, `p99`, `max`, `requests`, `failures`, `bytes`,
+//!   `throughput`, `elapsed`; `a|b` is "a, else b" (`p99|p95`).
+//! - `unit` suits the metric: `us`, `ms` or `s` for the latencies and `elapsed`; `B`, `KB`, `MB`,
+//!   `GB`, `KiB`, `MiB`, `GiB` for `bytes`; the same with `/s` for `throughput`; `count` for
+//!   `requests` and `failures`.
+//! - `blocked` leaves the element alone (so does a `data-blocked` attribute on it).
+//! - `label` overrides the data label; without it an arm naming `instance` is `test instance`
+//!   and any other arm is `farm`.
+//!
+//! The figures: the passes that count are those that are not the warm-up and were not aborted by
+//! the load gate. `p50`, `p95` and `max` take the median of the per-pass value (`max`: the
+//! largest). `p99` takes the median of the quiet passes, and only when those passes made 1,000
+//! requests between them; otherwise the metric is unavailable, the next alternative is tried,
+//! and with none left the element keeps its text and gets a `data-note` saying why.
+//! `throughput` is bytes over wall time of the passes that count.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+use clap::Args;
+use serde::Deserialize;
+
+use crate::cells::CellId;
+use crate::result::{CellResult, PassResult, Window};
+
+/// Requests the quiet passes must have made together before a p99 is quoted.
+const P99_MIN_REQUESTS: u64 = 1_000;
+
+/// Why a fill or a check stopped or failed.
+#[derive(Debug, thiserror::Error)]
+pub enum FillError {
+    /// A file could not be read or written.
+    #[error("{path}: {source}")]
+    Io {
+        /// The file.
+        path: PathBuf,
+        /// What the operating system said.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The mapping file is not a valid mapping.
+    #[error("mapping: {0}")]
+    Mapping(String),
+    /// A result file of the directory is not a result.
+    #[error("{file}: {reason}")]
+    Result {
+        /// The file name.
+        file: String,
+        /// What is wrong with it.
+        reason: String,
+    },
+    /// The paper's HTML cannot be scanned or an element cannot be filled.
+    #[error("paper: {0}")]
+    Html(String),
+    /// The flags contradict each other.
+    #[error("{0}")]
+    Usage(&'static str),
+    /// `--check` found problems; the text lists them.
+    #[error("check failed:\n{0}")]
+    Check(String),
+}
+
+/// Flags of `fill-paper`.
+#[derive(Debug, Args)]
+pub struct FillArgs {
+    /// The paper's HTML.
+    #[arg(long, value_name = "FILE")]
+    pub paper: PathBuf,
+    /// The mapping from placeholder ids to cells and metrics (JSON).
+    #[arg(long, value_name = "FILE")]
+    pub cells: PathBuf,
+    /// The directory of `<cell>-<arm>.json` results.
+    #[arg(long, value_name = "DIR")]
+    pub result_dir: PathBuf,
+    /// Where to write the filled paper.
+    #[arg(long, value_name = "FILE")]
+    pub out: Option<PathBuf>,
+    /// Write over the paper instead of to `--out`.
+    #[arg(long)]
+    pub in_place: bool,
+    /// Write nothing; exit non-zero listing placeholders without a mapping, mappings without a
+    /// result, and filled values whose source no longer exists.
+    #[arg(long)]
+    pub check: bool,
+}
+
+/// Runs `fill-paper`.
+///
+/// # Errors
+/// [`FillError`]: a file that cannot be read or written, a bad mapping, result or paper, a
+/// contradictory set of flags, or (with `--check`) the list of problems found.
+pub fn run(args: &FillArgs) -> Result<(), FillError> {
+    let html = read(&args.paper)?;
+    let mappings = Mapping::parse_all(&read(&args.cells)?)?;
+    let results = Results::load(&args.result_dir)?;
+    if args.check {
+        if args.out.is_some() || args.in_place {
+            return Err(FillError::Usage(
+                "--check writes nothing: no --out or --in-place",
+            ));
+        }
+        let findings = check(&html, &mappings, &results)?;
+        return if findings.is_empty() {
+            println!("fill-paper: check passed");
+            Ok(())
+        } else {
+            Err(FillError::Check(findings.join("\n")))
+        };
+    }
+    let target = match (&args.out, args.in_place) {
+        (Some(_), true) => return Err(FillError::Usage("--out and --in-place exclude each other")),
+        (None, false) => return Err(FillError::Usage("give --out FILE, or --in-place")),
+        (Some(out), false) => out,
+        (None, true) => &args.paper,
+    };
+    let (text, report) = fill(&html, &mappings, &results)?;
+    std::fs::write(target, text).map_err(|source| FillError::Io {
+        path: target.clone(),
+        source,
+    })?;
+    println!(
+        "fill-paper: {} filled, {} blocked, {} left with a note, {} without a mapping",
+        report.filled, report.blocked, report.noted, report.unmapped
+    );
+    Ok(())
+}
+
+fn read(path: &Path) -> Result<String, FillError> {
+    std::fs::read_to_string(path).map_err(|source| FillError::Io {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// The mapping
+
+/// A size in the mapping: a label (`4MiB`) or a byte count.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum Size {
+    /// As the arm names it.
+    Text(String),
+    /// Bytes.
+    Bytes(u64),
+}
+
+impl Size {
+    fn as_arm_suffix(&self) -> String {
+        match self {
+            Size::Text(t) => t.clone(),
+            Size::Bytes(b) => b.to_string(),
+        }
+    }
+}
+
+/// One row of the mapping file, as written.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MappingRow {
+    id: String,
+    cell: CellId,
+    metric: String,
+    unit: String,
+    condition: String,
+    #[serde(default)]
+    size: Option<Size>,
+    #[serde(default)]
+    blocked: bool,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// A figure of a result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Metric {
+    /// Median latency.
+    P50,
+    /// 95th percentile latency.
+    P95,
+    /// 99th percentile latency (quiet passes, 1,000 requests).
+    P99,
+    /// Slowest request.
+    Max,
+    /// Requests made.
+    Requests,
+    /// Requests that failed.
+    Failures,
+    /// Bytes moved.
+    Bytes,
+    /// Bytes per second.
+    Throughput,
+    /// Wall time of a pass.
+    Elapsed,
+}
+
+impl Metric {
+    const ALL: [(&'static str, Metric); 9] = [
+        ("p50", Metric::P50),
+        ("p95", Metric::P95),
+        ("p99", Metric::P99),
+        ("max", Metric::Max),
+        ("requests", Metric::Requests),
+        ("failures", Metric::Failures),
+        ("bytes", Metric::Bytes),
+        ("throughput", Metric::Throughput),
+        ("elapsed", Metric::Elapsed),
+    ];
+
+    fn parse(name: &str) -> Option<Metric> {
+        Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, m)| *m)
+    }
+
+    fn name(self) -> &'static str {
+        Self::ALL
+            .iter()
+            .find(|(_, m)| *m == self)
+            .map_or("", |(n, _)| n)
+    }
+}
+
+/// A unit and what it divides the base value (microseconds, bytes, bytes per second, a count)
+/// by.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Unit {
+    name: &'static str,
+    divisor: f64,
+    /// Printed without decimals whatever the value (the base unit of microseconds, bytes,
+    /// counts).
+    integral: bool,
+    /// The suffix after the number, with its space; empty for counts.
+    suffix: &'static str,
+}
+
+const TIME_UNITS: [Unit; 3] = [
+    Unit {
+        name: "us",
+        divisor: 1.0,
+        integral: true,
+        suffix: " us",
+    },
+    Unit {
+        name: "ms",
+        divisor: 1_000.0,
+        integral: false,
+        suffix: " ms",
+    },
+    Unit {
+        name: "s",
+        divisor: 1_000_000.0,
+        integral: false,
+        suffix: " s",
+    },
+];
+const SIZE_UNITS: [Unit; 7] = [
+    Unit {
+        name: "B",
+        divisor: 1.0,
+        integral: true,
+        suffix: " B",
+    },
+    Unit {
+        name: "KB",
+        divisor: 1e3,
+        integral: false,
+        suffix: " KB",
+    },
+    Unit {
+        name: "MB",
+        divisor: 1e6,
+        integral: false,
+        suffix: " MB",
+    },
+    Unit {
+        name: "GB",
+        divisor: 1e9,
+        integral: false,
+        suffix: " GB",
+    },
+    Unit {
+        name: "KiB",
+        divisor: 1024.0,
+        integral: false,
+        suffix: " KiB",
+    },
+    Unit {
+        name: "MiB",
+        divisor: 1_048_576.0,
+        integral: false,
+        suffix: " MiB",
+    },
+    Unit {
+        name: "GiB",
+        divisor: 1_073_741_824.0,
+        integral: false,
+        suffix: " GiB",
+    },
+];
+const RATE_UNITS: [Unit; 7] = [
+    Unit {
+        name: "B/s",
+        divisor: 1.0,
+        integral: true,
+        suffix: " B/s",
+    },
+    Unit {
+        name: "KB/s",
+        divisor: 1e3,
+        integral: false,
+        suffix: " KB/s",
+    },
+    Unit {
+        name: "MB/s",
+        divisor: 1e6,
+        integral: false,
+        suffix: " MB/s",
+    },
+    Unit {
+        name: "GB/s",
+        divisor: 1e9,
+        integral: false,
+        suffix: " GB/s",
+    },
+    Unit {
+        name: "KiB/s",
+        divisor: 1024.0,
+        integral: false,
+        suffix: " KiB/s",
+    },
+    Unit {
+        name: "MiB/s",
+        divisor: 1_048_576.0,
+        integral: false,
+        suffix: " MiB/s",
+    },
+    Unit {
+        name: "GiB/s",
+        divisor: 1_073_741_824.0,
+        integral: false,
+        suffix: " GiB/s",
+    },
+];
+const COUNT_UNITS: [Unit; 1] = [Unit {
+    name: "count",
+    divisor: 1.0,
+    integral: true,
+    suffix: "",
+}];
+
+fn units_of(metric: Metric) -> &'static [Unit] {
+    match metric {
+        Metric::P50 | Metric::P95 | Metric::P99 | Metric::Max | Metric::Elapsed => &TIME_UNITS,
+        Metric::Bytes => &SIZE_UNITS,
+        Metric::Throughput => &RATE_UNITS,
+        Metric::Requests | Metric::Failures => &COUNT_UNITS,
+    }
+}
+
+/// A validated mapping row.
+#[derive(Clone, Debug)]
+pub struct Mapping {
+    id: String,
+    cell: CellId,
+    /// The alternatives, in order, each with its unit.
+    metrics: Vec<(Metric, Unit)>,
+    condition: String,
+    size: Option<Size>,
+    blocked: bool,
+    label: Option<String>,
+}
+
+impl Mapping {
+    /// Parses and validates the mapping file.
+    ///
+    /// # Errors
+    /// [`FillError::Mapping`]: not JSON of the schema, a repeated id, an unknown metric, or a
+    /// unit that does not suit the metric.
+    pub fn parse_all(text: &str) -> Result<Vec<Mapping>, FillError> {
+        let rows: Vec<MappingRow> =
+            serde_json::from_str(text).map_err(|e| FillError::Mapping(e.to_string()))?;
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            if !seen.insert(row.id.clone()) {
+                return Err(FillError::Mapping(format!("id {:?} is repeated", row.id)));
+            }
+            out.push(Mapping::from_row(row)?);
+        }
+        Ok(out)
+    }
+
+    fn from_row(row: MappingRow) -> Result<Mapping, FillError> {
+        let mut metrics = Vec::new();
+        for name in row.metric.split('|') {
+            let metric = Metric::parse(name).ok_or_else(|| {
+                FillError::Mapping(format!("{}: unknown metric {name:?}", row.id))
+            })?;
+            let unit = units_of(metric)
+                .iter()
+                .find(|u| u.name == row.unit)
+                .ok_or_else(|| {
+                    FillError::Mapping(format!(
+                        "{}: unit {:?} does not suit metric {name}",
+                        row.id, row.unit
+                    ))
+                })?;
+            metrics.push((metric, *unit));
+        }
+        Ok(Mapping {
+            id: row.id,
+            cell: row.cell,
+            metrics,
+            condition: row.condition,
+            size: row.size,
+            blocked: row.blocked,
+            label: row.label,
+        })
+    }
+
+    fn arms(&self) -> Vec<String> {
+        let mut arms = Vec::new();
+        if let Some(size) = &self.size {
+            arms.push(format!("{}-{}", self.condition, size.as_arm_suffix()));
+        }
+        arms.push(self.condition.clone());
+        arms
+    }
+
+    fn label(&self, arm: &str) -> String {
+        match &self.label {
+            Some(l) => l.clone(),
+            None if arm.contains("instance") => "test instance".to_owned(),
+            None => "farm".to_owned(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The results
+
+/// The results of a directory, by file name.
+#[derive(Debug, Default)]
+pub struct Results {
+    files: BTreeMap<String, CellResult>,
+}
+
+impl Results {
+    /// Reads every `<cell>-<arm>.json` of `dir`; other files are not results and are skipped.
+    ///
+    /// # Errors
+    /// [`FillError::Io`] if the directory or a result cannot be read; [`FillError::Result`] if
+    /// a file named like a result is not one.
+    pub fn load(dir: &Path) -> Result<Results, FillError> {
+        let io = |source| FillError::Io {
+            path: dir.to_owned(),
+            source,
+        };
+        let mut files = BTreeMap::new();
+        for entry in std::fs::read_dir(dir).map_err(io)? {
+            let name = entry
+                .map_err(io)?
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            let named_like_a_result = name.ends_with(".json")
+                && CellId::ALL
+                    .iter()
+                    .any(|c| name.starts_with(&format!("{}-", c.as_str())));
+            if !named_like_a_result {
+                continue;
+            }
+            let result =
+                CellResult::from_json(&read(&dir.join(&name))?).map_err(|e| FillError::Result {
+                    file: name.clone(),
+                    reason: e.to_string(),
+                })?;
+            files.insert(name, result);
+        }
+        Ok(Results { files })
+    }
+
+    /// Builds a set from parsed results, named `<cell>-<arm>.json`.
+    #[must_use]
+    pub fn from_results(results: impl IntoIterator<Item = CellResult>) -> Results {
+        Results {
+            files: results
+                .into_iter()
+                .map(|r| (format!("{}-{}.json", r.cell.as_str(), r.arm), r))
+                .collect(),
+        }
+    }
+
+    fn find(&self, cell: CellId, arm: &str) -> Option<(&str, &CellResult)> {
+        let name = format!("{}-{arm}.json", cell.as_str());
+        self.files
+            .get_key_value(&name)
+            .filter(|(_, r)| r.cell == cell && r.arm == arm)
+            .map(|(k, v)| (k.as_str(), v))
+    }
+}
+
+/// The value of `metric` in `result`, in base units; `Err` says why there is none.
+fn measure(result: &CellResult, metric: Metric) -> Result<f64, String> {
+    let counted: Vec<&PassResult> = result
+        .passes
+        .iter()
+        .filter(|p| !p.discarded && p.gate_tripped.is_none())
+        .collect();
+    if counted.is_empty() {
+        return Err("no pass counts (warm-up or gate-aborted only)".to_owned());
+    }
+    let latency = |pick: fn(&PassResult) -> Option<u64>, passes: &[&PassResult]| {
+        let mut values: Vec<u64> = passes.iter().filter_map(|p| pick(p)).collect();
+        values.sort_unstable();
+        values.get(values.len().wrapping_sub(1) / 2).copied()
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let as_f = |v: u64| v as f64;
+    let figure = match metric {
+        Metric::P50 => latency(|p| p.percentiles.map(|q| q.p50_us), &counted).map(as_f),
+        Metric::P95 => latency(|p| p.percentiles.map(|q| q.p95_us), &counted).map(as_f),
+        Metric::Max => counted
+            .iter()
+            .filter_map(|p| p.percentiles.map(|q| q.max_us))
+            .max()
+            .map(as_f),
+        Metric::P99 => {
+            let quiet: Vec<&PassResult> = counted
+                .iter()
+                .copied()
+                .filter(|p| p.window == Window::Quiet)
+                .collect();
+            let n: u64 = quiet.iter().map(|p| p.requests).sum();
+            if n < P99_MIN_REQUESTS {
+                return Err(format!(
+                    "p99 needs {P99_MIN_REQUESTS} quiet requests, the result has {n}"
+                ));
+            }
+            latency(|p| p.percentiles.and_then(|q| q.p99_us), &quiet).map(as_f)
+        }
+        Metric::Requests => Some(as_f(counted.iter().map(|p| p.requests).sum())),
+        Metric::Failures => Some(as_f(counted.iter().map(|p| p.failures).sum())),
+        Metric::Bytes => Some(as_f(counted.iter().map(|p| p.bytes).sum())),
+        Metric::Elapsed => latency(|p| Some(p.elapsed_us), &counted).map(as_f),
+        Metric::Throughput => {
+            let us: u64 = counted.iter().map(|p| p.elapsed_us).sum();
+            let bytes: u64 = counted.iter().map(|p| p.bytes).sum();
+            (us > 0).then(|| as_f(bytes) * 1_000_000.0 / as_f(us))
+        }
+    };
+    figure.ok_or_else(|| format!("no pass has a {}", metric.name()))
+}
+
+/// `1234.5` as `1,235`, `12.34` as `12.3`, `1.234` as `1.23`: three significant figures at
+/// least, the integer part grouped by thousands.
+fn format_value(value: f64, unit: Unit) -> String {
+    let decimals = if unit.integral || value >= 100.0 {
+        0
+    } else if value >= 10.0 {
+        1
+    } else {
+        2
+    };
+    let fixed = format!("{value:.decimals$}");
+    let (int, frac) = match fixed.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (fixed.as_str(), None),
+    };
+    let mut grouped = String::new();
+    for (k, ch) in int.chars().enumerate() {
+        if k > 0 && (int.len() - k) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    if let Some(f) = frac {
+        grouped.push('.');
+        grouped.push_str(f);
+    }
+    grouped.push_str(unit.suffix);
+    grouped
+}
+
+/// What a mapping gives for the results: the text, where from, the label; or why nothing.
+enum Evaluated {
+    Value {
+        text: String,
+        source: String,
+        label: String,
+    },
+    Missing(String),
+}
+
+fn evaluate(mapping: &Mapping, results: &Results) -> Evaluated {
+    let arms = mapping.arms();
+    let Some((file, result)) = arms.iter().find_map(|a| results.find(mapping.cell, a)) else {
+        return Evaluated::Missing(format!(
+            "no result for cell {} arm {}",
+            mapping.cell.as_str(),
+            arms.join(" or ")
+        ));
+    };
+    let mut why = Vec::new();
+    for (metric, unit) in &mapping.metrics {
+        match measure(result, *metric) {
+            Ok(v) => {
+                return Evaluated::Value {
+                    text: format_value(v / unit.divisor, *unit),
+                    source: format!("{file}#{}", metric.name()),
+                    label: mapping.label(&result.arm),
+                };
+            }
+            Err(e) => why.push(e),
+        }
+    }
+    Evaluated::Missing(why.join("; "))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The HTML scan
+
+#[derive(Debug)]
+struct Attr {
+    name: String,
+    /// The whole attribute, `name` or `name="value"`.
+    start: usize,
+    end: usize,
+    /// The value without quotes, character references for `& " < >` resolved.
+    value: Option<String>,
+}
+
+#[derive(Debug)]
+struct StartTag {
+    name: String,
+    start: usize,
+    end: usize,
+    attrs: Vec<Attr>,
+    self_closing: bool,
+}
+
+impl StartTag {
+    fn attr(&self, name: &str) -> Option<&Attr> {
+        self.attrs.iter().find(|a| a.name == name)
+    }
+}
+
+#[derive(Debug)]
+enum Token {
+    Open(StartTag),
+    Close { name: String, start: usize },
+}
+
+const VOID: [&str; 15] = [
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr", "keygen",
+];
+/// Elements whose content is text up to the matching end tag: markup in it is not markup.
+const RAW_TEXT: [&str; 4] = ["script", "style", "textarea", "title"];
+
+fn is_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c)
+}
+
+fn unescape(raw: &str) -> String {
+    raw.replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Splits `html` into start and end tags, skipping comments, declarations and raw text. All
+/// cut points are ASCII bytes, so every slice is on a character boundary.
+fn tokenize(html: &str) -> Result<Vec<Token>, FillError> {
+    let bytes = html.as_bytes();
+    let lower = html.to_ascii_lowercase();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while let Some(off) = html[i..].find('<') {
+        i += off;
+        let rest = &html[i..];
+        if rest.starts_with("<!--") {
+            i = html[i + 4..]
+                .find("-->")
+                .map_or(html.len(), |e| i + 4 + e + 3);
+        } else if rest.starts_with("<!") || rest.starts_with("<?") {
+            i = html[i..].find('>').map_or(html.len(), |e| i + e + 1);
+        } else if rest.starts_with("</") {
+            let end = html[i..].find('>').map_or(html.len(), |e| i + e + 1);
+            let name = html[i + 2..end.saturating_sub(1).max(i + 2)]
+                .trim()
+                .to_ascii_lowercase();
+            tokens.push(Token::Close { name, start: i });
+            i = end;
+        } else if bytes.get(i + 1).is_some_and(u8::is_ascii_alphabetic) {
+            let tag = parse_start_tag(html, i)?;
+            i = tag.end;
+            if RAW_TEXT.contains(&tag.name.as_str()) && !tag.self_closing {
+                let close = format!("</{}", tag.name);
+                let next = lower[i..].find(&close).map_or(html.len(), |e| i + e);
+                tokens.push(Token::Open(tag));
+                i = next;
+            } else {
+                tokens.push(Token::Open(tag));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    Ok(tokens)
+}
+
+fn parse_start_tag(html: &str, start: usize) -> Result<StartTag, FillError> {
+    let bytes = html.as_bytes();
+    let unterminated = || FillError::Html(format!("a tag at byte {start} is not terminated"));
+    let mut j = start + 1;
+    while j < bytes.len() && !is_space(bytes[j]) && bytes[j] != b'/' && bytes[j] != b'>' {
+        j += 1;
+    }
+    let name = html[start + 1..j].to_ascii_lowercase();
+    let mut attrs = Vec::new();
+    loop {
+        while j < bytes.len() && (is_space(bytes[j]) || bytes[j] == b'/') {
+            j += 1;
+        }
+        match bytes.get(j) {
+            None => return Err(unterminated()),
+            Some(b'>') => {
+                let self_closing = bytes[start..j].last() == Some(&b'/');
+                return Ok(StartTag {
+                    name,
+                    start,
+                    end: j + 1,
+                    attrs,
+                    self_closing,
+                });
+            }
+            Some(_) => {}
+        }
+        let attr_start = j;
+        while j < bytes.len() && !is_space(bytes[j]) && !matches!(bytes[j], b'=' | b'>' | b'/') {
+            j += 1;
+        }
+        if j == attr_start {
+            // A stray `=`: take it as part of a name so the scan always advances.
+            j += 1;
+        }
+        let attr_name = html[attr_start..j].to_ascii_lowercase();
+        let mut k = j;
+        while k < bytes.len() && is_space(bytes[k]) {
+            k += 1;
+        }
+        let mut value = None;
+        let mut end = j;
+        if bytes.get(k) == Some(&b'=') {
+            k += 1;
+            while k < bytes.len() && is_space(bytes[k]) {
+                k += 1;
+            }
+            match bytes.get(k) {
+                None => return Err(unterminated()),
+                Some(&q) if q == b'"' || q == b'\'' => {
+                    let close = html[k + 1..].find(q as char).ok_or_else(unterminated)?;
+                    value = Some(unescape(&html[k + 1..k + 1 + close]));
+                    end = k + close + 2;
+                }
+                Some(_) => {
+                    let v = k;
+                    while k < bytes.len() && !is_space(bytes[k]) && bytes[k] != b'>' {
+                        k += 1;
+                    }
+                    value = Some(unescape(&html[v..k]));
+                    end = k;
+                }
+            }
+            j = end;
+        }
+        attrs.push(Attr {
+            name: attr_name,
+            start: attr_start,
+            end,
+            value,
+        });
+    }
+}
+
+/// For each start tag, the index of its end tag among the tokens: an end tag closes the nearest
+/// open element of its name, and what was open inside it (an unclosed `<p>`) is dropped.
+fn pair_closes(tokens: &[Token]) -> Vec<Option<usize>> {
+    let mut closes = vec![None; tokens.len()];
+    let mut open: Vec<usize> = Vec::new();
+    for (idx, token) in tokens.iter().enumerate() {
+        match token {
+            Token::Open(t) if !t.self_closing && !VOID.contains(&t.name.as_str()) => {
+                open.push(idx);
+            }
+            Token::Open(_) => {}
+            Token::Close { name, .. } => {
+                let found = open
+                    .iter()
+                    .rposition(|&o| matches!(&tokens[o], Token::Open(t) if &t.name == name));
+                if let Some(pos) = found {
+                    closes[open[pos]] = Some(idx);
+                    open.truncate(pos);
+                }
+            }
+        }
+    }
+    closes
+}
+
+/// A placeholder of the paper.
+struct Placeholder<'a> {
+    id: String,
+    tag: &'a StartTag,
+    /// The element's content, if the element is closed.
+    inner: Option<(usize, usize)>,
+}
+
+fn placeholders(tokens: &[Token]) -> Vec<Placeholder<'_>> {
+    let closes = pair_closes(tokens);
+    tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, token)| {
+            let Token::Open(tag) = token else { return None };
+            let id = tag.attr("data-cell")?.value.clone().unwrap_or_default();
+            let inner = closes[idx].and_then(|c| match &tokens[c] {
+                Token::Close { start, .. } => Some((tag.end, *start)),
+                Token::Open(_) => None,
+            });
+            Some(Placeholder { id, tag, inner })
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fill and check
+
+/// What a fill did, in counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FillReport {
+    /// Elements given a value.
+    pub filled: usize,
+    /// Elements left alone as blocked.
+    pub blocked: usize,
+    /// Elements left with their text and a note.
+    pub noted: usize,
+    /// Elements whose id the mapping does not know (left alone).
+    pub unmapped: usize,
+}
+
+/// One replacement of `start..end` of the paper by `text`.
+struct Edit {
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+/// The edits that set the attributes `set` (in place when present, else appended to the tag) and
+/// remove those of `remove` (with the whitespace before them) in `tag`.
+fn attribute_edits(html: &str, tag: &StartTag, set: &[(&str, &str)], remove: &[&str]) -> Vec<Edit> {
+    let mut edits = Vec::new();
+    let mut appended = String::new();
+    for (name, value) in set {
+        let text = format!("{name}=\"{}\"", escape(value));
+        match tag.attr(name) {
+            Some(a) => edits.push(Edit {
+                start: a.start,
+                end: a.end,
+                text,
+            }),
+            None => {
+                appended.push(' ');
+                appended.push_str(&text);
+            }
+        }
+    }
+    for name in remove {
+        if let Some(a) = tag.attr(name) {
+            let mut start = a.start;
+            while start > tag.start + 1 && is_space(html.as_bytes()[start - 1]) {
+                start -= 1;
+            }
+            edits.push(Edit {
+                start,
+                end: a.end,
+                text: String::new(),
+            });
+        }
+    }
+    // Straight after the last attribute, so spacing before the `>` is left as the author had it.
+    let at = tag.attrs.last().map_or(tag.end - 1, |a| a.end);
+    if !appended.is_empty() {
+        edits.push(Edit {
+            start: at,
+            end: at,
+            text: appended,
+        });
+    }
+    edits
+}
+
+fn apply(html: &str, mut edits: Vec<Edit>) -> Result<String, FillError> {
+    edits.sort_by_key(|e| (e.start, e.end));
+    let mut out = String::with_capacity(html.len());
+    let mut at = 0;
+    for e in &edits {
+        if e.start < at {
+            return Err(FillError::Html(format!(
+                "two placeholders overlap near byte {}: a data-cell inside another",
+                e.start
+            )));
+        }
+        out.push_str(&html[at..e.start]);
+        out.push_str(&e.text);
+        at = e.end;
+    }
+    out.push_str(&html[at..]);
+    Ok(out)
+}
+
+fn by_id(mappings: &[Mapping]) -> BTreeMap<&str, &Mapping> {
+    mappings.iter().map(|m| (m.id.as_str(), m)).collect()
+}
+
+/// Fills the paper; returns the new text and what happened.
+///
+/// # Errors
+/// [`FillError::Html`] if the paper cannot be scanned, a placeholder is not a closed element,
+/// or two placeholders are nested.
+pub fn fill(
+    html: &str,
+    mappings: &[Mapping],
+    results: &Results,
+) -> Result<(String, FillReport), FillError> {
+    let tokens = tokenize(html)?;
+    let known = by_id(mappings);
+    let mut report = FillReport::default();
+    let mut edits = Vec::new();
+    for ph in placeholders(&tokens) {
+        if ph.tag.attr("data-blocked").is_some() {
+            report.blocked += 1;
+            continue;
+        }
+        let Some(mapping) = known.get(ph.id.as_str()) else {
+            report.unmapped += 1;
+            continue;
+        };
+        if mapping.blocked {
+            report.blocked += 1;
+            continue;
+        }
+        let Some((inner_start, inner_end)) = ph.inner else {
+            return Err(FillError::Html(format!(
+                "placeholder {:?} is not a closed element with content",
+                ph.id
+            )));
+        };
+        match evaluate(mapping, results) {
+            Evaluated::Value {
+                text,
+                source,
+                label,
+            } => {
+                edits.extend(attribute_edits(
+                    html,
+                    ph.tag,
+                    &[("data-source", &source), ("data-label", &label)],
+                    &["data-note"],
+                ));
+                edits.push(Edit {
+                    start: inner_start,
+                    end: inner_end,
+                    text: escape(&text).replace("&quot;", "\""),
+                });
+                report.filled += 1;
+            }
+            Evaluated::Missing(why) => {
+                edits.extend(attribute_edits(html, ph.tag, &[("data-note", &why)], &[]));
+                report.noted += 1;
+            }
+        }
+    }
+    Ok((apply(html, edits)?, report))
+}
+
+/// Lists what is wrong between paper, mapping and results; empty when nothing is.
+///
+/// # Errors
+/// [`FillError::Html`] if the paper cannot be scanned.
+pub fn check(
+    html: &str,
+    mappings: &[Mapping],
+    results: &Results,
+) -> Result<Vec<String>, FillError> {
+    let tokens = tokenize(html)?;
+    let known = by_id(mappings);
+    let mut findings = Vec::new();
+    for ph in placeholders(&tokens) {
+        if ph.tag.attr("data-blocked").is_none() && !known.contains_key(ph.id.as_str()) {
+            findings.push(format!("placeholder {:?} has no mapping", ph.id));
+        }
+    }
+    for m in mappings.iter().filter(|m| !m.blocked) {
+        if let Evaluated::Missing(why) = evaluate(m, results) {
+            findings.push(format!("mapping {:?} has no result: {why}", m.id));
+        }
+    }
+    for token in &tokens {
+        let Token::Open(tag) = token else { continue };
+        let Some(source) = tag.attr("data-source") else {
+            continue;
+        };
+        let source = source.value.clone().unwrap_or_default();
+        let who = tag.attr("data-cell").and_then(|a| a.value.clone());
+        let who = who.unwrap_or_else(|| format!("<{}> at byte {}", tag.name, tag.start));
+        if let Err(why) = source_exists(&source, results) {
+            findings.push(format!(
+                "filled value {who:?} cites {source:?}, which no longer exists: {why}"
+            ));
+        }
+    }
+    Ok(findings)
+}
+
+/// Whether `file#metric` names a figure the results still have.
+fn source_exists(source: &str, results: &Results) -> Result<(), String> {
+    let (file, metric) = source
+        .split_once('#')
+        .ok_or_else(|| "not file#metric".to_owned())?;
+    let metric = Metric::parse(metric).ok_or_else(|| format!("unknown metric {metric:?}"))?;
+    let result = results
+        .files
+        .get(file)
+        .ok_or_else(|| format!("no file {file}"))?;
+    measure(result, metric).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::result::{Percentiles, Provenance, SCHEMA_VERSION};
+
+    fn pass(index: u32, window: Window, requests: u64, p99: Option<u64>) -> PassResult {
+        PassResult {
+            pass: index,
+            window,
+            discarded: index == 0,
+            requests,
+            failures: 1,
+            bytes: 1_000_000,
+            elapsed_us: 500_000,
+            percentiles: Some(Percentiles {
+                p50_us: 1_000 * u64::from(index),
+                p95_us: 20_000,
+                p99_us: p99,
+                max_us: 90_000 + u64::from(index),
+            }),
+            gate_tripped: None,
+        }
+    }
+
+    /// Pass 0 is the warm-up (p50 0); passes 1..=3 have p50 1, 2, 3 ms.
+    fn result(cell: CellId, arm: &str, requests: u64, p99: Option<u64>) -> CellResult {
+        CellResult {
+            schema_version: SCHEMA_VERSION,
+            cell,
+            arm: arm.to_owned(),
+            started_unix_ms: 0,
+            finished_unix_ms: 1,
+            provenance: Provenance::unrecorded(),
+            passes: (0..4)
+                .map(|i| pass(i, Window::Quiet, requests, p99))
+                .collect(),
+            notes: Vec::new(),
+        }
+    }
+
+    fn mappings(json: &str) -> Vec<Mapping> {
+        Mapping::parse_all(json).unwrap()
+    }
+
+    fn row(id: &str, metric: &str, unit: &str, arm: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","cell":"cold-put","metric":"{metric}","unit":"{unit}","condition":"{arm}"}}"#
+        )
+    }
+
+    fn one(id: &str, metric: &str, unit: &str, arm: &str) -> Vec<Mapping> {
+        mappings(&format!("[{}]", row(id, metric, unit, arm)))
+    }
+
+    fn results() -> Results {
+        Results::from_results([
+            result(CellId::ColdPut, "instance", 1_200, Some(80_000)),
+            result(CellId::ColdPut, "direct", 100, None),
+        ])
+    }
+
+    /// Catches a value written into the wrong place, a source or label not recorded, and any
+    /// byte outside the element and the two attributes changing: comments, scripts, odd
+    /// spacing, single quotes, CRLF and non-ASCII text all stay as they are.
+    #[test]
+    fn a_filled_paper_differs_only_in_the_cell_and_its_two_attributes() {
+        let html = "<!DOCTYPE html>\r\n<!-- <b data-cell=\"x\">keep</b> -->\n<script>var s = '<i data-cell=\"x\">';</script>\n\
+<p  class='a'>Naïve put <span  data-cell='x'   id=\"k\" >TBD</span>, then <b>bold</b>.</p>\n<p>tail</p>";
+        let (out, report) = fill(html, &one("x", "p50", "ms", "instance"), &results()).unwrap();
+        let expected = "<!DOCTYPE html>\r\n<!-- <b data-cell=\"x\">keep</b> -->\n<script>var s = '<i data-cell=\"x\">';</script>\n\
+<p  class='a'>Naïve put <span  data-cell='x'   id=\"k\" data-source=\"cold-put-instance.json#p50\" data-label=\"test instance\" >2.00 ms</span>, then <b>bold</b>.</p>\n<p>tail</p>";
+        assert_eq!(out, expected);
+        assert_eq!(
+            report,
+            FillReport {
+                filled: 1,
+                ..FillReport::default()
+            }
+        );
+    }
+
+    /// Catches a rewrite that is not a fixed point: the second run must give the first run's
+    /// bytes, with a value, with a note and with attributes already present.
+    #[test]
+    fn filling_twice_gives_the_same_bytes() {
+        let html = "<table><tr><td data-cell=\"a\">?</td><td data-cell=\"b\">keep</td>\
+<td data-cell=\"c\" data-source=\"old.json#p50\" data-label=\"farm\">9</td></tr></table>";
+        let m = mappings(&format!(
+            "[{},{},{}]",
+            row("a", "p50", "ms", "instance"),
+            row("b", "p99", "ms", "direct"),
+            row("c", "p95", "us", "direct"),
+        ));
+        let (once, _) = fill(html, &m, &results()).unwrap();
+        let (twice, report) = fill(&once, &m, &results()).unwrap();
+        assert_eq!(once, twice);
+        assert_eq!(report.filled, 2);
+        assert_eq!(report.noted, 1);
+        assert!(once.contains("data-source=\"cold-put-direct.json#p95\""));
+        assert!(!once.contains("old.json"));
+    }
+
+    /// Catches a blocked cell that is filled: by the mapping, by the attribute on the element,
+    /// and an unmapped cell, which is counted and left alone.
+    #[test]
+    fn blocked_and_unmapped_cells_are_untouched() {
+        let html =
+            "<i data-cell=\"a\">1</i><i data-cell=\"b\" data-blocked>2</i><i data-cell=\"z\">3</i>";
+        let m = mappings(&format!(
+            "[{},{}]",
+            row("a", "p50", "ms", "instance").replace('}', r#","blocked":true}"#),
+            row("b", "p50", "ms", "instance"),
+        ));
+        let (out, report) = fill(html, &m, &results()).unwrap();
+        assert_eq!(out, html);
+        assert_eq!(
+            report,
+            FillReport {
+                blocked: 2,
+                unmapped: 1,
+                ..FillReport::default()
+            }
+        );
+    }
+
+    /// Catches a p99 quoted from too few quiet requests, a missing fallback, and a stale note
+    /// left on a cell that has since been filled.
+    #[test]
+    fn p99_needs_a_thousand_quiet_requests_else_falls_back_or_notes() {
+        let html = "<b data-cell=\"a\">old</b>";
+        // 3 counted passes x 100 requests: not enough.
+        let few = Results::from_results([result(CellId::ColdPut, "direct", 100, Some(5_000))]);
+        let (out, report) = fill(html, &one("a", "p99", "ms", "direct"), &few).unwrap();
+        assert_eq!(report.noted, 1);
+        assert!(out.starts_with("<b data-cell=\"a\" data-note=\"p99 needs 1000 quiet requests, the result has 300\">old</b>"), "{out}");
+        assert!(!out.contains("data-source"));
+
+        let (out, report) = fill(html, &one("a", "p99|p95", "ms", "direct"), &few).unwrap();
+        assert_eq!(report.filled, 1);
+        assert!(
+            out.contains("data-source=\"cold-put-direct.json#p95\""),
+            "{out}"
+        );
+        assert!(out.ends_with(">20.0 ms</b>"), "{out}");
+
+        // Busy passes do not count toward p99 whatever their number.
+        let mut busy = result(CellId::ColdPut, "direct", 5_000, Some(1));
+        for p in &mut busy.passes {
+            p.window = Window::Busy;
+        }
+        let busy = Results::from_results([busy]);
+        assert_eq!(
+            fill(html, &one("a", "p99", "ms", "direct"), &busy)
+                .unwrap()
+                .1
+                .noted,
+            1
+        );
+
+        // Enough requests: filled, and the earlier note goes.
+        let (noted, _) = fill(html, &one("a", "p99", "ms", "direct"), &few).unwrap();
+        let (filled, _) = fill(&noted, &one("a", "p99", "ms", "instance"), &results()).unwrap();
+        assert!(!filled.contains("data-note"), "{filled}");
+        assert!(filled.ends_with(">80.0 ms</b>"), "{filled}");
+    }
+
+    /// Catches a unit that scales wrongly, a rounding rule that drifts, and grouping.
+    #[test]
+    fn values_are_formatted_by_unit() {
+        let ms = TIME_UNITS[1];
+        assert_eq!(format_value(1.234, ms), "1.23 ms");
+        assert_eq!(format_value(12.34, ms), "12.3 ms");
+        assert_eq!(format_value(123.4, ms), "123 ms");
+        assert_eq!(format_value(1_234.6, ms), "1,235 ms");
+        assert_eq!(format_value(999.0, COUNT_UNITS[0]), "999");
+        assert_eq!(format_value(1_234_567.0, COUNT_UNITS[0]), "1,234,567");
+        assert_eq!(format_value(100.0, TIME_UNITS[0]), "100 us");
+        let r = results();
+        let get = |metric, unit| {
+            let m = one("a", metric, unit, "direct");
+            match evaluate(&m[0], &r) {
+                Evaluated::Value { text, .. } => text,
+                Evaluated::Missing(w) => panic!("{w}"),
+            }
+        };
+        assert_eq!(get("p50", "us"), "2,000 us");
+        assert_eq!(get("p50", "s"), "0.00 s");
+        assert_eq!(get("max", "ms"), "90.0 ms");
+        assert_eq!(get("requests", "count"), "300");
+        assert_eq!(get("failures", "count"), "3");
+        assert_eq!(get("bytes", "MB"), "3.00 MB");
+        assert_eq!(get("bytes", "KiB"), "2,930 KiB");
+        // 3 MB over 1.5 s.
+        assert_eq!(get("throughput", "MB/s"), "2.00 MB/s");
+        assert_eq!(get("elapsed", "ms"), "500 ms");
+    }
+
+    /// Catches a mapping that is accepted and then does nothing: unit/metric mismatch, unknown
+    /// metric, repeated id, unknown field, bad JSON.
+    #[test]
+    fn a_bad_mapping_is_refused() {
+        let bad = |json: &str| Mapping::parse_all(json).unwrap_err().to_string();
+        assert!(bad(&format!("[{}]", row("a", "p50", "MB", "x"))).contains("does not suit"));
+        assert!(bad(&format!("[{}]", row("a", "p42", "ms", "x"))).contains("unknown metric"));
+        let twice = format!("[{0},{0}]", row("a", "p50", "ms", "x"));
+        assert!(bad(&twice).contains("repeated"));
+        assert!(
+            bad(&format!(
+                "[{}]",
+                row("a", "p50", "ms", "x").replace('}', r#","oops":1}"#)
+            ))
+            .contains("oops")
+        );
+        assert!(bad("{").contains("mapping"));
+        let sized = r#"[{"id":"a","cell":"cold-put","metric":"p50","unit":"ms","condition":"c","size":4096,"label":"farm"}]"#;
+        assert_eq!(
+            Mapping::parse_all(sized).unwrap()[0].arms(),
+            ["c-4096", "c"]
+        );
+        let named = sized.replace("4096", "\"4MiB\"");
+        assert_eq!(
+            Mapping::parse_all(&named).unwrap()[0].arms(),
+            ["c-4MiB", "c"]
+        );
+    }
+
+    /// Catches a size that does not choose the arm, and a label rule that drifts.
+    #[test]
+    fn the_size_picks_the_arm_and_the_label_follows_the_arm() {
+        let r = Results::from_results([
+            result(CellId::ColdPut, "direct-4096", 100, None),
+            result(CellId::ColdPut, "direct", 100, None),
+        ]);
+        let json = r#"[{"id":"a","cell":"cold-put","metric":"requests","unit":"count","condition":"direct","size":4096}]"#;
+        let (out, _) = fill("<b data-cell=\"a\"></b>", &mappings(json), &r).unwrap();
+        assert!(out.contains("cold-put-direct-4096.json#requests"), "{out}");
+        assert!(out.contains("data-label=\"farm\""), "{out}");
+        let json = json.replace("\"size\":4096", "\"label\":\"custom\"");
+        let (out, _) = fill("<b data-cell=\"a\"></b>", &mappings(&json), &r).unwrap();
+        assert!(out.contains("cold-put-direct.json#requests"), "{out}");
+        assert!(out.contains("data-label=\"custom\""), "{out}");
+    }
+
+    /// Catches a check that passes when a placeholder has no mapping, a mapping has no
+    /// result, or a filled value cites a file or figure that is gone; and one that complains
+    /// when all is well.
+    #[test]
+    fn check_lists_unmapped_unresulted_and_orphaned() {
+        let m = mappings(&format!(
+            "[{},{},{}]",
+            row("ok", "p50", "ms", "instance"),
+            row("nores", "p50", "ms", "missing-arm"),
+            row("few", "p99", "ms", "direct"),
+        ));
+        let html = "<i data-cell=\"ok\" data-source=\"cold-put-instance.json#p50\">1</i>\
+<i data-cell=\"nomap\">?</i><i data-cell=\"blk\" data-blocked>?</i>\
+<i data-cell=\"nores\">?</i><i data-cell=\"few\">?</i>\
+<u data-source=\"cold-put-gone.json#p50\">2</u>\
+<u data-cell=\"g2\" data-source=\"cold-put-direct.json#p99\">3</u>\
+<u data-cell=\"g3\" data-source=\"cold-put-direct.json#bogus\">3</u><u data-source=\"nohash\">4</u>";
+        let findings = check(html, &m, &results()).unwrap();
+        let text = findings.join("\n");
+        assert!(
+            text.contains("placeholder \"nomap\" has no mapping"),
+            "{text}"
+        );
+        assert!(!text.contains("\"blk\""), "{text}");
+        assert!(!text.contains("\"ok\""), "{text}");
+        assert!(text.contains("mapping \"nores\" has no result"), "{text}");
+        assert!(
+            text.contains("mapping \"few\" has no result: p99 needs"),
+            "{text}"
+        );
+        assert!(
+            text.contains("<u> at byte") && text.contains("no file cold-put-gone.json"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\"g2\" cites \"cold-put-direct.json#p99\""),
+            "{text}"
+        );
+        assert!(text.contains("unknown metric \"bogus\""), "{text}");
+        assert!(text.contains("not file#metric"), "{text}");
+        assert!(text.contains("placeholder \"g2\" has no mapping"), "{text}");
+        assert_eq!(findings.len(), 9, "{text}");
+
+        let good = "<i data-cell=\"ok\">1</i>";
+        let (filled, _) = fill(good, &m, &results()).unwrap();
+        let only_ok = mappings(&format!("[{}]", row("ok", "p50", "ms", "instance")));
+        assert!(check(&filled, &only_ok, &results()).unwrap().is_empty());
+    }
+
+    /// Catches a placeholder that cannot be filled being skipped silently, and nesting that
+    /// would drop an inner placeholder.
+    #[test]
+    fn unfillable_placeholders_are_errors() {
+        let m = one("a", "p50", "ms", "instance");
+        let unclosed = fill("<p><b data-cell=\"a\">x", &m, &results()).unwrap_err();
+        assert!(
+            unclosed.to_string().contains("not a closed element"),
+            "{unclosed}"
+        );
+        let void = fill("<br data-cell=\"a\">", &m, &results()).unwrap_err();
+        assert!(void.to_string().contains("not a closed element"), "{void}");
+        let m2 = mappings(&format!(
+            "[{},{}]",
+            row("a", "p50", "ms", "instance"),
+            row("b", "p95", "ms", "instance")
+        ));
+        let nested = fill(
+            "<div data-cell=\"a\"><b data-cell=\"b\">x</b></div>",
+            &m2,
+            &results(),
+        )
+        .unwrap_err();
+        assert!(nested.to_string().contains("overlap"), "{nested}");
+        let cut = fill("<b data-cell=\"a", &m, &results()).unwrap_err();
+        assert!(cut.to_string().contains("not terminated"), "{cut}");
+        let cut = fill("<b data-cell=", &m, &results()).unwrap_err();
+        assert!(cut.to_string().contains("not terminated"), "{cut}");
+    }
+
+    /// Catches a scanner that mishandles what real pages carry: unquoted values, valueless
+    /// attributes, an unclosed `<p>` inside the cell's parent, upper-case tags, nested same-name
+    /// elements, entities in the source file name.
+    #[test]
+    fn the_scanner_copes_with_ordinary_html() {
+        let html = "<DIV><P>one<SPAN DATA-CELL=a hidden>x<span>in</span>y</SPAN><P>two</DIV>\
+<?php x ?><![CDATA[ <b data-cell=\"a\"> ]]><textarea><b data-cell=\"a\"></textarea>";
+        let (out, report) = fill(html, &one("a", "max", "ms", "instance"), &results()).unwrap();
+        assert_eq!(report.filled, 1);
+        assert!(out.contains("<SPAN DATA-CELL=a hidden data-source=\"cold-put-instance.json#max\" data-label=\"test instance\">90.0 ms</SPAN>"), "{out}");
+        assert!(out.ends_with(
+            "<P>two</DIV><?php x ?><![CDATA[ <b data-cell=\"a\"> ]]><textarea><b data-cell=\"a\"></textarea>"
+        ));
+    }
+
+    /// Catches a result with nothing countable (only the warm-up, or all gate-aborted) filled
+    /// with a number.
+    #[test]
+    fn a_result_with_no_counted_pass_has_no_figures() {
+        let mut r = result(CellId::ColdPut, "direct", 100, None);
+        r.passes.truncate(1);
+        assert!(
+            measure(&r, Metric::P50)
+                .unwrap_err()
+                .contains("no pass counts")
+        );
+        let mut r = result(CellId::ColdPut, "direct", 100, None);
+        for p in &mut r.passes {
+            p.gate_tripped = Some("loadavg_1m".to_owned());
+        }
+        assert!(measure(&r, Metric::Requests).is_err());
+        let mut r = result(CellId::ColdPut, "direct", 100, None);
+        for p in &mut r.passes {
+            p.percentiles = None;
+            p.elapsed_us = 0;
+        }
+        assert!(
+            measure(&r, Metric::P50)
+                .unwrap_err()
+                .contains("no pass has a p50")
+        );
+        assert!(measure(&r, Metric::Throughput).is_err());
+        assert!(measure(&r, Metric::Max).is_err());
+    }
+}

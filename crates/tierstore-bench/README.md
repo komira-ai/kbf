@@ -31,3 +31,13 @@ tierstore-bench report           one table from the result JSON and CSV files
 
 One JSON per cell (`schema_version`, see `result.rs`) and a CSV of raw samples with the git SHA,
 the binary digest, the pass index and a quiet or busy flag on every row.
+
+## fill-paper
+
+`tierstore-bench fill-paper --paper P.html --cells cells.json --result-dir DIR --out OUT.html`
+writes the measured numbers into the paper: each element carrying `data-cell="<id>"` gets the
+formatted value of the mapped result and `data-source="<file>#<metric>"` and `data-label`
+(`test instance` or `farm`); `data-blocked` cells are left alone, and the rest of the HTML is
+copied byte for byte. `--in-place` replaces `--out`; `--check` writes nothing and exits 2 listing
+placeholders without a mapping, mappings without a result and filled values whose source is gone.
+The mapping schema and the rules for each figure are in the header of `src/fill.rs`.

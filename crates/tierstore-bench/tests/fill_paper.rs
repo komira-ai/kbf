@@ -1,0 +1,159 @@
+//! `fill-paper` as a process: the flags, the exit status and the files.
+
+use std::path::Path;
+use std::process::{Command, Output};
+
+use kbf_testkit::dir::TestDir;
+
+const PAPER: &str = "<html><body><p>Put: <b data-cell=\"put\">TBD</b> and <i data-cell=\"gone\">TBD</i></p></body></html>\n";
+
+const MAPPING: &str = r#"[
+ {"id":"put","cell":"cold-put","metric":"p50","unit":"ms","condition":"direct"},
+ {"id":"gone","cell":"cold-put","metric":"p50","unit":"ms","condition":"direct","blocked":true}
+]"#;
+
+const RESULT: &str = r#"{"schema_version":1,"cell":"cold-put","arm":"direct","started_unix_ms":0,"finished_unix_ms":1,
+"provenance":{"run_id":"","git_sha":"","binary_digest":"","tool_versions":{},"hardware":{}},
+"passes":[{"pass":0,"window":"quiet","discarded":true,"requests":10,"failures":0,"bytes":1,"elapsed_us":1,"percentiles":null,"gate_tripped":null},
+{"pass":1,"window":"quiet","discarded":false,"requests":10,"failures":0,"bytes":1,"elapsed_us":1,"percentiles":{"p50_us":2500,"p95_us":3,"p99_us":null,"max_us":4},"gate_tripped":null}],
+"notes":[]}"#;
+
+fn setup(name: &str) -> TestDir {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), name);
+    std::fs::create_dir(dir.path().join("results")).unwrap();
+    std::fs::write(dir.path().join("results/cold-put-direct.json"), RESULT).unwrap();
+    std::fs::write(dir.path().join("paper.html"), PAPER).unwrap();
+    std::fs::write(dir.path().join("cells.json"), MAPPING).unwrap();
+    dir
+}
+
+fn fill_paper(dir: &Path, extra: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_tierstore-bench"))
+        .arg("fill-paper")
+        .arg("--paper")
+        .arg(dir.join("paper.html"))
+        .arg("--cells")
+        .arg(dir.join("cells.json"))
+        .arg("--result-dir")
+        .arg(dir.join("results"))
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+/// Catches a fill that writes the paper in place without being asked, writes nothing to
+/// `--out`, or leaves the blocked cell changed.
+#[test]
+fn fill_writes_out_and_leaves_the_paper_alone() {
+    let dir = setup("fill-paper-out");
+    let out = dir.path().join("filled.html");
+    let run = fill_paper(dir.path(), &["--out", out.to_str().unwrap()]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("paper.html")).unwrap(),
+        PAPER
+    );
+    let filled = std::fs::read_to_string(&out).unwrap();
+    assert!(filled.contains(
+        "<b data-cell=\"put\" data-source=\"cold-put-direct.json#p50\" data-label=\"farm\">2.50 ms</b>"
+    ), "{filled}");
+    assert!(filled.contains("<i data-cell=\"gone\">TBD</i>"), "{filled}");
+}
+
+/// Catches `--in-place` that does nothing, and a re-run that changes the file again.
+#[test]
+fn in_place_rewrites_the_paper_and_a_second_run_changes_nothing() {
+    let dir = setup("fill-paper-inplace");
+    assert!(fill_paper(dir.path(), &["--in-place"]).status.success());
+    let first = std::fs::read(dir.path().join("paper.html")).unwrap();
+    assert_ne!(first, PAPER.as_bytes());
+    assert!(fill_paper(dir.path(), &["--in-place"]).status.success());
+    assert_eq!(std::fs::read(dir.path().join("paper.html")).unwrap(), first);
+    let check = fill_paper(dir.path(), &["--check"]);
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+/// Catches flag combinations that would write where the user did not say: neither target, both
+/// targets, and `--check` with a target. Each exits 2 and writes nothing.
+#[test]
+fn contradictory_flags_are_refused_and_write_nothing() {
+    let dir = setup("fill-paper-flags");
+    let out = dir.path().join("o.html");
+    let o = out.to_str().unwrap();
+    for extra in [
+        &[][..],
+        &["--out", o, "--in-place"],
+        &["--check", "--out", o],
+    ] {
+        let run = fill_paper(dir.path(), extra);
+        assert_eq!(run.status.code(), Some(2), "{extra:?}");
+    }
+    assert!(!out.exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("paper.html")).unwrap(),
+        PAPER
+    );
+}
+
+/// Catches a check that exits 0 when a result has been deleted since the fill: exit 2 and the
+/// listing on stderr.
+#[test]
+fn check_exits_2_and_lists_when_a_source_is_gone() {
+    let dir = setup("fill-paper-check");
+    assert!(fill_paper(dir.path(), &["--in-place"]).status.success());
+    std::fs::remove_file(dir.path().join("results/cold-put-direct.json")).unwrap();
+    let run = fill_paper(dir.path(), &["--check"]);
+    assert_eq!(run.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("mapping \"put\" has no result"), "{stderr}");
+    assert!(stderr.contains("no longer exists"), "{stderr}");
+}
+
+/// Catches a result directory read wrongly: other files skipped, a result-shaped file that is not
+/// a result refused, a directory that does not exist refused, and the lookup by cell and arm
+/// (a mapping for an arm that is not there has no result).
+#[test]
+fn results_load_from_a_directory() {
+    use tierstore_bench::fill::{FillError, Mapping, Results, check};
+
+    let dir = setup("fill-paper-load");
+    let results_dir = dir.path().join("results");
+    std::fs::write(results_dir.join("before.json"), "not a result").unwrap();
+    std::fs::write(results_dir.join("cold-put-note.txt"), "no").unwrap();
+    let loaded = Results::load(&results_dir).unwrap();
+    let map = |arm: &str, cell: &str| {
+        Mapping::parse_all(&format!(
+            r#"[{{"id":"a","cell":"{cell}","metric":"p50","unit":"ms","condition":"{arm}"}}]"#
+        ))
+        .unwrap()
+    };
+    assert!(
+        check("", &map("direct", "cold-put"), &loaded)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        check("", &map("direct", "cold-read"), &loaded)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        check("", &map("other", "cold-put"), &loaded).unwrap().len(),
+        1
+    );
+
+    std::fs::write(results_dir.join("cold-read-x.json"), "{}").unwrap();
+    let err = Results::load(&results_dir).unwrap_err();
+    assert!(err.to_string().starts_with("cold-read-x.json: "), "{err}");
+    let missing = Results::load(&dir.path().join("none")).unwrap_err();
+    assert!(matches!(missing, FillError::Io { .. }));
+}
