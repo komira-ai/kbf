@@ -177,6 +177,53 @@ fn a_plain_put_endpoint_needs_the_plain_http_opt_in() {
     );
 }
 
+/// Catches an `http://` read url accepted with no word from the operator: the grant's bearer
+/// token would cross the job network in clear. It is refused when the flags are parsed, naming
+/// the flag that allows it; `--executor-allow-plain-http-grant` accepts it, and is no more than a
+/// warning when the read url is `https`.
+#[test]
+fn a_plain_read_url_needs_the_plain_http_grant_opt_in() {
+    let http = ["--task-read-url=http://192.0.2.6:9400"];
+    let why = refused(&[], &http);
+    assert!(
+        why.contains("--task-read-url") && why.contains("--executor-allow-plain-http-grant"),
+        "{why}"
+    );
+    let mut with = http.to_vec();
+    with.push("--executor-allow-plain-http-grant");
+    let flags = parsed(argv(&[], &with)).expect("accepted with the opt-in");
+    assert_eq!(
+        flags.task.as_ref().map(|t| t.read_url.as_str()),
+        Some("http://192.0.2.6:9400")
+    );
+    let js = flags.executor.js.as_ref().expect("js-agent");
+    assert!(js.config.allow_plain_http_grant);
+
+    let mut https = parsed(argv(&[], &["--executor-allow-plain-http-grant"])).expect("parses");
+    let js = https.executor.js.as_mut().expect("js-agent");
+    let beside = Beside {
+        task: https.task.as_ref(),
+        job_read: https.job_read.as_ref(),
+        packs: https.packs.as_ref(),
+    };
+    let warnings = check(js, &beside).expect("checks");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("--executor-allow-plain-http-grant") && w.contains("not needed")),
+        "{warnings:?}"
+    );
+    let bare = parsed(argv(&[], &[])).expect("parses");
+    assert!(
+        !bare
+            .executor
+            .js
+            .expect("js-agent")
+            .config
+            .allow_plain_http_grant
+    );
+}
+
 /// Catches a read url or a tier store given by name: the job network has no DNS, so the task
 /// could not connect. An IPv6 address in brackets is an address.
 #[test]

@@ -427,6 +427,17 @@ fn a_storage_node_refuses_a_list_of_endpoints_and_a_cache_policy() {
     assert!(why.contains("keeps no cache"), "{why}");
 }
 
+/// Asserts that a build node's file with an `[oci]` table is refused, with a message that names
+/// `oci`, whether or not the table has `listen`.
+#[test]
+fn a_build_node_refuses_an_oci_table() {
+    for table in ["listen = \"127.0.0.1:5000\"", "prefix = \"cas/\""] {
+        let why = refusal(&format!("{CACHE}\n[oci]\n{table}\n"));
+        assert!(why.contains("oci"), "{why}");
+        assert!(why.contains("build node"), "{why}");
+    }
+}
+
 /// Asserts that a rate reads as a size and `/s`, is refused otherwise, and is written back as a
 /// rate that reads as the same.
 #[test]
@@ -436,7 +447,7 @@ fn a_rate_is_a_size_and_a_per_second() {
     assert_eq!(rate("7B/s").unwrap(), Rate(7));
     for bad in ["50MiB", "x/s", "-1B/s", "/s", "1 B/s"] {
         let why = rate(bad).unwrap_err().to_string();
-        assert!(why.contains("not a rate"), "{bad}: {why}");
+        assert!(why.contains("a rate such as"), "{bad}: {why}");
     }
     let why = serde_json::from_str::<Rate>("5").unwrap_err().to_string();
     assert!(why.contains("a rate such as"), "{why}");

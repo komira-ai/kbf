@@ -113,6 +113,25 @@ fn a_file_with_a_data_path_flag_is_refused_naming_the_flags() {
     assert!(!text.contains("--drain-lb-wait,"), "{text}");
 }
 
+/// Asserts that `--oci-listen` with `--config` is refused as a conflict that names the flag, even
+/// with the address the file's `[oci]` has, and that the file alone makes the front's settings.
+#[test]
+fn an_oci_flag_with_a_file_conflicts_and_the_file_holds_the_front() {
+    let (_dir, path) = with_file("tierstore-launch-oci");
+    for address in ["192.0.2.10:5000", "127.0.0.1:1"] {
+        let (kind, _, text) = refused(&["tierstore", "--config", &path, "--oci-listen", address]);
+        assert_eq!(kind, "config", "{address}");
+        assert!(
+            text.contains("cannot be given with --oci-listen:"),
+            "{address}: {text}"
+        );
+    }
+    let launch = resolve(words(&["tierstore", "--config", &path])).unwrap();
+    let cli = launch.settings.into_storage().unwrap();
+    assert_eq!(cli.oci_listen, Some("192.0.2.10:5000".parse().unwrap()));
+    assert_eq!(cli.oci_max_connections, Some(16));
+}
+
 /// Asserts that a flag that has a default still conflicts with the file when it is given, even
 /// with the default's own value (`--region us-east-1`), and so does a flag that may be repeated,
 /// and that each of them is named alone.

@@ -91,6 +91,10 @@
 //!   ([`pipeline_watch`]): the fail-fast of the push pipeline: cancel the run as soon as one of its jobs
 //!   has failed, and stop when the job `--last-job` has completed. Exit 0 whatever it saw; 1 only when
 //!   GitHub refuses the cancel.
+//! - `pipeline-rerun --repo <owner/repo> --run-id <id>` ([`pipeline_rerun`]): after a pipeline run has
+//!   completed, rerun its failed jobs once (first attempt only) when every failed job builds or moves
+//!   artifacts; a failed test or lint job, or an unknown one, means nothing is rerun. Exit 1 only
+//!   when GitHub refuses the rerun.
 //! - `runner-disk --path <path> --min-free-gb <n>` ([`runner_disk`]): exit 1 naming the disk
 //!   when the disk of `<path>` has less free space than the coverage run needs.
 //! - `static-elf <binary>` ([`static_elf`]): exit 1 unless the ELF64 binary is statically
@@ -123,6 +127,7 @@ pub mod entitlements;
 pub mod fetch;
 pub mod installer_tarball;
 pub mod package;
+pub mod pipeline_rerun;
 pub mod pipeline_watch;
 pub mod pkg;
 pub mod pkg_asset;
@@ -209,6 +214,8 @@ enum Verb {
     StaticElf(static_elf::Args),
     /// Cancel the pipeline run when one of its jobs has failed, so its other jobs stop.
     PipelineWatch(pipeline_watch::Args),
+    /// Rerun the failed jobs of a completed pipeline run once, when all of them build or move artifacts.
+    PipelineRerun(pipeline_rerun::Args),
     /// Refuse a row the budget file gains against `--base`.
     BudgetDiff {
         /// The revision to compare with (on a pull request, the base branch).
@@ -1029,6 +1036,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::RunnerDisk(args) => runner_disk::run(&args),
         Verb::StaticElf(args) => static_elf::run(&args),
         Verb::PipelineWatch(args) => pipeline_watch::run(&args),
+        Verb::PipelineRerun(args) => pipeline_rerun::run(&args),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
         Verb::SourceDateEpoch { commit, output } => {
             source_date_epoch(&root, &commit, &output).map(|line| vec![line])

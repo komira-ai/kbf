@@ -206,8 +206,9 @@ fn a_binary_that_exits_with_an_error_is_refused_whatever_it_printed() {
 #[test]
 fn a_binary_that_does_not_answer_is_killed_when_the_time_is_up() {
     // Catches: no time limit (the job would wait for the runner's limit), and a limit
-    // that waits for the binary to end on its own. The fake sleeps for two minutes. Catches:
-    // the timeout flag of the run ignored.
+    // that waits for the binary to end on its own. The fake sleeps for two minutes, so a
+    // limit of nothing is the only way the run ends in time. Catches: the timeout of the
+    // run ignored.
     let f = fx("hangs", &says(COMMIT, "release"));
     std::fs::write(f.kbf.with_file_name("kbf.mode"), "hang").expect("mode");
     let args = Args {
@@ -216,9 +217,9 @@ fn a_binary_that_does_not_answer_is_killed_when_the_time_is_up() {
         platform: Platform::LinuxX86_64,
         out: f.out.clone(),
     };
-    let refusal = emit(&args, Duration::from_millis(300)).expect_err("a binary that hangs");
+    let refusal = emit(&args, Duration::ZERO).expect_err("a binary that hangs");
     let why = refusal.to_string();
-    assert!(why.contains("did not answer in 300ms"), "{why}");
+    assert!(why.contains("did not answer in 0ns"), "{why}");
     assert!(!f.out.exists());
 }
 
