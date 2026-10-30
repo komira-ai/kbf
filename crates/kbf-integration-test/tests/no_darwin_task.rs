@@ -18,8 +18,8 @@
 //!   `apple-darwin`) names `kbf-task`: the build of it, its SBOM, its package or its image;
 //! - no line of a darwin job runs `cargo build`, `test`, `nextest`, `check` or `clippy` with
 //!   `--workspace` or `--all` and without `--exclude kbf-task` (it would build `kbf-task` without
-//!   naming it), and no line naming `kbf-task` has a `${{` interpolation (a matrix name the text
-//!   cannot resolve);
+//!   naming it), and no line naming `kbf-task` interpolates a matrix, env or input value (a name the
+//!   text cannot resolve);
 //! - no workflow names the feature `unconfined-for-tests`, which lets a Command run with the
 //!   network where no confine exists and is for developers' test runs only.
 
@@ -47,6 +47,15 @@ fn is_darwin_job(header: &str, body: &[&str]) -> bool {
         })
 }
 
+/// Whether `line` has a `${{ }}` that names a matrix or an env value (`${{ github.sha }}` and the
+/// like do not pick a platform).
+fn interpolates_a_platform(line: &str) -> bool {
+    line.split("${{").skip(1).any(|rest| {
+        let inner = rest.split("}}").next().unwrap_or(rest);
+        inner.contains("matrix") || inner.contains("env.") || inner.contains("inputs.")
+    })
+}
+
 /// Whether `line` runs a cargo verb over the whole workspace and does not exclude `kbf-task`.
 fn builds_workspace(line: &str) -> bool {
     let words: Vec<&str> = line.split_whitespace().collect();
@@ -71,7 +80,7 @@ fn problems(files: &[(String, String)]) -> Vec<String> {
                     line.trim()
                 ));
             }
-            if workflow && line.contains("kbf-task") && line.contains("${{") {
+            if workflow && line.contains("kbf-task") && interpolates_a_platform(line) {
                 out.push(format!(
                     "{at}: a line naming kbf-task has an interpolation the lint cannot resolve: {}",
                     line.trim()
