@@ -308,4 +308,7 @@ async fn a_multipart_counts_one_put_with_the_bytes_of_its_parts() {
     assert!(matches!(refused, Err(Error::AlreadyExists(_))));
     assert_eq!(puts(&rig), (1, 12));
     assert_eq!(failures(&rig), [1, 0, 0, 0, 0]);
+    // The completions the upstream saw are the ones taken and the ones that failed.
+    let failed = failures(&rig).iter().sum::<u64>();
+    assert_eq!(rig.calls(Op::CompleteUpload), puts(&rig).0 + failed);
 }
