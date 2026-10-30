@@ -1729,6 +1729,11 @@ fn check_accepts_the_task_image_of_each_linux_arch_and_refuses_it_on_the_mac() {
             &format!("kbf-task-image-{COMMIT}-{platform}.facts.json"),
             false,
         );
+        add_deb(
+            &listed,
+            &format!("kbf-task-image-{COMMIT}-{platform}.cdx.json"),
+            false,
+        );
     }
     let (code, _, err) = check(&listed, COMMIT);
     assert_eq!(code, Some(0), "{err}");
@@ -1751,7 +1756,13 @@ fn check_wants_the_facts_of_the_task_image_and_the_previous_release_may_lack_the
     let d = dist(&root, COMMIT);
     let image = format!("kbf-task-image-{COMMIT}-linux-arm64.oci.tar");
     let facts = format!("kbf-task-image-{COMMIT}-linux-arm64.facts.json");
+    // Its SBOM is listed, so that the facts are the one thing missing.
     add_deb(&d, &image, true);
+    add_deb(
+        &d,
+        &format!("kbf-task-image-{COMMIT}-linux-arm64.cdx.json"),
+        false,
+    );
     let (code, _, err) = check(&d, COMMIT);
     assert_eq!(code, Some(1), "{err}");
     assert_eq!(
@@ -1801,6 +1812,11 @@ fn check_takes_only_the_facts_of_the_task_image_for_the_commit() {
         true,
     );
     add_deb(&d, &facts, false);
+    add_deb(
+        &d,
+        &format!("kbf-task-image-{other}-linux-arm64.cdx.json"),
+        false,
+    );
     let (code, out, err) = check(&d, COMMIT);
     assert_eq!(code, Some(1), "{out}");
     assert!(

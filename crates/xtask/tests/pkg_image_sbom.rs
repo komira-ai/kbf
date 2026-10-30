@@ -190,9 +190,11 @@ fn syft_is_run_on_the_image_in_its_directory_with_the_pinned_arguments_and_the_s
         )
     );
     let env = std::fs::read_to_string(root.join("tools/syft-env")).expect("syft-env");
+    // (The coverage runtime of an instrumented fake adds a variable of its own to its environment.)
     let names: Vec<&str> = env
         .lines()
         .filter_map(|l| l.split_once('=').map(|(n, _)| n))
+        .filter(|n| !n.starts_with("__LLVM"))
         .collect();
     assert_eq!(
         names,
@@ -239,7 +241,7 @@ fn a_failing_syft_or_a_wrong_sbom_leaves_no_file_and_no_line() {
     assert!(!dist.join(&name).exists());
     assert!(!dist.join("SHA256SUMS.linux-x86_64").exists());
 
-    let (_, dist, syft, _) = world("wrong", |_| {
+    let (_root, dist, syft, _) = world("wrong", |_| {
         syft_says("sha256:other", "urn:uuid:one", "one")
     });
     let (code, out, err) = xtask(&make_args(&dist, &syft));
@@ -253,7 +255,7 @@ fn a_failing_syft_or_a_wrong_sbom_leaves_no_file_and_no_line() {
 fn the_verify_step_refuses_a_missing_or_another_images_sbom() {
     // Catches: a verify job that passes an image with no SBOM beside it, or one with another
     // image's, which the attest job would sign as this image's.
-    let (_, dist, _, _) = world("verify", |m| syft_says(m, "urn:uuid:one", "one"));
+    let (_root, dist, _, _) = world("verify", |m| syft_says(m, "urn:uuid:one", "one"));
     let (code, _, err) = xtask(&verify_args(&dist));
     assert_eq!(code, Some(1), "{err}");
     assert!(err.contains("the image has no SBOM"), "{err}");
@@ -275,7 +277,7 @@ fn the_flags_fit_together_and_only_the_task_image_has_an_sbom() {
     // Catches: `--verify-only` that also runs syft (`--syft` is refused with it), a build step with
     // no syft or no time (it would make an SBOM that is not reproducible), and an SBOM asked of the
     // frontend or coordinator image, which the release has none of.
-    let (_, dist, syft, _) = world("flags", |m| syft_says(m, "urn:uuid:one", "one"));
+    let (_root, dist, syft, _) = world("flags", |m| syft_says(m, "urn:uuid:one", "one"));
     let mut with_syft = verify_args(&dist);
     with_syft.extend(owned(&["--syft", s(&syft)]));
     let (code, _, err) = xtask(&with_syft);

@@ -1229,14 +1229,20 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             source_date_epoch,
             verify_only,
         } => match (&syft, source_date_epoch, verify_only) {
-            (Some(syft), Some(epoch), false) => pkg_image_sbom::make(
-                &image,
-                service,
-                &commit,
-                platform,
-                epoch,
-                &mut pkg_image_sbom::syft_process(syft),
-            ),
+            (Some(syft), Some(epoch), false) => {
+                // Under the build tree, named for this process: syft's home and cache.
+                let scratch = root
+                    .join("target")
+                    .join(format!("pkg-image-sbom-{}", std::process::id()));
+                pkg_image_sbom::make(
+                    &image,
+                    service,
+                    &commit,
+                    platform,
+                    epoch,
+                    &mut pkg_image_sbom::syft_process(syft, &scratch),
+                )
+            }
             _ => pkg_image_sbom::verify(&image, service, &commit, platform),
         },
         Verb::PkgMacosAsset {

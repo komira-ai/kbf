@@ -54,24 +54,25 @@ const DEB_PURL: &str = "pkg:deb/";
 pub type Syft<'a> = dyn FnMut(&Path, &[&str]) -> Result<Vec<u8>, Error> + 'a;
 
 /// The closure that runs the program `syft`: with the environment [`syft_env`] and nothing else,
-/// in the directory it is given, with a scratch directory of its own for syft's home, cache and
-/// temporary files, which it removes after.
-pub fn syft_process(syft: &Path) -> impl FnMut(&Path, &[&str]) -> Result<Vec<u8>, Error> {
-    let syft = syft.to_owned();
+/// in the directory it is given, with the directory `scratch` for syft's home, cache and
+/// temporary files, which it makes and removes after (the caller names one no one else uses).
+pub fn syft_process<'a>(
+    syft: &'a Path,
+    scratch: &'a Path,
+) -> impl FnMut(&Path, &[&str]) -> Result<Vec<u8>, Error> + 'a {
     move |dir, args| {
-        let scratch = std::env::temp_dir().join(format!("xtask-syft-{}", std::process::id()));
         for sub in ["home", "cache", "tmp"] {
             std::fs::create_dir_all(scratch.join(sub))
                 .map_err(Error::spawn(format!("create {}", scratch.display())))?;
         }
-        let out = Command::new(&syft)
+        let out = Command::new(syft)
             .current_dir(dir)
             .env_clear()
-            .envs(syft_env(&scratch))
+            .envs(syft_env(scratch))
             .args(args)
             .output();
         // The scratch directory holds nothing the build keeps.
-        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = std::fs::remove_dir_all(scratch);
         let out = out.map_err(Error::spawn(syft.display().to_string()))?;
         if !out.status.success() {
             return Err(Error::Failed(format!(

@@ -569,10 +569,12 @@ fn verify_wants_the_sbom_of_this_image_beside_it() {
 fn syft_runs_with_the_environment_given_and_nothing_else_and_its_scratch_is_removed() {
     // Catches: the runner's environment reaching syft (a token, a configuration, a proxy: the SBOM
     // would depend on where it ran, and syft would ask the network about updates), the home and
-    // temporary directories being the runner's or being left behind in the temporary directory,
+    // temporary directories being the runner's or being left behind,
     // a failing syft read as success and a missing one as a failure of the image.
-    let mut env = syft_process(Path::new("/usr/bin/env"));
-    let printed = env(&std::env::temp_dir(), &[]).expect("env");
+    let cwd = scratch("syft-process-cwd");
+    let scratch = scratch("syft-process");
+    let mut env = syft_process(Path::new("/usr/bin/env"), &scratch);
+    let printed = env(&cwd, &[]).expect("env");
     let text = String::from_utf8(printed).expect("utf-8");
     let names: Vec<&str> = text
         .lines()
@@ -591,22 +593,21 @@ fn syft_runs_with_the_environment_given_and_nothing_else_and_its_scratch_is_remo
         ]
     );
     assert!(text.contains("SYFT_CHECK_FOR_APP_UPDATE=false\n"), "{text}");
-    let scratch = std::env::temp_dir().join(format!("xtask-syft-{}", std::process::id()));
     let home = text
         .lines()
         .find_map(|l| l.strip_prefix("HOME="))
         .expect("home");
     assert!(Path::new(home).starts_with(&scratch), "{home}");
     assert!(!scratch.exists(), "the scratch directory was left behind");
-    let mut fails = syft_process(Path::new("/usr/bin/false"));
-    let got = fails(&std::env::temp_dir(), &["scan", "x"]);
+    let mut fails = syft_process(Path::new("/usr/bin/false"), &scratch);
+    let got = fails(&cwd, &["scan", "x"]);
     assert!(
         matches!(&got, Err(Error::Failed(m)) if m.starts_with("syft scan x: ")),
         "{got:?}"
     );
     assert!(!scratch.exists());
-    let mut missing = syft_process(Path::new("/nonexistent/syft"));
-    let got = missing(&std::env::temp_dir(), &[]);
+    let mut missing = syft_process(Path::new("/nonexistent/syft"), &scratch);
+    let got = missing(&cwd, &[]);
     assert!(
         matches!(&got, Err(Error::Spawn { what, .. }) if what == "/nonexistent/syft"),
         "{got:?}"

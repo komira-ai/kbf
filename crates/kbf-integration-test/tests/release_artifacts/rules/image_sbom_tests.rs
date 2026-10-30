@@ -188,13 +188,14 @@ fn the_verify_job_checks_the_sbom_beside_each_signed_task_image() {
         );
         let none = good().replacen(&step, "", 1);
         assert_ne!(none, good(), "{platform}");
-        assert!(found(&none).contains(&wanted), "{:?}", found(&none));
+        let names = |w: &str| found(w).iter().any(|l| l.contains(&wanted));
+        assert!(names(&none), "{:?}", found(&none));
         let skippable = step.replace("        run:", "        if: always()\n        run:");
         let w = good().replacen(&step, &skippable, 1);
-        assert!(found(&w).contains(&wanted), "{:?}", found(&w));
+        assert!(names(&w), "{:?}", found(&w));
         let other = step.replace("--platform", "--platform x-");
         let w = good().replacen(&step, &other, 1);
-        assert!(found(&w).contains(&wanted), "{:?}", found(&w));
+        assert!(names(&w), "{:?}", found(&w));
     }
     // One that runs before the attestation check is not after it.
     let step = verify_task_sbom_step("linux-arm64");
