@@ -94,7 +94,7 @@ trait Plane: Send + Sync {
     fn put_streamed<'a>(
         &'a self,
         digest: &'a Digest,
-        open: &'a OpenPieces,
+        open: &'a OpenPieces<'a>,
     ) -> BoxFuture<'a, Answer<()>>;
     fn metrics(&self) -> &CacheMetrics;
     fn render_metrics(&self) -> String;
@@ -211,7 +211,7 @@ impl Backend {
     pub async fn put_streamed(
         &self,
         digest: &Digest,
-        open: &OpenPieces,
+        open: &OpenPieces<'_>,
     ) -> Result<(), StorageError> {
         self.0.put_streamed(digest, open).await
     }
@@ -303,7 +303,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Plane for Local<M, O> {
     fn put_streamed<'a>(
         &'a self,
         digest: &'a Digest,
-        open: &'a OpenPieces,
+        open: &'a OpenPieces<'a>,
     ) -> BoxFuture<'a, Answer<()>> {
         Box::pin(async move {
             let body = open()
@@ -433,7 +433,7 @@ impl Plane for Remote {
     fn put_streamed<'a>(
         &'a self,
         digest: &'a Digest,
-        open: &'a OpenPieces,
+        open: &'a OpenPieces<'a>,
     ) -> BoxFuture<'a, Answer<()>> {
         Box::pin(async move {
             let claim = Box::pin(futures::future::ready(Some(*digest)));
@@ -601,7 +601,7 @@ impl Plane for RoutedPlane {
     fn put_streamed<'a>(
         &'a self,
         digest: &'a Digest,
-        open: &'a OpenPieces,
+        open: &'a OpenPieces<'a>,
     ) -> BoxFuture<'a, Answer<()>> {
         match self.routing() {
             Some(router) => Box::pin(router.put_streamed(digest, open)),

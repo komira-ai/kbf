@@ -94,7 +94,7 @@ impl Router {
     pub async fn put_streamed(
         &self,
         digest: &Digest,
-        open: &OpenPieces,
+        open: &OpenPieces<'_>,
     ) -> Result<(), StorageError> {
         self.routed(|view| self.put_streamed_in(view, *digest, open))
             .await
@@ -295,7 +295,7 @@ impl Router {
         &self,
         view: MapView,
         digest: Digest,
-        open: &OpenPieces,
+        open: &OpenPieces<'_>,
     ) -> Result<(), StorageError> {
         self.at_a_write_owner(&view, &digest, |node| {
             let body = open();
