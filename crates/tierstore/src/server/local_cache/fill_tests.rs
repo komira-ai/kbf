@@ -318,7 +318,7 @@ async fn a_missing_key_is_not_found_and_not_a_failed_fill() {
 }
 
 /// Asserts that a range that starts past the end of an object that is not in the cache is the
-/// error any backend gives, after the object was filled (the range is judged by its size).
+/// error any backend gives (the range is judged by the object's size), and the fill goes on.
 #[tokio::test]
 async fn a_range_past_the_end_of_an_uncached_object_is_an_error() {
     let rig = Rig::new("tscache-range-past");
@@ -327,6 +327,10 @@ async fn a_range_past_the_end_of_an_uncached_object_is_an_error() {
     let text = "range starting at 101 is past the end of the 100-byte object";
     let past = rig.cache.get("cas/b/obj", Some(range)).await;
     assert_eq!(past, Err(Error::Other(text.to_owned())));
+    // The error is given as soon as the size is known; the fill goes on and keeps the object.
+    while read(&rig.cache.counters().fills) < 1 {
+        tokio::task::yield_now().await;
+    }
     assert_eq!(rig.cache.held(), (100, 1));
 }
 

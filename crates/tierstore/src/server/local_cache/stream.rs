@@ -261,7 +261,10 @@ impl Follower {
                     Err(error) => return self.fail(error),
                 }
             }
-            if self.end.is_some_and(|end| self.sent >= end) {
+            // The end of the window, once the fill has said the object is good (a window of no
+            // bytes has nothing held back, and still waits for the verdict).
+            let whole = matches!(self.verdict, Some(Ok(Filled::Kept)));
+            if whole && self.end.is_some_and(|end| self.sent >= end) {
                 return None;
             }
             // How far this reader may read: up to what is written and no further than the last
