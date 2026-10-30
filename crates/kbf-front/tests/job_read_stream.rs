@@ -50,6 +50,8 @@ enum Fault {
     Extend,
     /// Fails in place of this chunk.
     FailAt(usize),
+    /// Sends an empty chunk after each chunk.
+    EmptyChunks,
     /// Fails in place of this chunk with the store's own report that the bytes are not the
     /// blob's: `Corrupt` when `corrupt`, else `DigestMismatch`.
     Reported {
@@ -157,6 +159,12 @@ impl BlobSource for Source {
                             actual,
                         }
                     }));
+                }
+                Fault::EmptyChunks => {
+                    items = items
+                        .into_iter()
+                        .flat_map(|chunk| [chunk, Ok(Bytes::new())])
+                        .collect();
                 }
                 Fault::None | Fault::Flip(_) => {}
             }
@@ -434,6 +442,21 @@ async fn a_store_that_reports_corruption_is_counted_as_a_mismatch() {
             "kbf_job_read_stream_ended_early_total{reason=\"store_error\"} 0",
         );
     }
+}
+
+/// Catches: an empty chunk from the source (a store may send one) ending the stream or being
+/// passed on as a chunk: the blob is served byte-exact and no empty chunk reaches the response.
+#[tokio::test]
+async fn empty_chunks_from_the_source_are_dropped() {
+    let w = world();
+    let rig = rig(w.blobs.clone(), limits());
+    rig.source.set_fault(Fault::EmptyChunks);
+    let token = rig.token(w.action);
+    let stream = rig.get(&w.big, &token).await.stream.expect("streamed");
+    let (chunks, ended) = drain(stream).await;
+    assert!(ended.is_none(), "{ended:?}");
+    assert_eq!(joined(&chunks), w.big_bytes);
+    assert!(chunks.iter().all(|c| !c.is_empty()));
 }
 
 /// Catches: a store that fails part way being served as a complete blob, and counted as a
