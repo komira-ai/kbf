@@ -3,6 +3,8 @@
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::OciMode;
+
 /// The calls the front tells apart in its counters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RouteKind {
@@ -52,9 +54,19 @@ pub struct OciMetrics {
     requests: [[AtomicU64; OUTCOMES.len()]; ROUTES.len()],
     bytes: AtomicU64,
     mismatches: AtomicU64,
+    mode: OciMode,
 }
 
 impl OciMetrics {
+    /// Counters of a front that carries its connections as `mode` says. (`Default` is HTTPS.)
+    #[must_use]
+    pub fn with_mode(mode: OciMode) -> Self {
+        Self {
+            mode,
+            ..Self::default()
+        }
+    }
+
     /// Counts one request.
     pub(super) fn request(&self, route: RouteKind, outcome: Outcome) {
         self.requests[route as usize][outcome as usize].fetch_add(1, Ordering::Relaxed);
@@ -111,6 +123,9 @@ impl OciMetrics {
         let mismatches = self.mismatches();
         let _ = writeln!(text, "# TYPE tierstore_oci_digest_mismatches_total counter");
         let _ = writeln!(text, "tierstore_oci_digest_mismatches_total {mismatches}");
+        let mode = self.mode.as_str();
+        let _ = writeln!(text, "# TYPE tierstore_oci_front_info gauge");
+        let _ = writeln!(text, "tierstore_oci_front_info{{mode=\"{mode}\"}} 1");
         text
     }
 }

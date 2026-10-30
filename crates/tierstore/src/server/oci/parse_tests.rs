@@ -6,7 +6,7 @@ use hyper::header::HeaderValue;
 use super::metrics::{Outcome, RouteKind};
 use super::names::{Digest, Route, is_tag, route, valid_name};
 use super::range::{self, Range};
-use super::{OciMetrics, OciPrefix, header_value, manifest};
+use super::{OciMetrics, OciMode, OciPrefix, header_value, manifest};
 
 const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -327,8 +327,17 @@ fn the_counters_count_and_render() {
     ] {
         assert!(text.contains(line), "{line}\n{text}");
     }
-    // Four routes by seven outcomes, three counters' type lines, two totals.
-    assert_eq!(text.lines().count(), 4 * 7 + 3 + 2);
+    assert!(
+        text.contains("tierstore_oci_front_info{mode=\"https\"} 1\n"),
+        "{text}"
+    );
+    let plain = OciMetrics::with_mode(OciMode::Http).render();
+    assert!(
+        plain.contains("tierstore_oci_front_info{mode=\"http\"} 1\n"),
+        "{plain}"
+    );
+    // Four routes by seven outcomes, four counters' type lines, two totals, the mode.
+    assert_eq!(text.lines().count(), 4 * 7 + 4 + 2 + 1);
 }
 
 /// Asserts a header value that cannot be one is replaced by an empty value, not a panic.

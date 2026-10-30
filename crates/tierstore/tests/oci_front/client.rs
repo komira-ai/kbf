@@ -7,10 +7,9 @@ use std::sync::Arc;
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-use tokio_rustls::client::TlsStream;
 
 /// A connector that trusts the CA in `ca_pem` and nothing else.
 pub fn connector(ca_pem: &str) -> TlsConnector {
@@ -62,9 +61,14 @@ impl Reply {
     }
 }
 
+/// What a connection runs over: TLS, or a bare socket.
+trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
+
 /// A connection, which carries requests one after the other.
 pub struct Conn {
-    stream: TlsStream<TcpStream>,
+    stream: Box<dyn Stream>,
     buf: Vec<u8>,
 }
 
@@ -75,7 +79,16 @@ impl Conn {
         let name = rustls::pki_types::ServerName::from(addr.ip());
         let stream = connector.connect(name, tcp).await?;
         Ok(Self {
-            stream,
+            stream: Box::new(stream),
+            buf: Vec::new(),
+        })
+    }
+
+    /// Connects to `addr` and speaks plain HTTP.
+    pub async fn open_plain(addr: SocketAddr) -> std::io::Result<Self> {
+        let tcp = TcpStream::connect(addr).await?;
+        Ok(Self {
+            stream: Box::new(tcp),
             buf: Vec::new(),
         })
     }

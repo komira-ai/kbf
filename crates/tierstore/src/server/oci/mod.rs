@@ -1,6 +1,16 @@
-//! A read-only OCI distribution front over the objects of a [`Backend`], served over HTTPS by
-//! `--oci-listen`, so that a container engine (podman through `certs.d`, or any client of the
-//! distribution API) pulls an image by digest from the store.
+//! A read-only OCI distribution front over the objects of a [`Backend`], served by
+//! `--oci-listen` over HTTPS, or over plain HTTP on loopback, so that a container engine (podman
+//! through `certs.d`, or any client of the distribution API) pulls an image by digest from the
+//! store.
+//!
+//! # Two modes
+//!
+//! With `--oci-tls-cert` and `--oci-tls-key` the front serves HTTPS ([`OciMode::Https`]) at any
+//! address. With neither it serves plain HTTP/1.1 ([`OciMode::Http`]), and only on a loopback
+//! address (127.0.0.0/8 or `::1`): a node's own container engine pulls from the front of its own
+//! store, and that traffic never leaves the host. A plain listener on any other address is refused
+//! at start. Everything else, the routes, the limits and the drain, is the same in both modes,
+//! except that a plain connection has no handshake to time.
 //!
 //! # What it serves
 //!
@@ -92,7 +102,7 @@ use crate::{Backend, ByteRange, Error};
 pub use body::{BodyError, OciBody};
 pub use listener::{OciLimits, OciListener};
 pub use metrics::OciMetrics;
-pub use tls::{OciError, acceptor};
+pub use tls::{OciError, OciMode, acceptor, plain_allowed};
 
 use body::BlobRead;
 use metrics::{Outcome, RouteKind};

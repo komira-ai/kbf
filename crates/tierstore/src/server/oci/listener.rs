@@ -1,5 +1,6 @@
-//! The OCI front's socket: HTTPS connections, bounded in number, in the time a client has to send
-//! a request, in how long a client may leave an answer unread, and in lifetime.
+//! The OCI front's socket: HTTPS connections, or plain HTTP ones on loopback, bounded in number,
+//! in the time a client has to send a request, in how long a client may leave an answer unread,
+//! and in lifetime.
 
 use std::convert::Infallible;
 use std::future::poll_fn;
@@ -12,14 +13,20 @@ use hyper::body::Incoming as RequestBody;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
-use super::{OciError, OciFront};
+use super::{OciError, OciFront, OciMode, plain_allowed};
 use crate::server::idle::Watched;
 use crate::server::{ACCEPT_PAUSE, Incoming};
+
+/// A connection's byte stream, whichever way it is carried: one code path serves HTTP over it.
+trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 
 /// The bounds on the connections of a listener.
 #[derive(Clone, Copy, Debug)]
@@ -27,7 +34,7 @@ pub struct OciLimits {
     /// The most connections open at once; the others wait in the kernel's backlog.
     pub max_connections: usize,
     /// How long a client has to finish the TLS handshake. Short, since a connection that never
-    /// speaks holds a slot until it is closed.
+    /// speaks holds a slot until it is closed. A plain listener has no handshake to time.
     pub handshake_timeout: Duration,
     /// How long a client has to send the head of a request, and so how long a connection may
     /// wait, idle, for its next request.
@@ -43,22 +50,46 @@ pub struct OciLimits {
     pub drain_deadline: Duration,
 }
 
-/// A bound socket, ready to serve the front over TLS.
+/// A bound socket, ready to serve the front over TLS, or over plain HTTP.
 pub struct OciListener {
     listener: TcpListener,
-    acceptor: TlsAcceptor,
+    /// `None` serves plain HTTP.
+    acceptor: Option<TlsAcceptor>,
     front: Arc<OciFront>,
     limits: OciLimits,
 }
 
 impl OciListener {
-    /// Binds `addr`.
+    /// Binds `addr`, to serve HTTPS.
     ///
     /// # Errors
     /// [`OciError::Bind`] if the address cannot be bound.
     pub async fn bind(
         addr: SocketAddr,
         acceptor: TlsAcceptor,
+        front: Arc<OciFront>,
+        limits: OciLimits,
+    ) -> Result<Self, OciError> {
+        Self::bind_as(addr, Some(acceptor), front, limits).await
+    }
+
+    /// Binds `addr`, to serve plain HTTP; `addr` must be a loopback address.
+    ///
+    /// # Errors
+    /// [`OciError::PlainNotLoopback`] if `addr` is not loopback (nothing is bound then), and
+    /// [`OciError::Bind`] if the address cannot be bound.
+    pub async fn bind_plain(
+        addr: SocketAddr,
+        front: Arc<OciFront>,
+        limits: OciLimits,
+    ) -> Result<Self, OciError> {
+        plain_allowed(addr)?;
+        Self::bind_as(addr, None, front, limits).await
+    }
+
+    async fn bind_as(
+        addr: SocketAddr,
+        acceptor: Option<TlsAcceptor>,
         front: Arc<OciFront>,
         limits: OciLimits,
     ) -> Result<Self, OciError> {
@@ -70,6 +101,16 @@ impl OciListener {
             front,
             limits,
         })
+    }
+
+    /// How the listener carries its connections.
+    #[must_use]
+    pub fn mode(&self) -> OciMode {
+        if self.acceptor.is_some() {
+            OciMode::Https
+        } else {
+            OciMode::Http
+        }
     }
 
     /// The address the socket is bound to.
@@ -98,7 +139,7 @@ impl OciListener {
 /// tests one that fails.
 pub(super) async fn accept_loop<I>(
     mut incoming: I,
-    acceptor: TlsAcceptor,
+    acceptor: Option<TlsAcceptor>,
     front: Arc<OciFront>,
     limits: OciLimits,
     mut stop: watch::Receiver<bool>,
@@ -155,13 +196,34 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
 
 /// What a connection needs besides its socket.
 struct Serving {
-    acceptor: TlsAcceptor,
+    acceptor: Option<TlsAcceptor>,
     front: Arc<OciFront>,
     limits: OciLimits,
     stop: watch::Receiver<bool>,
 }
 
 impl Serving {
+    /// The byte stream of the connection: `tcp` itself when the listener is plain, and else the
+    /// stream of its TLS handshake, which has [`OciLimits::handshake_timeout`] to finish. `None`
+    /// (and a line on stderr) if the handshake fails or takes too long.
+    async fn open(&self, tcp: TcpStream, peer: SocketAddr) -> Option<Box<dyn Io>> {
+        let Some(acceptor) = &self.acceptor else {
+            return Some(Box::new(tcp));
+        };
+        let handshake = tokio::time::timeout(self.limits.handshake_timeout, acceptor.accept(tcp));
+        match handshake.await {
+            Ok(Ok(tls)) => Some(Box::new(tls)),
+            Ok(Err(error)) => {
+                eprintln!("tierstore: oci: {peer}: TLS handshake: {error}");
+                None
+            }
+            Err(_) => {
+                eprintln!("tierstore: oci: {peer}: TLS handshake took too long");
+                None
+            }
+        }
+    }
+
     /// One connection, until its client leaves, it breaks, its lifetime ends or the listener
     /// stops; the slot is held throughout.
     async fn connection(
@@ -171,11 +233,8 @@ impl Serving {
         _slot: Result<OwnedSemaphorePermit, AcquireError>,
     ) {
         let limits = self.limits;
-        let handshake = tokio::time::timeout(limits.handshake_timeout, self.acceptor.accept(tcp));
-        let tls = match handshake.await {
-            Ok(Ok(tls)) => tls,
-            Ok(Err(error)) => return eprintln!("tierstore: oci: {peer}: TLS handshake: {error}"),
-            Err(_) => return eprintln!("tierstore: oci: {peer}: TLS handshake took too long"),
+        let Some(stream) = self.open(tcp, peer).await else {
+            return;
         };
         let front = Arc::clone(&self.front);
         let service = service_fn(move |request: Request<RequestBody>| {
@@ -186,7 +245,7 @@ impl Serving {
                 Ok::<_, Infallible>(answer)
             }
         });
-        let io = TokioIo::new(Watched::new(tls, limits.write_idle, peer));
+        let io = TokioIo::new(Watched::new(stream, limits.write_idle, peer));
         let serving = http1::Builder::new()
             .timer(TokioTimer::new())
             .header_read_timeout(limits.header_timeout)

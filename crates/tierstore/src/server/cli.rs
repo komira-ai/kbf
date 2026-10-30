@@ -32,13 +32,14 @@
 //! first byte that is not white space is `{`. Only its owner may read the file (mode 0600 or
 //! 0400), and no message of the process names a secret.
 //!
-//! `--oci-listen` adds a fourth thing: a read-only OCI distribution front over HTTPS (see
+//! `--oci-listen` adds a fourth thing: a read-only OCI distribution front (see
 //! [`oci`](super::oci)), served from the same proxy, so that podman pulls an image by digest from
-//! the tiers. It needs `--oci-tls-cert` and `--oci-tls-key` (the certificate must carry an IP
-//! subjectAltName for the address and be valid now, and the key file must not be readable by
-//! every user; the start checks); a certificate, key or prefix that
-//! cannot work exits with status 2, and one that cannot be read with status 1. The start line
-//! gets ` oci-listen=<address>`.
+//! the tiers. With `--oci-tls-cert` and `--oci-tls-key` it is HTTPS (the certificate must carry an
+//! IP subjectAltName for the address and be valid now, and the key file must not be readable by
+//! every user; the start checks). With neither it is plain HTTP, and the address must be
+//! loopback. One of the two flags without the other, a plain address that is not loopback, and a
+//! certificate, key or prefix that cannot work exit with status 2; a file that cannot be read
+//! with status 1. The start line gets ` oci-listen=<address> (http)` or ` (https)`.
 //!
 //! On SIGTERM or SIGINT the process drains (see the [`server`](super) docs): `/readyz` says 503,
 //! it serves for `--drain-lb-wait`, refuses new requests, waits for those in flight and for the
@@ -81,7 +82,9 @@ use crate::{
 
 use super::gc::{ensure_distinct as gc_distinct, gc_keys, ids as gc_ids};
 use super::keys::{ensure_distinct, read_credentials, read_only_keys};
-use super::oci::{self, OciError, OciFront, OciLimits, OciListener, OciMetrics, OciPrefix};
+use super::oci::{
+    self, OciError, OciFront, OciLimits, OciListener, OciMetrics, OciMode, OciPrefix,
+};
 use super::presign::{ensure_distinct as presign_distinct, presign_keys};
 use super::{Drained, Server, ServerConfig};
 
@@ -317,23 +320,26 @@ pub struct Cli {
     /// answers wrongly is not asked again.
     #[arg(long, default_value = "5m", value_parser = parse_duration)]
     pub backend_check_wait: Duration,
-    /// Serves a read-only OCI distribution front over HTTPS at this address, from the same tiers
-    /// (see the [`oci`](super::oci) docs): `GET` and `HEAD` of `/v2/`, of
-    /// `/v2/<name>/manifests/<digest>` and of `/v2/<name>/blobs/<digest>`, so that podman and
-    /// other registry clients pull an image by digest. Anonymous: no token is ever asked for.
-    /// Objects are read at `<--oci-prefix>blobs/sha256/<hex>`. Clients dial an IP address, so the
-    /// certificate must carry an IP subjectAltName for this address (any IP, if it is
-    /// unspecified), which the start checks. Needs `--oci-tls-cert` and `--oci-tls-key`; there is
-    /// no plain-HTTP mode. Left out, no such listener is opened.
-    #[arg(long, value_name = "ADDR", requires_all = ["oci_tls_cert", "oci_tls_key"])]
+    /// Serves a read-only OCI distribution front at this address, from the same tiers (see the
+    /// [`oci`](super::oci) docs): `GET` and `HEAD` of `/v2/`, of `/v2/<name>/manifests/<digest>`
+    /// and of `/v2/<name>/blobs/<digest>`, so that podman and other registry clients pull an
+    /// image by digest. Anonymous: no token is ever asked for. Objects are read at
+    /// `<--oci-prefix>blobs/sha256/<hex>`. With `--oci-tls-cert` and `--oci-tls-key` it is
+    /// HTTPS, and clients dial an IP address, so the certificate must carry an IP subjectAltName
+    /// for this address (any IP, if it is unspecified), which the start checks. With neither it
+    /// is plain HTTP, served only on a loopback address (127.0.0.0/8 or `::1`): a node's own
+    /// engine pulls from its own store, and the traffic never leaves the host; any other address
+    /// needs the certificate and key. Left out, no such listener is opened.
+    #[arg(long, value_name = "ADDR")]
     pub oci_listen: Option<SocketAddr>,
     /// The certificate chain (PEM) of `--oci-listen`, leaf first, issued by the CA the clients
-    /// trust. Read once at start: a new certificate takes a restart.
-    #[arg(long, value_name = "PATH", requires = "oci_listen")]
+    /// trust. Read once at start: a new certificate takes a restart. Given with
+    /// `--oci-tls-key` or not at all.
+    #[arg(long, value_name = "PATH", requires_all = ["oci_listen", "oci_tls_key"])]
     pub oci_tls_cert: Option<PathBuf>,
     /// The private key (PEM) of `--oci-tls-cert`. A file any user can read (a mode with the
     /// "other" bits set) is refused at start; a group may read it.
-    #[arg(long, value_name = "PATH", requires = "oci_listen")]
+    #[arg(long, value_name = "PATH", requires_all = ["oci_listen", "oci_tls_cert"])]
     pub oci_tls_key: Option<PathBuf>,
     /// The prefix of the keys the OCI front reads, ending in `/` (`oci/` if not given): an
     /// object is at `<prefix>blobs/sha256/<64 lowercase hex digits>`. A prefix inside
@@ -425,7 +431,8 @@ struct Built {
 /// The OCI front, as far as the flags and files go: the proxy it reads is not open yet.
 struct OciSetup {
     listen: SocketAddr,
-    acceptor: tokio_rustls::TlsAcceptor,
+    /// `None` serves plain HTTP.
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
     prefix: OciPrefix,
     metrics: Arc<OciMetrics>,
     limits: OciLimits,
@@ -644,10 +651,6 @@ fn oci_setup(cli: &Cli, server: &ServerConfig) -> Result<Option<OciSetup>, Error
             why.into()
         }
     };
-    let (Some(cert), Some(key)) = (&cli.oci_tls_cert, &cli.oci_tls_key) else {
-        let why = "--oci-listen needs --oci-tls-cert and --oci-tls-key (https only)";
-        return Err(refuse(OciError::Missing(why.to_owned())));
-    };
     let lifetime = cli.oci_connection_lifetime.unwrap_or(DEFAULT_OCI_LIFETIME);
     if lifetime.is_zero() {
         return Err(
@@ -656,7 +659,22 @@ fn oci_setup(cli: &Cli, server: &ServerConfig) -> Result<Option<OciSetup>, Error
     }
     let prefix = cli.oci_prefix.as_deref().unwrap_or(DEFAULT_OCI_PREFIX);
     let prefix = OciPrefix::new(prefix).map_err(refuse)?;
-    let acceptor = oci::acceptor(cert, key, listen).map_err(refuse)?;
+    let acceptor = match (&cli.oci_tls_cert, &cli.oci_tls_key) {
+        (Some(cert), Some(key)) => Some(oci::acceptor(cert, key, listen).map_err(refuse)?),
+        (None, None) => {
+            oci::plain_allowed(listen).map_err(refuse)?;
+            None
+        }
+        _ => {
+            let why = "--oci-tls-cert and --oci-tls-key go together: give both, or neither";
+            return Err(refuse(OciError::Missing(why.to_owned())));
+        }
+    };
+    let mode = if acceptor.is_some() {
+        OciMode::Https
+    } else {
+        OciMode::Http
+    };
     let connections = cli.oci_max_connections.unwrap_or(DEFAULT_OCI_CONNECTIONS);
     let limits = OciLimits {
         max_connections: connections as usize,
@@ -670,7 +688,7 @@ fn oci_setup(cli: &Cli, server: &ServerConfig) -> Result<Option<OciSetup>, Error
         listen,
         acceptor,
         prefix,
-        metrics: Arc::new(OciMetrics::default()),
+        metrics: Arc::new(OciMetrics::with_mode(mode)),
         limits,
     }))
 }
@@ -782,6 +800,8 @@ pub struct Addresses {
     pub s3: SocketAddr,
     /// The OCI read front, if `--oci-listen` was given.
     pub oci: Option<SocketAddr>,
+    /// How the OCI front carries its connections: `Some` exactly when [`oci`](Self::oci) is.
+    pub oci_mode: Option<OciMode>,
 }
 
 /// Opens the proxy and serves it until `stop` resolves, and then drains.
@@ -832,14 +852,20 @@ pub async fn run_serving(
     let listener = bound.map_err(|why| format!("binding {address}: {why}"))?;
     let oci = match oci {
         Some((listen, acceptor, front, limits)) => {
-            Some(OciListener::bind(listen, acceptor, front, limits).await?)
+            let bound = match acceptor {
+                Some(tls) => OciListener::bind(listen, tls, front, limits).await,
+                None => OciListener::bind_plain(listen, front, limits).await,
+            };
+            Some(bound?)
         }
         None => None,
     };
     let oci_addr = oci.as_ref().map(OciListener::local_addr).transpose()?;
+    let oci_mode = oci.as_ref().map(OciListener::mode);
     ready(Addresses {
         s3: listener.local_addr()?,
         oci: oci_addr,
+        oci_mode,
     });
     let stopping = Arc::clone(&server);
     let (oci_stop, oci_stopped) = watch::channel(false);
@@ -908,7 +934,8 @@ async fn serve_until_signalled(cli: Cli) -> Result<(), Error> {
     let announce = |bound: Addresses| {
         let mut line = format!("tierstore {version} listen={}", bound.s3);
         if let Some(oci) = bound.oci {
-            line.push_str(&format!(" oci-listen={oci}"));
+            let mode = bound.oci_mode.unwrap_or_default().as_str();
+            line.push_str(&format!(" oci-listen={oci} ({mode})"));
         }
         println!("{line}");
     };

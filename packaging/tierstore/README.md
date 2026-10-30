@@ -258,15 +258,15 @@ client before relying on either.
 ## The OCI read front
 
 With `--oci-listen`, the process also serves the objects of the store as a read-only container
-registry over HTTPS, so that podman (and the other clients of the OCI distribution API) pulls an
+registry, over HTTPS or over plain HTTP on loopback (see Two modes), so that podman (and the other clients of the OCI distribution API) pulls an
 image by digest from the same hot and cold tiers the S3 front writes to. It reads through the
 proxy in the process: no S3 credential and no hop through the S3 listener. It is off unless
 `--oci-listen` is given, and then nothing else about the process changes.
 
 | flag | what |
 |---|---|
-| `--oci-listen ADDR` | where the registry front listens. Needs `--oci-tls-cert` and `--oci-tls-key`: there is no plain-HTTP mode |
-| `--oci-tls-cert PATH`, `--oci-tls-key PATH` | the certificate chain (leaf first) and the private key, PEM. Clients dial an IP address, so the leaf must carry an IP subjectAltName for `--oci-listen` (any IP subjectAltName, if the address is `0.0.0.0` or `::`); a certificate without one, one that is expired or not yet valid, a key file any user can read (the "other" mode bits; a group may), or an unreadable file, is refused at start. The files are read once: a new certificate takes a restart, so renew it before it expires |
+| `--oci-listen ADDR` | where the registry front listens. With `--oci-tls-cert` and `--oci-tls-key` it is HTTPS; with neither it is plain HTTP and ADDR must be a loopback address (127.0.0.0/8 or `::1`): anything else, `0.0.0.0` and `::` included, is refused at start (exit 2) |
+| `--oci-tls-cert PATH`, `--oci-tls-key PATH` | both or neither (one without the other is refused at start, exit 2). The certificate chain (leaf first) and the private key, PEM. Clients dial an IP address, so the leaf must carry an IP subjectAltName for `--oci-listen` (any IP subjectAltName, if the address is `0.0.0.0` or `::`); a certificate without one, one that is expired or not yet valid, a key file any user can read (the "other" mode bits; a group may), or an unreadable file, is refused at start. The files are read once: a new certificate takes a restart, so renew it before it expires |
 | `--oci-prefix PREFIX` | the key prefix, ending in `/`, `oci/` if not given. A prefix inside `_journal/` or `_tiering/`, or one that is not plain path segments, is refused at start (exit 2) |
 | `--oci-max-connections N` | connections open at once, 256 if not given; the others wait in the kernel's backlog |
 | `--oci-connection-lifetime D` | the longest a connection lives, 1h if not given; a request being answered is finished first |
@@ -279,7 +279,31 @@ can keep the others waiting: the host's firewall rules are the control for that.
 is cut. A connection that reaches its lifetime finishes the answer it is sending for at most
 `--drain-deadline`, and is cut then. On the drain the front goes on serving through `--drain-lb-wait`, takes no new connection,
 lets the requests being answered finish, and closes what is left at `--drain-deadline`. The start
-line on stdout gets ` oci-listen=<address>` after `listen=<address>`.
+line on stdout gets ` oci-listen=<address> (https)` or ` (http)` after `listen=<address>`, and `/metricz`
+has `tierstore_oci_front_info{mode="https"}` or `{mode="http"}`. In plain mode there is no handshake,
+so the handshake time does not apply; the other limits are the same.
+
+### Two modes
+
+- **HTTPS**: with `--oci-tls-cert` and `--oci-tls-key`, at any address.
+- **Plain HTTP**: with neither, on loopback only. A node's own container engine can pull from the
+  front of its own tierstore, so the pull is a connection from the host to itself and the traffic
+  never leaves it. A connection to any address beyond loopback can be read and changed on
+  its way, so it needs TLS.
+
+A container engine that pulls over plain HTTP has to be told it may:
+
+- podman: mark the registry insecure for that location in `registries.conf`, e.g.
+
+  ```toml
+  [[registry]]
+  location = "127.0.0.1:9500"
+  insecure = true
+  ```
+
+  or pull with `--tls-verify=false`. No `certs.d` directory is needed.
+- js-oci needs to be allowed plain HTTP to a loopback registry address for such a pull; that is a
+  setting of js-oci, not of tierstore.
 
 What it serves, and nothing else (any other path is 404 and any method but GET and HEAD is 405
 `UNSUPPORTED` with `Allow: GET, HEAD`, both with the OCI error document):
@@ -370,7 +394,7 @@ that client's own settings.
 shows, in the Prometheus text format, `tierstore_oci_requests_total{route,outcome}` (routes `ping`,
 `manifest`, `blob`, `other`; outcomes `ok`, `partial`, `not_found`, `invalid`, `not_allowed`,
 `range_not_satisfiable`, `failed`), `tierstore_oci_bytes_served_total` (bytes of blobs read for
-responses) and `tierstore_oci_digest_mismatches_total`. They are not on the registry listener,
+responses), `tierstore_oci_digest_mismatches_total` and `tierstore_oci_front_info{mode="https"|"http"}` (1; the mode the front runs in). They are not on the registry listener,
 which serves nothing else. Without `--oci-listen` the path says the front is not enabled.
 
 ## Starting it

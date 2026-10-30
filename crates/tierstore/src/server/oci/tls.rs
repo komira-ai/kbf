@@ -1,5 +1,6 @@
-//! The TLS of the OCI front: the certificate and key, read once at start, and the check that the
-//! certificate names the address clients dial.
+//! The transport of the OCI front: the certificate and key of TLS, read once at start, and the
+//! check that the certificate names the address clients dial; or, with no certificate, the check
+//! that the plain HTTP listener is on loopback.
 
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::PermissionsExt as _;
@@ -23,9 +24,18 @@ pub enum OciError {
         /// What is wrong with it.
         why: String,
     },
-    /// `--oci-tls-cert` or `--oci-tls-key` is missing.
+    /// Only one of `--oci-tls-cert` and `--oci-tls-key` is given.
     #[error("{0}")]
     Missing(String),
+    /// A plain HTTP listener is asked for on an address that is not loopback.
+    #[error(
+        "--oci-listen {addr}: plain HTTP is served only on loopback (127.0.0.0/8 or ::1); a \
+         non-loopback listener needs --oci-tls-cert and --oci-tls-key"
+    )]
+    PlainNotLoopback {
+        /// The address.
+        addr: SocketAddr,
+    },
     /// A certificate or key file cannot be read.
     #[error("{flag} {path}: {source}")]
     Read {
@@ -67,6 +77,41 @@ impl OciError {
     #[must_use]
     pub fn is_invalid_flags(&self) -> bool {
         !matches!(self, Self::Read { .. } | Self::Bind { .. })
+    }
+}
+
+/// How the front's connections are carried.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OciMode {
+    /// Plain HTTP/1.1, on loopback only.
+    Http,
+    /// HTTP/1.1 over TLS.
+    #[default]
+    Https,
+}
+
+impl OciMode {
+    /// `http` or `https`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+}
+
+/// Whether the front may serve plain HTTP at `listen`: only on loopback (127.0.0.0/8 or `::1`),
+/// since a plain connection can be read and changed by whoever is on its path.
+///
+/// # Errors
+/// [`OciError::PlainNotLoopback`] if `listen` is not a loopback address (the unspecified
+/// addresses `0.0.0.0` and `::` are not).
+pub fn plain_allowed(listen: SocketAddr) -> Result<(), OciError> {
+    if listen.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err(OciError::PlainNotLoopback { addr: listen })
     }
 }
 

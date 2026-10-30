@@ -29,7 +29,9 @@ pub struct Rig {
     pub proxy: Arc<Proxy>,
     pub metrics: Arc<OciMetrics>,
     pub connector: TlsConnector,
-    tls: TlsAcceptor,
+    /// `None` for a plain front.
+    tls: Option<TlsAcceptor>,
+    plain: bool,
     front: Arc<OciFront>,
     limits: OciLimits,
     stop: watch::Sender<bool>,
@@ -42,13 +44,33 @@ impl Rig {
         Self::with(|_| {}).await
     }
 
+    /// A front that serves plain HTTP on 127.0.0.1.
+    pub async fn start_plain() -> Self {
+        Self::plain_with(|_| {}).await
+    }
+
+    /// A plain front whose limits are the defaults of the tests, changed by `change`.
+    pub async fn plain_with(change: impl FnOnce(&mut OciLimits)) -> Self {
+        let listen = "127.0.0.1:0".parse().expect("an address");
+        Self::build(true, listen, change).await
+    }
+
     /// A front whose limits are the defaults of the tests, changed by `change`.
     pub async fn with(change: impl FnOnce(&mut OciLimits)) -> Self {
+        let listen = "127.0.0.1:0".parse().expect("an address");
+        Self::build(false, listen, change).await
+    }
+
+    /// A plain front at `listen`, which must be loopback.
+    pub async fn plain_at(listen: SocketAddr) -> Self {
+        Self::build(true, listen, |_| {}).await
+    }
+
+    async fn build(plain: bool, listen: SocketAddr, change: impl FnOnce(&mut OciLimits)) -> Self {
         let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "oci-rig");
         let ca = ca();
         let files = leaf(dir.path(), "front", &ca, vec![ip("127.0.0.1")]);
-        let listen: SocketAddr = "127.0.0.1:0".parse().expect("an address");
-        let tls = acceptor(&files.cert, &files.key, listen).expect("an acceptor");
+        let tls = (!plain).then(|| acceptor(&files.cert, &files.key, listen).expect("an acceptor"));
         let hot = Arc::new(MemoryBackend::new());
         let cold = Arc::new(MemoryBackend::new());
         let mut config = ProxyConfig::new("oci-rig", 1 << 30, Arc::new(SystemClock));
@@ -68,7 +90,10 @@ impl Rig {
             drain_deadline: Duration::from_secs(30),
         };
         change(&mut limits);
-        let bound = OciListener::bind(listen, tls.clone(), front.clone(), limits).await;
+        let bound = match &tls {
+            Some(tls) => OciListener::bind(listen, tls.clone(), front.clone(), limits).await,
+            None => OciListener::bind_plain(listen, front.clone(), limits).await,
+        };
         let listener = bound.expect("bound");
         let addr = listener.local_addr().expect("an address");
         let (stop, stopped) = watch::channel(false);
@@ -80,6 +105,7 @@ impl Rig {
             metrics,
             connector: connector(&ca.pem),
             tls,
+            plain,
             front,
             limits,
             stop,
@@ -103,9 +129,12 @@ impl Rig {
     }
 
     pub async fn conn(&self) -> Conn {
-        Conn::open(self.addr, &self.connector)
-            .await
-            .expect("a connection")
+        let opened = if self.plain {
+            Conn::open_plain(self.addr).await
+        } else {
+            Conn::open(self.addr, &self.connector).await
+        };
+        opened.expect("a connection")
     }
 
     /// One request on a connection of its own.
@@ -127,7 +156,8 @@ impl Rig {
 impl Rig {
     /// Binds the address this front listens on again, which is in use.
     pub async fn bind_again(&self) -> Result<OciListener, OciError> {
-        let (tls, front) = (self.tls.clone(), self.front.clone());
+        let tls = self.tls.clone().expect("a front with TLS");
+        let front = self.front.clone();
         OciListener::bind(self.addr, tls, front, self.limits).await
     }
 }

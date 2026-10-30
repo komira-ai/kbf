@@ -16,6 +16,7 @@ use kbf_testkit::reaped::{first_line, spawn};
 use rustix::process::{Pid, Signal, kill_process};
 use tierstore::server::Drained;
 use tierstore::server::cli::{Addresses, Cli, run_serving};
+use tierstore::server::oci::OciMode;
 use tokio::sync::oneshot;
 
 use crate::client::{Conn, connector};
@@ -81,6 +82,13 @@ impl Files {
             ];
             flags.extend(more.map(str::to_owned));
         }
+        flags
+    }
+
+    /// The flags of a start with the OCI front on plain HTTP at `listen`: no certificate, no key.
+    fn plain(&self, listen: &str) -> Vec<String> {
+        let mut flags = self.flags(false);
+        flags.extend(["--oci-listen", listen].map(str::to_owned));
         flags
     }
 }
@@ -201,7 +209,8 @@ async fn the_process_announces_the_front_and_refuses_a_bad_certificate() {
     let stdout = child.stdout.take().expect("stdout");
     let (line, _reader) = first_line(stdout, Duration::from_secs(30)).expect("a start line");
     let words: Vec<&str> = line.split_whitespace().collect();
-    assert_eq!(words.len(), 4, "{line}");
+    assert_eq!(words.len(), 5, "{line}");
+    assert_eq!(words[4], "(https)", "{line}");
     assert!(words[2].starts_with("listen="), "{line}");
     let oci: SocketAddr = words[3]
         .strip_prefix("oci-listen=")
@@ -254,4 +263,149 @@ async fn an_oci_address_in_use_fails_the_start() {
     let started = run_serving(&cli, std::future::pending(), |_| {}).await;
     let why = started.expect_err("a failed start").to_string();
     assert!(why.starts_with("binding 127.0.0.1:"), "{why}");
+}
+
+/// Asserts that without a certificate and key the front is plain HTTP on a loopback address: an
+/// object put through the S3 front is pulled by digest over plain HTTP, the start reports the
+/// mode, `/metricz` says `http`, and a stop drains with nothing cut.
+#[tokio::test]
+async fn a_loopback_front_without_a_certificate_serves_plain_http() {
+    let files = files("oci-binary-plain");
+    let content = b"a layer pulled over loopback".repeat(100);
+    let hex = hex_of(&content);
+    let drained = serving(files.plain("127.0.0.1:0"), |bound| async move {
+        assert_eq!(bound.oci_mode, Some(OciMode::Http));
+        let oci = bound.oci.expect("the OCI front is bound");
+        let key = ObjectKey::new(format!("oci/blobs/sha256/{hex}")).expect("a key");
+        store(bound.s3)
+            .put_new(&key, Bytes::from(content.clone()), None)
+            .await
+            .expect("put");
+        let mut conn = Conn::open_plain(oci).await.expect("a connection");
+        let path = format!("/v2/library/app/blobs/sha256:{hex}");
+        let reply = conn.request("GET", &path, &[]).await.expect("an answer");
+        assert_eq!(reply.status, 200);
+        assert!(reply.body == content);
+        let metrics = reqwest::get(format!("http://{}/metricz", bound.s3))
+            .await
+            .expect("metricz");
+        let text = metrics.text().await.expect("text");
+        assert!(
+            text.contains("tierstore_oci_front_info{mode=\"http\"} 1\n"),
+            "{text}"
+        );
+        assert!(!text.contains("mode=\"https\""), "{text}");
+    })
+    .await;
+    assert_eq!(drained, Drained { abandoned: 0 });
+}
+
+/// Asserts that `/metricz` says `https` when the front has a certificate.
+#[tokio::test]
+async fn metricz_says_https_when_the_front_has_a_certificate() {
+    let files = files("oci-binary-https-mode");
+    let drained = serving(files.flags(true), |bound| async move {
+        assert_eq!(bound.oci_mode, Some(OciMode::Https));
+        let metrics = reqwest::get(format!("http://{}/metricz", bound.s3))
+            .await
+            .expect("metricz");
+        let text = metrics.text().await.expect("text");
+        assert!(
+            text.contains("tierstore_oci_front_info{mode=\"https\"} 1\n"),
+            "{text}"
+        );
+    })
+    .await;
+    assert_eq!(drained, Drained { abandoned: 0 });
+}
+
+/// Asserts that the process prints `(http)` after the OCI address of a plain front and serves
+/// plain HTTP there, and exits 0 on SIGTERM.
+#[tokio::test]
+async fn the_process_announces_a_plain_front() {
+    let files = files("oci-binary-plain-process");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tierstore"));
+    command
+        .args(&files.plain("127.0.0.1:0")[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = spawn(&mut command, 3).expect("spawned");
+    let stdout = child.stdout.take().expect("stdout");
+    let (line, _reader) = first_line(stdout, Duration::from_secs(30)).expect("a start line");
+    let words: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(words.len(), 5, "{line}");
+    assert_eq!(words[4], "(http)", "{line}");
+    let oci: SocketAddr = words[3]
+        .strip_prefix("oci-listen=")
+        .expect("oci-listen=")
+        .parse()
+        .expect("an address");
+    let mut conn = Conn::open_plain(oci).await.expect("a connection");
+    let reply = conn.request("GET", "/v2/", &[]).await.expect("an answer");
+    assert_eq!(reply.status, 200);
+    assert_eq!(
+        reply.must("docker-distribution-api-version"),
+        "registry/2.0"
+    );
+    drop(conn);
+    let pid = Pid::from_raw(i32::try_from(child.id()).expect("a pid")).expect("a pid");
+    kill_process(pid, Signal::TERM).expect("signalled");
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .expect("joined");
+    assert_eq!(status.expect("waited").code(), Some(0));
+}
+
+/// The status and the text on stderr of a start with `flags`, which must end before it serves.
+fn refused(flags: &[String]) -> (Option<i32>, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_tierstore"))
+        .args(&flags[1..])
+        .output()
+        .expect("ran");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Asserts that a plain front on an address that is not loopback (unspecified ones and a
+/// documentation range among them) is refused at start with status 2, and the message says why
+/// and what to give instead.
+#[tokio::test]
+async fn a_plain_front_off_loopback_is_refused_at_start() {
+    let files = files("oci-binary-plain-refused");
+    for listen in [
+        "0.0.0.0:0",
+        "[::]:0",
+        "192.0.2.1:9500",
+        "[2001:db8::1]:9500",
+    ] {
+        let (status, stderr) = refused(&files.plain(listen));
+        assert_eq!(status, Some(2), "{listen}: {stderr}");
+        assert!(
+            stderr.contains("plain HTTP is served only on loopback"),
+            "{listen}: {stderr}"
+        );
+        assert!(
+            stderr.contains("needs --oci-tls-cert and --oci-tls-key"),
+            "{listen}: {stderr}"
+        );
+        assert!(stderr.contains(listen), "{listen}: {stderr}");
+    }
+}
+
+/// Asserts that a certificate without a key, and a key without a certificate, are refused at
+/// start with status 2.
+#[tokio::test]
+async fn a_certificate_without_a_key_is_refused_at_start() {
+    let files = files("oci-binary-half-pair");
+    let cert = files.leaf.cert.to_str().expect("a path");
+    let key = files.leaf.key.to_str().expect("a path");
+    for (flag, path) in [("--oci-tls-cert", cert), ("--oci-tls-key", key)] {
+        let mut flags = files.plain("127.0.0.1:0");
+        flags.extend([flag, path].map(str::to_owned));
+        let (status, stderr) = refused(&flags);
+        assert_eq!(status, Some(2), "{flag}: {stderr}");
+        assert!(stderr.contains(flag), "{flag}: {stderr}");
+    }
 }

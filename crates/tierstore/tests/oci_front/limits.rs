@@ -11,15 +11,15 @@ use crate::rig::{Rig, hex_of};
 
 /// A small real time for the limits whose test waits for the server to act on them. No test
 /// asserts how long that takes.
-const SHORT: Duration = Duration::from_millis(200);
+pub const SHORT: Duration = Duration::from_millis(200);
 
 /// The longest a test waits for the server to do what it was told. It only stops a test that
 /// hangs, and then the test fails.
-const SAFETY: Duration = Duration::from_secs(60);
+pub const SAFETY: Duration = Duration::from_secs(60);
 
 /// Opens a connection and gets `/v2/` on it, within [`SAFETY`]: it succeeds only when a slot is
 /// free, so it shows that the server closed what held the only slot.
-async fn served_within_safety(rig: &Rig) -> u16 {
+pub async fn served_within_safety(rig: &Rig) -> u16 {
     let serve = async { rig.get("/v2/").await.status };
     tokio::time::timeout(SAFETY, serve)
         .await
@@ -28,7 +28,7 @@ async fn served_within_safety(rig: &Rig) -> u16 {
 
 /// Stores a blob that is wrong for its digest and too large for the socket buffers of both ends,
 /// and has a client ask for it and not read it: the answer is held back in the server.
-async fn hold_an_answer_back(rig: &Rig) -> Conn {
+pub async fn hold_an_answer_back(rig: &Rig) -> Conn {
     let big = vec![7u8; 64 << 20];
     let hex = hex_of(b"not these bytes");
     rig.put_under(&hex, &big).await;
@@ -40,7 +40,7 @@ async fn hold_an_answer_back(rig: &Rig) -> Conn {
 }
 
 /// Whether the server closes `tcp` without sending a byte of HTTP.
-async fn closed_by_server(mut tcp: TcpStream) -> bool {
+pub async fn closed_by_server(mut tcp: TcpStream) -> bool {
     let mut buf = Vec::new();
     let _ = tcp.read_to_end(&mut buf).await;
     !buf.starts_with(b"HTTP/")

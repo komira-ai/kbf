@@ -107,8 +107,14 @@ fn the_flags_make_the_front() {
     assert_eq!(setup.limits.header_timeout, built.server.header_timeout);
     assert_eq!(setup.limits.write_idle, built.server.body_idle_timeout);
     assert_eq!(setup.limits.drain_deadline, built.server.drain_deadline);
+    assert!(setup.acceptor.is_some());
     let shown = built.server.oci_metrics.expect("counters");
     assert!(Arc::ptr_eq(&shown, &setup.metrics));
+    assert!(
+        shown
+            .render()
+            .contains("tierstore_oci_front_info{mode=\"https\"} 1\n")
+    );
 
     let given = ["--oci-prefix", "images/v1/", "--oci-max-connections", "7"];
     let given = [&given[..], &["--oci-connection-lifetime", "90s"]].concat();
@@ -119,9 +125,9 @@ fn the_flags_make_the_front() {
     assert_eq!(setup.limits.lifetime, Duration::from_secs(90));
 }
 
-/// Asserts the flags that need `--oci-listen` are refused without it, and `--oci-listen` is
-/// refused without a certificate and a key (there is no plain-HTTP mode), and values that
-/// cannot be right are refused by the parser.
+/// Asserts the flags that need `--oci-listen` are refused without it, `--oci-listen` is accepted
+/// with a certificate and key or with neither (plain HTTP), one of the pair without the other is
+/// refused by the parser, and values that cannot be right are refused too.
 #[test]
 fn the_oci_flags_go_together() {
     let rig = Rig::new("oci-flags-parse");
@@ -134,7 +140,16 @@ fn the_oci_flags_go_together() {
     };
     let cert = rig.leaf.cert.to_str().expect("a path");
     let key = rig.leaf.key.to_str().expect("a path");
-    assert!(with(&["--oci-listen", "127.0.0.1:0"]).is_err());
+    assert!(with(&["--oci-listen", "127.0.0.1:0"]).is_ok());
+    let pair = [
+        "--oci-listen",
+        "127.0.0.1:0",
+        "--oci-tls-cert",
+        cert,
+        "--oci-tls-key",
+        key,
+    ];
+    assert!(with(&pair).is_ok());
     assert!(with(&["--oci-listen", "127.0.0.1:0", "--oci-tls-cert", cert]).is_err());
     assert!(with(&["--oci-listen", "127.0.0.1:0", "--oci-tls-key", key]).is_err());
     assert!(with(&["--oci-tls-cert", cert]).is_err());
@@ -190,7 +205,8 @@ fn a_front_that_cannot_serve_is_refused_at_start() {
     cli.oci_tls_key = Some(rig.dir.join("missing.key"));
     assert_eq!(refused(&cli).0, 1);
 
-    // The parser does not let these through; a settings struct built by hand might.
+    // The parser does not let these through; a settings struct built by hand might. They are
+    // refused on loopback too, where no certificate at all would do.
     for drop in [0, 1] {
         let mut cli = rig.cli(&[]);
         match drop {
@@ -199,7 +215,7 @@ fn a_front_that_cannot_serve_is_refused_at_start() {
         }
         let (status, why) = refused(&cli);
         assert_eq!(status, 2, "{why}");
-        assert!(why.contains("https only"), "{why}");
+        assert!(why.contains("go together"), "{why}");
     }
 }
 
@@ -261,4 +277,76 @@ fn the_help_names_the_oci_flags() {
         assert!(help.contains(flag), "{flag}");
     }
     assert!(help.contains("`oci/` if not given"));
+}
+
+/// The flags of a start whose OCI front is at `listen` with no certificate and no key.
+fn plain_cli(rig: &Rig, listen: &str) -> Cli {
+    let mut args = rig.args(&[]);
+    args.truncate(args.len() - 4);
+    *args.last_mut().expect("a listen address") = listen.to_owned();
+    Cli::try_parse_from(args).expect("flags")
+}
+
+/// Asserts that with no certificate and no key a loopback address makes a plain front (no TLS
+/// acceptor), that `/metricz` says so, and that the start line's mode is the listener's.
+#[test]
+fn a_loopback_front_without_a_certificate_is_plain() {
+    let rig = Rig::new("oci-flags-plain");
+    for listen in ["127.0.0.1:0", "127.0.0.1:9500", "[::1]:0"] {
+        let built = build(&plain_cli(&rig, listen)).expect("built");
+        let setup = built.oci.expect("a front");
+        assert!(setup.acceptor.is_none(), "{listen}");
+        assert_eq!(setup.listen.to_string(), listen);
+        let shown = built.server.oci_metrics.expect("counters").render();
+        assert!(
+            shown.contains("tierstore_oci_front_info{mode=\"http\"} 1\n"),
+            "{shown}"
+        );
+    }
+}
+
+/// Asserts that a plain front off loopback is refused at start with status 2, before anything is
+/// bound, whatever the port: the unspecified addresses and the documentation ranges of
+/// both IP versions. The message says plain HTTP is for loopback and what a wider listener needs.
+#[test]
+fn a_plain_front_off_loopback_is_refused_at_start() {
+    let rig = Rig::new("oci-flags-plain-refused");
+    for listen in [
+        "0.0.0.0:0",
+        "[::]:0",
+        "192.0.2.1:9500",
+        "[2001:db8::1]:9500",
+    ] {
+        let (status, why) = refused(&plain_cli(&rig, listen));
+        assert_eq!(status, 2, "{listen}: {why}");
+        assert!(
+            why.contains("plain HTTP is served only on loopback"),
+            "{why}"
+        );
+        assert!(
+            why.contains("needs --oci-tls-cert and --oci-tls-key"),
+            "{why}"
+        );
+        assert!(why.contains(listen), "{why}");
+    }
+}
+
+/// Asserts that a certificate and key keep the front HTTPS at an address that is not loopback,
+/// with the checks of the certificate as before.
+#[test]
+fn a_certificate_and_key_allow_an_address_off_loopback() {
+    let rig = Rig::new("oci-flags-tls-wide");
+    let wide = leaf(&rig.dir, "wide", &ca(), vec![ip("192.0.2.1")]);
+    let mut cli = rig.cli(&[]);
+    cli.oci_listen = Some("192.0.2.1:9500".parse().expect("an address"));
+    cli.oci_tls_cert = Some(wide.cert);
+    cli.oci_tls_key = Some(wide.key);
+    let setup = build(&cli).expect("built").oci.expect("a front");
+    assert!(setup.acceptor.is_some());
+    // A certificate for another address is refused as before.
+    let mut cli = rig.cli(&[]);
+    cli.oci_listen = Some("192.0.2.1:9500".parse().expect("an address"));
+    let (status, why) = refused(&cli);
+    assert_eq!(status, 2, "{why}");
+    assert!(why.contains("no IP subjectAltName for 192.0.2.1"), "{why}");
 }
