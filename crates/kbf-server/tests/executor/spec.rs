@@ -17,6 +17,13 @@ fn code(finished: &Finished) -> Code {
     }
 }
 
+fn message(finished: &Finished) -> String {
+    match finished {
+        Finished::Failed(status) => status.message.clone(),
+        other => panic!("not a failure: {other:?}"),
+    }
+}
+
 async fn posted(rig: &mut Rig) -> Posted {
     rig.pump().await;
     let _caller = rig.submit(3);
@@ -252,11 +259,11 @@ async fn a_run_whose_inputs_are_not_measured_books_the_allowance_and_says_so() {
     );
 }
 
-/// Catches a run whose disk the host cannot hold being posted, or being taken for a fault of
-/// the host: with the pool's shape under what the run books, the lease server answers
-/// `limits-exceed-shape`, nothing is queued, the host stays held (a refusal is not a reason to
-/// drop or drain it), and the action ends as the farm's to run again, as every other refusal
-/// does. With a shape that holds the run, the same executor posts it.
+/// Catches a run whose limits the pool's shape cannot hold being rerun for ever: every host
+/// shares the shape, so the refusal `limits-exceed-shape` is the caller's, not the farm's.
+/// Nothing is queued, the host stays held (a refusal is not a reason to drop or drain it), and
+/// the action ends `InvalidArgument` (no rerun), the message naming the limit (disk, with the
+/// bytes asked) and the shape. With a shape that holds the run, the same executor posts it.
 #[tokio::test(start_paused = true)]
 async fn a_run_whose_disk_exceeds_the_hosts_shape_is_refused_cleanly() {
     let booked = INPUT_BYTES + 8 * GIB + DISK_MARGIN;
@@ -271,7 +278,16 @@ async fn a_run_whose_disk_exceeds_the_hosts_shape_is_refused_cleanly() {
     rig.pump().await;
     let caller = rig.submit(3);
     let finished = rig.until_done(&caller, 3).await;
-    assert_eq!(code(&finished), Code::Internal, "{finished:?}");
+    assert_eq!(code(&finished), Code::InvalidArgument, "{finished:?}");
+    let said = message(&finished);
+    assert!(
+        said.contains("limits") && said.contains("shape"),
+        "the message names neither the limits nor the shape: {said}"
+    );
+    assert!(
+        said.contains(&format!("disk {booked} bytes")),
+        "the message does not name the disk asked: {said}"
+    );
     assert!(rig.runs().await.is_empty(), "a run the host cannot hold");
     let asked = rig
         .requests()
@@ -294,4 +310,22 @@ async fn a_run_whose_disk_exceeds_the_hosts_shape_is_refused_cleanly() {
     .await;
     let run = posted(&mut rig).await;
     assert_eq!(rig.fake.run_disk_bytes(&run.run), Some(booked));
+}
+
+/// Catches the shape rule swallowing every refusal: a refusal that is not about the limits
+/// (here a run id that exists) is still the farm's to run again, and ends as infrastructure.
+#[tokio::test(start_paused = true)]
+async fn a_refusal_that_is_not_about_the_shape_is_still_infrastructure() {
+    let mut rig = Rig::pooled(&["node1"], 1, 16, |_| {}, |_| {}).await;
+    rig.pump().await;
+    assert!(rig.fake.refuse_posts("node1", Some("run-exists")));
+    let caller = rig.submit(3);
+    let finished = rig.until_done(&caller, 3).await;
+    assert_eq!(code(&finished), Code::Internal, "{finished:?}");
+    assert!(
+        message(&finished).contains("run-exists"),
+        "{}",
+        message(&finished)
+    );
+    assert!(rig.runs().await.is_empty());
 }
