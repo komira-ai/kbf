@@ -2766,26 +2766,19 @@ dependencies = [
 name = "kbf-objstore"
 version = "0.1.0"
 dependencies = [
- "base64 0.23.1",
  "bytes",
  "clap",
  "futures",
  "hex",
- "hmac 0.13.0",
- "http 1.5.0",
- "http-body 1.1.0",
  "kbf-objstore",
  "kbf-segments",
  "kbf-testkit",
  "kbf-threads",
  "kbf-types",
- "md-5 0.11.0",
- "reqwest",
- "roxmltree",
+ "objstore-s3",
  "sha2 0.11.0",
  "thiserror",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -3872,6 +3865,28 @@ dependencies = [
  "objc2-app-kit",
  "objc2-core-foundation",
  "objc2-foundation",
+]
+
+[[package]]
+name = "objstore-s3"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "bytes",
+ "futures",
+ "hex",
+ "hmac 0.13.0",
+ "http 1.5.0",
+ "http-body 1.1.0",
+ "kbf-testkit",
+ "md-5 0.11.0",
+ "objstore-s3",
+ "reqwest",
+ "roxmltree",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5182,7 +5197,7 @@ dependencies = [
 
 [[package]]
 name = "tierstore"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "aws-sdk-s3",

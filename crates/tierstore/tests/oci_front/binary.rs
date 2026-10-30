@@ -175,8 +175,8 @@ async fn an_object_put_over_s3_is_pulled_by_digest_over_https() {
     assert_eq!(drained, Drained { abandoned: 0 });
 }
 
-/// Asserts that without the OCI flags no such listener is bound and `/metricz` says the front is
-/// not enabled.
+/// Asserts that without the OCI flags no such listener is bound and `/metricz` has no block of
+/// the front, only that of the proxy.
 #[tokio::test]
 async fn without_the_flags_there_is_no_front() {
     let files = files("oci-binary-off");
@@ -187,8 +187,9 @@ async fn without_the_flags_there_is_no_front() {
             .expect("metricz");
         assert_eq!(metrics.status(), 200);
         let text = metrics.text().await.expect("text");
-        assert!(text.contains("not enabled"), "{text}");
-        assert!(!text.contains("tierstore_oci_requests_total"));
+        assert!(!text.contains("tierstore_oci_requests_total"), "{text}");
+        let hits = r#"tierstore_hits_total{tier="hot",op="get"} 0"#;
+        assert!(text.contains(hits), "{text}");
     })
     .await;
     assert_eq!(drained, Drained { abandoned: 0 });

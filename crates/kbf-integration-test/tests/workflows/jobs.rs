@@ -18,6 +18,19 @@ fn job_of<'a>(root: &'a Node, job: &str) -> Result<&'a [(Node, Node)], String> {
     }
 }
 
+/// The job `job`'s `name:` (what its check is called); `None` without one. An error when it is
+/// not a string.
+pub fn job_name(text: &str, job: &str) -> Result<Option<String>, String> {
+    let root = yaml::load(text)?;
+    match get(job_of(&root, job)?, "name") {
+        None => Ok(None),
+        Some(n) => n
+            .as_str()
+            .map(|n| Some(n.to_owned()))
+            .ok_or_else(|| format!("the `name` of job `{job}` is not a string")),
+    }
+}
+
 /// The environment the job `job` runs in: `None` without `environment:`; the name when
 /// it is a string or a mapping with a string `name:`. An error for any other shape.
 pub fn job_environment(text: &str, job: &str) -> Result<Option<String>, String> {
