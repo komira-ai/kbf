@@ -18,6 +18,18 @@
 //!    packs' [`kbf_front::VerifyingKeys`] until the ingest ends; and
 //! 3. is not recorded in the pack index, asked again for that one key just before its delete.
 //!
+//! **The invariant that makes a delete safe.** The janitor takes a claim on the key in the same
+//! registry the ingests hold keys in, after the index's last answer for the page and held through
+//! the index's answer for that key and the delete. A claim and a hold on one key exclude each
+//! other under one lock: an ingest that has begun makes the janitor keep the key, and an ingest
+//! that begins after the claim is refused (`Expired`) before it reads anything. So the index is
+//! never told of a pack whose object is being deleted. An ingest also refuses a key as old as
+//! `kbf_pack::MIN_GRACE`, the least grace the flag takes, so an over-age key (a run seen as ended
+//! only after a long outage) is never committed. The leadership is asked before each page and each
+//! delete, and a sweep that finds it lost stops (`abandoned`). A 403 on a delete ends the
+//! sweep at the first key (a key that may not delete may not delete any), and so do a number of
+//! deletes failing in a row; both are counted in `sweep_errors` and logged once.
+//!
 //! A key whose name the parser does not understand is kept and counted (`kept_unparsed`).
 //!
 //! **Only `cas/b/`.** The listing is for the prefix `cas/b/`, each key it returns is checked to
@@ -473,7 +485,12 @@ impl Janitor {
                 let verifying = Arc::clone(&verifying);
                 move |key| verifying.is_held(key)
             }),
-            claim: Box::new(|_| Some(Box::new(()))),
+            // Atomic with the ingests' holds: see `kbf_front::VerifyingKeys`.
+            claim: Box::new(move |key| {
+                verifying
+                    .claim(key)
+                    .map(|claim| Box::new(claim) as kbf_pack::Claim)
+            }),
         };
         let sweeper = Arc::new(Sweeper::new(store, index, config, gates));
         let pass: Pass = Box::new(move |now| {

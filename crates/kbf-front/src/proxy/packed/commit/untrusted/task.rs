@@ -60,9 +60,10 @@
 //!
 //! What is not decided here:
 //!
-//! - **The age of the key.** [`PackKeyMint::verify`] says the minute a key was minted in, and
-//!   `ingest` enforces no age: the executor knows the run's wall time and decides when a key has
-//!   expired.
+//! - **The age of the run's wall.** [`PackKeyMint::verify`] says the minute a key was minted in,
+//!   and `ingest` refuses a key as old as [`kbf_pack::MIN_GRACE`] (`Expired`), the age from which
+//!   the janitor of `cas/b/` may delete it; a younger key is the executor's to judge against the
+//!   run's wall time.
 //! - Whether the paths are the Command's declared outputs (the executor knows the Command).
 //! - A replaced object (the store's create-only write is the guard).
 //!
@@ -73,11 +74,13 @@
 //! The wiring of the executor builds the backend so.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use kbf_meta::Closure;
 use kbf_objstore::{ByteRange, ObjectKey};
 use kbf_pack::{
-    MAX_LARGE, MAX_PACKS, ShapeError, Slot, TaskManifest, TaskPackKey, check_records, check_shape,
+    MAX_LARGE, MAX_PACKS, MIN_GRACE, ShapeError, Slot, TaskManifest, TaskPackKey, check_records,
+    check_shape,
 };
 use kbf_pack_index::{BlobDigest, NewPack, PackBlob};
 use kbf_proto::reapi::{self, ActionResult};
@@ -234,7 +237,8 @@ pub async fn ingest(
 ///
 /// Every key of `keys` is held in [`Packs::verifying_keys`] from the start of the call until it
 /// returns or is dropped, so the janitor of `cas/b/` never deletes a pack or a large object this
-/// ingest is reading or copying, however old its key says it is.
+/// ingest is reading or copying, however old its key says it is. A key the janitor has claimed
+/// for its delete, or one as old as [`kbf_pack::MIN_GRACE`], is refused as `Expired`.
 ///
 /// Every ending is counted: an ingest (`kbf_pack_ingests_total`, with the packs of the run in
 /// `kbf_pack_ingest_packs_total` and the bytes of its large objects in
@@ -249,18 +253,6 @@ pub async fn ingest_set(
     action: &Digest,
     limits: &UntrustedLimits,
 ) -> Ingested {
-    // Every key of the set is held from here to the end of the call, or its being dropped, so the
-    // janitor of `cas/b/` never deletes what this ingest is reading or copying.
-    let _verifying = packs
-        .verifying
-        .hold(
-            keys.packs()
-                .iter()
-                .chain(keys.large())
-                .map(|key| key.key().to_owned())
-                .collect(),
-        )
-        .ok();
     let done = Ingest {
         packs,
         backend,
@@ -329,6 +321,17 @@ enum Place {
 
 impl Ingest<'_> {
     async fn run(&self) -> Step<Ran> {
+        // Every key of the set is held from here to the end of the run, or its being dropped, and
+        // a key the janitor has claimed for its delete refuses the run before anything is read:
+        // the janitor never deletes what this ingest is reading or copying, and this ingest never
+        // records a pack whose object the janitor is deleting (`verifying`).
+        let names = self.keys.packs().iter().chain(self.keys.large());
+        let names = names.map(|key| key.key().to_owned()).collect();
+        let _held = self
+            .packs
+            .verifying
+            .hold(names)
+            .map_err(|_| Stop::from(RejectReason::Expired))?;
         let first = self.verified()?;
         let size = self.length(&first.object).await?;
         let (footer, entry) = self.footer(&first.object, size, true).await?;
@@ -403,9 +406,16 @@ impl Ingest<'_> {
             if slot_of(key) != Some(slot) {
                 return Err(wrong_key());
             }
-            self.mint
+            let minted = self
+                .mint
                 .verify(key, self.action)
                 .map_err(|_| wrong_key())?;
+            // A key as old as the longest it can be in use is never committed: the janitor may
+            // delete it from that age on.
+            let age = self.packs.now().duration_since(minted);
+            if age.unwrap_or(Duration::ZERO) >= MIN_GRACE {
+                return Err(RejectReason::Expired.into());
+            }
         }
         Ok(first)
     }

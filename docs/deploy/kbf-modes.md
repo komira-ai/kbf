@@ -267,7 +267,15 @@ the store of `--pack-store-endpoint` (same endpoint, bucket and region), which t
 as it needs `--task-secret-file` and `--pack-index`. A sweep lists `--task-janitor-page-size`
 (default 500) keys at a time and waits `--task-janitor-page-pause-ms` (default 1000) after each
 page, which bounds how fast it lists and deletes. `--task-janitor-dry-run` counts and logs what a
-sweep would delete and deletes nothing. `GET /metrics` has `kbf_cas_b_janitor_listed_total`,
+sweep would delete and deletes nothing. A key the janitor is about to delete is claimed in the
+registry the ingests hold their keys in, after the pack index's last answer and through the delete,
+and a claim and a hold on one key exclude each other: an ingest that has begun makes the janitor
+keep the key, and one that begins after the claim is refused (`expired`) before it reads anything.
+An ingest also refuses a key as old as the least grace (18000 s), so a key seen as ended only
+after a long outage is never committed. The leadership is asked before each page and each delete,
+and a sweep that finds it lost stops (`..._abandoned_total`). A 403 on a delete ends the sweep at
+that key, and so do 5 deletes failing in a row; each is one `..._sweep_errors_total` and one log
+line. `GET /metrics` has `kbf_cas_b_janitor_listed_total`,
 `..._reaped_total`, `..._kept_young_total`, `..._kept_verifying_total`,
 `..._kept_referenced_total`, `..._kept_unparsed_total`, `..._kept_outside_total`,
 `..._would_reap_total`, `..._reap_errors_total` (deletes the store refused, retried by the next

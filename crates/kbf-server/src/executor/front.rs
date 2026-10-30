@@ -331,8 +331,7 @@ fn reason(why: kbf_front::RejectReason) -> RejectReason {
         Front::HashMismatch => RejectReason::HashMismatch,
         Front::BadManifest => RejectReason::BadManifest,
         Front::Incomplete => RejectReason::Incomplete,
-        // The key cannot be used any more; the run is refused as one with a key that is not its.
-        Front::Expired => RejectReason::WrongKey,
+        Front::Expired => RejectReason::Expired,
     }
 }
 

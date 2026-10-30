@@ -138,7 +138,7 @@ pub enum SweepError {
     /// The index could not say which keys it records.
     #[error("sweep: the pack index failed: {0}")]
     Index(#[source] PackIndexError),
-    /// The store answered a delete with 401 or 403: the key may not delete under the prefix, and
+    /// The store answered a delete with 403: the key may not delete under the prefix, and
     /// no other delete of the sweep would be allowed either.
     #[error("sweep: the store refused to let this key delete under {SWEPT_PREFIX}: {0}")]
     Denied(#[source] ObjectStoreError),
@@ -184,13 +184,17 @@ impl<S: ObjectStore> Sweeper<S> {
     /// before stays deleted.
     pub async fn sweep(&self, now: SystemTime) -> Result<SweepReport, SweepError> {
         let mut report = SweepReport::default();
-        if !(self.gates.is_leader)() {
-            return Ok(report);
-        }
-        report.led = true;
         let prefix = KeyPrefix::new(SWEPT_PREFIX).expect("the swept prefix is a valid prefix");
         let mut after: Option<ListToken> = None;
+        let mut failures = 0;
         loop {
+            // Asked before each page and before each delete: a server that stops leading stops
+            // deleting at once, and says so if it had begun.
+            if !(self.gates.is_leader)() {
+                report.abandoned = report.led;
+                return Ok(report);
+            }
+            report.led = true;
             let page = self
                 .store
                 .list(&prefix, after.as_ref(), self.config.page)
@@ -222,7 +226,10 @@ impl<S: ObjectStore> Sweeper<S> {
                     candidates.push(object.key.clone());
                 }
             }
-            self.judge(candidates, &mut report).await?;
+            self.judge(candidates, &mut report, &mut failures).await?;
+            if report.abandoned {
+                return Ok(report);
+            }
             match page.next {
                 Some(token) => after = Some(token),
                 None => return Ok(report),
@@ -236,6 +243,7 @@ impl<S: ObjectStore> Sweeper<S> {
         &self,
         candidates: Vec<ObjectKey>,
         report: &mut SweepReport,
+        failures: &mut usize,
     ) -> Result<(), SweepError> {
         if candidates.is_empty() {
             return Ok(());
@@ -248,6 +256,17 @@ impl<S: ObjectStore> Sweeper<S> {
             if !orphans.contains(&key.to_string()) {
                 continue;
             }
+            if !(self.gates.is_leader)() {
+                report.abandoned = true;
+                return Ok(());
+            }
+            // From here to the end of the delete nothing may begin to verify the key (and
+            // if something already does, the key is kept): the claim is taken after the last
+            // answer of the page and held through the index's answer for this key and the delete.
+            let Some(_claim) = (self.gates.claim)(&key.to_string()) else {
+                report.verifying += 1;
+                continue;
+            };
             // The page was judged a moment ago: a pack may have been recorded since.
             if self.unreferenced(vec![key.to_string()]).await?.is_empty() {
                 report.referenced += 1;
@@ -262,10 +281,22 @@ impl<S: ObjectStore> Sweeper<S> {
                 Ok(()) => {
                     tracing::info!(%key, "deleted an orphan pack");
                     report.deleted += 1;
+                    *failures = 0;
+                }
+                Err(error @ ObjectStoreError::Service { status: 403, .. }) => {
+                    return Err(SweepError::Denied(error));
                 }
                 Err(error) => {
                     tracing::warn!(%key, %error, "could not delete an orphan pack");
                     report.delete_failed += 1;
+                    *failures += 1;
+                    if *failures >= self.config.max_consecutive_failures {
+                        let failures = *failures;
+                        return Err(SweepError::Failing {
+                            failures,
+                            last: error,
+                        });
+                    }
                 }
             }
         }

@@ -41,6 +41,9 @@ pub enum RejectReason {
     BadManifest,
     /// An output the manifest names is not in the pack.
     Incomplete,
+    /// A key is as old as the longest it can be in use, or the janitor of `cas/b/` has claimed
+    /// it for its delete: the pack is not read.
+    Expired,
 }
 
 impl fmt::Display for RejectReason {
@@ -53,6 +56,7 @@ impl fmt::Display for RejectReason {
             Self::HashMismatch => "a record does not hash to its digest",
             Self::BadManifest => "bad manifest",
             Self::Incomplete => "an output is missing",
+            Self::Expired => "the key is too old to be ingested",
         })
     }
 }

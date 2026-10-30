@@ -12,6 +12,7 @@ fn every_reject_reason_says_something_different() {
         RejectReason::HashMismatch,
         RejectReason::BadManifest,
         RejectReason::Incomplete,
+        RejectReason::Expired,
     ];
     let words: std::collections::BTreeSet<String> = all.iter().map(ToString::to_string).collect();
     assert_eq!(words.len(), all.len());

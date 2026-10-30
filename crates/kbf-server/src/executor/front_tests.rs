@@ -762,6 +762,7 @@ fn every_reason_of_the_frontend_is_the_executors_own() {
         (Front::HashMismatch, RejectReason::HashMismatch),
         (Front::BadManifest, RejectReason::BadManifest),
         (Front::Incomplete, RejectReason::Incomplete),
+        (Front::Expired, RejectReason::Expired),
     ];
     assert_eq!(pairs.len(), Front::ALL.len());
     for (front, ours) in pairs {
