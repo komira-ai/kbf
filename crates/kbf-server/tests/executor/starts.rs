@@ -19,7 +19,7 @@ fn invalid(finished: &Finished) -> Code {
 /// Catches an action that does not run end to end: placed on the leased host's worker, posted
 /// as a run of the task tool, read back at its exit, ingested, reported, acknowledged and
 /// answered to the caller, with the task given what it needs (the image without its scheme,
-/// the tool, the secrets as arguments, the pack under `cas/b`, the host's own store proxy, a
+/// the secrets as arguments, the pack under `cas/b`, the host's own store proxy, a
 /// url good for the run's wall time) and the lease server asked for one lease and one run.
 #[tokio::test(start_paused = true)]
 async fn an_action_runs_end_to_end() {
@@ -33,7 +33,14 @@ async fn an_action_runs_end_to_end() {
     assert_eq!(runs.len(), 1, "{runs:?}");
     let run = &runs[0];
     assert_eq!(run.arg("--action"), Some(format!("{}/7", hex(7)).as_str()));
-    assert_eq!(run.args[0], "/mnt/kbf-tools/kbf-task");
+    // The kbf image keeps the task tool as its entrypoint: the arguments are its flags, with
+    // no path in front, and the run is launched from that image with nothing mounted.
+    assert_eq!(run.args[0], "--action");
+    assert_eq!(
+        rig.fake.run_image(&run.run).as_deref(),
+        Some(crate::rig::IMAGE.trim_start_matches("docker://"))
+    );
+    assert_eq!(rig.fake.run_mounts(&run.run), Some(Vec::new()));
     assert_eq!(run.arg("--grant-token"), Some("read-token-0001"));
     assert_eq!(run.arg("--grant-url"), Some("https://grant.test:9400"));
     assert!(run.args.contains(&"--insecure-argv-secrets".to_owned()));

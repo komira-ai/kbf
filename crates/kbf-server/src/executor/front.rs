@@ -14,12 +14,12 @@
 //!   preparation's: it signs for one store endpoint and the signer limits the object. A run
 //!   that cannot be prepared is the caller's ([`MintError::Refused`]) unless the store could
 //!   not be read ([`MintError::Unavailable`]): see [`RunPrep`]'s [`PrepareFault`].
-//! - **The action's facts** are read from the Action and the Command in the CAS: the image from
-//!   the `container-image` platform property, which must name the image by digest (an action
-//!   that names none is run in the operator's default image, if there is one), and the
-//!   timeout. Whether the image sets an `ENTRYPOINT` is in the image's config, which the
-//!   frontend never reads, so it is not known: every action is refused as such unless the
-//!   operator said no image of the farm sets one.
+//! - **The action's facts** are read from the Action and the Command in the CAS: the
+//!   `container-image` platform property, which names the BASE environment the Command sees and
+//!   must be, by digest, the base the executor serves (an action that names none uses it); and
+//!   the timeout. The image a run is launched from is the kbf image, built from that base and
+//!   set by the operator: it keeps its `ENTRYPOINT` (the task tool), so no action's image is
+//!   launched and no entrypoint is looked for.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -51,6 +51,9 @@ pub struct PreparedRun {
     pub grant_token: Secret,
     /// The Unix second the write and the grant stop working at.
     pub not_after: u64,
+    /// The bytes of the input closure the task fetches; `None` when the preparation did not
+    /// measure it.
+    pub input_bytes: Option<u64>,
 }
 
 /// Why a run could not be prepared.
@@ -114,6 +117,7 @@ impl RunPrepare for RunPrep {
             grant_url: run.read_grant.url,
             grant_token: Secret::new(run.read_grant.token.expose()),
             not_after: run.read_grant.not_after,
+            input_bytes: Some(run.closure.input_bytes()),
         })
     }
 }
@@ -159,10 +163,12 @@ pub struct FrontParts {
     pub mint: PackKeyMint,
     /// The preparation of a run.
     pub prepare: Arc<dyn RunPrepare>,
-    /// Whether the operator says no image of the farm sets an `ENTRYPOINT`.
-    pub images_have_no_entrypoint: bool,
-    /// The image, pinned by digest, of an action that names none.
-    pub default_image: Option<ImageRef>,
+    /// The base environment this executor serves, pinned by digest: the one image an action's
+    /// `container-image` may name (an action that names none gets it).
+    pub base_image: ImageRef,
+    /// The kbf image, pinned by digest, built from [`FrontParts::base_image`]: the image every
+    /// run is launched from.
+    pub kbf_image: ImageRef,
 }
 
 /// What [`Front`] holds of one run between the three steps.
@@ -264,6 +270,7 @@ impl Ingest for Front {
                 grant: Some(ReadGrant {
                     url: prepared.grant_url,
                     token: prepared.grant_token,
+                    input_bytes: prepared.input_bytes,
                 }),
                 not_after: prepared.not_after,
             },
@@ -360,19 +367,15 @@ impl Inputs for Front {
             .ok_or_else(|| InputsError::Invalid("the action names no command".to_owned()))?;
         let command = cas_digest(command).map_err(InputsError::Invalid)?;
         let command: Command = self.read("command", &command).await?;
-        let image = image_of(&action, &command, self.parts.default_image.as_ref())?;
-        if !self.parts.images_have_no_entrypoint {
-            return Err(InputsError::Invalid(
-                "whether the action's image sets an ENTRYPOINT is in the image's config, which \
-                 the frontend does not read, and the task tool cannot run under one: set \
-                 --executor-images-have-no-entrypoint when no image of the farm sets one"
-                    .to_owned(),
-            ));
-        }
+        check_base(
+            &action,
+            &command,
+            &self.parts.base_image,
+            &self.parts.kbf_image,
+        )?;
         Ok(ActionFacts {
-            image,
+            image: self.parts.kbf_image.to_string(),
             timeout: timeout_of(&action)?,
-            has_entrypoint: false,
         })
     }
 
@@ -389,29 +392,33 @@ impl Inputs for Front {
     }
 }
 
-/// The action's image, by digest, from the platform of the Action or else the Command's; the
-/// operator's `default` if the action names none.
+/// Refuses an action whose `container-image` is not the base environment `base` this executor
+/// serves. The property is read from the Action's platform or else the Command's; one that
+/// names none means the base. Only the manifest digest is compared: two spellings of one digest
+/// are one image. The refusal names both images, and the kbf image the run would use.
 #[allow(deprecated)]
-fn image_of(
+fn check_base(
     action: &Action,
     command: &Command,
-    default: Option<&ImageRef>,
-) -> Result<String, InputsError> {
+    base: &ImageRef,
+    kbf: &ImageRef,
+) -> Result<(), InputsError> {
     let platform: Option<&reapi::Platform> = action.platform.as_ref().or(command.platform.as_ref());
     let named = platform
         .and_then(|p| p.properties.iter().find(|p| p.name == IMAGE_PROPERTY))
         .map(|p| p.value.as_str());
     let Some(value) = named else {
-        return default.map(ImageRef::to_string).ok_or_else(|| {
-            InputsError::Invalid(format!(
-                "the action names no {IMAGE_PROPERTY} property, and the executor has no \
-                 --executor-default-image"
-            ))
-        });
+        return Ok(());
     };
-    ImageRef::parse(value)
-        .map(|image| image.to_string())
-        .map_err(|e| InputsError::Invalid(e.to_string()))
+    let image = ImageRef::parse(value).map_err(|e| InputsError::Invalid(e.to_string()))?;
+    match image.digest() == base.digest() {
+        true => Ok(()),
+        false => Err(InputsError::Invalid(format!(
+            "the action's {IMAGE_PROPERTY} {image} is not the base environment this executor \
+             serves, {base} (runs are launched from the kbf image {kbf}, which is built from \
+             it): name the served base, or none"
+        ))),
+    }
 }
 
 /// The action's timeout; none if it names none or zero.

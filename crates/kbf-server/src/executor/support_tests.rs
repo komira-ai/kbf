@@ -56,7 +56,6 @@ impl Inputs for Easy {
         Ok(ActionFacts {
             image: format!("registry.test/app@sha256:{}", "ab".repeat(32)),
             timeout: Some(Duration::from_secs(20)),
-            has_entrypoint: false,
         })
     }
 
@@ -69,6 +68,7 @@ impl Inputs for Easy {
         Ok(ReadGrant {
             url: "https://grant.test:9400".to_owned(),
             token: Secret::new("token"),
+            input_bytes: Some(3 * GIB),
         })
     }
 }

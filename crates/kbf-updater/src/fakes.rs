@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::inventory::{Host, Role};
 use crate::ports::{
     Apply, Clock, Drain, DrainStatus, FrontendControl, Health, HealthCheck, InstallAnswer,
-    Installed, Installer, PortError, Report, SafeToStop, Stop, Verdict,
+    Installed, Installer, Placed, PortError, Report, SafeToStop, Stop, Verdict,
 };
 use crate::version::Version;
 
@@ -459,6 +459,10 @@ impl FakeDrain {
 }
 
 impl Drain for FakeDrain {
+    fn placed(&self, _host: &Host) -> Result<Placed, PortError> {
+        Ok(Placed::In)
+    }
+
     fn drain(&self, host: &Host, deadline: Option<Duration>) -> Result<(), PortError> {
         self.log.push(Event::Drain(
             host.alias.clone(),
