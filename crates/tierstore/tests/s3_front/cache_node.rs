@@ -267,3 +267,82 @@ fn check_config_without_a_file_is_a_usage_error() {
     assert_eq!(code, 2);
     assert!(said.contains("--config"), "{said}");
 }
+
+/// The file of a storage node with an `[oci]` table holding `oci`.
+fn oci_file(files: &Files, oci: &str) -> String {
+    let text = format!(
+        r#"
+[server]
+listen          = "127.0.0.1:0"
+proxy_id        = "bin-oci"
+bucket          = "tier-bucket"
+access_key_file = "{key}"
+
+[hot_store]
+kind   = "memory"
+budget = 1048576
+
+[cold_store]
+kind = "memory"
+
+[oci]
+{oci}
+"#,
+        key = files.key.display(),
+    );
+    files.secret("oci.toml", &text).display().to_string()
+}
+
+/// Asserts that `--check-config` of a storage-node file with a valid `[oci]` table passes with
+/// no output and status 0, on a loopback address and on an address that is not loopback (where a
+/// start warns that it serves plain HTTP, and the check does not), and that it binds nothing: the
+/// OCI address is held by a listener of the test, which a check that bound it would have found in
+/// use.
+#[test]
+fn check_config_accepts_a_storage_node_with_oci_without_a_warning_or_a_bind() {
+    let files = Files::new("bin-check-oci-good");
+    let held = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = held.local_addr().unwrap().port();
+    for listen in [format!("127.0.0.1:{port}"), format!("0.0.0.0:{port}")] {
+        let config = oci_file(&files, &format!("listen = \"{listen}\""));
+        assert_eq!(
+            run(&checking(&config)),
+            (0, String::new(), String::new()),
+            "{listen}"
+        );
+    }
+    drop(held);
+}
+
+/// Asserts that `--check-config` refuses an `[oci]` table a start refuses, with the start's
+/// message and status 2: a certificate file that is not there, and a prefix that overlaps
+/// `_journal/`; and a certificate without its key.
+#[test]
+fn check_config_refuses_a_bad_oci_table_with_the_message_of_a_start() {
+    let files = Files::new("bin-check-oci-bad");
+    let key = files.secret("oci.key", "not a key\n").display().to_string();
+    let cases = [
+        (
+            format!(
+                "listen = \"127.0.0.1:0\"\ntls_cert_file = \"/no/such/cert.pem\"\ntls_key_file = \"{key}\""
+            ),
+            "/no/such/cert.pem",
+        ),
+        (
+            "listen = \"127.0.0.1:0\"\nprefix = \"_journal/x/\"".to_owned(),
+            "overlaps",
+        ),
+        (
+            format!("listen = \"127.0.0.1:0\"\ntls_cert_file = \"{key}\""),
+            "tls_key_file",
+        ),
+    ];
+    for (oci, want) in cases {
+        let config = oci_file(&files, &oci);
+        let (code, out, said) = run(&checking(&config));
+        assert_eq!((code, out.as_str()), (2, ""), "{oci}");
+        assert!(said.contains(want), "{want}: {said}");
+        let (_, _, started) = run(&["--config".to_owned(), config]);
+        assert_eq!(said, started, "{oci}");
+    }
+}
