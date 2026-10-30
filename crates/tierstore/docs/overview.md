@@ -45,6 +45,4 @@ A write goes to the hot tier and is acknowledged once a journal entry for it is 
 
 These are planned for the v1 shape and are not in the code on main. Nothing here can be configured today.
 
-- **Write-through.** A cache node sending writes to the upstream before it answers, so that a write is never only on the node. Today a cache node is read-only.
 - **Client retries on 503.** Clients retrying a 503 with jittered waits, and the server waiting briefly for a free put slot before it answers 503.
-- **Hot and cold counters.** Hit, miss, byte and cold-read counters for the two tiers.

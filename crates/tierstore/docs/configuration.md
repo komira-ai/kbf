@@ -2,7 +2,7 @@
 
 tierstore is configured by flags, or by one TOML file given with `--config <path>`. The two make the same settings and run the same code: the file is read into the settings the flags make, and a key that is left out has the default of its flag. A file holds no secret, only the paths of key files.
 
-> `--config` and `--print-config` are on main and not in the latest release (v0.0.38). Every flag below works in every release. A file has one of two shapes, told apart by its tables: a storage node (a hot tier and a cold tier, as the flags have) and a build node (a read cache on local disk in front of one upstream, `[local_cache]`). The build node is on main and has no flag form.
+> `--config` and `--print-config` are on main and not in the latest release (v0.0.38). Every flag below works in every release. A file has one of two shapes, told apart by its tables: a storage node (a hot tier and a cold tier, as the flags have) and a build node (a read cache on local disk in front of one upstream, `[local_cache]`). The build node is on main and has no flag form (`--check-config` checks a file of either shape).
 
 ## A file for a storage node
 
@@ -169,7 +169,7 @@ The water marks are percents from 1 to 100. The start refuses `low_water` at or 
 
 ## `[local_cache]`
 
-The read cache of a build node. A GET or HEAD of a key that a `[[policy]]` with `cache = true` holds is answered from the directory and filled from the upstream on a miss; every other call to the front but GET and HEAD is refused 403. The table has no flag.
+The read cache of a build node. A GET or HEAD of a key that a `[[policy]]` with `cache = true` holds is answered from the directory and filled from the upstream on a miss; every other call to the front but GET and HEAD is refused 403, unless `write_through` is `true`. The table has no flag.
 
 | Key | Type, default | What |
 |---|---|---|
@@ -181,10 +181,11 @@ The read cache of a build node. A GET or HEAD of a key that a `[[policy]]` with 
 | `local_cache.critical` | percent, 95 | above this share a fill is skipped; not below `high_water` |
 | `local_cache.free_floor` | percent, 10 (0 to 99) | the share of the file system that is kept free: below it a pass evicts, even under the budget. The budget may not be above the size of the file system less this share |
 | `local_cache.max_concurrent_fills` | count, 4 (1 to 64) | the most fills that run at once; a miss that finds them all running is served from the upstream and kept nowhere |
+| `local_cache.write_through` | boolean, `false` | `false`: the node refuses every write with 403. `true`: it takes the writes its keys may do and sends each to the upstream, which must then be read with a key that may write; the start runs the self-test of a storage node against the upstream and exits 3 if it answers one wrongly |
 | `local_cache.cache` | boolean, `true` | `false` is refused: leave `[local_cache]` out to run without a cache |
 | `local_cache.scrub_rate` | rate, none | a size and `/s`, such as `"50MiB/s"`: accepted, and not used by this release |
 
-The upstream is `[cold_store]`, with any `kind`. In place of `endpoint` it may have a list `endpoints` of exactly one entry. A build node leaves out `skip_checks` and the reconciler's keys, `server.backend_check_wait`, and the `[oci]` table.
+The upstream is `[cold_store]`, with any `kind`. In place of `endpoint` it may have a list `endpoints` of exactly one entry. With `write_through = true` the node takes create-only puts, presigned puts, multipart uploads and deletes, and sends each to the upstream before it answers; the keys' roles apply as on a storage node, and a put that replaces (`If-Match`) and a copy are still refused. A build node leaves out `skip_checks` and the reconciler's keys, `server.backend_check_wait`, and the `[oci]` table.
 
 ## `[oci]`
 
@@ -223,10 +224,11 @@ These describe one run, not the data path, and have no key:
 |---|---|---|
 | `--config` | none | the file |
 | `--print-config` | off | print the file for the flags given, and exit |
+| `--check-config` | off | with `--config`: load and check the file as a start does, and the key files it names, then exit 0 and print nothing, or print the refusal and exit 2. It binds nothing and asks no store; the disk checks of a start (the cache directory, the budget against the file system) and the self-test are not made. Without `--config` it is a usage error |
 | `--drain-lb-wait` | `10s` | on SIGTERM, how long `/readyz` says 503 while the server goes on serving |
 | `--drain-deadline` | `15m` | then how long it waits for requests in flight |
 
-`--help` and `--version` are the usual. A start that gives `--config` and any other flag but `--drain-lb-wait` and `--drain-deadline` is refused with exit status 2.
+`--help` and `--version` are the usual. A start that gives `--config` and any other flag but `--drain-lb-wait`, `--drain-deadline` and `--check-config` is refused with exit status 2.
 
 ## What the loader refuses
 
@@ -253,5 +255,4 @@ Then change `ExecStart=` to the `--config` line above, keeping `--drain-lb-wait`
 
 ## Not in a release yet
 
-- **Write-through for the cache.** A setting that sends a write to the upstream before the cache node answers. A build node refuses every write today.
 - **Several upstream endpoints.** A cache node listing more than one upstream, with failover between them.

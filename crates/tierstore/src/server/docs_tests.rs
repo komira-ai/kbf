@@ -63,6 +63,7 @@ const LOCAL_CACHE_KEYS: &[&str] = &[
     "local_cache.critical",
     "local_cache.free_floor",
     "local_cache.max_concurrent_fills",
+    "local_cache.write_through",
     "local_cache.cache",
     "local_cache.scrub_rate",
 ];
@@ -568,7 +569,7 @@ fn a_flag_that_is_not_the_binarys_is_found() {
 /// each of them loads as a build node, and the table written back has just those keys.
 #[test]
 fn the_cache_table_has_the_keys_listed() {
-    let text = "[local_cache]\npath = \"/var/cache\"\nlayout = \"digest-v1\"\nbudget = \"1GiB\"\nhigh_water = 90\nlow_water = 75\ncritical = 95\nfree_floor = 10\nmax_concurrent_fills = 4\ncache = true\nscrub_rate = \"1MiB/s\"\n";
+    let text = "[local_cache]\npath = \"/var/cache\"\nlayout = \"digest-v1\"\nbudget = \"1GiB\"\nhigh_water = 90\nlow_water = 75\ncritical = 95\nfree_floor = 10\nmax_concurrent_fills = 4\nwrite_through = false\ncache = true\nscrub_rate = \"1MiB/s\"\n";
     let table: LocalCacheTable = toml::from_str::<toml::Table>(text)
         .expect("the TOML parses")
         .remove("local_cache")

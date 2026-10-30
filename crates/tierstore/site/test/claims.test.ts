@@ -53,7 +53,7 @@ const page = (name: string): string => read(SITE, 'content', `${name}.html`);
 
 test('the pages say what they say about the cache and metrics, so the code check below is not vacuous', () => {
   assert.match(read(DOCS, 'operations.md'), /the counters of the OCI read front/);
-  assert.match(page('why'), /serves the counters of the OCI read front and those of the local cache, and no others/);
+  assert.match(page('why'), /serves the counters of the OCI read front, those of the local cache of a build node and, on main, hit, miss and byte counters of the two tiers/);
   assert.match(page('why'), /The <code>tierstore<\/code> binary does not use it/);
   assert.match(page('why'), /<code>\[local_cache\]<\/code> and <code>\[cold_store\]<\/code> and no <code>\[hot_store\]<\/code>/);
   assert.match(page('index'), /a build node, file only/);

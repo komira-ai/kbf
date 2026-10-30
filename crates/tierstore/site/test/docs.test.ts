@@ -109,8 +109,13 @@ test('the first paragraph is the lede, and the page names the guide in its navig
   assert.match(page, /<a href="\/docs\/" aria-current="page">Docs<\/a>/);
 });
 
-test('the workflow runs the site tests when the guide changes, on a pull request and on a push', () => {
+test('the workflow runs the site tests when the guide or the crate source changes, on a pull request and on a push', () => {
   const wf = readFileSync(join(REPO, '.github', 'workflows', 'tierstore-site.yml'), 'utf8');
-  const glob = `      - ${relative(REPO, DOCS).split(sep).join('/')}/**\n`;
-  assert.equal(wf.split(glob).length - 1, 2, `the workflow's paths: filters (pull_request and push) each name ${glob.trim()}`);
+  const docs = relative(REPO, DOCS).split(sep).join('/');
+  // test/claims.test.ts reads the crate's src/ (the directory beside docs/): a code change that makes a page wrong must fail on its own pull request.
+  const src = `${docs.replace(/\/docs$/, '')}/src`;
+  for (const dir of [docs, src]) {
+    const glob = `      - ${dir}/**\n`;
+    assert.equal(wf.split(glob).length - 1, 2, `the workflow's paths: filters (pull_request and push) each name ${glob.trim()}`);
+  }
 });

@@ -84,9 +84,8 @@ At start the process makes the directory, removes what a fill left half done, re
 
 ## Metrics
 
-`GET /metricz` on the S3 listener (unsigned) answers 200 in the Prometheus text format. On main it has the counters of the OCI read front, such as `tierstore_oci_requests_total`, and without `--oci-listen` it says the front is not enabled. The counters of the cache of a build node follow them, each named `tierstore_cache_` and one of `hits_total`, `misses_total`, `bytes_served_local_total`, `bytes_served_upstream_total`, `fills_total`, `fills_skipped_total`, `fills_skipped_busy_total`, `fill_failures_total` (label `reason`), `evictions_total` (label `reason`: `budget` or `floor`), `pinned_skips_total` and `discarded_at_start_total`, and the gauges `bytes`, `objects`, `fs_free_bytes` and `staging_files`; a node with no cache says so on a line of its own. The full list of metric names, their labels and queries to alert on is in [metrics](metrics.md).
+`GET /metricz` on the S3 listener (unsigned) answers 200 in the Prometheus text format. On main it has the hit, miss, byte and cold-read counters of the hot and cold tiers, the counters of the OCI read front, such as `tierstore_oci_requests_total`, and the counters of the cache of a build node, all named `tierstore_` and a word; without `--oci-listen` it says the front is not enabled, and a node with no cache says so on a line of its own. The tier counters are not in the latest release (v0.0.38). The full list of metric names, their labels and queries to alert on is in [metrics](metrics.md).
 
 ## Not in a release yet
 
-- **Hot and cold counters.** Counters of hits, misses, bytes and cold reads for the two tiers on `/metricz`. Until they land, watch `/usagez` for the hot tier and the cold store's own metrics for its load.
 - **Waiting for a put slot.** Today a put over `--max-concurrent-puts` is answered 503 `SlowDown` at once; the server will instead wait briefly for a slot first, and clients will retry a 503 with jittered waits.
