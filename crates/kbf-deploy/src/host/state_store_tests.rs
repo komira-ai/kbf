@@ -3,8 +3,9 @@ use std::ffi::OsStr;
 use std::os::unix::fs::symlink;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use kbf_host::testkit::{FakeExec, reply, scratch};
 use kbf_host::user::ID;
@@ -18,16 +19,13 @@ const STAMP: &str = "20280229T123456Z";
 
 /// Opens a store on `db`. A lock this process held a moment ago can still be held by a
 /// copy of its descriptor in a child another test is starting (between its fork and
-/// its exec, which closes it), so a `Locked` open is tried again for a while; a lock a
-/// store or a restore really holds lasts longer than that.
+/// its exec, which closes it), so a `Locked` open is tried again until the copy is gone (a
+/// lock that is never released is ended by the test runner's hang guard).
 fn open(db: &Path) -> SqliteStore {
-    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
         match SqliteStore::open(db, clock, Options::default()) {
-            Err(SqliteError::Locked { .. }) if Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(10));
-            }
+            Err(SqliteError::Locked { .. }) => thread::yield_now(),
             opened => return opened.expect("open the state file"),
         }
     }
@@ -155,6 +153,7 @@ fn a_backup_while_a_writer_commits_is_a_consistent_checked_copy() {
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicU64::new(0)),
     );
+    let (progress, commits) = mpsc::channel::<u64>();
     let writer = {
         let (store, stop, done) = (Arc::clone(&store), Arc::clone(&stop), Arc::clone(&done));
         thread::spawn(move || {
@@ -168,15 +167,15 @@ fn a_backup_while_a_writer_commits_is_a_consistent_checked_copy() {
                 store.txn(txn).expect("reachable").expect("commits");
                 n += 1;
                 done.store(n, Ordering::SeqCst);
+                progress.send(n).expect("the test is listening");
             }
         })
     };
     let wait_for = |at_least: u64| {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while done.load(Ordering::SeqCst) < at_least {
-            assert!(Instant::now() < deadline, "the writer stalled");
-            thread::sleep(Duration::from_millis(1));
-        }
+        commits
+            .iter()
+            .find(|n| *n >= at_least)
+            .expect("the writer is still running");
     };
 
     let mut taken = Vec::new();

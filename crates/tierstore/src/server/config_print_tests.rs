@@ -140,10 +140,11 @@ fn every_flag_is_given_in_one_of_the_round_trips() {
         .map(|word| word.split('=').next().unwrap().to_owned())
         .collect();
     let command = Cli::command();
-    // `--config` is the file itself: a round trip never gives it.
+    // `--config` is the file itself, and `--check-config` only checks one: a round trip never
+    // gives either.
     for arg in command
         .get_arguments()
-        .filter(|arg| arg.get_long() != Some("config"))
+        .filter(|arg| !matches!(arg.get_long(), Some("config" | "check-config")))
     {
         let long = arg.get_long().unwrap();
         assert!(given.contains(long), "--{long} is in no set of flags");
