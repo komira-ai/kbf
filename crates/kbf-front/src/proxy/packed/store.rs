@@ -22,6 +22,7 @@ use tonic::Status;
 use super::metrics::PackMetrics;
 use super::room::{Budget, DEFAULT_INFLIGHT_BYTES, Room};
 use super::verifying::VerifyingKeys;
+use crate::large_backfill::LargeStore;
 
 /// The largest blob a frontend puts in a pack or serves from one by default: 64 MiB, the
 /// most it holds in memory to hash a blob before the first byte of it is sent.
@@ -524,4 +525,22 @@ where
 {
     let joined = tokio::task::spawn_blocking(work).await;
     joined.expect("a blocking pack index call panicked")
+}
+
+impl LargeStore for Packs {
+    fn len<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> BoxFuture<'a, Result<Option<u64>, ObjectStoreError>> {
+        self.store.len(key)
+    }
+
+    fn put<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        len: u64,
+        body: BodyStream,
+    ) -> BoxFuture<'a, Result<(), ObjectStoreError>> {
+        self.store.put_stream(key, len, body)
+    }
 }

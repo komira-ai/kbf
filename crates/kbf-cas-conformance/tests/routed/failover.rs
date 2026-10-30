@@ -4,8 +4,8 @@
 //! read is dropped part way.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use kbf_proto::reapi::Digest;
 use kbf_transfer::{Cas, CasError, digest_of, label};
@@ -124,18 +124,6 @@ async fn read_to(owners: &Owners, digest: &Digest, dir: &Path) -> (Result<(), Ca
     (answer, held[HEAD.len()..].to_vec())
 }
 
-/// Whether `path` comes to hold exactly `want` within ten seconds.
-async fn until_holds(path: &Path, want: &[u8]) -> bool {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        if std::fs::read(path).is_ok_and(|held| held == want) {
-            return true;
-        }
-    }
-    false
-}
-
 /// Catches a same-length lie written as the blob (the read checks nothing, or only the
 /// length), a read that stops at the first owner, a bad copy left in the file under the
 /// good one (no truncation, or truncation without going back to the offset) and a bad
@@ -211,18 +199,20 @@ async fn a_large_blob_streams_through_a_failover() {
     let owners = farm(&blob, &[Serves::Lie, Serves::Good]);
     let dir = directory("failover-streams");
     let path = dir.join("blob");
-    let half = owners.in_order(&digest)[1].pause_after(512);
+    let owner = Arc::clone(&owners.in_order(&digest)[1]);
+    let half = owner.pause_after(512);
 
     let want: Vec<u8> = [HEAD, &blob[..2048]].concat();
     let watch = async {
-        let seen = until_holds(&path, &want).await;
+        owner.paused.notified().await;
+        let held = std::fs::read(&path).expect("the file");
         half.add_permits(1);
-        seen
+        held
     };
-    let ((answer, written), seen) = tokio::join!(read_to(&owners, &digest, &dir), watch);
-    assert!(
-        seen,
-        "the first half was not in the file while the rest was held back"
+    let ((answer, written), held) = tokio::join!(read_to(&owners, &digest, &dir), watch);
+    assert_eq!(
+        held, want,
+        "the first half, in the file while the rest was held back"
     );
     assert_eq!(answer, Ok(()));
     assert_eq!(written, blob);
@@ -280,12 +270,16 @@ async fn a_read_dropped_part_way_leaves_the_file_as_it_was() {
     let path = dir.join("blob");
     let mut file = with_head(&path).await;
 
+    let owner = Arc::clone(&owners.in_order(&digest)[0]);
     let want: Vec<u8> = [HEAD, &blob[..2048]].concat();
-    let seen = tokio::select! {
+    let held = tokio::select! {
         answer = owners.cas.read_to(&digest, &mut file) => panic!("the read ended: {answer:?}"),
-        seen = until_holds(&path, &want) => seen,
+        held = async {
+            owner.paused.notified().await;
+            std::fs::read(&path).expect("the file")
+        } => held,
     };
-    assert!(seen, "half the blob was never in the file");
+    assert_eq!(held, want, "half the blob, once the read waits");
     assert_eq!(std::fs::read(&path).expect("the file"), HEAD);
     let offset = file.stream_position().await.expect("the offset");
     assert_eq!(offset, HEAD.len() as u64);
@@ -315,9 +309,7 @@ fn a_write_queued_when_the_read_is_dropped_writes_nothing() {
         let mut blocker = None;
 
         let queue = async {
-            while owner.reads.load(Ordering::SeqCst) == 0 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
+            owner.asked.notified().await;
             let (busy, busied) = tokio::sync::oneshot::channel();
             let busy_thread = tokio::task::spawn_blocking(move || {
                 let _ = busy.send(());
@@ -326,7 +318,7 @@ fn a_write_queued_when_the_read_is_dropped_writes_nothing() {
             busied.await.expect("the blocking thread is busy");
             first.add_permits(1);
             blocker = Some(busy_thread);
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            owner.served.notified().await;
         };
         tokio::select! {
             answer = owners.cas.read_to(&digest, &mut file) => panic!("the read ended: {answer:?}"),

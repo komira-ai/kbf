@@ -32,6 +32,12 @@ test-group = 'mac-provision-scratch'
 filter = 'binary_id(=kbf-front::large_blobs)'
 slow-timeout = { period = "450s", terminate-after = 4 }
 
+# The backfill tests wait on the put's own signal, with no deadline of their own, so a put that
+# never ends hangs the test: nextest kills it after 30 s x 4 (the whole test takes milliseconds).
+[[profile.default.overrides]]
+filter = 'package(kbf-front) & (binary(large_backfill) | test(/^large_backfill::tests::/))'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
 # A hang guard, not a bound: this test waits for a run that ends once the daemon has
 # killed it; a daemon that loses the kill leaves it waiting for ever.
 [[profile.default.overrides]]

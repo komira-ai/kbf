@@ -55,7 +55,12 @@ export const ROUTER_SOURCE = `function handler(event) {
 }
 `;
 
-/** Private S3 bucket + CloudFront (OAC) for the site domain, plus the role the kbf publish workflow assumes. */
+/**
+ * Private S3 bucket + CloudFront (OAC) for the site domain, plus the role the site's publish workflow assumes. Every
+ * physical name comes from the site id (config.ts siteNames); logical ids are the same for every site. The security
+ * headers (CONTENT_SECURITY_POLICY, PERMISSIONS_POLICY), the router and the cache settings are one definition shared by
+ * all sites: a site that needs a different policy gets its own constants here, not an edit of another site's.
+ */
 export class SiteStack extends Stack {
   readonly bucket: s3.Bucket;
   readonly distribution: cloudfront.Distribution;
@@ -63,7 +68,8 @@ export class SiteStack extends Stack {
 
   constructor(scope: Construct, props: SiteStackProps) {
     // No assets, so no cdk bootstrap is needed; the admin deploys with their own credentials.
-    super(scope, c.SITE_STACK_NAME, { ...props, synthesizer: new LegacyStackSynthesizer() });
+    const names = c.namesOf(props.config);
+    super(scope, names.siteStack, { ...props, synthesizer: new LegacyStackSynthesizer() });
     if (!Token.isUnresolved(this.region) && this.region !== c.REGION) {
       throw new Error(`must be deployed to ${c.REGION}; got ${this.region}`);
     }
@@ -72,7 +78,7 @@ export class SiteStack extends Stack {
     }
 
     this.bucket = new s3.Bucket(this, 'Bucket', {
-      bucketName: c.bucketName(this.account),
+      bucketName: names.bucket(this.account),
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
       versioned: true,
@@ -101,7 +107,7 @@ export class SiteStack extends Stack {
       : undefined;
 
     const headers = new cloudfront.ResponseHeadersPolicy(this, 'Headers', {
-      responseHeadersPolicyName: c.HEADERS_POLICY_NAME,
+      responseHeadersPolicyName: names.headersPolicy,
       securityHeadersBehavior: {
         contentSecurityPolicy: { contentSecurityPolicy: CONTENT_SECURITY_POLICY, override: true },
         contentTypeOptions: { override: true },
@@ -119,8 +125,8 @@ export class SiteStack extends Stack {
     });
 
     const router = new cloudfront.Function(this, 'Router', {
-      functionName: c.ROUTER_NAME,
-      comment: 'kbf site: /x/ -> /x/index.html; /releases/* untouched',
+      functionName: names.router,
+      comment: `${names.id} site: /x/ -> /x/index.html; /releases/* untouched`,
       runtime: cloudfront.FunctionRuntime.JS_2_0,
       code: cloudfront.FunctionCode.fromInline(ROUTER_SOURCE),
     });
@@ -158,15 +164,15 @@ export class SiteStack extends Stack {
 
     // The publish role: assumed by the kbf reusable workflow only. No CDK, no bootstrap roles, no IAM.
     this.publishRole = new iam.Role(this, 'PublishRole', {
-      roleName: c.ROLE_NAME,
-      description: 'kbf site-publish workflow: uploads to the kbf.dev bucket and invalidates its distribution',
+      roleName: names.role,
+      description: `${names.id} site-publish workflow: uploads to the ${domain} bucket and invalidates its distribution`,
       maxSessionDuration: Duration.hours(1),
       assumedBy: new iam.FederatedPrincipal(
         props.oidcProviderArn,
         {
           StringEquals: {
             [`${c.GITHUB_OIDC_HOST}:aud`]: c.OIDC_AUDIENCE,
-            [`${c.GITHUB_OIDC_HOST}:sub`]: c.oidcSubject(props.config),
+            [`${c.GITHUB_OIDC_HOST}:sub`]: c.oidcSubject(props.config, names),
           },
         },
         'sts:AssumeRoleWithWebIdentity',

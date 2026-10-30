@@ -279,6 +279,7 @@ const GROUPS: &[(&str, &[&str])] = &[
         "executor",
         &[
             "executor",
+            "executor-allow-plain-http-grant",
             "executor-allow-plain-http-put",
             "executor-arch",
             "executor-base-image",

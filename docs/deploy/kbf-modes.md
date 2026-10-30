@@ -153,7 +153,9 @@ four flags it needs), `--job-listen` (with its three) and `--pack-store-endpoint
 unless they agree with it: the tier store and the read url must be IP addresses (the job network
 has no DNS); `--task-put-bucket` must be `--pack-store-bucket`, the bucket the pack is read
 from; an `http://` `--task-put-endpoint` needs `--executor-allow-plain-http-put` (with an
-`https://` one the flag is only warned about); and the longest run (`--executor-max-run-secs`
+`https://` one the flag is only warned about); an `http://` `--task-read-url` needs
+`--executor-allow-plain-http-grant` (the same, with the read grant: the task tool is then
+given `--allow-plain-http-grant`, and the read token crosses the job network in clear); and the longest run (`--executor-max-run-secs`
 plus `--executor-run-margin-secs`) must fit 14400 s less `--task-url-slack-secs`, the longest a
 presigned write may be good for once the slack is added. A lease ttl over 3600 s is warned
 about: the lease server grants at most its `--max-ttl` (3600 s unless started with another) and
@@ -173,8 +175,10 @@ presigned write and the read token are never part of an error, a log line or a m
 `--executor-default-timeout-secs` (3000), `--executor-call-timeout-secs` (5),
 `--executor-work-dir` (for the task tool),
 `--executor-output-disk-bytes` (8 GiB; the scratch disk a run books for its outputs, the pack and its
-private home, on top of the bytes of its inputs and a fixed 1 GiB margin), and
-`--executor-allow-plain-http-put` (until the store serves TLS). A setting that breaks a rule
+private home, on top of the bytes of its inputs and a fixed 1 GiB margin),
+`--executor-allow-plain-http-put` (until the store serves TLS), and
+`--executor-allow-plain-http-grant` (a read listener without TLS, on a farm's own network; both
+plain-http flags are off by default). A setting that breaks a rule
 the executor's safety rests on (the fence time against the scheduler's grace, the lease ttl
 against the longest run) is refused at start, exit status 2.
 
@@ -240,7 +244,7 @@ under it is refused at parse time. Every URL of a run has the same expiry. The s
 `--task-put-credentials-file` (JSON `{"access_key_id": "...", "secret_access_key": "..."}` of
 the presign-only key, owned by the server's user, mode 0600 or 0400) and `--task-read-url`
 (`https://host:port`, no path: an `http://` URL is refused at start, as the token is a bearer
-secret). The secret file holds one secret of at least 32 bytes, owned by the server's user
+secret, unless `--executor-allow-plain-http-grant` is given with `--executor js-agent`). The secret file holds one secret of at least 32 bytes, owned by the server's user
 and readable by it alone; the pack-key mint and the grant key are made from it, and the
 job-facing listener must verify grants with the same secret. No secret is a flag. Left out, no
 secret file is read and the frontend serves exactly as before.
