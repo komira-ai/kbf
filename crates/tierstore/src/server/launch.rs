@@ -14,14 +14,14 @@ use clap::{ArgMatches, Command, CommandFactory, Parser};
 
 use super::cli::Cli;
 use super::config::{
-    ConfigError, DEFAULT_DRAIN_DEADLINE, DEFAULT_DRAIN_LB_WAIT, PER_RUN, PerRun, load,
+    ConfigError, DEFAULT_DRAIN_DEADLINE, DEFAULT_DRAIN_LB_WAIT, PER_RUN, PerRun, Settings, load,
 };
 
 /// What the command line made.
 #[derive(Debug)]
 pub(super) struct Launch {
-    /// The settings.
-    pub cli: Cli,
+    /// The settings: the flags', or those of the file (of either shape).
+    pub settings: Settings,
     /// Whether they were read from a file, so that a refusal speaks of its keys.
     pub from_file: bool,
 }
@@ -51,21 +51,25 @@ pub(super) fn resolve(args: Vec<OsString>) -> Result<Launch, Refused> {
         .as_ref()
         .and_then(|matches| matches.get_one::<PathBuf>("config"));
     if let (Some(matches), Some(path)) = (given.as_ref(), path) {
-        let cli = from_file(&command, matches, path).map_err(Refused::Config)?;
+        let settings = from_file(&command, matches, path).map_err(Refused::Config)?;
         return Ok(Launch {
-            cli,
+            settings,
             from_file: true,
         });
     }
     let cli = Cli::try_parse_from(args).map_err(Refused::Usage)?;
     Ok(Launch {
-        cli,
+        settings: Settings::Storage(Box::new(cli)),
         from_file: false,
     })
 }
 
 /// The settings of the file at `path`, given the flags `matches` holds.
-fn from_file(command: &Command, matches: &ArgMatches, path: &Path) -> Result<Cli, ConfigError> {
+fn from_file(
+    command: &Command,
+    matches: &ArgMatches,
+    path: &Path,
+) -> Result<Settings, ConfigError> {
     if matches.get_flag("print_config") {
         return Err(ConfigError::PrintWithConfig);
     }

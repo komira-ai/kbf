@@ -12,6 +12,13 @@ install-sh-fixture = { max-threads = 1 }
 # name share a directory (crates/kbf-mac-provision/tests/support/mod.rs).
 mac-provision-scratch = { max-threads = 1 }
 
+# Hang guards for the tests of the tierstore local cache that wait for a task: no test asserts how
+# long it takes, and a test that waits for something that never comes is stopped after a minute
+# and fails. Named overrides go before any override that matches more.
+[[profile.default.overrides]]
+filter = 'package(tierstore) & (test(~local_cache::) | test(~cache_cli_tests::) | test(~cache_node::))'
+slow-timeout = { period = "60s", terminate-after = 2 }
+
 [[profile.default.overrides]]
 filter = 'package(xtask) & binary(install_sh)'
 test-group = 'install-sh-fixture'
