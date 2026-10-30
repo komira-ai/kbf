@@ -147,13 +147,12 @@ fn verify_args(dist: &Path) -> Vec<String> {
 }
 
 #[test]
-fn syft_is_run_on_the_image_in_its_directory_with_the_pinned_arguments_and_the_sbom_is_listed() {
-    // Catches: syft run on another path than the asset's file name in its own directory (the
-    // document would carry the runner's paths), with other arguments than the build pins, with
-    // the runner's environment (an update check, a configuration), the SBOM missing from `dist`
-    // or from the platform's sums, listed with another digest than its bytes, left with the serial
-    // number and time syft stamped, or an SBOM that the verify step then refuses.
-    let (root, dist, syft, manifest) = world("make", |m| syft_says(m, "urn:uuid:random", "later"));
+fn the_sbom_syft_prints_is_written_beside_the_image_listed_and_verified() {
+    // Catches: the SBOM missing from `dist` or from the platform's sums, listed with another digest
+    // than its bytes or printed as another line than the one listed, left with the serial number
+    // and time syft stamped, not the image's, or an SBOM that the verify step then refuses. (What
+    // syft is run with, directory, arguments and environment, is the unit tests'.)
+    let (_root, dist, syft, manifest) = world("make", |m| syft_says(m, "urn:uuid:random", "later"));
     let (code, out, err) = xtask(&make_args(&dist, &syft));
     assert_eq!(code, Some(0), "{err}");
     let name = format!("{IMAGE}.cdx.json");
@@ -177,35 +176,6 @@ fn syft_is_run_on_the_image_in_its_directory_with_the_pinned_arguments_and_the_s
     );
     assert_eq!(bom["metadata"]["timestamp"], "2026-09-01T00:00:00Z");
     assert_eq!(bom["metadata"]["component"]["version"], manifest);
-    let asked = std::fs::read_to_string(root.join("tools/syft-args")).expect("syft-args");
-    let (cwd, args) = asked.trim_end().split_once(": ").expect("a line");
-    assert_eq!(
-        Path::new(cwd).file_name().and_then(|n| n.to_str()),
-        Some("dist")
-    );
-    assert_eq!(
-        args,
-        format!(
-            "scan oci-archive:{IMAGE}.oci.tar --output cyclonedx-json --source-name {IMAGE} --quiet"
-        )
-    );
-    let env = std::fs::read_to_string(root.join("tools/syft-env")).expect("syft-env");
-    // (The coverage runtime of an instrumented fake adds a variable of its own to its environment.)
-    let names: Vec<&str> = env
-        .lines()
-        .filter_map(|l| l.split_once('=').map(|(n, _)| n))
-        .filter(|n| !n.starts_with("__LLVM"))
-        .collect();
-    assert_eq!(
-        names,
-        [
-            "HOME",
-            "SYFT_CHECK_FOR_APP_UPDATE",
-            "SYFT_FILE_METADATA_SELECTION",
-            "TMPDIR",
-            "XDG_CACHE_HOME",
-        ]
-    );
     let (code, out, err) = xtask(&verify_args(&dist));
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(out, format!("{name}: the SBOM of the image\n"));
@@ -230,13 +200,15 @@ fn the_same_image_has_the_same_sbom_bytes_from_two_runs_of_syft() {
 
 #[test]
 fn a_failing_syft_or_a_wrong_sbom_leaves_no_file_and_no_line() {
-    // Catches: an SBOM or a sums line left behind by a run that failed, syft's own message lost,
-    // and an SBOM of another image written because syft ran.
-    let (root, dist, syft, _) = world("failing", |m| syft_says(m, "urn:uuid:one", "one"));
-    std::fs::write(root.join("tools/syft.mode"), "fail\n").expect("mode");
-    let (code, out, err) = xtask(&make_args(&dist, &syft));
+    // Catches: an SBOM or a sums line left behind by a run that failed (here syft is `false`),
+    // syft's failure lost from the message, and an SBOM of another image written because syft ran.
+    let (_root, dist, _, _) = world("failing", |m| syft_says(m, "urn:uuid:one", "one"));
+    let (code, out, err) = xtask(&make_args(&dist, Path::new("/usr/bin/false")));
     assert_eq!(code, Some(1), "{out}");
-    assert!(err.contains("syft: boom"), "{err}");
+    assert!(
+        err.starts_with("xtask: syft scan oci-archive:") && err.contains("--output cyclonedx-json"),
+        "{err}"
+    );
     let name = format!("{IMAGE}.cdx.json");
     assert!(!dist.join(&name).exists());
     assert!(!dist.join("SHA256SUMS.linux-x86_64").exists());

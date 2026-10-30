@@ -84,10 +84,9 @@
 //! - Run as `uname` (by name, from PATH, or by path), it is a host that is no platform of
 //!   ours: `-s` prints `Linux` and `-m` prints `riscv64` (or `XTASK_FAKE_MACHINE` when set). Run as `id`, `-u` prints 1000
 //!   (a user that is not root).
-//! - Run as `syft`, it appends `<working directory>: <arguments>` as one line to `syft-args` next
-//!   to it, rewrites `syft-env` next to it with the environment it was given (`NAME=value`, one
-//!   per line), and prints the file `syft.json` next to it on stdout: what syft prints of an image.
-//!   When the file `syft.mode` next to it says `fail`, it prints `syft: boom` on stderr and exits 1.
+//! - Run as `syft`, it prints the file `syft.json` next to it on stdout: what syft prints of an
+//!   image. (`pkg-image-sbom` runs it with an empty environment, so what it was given is tested
+//!   with `env` in `src/pkg_image_sbom/tests.rs`.)
 //! - Run as `systemd-sysusers` or `systemd-tmpfiles` (by name, from PATH, or by path), it
 //!   appends `<name> <arguments>` as one line to `systemd-args` next to the fake's own
 //!   file and exits 0: the host's systemd, as `packaging/install.sh` calls it.
@@ -785,27 +784,10 @@ fn systemd(name: &str, args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `syft scan ...`: records what it was asked and given, and prints the SBOM a test wrote for it.
-fn syft(argv0: &str, args: &[String]) -> ExitCode {
-    let beside = |name: &str| Path::new(argv0).with_file_name(name);
-    let cwd = std::env::current_dir().map(|d| d.display().to_string());
-    let mut log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(beside("syft-args"))
-        .expect("syft-args");
-    writeln!(log, "{}: {}", cwd.unwrap_or_default(), args.join(" ")).expect("log");
-    let mut env: Vec<String> = std::env::vars().map(|(k, v)| format!("{k}={v}")).collect();
-    env.sort();
-    std::fs::write(beside("syft-env"), env.join("\n") + "\n").expect("syft-env");
-    if std::fs::read_to_string(beside("syft.mode")).is_ok_and(|m| m.trim() == "fail") {
-        eprintln!("syft: boom");
-        return ExitCode::FAILURE;
-    }
-    print!(
-        "{}",
-        std::fs::read_to_string(beside("syft.json")).expect("syft.json")
-    );
+/// `syft ...`: prints the SBOM a test wrote for it, the file `syft.json` next to it.
+fn syft(argv0: &str) -> ExitCode {
+    let json = std::fs::read_to_string(Path::new(argv0).with_file_name("syft.json"));
+    print!("{}", json.expect("syft.json"));
     ExitCode::SUCCESS
 }
 
@@ -849,7 +831,7 @@ fn main() -> ExitCode {
     } else if argv0.ends_with("/sudo") {
         sudo(&argv0, &rest)
     } else if argv0.ends_with("/syft") {
-        syft(&argv0, &rest)
+        syft(&argv0)
     } else if matches!(base, "systemd-sysusers" | "systemd-tmpfiles") {
         systemd(base, &rest)
     } else if argv0 == "uname" || argv0.ends_with("/uname") {
