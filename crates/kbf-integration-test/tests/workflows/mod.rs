@@ -89,7 +89,7 @@ mod yaml;
 
 mod jobs;
 pub use jobs::{
-    concurrency, job_defaults_shell, job_env, job_environment, job_has_key, job_needs, job_outputs,
+    concurrency, job_env, job_environment, job_has_key, job_needs, job_outputs,
     job_permission_levels, job_uses, job_with, push_filters, top_defaults_shell, top_env,
     trigger_filters,
 };

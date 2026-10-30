@@ -885,7 +885,7 @@ fn the_attest_job_checks_the_downloaded_sums_and_files_before_it_signs() {
     cases.artifacts("no file check", &broken(files, ""), wrong_files, true);
     cases.artifacts(
         "the digest check after the first attestation",
-        &broken(&digest, &"").replacen(first_attest, &format!("{first_attest}{digest}"), 1),
+        &broken(&digest, "").replacen(first_attest, &format!("{first_attest}{digest}"), 1),
         "the digest check of `attest-linux` comes after an attestation step",
         true,
     );
@@ -898,11 +898,7 @@ fn the_attest_job_checks_the_downloaded_sums_and_files_before_it_signs() {
     let sums_download = "          name: sha256sums-linux\n          path: dist\n";
     cases.artifacts(
         "the checks before the last download",
-        &broken(
-            &format!("{sums_download}{digest}{files}"),
-            &format!("{sums_download}"),
-        )
-        .replacen(
+        &broken(&format!("{sums_download}{digest}{files}"), sums_download).replacen(
             "  attest-linux:\n    runs-on: ubuntu-24.04\n    steps:\n",
             &format!("  attest-linux:\n    runs-on: ubuntu-24.04\n    steps:\n{digest}{files}"),
             1,
