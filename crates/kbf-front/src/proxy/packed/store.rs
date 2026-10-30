@@ -95,8 +95,9 @@ pub trait PackStore: Send + Sync {
         key: &'a ObjectKey,
     ) -> BoxFuture<'a, Result<Option<u64>, ObjectStoreError>>;
 
-    /// Writes the object `key` of `len` bytes from `body`, create-only
-    /// ([`ObjectStore::put_stream`]).
+    /// Writes the object `key` of exactly `len` bytes from `body` as it is sent
+    /// ([`ObjectStore::put_stream`]): create-only, and an `Err` piece or a body of another length
+    /// leaves nothing under `key`.
     fn put_stream<'a>(
         &'a self,
         key: &'a ObjectKey,
