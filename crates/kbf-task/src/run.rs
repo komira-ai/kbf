@@ -454,8 +454,8 @@ mod tests {
         // `env` exits 127 when it cannot find the program it was asked to run. Each run gets its
         // own work directory: a run refuses a `private` directory an earlier one left.
         for (argv, code) in [
-            (vec!["/bin/true"], 0),
-            (vec!["/bin/false"], 1),
+            (vec!["/usr/bin/true"], 0),
+            (vec!["/usr/bin/false"], 1),
             (vec!["/usr/bin/env", "./no-such-program"], 127),
         ] {
             let rig = Rig::new(&format!("exit-{code}"));
@@ -570,7 +570,7 @@ mod tests {
         std::fs::create_dir(rig.private()).expect("private");
         std::fs::write(rig.private().join("stale"), b"old").expect("stale");
         let error = rig
-            .run(&program(&["/bin/true"]), LONG)
+            .run(&program(&["/usr/bin/true"]), LONG)
             .await
             .expect_err("refused");
         assert!(matches!(error, RunError::Io { .. }), "{error}");
@@ -591,7 +591,7 @@ mod tests {
         let target = TestDir::under(std::env::temp_dir(), "kbf-task-run-symlink-target");
         std::os::unix::fs::symlink(&*target, rig.private()).expect("link");
         let error = rig
-            .run(&program(&["/bin/true"]), LONG)
+            .run(&program(&["/usr/bin/true"]), LONG)
             .await
             .expect_err("refused");
         assert!(matches!(error, RunError::Io { .. }), "{error}");
@@ -604,7 +604,7 @@ mod tests {
     #[tokio::test]
     async fn an_output_path_out_of_the_root_is_refused_before_the_command_runs() {
         let rig = Rig::new("escape");
-        let mut command = program(&["/bin/true"]);
+        let mut command = program(&["/usr/bin/true"]);
         command.output_paths = vec!["../private/tmp/x".into()];
         let error = rig.run(&command, LONG).await.expect_err("refused");
         assert!(matches!(error, RunError::Invalid(_)), "{error}");
@@ -618,7 +618,7 @@ mod tests {
         let rig = Rig::new("blocked");
         std::fs::write(rig.private(), b"in the way").expect("file");
         let error = rig
-            .run(&program(&["/bin/true"]), LONG)
+            .run(&program(&["/usr/bin/true"]), LONG)
             .await
             .expect_err("refused");
         assert!(matches!(error, RunError::Io { .. }), "{error}");
@@ -662,7 +662,7 @@ mod tests {
     #[tokio::test]
     async fn the_parent_directories_of_outputs_are_made_under_the_working_directory() {
         let rig = Rig::new("parents");
-        let mut command = program(&["/bin/true"]);
+        let mut command = program(&["/usr/bin/true"]);
         command.working_directory = "w".into();
         command.output_paths = vec!["out/deep/file".into(), "top".into()];
         rig.run(&command, LONG).await.expect("ran");
@@ -675,7 +675,7 @@ mod tests {
     #[allow(deprecated)]
     async fn the_older_output_lists_make_their_parents_too() {
         let rig = Rig::new("legacy");
-        let mut command = program(&["/bin/true"]);
+        let mut command = program(&["/usr/bin/true"]);
         command.output_files = vec!["f/g/file".into()];
         command.output_directories = vec!["d/e".into()];
         rig.run(&command, LONG).await.expect("ran");
@@ -735,7 +735,7 @@ mod tests {
             ("", "../x"),
             ("", ""),
         ] {
-            let mut command = program(&["/bin/true"]);
+            let mut command = program(&["/usr/bin/true"]);
             command.working_directory = work.into();
             command.output_paths = vec![output.into()];
             let error = rig.run(&command, LONG).await.expect_err("refused");
@@ -752,13 +752,13 @@ mod tests {
         std::os::unix::fs::symlink("/", rig.root().join("link")).expect("link");
         std::fs::write(rig.root().join("file"), b"x").expect("file");
         for work in ["link", "link/x", "file/x"] {
-            let mut command = program(&["/bin/true"]);
+            let mut command = program(&["/usr/bin/true"]);
             command.working_directory = work.into();
             let error = rig.run(&command, LONG).await.expect_err("refused");
             assert!(matches!(error, RunError::Invalid(_)), "{work}: {error}");
         }
         // The same for a directory an output needs.
-        let mut command = program(&["/bin/true"]);
+        let mut command = program(&["/usr/bin/true"]);
         command.output_paths = vec!["link/out".into()];
         let error = rig.run(&command, LONG).await.expect_err("refused");
         assert!(matches!(error, RunError::Invalid(_)), "{error}");
@@ -780,7 +780,7 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o500),
         )
         .expect("chmod");
-        let mut command = program(&["/bin/true"]);
+        let mut command = program(&["/usr/bin/true"]);
         command.working_directory = "new".into();
         let result = rig.run(&command, LONG).await;
         std::fs::set_permissions(
@@ -802,7 +802,7 @@ mod tests {
         let root = rig.root();
         let missing = rig.dir.join("none/stdout");
         let error = run(
-            &program(&["/bin/true"]),
+            &program(&["/usr/bin/true"]),
             &Run {
                 root: &root,
                 private: &rig.private(),

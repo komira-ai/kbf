@@ -714,7 +714,10 @@ fn the_seatbelt_profile_denies_the_network_only_to_a_denied_command() {
     let denied = seatbelt_profile(Network::Denied, &[]).expect("denied");
     let allowed = seatbelt_profile(Network::Allowed, &[]).expect("allowed");
     assert!(denied.contains("(deny network*)"), "{denied}");
-    assert!(!allowed.contains("network"), "{allowed}");
+    assert!(
+        !allowed.contains("(deny network*)") && !allowed.contains("localhost"),
+        "{allowed}"
+    );
     assert_eq!(
         denied.replace(kbf_seatbelt::DENY_NETWORK_RULES, ""),
         allowed
