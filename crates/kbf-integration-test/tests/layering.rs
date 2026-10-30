@@ -772,6 +772,84 @@ fn tierstore_links_the_s3_client_only_with_its_s3_or_server_feature() {
     }
 }
 
+/// Asserts that `tierstore`, with every feature on and with its dev-dependencies, reaches no
+/// `kbf-*` crate of this workspace but `kbf-testkit`, a dev-dependency (the scratch directories
+/// and the child-process helper of its tests) that a later change removes, and that the walk
+/// sees `objstore-s3`, the S3 client it is built on, so the check does not pass on an empty
+/// walk. The walk follows every kind of edge of the resolved `cargo metadata` graph, which has
+/// the features of the whole workspace (the `server` and `s3` features are on through the
+/// crate's dev-dependency on itself), so it covers what the two tests above leave out: the
+/// dev-dependencies and the `s3` feature's tree together.
+#[test]
+fn tierstore_with_its_tests_reaches_no_kbf_crate_but_the_test_helpers() {
+    let cargo = std::env::var("CARGO").expect("CARGO is set when cargo runs a test");
+    let out = Command::new(cargo)
+        .args(["metadata", "--format-version", "1", "--locked"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run cargo metadata");
+    assert!(
+        out.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta: Value = serde_json::from_slice(&out.stdout).expect("cargo metadata emits JSON");
+    let nodes = meta["resolve"]["nodes"].as_array().expect("resolve.nodes");
+    let edges: BTreeMap<&str, Vec<&str>> = nodes
+        .iter()
+        .map(|node| {
+            let id = node["id"].as_str().expect("node id");
+            let deps = node["deps"]
+                .as_array()
+                .expect("deps")
+                .iter()
+                .map(|d| d["pkg"].as_str().expect("dep pkg"))
+                .collect();
+            (id, deps)
+        })
+        .collect();
+    let name_of: BTreeMap<&str, &str> = meta["packages"]
+        .as_array()
+        .expect("packages")
+        .iter()
+        .map(|p| {
+            (
+                p["id"].as_str().expect("package id"),
+                p["name"].as_str().expect("package name"),
+            )
+        })
+        .collect();
+    let root = name_of
+        .iter()
+        .find(|(_, name)| **name == "tierstore")
+        .map(|(id, _)| *id)
+        .expect("tierstore is a workspace member");
+    let mut seen = BTreeSet::from([root]);
+    let mut queue = VecDeque::from([root]);
+    while let Some(id) = queue.pop_front() {
+        for dep in edges.get(id).into_iter().flatten() {
+            if seen.insert(dep) {
+                queue.push_back(dep);
+            }
+        }
+    }
+    let reached: BTreeSet<&str> = seen.iter().map(|id| name_of[id]).collect();
+    assert!(
+        reached.contains("objstore-s3"),
+        "tierstore's walk must reach objstore-s3, or this check proves nothing: {reached:?}"
+    );
+    let kbf: BTreeSet<&str> = reached
+        .iter()
+        .copied()
+        .filter(|name| name.starts_with("kbf-"))
+        .collect();
+    assert_eq!(
+        kbf,
+        BTreeSet::from(["kbf-testkit"]),
+        "the kbf crates tierstore reaches, with its features and dev-dependencies"
+    );
+}
+
 /// Asserts that the S3 client and the object store trait (`objstore-s3`) link no other crate of
 /// this workspace, with its loopback S3 service (feature `testkit`) on, so that it can move to
 /// a repository of its own with `tierstore`; that the walk sees its dependencies (it reaches
