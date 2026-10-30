@@ -28,13 +28,14 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use futures::stream::{self, StreamExt as _};
 use kbf_objstore::{BodyStream, ObjectKey, ObjectStoreError};
 use kbf_types::Digest;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::metrics::{Counter, Families};
 
@@ -104,9 +105,37 @@ impl LargeBackfill {
     /// A tee for a read of `digest`, or `None` (counted `skipped`) when a put of it is already
     /// running or all the puts the bound allows are. Must run inside a tokio runtime.
     pub(crate) fn tee(&self, digest: &Digest) -> Option<Tee> {
-        let _ = digest;
-        self.counts.skipped.add(1);
-        None
+        let Ok(slot) = Arc::clone(&self.slots).try_acquire_owned() else {
+            self.counts.skipped.add(1);
+            return None;
+        };
+        if !self.lock().insert(*digest) {
+            self.counts.skipped.add(1);
+            return None;
+        }
+        let (sender, chunks) = mpsc::channel(BUFFERED_CHUNKS);
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let put = Put {
+            store: Arc::clone(&self.store),
+            digest: *digest,
+            counts: Arc::clone(&self.counts),
+            abandoned: Arc::clone(&abandoned),
+            _slot: slot,
+            _claim: Claim {
+                inflight: Arc::clone(&self.inflight),
+                digest: *digest,
+            },
+        };
+        tokio::spawn(put.run(chunks));
+        Some(Tee {
+            sender,
+            abandoned,
+            finished: false,
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<Digest>> {
+        self.inflight.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Appends `kbf_large_backfill_total` by `result` to `out`.
@@ -160,6 +189,56 @@ impl Drop for Tee {
     fn drop(&mut self) {
         if !self.finished {
             self.abandoned.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The claim of one blob on the in-flight set, given up when the put ends however it ends.
+struct Claim {
+    inflight: Arc<Mutex<HashSet<Digest>>>,
+    digest: Digest,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let mut inflight = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
+        inflight.remove(&self.digest);
+    }
+}
+
+/// One blob's put, running in the background.
+struct Put {
+    store: Arc<dyn LargeStore>,
+    digest: Digest,
+    counts: Arc<Counts>,
+    abandoned: Arc<AtomicBool>,
+    _slot: OwnedSemaphorePermit,
+    _claim: Claim,
+}
+
+impl Put {
+    async fn run(self, chunks: mpsc::Receiver<Result<Bytes, ObjectStoreError>>) {
+        let key = large_key(&self.digest);
+        // An object of the right length is the blob (the key is content-bound); a store that
+        // cannot say is left to the create-only put to decide.
+        if let Ok(Some(len)) = self.store.len(&key).await
+            && len == self.digest.size_bytes
+        {
+            self.counts.already_present.add(1);
+            return;
+        }
+        let body: BodyStream = stream::unfold(chunks, |mut chunks| async move {
+            chunks.recv().await.map(|item| (item, chunks))
+        })
+        .boxed();
+        match self.store.put(&key, self.digest.size_bytes, body).await {
+            Ok(()) => self.counts.backfilled.add(1),
+            Err(ObjectStoreError::AlreadyExists(_)) => self.counts.already_present.add(1),
+            Err(_) if self.abandoned.load(Ordering::SeqCst) => self.counts.skipped.add(1),
+            Err(error) => {
+                self.counts.failed.add(1);
+                tracing::warn!(%key, %error, "the backfill of a large blob to tierstore failed");
+            }
         }
     }
 }
