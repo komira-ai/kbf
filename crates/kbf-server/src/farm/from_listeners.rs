@@ -23,6 +23,7 @@ impl Farm {
             listeners.finished_retention,
         )
         .with_memory_ladder(listeners.memory_ladder.clone())
+        .with_memory_climb(listeners.memory_climb)
         .with_learned_sizes(listeners.learned_sizes, listeners.memory_ladder.first())
         .with_placement_load(listeners.placement_load)
         .with_placement_predictions(listeners.placement_predictions)

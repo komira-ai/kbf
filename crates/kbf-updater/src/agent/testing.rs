@@ -10,7 +10,7 @@ use std::time::Duration;
 use super::coordinator::{Coordinator, CoordinatorError};
 use super::local::{Ended, HostState, Local, LocalError, Staged, Trial};
 use crate::inventory::{Host, Role};
-use crate::ports::{Clock, Drain, Health, HealthCheck, PortError};
+use crate::ports::{Clock, Drain, Health, HealthCheck, Placed, PortError};
 use crate::version::Version;
 use crate::wire::{self, Heartbeat, Reply, ServiceReply};
 
@@ -234,6 +234,9 @@ pub struct FakeDrain {
     pub drain_error: Arc<Mutex<Option<PortError>>>,
     pub leases_error: Arc<Mutex<Option<PortError>>>,
     pub undrain_error: Arc<Mutex<Option<PortError>>>,
+    pub placed_error: Arc<Mutex<Option<PortError>>>,
+    /// Whether the node is in placement before the roll; in placement unless a test says not.
+    pub placed: Arc<Mutex<Placed>>,
 }
 
 impl FakeDrain {
@@ -245,7 +248,15 @@ impl FakeDrain {
             drain_error: Arc::default(),
             leases_error: Arc::default(),
             undrain_error: Arc::default(),
+            placed_error: Arc::default(),
+            placed: Arc::new(Mutex::new(Placed::In)),
         }
+    }
+
+    /// The node is out of placement (an operator drained it) before the roll comes.
+    pub fn out_of_placement(&self) {
+        *lock(&self.placed) = Placed::Out;
+        *lock(&self.drained) = true;
     }
 
     pub fn is_drained(&self) -> bool {
@@ -254,6 +265,14 @@ impl FakeDrain {
 }
 
 impl Drain for FakeDrain {
+    fn placed(&self, _host: &Host) -> Result<Placed, PortError> {
+        self.events.push("placed");
+        if let Some(e) = lock(&self.placed_error).clone() {
+            return Err(e);
+        }
+        Ok(*lock(&self.placed))
+    }
+
     fn drain(&self, host: &Host, deadline: Option<Duration>) -> Result<(), PortError> {
         self.events.push(match deadline {
             Some(deadline) => format!("drain {} {}", host.alias, deadline.as_secs()),
@@ -285,6 +304,106 @@ impl Drain for FakeDrain {
             return Err(e);
         }
         *lock(&self.drained) = false;
+        Ok(())
+    }
+}
+
+/// A node as the frontend keeps it: serving until drained, serving again when uncordoned.
+/// Unlike [`FakeDrain`], what it says of its placement follows what was done to it.
+#[derive(Clone)]
+pub struct ServingNode {
+    pub serving: Arc<Mutex<bool>>,
+    /// The leases it holds; they run on while it is drained.
+    pub leases: Arc<Mutex<usize>>,
+    pub drain_error: Arc<Mutex<Option<PortError>>>,
+    pub undrain_error: Arc<Mutex<Option<PortError>>>,
+    /// How many drain calls reached it.
+    pub drain_calls: Arc<Mutex<usize>>,
+    /// A directory to look into whenever a drain call arrives, and whether it held anything.
+    pub watch: Arc<Mutex<Option<std::path::PathBuf>>>,
+    pub seen_at_drain: Arc<Mutex<Option<bool>>>,
+    /// The frontend knows no node here: reads say in placement, drain and undrain do nothing.
+    pub absent: Arc<Mutex<bool>>,
+}
+
+impl ServingNode {
+    pub fn new() -> Self {
+        Self {
+            serving: Arc::new(Mutex::new(true)),
+            leases: Arc::default(),
+            drain_error: Arc::default(),
+            undrain_error: Arc::default(),
+            drain_calls: Arc::default(),
+            watch: Arc::default(),
+            seen_at_drain: Arc::default(),
+            absent: Arc::default(),
+        }
+    }
+
+    /// The frontend has no node for the host.
+    pub fn no_node(&self) {
+        *lock(&self.absent) = true;
+    }
+
+    /// An operator uncordons it by hand.
+    pub fn operator_uncordons(&self) {
+        *lock(&self.serving) = true;
+    }
+
+    /// An operator cordons and drains it.
+    pub fn operator_drains(&self) {
+        *lock(&self.serving) = false;
+    }
+
+    pub fn is_serving(&self) -> bool {
+        *lock(&self.serving)
+    }
+}
+
+impl Drain for ServingNode {
+    fn placed(&self, _host: &Host) -> Result<Placed, PortError> {
+        Ok(if self.is_serving() {
+            Placed::In
+        } else {
+            Placed::Out
+        })
+    }
+
+    fn placed_if_known(&self, host: &Host) -> Result<Option<Placed>, PortError> {
+        if *lock(&self.absent) {
+            return Ok(None);
+        }
+        self.placed(host).map(Some)
+    }
+
+    fn drain(&self, _host: &Host, _deadline: Option<Duration>) -> Result<(), PortError> {
+        *lock(&self.drain_calls) += 1;
+        if *lock(&self.absent) {
+            return Ok(());
+        }
+        if let Some(dir) = lock(&self.watch).clone() {
+            let held = std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some());
+            *lock(&self.seen_at_drain) = Some(held);
+        }
+        if let Some(e) = lock(&self.drain_error).clone() {
+            return Err(e);
+        }
+        *lock(&self.serving) = false;
+        Ok(())
+    }
+
+    fn leases(&self, _host: &Host) -> Result<usize, PortError> {
+        if self.is_serving() {
+            return Err(PortError::other("serving again"));
+        }
+        Ok(*lock(&self.leases))
+    }
+
+    fn undrain(&self, _host: &Host) -> Result<(), PortError> {
+        if let Some(e) = lock(&self.undrain_error).clone() {
+            return Err(e);
+        }
+        *lock(&self.serving) = true;
         Ok(())
     }
 }

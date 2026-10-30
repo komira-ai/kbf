@@ -674,7 +674,7 @@ fn attestations_refuse_a_foreign_workflow_an_unknown_file_and_a_missing_gh() {
     assert_eq!(
         err,
         "xtask: SHA256SUMS lists notes.txt, neither a tarball, a package, an SBOM \
-         nor version facts\n"
+         nor facts\n"
     );
 }
 
@@ -744,6 +744,69 @@ fn version_facts_are_verified_for_build_provenance_and_nothing_else() {
         *mine[0],
         format!("attestation verify {path} {}", flags(WORKFLOW))
     );
+    r.attest(Some((facts.as_str(), false)));
+    let (code, _, err) = r.verify(WORKFLOW, None);
+    assert_eq!(code, Some(1), "{err}");
+    let want = format!(
+        "xtask: {path}: no build provenance attestation signed by \
+         {WORKFLOW} verifies\n"
+    );
+    assert_eq!(err, want);
+}
+
+#[test]
+fn a_task_image_does_not_go_without_its_facts_or_the_facts_without_the_image() {
+    // Catches: a release set that lists the task image without the facts that carry the digests
+    // of its manifest and base (the attestation would not cover them), and facts left in a set
+    // with no image they state anything of. The control is the set with both listed.
+    let names: &[&str] = &["kbf-daemon"];
+    let r = Release::build_with("image-facts", &[("linux-x86_64", names)]);
+    let image = format!("kbf-task-image-{COMMIT}-linux-x86_64.oci.tar");
+    let facts = format!("kbf-task-image-{COMMIT}-linux-x86_64.facts.json");
+    r.add_listed(&image, "the task image\n");
+    let (code, out, err) = xtask(&["verify-assets", "sums", s(&r.dist)], &r.tmp, None);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!("xtask: {image}: its image facts {facts} are not listed in SHA256SUMS\n")
+    );
+    r.add_listed(&facts, "the facts of the task image\n");
+    let (code, out, err) = xtask(&["verify-assets", "sums", s(&r.dist)], &r.tmp, None);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.starts_with("sums: "), "{out}");
+
+    let r = Release::build_with("image-facts-orphan", &[("linux-x86_64", names)]);
+    r.add_listed(&facts, "the facts of the task image\n");
+    let (code, out, err) = xtask(&["verify-assets", "sums", s(&r.dist)], &r.tmp, None);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!(
+            "xtask: {facts}: the image it states the facts of, {image}, is not listed in \
+             SHA256SUMS\n"
+        )
+    );
+}
+
+#[test]
+fn the_facts_of_the_task_image_are_verified_for_build_provenance_and_nothing_else() {
+    // Catches: image facts the attest job signs through the sums that the verify job refuses as
+    // neither a tarball, a package nor an SBOM; facts held to what only a tarball has (an SBOM
+    // attestation, a bundle: neither exists); and facts whose provenance is not checked, or
+    // whose missing attestation is passed over.
+    let names: &[&str] = &["kbf", "kbf-daemon"];
+    let r = Release::build_with("image-facts-attested", &[("linux-x86_64", names)]);
+    let facts = format!("kbf-task-image-{COMMIT}-linux-x86_64.facts.json");
+    r.add_listed(&facts, "the facts of the task image\n");
+    r.attest(None);
+    let (code, out, err) = r.verify(&format!("{WORKFLOW}@refs/heads/main"), None);
+    assert_eq!(code, Some(0), "{err}");
+    let line = format!("verified: {facts} (provenance)\n");
+    assert!(out.contains(&line), "{out}");
+    let path = s(&r.dist.join(&facts)).to_owned();
+    let calls = r.gh_calls();
+    let mine: Vec<&String> = calls.iter().filter(|c| c.contains(&path)).collect();
+    assert_eq!(mine.len(), 1, "{mine:#?}");
     r.attest(Some((facts.as_str(), false)));
     let (code, _, err) = r.verify(WORKFLOW, None);
     assert_eq!(code, Some(1), "{err}");

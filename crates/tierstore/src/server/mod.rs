@@ -95,6 +95,9 @@
 //! A key that lists, heads and deletes under one prefix, and does nothing else (no get, no put), is a
 //! GC key: see [`gc`], and [`ServerConfig::gc_keys`] (`--gc-key-file` in the binary). Its deletes are
 //! not create-only: they are the only way an object leaves a prefix that presigned PUTs write.
+//! A key that reads, creates and deletes under the prefixes of three lists in its key file, and replaces and
+//! copies nothing, is a scoped key: see [`scoped`], and [`ServerConfig::scoped_keys`] (`--scoped-key-file` in the
+//! binary).
 //!
 //! # Checksums
 //!
@@ -163,15 +166,19 @@
 
 mod auth;
 pub mod cli;
+mod config;
+mod config_print;
 pub mod gc;
 mod handover;
 mod idle;
 mod keys;
+mod launch;
 pub mod oci;
 mod ops;
 pub mod presign;
 mod reply;
 mod request;
+pub mod scoped;
 mod time;
 mod xml;
 
@@ -181,6 +188,8 @@ mod auth_tests;
 mod body_stall_tests;
 #[cfg(test)]
 mod completion_tests;
+#[cfg(test)]
+mod config_testing;
 #[cfg(test)]
 mod drain_tests;
 #[cfg(test)]
@@ -203,6 +212,10 @@ mod reply_tests;
 mod request_tests;
 #[cfg(test)]
 mod role_tests;
+#[cfg(test)]
+mod scoped_server_tests;
+#[cfg(test)]
+mod scoped_tests;
 #[cfg(test)]
 mod server_tests;
 #[cfg(test)]
@@ -245,6 +258,7 @@ pub use gc::GcKey;
 pub use keys::AccessKey;
 use keys::Role;
 pub use presign::{Grant, PresignKey, PresignRequest, presign_put};
+pub use scoped::{Prefixes, ScopedKey};
 
 use idle::Watched;
 use reply::{Answer, S3Error, answer};
@@ -271,6 +285,10 @@ pub struct ServerConfig {
     /// The GC keys (see [`gc`]): header-signed keys that list, head and delete under one prefix.
     /// None by default. Their ids differ from each other's and from the other keys'.
     pub gc_keys: Vec<GcKey>,
+    /// The scoped keys (see [`scoped`]): header-signed keys that read, create and delete under
+    /// the prefixes of three lists. None by default. Their ids differ from each other's and from
+    /// the other keys'.
+    pub scoped_keys: Vec<ScopedKey>,
     /// The longest `X-Amz-Expires` a presigned URL may have, whatever the ceiling of its key says.
     pub presign_max_expires: Duration,
     /// The most bytes of a request body: the longest object that one put takes, and the
@@ -349,6 +367,7 @@ impl ServerConfig {
             read_only_keys: Vec::new(),
             presign_keys: Vec::new(),
             gc_keys: Vec::new(),
+            scoped_keys: Vec::new(),
             presign_max_expires: Duration::from_secs(900),
             max_request_bytes: 256 << 20,
             body_idle_timeout: Duration::from_secs(30),
@@ -712,6 +731,9 @@ impl Server {
         let check = Check::new(&signed.payload, &parts.headers, data)?;
         if let Role::Gc(prefix) = &signed.role {
             gc::permit(prefix, parts, &target, &query)?;
+        }
+        if let Role::Scoped(scopes) = &signed.role {
+            scoped::permit(scopes, parts, &target, &query)?;
         }
         let limit = self.config.max_request_bytes;
         let limit = signed.presign.as_ref().map_or(limit, |grant| {

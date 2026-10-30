@@ -181,6 +181,35 @@ jobs:
           # The oldest macOS the binaries support, as artifacts.yml builds them.
           MACOSX_DEPLOYMENT_TARGET: "14.0"
         run: cargo check --locked --target aarch64-apple-darwin -p kbf-cli --bin kbf
+      # The task runner has no confine for a Mac (a Command denied the network is refused there), and
+      # that code path compiles only for a non-Linux target: check it, without building or shipping it.
+      - name: Check for aarch64-apple-darwin the task runner, whose confine is not built there
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo check --locked --target aarch64-apple-darwin --tests -p kbf-task
+      # kbf-task is the one binary the release builds for a static musl target
+      # (artifacts.yml, linux-x86_64 and linux-arm64: it runs in any Linux image). The other
+      # jobs here check glibc, where libc's type aliases differ (`libc::Ioctl` is `c_ulong` on
+      # glibc and `c_int` on musl), so a glibc-only type compiled on the pull request and broke
+      # the release build after the merge. The same musl C compiler as the release job, for ring's
+      # build script; `cargo check` does not link. The Arm target has the same libc types.
+      - name: Refresh the package lists for the musl C compiler
+        if: ${{ !cancelled() }}
+        run: sudo apt-get update
+      - name: Install the musl C compiler ring's build uses for the static target
+        if: ${{ !cancelled() }}
+        run: sudo apt-get install --yes --no-install-recommends musl-tools
+      - run: rustup target add x86_64-unknown-linux-musl
+        if: ${{ !cancelled() }}
+      - name: Check for x86_64-unknown-linux-musl the binary the release builds for the static target
+        if: ${{ !cancelled() }}
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo check --locked --target x86_64-unknown-linux-musl -p kbf-task --bin kbf-task
       # The interpreter budget only shrinks: a pull request may not add a row to it
       # (crates/xtask/src/budget.rs). A pull request is checked out as the merge commit,
       # so HEAD^1 is the base branch it merges into.

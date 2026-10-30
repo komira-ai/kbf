@@ -61,6 +61,10 @@ pub(crate) struct Settings {
     pub orphan_wait: Duration,
     /// The memory ladder an action that passes its limit climbs.
     pub ladder: MemoryLadder,
+    /// Whether an own-limit kill climbs the ladder (`--no-memory-climb` is `false`). Only the
+    /// legacy scheduler is told: the js core builds its own, so a startup check refuses the
+    /// flag with it.
+    pub climb: bool,
     /// How many memory floors are kept.
     pub floors: usize,
     /// How placement uses the load (`--placement-load`).
@@ -85,6 +89,7 @@ impl Default for Settings {
         Self {
             orphan_wait: ORPHAN_WAIT,
             ladder: MemoryLadder::default(),
+            climb: true,
             floors: MEMORY_FLOORS,
             placement_load: PlacementLoad::Off,
             learned: LearnedSizes::Off,
@@ -159,6 +164,16 @@ impl Driver {
             .engine
             .sched
             .set_memory_ladder(settings.ladder.clone());
+    }
+
+    /// Applies `settings.climb` to the legacy scheduler.
+    pub(super) fn set_climb(&mut self, settings: &Settings) {
+        if matches!(self, Self::Legacy(_)) {
+            self.state_mut()
+                .engine
+                .sched
+                .set_memory_climb(settings.climb);
+        }
     }
 
     /// Applies `settings.floors` to the scheduler of `term`.

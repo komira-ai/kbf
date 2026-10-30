@@ -71,6 +71,7 @@ use super::auth::{
     hmac, keyed, signing_key, string_to_sign_for,
 };
 use super::keys::{AccessKey, Role, read_private_text};
+use super::ops::MULTIPART;
 use super::request::{Query, Target, header, query_pairs};
 use super::time::{amz_date, parse_amz_date};
 
@@ -85,9 +86,6 @@ pub const MAX_OBJECT_BYTES: u64 = 5 << 30;
 
 /// The most seconds of `X-Amz-Expires` that AWS accepts.
 pub const MAX_EXPIRES_SECS: u64 = 604_800;
-
-/// The query parameters that make a request part of a multipart upload.
-const MULTIPART: [&str; 3] = ["partNumber", "uploadId", "uploads"];
 
 /// The flag whose files hold the presigning keys.
 const FLAG: &str = "--presign-key-file";

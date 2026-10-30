@@ -158,3 +158,40 @@ fn a_hosts_detail_never_reaches_the_caller() {
         "{said}"
     );
 }
+
+/// Catches a start the host refused for its scratch quota (`quota-unavailable`, a wire detail
+/// of a run that failed to start) being the action's infrastructure failure: it is the
+/// host's, so the farm runs the action again elsewhere without charging the caller's retry
+/// budget, as it does for a host it lost. Only that detail on that outcome: another refusal
+/// of a start (including `host-tainted`, which has its own handling) and the same words on a
+/// run that did start stay infrastructure.
+#[test]
+fn a_start_refused_for_the_quota_is_lost_to_the_host() {
+    let refused = |outcome, detail: &str| Run {
+        detail: Some(detail.to_owned()),
+        ..run(RunState::Exited, Some(outcome), None)
+    };
+    assert_eq!(
+        judge(&refused(Outcome::FailedToStart, "quota-unavailable"), false),
+        Verdict::Settled(Settled::Lost(Lost::Fenced))
+    );
+    for (outcome, detail) in [
+        (Outcome::FailedToStart, "host-tainted"),
+        (Outcome::FailedToStart, "scratch-failed"),
+        (Outcome::FailedToStart, "quota-unavailable-ish"),
+        (Outcome::FailedToStart, ""),
+        (Outcome::Failed, "quota-unavailable"),
+    ] {
+        let verdict = judge(&refused(outcome, detail), false);
+        assert!(
+            matches!(verdict, Verdict::Settled(Settled::Infra(_))),
+            "{outcome:?} {detail:?}: {verdict:?}"
+        );
+    }
+    let mut bare = refused(Outcome::FailedToStart, "");
+    bare.detail = None;
+    assert!(matches!(
+        judge(&bare, false),
+        Verdict::Settled(Settled::Infra(_))
+    ));
+}

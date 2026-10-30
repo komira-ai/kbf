@@ -11,6 +11,7 @@
 //! | out of memory | `RESOURCE_EXHAUSTED`, killed at its own limit: a farm fault, rerun with more memory |
 //! | timed out at the wall the executor asked for | `DEADLINE_EXCEEDED`: the caller's timeout |
 //! | timed out at a wall the lease cut short | lost (fenced): the farm's fault, rerun |
+//! | failed to start because the host's scratch quota is out of order (`quota-unavailable`) | lost (fenced): the host's fault, rerun elsewhere |
 //! | failed (the tool exited nonzero), killed unasked, failed to start, unknown | `UNAVAILABLE`: infrastructure, rerun |
 //! | the server forgot the run (it is not listed any more) or the host never listed it | lost (daemon restarted): rerun |
 
@@ -45,6 +46,17 @@ pub(super) enum Settled {
     Invalid(String),
 }
 
+/// The detail a js-agent gives a start it refuses because its scratch disk quota is out of
+/// order (`js-agent-wire`'s `QUOTA_UNAVAILABLE`). Nothing was created, the host is clean, and
+/// it recovers by itself.
+const QUOTA_UNAVAILABLE: &str = "quota-unavailable";
+
+/// Whether `run` never started because the host's scratch quota is out of order: the host's
+/// fault, and no taint.
+pub(super) fn refused_for_quota(run: &Run) -> bool {
+    run.outcome == Some(Outcome::FailedToStart) && run.detail.as_deref() == Some(QUOTA_UNAVAILABLE)
+}
+
 /// The verdict on `run`. `truncated` says the lease cut the run's wall time short of what
 /// was asked, so a timeout was the lease's.
 pub(super) fn judge(run: &Run, truncated: bool) -> Verdict {
@@ -68,6 +80,10 @@ pub(super) fn judge(run: &Run, truncated: bool) -> Verdict {
         (_, Some(Outcome::TimedOut)) if truncated => Verdict::Settled(Settled::Lost(Lost::Fenced)),
         (_, Some(Outcome::TimedOut)) => Verdict::Settled(Settled::Timeout),
         (_, Some(Outcome::OutOfMemory)) => Verdict::Settled(Settled::OutOfMemory),
+        (_, Some(Outcome::FailedToStart)) if refused_for_quota(run) => {
+            tracing::warn!(run = %run.run_id, "the host refused the start: its scratch quota is out of order");
+            Verdict::Settled(Settled::Lost(Lost::Fenced))
+        }
         (_, Some(Outcome::FailedToStart)) => infra("the run could not start"),
         (_, Some(Outcome::Unknown)) => infra("the run ended in a way this server does not know"),
         (_, None) => infra("the run ended with no outcome"),
