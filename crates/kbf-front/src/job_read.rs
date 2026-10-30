@@ -83,6 +83,19 @@ pub const BATCH_MAX_BYTES: u64 = 4 << 20;
 /// of at most 90 bytes each), so that no body of any size is held.
 pub const MAX_BATCH_REQUEST_BYTES: usize = 64 << 10;
 
+/// The largest Action or Directory blob the scope walk reads: a tenant writes the sizes in
+/// the Directories it is asked to walk, and a read of one of 10^12 bytes would take the whole
+/// budget.
+pub const MAX_SCOPE_BLOB_BYTES: u64 = 4 << 20;
+
+/// The size of the pieces a held body is handed to a connection in: a connection takes the next
+/// when it has room, so what the budget no longer charges is no more than one piece.
+pub const HELD_CHUNK_BYTES: usize = 256 << 10;
+
+/// What a batch is charged for each gap between its blobs: the pack layer reads blobs that lie
+/// within this of each other in one range, and the slices of that range pin the gap.
+pub const BATCH_GAP_BYTES: u64 = 64 << 10;
+
 /// The default of [`Limits::read_budget_bytes`]: 1 GiB.
 pub const DEFAULT_READ_BUDGET_BYTES: u64 = 1 << 30;
 
@@ -156,8 +169,9 @@ pub struct Limits {
     pub reads_in_flight: usize,
     /// The bytes of reads open at once, in all (at least 1 KiB): a read takes its blob's size
     /// first (a streamed blob [`Limits::stream_window`] of it, the scope walk's reads their
-    /// own sizes, a batch the sizes of its blobs together), one over the budget waits for room
-    /// and never fails, and a read larger than the whole budget takes the whole of it.
+    /// own sizes, a batch the sizes of its blobs and the gaps between them), and keeps it until
+    /// its reply is sent or dropped (the bytes are held until then); one over the budget waits
+    /// for room and never fails, and a read larger than the whole budget takes the whole of it.
     pub read_budget_bytes: u64,
     /// What a streamed blob takes from the budget, at most its size. Not a flag; a test
     /// lowers it.
@@ -170,7 +184,8 @@ pub struct Limits {
     pub stream_over: u64,
     /// The most digests a scope may hold: an input tree past it gives its Action no scope.
     pub scope_digests: usize,
-    /// The Actions whose scope is remembered; at the bound the memory is emptied and begins
+    /// The Actions whose scope is remembered; at the bound the memory is emptied of the walks
+    /// that are done (those in progress stay, so that a second ask joins them) and begins
     /// again.
     pub scopes: usize,
 }
@@ -199,6 +214,42 @@ pub struct Reply {
     pub body: Bytes,
     /// The blob of a 200 that is streamed ([`Limits::stream_over`]), whose `body` is empty.
     pub stream: Option<BlobStream>,
+    /// What the bytes of `body` are charged to until the reply is sent or dropped.
+    hold: Option<Hold>,
+}
+
+/// The read places and budget a reply keeps until it is dropped, so that bytes held for a
+/// client that is slow to read them stay charged to the budget.
+#[derive(Debug)]
+struct Hold(Vec<Result<OwnedSemaphorePermit, AcquireError>>);
+
+impl Reply {
+    /// The body as a stream of pieces of at most [`HELD_CHUNK_BYTES`], when the reply holds
+    /// budget for it, which then stays held until the stream ends or is dropped; `body` is
+    /// then empty. None (and `body` as it was) for a reply that holds nothing. The caller that
+    /// sends the reply calls this, so that the budget is not given back while the connection
+    /// still has the bytes.
+    pub fn held_stream(&mut self) -> Option<BlobStream> {
+        let hold = self.hold.take()?;
+        let body = std::mem::take(&mut self.body);
+        let size = body.len();
+        let pieces: Vec<Bytes> = (0..size)
+            .step_by(HELD_CHUNK_BYTES)
+            .map(|at| body.slice(at..(at + HELD_CHUNK_BYTES).min(size)))
+            .collect();
+        let chunks = stream::unfold(
+            (pieces.into_iter(), hold),
+            |(mut pieces, hold)| async move {
+                let piece = pieces.next()?;
+                Some((Ok(piece), (pieces, hold)))
+            },
+        )
+        .boxed();
+        Some(BlobStream {
+            size: size as u64,
+            chunks,
+        })
+    }
 }
 
 /// A blob being streamed to a response: its length, and its chunks as they are checked.
@@ -465,9 +516,15 @@ impl JobRead {
                 Err(error) => self.unreadable(&error),
             };
         }
-        let _room = self.budget.take(digest.size_bytes).await;
+        let room = self.budget.take(digest.size_bytes).await;
         match self.source.read_blob(&digest).await {
-            Ok(bytes) => self.serve(bytes),
+            Ok(bytes) => {
+                // The place is given back with the read; the bytes stay charged to the budget
+                // until the reply is sent.
+                let mut reply = self.serve(bytes);
+                reply.hold = Some(Hold(vec![room]));
+                reply
+            }
             Err(error) => self.unreadable(&error),
         }
     }
@@ -496,7 +553,7 @@ impl JobRead {
                 return self.refuse_batch(Outcome::Unavailable, "store_unavailable");
             }
         };
-        let answers = self.batch_blobs(&scope, &digests).await;
+        let (answers, held) = self.batch_blobs(&claims, &scope, &digests).await;
         let mut frames = Vec::new();
         for (status, bytes) in answers {
             self.blobs[status as usize].add(1);
@@ -505,33 +562,47 @@ impl JobRead {
             frames.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
             frames.extend_from_slice(&bytes);
         }
-        self.tally(&self.batches, Outcome::Ok, Bytes::from(frames))
+        let mut reply = self.tally(&self.batches, Outcome::Ok, Bytes::from(frames));
+        reply.hold = Some(Hold(held));
+        reply
     }
 
-    /// How each of `digests` is answered, in order, and the bytes of the ok ones. The blobs
-    /// that need a read are read together, each once, with [`BlobSource::read_many`], under one
-    /// take of the reads in flight (as many places as blobs, at most all of them) and of the
-    /// budget (their sizes together).
-    async fn batch_blobs(&self, scope: &Scope, digests: &[Digest]) -> Vec<(BlobStatus, Bytes)> {
-        let readable = |digest: &Digest| {
-            scope.allows(digest) && digest.size_bytes <= BATCH_MAX_BYTES && !is_empty_blob(digest)
-        };
+    /// How each of `digests` is answered, in order, and the bytes of the ok ones, with the
+    /// budget they are charged to, which the reply keeps until it is sent. The blobs that need
+    /// a read are read together, each once, with [`BlobSource::read_many`], under a take of at
+    /// most half the reads in flight (as many places as blobs) while they are read, and of the
+    /// budget: their sizes together and [`BATCH_GAP_BYTES`] for each gap between them.
+    async fn batch_blobs(
+        &self,
+        claims: &Claims,
+        scope: &Scope,
+        digests: &[Digest],
+    ) -> (
+        Vec<(BlobStatus, Bytes)>,
+        Vec<Result<OwnedSemaphorePermit, AcquireError>>,
+    ) {
+        let allowed: Vec<bool> = digests
+            .iter()
+            .map(|digest| scope.check(claims, std::slice::from_ref(digest)).is_ok())
+            .collect();
         let mut wanted: Vec<Digest> = Vec::new();
-        for digest in digests.iter().filter(|digest| readable(digest)) {
-            if !wanted.contains(digest) {
+        for (digest, allowed) in digests.iter().zip(&allowed) {
+            let readable = *allowed && digest.size_bytes <= BATCH_MAX_BYTES;
+            if readable && !is_empty_blob(digest) && !wanted.contains(digest) {
                 wanted.push(*digest);
             }
         }
         let mut read: HashMap<Digest, (BlobStatus, Bytes)> = HashMap::new();
+        let mut held = Vec::new();
         if !wanted.is_empty() {
-            let places = wanted.len().min(self.limits.reads_in_flight.max(1));
+            let share = (self.limits.reads_in_flight / 2).max(1);
+            let places = wanted.len().min(share);
             let _places = Arc::clone(&self.reads)
                 .acquire_many_owned(u32::try_from(places).unwrap_or(u32::MAX))
                 .await;
-            let _room = self
-                .budget
-                .take(wanted.iter().map(|digest| digest.size_bytes).sum())
-                .await;
+            let sizes: u64 = wanted.iter().map(|digest| digest.size_bytes).sum();
+            let gaps = BATCH_GAP_BYTES * (wanted.len() as u64).saturating_sub(1);
+            held.push(self.budget.take(sizes + gaps).await);
             let answers = self.source.read_many(&wanted).await;
             for (digest, answer) in wanted.iter().zip(answers) {
                 let status = match answer {
@@ -543,20 +614,23 @@ impl JobRead {
                 read.insert(*digest, status);
             }
         }
-        digests
+        let answers = digests
             .iter()
-            .map(|digest| {
-                if !scope.allows(digest) {
+            .zip(&allowed)
+            .map(|(digest, allowed)| {
+                if !allowed {
                     (BlobStatus::OutOfScope, Bytes::new())
                 } else if digest.size_bytes > BATCH_MAX_BYTES {
                     (BlobStatus::TooLarge, Bytes::new())
                 } else if is_empty_blob(digest) {
                     (BlobStatus::Ok, Bytes::new())
                 } else {
-                    read[digest].clone()
+                    let unanswered = (BlobStatus::StoreUnavailable, Bytes::new());
+                    read.get(digest).cloned().unwrap_or(unanswered)
                 }
             })
-            .collect()
+            .collect();
+        (answers, held)
     }
 
     fn refuse_batch(&self, outcome: Outcome, reason: &'static str) -> Reply {
@@ -587,7 +661,7 @@ impl JobRead {
         let cell = {
             let mut cells = self.scopes.lock().unwrap_or_else(PoisonError::into_inner);
             if cells.len() >= self.limits.scopes {
-                cells.clear();
+                cells.retain(|_, cell| !cell.initialized());
             }
             Arc::clone(cells.entry(action).or_default())
         };
@@ -665,6 +739,7 @@ impl JobRead {
             status: outcome.status(),
             body,
             stream: None,
+            hold: None,
         }
     }
 
@@ -855,6 +930,9 @@ async fn walk(
     action: Digest,
     most: usize,
 ) -> Result<Scope, ScopeError> {
+    if action.size_bytes > MAX_SCOPE_BLOB_BYTES {
+        return Err(ScopeError::Unusable);
+    }
     let bytes = {
         let _room = budget.take(action.size_bytes).await;
         source.read_blob(&action).await?
@@ -894,6 +972,9 @@ async fn directory(
 ) -> Result<reapi::Directory, ScopeError> {
     if is_empty_blob(&digest) {
         return Ok(reapi::Directory::default());
+    }
+    if digest.size_bytes > MAX_SCOPE_BLOB_BYTES {
+        return Err(ScopeError::Unusable);
     }
     let bytes = {
         let _room = budget.take(digest.size_bytes).await;

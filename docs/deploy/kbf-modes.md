@@ -304,7 +304,11 @@ given together, and takes two more that have defaults:
 - `--job-read-budget-bytes` (default 1073741824, 1 GiB): the bytes of blob reads open at once. A
   read takes its blob's size first (a streamed blob a bounded window of 16 MiB, a batch the sizes
   of its blobs together, and the reads of the scope walk their own sizes); one over the budget
-  waits for room and never fails, and a blob larger than the whole budget is read alone. The scope
+  waits for room and never fails, and a blob larger than the whole budget is read alone. The room
+  stays taken until the response has been sent (or the connection dropped), so that clients that
+  are slow to read do not hold more than the budget; a batch also pays 64 KiB for each gap
+  between its blobs, and takes at most half of `--job-reads-in-flight` while it reads. An Action
+  or Directory blob over 4 MiB gives its Action no scope (it is not read). The scope
   of an Action is worked out once however many tasks ask for it at the same time.
 
 The answers are 200 with the blob and its `Content-Length`; 401 for a missing, malformed, forged,

@@ -441,11 +441,14 @@ async fn batch_body(body: Body, wait: Duration) -> Bytes {
 
 /// The HTTP response of `reply`: its status and body, the headers a client needs to read
 /// a refusal (`WWW-Authenticate` on 401, `Allow: <allow>` on 405) and a content type.
-fn response(reply: Reply, allow: &'static str) -> Response {
+fn response(mut reply: Reply, allow: &'static str) -> Response {
     let status = reply.status;
     // A streamed blob states its length before its first byte: a response that ends short of
     // it is a broken one to the client, which is how a blob that fails its digest is refused.
-    let (body, length) = match reply.stream {
+    // A body whose bytes are charged to the read budget is sent in pieces that keep the charge
+    // until the connection has taken the last of them.
+    let streamed = reply.stream.take().or_else(|| reply.held_stream());
+    let (body, length) = match streamed {
         Some(stream) => (Body::from_stream(stream.chunks), Some(stream.size)),
         None => (Body::from(reply.body), None),
     };
