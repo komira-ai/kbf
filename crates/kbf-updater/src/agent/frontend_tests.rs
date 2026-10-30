@@ -211,7 +211,11 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
         http("404 Not Found", "", "{}"),
         ok(OWN),
     ]);
-    let with_frontend = rig.config(Some(addr));
+    // Its own marks: the daemon's drain above left one for the same node.
+    let marks = rig.dir.join("storage-marks");
+    std::fs::create_dir(&marks).unwrap();
+    let mut with_frontend = rig.config(Some(addr));
+    with_frontend.cordon_dir = Some(marks);
     let (storage_drain, storage_health) =
         node_ports(&with_frontend, &rig.identity(), Role::Storage, &local).unwrap();
     let st = host(Role::Storage);

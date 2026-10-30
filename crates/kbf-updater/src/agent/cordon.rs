@@ -18,7 +18,7 @@
 //! operator's.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write as _;
+use std::io::{ErrorKind, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,6 +26,8 @@ use std::time::Duration;
 
 use crate::inventory::{Host, valid_node_id};
 use crate::ports::{Drain, Placed, PortError};
+
+const MARK: &[u8] = b"cordoned by kbf-updater\n";
 
 /// A [`Drain`] that remembers, on disk, the nodes it cordoned itself.
 pub struct OwnCordon {
@@ -57,36 +59,30 @@ impl OwnCordon {
             .map_err(|e| Self::fail("look for the cordon mark", mark, &e))
     }
 
-    /// Write the mark and make it durable before returning.
+    /// Write the mark and make it, and the directory entry, durable before returning.
     fn set(&self, mark: &Path) -> Result<(), PortError> {
-        let mut file = OpenOptions::new()
+        OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
             .open(mark)
-            .map_err(|e| Self::fail("record the cordon in", mark, &e))?;
-        file.write_all(b"cordoned by kbf-updater\n")
-            .and_then(|()| file.sync_all())
-            .map_err(|e| Self::fail("record the cordon in", mark, &e))?;
-        self.sync_dir(mark)
+            .and_then(|mut file| file.write_all(MARK).and_then(|()| file.sync_all()))
+            .and_then(|()| self.sync_dir())
+            .map_err(|e| Self::fail("record the cordon in", mark, &e))
     }
 
     /// Remove the mark, if there is one, and make that durable.
     fn clear(&self, mark: &Path) -> Result<(), PortError> {
-        match std::fs::remove_file(mark) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(Self::fail("clear the cordon mark", mark, &e)),
-        }
-        self.sync_dir(mark)
+        std::fs::remove_file(mark)
+            .map(|()| true)
+            .or_else(|e| (e.kind() == ErrorKind::NotFound).then_some(false).ok_or(e))
+            .and_then(|removed| if removed { self.sync_dir() } else { Ok(()) })
+            .map_err(|e| Self::fail("clear the cordon mark", mark, &e))
     }
 
-    fn sync_dir(&self, mark: &Path) -> Result<(), PortError> {
-        File::open(&self.dir)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|e| Self::fail("sync", &self.dir, &e))
-            .map_err(|e| PortError::other(format!("{e} (for {})", mark.display())))
+    fn sync_dir(&self) -> std::io::Result<()> {
+        File::open(&self.dir).and_then(|dir| dir.sync_all())
     }
 }
 

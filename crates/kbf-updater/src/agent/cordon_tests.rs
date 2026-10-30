@@ -126,6 +126,55 @@ fn an_undrain_clears_the_mark_only_when_it_worked() {
     assert_eq!(w.placed(&h).unwrap(), Placed::Out);
 }
 
+/// A host with no usable node id is the inner drain's to refuse: nothing is marked or read on
+/// disk for it, and the calls pass through.
+///
+/// Catches: a mark path built from a missing or free-text node id.
+#[test]
+fn a_host_without_a_node_id_passes_through_with_no_mark() {
+    let dir = scratch("cordon-noid");
+    let mut h = host(Role::Daemon);
+    h.node_id = None;
+    let node = ServingNode::new();
+    let w = cordon(&node, &dir);
+    assert_eq!(w.placed(&h).unwrap(), Placed::In);
+    w.drain(&h, None).unwrap();
+    assert_eq!(marks(&dir), 0);
+    assert_eq!(w.placed(&h).unwrap(), Placed::Out);
+    assert_eq!(w.leases(&h).unwrap(), 0);
+    w.undrain(&h).unwrap();
+    assert!(node.is_serving());
+}
+
+/// An undrain with no mark to clear is fine (the node was never marked), and a mark that cannot
+/// be read or cleared is an error, not a guess: a directory that is a file reads as an
+/// error from every call that looks, and a mark that is a directory cannot be removed.
+///
+/// Catches: a missing mark failing the undrain, and an unreadable one read as "none", which
+/// would take the updater's own cordon for an operator's.
+#[test]
+fn a_mark_that_cannot_be_read_or_cleared_is_an_error() {
+    let h = host(Role::Daemon);
+    let dir = scratch("cordon-nomark");
+    let node = ServingNode::new();
+    cordon(&node, &dir).undrain(&h).unwrap();
+
+    let file = crate::testutil::file(&scratch("cordon-file"), "not-a-dir", "x", 0o600);
+    let node = ServingNode::new();
+    let w = cordon(&node, &file);
+    assert!(w.placed(&h).is_err());
+    assert!(w.drain(&h, None).is_err());
+    assert_eq!(*node.drain_calls.lock().unwrap(), 0);
+    assert!(w.undrain(&h).is_err());
+
+    let dir = scratch("cordon-dirmark");
+    std::fs::create_dir(dir.join("cordon-n1")).unwrap();
+    let node = ServingNode::new();
+    let w = cordon(&node, &dir);
+    assert_eq!(w.placed(&h).unwrap(), Placed::In);
+    assert!(w.undrain(&h).is_err());
+}
+
 struct Rig {
     events: Events,
     local: FakeLocal,
