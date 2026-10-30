@@ -111,7 +111,7 @@ const S3_MIN_BODY_RATE: Option<NonZeroU64> = NonZeroU64::new(1 << 20);
 #[derive(Clone, Debug, Parser)]
 #[command(name = "tierstore", version)]
 pub struct Cli {
-    /// The address the S3 API, `/healthz` and `/readyz` are served on.
+    /// The address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on.
     #[arg(long)]
     pub listen: SocketAddr,
     /// The id of this proxy, which names its journal in the hot tier and its lease. Keep it
@@ -238,6 +238,14 @@ pub struct Cli {
     /// How often the reconciler works: shorter than `--lease-ttl`.
     #[arg(long, default_value = "5s", value_parser = parse_duration)]
     pub reconcile_interval: Duration,
+    /// How old the usage the reconciler publishes may be before `/usagez` says 503 with the
+    /// reason (`/readyz` does not look at it): a number and `ms`, `s`, `m` or `h`, longer than
+    /// `--lease-ttl`, so that a reconciler that takes over the lease does not show. A usage that
+    /// is older than 30 seconds is ignored by the puts as if the hot tier were not full, so a
+    /// reconciler that has stopped would otherwise show nowhere; the puts are not refused. A
+    /// process that has run this long without any usage is judged the same way.
+    #[arg(long, default_value = "2m", value_parser = parse_duration)]
+    pub usage_stale_after: Duration,
     /// The longest body of a request, in bytes: the longest object, and the longest part of a
     /// multipart upload. An upper bound on the length of what is streamed, not a bound on
     /// memory: the body of a put or of a part is passed on to the tiers as it arrives and is
@@ -491,7 +499,10 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     if cli.reconcile_interval >= cli.lease_ttl {
         return Err("--reconcile-interval must be shorter than --lease-ttl".into());
     }
-    if matches!(cli.bucket.as_str(), "healthz" | "readyz") {
+    if cli.usage_stale_after <= cli.lease_ttl {
+        return Err("--usage-stale-after must be longer than --lease-ttl".into());
+    }
+    if matches!(cli.bucket.as_str(), "healthz" | "readyz" | "usagez") {
         let name = &cli.bucket;
         return Err(format!("--bucket {name:?} is the name of a probe path").into());
     }
@@ -529,6 +540,7 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     server.put_rate_grace = cli.put_rate_grace;
     server.drain_lb_wait = cli.drain_lb_wait;
     server.drain_deadline = cli.drain_deadline;
+    server.usage_stale_after = cli.usage_stale_after;
     let mut proxy = ProxyConfig::new(&cli.proxy_id, cli.hot_bytes, Arc::clone(&clock));
     proxy.critical = share(cli.critical);
     proxy.linger = cli.journal_linger;
@@ -662,13 +674,14 @@ pub async fn run(
     stop: impl Future<Output = ()> + Send + 'static,
     ready: impl FnOnce(SocketAddr),
 ) -> Result<Drained, Error> {
-    let built = build(cli)?;
+    let mut built = build(cli)?;
     let (hot, cold) = (built.hot.as_ref(), built.cold.as_ref());
     probe_tiers(cli, hot, cold, cli.backend_check_wait).await?;
     let (hot, cold) = (Arc::clone(&built.hot), Arc::clone(&built.cold));
     let opened = Proxy::open(hot, cold, built.proxy).await;
-    let proxy = opened.map_err(|why| format!("opening the proxy: {why}"))?;
-    let server = Server::new(Arc::new(proxy), built.server);
+    let proxy = Arc::new(opened.map_err(|why| format!("opening the proxy: {why}"))?);
+    built.server.proxy = Some(Arc::clone(&proxy));
+    let server = Server::new(proxy, built.server);
     let address = cli.listen;
     let bound = TcpListener::bind(address).await;
     let listener = bound.map_err(|why| format!("binding {address}: {why}"))?;
