@@ -108,12 +108,13 @@ fn gives_up_and_stops_for_a_failed_shard() {
 }
 
 /// Catches: a run GitHub does not know (HTTP 404) read as no artifacts yet, which would
-/// wait out every look; it is asked about a few times (a bad reply is tried again) and then
-/// the wait fails.
+/// wait out every look; it is asked about again until `FAILED_LOOKS` looks in a row have
+/// failed, and then the wait fails with the error. The looks are more than that, so the count
+/// ends the wait and not the end of the looks.
 #[test]
-fn a_missing_run_fails_after_a_few_looks() {
+fn a_missing_run_fails_after_the_failed_looks_in_a_row() {
     let f = fx("missing", &json!({}));
-    let (code, _, err) = f.run("5");
+    let (code, _, err) = f.run("40");
     assert_eq!(code, Some(1));
     assert!(err.contains("not found"), "{err}");
 }
