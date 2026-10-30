@@ -89,7 +89,8 @@
 //! answered 403 `AccessDenied` with the S3 error document before its body is read, and changes
 //! nothing. The roles of those keys are of the key and not of a prefix. A put by the full key
 //! is create-only but, when the hot tier is full, can race another put of the same key into the
-//! cold tier (see [`Proxy`](crate::Proxy)); a presigned PUT never goes to the cold tier.
+//! cold tier (see [`Proxy`](crate::Proxy)); on a storage node
+//! a presigned PUT never goes to the cold tier (with only a cold store it goes straight to it).
 //! A credential that may write one object under a prefix, and expires, is a presigned PUT URL: see [`presign`], and
 //! [`ServerConfig::presign_keys`] for the keys that sign them (`--presign-key-file` in the binary).
 //! A key that lists, heads and deletes under one prefix, and does nothing else (no get, no put), is a

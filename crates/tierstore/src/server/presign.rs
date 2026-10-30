@@ -44,10 +44,11 @@
 //!
 //! The object appears only once its whole body has arrived and passed the checks of the body:
 //! the front streams the body to the backend's streamed put (never holding it whole), which
-//! makes the object visible only after the last byte, create-only, and writes to the hot tier
-//! only: a full hot tier is `503 SlowDown` with `Retry-After` and nothing is stored, never a write
-//! to the cold tier, so the hot tier's create-only write is the one arbiter of a race. It
-//! publishes the object atomically and refuses a key that exists (`412 PreconditionFailed`, the
+//! makes the object visible only after the last byte, create-only, and (on a storage node) writes
+//! to the hot tier only: a full hot tier is `503 SlowDown` with `Retry-After` and nothing is
+//! stored, never a write to the cold tier, so the hot tier's create-only write is the one arbiter
+//! of a race. It publishes
+//! the object atomically and refuses a key that exists (`412 PreconditionFailed`, the
 //! stored object untouched), so the first complete `PUT` of a key wins and a connection that is
 //! cut leaves nothing. The signature does not cover the body (`UNSIGNED-PAYLOAD`: the URL is made
 //! before the body exists), so whoever reads the object must check its content, as the frontend

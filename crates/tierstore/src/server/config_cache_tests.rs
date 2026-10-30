@@ -10,7 +10,7 @@ use super::config_testing::{DEFAULTS, GOLDEN};
 use super::local_cache::{FILL_CHUNK, WHOLE_FILL_LIMIT};
 
 /// A build node's file with every key given a value that is not the default.
-const CACHE: &str = r#"
+pub(super) const CACHE: &str = r#"
 [server]
 listen                = "192.0.2.10:9400"
 proxy_id              = "tierstore-cache-1"

@@ -891,7 +891,7 @@ pub(super) fn from_text(text: &str, per_run: PerRun) -> Result<Cli, ConfigError>
             Err(invalid("local_cache", why))
         }
         Settings::Cold(_) => {
-            let why = "alone is the file of a pass-through front, which has no flag form";
+            let why = "is the file of a pass-through front when alone, which has no flag form";
             Err(invalid("cold_store", why))
         }
     }

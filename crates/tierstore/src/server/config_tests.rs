@@ -277,7 +277,7 @@ fn a_fault_inside_a_multi_line_string_shows_nothing_of_the_string() {
 /// `[cold_store]`) is refused for the shape. A storage node's file missing `[hot_store]` is the
 /// pass-through shape (see `config_cold_tests.rs`).
 #[test]
-fn a_local_cache_with_a_hot_store_and_any_shape_but_the_two_are_refused() {
+fn a_local_cache_with_a_hot_store_and_any_shape_but_the_three_are_refused() {
     let cache = format!("{GOLDEN}\n[local_cache]\npath = \"/var/cache\"\n");
     let why = refusal(&cache);
     assert!(

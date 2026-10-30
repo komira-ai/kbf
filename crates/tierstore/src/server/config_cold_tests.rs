@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use super::config::{PerRun, from_text, settings_from_text};
+use super::config_cache_tests::CACHE;
 use super::config_cold::ColdSettings;
 use super::config_testing::{DEFAULTS, GOLDEN};
 
@@ -172,7 +173,11 @@ fn the_cold_store_is_held_to_the_keys_of_its_kind() {
 #[test]
 fn the_other_shapes_are_unchanged() {
     let storage = settings_from_text(GOLDEN, DEFAULTS).unwrap();
+    assert!(storage.into_cold().is_none());
+    let storage = settings_from_text(GOLDEN, DEFAULTS).unwrap();
     assert!(storage.into_storage().is_some());
+    let cache = settings_from_text(CACHE, DEFAULTS).unwrap();
+    assert!(cache.into_cold().is_none());
     let hot_alone = "[hot_store]\nkind = \"memory\"\nbudget = 1000\n";
     let why = refusal(&format!("{SERVER}\n{hot_alone}"));
     assert!(why.contains("both [hot_store] and [cold_store]"), "{why}");
