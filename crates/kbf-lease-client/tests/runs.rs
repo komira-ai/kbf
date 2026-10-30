@@ -378,12 +378,18 @@ async fn arguments_reach_the_server_and_never_a_log_line() {
     let id = lease(&client).await;
     let mut spec = run_of(1000, 1);
     spec.args = vec!["https://store.example/put?X-Amz-Signature=SECRETSIG".to_owned()];
+    spec.mounts = vec![kbf_lease_client::Mount {
+        root_name: "tools".to_owned(),
+        rel: "tool".to_owned(),
+        ro: true,
+    }];
     let printed = format!("{spec:?}");
     assert!(!printed.contains("SECRETSIG"), "{printed}");
     assert!(printed.contains("<1 redacted>"), "{printed}");
     assert!(printed.contains(IMAGE));
     let queued = client.queue_run(id, &spec).await.unwrap().run_id;
     assert_eq!(server.run_args(&queued), Some(spec.args.clone()));
+    assert_eq!(server.run_mounts(&queued), Some(spec.mounts.clone()));
 }
 
 /// Asserts that a run's labels come back on the run and on the list, and that a run with
