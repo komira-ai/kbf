@@ -22,16 +22,42 @@
 //!
 //! with every field required except `stdout` and `stderr`, which are left out when the stream
 //! is empty. An unknown field, a duplicate key and uppercase hex are refused.
+//!
+//! Version 2 is for a run that wrote several packs or large objects (a blob over
+//! [`MAX_RECORD_BYTES`] is a raw object of its own). It adds two required fields after `usage`,
+//! which version 1 must not have:
+//!
+//! ```json
+//!  ,"packs":2,"large":[{"slot":0,"digest":"<hex>/<size>"}]
+//! ```
+//!
+//! and may add an advisory `"inputs":{..}` ([`InputStats`]) after them, which only version 2
+//! may carry: a manifest with `inputs` is written as version 2, since a version 1 reader
+//! refuses a field it does not know. Version 2 is required exactly when `packs` is above 1, `large`
+//! is not empty or `inputs` is present: a body of either version that disagrees is refused, so a
+//! manifest has one spelling.
+//!
+//! `packs` is how many of packs `0..` were written (1 to [`MAX_PACKS`]); `large` names the
+//! large objects by slot (unique, below [`MAX_LARGE`]), each of a size above
+//! [`MAX_RECORD_BYTES`] and at most the large cap the reader is given. Every digest an output
+//! names is in exactly one place, a pack record or one large object; which pack holds it is for
+//! ingest to check. A manifest of one pack and no large object is written as version 1, so the
+//! bytes of a small run do not change.
 
 use std::collections::BTreeSet;
 
 use kbf_types::{Digest, DigestFunction, ParseDigestError};
 use serde::{Deserialize, Serialize};
 
-use crate::task_key::{TaskKeyError, check_build};
+use crate::task_key::{MAX_LARGE, MAX_PACKS, TaskKeyError, check_build};
+use crate::task_pack::MAX_RECORD_BYTES;
 
-/// The manifest version this build reads and writes.
+/// The first manifest version: one pack, no large object. Written whenever the manifest names
+/// nothing more.
 pub const MANIFEST_VERSION: u32 = 1;
+
+/// The second manifest version: adds `packs` and `large`.
+pub const MANIFEST_VERSION_2: u32 = 2;
 
 /// The largest manifest record: a larger one is refused before it is read.
 pub const MAX_MANIFEST_BYTES: u64 = 4 << 20;
@@ -84,9 +110,63 @@ pub enum ManifestError {
     /// field, a duplicate key or a missing field.
     #[error("the manifest is not valid: {0}")]
     Json(#[from] serde_json::Error),
-    /// The version is not [`MANIFEST_VERSION`].
-    #[error("manifest version {0}, this build reads {MANIFEST_VERSION}")]
+    /// The version is neither [`MANIFEST_VERSION`] nor [`MANIFEST_VERSION_2`].
+    #[error("manifest version {0}, this build reads {MANIFEST_VERSION} and {MANIFEST_VERSION_2}")]
     Version(u32),
+    /// A version 1 manifest holds a field only version 2 has.
+    #[error("manifest version {MANIFEST_VERSION} has no field {0:?}")]
+    UnexpectedField(&'static str),
+    /// A version 2 manifest lacks a field it requires.
+    #[error("manifest version {MANIFEST_VERSION_2} requires the field {0:?}")]
+    MissingField(&'static str),
+    /// A version 2 body that has one pack, no large object and no `inputs`: that manifest is
+    /// spelled as version 1.
+    #[error(
+        "manifest version {MANIFEST_VERSION_2} with one pack, no large object and no inputs is spelled as version {MANIFEST_VERSION}"
+    )]
+    NotV2,
+    /// A manifest that names more than one pack, given to a reader of one pack: only the `_with`
+    /// forms read a multi-pack run, because the others would take pack 0 for all of it.
+    #[error("the manifest names {0} packs; this reader takes one")]
+    MultiPack(u8),
+    /// `packs` is 0 or more than [`MAX_PACKS`].
+    #[error("packs is {0}, not in 1..={MAX_PACKS}")]
+    Packs(u8),
+    /// A large slot at or above [`MAX_LARGE`].
+    #[error("large slot {0} is not below {MAX_LARGE}")]
+    LargeSlot(u8),
+    /// Two large entries have one slot.
+    #[error("large slot {0} is listed twice")]
+    DuplicateLargeSlot(u8),
+    /// Two large entries have one digest: a digest is in exactly one place.
+    #[error("the digest {0} is listed as a large object twice")]
+    DuplicateLargeDigest(Digest),
+    /// A large entry of at most [`MAX_RECORD_BYTES`]: a blob that small is a pack record.
+    #[error("large slot {slot} has {size} bytes, not more than the {MAX_RECORD_BYTES} of a record")]
+    LargeTooSmall {
+        /// The slot.
+        slot: u8,
+        /// The size given.
+        size: u64,
+    },
+    /// A large entry over the large cap.
+    #[error("large slot {slot} has {size} bytes, more than the large cap {cap}")]
+    LargeTooBig {
+        /// The slot.
+        slot: u8,
+        /// The size given.
+        size: u64,
+        /// The cap the reader was given.
+        cap: u64,
+    },
+    /// A large entry that no output names.
+    #[error("large slot {slot} holds {digest}, which no output names")]
+    LargeUnnamed {
+        /// The slot.
+        slot: u8,
+        /// The digest given.
+        digest: Digest,
+    },
     /// The lease is not a build id.
     #[error("the lease: {0}")]
     Lease(#[from] TaskKeyError),
@@ -168,6 +248,108 @@ pub struct OutputSymlink {
     pub target: String,
 }
 
+/// A large object: the raw object under key slot `L<slot>`, holding one blob over
+/// [`MAX_RECORD_BYTES`]. The size is the digest's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LargeEntry {
+    /// The index `i` of the key slot `L<i>`.
+    pub slot: u8,
+    /// The digest of the blob, and so its size.
+    pub digest: Digest,
+}
+
+impl LargeEntry {
+    /// The size of the blob, in bytes.
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.digest.size_bytes
+    }
+}
+
+/// Where the bytes of a task's inputs came from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SourceBytes {
+    /// From the read listener, one blob per request.
+    pub listener_get: u64,
+    /// From the read listener's batch request.
+    pub listener_batch: u64,
+    /// From a node-local read cache.
+    pub cache_hit: u64,
+    /// Directly from the tier store.
+    pub tierstore_direct: u64,
+}
+
+/// What a task measured while fetching its inputs. A field the writer leaves out is 0.
+///
+/// ADVISORY, NEVER TRUSTED: the task writes it and ingest only carries it into metrics. It
+/// decides nothing: not what is stored, not the action result, not whether the run is accepted
+/// (beyond each number fitting an `i64`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct InputStats {
+    /// Blobs fetched.
+    pub blobs: u64,
+    /// Files in the input tree.
+    pub files: u64,
+    /// Directories in the input tree.
+    pub directories: u64,
+    /// Requests made.
+    pub requests: u64,
+    /// Requests that were retried.
+    pub retries: u64,
+    /// The most requests in flight at once.
+    pub max_in_flight: u64,
+    /// Bytes written to the scratch directory.
+    pub bytes_written_scratch: u64,
+    /// Time walking the input tree, in milliseconds.
+    pub walk_ms: u64,
+    /// Time fetching, in milliseconds.
+    pub fetch_ms: u64,
+    /// Time hashing, in milliseconds.
+    pub hash_ms: u64,
+    /// Time writing to scratch, in milliseconds.
+    pub write_ms: u64,
+    /// The median request time, in milliseconds.
+    pub request_p50_ms: u64,
+    /// The 99th percentile request time, in milliseconds.
+    pub request_p99_ms: u64,
+    /// Bytes by where they came from.
+    pub bytes_by_source: SourceBytes,
+}
+
+impl InputStats {
+    /// Every number with its field name, for the `i64` check.
+    fn numbers(&self) -> [(&'static str, u64); 17] {
+        let source = &self.bytes_by_source;
+        [
+            ("inputs.blobs", self.blobs),
+            ("inputs.files", self.files),
+            ("inputs.directories", self.directories),
+            ("inputs.requests", self.requests),
+            ("inputs.retries", self.retries),
+            ("inputs.max_in_flight", self.max_in_flight),
+            ("inputs.bytes_written_scratch", self.bytes_written_scratch),
+            ("inputs.walk_ms", self.walk_ms),
+            ("inputs.fetch_ms", self.fetch_ms),
+            ("inputs.hash_ms", self.hash_ms),
+            ("inputs.write_ms", self.write_ms),
+            ("inputs.request_p50_ms", self.request_p50_ms),
+            ("inputs.request_p99_ms", self.request_p99_ms),
+            ("inputs.bytes_by_source.listener_get", source.listener_get),
+            (
+                "inputs.bytes_by_source.listener_batch",
+                source.listener_batch,
+            ),
+            ("inputs.bytes_by_source.cache_hit", source.cache_hit),
+            (
+                "inputs.bytes_by_source.tierstore_direct",
+                source.tierstore_direct,
+            ),
+        ]
+    }
+}
+
 /// How long the task's steps took, in milliseconds. Advisory.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Timing {
@@ -214,23 +396,65 @@ pub struct TaskManifest {
     pub timing: Timing,
     /// Resource use.
     pub usage: Usage,
+    /// How many of packs `0..` were written: 1 to [`MAX_PACKS`]. Pack 0 holds the manifest.
+    pub packs: u8,
+    /// The large objects, by slot. Empty for a version 1 manifest.
+    pub large: Vec<LargeEntry>,
+    /// What the task measured fetching its inputs, if it says. Advisory: see [`InputStats`].
+    pub inputs: Option<InputStats>,
 }
 
 impl TaskManifest {
-    /// Reads the manifest record `bytes`.
+    /// Reads the manifest record `bytes` for a consumer of one pack: a manifest of more than one
+    /// pack (or with a large object) is refused; [`TaskManifest::parse_with`] takes those.
     ///
     /// # Errors
     /// [`ManifestError::TooLarge`] first, before anything is parsed; then the first of
     /// [`ManifestError::Json`], [`ManifestError::Version`], [`ManifestError::Digest`] and the
-    /// refusals of [`TaskManifest::validate`].
+    /// refusals of [`TaskManifest::validate`], and [`ManifestError::MultiPack`].
     pub fn parse(bytes: &[u8]) -> Result<Self, ManifestError> {
+        let manifest = Self::parse_with(bytes, 0)?;
+        manifest.check_single_pack()?;
+        Ok(manifest)
+    }
+
+    /// [`TaskManifest::parse`] for a reader that accepts large objects of up to `large_max`
+    /// bytes. A `large_max` of 0 accepts none, as [`TaskManifest::parse`] does.
+    ///
+    /// # Errors
+    /// Those of [`TaskManifest::parse`], and [`ManifestError::UnexpectedField`] or
+    /// [`ManifestError::MissingField`] for the fields of the version.
+    pub fn parse_with(bytes: &[u8], large_max: u64) -> Result<Self, ManifestError> {
         check_len(bytes.len() as u64)?;
         let wire: Wire = serde_json::from_slice(bytes)?;
-        if wire.version != MANIFEST_VERSION {
-            return Err(ManifestError::Version(wire.version));
+        let wire_version = wire.version;
+        match wire.version {
+            MANIFEST_VERSION => {
+                if wire.packs.is_some() {
+                    return Err(ManifestError::UnexpectedField("packs"));
+                }
+                if wire.large.is_some() {
+                    return Err(ManifestError::UnexpectedField("large"));
+                }
+                if wire.inputs.is_some() {
+                    return Err(ManifestError::UnexpectedField("inputs"));
+                }
+            }
+            MANIFEST_VERSION_2 => {
+                if wire.packs.is_none() {
+                    return Err(ManifestError::MissingField("packs"));
+                }
+                if wire.large.is_none() {
+                    return Err(ManifestError::MissingField("large"));
+                }
+            }
+            other => return Err(ManifestError::Version(other)),
         }
         let manifest = wire.into_manifest()?;
-        manifest.validate()?;
+        manifest.validate_with(large_max)?;
+        if wire_version == MANIFEST_VERSION_2 && manifest.version() == MANIFEST_VERSION {
+            return Err(ManifestError::NotV2);
+        }
         Ok(manifest)
     }
 
@@ -241,6 +465,16 @@ impl TaskManifest {
     /// JSON would pass [`MAX_MANIFEST_BYTES`].
     pub fn to_json(&self) -> Result<Vec<u8>, ManifestError> {
         self.validate()?;
+        self.to_json_with(0)
+    }
+
+    /// [`TaskManifest::to_json`] for a writer whose large objects may have up to `large_max`
+    /// bytes. Version 1 is written for one pack and no large object, version 2 otherwise.
+    ///
+    /// # Errors
+    /// Those of [`TaskManifest::to_json`], checked against `large_max`.
+    pub fn to_json_with(&self, large_max: u64) -> Result<Vec<u8>, ManifestError> {
+        self.validate_with(large_max)?;
         let json = serde_json::to_vec(&Wire::from_manifest(self))?;
         check_len(json.len() as u64)?;
         Ok(json)
@@ -255,6 +489,28 @@ impl TaskManifest {
     /// # Errors
     /// The first rule that fails, in the order of the fields.
     pub fn validate(&self) -> Result<(), ManifestError> {
+        self.validate_with(0)?;
+        self.check_single_pack()
+    }
+
+    /// The rule of the plain forms, which are for a consumer of one pack: more than one pack is
+    /// [`ManifestError::MultiPack`], so pack 0 is never taken for all of a multi-pack run.
+    pub(crate) fn check_single_pack(&self) -> Result<(), ManifestError> {
+        if self.packs > 1 {
+            return Err(ManifestError::MultiPack(self.packs));
+        }
+        Ok(())
+    }
+
+    /// [`TaskManifest::validate`] for a reader that accepts large objects of up to `large_max`
+    /// bytes, and also: `packs` is 1 to [`MAX_PACKS`]; large slots are below [`MAX_LARGE`] and
+    /// unique; large digests are unique; each large size is over [`MAX_RECORD_BYTES`] and at most
+    /// `large_max`; each large digest is named by an output. Which pack holds each other digest
+    /// is not checked here.
+    ///
+    /// # Errors
+    /// The first rule that fails, the large rules after those of [`TaskManifest::validate`].
+    pub fn validate_with(&self, large_max: u64) -> Result<(), ManifestError> {
         check_build(&self.lease)?;
         check_digest("action", &self.action)?;
         for (field, stream) in [("stdout", &self.stdout), ("stderr", &self.stderr)] {
@@ -287,12 +543,57 @@ impl TaskManifest {
             ("timing.pack_ms", self.timing.pack_ms),
             ("usage.cpu_usage_us", self.usage.cpu_usage_us),
             ("usage.memory_peak_bytes", self.usage.memory_peak_bytes),
-        ] {
+        ]
+        .into_iter()
+        .chain(self.inputs.iter().flat_map(|i| i.numbers()))
+        {
             if i64::try_from(value).is_err() {
                 return Err(ManifestError::Advisory { field, value });
             }
         }
+        self.check_packs_and_large(large_max)
+    }
+
+    fn check_packs_and_large(&self, large_max: u64) -> Result<(), ManifestError> {
+        if !(1..=MAX_PACKS).contains(&self.packs) {
+            return Err(ManifestError::Packs(self.packs));
+        }
+        let mut slots = BTreeSet::new();
+        let mut digests = BTreeSet::new();
+        for entry in &self.large {
+            let (slot, size) = (entry.slot, entry.size());
+            if slot >= MAX_LARGE {
+                return Err(ManifestError::LargeSlot(slot));
+            }
+            if !slots.insert(slot) {
+                return Err(ManifestError::DuplicateLargeSlot(slot));
+            }
+            if size <= MAX_RECORD_BYTES {
+                return Err(ManifestError::LargeTooSmall { slot, size });
+            }
+            if size > large_max {
+                let cap = large_max;
+                return Err(ManifestError::LargeTooBig { slot, size, cap });
+            }
+            if !digests.insert(entry.digest) {
+                return Err(ManifestError::DuplicateLargeDigest(entry.digest));
+            }
+            if !self.output_digests().any(|d| d == entry.digest) {
+                let digest = entry.digest;
+                return Err(ManifestError::LargeUnnamed { slot, digest });
+            }
+        }
         Ok(())
+    }
+
+    /// The manifest version this manifest is written as.
+    #[must_use]
+    pub fn version(&self) -> u32 {
+        if self.packs == 1 && self.large.is_empty() && self.inputs.is_none() {
+            MANIFEST_VERSION
+        } else {
+            MANIFEST_VERSION_2
+        }
     }
 
     /// The digests of the outputs that need a record in the pack or a copy already in the store:
@@ -382,6 +683,19 @@ struct Wire {
     output_symlinks: Vec<WireSymlink>,
     timing: WireTiming,
     usage: WireUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    packs: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    large: Option<Vec<WireLarge>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inputs: Option<InputStats>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireLarge {
+    slot: u8,
+    digest: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -424,7 +738,7 @@ struct WireUsage {
 impl Wire {
     fn from_manifest(m: &TaskManifest) -> Self {
         Self {
-            version: MANIFEST_VERSION,
+            version: m.version(),
             lease: m.lease.clone(),
             action: m.action.to_string(),
             exit_code: m.exit_code,
@@ -464,6 +778,17 @@ impl Wire {
                 cpu_usage_us: m.usage.cpu_usage_us,
                 memory_peak_bytes: m.usage.memory_peak_bytes,
             },
+            packs: (m.version() == MANIFEST_VERSION_2).then_some(m.packs),
+            large: (m.version() == MANIFEST_VERSION_2).then(|| {
+                m.large
+                    .iter()
+                    .map(|l| WireLarge {
+                        slot: l.slot,
+                        digest: l.digest.to_string(),
+                    })
+                    .collect()
+            }),
+            inputs: m.inputs,
         }
     }
 
@@ -484,6 +809,13 @@ impl Wire {
             output_directories.push(OutputDirectory {
                 tree: digest_of(format!("output_directories[{i}].tree"), &d.tree)?,
                 path: d.path,
+            });
+        }
+        let mut large = Vec::new();
+        for (i, l) in self.large.into_iter().flatten().enumerate() {
+            large.push(LargeEntry {
+                digest: digest_of(format!("large[{i}].digest"), &l.digest)?,
+                slot: l.slot,
             });
         }
         Ok(TaskManifest {
@@ -511,6 +843,9 @@ impl Wire {
                 cpu_usage_us: self.usage.cpu_usage_us,
                 memory_peak_bytes: self.usage.memory_peak_bytes,
             },
+            packs: self.packs.unwrap_or(1),
+            large,
+            inputs: self.inputs,
         })
     }
 }

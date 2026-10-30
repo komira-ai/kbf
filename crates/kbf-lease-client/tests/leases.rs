@@ -5,7 +5,7 @@ mod support;
 use std::time::Duration;
 
 use kbf_lease_client::fake::FakeLeaseServer;
-use kbf_lease_client::{Acquired, ErrorCode, LeaseState, ReleaseState, Resources};
+use kbf_lease_client::{Acquired, ErrorCode, HostLoad, LeaseState, ReleaseState, Resources};
 use support::{fake, lease, pool, refused, run_of, whole_host};
 
 /// Asserts that a lease books a whole host, the next lease gets the next free host, and
@@ -369,4 +369,46 @@ async fn a_small_lease_still_books_the_whole_host() {
     client.acquire(&request).await.unwrap();
     let error = client.acquire(&request).await.unwrap_err();
     assert_eq!(refused(error), (409, ErrorCode::NoCapacity));
+}
+
+/// Asserts the load the fake lists per host: none until set, the set reading on its own host
+/// only, none again once cleared, and none for a lost host (as the server lists), back when
+/// it answers again. It catches a load shown on the wrong host, one that outlives its
+/// clearing, and a lost host that keeps a reading no consumer should believe.
+#[tokio::test]
+async fn the_host_list_shows_the_load_a_host_reported() {
+    let (server, client) = fake().await;
+    let reading = HostLoad {
+        seq: 3,
+        mono_usec: 9_000_000,
+        cpu_usage_usec: 4_000_000,
+        memory_working_set_bytes: 1 << 30,
+        memory_active_file_bytes: 0,
+        actions_cpu_limited: false,
+        covered: Vec::new(),
+        lease_clocks: Vec::new(),
+        minutes: Vec::new(),
+    };
+    assert!(
+        client
+            .hosts()
+            .await
+            .unwrap()
+            .iter()
+            .all(|h| h.load.is_none())
+    );
+    assert!(server.set_host_load("node2", Some(reading.clone())));
+    assert!(!server.set_host_load("nowhere", Some(reading.clone())));
+    let hosts = client.hosts().await.unwrap();
+    assert_eq!(hosts[0].load, None);
+    assert_eq!(hosts[1].load.as_ref(), Some(&reading));
+    assert!(server.set_lost("node2", true));
+    assert_eq!(client.hosts().await.unwrap()[1].load, None);
+    assert!(server.set_lost("node2", false));
+    assert_eq!(
+        client.hosts().await.unwrap()[1].load.as_ref(),
+        Some(&reading)
+    );
+    assert!(server.set_host_load("node2", None));
+    assert_eq!(client.hosts().await.unwrap()[1].load, None);
 }

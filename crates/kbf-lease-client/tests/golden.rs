@@ -165,6 +165,37 @@ fn what_the_server_sends_reads_now_and_after_it_grows() {
     assert!(only_state.lost.is_none() && only_state.is_lost());
     let live: Host = serde_json::from_value(hosts["hosts"][4].clone()).unwrap();
     assert!(!live.is_lost());
+    // The load is optional: the host with none reads as `None`, and the host with one keeps
+    // every figure in the unit its name states.
+    assert!(first.load.is_none() && second.load.is_none());
+    let load = live.load.as_ref().expect("the live host lists a load");
+    assert_eq!(
+        (load.seq, load.mono_usec, load.cpu_usage_usec),
+        (5, 61_000_000, 125_000_000)
+    );
+    assert_eq!(
+        (load.memory_working_set_bytes, load.memory_active_file_bytes),
+        (7_000_000_000, 250)
+    );
+    assert!(load.actions_cpu_limited);
+    assert_eq!(load.covered, ["3-7"]);
+    assert_eq!(load.lease_clocks[0].started_mono_usec, 500_000);
+    assert_eq!(load.minutes[0].cpu_peak_window_millis, 2000);
+    // A server that grows the load (a field this client has not heard of) is still read.
+    let mut grown = hosts["hosts"][4].clone();
+    grown["load"]["new_figure"] = json!(1);
+    let grown: Host = serde_json::from_value(grown).unwrap();
+    assert_eq!(grown.load.as_ref(), Some(load));
+    // A load with only the figures that are always sent reads, its lists empty.
+    let mut bare = hosts["hosts"][4].clone();
+    for list in ["covered", "lease_clocks", "minutes"] {
+        bare["load"].as_object_mut().unwrap().remove(list);
+    }
+    let bare: Host = serde_json::from_value(bare).unwrap();
+    assert!(
+        bare.load
+            .is_some_and(|l| l.covered.is_empty() && l.minutes.is_empty())
+    );
     for element in hosts["hosts"].as_array().unwrap() {
         let host: Host = serde_json::from_value(element.clone()).unwrap();
         assert_eq!(&serde_json::to_value(&host).unwrap(), element);

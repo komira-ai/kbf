@@ -14,8 +14,8 @@ use kbf_front::{
     Backend, Ingested, IssuedPackKey, PackKeyMint, RejectReason, UntrustedLimits, ingest,
 };
 use kbf_pack::{
-    EMPTY_DIGEST, OutputDirectory, OutputFile, OutputSymlink, TaskManifest, Timing, Usage,
-    write_pack,
+    EMPTY_DIGEST, InputStats, OutputDirectory, OutputFile, OutputSymlink, Slot, TaskManifest,
+    Timing, Usage, write_pack, write_pack_with,
 };
 use kbf_pack_index::PackIndex as _;
 use kbf_proto::reapi::action_cache_client::ActionCacheClient;
@@ -155,7 +155,9 @@ impl Farm {
         }
         let backend = Backend::remote_over(rig.node().clone(), Some(rig.packs.clone()));
         let mint = PackKeyMint::new(SECRET).expect("a mint");
-        let key = mint.mint(LEASE, &action, now()).expect("a key");
+        let key = mint
+            .mint(LEASE, &action, now(), Slot::Pack(0))
+            .expect("a key");
         Self {
             rig,
             backend,
@@ -197,6 +199,9 @@ impl Farm {
                 .to_vec(),
             timing: Timing::default(),
             usage: Usage::default(),
+            packs: 1,
+            large: Vec::new(),
+            inputs: None,
         }
     }
 
@@ -465,13 +470,15 @@ async fn a_key_not_minted_here_is_wrong_key() {
     let made_up = format!("{}{:08x}-0", "ab".repeat(16), NOW_SECS / 60);
     let keys = [
         IssuedPackKey::new(LEASE, &made_up).expect("a key"),
-        farm.mint.mint(LEASE, &other_action, now()).expect("a key"),
         farm.mint
-            .mint("another", &farm.action, now())
+            .mint(LEASE, &other_action, now(), Slot::Pack(0))
+            .expect("a key"),
+        farm.mint
+            .mint("another", &farm.action, now(), Slot::Pack(0))
             .expect("a key"),
         PackKeyMint::new(secret)
             .expect("a mint")
-            .mint(LEASE, &farm.action, now())
+            .mint(LEASE, &farm.action, now(), Slot::Pack(0))
             .expect("a key"),
     ];
     for key in &keys {
@@ -844,6 +851,49 @@ async fn an_output_path_with_a_parent_component_is_a_bad_manifest() {
 
     farm.rejected(got, RejectReason::BadManifest).await;
     farm.nothing_indexed();
+}
+
+/// Asserts that a version 2 manifest that names a second pack is a `BadManifest` and indexes
+/// nothing: this ingest reads one pack, so it must not take the first of two as the whole run.
+#[tokio::test]
+async fn a_manifest_naming_two_packs_is_a_bad_manifest() {
+    let farm = Farm::new().await;
+    let mut manifest = farm.manifest(0);
+    manifest.packs = 2;
+    let (object, stdout) = (blob(OBJECT).1, blob(STDOUT).1);
+    let (tree, in_dir) = (farm.tree().1, blob(IN_DIR).1);
+    let pack = write_pack_with(&manifest, &[&object, &stdout, &tree, &in_dir], 0).expect("a pack");
+    farm.put(&pack).await;
+
+    let got = farm.ingest().await;
+
+    farm.rejected(got, RejectReason::BadManifest).await;
+    farm.nothing_indexed();
+}
+
+/// Asserts that a manifest carrying the advisory `inputs` object is ingested like any other: the
+/// numbers are carried for metrics and decide nothing.
+#[tokio::test]
+async fn a_manifest_with_inputs_is_ingested() {
+    let farm = Farm::new().await;
+    let mut manifest = farm.manifest(0);
+    manifest.inputs = Some(InputStats {
+        blobs: 3,
+        requests: 4,
+        ..InputStats::default()
+    });
+    let (object, stdout) = (blob(OBJECT).1, blob(STDOUT).1);
+    let (tree, in_dir) = (farm.tree().1, blob(IN_DIR).1);
+    let pack = write_pack(&manifest, &[&object, &stdout, &tree, &in_dir]).expect("a pack");
+    farm.put(&pack).await;
+
+    let got = farm.ingest().await;
+
+    let want = Ingested::Ran {
+        result: Box::new(farm.result(0)),
+        cached: true,
+    };
+    assert_eq!(got, want);
 }
 
 /// Asserts that a store or an index that fails is `Unavailable`, counted as neither a refusal nor

@@ -170,13 +170,14 @@ impl Opening<'_> {
     }
 
     /// The estimator the settings ask for. `on` is not supported on this core: it learns as
-    /// `shadow` does and books what `off` books.
+    /// `shadow` does and books what `off` books. `--placement-predictions` is read as it is.
     fn learned(&self) -> Learned {
         let mode = match self.settings.learned {
             LearnedSizes::On => LearnedSizes::Shadow,
             mode => mode,
         };
         Learned::new(mode, self.settings.default_memory, self.epoch_unix_ms)
+            .with_predictions(self.settings.predictions)
     }
 
     fn adapter(&self, store: Arc<dyn Store>, stored: bool) -> KbfAdapter {

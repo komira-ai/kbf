@@ -294,13 +294,26 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         })
     }
 
+    /// The same cache, rendering `reads` in its scrape: the reads that the storage node's
+    /// service serves from this cache ([`kbf_storage::legacy`]). Give the same handle to the
+    /// service ([`kbf_storage::service::StorageService::with_legacy_reads`]).
+    #[must_use]
+    pub fn with_legacy_reads(mut self, reads: Arc<kbf_storage::legacy::LegacyReads>) -> Self {
+        self.legacy_reads = Some(reads);
+        self
+    }
+
     /// Every metric family: [`CacheMetrics::render`](crate::metrics::CacheMetrics::render),
-    /// then, with a tier attached, the tier's (its counters, its budget and usage, and
+    /// then the legacy reads of a storage node's cache, then, with a tier attached, the
+    /// tier's (its counters, its budget and usage, and
     /// the unflushed bytes and oldest unflushed block's age, measured now).
     #[must_use]
     pub fn render_metrics(&self) -> String {
         let mut out = self.writer.metrics.render();
         self.render_ram(&mut out);
+        if let Some(reads) = &self.legacy_reads {
+            reads.render(&mut out);
+        }
         // The process's, not this cache's: what every request in the process holds.
         kbf_storage::in_flight::render(&mut out);
         if let Some(staging) = self.writer.tier.get() {

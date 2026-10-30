@@ -36,7 +36,7 @@ mod closure;
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kbf_pack::{TaskKeyError, check_build};
+use kbf_pack::{Slot, TaskKeyError, check_build};
 use kbf_types::Digest;
 use tierstore::server::presign::PresignError;
 use tierstore::server::{PresignRequest, presign_put};
@@ -408,7 +408,7 @@ impl RunPrep {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| PrepareError::Clock)?;
         let closure = self.closure(action).await?;
-        let key = self.mint.mint(lease, action, now)?;
+        let key = self.mint.mint(lease, action, now, Slot::Pack(0))?;
         let put_url = presign_put(
             &self.put.key,
             &PresignRequest {
