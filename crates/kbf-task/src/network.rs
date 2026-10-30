@@ -162,11 +162,12 @@ pub enum Layers {
     /// A network namespace of the Command's own, in which only `lo` exists, and the filter that
     /// lets `AF_INET` and `AF_INET6` sockets be made (they reach `lo`).
     SeccompAndNetns,
+    /// The child did not report, so which filter it installed is not known.
+    Unreported,
     /// The strict seccomp filter alone, which refuses every `AF_INET` and `AF_INET6` socket: a
     /// step of the namespace layer failed, which is not a failure of the run.
     SeccompOnly {
-        /// The step: `unshare`, `setgroups`, `uid_map`, `gid_map`, `loopback`, or `report` (the
-        /// child did not say).
+        /// The step: `unshare`, `setgroups`, `uid_map`, `gid_map` or `loopback`.
         step: &'static str,
         /// Its `errno`.
         errno: i32,
@@ -178,6 +179,7 @@ impl std::fmt::Display for Layers {
         match self {
             Layers::Open => write!(f, "open ({PROPERTY}={ALLOW})"),
             Layers::Unavailable => write!(f, "none (this system has no filter)"),
+            Layers::Unreported => write!(f, "unknown (no report from the child)"),
             Layers::SeccompOnlyForRoot => {
                 write!(f, "seccomp only, no inet (netns: skipped for uid 0)")
             }
@@ -268,11 +270,29 @@ fn deny_sockets(_process: &mut Process) -> Result<Confinement, RunError> {
     Ok(Confinement { denied: true })
 }
 
+/// The filter that lets `AF_INET` through is for a Command that is certainly in a namespace of
+/// its own: every step must have succeeded. Any other outcome, a skip for root included, gets
+/// the strict one.
+#[cfg(target_os = "linux")]
+fn pick<'a>(
+    outcome: (u8, u8),
+    strict: &'a [libc::sock_filter],
+    in_netns: &'a [libc::sock_filter],
+) -> &'a [libc::sock_filter] {
+    if outcome == (netns::OK, 0) {
+        in_netns
+    } else {
+        strict
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn deny_sockets(process: &mut Process) -> Result<Confinement, RunError> {
     let strict = seccomp::filter(false);
     let in_netns = seccomp::filter(true);
-    let (plan, report) = netns::plan().map_err(|source| RunError::Io {
+    // SAFETY: no arguments.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let (plan, report) = netns::plan(uid, gid).map_err(|source| RunError::Io {
         path: "the network report pipe".into(),
         source,
     })?;
@@ -282,10 +302,7 @@ fn deny_sockets(process: &mut Process) -> Result<Confinement, RunError> {
     unsafe {
         process.pre_exec(move || {
             let outcome = plan.apply();
-            // The filter that lets `AF_INET` through is for a Command that is certainly in a
-            // namespace of its own: every step must have succeeded.
-            let succeeded = outcome == (netns::OK, 0);
-            seccomp::install(if succeeded { &in_netns } else { &strict })?;
+            seccomp::install(pick(outcome, &strict, &in_netns))?;
             plan.tell(outcome);
             Ok(())
         });
@@ -317,7 +334,7 @@ mod netns {
 
     pub const OK: u8 = 0;
     /// The steps, in the order they run; the number is what the child writes.
-    const SKIPPED_FOR_ROOT: u8 = 6;
+    pub const SKIPPED_FOR_ROOT: u8 = 6;
     const STEPS: [&str; 5] = ["unshare", "setgroups", "uid_map", "gid_map", "loopback"];
 
     /// What the child needs, made before the fork.
@@ -345,7 +362,9 @@ mod netns {
         euid == 0
     }
 
-    pub fn plan() -> io::Result<(Plan, Report)> {
+    /// The plan for a Command run as `uid` and `gid` (the effective ids, read once before the
+    /// fork), and the pipe it reports on.
+    pub fn plan(uid: u32, gid: u32) -> io::Result<(Plan, Report)> {
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: `fds` has room for the two descriptors.
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
@@ -353,8 +372,6 @@ mod netns {
         }
         // SAFETY: pipe2 made both descriptors and nothing else owns them.
         let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-        // SAFETY: no arguments.
-        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
         let path = |p: &str| CString::new(p).expect("a path without NUL");
         let plan = Plan {
             setgroups: path("/proc/self/setgroups"),
@@ -368,6 +385,13 @@ mod netns {
         Ok((plan, Report { read, write }))
     }
 
+    impl Plan {
+        /// Whether the plan leaves the namespace layer out.
+        pub fn skips(&self) -> bool {
+            self.skip
+        }
+    }
+
     impl Report {
         /// What the child said, once it has executed.
         pub fn read(self) -> Layers {
@@ -375,18 +399,17 @@ mod netns {
             let mut said = [0u8; 2];
             let mut read = std::fs::File::from(self.read);
             if read.read_exact(&mut said).is_err() {
-                return Layers::SeccompOnly {
-                    step: "report",
-                    errno: 0,
-                };
+                return Layers::Unreported;
             }
             match said[0] {
                 OK => Layers::SeccompAndNetns,
                 SKIPPED_FOR_ROOT => Layers::SeccompOnlyForRoot,
-                n => Layers::SeccompOnly {
-                    step: STEPS.get(usize::from(n) - 1).copied().unwrap_or("report"),
-                    errno: i32::from(said[1]),
-                },
+                n => STEPS
+                    .get(usize::from(n).wrapping_sub(1))
+                    .map_or(Layers::Unreported, |step| Layers::SeccompOnly {
+                        step,
+                        errno: i32::from(said[1]),
+                    }),
             }
         }
     }
@@ -395,7 +418,7 @@ mod netns {
         /// Runs the steps in the child; returns the step that failed (1-based) and its errno, or
         /// `(OK, 0)`. Only system calls on memory made before the fork.
         pub fn apply(&self) -> (u8, u8) {
-            if self.skip {
+            if self.skips() {
                 return (SKIPPED_FOR_ROOT, 0);
             }
             let outcome = self.steps();

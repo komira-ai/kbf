@@ -100,6 +100,48 @@ fn the_layers_notice_names_the_action_and_each_layer() {
     assert!(line(Layers::Open).contains("open (kbf-network=allow)"));
 }
 
+/// Catches the use site of the root rule being wrong: a plan for euid 0 skips the namespace
+/// steps (its outcome is `SKIPPED_FOR_ROOT`, with nothing done) and the strict program is the
+/// one installed after it; a plan for anyone else does not skip.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_plan_for_root_skips_the_namespace_and_gets_the_strict_filter() {
+    let (root, _report) = super::netns::plan(0, 0).unwrap();
+    assert!(root.skips());
+    // Nothing is done for root, so this is safe to run in the test process.
+    let outcome = root.apply();
+    assert_eq!(outcome, (super::netns::SKIPPED_FOR_ROOT, 0));
+    let strict = super::seccomp::filter(false);
+    let in_netns = super::seccomp::filter(true);
+    assert!(std::ptr::eq(
+        super::pick(outcome, &strict, &in_netns),
+        strict.as_slice()
+    ));
+    for uid in [1, 1000, u32::MAX] {
+        let (plan, _report) = super::netns::plan(uid, uid).unwrap();
+        assert!(!plan.skips(), "{uid}");
+    }
+    // Only a clean outcome gets the program that lets the internet domains through.
+    let clean = (super::netns::OK, 0);
+    assert!(std::ptr::eq(
+        super::pick(clean, &strict, &in_netns),
+        in_netns.as_slice()
+    ));
+    assert!(std::ptr::eq(
+        super::pick((5, 1), &strict, &in_netns),
+        strict.as_slice()
+    ));
+}
+
+#[test]
+fn an_unreported_child_is_named_unknown() {
+    let digest = kbf_segments::sha256(b"an action");
+    assert_eq!(
+        layers_notice(&digest, &Layers::Unreported),
+        format!("kbf-task: action {digest}: network: unknown (no report from the child)")
+    );
+}
+
 /// Catches the namespace layer being made for root (whose one-id map breaks `chown`, `setuid`
 /// and `setgroups`) or left out for an ordinary user.
 #[cfg(target_os = "linux")]
