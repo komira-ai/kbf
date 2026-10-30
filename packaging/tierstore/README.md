@@ -338,8 +338,10 @@ key `cas/l/<sha256>`, the SHA-256 in the key, which the bytes must hash to or th
 discarded and counted, and the read is answered with an error, since the upstream's bytes are known
 to be wrong) only when the object is whole; a sidecar `<hex>.meta` holds the key, the
 size, the hash of the bytes and the upstream's tag. The misses of one key share one fill. A ranged
-GET of an object that is not there fills the whole object if it is at most 64 MiB, and otherwise
-passes the range through and keeps nothing. A fill that fails (a short body, an object written over
+GET of an object that is not there fills the whole object if it is at most `whole_fill_limit` (64
+MiB by default), and otherwise passes the range through and keeps nothing; each such ranged read
+costs the upstream a HEAD and a GET. A node that serves container layers through the registry front
+(see The registry front) should raise the limit to its largest layer: a layer over it is never kept. A fill that fails (a short body, an object written over
 while it was read, an upstream error, a directory that cannot be written) never fails the reader for
 the cache's reasons: the reader is answered from the upstream. A kept object is never checked
 against the upstream again, and a hit is not hashed again: put `cache = true` only on prefixes whose
@@ -391,6 +393,7 @@ scrub.
 | `local_cache.critical` | percent of the budget above which a fill is skipped (default 95, not below `high_water`) |
 | `local_cache.free_floor` | percent of the file system that is kept free (0 to 99, default 10): below it a pass evicts, even under the budget; it does not stop a fill, and `budget` may not be above the file system's size less the floor (exit status 2), unless its size cannot be read or is 0, which the start warns of and does not judge |
 | `local_cache.max_concurrent_fills` | the most fills that run at once (1 to 64, default 4); a miss that finds them all running is served from the upstream and kept nowhere |
+| `local_cache.whole_fill_limit` | the most an object may be for a ranged read of it to fill the whole of it: a number or a size such as `"512MiB"`, from 1 byte to the `budget` (default 64 MiB); a larger object is passed through and kept nowhere. A fill reads 8 MiB at a time whatever the limit, so raising it does not raise the memory of the fills |
 | `local_cache.cache` | `true`, the default; `false` is refused (leave `[local_cache]` out to run without a cache) |
 | `local_cache.scrub_rate` | a size and `/s`, such as `"50MiB/s"`: accepted, and not used by this release |
 | `cold_store.endpoints` | a list of exactly one endpoint, in place of `endpoint`: several are refused as not supported yet, since the cache reads from one upstream |
@@ -431,7 +434,19 @@ or of a build node's, left out for a server with no front. The two shapes have t
 the same rules. On a storage node the front reads through the proxy; on a build node it reads
 through the local cache, so a blob or a manifest under a `[[policy]]` prefix with `cache = true`
 is served from the disk when it is there and filled from the upstream when it is not, as an S3 GET
-is. The front is another listener of the same process: it starts with the node, drains with it,
+is. The blobs the front reads are the keys under `<prefix>blobs/sha256/` (`oci/` by default), so the
+file is refused at load, naming `oci.prefix`, unless the longest `[[policy]]` prefix that covers
+them has `cache = true`: a front whose blobs are kept nowhere would send every pull to the upstream,
+and there is no use of that to keep (a registry that passes through is a storage node's front). A
+blob over `local_cache.whole_fill_limit` is passed through, still checked against its digest, and
+not kept.
+
+A kept object is not checked again on a hit, so a blob that rotted on the cache's disk is detected
+by the front when it is read whole (the response ends in an error or a cut connection, and
+`tierstore_oci_digest_mismatches_total` counts it) but it is not evicted: it stays until the budget
+evicts it, and every pull of it fails until then. To refill it, remove its data file and its
+`.meta` sidecar (named by the digest) under the `obj/` directory of `local_cache.path`: the next
+read finds the file gone, drops the entry and fills the object again from the upstream. The front is another listener of the same process: it starts with the node, drains with it,
 and its counters are on the `/metricz` of the S3 listener beside the cache's. A key of the table
 that is left out has the default of its flag:
 

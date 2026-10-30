@@ -621,7 +621,7 @@ fn build(cli: &Cli) -> Result<Built, Error> {
 }
 
 /// The default of `--oci-prefix`.
-const DEFAULT_OCI_PREFIX: &str = "oci/";
+pub(super) const DEFAULT_OCI_PREFIX: &str = "oci/";
 
 /// The default of `--oci-max-connections`.
 const DEFAULT_OCI_CONNECTIONS: u32 = 64;

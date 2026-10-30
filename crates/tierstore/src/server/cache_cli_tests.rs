@@ -415,7 +415,7 @@ async fn a_build_node_with_a_bad_oci_certificate_is_refused_before_the_cache_ope
     let node = Node::new("tscache-cli-oci-cert");
     let key = node.key.display();
     let text = format!(
-        "{}\n[oci]\nlisten = \"127.0.0.1:0\"\ntls_cert_file = \"{key}\"\ntls_key_file = \"{key}\"\n",
+        "{}\n[oci]\nlisten = \"127.0.0.1:0\"\nprefix = \"cas/\"\ntls_cert_file = \"{key}\"\ntls_key_file = \"{key}\"\n",
         node.text("", "")
     );
     let settings = settings_from_text(&text, QUICK)
@@ -430,4 +430,33 @@ async fn a_build_node_with_a_bad_oci_certificate_is_refused_before_the_cache_ope
         .unwrap_err();
     assert_eq!(exit_status(&why), 2, "{why}");
     assert!(!node.cache_dir().exists());
+}
+
+/// Asserts that an OCI address that is taken stops the start of a build node with an error that
+/// a restart may mend (exit status 1), and that the S3 listener, which was bound first, is
+/// closed again: its address can be bound by someone else as soon as the start has returned.
+#[tokio::test]
+async fn a_taken_oci_address_stops_the_start_and_closes_the_s3_listener() {
+    let node = Node::new("tscache-cli-oci-taken");
+    let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let s3 = free.local_addr().unwrap();
+    drop(free);
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let busy = taken.local_addr().unwrap();
+    let text = node.text("", "").replace("127.0.0.1:0", &s3.to_string());
+    let text = format!("{text}\n[oci]\nlisten = \"{busy}\"\nprefix = \"cas/\"\n");
+    let settings = settings_from_text(&text, QUICK)
+        .unwrap()
+        .into_cache()
+        .unwrap();
+    let upstream: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let disk: Arc<dyn Disk> = Arc::new(SystemDisk);
+    let nothing = |_addr: SocketAddr| async {};
+    let why = serving(&settings, upstream, disk, nothing)
+        .await
+        .unwrap_err();
+    assert!(why.to_string().contains(&busy.to_string()), "{why}");
+    assert_eq!(exit_status(&why), 1, "{why}");
+    let again = std::net::TcpListener::bind(s3);
+    assert!(again.is_ok(), "the S3 address is still held");
 }

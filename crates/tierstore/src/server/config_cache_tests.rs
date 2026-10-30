@@ -35,6 +35,7 @@ low_water  = 60
 critical   = 97
 free_floor = 15
 max_concurrent_fills = 6
+whole_fill_limit = "128MiB"
 cache      = true
 scrub_rate = "50MiB/s"
 
@@ -51,6 +52,10 @@ cache  = true
 
 [[policy]]
 prefix = "cas/d/"
+cache  = true
+
+[[policy]]
+prefix = "images/"
 cache  = true
 
 [[policy]]
@@ -83,6 +88,26 @@ kind = "memory"
 
 [[policy]]
 prefix = "cas/"
+cache  = true
+"#;
+
+/// `LEAST` with a policy that keeps the keys of the default `[oci]` prefix, `oci/`.
+const KEEPS_OCI: &str = r#"
+[server]
+listen          = "127.0.0.1:0"
+proxy_id        = "c1"
+bucket          = "tier-bucket"
+access_key_file = "key"
+
+[local_cache]
+path   = "/c"
+budget = 1000
+
+[cold_store]
+kind = "memory"
+
+[[policy]]
+prefix = "oci/"
 cache  = true
 "#;
 
@@ -146,13 +171,21 @@ fn a_build_node_file_makes_a_cache() {
         ),
         (85, 60, 97, 15)
     );
-    let policies = [("cas/b/", true), ("cas/d/", true), ("", false)];
+    let policies = [
+        ("cas/b/", true),
+        ("cas/d/", true),
+        ("images/", true),
+        ("", false),
+    ];
     let policies: Vec<(String, bool)> = policies
         .iter()
         .map(|(p, c)| ((*p).to_owned(), *c))
         .collect();
     assert_eq!(config.policies, policies);
-    assert_eq!((config.fill_chunk, config.whole_limit), (8 << 20, 64 << 20));
+    assert_eq!(
+        (config.fill_chunk, config.whole_limit),
+        (8 << 20, 128 << 20)
+    );
     assert_eq!((FILL_CHUNK, WHOLE_FILL_LIMIT), (8 << 20, 64 << 20));
     assert_eq!(config.max_concurrent_fills, 6);
     let upstream = &cache.upstream;
@@ -189,6 +222,7 @@ fn a_build_node_file_has_the_defaults_of_the_flags_and_of_the_cache() {
         (90, 75, 95, 10)
     );
     assert_eq!(config.max_concurrent_fills, 4);
+    assert_eq!(config.whole_limit, WHOLE_FILL_LIMIT);
     assert_eq!(config.budget, 1000);
     assert_eq!(cache.front.region, "us-east-1");
     assert_eq!(cache.front.max_request_bytes, 256 << 20);
@@ -439,7 +473,7 @@ fn a_build_node_file_with_an_oci_table_makes_the_front() {
     assert_eq!(oci.max_connections, Some(16));
     assert_eq!(oci.connection_lifetime, Some(Duration::from_secs(1800)));
 
-    let plain = format!("{LEAST}\n[oci]\nlisten = \"127.0.0.1:5000\"\n");
+    let plain = format!("{KEEPS_OCI}\n[oci]\nlisten = \"127.0.0.1:5000\"\n");
     let oci = cache_of(&plain).oci;
     assert_eq!(oci.listen, Some("127.0.0.1:5000".parse().unwrap()));
     assert_eq!((oci.tls_cert, oci.tls_key, oci.prefix), (None, None, None));
@@ -522,8 +556,58 @@ fn a_build_node_file_written_back_makes_the_same_settings() {
     assert_eq!(format!("{again:?}"), format!("{:?}", cache_of(CACHE)));
 }
 
+/// Asserts that an `[oci]` front whose blobs no policy keeps is refused at load, with a message
+/// that names `oci.prefix` and says which policy decides: none covers the default prefix, the
+/// policy that covers it has `cache = false`, and a given prefix is checked, not the default. A
+/// policy that keeps the prefix (the default, and a given one) loads.
+#[test]
+fn an_oci_front_over_keys_the_cache_does_not_keep_is_refused() {
+    let front = "[oci]\nlisten = \"127.0.0.1:5000\"\n";
+    let none = refusal(&format!("{LEAST}\n{front}"));
+    assert!(none.contains("oci.prefix"), "{none}");
+    assert!(none.contains("no [[policy]] covers"), "{none}");
+    assert!(none.contains("\"oci/blobs/sha256/\""), "{none}");
+
+    let off = "[[policy]]\nprefix = \"\"\ncache = false\n";
+    let why = refusal(&format!("{LEAST}\n{off}\n{front}"));
+    assert!(why.contains("oci.prefix"), "{why}");
+    assert!(why.contains("cache = false"), "{why}");
+
+    let exact = "[[policy]]\nprefix = \"oci/\"\ncache = false\n";
+    let why = refusal(&format!("{LEAST}\n{exact}\n{front}"));
+    assert!(why.contains("oci.prefix"), "{why}");
+    assert!(why.contains("cache = false"), "{why}");
+
+    let given = format!("{front}prefix = \"layers/\"\n");
+    let why = refusal(&format!("{KEEPS_OCI}\n{given}"));
+    assert!(why.contains("\"layers/blobs/sha256/\""), "{why}");
+    let layers = "[[policy]]\nprefix = \"layers/\"\ncache = true\n";
+    let kept = cache_of(&format!("{KEEPS_OCI}\n{layers}\n{given}"));
+    assert!(kept.oci.listen.is_some());
+    let default = cache_of(&format!("{KEEPS_OCI}\n{front}"));
+    assert!(default.oci.listen.is_some());
+    // No front, no check: a file whose policies keep nothing under `oci/` loads as before.
+    assert_eq!(cache_of(LEAST).oci.listen, None);
+}
+
+/// Asserts the `whole_fill_limit` key: a size that reaches `whole_limit`, and refused at zero and
+/// above the budget, naming the key.
+#[test]
+fn the_whole_fill_limit_is_a_size_between_one_byte_and_the_budget() {
+    let with = |limit: &str| {
+        let key = format!("budget = 1000\nwhole_fill_limit = {limit}");
+        LEAST.replacen("budget = 1000", &key, 1)
+    };
+    assert_eq!(cache_of(&with("1000")).cache.whole_limit, 1000);
+    assert_eq!(cache_of(&with("1")).cache.whole_limit, 1);
+    for bad in ["0", "1001"] {
+        let why = refusal(&with(bad));
+        assert!(why.contains("local_cache.whole_fill_limit"), "{bad}: {why}");
+    }
+}
+
 /// The keys of `[local_cache]`, which the README of the packaging must document each in a row.
-const LOCAL_CACHE_KEYS: [&str; 10] = [
+const LOCAL_CACHE_KEYS: [&str; 11] = [
     "path",
     "layout",
     "budget",
@@ -532,6 +616,7 @@ const LOCAL_CACHE_KEYS: [&str; 10] = [
     "critical",
     "free_floor",
     "max_concurrent_fills",
+    "whole_fill_limit",
     "cache",
     "scrub_rate",
 ];
