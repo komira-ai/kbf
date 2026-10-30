@@ -19,18 +19,21 @@ use super::presign::Grant;
 use super::reply::{Answer, S3Error, answer, xml_answer};
 use super::request::{BoxError, Check, Query, Reader, Refused, Target, header, pieces};
 use super::time::http_date;
-use super::xml::{self, Listing};
+use super::xml::{self, Listing, UploadListing};
 
 /// The query parameters this front understands. A request with another is not served.
 /// `x-id` names the operation (`?x-id=PutObject`) and S3 ignores it; the AWS SDKs add it to
 /// the calls of an object, so a request with it is served as one without.
-const SUPPORTED: [&str; 9] = [
+const SUPPORTED: [&str; 12] = [
     "continuation-token",
+    "key-marker",
     "list-type",
     "max-keys",
+    "max-uploads",
     "partNumber",
     "prefix",
     "start-after",
+    "upload-id-marker",
     "uploadId",
     "uploads",
     "x-id",
@@ -126,14 +129,17 @@ fn refuse_unsupported(parts: &Parts, query: &Query, presigned: bool) -> Result<(
     Ok(())
 }
 
-/// The number of keys a listing asked for, at most [`PAGE_LIMIT`].
-fn page_size(query: &Query) -> Result<usize, S3Error> {
-    let Some(text) = query.get("max-keys") else {
+/// The size of a page a listing asked for in the parameter `name` (`max-keys` or
+/// `max-uploads`), at most [`PAGE_LIMIT`].
+fn page_size(query: &Query, name: &str) -> Result<usize, S3Error> {
+    let Some(text) = query.get(name) else {
         return Ok(PAGE_LIMIT);
     };
     match text.parse::<usize>() {
         Ok(count) if count > 0 => Ok(count.min(PAGE_LIMIT)),
-        _ => Err(S3Error::invalid("max-keys must be a positive whole number")),
+        _ => Err(S3Error::invalid(format!(
+            "{name} must be a positive whole number"
+        ))),
     }
 }
 
@@ -262,6 +268,7 @@ impl Server {
                 Ok(answer(StatusCode::OK, &[], Bytes::new()))
             }
             ("GET", Target::Bucket, false) => self.list_objects(query).await,
+            ("GET", Target::Bucket, true) if query.has("uploads") => self.list_uploads(query).await,
             ("GET", Target::Object(key), false) => self.get_object(parts, &key).await,
             ("HEAD", Target::Object(key), false) => self.head_object(parts, &key).await,
             ("PUT", Target::Object(key), false) => self.put_conditional(parts, &key).await,
@@ -427,7 +434,7 @@ impl Server {
             ));
         }
         let prefix = query.get("prefix").unwrap_or_default();
-        let max_keys = page_size(query)?;
+        let max_keys = page_size(query, "max-keys")?;
         let after = start_after(query)?;
         let after = after.as_deref();
         let listed = self.backend.list_page(prefix, after, max_keys + 1).await?;
@@ -438,6 +445,32 @@ impl Server {
             prefix,
             max_keys,
             objects: page,
+            next,
+        };
+        Ok(xml_answer(StatusCode::OK, listing.to_xml()))
+    }
+
+    /// ListMultipartUploads: a page of the open uploads under `prefix`, after `key-marker`
+    /// (and `upload-id-marker`, which S3 ignores without a key marker), at most `max-uploads`.
+    /// The uploads of a key under the proxy's reserved prefixes are never listed.
+    async fn list_uploads(&self, query: &Query) -> Result<Answer, S3Error> {
+        let prefix = query.get("prefix").unwrap_or_default();
+        let max_uploads = page_size(query, "max-uploads")?;
+        let key_marker = query.get("key-marker").unwrap_or_default();
+        let id_marker = query.get("upload-id-marker").filter(|id| !id.is_empty());
+        let after = (!key_marker.is_empty()).then_some((key_marker, id_marker));
+        let backend = &self.backend;
+        let listed = backend.list_uploads(prefix, after, max_uploads + 1).await;
+        let listed = listed.map_err(S3Error::from)?;
+        let page = &listed[..listed.len().min(max_uploads)];
+        let next = (listed.len() > max_uploads).then(|| &page[max_uploads - 1]);
+        let listing = UploadListing {
+            bucket: &self.config.bucket,
+            prefix,
+            key_marker,
+            id_marker: id_marker.unwrap_or_default(),
+            max_uploads,
+            uploads: page,
             next,
         };
         Ok(xml_answer(StatusCode::OK, listing.to_xml()))

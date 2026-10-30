@@ -45,9 +45,71 @@ use reqwest::{Method, Response, StatusCode};
 use super::sigv4::UNSIGNED_PAYLOAD;
 use super::{Conn, S3Store, Stalled, failure, multipart, transport, xml};
 use crate::body::{too_long, too_short};
-use crate::{BodyStream, ObjectKey, ObjectStoreError};
+use crate::{BodyStream, KeyPrefix, ObjectKey, ObjectStoreError, PageSize};
+
+/// A multipart upload that was started and is neither completed nor aborted, as
+/// [`S3Store::list_multipart_uploads`] lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenUpload {
+    /// The key of the object the upload is for.
+    pub key: ObjectKey,
+    /// The id of the upload.
+    pub upload_id: String,
+    /// When the upload was started, in milliseconds since the Unix epoch, as the listing
+    /// states it (S3 sends whole seconds).
+    pub initiated_millis: u64,
+}
+
+/// One page of [`S3Store::list_multipart_uploads`], in the order the store gives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadsPage {
+    /// The uploads on this page.
+    pub uploads: Vec<OpenUpload>,
+    /// The key and the upload id after which the next page starts, or `None` if this is the
+    /// last page.
+    pub next: Option<(ObjectKey, String)>,
+}
 
 impl S3Store {
+    /// ListMultipartUploads: one page of at most `max_uploads` of the uploads under `prefix`
+    /// that are neither completed nor aborted. The page starts after `after`, the key (and
+    /// the upload id, if the page before ended inside a key) that ends the page before;
+    /// `None` is the first page. The order is the store's: by key, and by the time of the
+    /// start within a key.
+    ///
+    /// # Errors
+    /// [`ObjectStoreError::Service`] if the store refuses,
+    /// [`ObjectStoreError::Transport`] if the request does not complete,
+    /// [`ObjectStoreError::Protocol`] if the answer is not a listing of uploads, or lists one
+    /// without a key, an id or a readable time.
+    pub async fn list_multipart_uploads(
+        &self,
+        prefix: &KeyPrefix,
+        after: Option<(&ObjectKey, Option<&str>)>,
+        max_uploads: PageSize,
+    ) -> Result<UploadsPage, ObjectStoreError> {
+        let mut query = vec![
+            ("uploads", String::new()),
+            ("prefix", prefix.as_str().to_owned()),
+            ("max-uploads", max_uploads.get().to_string()),
+        ];
+        if let Some((key, id)) = after {
+            query.push(("key-marker", key.as_str().to_owned()));
+            if let Some(id) = id {
+                query.push(("upload-id-marker", id.to_owned()));
+            }
+        }
+        let resp = self
+            .conn
+            .send(Method::GET, None, &query, Vec::new(), Bytes::new())
+            .await?;
+        if resp.status() != StatusCode::OK {
+            return Err(failure(resp).await);
+        }
+        let body = resp.bytes().await.map_err(transport)?;
+        xml::uploads_page(&body)
+    }
+
     /// CreateMultipartUpload: starts an upload of an object `key` and gives its id. Nothing
     /// is stored until the upload is completed, and an upload that is neither completed nor
     /// aborted holds the parts sent to it until a lifecycle rule of the bucket removes it.
