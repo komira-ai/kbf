@@ -64,9 +64,10 @@ fn status(rest: &str) -> &str {
     rest.split(' ').next().expect("a status")
 }
 
-const NAMES: [&str; 17] = [
+const NAMES: [&str; 19] = [
     "layers",
     "child",
+    "netns_distinct",
     "loopback",
     "inet_unreachable",
     "netlink",
@@ -75,6 +76,7 @@ const NAMES: [&str; 17] = [
     "secret_path",
     "apparmor_restrict_unprivileged_userns",
     "max_user_namespaces",
+    "io_uring_disabled",
     "euid",
     "uid_map",
     "gid_map",
@@ -115,6 +117,10 @@ fn the_probe_prints_the_documented_lines_and_its_exit_code_is_the_verdict() {
     if status(layers) == "ok" {
         assert_eq!(layers, "ok netns (loopback only) + seccomp");
         assert_eq!(rest(&checks, "child"), "ok exit 0");
+        assert!(
+            rest(&checks, "netns_distinct").starts_with("ok net:["),
+            "{checks:?}"
+        );
         assert!(rest(&checks, "loopback").starts_with("ok "), "{checks:?}");
         assert_eq!(
             rest(&checks, "inet_unreachable"),
@@ -132,6 +138,7 @@ fn the_probe_prints_the_documented_lines_and_its_exit_code_is_the_verdict() {
             "{layers}"
         );
         assert!(rest(&checks, "loopback").starts_with("n/a "));
+        assert!(rest(&checks, "netns_distinct").starts_with("n/a "));
         assert_eq!(last, "probe result: FAIL");
     }
 }

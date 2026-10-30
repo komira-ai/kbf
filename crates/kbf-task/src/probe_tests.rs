@@ -12,6 +12,11 @@ fn obs(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 /// What a Command that met the namespace layer in order sees.
 fn good() -> BTreeMap<String, String> {
     obs(&[
+        ("netns", "net:[2]"),
+        ("parent.netns", "net:[1]"),
+        // CAP_NET_RAW (bit 13) is held, so `packet` is a proof of the filter.
+        ("fact.cap_eff", "0000000000002000"),
+        ("fact.io_uring_disabled", "0"),
         ("loopback", "ok"),
         ("inet", "errno 101"),
         ("netlink", "errno 1"),
@@ -52,6 +57,7 @@ fn every_required_check_ok_is_a_pass() {
         [
             "probe layers: ok netns (loopback only) + seccomp",
             "probe child: ok exit 0",
+            "probe netns_distinct: ok net:[2] != net:[1]",
             "probe loopback: ok bind, connect and accept on 127.0.0.1",
             "probe inet_unreachable: ok ENETUNREACH (101) (netns)",
             "probe netlink: ok EPERM (1)",
@@ -428,6 +434,17 @@ mod confined {
         );
     }
 
+    /// Catches: an error with no OS errno being written as `errno 0`, which reads as a refusal.
+    #[test]
+    fn an_error_with_no_os_errno_is_written_as_other() {
+        let timed_out = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        assert_eq!(child::errno(&timed_out), "other TimedOut");
+        assert_eq!(
+            child::errno(&std::io::Error::from_raw_os_error(13)),
+            "errno 13"
+        );
+    }
+
     /// Catches: a descriptor leaked or an error lost by the call helper both sockets and the ring use.
     #[test]
     fn a_call_that_returns_a_descriptor_is_closed_and_one_that_fails_names_its_errno() {
@@ -441,4 +458,142 @@ mod confined {
         unsafe { *libc::__errno_location() = libc::EBADF };
         assert_eq!(child::fd_outcome(-1), format!("errno {}", libc::EBADF));
     }
+}
+
+/// Catches: `packet` counted as a proof of the filter when the Command has no `CAP_NET_RAW`
+/// (the kernel refuses it then), and a proof that is not required being allowed to fail.
+#[test]
+fn packet_is_a_proof_only_with_cap_net_raw() {
+    let with = |cap: &str, packet: &str| {
+        let mut seen = good();
+        seen.insert("fact.cap_eff".to_owned(), cap.to_owned());
+        seen.insert("packet".to_owned(), packet.to_owned());
+        let checks = evaluate(&Layers::SeccompAndNetns, Ok(0), &seen, None);
+        (by_name(&checks, "packet").line(), passes(&checks))
+    };
+    assert_eq!(
+        with("0000000000002000", "errno 1"),
+        ("probe packet: ok EPERM (1)".to_owned(), true)
+    );
+    // Held, but refused by something else: not the filter's answer.
+    assert_eq!(
+        with("0000000000002000", "errno 38"),
+        (
+            "probe packet: FAIL refused, not by the filter: ENOSYS (38)".to_owned(),
+            false
+        )
+    );
+    assert_eq!(
+        with("0000000000000000", "errno 1"),
+        (
+            "probe packet: ok EPERM (1) (no CAP_NET_RAW: not a filter proof)".to_owned(),
+            true
+        )
+    );
+    // Not a proof: another errno does not fail the probe, a call that worked does.
+    assert!(with("0000000000000000", "errno 13").1);
+    assert!(!with("0000000000000000", "ok").1);
+    // No capability report is no capability.
+    assert!(!has_net_raw(None));
+    assert!(!has_net_raw(Some(&"zz".to_owned())));
+    assert!(has_net_raw(Some(&"ffffffffffffffff".to_owned())));
+}
+
+/// Catches: a refusal by another errno being taken for the filter's, and `io_uring` counted as
+/// a proof where the host switch alone refuses it.
+#[test]
+fn netlink_and_io_uring_need_the_filters_own_errno() {
+    let with = |name: &str, value: &str, disabled: &str| {
+        let mut seen = good();
+        seen.insert(name.to_owned(), value.to_owned());
+        seen.insert("fact.io_uring_disabled".to_owned(), disabled.to_owned());
+        let checks = evaluate(&Layers::SeccompAndNetns, Ok(0), &seen, None);
+        (by_name(&checks, name).line(), passes(&checks))
+    };
+    assert_eq!(
+        with("netlink", "errno 13", "0"),
+        (
+            "probe netlink: FAIL refused, not by the filter: EACCES (13)".to_owned(),
+            false
+        )
+    );
+    assert_eq!(
+        with("io_uring", "errno 38", "0"),
+        (
+            "probe io_uring: FAIL refused, not by the filter: ENOSYS (38)".to_owned(),
+            false
+        )
+    );
+    assert_eq!(
+        with("io_uring", "errno 1", "2"),
+        (
+            "probe io_uring: ok EPERM (1) (io_uring_disabled=2: not a filter proof)".to_owned(),
+            true
+        )
+    );
+    assert_eq!(
+        with("io_uring", "errno 1", "1").0,
+        "probe io_uring: ok EPERM (1) (io_uring_disabled=1: not a filter proof)"
+    );
+    assert!(!with("io_uring", "ok", "2").1);
+}
+
+/// Catches: a Command that is in the probe's own namespace, or that did not say, passing.
+#[test]
+fn the_command_must_be_in_a_namespace_of_its_own() {
+    let with = |child: Option<&str>, probe: Option<&str>| {
+        let mut seen = good();
+        seen.remove("netns");
+        seen.remove("parent.netns");
+        seen.extend(child.map(|v| ("netns".to_owned(), v.to_owned())));
+        seen.extend(probe.map(|v| ("parent.netns".to_owned(), v.to_owned())));
+        let checks = evaluate(&Layers::SeccompAndNetns, Ok(0), &seen, None);
+        (by_name(&checks, "netns_distinct").line(), passes(&checks))
+    };
+    assert_eq!(
+        with(Some("net:[2]"), Some("net:[1]")),
+        (
+            "probe netns_distinct: ok net:[2] != net:[1]".to_owned(),
+            true
+        )
+    );
+    let (line, pass) = with(Some("net:[1]"), Some("net:[1]"));
+    assert!(
+        line.starts_with("probe netns_distinct: FAIL the Command's namespace is not a new one"),
+        "{line}"
+    );
+    assert!(!pass);
+    assert!(!with(Some("errno 13"), Some("net:[1]")).1);
+    assert_eq!(
+        with(None, Some("net:[1]")).0,
+        "probe netns_distinct: FAIL the Command reported nothing"
+    );
+    assert_eq!(
+        with(Some("net:[2]"), None).0,
+        "probe netns_distinct: FAIL cannot read the probe's own /proc/self/ns/net"
+    );
+    // On the fallback there is no namespace to compare.
+    let fallback = Layers::SeccompOnly {
+        step: "unshare",
+        errno: 1,
+    };
+    let checks = evaluate(&fallback, Ok(0), &good(), None);
+    assert_eq!(
+        by_name(&checks, "netns_distinct").line(),
+        "probe netns_distinct: n/a the namespace path did not run"
+    );
+}
+
+/// Catches: an error with no OS errno (a timeout) or `errno 0` counting as a refusal.
+#[test]
+fn an_error_without_an_errno_is_not_a_refusal() {
+    assert_eq!(errno_of(Some(&"errno 0".to_owned())), None);
+    assert_eq!(errno_of(Some(&"other TimedOut".to_owned())), None);
+    let mut seen = good();
+    seen.insert("netlink".to_owned(), "other TimedOut".to_owned());
+    let checks = evaluate(&Layers::SeccompAndNetns, Ok(0), &seen, None);
+    assert_eq!(
+        by_name(&checks, "netlink").line(),
+        "probe netlink: FAIL not refused: other TimedOut"
+    );
 }

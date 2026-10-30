@@ -10,8 +10,11 @@ use std::time::Duration;
 /// whose route is unexpectedly live.
 const CONNECT: Duration = Duration::from_secs(3);
 
-fn errno(e: &std::io::Error) -> String {
-    format!("errno {}", e.raw_os_error().unwrap_or(0))
+/// `errno <n>`; an error that carries no OS error is `other <kind>`, which the probe never
+/// reads as a refusal.
+pub(super) fn errno(e: &std::io::Error) -> String {
+    e.raw_os_error()
+        .map_or_else(|| format!("other {:?}", e.kind()), |n| format!("errno {n}"))
 }
 
 fn outcome<T>(result: std::io::Result<T>) -> String {
@@ -28,6 +31,14 @@ fn loopback() -> String {
         let _client = TcpStream::connect_timeout(&listener.local_addr()?, CONNECT)?;
         listener.accept()
     })())
+}
+
+/// The Command's network namespace, as the link `/proc/self/ns/net` reads (`net:[<inode>]`).
+fn netns() -> String {
+    match std::fs::read_link("/proc/self/ns/net") {
+        Ok(link) => link.to_string_lossy().into_owned(),
+        Err(e) => errno(&e),
+    }
 }
 
 /// Connect to an address outside any local network.
@@ -88,6 +99,7 @@ fn read_directory(path: &Path) -> std::io::Result<()> {
 /// The `observe` lines, one per call.
 pub fn observations(secret_path: Option<&Path>) -> Vec<String> {
     let mut lines = vec![
+        format!("observe netns {}", netns()),
         format!("observe loopback {}", loopback()),
         format!("observe inet {}", inet()),
         format!("observe netlink {}", socket(libc::AF_NETLINK)),
