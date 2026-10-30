@@ -383,11 +383,25 @@ fn host_env(key: &str) -> Option<OsString> {
     std::env::var_os(key)
 }
 
-/// Parse `args` and run the subcommand through `exec`, reading secrets with `env`.
+/// Parse `args` and run the subcommand through `exec`, reading secrets with `env`, at
+/// the host's clock.
 pub fn run<E: Exec>(
     args: Vec<OsString>,
     exec: &mut E,
     env: &dyn Fn(&str) -> Option<OsString>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    run_at(args, exec, env, SystemTime::now(), out, err)
+}
+
+/// [`run`] with the instant it stamps rollback directories, erase requests and
+/// certificate checks with given, so a test can fix it.
+pub fn run_at<E: Exec>(
+    args: Vec<OsString>,
+    exec: &mut E,
+    env: &dyn Fn(&str) -> Option<OsString>,
+    now: SystemTime,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
@@ -409,10 +423,10 @@ pub fn run<E: Exec>(
         Kit::Minio(Minio::Buckets(a)) => minio_buckets(a, exec, env, out),
         Kit::Minio(Minio::Nodeport(a)) => minio_nodeport(a, exec, out),
         Kit::Linux(l) => return linux_kit(l, exec, out, err),
-        Kit::Mdm(m) => return mdm_kit(m, exec, out, err),
+        Kit::Mdm(m) => return mdm_kit(m, exec, now, out, err),
         Kit::Log(a) => return log::run(&a, out, err),
         Kit::Pilot(p) => {
-            return pilot::cli::run(p, exec, env, out, err, &pilot::cli::sleep_a_second);
+            return pilot::cli::run(p, exec, env, now, out, err, &pilot::cli::sleep_a_second);
         }
     };
     match result {
@@ -465,83 +479,91 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The `mdm` kit: 0 done (or every check passed), 1 a step, download or check failed,
 /// 2 refused.
-fn mdm_kit<E: Exec>(m: Mdm, exec: &mut E, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
-    let done = match m {
-        Mdm::Fetch { dir, only, apply } => Client::system(FETCH_TIMEOUT)
-            .map_err(MdmError::from)
-            .and_then(|client| {
-                let f = Fetch { dir, only };
-                mdm::fetch::run(
-                    &f,
-                    &Pins::built_in(),
-                    exec.euid(),
-                    &client,
-                    mode(apply),
-                    out,
-                )
-            })
-            .map(|()| true),
-        Mdm::Install {
-            config,
-            bin_dir,
-            uninstall,
-            apply,
-        } => MdmConfig::load(&config)
-            .map_err(MdmError::from)
-            .and_then(|config| match (uninstall, bin_dir) {
-                (true, _) => mdm::install::run_uninstall(exec, &config, &stamp(), mode(apply), out),
-                (false, Some(bin_dir)) => {
-                    let a = Install { config, bin_dir };
-                    mdm::install::run(exec, &a, &Pins::built_in(), mode(apply), out)
-                }
-                (false, None) => Err(MdmError::NoBinDir),
-            })
-            .map(|()| true),
-        Mdm::Tls {
-            config,
-            check_godaddy,
-            apply,
-        } => MdmConfig::load(&config)
-            .map_err(MdmError::from)
-            .and_then(|c| {
-                if check_godaddy {
-                    let client = Client::system(VERIFY_TIMEOUT)?;
-                    return mdm::tls::check_godaddy(&*exec, &c, &client, None, out);
-                }
-                let acme = Acme::load(&config)?;
-                mdm::tls::run(exec, &c, &acme, mode(apply), out).map(|()| true)
-            }),
-        Mdm::PushCert {
-            config,
-            cert,
-            key,
-            profile_only: _,
-            topic,
-            apply,
-        } => MdmConfig::load(&config)
-            .map_err(MdmError::from)
-            .and_then(|config| {
-                let with = match (cert, key) {
-                    (Some(cert), Some(key)) => With::Pair { cert, key },
-                    _ => With::ProfileOnly(topic),
-                };
-                let a = PushCert { config, with };
-                push_cert::run(exec, &a, SystemTime::now(), mode(apply), out)
-            })
-            .map(|()| true),
-        Mdm::Dep(verb) => {
-            let (with, d) = match verb {
-                DepVerb::GetCert { with, out } => (with, Dep::GetCert { out }),
-                DepVerb::UploadToken { with, token } => (with, Dep::UploadToken { token }),
-                DepVerb::DefineProfile { with } => (with, Dep::DefineProfile),
-                DepVerb::Assign { with, serial } => (with, Dep::Assign { serials: serial }),
-            };
-            MdmConfig::load(&with.config)
+fn mdm_kit<E: Exec>(
+    m: Mdm,
+    exec: &mut E,
+    now: SystemTime,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let done =
+        match m {
+            Mdm::Fetch { dir, only, apply } => Client::system(FETCH_TIMEOUT)
                 .map_err(MdmError::from)
-                .and_then(|c| mdm::dep::run(exec, &c, &d, mode(with.apply), out))
-        }
-        Mdm::Verify { config, via } => {
-            MdmConfig::load(&config)
+                .and_then(|client| {
+                    let f = Fetch { dir, only };
+                    mdm::fetch::run(
+                        &f,
+                        &Pins::built_in(),
+                        exec.euid(),
+                        &client,
+                        mode(apply),
+                        out,
+                    )
+                })
+                .map(|()| true),
+            Mdm::Install {
+                config,
+                bin_dir,
+                uninstall,
+                apply,
+            } => MdmConfig::load(&config)
+                .map_err(MdmError::from)
+                .and_then(|config| match (uninstall, bin_dir) {
+                    (true, _) => {
+                        mdm::install::run_uninstall(exec, &config, &stamp(now), mode(apply), out)
+                    }
+                    (false, Some(bin_dir)) => {
+                        let a = Install { config, bin_dir };
+                        mdm::install::run(exec, &a, &Pins::built_in(), mode(apply), out)
+                    }
+                    (false, None) => Err(MdmError::NoBinDir),
+                })
+                .map(|()| true),
+            Mdm::Tls {
+                config,
+                check_godaddy,
+                apply,
+            } => MdmConfig::load(&config)
+                .map_err(MdmError::from)
+                .and_then(|c| {
+                    if check_godaddy {
+                        let client = Client::system(VERIFY_TIMEOUT)?;
+                        return mdm::tls::check_godaddy(&*exec, &c, &client, None, out);
+                    }
+                    let acme = Acme::load(&config)?;
+                    mdm::tls::run(exec, &c, &acme, mode(apply), out).map(|()| true)
+                }),
+            Mdm::PushCert {
+                config,
+                cert,
+                key,
+                profile_only: _,
+                topic,
+                apply,
+            } => MdmConfig::load(&config)
+                .map_err(MdmError::from)
+                .and_then(|config| {
+                    let with = match (cert, key) {
+                        (Some(cert), Some(key)) => With::Pair { cert, key },
+                        _ => With::ProfileOnly(topic),
+                    };
+                    let a = PushCert { config, with };
+                    push_cert::run(exec, &a, now, mode(apply), out)
+                })
+                .map(|()| true),
+            Mdm::Dep(verb) => {
+                let (with, d) = match verb {
+                    DepVerb::GetCert { with, out } => (with, Dep::GetCert { out }),
+                    DepVerb::UploadToken { with, token } => (with, Dep::UploadToken { token }),
+                    DepVerb::DefineProfile { with } => (with, Dep::DefineProfile),
+                    DepVerb::Assign { with, serial } => (with, Dep::Assign { serials: serial }),
+                };
+                MdmConfig::load(&with.config)
+                    .map_err(MdmError::from)
+                    .and_then(|c| mdm::dep::run(exec, &c, &d, mode(with.apply), out))
+            }
+            Mdm::Verify { config, via } => MdmConfig::load(&config)
                 .map_err(MdmError::from)
                 .and_then(|config| {
                     let client = Client::system(VERIFY_TIMEOUT)?;
@@ -549,36 +571,35 @@ fn mdm_kit<E: Exec>(m: Mdm, exec: &mut E, out: &mut dyn Write, err: &mut dyn Wri
                         proxy: via.unwrap_or(SocketAddr::from((config.bind, 443))),
                         config: &config,
                         client: &client,
-                        now: SystemTime::now(),
+                        now,
                     };
                     mdm::verify::run(&*exec, &v, out)
+                }),
+            Mdm::EraseRequest {
+                serial,
+                reason,
+                lease,
+                key,
+                out: file,
+                valid_for,
+                ssh_keygen,
+                apply,
+            } => erase::random_nonce()
+                .and_then(|nonce| {
+                    let a = EraseArgs {
+                        serial,
+                        lease,
+                        reason,
+                        key,
+                        out: file,
+                        valid_for,
+                        ssh_keygen,
+                    };
+                    let now = i64::try_from(epoch_secs(now)).unwrap_or(i64::MAX);
+                    erase::run(exec, &a, Made { now, nonce }, mode(apply), out)
                 })
-        }
-        Mdm::EraseRequest {
-            serial,
-            reason,
-            lease,
-            key,
-            out: file,
-            valid_for,
-            ssh_keygen,
-            apply,
-        } => erase::random_nonce()
-            .and_then(|nonce| {
-                let a = EraseArgs {
-                    serial,
-                    lease,
-                    reason,
-                    key,
-                    out: file,
-                    valid_for,
-                    ssh_keygen,
-                };
-                let now = i64::try_from(stamp_secs()).unwrap_or(i64::MAX);
-                erase::run(exec, &a, Made { now, nonce }, mode(apply), out)
-            })
-            .map(|()| true),
-    };
+                .map(|()| true),
+        };
     match done {
         Ok(passed) => ExitCode::from(u8::from(!passed)),
         Err(e) if e.exit_code() == 1 => {
@@ -609,15 +630,13 @@ fn host_verb(done: Result<(), HostError>, err: &mut dyn Write) -> ExitCode {
 
 /// The directory name `mdm install --uninstall` and `pilot server-install --uninstall`
 /// move the files into: seconds since the Unix epoch.
-pub(crate) fn stamp() -> String {
-    stamp_secs().to_string()
+pub(crate) fn stamp(now: SystemTime) -> String {
+    epoch_secs(now).to_string()
 }
 
-/// Seconds since the epoch, now.
-fn stamp_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+/// Seconds since the epoch at `at` (0 before it).
+fn epoch_secs(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 fn mode(apply: bool) -> Mode {

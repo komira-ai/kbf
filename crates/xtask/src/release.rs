@@ -15,10 +15,10 @@
 //!   with the base commit and the pull request's merge commit, so a check that accepts
 //!   every commit (or none) fails there instead of at a release.
 //! - `release check <dir> --commit <sha> [--without-version-facts]` ([`check`]): `<dir>`
-//!   passes `verify-assets sums` (so each `kbf` tarball has its version facts listed; the
-//!   flag, for the release before the build jobs recorded them, waives that and nothing
-//!   else: [`Pairing::Waived`]), every file `SHA256SUMS`
-//!   lists is `<binary>-<sha>-<platform>.tar.gz` or `.cdx.json`, or `kbf`'s
+//!   passes `verify-assets sums` (so each `kbf` tarball has its version facts listed, and each task
+//!   image its facts and its CycloneDX SBOM; the flag, for the release before the build jobs
+//!   recorded them, waives those and nothing else: [`Pairing::Waived`]), every file `SHA256SUMS`
+//!   lists is `<binary>-<sha>-<platform>.tar.gz` or `.cdx.json` (the task image's too), or `kbf`'s
 //!   `kbf-<sha>-<platform>.version.json` ([`crate::version_facts`]): the assets of that
 //!   commit and no other, and each tarball has exactly
 //!   one provenance bundle, `<tarball>.sigstore.json`, whose one subject is that

@@ -235,6 +235,7 @@ fn flags(name: &str) -> (kbf_testkit::dir::TestDir, Flags) {
         "--worker-listen=127.0.0.1:0".to_owned(),
         "--default-platform=none".to_owned(),
         format!("--cold-store=file://{}", at("cold")),
+        "--cold-store-floor-bytes=1".to_owned(),
         format!("--meta-dir={}", at("meta")),
     ])
     .expect("the server's flags");

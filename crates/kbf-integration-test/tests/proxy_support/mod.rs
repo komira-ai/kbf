@@ -218,6 +218,7 @@ pub fn storage_node(dir: &Path, name: &str) -> Child {
         &[
             "storage".to_owned(),
             "--storage-listen=127.0.0.1:0".to_owned(),
+            "--cold-store-floor-bytes=1".to_owned(),
             format!(
                 "--cold-store=file://{}",
                 dir.join(name).join("cold").display()
