@@ -743,3 +743,177 @@ fn get_returns_the_blob_over_http() {
     assert_eq!(got, bytes);
     assert_eq!(server.gets().len(), 1);
 }
+
+// The golden fixture below is copied byte for byte from the server's tests
+// (crates/kbf-front/tests/data/job_read_batch.golden); kbf-task does not depend on kbf-front, so
+// the copy is how the client is pinned to the server's framing.
+const GOLDEN: &str = include_str!("../tests/data/job_read_batch.golden");
+
+/// The text after `prefix` on the first such line of the named case.
+fn case_line(name: &str, prefix: &str) -> String {
+    let block = GOLDEN
+        .split("\ncase ")
+        .skip(1)
+        .find(|block| block.starts_with(name))
+        .expect("the case");
+    block
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .expect("the line")
+        .to_owned()
+}
+
+/// The bytes of the fixture's blob `name`.
+fn world(name: &str) -> Vec<u8> {
+    let line = GOLDEN
+        .lines()
+        .filter_map(|line| line.strip_prefix("blob "))
+        .find(|line| line.split(' ').next() == Some(name))
+        .expect("the blob");
+    hex::decode(line.split(' ').nth(2).unwrap_or("")).expect("hex")
+}
+
+fn parsed(label: &str) -> Digest {
+    let (hash, size) = label.split_once('/').expect("label");
+    Digest {
+        hash: hash.to_owned(),
+        size_bytes: size.parse().expect("size"),
+    }
+}
+
+/// What the client made of each frame of a replayed response.
+type Outcomes = Vec<Result<Vec<u8>, String>>;
+
+/// Sends the case's digests as the client would, has the fake grant answer exactly the case's
+/// response hex, and reads the frames: returns the grant, the labels asked for and what each
+/// frame yielded. The request body the grant saw must be the fixture's request JSON, byte for byte.
+fn replay(name: &str) -> (Server, Vec<String>, Outcomes) {
+    let request = case_line(name, "request ");
+    let response = hex::decode(
+        case_line(name, "response ")
+            .split_whitespace()
+            .collect::<String>(),
+    )
+    .expect("hex");
+    let server = Server::start(
+        Grant::new(&Arc::default())
+            .on_batch(move |_| Reply::new(200, response.clone()))
+            .on_get(|_, _| Reply::new(200, b"refetched".to_vec())),
+    );
+    let labels = digests_of(request.as_bytes());
+    let digests: Vec<Digest> = labels.iter().map(|l| parsed(l)).collect();
+    let indexes: Vec<usize> = (0..digests.len()).collect();
+    let source = batching(&server);
+    let mut http = source.post_batch(&digests, &indexes).expect("post");
+    assert_eq!(http.status().as_u16(), 200);
+    let seen: Mutex<Outcomes> = Mutex::new(Vec::new());
+    let each = |_: usize, fetch: Fetch<'_>| -> Result<(), FetchError> {
+        let mut out = Vec::new();
+        let result = fetch(&mut out).map(|()| out).map_err(|e| e.to_string());
+        seen.lock().expect("seen").push(result);
+        Ok(())
+    };
+    source
+        .read_frames(&digests, &indexes, &each, &mut http.body_mut().as_reader())
+        .expect("frames");
+    assert_eq!(server.log.lock().expect("log")[0].body, request.as_bytes());
+    let outcomes = seen.into_inner().expect("seen");
+    (server, labels, outcomes)
+}
+
+/// Catches the client disagreeing with the server on duplicates: the digests are requested as
+/// the fixture's JSON says (order and format), and each of the four frames, a digest twice and an
+/// empty blob included, yields the blob of its position.
+#[test]
+fn the_fixture_duplicates_are_answered_each_time_in_request_order() {
+    let (server, labels, outcomes) = replay("duplicates_are_answered_each_time_in_request_order");
+    let (alpha, beta, empty) = (world("alpha"), world("beta"), world("empty"));
+    let expected: Vec<String> = [&beta, &alpha, &beta, &empty]
+        .iter()
+        .map(|bytes| label(&digest_of(bytes)))
+        .collect();
+    assert_eq!(labels, expected);
+    assert_eq!(outcomes, [Ok(beta.clone()), Ok(alpha), Ok(beta), Ok(empty)]);
+    assert!(server.gets().is_empty());
+}
+
+/// Catches a status the client reads differently from the server: in the fixture's six-frame
+/// answer, ok and empty-ok give their bytes, not_found and out_of_scope fail naming their blobs,
+/// and too_large and store_unavailable are each refetched by one GET of that blob.
+#[test]
+fn the_fixture_statuses_have_the_outcomes_the_client_defines() {
+    let (server, labels, outcomes) = replay("every_status");
+    assert_eq!(outcomes.len(), 6);
+    assert_eq!(outcomes[0], Ok(world("alpha")));
+    assert_eq!(outcomes[5], Ok(world("empty")));
+    let missing = outcomes[1].clone().expect_err("not found");
+    assert!(missing.contains(&labels[1]), "{missing}");
+    let withheld = outcomes[2].clone().expect_err("out of scope");
+    assert!(withheld.contains(&labels[2]), "{withheld}");
+    assert_eq!(outcomes[3], Ok(b"refetched".to_vec()));
+    assert_eq!(outcomes[4], Ok(b"refetched".to_vec()));
+    assert_eq!(server.gets(), [labels[3].clone(), labels[4].clone()]);
+}
+
+/// Catches the client disagreeing about the largest request the server reads: two 2 MiB digests,
+/// whose sizes sum to exactly 4 MiB, are sent as the fixture's JSON and the two not_found frames
+/// that answer them are read as two failures naming the blobs.
+#[test]
+fn the_fixture_sizes_at_the_sum_bound_are_read() {
+    let (_, labels, outcomes) = replay("sizes_at_the_sum_bound_are_read");
+    assert_eq!(outcomes.len(), 2);
+    let first = outcomes[0].clone().expect_err("first");
+    let second = outcomes[1].clone().expect_err("second");
+    assert!(first.contains(&labels[0]), "{first}");
+    assert!(second.contains(&labels[1]), "{second}");
+}
+
+/// Has the fake grant refuse the whole request as the case says, and returns the grant and the
+/// error the client gives for a batch of `digests`.
+fn refusal(name: &str, digests: &[Digest]) -> (Server, String) {
+    let line = case_line(name, "refused ");
+    let (status, reason) = line.split_once(' ').expect("status and reason");
+    let status: u16 = status.parse().expect("status");
+    let body = format!("{reason}\n").into_bytes();
+    let server = Server::start(
+        Grant::new(&Arc::default()).on_batch(move |_| Reply::new(status, body.clone())),
+    );
+    let indexes: Vec<usize> = (0..digests.len()).collect();
+    let error = batching(&server)
+        .fetch_batch(digests, &indexes, &|_, fetch| fetch(&mut Vec::new()))
+        .expect_err("refused");
+    (server, error.to_string())
+}
+
+/// Catches the client failing to treat the server's 413 as a fetch failure: the request is the
+/// fixture's JSON for two digests summing past 4 MiB, the answer is a source error naming the
+/// status, and no GET follows.
+#[test]
+fn the_fixture_413_is_a_fetch_failure() {
+    let name = "sizes_over_the_sum_bound_are_refused";
+    let digests: Vec<Digest> = digests_of(case_line(name, "request ").as_bytes())
+        .iter()
+        .map(|l| parsed(l))
+        .collect();
+    let (server, error) = refusal(name, &digests);
+    assert!(error.contains("answered 413"), "{error}");
+    assert!(server.gets().is_empty());
+    let log = server.log.lock().expect("log");
+    assert_eq!(log[0].body, case_line(name, "request ").as_bytes());
+}
+
+/// Catches the client treating the server's 400 as anything but a fetch failure (and as a missing
+/// route): the malformed-body and empty-list refusals, answered to an ordinary batch, each fail
+/// the fetch naming the status, with no GET.
+#[test]
+fn the_fixture_400s_are_fetch_failures() {
+    let digests = [digest_of(&world("alpha"))];
+    for name in [
+        "a_body_that_is_not_json_is_refused",
+        "an_empty_list_is_refused",
+    ] {
+        let (server, error) = refusal(name, &digests);
+        assert!(error.contains("answered 400"), "{name}: {error}");
+        assert!(server.gets().is_empty(), "{name}");
+    }
+}
