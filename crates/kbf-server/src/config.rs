@@ -311,6 +311,24 @@ pub struct Args {
         default_values_t = kbf_sched::MemoryLadder::DEFAULT_GIB
     )]
     pub memory_ladder_gib: Vec<u64>,
+    /// Every `action` lease books the whole worker it lands on: all of its CPUs and all of
+    /// its memory, whichever worker that is, so that exactly one action runs per worker
+    /// and a second waits for it. The action digest is the client's and does not change
+    /// (the per-action `kbf-book-cpus` and `kbf-book-mem-gib` properties would split the
+    /// action cache); this is a setting of the server. `kbf-book-cpus` and `kbf-book-mem-gib`
+    /// are still checked, but no longer change what is booked. `kbf-lease=whole_machine` and
+    /// `vm` leases are as they were. An action killed for passing its own memory limit has
+    /// no larger booking to climb to, so `--memory-ladder-gib` has no further rung to give
+    /// it: it finishes out-of-memory, as an action that already books the largest node does,
+    /// and its memory floor is not raised. A worker books by what it reported at
+    /// registration. The setting is not kept in the state store, so a server restart
+    /// ends it for the operations the store holds: one that was queued is read back as
+    /// an ordinary action, and one that was running is recovered holding only the booking
+    /// the front computed for it, not the worker, so ordinary actions can be placed
+    /// beside it and, if it is lost or requeued, it runs again as an ordinary action. A
+    /// run that needs one action per worker must not restart the server. Off by default
+    #[arg(long, default_value_t = false)]
+    pub exclusive_actions: bool,
     /// Keeps an action's memory booking where it started. An action that passes its own
     /// memory limit is not run again on the next rung of `--memory-ladder-gib`: the kill
     /// finishes it, FAILED_PRECONDITION with reason `ACTION_OUT_OF_MEMORY`, as a kill at the
@@ -972,6 +990,7 @@ impl Args {
             memory_climb: !self.no_memory_climb,
             vm_host_floor: HostFloor::new(self.vm_host_floor_cpus, self.vm_host_floor_mem_gib),
             learned_sizes: self.learned_sizes,
+            exclusive_actions: self.exclusive_actions,
             scheduler_core: self.scheduler_core,
             placement_load: self.placement_load,
             placement_predictions: self.placement_predictions,
