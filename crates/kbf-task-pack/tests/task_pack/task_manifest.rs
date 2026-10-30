@@ -5,7 +5,8 @@ use std::path::Path;
 
 use kbf_segments::sha256;
 use kbf_task_pack::{
-    EMPTY_DIGEST, MAX_MANIFEST_BYTES, ManifestError, OutputDirectory, OutputFile, OutputSymlink,
+    EMPTY_DIGEST, LargeEntry, MANIFEST_VERSION, MANIFEST_VERSION_2, MAX_LARGE, MAX_MANIFEST_BYTES,
+    MAX_PACKS, MAX_RECORD_BYTES, ManifestError, OutputDirectory, OutputFile, OutputSymlink,
     PathError, TaskKeyError, TaskManifest, Timing, Usage,
 };
 use kbf_types::{Digest, DigestFunction, ParseDigestError};
@@ -60,6 +61,8 @@ fn base() -> TaskManifest {
             cpu_usage_us: 3_300_000,
             memory_peak_bytes: 104_857_600,
         },
+        packs: 1,
+        large: Vec::new(),
     }
 }
 
@@ -193,12 +196,17 @@ fn a_missing_or_mistyped_field_or_a_truncated_document_is_refused() {
     }
 }
 
-/// Asserts that a version other than 1 is refused with the version it names.
+/// Asserts that a version other than 1 and 2 is refused with the version it names, and that
+/// version 2 without the fields it requires is not read as version 1.
 #[test]
 fn a_manifest_of_another_version_is_refused() {
     assert!(matches!(
+        refusal("invalid/version_3.json"),
+        ManifestError::Version(3)
+    ));
+    assert!(matches!(
         refusal("invalid/version_2.json"),
-        ManifestError::Version(2)
+        ManifestError::MissingField("packs")
     ));
 }
 
@@ -469,4 +477,258 @@ fn to_json_refuses_an_invalid_manifest_and_one_over_four_mebibytes() {
 fn the_output_digests_skip_the_empty_file_and_the_action() {
     let listed: Vec<Digest> = golden().output_digests().collect();
     assert_eq!(listed, [STDOUT, STDERR, A_O, TOOL, TREE].map(digest));
+}
+
+// Version 2: several packs and large objects.
+
+/// The large cap of the farm: 512 MiB.
+const LARGE_MAX: u64 = 536_870_912;
+
+const BIG_1: &str = "1111111111111111111111111111111111111111111111111111111111111111/138847232";
+const BIG_2: &str = "2222222222222222222222222222222222222222222222222222222222222222/114300000";
+
+fn parse_v2(name: &str) -> Result<TaskManifest, ManifestError> {
+    TaskManifest::parse_with(&fixture(name), LARGE_MAX)
+}
+
+fn refusal_v2(name: &str) -> ManifestError {
+    parse_v2(name).expect_err(name)
+}
+
+fn large(slot: u8, text: &str) -> LargeEntry {
+    LargeEntry {
+        slot,
+        digest: digest(text),
+    }
+}
+
+/// Asserts that each version 2 fixture parses (under the farm's large cap) to the value written
+/// out here, that it is written back byte for byte, and that it is written as version 2: two
+/// packs, one large object, and both.
+#[test]
+fn the_golden_v2_manifests_parse_to_their_values_and_write_back_byte_for_byte() {
+    let cases = [
+        (
+            "valid_v2/two_packs.json",
+            TaskManifest { packs: 2, ..base() },
+        ),
+        (
+            "valid_v2/one_large.json",
+            TaskManifest {
+                output_files: vec![file("bin/mojo", BIG_1, true)],
+                large: vec![large(0, BIG_1)],
+                ..base()
+            },
+        ),
+        (
+            "valid_v2/packs_and_large.json",
+            TaskManifest {
+                output_files: vec![
+                    file("bin/mojo", BIG_1, true),
+                    file("bin/lld", BIG_2, true),
+                    file("lib/a.o", A_O, true),
+                ],
+                packs: 3,
+                large: vec![large(0, BIG_1), large(2, BIG_2)],
+                ..base()
+            },
+        ),
+    ];
+    for (name, expected) in cases {
+        let parsed = parse_v2(name).expect(name);
+        assert_eq!(parsed, expected, "{name}");
+        assert_eq!(parsed.version(), MANIFEST_VERSION_2, "{name}");
+        assert_eq!(
+            expected.to_json_with(LARGE_MAX).expect(name),
+            fixture(name),
+            "{name}"
+        );
+    }
+    let one = parse_v2("valid_v2/one_large.json").expect("valid");
+    assert_eq!(one.large[0].size(), 138_847_232);
+}
+
+/// Asserts that a version 1 manifest still reads as before: one pack, no large object, version
+/// 1, under any cap; and that a manifest of one pack and no large object is written as version
+/// 1, so a small run's bytes are what they were.
+#[test]
+fn a_v1_manifest_is_one_pack_and_is_written_as_v1() {
+    for cap in [0, LARGE_MAX] {
+        let parsed = TaskManifest::parse_with(&fixture("valid/minimal.json"), cap).expect("valid");
+        assert_eq!((parsed.packs, parsed.large.len()), (1, 0));
+        assert_eq!(parsed.version(), MANIFEST_VERSION);
+    }
+    assert_eq!(
+        base().to_json().expect("json"),
+        fixture("valid/minimal.json")
+    );
+}
+
+/// Asserts that a large object is refused by a reader given no cap (what `parse` is), even when
+/// the manifest is right under the farm's cap: a reader opts in to large objects.
+#[test]
+fn parse_without_a_cap_refuses_a_large_object() {
+    assert!(matches!(
+        TaskManifest::parse(&fixture("valid_v2/one_large.json")),
+        Err(ManifestError::LargeTooBig {
+            slot: 0,
+            size: 138_847_232,
+            cap: 0
+        })
+    ));
+    assert!(TaskManifest::parse(&fixture("valid_v2/two_packs.json")).is_ok());
+}
+
+/// Asserts that `packs` is 1 to 8: 0 and 9 are refused, 1 and 8 are not.
+#[test]
+fn packs_is_one_to_eight() {
+    assert!(matches!(
+        refusal_v2("invalid_v2/packs_zero.json"),
+        ManifestError::Packs(0)
+    ));
+    assert!(matches!(
+        refusal_v2("invalid_v2/packs_nine.json"),
+        ManifestError::Packs(9)
+    ));
+    for packs in [1, MAX_PACKS] {
+        let manifest = TaskManifest { packs, ..base() };
+        assert!(manifest.validate().is_ok(), "{packs}");
+    }
+    for packs in [0, MAX_PACKS + 1] {
+        let manifest = TaskManifest { packs, ..base() };
+        assert!(matches!(manifest.to_json(), Err(ManifestError::Packs(p)) if p == packs));
+    }
+}
+
+/// Asserts that a large slot must be below 8: slot 8 is refused, slot 7 is not.
+#[test]
+fn a_large_slot_is_below_eight() {
+    assert!(matches!(
+        refusal_v2("invalid_v2/large_slot_eight.json"),
+        ManifestError::LargeSlot(8)
+    ));
+    let named = |slot| TaskManifest {
+        output_files: vec![file("bin/x", BIG_1, false)],
+        large: vec![large(slot, BIG_1)],
+        ..base()
+    };
+    assert!(named(MAX_LARGE - 1).validate_with(LARGE_MAX).is_ok());
+    assert!(matches!(
+        named(MAX_LARGE).validate_with(LARGE_MAX),
+        Err(ManifestError::LargeSlot(8))
+    ));
+}
+
+/// Asserts that two large entries with one slot, and two with one digest, are refused: every
+/// digest is in exactly one place.
+#[test]
+fn a_large_slot_or_digest_listed_twice_is_refused() {
+    assert!(matches!(
+        refusal_v2("invalid_v2/duplicate_large_slot.json"),
+        ManifestError::DuplicateLargeSlot(1)
+    ));
+    let err = refusal_v2("invalid_v2/duplicate_large_digest.json");
+    assert!(
+        matches!(err, ManifestError::DuplicateLargeDigest(d) if d == digest(BIG_1)),
+        "{err}"
+    );
+}
+
+/// Asserts the size window of a large object: at the record cap it is a pack's business (refused),
+/// one byte over is large; at the large cap it is allowed, one byte over is refused; the cap
+/// is the one given, not a constant.
+#[test]
+fn a_large_size_is_over_the_record_cap_and_at_most_the_given_cap() {
+    assert!(matches!(
+        refusal_v2("invalid_v2/large_size_at_record_cap.json"),
+        ManifestError::LargeTooSmall {
+            slot: 0,
+            size: MAX_RECORD_BYTES
+        }
+    ));
+    assert!(matches!(
+        refusal_v2("invalid_v2/large_over_cap.json"),
+        ManifestError::LargeTooBig {
+            slot: 0,
+            size: 536_870_913,
+            cap: LARGE_MAX
+        }
+    ));
+    let sized = |size: u64| {
+        let text = format!("{}/{size}", "3".repeat(64));
+        TaskManifest {
+            output_files: vec![file("bin/x", &text, false)],
+            large: vec![large(0, &text)],
+            ..base()
+        }
+    };
+    assert!(sized(MAX_RECORD_BYTES + 1).validate_with(LARGE_MAX).is_ok());
+    assert!(sized(LARGE_MAX).validate_with(LARGE_MAX).is_ok());
+    assert!(matches!(
+        sized(LARGE_MAX).validate_with(LARGE_MAX - 1),
+        Err(ManifestError::LargeTooBig { .. })
+    ));
+    assert!(sized(LARGE_MAX + 1).validate_with(LARGE_MAX + 1).is_ok());
+}
+
+/// Asserts that a large entry no output names is refused: it would be streamed into the store
+/// for nothing.
+#[test]
+fn a_large_object_no_output_names_is_refused() {
+    let err = refusal_v2("invalid_v2/large_unnamed.json");
+    assert!(
+        matches!(err, ManifestError::LargeUnnamed { slot: 0, digest: d } if d == digest(BIG_1)),
+        "{err}"
+    );
+}
+
+/// Asserts the fields of each version: an unknown field (top level or in a large entry) is
+/// refused, a slot that is not a number is a JSON error, version 1 may not carry `packs` or
+/// `large`, and version 2 must carry both.
+#[test]
+fn the_fields_of_each_version_are_exact() {
+    for name in [
+        "invalid_v2/unknown_field.json",
+        "invalid_v2/unknown_large_field.json",
+    ] {
+        let ManifestError::Json(e) = refusal_v2(name) else {
+            panic!("{name}: not a Json refusal");
+        };
+        assert!(e.to_string().contains("unknown field"), "{name}: {e}");
+    }
+    assert!(matches!(
+        refusal_v2("invalid_v2/large_slot_not_a_number.json"),
+        ManifestError::Json(_)
+    ));
+    assert!(matches!(
+        refusal_v2("invalid_v2/v1_with_packs.json"),
+        ManifestError::UnexpectedField("packs")
+    ));
+    assert!(matches!(
+        refusal_v2("invalid_v2/v1_with_large.json"),
+        ManifestError::UnexpectedField("large")
+    ));
+    assert!(matches!(
+        refusal_v2("invalid_v2/missing_packs.json"),
+        ManifestError::MissingField("packs")
+    ));
+    assert!(matches!(
+        refusal_v2("invalid_v2/missing_large.json"),
+        ManifestError::MissingField("large")
+    ));
+}
+
+/// Asserts that a large digest that is not `<hex>/<size>` names its position in the refusal.
+#[test]
+fn a_bad_large_digest_names_its_position() {
+    let text = String::from_utf8(fixture("valid_v2/one_large.json")).expect("utf8");
+    let broken = text.replace(
+        &format!("\"digest\":\"{BIG_1}\"}}]}}"),
+        "\"digest\":\"zz\"}]}",
+    );
+    assert_ne!(broken, text);
+    assert!(matches!(
+        TaskManifest::parse_with(broken.as_bytes(), LARGE_MAX),
+        Err(ManifestError::Digest { field, .. }) if field == "large[0].digest"
+    ));
 }
