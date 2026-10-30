@@ -409,13 +409,14 @@ mod tests {
 
     #[tokio::test]
     async fn the_exit_code_is_reported() {
-        let rig = Rig::new("exit");
-        // `env` exits 127 when it cannot find the program it was asked to run.
+        // `env` exits 127 when it cannot find the program it was asked to run. Each run gets its
+        // own work directory: a run refuses a `private` directory an earlier one left.
         for (argv, code) in [
             (vec!["/bin/true"], 0),
             (vec!["/bin/false"], 1),
             (vec!["/usr/bin/env", "./no-such-program"], 127),
         ] {
+            let rig = Rig::new(&format!("exit-{code}"));
             let ran = rig.run(&program(&argv), LONG).await.expect("ran");
             assert_eq!(ran.exit_code, code, "{argv:?}");
             assert!(!ran.timed_out);
