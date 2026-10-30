@@ -95,7 +95,7 @@ max_concurrent_fills = 4
 [cold_store]
 kind             = "s3"
 bucket           = "tierstore"
-endpoint         = "http://s3-upstream.example:9300"
+endpoint         = "http://s3-cold.example:9000"
 credentials_file = "/etc/tierstore-cache/upstream-read.key"
 
 [[policy]]
