@@ -370,8 +370,8 @@ async fn a_fill_that_ended_after_the_miss_is_not_run_again() {
     assert_eq!(rig.get("cas/b/obj").await.unwrap().len(), 100);
     let (heads, gets) = (rig.calls(Op::Head), rig.calls(Op::Get));
     let name = name_of("cas/b/obj");
-    let late = rig.cache.inner.fill_once("cas/b/obj", &name).await;
-    assert_eq!(late, Ok(super::fill::Filled::Kept));
+    let late = rig.cache.inner.join_or_start("cas/b/obj", &name);
+    assert_eq!(late.err(), Some(super::fill::Filled::Kept));
     assert_eq!((rig.calls(Op::Head), rig.calls(Op::Get)), (heads, gets));
     assert_eq!(read(&rig.cache.counters().fills), 1);
 }
@@ -410,8 +410,8 @@ async fn fills_that_run_together_are_held_to_the_critical_mark() {
 
 /// Asserts that an object written over while it is read is not kept: the second HEAD shows
 /// another tag, the fill is counted as `changed`, nothing is left staged or indexed, and the
-/// reader is served the object as the upstream has it now. Also drives the upstream's
-/// conditional put and delete.
+/// reader, who may have been given bytes of the first version, gets an `Unavailable` error
+/// and not a mix. Also drives the upstream's conditional put and delete.
 #[tokio::test]
 async fn an_object_written_over_during_its_fill_is_not_kept() {
     let rig = Rig::new("tscache-changed");
@@ -430,7 +430,7 @@ async fn an_object_written_over_during_its_fill_is_not_kept() {
         .await;
     assert!(put.is_ok());
     gate.add_permits(64);
-    assert_eq!(reader.await.unwrap().unwrap(), new);
+    assert!(reader.await.unwrap().unwrap_err().is_unavailable());
     assert_eq!(rig.cache.counters().failures(FailedFill::Changed), 1);
     assert_eq!(rig.cache.held(), (0, 0));
     assert!(!rig.has_file("cas/b/obj"));

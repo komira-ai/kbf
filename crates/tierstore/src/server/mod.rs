@@ -250,7 +250,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::Full;
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::http::request::Parts;
 use hyper::server::conn::http1;
@@ -271,6 +270,7 @@ pub use presign::{Grant, PresignKey, PresignRequest, presign_put};
 pub use scoped::{Prefixes, ScopedKey};
 
 use idle::Watched;
+pub use reply::AnswerBody;
 use reply::{Answer, S3Error, answer};
 use request::{BoxError, Check, Query, Reader, Target, resolve};
 
@@ -683,7 +683,7 @@ impl Server {
     }
 
     /// Answers one request.
-    pub async fn handle<B>(&self, request: Request<B>) -> Response<Full<Bytes>>
+    pub async fn handle<B>(&self, request: Request<B>) -> Response<AnswerBody>
     where
         B: hyper::body::Body + Send,
         B::Data: Send,

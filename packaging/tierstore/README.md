@@ -355,10 +355,14 @@ The misses of a key whose fill is running share it and need no slot. A pass-thro
 the object is filled by the next miss of its key that finds a free slot, so with every slot busy
 for long, as under a sustained cold load, new keys are warmed more slowly (watch
 `fills_skipped_busy_total`; raise `max_concurrent_fills` if it climbs). That bound is only for the
-fills. The front holds a response whole, as it does for any backend, so a GET of a large object
-(a whole GET, or a range) holds the bytes asked in memory for the request, hit, miss or
-pass-through, whether or not the object is kept, and a whole GET of a miss holds the object once
-the fill has kept it. A fill that panics or is cancelled frees its slot and its key, and the
+fills. A read of the cache is streamed: a hit is read from its file, a miss is given to the client
+as the fill writes the bytes (every reader of a key reads the staged file, never a shared copy in
+memory), and a pass-through is read from the upstream a chunk at a time, so a GET holds at most
+one chunk (8 MiB) in memory whatever the size of the object. The last chunk of the bytes a client
+asked for is held back until the fill has checked the object: a `cas/l` object whose bytes do not
+hash to its name, or an object written over during its fill, ends the response with an error
+(the connection is closed, and a client never sees a complete answer), and nothing is kept. A
+storage node still holds the bytes of a GET whole. A fill that panics or is cancelled frees its slot and its key, and the
 readers that waited for it get a 503 (`fill_failures_total{reason="aborted"}`).
 
 No scrub. A hit is not hashed again, and the sidecar's `sha256` is written but not checked after

@@ -3,11 +3,15 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::StreamExt as _;
+use futures::stream;
+use http_body_util::BodyExt as _;
 use hyper::StatusCode;
+use hyper::body::Body as _;
 
-use crate::Error;
+use crate::{Error, ReadBody};
 
-use super::reply::{S3Error, answer, header_text};
+use super::reply::{AnswerBody, S3Error, answer, header_text, streamed_answer};
 
 /// Asserts that printable ASCII is kept, including the space, and everything else becomes `?`.
 #[test]
@@ -87,4 +91,71 @@ fn a_hash_that_does_not_match_is_answered_by_the_header_it_was_claimed_in() {
     let invalid = S3Error::invalid_digest("x-amz-checksum-crc32");
     assert_eq!(invalid.kind(), (StatusCode::BAD_REQUEST, "InvalidDigest"));
     assert!(invalid.message().contains("x-amz-checksum-crc32"));
+}
+
+/// A body of the chunks and errors given, in order.
+fn chunks(items: Vec<Result<&'static [u8], Error>>) -> ReadBody {
+    let items = items
+        .into_iter()
+        .map(|item| item.map(Bytes::from_static))
+        .collect::<Vec<_>>();
+    stream::iter(items).boxed()
+}
+
+/// The frames of `body` to its end: the bytes of each, or the error that ended it.
+async fn frames(mut body: AnswerBody) -> Vec<Result<Bytes, Error>> {
+    let mut seen = Vec::new();
+    while let Some(frame) = body.frame().await {
+        seen.push(frame.map(|frame| frame.into_data().expect("data")));
+    }
+    seen
+}
+
+/// Asserts that a streamed answer gives its length to the connection (so a length header is
+/// sent), gives the chunks as they are, skips an empty chunk, and ends cleanly after exactly
+/// that many bytes. The end is the stream's own: `is_end_stream` is false until then.
+#[tokio::test]
+async fn a_streamed_answer_of_the_length_given_ends_cleanly() {
+    let body = chunks(vec![Ok(b"abc"), Ok(b""), Ok(b"de")]);
+    let made = streamed_answer(StatusCode::OK, &[], 5, body);
+    let body = made.into_body();
+    assert_eq!(body.size_hint().exact(), Some(5));
+    assert!(!body.is_end_stream());
+    let seen = frames(body).await;
+    assert_eq!(
+        seen,
+        vec![
+            Ok(Bytes::from_static(b"abc")),
+            Ok(Bytes::from_static(b"de"))
+        ]
+    );
+}
+
+/// Asserts that a streamed answer whose stream ends before the length it gave, gives more bytes
+/// than it gave, or ends with an error is an error of the body, which comes once and ends the
+/// body: the connection is cut and the client cannot take the answer for whole.
+#[tokio::test]
+async fn a_streamed_answer_that_is_short_long_or_failed_ends_with_an_error() {
+    let short = streamed_answer(StatusCode::OK, &[], 5, chunks(vec![Ok(b"abc")]));
+    let seen = frames(short.into_body()).await;
+    assert_eq!(seen.len(), 2);
+    assert!(matches!(&seen[1], Err(Error::Other(text)) if text.contains("2 bytes short")));
+
+    let long = streamed_answer(StatusCode::OK, &[], 2, chunks(vec![Ok(b"ab"), Ok(b"c")]));
+    let seen = frames(long.into_body()).await;
+    assert_eq!(seen.len(), 2);
+    assert!(matches!(&seen[1], Err(Error::Other(text)) if text.contains("more bytes")));
+
+    let failed = Error::Unavailable("gone".to_owned());
+    let late = chunks(vec![Ok(b"ab"), Err(failed.clone()), Ok(b"cd")]);
+    let seen = frames(streamed_answer(StatusCode::OK, &[], 4, late).into_body()).await;
+    assert_eq!(
+        seen,
+        vec![Ok(Bytes::from_static(b"ab")), Err(failed.clone())]
+    );
+
+    // An error after every byte was given is still heard: the end is the stream's.
+    let after = chunks(vec![Ok(b"ab"), Err(failed.clone())]);
+    let seen = frames(streamed_answer(StatusCode::OK, &[], 2, after).into_body()).await;
+    assert_eq!(seen, vec![Ok(Bytes::from_static(b"ab")), Err(failed)]);
 }

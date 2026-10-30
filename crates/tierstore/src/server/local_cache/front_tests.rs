@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
+use hyper::body::Body as _;
 use hyper::{Request, StatusCode};
 
 use super::testing::Rig;
@@ -28,7 +29,12 @@ type Call<'a> = (&'a str, String, Vec<(&'a str, &'a str)>);
 
 impl Front {
     async fn new(name: &str) -> Self {
-        let rig = Rig::new(name);
+        Self::with(name, |_| {}).await
+    }
+
+    /// The same, with the settings of the cache changed by `change`.
+    async fn with(name: &str, change: impl FnOnce(&mut super::CacheConfig)) -> Self {
+        let rig = Rig::with(name, change);
         rig.clock.set(NOW);
         rig.put("cas/b/obj", TEXT.as_bytes()).await;
         let mut config = ServerConfig::new(BUCKET, KEY_ID, SECRET, rig.clock.clone());
@@ -200,4 +206,81 @@ async fn metricz_shows_the_counters_or_says_there_is_no_cache() {
         .await;
     assert_eq!(reply.status, StatusCode::OK);
     assert!(reply.body.contains("no local cache"), "{}", reply.body);
+}
+
+/// The frames of an answer's body to its end: the bytes of each, and the error that ended it.
+async fn frames(response: hyper::Response<crate::server::AnswerBody>) -> (Vec<Bytes>, bool) {
+    let mut body = response.into_body();
+    let mut seen = Vec::new();
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => seen.push(frame.into_data().expect("data")),
+            Err(_) => return (seen, true),
+        }
+    }
+    (seen, false)
+}
+
+/// Asserts that the front streams a GET of the cache: the answer says its length (the body's size
+/// is known, which is what sends a `Content-Length`), the body comes as frames no larger than the
+/// cache's chunk (10 bytes here, for a hundred-byte object), for a miss, a hit and a range, and a
+/// body is never held whole by the front.
+#[tokio::test]
+async fn a_get_is_streamed_in_frames_no_larger_than_the_chunk() {
+    let front = Front::with("tscache-front-stream", |config| config.fill_chunk = 10).await;
+    let uri = format!("/{BUCKET}/cas/b/obj");
+    for (extra, expect) in [
+        (vec![], TEXT),
+        (vec![], TEXT),
+        (vec![("range", "bytes=15-54")], &TEXT[15..55]),
+    ] {
+        let request = sign(&front.config, "GET", &uri, &extra, b"");
+        let response = front.server.handle(request).await;
+        assert_eq!(
+            response.body().size_hint().exact(),
+            Some(expect.len() as u64)
+        );
+        let (seen, failed) = frames(response).await;
+        assert!(!failed);
+        assert!(seen.len() >= 4, "{} frames", seen.len());
+        assert!(seen.iter().all(|frame| frame.len() <= 10));
+        assert_eq!(seen.concat(), expect.as_bytes());
+    }
+}
+
+/// Asserts that a `cas/l` object whose bytes do not hash to its name, larger than the chunk, is
+/// answered with a body that ends with an error and less than its length, and not with a complete
+/// answer; and that an object no larger than the chunk is refused with a 503 before any byte is
+/// sent.
+#[tokio::test]
+async fn a_body_that_fails_the_hash_is_a_broken_answer_not_a_clean_end() {
+    let front = Front::with("tscache-front-mismatch", |config| config.fill_chunk = 10).await;
+    let name = format!(
+        "cas/l/{}",
+        crate::server::local_cache::testing::digest(b"other")
+    );
+    front.rig.put(&name, &[9u8; 100]).await;
+    // The upstream gives one chunk, so that the answer starts with the fill still running.
+    let gate = front.rig.tamper.hold();
+    gate.add_permits(1);
+    let uri = format!("/{BUCKET}/{name}");
+    let response = front
+        .server
+        .handle(sign(&front.config, "GET", &uri, &[], b""))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    gate.add_permits(64);
+    let (seen, failed) = frames(response).await;
+    assert!(failed);
+    assert!(seen.concat().len() <= 90);
+
+    let small = format!(
+        "cas/l/{}",
+        crate::server::local_cache::testing::digest(b"other two")
+    );
+    front.rig.put(&small, &[9u8; 5]).await;
+    let uri = format!("/{BUCKET}/{small}");
+    let refused = front.send("GET", &uri, &[], b"").await;
+    assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(front.rig.cache.held(), (0, 0));
 }

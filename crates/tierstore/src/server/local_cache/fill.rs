@@ -2,18 +2,22 @@
 //! into `obj/`; and the single flight that lets the readers of one key share it.
 
 use std::collections::hash_map::Entry;
+use std::fs::File;
+use std::future::Future;
 use std::io;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::task::{Context, Poll};
 
 use futures::FutureExt as _;
 use futures::future::{BoxFuture, OptionFuture, Shared};
 use sha2::{Digest, Sha256};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt as _;
-use tokio::sync::{OwnedSemaphorePermit, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::{ByteRange, Error};
@@ -31,8 +35,37 @@ pub(super) enum Filled {
     Skipped,
 }
 
-/// A fill that is running, which every reader of the key waits on.
-pub(super) type Pending = Shared<BoxFuture<'static, Result<Filled, Error>>>;
+/// How far a fill has come, as its readers see it. The bytes are in a file, never in a copy in
+/// memory that the readers share.
+#[derive(Clone, Debug)]
+pub(super) enum Live {
+    /// The fill has not made its file yet.
+    Starting,
+    /// The bytes of the object up to `written` are in the file `file` reads, flushed. The file
+    /// stays readable through this handle after it is linked into `obj/` or removed.
+    Staging {
+        /// The size the upstream said the object has.
+        size: u64,
+        file: Arc<File>,
+        written: u64,
+    },
+}
+
+/// A fill that is running: its end, which every reader of the key waits on, and its progress,
+/// which a reader that streams from the staged file follows.
+#[derive(Clone)]
+pub(super) struct Pending {
+    done: Shared<BoxFuture<'static, Result<Filled, Error>>>,
+    pub(super) live: watch::Receiver<Live>,
+}
+
+impl Future for Pending {
+    type Output = Result<Filled, Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().done).poll(cx)
+    }
+}
 
 /// The task of a fill.
 type Task = JoinHandle<Result<Filled, Error>>;
@@ -68,6 +101,8 @@ impl From<Error> for Stop {
 struct Staged {
     inner: Arc<Inner>,
     file: tokio::fs::File,
+    /// A handle that reads the file, for the readers that stream from it.
+    reader: Arc<File>,
     path: PathBuf,
     /// Where the sidecar is written before it is renamed into place.
     sidecar: PathBuf,
@@ -90,13 +125,21 @@ impl Staged {
         // The mode given to `open` is cut by the umask: set it, so that it is 0444 for any.
         file.set_permissions(std::fs::Permissions::from_mode(0o444))
             .await?;
+        let reader = tokio::fs::File::open(&path).await?.into_std().await;
         let _ = inner.counters.staging_files.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             inner: Arc::clone(inner),
             file,
+            reader: Arc::new(reader),
             path,
             sidecar,
         })
+    }
+
+    /// Appends `chunk` and flushes it, so that a reader of the file sees it once this returns.
+    async fn append(&mut self, chunk: &[u8]) -> io::Result<()> {
+        self.file.write_all(chunk).await?;
+        self.file.flush().await
     }
 
     /// Writes the end of the file to the disk, so that a name linked to it is whole after a
@@ -208,20 +251,6 @@ impl Inner {
         (size <= self.config.budget && total <= critical).then_some(reservation)
     }
 
-    /// The fill of `key`, started if none is running, and waited for. A key with no fill running
-    /// when all the fills the cache may run are running is not filled: the answer is
-    /// [`Filled::Skipped`] at once, and the reader goes to the upstream.
-    pub(super) async fn fill_once(
-        self: &Arc<Self>,
-        key: &str,
-        name: &Name,
-    ) -> Result<Filled, Error> {
-        match self.join_or_start(key, name) {
-            Ok(pending) => pending.await,
-            Err(filled) => Ok(filled),
-        }
-    }
-
     /// The fill of `key` to wait for (`Ok`), started if none is running; or (`Err`) the answer
     /// that needs no wait. It does not wait, and it holds no lock when it returns.
     ///
@@ -252,21 +281,28 @@ impl Inner {
                         return Err(Filled::Skipped);
                     };
                     let (sender, receiver) = oneshot::channel();
-                    let pending = self.waiting(receiver);
+                    let (live, progress) = watch::channel(Live::Starting);
+                    let pending = Pending {
+                        done: self.waiting(receiver),
+                        live: progress,
+                    };
                     slot.insert(pending.clone());
-                    (pending, Some((permit, sender)))
+                    (pending, Some((permit, sender, live)))
                 }
             }
         };
-        if let Some((permit, sender)) = launch {
-            self.start(key, name, permit, sender);
+        if let Some((permit, sender, live)) = launch {
+            self.start(key, name, (permit, live), sender);
         }
         Ok(pending)
     }
 
     /// The fill that waits for the task that `receiver` is to be given, and for its end. A task
     /// that did not end by itself is an error of the readers that waited for it, and is counted.
-    fn waiting(self: &Arc<Self>, receiver: oneshot::Receiver<Task>) -> Pending {
+    fn waiting(
+        self: &Arc<Self>,
+        receiver: oneshot::Receiver<Task>,
+    ) -> Shared<BoxFuture<'static, Result<Filled, Error>>> {
         let inner = Arc::clone(self);
         let waiting = async move {
             let task = OptionFuture::from(receiver.await.ok()).await;
@@ -290,7 +326,7 @@ impl Inner {
         self: &Arc<Self>,
         key: &str,
         name: &Name,
-        permit: OwnedSemaphorePermit,
+        held: (OwnedSemaphorePermit, watch::Sender<Live>),
         sender: oneshot::Sender<Task>,
     ) {
         let (inner, key, name) = (Arc::clone(self), key.to_owned(), name.clone());
@@ -300,9 +336,9 @@ impl Inner {
             hex: name.hex.clone(),
         };
         let task = tokio::spawn(async move {
-            let _permit = permit;
+            let (_permit, live) = held;
             let _flight = flight;
-            inner.fill(&key, &name).await
+            inner.fill(&key, &name, &live).await
         });
         // The receiver is in the fill that is in the table, and in the caller: it is there.
         let _ = sender.send(task);
@@ -310,8 +346,13 @@ impl Inner {
 
     /// Reads the object into the stage directory and, if it is whole and is what its name says,
     /// puts it in the cache.
-    async fn fill(self: &Arc<Self>, key: &str, name: &Name) -> Result<Filled, Error> {
-        match self.fetch(key, name).await {
+    async fn fill(
+        self: &Arc<Self>,
+        key: &str,
+        name: &Name,
+        live: &watch::Sender<Live>,
+    ) -> Result<Filled, Error> {
+        match self.fetch(key, name, live).await {
             Ok(filled) => Ok(filled),
             Err(Stop::Upstream(error)) => {
                 if !matches!(error, Error::NotFound(_)) {
@@ -321,7 +362,12 @@ impl Inner {
             }
             Err(Stop::Short) => self.skipped(FailedFill::ShortBody),
             Err(Stop::Local) => self.skipped(FailedFill::LocalIo),
-            Err(Stop::Changed) => self.skipped(FailedFill::Changed),
+            Err(Stop::Changed) => {
+                // Readers may have been given bytes of the first version already.
+                self.counters.failed(FailedFill::Changed);
+                let text = "the object was written over while it was being read";
+                Err(Error::Unavailable(text.to_owned()))
+            }
             Err(Stop::Mismatch) => {
                 // The bytes are known to be wrong: they go to nobody.
                 self.counters.failed(FailedFill::HashMismatch);
@@ -337,7 +383,12 @@ impl Inner {
         Ok(Filled::Skipped)
     }
 
-    async fn fetch(self: &Arc<Self>, key: &str, name: &Name) -> Result<Filled, Stop> {
+    async fn fetch(
+        self: &Arc<Self>,
+        key: &str,
+        name: &Name,
+        live: &watch::Sender<Live>,
+    ) -> Result<Filled, Stop> {
         let meta = self.upstream.head(key).await?;
         let Some(reservation) = self.reserve(meta.size) else {
             bump(&self.counters.fills_skipped);
@@ -346,6 +397,13 @@ impl Inner {
         let mut staged = Staged::create(self).await?;
         let mut hasher = Sha256::new();
         let mut offset = 0;
+        let (size, reader) = (meta.size, Arc::clone(&staged.reader));
+        let progress = |written| Live::Staging {
+            size,
+            file: Arc::clone(&reader),
+            written,
+        };
+        let _ = live.send_replace(progress(0));
         while offset < meta.size {
             let want = self.config.fill_chunk.max(1).min(meta.size - offset);
             let range = ByteRange::new(offset, want);
@@ -353,9 +411,10 @@ impl Inner {
             if chunk.len() as u64 != want {
                 return Err(Stop::Short);
             }
-            staged.file.write_all(&chunk).await?;
+            staged.append(&chunk).await?;
             hasher.update(&chunk);
             offset += want;
+            let _ = live.send_replace(progress(offset));
         }
         staged.finish().await?;
         // A key named by its content is checked by the hash below. Any other key could have been
