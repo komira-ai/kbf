@@ -32,6 +32,7 @@ struct Source {
     asked: Mutex<Vec<Vec<Digest>>>,
     heads: Mutex<Vec<Digest>>,
     index_down: AtomicBool,
+    blobs_down: AtomicBool,
     head_down: AtomicBool,
 }
 
@@ -66,6 +67,9 @@ impl BlobSource for Source {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(*digest);
             tokio::task::yield_now().await;
+            if self.blobs_down.load(Ordering::SeqCst) {
+                return Err(down());
+            }
             self.blobs
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -569,4 +573,86 @@ async fn the_table_is_sent_from_a_held_stream() {
         .concat()
         .await;
     assert_eq!(sent, body.to_vec());
+}
+
+/// A source that implements only the reads: its locate answers are the defaults of the trait.
+struct Bare(Source);
+
+impl BlobSource for Bare {
+    fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Result<Bytes, StorageError>> {
+        self.0.read_blob(digest)
+    }
+
+    fn read_stream<'a>(
+        &'a self,
+        digest: &'a Digest,
+    ) -> BoxFuture<'a, Result<ReadStream, StorageError>> {
+        self.0.read_stream(digest)
+    }
+}
+
+/// Catches: a source without packs or large objects that answers a table with anything but
+/// `absent` for every digest of the scope, or fails the request.
+#[tokio::test]
+async fn a_source_that_cannot_locate_answers_every_digest_absent() {
+    let source = Source::default();
+    let a = build(&source, "a", &[b"alpha".to_vec(), vec![7; 2000]]);
+    let key = GrantKey::from_secret(&[1; MIN_SECRET_LEN]).expect("a long enough secret");
+    let clock = Arc::new(AtomicU64::new(100));
+    let grants = Arc::new(Grants::new(
+        key,
+        Arc::new(move || clock.load(Ordering::SeqCst)),
+    ));
+    let token = grants
+        .issue(BUILD, a.action, NOT_AFTER)
+        .expect("a valid build id")
+        .expose()
+        .to_owned();
+    let read = JobRead::new(Arc::new(Bare(source)), grants, small());
+    let header = format!("Bearer {token}");
+    let reply = read.respond(&Method::GET, LOCATE_PATH, Some(&header)).await;
+    let table = table(&reply);
+    assert_eq!(table.len(), a.scope().len());
+    assert!(table.values().all(|line| line["absent"] == true));
+}
+
+/// Catches: a store that cannot read the Action answered as a table or as `no_scope`: it is 503
+/// `store_unavailable`, as a GET is.
+#[tokio::test]
+async fn a_scope_that_cannot_be_read_is_unavailable() {
+    let source = Source::default();
+    let a = build(&source, "a", &[b"alpha".to_vec()]);
+    source.blobs_down.store(true, Ordering::SeqCst);
+    let rig = rig(source, small());
+    let reply = rig.locate(&rig.token(a.action)).await;
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(&reply.body[..], b"store_unavailable\n");
+}
+
+/// Catches: a presence memory that grows without bound: a scope of more large blobs than the
+/// memory holds is answered whole and correctly, and the memory is forgotten at its bound (the
+/// next request asks about nearly all of them again).
+#[tokio::test]
+async fn a_scope_of_many_large_blobs_is_answered_whole() {
+    const MANY: usize = 4100;
+    let source = Source::default();
+    let contents: Vec<Vec<u8>> = (0..MANY)
+        .map(|i| format!("{i:01100}").into_bytes())
+        .collect();
+    let a = build(&source, "a", &contents);
+    for file in &a.files {
+        source.large.lock().unwrap().insert(*file, 1100);
+    }
+    let rig = rig(source, small());
+    let token = rig.token(a.action);
+    let table = table(&rig.locate(&token).await);
+    assert!(
+        a.files
+            .iter()
+            .all(|f| table[&f.to_string()]["large"].is_object())
+    );
+    let heads = |rig: &Rig| rig.source.heads.lock().unwrap().len();
+    assert_eq!(heads(&rig), MANY);
+    rig.locate(&token).await;
+    assert!(heads(&rig) >= MANY + 4096, "{}", heads(&rig));
 }

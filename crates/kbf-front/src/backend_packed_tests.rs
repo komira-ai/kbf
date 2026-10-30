@@ -457,3 +457,60 @@ async fn locate_packed_is_the_indexs_answer_and_object_len_a_head() {
     let failed = down.locate_packed(&[held.0]).await.unwrap_err();
     assert!(matches!(failed, StorageError::Unavailable(_)), "{failed:?}");
 }
+
+/// Asserts that a job read over a [`Backend`] gets the same answers through [`BlobSource`]: a
+/// span for a packed blob (over one node and over a map), none for what is in no pack or too
+/// large for one, none from a store without packs or an in-process cache, and the length of a
+/// stored object for [`BlobSource::large_len`] by the key of the digest (none when it is not
+/// there, an error for a key the object store cannot take).
+#[tokio::test]
+async fn a_backend_answers_a_job_read_locate_as_a_blob_source() {
+    use crate::job_read::{BlobSource, Span, large_key};
+
+    let held = blob("a blob a job locates in a pack");
+    let too_large = Digest::new(kbf_types::DigestFunction::Sha256, [9; 32], 100 << 20);
+    let node = Arc::new(CacheStorage::new(
+        Arc::new(Cache::memory()),
+        SegmentsConfig::DEFAULT,
+    ));
+    let alone = Backend::remote_over(node.clone(), Some(packs_holding(&[&held]).await));
+    let trio = Arc::new(Trio::new());
+    let routed = Arc::new(Routed::new(trio.clone(), trio.clone(), trio.clone()));
+    let first = Arc::clone(&trio.nodes[&MemberId(1)]);
+    let mapped = Backend::routed_over(routed, first, Some(packs_holding(&[&held]).await));
+
+    for backend in [&alone, &mapped] {
+        let spans = BlobSource::locate_packed(backend, &[held.0, too_large])
+            .await
+            .expect("located");
+        let at: &Span = spans[0].as_ref().expect("a span for the packed blob");
+        assert_eq!(at.length, held.1.len() as u64);
+        assert!(
+            spans[1].is_none(),
+            "a blob over the pack cap is not asked of the index"
+        );
+        let size = backend.object_len(&at.key).await.expect("a head");
+        assert!(at.offset + at.length <= size.expect("the pack is stored"));
+        assert_eq!(
+            BlobSource::large_len(backend, &held.0)
+                .await
+                .expect("a head"),
+            None
+        );
+        assert!(matches!(
+            backend.object_len("").await.unwrap_err(),
+            StorageError::Unavailable(_)
+        ));
+    }
+    assert!(large_key(&held.0).starts_with("cas/l/"));
+
+    let local = Backend::from(Arc::new(Cache::memory()));
+    let spans = BlobSource::locate_packed(&local, &[held.0])
+        .await
+        .expect("none");
+    assert_eq!(spans, vec![None]);
+    assert_eq!(
+        BlobSource::large_len(&local, &held.0).await.expect("none"),
+        None
+    );
+}

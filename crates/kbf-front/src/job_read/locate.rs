@@ -66,8 +66,8 @@ const ENTRY_BYTES: u64 = 256;
 /// The presence checks of large objects in flight at once.
 const HEADS_IN_FLIGHT: usize = 16;
 
-/// The digests whose presence is remembered, at most; at the bound the answers that have run
-/// out go, and if none has, all of them.
+/// The digests whose presence is remembered, at most; at the bound all of them are forgotten
+/// (an answer is a HEAD to ask again, and a scope has few large blobs).
 const PRESENCE_BOUND: usize = 4096;
 
 /// The kinds of entry, in the order they are counted.
@@ -110,10 +110,7 @@ impl Locating {
         };
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         if seen.len() >= PRESENCE_BOUND {
-            seen.retain(|_, (until, _)| now < *until);
-            if seen.len() >= PRESENCE_BOUND {
-                seen.clear();
-            }
+            seen.clear();
         }
         seen.insert(digest, (now + keep, present));
     }
@@ -213,10 +210,7 @@ impl JobRead {
             .filter(|d| d.size_bytes <= over && !is_empty_blob(d))
             .copied()
             .collect();
-        let mut spans = match self.source.locate_packed(&packed).await {
-            Ok(spans) if spans.len() == packed.len() => spans.into_iter(),
-            _ => return Err(()),
-        };
+        let spans = self.source.locate_packed(&packed).await.map_err(|_| ())?;
         let large: Vec<Digest> = digests
             .iter()
             .filter(|d| d.size_bytes > over)
@@ -226,24 +220,22 @@ impl JobRead {
         for group in large.chunks(HEADS_IN_FLIGHT) {
             held.extend(join_all(group.iter().map(|d| self.large_object(d))).await);
         }
-        let mut held = large.iter().zip(held);
-        digests
+        // What the source did not answer for is absent: the task asks the listener for it.
+        let mut entries: HashMap<Digest, Entry> = HashMap::new();
+        for (digest, at) in packed.iter().zip(spans) {
+            entries.insert(*digest, at.map_or(Entry::Absent, Entry::Pack));
+        }
+        for (digest, length) in large.iter().zip(held) {
+            let entry = match length? {
+                Some(size) if size == digest.size_bytes => Entry::Large(size),
+                _ => Entry::Absent,
+            };
+            entries.insert(*digest, entry);
+        }
+        Ok(digests
             .iter()
-            .map(|digest| {
-                if digest.size_bytes > over {
-                    let (asked, length) = held.next().ok_or(())?;
-                    debug_assert_eq!(asked, digest);
-                    return Ok(match length? {
-                        Some(size) if size == digest.size_bytes => Entry::Large(size),
-                        _ => Entry::Absent,
-                    });
-                }
-                if is_empty_blob(digest) {
-                    return Ok(Entry::Absent);
-                }
-                Ok(spans.next().ok_or(())?.map_or(Entry::Absent, Entry::Pack))
-            })
-            .collect()
+            .map(|digest| entries.remove(digest).unwrap_or(Entry::Absent))
+            .collect())
     }
 
     /// The length of the large object of `digest` if tierstore holds it, from what was found out

@@ -307,13 +307,11 @@ impl Packs {
     /// The length of the object `key` in the pack store (a HEAD), `None` if there is none.
     ///
     /// # Errors
-    /// UNAVAILABLE when the store fails, INVALID_ARGUMENT when `key` is not an object key.
+    /// UNAVAILABLE when the store fails or `key` is not an object key.
     pub async fn object_len(&self, key: &str) -> Result<Option<u64>, Status> {
-        let key = ObjectKey::new(key).map_err(|e| Status::invalid_argument(e.to_string()))?;
-        self.store
-            .len(&key)
-            .await
-            .map_err(|e| Status::unavailable(format!("object store: {e}")))
+        let failed = |e: &dyn fmt::Display| Status::unavailable(format!("object store: {e}"));
+        let key = ObjectKey::new(key).map_err(|e| failed(&e))?;
+        self.store.len(&key).await.map_err(|e| failed(&e))
     }
 
     /// Writes `blobs` into packs and records them. They are in the pack index, and the packs
