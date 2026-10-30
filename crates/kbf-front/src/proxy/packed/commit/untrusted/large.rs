@@ -159,13 +159,29 @@ impl<'a> Large<'a> {
         let metrics = Arc::clone(&self.packs.metrics);
         let size = self.digest.size_bytes;
         let task = tokio::spawn(async move {
-            let how = match store.put_stream(&key, size, body).await {
-                Ok(()) => LargeWriteThrough::Ok,
-                Err(ObjectStoreError::AlreadyExists(_)) => LargeWriteThrough::Exists,
-                Err(error) => {
-                    tracing::warn!(%key, %error, "the write-through of a large object failed");
+            let how = match store.len(&key).await {
+                // Held whole already: the key names the bytes, so there is nothing to upload.
+                Ok(Some(held)) if held == size => LargeWriteThrough::Exists,
+                // An object of another length under a key that names these bytes is not trusted
+                // and is not replaced (a create-only write would be refused): a failure.
+                Ok(Some(held)) => {
+                    tracing::warn!(%key, held, size, "a large object's key holds another length");
                     LargeWriteThrough::Failed
                 }
+                // Not there, or the store could not say: write, and let the create-only rule decide.
+                Ok(None) | Err(_) => match store.put_stream(&key, size, body).await {
+                    Ok(()) => LargeWriteThrough::Ok,
+                    Err(ObjectStoreError::AlreadyExists(_)) => LargeWriteThrough::Exists,
+                    // The body ended short or gave an error: the ingest gave the write up.
+                    Err(ObjectStoreError::Body(why)) => {
+                        tracing::debug!(%key, why, "the write-through of a large object was given up");
+                        LargeWriteThrough::Aborted
+                    }
+                    Err(error) => {
+                        tracing::warn!(%key, %error, "the write-through of a large object failed");
+                        LargeWriteThrough::Failed
+                    }
+                },
             };
             metrics.ingest_large_writethrough[how as usize].add(1);
         });

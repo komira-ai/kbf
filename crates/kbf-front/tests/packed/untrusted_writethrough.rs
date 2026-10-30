@@ -27,7 +27,7 @@ fn count(farm: &Multi, how: LargeWriteThrough) -> u64 {
 
 /// Asserts that a run with a large object leaves `cas/l/<sha256>` holding exactly the object's
 /// bytes, counts one `ok` and no other ending, the ingest is cached, and the scrape names the
-/// family with its three results.
+/// family with its four results.
 #[tokio::test]
 async fn a_large_object_is_written_to_its_content_bound_key() {
     let farm = farm_with_large().await;
@@ -48,16 +48,17 @@ async fn a_large_object_is_written_to_its_content_bound_key() {
         "kbf_pack_ingest_large_writethrough_total{result=\"ok\"} 1\n",
         "kbf_pack_ingest_large_writethrough_total{result=\"exists\"} 0\n",
         "kbf_pack_ingest_large_writethrough_total{result=\"failed\"} 0\n",
+        "kbf_pack_ingest_large_writethrough_total{result=\"aborted\"} 0\n",
     ] {
         assert!(scrape.contains(line), "{scrape}");
     }
 }
 
-/// Asserts that a key already held (the store's create-only refusal) is success: the ingest
-/// succeeds and caches, `exists` is counted, `failed` is not, and the object under the key is the
-/// one that was there.
+/// Asserts that a key already held whole (the right length) is not uploaded again: the ingest
+/// succeeds and caches, `exists` is counted, `failed` is not, no write is tried and no byte is
+/// handed to the store, and the object under the key is the one that was there.
 #[tokio::test]
-async fn a_create_only_refusal_of_the_key_is_exists_and_the_ingest_succeeds() {
+async fn a_key_held_at_the_right_length_is_not_uploaded_again() {
     let farm = farm_with_large().await;
     let (bytes, digest) = large();
     farm.rig.store.seed(&key_of(digest), bytes).await;
@@ -68,8 +69,52 @@ async fn a_create_only_refusal_of_the_key_is_exists_and_the_ingest_succeeds() {
     assert_eq!(count(&farm, LargeWriteThrough::Exists), 1);
     assert_eq!(count(&farm, LargeWriteThrough::Ok), 0);
     assert_eq!(count(&farm, LargeWriteThrough::Failed), 0);
+    assert_eq!(farm.rig.store.puts(), 0, "no write was tried");
+    assert_eq!(farm.rig.store.largest_piece(), 0);
     let held = farm.rig.store.held(&key_of(digest)).await;
     assert_eq!(held.as_ref(), Some(bytes));
+}
+
+/// Asserts that the store's create-only refusal of the key, when the length question did not show
+/// the object (a race with another writer), is `exists`: the write is tried, refused, and the
+/// ingest succeeds and caches with the held object unchanged.
+#[tokio::test]
+async fn a_create_only_refusal_of_the_key_is_exists_and_the_ingest_succeeds() {
+    let farm = farm_with_large().await;
+    let (bytes, digest) = large();
+    farm.rig.store.seed(&key_of(digest), bytes).await;
+    farm.rig.store.hide_len_of(&key_of(digest));
+
+    let got = farm.run().await;
+
+    assert!(matches!(got, Ingested::Ran { cached: true, .. }), "{got:?}");
+    assert_eq!(farm.rig.store.puts(), 1, "the write was tried");
+    assert_eq!(count(&farm, LargeWriteThrough::Exists), 1);
+    assert_eq!(count(&farm, LargeWriteThrough::Failed), 0);
+    let held = farm.rig.store.held(&key_of(digest)).await;
+    assert_eq!(held.as_ref(), Some(bytes));
+}
+
+/// Asserts that an object of another length under the key is not trusted and not replaced: no
+/// write is tried, `failed` is counted (not `exists`), the object is as it was, and the ingest
+/// still succeeds and caches.
+#[tokio::test]
+async fn a_key_held_at_another_length_is_a_failure_and_the_ingest_succeeds() {
+    let farm = farm_with_large().await;
+    let (bytes, digest) = large();
+    farm.rig
+        .store
+        .seed(&key_of(digest), &bytes[..LARGE_LEN - 5])
+        .await;
+
+    let got = farm.run().await;
+
+    assert!(matches!(got, Ingested::Ran { cached: true, .. }), "{got:?}");
+    assert_eq!(farm.rig.store.puts(), 0);
+    assert_eq!(count(&farm, LargeWriteThrough::Failed), 1);
+    assert_eq!(count(&farm, LargeWriteThrough::Exists), 0);
+    let held = farm.rig.store.held(&key_of(digest)).await.expect("held");
+    assert_eq!(held.len(), LARGE_LEN - 5);
 }
 
 /// Asserts that a write the store fails still ingests the run, with the result the manifest
@@ -123,7 +168,7 @@ async fn the_write_through_is_streamed_in_windows_from_the_one_read() {
 }
 
 /// Asserts that bytes that do not hash to the digest never land under `cas/l/<sha256>`: the ingest
-/// is refused, the put is abandoned before the object is whole (counted `failed`), and the store
+/// is refused, the put is abandoned before the object is whole (counted `aborted`, not `failed`), and the store
 /// holds nothing under `cas/l/`, though all but the last window had been sent.
 #[tokio::test]
 async fn bytes_that_do_not_hash_are_not_left_under_the_key() {
@@ -167,4 +212,24 @@ async fn a_run_without_a_large_object_writes_nothing_under_the_large_prefix() {
     }
     let listed = farm.rig.store.keys().await;
     assert!(listed.iter().all(|k| !k.starts_with("cas/l/")));
+}
+
+/// Asserts that a write the ingest gives up (the storage node refuses the CAS write, so the
+/// stream is dropped before its end) is counted `aborted` and not `failed`, nothing is under the
+/// key, and the ingest is `Unavailable` as without write-through.
+#[tokio::test]
+async fn a_write_given_up_with_the_cas_write_is_aborted_and_not_failed() {
+    let farm = farm_with_large().await;
+    let (_, digest) = large();
+    farm.watching
+        .refuse
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let got = farm.run().await;
+
+    assert!(matches!(got, Ingested::Unavailable(_)), "{got:?}");
+    assert_eq!(count(&farm, LargeWriteThrough::Aborted), 1);
+    assert_eq!(count(&farm, LargeWriteThrough::Failed), 0);
+    assert_eq!(count(&farm, LargeWriteThrough::Ok), 0);
+    assert!(farm.rig.store.held(&key_of(digest)).await.is_none());
 }

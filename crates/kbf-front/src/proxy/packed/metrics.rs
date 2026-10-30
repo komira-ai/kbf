@@ -101,13 +101,18 @@ pub enum LargeWriteThrough {
     /// The store already held the key (a create-only refusal): the key is bound to the bytes, so
     /// whoever wrote it wrote these.
     Exists,
-    /// The write failed or was abandoned, and nothing was kept under the key.
+    /// The store failed the write, or held an object of another length under the key; nothing
+    /// was kept under the key by this write.
     Failed,
+    /// The ingest gave the write up before its end (the CAS write stopped, the bytes were not the
+    /// blob, a retry started the pass over, or the store did not take a window in time): nothing
+    /// was kept under the key. Not a failure of the store.
+    Aborted,
 }
 
 impl LargeWriteThrough {
     /// Every ending, in the order of the variants.
-    pub const ALL: [Self; 3] = [Self::Ok, Self::Exists, Self::Failed];
+    pub const ALL: [Self; 4] = [Self::Ok, Self::Exists, Self::Failed, Self::Aborted];
 
     /// The `result` label of the ending.
     #[must_use]
@@ -116,6 +121,7 @@ impl LargeWriteThrough {
             Self::Ok => "ok",
             Self::Exists => "exists",
             Self::Failed => "failed",
+            Self::Aborted => "aborted",
         }
     }
 }
@@ -361,7 +367,7 @@ impl PackMetrics {
             "kbf_pack_ingest_large_writethrough_total",
             "counter",
             "Large objects a task wrote that ingest also put to cas/l/<sha256> in the object \
-             store, by how the put ended (ok, exists, failed); best effort, never fails an ingest",
+             store, by how the put ended (ok, exists, failed, aborted); best effort, never fails an ingest",
         );
         for (how, counter) in LargeWriteThrough::ALL
             .iter()

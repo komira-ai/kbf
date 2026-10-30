@@ -63,6 +63,7 @@ pub struct Spy {
     reject_big_reads: AtomicU32,
     reject_large_lens: AtomicU32,
     overstated: Mutex<Vec<(String, u64)>>,
+    hidden: Mutex<Vec<String>>,
     puts: AtomicU32,
     largest_piece: AtomicU64,
     ranges: Mutex<Vec<(String, u64, u64)>>,
@@ -103,6 +104,7 @@ impl Spy {
             reject_big_reads: AtomicU32::new(0),
             reject_large_lens: AtomicU32::new(0),
             overstated: Mutex::new(Vec::new()),
+            hidden: Mutex::new(Vec::new()),
             puts: AtomicU32::new(0),
             largest_piece: AtomicU64::new(0),
             ranges: Mutex::new(Vec::new()),
@@ -149,6 +151,13 @@ impl Spy {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         overstated.push((key.to_owned(), by));
+    }
+
+    /// The length question about `key` is answered as if there were no object (a write of the key
+    /// is still refused when it is held).
+    pub fn hide_len_of(&self, key: &str) {
+        let mut hidden = self.hidden.lock().unwrap_or_else(PoisonError::into_inner);
+        hidden.push(key.to_owned());
     }
 
     /// How many writes were tried.
@@ -273,6 +282,13 @@ impl ObjectStore for Spy {
         let large = key.as_str().rsplit('-').next();
         if large.is_some_and(|slot| slot.starts_with('L')) && fires(&self.reject_large_lens) {
             return Err(injected());
+        }
+        let hidden = {
+            let hidden = self.hidden.lock().unwrap_or_else(PoisonError::into_inner);
+            hidden.iter().any(|named| named == key.as_str())
+        };
+        if hidden {
+            return Ok(None);
         }
         let shave = self.shave_len.load(SeqCst);
         let len = self.inner.len(key).await?;
