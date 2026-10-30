@@ -578,6 +578,18 @@ fn an_oci_front_over_keys_the_cache_does_not_keep_is_refused() {
     assert!(why.contains("oci.prefix"), "{why}");
     assert!(why.contains("cache = false"), "{why}");
 
+    // A policy that keeps everything else, and a narrower one inside the blobs that keeps nothing:
+    // the blobs under it would never be kept.
+    let rest = "[[policy]]\nprefix = \"\"\ncache = true\n";
+    let inside = "[[policy]]\nprefix = \"oci/blobs/sha256/0\"\ncache = false\n";
+    let why = refusal(&format!("{LEAST}\n{rest}\n{inside}\n{front}"));
+    assert!(why.contains("oci.prefix"), "{why}");
+    assert!(why.contains("\"oci/blobs/sha256/0\""), "{why}");
+    assert!(why.contains("cache = false"), "{why}");
+    let outside = "[[policy]]\nprefix = \"other/\"\ncache = false\n";
+    let loaded = cache_of(&format!("{LEAST}\n{rest}\n{outside}\n{front}"));
+    assert!(loaded.oci.listen.is_some());
+
     let given = format!("{front}prefix = \"layers/\"\n");
     let why = refusal(&format!("{KEEPS_OCI}\n{given}"));
     assert!(why.contains("\"layers/blobs/sha256/\""), "{why}");

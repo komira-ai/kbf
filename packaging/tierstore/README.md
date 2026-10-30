@@ -438,6 +438,8 @@ is. The blobs the front reads are the keys under `<prefix>blobs/sha256/` (`oci/`
 file is refused at load, naming `oci.prefix`, unless the longest `[[policy]]` prefix that covers
 them has `cache = true`: a front whose blobs are kept nowhere would send every pull to the upstream,
 and there is no use of that to keep (a registry that passes through is a storage node's front). A
+`cache = false` policy whose prefix lies inside that range (such as `oci/blobs/sha256/0`) is refused
+too, since the blobs under it would never be kept. A
 blob over `local_cache.whole_fill_limit` is passed through, still checked against its digest, and
 not kept.
 
@@ -445,8 +447,11 @@ A kept object is not checked again on a hit, so a blob that rotted on the cache'
 by the front when it is read whole (the response ends in an error or a cut connection, and
 `tierstore_oci_digest_mismatches_total` counts it) but it is not evicted: it stays until the budget
 evicts it, and every pull of it fails until then. To refill it, remove its data file and its
-`.meta` sidecar (named by the digest) under the `obj/` directory of `local_cache.path`: the next
-read finds the file gone, drops the entry and fills the object again from the upstream. The front is another listener of the same process: it starts with the node, drains with it,
+`.meta` sidecar (named by the digest, in `obj/<first two digits>/<next two digits>/`) under
+`local_cache.path`: the next
+read finds the file gone, drops the entry and fills the object again from the upstream.
+
+The front is another listener of the same process: it starts with the node, drains with it,
 and its counters are on the `/metricz` of the S3 listener beside the cache's. A key of the table
 that is left out has the default of its flag:
 

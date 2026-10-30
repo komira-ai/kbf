@@ -292,6 +292,46 @@ async fn a_blob_over_the_whole_fill_limit_is_passed_through_and_verified() {
     assert_eq!(node.stop().await, Some(0));
 }
 
+/// Asserts the refill recipe of the README: after the data file of a cached blob is removed from
+/// the cache directory, the next pull of it is whole and has the bytes and the digest of the
+/// upstream, is filled again from the upstream (one more fill, one more GET there), and the pull
+/// after that is a hit again with no GET at the upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cached_blob_whose_file_is_removed_is_filled_again() {
+    let fake = FakeS3::start().await;
+    let blob = pattern(150_000);
+    let hex = hex_of(&blob);
+    seed(&fake, &hex, &blob).await;
+    let node = Node::start(&fake, "oci-cache-refill", "");
+    let fills = "tierstore_cache_fills_total";
+    let hits = "tierstore_cache_hits_total";
+
+    node.pull_whole(&hex, &blob).await;
+    let kept = node.metrics().await;
+    let gets_kept = node.blob_gets(&hex);
+    let file = node.cache_dir.join("obj").join(&hex[..2]).join(&hex[2..4]);
+    let file = file.join(&hex);
+    assert!(file.is_file(), "the blob is not in the cache directory");
+
+    std::fs::remove_file(&file).expect("removed");
+    node.pull_whole(&hex, &blob).await;
+    let refilled = node.metrics().await;
+    assert_eq!(counter(&refilled, fills), counter(&kept, fills) + 1);
+    assert!(
+        node.blob_gets(&hex) > gets_kept,
+        "the upstream was not read"
+    );
+    assert!(file.is_file(), "the blob was not written again");
+
+    let gets_refilled = node.blob_gets(&hex);
+    node.pull_whole(&hex, &blob).await;
+    let hit = node.metrics().await;
+    assert!(counter(&hit, hits) > counter(&refilled, hits));
+    assert_eq!(counter(&hit, fills), counter(&refilled, fills));
+    assert_eq!(node.blob_gets(&hex), gets_refilled);
+    assert_eq!(node.stop().await, Some(0));
+}
+
 /// Asserts that a start whose OCI address is taken exits with status 1 and prints no start line,
 /// so no client is told of an S3 listener that is not served.
 #[test]
