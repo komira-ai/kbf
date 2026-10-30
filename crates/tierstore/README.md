@@ -23,6 +23,23 @@ does, it is answered 503 `SlowDown` with `Retry-After: 1` and its body is never 
 that is slow to take a body, clients queue here for up to that long instead of retrying at once.
 `0s` answers 503 at once. The requests that are refused for their head (411, 413) do not wait.
 
+What waiting costs, as the code does it:
+
+- A waiting request holds a connection and its task, and no permit and no body memory. It has
+  been authenticated (a valid signature) before it waits. The number of waiters is bounded only by
+  the number of connections the server accepts.
+- A waiter counts as a request in flight. During a drain the server waits for it, so a drain can
+  take up to `--put-permit-wait` longer than without waiting, and never longer than
+  `--drain-deadline`.
+- A waiter does not notice that its client went away: the connection is looked at again when the
+  body is first read, after a permit is given.
+- The client of kbf (`kbf-task`) retries the 503, and a connection that broke while it was still
+  sending the body of a refused PUT, with jittered waits (see its crate docs). It does not retry
+  429, 500, 502 or 504, deliberately.
+- The 503 is sent before the body is read, so the front may close the connection under a client
+  that is still sending a large body. A client that sees the reset instead of the 503 has to treat
+  it as one; `kbf-task` does.
+
 ## Roles of a key
 
 | role | flag | may do |

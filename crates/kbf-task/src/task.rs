@@ -105,8 +105,12 @@ pub const EXIT_NO_CONFINE: u8 = 15;
 /// The pack is PUT once, create-only. A 503 (no room in the store, or the store is taking as
 /// many puts as it may) is retried up to seven times, each after a wait of between half and one
 /// and a half times the `Retry-After` it names (taken as at most 30 s; 2 s when it names none),
-/// the waits adding up to at most 60 s; every other answer is final, and a 412 means
-/// the key exists (a re-attempt of the task gets a new key).
+/// the task's own waits adding up to at most 60 s (the store may also hold each refused attempt
+/// for its put-permit wait before answering, so the last attempt can begin about 165 s after the
+/// first; the URL's lifetime, the run's wall limit plus the frontend's slack, bounds it). A
+/// connection that broke after it was made is retried the same way. Every other answer is final
+/// (429, 500, 502 and 504 deliberately not retried), and a 412 means the key exists (a
+/// re-attempt of the task gets a new key).
 #[derive(Parser)]
 #[command(
     name = "kbf-task",

@@ -704,15 +704,20 @@ async fn a_put_that_gets_no_permit_within_the_wait_is_answered_slow_down_without
     let (claim, _) = truth(2);
 
     let body = Generated::new(2, &made);
+    // The paused runtime's own clock moves only when every task waits for a timer, and then to
+    // that timer, so the time the request waited is exactly the wait it was given.
+    let started = tokio::time::Instant::now();
     let over = answer(
         &rig.server,
         put_request(&rig.config, "second", &claim, &[], body),
     )
     .await;
+    let waited = started.elapsed();
 
     assert_eq!(over.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(over.code(), "SlowDown");
     assert_eq!(over.header("retry-after"), "1");
+    assert_eq!(waited, Duration::from_secs(15));
     assert_eq!(made.load(Ordering::SeqCst), 0);
     assert!(rig.hot_mem.get("second", None).await.is_err());
     assert_eq!(first.await.unwrap(), StatusCode::OK);

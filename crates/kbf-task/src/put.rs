@@ -9,9 +9,12 @@
 //! many puts as it may, and nothing was stored ([`put_retrying`]): up to [`MAX_RETRIES`] more
 //! times, each after the store's `Retry-After` moved by a random share of -50% to +50%
 //! ([`Jitter`]), so that tasks that were refused together do not come back together, and
-//! stopping when the waits have added up to [`MAX_TOTAL_WAIT`]. Every other answer, a 412 (the key exists, and a re-attempt of the
-//! task gets a new key, so it is final) and a transport error included, is reported on the first
-//! attempt.
+//! stopping when the waits have added up to [`MAX_TOTAL_WAIT`]. The same retry follows a
+//! connection that broke after it was made ([`PutError::Interrupted`]), which is what a client
+//! that is still sending a large body sees when the store answers 503 and closes without reading
+//! it. Every other answer, a 412 (the key exists, and a re-attempt of the task gets a new key, so
+//! it is final), 429, 500, 502 and 504 (deliberately not retried) and any other transport error
+//! included, is reported on the first attempt.
 //!
 //! [`put_file`] is the same PUT for a large object: the body is streamed from a file, never read
 //! whole, and the file is reopened by each attempt of [`put_retrying`]. [`put_reader`] is the same
@@ -104,6 +107,33 @@ pub enum PutError {
         /// What went wrong, with the URL's secret parts removed.
         reason: String,
     },
+    /// The connection was reset or aborted, or its writing end was closed, after it was made. A
+    /// store that refuses a PUT with a 503 before it reads the body (tierstore does when it is
+    /// taking as many puts as it may) closes the connection while the client is still sending a
+    /// body that does not fit the socket buffers, and the client then sees this and not the 503. [`put_retrying`] treats it as a 503 with no `Retry-After`.
+    #[error("the connection of the PUT of {url} broke before an answer came: {reason}")]
+    Interrupted {
+        /// The URL, redacted.
+        url: String,
+        /// What went wrong, with the URL's secret parts removed.
+        reason: String,
+    },
+}
+
+/// The error of a request that did not complete: [`PutError::Interrupted`] for a connection that
+/// broke after it was made, [`PutError::Transport`] for any other (a store not reached, a bad
+/// URL, a timeout, a protocol error).
+fn transport_error(error: &ureq::Error, url: &str) -> PutError {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
+    let (url, reason) = (redact(url), scrub(&error.to_string(), url));
+    match error {
+        ureq::Error::Io(e)
+            if matches!(e.kind(), BrokenPipe | ConnectionAborted | ConnectionReset) =>
+        {
+            PutError::Interrupted { url, reason }
+        }
+        _ => PutError::Transport { url, reason },
+    }
 }
 
 /// The part of a 503's message that tells what the store asked for.
@@ -229,10 +259,7 @@ pub fn put(agent: &ureq::Agent, url: &str, body: &[u8]) -> Result<(), PutError> 
         .put(url)
         .header("If-None-Match", "*")
         .send(body)
-        .map_err(|e| PutError::Transport {
-            url: shown.clone(),
-            reason: scrub(&e.to_string(), url),
-        })?;
+        .map_err(|e| transport_error(&e, url))?;
     answer(&response, &shown)
 }
 
@@ -297,10 +324,7 @@ fn put_stream(
         .header("If-None-Match", "*")
         .header("Content-Length", len.to_string())
         .send(ureq::SendBody::from_reader(&mut body))
-        .map_err(|e| PutError::Transport {
-            url: redact(url),
-            reason: scrub(&e.to_string(), url),
-        })?;
+        .map_err(|e| transport_error(&e, url))?;
     answer(&response, &redact(url))
 }
 
@@ -370,19 +394,32 @@ fn jittered(wait: Duration, unit: f64) -> Duration {
     wait.mul_f64(0.5 + unit)
 }
 
-/// Runs `attempt` (one PUT) and runs it again after a 503, up to [`MAX_RETRIES`] more times,
-/// waiting with `sleeper` before each: the store's `Retry-After` (at most [`MAX_WAIT`]; 2 s when
-/// it gave none) moved by `jitter` to between half and one and a half times as long. The waits
+/// Runs `attempt` (one PUT) and runs it again after a 503 or a [`PutError::Interrupted`]
+/// connection, up to [`MAX_RETRIES`] more times, waiting with `sleeper` before each: the store's
+/// `Retry-After` (at most [`MAX_WAIT`]; 2 s when it gave none, and always for an interrupted
+/// connection) moved by `jitter` to between half and one and a half times as long. The waits
 /// add up to at most [`MAX_TOTAL_WAIT`]: the wait that would pass it is cut to end there, and
-/// when they have added up to it no retry follows. Any other outcome is returned at once.
+/// when they have added up to it no retry follows. Any other outcome is returned at once: 429,
+/// 500, 502 and 504 are deliberately not retried, since the store gives none of them for a full
+/// hot tier or a busy put cap, and a 412 or a transport error that is not an interrupted
+/// connection is final.
 ///
 /// A retry is safe because every attempt is the create-only PUT (`If-None-Match: *`) of the same
-/// key: a 503 stored nothing, and if an earlier attempt had in fact stored the object, the retry
-/// meets a 412 and fails instead of overwriting it.
+/// key: a 503 stored nothing, and if an earlier attempt had in fact stored the object (an
+/// interrupted connection may follow a store that did), the retry meets a 412, which is reported
+/// as [`PutError::Exists`] like any 412 and is not taken for success: the task fails (exit 13)
+/// instead of overwriting, as it would have for the interrupted connection itself.
 ///
-/// The URL's expiry is not checked: the waits add up to at most [`MAX_TOTAL_WAIT`] (60 s), and an
-/// attempt the store gets after the URL expired is refused with a 403, which is not retried. A
-/// late retry therefore fails the task and stores nothing.
+/// The URL's expiry is not checked. The waits of this function add up to at most
+/// [`MAX_TOTAL_WAIT`] (60 s), but the time from the first attempt to the last is longer: each
+/// attempt that the store refuses can also wait for a put permit at the store before it is
+/// answered (`--put-permit-wait` of tierstore, 15 s by default), so the last attempt begins at
+/// most about `MAX_RETRIES` times that wait plus 60 s after the first (about 165 s by default),
+/// plus the time any refused attempt spent sending bytes. What bounds it is the URL itself: it is
+/// good for the run's wall limit plus the frontend's slack (`--task-url-slack-secs`), which must
+/// cover this, and a store checks the signature before it waits, so an attempt that begins after
+/// the URL expired is refused with a 403, which is final. A late retry therefore fails the task
+/// and stores nothing.
 ///
 /// # Errors
 /// The last attempt's [`PutError`].
@@ -394,17 +431,23 @@ pub fn put_retrying(
     let mut retries = 0;
     let mut waited = Duration::ZERO;
     loop {
-        match attempt() {
+        let outcome = attempt();
+        let retry_after = match &outcome {
             Err(PutError::Unavailable {
                 retry_after_secs, ..
-            }) if retries < MAX_RETRIES && waited < MAX_TOTAL_WAIT => {
+            }) => Some(*retry_after_secs),
+            Err(PutError::Interrupted { .. }) => Some(None),
+            _ => None,
+        };
+        match retry_after {
+            Some(retry_after_secs) if retries < MAX_RETRIES && waited < MAX_TOTAL_WAIT => {
                 let wait = jittered(wait_for(retry_after_secs), jitter.unit())
                     .min(MAX_TOTAL_WAIT - waited);
                 sleeper.sleep(wait);
                 waited += wait;
                 retries += 1;
             }
-            outcome => return outcome,
+            _ => return outcome,
         }
     }
 }
@@ -848,6 +891,79 @@ mod tests {
         let waits = sleeper.waits();
         assert_eq!(waits, [Duration::from_secs(45), Duration::from_secs(15)]);
         assert_eq!(waits.iter().sum::<Duration>(), MAX_TOTAL_WAIT);
+    }
+
+    /// Catches a store's reset of a connection that was still sending a body being final: an
+    /// interrupted connection and then a 201 is stored after one wait of the default length,
+    /// and one that keeps breaking is asked `MAX_RETRIES` + 1 times and is the error.
+    #[test]
+    fn an_interrupted_connection_is_retried_like_a_503_without_a_retry_after() {
+        let broken = || {
+            Err(PutError::Interrupted {
+                url: "u".into(),
+                reason: "reset".into(),
+            })
+        };
+        let sleeper = Recorded::default();
+        let (attempt, calls) = answering(vec![broken(), Ok(())]);
+        assert_eq!(put_retrying(attempt, &sleeper, &MIDDLE), Ok(()));
+        assert_eq!(calls.get(), 2);
+        assert_eq!(sleeper.waits(), [DEFAULT_WAIT]);
+
+        let sleeper = Recorded::default();
+        let (attempt, calls) = answering((0..=MAX_RETRIES).map(|_| broken()).collect());
+        assert_eq!(put_retrying(attempt, &sleeper, &MIDDLE), broken());
+        assert_eq!(calls.get(), MAX_RETRIES as usize + 1);
+        assert_eq!(sleeper.waits().len(), MAX_RETRIES as usize);
+    }
+
+    /// Catches a 412 that follows an interrupted connection being taken for success or hidden:
+    /// the retry that meets the object an earlier attempt stored is the failure, `Exists`.
+    #[test]
+    fn a_412_after_an_interrupted_connection_is_the_failure() {
+        let sleeper = Recorded::default();
+        let exists = PutError::Exists { url: "u".into() };
+        let broken = PutError::Interrupted {
+            url: "u".into(),
+            reason: "reset".into(),
+        };
+        let (attempt, calls) = answering(vec![Err(broken), Err(exists.clone())]);
+        assert_eq!(put_retrying(attempt, &sleeper, &MIDDLE), Err(exists));
+        assert_eq!(calls.get(), 2);
+    }
+
+    /// Catches the wrong errors being retried: a reset, an abort and a broken pipe are
+    /// `Interrupted`; a refused connection, a timeout and a bad URL are `Transport` (final), and
+    /// neither message holds the URL's query.
+    #[test]
+    fn only_a_connection_that_broke_after_it_was_made_is_interrupted() {
+        use std::io::{Error, ErrorKind};
+        let url = "http://h/k?X-Sig=secret";
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+        ] {
+            let got = transport_error(&ureq::Error::Io(Error::from(kind)), url);
+            assert!(
+                matches!(got, PutError::Interrupted { .. }),
+                "{kind:?}: {got:?}"
+            );
+            assert!(!got.to_string().contains("secret"), "{got}");
+        }
+        for error in [
+            ureq::Error::Io(Error::from(ErrorKind::ConnectionRefused)),
+            ureq::Error::Io(Error::from(ErrorKind::UnexpectedEof)),
+            ureq::Error::Timeout(ureq::Timeout::Global),
+            ureq::Error::HostNotFound,
+        ] {
+            let got = transport_error(&error, url);
+            assert!(
+                matches!(got, PutError::Transport { .. }),
+                "{error:?}: {got:?}"
+            );
+            assert!(!got.to_string().contains("secret"), "{got}");
+        }
     }
 
     /// Catches the real jitter being constant or outside 0 to under 1: 64 draws are all in range
