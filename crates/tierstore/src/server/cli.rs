@@ -132,6 +132,12 @@ pub struct Cli {
     /// path, never their contents), and exits with status 0 without starting anything.
     #[arg(long)]
     pub print_config: bool,
+    /// With `--config`: loads and checks the file as a start does (the file, and the key files it
+    /// names) and exits with status 0 and no output, or prints the refusal and exits with status
+    /// 2. Nothing is bound, opened or asked of the network. Without `--config` it is a usage
+    /// error.
+    #[arg(long)]
+    pub check_config: bool,
     /// The address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on.
     #[arg(long)]
     pub listen: SocketAddr,
@@ -756,7 +762,11 @@ pub fn main(args: Vec<OsString>) -> ExitCode {
     let Launch {
         settings,
         from_file,
+        check_only,
     } = launch;
+    if check_only {
+        return check_config(&settings);
+    }
     let started = match settings {
         Settings::Storage(cli) if cli.print_config => return print_config(&cli),
         Settings::Storage(cli) => blocking(serve_until_signalled(*cli)),
@@ -774,6 +784,28 @@ pub fn main(args: Vec<OsString>) -> ExitCode {
             };
             eprintln!("tierstore: {text}");
             ExitCode::from(exit_status(&why))
+        }
+    }
+}
+
+/// `--check-config`: what a start refuses before it opens anything, asked of the settings of a
+/// file: the front's settings, which reads the key files it names, and the limits a start
+/// checks first. Status 0 and no output if there is nothing to refuse; else the start's message
+/// on stderr and status 2. It binds nothing and asks nothing of a tier.
+fn check_config(settings: &Settings) -> ExitCode {
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let checked = match settings {
+        Settings::Storage(cli) => server_config(&cli.front(), clock).map(drop),
+        Settings::Cache(cache) if cache.s3_request_timeout.is_zero() => {
+            Err("--s3-request-timeout must be longer than zero".into())
+        }
+        Settings::Cache(cache) => server_config(&cache.front, clock).map(drop),
+    };
+    match checked {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(why) => {
+            eprintln!("tierstore: {}", keys_for_flags(&why.to_string()));
+            ExitCode::from(2)
         }
     }
 }

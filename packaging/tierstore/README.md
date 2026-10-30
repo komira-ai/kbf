@@ -492,11 +492,19 @@ the flags of the binary against this table, so a flag added without a key fails 
 | `--backend-check-wait` | `server.backend_check_wait` | how long the start-up self-test asks again of a tier that does not answer |
 
 These stay flags, since they describe one run and not the data path: `--config`,
-`--print-config`, `--drain-lb-wait` and `--drain-deadline`. A start that gives `--config` and any
-other flag is refused with status 2 and a message that names the flags (`--drain-lb-wait` and
-`--drain-deadline` may go with it). A refusal that the checks of the start make (water marks out of
-order, a key file others can read) names the keys of the file where the flag-mode message names the
-flags.
+`--print-config`, `--check-config`, `--drain-lb-wait` and `--drain-deadline`. A start that gives
+`--config` and any other flag is refused with status 2 and a message that names the flags
+(`--drain-lb-wait`, `--drain-deadline` and `--check-config` may go with it). A refusal that the
+checks of the start make (water marks out of order, a key file others can read) names the keys of
+the file where the flag-mode message names the flags.
+
+`tierstore --config <path> --check-config` loads the file as a start does (the same loader and the
+same refusals, the build-node checks and `write_through` included) and reads the key files it
+names; it binds nothing, makes no directory and calls no store or network. It prints nothing and
+exits 0 if the file would start; if the file is refused it prints the message a start prints and
+exits 2. `--check-config` without `--config` is a usage error (status 2). It does not reach the
+tiers, so a tier that is down, or a key that the store would refuse, is found by a start (its
+self-test) and not by the check.
 
 ### What the loader refuses
 

@@ -40,6 +40,7 @@ fn flags_without_a_file_are_the_flags() {
     let Launch {
         settings,
         from_file,
+        check_only: _,
     } = resolve(words(&golden_flags())).unwrap();
     assert!(!from_file);
     assert_eq!(
