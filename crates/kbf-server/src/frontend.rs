@@ -997,7 +997,9 @@ impl<'a> Prepared<'a> {
         let job_addr = job_read.as_ref().map(job_read::Prepared::local);
         let job_read = job_read
             .map(|prepared| {
-                prepared.start(Arc::new(backend.clone()), job_read::Timeouts::default())
+                prepared
+                    .with_backfill(packs.clone())
+                    .start(Arc::new(backend.clone()), job_read::Timeouts::default())
             })
             .transpose()?;
         let (job_stats, job_task) = match job_read {
