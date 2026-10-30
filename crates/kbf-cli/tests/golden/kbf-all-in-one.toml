@@ -180,6 +180,8 @@ memory-limit-percent = 150
 memory-poll-ms = 250
 # The daemon takes no new lease while the node's memory stall time (the `some` line's `avg10` in `/proc/pressure/memory`, as a percentage) is above this and it runs a lease: it says so to the server, which places nothing on it until the stall falls, and the leases it runs go on. With no lease it serves whatever the stall, so it is never left idle for good. Off where the kernel reports no pressure stall information (macOS, a kernel built without it)
 memory-pressure-pause-percent = 10
+# Keeps an action's memory booking where it started. An action that passes its own memory limit is not run again on the next rung of `--memory-ladder-gib`: the kill finishes it, FAILED_PRECONDITION with reason `ACTION_OUT_OF_MEMORY`, as a kill at the largest node does, and its attempt is recorded with `memory_kill` `own_limit`. A booking is therefore the first rung, or the GiB the action names in `kbf-book-mem-gib`. No floor is raised, so with `--learned-sizes on` an own-limit kill leaves none either. A kill the node made under memory pressure is not the action's: it runs again with the same booking, as it does without this flag. Needs `--scheduler-core legacy`; a server given it with `js` refuses to start (exit status 2)
+no-memory-climb = false
 
 [outputs]
 # The most bytes one action's output files may hold together

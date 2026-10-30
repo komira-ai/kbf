@@ -1323,6 +1323,49 @@ fn exclusive_actions_come_from_their_flag() {
     args(&["--exclusive-actions=true"]).expect_err("a switch takes no value");
 }
 
+/// Catches `--no-memory-climb` not reaching the listeners (a server that ignores it
+/// climbs), or read the wrong way round (the default must climb), or a ladder lost with it.
+#[test]
+fn the_memory_climb_is_on_unless_its_flag_turns_it_off() {
+    use clap::Parser;
+    let listeners = |args: &[&str]| {
+        kbf_server::Args::parse_from(std::iter::once("kbf-server").chain(args.iter().copied()))
+            .listeners()
+            .expect("listeners")
+    };
+    assert!(listeners(&[]).memory_climb);
+    assert!(!listeners(&["--no-memory-climb"]).memory_climb);
+    // The ladder is still read: the first rung is the booking.
+    assert_eq!(
+        listeners(&["--no-memory-climb", "--memory-ladder-gib=2,8"]).memory_ladder,
+        kbf_server::MemoryLadder::from_gib(&[2, 8]).unwrap()
+    );
+}
+
+/// Catches `--no-memory-climb` accepted with the js core, whose scheduler the flag cannot
+/// reach (the climb would stay on while the flag says off), and the refusal applied to the
+/// combinations the core runs: the flag on the legacy core, and the js core without it.
+#[test]
+fn no_memory_climb_is_refused_with_the_js_core_only() {
+    use clap::Parser;
+    let check = |flags: &[&str]| {
+        kbf_server::Args::parse_from(std::iter::once("kbf-server").chain(flags.iter().copied()))
+            .check_scheduler_core()
+    };
+    let refused = check(&["--scheduler-core=js", "--no-memory-climb"]).expect_err("refused");
+    assert!(matches!(
+        refused,
+        kbf_server::ConfigError::NoMemoryClimbUnderJs
+    ));
+    let said = refused.to_string();
+    assert!(said.contains("--no-memory-climb"), "{said}");
+    assert!(said.contains("--scheduler-core js"), "{said}");
+    check(&["--scheduler-core=legacy", "--no-memory-climb"]).expect("legacy");
+    check(&["--scheduler-core=js"]).expect("js without the flag");
+    // Allowed with learned sizes on: no kill raises a booking floor.
+    check(&["--no-memory-climb", "--learned-sizes=on"]).expect("learned on");
+}
+
 /// Catches: `--memory-ladder-gib` not parsed into the listeners' ladder (a farm that
 /// ignores it books 4 GiB whatever the operator set), a default other than 4, 16 and
 /// 32 GiB, a comma that does not separate rungs, and a ladder that is not ascending

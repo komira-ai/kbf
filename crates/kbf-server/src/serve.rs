@@ -89,6 +89,9 @@ pub struct Listeners {
     /// books, the others are what it climbs through when it passes its own memory
     /// limit, before a whole host (`--memory-ladder-gib`).
     pub memory_ladder: MemoryLadder,
+    /// Whether an action that passes its own memory limit runs again on the next rung
+    /// (`false` is `--no-memory-climb`: the kill finishes it, and the legacy core only).
+    pub memory_climb: bool,
     /// What a node that reports VM slots keeps for the host: its CPUs and memory,
     /// subtracted from what placement may book on it (`--vm-host-floor-cpus`,
     /// `--vm-host-floor-mem-gib`).
@@ -559,10 +562,15 @@ pub(crate) fn sweeping(members: Option<Arc<Members>>) -> Pin<Box<dyn Future<Outp
     }
 }
 
-/// Logs the core `farm` runs on, as its driver says (not as the flag does), in the words
-/// the all-in-one server and the frontend both use.
+/// Logs the core `farm` runs on, as its driver says (not as the flag does), and whether an
+/// own-limit kill climbs the ladder (`--no-memory-climb`), in the words the all-in-one server
+/// and the frontend both use.
 pub(crate) fn log_core(farm: &Farm) {
     tracing::info!("{}", farm.scheduler_core().start_line());
+    tracing::info!(
+        "memory climb: {}",
+        if farm.memory_climb() { "on" } else { "off" }
+    );
 }
 
 /// The line a start logs when `--exclusive-actions` is on, and none when it is off.
