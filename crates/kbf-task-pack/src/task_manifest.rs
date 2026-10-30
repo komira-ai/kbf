@@ -125,6 +125,10 @@ pub enum ManifestError {
         "manifest version {MANIFEST_VERSION_2} with one pack, no large object and no inputs is spelled as version {MANIFEST_VERSION}"
     )]
     NotV2,
+    /// A manifest that names more than one pack, given to a reader of one pack: only the `_with`
+    /// forms read a multi-pack run, because the others would take pack 0 for all of it.
+    #[error("the manifest names {0} packs; this reader takes one")]
+    MultiPack(u8),
     /// `packs` is 0 or more than [`MAX_PACKS`].
     #[error("packs is {0}, not in 1..={MAX_PACKS}")]
     Packs(u8),
@@ -401,14 +405,17 @@ pub struct TaskManifest {
 }
 
 impl TaskManifest {
-    /// Reads the manifest record `bytes`.
+    /// Reads the manifest record `bytes` for a consumer of one pack: a manifest of more than one
+    /// pack (or with a large object) is refused; [`TaskManifest::parse_with`] takes those.
     ///
     /// # Errors
     /// [`ManifestError::TooLarge`] first, before anything is parsed; then the first of
     /// [`ManifestError::Json`], [`ManifestError::Version`], [`ManifestError::Digest`] and the
-    /// refusals of [`TaskManifest::validate`].
+    /// refusals of [`TaskManifest::validate`], and [`ManifestError::MultiPack`].
     pub fn parse(bytes: &[u8]) -> Result<Self, ManifestError> {
-        Self::parse_with(bytes, 0)
+        let manifest = Self::parse_with(bytes, 0)?;
+        manifest.check_single_pack()?;
+        Ok(manifest)
     }
 
     /// [`TaskManifest::parse`] for a reader that accepts large objects of up to `large_max`
@@ -457,6 +464,7 @@ impl TaskManifest {
     /// The refusals of [`TaskManifest::validate`], and [`ManifestError::TooLarge`] when the
     /// JSON would pass [`MAX_MANIFEST_BYTES`].
     pub fn to_json(&self) -> Result<Vec<u8>, ManifestError> {
+        self.validate()?;
         self.to_json_with(0)
     }
 
@@ -481,7 +489,17 @@ impl TaskManifest {
     /// # Errors
     /// The first rule that fails, in the order of the fields.
     pub fn validate(&self) -> Result<(), ManifestError> {
-        self.validate_with(0)
+        self.validate_with(0)?;
+        self.check_single_pack()
+    }
+
+    /// The rule of the plain forms, which are for a consumer of one pack: more than one pack is
+    /// [`ManifestError::MultiPack`], so pack 0 is never taken for all of a multi-pack run.
+    pub(crate) fn check_single_pack(&self) -> Result<(), ManifestError> {
+        if self.packs > 1 {
+            return Err(ManifestError::MultiPack(self.packs));
+        }
+        Ok(())
     }
 
     /// [`TaskManifest::validate`] for a reader that accepts large objects of up to `large_max`

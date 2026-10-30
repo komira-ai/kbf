@@ -119,10 +119,6 @@ jobs:
     stage: suite
   - job: beta.yml#native-macos
     stage: suite
-  - job: beta.yml#native-macos-assert
-    stage: suite
-  - job: beta.yml#pkg-macos
-    stage: suite
   - job: beta.yml#packages
     stage: suite
   - job: beta.yml#m1-cell

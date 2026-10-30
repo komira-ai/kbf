@@ -113,6 +113,65 @@ that keeps sending, however slowly, is never cut and keeps its bytes until it en
 nothing holds only its reservation, never a buffer of the claimed size. Both flags are
 accepted and ignored without `--pack-store-endpoint`.
 
+Where the frontend runs the actions it places is `--executor` (the `[executor]` table of
+`kbf.toml`). `kbf-daemon`, the default, is the daemon of each node over the worker listener,
+as always: the frontend builds no executor and contacts no lease server, whatever the other
+`--executor-*` flags say, so a unit or `kbf.toml` that names a lease server keeps its settings
+when the executor is switched back, `--executor-insecure-argv-secrets` too (it is ignored, with a
+warning, so the rollback is the one flag: `executor = "kbf-daemon"`). Stopping the frontend
+releases its leases; a frontend that is killed (a stop timeout, SIGKILL) leaves them, and the
+hosts stay held until their ttl ends (`--executor-lease-ttl-secs`, an hour by default) unless a
+later `js-agent` start releases them. `js-agent` leases hosts from the job scheduler's lease server
+instead, one lease for each of `--executor-hosts` hosts of `--executor-host-cpus` cores and
+`--executor-host-memory-gib` GiB in the class `--executor-class`, asked for with
+`os=linux` and `--executor-arch` (default `x86_64`), and runs each placed action in its own
+image by a task tool that the agent mounts read-only (`--executor-task-tool`, default
+`/mnt/kbf-tools/kbf-task`). The image must be named by digest and be on the host. It needs the
+lease server (`--executor-lease-url`, `https://`, or `http://` to loopback only;
+`--executor-lease-token-file`, mode 0600 or 0400; `--executor-lease-ca-file` for an `https`
+URL), `--executor-frontend-id` (the `kbf-frontend` label on the frontend's leases, by which a
+restarted frontend finds and releases them; it must be different for each frontend, so a
+`kbf.toml` is not copied to a second frontend with it), the packs (`--pack-store-endpoint`, through which
+the pack a task writes is read, hashed and turned into the action's result) and
+`--executor-insecure-argv-secrets`: the lease server's job has no secret field yet, so the
+presigned write url and the read token travel as arguments of the run, where the action can
+read them. No image's config is read, and the task tool cannot run under an `ENTRYPOINT`, so
+every action is refused until `--executor-images-have-no-entrypoint` says no image of the farm
+sets one. The executor runs on exactly one frontend: it looks for another frontend's leases on
+the lease server before its first pass and every minute after, and a frontend that finds one
+older than its own (or finds one before it has any) stops with an error naming it. Each lease
+also carries the process that made it: a frontend that starts and finds leases of another
+process under its own id watches them for a renewal (the longest a live executor goes without
+one, 30 s, plus the fence time) before it takes them over, and stops if one is renewed; it takes
+them if none is, as after a crash. Nothing asks for a host meanwhile. A restart of the frontend fails the builds in flight, and
+stopping it stops the runs and releases the leases. The executor prepares each run with the
+frontend's **task runs** (below) and its job-facing read listener (`--job-listen`), so
+`--executor js-agent` is refused when the flags are read unless `--task-secret-file` (with the
+four flags it needs), `--job-listen` (with its three) and `--pack-store-endpoint` are given, and
+unless they agree with it: the tier store and the read url must be IP addresses (the job network
+has no DNS); `--task-put-bucket` must be `--pack-store-bucket`, the bucket the pack is read
+from; an `http://` `--task-put-endpoint` needs `--executor-allow-plain-http-put` (with an
+`https://` one the flag is only warned about); and the longest run (`--executor-max-run-secs`
+plus `--executor-run-margin-secs`) must fit 14400 s less `--task-url-slack-secs`, the longest a
+presigned write may be good for once the slack is added. A lease ttl over 3600 s is warned
+about: the lease server grants at most its `--max-ttl` (3600 s unless started with another) and
+clamps the ask. The run's wall time is the action's timeout plus the margin, and
+`--task-run-wall-secs` is not used by the executor. A run that cannot be prepared because an
+input blob is missing, malformed or over the closure budget ends as an invalid argument to its
+caller and is not rerun; one that cannot be prepared because the store cannot be read is rerun.
+`--executor-default-image` (`<repository>@sha256:<digest>`, the `docker://` scheme optional)
+is the image of an action that names no `container-image` property; an action that names one
+runs in its own, a tag is refused, and an action with neither is refused as invalid. The
+presigned write and the read token are never part of an error, a log line or a metric.
+`GET /metrics` gains the `kbf_executor_*` families. The remaining settings are `--executor-host-slots` (default 8),
+`--executor-run-margin-secs` (300; what a run's wall time adds to the action's timeout),
+`--executor-lease-ttl-secs` (3600), `--executor-max-run-secs` and
+`--executor-default-timeout-secs` (3000), `--executor-call-timeout-secs` (5),
+`--executor-root-der` and `--executor-work-dir` (for the task tool), and
+`--executor-allow-plain-http-put` (until the store serves TLS). A setting that breaks a rule
+the executor's safety rests on (the fence time against the scheduler's grace, the lease ttl
+against the longest run) is refused at start, exit status 2.
+
 A daemon reads from the packs with `--pack-read` (off by default; the `[packs]` table of
 `kbf.toml`), which needs `--pack-store-endpoint`, `--pack-store-bucket` and
 `--pack-store-credentials-file` (a JSON key pair, mode 0600 or 0400, of a key that may read
@@ -233,7 +292,7 @@ Action, its Command and its input tree, and no other blob). The task is untruste
 no client certificate, so the REAPI listener is not open to it; `--job-listen <addr>` opens
 another, over HTTPS, that serves `GET /<hex>/<size>` with `Authorization: Bearer <read grant>` and
 nothing else (any other path is 404, any other method 405). It needs three more flags, all four
-given together:
+given together, and takes two more that have defaults:
 
 - `--job-tls-cert` and `--job-tls-key`: the certificate chain and key of the listener (PEM), issued
   by the farm CA that the task is told to trust. The TLS is the server's alone: no client
@@ -249,20 +308,27 @@ given together:
   0600 or 0400, owned by the server's user; surrounding whitespace is dropped). Every frontend
   of the farm, and whatever issues the grants, reads the same secret, so a grant is verified by
   any frontend. It is never a flag.
+- `--job-max-blob-bytes` (default 536870912, 512 MiB): the largest blob a response carries.
+- `--job-reads-in-flight` (default 32): the blob reads open at once.
 
 The answers are 200 with the blob and its `Content-Length`; 401 for a missing, malformed, forged,
 expired or revoked grant (with `WWW-Authenticate: Bearer`); 403 for a digest outside the grant's
 scope, or a grant whose Action has no readable inputs in the store; 404 for a blob that is not
-held, an unknown path, and 405 (with `Allow: GET`) for another method; 413 for a blob over 64 MiB,
-without reading it; and 503 when the store cannot answer. A body carries a reason code
+held, an unknown path, and 405 (with `Allow: GET`) for another method; 413 for a blob over
+`--job-max-blob-bytes`, without reading it; and 503 when the store cannot answer. A body carries a reason code
 (`missing_token`, `invalid_token`, `expired`, `revoked`, `out_of_scope`, `no_scope`, `too_large`,
 `not_found`, `method_not_allowed`, `store_unavailable`) and nothing else. A blob is read as the
 REAPI listener's reads are (the pack index first, then the storage nodes, checked against its
-digest) and sent whole, so a response never holds more than 64 MiB; at most 32 reads are open at
-once, at most 256 connections are open, a client has 10 seconds to send a request's headers, and a
+digest). A blob of at most 64 MiB is read whole and sent whole. A larger one is streamed from the
+storage nodes through SHA-256, one chunk at a time with the last held back until the whole has
+hashed to its digest, so a response never holds more than a few MiB of it; a blob whose bytes are
+not its digest's ends its response short of its `Content-Length` (the client sees a broken
+response and refuses it) and is counted in `kbf_job_read_stream_ended_early_total`. At most
+`--job-reads-in-flight` reads are open at once (a streamed one until its response ends), at most 256 connections are open, a client has 10 seconds to send a request's headers, and a
 connection lives at most 10 minutes. The listener's socket is closed the moment a drain begins; the
 connections open finish their request. `GET /metrics` of the operator API gains
-`kbf_job_read_requests_total` (by `outcome`) and `kbf_job_read_bytes_total`, and
+`kbf_job_read_requests_total` (by `outcome`), `kbf_job_read_bytes_total` and
+`kbf_job_read_stream_ended_early_total` (by `reason`: `digest_mismatch` or `store_error`), and
 `kbf_tls_reloads_total` a `listener="job"` series. Where the jobs run must be allowed to reach
 this address and port (the egress allowlist of the worker's network), and the listener should be
 on an interface the jobs, and nothing outside the farm, can reach.
