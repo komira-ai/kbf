@@ -29,8 +29,10 @@ use crate::meta_log::MetaLog;
 /// appender waits for room past it.
 pub(crate) const STORE_CHUNKS_IN_FLIGHT: usize = 2;
 
-/// Why an append failed once the store's write stopped (it failed, and its commit
-/// answers why).
+/// Why an append failed when the upload task ended without an error of its own to give.
+/// A task that ends normally before the claim cannot (the claim is held until the
+/// commit, so only a claim withdrawn ends it with no result), so this is what is left
+/// when the task panicked or its runtime shut down.
 const STOPPED: &str = "the store stopped taking the streamed blob";
 
 /// The upload of one streamed record to the store, running from its first append.
@@ -41,6 +43,11 @@ pub(super) struct ToStore {
     bytes: mpsc::Sender<Result<Bytes, ObjectStoreError>>,
     claim: oneshot::Sender<Digest>,
     upload: Upload,
+    /// The runtime `upload` runs on, to wait for its end from the appending thread.
+    runtime: tokio::runtime::Handle,
+    /// Why the upload ended, once an append found it gone: the same answer for every
+    /// append after.
+    refused: Option<CacheError>,
     size: u64,
     written: u64,
     crc: Crc32c,
@@ -61,7 +68,7 @@ impl ToStore {
         cache: &Arc<Cache<M, O>>,
         size: u64,
     ) -> Option<Self> {
-        let runtime = cache.runtime.as_ref()?;
+        let runtime = cache.runtime.clone()?;
         (size > 0).then_some(())?;
         let (bytes, queued) = mpsc::channel(STORE_CHUNKS_IN_FLIGHT);
         let (claim, claimed) = oneshot::channel();
@@ -78,13 +85,16 @@ impl ToStore {
             bytes,
             claim,
             upload,
+            runtime,
+            refused: None,
             size,
             written: 0,
             crc: Crc32c::new(),
         })
     }
 
-    /// Queues a copy of `chunk` for the store, waiting for room. Blocking.
+    /// Queues a copy of `chunk` for the store, waiting for room. Blocking. An upload that
+    /// has ended fails the append with the error it ended with (the store's own).
     pub(super) fn append(&mut self, chunk: &[u8]) -> Result<(), CacheError> {
         let after = self.written + chunk.len() as u64;
         if after > self.size {
@@ -93,12 +103,36 @@ impl ToStore {
                 self.size
             )));
         }
-        let queued = self.bytes.blocking_send(Ok(Bytes::copy_from_slice(chunk)));
-        // Built whether or not it is needed: no branch of its own.
-        queued.or(Err(CacheError::Invalid(STOPPED.to_owned())))?;
+        // A queue the upload no longer reads has no room for ever: the upload ended, and
+        // its own error is the answer.
+        if self.refused.is_some()
+            || self
+                .bytes
+                .blocking_send(Ok(Bytes::copy_from_slice(chunk)))
+                .is_err()
+        {
+            return Err(self.ended());
+        }
         self.crc.update(chunk);
         self.written = after;
         Ok(())
+    }
+
+    /// The error the upload ended with, taken from its task (which has ended or is
+    /// ending: its body is dropped, and it only settles the store's write). Blocking.
+    fn ended(&mut self) -> CacheError {
+        // Built whether or not it is needed: no branch of its own.
+        let gone = CacheError::Invalid(STOPPED.to_owned());
+        let (runtime, upload) = (&self.runtime, &mut self.upload);
+        self.refused
+            .get_or_insert_with(|| {
+                runtime
+                    .block_on(upload)
+                    .ok()
+                    .and_then(Result::err)
+                    .unwrap_or(gone)
+            })
+            .clone()
     }
 
     /// Ends the bytes as the blob `digest` with CRC-32C `crc32c`, checked as a tier
