@@ -71,11 +71,19 @@ fn at_rest(rig: &Rig) {
     assert_eq!(free, rig.config.max_concurrent_keeps);
 }
 
-/// Waits, by giving up the thread, until `done` is true.
-async fn until(mut done: impl FnMut() -> bool) {
-    while !done() {
+/// The turns of the scheduler a test gives an event before it fails.
+const SPINS: u32 = 1_000_000;
+
+/// Waits, by giving up the thread, until `done` is true; fails the test, saying what `what` was
+/// to have happened, if it has not after [`SPINS`] turns.
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..SPINS {
+        if done() {
+            return;
+        }
         tokio::task::yield_now().await;
     }
+    panic!("after {SPINS} turns of the scheduler, this never happened: {what}");
 }
 
 /// Asserts that a create-only put under a kept prefix leaves the object in the cache before it is
@@ -306,7 +314,11 @@ async fn a_put_that_finds_every_keep_busy_succeeds_and_is_counted() {
     let cache = rig.cache.clone();
     let slow_put =
         tokio::spawn(async move { cache.put_stream("cas/b/slow", Some(11), slow).await });
-    until(|| taken.load(Ordering::SeqCst) >= 1).await;
+    until(
+        "the first put's body was polled for its second chunk",
+        || taken.load(Ordering::SeqCst) >= 1,
+    )
+    .await;
     assert_eq!(rig.staged_files(), 1);
 
     let made = rig.cache.put_stream("cas/b/fast", Some(4), whole(b"fast"));
@@ -337,7 +349,10 @@ async fn a_running_fill_does_not_stop_a_put_from_being_kept() {
     let gate = rig.tamper.hold_key("cas/b/filling");
     let cache = rig.cache.clone();
     let reader = tokio::spawn(async move { cache.get("cas/b/filling", None).await });
-    until(|| !super::locked(&rig.cache.inner.flights).is_empty()).await;
+    until("the fill of the first key started", || {
+        !super::locked(&rig.cache.inner.flights).is_empty()
+    })
+    .await;
     assert_eq!(rig.cache.inner.permits.available_permits(), 0);
 
     let made = rig.cache.put_stream("cas/b/put", Some(3), whole(b"new"));
@@ -365,7 +380,10 @@ async fn a_delete_that_races_a_keep_leaves_no_entry() {
         let body = whole(b"doomed");
         cache.put_stream(&name, Some(6), body).await
     });
-    until(|| rig.tamper.heading() >= 1).await;
+    until("the keep's HEAD found the object", || {
+        rig.tamper.heading() >= 1
+    })
+    .await;
     assert_eq!(rig.cache.held(), (0, 0));
 
     assert_eq!(rig.cache.delete(key).await, Ok(()));
