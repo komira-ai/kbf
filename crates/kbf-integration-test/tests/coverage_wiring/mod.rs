@@ -3,9 +3,12 @@
 //! must check on pull requests that no floor is lower than the base's. Nothing else
 //! notices when a refactor of the job drops the second step or gives either a
 //! condition: the gate would pass every pull request, and floors could be lowered. The
-//! rules read the workflow; [`wiring`] returns how it does not meet them.
+//! rules read the workflow; [`wiring`] returns how it does not meet them. The split of the
+//! tests into shards, and what the gate takes from them, are the rules of [`shards`].
 
 use super::workflows;
+
+mod shards;
 
 /// The workflow and job that run the gate, and the floors file they name.
 const CI: &str = ".github/workflows/ci.yml";
@@ -147,6 +150,17 @@ fn wiring(workflow: &str, job: &str, floors_exist: bool) -> Result<(), String> {
         return Err("the base checkout comes after the no-lowering step".to_owned());
     }
     Ok(())
+}
+
+#[test]
+fn the_coverage_run_is_sharded_and_merged_whole() {
+    // Catches: a part of a core left out or run twice, a core left out, a shard whose profiles
+    // could overwrite another's or go unchecked, a gate that does not wait for every shard
+    // (so tests would count as never run), and a required check renamed or skippable.
+    let text = std::fs::read_to_string(super::repo_root().join(CI)).expect(CI);
+    assert_eq!(shards::shard_wiring(&text), Ok(()), "{CI}");
+    assert_eq!(shards::gate_wiring(&text), Ok(()), "{CI}");
+    assert_eq!(shards::check_names(&text), Ok(()), "{CI}");
 }
 
 #[test]
