@@ -206,6 +206,7 @@ impl Rng {
             needs: self.needs(),
             hermetic: self.below(2) == 0,
             do_not_cache: self.below(2) == 0,
+            whole_worker: false,
         }
     }
 
@@ -949,6 +950,7 @@ fn a_work_key_that_is_not_an_action_is_not_written() {
         needs: kbf_caps::Request::default(),
         hermetic: true,
         do_not_cache: false,
+        whole_worker: false,
     };
     assert_eq!(
         encode(Format::V1, &batch(FarmInput::Submit(request("job 7")))),

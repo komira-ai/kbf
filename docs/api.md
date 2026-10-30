@@ -1832,6 +1832,18 @@ count since the frontend started (a restart starts them again from 0):
 | `kbf_sched_load_chose_slack_total`, `kbf_sched_load_chose_distrusted_total`, `kbf_sched_load_chose_concentrated_total`, `kbf_sched_load_chose_by_tie_break_total` | counter | of the scored placements: on a node predicted above its capacity; on a distrusted node; on a node concentrated on the lease's key; decided by the last tie-break |
 | `kbf_sched_load_fallback_cpu_limited_nodes` | gauge | live nodes charged by prediction because their newest reading says the actions cgroup has a CPU limit, while `--placement-load` is on: not a running total, and above 0 means a node whose cgroup limit and pool do not match |
 
+The js core also writes the `kbf_ablation_*` families, which split the counts above and a few
+more into the cases a run of the placement ablation is compared on (js alone, `--placement-load
+on`, `--placement-predictions` shadow or on). All are written from the start of a frontend on the
+js core and absent on the farm's own scheduler core:
+
+| Family | Type | Labels | What it measures |
+|---|---|---|---|
+| `kbf_ablation_placements_total` | counter | `decision` | `by_load`: leases admitted by the load rule on a node with a usable reading; `fallback_charge`: leases admitted on a node charged by prediction alone; `refused_over_capacity`: queued requests, once per request per round, that had a node with room apart from the rule and found none it admitted. All 0 while placement does not read the load. The nodes charged by prediction because of a CPU quota are `kbf_placement_cpu_limited_nodes` |
+| `kbf_ablation_charges_total` | counter | `source` | of the leases admitted by load: `profile_cpu` and `profile_memory` charged by their key's learned curve, `curve_flat` whose key has a curve that was not used |
+| `kbf_ablation_bookings_total` | counter | `source` | leases started, by what admission charged them: `prediction` (a learned estimate), `cold` (the cold costs of a key with no estimate), `retry` (a rerun up the memory ladder, charged at its rung), `default` (the request's cores and no memory) |
+| `kbf_ablation_oom_retries_total` | counter | `rung_gib` | leases given up after passing their own memory limit, by the whole GiB they run again at; a series for a rung only once something was retried at it |
+
 Each node that has a load in its view ([Node load](#node-load); `GET /v1/nodes/{id}`) has one
 sample of each of these, labelled `node` (the node id) as the pack families are: at most one series
 per node the frontend has accepted a reading of. A node with no accepted reading has none. A node
@@ -1897,7 +1909,8 @@ from its transfer engine, what it read and uploaded (`transfers:`), joined on `l
 ([daemon.md](design/daemon.md#where-a-leases-time-went)). The server logs, per lease
 report that carries usage (an OK run or any failed one the daemon measured, for
 example an out-of-memory kill, a timeout or a lost run), `action usage:` with the same cgroup fields, the action's
-shape `key`, its `cfg`, the `outcome` and the `lease`, and names the `key` on each
+shape `key`, its `cfg`, the `outcome` and the `lease`, then `booked_millicpus` and
+`booked_memory_bytes`, the lease's grant, to set against what it used, and names the `key` on each
 `lease granted` line ([daemon.md](design/daemon.md#the-servers-action-usage-line)).
 
 ## `GET /v1/invocations/{id}` and below
@@ -1966,7 +1979,10 @@ applies and the routes are as described above.
 route) is one attempt: the instance, `lease` (`term.seq`), `worker`, `queued`, `granted`,
 `started` and `ended`, `class` (`ok`, `failed`, `timed_out`, `memory_killed`, `infra`,
 `lost`), `exit_code` for a run that exited, the memory kill and the booking, cap, raised
-booking, memory used and limit of a killed run, the REAPI times and cgroup `usage` the
+booking, memory used and limit of a killed run, `booked_millicpus` and
+`booked_memory_bytes` (what the run's lease was granted, for every run, with the
+meaning and the gaps given for the build pages' attempts above; the two routes show the
+same grant), the REAPI times and cgroup `usage` the
 daemon reported, the digests of the action, command, result and logs, and the `shape`
 (its key, `cfg`, target and whether it is a test). A key the record has no value for is
 left out. The run is read from the in-memory record while it is held and from history
@@ -2110,8 +2126,13 @@ own route; then the keys added since (none of the keys above changed):
   it, so once given they never change; `queue_ms` only grows, by each lease granted
   after a requeue.
 - on each attempt: `memory_kill` once it ended (`none`, `own_limit` or
-  `node_pressure`, read from how it ended); `booked_memory_bytes` for a lease killed
-  for memory (the one that ended the operation too), `cap_bytes` for an own-limit kill
+  `node_pressure`, read from how it ended); `booked_millicpus` and
+  `booked_memory_bytes`, what the lease was granted (its `Start`'s booking, after the
+  memory ladder and the floors, not the client's request), thousandths of a CPU and
+  bytes, for every attempt whose report the scheduler took; each is left out for a
+  lease taken up from the state store, which the server never started, and for a record
+  written before the grant was kept (its `booked_memory_bytes` is then only a
+  memory kill's); `cap_bytes` for an own-limit kill
   (the largest node that could run it), `raised_memory_bytes` for an own-limit
   requeue (the next booking); and, for a lease whose report the scheduler took,
   `reapi_times` (each of REAPI's nine `ExecutedActionMetadata` times it has, by name

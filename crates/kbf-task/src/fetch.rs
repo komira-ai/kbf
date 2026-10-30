@@ -27,6 +27,9 @@
 //! keep-alive connections are pooled. The first failure stops new requests; requests already in
 //! flight finish, and that first error is returned.
 //!
+//! With [`HttpBlobSource::with_batch`], blobs under 64 KiB are asked for many to a request instead
+//! (see the `batch` module): the same bounded concurrency counts a batch as one request.
+//!
 //! # Copies
 //!
 //! A blob named by several paths is fetched once, streamed to the first path. The other paths are
@@ -357,6 +360,12 @@ pub struct HttpBlobSource {
     agent: ureq::Agent,
     base: String,
     authorization: String,
+    /// Whether small blobs are asked for in batches (see the `batch` module).
+    batch: bool,
+    /// Set once the grant has answered that it has no batch route.
+    batch_off: AtomicBool,
+    /// Makes the one stderr line about a missing batch route.
+    batch_notice: std::sync::Once,
 }
 
 impl std::fmt::Debug for HttpBlobSource {
@@ -418,6 +427,9 @@ impl HttpBlobSource {
             agent,
             base: base.trim_end_matches('/').to_owned(),
             authorization: format!("Bearer {token}"),
+            batch: false,
+            batch_off: AtomicBool::new(false),
+            batch_notice: std::sync::Once::new(),
         }
     }
 }
@@ -454,6 +466,15 @@ impl BlobSource for HttpBlobSource {
         std::io::copy(&mut response.body_mut().as_reader().take(limit), out)
             .map(|_| ())
             .map_err(|e| source(e.to_string()))
+    }
+
+    fn fetch_many(
+        &self,
+        digests: &[Digest],
+        concurrency: usize,
+        each: &Each<'_>,
+    ) -> Result<(), FetchError> {
+        self.fetch_units(digests, concurrency, each)
     }
 }
 
@@ -535,9 +556,23 @@ pub fn materialize(
     std::fs::create_dir_all(dir).map_err(io(dir))?;
     let files = make_directories(source, root, dir, concurrency)?;
     let digests: Vec<Digest> = files.iter().map(|f| f.digest.clone()).collect();
+    let written = AtomicUsize::new(0);
     source.fetch_many(&digests, concurrency, &|index, fetch| {
-        write_copies(&files[index], fetch)
-    })
+        write_copies(&files[index], fetch)?;
+        written.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })?;
+    all_written(written.into_inner(), files.len())
+}
+
+/// Fails when a source called back for fewer blobs than it was asked for. It is not generic, so
+/// both outcomes are one branch however many sources `materialize` is used with.
+fn all_written(written: usize, wanted: usize) -> Result<(), FetchError> {
+    if written == wanted {
+        Ok(())
+    } else {
+        Err(FetchError::Invalid("a source skipped a blob".to_owned()))
+    }
 }
 
 /// Fetches and decodes one Directory message and checks its names.
@@ -670,6 +705,9 @@ fn create_file(path: &Path, is_executable: bool) -> Result<std::fs::File, FetchE
         .map_err(io(path))?;
     Ok(file)
 }
+
+#[path = "batch.rs"]
+mod batch;
 
 #[cfg(test)]
 #[path = "fetch_tests.rs"]

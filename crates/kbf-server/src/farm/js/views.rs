@@ -28,6 +28,7 @@ use crate::farm::nodes::{detail_of, look_of, node_of};
 use crate::farm::sched_view::{LeaseViews, WholeView, whole_of};
 use crate::farm::{NodeLook, NodeUnread, StreamId, node_load};
 use crate::farm_js::KbfAdapter;
+use crate::farm_js::ablation::Ablation;
 use crate::fleet::{NodeDetail, NodeView, NodesView};
 
 /// `worker`, which the machine knows, as the node list shows it.
@@ -161,6 +162,12 @@ pub(crate) fn queue_view(js: &JsFarm) -> QueueView {
 /// [`Farm::load_counters`](crate::farm::Farm::load_counters).
 pub(crate) fn load_counters(js: &JsFarm) -> LoadCounters {
     js.core.with(|view, _| view.sched().load_counters())
+}
+
+/// [`Farm::ablation`](crate::farm::Farm::ablation).
+pub(crate) fn ablation(js: &JsFarm) -> Option<(Ablation, LoadCounters)> {
+    js.core
+        .with(|view, adapter| Some((adapter.ablation().clone(), view.sched().load_counters())))
 }
 
 /// [`Farm::whole_view`](crate::farm::Farm::whole_view).

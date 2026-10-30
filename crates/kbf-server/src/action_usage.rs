@@ -14,6 +14,7 @@
 //!   action usage: exit_code=<n|-> mnemonic=<"..."|-> target_hint=<"..."|-> wall_us=<n>
 //!     <cgroup fields> key=<16 hex> cfg=<16 hex[-16 hex]|-> target=<"..."|->
 //!     target_kind=<target|anon|bxl|-> outcome=<word> lease=<lease> node=<node>
+//!     booked_millicpus=<n|-> booked_memory_bytes=<n|->
 //!   ```
 //!
 //!   (one line). `exit_code` is the run's, as the daemon reported it for a run it says
@@ -27,6 +28,10 @@
 //!   the cgroup's ([`ResourceUsage::log_fields`]); a macOS lease has no cgroup, so its
 //!   CPU and `mem_peak` come from its footprint block when it read its processes, and
 //!   every one it did not measure is `-` (a whole-machine lease measures only `wall_us`).
+//!   `booked_millicpus` (thousandths of a CPU) and `booked_memory_bytes` are what the
+//!   lease was granted, as its `Start` carried them (after the memory ladder and the
+//!   floors, not the request), so a reader can set what a lease held beside what it
+//!   used; `-` for a lease the server never started (one taken up from the state store).
 //! - `action shape:`, the first time this process sees a key: what the key stands for
 //!   (`key=… program="…" outputs=<n> patterns="<up to 8>…"`).
 //!
@@ -58,6 +63,8 @@ use std::sync::{Mutex, PoisonError};
 use kbf_front::{ActionLabel, Described};
 use kbf_proto::worker::{self, ResourceUsage};
 use kbf_types::{Failure, LeaseId, LostWhy, OperationId, Outcome, WorkerId};
+
+use crate::machine::Booked;
 use tonic::Code;
 
 pub use shape::{Shape, ShapeKey, Target, TargetKind};
@@ -192,6 +199,7 @@ pub fn exit_code(result: &worker::Result) -> Option<i32> {
 pub struct Measured {
     usage: ResourceUsage,
     exit_code: Option<i32>,
+    booked: Option<Booked>,
 }
 
 impl Measured {
@@ -206,7 +214,14 @@ impl Measured {
         Some(Self {
             usage,
             exit_code: exit_code(result),
+            booked: None,
         })
+    }
+
+    /// This measurement, for a lease granted `booked`.
+    #[must_use]
+    pub fn booked(self, booked: Option<Booked>) -> Self {
+        Self { booked, ..self }
     }
 
     /// The `ResourceUsage` the result carried.
@@ -243,14 +258,19 @@ pub fn line(
     lease: LeaseId,
     node: &WorkerId,
 ) -> String {
-    let Measured { usage, exit_code } = measured;
+    let Measured {
+        usage,
+        exit_code,
+        booked,
+    } = measured;
     let text = |t: Option<&String>| t.map_or_else(|| "-".to_owned(), |t| format!("{t:?}"));
     let dash = |v: Option<String>| v.unwrap_or_else(|| "-".to_owned());
     let cgroup = usage.log_fields();
     let target = subject.target.as_ref();
     format!(
         "exit_code={} mnemonic={} target_hint={} wall_us={} {cgroup} key={} cfg={} target={} \
-         target_kind={} outcome={} lease={lease} node={node}",
+         target_kind={} outcome={} lease={lease} node={node} booked_millicpus={} \
+         booked_memory_bytes={}",
         dash(exit_code.map(|c| c.to_string())),
         text(subject.label.mnemonic.as_ref()),
         text(subject.label.target.as_ref()),
@@ -260,6 +280,8 @@ pub fn line(
         text(target.map(|t| &t.label)),
         target.map_or("-", |t| t.kind.name()),
         outcome(judged),
+        dash(booked.map(|b| b.cpu_millis.to_string())),
+        dash(booked.map(|b| b.memory_bytes.to_string())),
     )
 }
 
