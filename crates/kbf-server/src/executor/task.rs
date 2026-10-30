@@ -118,8 +118,6 @@ pub enum Delivery {
 
 /// The command line of one task: what the task tool is given.
 pub struct TaskArgs<'a> {
-    /// The path of the tool in the container.
-    pub tool: &'a str,
     /// The action to run.
     pub action: &'a Digest,
     /// The farm lease the run belongs to.
@@ -132,21 +130,19 @@ pub struct TaskArgs<'a> {
     pub pack_url: &'a Secret,
     /// How long the tool lets the action run.
     pub deadline: Duration,
-    /// The farm's root certificate in the container, when the reads are `https`.
-    pub root_der: Option<&'a str>,
-    /// Where the tool works, if not where it would: the action image's writable directory.
+    /// Where the tool works, if not where it would: a writable directory of the kbf image.
     pub work_dir: Option<&'a str>,
     /// Whether the `PUT` goes over plain http (until the store serves TLS).
     pub allow_plain_http_put: bool,
 }
 
 impl TaskArgs<'_> {
-    /// The arguments, tool first, for [`Delivery::InsecureArgv`].
+    /// The flags of the task tool, for [`Delivery::InsecureArgv`]. The tool is the kbf image's
+    /// `ENTRYPOINT`, which the lease server prepends the arguments to: no path comes first.
     #[must_use]
     pub fn argv(&self, delivery: Delivery) -> Vec<String> {
         let Delivery::InsecureArgv = delivery;
         let mut argv = vec![
-            self.tool.to_owned(),
             "--action".to_owned(),
             format!("{}/{}", self.action.hash, self.action.size_bytes),
             "--lease".to_owned(),
@@ -161,9 +157,6 @@ impl TaskArgs<'_> {
             "--grant-token".to_owned(),
             self.grant_token.expose().to_owned(),
         ];
-        if let Some(root) = self.root_der {
-            argv.extend(["--root-der".to_owned(), root.to_owned()]);
-        }
         if let Some(dir) = self.work_dir {
             argv.extend(["--work-dir".to_owned(), dir.to_owned()]);
         }
@@ -177,7 +170,6 @@ impl TaskArgs<'_> {
 impl fmt::Debug for TaskArgs<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TaskArgs")
-            .field("tool", &self.tool)
             .field("action", &format_args!("{}", self.action.hash))
             .field("lease", &self.lease)
             .field("grant_url", &self.grant_url)

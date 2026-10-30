@@ -44,21 +44,20 @@ const CPUS: &str = "executor_host_cpus";
 const MEMORY_GIB: &str = "executor_host_memory_gib";
 const SLOTS: &str = "executor_host_slots";
 const ARCH: &str = "executor_arch";
-const TOOL: &str = "executor_task_tool";
-const ROOT_DER: &str = "executor_root_der";
 const WORK_DIR: &str = "executor_work_dir";
 const PLAIN_PUT: &str = "executor_allow_plain_http_put";
 const INSECURE: &str = "executor_insecure_argv_secrets";
-const DEFAULT_IMAGE: &str = "executor_default_image";
-const NO_ENTRYPOINT: &str = "executor_images_have_no_entrypoint";
+const BASE_IMAGE: &str = "executor_base_image";
+const KBF_IMAGE: &str = "executor_kbf_image";
 const MARGIN: &str = "executor_run_margin_secs";
 const TTL: &str = "executor_lease_ttl_secs";
 const MAX_RUN: &str = "executor_max_run_secs";
 const DEFAULT_TIMEOUT: &str = "executor_default_timeout_secs";
 const CALL_TIMEOUT: &str = "executor_call_timeout_secs";
+const OUTPUT_DISK: &str = "executor_output_disk_bytes";
 
 /// The flags a `js-agent` executor cannot do without, in the order their absence is named.
-const REQUIRED: [(&str, &str); 7] = [
+const REQUIRED: [(&str, &str); 9] = [
     (LEASE_URL, "--executor-lease-url"),
     (TOKEN_FILE, "--executor-lease-token-file"),
     (FRONTEND, "--executor-frontend-id"),
@@ -66,6 +65,8 @@ const REQUIRED: [(&str, &str); 7] = [
     (HOSTS, "--executor-hosts"),
     (CPUS, "--executor-host-cpus"),
     (MEMORY_GIB, "--executor-host-memory-gib"),
+    (BASE_IMAGE, "--executor-base-image"),
+    (KBF_IMAGE, "--executor-kbf-image"),
 ];
 
 fn text(id: &'static str, long: &'static str, value_name: &'static str, help: &'static str) -> Arg {
@@ -113,7 +114,8 @@ pub(super) fn args() -> Vec<Arg> {
                  daemon of each node, over the worker listener: no executor is built and no \
                  lease server is contacted, whatever the other `--executor-*` flags say. \
                  `js-agent` runs them on hosts leased from the job scheduler's lease server, in \
-                 the action's own image, by a task tool the agent mounts; it needs the lease \
+                 the kbf image (`--executor-kbf-image`, built from `--executor-base-image`), \
+                 whose task tool runs the action inside it; it needs the lease \
                  server's flags (`--executor-lease-url`, `--executor-lease-token-file`, and \
                  `--executor-lease-ca-file` for https), the pool's (`--executor-class`, \
                  `--executor-hosts`, `--executor-host-cpus`, `--executor-host-memory-gib`), \
@@ -209,27 +211,10 @@ pub(super) fn args() -> Vec<Arg> {
                  `--executor js-agent`",
             ),
         text(
-            TOOL,
-            "executor-task-tool",
-            "PATH",
-            "Where the task tool is in the action's container, as `/mnt/<root>/<file>`: the \
-             agent mounts `<file>` of its root `<root>` read-only at `/mnt/<root>/<file>`. \
-             Used only with `--executor js-agent`",
-        )
-        .default_value("/mnt/kbf-tools/kbf-task"),
-        text(
-            ROOT_DER,
-            "executor-root-der",
-            "FILE",
-            "A file beside the task tool in its root (the farm's root certificate, DER) that the \
-             task trusts for its https reads; mounted read-only next to the tool. Left out, the \
-             task is given none. Used only with `--executor js-agent`",
-        ),
-        text(
             WORK_DIR,
             "executor-work-dir",
             "DIR",
-            "Where the task tool works in the container, if not in its own default: the action's \
+            "Where the task tool works in the container, if not in its own default: the kbf \
              image must have a writable directory there. Used only with `--executor js-agent`",
         ),
         switch(
@@ -247,24 +232,24 @@ pub(super) fn args() -> Vec<Arg> {
              js-agent` cannot run without it; it is refused with `--executor kbf-daemon`. Off \
              by default",
         ),
-        switch(
-            NO_ENTRYPOINT,
-            "executor-images-have-no-entrypoint",
-            "Says that no image of the farm sets an `ENTRYPOINT`. The lease server appends the \
-             task tool's arguments to the image's entrypoint, so the tool would not run under \
-             one, and the frontend does not read an image's config: without this every action \
-             is refused as such. Used only with `--executor js-agent`",
+        text(
+            BASE_IMAGE,
+            "executor-base-image",
+            "IMAGE",
+            "The base environment the Command of an action sees, pinned by digest as \
+             `<repository>@sha256:<64 hex digits>` (a leading `docker://` is optional). It is \
+             the one image an action's `container-image` platform property may name: an action \
+             that names another is refused as invalid, one that names none gets this. A tag is \
+             refused. Needed with `--executor js-agent`",
         ),
         text(
-            DEFAULT_IMAGE,
-            "executor-default-image",
+            KBF_IMAGE,
+            "executor-kbf-image",
             "IMAGE",
-            "The image, pinned by digest as `<repository>@sha256:<64 hex digits>` (a leading \
-             `docker://` is optional), that an action runs in when it names no `container-image` \
-             platform property. An action that names one runs in its own. A tag is refused, and \
-             an action with neither is refused as invalid. Like every image of the farm, it \
-             must not set an `ENTRYPOINT` (see `--executor-images-have-no-entrypoint`). Used \
-             only with `--executor js-agent`",
+            "The kbf image, pinned by digest like `--executor-base-image` and built from it, \
+             that every run is launched from. It keeps the task tool as its `ENTRYPOINT`, so \
+             the run's arguments are the tool's flags and the action runs inside this image. \
+             Must be another image than the base. Needed with `--executor js-agent`",
         ),
         number(
             MARGIN,
@@ -304,6 +289,18 @@ pub(super) fn args() -> Vec<Arg> {
              seconds. Under the fence time. Used only with `--executor js-agent`",
             "5",
         ),
+        Arg::new(OUTPUT_DISK)
+            .long("executor-output-disk-bytes")
+            .value_name("BYTES")
+            .value_parser(clap::value_parser!(u64).range(1..))
+            .default_value("8589934592")
+            .help(
+                "The scratch disk a run books for what it writes, in bytes: its outputs, the \
+                 pack and the private home, tmp and cache. A run books this, the bytes of its \
+                 inputs and a fixed 1 GiB margin against the host's scratch, and the lease \
+                 server refuses a run the host's disk cannot hold. Used only with `--executor \
+                 js-agent`",
+            ),
     ]
 }
 
@@ -318,10 +315,10 @@ pub struct JsAgentFlags {
     pub token_file: PathBuf,
     /// `--executor-lease-ca-file`.
     pub ca_file: Option<PathBuf>,
-    /// `--executor-images-have-no-entrypoint`.
-    pub images_have_no_entrypoint: bool,
-    /// `--executor-default-image`, by digest.
-    pub default_image: Option<ImageRef>,
+    /// `--executor-base-image`, by digest.
+    pub base_image: ImageRef,
+    /// `--executor-kbf-image`, by digest.
+    pub kbf_image: ImageRef,
 }
 
 /// What `--executor` says: the daemons, or hosts of a lease server.
@@ -347,8 +344,8 @@ impl Default for ExecutorFlags {
 /// # Errors
 /// For `js-agent`, a flag it
 /// needs that is missing, a setting that breaks a rule ([`Config::validate`]), a lease server
-/// URL that is not one or does not agree with the CA flag, or a task tool or root certificate
-/// path that is not one.
+/// URL that is not one or does not agree with the CA flag, or a base or kbf image that is not
+/// pinned by digest or is the same image twice.
 pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
     let js_agent = m.get_one::<String>(KIND).is_some_and(|k| k == "js-agent");
     if !js_agent {
@@ -404,6 +401,14 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
         }
         _ => {}
     }
+    let base_image = image(m, BASE_IMAGE, "--executor-base-image")?;
+    let kbf_image = image(m, KBF_IMAGE, "--executor-kbf-image")?;
+    if base_image.digest() == kbf_image.digest() {
+        return Err(format!(
+            "--executor-kbf-image is the base image {base_image}: it must be an image built \
+             from the base, which keeps the task tool as its entrypoint"
+        ));
+    }
     let hosts = m.get_one::<usize>(HOSTS).copied().unwrap_or_default();
     let mut config = Config::new(
         &one(FRONTEND),
@@ -414,15 +419,6 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     );
     config.slots = count(SLOTS);
     config.arch = one(ARCH);
-    config.tool_mount = tool_mount(&one(TOOL))?;
-    config.root_der = m.get_one::<String>(ROOT_DER).cloned();
-    if let Some(file) = &config.root_der
-        && (file.is_empty() || file.contains('/') || file == "..")
-    {
-        return Err(format!(
-            "--executor-root-der {file:?} is not a file beside the task tool"
-        ));
-    }
     config.work_dir = m.get_one::<String>(WORK_DIR).cloned();
     if config
         .work_dir
@@ -438,6 +434,7 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     config.max_run = secs(MAX_RUN);
     config.default_timeout = secs(DEFAULT_TIMEOUT);
     config.call_timeout = secs(CALL_TIMEOUT);
+    config.output_disk_bytes = count(OUTPUT_DISK);
     Ok(JsAgentFlags {
         config,
         lease_url,
@@ -446,45 +443,20 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
             .cloned()
             .unwrap_or_default(),
         ca_file,
-        images_have_no_entrypoint: m.get_flag(NO_ENTRYPOINT),
-        default_image: m
-            .get_one::<String>(DEFAULT_IMAGE)
-            .map(|value| default_image(value))
-            .transpose()?,
+        base_image,
+        kbf_image,
     })
 }
 
-/// The image `--executor-default-image` names: by digest, with or without the `docker://`
+/// The image the flag `long` (argument `id`) names: by digest, with or without the `docker://`
 /// scheme of the `container-image` property.
-fn default_image(value: &str) -> Result<ImageRef, String> {
+fn image(m: &ArgMatches, id: &str, long: &str) -> Result<ImageRef, String> {
+    let value = m.get_one::<String>(id).map_or("", String::as_str);
     let named = match value.starts_with("docker://") {
         true => value.to_owned(),
         false => format!("docker://{value}"),
     };
-    ImageRef::parse(&named).map_err(|e| format!("--executor-default-image: {e}"))
-}
-
-/// The mount that puts the tool at `path` (`/mnt/<root>/<file>`), read-only.
-fn tool_mount(path: &str) -> Result<kbf_lease_client::Mount, String> {
-    let refuse = || {
-        format!(
-            "--executor-task-tool {path:?} is not /mnt/<root>/<file>, with a root and a file \
-             that name nothing above them"
-        )
-    };
-    let (root, rel) = path
-        .strip_prefix("/mnt/")
-        .and_then(|rest| rest.split_once('/'))
-        .ok_or_else(refuse)?;
-    let plain = |part: &str| !part.is_empty() && part != "." && part != "..";
-    if !plain(root) || !rel.split('/').all(plain) {
-        return Err(refuse());
-    }
-    Ok(kbf_lease_client::Mount {
-        root_name: root.to_owned(),
-        rel: rel.to_owned(),
-        ro: true,
-    })
+    ImageRef::parse(&named).map_err(|e| format!("{long}: {e}"))
 }
 
 impl JsAgentFlags {
@@ -497,8 +469,8 @@ impl JsAgentFlags {
             backend,
             mint: source.mint,
             prepare: source.prepare,
-            images_have_no_entrypoint: self.images_have_no_entrypoint,
-            default_image: self.default_image.clone(),
+            base_image: self.base_image.clone(),
+            kbf_image: self.kbf_image.clone(),
         })
     }
 

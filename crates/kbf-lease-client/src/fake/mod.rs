@@ -239,10 +239,23 @@ impl FakeLeaseServer {
         locked(&self.shared.state).run_wall_ms(run)
     }
 
+    /// The scratch disk the run was queued with, as the server received it; `None` for a run
+    /// that booked none and for a run the server does not know.
+    #[must_use]
+    pub fn run_disk_bytes(&self, run: &RunId) -> Option<u64> {
+        locked(&self.shared.state).run_disk_bytes(run)
+    }
+
     /// The arguments the run was queued with, as the server received them.
     #[must_use]
     pub fn run_args(&self, run: &RunId) -> Option<Vec<String>> {
         locked(&self.shared.state).run_args(run)
+    }
+
+    /// The image the run was queued with, as the server received it.
+    #[must_use]
+    pub fn run_image(&self, run: &RunId) -> Option<String> {
+        locked(&self.shared.state).run_image(run)
     }
 
     /// The mounts the run was queued with, as the server received them.

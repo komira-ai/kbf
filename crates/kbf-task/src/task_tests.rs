@@ -426,6 +426,21 @@ fn each_failure_class_has_its_own_exit_code() {
     assert_eq!(codes, [14, 10, 11, 12, 12, 12, 13]);
 }
 
+/// A Command refused for want of a confine has an exit code of its own, so the farm can tell
+/// "this system cannot confine" from a Command that could not be started.
+#[test]
+fn a_run_refused_for_want_of_a_confine_has_its_own_exit_code() {
+    let failure = Failure::Run(RunError::NoConfine);
+    assert_eq!(failure.exit_code(), EXIT_NO_CONFINE);
+    assert_eq!(EXIT_NO_CONFINE, 15);
+    assert_ne!(EXIT_NO_CONFINE, EXIT_RUN);
+    assert!(
+        failure
+            .to_string()
+            .contains("cannot deny the Command the network")
+    );
+}
+
 #[test]
 fn a_result_digest_that_is_absent_or_malformed_is_refused() {
     let good = reapi_of(b"x");

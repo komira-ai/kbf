@@ -6,7 +6,7 @@
 //! Neither scheduler core knows. A held lease becomes a virtual worker, `js:<host>`, that
 //! registers with the [`Farm`] as a node whose only driver is `container`, and takes the
 //! messages the farm sends a daemon on the channel it owns the receiving end of. A `Start` is
-//! posted to the lease server as a run of the task tool in the action's own image; the host's
+//! posted to the lease server as a run of the kbf image, whose entrypoint is the task tool; the host's
 //! heartbeats trail the run, its outcome is mapped to the farm's failure classes
 //! ([`outcome`]), and the result is reported the way a daemon reports one. `worker.rs`, the
 //! two cores and the sched crates are untouched, and a server that never builds an
@@ -56,7 +56,7 @@ use tokio::time::Instant;
 use crate::Farm;
 use pool::{Adopted, Adoption, Slot};
 
-pub use config::{Config, ConfigError};
+pub use config::{Config, ConfigError, DEFAULT_OUTPUT_DISK, DISK_MARGIN};
 pub use driver::Running;
 pub use front::{Front, FrontParts, PrepareError, PreparedRun, RunPrepare, RunSource};
 pub use metrics::Metrics;
