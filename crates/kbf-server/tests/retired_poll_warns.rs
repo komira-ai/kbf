@@ -48,6 +48,7 @@ async fn the_server_start_warns_once_for_a_retired_release_poll_flag() {
             "--listen=127.0.0.1:0".to_owned(),
             "--worker-listen=127.0.0.1:0".to_owned(),
             format!("--cold-store=file://{}", at("cold")),
+            "--cold-store-floor-bytes=1".to_owned(),
             format!("--meta-dir={}", at("meta")),
         ];
         argv.extend(more.iter().map(|s| (*s).to_owned()));

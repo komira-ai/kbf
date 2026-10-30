@@ -54,8 +54,11 @@ fn flags(dir: &Path, more: &[String]) -> Result<StorageFlags, clap::Error> {
     if !more.iter().any(|m| m.starts_with("--storage-listen")) {
         argv.push("--storage-listen=127.0.0.1:0".to_owned());
     }
+    // An explicit floor: the default is 5% of the disk, and a runner's free space shrinks
+    // while the coverage build fills it, so a write would pass or fail with the disk.
     argv.extend([
         format!("--cold-store=file://{}", dir.join("cold").display()),
+        "--cold-store-floor-bytes=1".to_owned(),
         format!("--meta-dir={}", dir.join("meta").display()),
     ]);
     argv.extend_from_slice(more);
