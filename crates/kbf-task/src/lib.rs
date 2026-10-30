@@ -4,7 +4,9 @@
 //! inputs, and starts a job whose arguments name both. The tool then
 //! 1. reads the Action, its Command and its input root through the read grant ([`fetch`]), checking
 //!    every blob's SHA-256 against its digest, and lays the input tree out under the working
-//!    directory;
+//!    directory. The tree is read breadth-first with at most `--fetch-concurrency` requests in
+//!    flight (32 by default) over pooled connections, and each file streams from the response to
+//!    disk through its digest check instead of being held in memory;
 //! 2. runs the Command there ([`run`]): its argv, environment and working directory, stdout and
 //!    stderr to files, under a deadline;
 //! 3. collects the declared outputs as REAPI does ([`outputs`]): files, directories as Trees,

@@ -1,0 +1,392 @@
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::Path;
+
+use super::super::{FrontendFlags, command, parse};
+use super::*;
+use crate::test_dir::scratch_dir;
+
+/// The flags of a frontend with the packs on, which `--executor js-agent` needs, and `more`.
+fn argv(more: &[&str]) -> Vec<String> {
+    [
+        "frontend",
+        "--storage=http://127.0.0.1:1",
+        "--listen=127.0.0.1:0",
+        "--worker-listen=127.0.0.1:0",
+        "--api-listen=127.0.0.1:0",
+        "--state-store=postgres:///kbf?host=/run/postgresql",
+        "--pack-index",
+        "--pack-store-endpoint=http://127.0.0.1:9",
+        "--pack-store-bucket=packs",
+        "--pack-store-credentials-file=/nowhere",
+        // What `--executor js-agent` prepares its runs with, which the parse requires.
+        "--task-secret-file=/nowhere/secret",
+        "--task-put-endpoint=http://127.0.0.1:9",
+        "--task-put-bucket=packs",
+        "--task-put-credentials-file=/nowhere/presign.json",
+        "--task-read-url=https://127.0.0.1:9400",
+        "--job-listen=127.0.0.1:9400",
+        "--job-tls-cert=/nowhere/job.pem",
+        "--job-tls-key=/nowhere/job.key",
+        "--job-grant-secret-file=/nowhere/secret",
+    ]
+    .iter()
+    .filter(|flag| !more.iter().any(|m| name(m) == name(flag)))
+    .chain(more)
+    .map(ToString::to_string)
+    .collect()
+}
+
+fn parsed(argv: Vec<String>) -> Result<FrontendFlags, String> {
+    let matches = command()
+        .try_get_matches_from(argv)
+        .map_err(|e| e.to_string())?;
+    parse(&matches).map_err(|e| e.to_string())
+}
+
+/// The flags `--executor js-agent` needs, and nothing it can do without.
+const JS: [&str; 11] = [
+    "--executor=js-agent",
+    "--executor-lease-url=http://127.0.0.1:7",
+    "--executor-lease-token-file=/etc/token",
+    "--executor-frontend-id=front-1",
+    "--executor-class=farm-linux",
+    "--executor-hosts=2",
+    "--executor-host-cpus=8",
+    "--executor-host-memory-gib=32",
+    "--executor-insecure-argv-secrets",
+    "--executor-images-have-no-entrypoint",
+    // The tier store of the task flags is `http://`, as it is until it serves TLS.
+    "--executor-allow-plain-http-put",
+];
+
+/// The name of a flag given as `--name=value`.
+fn name(flag: &str) -> &str {
+    flag.split('=').next().expect("a flag")
+}
+
+/// [`JS`] with `more` given, a flag of `more` taking the place of the one of that name.
+fn js_with(more: &[&str]) -> Result<FrontendFlags, String> {
+    let mut all: Vec<&str> = JS
+        .iter()
+        .copied()
+        .filter(|flag| !more.iter().any(|m| name(m) == name(flag)))
+        .collect();
+    all.extend(more);
+    parsed(argv(&all))
+}
+
+fn refused(more: &[&str]) -> String {
+    js_with(more).expect_err("refused")
+}
+
+/// Catches a default that builds an executor: a frontend given no `--executor` runs placed
+/// actions on daemons, as it always has, and has no settings of the executor.
+#[test]
+fn a_frontend_with_no_executor_flag_runs_on_daemons_and_holds_no_settings() {
+    let flags = parsed(argv(&[])).expect("flags");
+    assert_eq!(flags.executor.kind, ExecutorKind::KbfDaemon);
+    assert!(flags.executor.js.is_none());
+}
+
+/// Catches the rollback losing its settings or tripping on them: with `--executor kbf-daemon`
+/// (or none) every setting of the lease server may stay in the unit or `kbf.toml`, the one that
+/// lets secrets travel as arguments too, and none is read. Flipping the one flag is the
+/// rollback: a frontend that refused to start over a setting nothing reads would need a second
+/// edit in an incident.
+#[test]
+fn the_daemon_executor_keeps_the_lease_servers_settings_unread() {
+    // The warning is made (its arguments are only evaluated under a subscriber).
+    let _logged =
+        tracing::subscriber::set_default(tracing_subscriber::fmt().with_test_writer().finish());
+    for executor in ["--executor=kbf-daemon", ""] {
+        let mut all: Vec<&str> = JS.to_vec();
+        if executor.is_empty() {
+            all.remove(0);
+        } else {
+            all[0] = executor;
+        }
+        assert!(all.contains(&"--executor-insecure-argv-secrets"));
+        // A tag, which the js-agent parse refuses: the daemon executor must never read it.
+        all.push("--executor-default-image=registry.test/base:22.04");
+        let flags = parsed(argv(&all)).expect("flags");
+        assert_eq!(flags.executor.kind, ExecutorKind::KbfDaemon);
+        assert!(flags.executor.js.is_none());
+    }
+}
+
+/// Catches an executor started with what it cannot do without left out: each missing flag is
+/// named, and all of them at once.
+#[test]
+fn js_agent_names_each_flag_it_needs() {
+    let why = parsed(argv(&["--executor=js-agent"])).expect_err("refused");
+    for flag in [
+        "--executor-lease-url",
+        "--executor-lease-token-file",
+        "--executor-frontend-id",
+        "--executor-class",
+        "--executor-hosts",
+        "--executor-host-cpus",
+        "--executor-host-memory-gib",
+    ] {
+        assert!(why.contains(flag), "{flag} in {why}");
+    }
+    for (at, flag) in JS.iter().enumerate().skip(1).take(7) {
+        let name = name(flag);
+        let mut all = JS.to_vec();
+        all.remove(at);
+        let why = parsed(argv(&all)).expect_err("refused");
+        let first = why.lines().next().expect("a line");
+        assert!(first.ends_with(&format!("needs {name}")), "{name} in {why}");
+    }
+}
+
+/// Catches `js-agent` running without having been told that the secrets travel as arguments,
+/// and without the packs the ingest reads.
+#[test]
+fn js_agent_needs_the_secrets_opt_in_and_the_packs() {
+    let mut all = JS.to_vec();
+    all.retain(|flag| *flag != "--executor-insecure-argv-secrets");
+    let why = parsed(argv(&all)).expect_err("refused");
+    assert!(why.contains("--executor-insecure-argv-secrets"), "{why}");
+
+    let mut bare: Vec<String> = argv(&JS)
+        .into_iter()
+        .filter(|flag| !flag.contains("pack-store") && flag != "--pack-index")
+        .collect();
+    bare.retain(|flag| !flag.starts_with("--state-store"));
+    let why = parsed(bare).expect_err("refused");
+    assert!(why.contains("--pack-store-endpoint"), "{why}");
+}
+
+/// Catches settings that do not become the executor's: the shape is in cores and GiB, the tool
+/// is a path in the container, and everything else is what was given.
+#[test]
+fn js_agent_settings_become_the_executors_config() {
+    let flags = js_with(&[
+        "--executor-host-slots=4",
+        "--executor-arch=arm64",
+        "--executor-task-tool=/mnt/tools/bin/task",
+        "--executor-root-der=farm-ca.der",
+        "--executor-work-dir=/scratch",
+        "--executor-allow-plain-http-put",
+        "--executor-run-margin-secs=120",
+        "--executor-lease-ttl-secs=7200",
+        "--executor-max-run-secs=1800",
+        "--executor-default-timeout-secs=900",
+        "--executor-call-timeout-secs=3",
+    ])
+    .expect("flags");
+    let js = flags.executor.js.expect("js-agent");
+    let config = &js.config;
+    assert_eq!(flags.executor.kind, ExecutorKind::JsAgent);
+    assert_eq!(js.lease_url, "http://127.0.0.1:7");
+    assert_eq!(js.token_file, Path::new("/etc/token"));
+    assert!(js.ca_file.is_none());
+    assert!(js.images_have_no_entrypoint);
+    assert_eq!(config.frontend, "front-1");
+    assert_eq!(config.class, "farm-linux");
+    assert_eq!(config.hosts, 2);
+    assert_eq!(config.cpu_millis, 8_000);
+    assert_eq!(config.memory_bytes, 32 << 30);
+    assert_eq!(config.slots, 4);
+    assert_eq!(config.arch, "arm64");
+    assert_eq!(config.tool_mount.root_name, "tools");
+    assert_eq!(config.tool_mount.rel, "bin/task");
+    assert!(config.tool_mount.ro);
+    assert_eq!(config.tool_path(), "/mnt/tools/bin/task");
+    assert_eq!(config.root_der.as_deref(), Some("farm-ca.der"));
+    assert_eq!(config.work_dir.as_deref(), Some("/scratch"));
+    assert!(config.allow_plain_http_put);
+    assert!(config.insecure_argv_secrets);
+    assert_eq!(config.run_margin, Duration::from_secs(120));
+    assert_eq!(config.lease_ttl, Duration::from_secs(7200));
+    assert_eq!(config.max_run, Duration::from_secs(1800));
+    assert_eq!(config.default_timeout, Duration::from_secs(900));
+    assert_eq!(config.call_timeout, Duration::from_secs(3));
+}
+
+/// Catches a flag default that has drifted from the executor's own: the defaults are written
+/// as text in the flags and are the config's.
+#[test]
+fn the_defaults_are_the_executors_own() {
+    let mut all: Vec<&str> = JS
+        .iter()
+        .copied()
+        .filter(|flag| *flag != "--executor-allow-plain-http-put")
+        .collect();
+    all.push("--task-put-endpoint=https://127.0.0.1:9");
+    let flags = parsed(argv(&all)).expect("flags");
+    let config = flags.executor.js.expect("js-agent").config;
+    let own = Config::new("front-1", 2, "farm-linux", 8_000, 32 << 30);
+    assert_eq!(config.slots, own.slots);
+    assert_eq!(config.arch, own.arch);
+    assert_eq!(config.tool_mount, own.tool_mount);
+    assert_eq!(config.root_der, own.root_der);
+    assert_eq!(config.work_dir, own.work_dir);
+    assert_eq!(config.allow_plain_http_put, own.allow_plain_http_put);
+    assert_eq!(config.run_margin, own.run_margin);
+    assert_eq!(config.lease_ttl, own.lease_ttl);
+    assert_eq!(config.max_run, own.max_run);
+    assert_eq!(config.default_timeout, own.default_timeout);
+    assert_eq!(config.call_timeout, own.call_timeout);
+    assert_eq!(own.delivery, config.delivery);
+}
+
+/// Catches a default image that is taken when it is not pinned by digest, or dropped when it is:
+/// the scheme is optional, a tag is refused naming the flag, and no flag is no default (an
+/// action that names no image is then the caller's to fix).
+#[test]
+fn the_default_image_is_pinned_by_digest() {
+    let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let own = format!("registry.test/base@sha256:{digest}");
+    for given in [own.clone(), format!("docker://{own}")] {
+        let flags = js_with(&[&format!("--executor-default-image={given}")]).expect("flags");
+        let image = flags.executor.js.expect("js-agent").default_image;
+        assert_eq!(image.map(|i| i.to_string()), Some(own.clone()), "{given}");
+    }
+    assert!(
+        js_with(&[])
+            .expect("flags")
+            .executor
+            .js
+            .expect("js")
+            .default_image
+            .is_none()
+    );
+    for tag in [
+        "registry.test/base:22.04",
+        &format!("registry.test/base:22.04@sha256:{digest}"),
+        "registry.test/base",
+        "registry.test/base@sha256:abc",
+        "",
+    ] {
+        let why = refused(&[&format!("--executor-default-image={tag}")]);
+        assert!(why.contains("--executor-default-image"), "{tag}: {why}");
+    }
+}
+
+/// Catches a lease server, a tool, a certificate or a directory that is not one being taken:
+/// each is refused at the flags, naming the flag.
+#[test]
+fn settings_that_are_not_what_they_name_are_refused_naming_the_flag() {
+    let cases: [(&[&str], &str); 12] = [
+        (&["--executor-lease-url=ftp://x"], "--executor-lease-url"),
+        (
+            &["--executor-lease-url=http://lease.example:80"],
+            "--executor-lease-url",
+        ),
+        (
+            &["--executor-lease-url=https://lease.example"],
+            "--executor-lease-ca-file",
+        ),
+        (
+            &["--executor-lease-ca-file=/etc/ca.pem"],
+            "--executor-lease-ca-file",
+        ),
+        (
+            &["--executor-task-tool=/usr/bin/task"],
+            "--executor-task-tool",
+        ),
+        (&["--executor-task-tool=/mnt/tools"], "--executor-task-tool"),
+        (
+            &["--executor-task-tool=/mnt/../task"],
+            "--executor-task-tool",
+        ),
+        (
+            &["--executor-task-tool=/mnt/tools/a//b"],
+            "--executor-task-tool",
+        ),
+        (&["--executor-root-der=dir/ca.der"], "--executor-root-der"),
+        (&["--executor-root-der="], "--executor-root-der"),
+        (&["--executor-root-der=.."], "--executor-root-der"),
+        (&["--executor-work-dir=scratch"], "--executor-work-dir"),
+    ];
+    for (more, flag) in cases {
+        let why = refused(more);
+        assert!(why.contains(flag), "{more:?}: {why}");
+    }
+}
+
+/// Catches settings that break a rule the executor's safety rests on starting anyway: the
+/// executor's own validation is run on the flags, and a frontend id that cannot label a lease
+/// is refused.
+#[test]
+fn settings_that_break_a_rule_of_the_executor_are_refused() {
+    for more in [
+        &["--executor-lease-ttl-secs=10"][..],
+        &["--executor-default-timeout-secs=4000"],
+        &["--executor-call-timeout-secs=60"],
+        &["--executor-max-run-secs=20000"],
+    ] {
+        let why = refused(more);
+        assert!(why.contains("--executor js-agent: "), "{more:?}: {why}");
+    }
+    let mut all = JS.to_vec();
+    all[3] = "--executor-frontend-id=front 1";
+    let why = parsed(argv(&all)).expect_err("refused");
+    assert!(why.contains("frontend id"), "{why}");
+}
+
+fn flags_of(url: &str, token: &Path, ca: Option<&Path>) -> JsAgentFlags {
+    let config = Config::new("front-1", 1, "farm-linux", 2_000, 16 << 30);
+    JsAgentFlags {
+        config,
+        lease_url: url.to_owned(),
+        token_file: token.to_path_buf(),
+        ca_file: ca.map(Path::to_path_buf),
+        images_have_no_entrypoint: false,
+        default_image: None,
+    }
+}
+
+fn write_private(path: &Path, text: &str, mode: u32) {
+    std::fs::write(path, text).expect("written");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("mode");
+}
+
+/// Catches a client built from files it should have refused: a token file that others can read
+/// or that is missing, a CA file that is missing or holds no certificate, and a plain URL with a
+/// CA. A good token and a plain loopback URL give a client.
+#[test]
+fn the_client_is_built_from_a_private_token_and_a_ca_that_is_a_certificate() {
+    let dir = scratch_dir("executor-client");
+    let token = dir.path().join("token");
+    write_private(&token, "a-token-of-printable-bytes-0123456789\n", 0o600);
+    assert!(
+        flags_of("http://127.0.0.1:7", &token, None)
+            .client()
+            .is_ok()
+    );
+
+    let open = dir.path().join("open");
+    write_private(&open, "a-token-of-printable-bytes-0123456789\n", 0o644);
+    let why = flags_of("http://127.0.0.1:7", &open, None)
+        .client()
+        .expect_err("refused")
+        .to_string();
+    assert!(why.contains("--executor-lease-token-file"), "{why}");
+    let absent = dir.path().join("absent");
+    assert!(
+        flags_of("http://127.0.0.1:7", &absent, None)
+            .client()
+            .is_err()
+    );
+
+    let ca = dir.path().join("ca.pem");
+    write_private(&ca, "not a certificate", 0o600);
+    let why = flags_of("https://localhost:7", &token, Some(&ca))
+        .client()
+        .expect_err("refused")
+        .to_string();
+    assert!(why.contains("--executor-lease-url"), "{why}");
+    let why = flags_of("https://localhost:7", &token, Some(&absent))
+        .client()
+        .expect_err("refused")
+        .to_string();
+    assert!(why.contains("--executor-lease-ca-file"), "{why}");
+    let why = flags_of("http://127.0.0.1:7", &token, Some(&ca))
+        .client()
+        .expect_err("refused")
+        .to_string();
+    assert!(why.contains("--executor-lease-url"), "{why}");
+}

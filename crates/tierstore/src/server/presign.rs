@@ -32,9 +32,13 @@
 //!   server's `--presign-max-expires`, and the URL is refused from the second
 //!   `X-Amz-Date + X-Amz-Expires` on, with no grace (a date more than 15 minutes ahead of the
 //!   server's clock is refused too);
-//! - a body of at most `max_object_bytes` (at most 128 MiB, the largest segment), checked on
+//! - a body of at most `max_object_bytes` (at most 5 GiB, the limit of one S3 PUT, and each key file chooses its own), checked on
 //!   `Content-Length` and on the bytes received: a request over the limit is answered 413 and
-//!   stores nothing.
+//!   stores nothing. A put is also held to `--max-request-bytes` ([`ServerConfig::max_request_bytes`],
+//!   256 MiB by default), so a key whose cap is larger needs that raised as well: the cap in force is
+//!   the smaller of the two. A declared length over it is refused before the body is read. The body
+//!   is streamed to the tier and never held whole (an S3 tier takes it as a multipart upload of
+//!   16 MiB parts, a directory tier writes it to a temporary file).
 //!
 //! # What the store guarantees
 //!
@@ -77,7 +81,7 @@ const UNSIGNED: &str = "UNSIGNED-PAYLOAD";
 const SKEW_MILLIS: u64 = 15 * 60 * 1000;
 
 /// The most bytes of a body under any presigning key: the largest segment.
-pub const MAX_OBJECT_BYTES: u64 = 128 << 20;
+pub const MAX_OBJECT_BYTES: u64 = 5 << 30;
 
 /// The most seconds of `X-Amz-Expires` that AWS accepts.
 pub const MAX_EXPIRES_SECS: u64 = 604_800;
@@ -171,6 +175,9 @@ pub fn validate_prefix(prefix: &str) -> Result<(), PresignError> {
     if prefix.is_empty() {
         return Err(PresignError::Name("empty"));
     }
+    if prefix.starts_with('/') {
+        return Err(PresignError::Name("starts with /"));
+    }
     check_name(prefix)?;
     let reserved = [JOURNAL_PREFIX, TIERING_PREFIX];
     if is_reserved(prefix) || reserved.iter().any(|name| name.starts_with(prefix)) {
@@ -208,7 +215,9 @@ impl Grant {
             return Err(PresignError::Key("max_expires_secs is from 1 to 604800"));
         }
         if !(1..=MAX_OBJECT_BYTES).contains(&self.max_object_bytes) {
-            return Err(PresignError::Key("max_object_bytes is from 1 to 134217728"));
+            return Err(PresignError::Key(
+                "max_object_bytes is from 1 to 5368709120",
+            ));
         }
         Ok(())
     }

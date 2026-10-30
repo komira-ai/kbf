@@ -125,6 +125,11 @@ pub struct Cli {
     /// The base URL of the read grant: blobs are read from `<base>/<hex>/<size>`.
     #[arg(long)]
     pub grant_url: String,
+    /// The most requests to the read grant in flight at once while the input tree is fetched, 1 to
+    /// 256. The tree is read breadth-first: each level's Directory messages together, then every
+    /// distinct file blob, each streamed to disk.
+    #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u16).range(1..=256))]
+    pub fetch_concurrency: u16,
     /// A file holding the read grant's bearer token (a trailing newline is dropped).
     #[arg(long)]
     pub grant_token_file: Option<PathBuf>,
@@ -257,7 +262,12 @@ pub async fn execute(
         fetch_message(source, &named("command", action.command_digest.as_ref())?)?;
     let input_root = named("input root", action.input_root_digest.as_ref())?;
     let root = cli.work_dir.join("in");
-    materialize(source, &input_root, &root)?;
+    materialize(
+        source,
+        &input_root,
+        &root,
+        usize::from(cli.fetch_concurrency),
+    )?;
     let fetch_ms = millis(fetching.elapsed());
 
     let stdout = cli.work_dir.join("stdout");
