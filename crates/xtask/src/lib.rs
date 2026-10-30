@@ -63,6 +63,9 @@
 //!   release asset `kbf-<service>-image-<commit>-<platform>.oci.tar`, refused unless its program
 //!   is the attested `kbf` (frontend) or the built `kbf-coordinator` or `kbf-task`, it runs as a user that is
 //!   not root with the service's entrypoint, and it is built for the platform.
+//! - `pkg-image-sbom` ([`pkg_image_sbom`]): the CycloneDX SBOM of the task image, read from its
+//!   layers with the pinned syft, as the release asset `kbf-task-image-<commit>-<platform>.cdx.json`
+//!   beside the image; with the same bytes for the same image.
 //! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf` package
 //!   carries, in the one form a deb and an rpm put in the same order, and the most a package
 //!   that carries a kbf release may weigh. `pkg-config` and `pkg-kbf-asset` take them up with
@@ -139,6 +142,7 @@ pub mod pipeline_watch;
 pub mod pkg;
 pub mod pkg_asset;
 pub mod pkg_image_asset;
+pub mod pkg_image_sbom;
 pub mod pkg_install;
 pub mod pkg_kbf_asset;
 pub mod pkg_linux;
@@ -450,6 +454,42 @@ enum Verb {
         #[arg(long)]
         verify_only: bool,
     },
+    /// The CycloneDX SBOM of the task OCI image, read from its layers (the base's packages too), as
+    /// a release asset beside the image; or, with `--verify-only`, a check that the one beside the
+    /// signed image is the image's.
+    PkgImageSbom {
+        /// The image asset, `kbf-task-image-<commit>-<platform>.oci.tar`, in the directory its
+        /// SBOM and line of `SHA256SUMS.<platform>` go in.
+        #[arg(long)]
+        image: PathBuf,
+        /// The service the image runs (only the task image has an SBOM asset).
+        #[arg(long, value_enum)]
+        service: pkg_image_asset::Image,
+        /// The platform it was built for (`linux-x86_64`, `linux-arm64`).
+        #[arg(long, value_enum)]
+        platform: package::Platform,
+        /// The commit it was built from (`$GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// The pinned syft program that reads the image.
+        #[arg(
+            long,
+            required_unless_present = "verify_only",
+            conflicts_with = "verify_only"
+        )]
+        syft: Option<PathBuf>,
+        /// The time the SBOM carries, seconds since 1970: the commit's time
+        /// (`source-date-epoch`), so the same image has the same SBOM.
+        #[arg(
+            long,
+            required_unless_present = "verify_only",
+            conflicts_with = "verify_only"
+        )]
+        source_date_epoch: Option<u64>,
+        /// Only check the SBOM beside `--image`; run nothing and write nothing.
+        #[arg(long)]
+        verify_only: bool,
+    },
     /// Install a package into a fresh container and check it never starts or enables.
     PkgInstallTest {
         /// The package's name, as the package manager knows it (`kbf`).
@@ -729,9 +769,10 @@ enum ReleaseVerb {
         /// The commit the assets were built from, a full SHA.
         #[arg(long)]
         commit: String,
-        /// Do not require the version facts of each `kbf` tarball: for the release made
-        /// before the build jobs recorded them (the previous release, read by the first
-        /// release that has them). Facts without their tarball are still refused.
+        /// Do not require the version facts of each `kbf` tarball, nor the facts and the SBOM of
+        /// the task image: for the release made before the build jobs recorded them (the
+        /// previous release, read by the first release that has them). Facts and an SBOM without
+        /// their tarball or image are still refused.
         #[arg(long)]
         without_version_facts: bool,
     },
@@ -1202,6 +1243,31 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 },
             )
         }
+        Verb::PkgImageSbom {
+            image,
+            service,
+            platform,
+            commit,
+            syft,
+            source_date_epoch,
+            verify_only,
+        } => match (&syft, source_date_epoch, verify_only) {
+            (Some(syft), Some(epoch), false) => {
+                // Under the build tree, named for this process: syft's home and cache.
+                let scratch = root
+                    .join("target")
+                    .join(format!("pkg-image-sbom-{}", std::process::id()));
+                pkg_image_sbom::make(
+                    &image,
+                    service,
+                    &commit,
+                    platform,
+                    epoch,
+                    &mut pkg_image_sbom::syft_process(syft, &scratch),
+                )
+            }
+            _ => pkg_image_sbom::verify(&image, service, &commit, platform),
+        },
         Verb::PkgMacosAsset {
             package,
             commit,

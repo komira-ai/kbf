@@ -37,14 +37,20 @@ fn refused(args: &[&str]) -> (&'static str, bool, String) {
 /// `--print-config` comes through with them.
 #[test]
 fn flags_without_a_file_are_the_flags() {
-    let Launch { cli, from_file } = resolve(words(&golden_flags())).unwrap();
+    let Launch {
+        settings,
+        from_file,
+    } = resolve(words(&golden_flags())).unwrap();
     assert!(!from_file);
-    assert_eq!(cli, Cli::try_parse_from(golden_flags()).unwrap());
+    assert_eq!(
+        settings.into_storage(),
+        Some(Cli::try_parse_from(golden_flags()).unwrap())
+    );
     let mut printing = golden_flags();
     printing.push("--print-config");
     let launch = resolve(words(&printing)).unwrap();
-    assert!(launch.cli.print_config);
     assert!(!launch.from_file);
+    assert!(launch.settings.into_storage().unwrap().print_config);
 }
 
 /// Asserts that with `--config` the settings are the file's, with the two parts of the drain from
@@ -54,7 +60,10 @@ fn a_file_makes_the_settings_and_the_drain_stays_a_flag() {
     let (_dir, path) = with_file("tierstore-launch-file");
     let launch = resolve(words(&["tierstore", "--config", &path])).unwrap();
     assert!(launch.from_file);
-    assert_eq!(launch.cli, from_text(GOLDEN, DEFAULTS).unwrap());
+    assert_eq!(
+        launch.settings.into_storage(),
+        Some(from_text(GOLDEN, DEFAULTS).unwrap())
+    );
     let given = [
         "tierstore",
         "--drain-lb-wait",
@@ -64,13 +73,17 @@ fn a_file_makes_the_settings_and_the_drain_stays_a_flag() {
         "--drain-deadline",
         "4m",
     ];
-    let launch = resolve(words(&given)).unwrap();
-    assert_eq!(launch.cli.drain_lb_wait, Duration::from_secs(2));
-    assert_eq!(launch.cli.drain_deadline, Duration::from_secs(240));
+    let cli = resolve(words(&given))
+        .unwrap()
+        .settings
+        .into_storage()
+        .unwrap();
+    assert_eq!(cli.drain_lb_wait, Duration::from_secs(2));
+    assert_eq!(cli.drain_deadline, Duration::from_secs(240));
     let mut expected = from_text(GOLDEN, DEFAULTS).unwrap();
-    expected.drain_lb_wait = launch.cli.drain_lb_wait;
-    expected.drain_deadline = launch.cli.drain_deadline;
-    assert_eq!(launch.cli, expected);
+    expected.drain_lb_wait = cli.drain_lb_wait;
+    expected.drain_deadline = cli.drain_deadline;
+    assert_eq!(cli, expected);
 }
 
 /// Asserts that a start with `--config` and a flag that describes the data path is refused, with
@@ -114,11 +127,9 @@ fn an_oci_flag_with_a_file_conflicts_and_the_file_holds_the_front() {
         );
     }
     let launch = resolve(words(&["tierstore", "--config", &path])).unwrap();
-    assert_eq!(
-        launch.cli.oci_listen,
-        Some("192.0.2.10:5000".parse().unwrap())
-    );
-    assert_eq!(launch.cli.oci_max_connections, Some(16));
+    let cli = launch.settings.into_storage().unwrap();
+    assert_eq!(cli.oci_listen, Some("192.0.2.10:5000".parse().unwrap()));
+    assert_eq!(cli.oci_max_connections, Some(16));
 }
 
 /// Asserts that a flag that has a default still conflicts with the file when it is given, even

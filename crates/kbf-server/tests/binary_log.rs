@@ -52,7 +52,9 @@ fn fresh_dir(name: &str) -> Fresh {
 fn run(base: &Path, extra: &[&str]) -> String {
     let cold = format!("file://{}", base.join("cold").display());
     let mut c = Command::new(BIN);
-    c.args(["--cold-store", &cold]).args(ANY_PORT).args(extra);
+    c.args(["--cold-store", &cold, "--cold-store-floor-bytes=1"])
+        .args(ANY_PORT)
+        .args(extra);
     if !extra.contains(&"--hot-store") {
         c.arg("--meta-dir").arg(base.join("meta"));
     }
