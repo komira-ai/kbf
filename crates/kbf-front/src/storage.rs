@@ -279,7 +279,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> StreamedPut for Written<M, O> {
 
 /// The windows `read` hands over, cut to chunks of at most [`READ_CHUNK_BYTES`] as
 /// zero-copy slices. A window that fails is the stream's last item.
-fn chunks<M: MetaLog, O: ObjectStore + 'static>(read: BlobRead<M, O>) -> ReadStream {
+pub(crate) fn chunks<M: MetaLog, O: ObjectStore + 'static>(read: BlobRead<M, O>) -> ReadStream {
     futures::stream::unfold((read, Bytes::new()), |(mut read, mut held)| async move {
         if held.is_empty() {
             match read.next().await? {
