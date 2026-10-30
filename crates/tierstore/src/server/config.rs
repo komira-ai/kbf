@@ -21,6 +21,10 @@
 //!   the reconciler and its lease.
 //! - `[cold_store]`: the cold tier, and the start-up check it may skip.
 //! - `[local_cache]`: the cache directory, its budget and marks (build node only).
+//! - `[oci]`: the read-only OCI front, left out when there is none: `listen` (needed in the
+//!   table), the certificate and key files, the key prefix and the connection limits. They
+//!   follow the rules of the `--oci-*` flags. A storage node only: a build node's file with an
+//!   `[oci]` table is refused.
 //! - `[[policy]]`: the per-prefix settings. On a build node `cache = true` keeps the keys under
 //!   the prefix in the cache; on a storage node a policy is read and checked and has no
 //!   effect, and `cache = true` is refused.
@@ -98,6 +102,13 @@ pub(super) const KEYS: &[(&str, &[&str])] = &[
     ("body-idle-timeout", &["server.body_idle_timeout"]),
     ("skip-backend-check", &["cold_store.skip_checks"]),
     ("backend-check-wait", &["server.backend_check_wait"]),
+    ("oci-listen", &["oci.listen"]),
+    // The names end in `_file`, as every key that holds a path to a secret does.
+    ("oci-tls-cert", &["oci.tls_cert_file"]),
+    ("oci-tls-key", &["oci.tls_key_file"]),
+    ("oci-prefix", &["oci.prefix"]),
+    ("oci-max-connections", &["oci.max_connections"]),
+    ("oci-connection-lifetime", &["oci.connection_lifetime"]),
 ];
 
 /// The default of `--drain-lb-wait`, which a start from a file takes when the flag is not given.
@@ -299,6 +310,8 @@ pub(super) struct File {
     pub hot_store: Option<TierTable>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cold_store: Option<TierTable>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oci: Option<OciTable>,
     /// The cache of a build node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_cache: Option<LocalCacheTable>,
@@ -378,6 +391,25 @@ pub(super) struct TierTable {
     /// `endpoint`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoints: Option<Vec<String>>,
+}
+
+/// `[oci]`: the read-only OCI front. The table is the front: `listen` is needed in it, and the
+/// other keys are refused without it, as the `--oci-*` flags are.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OciTable {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<SocketAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_cert_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_key_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_lifetime: Option<Dur>,
 }
 
 /// `[[policy]]`: what is done with the keys under a prefix.
@@ -630,6 +662,66 @@ pub(super) fn check_policies(policies: &[Policy], caching: bool) -> Result<(), C
     Ok(())
 }
 
+/// The OCI front's table checked as its flags are: the values of the `--oci-*` flags.
+struct OciFlags {
+    listen: Option<SocketAddr>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    prefix: Option<String>,
+    max_connections: Option<u32>,
+    connection_lifetime: Option<Duration>,
+}
+
+/// The flags `[oci]` stands for: none when the table is left out. A table without `listen` is
+/// refused (naming the key it has that needs it, if it has one), the certificate and the key go
+/// together, and the count is at least one.
+fn oci(table: Option<OciTable>) -> Result<OciFlags, ConfigError> {
+    let Some(table) = table else {
+        return Ok(OciFlags {
+            listen: None,
+            tls_cert: None,
+            tls_key: None,
+            prefix: None,
+            max_connections: None,
+            connection_lifetime: None,
+        });
+    };
+    if table.listen.is_none() {
+        let others = [
+            ("tls_cert_file", table.tls_cert_file.is_some()),
+            ("tls_key_file", table.tls_key_file.is_some()),
+            ("prefix", table.prefix.is_some()),
+            ("max_connections", table.max_connections.is_some()),
+            ("connection_lifetime", table.connection_lifetime.is_some()),
+        ];
+        refuse("oci", "it needs oci.listen", &others)?;
+    }
+    let listen = require("oci", "listen", table.listen)?;
+    match (&table.tls_cert_file, &table.tls_key_file) {
+        (Some(_), None) => {
+            let why = "it is needed with oci.tls_cert_file: give both, or neither";
+            return Err(invalid("oci.tls_key_file", why));
+        }
+        (None, Some(_)) => {
+            let why = "it is needed with oci.tls_key_file: give both, or neither";
+            return Err(invalid("oci.tls_cert_file", why));
+        }
+        _ => {}
+    }
+    let max_connections = match table.max_connections {
+        Some(count) => Some(within("oci", "max_connections", count, 1, u32::MAX)?),
+        None => None,
+    };
+    Ok(OciFlags {
+        listen: Some(listen),
+        tls_cert: table.tls_cert_file,
+        tls_key: table.tls_key_file,
+        prefix: table.prefix,
+        max_connections,
+        connection_lifetime: table.connection_lifetime.map(|dur| dur.0),
+    })
+}
+
 /// What a file makes: the settings of one of the two shapes.
 #[derive(Debug)]
 pub(super) enum Settings {
@@ -681,15 +773,20 @@ fn settings(file: File, per_run: PerRun) -> Result<Settings, ConfigError> {
         server,
         hot_store,
         cold_store,
+        oci,
         local_cache,
         policy,
     } = file;
     match (hot_store, cold_store, local_cache) {
         (Some(hot), Some(cold), None) => {
-            let cli = storage(server, (hot, cold), &policy, per_run)?;
+            let cli = storage(server, (hot, cold), oci, &policy, per_run)?;
             Ok(Settings::Storage(Box::new(cli)))
         }
         (None, Some(cold), Some(cache)) => {
+            if oci.is_some() {
+                let why = "is refused in the file of a build node: the OCI front is a storage node's, and this node serves only the S3 front";
+                return Err(invalid("oci", why));
+            }
             let cache = CacheSettings::new(server, (cache, cold), &policy, per_run)?;
             Ok(Settings::Cache(Box::new(cache)))
         }
@@ -708,6 +805,7 @@ fn settings(file: File, per_run: PerRun) -> Result<Settings, ConfigError> {
 fn storage(
     server: ServerTable,
     tiers: (TierTable, TierTable),
+    oci_table: Option<OciTable>,
     policy: &[Policy],
     per_run: PerRun,
 ) -> Result<Cli, ConfigError> {
@@ -750,6 +848,7 @@ fn storage(
     let critical = percent("critical", hot.critical, 95)?;
     let copy_parallel = hot.copy_parallel.unwrap_or(16);
     let copy_parallel = within("hot_store", "copy_parallel", copy_parallel, 1, u32::MAX)?;
+    let oci = oci(oci_table)?;
     let shared = front_of(server, per_run)?;
     let front = shared.front;
     Ok(Cli {
@@ -793,6 +892,12 @@ fn storage(
         body_idle_timeout: front.body_idle_timeout,
         skip_backend_check,
         backend_check_wait: shared.backend_check_wait,
+        oci_listen: oci.listen,
+        oci_tls_cert: oci.tls_cert,
+        oci_tls_key: oci.tls_key,
+        oci_prefix: oci.prefix,
+        oci_max_connections: oci.max_connections,
+        oci_connection_lifetime: oci.connection_lifetime,
     })
 }
 
