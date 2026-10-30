@@ -612,6 +612,7 @@ async fn run_confined(
             stderr: &dir.join("stderr"),
             deadline,
             network: Network::Denied,
+            unreadable: &[],
         },
     )
     .await;
