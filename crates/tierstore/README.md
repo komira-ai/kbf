@@ -21,7 +21,7 @@ registry (`server::oci`), so that podman and other registry clients pull an imag
 same tiers. It runs in one of two modes:
 
 - **HTTPS**, with `--oci-tls-cert PATH --oci-tls-key PATH`, at any address.
-- **Plain HTTP**, with neither flag, and only on a loopback address (127.0.0.0/8 or `::1`). A node's
+- **Plain HTTP**, with neither flag, and only on a loopback address (127/8 or `::1`). A node's
   own container engine pulls from the front of its own store over loopback, so the traffic never
   leaves the host. Any other address, `0.0.0.0` and `::` included, is refused at start (exit 2) and
   needs the certificate and key. One of the two flags without the other is refused too.

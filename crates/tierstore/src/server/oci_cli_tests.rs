@@ -246,7 +246,16 @@ async fn an_oci_address_in_use_is_status_1() {
 #[test]
 fn the_metrics_path_is_not_a_bucket_name() {
     let rig = Rig::new("oci-flags-bucket");
-    let (status, why) = refused(&rig.cli(&["--bucket", "metricz"]));
+    // The rig names a bucket already; a second --bucket is a clap conflict, so swap its value.
+    let args = rig.args(&[]).into_iter().map(|arg| {
+        if arg == "tier-bucket" {
+            "metricz".to_owned()
+        } else {
+            arg
+        }
+    });
+    let cli = Cli::try_parse_from(args).expect("flags");
+    let (status, why) = refused(&cli);
     assert_eq!(status, 2, "{why}");
     assert!(why.contains("probe path"), "{why}");
 }

@@ -7,7 +7,7 @@
 //!
 //! With `--oci-tls-cert` and `--oci-tls-key` the front serves HTTPS ([`OciMode::Https`]) at any
 //! address. With neither it serves plain HTTP/1.1 ([`OciMode::Http`]), and only on a loopback
-//! address (127.0.0.0/8 or `::1`): a node's own container engine pulls from the front of its own
+//! address (127/8 or `::1`): a node's own container engine pulls from the front of its own
 //! store, and that traffic never leaves the host. A plain listener on any other address is refused
 //! at start. Everything else, the routes, the limits and the drain, is the same in both modes,
 //! except that a plain connection has no handshake to time.

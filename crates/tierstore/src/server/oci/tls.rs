@@ -29,7 +29,7 @@ pub enum OciError {
     Missing(String),
     /// A plain HTTP listener is asked for on an address that is not loopback.
     #[error(
-        "--oci-listen {addr}: plain HTTP is served only on loopback (127.0.0.0/8 or ::1); a \
+        "--oci-listen {addr}: plain HTTP is served only on loopback (127/8 or ::1); a \
          non-loopback listener needs --oci-tls-cert and --oci-tls-key"
     )]
     PlainNotLoopback {
@@ -101,7 +101,7 @@ impl OciMode {
     }
 }
 
-/// Whether the front may serve plain HTTP at `listen`: only on loopback (127.0.0.0/8 or `::1`),
+/// Whether the front may serve plain HTTP at `listen`: only on loopback (127/8 or `::1`),
 /// since a plain connection can be read and changed by whoever is on its path.
 ///
 /// # Errors

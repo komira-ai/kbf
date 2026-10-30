@@ -327,7 +327,7 @@ pub struct Cli {
     /// `<--oci-prefix>blobs/sha256/<hex>`. With `--oci-tls-cert` and `--oci-tls-key` it is
     /// HTTPS, and clients dial an IP address, so the certificate must carry an IP subjectAltName
     /// for this address (any IP, if it is unspecified), which the start checks. With neither it
-    /// is plain HTTP, served only on a loopback address (127.0.0.0/8 or `::1`): a node's own
+    /// is plain HTTP, served only on a loopback address (127/8 or `::1`): a node's own
     /// engine pulls from its own store, and the traffic never leaves the host; any other address
     /// needs the certificate and key. Left out, no such listener is opened.
     #[arg(long, value_name = "ADDR")]

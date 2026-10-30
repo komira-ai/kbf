@@ -265,7 +265,7 @@ proxy in the process: no S3 credential and no hop through the S3 listener. It is
 
 | flag | what |
 |---|---|
-| `--oci-listen ADDR` | where the registry front listens. With `--oci-tls-cert` and `--oci-tls-key` it is HTTPS; with neither it is plain HTTP and ADDR must be a loopback address (127.0.0.0/8 or `::1`): anything else, `0.0.0.0` and `::` included, is refused at start (exit 2) |
+| `--oci-listen ADDR` | where the registry front listens. With `--oci-tls-cert` and `--oci-tls-key` it is HTTPS; with neither it is plain HTTP and ADDR must be a loopback address (127/8 or `::1`): anything else, `0.0.0.0` and `::` included, is refused at start (exit 2) |
 | `--oci-tls-cert PATH`, `--oci-tls-key PATH` | both or neither (one without the other is refused at start, exit 2). The certificate chain (leaf first) and the private key, PEM. Clients dial an IP address, so the leaf must carry an IP subjectAltName for `--oci-listen` (any IP subjectAltName, if the address is `0.0.0.0` or `::`); a certificate without one, one that is expired or not yet valid, a key file any user can read (the "other" mode bits; a group may), or an unreadable file, is refused at start. The files are read once: a new certificate takes a restart, so renew it before it expires |
 | `--oci-prefix PREFIX` | the key prefix, ending in `/`, `oci/` if not given. A prefix inside `_journal/` or `_tiering/`, or one that is not plain path segments, is refused at start (exit 2) |
 | `--oci-max-connections N` | connections open at once, 256 if not given; the others wait in the kernel's backlog |
