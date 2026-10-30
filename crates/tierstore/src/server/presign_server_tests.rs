@@ -631,3 +631,22 @@ async fn the_conditions_and_the_calls_a_presigned_put_does_not_do() {
     }
     assert_eq!(f.rig.get("cas/b/plain", None).await.body, "1");
 }
+
+/// Asserts that the cap of a key holds when `--max-request-bytes` is far larger: a presigned PUT
+/// that declares more than the cap of its key is 413 before any byte of the body is read (the
+/// body here fails if it is read, so a 400 would mean it was), nothing is stored, and a body of
+/// the cap itself is stored.
+#[tokio::test(start_paused = true)]
+async fn the_cap_of_a_key_holds_when_the_request_limit_is_larger() {
+    let f = fixture_with(|config| config.max_request_bytes = 1 << 30).await;
+    let url = put_url("cas/b/big", 300);
+    let (parts, _) = request_for("PUT", &url, &[("content-length", "17")], b"").into_parts();
+    let failing = Scripted::new(vec![Step::Fail]);
+    let reply = f.rig.send_raw(Request::from_parts(parts, failing)).await;
+    assert_eq!(refused(&reply), (413, "EntityTooLarge".to_owned()));
+    assert!(!f.holds("cas/b/big").await);
+    assert_eq!(
+        f.put(&put_url("cas/b/fits", 300), &[1_u8; 16]).await.status,
+        StatusCode::OK
+    );
+}

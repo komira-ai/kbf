@@ -46,6 +46,13 @@ async fn an_out_of_memory_run_is_rerun_with_more_memory() {
     assert_eq!(runs.len(), 2, "no rerun: {runs:?}");
     rig.host_finishes(&runs[1].run, Outcome::Succeeded, Some(0));
     assert_eq!(exit_code(&rig.until_done(&caller, 4).await), 0);
+    let counted = rig.counted();
+    for row in [
+        "kbf_executor_runs_total{outcome=\"out_of_memory\"} 1\n",
+        "kbf_executor_runs_total{outcome=\"ran\"} 1\n",
+    ] {
+        assert!(counted.contains(row), "{row} in {counted}");
+    }
 }
 
 /// Catches a run that passed its wall time being rerun or called the farm's fault: the

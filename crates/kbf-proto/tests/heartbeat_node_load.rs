@@ -59,6 +59,7 @@ fn new(node_load: Option<worker::NodeLoad>) -> worker::Heartbeat {
         pack_reads: old.pack_reads,
         pack_writes: old.pack_writes,
         node_load,
+        input_cache: None,
     }
 }
 

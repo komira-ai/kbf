@@ -977,7 +977,8 @@ fn today_s_worker_proto_removes_and_changes_nothing_of_the_earlier_file() {
 }
 
 #[test]
-fn the_only_additions_to_the_worker_proto_are_the_job_fields_and_the_node_and_placement_load() {
+fn the_only_additions_to_the_worker_proto_are_the_job_fields_and_the_node_and_placement_load_and_cache_counts()
+ {
     let mut want: Vec<String> = [
         "enum FencePolicy",
         "enum Isolation",
@@ -987,6 +988,10 @@ fn the_only_additions_to_the_worker_proto_are_the_job_fields_and_the_node_and_pl
         "field CgroupUsage.peak_window_millicores = 17",
         "field Heartbeat.node_load = 6",
         "message NodeLoad",
+        // The input cache counts a heartbeat carries.
+        "field Heartbeat.input_cache = 7",
+        "message InputCacheCounts",
+        "message TreeCounts",
         // Whether the farm places by the load the nodes measure.
         "field Welcome.placement_load = 6",
         "field Result.job_outcome = 7",

@@ -350,3 +350,64 @@ async fn a_corrupt_blob_in_a_tree_fails_the_lease_and_names_no_tree() {
     assert_eq!(result.exit_code, 0, "{result:?}");
     assert_eq!(fake.runtime.tree_stats().expect("a store").trees, 1);
 }
+
+/// Catches counts the heartbeat reads that do not follow the cache: a runtime with no
+/// cache reporting counts (zeros would read as "a cache that did nothing"), the first
+/// lease's two inputs not counted as two fills with their bytes, the second lease's not
+/// counted as two hits with theirs (and as fills again), and the tree store's own builds
+/// and hits missing from the same report.
+#[tokio::test]
+async fn the_runtime_reports_the_fills_then_the_hits_of_its_leases() {
+    use kbf_daemon::Runtime as _;
+    let plain = Fake::new("counts-plain");
+    assert_eq!(plain.runtime.input_cache(), None, "no cache, no counts");
+
+    let fake = treed("counts");
+    let mut spec = Spec::new(&image(), "unused");
+    spec.inputs = toolchain_inputs(300);
+    spec.outputs = vec!["seen".to_owned()];
+    let steps = ["copy", "$UPPER/seen", "$ROOT/toolchain/d1/f1"];
+    let key_bytes: u64 = spec
+        .inputs
+        .iter()
+        .map(|(_, bytes, _)| bytes.len() as u64)
+        .sum();
+    assert_eq!(fake.runtime.input_cache().map(|c| c.fills), Some(0));
+
+    fake.run(1, &spec, &steps).await.expect("first");
+    let first = fake.runtime.input_cache().expect("counts");
+    assert_eq!(
+        (first.fills, first.fill_bytes),
+        (301, key_bytes),
+        "{first:?}"
+    );
+    assert_eq!((first.hits, first.hit_bytes), (0, 0), "{first:?}");
+    assert_eq!(
+        first.trees.map(|t| (t.builds, t.hits)),
+        Some((1, 0)),
+        "{first:?}"
+    );
+
+    fake.run(2, &spec, &steps).await.expect("second");
+    let second = fake.runtime.input_cache().expect("counts");
+    assert_eq!(
+        (second.fills, second.fill_bytes),
+        (301, key_bytes),
+        "{second:?}"
+    );
+    assert_eq!(
+        second.hits, 1,
+        "only the small file is the lease's own: {second:?}"
+    );
+    assert_eq!(second.hit_bytes, 5, "{second:?}");
+    assert_eq!(
+        second.trees.map(|t| (t.builds, t.hits)),
+        Some((1, 1)),
+        "{second:?}"
+    );
+    assert_eq!(
+        (second.evictions, second.evicted_bytes),
+        (0, 0),
+        "{second:?}"
+    );
+}
