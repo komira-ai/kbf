@@ -134,6 +134,10 @@ invocation-memory = 268435456
 # job-grant-secret-file = "PATH"
 # Serves the inputs of an action to the task that runs it, over HTTPS at this address: `GET /<hex>/<size>` with `Authorization: Bearer <read grant>`, and nothing else (any other path is 404 and any other method 405). A read grant is the token a run is given; until it expires it reads the Action it was issued for, its Command and its input tree, and no other blob. The TLS is the server's alone and no client certificate is asked for. The task dials an IP address, so give the address the jobs dial, and a `--job-tls-cert` that names it as an IP subjectAltName. Needs `--job-tls-cert`, `--job-tls-key` and `--job-grant-secret-file`. Left out, no such listener is opened
 # job-listen = "ADDR"
+# The most bytes of one blob the listener serves, at least 1: a blob of more is refused 413 `too_large` before anything is read. A blob of more than 67108864 bytes is streamed from the store through SHA-256 and never held whole; one whose bytes are not its digest's ends its response early, and is counted. Needs `--job-listen`
+job-max-blob-bytes = 536870912
+# The blob reads this listener has open at once, at least 1: a streamed blob holds its place until its response ends, and a request over the bound waits for one to end. Needs `--job-listen`
+job-reads-in-flight = 32
 # The certificate chain (PEM) of `--job-listen`, issued by the farm CA that the jobs trust. It must carry an IP subjectAltName for each address a job dials the frontend at: the start is refused if it has none, or if `--job-listen` is on one address and the certificate does not name it, since a client that dials an IP address accepts only a certificate that names it. Read again every `--tls-reload-interval-secs`, as the other listeners' are; the names are checked at start only
 # job-tls-cert = "PATH"
 # The private key (PEM) of `--job-tls-cert`
