@@ -194,14 +194,14 @@ impl Inner {
         size: u64,
         between: impl FnOnce(),
     ) -> Option<Reserved> {
+        let held = locked(&self.index).bytes();
+        between();
         let before = self.reserved.fetch_add(size, Ordering::SeqCst);
         // A refused reservation is dropped, which gives the bytes back.
         let reservation = Reserved {
             inner: Arc::clone(self),
             size,
         };
-        between();
-        let held = locked(&self.index).bytes();
         let critical = percent_of(self.config.budget, self.config.critical);
         let total = held.saturating_add(before).saturating_add(size);
         (size <= self.config.budget && total <= critical).then_some(reservation)
