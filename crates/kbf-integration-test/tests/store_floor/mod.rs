@@ -7,10 +7,12 @@
 //! testing the floor passes `--cold-store-floor-bytes` (1 is enough), or opens its `FsStore`
 //! with `Floor::Bytes`; the rule is per test file (under a `tests/` directory, or named
 //! `*tests.rs`) in any crate: a file whose code names `--cold-store` and a `file://{..}`
-//! URI built from a directory must also name `cold-store-floor-bytes` or `Floor::Bytes`.
+//! URI built from a directory must name `cold-store-floor-bytes` or `Floor::Bytes` at least as often as it has
+//! `--cold-store=file://{..}` rigs (a rig that passes its URI as a separate `"--cold-store"`
+//! argument counts once per file).
 //!
 //! What it catches: a new test rig that builds a cold store directory and never sets a
-//! floor. What it misses: a floor set in one rig of a file and not another, harness code
+//! floor. What it misses: a floor mention that is not on a rig while another rig lacks one, harness code
 //! outside test files (`kbf-integration-test/src`, `kbf-harness/src`, which build the
 //! cells' and units' flags), and a file that builds its flags some other way (`--config`,
 //! a variable URI scheme).
@@ -65,13 +67,23 @@ fn code_of(text: &str) -> String {
         .join("\n")
 }
 
-/// Whether the file builds a cold store directory without naming the floor flag.
-fn lacks_floor(text: &str) -> bool {
+/// The `--cold-store=file://{..}` rigs of a file, and its floor mentions. A file that
+/// builds its flags as a separate `"--cold-store"` argument counts as one rig.
+fn rigs_and_floors(text: &str) -> (usize, usize) {
     let code = code_of(text);
-    code.contains("--cold-store")
-        && code.contains("file://{")
-        && !code.contains("cold-store-floor-bytes")
-        && !code.contains("Floor::Bytes")
+    if !code.contains("file://{") || !code.contains("--cold-store") {
+        return (0, 0);
+    }
+    let inline = code.matches("--cold-store=file://{").count();
+    let floors =
+        code.matches("cold-store-floor-bytes").count() + code.matches("Floor::Bytes").count();
+    (inline.max(1), floors)
+}
+
+/// Whether the file has more cold store rigs than floor mentions.
+fn lacks_floor(text: &str) -> bool {
+    let (rigs, floors) = rigs_and_floors(text);
+    floors < rigs
 }
 
 /// What is wrong with the files, one line each.
