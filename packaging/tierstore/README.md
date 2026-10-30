@@ -445,9 +445,9 @@ fill included, so the byte hit ratio is the first over the sum of the two), `fil
 slot taken), `fill_failures_total{reason}` (`hash_mismatch`, `upstream_error`,
 `short_body`, `local_io`, `changed`, `aborted`), `evictions_total{reason}` (`budget`, `floor`), `pinned_skips_total`,
 `discarded_at_start_total`, and the gauges `bytes`, `objects`, `fs_free_bytes` and `staging_files`.
-On a storage node it says there is no cache. The same path on a storage node with the OCI front
-has the OCI counters (see Counters); a node with neither has a line for each that says it is not
-there.
+A storage node has the proxy's counters instead, the same path on a node with the OCI front also
+has the OCI counters (see Counters), and a process with none of the three has one line that says
+so; the proxy's series are in "Metrics" in `crates/tierstore/README.md`.
 
 ### The registry front
 

@@ -150,13 +150,16 @@
 //! Without [`ServerConfig::proxy`] it is 200 and says the usage is not watched. A bucket cannot
 //! be called `usagez` either.
 //!
-//! `GET /metricz` is 200 with the counters of the OCI read front ([`oci`]) and of the local cache
-//! ([`local_cache`]) in the Prometheus text format, each block or else a line that says it is
-//! not there; it is not signed either, and a bucket cannot be called `metricz`. A server that is
-//! the front of a local cache is a read cache: it answers GET and HEAD and refuses every other
-//! method, copies and multipart calls included, with 403 `AccessDenied`, before the role of the
-//! key is looked at. With [`ServerConfig::cache_writes`] it takes the writes its keys may do (see
-//! [`local_cache`]): the roles apply as on any front.
+//! `GET /metricz` is 200 with the counters of every source the process has, one block after the
+//! other, in the Prometheus text format: the proxy's reads ([`Proxy::metrics`]: hits, misses,
+//! errors and bytes of each tier, the copies cold reads made into the hot tier), the OCI read
+//! front ([`oci`]) and the local cache ([`local_cache`]). A line says so when the process has
+//! none of them. It is not signed either, and a bucket cannot be called `metricz`. A cache node
+//! and a storage node are different processes; the README of the crate lists every name and
+//! label. A server that is the front of a local cache is a read cache: it answers GET and HEAD
+//! and refuses every other method, copies and multipart calls included, with 403
+//! `AccessDenied`, before the role of the key is looked at. With [`ServerConfig::cache_writes`]
+//! it takes the writes its keys may do (see [`local_cache`]): the roles apply as on any front.
 //!
 //! # Drain
 //!
@@ -213,6 +216,10 @@ mod gc_server_tests;
 mod gc_tests;
 #[cfg(test)]
 mod idle_tests;
+#[cfg(test)]
+mod metrics_race_tests;
+#[cfg(test)]
+mod metrics_tests;
 #[cfg(test)]
 mod ops_tests;
 #[cfg(test)]
@@ -369,7 +376,7 @@ pub struct ServerConfig {
     /// the pass interval of the reconciler, so that a takeover of the lease does not show.
     pub usage_stale_after: Duration,
     /// The counters of the OCI read front, which `GET /metricz` shows; none by default, and then
-    /// `/metricz` says the front is not enabled. The binary sets them when it runs the front.
+    /// `/metricz` has no block of it. The binary sets them when it runs the front.
     pub oci_metrics: Option<Arc<oci::OciMetrics>>,
     /// The time, for the age of a signature and of the usage object.
     pub clock: Arc<dyn Clock>,
@@ -806,19 +813,26 @@ impl Server {
         Some(answer(status, &headers, Bytes::from(text)))
     }
 
-    /// The text of `/metricz`: the counters of the OCI front and those of the local cache, each
-    /// block or else a line that says it is not there.
+    /// The text of `/metricz`: the block of every source of counters the process has (the
+    /// proxy's, the OCI front's, the local cache's), one after the other, each ending in a
+    /// newline, or one line that names them all when there is none. Every block that exists
+    /// renders, never one of them; a storage node has the proxy's, a cache node the cache's, and
+    /// either may have the OCI front's.
     fn metrics_probe(&self) -> String {
-        let mut text = match &self.config.oci_metrics {
-            Some(metrics) => metrics.render(),
-            None => "# the OCI read front is not enabled\n".to_owned(),
-        };
-        if !text.ends_with('\n') {
-            text.push('\n');
+        let blocks = [
+            self.config.proxy.as_ref().map(|proxy| proxy.metrics()),
+            self.config.oci_metrics.as_ref().map(|oci| oci.render()),
+            self.config.cache.as_ref().map(|cache| cache.metrics()),
+        ];
+        let mut text = String::new();
+        for block in blocks.into_iter().flatten() {
+            text.push_str(&block);
+            if !block.ends_with('\n') {
+                text.push('\n');
+            }
         }
-        match &self.config.cache {
-            Some(cache) => text.push_str(&cache.metrics()),
-            None => text.push_str("# this tierstore has no local cache\n"),
+        if text.is_empty() {
+            text = "# this server has no proxy, no OCI read front and no local cache\n".to_owned();
         }
         text
     }

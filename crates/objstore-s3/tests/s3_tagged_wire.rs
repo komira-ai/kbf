@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use kbf_objstore::s3::{Credentials, ObjectHead, S3Config, S3Store};
-use kbf_objstore::{Capabilities, KeyPrefix, ObjectKey, ObjectStoreError, PageSize};
+use objstore_s3::s3::{Credentials, ObjectHead, S3Config, S3Store};
+use objstore_s3::{Capabilities, KeyPrefix, ObjectKey, ObjectStoreError, PageSize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 

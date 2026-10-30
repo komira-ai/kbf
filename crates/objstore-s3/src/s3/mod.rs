@@ -831,14 +831,11 @@ mod tests {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 1024];
                     while let Ok(n) = sock.read(&mut buf).await {
-                        if n == 0
-                            || sock
-                                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
-                                .await
-                                .is_err()
-                        {
+                        if n == 0 {
                             break;
                         }
+                        let answer = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+                        let _ = sock.write_all(answer).await;
                     }
                 });
             }
