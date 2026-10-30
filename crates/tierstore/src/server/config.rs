@@ -6,12 +6,14 @@
 //! defaults (the tests check that a file that gives the least a start needs and the flags that
 //! give the least make equal settings).
 //!
-//! There are two shapes, told apart by the tables the file has:
+//! There are three shapes, told apart by the tables the file has:
 //!
 //! - a storage node: `[hot_store]` and `[cold_store]`, as the flags are;
 //! - a build node: `[local_cache]` and `[cold_store]` and no `[hot_store]`, a read cache in
 //!   front of one upstream (see [`config_cache`](super::config_cache) and
-//!   [`local_cache`](super::local_cache)). It has no flag form.
+//!   [`local_cache`](super::local_cache)). It has no flag form;
+//! - a pass-through front: `[cold_store]` alone, every call sent straight to it (see
+//!   [`config_cold`](super::config_cold)). It has no flag form either.
 //!
 //! The tables:
 //!
@@ -46,6 +48,7 @@ use super::cli::{
     DEFAULT_REGION, SkippedCheck, parse_duration, parse_skip,
 };
 use super::config_cache::{CacheSettings, LocalCacheTable};
+use super::config_cold::ColdSettings;
 use super::front::FrontSettings;
 use crate::journal::{JOURNAL_PREFIX, TIERING_PREFIX};
 
@@ -633,6 +636,8 @@ pub(super) enum Settings {
     Storage(Box<Cli>),
     /// A build node: a read cache, which has no flags.
     Cache(Box<CacheSettings>),
+    /// A pass-through front over the cold store alone, which has no flags.
+    Cold(Box<ColdSettings>),
 }
 
 /// Refuses the keys only `[hot_store]` has, in `cold`.
@@ -658,15 +663,23 @@ impl Settings {
     pub(super) fn into_storage(self) -> Option<Cli> {
         match self {
             Settings::Storage(cli) => Some(*cli),
-            Settings::Cache(_) => None,
+            Settings::Cache(_) | Settings::Cold(_) => None,
         }
     }
 
     /// The settings of a build node, if that is what these are.
     pub(super) fn into_cache(self) -> Option<CacheSettings> {
         match self {
-            Settings::Storage(_) => None,
+            Settings::Storage(_) | Settings::Cold(_) => None,
             Settings::Cache(cache) => Some(*cache),
+        }
+    }
+
+    /// The settings of a pass-through front, if that is what these are.
+    pub(super) fn into_cold(self) -> Option<ColdSettings> {
+        match self {
+            Settings::Storage(_) | Settings::Cache(_) => None,
+            Settings::Cold(cold) => Some(*cold),
         }
     }
 }
@@ -689,12 +702,16 @@ fn settings(file: File, per_run: PerRun) -> Result<Settings, ConfigError> {
             let cache = CacheSettings::new(server, (cache, cold), &policy, per_run)?;
             Ok(Settings::Cache(Box::new(cache)))
         }
+        (None, Some(cold), None) => {
+            let cold = ColdSettings::new(server, cold, &policy, per_run)?;
+            Ok(Settings::Cold(Box::new(cold)))
+        }
         (Some(_), Some(_), Some(_)) => {
             let why = "is refused with [hot_store]: the hot store is already local disk, and a disk cache in front of it would cache a disk with a disk";
             Err(invalid("local_cache", why))
         }
         _ => {
-            let why = "the file needs both [hot_store] and [cold_store] (the storage-node shape), or [local_cache] and [cold_store] without [hot_store] (the build-node shape)";
+            let why = "the file needs both [hot_store] and [cold_store] (the storage-node shape), [local_cache] and [cold_store] without [hot_store] (the build-node shape), or [cold_store] alone (the pass-through shape)";
             Err(invalid("hot_store, cold_store, local_cache", why))
         }
     }
@@ -872,6 +889,10 @@ pub(super) fn from_text(text: &str, per_run: PerRun) -> Result<Cli, ConfigError>
         Settings::Cache(_) => {
             let why = "is the file of a build node, which has no flag form";
             Err(invalid("local_cache", why))
+        }
+        Settings::Cold(_) => {
+            let why = "alone is the file of a pass-through front, which has no flag form";
+            Err(invalid("cold_store", why))
         }
     }
 }

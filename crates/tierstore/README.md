@@ -25,6 +25,15 @@ floor; every other call is refused 403. It has no journal and no lease. The keys
 the rules are in "A build node" in `packaging/tierstore/README.md`; `GET /metricz` shows its
 counters.
 
+## A cold store alone: a pass-through front
+
+A file with `[server]` and `[cold_store]` and no other tier runs the same binary as a front that
+sends every call (reads, listings, create-only puts, multipart uploads, deletes, presigned puts,
+every key role) straight to the cold store, with no journal, no lease and no reconciler
+(`src/server/cold_cli.rs`, the file's tables in `src/server/config_cold.rs`). Create-only is the
+cold store's: the start asks it the whole self-test, and `skip_checks` is refused. See "A cold store
+alone" in `packaging/tierstore/README.md`.
+
 ## Roles of a key
 
 | role | flag | may do |

@@ -169,8 +169,10 @@
 mod auth;
 mod cache_cli;
 pub mod cli;
+mod cold_cli;
 mod config;
 mod config_cache;
+mod config_cold;
 mod config_print;
 mod front;
 pub mod gc;
@@ -194,9 +196,13 @@ mod body_stall_tests;
 #[cfg(test)]
 mod cache_cli_tests;
 #[cfg(test)]
+mod cold_cli_tests;
+#[cfg(test)]
 mod completion_tests;
 #[cfg(test)]
 mod config_cache_tests;
+#[cfg(test)]
+mod config_cold_tests;
 #[cfg(test)]
 mod config_testing;
 #[cfg(test)]

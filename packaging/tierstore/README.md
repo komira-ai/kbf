@@ -234,10 +234,12 @@ the key. A number above 9223372036854775807 (the largest TOML integer) cannot go
 is accepted, and `--print-config` refuses it with exit 2. A `--print-config` that cannot write its output
 (a closed pipe, a full disk) exits 1; a refusal of the file or the flags exits 2.
 
-A file has one of two shapes, told apart by its tables: a storage node (`[server]`, `[hot_store]`
-and `[cold_store]`, as the flags are, and an optional `[[policy]]`) and a build node (`[server]`,
+A file has one of three shapes, told apart by its tables: a storage node (`[server]`, `[hot_store]`
+and `[cold_store]`, as the flags are, and an optional `[[policy]]`), a build node (`[server]`,
 `[local_cache]` and `[cold_store]` with no `[hot_store]`, and `[[policy]]`), which is a read cache
-and has no flag form (see "A build node" below). A file for a storage node:
+and has no flag form (see "A build node" below), and a pass-through front (`[server]` and
+`[cold_store]` alone, see "A cold store alone" below), which has none either. A file for a storage
+node:
 
 ```toml
 [server]
@@ -421,6 +423,39 @@ slot taken), `fill_failures_total{reason}` (`hash_mismatch`, `upstream_error`,
 `discarded_at_start_total`, and the gauges `bytes`, `objects`, `fs_free_bytes` and `staging_files`.
 On a storage node it says there is no cache.
 
+### A cold store alone
+
+A file with `[server]` and `[cold_store]` and no other tier (and no `[local_cache]`) runs a front
+that sends every call straight to the cold store: reads, listings, create-only puts, multipart
+uploads, deletes, presigned puts, and the calls of the read-only, presigning, GC and scoped keys.
+It has no journal, no lease and no reconciler, and nothing is kept on the machine. `/readyz` is 200
+until the drain begins, `/usagez` says the usage is not watched, and `/metricz` says there is no
+cache. It has no flag form.
+
+```toml
+[server]
+listen          = "192.0.2.10:9300"
+proxy_id        = "tierstore-pass-1"
+bucket          = "tierstore"
+access_key_file = "/etc/tierstore/access.key"
+
+[cold_store]
+kind             = "s3"
+bucket           = "tierstore"
+endpoint         = "http://192.0.2.20:9000"
+credentials_file = "/etc/tierstore/cold.credentials"
+```
+
+Create-only is a guarantee the clients rely on, and here only the cold store can keep it: a put
+carries `If-None-Match: *`, and so does the completion of a multipart upload. The process asks the
+cold store the whole start-up self-test before it binds the address, the multipart-completion
+check included, and a store that overwrites on either is not served over (exit status 3). Because
+that check is the one thing a storage node may skip, `skip_checks` is refused in this shape (exit
+status 2): a store that cannot pass it cannot be put behind this front. Also refused: `endpoints`
+(there is one cold store), the keys only `[hot_store]` has, and a `[[policy]]` with `cache = true`
+(a `[[policy]]` is otherwise read and checked, and has no effect). `backend_check_wait`
+and `s3_request_timeout` in `[server]` apply as on a storage node.
+
 ### Which key each flag has
 
 Every flag that describes the data path has the key or keys below, and no other has one. A flag
@@ -485,9 +520,9 @@ Each of these exits with status 2 and names the file and the key:
 - a key that holds a secret: keys and credentials are paths of files, whose names end in `_file`
   or `_files`; `secret_access_key`, `access_key_id`, `password`, a name with `token` in it and the
   like are refused wherever they are;
-- `[local_cache]` along with `[hot_store]`, and a file with neither shape's tables (it needs both
-  `[hot_store]` and `[cold_store]`, or `[local_cache]` and `[cold_store]`); the refusals of a build
-  node are with its table above;
+- `[local_cache]` along with `[hot_store]`, and a file with none of the shapes' tables (it needs both
+  `[hot_store]` and `[cold_store]`, or `[local_cache]` and `[cold_store]`, or `[cold_store]` alone);
+  the refusals of a build node are with its table above, those of a cold store alone below it;
 - a key of a tier that its `kind` does not take (`path` for a `memory` tier, `endpoint` for a `dir`
   tier), a `dir` tier without `path`, an `s3` tier without `bucket`, `endpoint` or
   `credentials_file`, and a key only one tier has in the other (`budget` and the reconciler's keys
