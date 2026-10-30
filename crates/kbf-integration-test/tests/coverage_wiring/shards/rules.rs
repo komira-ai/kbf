@@ -9,8 +9,13 @@ const LEGACY_ARGS: &str = "--workspace --features tierstore/s3";
 const JS_ARGS: &str = "-p kbf-server --features kbf-server/farm-core-js";
 
 fn entry(core: &str, part: usize, parts: usize, args: &str) -> String {
+    let gb = if core == "js" { 55 } else { 75 };
+    entry_with_disk(core, part, parts, args, &gb.to_string())
+}
+
+fn entry_with_disk(core: &str, part: usize, parts: usize, args: &str, gb: &str) -> String {
     format!(
-        "          - core: {core}\n            part: {part}\n            parts: {parts}\n            args: {args}\n"
+        "          - core: {core}\n            part: {part}\n            parts: {parts}\n            min_free_gb: {gb}\n            args: {args}\n"
     )
 }
 
@@ -27,18 +32,20 @@ fn good_matrix() -> String {
     ))
 }
 
-const SHARD_ENV: &str = "    env:\n      PART: ${{ matrix.part }}\n      PARTS: ${{ matrix.parts }}\n      ARGS: ${{ matrix.args }}\n      LLVM_PROFILE_FILE_NAME: kbf-${{ matrix.core }}-${{ matrix.part }}-%p-%4m.profraw\n";
-const SHARD_STEPS: &str = "    steps:\n      - run: cargo llvm-cov nextest $ARGS --locked --branch --no-report --no-fail-fast --profile pr \"--partition=count:$PART/$PARTS\"\n      - if: ${{ always() }}\n        run: df -h /\n      - uses: actions/upload-artifact@abc # v7\n        with:\n          name: profraw-${{ matrix.core }}-${{ matrix.part }}\n          path: target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-*.profraw\n          if-no-files-found: error\n          overwrite: true\n";
+const SHARD_ENV: &str = "    env:\n      PART: ${{ matrix.part }}\n      PARTS: ${{ matrix.parts }}\n      ARGS: ${{ matrix.args }}\n      MIN_FREE_GB: ${{ matrix.min_free_gb }}\n      LLVM_PROFILE_FILE_NAME: kbf-${{ matrix.core }}-${{ matrix.part }}-%p-%4m.profraw\n";
+const SHARD_STEPS: &str = "    steps:\n      - run: cargo xtask runner-disk --path . --min-free-gb \"$MIN_FREE_GB\"\n      - run: cargo llvm-cov nextest $ARGS --locked --branch --no-report --no-fail-fast --profile pr \"--partition=count:$PART/$PARTS\"\n      - if: ${{ always() }}\n        run: df -h /\n      - uses: actions/upload-artifact@abc # v7\n        with:\n          name: profraw-${{ matrix.core }}-${{ matrix.part }}\n          path: target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-*.profraw\n          if-no-files-found: error\n          overwrite: true\n";
 
 fn shard_job(matrix: &str) -> String {
-    format!("  test-shard:\n    runs-on: ubuntu-latest\n{matrix}{SHARD_ENV}{SHARD_STEPS}")
+    format!(
+        "  test-shard:\n    name: test-shard (${{{{ matrix.core }}}}-${{{{ matrix.part }}}}-of-${{{{ matrix.parts }}}})\n    runs-on: ubuntu-latest\n{matrix}{SHARD_ENV}{SHARD_STEPS}"
+    )
 }
 
 const GATE_HEAD: &str = "  test:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      actions: read\n    steps:\n";
 const BUILD_LEGACY: &str = "      - run: cargo llvm-cov nextest --workspace --features tierstore/s3 --locked --branch --no-report --profile pr -E 'none()' --no-tests=pass\n";
 const BUILD_JS: &str = "      - run: cargo llvm-cov nextest -p kbf-server --features kbf-server/farm-core-js --locked --branch --no-report --profile pr -E 'none()' --no-tests=pass\n";
 const CLEAN: &str = "      - run: cargo llvm-cov clean --profraw-only\n";
-const WAIT: &str = "      - run: cargo xtask wait-artifacts --repo r --run-id 1 --job-prefix test-shard --artifact profraw-legacy-1 --artifact profraw-legacy-2 --artifact profraw-js-1\n";
+const WAIT: &str = "      - run: cargo xtask wait-artifacts --repo r --run-id 1 --job-prefix test-shard --artifact \"profraw-legacy-1=(legacy-1-of-2)\" --artifact \"profraw-legacy-2=(legacy-2-of-2)\" --artifact \"profraw-js-1=(js-1-of-1)\"\n";
 const DOWNLOAD: &str = "      - uses: actions/download-artifact@abc # v8\n        with:\n          pattern: profraw-*\n          path: target/llvm-cov-target\n          merge-multiple: true\n";
 const COMPLETE: &str = "      - run: cargo xtask profiles-complete --dir target/llvm-cov-target --prefix kbf-legacy-1- --prefix kbf-legacy-2- --prefix kbf-js-1-\n";
 const REPORT: &str = "      - run: cargo llvm-cov report --branch --lcov\n";
@@ -281,6 +288,61 @@ fn each_drift_of_a_shard_is_refused() {
             changed("          if-no-files-found: error\n", ""),
             "the upload step lacks `if-no-files-found: error`, so a shard with no profile would pass",
         ),
+        // A shard with an empty part passes under `--no-tests=pass`.
+        (
+            changed(" --no-fail-fast", " --no-fail-fast --no-tests=pass"),
+            "the test step of `test-shard` passes when no test runs (`--no-tests`)",
+        ),
+        (
+            changed(" --no-fail-fast", " --no-tests=pass --no-fail-fast"),
+            "the test step of `test-shard` passes when no test runs (`--no-tests`)",
+        ),
+        (
+            changed(" --no-fail-fast", " --no-fail-fast --no-tests pass"),
+            "the test step of `test-shard` passes when no test runs (`--no-tests`)",
+        ),
+        (
+            changed(" --no-fail-fast", " --no-fail-fast --no-tests=warn"),
+            "the test step of `test-shard` passes when no test runs (`--no-tests`)",
+        ),
+        // The job's name is what `test` finds it by.
+        (
+            changed(
+                "    name: test-shard (${{ matrix.core }}-${{ matrix.part }}-of-${{ matrix.parts }})\n",
+                "",
+            ),
+            "the job `test-shard` is not named `test-shard (${{ matrix.core }}-${{ matrix.part }}-of-${{ matrix.parts }})`",
+        ),
+        (
+            changed(
+                "(${{ matrix.core }}-${{ matrix.part }}-of-${{ matrix.parts }})\n    runs-on",
+                "(${{ matrix.core }} ${{ matrix.part }}/${{ matrix.parts }})\n    runs-on",
+            ),
+            "the job `test-shard` is not named",
+        ),
+        // The early disk check uses the matrix's number.
+        (
+            changed("      MIN_FREE_GB: ${{ matrix.min_free_gb }}\n", ""),
+            "the job `test-shard` does not set `MIN_FREE_GB: ${{ matrix.min_free_gb }}`",
+        ),
+        (
+            changed(
+                "      - run: cargo xtask runner-disk --path . --min-free-gb \"$MIN_FREE_GB\"\n",
+                "",
+            ),
+            "the job `test-shard` has no unconditional step `xtask runner-disk",
+        ),
+        (
+            changed("--min-free-gb \"$MIN_FREE_GB\"", "--min-free-gb 10"),
+            "the job `test-shard` has no unconditional step `xtask runner-disk",
+        ),
+        (
+            changed(
+                "      - run: cargo xtask runner-disk",
+                "      - if: ${{ github.event_name == 'push' }}\n        run: cargo xtask runner-disk",
+            ),
+            "the job `test-shard` has no unconditional step `xtask runner-disk",
+        ),
     ];
     for (w, want) in cases {
         let got = shard_wiring(&w);
@@ -289,6 +351,69 @@ fn each_drift_of_a_shard_is_refused() {
             "want `{want}`, got {got:?}:\n{w}"
         );
     }
+}
+
+#[test]
+fn a_shard_with_too_little_disk_is_refused() {
+    // Catches: an early disk check set below what the core's build and tests measured (legacy
+    // about 67 GB, js about 50), which passes a runner that then fails tests for want of room;
+    // a number that is missing or is not one.
+    let l2 = entry("legacy", 2, 2, LEGACY_ARGS);
+    let js = entry("js", 1, 1, JS_ARGS);
+    let with = |l1: String, js: String| {
+        workflow(
+            &shard_job(&matrix(&format!("{l1}{l2}{js}"))),
+            &gate_job(&good_steps()),
+        )
+    };
+    let l1 = |gb: &str| entry_with_disk("legacy", 1, 2, LEGACY_ARGS, gb);
+    let js_gb = |gb: &str| entry_with_disk("js", 1, 1, JS_ARGS, gb);
+    let cases = [
+        (
+            with(l1("74"), js.clone()),
+            "a `legacy` entry says `min_free_gb: 74`, under the 75",
+        ),
+        (
+            with(l1("60"), js.clone()),
+            "a `legacy` entry says `min_free_gb: 60`, under the 75",
+        ),
+        (
+            with(l1("75"), js_gb("54")),
+            "a `js` entry says `min_free_gb: 54`, under the 55",
+        ),
+        (
+            with(l1("75"), js_gb("40")),
+            "a `js` entry says `min_free_gb: 40`, under the 55",
+        ),
+        (
+            with(l1("lots"), js.clone()),
+            "a `legacy` entry has no numeric `min_free_gb`",
+        ),
+        (
+            with(
+                l1("75").replace("            min_free_gb: 75\n", ""),
+                js.clone(),
+            ),
+            "a `legacy` entry has no numeric `min_free_gb`",
+        ),
+    ];
+    for (w, want) in cases {
+        let got = shard_wiring(&w);
+        assert!(
+            got.as_ref().is_err_and(|e| e.starts_with(want)),
+            "want `{want}`, got {got:?}"
+        );
+    }
+    // The measured numbers and more pass.
+    assert_eq!(shard_wiring(&with(l1("75"), js_gb("55"))), Ok(()));
+    assert_eq!(shard_wiring(&with(l1("120"), js_gb("90"))), Ok(()));
+}
+
+#[test]
+fn a_shard_may_say_no_tests_fail() {
+    // `--no-tests=fail` is nextest's own default: it is allowed, not required.
+    let w = changed(" --no-fail-fast", " --no-fail-fast --no-tests=fail");
+    assert_eq!(shard_wiring(&w), Ok(()));
 }
 
 #[test]
@@ -391,20 +516,33 @@ fn each_drift_of_the_gate_is_refused() {
             "the wait step does not pass `--job-prefix test-shard`, so a failed shard would not end it",
         ),
         (
-            changed(" --artifact profraw-js-1", ""),
+            changed(" --artifact \"profraw-js-1=(js-1-of-1)\"", ""),
             "the wait step's `--artifact` names are not the shards' artifacts",
         ),
         (
             changed(
-                " --artifact profraw-js-1",
-                " --artifact profraw-js-1 --artifact profraw-js-2",
+                " --artifact \"profraw-js-1=(js-1-of-1)\"",
+                " --artifact \"profraw-js-1=(js-1-of-1)\" --artifact \"profraw-js-2=(js-2-of-1)\"",
             ),
             "the wait step's `--artifact` names are not the shards' artifacts",
         ),
         (
             changed(
-                " --artifact profraw-js-1",
-                " --artifact profraw-js-1 --artifact profraw-js-1",
+                " --artifact \"profraw-js-1=(js-1-of-1)\"",
+                " --artifact \"profraw-js-1=(js-1-of-1)\" --artifact \"profraw-js-1=(js-1-of-1)\"",
+            ),
+            "the wait step's `--artifact` names are not the shards' artifacts",
+        ),
+        // An artifact asked for by its name alone would count whatever attempt made it.
+        (
+            changed("\"profraw-js-1=(js-1-of-1)\"", "profraw-js-1"),
+            "the wait step's `--artifact` names are not the shards' artifacts",
+        ),
+        // Or for the wrong shard's job: the key must be that of the artifact's own shard.
+        (
+            changed(
+                "\"profraw-js-1=(js-1-of-1)\"",
+                "\"profraw-js-1=(legacy-1-of-2)\"",
             ),
             "the wait step's `--artifact` names are not the shards' artifacts",
         ),
