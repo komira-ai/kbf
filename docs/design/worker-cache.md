@@ -858,6 +858,20 @@ Per node, on the operator API: `cache_bytes`, `cache_entries`, `cache_evictions`
 `cache_index_load_ms`, `cache_index_discarded`, `cache_adopted_entries`, `cache_dropped_entries`,
 `cache_foreign_files`, `cache_index_drift_bytes`.
 
+Per node, as monotonic counters since the daemon process started: the daemon sends
+`Heartbeat.input_cache` (`InputCacheCounts`: `fills`, `fill_bytes`, `hits`, `hit_bytes`,
+`evictions`, `evicted_bytes`, and the tree store's `builds`, `hits`, `evictions` in `trees`) on
+every heartbeat, and a frontend keeps the newest per node and exports it as
+`kbf_node_input_cache_*_total{node}` on `/metrics` and as `input_cache` in
+`GET /v1/nodes/{id}` (`docs/api.md`, "Input cache counts"). The unit is the entry (a blob by
+digest and executable bit), not a file name. The counts are incremented where the events
+happen: a fill after the CAS fetch has been inserted as an entry (an entry copied from its
+sibling is not one), a hit when a lease uses an indexed entry that passed its stat check
+(including a lease that waited for another's fill; the filling lease is a miss), an eviction in
+the evictor's one removal. The field is absent, not zero, from a daemon with no cache open
+(its cache is off, could not be opened, or the runtime has none), and a restarted
+daemon counts again from 0.
+
 The cache's acceptance check is one of these numbers: **a second lease with the same zig
 tree on the same node fetches 0 bytes for the toolchain** and has
 `cache_hits == files - empty_files`. C1 checks this with a test counter and a log
