@@ -125,6 +125,9 @@ hmac.workspace = true
 kbf-objstore = { workspace = true, features = ["testkit"] }
 # Scratch directories and key files of the tests of the binary.
 kbf-testkit.workspace = true
+# tests/s3_front/activated.rs plays the service manager: between fork and exec of the binary it
+# places the listening sockets as descriptors 3 and up and sets LISTEN_PID to the child's pid.
+libc.workspace = true
 # A test CA and a leaf with IP subjectAltNames, for the tests of the OCI read front.
 rcgen.workspace = true
 # Sends the requests the S3 client does not: unsigned ones and ones signed by hand.
