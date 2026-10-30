@@ -41,7 +41,12 @@
 //!   that does not answer the HEAD, would otherwise hold the keep for ever; at the deadline the
 //!   keep is abandoned: its stage file is removed, its permit and room are given back, its
 //!   place in the table of the fills is freed, and it is counted as `deadline`. A link that is
-//!   under way at the deadline cannot be called back; it is undone as soon as it ends.
+//!   under way at the deadline cannot be called back; it is undone as soon as it ends. Two
+//!   residuals of that: a link whose thread never returns (a disk that hangs for good) leaks the
+//!   staged file and the `Arc` of the cache that the cleanup holds, until the process ends; and
+//!   the cleanup's `drop_entry` may remove the entry of a fill of the same key that a reader
+//!   started and finished after the abandonment, which costs that reader's next read a trip to
+//!   the upstream (a lost entry, never stale data: the cleanup removes files, it adds none).
 //! - A key named by its content (`cas/l/<sha256>`) is hashed as the body passes, whether or not
 //!   it is copied. The check is made when the declared length has passed, in place of the chunk
 //!   that completes the body, or when the body ends: a body that does not hash to the name ends

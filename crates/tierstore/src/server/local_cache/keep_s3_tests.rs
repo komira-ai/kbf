@@ -14,7 +14,7 @@ use kbf_testkit::dir::TestDir;
 
 use super::layout::{Sidecar, meta_path, name_of};
 use super::metrics::read;
-use super::testing::{digest, pattern};
+use super::testing::{digest, never_expires, pattern};
 use super::{CacheConfig, LocalCache, SystemDisk};
 use crate::s3::{Capabilities, Credentials, S3Config};
 use crate::{Backend, FaultyBackend, Op, PartBody, S3Backend, TestClock};
@@ -50,6 +50,7 @@ fn node(s3: &FakeS3, name: &str) -> (LocalCache, CacheConfig, TestDir) {
     let policies = vec![("cas/".to_owned(), true)];
     let mut config = CacheConfig::new(dir.path().join("cache"), 64 << 20, policies);
     config.write_through = true;
+    never_expires(&mut config);
     let clock = Arc::new(TestClock::new());
     let cache = LocalCache::open(config.clone(), s3_backend(s3), Arc::new(SystemDisk), clock);
     (cache.unwrap(), config, dir)
@@ -84,6 +85,7 @@ async fn a_put_over_s3_is_kept_with_the_upstreams_tag_also_when_sent_as_parts() 
     let policies = vec![("cas/".to_owned(), true)];
     let mut config = CacheConfig::new(dir.path().join("cache"), 64 << 20, policies);
     config.write_through = true;
+    never_expires(&mut config);
     let clock = Arc::new(TestClock::new());
     let cache = LocalCache::open(
         config.clone(),
@@ -168,6 +170,7 @@ async fn a_cut_multipart_sized_body_leaves_nothing_over_s3() {
     let policies = vec![("cas/".to_owned(), true)];
     let mut config = CacheConfig::new(dir.path().join("cache"), 64 << 20, policies);
     config.write_through = true;
+    never_expires(&mut config);
     let clock = Arc::new(TestClock::new());
     let cache = LocalCache::open(config.clone(), upstream, Arc::new(SystemDisk), clock);
     let cache = cache.unwrap();

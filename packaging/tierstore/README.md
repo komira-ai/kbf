@@ -329,7 +329,12 @@ acknowledged the object, the rest of the keep runs on its own task, so a client 
 that point does not leave a half-made copy. The put waits for that task for `keep_wait` and is then
 answered; the task ends within `keep_deadline` with the object kept or abandoned. A read of a key
 whose copy is still being made never waits for it: it is answered from the upstream. The eviction
-pass that a kept object may call for runs on its own task, and the put does not wait for it. A key named by its content (`cas/l/<sha256>`) is hashed as the body streams, copied or not;
+pass that a kept object may call for runs on its own task, and the put does not wait for it. A link
+that is under way when a copy is abandoned cannot be called back and is undone when it ends; if its
+thread never returns (a disk that hangs for good) the staged file and a reference to the cache stay
+until the process ends, and the undoing may remove the entry of a fill of the same key made after
+the abandonment, which costs one more trip to the upstream and never serves stale data.
+A key named by its content (`cas/l/<sha256>`) is hashed as the body streams, copied or not;
 a body that does not hash to the name is answered 400 `BadDigest`, the upstream stores nothing, and
 nothing is kept. A body that is cut leaves nothing at the upstream or in the cache.
 `/metricz` has `tierstore_cache_writes_through_total` (puts the upstream took),

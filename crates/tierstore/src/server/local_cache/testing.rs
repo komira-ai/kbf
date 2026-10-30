@@ -24,6 +24,14 @@ use crate::{
 use super::layout::{data_path, name_of};
 use super::{CacheConfig, Disk, LocalCache, Space, SystemDisk};
 
+/// The wait and the deadline of a keep in tests that do not test them: an hour, so that no test
+/// that runs on the real clock can reach either, whatever the load on the disk. The tests of the
+/// two settings run on a paused clock and set small values themselves.
+pub(in crate::server) fn never_expires(config: &mut CacheConfig) {
+    config.keep_wait = std::time::Duration::from_secs(3600);
+    config.keep_deadline = std::time::Duration::from_secs(3600);
+}
+
 /// `len` bytes that differ from one place to the next, so that a wrong range shows.
 pub(in crate::server) fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| ((i * 7 + 3) % 251) as u8).collect()
@@ -567,6 +575,7 @@ impl Rig {
         let dir = TestDir::under(std::env::temp_dir(), name);
         let path = dir.path().join("cache");
         let mut config = CacheConfig::new(path, 1 << 20, vec![("cas/".to_owned(), true)]);
+        never_expires(&mut config);
         change(&mut config);
         let tamper = Arc::new(Tamper::new());
         let upstream = Arc::new(FaultyBackend::new(tamper.clone()));
