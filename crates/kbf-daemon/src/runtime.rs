@@ -10,7 +10,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use kbf_proto::reapi::{ActionResult, Digest};
-use kbf_proto::worker::{NodeLoad, ResourceUsage};
+use kbf_proto::worker::{InputCacheCounts, NodeLoad, ResourceUsage};
 use kbf_types::{LeaseId, LeaseKind, LostWhy, Resources};
 use tokio::sync::oneshot;
 
@@ -187,6 +187,13 @@ pub trait Runtime: Send + Sync + 'static {
     /// The reading could not be made.
     fn node_load(&self) -> impl Future<Output = Result<Option<NodeReading>, NodeLoadError>> + Send {
         async { Ok(None) }
+    }
+
+    /// What the runtime's input cache has done since the process started, for the
+    /// heartbeat (`Heartbeat.input_cache`). `None` for a runtime with no input cache open
+    /// (the default).
+    fn input_cache(&self) -> Option<InputCacheCounts> {
+        None
     }
 
     /// Told by each Welcome whether the farm places by the load the nodes measure
