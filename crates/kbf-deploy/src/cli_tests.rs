@@ -582,10 +582,11 @@ fn a_pilot_verb_runs_through_the_same_command_line() {
 
 /// Catches `mdm erase-request` not wired to the kit, a pair that does not check
 /// exiting other than 1, and a refusal other than 2. Also catches the verb not wired to
-/// the clock: the signed request's not-after must be at least 15 min after a clock
-/// read before the call (a stuck or zero clock writes an expired request). And catches a fixed or counted nonce: two signed requests must carry
-/// nonces that differ in at least 8 of their 16 bytes (equal nonces make the gate's
-/// replay check refuse every request after the first; a counter differs in one byte).
+/// the clock: the signed request's not-after must equal the run's instant plus 15 min
+/// (a stuck or zero clock, or a wrong offset, fails). And catches a fixed or counted
+/// nonce: two signed requests must carry nonces that differ in at least 8 of their 16
+/// bytes (equal nonces make the gate's replay check refuse every request after the
+/// first; a counter differs in one byte).
 /// In-process, so the lib tests' instantiation of `run` covers the arm.
 #[test]
 fn mdm_erase_request_signs_and_its_refusals_exit_2() {
