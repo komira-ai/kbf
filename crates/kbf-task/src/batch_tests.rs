@@ -781,6 +781,9 @@ fn parsed(label: &str) -> Digest {
     }
 }
 
+/// What the fake grant answers a GET with, cut to the size of the digest asked for.
+const REFETCHED: &[u8] = b"refetched-body";
+
 /// What the client made of each frame of a replayed response.
 type Outcomes = Vec<Result<Vec<u8>, String>>;
 
@@ -798,7 +801,17 @@ fn replay(name: &str) -> (Server, Vec<String>, Outcomes) {
     let server = Server::start(
         Grant::new(&Arc::default())
             .on_batch(move |_| Reply::new(200, response.clone()))
-            .on_get(|_, _| Reply::new(200, b"refetched".to_vec())),
+            .on_get(|label, _| {
+                // A GET body is read to one byte past the digest's size, so the fake answers no
+                // more than the size it was asked for.
+                let size: usize = label
+                    .rsplit('/')
+                    .next()
+                    .expect("size")
+                    .parse()
+                    .expect("int");
+                Reply::new(200, REFETCHED[..size.min(REFETCHED.len())].to_vec())
+            }),
     );
     let labels = digests_of(request.as_bytes());
     let digests: Vec<Digest> = labels.iter().map(|l| parsed(l)).collect();
@@ -850,8 +863,8 @@ fn the_fixture_statuses_have_the_outcomes_the_client_defines() {
     assert!(missing.contains(&labels[1]), "{missing}");
     let withheld = outcomes[2].clone().expect_err("out of scope");
     assert!(withheld.contains(&labels[2]), "{withheld}");
-    assert_eq!(outcomes[3], Ok(b"refetched".to_vec()));
-    assert_eq!(outcomes[4], Ok(b"refetched".to_vec()));
+    assert_eq!(outcomes[3], Ok(REFETCHED.to_vec()));
+    assert_eq!(outcomes[4], Ok(REFETCHED[..5].to_vec()));
     assert_eq!(server.gets(), [labels[3].clone(), labels[4].clone()]);
 }
 
