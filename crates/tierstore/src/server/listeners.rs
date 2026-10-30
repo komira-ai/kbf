@@ -99,7 +99,7 @@ impl JobListeners {
         group: Option<String>,
     ) -> Result<Self, ConfigError> {
         if let Some(address) = bridge {
-            if address.ip().is_unspecified() {
+            if address.ip().to_canonical().is_unspecified() {
                 let why = "it must name one address; 0.0.0.0 and :: are open on every network";
                 return Err(invalid("server.bridge_listen", why));
             }
@@ -234,11 +234,13 @@ pub(super) struct Listeners {
 
 /// Binds `address` and says where, naming `what` in the error.
 async fn bind_tcp(address: SocketAddr, what: &str) -> Result<(TcpListener, SocketAddr), String> {
-    let bound = TcpListener::bind(address).await;
-    let listener = bound.map_err(|why| format!("binding {what}{address}: {why}"))?;
-    let local = listener.local_addr();
-    let local = local.map_err(|why| format!("binding {what}{address}: {why}"))?;
-    Ok((listener, local))
+    let made = async {
+        let listener = TcpListener::bind(address).await?;
+        let local = listener.local_addr()?;
+        Ok((listener, local))
+    };
+    let made: io::Result<_> = made.await;
+    made.map_err(|why| format!("binding {what}{address}: {why}"))
 }
 
 impl Listeners {
@@ -310,8 +312,8 @@ fn group_id(name: &str, file: &Path) -> Result<u32, String> {
     let shown = file.display();
     let text = std::fs::read_to_string(file).map_err(|why| format!("reading {shown}: {why}"))?;
     let found = text.lines().find_map(|line| {
-        let mut fields = line.split(':');
-        let (entry, gid) = (fields.next()?, fields.nth(1)?);
+        let (entry, rest) = line.split_once(':')?;
+        let gid = rest.split(':').nth(1)?;
         // All ones is the id that means "no change" to chown.
         gid.parse::<u32>()
             .ok()
@@ -323,16 +325,17 @@ fn group_id(name: &str, file: &Path) -> Result<u32, String> {
 /// Removes the file at `path` if it is a socket, and refuses to if it is anything else.
 fn clear_stale(path: &Path) -> Result<(), String> {
     let shown = path.display();
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => {
-            std::fs::remove_file(path).map_err(|why| format!("listen_unix {shown}: {why}"))
+    let removed = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path),
+        Ok(_) => {
+            return Err(format!(
+                "listen_unix {shown}: the file exists and is not a socket; it is not replaced"
+            ));
         }
-        Ok(_) => Err(format!(
-            "listen_unix {shown}: the file exists and is not a socket; it is not replaced"
-        )),
         Err(why) if why.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(why) => Err(format!("listen_unix {shown}: {why}")),
-    }
+        Err(why) => Err(why),
+    };
+    removed.map_err(|why| format!("listen_unix {shown}: {why}"))
 }
 
 /// Makes the socket of `socket`: mode 0660 and its group are set after the file is made and
@@ -344,24 +347,23 @@ fn bind_unix(socket: &UnixSocket) -> Result<(UnixListener, SocketFile), String> 
         None => None,
     };
     clear_stale(path)?;
-    let fail = |step: &str, why: &dyn std::fmt::Display| {
-        format!("listen_unix {}: {step}: {why}", path.display())
-    };
+    make_socket(path, gid).map_err(|why| format!("listen_unix {}: {why}", path.display()))
+}
+
+/// The steps of [`bind_unix`] that touch the file system and the socket, in the order that
+/// keeps the socket closed to clients until its mode and group are set.
+fn make_socket(path: &Path, gid: Option<u32>) -> io::Result<(UnixListener, SocketFile)> {
     let flags = SocketFlags::NONBLOCK | SocketFlags::CLOEXEC;
-    let fd = socket_with(AddressFamily::UNIX, SocketType::STREAM, flags, None)
-        .map_err(|why| fail("socket", &why))?;
-    let address = SocketAddrUnix::new(path).map_err(|why| fail("address", &why))?;
-    bind(&fd, &address).map_err(|why| fail("bind", &why))?;
-    let file = SocketFile::claim(path).map_err(|why| fail("stat", &why))?;
-    let mode = std::fs::Permissions::from_mode(SOCKET_MODE);
-    std::fs::set_permissions(path, mode).map_err(|why| fail("chmod", &why))?;
+    let fd = socket_with(AddressFamily::UNIX, SocketType::STREAM, flags, None)?;
+    bind(&fd, &SocketAddrUnix::new(path)?)?;
+    let file = SocketFile::claim(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_MODE))?;
     if let Some(gid) = gid {
         chown(path, None, Some(Gid::from_raw_unchecked(gid)))
-            .map_err(|why| fail("changing the group", &why))?;
+            .map_err(|why| io::Error::other(format!("changing the group: {why}")))?;
     }
-    listen(&fd, BACKLOG).map_err(|why| fail("listen", &why))?;
-    let listener = UnixListener::from_std(std::os::unix::net::UnixListener::from(fd))
-        .map_err(|why| fail("registering", &why))?;
+    listen(&fd, BACKLOG)?;
+    let listener = UnixListener::from_std(std::os::unix::net::UnixListener::from(fd))?;
     Ok((listener, file))
 }
 

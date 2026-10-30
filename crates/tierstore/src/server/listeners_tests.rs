@@ -498,6 +498,19 @@ fn grouped(node: &Node, group: &str, file: Option<&Path>) -> CacheSettings {
     settings
 }
 
+/// A group the process may give a file that is not `own`, its effective group: one of its
+/// supplementary groups, or any id if it is root; none if there is no such group.
+fn other_group(own: u32) -> Option<u32> {
+    if rustix::process::geteuid().is_root() {
+        return Some(60_000);
+    }
+    rustix::process::getgroups()
+        .unwrap()
+        .iter()
+        .map(|gid| gid.as_raw())
+        .find(|gid| *gid != own)
+}
+
 /// Asserts the group of the socket: a group the system does not have fails the start, with exit
 /// status 1, and no socket is left; a group of the process (its own, found in a group file of the
 /// test) is the group of the file; and a group the process is not in is refused when it is not
@@ -508,7 +521,9 @@ async fn the_group_of_the_socket_is_the_one_named() {
     let path = node.socket();
 
     let own = rustix::process::getegid().as_raw();
-    let file = group_file(&node, "builders", own);
+    // A group other than the one a new file gets, so that the test fails without the chown.
+    let named = other_group(own);
+    let file = group_file(&node, "builders", named.unwrap_or(own));
     let unknown = grouped(&node, "no-such-group", Some(&file));
     let (result, started) = serving(&unknown, empty_upstream(), |_| async {}).await;
     let why = result.unwrap_err();
@@ -521,7 +536,7 @@ async fn the_group_of_the_socket_is_the_one_named() {
     let settings = grouped(&node, "builders", Some(&file));
     let work = |bound: Bound| async move {
         let meta = std::fs::symlink_metadata(bound.unix.unwrap()).unwrap();
-        assert_eq!(meta.gid(), own);
+        assert_eq!(meta.gid(), named.unwrap_or(own));
     };
     let (drained, done) = serving(&settings, empty_upstream(), work).await;
     assert_eq!(drained.unwrap(), Drained { abandoned: 0 });
@@ -646,6 +661,20 @@ async fn a_file_that_replaced_the_socket_is_left_alone() {
     let listeners = Listeners::bind(any, &jobs).await.unwrap();
     drop(listeners);
     assert!(std::fs::symlink_metadata(&path).is_err());
+
+    // A socket that took the place of ours is left too: ours still holds its inode, so the new
+    // one cannot have the same number, and only the comparison of the two tells them apart.
+    let listeners = Listeners::bind(any, &jobs).await.unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let theirs = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    drop(listeners);
+    assert!(
+        std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_socket()
+    );
+    drop(theirs);
 }
 
 /// Asserts what the start line adds for the listeners: nothing for none, the bridge, the socket,
@@ -685,7 +714,7 @@ fn refused(node: &Node, server: &str) -> String {
 #[test]
 fn the_file_refuses_a_listener_it_cannot_serve() {
     let node = Node::new("tsl-config");
-    for wildcard in ["0.0.0.0:9400", "[::]:9400"] {
+    for wildcard in ["0.0.0.0:9400", "[::]:9400", "[::ffff:0.0.0.0]:9400"] {
         let why = refused(&node, &format!("bridge_listen = \"{wildcard}\""));
         assert!(why.contains("server.bridge_listen"), "{why}");
         assert!(why.contains("0.0.0.0"), "{why}");
@@ -779,5 +808,5 @@ fn the_readme_documents_the_listeners_for_jobs() {
         assert!(row.is_some(), "no row for {key}");
     }
     assert!(readme.contains("### Listeners for jobs"));
-    assert!(readme.contains("`Host`"));
+    assert!(readme.contains("`localhost` is the convention"));
 }

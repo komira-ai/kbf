@@ -395,7 +395,7 @@ scrub.
 | `cold_store.endpoints` | a list of exactly one endpoint, in place of `endpoint`: several are refused as not supported yet, since the cache reads from one upstream |
 | `server.bridge_listen` | build node only: a second TCP listener on this one address (the host's address on the job network's bridge), plain HTTP, served as `listen` is; `0.0.0.0` and `::` are refused, and so is the address of `listen` |
 | `server.listen_unix` | build node only: the absolute path of a Unix-domain socket that is listened on as well, served as `listen` is |
-| `server.listen_unix_group` | build node only, and only with `listen_unix`: the group (a name in `/etc/group`) that owns the socket file; without it the file belongs to the primary group of the process |
+| `server.listen_unix_group` | build node only, and only with `listen_unix`: the group (a name in `/etc/group`) that owns the socket file; without it the file belongs to the effective group of the process, or to the group of the directory if that is setgid |
 
 `[cold_store]` is the upstream: any `kind` (an `s3` bucket, with `endpoint` and a `credentials_file`
 of a read-only key, in practice), and without `skip_checks` and the keys of the reconciler. `[server]`
@@ -427,7 +427,7 @@ On a storage node it says there is no cache.
 ### Listeners for jobs
 
 A build node may listen for jobs on two more places than `listen`, both optional, both for the
-build-node shape only (a storage-node file with either key is refused, exit status 2):
+build-node shape only (a storage-node file with any of the three keys is refused, exit status 2):
 
 ```toml
 [server]
@@ -453,7 +453,7 @@ network with the host's firewall.
 mode, and with the group `listen_unix_group` if one is given (the group is looked up in
 `/etc/group`; a name it does not have fails the start, exit status 1, and so does a group the
 process may not give a file to). Who may connect is decided by the file: its owner, its group, and
-the directory it is in. A file at the path that is a socket is replaced (the socket of a process
+the directory it is in; that directory must not be writable by others, since the mode and group are set by path after the socket is made. A file at the path that is a socket is replaced (the socket of a process
 that did not clean up, or of one that is still running, which is then unreachable); a file of any
 other type, a symbolic link included, is never replaced and the start fails. The socket is removed
 when the server stops accepting at the start of the drain, unless the file there is no longer the
