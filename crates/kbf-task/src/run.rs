@@ -9,6 +9,9 @@
 //! variables: a variable the Command sets itself is the Command's. A program name with
 //! a slash is resolved from the working directory, a bare name from the Command's own `PATH`.
 //!
+//! Unless the action asked for it (`kbf-network=allow`, [`network`]), the program and everything it
+//! starts can make no socket but a Unix one.
+//!
 //! The program leads its own process group. When the deadline passes the whole group is killed
 //! with SIGKILL and reaped, and the run is reported as timed out with exit code 137. A process a
 //! signal ended reports 128 plus the signal number, as the daemon does.
@@ -30,6 +33,7 @@ use tokio::fs;
 use tokio::process::Command as Process;
 
 use crate::fetch;
+use crate::network::{self, Network};
 
 /// The exit code reported for a run the deadline ended: 128 plus SIGKILL.
 pub const TIMED_OUT_EXIT_CODE: i32 = 128 + 9;
@@ -83,6 +87,9 @@ pub struct Run<'a> {
     pub stderr: &'a Path,
     /// After this long the process group is killed.
     pub deadline: Duration,
+    /// Whether the program may use the network; [`Network::Denied`] unless the action asked
+    /// ([`network::from_platform`]).
+    pub network: Network,
 }
 
 /// Runs `command` under `run.root`.
@@ -92,7 +99,8 @@ pub struct Run<'a> {
 /// and plain, or one the input root made something other than a directory (a symlink or a file).
 /// [`RunError::Io`]: a directory (the run's private ones included) or an output stream file could
 /// not be made.
-/// [`RunError::Spawn`]: the program could not be started.
+/// [`RunError::Spawn`]: the program could not be started, or the no-network filter could not be
+/// installed (the network is never left open for it).
 pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
     let Some(program) = command.arguments.first() else {
         return Err(RunError::Invalid("the Command has no arguments".to_owned()));
@@ -135,6 +143,7 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         .stderr(stderr)
         .process_group(0)
         .kill_on_drop(true);
+    network::confine(&mut process, run.network)?;
 
     let cpu_before = children_usage().cpu_us;
     let started = Instant::now();
@@ -313,6 +322,8 @@ mod tests {
 
     use super::*;
 
+    const NETWORK: Network = Network::Denied;
+
     struct Rig {
         dir: TestDir,
         stdout: PathBuf,
@@ -348,6 +359,7 @@ mod tests {
                     stdout: &self.stdout,
                     stderr: &self.stderr,
                     deadline,
+                    network: NETWORK,
                 },
             )
             .await
@@ -767,6 +779,7 @@ mod tests {
                 stdout: &missing,
                 stderr: &rig.stderr,
                 deadline: LONG,
+                network: NETWORK,
             },
         )
         .await

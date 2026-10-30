@@ -13,7 +13,10 @@
 //!    and its `/tmp` is a small `noexec` tmpfs, so a compiler that writes under `~` or the
 //!    temporary directory would otherwise fail; and since outputs are collected relative to the
 //!    input root, nothing written there is packed. A variable the Command sets itself keeps its
-//!    value. A directory that cannot be made fails the run start (exit 11);
+//!    value. A directory that cannot be made fails the run start (exit 11). The Command has no
+//!    network: it and everything it starts can make no socket but a Unix one, and no io_uring
+//!    ([`network`]; the platform property `kbf-network=allow` lifts that for one action, and any
+//!    other value of it fails the run start before the inputs are fetched);
 //! 3. collects the declared outputs as REAPI does ([`outputs`]): files, directories as Trees,
 //!    symlinks, the executable bit;
 //! 4. writes every output blob, stdout, stderr and Tree, and the manifest, into ONE kbf-segments
@@ -63,6 +66,7 @@
 
 pub mod digest;
 pub mod fetch;
+pub mod network;
 pub mod outputs;
 pub mod pack;
 pub mod put;

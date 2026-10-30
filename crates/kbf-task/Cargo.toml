@@ -11,6 +11,12 @@ publish.workspace = true
 name = "kbf-task"
 path = "src/main.rs"
 
+# A helper for the tests (tests/network.rs); the release builds `--bin kbf-task` only.
+[[bin]]
+name = "socket_probe"
+path = "src/bin/socket_probe.rs"
+test = false
+
 [dependencies]
 clap.workspace = true
 hex.workspace = true

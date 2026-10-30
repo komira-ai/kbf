@@ -13,6 +13,7 @@ These properties change how kbf schedules an action today:
 | `gpu` | a whole number | `0` | Whole GPUs the action needs. |
 | `kbf-book-cpus` | a whole number, at least 1, plain digits | `1` | Whole cores the lease books. |
 | `kbf-book-mem-gib` | a whole number, at least 1, plain digits | `4` (the first rung of `--memory-ladder-gib`) | GiB of memory the lease asks for: the limit it runs under, checked against the node's memory but not reserved (see [below](#kbf-book-cpus-and-kbf-book-mem-gib)). |
+| `kbf-network` | `allow` | absent: no network | Lets the action's Command use the network (see [`kbf-network`](#kbf-network)). |
 | `OSFamily` | `linux`; `darwin`, `macos`, `macosx`, `osx` (any case) | any | The operating system of the worker. |
 | `ISA`, `Arch` | `x86-64`, `x86_64`, `amd64`; `arm-a64`, `arm64`, `aarch64`; an ISA level such as `x86-64-v3` (any case) | any | The CPU architecture, and level, of the worker. |
 
@@ -407,6 +408,30 @@ iOS 26.0 do not together serve `ios.device.class=iPhone` with
 an attribute key without `ios.device=1`, an `ios.device.<attribute>` not in the table,
 `ios.device` with an OS other than macOS, and `ios.device` with `kbf-lease=vm` or
 `whole_machine`. Names are read in any case.
+
+## `kbf-network`
+
+The Command of an action runs without the network: `kbf-task`, the tool that runs it inside
+the job, installs a seccomp filter in the Command's process before it executes, and every
+process the Command starts inherits it. The filter refuses, with `EPERM`, `socket` and
+`socketpair` for every domain but `AF_UNIX` (so `AF_INET`, `AF_INET6`, `AF_NETLINK`,
+`AF_PACKET`, `AF_VSOCK` and the rest), and `io_uring_setup`, `io_uring_enter` and
+`io_uring_register` (a ring can make a socket without calling `socket`). A call under another
+system call ABI is killed with `SIGSYS` (exit code 159). It needs no capability, and it sets
+`no_new_privs`, so a setuid program the Command starts gains nothing. Only `kbf-task`'s own
+fetch of the inputs and upload of the pack use the network.
+
+`kbf-network=allow` turns that off for one action, for a test that needs a real socket or a
+step that fetches from the internet; `kbf-task` writes one line naming the action digest and
+the property to its standard error. Any other value (`Allow`, `true`, an empty one) or the
+property given twice is refused: the action fails without running and `kbf-task` exits 11
+(run-start). The name is read in any case. Like every platform property it is part of the
+action digest, so the same action with and without it are two cache entries.
+
+A job that is given a network namespace of its own is a separate, stronger layer and is not
+what this property is about. This property does not reach the Mac driver, which has its own
+[`network`](#network) property. Where `kbf-task` is built for a system other than Linux (a developer's machine; the
+release is a Linux build), there is no filter and the tool says so on standard error.
 
 ## `network`
 
