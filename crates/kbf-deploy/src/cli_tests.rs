@@ -53,14 +53,21 @@ fn admin_env(key: &str) -> Option<OsString> {
     }))
 }
 
-/// Exit status, stdout and stderr of `run` over `exec`.
+/// The instant the tests that read the clock run at: 2026-01-01T00:00:00Z.
+const NOW_SECS: u64 = 1_767_225_600;
+
+fn now() -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(NOW_SECS)
+}
+
+/// Exit status, stdout and stderr of `run` over `exec`, at [`now`].
 fn cli(
     exec: &mut FakeExec,
     env: &dyn Fn(&str) -> Option<OsString>,
     args: &[&str],
 ) -> (ExitCode, String, String) {
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let code = run(argv(args), exec, env, &mut out, &mut err);
+    let code = run_at(argv(args), exec, env, now(), &mut out, &mut err);
     let text = |b: Vec<u8>| String::from_utf8(b).expect("utf-8");
     (code, text(out), text(err))
 }
@@ -346,17 +353,13 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
     );
 }
 
-/// Catches a rollback directory name that is not the seconds since the epoch (two
-/// rollbacks in one run of the clock would share it, or sort out of order); the stamp
-/// is not before a clock read made first.
+/// Catches a rollback directory name that is not the seconds since the epoch of the
+/// instant it is given (a stamp in milliseconds, or one read from anywhere but the
+/// clock the run was handed).
 #[test]
 fn the_rollback_stamp_is_unix_seconds() {
-    let before = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_secs();
-    let stamp: u64 = stamp().parse().expect("a number");
-    assert!(stamp >= before, "{stamp} before {before}");
+    assert_eq!(stamp(now()), NOW_SECS.to_string());
+    assert_eq!(stamp(UNIX_EPOCH), "0");
 }
 
 /// Catches a retired units verb still taken by the command line (or answered by
@@ -632,11 +635,6 @@ fn mdm_erase_request_signs_and_its_refusals_exit_2() {
         cli(exec, &no_env, &v)
     };
 
-    let secs = || {
-        let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
-        i64::try_from(d.expect("after the epoch").as_secs()).expect("secs")
-    };
-    let before = secs();
     let (code, out, err) = call(&mut exec, &with("/srv/op/a.req", &["--apply"]));
     assert_eq!(code, ExitCode::SUCCESS, "{err}");
     assert!(
@@ -662,9 +660,10 @@ fn mdm_erase_request_signs_and_its_refusals_exit_2() {
         .collect();
     assert_eq!(requests.len(), 2);
     let not_after = requests[0].not_after;
-    assert!(
-        not_after >= before + 15 * 60,
-        "not-after {not_after} before {before}+900"
+    assert_eq!(
+        not_after,
+        i64::try_from(NOW_SECS).expect("secs") + 15 * 60,
+        "not-after is the run's instant plus 900 s"
     );
     let nonce = |r: &kbf_mdm::request::EraseRequest| hex::decode(&r.nonce).expect("hex");
     let (n1, n2) = (nonce(&requests[0]), nonce(&requests[1]));

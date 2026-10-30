@@ -42,9 +42,15 @@ fn cli(
     let pilot = parse(args).expect("valid flags");
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let pauses = Cell::new(0);
-    let code = run(pilot, exec, env, &mut out, &mut err, &|| {
-        pauses.set(pauses.get() + 1)
-    });
+    let code = run(
+        pilot,
+        exec,
+        env,
+        SystemTime::UNIX_EPOCH,
+        &mut out,
+        &mut err,
+        &|| pauses.set(pauses.get() + 1),
+    );
     let text = |b: Vec<u8>| String::from_utf8(b).expect("utf-8");
     let code = if code == ExitCode::SUCCESS {
         0
