@@ -56,7 +56,7 @@ use clap::Parser;
 use kbf_proto::reapi::Command;
 
 use crate::network::{Layers, Network};
-use crate::run::{Run, run};
+use crate::run::{Ran, Run, RunError, run};
 
 #[cfg(target_os = "linux")]
 mod child;
@@ -467,10 +467,16 @@ async fn run_confined(
         },
     )
     .await;
+    let text = std::fs::read_to_string(&stdout).unwrap_or_default();
+    after_run(ran, &text, secret_path)
+}
+
+/// The checks that follow from how the run ended and what the Command printed. Not in the async
+/// function above, so that its branches are one function whatever the executor makes of it.
+fn after_run(ran: Result<Ran, RunError>, stdout: &str, secret_path: Option<&Path>) -> Vec<Check> {
     match ran {
         Ok(ran) => {
-            let observed =
-                parse_observations(&std::fs::read_to_string(&stdout).unwrap_or_default());
+            let observed = parse_observations(stdout);
             let ended = if ran.timed_out {
                 Err("timed out".to_owned())
             } else {

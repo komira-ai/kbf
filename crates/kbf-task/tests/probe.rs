@@ -246,6 +246,14 @@ fn the_command_side_prints_one_observation_per_call() {
     }
     assert!(text.contains("observe secret readable"));
     assert!(!text.contains(SENTINEL));
+    // Without a path there is no `secret` line.
+    let out = Command::new(env!("CARGO_BIN_EXE_kbf-task"))
+        .arg("--probe-confinement-child")
+        .output()
+        .expect("kbf-task starts");
+    let bare = String::from_utf8(out.stdout).expect("utf-8");
+    assert!(bare.contains("observe io_uring "), "{bare}");
+    assert!(!bare.contains("observe secret"), "{bare}");
     // A directory is listed, and a path that is not there names its errno.
     for (path, want) in [
         (dir.path().to_owned(), "readable"),
