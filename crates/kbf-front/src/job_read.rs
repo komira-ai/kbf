@@ -22,8 +22,10 @@
 //! source whose bytes are not the blob's ends the response early and without its last chunk
 //! (the response is shorter than its length, and the client's own hash check refuses it); the
 //! end is counted. A response is never larger than [`Limits::max_blob_bytes`] (413 above it,
-//! before anything is read), and at most [`Limits::reads_in_flight`] reads are open at once,
-//! a streamed one until its response ends or is dropped; the others wait for one to end.
+//! before anything is read), and at most [`Limits::reads_in_flight`] places are taken at once:
+//! a GET takes one, a streamed one until its response ends or is dropped, and a batch takes one
+//! reservation of at most half of them for its whole read (as many as it has blobs to read, not
+//! one per blob); the others wait for room.
 //!
 //! `POST /batch` answers many small blobs of the Action in one request, so that a task is not
 //! held up by the round trips of thousands of GETs. The body is JSON, `{"digests":
@@ -35,8 +37,8 @@
 //! reachable). Otherwise it is 200 `application/octet-stream` with one frame per digest, in
 //! request order: one status byte (0 ok, 1 not_found, 2 out_of_scope, 3 too_large, 4
 //! store_unavailable), the length as eight bytes big-endian (the blob's size when ok, else 0)
-//! and the bytes. Scope is checked for each digest, each read counts against
-//! [`Limits::reads_in_flight`], and an ok blob is hashed against its digest here: bytes that
+//! and the bytes. Scope is checked for each digest, the batch's read takes one reservation of
+//! [`Limits::reads_in_flight`] places (at most half of them, as above), and an ok blob is hashed against its digest here: bytes that
 //! are not the blob's are `store_unavailable`, never an ok frame.
 //!
 //! An answer carries a reason code in its body and no other detail: `missing_token`,
@@ -163,8 +165,9 @@ impl BlobSource for Backend {
 /// The bounds of a [`JobRead`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// The reads of blobs open at once (at least 1), a streamed one until its response ends;
-    /// a request over it waits for one to end.
+    /// The places for reads of blobs (at least 1): a GET takes one, a streamed one until its
+    /// response ends, and a batch one reservation of at most half of them for its whole read; a
+    /// request over it waits for room.
     pub reads_in_flight: usize,
     /// The bytes of reads open at once, in all (at least 1 KiB): a read takes its blob's size
     /// first (a streamed blob [`Limits::stream_window`] of it, the scope walk's reads their
@@ -423,6 +426,17 @@ impl JobRead {
         }
     }
 
+    /// How many Actions the memory of scopes holds now, walks in progress included: at most
+    /// [`Limits::scopes`] once the walks that are done, failed or cancelled are dropped (which
+    /// happens when an Action arrives at the bound).
+    #[must_use]
+    pub fn scopes_held(&self) -> usize {
+        self.scopes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
     /// The answer to `method` `path` with the `Authorization` header `authorization`.
     /// `path` is the request's path alone, without its query.
     pub async fn respond(&self, method: &Method, path: &str, authorization: Option<&str>) -> Reply {
@@ -545,7 +559,8 @@ impl JobRead {
     /// a read are read together, each once, with [`BlobSource::read_many`], under a take of at
     /// most half the reads in flight (as many places as blobs) while they are read, and of the
     /// budget: their sizes together and [`BATCH_GAP_BYTES`] for each gap between them.
-    /// The places bound the batches that read at once, not the reads of one: a source reads the
+    /// A batch takes one reservation of places, not one place per blob. The places bound the
+    /// batches that read at once, not the reads of one: a source reads the
     /// blobs it does not read together concurrently, up to the batch's size (at most
     /// [`BATCH_MAX_DIGESTS`]), and what bounds their bytes is the budget.
     async fn batch_blobs(

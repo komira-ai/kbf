@@ -362,7 +362,8 @@ over 4194304 bytes is not added, it is answered `too_large` below). Otherwise it
 `application/octet-stream` with one frame per digest in request order: a status byte (0 ok, 1
 not_found, 2 out_of_scope, 3 too_large (use GET), 4 store_unavailable), the length as 8 bytes
 big-endian (the blob's size when ok, else 0), and the bytes. Each digest is checked against the
-grant's scope, each read counts against `--job-reads-in-flight`, and the frontend hashes every ok
+grant's scope, the batch's read takes one reservation of `--job-reads-in-flight` places (at most
+half of them, however many blobs it reads; a GET takes one), and the frontend hashes every ok
 blob against its digest. The blobs of a batch are read together: with packs, those in a pack are
 read with few ranged reads of the object store (one for blobs that lie close together), and only
 the others from the storage nodes. A GET of `/batch` is 405 with `Allow: POST`. The golden request and
