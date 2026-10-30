@@ -232,7 +232,9 @@ pub fn shard_wiring(workflow: &str) -> Result<(), String> {
             return Err(format!("the test step of `{SHARD}` lacks `{need}`: {text}"));
         }
     }
-    if w.iter().any(|x| x.starts_with("--no-tests")) && !w.contains(&"--no-tests=fail") {
+    if w.iter()
+        .any(|x| x.starts_with("--no-tests") && *x != "--no-tests=fail")
+    {
         return Err(format!(
             "the test step of `{SHARD}` passes when no test runs (`--no-tests`), so a part that ran nothing would be green"
         ));

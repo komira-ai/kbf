@@ -57,7 +57,7 @@ impl Fx {
 }
 
 fn running() -> Value {
-    json!({ "jobs": [{ "name": "test-shard (js 1/1)", "conclusion": null }] })
+    json!({ "jobs": [{ "name": "test-shard (js-1-of-1)", "conclusion": null }] })
 }
 
 fn made(names: &[&str]) -> Value {
@@ -97,12 +97,12 @@ fn gives_up_and_stops_for_a_failed_shard() {
     );
 
     let failed =
-        json!({ "jobs": [{ "name": "test-shard (legacy 1/3)", "conclusion": "failure" }] });
+        json!({ "jobs": [{ "name": "test-shard (legacy-1-of-3)", "conclusion": "failure" }] });
     let f = fx("failed", &json!({ JOBS: failed, ARTIFACTS: made(&[]) }));
     let (code, _, err) = f.run("2");
     assert_eq!(code, Some(1));
     assert!(
-        err.contains("test-shard (legacy 1/3) (failure) did not succeed"),
+        err.contains("test-shard (legacy-1-of-3) (failure) did not succeed"),
         "{err}"
     );
 }
@@ -148,22 +148,22 @@ fn dated(name: &str, created: &str) -> Value {
     json!({ "name": name, "created_at": created })
 }
 
-fn job(name: &str, conclusion: Value, attempt: u64, started: &str) -> Value {
-    json!({ "name": name, "conclusion": conclusion, "run_attempt": attempt, "started_at": started })
+fn job(name: &str, conclusion: Value, started: &str) -> Value {
+    json!({ "name": name, "conclusion": conclusion, "run_attempt": 2, "started_at": started })
 }
 
 /// Catches: the real verb not telling a rerun of every job from a rerun of the failed one.
-/// After "Re-run all jobs" the artifacts are those of attempt 1 and are not counted while the
-/// shards run again; after "Re-run failed jobs" the shard that passed keeps its attempt-1
-/// artifact, and the one that runs again is waited for.
+/// After "Re-run all jobs" the artifacts are older than the new jobs' starts and are not counted
+/// while the shards run again; after "Re-run failed jobs" the shard that passed comes back with
+/// its original start and keeps its artifact, and the one that runs again is waited for.
 #[test]
 fn a_rerun_counts_the_artifacts_of_the_shards_that_ran_in_it() {
     let old = "2026-10-01T10:00:00Z";
     let start = "2026-10-01T11:00:00Z";
     let new = "2026-10-01T11:30:00Z";
     let everything = json!({ "jobs": [
-        job("test-shard (legacy-1-of-1)", Value::Null, 2, start),
-        job("test-shard (js-1-of-1)", Value::Null, 2, start),
+        job("test-shard (legacy-1-of-1)", Value::Null, start),
+        job("test-shard (js-1-of-1)", Value::Null, start),
     ]});
     let f = fx(
         "rerun-all",
@@ -179,8 +179,8 @@ fn a_rerun_counts_the_artifacts_of_the_shards_that_ran_in_it() {
     );
 
     let failed_only = json!({ "jobs": [
-        job("test-shard (legacy-1-of-1)", json!("success"), 1, old),
-        job("test-shard (js-1-of-1)", Value::Null, 2, start),
+        job("test-shard (legacy-1-of-1)", json!("success"), old),
+        job("test-shard (js-1-of-1)", Value::Null, start),
     ]});
     let f = fx(
         "rerun-failed",

@@ -17,17 +17,22 @@
 //! **Artifacts of an earlier attempt.** A re-run of the run keeps the run id and the artifacts
 //! of its earlier attempts, so a name that is there is not proof that this attempt's shard made
 //! it. An `--artifact` may therefore say which job makes it, `NAME=JOBTEXT`: the job whose name
-//! contains `JOBTEXT`, in its latest attempt (the jobs reply of `filter=latest` holds one job
-//! of each name). The newest attempt is the highest `run_attempt` among the listed jobs (this
-//! job is one of them). For such an artifact:
+//! contains `JOBTEXT`, as the jobs reply of `filter=latest` lists it (one job of each name).
+//! Such an artifact counts only when it was created at or after that job's `started_at`; with
+//! no job of that text listed it does not count. The rule rests on timestamps alone, because of
+//! the shape GitHub gives a re-run:
 //!
-//! - a job of the newest attempt runs now or ran in it, so the artifact counts only when it was
-//!   created at or after the job started (a name left by an earlier attempt is older);
-//! - a job whose latest run is of an earlier attempt was not run again ("Re-run failed jobs"
-//!   leaves the shards that passed alone), so the artifact it made then still counts;
-//! - with no job of that text listed the artifact does not count.
+//! - "Re-run all jobs": every job is new and starts after the artifacts of the first attempt were
+//!   made, so none of those counts, and the wait goes on until each shard has uploaded again.
+//! - "Re-run failed jobs": the shards that passed come back as new job records of the newest
+//!   attempt but with their original `started_at`, so the artifact they made then is not older
+//!   than their start and counts. The shard that runs again has a new `started_at` (a queued job
+//!   has its creation time), after any artifact an earlier attempt left, so it is waited for.
+//! - Only this job re-run: the shards keep their `started_at` and their artifacts count at once.
 //!
-//! An `--artifact` with no `=` counts by its name alone.
+//! The attempt number of a job is not used: carried-over jobs carry the newest one. A time is an
+//! RFC 3339 string in UTC, which orders as text. An `--artifact` with no `=` counts by its name
+//! alone.
 //!
 //! GitHub is spoken to with `gh api` ([`crate::advisories::Process`]); the job's token needs
 //! the `actions: read` permission.
@@ -117,8 +122,6 @@ struct Shard<'a> {
     name: &'a str,
     /// `None` while the job has not finished.
     conclusion: Option<&'a str>,
-    /// The attempt of the run this job was last run in.
-    attempt: Option<u64>,
     /// When the job started (an RFC 3339 time in UTC, which orders as text).
     started: Option<&'a str>,
 }
@@ -131,20 +134,10 @@ fn shards<'a>(jobs: &'a Value, prefix: &str) -> Vec<Shard<'a>> {
             name.contains(prefix).then(|| Shard {
                 name,
                 conclusion: job.get("conclusion").and_then(Value::as_str),
-                attempt: job.get("run_attempt").and_then(Value::as_u64),
                 started: job.get("started_at").and_then(Value::as_str),
             })
         })
         .collect()
-}
-
-/// The newest attempt of the run: the highest attempt among the listed jobs (this job is one,
-/// and it runs in the newest attempt).
-fn newest_attempt(jobs: &Value) -> u64 {
-    items(jobs, "jobs")
-        .filter_map(|job| job.get("run_attempt").and_then(Value::as_u64))
-        .max()
-        .unwrap_or(1)
 }
 
 /// The first of the jobs that did not succeed, as `name (conclusion)`.
@@ -164,19 +157,18 @@ fn split(want: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Whether `artifact` is what the job named by `job` makes in the newest attempt `newest`.
-fn made_by(artifact: &Value, job: &str, shards: &[Shard], newest: u64) -> bool {
+/// Whether `artifact` was made by the job named by `job`: created at or after its start.
+fn made_by(artifact: &Value, job: &str, shards: &[Shard]) -> bool {
     let mine: Vec<&Shard> = shards.iter().filter(|s| s.name.contains(job)).collect();
     let created = artifact.get("created_at").and_then(Value::as_str);
     !mine.is_empty()
-        && mine.iter().all(|s| {
-            s.attempt.unwrap_or(newest) != newest
-                || matches!((s.started, created), (Some(start), Some(made)) if made >= start)
-        })
+        && mine
+            .iter()
+            .all(|s| matches!((s.started, created), (Some(start), Some(made)) if made >= start))
 }
 
 /// The names of `wanted` that no live (not expired) artifact of the reply counts for.
-fn missing(reply: &Value, wanted: &[String], shards: &[Shard], newest: u64) -> Vec<String> {
+fn missing(reply: &Value, wanted: &[String], shards: &[Shard]) -> Vec<String> {
     let live: Vec<&Value> = items(reply, "artifacts")
         .filter(|a| !a.get("expired").and_then(Value::as_bool).unwrap_or(false))
         .collect();
@@ -186,7 +178,7 @@ fn missing(reply: &Value, wanted: &[String], shards: &[Shard], newest: u64) -> V
         .filter(|(name, job)| {
             !live.iter().any(|a| {
                 a.get("name").and_then(Value::as_str) == Some(name)
-                    && job.is_none_or(|j| made_by(a, j, shards, newest))
+                    && job.is_none_or(|j| made_by(a, j, shards))
             })
         })
         .map(|(name, _)| name.to_owned())
@@ -229,7 +221,6 @@ pub fn wait(github: &mut dyn Github, args: &Args) -> Result<String, Error> {
         else {
             continue;
         };
-        let newest = newest_attempt(&jobs);
         let shards = shards(&jobs, &args.job_prefix);
         if let Some(job) = failed(&shards) {
             return Err(Error::Failed(format!(
@@ -244,7 +235,7 @@ pub fn wait(github: &mut dyn Github, args: &Args) -> Result<String, Error> {
             continue;
         };
         failed_looks = 0;
-        absent = missing(&reply, &args.artifacts, &shards, newest);
+        absent = missing(&reply, &args.artifacts, &shards);
         if absent.is_empty() {
             return Ok(format!(
                 "wait-artifacts: the {} artifact(s) are there: {}",

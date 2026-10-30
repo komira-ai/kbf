@@ -277,14 +277,16 @@ fn a_look_that_fails_is_tried_again() {
 const T0: &str = "2026-10-01T09:00:00Z";
 /// When the first attempt's shards made their artifacts.
 const T1: &str = "2026-10-01T10:00:00Z";
-/// When the second attempt's jobs started.
+/// When the jobs that run again started.
 const T2: &str = "2026-10-01T11:00:00Z";
-/// After the second attempt's jobs started.
+/// After the jobs that run again started.
 const T3: &str = "2026-10-01T11:30:00Z";
 
-/// A job as the jobs reply lists it: the attempt it last ran in and when it started.
-fn job(name: &str, conclusion: Value, attempt: u64, started: &str) -> Value {
-    json!({ "name": name, "conclusion": conclusion, "run_attempt": attempt, "started_at": started })
+/// A job as the jobs reply lists it: the attempt number is the newest for every job, carried-over
+/// ones included; `started_at` is the original one for a job carried over by a re-run of the
+/// failed jobs, and the creation time while a re-run job is queued.
+fn job(name: &str, conclusion: Value, started: &str) -> Value {
+    json!({ "name": name, "conclusion": conclusion, "run_attempt": 2, "started_at": started })
 }
 
 fn listed(jobs: &[Value]) -> Value {
@@ -306,28 +308,24 @@ const KEYED: [&str; 3] = [
     "profraw-js-1=(js-1-of-1)",
 ];
 
-fn shard_names() -> [&'static str; 3] {
-    [
-        "test-shard (legacy-1-of-2)",
-        "test-shard (legacy-2-of-2)",
-        "test-shard (js-1-of-1)",
-    ]
-}
+const L1: &str = "test-shard (legacy-1-of-2)";
+const L2: &str = "test-shard (legacy-2-of-2)";
+const JS: &str = "test-shard (js-1-of-1)";
 
 /// Catches: "Re-run all jobs" read as done at once. Attempt 1's artifacts are still there while
 /// every shard runs again, so the wait returned and `test` downloaded stale profiles; a shard
-/// that then failed did not fail `test`. Each artifact counts only when it was made after its
-/// shard's job of this attempt started; the wait goes on until all three are.
+/// that then failed did not fail `test`. Each artifact counts only when it was made at or after
+/// its shard's job started (every job is new, so every start is after attempt 1's artifacts);
+/// the wait goes on until all three are. Ignoring `started_at` returns at the first look.
 #[test]
 fn rerun_of_every_job_waits_for_this_attempts_artifacts() {
-    let [l1, l2, js] = shard_names();
     let running = || {
-        let rows: Vec<Value> = [l1, l2, js]
-            .iter()
-            .map(|n| job(n, Value::Null, 2, T2))
-            .chain([job("test", Value::Null, 2, T2)])
-            .collect();
-        listed(&rows)
+        listed(&[
+            job(L1, Value::Null, T2),
+            job(L2, Value::Null, T2),
+            job(JS, Value::Null, T2),
+            job("test", Value::Null, T2),
+        ])
     };
     let stale = |name: &str| art(name, T1);
     let mut s = Script::new(vec![
@@ -381,27 +379,26 @@ fn rerun_of_every_job_waits_for_this_attempts_artifacts() {
 }
 
 /// Catches: "Re-run failed jobs" broken by a rule on the age of artifacts. The shards that
-/// passed are not run again: their jobs are still of attempt 1 and their artifacts older than
-/// attempt 2, and they count. Only the shard that failed (no artifact: it never uploaded) is
-/// waited for, and it counts once its artifact is made after its job of attempt 2 started.
+/// passed come back with their original start, so their artifacts are not older than it and
+/// count; only the shard that runs again (a new start; it never uploaded the first time) is
+/// waited for, and it counts once its artifact is made after its start.
 #[test]
 fn rerun_of_the_failed_job_keeps_the_shards_that_passed() {
-    let [l1, l2, js] = shard_names();
     let rows = |second: Value| {
         listed(&[
-            job(l1, json!("success"), 1, T0),
+            job(L1, json!("success"), T0),
             second,
-            job(js, json!("success"), 1, T0),
-            job("test", Value::Null, 2, T2),
+            job(JS, json!("success"), T0),
+            job("test", Value::Null, T2),
         ])
     };
     let mut s = Script::new(vec![
         (
-            rows(job(l2, Value::Null, 2, T2)),
+            rows(job(L2, Value::Null, T2)),
             artifacts(&[art("profraw-legacy-1", T1), art("profraw-js-1", T1)]),
         ),
         (
-            rows(job(l2, Value::Null, 2, T2)),
+            rows(job(L2, Value::Null, T2)),
             artifacts(&[
                 art("profraw-legacy-1", T1),
                 art("profraw-js-1", T1),
@@ -417,7 +414,7 @@ fn rerun_of_the_failed_job_keeps_the_shards_that_passed() {
 
     // The shard that runs again fails again: the wait ends with it, whatever is there.
     let mut s = Script::new(vec![(
-        rows(job(l2, json!("failure"), 2, T2)),
+        rows(job(L2, json!("failure"), T2)),
         artifacts(&[art("profraw-legacy-1", T1), art("profraw-js-1", T1)]),
     )]);
     let e = wait(&mut s, &args(&KEYED, 10)).expect_err("failed again");
@@ -429,9 +426,9 @@ fn rerun_of_the_failed_job_keeps_the_shards_that_passed() {
     // A passed shard's artifact that has expired is missing, and said so once all have ended.
     let mut s = Script::new(vec![(
         listed(&[
-            job(l1, json!("success"), 1, T0),
-            job(l2, json!("success"), 2, T2),
-            job(js, json!("success"), 1, T0),
+            job(L1, json!("success"), T0),
+            job(L2, json!("success"), T2),
+            job(JS, json!("success"), T0),
         ]),
         artifacts(&[
             json!({ "name": "profraw-legacy-1", "expired": true, "created_at": T1 }),
@@ -446,72 +443,58 @@ fn rerun_of_the_failed_job_keeps_the_shards_that_passed() {
     );
 }
 
-/// Catches: an artifact of a job of this attempt counted without proof that it is newer than
-/// the job's start: one made at the very start counts, one without a creation time, or a job
-/// without a start time, does not; a keyed artifact whose job is not listed does not count (a
-/// key that matches nothing would otherwise pass for ever); a job of another shard with the
-/// same text in its name is not enough.
+/// Catches: a re-run of `test` alone (every shard keeps its start and its artifact) made to
+/// wait: the wait returns at the first look.
 #[test]
-fn an_artifact_counts_only_with_a_creation_time_after_the_start_of_its_job() {
+fn rerun_of_the_gate_alone_returns_at_once() {
+    let mut s = Script::new(vec![(
+        listed(&[
+            job(L1, json!("success"), T0),
+            job(L2, json!("success"), T0),
+            job(JS, json!("success"), T0),
+            job("test", Value::Null, T2),
+        ]),
+        artifacts(&[
+            art("profraw-legacy-1", T1),
+            art("profraw-legacy-2", T1),
+            art("profraw-js-1", T1),
+        ]),
+    )]);
+    wait(&mut s, &args(&KEYED, 10)).expect("all there");
+    assert_eq!(s.pauses, 0);
+}
+
+/// Catches: an artifact counted without proof that it is not older than its job's start: one
+/// made at the very start counts (`>` instead of `>=` fails), one made before, one without a
+/// creation time, or a job without a start time, does not; a keyed artifact whose job is not
+/// listed does not count (a key that matches nothing would otherwise pass for ever); a job of
+/// another shard with similar text in its name is not enough; a name with no `=` counts by name.
+#[test]
+fn an_artifact_counts_only_with_a_creation_time_not_before_the_start_of_its_job() {
     let one = |row: Value, artifact: Value| {
         let mut s = Script::new(vec![(listed(&[row]), artifacts(&[artifact]))]);
         wait(&mut s, &args(&["profraw-js-1=(js-1-of-1)"], 1)).is_ok()
     };
-    let name = "test-shard (js-1-of-1)";
-    assert!(one(job(name, Value::Null, 2, T2), art("profraw-js-1", T2)));
-    assert!(!one(job(name, Value::Null, 2, T2), art("profraw-js-1", T1)));
+    assert!(one(job(JS, Value::Null, T2), art("profraw-js-1", T2)));
+    assert!(one(job(JS, Value::Null, T2), art("profraw-js-1", T3)));
+    assert!(!one(job(JS, Value::Null, T2), art("profraw-js-1", T1)));
     assert!(!one(
-        job(name, Value::Null, 2, T2),
+        job(JS, Value::Null, T2),
         json!({ "name": "profraw-js-1", "expired": false })
     ));
     assert!(!one(
-        json!({ "name": name, "conclusion": null, "run_attempt": 2 }),
+        json!({ "name": JS, "conclusion": null, "run_attempt": 2 }),
         art("profraw-js-1", T3)
     ));
     assert!(!one(
-        job("test-shard (js-1-of-10)", Value::Null, 2, T2),
+        job("test-shard (js-1-of-10)", Value::Null, T2),
         art("profraw-js-1", T3)
     ));
-    assert!(!one(
-        job("test-shard (legacy-1-of-2)", Value::Null, 2, T2),
-        art("profraw-js-1", T3)
-    ));
-    // A job of the first attempt, in a run with no later one: its artifact is simply there.
-    assert!(one(
-        job(name, json!("success"), 1, T0),
-        art("profraw-js-1", T1)
-    ));
+    assert!(!one(job(L1, Value::Null, T2), art("profraw-js-1", T3)));
 
-    // An artifact asked for by name alone counts by name, whatever its age.
     let mut s = Script::new(vec![(
-        listed(&[job("test-shard (js-1-of-1)", Value::Null, 2, T2)]),
+        listed(&[job(JS, Value::Null, T2)]),
         artifacts(&[art("profraw-js-1", T1)]),
     )]);
     wait(&mut s, &args(&["profraw-js-1"], 1)).expect("by name");
-}
-
-/// Catches: the newest attempt taken as attempt 1 or from the shard alone. It is the highest
-/// attempt among all listed jobs (`test` is one of them), so a shard whose latest job is of
-/// attempt 1 beside a `test` of attempt 2 was not run again and its artifact counts; the same
-/// job with no later attempt listed is the newest, and a stale artifact does not count.
-#[test]
-fn the_newest_attempt_is_the_highest_among_the_listed_jobs() {
-    let name = "test-shard (js-1-of-1)";
-    // `test` runs in attempt 2 and this shard's latest job is the first attempt's: it counts.
-    let mut s = Script::new(vec![(
-        listed(&[
-            job(name, json!("success"), 1, T0),
-            job("test", Value::Null, 2, T2),
-        ]),
-        artifacts(&[art("profraw-js-1", T1)]),
-    )]);
-    wait(&mut s, &args(&["profraw-js-1=(js-1-of-1)"], 1)).expect("first attempt's job, passed");
-
-    // The same job in a run with no other attempt is the newest, and a stale artifact (made
-    // before the job started) does not count.
-    let mut s = Script::new(vec![(
-        listed(&[job(name, Value::Null, 1, T2)]),
-        artifacts(&[art("profraw-js-1", T1)]),
-    )]);
-    assert!(wait(&mut s, &args(&["profraw-js-1=(js-1-of-1)"], 1)).is_err());
 }

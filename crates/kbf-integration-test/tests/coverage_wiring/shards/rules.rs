@@ -305,6 +305,13 @@ fn each_drift_of_a_shard_is_refused() {
             changed(" --no-fail-fast", " --no-fail-fast --no-tests=warn"),
             "the test step of `test-shard` passes when no test runs (`--no-tests`)",
         ),
+        (
+            changed(
+                " --no-fail-fast",
+                " --no-fail-fast --no-tests=fail --no-tests=pass",
+            ),
+            "the test step of `test-shard` passes when no test runs (`--no-tests`)",
+        ),
         // The job's name is what `test` finds it by.
         (
             changed(
