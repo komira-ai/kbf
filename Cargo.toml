@@ -85,18 +85,18 @@ hyper-util = { version = "0.1.21", default-features = false }
 # (a lease id, say) is the same type in every kbf crate; a test in kbf-integration-test
 # reads Cargo.lock and refuses a second source. The revision is raised by a pull request
 # of its own that runs the whole CI, never along with other changes.
-js-agent-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "ca40504e4665d0fc8392bfd2a8dd84b55e16ae9b" }
-js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "ca40504e4665d0fc8392bfd2a8dd84b55e16ae9b" }
-js-sched = { git = "https://github.com/komira-ai/jobscheduler", rev = "ca40504e4665d0fc8392bfd2a8dd84b55e16ae9b" }
-js-server-core = { git = "https://github.com/komira-ai/jobscheduler", rev = "ca40504e4665d0fc8392bfd2a8dd84b55e16ae9b" }
-js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "ca40504e4665d0fc8392bfd2a8dd84b55e16ae9b" }
-js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "ca40504e4665d0fc8392bfd2a8dd84b55e16ae9b" }
-js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "ca40504e4665d0fc8392bfd2a8dd84b55e16ae9b" }
-js-store = { git = "https://github.com/komira-ai/jobscheduler", rev = "ca40504e4665d0fc8392bfd2a8dd84b55e16ae9b" }
-js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "ca40504e4665d0fc8392bfd2a8dd84b55e16ae9b" }
-js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "ca40504e4665d0fc8392bfd2a8dd84b55e16ae9b" }
-js-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "ca40504e4665d0fc8392bfd2a8dd84b55e16ae9b" }
-js-whole = { git = "https://github.com/komira-ai/jobscheduler", rev = "ca40504e4665d0fc8392bfd2a8dd84b55e16ae9b" }
+js-agent-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-sched = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-server-core = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-store = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-whole = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
 md-5 = "0.11.0"
 # macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
 objc2 = "0.6.5"

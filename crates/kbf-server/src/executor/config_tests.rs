@@ -225,6 +225,13 @@ fn each_unsafe_setting_is_refused_by_name() {
         ),
         (
             Config {
+                renew_every: Duration::ZERO,
+                ..base()
+            },
+            ConfigError::Renew,
+        ),
+        (
+            Config {
                 insecure_argv_secrets: false,
                 ..base()
             },
@@ -340,4 +347,13 @@ fn the_ttl_exceeds_the_longest_run_by_two_heartbeats() {
         with(room - Duration::from_millis(1)).validate(),
         Err(ConfigError::Ttl)
     );
+}
+
+/// Catches a watch of an earlier process's leases that is shorter than a live executor's gap
+/// between two renewals: it would take the leases of a process that is alive and has not yet
+/// had the chance to renew them.
+#[test]
+fn the_watch_over_earlier_leases_outlasts_a_renewal_and_a_held_pass() {
+    let config = base();
+    assert!(config.adopt_watch() > config.renew_every + config.fence_after);
 }

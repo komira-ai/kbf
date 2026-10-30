@@ -53,7 +53,7 @@ package is a xar archive of `Bom`, `Payload` (a gzip-compressed odc cpio archive
 `PackageInfo`, written by `crates/xtask/src/pkg/`. The Bom format is undocumented; the
 writer follows `mkbom` of bomutils, and is checked on Linux by an independent reader in the
 tests and on macOS by Apple's `pkgutil --expand`, `lsbom` and `installer`
-(`crates/xtask/tests/pkg_macos.rs`, the `pkg-macos` job). The package is unsigned:
+(`crates/xtask/tests/pkg_macos.rs`, the package steps of the `native-macos` job). The package is unsigned:
 `productsign` with the release identity (contract decision 7) wraps the file without
 changing it. CI signs the binary inside it ad hoc.
 

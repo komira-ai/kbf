@@ -553,6 +553,7 @@ fn from_resources(
         memory_bytes: r.memory_bytes,
         gpus: r.gpus,
         vms: r.vms,
+        disk_bytes: 0,
         leases: r.leases,
     })
 }
