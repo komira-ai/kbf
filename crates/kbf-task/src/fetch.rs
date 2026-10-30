@@ -685,7 +685,10 @@ fn make_directories(
 fn write_copies(blob: &Copies, fetch: Fetch<'_>) -> Result<(), FetchError> {
     let (first, first_executable) = &blob.copies[0];
     let mut file = create_file(first, *first_executable)?;
-    if let Err(error) = stream_checked(&blob.digest, first, &mut file, fetch) {
+    let streamed = stream_checked(&blob.digest, first, &mut file, fetch);
+    // Closed before the copies are made from it, or the failed file removed.
+    drop(file);
+    if let Err(error) = streamed {
         // Best effort: the error is the one to report, and the file is not complete.
         let _ = std::fs::remove_file(first);
         return Err(error);
