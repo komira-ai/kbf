@@ -22,12 +22,21 @@
 //!   supported ways: enrolling needs a token and the frontend's enroll listener for a result that
 //!   is the same files;
 //! - release N's helper and `kbf` on the host, as in the first rehearsal;
+//! - release N's `kbf --mode=storage-and-daemon`, as the farm's nodes run it: the storage node and
+//!   the node daemon in one process, under a unit with `Delegate=yes`, as the account the
+//!   storage rehearsal uses. The daemon half runs the container driver over the runner's own
+//!   `crun` (rootless, the account's subordinate ids, its cgroup subtree delegated by the unit),
+//!   which is the one runtime the daemon of `storage-and-daemon` supports; no action is sent to
+//!   it, so no image is fetched;
 //! - a real frontend of release N (`kbf --mode=frontend`, a SQLite state store, the farm CA, the
 //!   operator API and the enroll listener) that the host's storage node registers with, as the
 //!   storage member whose state and build the agent reads from the frontend's worker listener
-//!   (`GET /v1/nodes/{id}/storage-health`) with its certificate alone, no token. The host was
-//!   provisioned by hand, so the operator adopts it (`POST /v1/enroll/nodes/{id}:adopt`), the
-//!   registry row that joins the node to its member.
+//!   (`GET /v1/nodes/{id}/storage-health`) with its certificate alone, no token, and that the
+//!   daemon half registers with as a node, whose placement the agent drains and gives back on
+//!   the same listener (`GET /v1/nodes/{id}`, `:drain`, `:uncordon`) and the operator reads on
+//!   `GET /v1/nodes/{id}` of the operator API. The host was provisioned by hand, so the
+//!   operator adopts it (`POST /v1/enroll/nodes/{id}:adopt`), the registry row that joins the
+//!   node to its member.
 //!
 //! What proves what: the coordinator only knows the host by its heartbeats, so the host
 //! appearing in its status at release N proves the agent dialled it over mutual TLS with the
@@ -36,16 +45,24 @@
 //! health, confirm, undrain) through the helper; `deploy-farm` ending 0 proves the coordinator
 //! reported the farm converged on the version `farm-version` printed.
 //!
-//! What is not covered: the host is a storage node without a daemon half, so the frontend does
-//! not know it as a worker and the drain and the undrain are answered "no such node", which the
-//! agent takes as nothing to drain; a drain of a node with leases is not rehearsed (a daemon
-//! half needs a container runtime). The minimum of storage hosts that must stay up is 0 (the
-//! farm has the one host; with the default 1 the coordinator never orders the last storage
-//! host). The issuer is a stand-in for GitHub's, and the coordinator's address is loopback.
+//! The drain is watched from the frontend's side: the operator API's view of the node is read
+//! every tenth of a second while `deploy-farm` runs, and each change is kept. Before the update
+//! the node is `serving`, connected, on release N's daemon. During it the node is cordoned
+//! (`cordoned`, `draining`, `drained`) while the daemon that is registered still reports
+//! release N, so the agent drained it before the switch started release N+1's daemon, and its
+//! placement does not return to `serving` before that daemon has registered. After the confirm
+//! the node is `serving` and connected on N+1's daemon, which proves the undrain reached the
+//! frontend and the node came back from the restart.
 //!
-//! It needs Linux, systemd, root and the network, so it is `#[ignore]`d and runs through
-//! `cargo xtask sudo-test -p kbf-host-install --test update_rehearsal_agent` on a GitHub-hosted
-//! runner, after the job built `kbf-coordinator`. The setup it shares with the first rehearsal
+//! What is not covered: no action runs on the node, so a drain that has to wait for a lease
+//! (and an action cut by the switch, or rerun) is not rehearsed; the node holds no lease when
+//! the agent asks. The minimum of storage hosts that must stay up is 0 (the farm has the one
+//! host; with the default 1 the coordinator never orders the last storage host). The issuer is
+//! a stand-in for GitHub's, and the coordinator's address is loopback.
+//!
+//! It needs Linux, systemd, root, `crun` (and `uidmap`) and the network, so it is `#[ignore]`d
+//! and runs through `cargo xtask sudo-test -p kbf-host-install --test update_rehearsal_agent` on
+//! a GitHub-hosted runner, after the job built `kbf-coordinator` and installed `crun`. The setup it shares with the first rehearsal
 //! is in `rehearsal/mod.rs`; the farm is in `rehearsal/farm.rs`.
 
 #![cfg(target_os = "linux")]
@@ -100,6 +117,20 @@ fn agent_unit(host_agent: &Path, exec: &str) -> String {
     let mut out: Vec<String> = lines.iter().map(|l| (*l).to_owned()).collect();
     out[at[0]] = format!("ExecStart={exec}");
     out.join("\n") + "\n"
+}
+
+/// The runner's `crun`, and the subordinate ids the daemon's account needs for rootless
+/// containers (`kbf --mode=storage-and-daemon` refuses to start without a range of each).
+fn container_runtime(account: &str) {
+    assert!(
+        Path::new("/usr/bin/crun").is_file(),
+        "no /usr/bin/crun: the job installs `crun` and `uidmap` before the test"
+    );
+    for file in ["/etc/subuid", "/etc/subgid"] {
+        let mut text = fs::read_to_string(file).unwrap_or_default();
+        text.push_str(&format!("{account}:200000:65536\n"));
+        fs::write(file, text).unwrap();
+    }
 }
 
 /// The storage members of the frontend, once every one is `active` on `commit`.
@@ -176,22 +207,30 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
     let storage_dir = farm_dir.join("storage");
     let updater_files = farm_dir.join("updater");
 
-    // The host: release N's kbf as a storage node that registers with the frontend. Its
-    // accounts (the service's and the updater's) exist once the host is laid out, and the keys
-    // are made for them then.
+    // The host: release N's kbf as a farm node (a storage node and a daemon in one process)
+    // that registers with the frontend. Its accounts (the service's and the updater's) exist
+    // once the host is laid out, and the keys are made for them then.
     let path = |p: &Path| p.display().to_string();
+    let worker = farm::FRONTEND_WORKER.rsplit(':').next().unwrap();
     let flags = format!(
         "--storage-listen={storage} --storage-tls-cert={} --storage-tls-key={} \
-         --storage-client-ca={} --frontend=https://localhost:{} --advertise-addr={storage}",
+         --storage-client-ca={} --frontend=https://localhost:{worker} --advertise-addr={storage} \
+         --driver=container --server=https://localhost:{worker} --ca-cert={} --cert={} --key={} \
+         --node-id={} --data-dir=/var/lib/kbf-rehearsal/data",
         path(&storage_dir.join("storage.pem")),
         path(&storage_dir.join("storage.key")),
         path(&storage_dir.join("ca.pem")),
-        farm::FRONTEND_WORKER.rsplit(':').next().unwrap(),
+        path(&storage_dir.join("ca.pem")),
+        path(&storage_dir.join("daemon.pem")),
+        path(&storage_dir.join("daemon.key")),
+        farm::NODE,
     );
-    let unit = rehearsal::kbf_unit(&format!("User={SERVICE_ACCOUNT}"), &flags);
+    let unit = rehearsal::kbf_node_unit(&format!("User={SERVICE_ACCOUNT}"), &flags);
     let host_agent = rehearsal::lay_out(&r, &unit);
+    container_runtime(SERVICE_ACCOUNT);
     farm::private_dir(&storage_dir, Some(SERVICE_ACCOUNT));
     pki.storage(&storage_dir, &ip, SERVICE_ACCOUNT);
+    pki.daemon(&storage_dir, SERVICE_ACCOUNT);
     farm::put(
         &storage_dir.join("ca.pem"),
         &ca_pem,
@@ -246,6 +285,13 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
         "the storage member active on release N",
         &mut [&mut frontend],
         || members_active_on(old),
+    );
+    // The daemon half registered too: the frontend shows the node serving and connected, on
+    // release N's daemon.
+    wait(
+        "the node serving and connected on release N",
+        &mut [&mut frontend],
+        || farm::seen().is_some_and(|n| n.serving() && n.connected && n.runs(old)),
     );
 
     // The coordinator, trusting the stand-in issuer.
@@ -362,6 +408,7 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
         desired, r.version,
         "farm-version and the version facts agree"
     );
+    let watch = farm::Watch::start();
     let deployed = deploy("deploy_farm", &desired);
     assert!(
         deployed.contains("baseline: hosts live before the deploy: storage 1"),
@@ -370,6 +417,48 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
     assert!(
         deployed.contains(&format!("ok: every live host runs {desired}")),
         "{deployed}"
+    );
+
+    // The node, as the frontend showed it through the update.
+    wait(
+        "the node serving and connected on release N+1",
+        &mut [&mut frontend, &mut coordinator],
+        || farm::seen().is_some_and(|n| n.serving() && n.connected && n.runs(new)),
+    );
+    let mut looks = watch.stop();
+    // The look the wait just made, which the watch may not have kept yet.
+    if let Some(last) = farm::seen().filter(|n| looks.last() != Some(n)) {
+        looks.push(last);
+    }
+    println!("the node, as the frontend showed it: {looks:#?}");
+    let cordoned = looks
+        .iter()
+        .position(|n| !n.serving())
+        .unwrap_or_else(|| panic!("the node was never out of placement: {looks:#?}"));
+    assert!(
+        looks[..cordoned].iter().all(|n| n.serving() && n.runs(old)),
+        "before the drain the node serves on release N: {looks:#?}"
+    );
+    // The drain came first: the daemon that is registered while the node is out of placement is
+    // release N's, so release N+1's had not started.
+    assert!(
+        looks[cordoned].runs(old),
+        "the node was drained while release N's daemon was registered: {looks:#?}"
+    );
+    // Back in placement only on N+1's daemon: the undrain came after the confirm.
+    let back = looks
+        .iter()
+        .rposition(|n| !n.serving())
+        .map_or(cordoned, |i| i + 1);
+    assert!(
+        looks
+            .get(back)
+            .is_some_and(|n| n.serving() && n.connected && n.runs(new)),
+        "the node came back into placement on release N+1's daemon: {looks:#?}"
+    );
+    assert!(
+        looks[cordoned..back].iter().all(|n| !n.serving()),
+        "the node stayed out of placement until then: {looks:#?}"
     );
 
     // The host runs N+1, and the coordinator's word for it is the agent's.

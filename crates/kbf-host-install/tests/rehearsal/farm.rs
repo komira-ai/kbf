@@ -174,6 +174,23 @@ impl Pki {
         })
     }
 
+    /// The daemon half's certificate (role `daemon`) for the host `NODE`, owned by `account`.
+    pub fn daemon(&self, dir: &Path, account: &str) -> (PathBuf, PathBuf) {
+        Self::write(dir, "daemon", Some(account), |key| {
+            let node_id = NODE.parse().unwrap();
+            let cert = NodeCert {
+                node_id: &node_id,
+                role: Role::Daemon,
+                key,
+                advertise: None,
+            };
+            self.ca
+                .issue_node(&cert, unix_now(), &mut SystemEntropy)
+                .unwrap()
+                .der
+        })
+    }
+
     /// The updater's certificate for the host `NODE`, which runs storage, owned by `account`.
     pub fn updater(&self, dir: &Path, account: &str) -> (PathBuf, PathBuf) {
         Self::write(dir, "updater", Some(account), |key| {
@@ -314,11 +331,12 @@ pub fn call(name: &str, method: &str, url: &str, ca: Option<&Path>, body: Option
     run(name, cmd.arg(url))
 }
 
-/// Records the host as the frontend's node, with the storage address it advertises: the node
-/// was provisioned by hand, with certificates the operator issued, so it never enrolled.
+/// Records the host as the frontend's node, a storage node and a daemon, with the storage
+/// address it advertises: the node was provisioned by hand, with certificates the operator
+/// issued, so it never enrolled.
 pub fn adopt(advertise: &str) {
     let url = format!("http://{FRONTEND_API}/v1/enroll/nodes/{NODE}:adopt");
-    let body = format!(r#"{{"roles":["storage"],"advertise":"{advertise}"}}"#);
+    let body = format!(r#"{{"roles":["storage","daemon"],"advertise":"{advertise}"}}"#);
     call("adopt", "POST", &url, None, Some(&body));
 }
 
@@ -416,4 +434,90 @@ pub fn storage_health(ca: &Path, cert: &Path, key: &Path) -> Value {
             .arg(url),
     );
     serde_json::from_str(&text).unwrap()
+}
+
+/// The frontend's operator API view of the host's node (`GET /v1/nodes/{id}`): `None` while the
+/// frontend does not know it as a daemon (404) or does not answer.
+pub fn node() -> Option<Value> {
+    let out = Command::new("curl")
+        .args(["--silent", "--max-time", "5"])
+        .args(["-H", &format!("Authorization: Bearer {OPERATOR_TOKEN}")])
+        .arg(format!("http://{FRONTEND_API}/v1/nodes/{NODE}"))
+        .output()
+        .ok()?;
+    let node: Value = serde_json::from_slice(&out.stdout).ok()?;
+    (node["node_id"] == NODE).then_some(node)
+}
+
+/// What the frontend said of the node at one look.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Seen {
+    /// `placement.state`: `serving`, `cordoned`, `draining`, `drained` or `drain_paused`.
+    pub placement: String,
+    /// Whether the daemon's newest stream is open.
+    pub connected: bool,
+    /// The daemon's version as it last reported it: `<semver>+<12 hex digits of the commit>`.
+    pub version: String,
+}
+
+impl Seen {
+    fn of(node: &Value) -> Self {
+        Self {
+            placement: node["placement"]["state"].as_str().unwrap_or("").to_owned(),
+            connected: node["connected"] == true,
+            version: node["software"]["daemon_version"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned(),
+        }
+    }
+
+    /// Whether placement may offer the node leases.
+    pub fn serving(&self) -> bool {
+        self.placement == "serving"
+    }
+
+    /// Whether the daemon runs the build of `commit`.
+    pub fn runs(&self, commit: &str) -> bool {
+        self.version.ends_with(&format!("+{}", &commit[..12]))
+    }
+}
+
+/// The node as the frontend shows it now.
+pub fn seen() -> Option<Seen> {
+    node().map(|n| Seen::of(&n))
+}
+
+/// A look at the node every tenth of a second, from [`Watch::start`] until [`Watch::stop`],
+/// that keeps each look which differs from the one before.
+pub struct Watch {
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<Vec<Seen>>,
+}
+
+impl Watch {
+    pub fn start() -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&done);
+        let thread = std::thread::spawn(move || {
+            let mut log: Vec<Seen> = Vec::new();
+            while !flag.load(Ordering::Acquire) {
+                if let Some(now) = seen()
+                    && log.last() != Some(&now)
+                {
+                    log.push(now);
+                }
+                sleep(Duration::from_millis(100));
+            }
+            log
+        });
+        Self { done, thread }
+    }
+
+    /// Ends the watch: every distinct look, in order.
+    pub fn stop(self) -> Vec<Seen> {
+        self.done.store(true, std::sync::atomic::Ordering::Release);
+        self.thread.join().unwrap()
+    }
 }
