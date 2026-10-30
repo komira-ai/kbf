@@ -138,3 +138,20 @@ fn the_http_sink_reports_the_slots_of_its_key_set() {
     assert_eq!(sink.pack_slots(), 1);
     assert_eq!(sink.large_slots(), 1);
 }
+
+/// Catches a large object whose file changed after it was hashed being reported stored: the PUT
+/// reaches the store (the object there is an orphan), and the sink fails with a put error
+/// (exit 13) saying the bytes changed.
+#[tokio::test]
+async fn a_large_put_of_a_changed_file_fails_after_the_store_took_it() {
+    let (dir, blobs, digest, _) = recorded("http-large-changed").await;
+    crate::task::recording_sink::flip_first_byte(&dir.join("blob"));
+    let (base, server) = serve(vec![201]);
+    let waits = Arc::new(Waits::default());
+    let err = sink(format!("{base}/large?sig=s"), &waits)
+        .store_large(0, &blobs, &digest)
+        .expect_err("changed");
+    assert_eq!(server.join().expect("server").len(), 1);
+    assert!(err.to_string().contains("orphan"), "{err}");
+    assert_eq!(Failure::from(err).exit_code(), EXIT_PUT);
+}

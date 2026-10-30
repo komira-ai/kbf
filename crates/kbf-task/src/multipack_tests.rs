@@ -1,8 +1,10 @@
 //! The run path with several packs and large objects: what is PUT, where, and in what order.
 
 use super::*;
+use crate::outputs::collect_outputs;
 use crate::pack::MAX_LARGE_BYTES;
 use crate::task::recording_sink::Put;
+use crate::task::recording_sink::flip_first_byte;
 use kbf_segments::layout::footer_len;
 use kbf_task_pack::{LargeEntry, MAX_RECORD_BYTES, read_manifest_with, write_pack};
 
@@ -297,49 +299,59 @@ async fn a_failed_pack_put_stops_before_pack_0() {
     assert_eq!(sink.tried(), [(false, 1)]);
 }
 
-/// Declares the file `big` and the two small outputs of the input tree (`BIG` writes the file).
-const BIG_AND_TREE: &[&str] = &["big", "data", "src"];
-
-/// The most records a pack may hold so that `blobs` one-byte blobs need exactly three packs
-/// (pack 0 keeps one record for the manifest): found by asking the plan.
-fn records_for_three_packs(blobs: usize) -> usize {
-    let sizes: Vec<_> = (0..blobs as u32)
-        .map(|n| {
-            let mut hash = [0u8; 32];
-            hash[..4].copy_from_slice(&n.to_be_bytes());
-            (
-                kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, hash, 1),
-                1,
-            )
+/// An action over an input root of `count` files `f0`.. with distinct contents, running `argv`.
+fn files_action(mem: &mut Mem, count: usize, argv: &[&str], outputs: &[&str]) -> Digest {
+    let files = (0..count)
+        .map(|i| FileNode {
+            name: format!("f{i}"),
+            digest: Some(mem.add(format!("file {i}\n").into_bytes())),
+            is_executable: false,
+            ..Default::default()
         })
         .collect();
-    (2..=blobs)
-        .find(|&per_pack| {
-            let limits = Limits {
-                pack_records: per_pack,
-                packs: 8,
-                large: 0,
-                ..Limits::real()
-            };
-            plan(&sizes, 0, &limits).map(|p| p.packs.len()) == Ok(3)
-        })
-        .expect("a record limit that gives three packs")
+    let root = mem.add(
+        Directory {
+            files,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    );
+    let command = mem.add(
+        Command {
+            arguments: argv.iter().map(|a| (*a).to_owned()).collect(),
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_owned(),
+                value: "/usr/bin:/bin".to_owned(),
+            }],
+            output_paths: outputs.iter().map(|o| (*o).to_owned()).collect(),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    );
+    mem.add(
+        Action {
+            command_digest: Some(command),
+            input_root_digest: Some(root),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    )
 }
 
 /// Catches the packs being PUT in ascending order, or the large object not first, or pack 0 not
-/// last, when there are three packs (an ascending loop is invisible with two): a large object and
-/// outputs that need packs 2, 1 and 0 are PUT as large 0, pack 2, pack 1, pack 0, and pack 0's
-/// manifest says `packs = 3` and lists the large object.
+/// last, when there are three packs (an ascending loop is invisible with two). The input has four
+/// files of distinct contents and the command writes a 65 MiB file, so the outputs are exactly
+/// four small blobs and one large one; at two records a pack (one beside the manifest in pack 0)
+/// the small blobs need packs 1 and 2 and leave pack 0 with the manifest alone. The PUTs are large
+/// 0, pack 2, pack 1, pack 0, and pack 0's manifest says `packs = 3` and lists the large object.
 #[tokio::test]
 async fn three_packs_and_a_large_object_are_put_in_commit_order() {
     let mut mem = Mem::default();
-    let small = action(&mut mem, TWO_OUTPUTS, TWO_PATHS);
-    let blobs = blob_count(&mem, &small, "multi-three-count").await;
-    let digest = action(&mut mem, BIG, BIG_AND_TREE);
+    let digest = files_action(&mut mem, 4, BIG, &["big", "f0", "f1", "f2", "f3"]);
     let dir = scratch("multi-three");
     let sink = Fake::with_slots(3, 1);
     let limits = Limits {
-        pack_records: records_for_three_packs(blobs),
+        pack_records: 2,
         packs: 3,
         large: 1,
         ..Limits::real()
@@ -347,6 +359,9 @@ async fn three_packs_and_a_large_object_are_put_in_commit_order() {
     let manifest = execute_with(&cli(&dir, digest), &mem, &sink, &limits)
         .await
         .expect("task");
+    assert_eq!(manifest.output_files.len(), 5);
+    assert_eq!(manifest.stdout, None);
+    assert_eq!(manifest.stderr, None);
     assert_eq!(manifest.packs, 3);
     assert_eq!(manifest.large.len(), 1);
     assert_eq!(
@@ -354,43 +369,52 @@ async fn three_packs_and_a_large_object_are_put_in_commit_order() {
         [(true, 0), (false, 2), (false, 1), (false, 0)]
     );
     let bodies = bodies(&sink);
+    assert_eq!(records_of(&bodies[0]).len(), 2);
+    assert_eq!(records_of(&bodies[1]).len(), 2);
+    assert_eq!(records_of(&bodies[2]).len(), 1);
     assert_eq!(
         read_manifest_with(&bodies[2], MAX_LARGE_BYTES).expect("pack 0"),
         manifest
     );
 }
 
-/// Catches the bytes of a small run changing: the manifest's JSON begins with the frozen text
-/// of the v1 wire form (key order, no `packs` or `large`, empty lists written), the one record
-/// after it is the output's bytes, and the pack is the manifest, that record and a footer of two
-/// entries, ending with the segment magic. These are written out here and do not move when
-/// `write_pack` does.
-#[tokio::test]
-async fn a_small_run_is_frozen_to_the_v1_wire_form() {
-    let mut mem = Mem::default();
-    let digest = action(&mut mem, &["true"], &["data"]);
-    let dir = scratch("multi-frozen");
+/// The pack of the hexadecimal text of the fixture `name`, a path from this crate's directory.
+fn fixture_pack(name: &str) -> Vec<u8> {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(name);
+    let text = std::fs::read_to_string(path).expect("fixture");
+    hex::decode(text.split_whitespace().collect::<String>()).expect("hex")
+}
+
+/// Catches any change to the bytes of a v1 run's pack: the manifest of the shared v1 fixture and
+/// its records go through the run's packing (`store_outputs`, the function `execute` ends with),
+/// and the pack PUT must equal `tests/fixtures/v1_digest_order.pack.hex` byte for byte, manifest,
+/// records, index and trailer. The fixture is the shared fixture's manifest followed by the same
+/// six records in ascending digest order (the order the plan gives), with the index laid out as
+/// `kbf-segments` documents it (fan-out, entries sorted by digest, trailer with the CRC-32C of
+/// the index). It was written by a separate program that builds the segment from that layout,
+/// and the same program reproduces the shared fixture byte for byte when given its record order,
+/// so the fixture does not depend on `write_pack` or `SegmentWriter`.
+#[test]
+fn a_v1_run_is_frozen_byte_for_byte() {
+    let shared = fixture_pack("../kbf-task-pack/tests/fixtures/task_pack/task_pack_v1.pack.hex");
+    let mut manifest = read_manifest(&shared).expect("manifest");
+    let reader = SegmentReader::open(&shared).expect("segment");
+    let mut entries = reader.footer().entries().to_vec();
+    entries.sort_by_key(|e| e.offset);
+    let records: Vec<&[u8]> = entries[1..]
+        .iter()
+        .map(|e| reader.get(&e.digest).expect("get").expect("record"))
+        .collect();
+    assert_eq!(records.len(), 6);
     let sink = Fake::new(false);
-    let flags = cli(&dir, digest);
-    let manifest = execute(&flags, &mem, &sink).await.expect("task");
-    let body = bodies(&sink).remove(0);
-    let json_len = manifest.to_json().expect("json").len();
-    let json = String::from_utf8(body[..json_len].to_vec()).expect("utf-8");
-    let frozen = format!(
-        concat!(
-            r#"{{"version":1,"lease":"lease-1","action":"{}","exit_code":0,"#,
-            r#""output_files":[{{"path":"data","digest":"{}","is_executable":false}}],"#,
-            r#""output_directories":[],"output_symlinks":[],"timing":{{"fetch_ms":"#
-        ),
-        flags.action,
-        sha256(b"hi\n"),
-    );
-    assert!(json.starts_with(&frozen), "{json}");
-    assert!(json.ends_with("}}"), "{json}");
-    assert_eq!(&body[json_len..json_len + 3], b"hi\n");
-    // Two entries of 52 bytes, the fan-out of 1,024 and the 32-byte trailer.
-    assert_eq!(body.len(), json_len + 3 + 1024 + 2 * 52 + 32);
-    assert_eq!(&body[body.len() - 8..], b"KBFSEG\r\n");
+    let limits = Limits {
+        packs: 1,
+        large: 0,
+        ..Limits::real()
+    };
+    store_outputs(&mut manifest, &Blobs::from_bytes(&records), &limits, &sink).expect("stored");
+    let frozen = fixture_pack("tests/fixtures/v1_digest_order.pack.hex");
+    assert_eq!(bodies(&sink), [frozen]);
 }
 
 /// Catches an extra pack that cannot be built being found only after other packs were PUT: with
@@ -471,4 +495,144 @@ async fn a_v1_run_that_exactly_fills_the_pack_is_accepted() {
     assert_eq!(fits(exact).expect("exactly full").packs, [vec![blob[0].0]]);
     let text = fits(exact - 1).unwrap_err().to_string();
     assert!(text.contains("output-too-large"), "{text}");
+}
+
+/// Files `f0`.. of 1,000 bytes over the hashing chunk and distinct contents, recorded as outputs
+/// of a run, with the manifest that names them.
+async fn recorded_files(name: &str, count: usize) -> (TestDir, TaskManifest, Blobs) {
+    let dir = scratch(name);
+    for i in 0..count {
+        let bytes: Vec<u8> = (0..kbf_outputs::CHUNK_BYTES + 1000)
+            .map(|n| ((n + i) % 251) as u8)
+            .collect();
+        std::fs::write(dir.join(format!("f{i}")), bytes).expect("file");
+    }
+    std::fs::write(dir.join("out"), b"").expect("out");
+    std::fs::write(dir.join("err"), b"").expect("err");
+    let paths: Vec<String> = (0..count).map(|i| format!("f{i}")).collect();
+    let outputs = collect_outputs(
+        &dir,
+        "",
+        &paths,
+        &dir.join("out"),
+        &dir.join("err"),
+        OutputLimits::default(),
+        u64::MAX,
+    )
+    .await
+    .expect("collected");
+    let manifest = TaskManifest {
+        lease: "lease-1".to_owned(),
+        action: sha256(b"a"),
+        exit_code: 0,
+        stdout: None,
+        stderr: None,
+        output_files: outputs
+            .result
+            .output_files
+            .iter()
+            .map(|f| kbf_task_pack::OutputFile {
+                path: f.path.clone(),
+                digest: digest_of(f.digest.as_ref()).expect("digest"),
+                is_executable: false,
+            })
+            .collect(),
+        output_directories: Vec::new(),
+        output_symlinks: Vec::new(),
+        timing: kbf_task_pack::Timing::default(),
+        usage: kbf_task_pack::Usage::default(),
+        packs: 1,
+        large: Vec::new(),
+        inputs: None,
+    };
+    (dir, manifest, outputs.blobs)
+}
+
+/// Limits for one pack, and for three packs of two records.
+fn pack_shapes() -> [Limits; 2] {
+    [
+        Limits {
+            packs: 1,
+            large: 0,
+            ..Limits::real()
+        },
+        Limits {
+            pack_records: 2,
+            packs: 3,
+            large: 0,
+            ..Limits::real()
+        },
+    ]
+}
+
+/// Catches a file changed in place after it was hashed (the same size, so nothing else notices)
+/// being packed under its old digest and stored: whether the file lands in pack 0 or in another
+/// pack, the task fails as `output-changed` (exit 12) and no PUT is tried.
+#[tokio::test]
+async fn a_file_changed_after_hashing_fails_before_any_put() {
+    for limits in pack_shapes() {
+        let (dir, mut manifest, blobs) = recorded_files("multi-changed", 4).await;
+        flip_first_byte(&dir.join("f0"));
+        let sink = Fake::with_slots(3, 0);
+        let failure = store_outputs(&mut manifest, &blobs, &limits, &sink).unwrap_err();
+        assert_eq!(failure.exit_code(), EXIT_PACK);
+        assert!(failure.to_string().contains("output-changed"), "{failure}");
+        assert!(sink.tried().is_empty());
+    }
+}
+
+/// Catches a file that shrank after it was hashed failing in the middle of the PUTs: it cannot be
+/// read in full, which is found while packs are checked, exit 12 with no PUT tried.
+#[tokio::test]
+async fn a_file_that_shrank_after_hashing_fails_before_any_put() {
+    for limits in pack_shapes() {
+        let (dir, mut manifest, blobs) = recorded_files("multi-shrunk", 4).await;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("f0"))
+            .expect("open")
+            .set_len(10)
+            .expect("truncate");
+        let sink = Fake::with_slots(3, 0);
+        let failure = store_outputs(&mut manifest, &blobs, &limits, &sink).unwrap_err();
+        assert_eq!(failure.exit_code(), EXIT_PACK);
+        assert!(sink.tried().is_empty());
+    }
+}
+
+/// Catches a change between the check of a pack and its PUT going unseen: every file changes
+/// while pack 2 is being PUT, pack 1 is built again from them, and the task fails as
+/// `output-changed` (exit 12) before pack 1 is PUT; pack 0 is never PUT.
+#[tokio::test]
+async fn a_file_changed_before_its_pack_is_put_fails_before_that_put() {
+    let (dir, mut manifest, blobs) = recorded_files("multi-changed-late", 4).await;
+    let paths: Vec<_> = (0..4).map(|i| dir.join(format!("f{i}"))).collect();
+    let sink = Fake::with_slots(3, 0).with_hook(move |_, _| {
+        for path in &paths {
+            flip_first_byte(path);
+        }
+    });
+    let limits = &pack_shapes()[1];
+    let failure = store_outputs(&mut manifest, &blobs, limits, &sink).unwrap_err();
+    assert_eq!(failure.exit_code(), EXIT_PACK);
+    assert!(failure.to_string().contains("output-changed"), "{failure}");
+    assert_eq!(sink.tried(), [(false, 2)]);
+}
+
+/// Catches a large object whose file changed while it was PUT being counted as stored: the bytes
+/// streamed do not hash to the blob, the PUT fails (exit 13; the object stored is an orphan for
+/// the janitor), and pack 0 is never PUT.
+#[tokio::test]
+async fn a_large_file_changed_during_its_put_fails_the_task_and_pack_0_is_never_put() {
+    let mut mem = Mem::default();
+    let digest = action(&mut mem, BIG, &["big"]);
+    let dir = scratch("multi-large-changed");
+    let big = dir.join("in/big");
+    let sink = Fake::with_slots(2, 1).with_hook(move |_, _| flip_first_byte(&big));
+    let failure = execute(&cli(&dir, digest), &mem, &sink)
+        .await
+        .expect_err("changed");
+    assert_eq!(failure.exit_code(), EXIT_PUT);
+    assert!(failure.to_string().contains("changed"), "{failure}");
+    assert_eq!(sink.tried(), [(true, 0)]);
 }

@@ -31,6 +31,9 @@ pub use kbf_task_pack::MAX_PACK_BYTES;
 /// or there are too many records.
 pub const OUTPUT_TOO_LARGE: &str = "output-too-large";
 
+/// The detail of a refusal because an output file no longer has the bytes it was hashed with.
+pub const OUTPUT_CHANGED: &str = "output-changed";
+
 /// The detail of a refusal of the manifest for any other reason: a path, a target, a digest, a
 /// number or the lease that ingest would refuse.
 pub const INVALID_MANIFEST: &str = "invalid-manifest";
@@ -41,9 +44,20 @@ pub const INVALID_PACK: &str = "invalid-pack";
 /// Why a pack was not built: a short `detail` and the refusal's own text.
 #[derive(Debug)]
 pub struct PackError {
-    /// [`OUTPUT_TOO_LARGE`], [`INVALID_MANIFEST`] or [`INVALID_PACK`].
+    /// [`OUTPUT_TOO_LARGE`], [`OUTPUT_CHANGED`], [`INVALID_MANIFEST`] or [`INVALID_PACK`].
     pub detail: &'static str,
     message: String,
+}
+
+impl PackError {
+    /// The refusal of a blob whose bytes are no longer those of `digest`.
+    #[must_use]
+    pub fn changed(digest: &kbf_types::Digest) -> Self {
+        Self {
+            detail: OUTPUT_CHANGED,
+            message: format!("the output {digest} changed after it was hashed"),
+        }
+    }
 }
 
 impl fmt::Display for PackError {

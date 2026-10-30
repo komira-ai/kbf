@@ -40,7 +40,7 @@
 //! streamed from the file it was read from, never held whole), the others fill packs 1.. and then
 //! pack 0, which keeps room for the manifest. More large blobs or packs than the key set has, or
 //! a blob over the large cap, fails the task as `output-too-large` (exit 12) before anything is
-//! stored. Pack 0 is built, validated and read back first and every other pack is built once to check it can be, one at a time; then the PUTs go in the order large
+//! stored. Pack 0 is built, validated and read back first and every other pack is built once to check it can be, one at a time, with each blob checked against its digest (a file changed after it was hashed fails the task as `output-changed`, exit 12); then the PUTs go in the order large
 //! objects, packs `N-1` down to 1, and pack 0 last, so pack 0, which holds the manifest at offset
 //! 0, is the commit point. Any refused PUT fails the task (exit 13) and later PUTs are not made.
 //! A run that needs one pack and no large object writes the manifest as version 1 and the same
@@ -52,10 +52,15 @@
 //!   key for every attempt at a lease, so a re-attempt of the task does not meet the old key.
 //! - The `exit_code`, `timing` and `usage` in the manifest are written by this tool, which runs
 //!   as the same user as the Command, so they are claims. Ingest does not trust them.
-//! - The tool builds the pack in memory: the collected blobs, the segment writer's buffer and the
-//!   finished pack are each about the size of the pack, so the peak is about three times the pack
-//!   (about 384 MiB at the 128 MiB pack limit). A job's memory limit must allow for it; a task
-//!   killed for passing it ends with 137, not with the pack code 12.
+//! - The tool builds packs in memory. While pack 0 is built, the blobs read for it, the segment
+//!   writer's buffer and the finished pack are each about the size of a pack. Pack 0 is then kept,
+//!   and each other pack is built twice (once to check it before anything is stored, once to PUT
+//!   it), one at a time, each time from the blobs read for it (every blob is checked against its
+//!   digest as it is read) and the pack built from them. So the peak is about pack 0 plus two
+//!   packs: three packs, about 384 MiB at the 128 MiB pack limit, and the blobs of every pack but
+//!   pack 0 are read twice. A large object is streamed from its file and is never held. A job's
+//!   memory limit must allow for it; a task killed for passing it ends with 137, not with the
+//!   pack code 12.
 //!
 //! # What the tool does not separate
 //!

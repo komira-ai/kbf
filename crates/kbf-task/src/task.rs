@@ -17,7 +17,7 @@
 //! | 2 | the flags are wrong (clap) |
 //! | 10 | fetch: the Action, the Command or an input could not be read or checked, or laid out |
 //! | 11 | run-start: the Command could not be started (bad paths, no program) |
-//! | 12 | pack: the outputs could not be collected, did not fit the run's packs and large objects (`output-too-large`), or made a manifest or pack the frontend would refuse (`invalid-manifest`, `invalid-pack`) |
+//! | 12 | pack: the outputs could not be collected, did not fit the run's packs and large objects (`output-too-large`), changed after they were hashed (`output-changed`), or made a manifest or pack the frontend would refuse (`invalid-manifest`, `invalid-pack`) |
 //! | 13 | put: the pack could not be stored (refused, key already taken, still no room after the retries of a 503, unreachable) |
 //! | 14 | setup: `--lease` is not a build id, a credential or root certificate is unusable, a credential given as a flag value without `--insecure-argv-secrets`, or the runtime did not start |
 
@@ -29,9 +29,10 @@ use std::time::{Duration, Instant};
 
 use clap::{ArgGroup, Parser};
 use kbf_proto::reapi::{self, Action, Command};
+use kbf_segments::sha256;
 use kbf_task_pack::{
-    LargeEntry, MAX_LARGE, MAX_PACKS, OutputDirectory, OutputFile, OutputSymlink, TaskManifest,
-    Timing, Usage, check_build,
+    LargeEntry, OutputDirectory, OutputFile, OutputSymlink, TaskManifest, Timing, Usage,
+    check_build,
 };
 use kbf_types::Digest;
 
@@ -89,10 +90,11 @@ pub const EXIT_SETUP: u8 = 14;
 /// # What the manifest claims
 ///
 /// The manifest's `exit_code`, `timing` and `usage` are written by this tool, which runs as the
-/// same user as the Command: they are claims, and the frontend does not trust them. The pack is
-/// built in memory (the collected blobs, the writer's buffer and the finished pack), so the tool's
-/// peak memory is about three times the pack (about 384 MiB at the 128 MiB limit); a job's memory
-/// limit must allow for it, or the kill shows as 137, not 12.
+/// same user as the Command: they are claims, and the frontend does not trust them. Packs are
+/// built in memory: pack 0 is kept built, and each other pack is built twice, one at a time, from
+/// the blobs read for it, so the tool's peak memory is about pack 0 plus two packs (about 384 MiB
+/// at the 128 MiB limit); a job's memory limit must allow for it, or the kill shows as 137, not
+/// 12. A large object is streamed from its file and never held.
 ///
 /// # Storing the pack
 ///
@@ -123,7 +125,7 @@ pub struct Cli {
     /// `--pack-url-file`: read, never deleted, and a credential like the pack URL. The pack URLs
     /// are, in order, the slots of packs 0..; the large URLs, the slots of large objects 0.. . A
     /// run that needs more packs or large objects than the set has fails with `output-too-large`
-    /// before anything is stored. At most 8 of each are used. The file's protection is the
+    /// before anything is stored. More than 8 of either is refused at startup (exit 14). The file's protection is the
     /// executor's per-run directory, not its mode: the executor delivers it read-only for the
     /// run, so the tool does not check its permissions.
     #[arg(long)]
@@ -276,19 +278,26 @@ impl PackSink for HttpSink {
         // Each attempt reads the blob again from its first byte.
         put_retrying(
             || {
-                let mut reader =
-                    blobs
-                        .reader(&digest::to_reapi(digest))
-                        .map_err(|e| PutError::File {
-                            path: format!("output blob {digest}"),
-                            reason: e.to_string(),
-                        })?;
+                let blob = digest::to_reapi(digest);
+                let mut reader = blobs.reader(&blob).map_err(|e| PutError::File {
+                    path: format!("output blob {digest}"),
+                    reason: e.to_string(),
+                })?;
                 put_reader(
                     &self.agent,
                     &self.urls.large[slot],
                     digest.size_bytes,
                     &mut reader,
-                )
+                )?;
+                // The bytes streamed are hashed on the way. If they are not the blob's, the
+                // object is stored but wrong: the run fails (exit 13) and pack 0 is never PUT,
+                // so the object is an orphan that the janitor removes.
+                reader.matches(&blob).then_some(()).ok_or(PutError::File {
+                    path: format!("output blob {digest}"),
+                    reason:
+                        "its bytes changed after they were hashed; the object stored is an orphan"
+                            .to_owned(),
+                })
             },
             self.sleeper.as_ref(),
         )
@@ -296,7 +305,7 @@ impl PackSink for HttpSink {
 }
 
 /// What the manifest of a run with several large objects can take beyond a manifest without:
-/// the `packs` field and up to [`MAX_LARGE`] entries of about 110 bytes each.
+/// the `packs` field and up to [`MAX_LARGE`](kbf_task_pack::MAX_LARGE) entries of about 110 bytes each.
 const MANIFEST_SLACK: u64 = 2048;
 
 /// The bytes pack 0 keeps for the manifest. A run of one pack and no large object writes the
@@ -326,11 +335,18 @@ fn extra_pack(blobs: &Blobs, digests: &[Digest]) -> Result<Vec<u8>, Failure> {
     Ok(build_extra(&views)?)
 }
 
-/// The recorded blobs `digests` in memory, for one pack.
+/// The recorded blobs `digests` in memory, for one pack, each checked against its digest: a file
+/// that changed in place after it was hashed is not packed (detail `output-changed`), and one
+/// that shrank cannot be read in full.
 fn held<'a>(blobs: &'a Blobs, digests: &[Digest]) -> Result<Vec<Cow<'a, [u8]>>, Failure> {
     let mut held = Vec::new();
     for digest in digests {
-        held.extend(blobs.read(&digest::to_reapi(digest))?);
+        for bytes in blobs.read(&digest::to_reapi(digest))?.into_iter() {
+            if sha256(&bytes) != *digest {
+                return Err(PackError::changed(digest).into());
+            }
+            held.push(bytes);
+        }
     }
     Ok(held)
 }
@@ -361,18 +377,13 @@ pub async fn execute(
 }
 
 /// [`execute`] within `limits`: the placement limits are a parameter so a test can use small packs.
+/// `limits.packs` and `limits.large` are at most the manifest's maxima (a key set has no more).
 pub(crate) async fn execute_with(
     cli: &Cli,
     source: &impl BlobSource,
     sink: &impl PackSink,
     limits: &Limits,
 ) -> Result<TaskManifest, Failure> {
-    // A manifest names at most MAX_PACKS packs and MAX_LARGE large objects.
-    let limits = &Limits {
-        packs: limits.packs.min(usize::from(MAX_PACKS)),
-        large: limits.large.min(usize::from(MAX_LARGE)),
-        ..*limits
-    };
     let fetching = Instant::now();
     let action_digest = digest::to_reapi(&cli.action);
     let action: Action = fetch_message(source, &action_digest)?;
@@ -457,16 +468,39 @@ pub(crate) async fn execute_with(
             target: link.target.clone(),
         });
     }
+    store_outputs(&mut manifest, &outputs.blobs, limits, sink)?;
+    Ok(manifest)
+}
+
+/// Plans `blobs` into the slots `limits` allows, sets `manifest.packs` and `manifest.large`, and
+/// stores the large objects and the packs, in this order: large objects, packs `N-1` down to 1,
+/// then pack 0, the commit point.
+///
+/// Nothing is stored until pack 0 has been built, validated and read back, and every other pack
+/// has been built once; a blob that no longer has the bytes it was hashed with fails there (exit
+/// 12, detail `output-changed`). Memory: pack 0 is kept built; each other pack is built once to
+/// check it and dropped, and built again when its turn comes, so besides pack 0 there are, at
+/// one time, the blobs read for one pack and the pack built from them: about three packs of
+/// 128 MiB, and the blobs of every pack but pack 0 are read twice.
+///
+/// # Errors
+/// A [`Failure`]: a pack refusal (exit 12) before the first PUT, or the first refused PUT (exit
+/// 13), after which nothing more is stored.
+fn store_outputs(
+    manifest: &mut TaskManifest,
+    blobs: &Blobs,
+    limits: &Limits,
+    sink: &impl PackSink,
+) -> Result<(), Failure> {
     // Plan before anything is built or stored: pack 0 keeps room for the manifest as it will be
     // written, with its `packs` and `large` fields.
-    let reserve = manifest_reserve(&manifest, limits)?;
-    let sizes = outputs
-        .blobs
+    let reserve = manifest_reserve(manifest, limits)?;
+    let sizes = blobs
         .digests()
         .map(|d| digest_of(Some(&d)).map(|d| (d, d.size_bytes)))
         .collect::<Result<Vec<_>, _>>()?;
     let planned = plan(&sizes, reserve, limits).map_err(PackError::from)?;
-    // At most `limits.packs`, which is at most MAX_PACKS.
+    // At most `limits.packs`, which is at most MAX_PACKS (a key set has no more URLs).
     manifest.packs = planned.packs.len() as u8;
     manifest.large = planned
         .large
@@ -478,30 +512,22 @@ pub(crate) async fn execute_with(
         })
         .collect();
 
-    // Pack 0 is built, validated and read back first, so a manifest or a pack ingest would
-    // refuse fails the task before anything is stored. It is kept until the end, and the other
-    // packs are built one at a time, so about three packs are in memory at once.
     let pack_0 = {
-        let held = held(&outputs.blobs, &planned.packs[0])?;
-        let blobs: Vec<&[u8]> = held.iter().map(|bytes| bytes.as_ref()).collect();
-        build(&manifest, &blobs)?
+        let held = held(blobs, &planned.packs[0])?;
+        let views: Vec<&[u8]> = held.iter().map(|bytes| bytes.as_ref()).collect();
+        build(manifest, &views)?
     };
-    // Every other pack is built once now and dropped, one at a time, so a pack that cannot be
-    // built fails the task (exit 12) before anything is stored; each is built again, only when
-    // its turn to be PUT comes, so at most one extra pack is in memory besides pack 0.
     for slot in 1..planned.packs.len() {
-        extra_pack(&outputs.blobs, &planned.packs[slot])?;
+        extra_pack(blobs, &planned.packs[slot])?;
     }
-    // The order is the commit order: large objects, packs N-1 down to 1, then pack 0, so a run
-    // whose pack 0 is absent is lost whatever else was written.
     for (slot, digest) in planned.large.iter().enumerate() {
-        sink.store_large(slot, &outputs.blobs, digest)?;
+        sink.store_large(slot, blobs, digest)?;
     }
     for slot in (1..planned.packs.len()).rev() {
-        sink.store_pack(slot, &extra_pack(&outputs.blobs, &planned.packs[slot])?)?;
+        sink.store_pack(slot, &extra_pack(blobs, &planned.packs[slot])?)?;
     }
     sink.store_pack(0, &pack_0)?;
-    Ok(manifest)
+    Ok(())
 }
 
 /// The digest an Action field names, or a fetch failure saying which field is missing.
@@ -686,4 +712,4 @@ mod put_urls_flag_tests;
 
 #[cfg(test)]
 #[path = "recording_sink.rs"]
-mod recording_sink;
+pub(crate) mod recording_sink;

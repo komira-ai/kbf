@@ -104,3 +104,21 @@ async fn a_reader_for_an_unrecorded_blob_is_not_found() {
     let err = outputs.blobs.reader(&absent).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 }
+
+/// Catches `matches` not telling a changed blob from the recorded one: after a full read of the
+/// recorded bytes it is true, and after the file changed in place (same size) it is false.
+#[tokio::test]
+async fn a_reader_knows_whether_the_bytes_it_read_are_the_blob() {
+    let (dir, outputs, _, _) = record("matches").await;
+    for path in ["small", "big"] {
+        let digest = digest_of_output(&outputs, path);
+        let mut reader = outputs.blobs.reader(&digest).expect("reader");
+        std::io::copy(&mut reader, &mut std::io::sink()).expect("read");
+        assert!(reader.matches(&digest));
+    }
+    let digest = digest_of_output(&outputs, "big");
+    crate::task::recording_sink::flip_first_byte(&dir.join("big"));
+    let mut reader = outputs.blobs.reader(&digest).expect("reader");
+    std::io::copy(&mut reader, &mut std::io::sink()).expect("read");
+    assert!(!reader.matches(&digest));
+}

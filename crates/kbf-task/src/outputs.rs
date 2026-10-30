@@ -23,6 +23,7 @@ use std::sync::Mutex;
 
 use kbf_outputs::{OutputsError, Store, StoreError, digest_of, store_file};
 use kbf_proto::reapi::{ActionResult, Digest};
+use sha2::{Digest as _, Sha256};
 
 pub use kbf_outputs::OutputLimits;
 
@@ -58,6 +59,21 @@ impl Blobs {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.blobs.is_empty()
+    }
+
+    /// Blobs of the given bytes held in memory, for tests.
+    #[cfg(test)]
+    pub(crate) fn from_bytes(all: &[&[u8]]) -> Self {
+        let mut blobs = Self::default();
+        for bytes in all {
+            let digest = digest_of(bytes);
+            blobs.bytes += bytes.len() as u64;
+            blobs.blobs.insert(
+                (digest.hash, digest.size_bytes),
+                Blob::Bytes(bytes.to_vec()),
+            );
+        }
+        blobs
     }
 
     /// The sum of the sizes of the distinct blobs.
@@ -111,48 +127,61 @@ impl Blobs {
             .blobs
             .get(&(digest.hash.clone(), digest.size_bytes))
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
-        Ok(match blob {
-            Blob::Bytes(bytes) => BlobReader::Bytes(bytes),
-            Blob::File { file, start } => BlobReader::File {
-                file,
-                next: *start,
-                end: *start + digest.size_bytes.unsigned_abs(),
+        Ok(BlobReader {
+            source: match blob {
+                Blob::Bytes(bytes) => Source::Bytes(bytes),
+                Blob::File { file, start } => Source::File {
+                    file,
+                    next: *start,
+                    end: *start + digest.size_bytes.unsigned_abs(),
+                },
             },
+            hasher: Sha256::new(),
         })
     }
 }
 
 /// A reader over one recorded blob's bytes from the start. A held file is read where it was
 /// recorded with `pread`, never loaded whole, and every [`Blobs::reader`] call starts again from
-/// the first byte, so a retried PUT re-sends the whole blob.
+/// the first byte, so a retried PUT re-sends the whole blob. The bytes read are hashed as they
+/// pass, so [`BlobReader::matches`] says whether what was streamed is the blob that was recorded.
 #[derive(Debug)]
-pub enum BlobReader<'a> {
+pub struct BlobReader<'a> {
+    source: Source<'a>,
+    hasher: Sha256,
+}
+
+#[derive(Debug)]
+enum Source<'a> {
     /// Bytes held in memory.
     Bytes(&'a [u8]),
     /// A held file: the next offset to read and where the blob ends.
-    File {
-        /// The open descriptor the blob was hashed from.
-        file: &'a File,
-        /// The next offset to read.
-        next: u64,
-        /// The offset after the blob's last byte.
-        end: u64,
-    },
+    File { file: &'a File, next: u64, end: u64 },
+}
+
+impl BlobReader<'_> {
+    /// Whether the bytes read so far hash to `digest`. Call it after reading to the end.
+    #[must_use]
+    pub fn matches(self, digest: &Digest) -> bool {
+        hex::encode(self.hasher.finalize()) == digest.hash
+    }
 }
 
 impl Read for BlobReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            BlobReader::Bytes(bytes) => bytes.read(buf),
-            BlobReader::File { file, next, end } => {
+        let n = match &mut self.source {
+            Source::Bytes(bytes) => bytes.read(buf)?,
+            Source::File { file, next, end } => {
                 let want = buf
                     .len()
                     .min(usize::try_from(*end - *next).unwrap_or(usize::MAX));
                 let n = file.read_at(&mut buf[..want], *next)?;
                 *next += n as u64;
-                Ok(n)
+                n
             }
-        }
+        };
+        self.hasher.update(&buf[..n]);
+        Ok(n)
     }
 }
 

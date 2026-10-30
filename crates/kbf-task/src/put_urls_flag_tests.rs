@@ -159,3 +159,20 @@ fn the_help_describes_the_key_set() {
     assert!(help.contains("output-too-large"), "{help}");
     assert!(!help.contains("today only"), "{help}");
 }
+
+/// Catches a key set longer than a manifest can name starting a run: 9 packs or 9 large URLs is a
+/// setup failure (exit 14) naming the list, and 8 of each is accepted.
+#[test]
+fn a_key_set_of_more_than_8_urls_is_a_setup_failure() {
+    let list = |n: usize| vec!["\"https://store.example/k\""; n].join(",");
+    let with = |packs: usize, large: usize| {
+        let set = format!(r#"{{"packs":[{}],"large":[{}]}}"#, list(packs), list(large));
+        parse(&[&format!("--put-urls={set}"), "--insecure-argv-secrets"]).expect("flags")
+    };
+    put_urls(&with(8, 8)).expect("8 each");
+    for (packs, large, field) in [(9, 1, "packs"), (1, 9, "large")] {
+        let failure = put_urls(&with(packs, large)).unwrap_err();
+        assert_eq!(failure.exit_code(), EXIT_SETUP);
+        assert!(failure.to_string().contains(field), "{failure}");
+    }
+}

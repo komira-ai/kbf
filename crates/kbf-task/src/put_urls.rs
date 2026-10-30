@@ -12,6 +12,9 @@
 //! from `--put-urls-file` (read, never deleted) or, as a stopgap that needs
 //! `--insecure-argv-secrets` like the other credentials in argv, from `--put-urls`.
 //!
+//! The file's protection is the executor's per-run directory, not its mode: the executor delivers
+//! it read-only for the run, so the tool does not check its permissions.
+//!
 //! The URLs are credentials, so no error here contains any part of the input: a refusal names
 //! the field and the rule, and a JSON syntax error only its line and column.
 //!
@@ -20,16 +23,14 @@
 //! Slot `i` of `packs` is where pack `i` is PUT (pack 0 holds the manifest and is the commit
 //! point), and slot `i` of `large` is where large object `i` is PUT. The run needs at most as
 //! many of each as its outputs call for ([`crate::plan`]); URLs it does not need are not used.
-//! The lengths of the lists are `N` and `M` for the plan, up to 8 of each. The v1 flag
+//! The lengths of the lists are `N` and `M` for the plan; a list longer than a manifest can name (8) is refused at startup (exit 14). The v1 flag
 //! `--pack-url-file` is a key set of one pack and no large object.
 
 use std::fmt;
 use std::path::Path;
 
+use kbf_task_pack::{MAX_LARGE, MAX_PACKS};
 use serde_json::Value;
-
-/// The most URLs either list may hold: a slot is named by one byte of the manifest.
-pub const MAX_SLOTS: usize = 255;
 
 /// The only keys the key set's JSON may hold.
 const FIELDS: [&str; 2] = ["packs", "large"];
@@ -93,13 +94,16 @@ pub enum PutUrlsError {
     /// `packs` is empty: pack 0 is the commit point and must have a URL.
     #[error("`packs` is empty; pack 0 needs a URL")]
     NoPacks,
-    /// A list has more than [`MAX_SLOTS`] URLs.
-    #[error("`{field}` has {count} URLs, more than {MAX_SLOTS}")]
+    /// A list has more URLs than a manifest can name: [`MAX_PACKS`] packs, [`MAX_LARGE`] large
+    /// objects.
+    #[error("`{field}` has {count} URLs, more than the {max} a run can use")]
     TooMany {
         /// The field.
         field: &'static str,
         /// How many URLs.
         count: usize,
+        /// The most it may hold.
+        max: usize,
     },
     /// A URL is empty, is not an `http` or `https` URL, or holds whitespace or a control
     /// character.
@@ -118,7 +122,7 @@ impl PutUrls {
     /// # Errors
     /// A [`PutUrlsError`] for text that is not a JSON object of the fields `packs` (required, a
     /// non-empty array) and `large` (optional, an array; absent means none), each of at most
-    /// [`MAX_SLOTS`] `http` or `https` URLs. Any other field is refused, so a misspelt `large`
+    /// [`MAX_PACKS`] or [`MAX_LARGE`] `http` or `https` URLs. Any other field is refused, so a misspelt `large`
     /// is not read as "no large objects".
     pub fn parse(text: &str) -> Result<Self, PutUrlsError> {
         let value: Value = serde_json::from_str(text).map_err(|e| PutUrlsError::Syntax {
@@ -131,9 +135,10 @@ impl PutUrls {
         if object.keys().any(|k| !FIELDS.contains(&k.as_str())) {
             return Err(PutUrlsError::UnknownField);
         }
-        let packs = urls(object.remove("packs"), "packs")?
+        let packs = urls(object.remove("packs"), "packs", usize::from(MAX_PACKS))?
             .ok_or(PutUrlsError::Missing { field: "packs" })?;
-        let large = urls(object.remove("large"), "large")?.unwrap_or_default();
+        let large =
+            urls(object.remove("large"), "large", usize::from(MAX_LARGE))?.unwrap_or_default();
         if packs.is_empty() {
             return Err(PutUrlsError::NoPacks);
         }
@@ -165,17 +170,22 @@ impl PutUrls {
 }
 
 /// The URLs of the list `value` holds under `field`; `None` when the field is absent.
-fn urls(value: Option<Value>, field: &'static str) -> Result<Option<Vec<String>>, PutUrlsError> {
+fn urls(
+    value: Option<Value>,
+    field: &'static str,
+    max: usize,
+) -> Result<Option<Vec<String>>, PutUrlsError> {
     let Some(value) = value else {
         return Ok(None);
     };
     let Value::Array(items) = value else {
         return Err(PutUrlsError::NotStrings { field });
     };
-    if items.len() > MAX_SLOTS {
+    if items.len() > max {
         return Err(PutUrlsError::TooMany {
             field,
             count: items.len(),
+            max,
         });
     }
     let mut urls = Vec::with_capacity(items.len());
