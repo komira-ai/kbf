@@ -4,6 +4,16 @@ An S3 front over a hot and a cold tier. It serves one bucket, path-style, and ch
 `Authorization` header (and presigned PUT URLs). The packaging notes, the flags and the key files
 are in `packaging/tierstore/README.md`; the roles of a key are in `src/server/keys.rs`.
 
+## Flags or a file
+
+The settings that describe the data path are flags, or one TOML file given with `--config <path>`
+(`[server]`, `[hot_store]`, `[cold_store]` and `[[policy]]`; `src/server/config.rs`). The two make
+the same settings and run the same code. `--print-config`, given the flags of a start, prints the
+file that is equivalent to them. A file holds no secret, only the paths of key files, and refuses
+a key or a table it does not know. The format, the table of the key of each flag and the rules are
+in "The configuration file" in `packaging/tierstore/README.md`; the flags stay accepted for one
+release along with the file.
+
 ## Roles of a key
 
 | role | flag | may do |

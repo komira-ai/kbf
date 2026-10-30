@@ -26,7 +26,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_tierstore");
 const SAFETY: Duration = Duration::from_secs(60);
 
 /// Runs the binary to its end: the exit status, stdout and stderr.
-fn run(flags: &[String]) -> (i32, String, String) {
+pub(crate) fn run(flags: &[String]) -> (i32, String, String) {
     let out = Command::new(BIN).args(flags).output().unwrap();
     (
         out.status.code().unwrap(),
@@ -36,7 +36,7 @@ fn run(flags: &[String]) -> (i32, String, String) {
 }
 
 /// A running binary, and the address it said it listens on.
-struct Running {
+pub(crate) struct Running {
     /// None once `exit_code` has taken it to wait for its end.
     child: Option<Reaped>,
     pid: Pid,
@@ -45,7 +45,7 @@ struct Running {
     _stdout: std::io::BufReader<std::process::ChildStdout>,
 }
 
-fn start(flags: &[String]) -> Running {
+pub(crate) fn start(flags: &[String]) -> Running {
     let mut command = Command::new(BIN);
     command
         .args(flags)
@@ -69,7 +69,7 @@ fn start(flags: &[String]) -> Running {
 
 impl Running {
     /// The client of kbf with the key of the key file.
-    fn store(&self) -> S3Store {
+    pub(crate) fn store(&self) -> S3Store {
         self.store_as(BIN_KEY_ID, BIN_SECRET)
     }
 
@@ -91,14 +91,14 @@ impl Running {
         S3Store::new(config).unwrap()
     }
 
-    fn signal(&self, signal: Signal) {
+    pub(crate) fn signal(&self, signal: Signal) {
         kill_process(self.pid, signal).unwrap();
     }
 
     /// The exit code, once the process has exited: a thread of the blocking pool waits for the
     /// process to end. A process that has not ended within `SAFETY` is killed, so that the wait
     /// ends, and the test fails.
-    async fn exit_code(&mut self) -> Option<i32> {
+    pub(crate) async fn exit_code(&mut self) -> Option<i32> {
         let mut child = self.child.take().expect("no process to wait for");
         let waiting = tokio::task::spawn_blocking(move || {
             let status = child.wait();

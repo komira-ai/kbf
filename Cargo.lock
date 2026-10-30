@@ -5206,6 +5206,7 @@ dependencies = [
  "thiserror",
  "tierstore",
  "tokio",
+ "toml",
 ]
 
 [[package]]
