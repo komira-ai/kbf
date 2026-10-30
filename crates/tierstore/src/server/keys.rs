@@ -26,9 +26,11 @@ use std::path::{Path, PathBuf};
 use hyper::Method;
 use serde::Deserialize;
 
+use crate::journal::is_reserved;
+
 use super::ServerConfig;
 use super::auth::{READ_ONLY, Refusal};
-use super::gc::NOT_ALLOWED;
+use super::gc::{NOT_ALLOWED, OUT_OF_SCOPE};
 use super::presign::PUT_ONLY;
 
 /// The flag whose files hold the read-only keys.
@@ -75,7 +77,7 @@ impl fmt::Debug for AccessKey {
 pub(crate) enum Role {
     /// Everything the front serves.
     Full,
-    /// GetObject, HeadObject, ListObjectsV2 and HeadBucket.
+    /// GetObject, HeadObject, ListObjectsV2, ListMultipartUploads and HeadBucket.
     ReadOnly,
     /// A presigning key: one presigned `PUT`, as far as its grant goes (see `presign`).
     PresignPut,
@@ -100,6 +102,28 @@ impl Role {
                 Err(NOT_ALLOWED)
             }
             _ => Ok(()),
+        }
+    }
+
+    /// Whether the role may list the open multipart uploads under `prefix` (ListMultipartUploads,
+    /// a `GET`). A presigning key may not ([`PUT_ONLY`]). The full and the read-only role may, for
+    /// any prefix: a read-only key already lists every key of the bucket, and the listing gives
+    /// it upload ids, which let it do nothing, since a part, a completion and an abort are not
+    /// reads. S3 asks for a permission of its own (`s3:ListBucketMultipartUploads`) here.
+    ///
+    /// A GC key may list the uploads under its own prefix, as it may abort them: `prefix` must
+    /// start with the prefix of the key and not be a reserved one. A listing with no prefix, or
+    /// with one outside, is [`OUT_OF_SCOPE`] and is not filtered.
+    ///
+    /// # Errors
+    /// [`PUT_ONLY`] for a presigning key, [`OUT_OF_SCOPE`] for a GC key and a prefix that is not
+    /// inside its own.
+    pub(crate) fn permit_list_uploads(&self, prefix: &str) -> Result<(), Refusal> {
+        match self {
+            Self::Full | Self::ReadOnly => Ok(()),
+            Self::PresignPut => Err(PUT_ONLY),
+            Self::Gc(own) if prefix.starts_with(own.as_str()) && !is_reserved(prefix) => Ok(()),
+            Self::Gc(_) => Err(OUT_OF_SCOPE),
         }
     }
 }

@@ -318,6 +318,9 @@ pub async fn execute(
             cpu_usage_us: ran.cpu_us,
             memory_peak_bytes: ran.peak_rss_bytes,
         },
+        packs: 1,
+        large: Vec::new(),
+        inputs: None,
     };
     for file in &result.output_files {
         manifest.output_files.push(OutputFile {
