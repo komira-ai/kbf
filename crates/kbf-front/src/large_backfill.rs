@@ -314,7 +314,7 @@ impl Put {
                 Some(Piece::Window(bytes, _place)) => Some((Ok(bytes), chunks)),
                 Some(Piece::Done) => None,
                 // An error ends a body; a closed channel stays closed if it is polled again.
-                None => Some((Err(ObjectStoreError::Body(ABANDONED.to_owned())), chunks)),
+                None => None,
             }
         })
         .boxed();
