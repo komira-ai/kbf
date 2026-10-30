@@ -285,7 +285,8 @@ pub struct RunRecord {
     /// The memory kill that ended it, if any.
     #[prost(enumeration = "MemoryKill", tag = "18")]
     pub memory_kill: i32,
-    /// The memory booked for the attempt, bytes.
+    /// The memory booked for the attempt, bytes: the grant its `Start` carried (a record
+    /// written before the grant was kept holds it for a memory kill only).
     #[prost(uint64, tag = "19")]
     pub booked_memory_bytes: u64,
     /// The booking the next attempt gets after a memory kill, bytes.
@@ -367,8 +368,9 @@ pub struct RunRecord {
     /// not read it. Absent is not zero.
     #[prost(uint32, optional, tag = "41")]
     pub node_cpu_pressure_centi: Option<u32>,
-    /// The CPU booked for the lease, in thousandths of a CPU; absent when the daemon
-    /// did not report it.
+    /// The CPU booked for the lease, in thousandths of a CPU: the daemon's report, else
+    /// the grant the server sent in the `Start`; absent for a lease the server never
+    /// started (taken up from the state store) whose daemon reported none.
     #[prost(uint64, optional, tag = "42")]
     pub booked_millicpus: Option<u64>,
     /// The scheduler's operation the attempt belonged to: every attempt of one operation

@@ -284,6 +284,62 @@ async fn a_run_logs_its_usage_keyed_by_shape_and_labelled() {
     );
 }
 
+/// Runs the job `argv` (booking as `platform` says) to completion on `node` and returns its
+/// one `action usage:` line and the `Start` the daemon was sent.
+async fn usage_line_of(
+    argv: &str,
+    platform: &[(&str, &str)],
+    cell: &Cell,
+    node: &mut support::FakeDaemon,
+) -> (String, worker::Start) {
+    let job = Job::new(argv, platform);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let start = node.start().await;
+    let result = with_usage(output(cell, "out", 0).await, &usage());
+    assert!(node.report(ran(start.lease_id, &result)).await.accepted);
+    done(&mut ops).await;
+    let key = job_key(argv);
+    let [line] = &lines("action usage:", key)[..] else {
+        panic!("one usage line: {:?}", lines("action usage:", key));
+    };
+    (line.clone(), start)
+}
+
+/// Catches: a lease's booking missing from its usage line (a reader cannot set what a
+/// lease held beside what it used), the farm's default written as something other than
+/// what the `Start` carried, and the two axes swapped or in other units.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_default_booking_is_on_the_usage_line() {
+    log();
+    let cell = Cell::start().await;
+    let mut node = cell.daemon("node-e", 8, 16).await;
+    let (line, start) = usage_line_of("default booking", &[], &cell, &mut node).await;
+    assert!(start.millicpus > 0 && start.memory_bytes > 0, "{start:?}");
+    assert!(
+        line.contains(&format!(
+            " node=node-e booked_millicpus={} booked_memory_bytes={}",
+            start.millicpus, start.memory_bytes
+        )),
+        "{line}"
+    );
+}
+
+/// Catches: the line carrying the request or the default instead of the booking the
+/// lease was granted with a size the client named (`kbf-book-cpus`, `kbf-book-mem-gib`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hinted_booking_is_on_the_usage_line() {
+    log();
+    let cell = Cell::start().await;
+    let mut node = cell.daemon("node-f", 8, 16).await;
+    let size = [("kbf-book-cpus", "5"), ("kbf-book-mem-gib", "12")];
+    let (line, _) = usage_line_of("hinted booking", &size, &cell, &mut node).await;
+    assert!(
+        line.contains(" node=node-f booked_millicpus=5000 booked_memory_bytes=12884901888"),
+        "{line}"
+    );
+}
+
 /// Catches: a memory-killed rung's usage dropped (the peak the ladder needs is lost:
 /// the killed result is discarded before the line), a killed run given an exit code,
 /// a rung that runs again higher up the ladder logged under another key or not at

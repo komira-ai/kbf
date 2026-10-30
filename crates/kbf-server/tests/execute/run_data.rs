@@ -103,6 +103,40 @@ async fn a_run_keeps_its_cgroup_block_and_its_reapi_times() {
     assert_eq!(attempt.memory_kill(), Some(Kill::None));
 }
 
+/// Catches: the booking kept only for a memory-killed attempt (an accepted run's row
+/// without what its lease held), the request kept rather than the grant, and the two axes
+/// in other units than the `Start` carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accepted_run_keeps_the_booking_its_lease_was_granted() {
+    let cell = Cell::start().await;
+    let mut daemon = cell.daemon("node-a", 8, 16).await;
+    let job = Job::new(
+        "sized",
+        &[("kbf-book-cpus", "3"), ("kbf-book-mem-gib", "6")],
+    );
+    upload(&cell, BUILD, &job.blobs()).await;
+    let mut ops = execute(&cell, BUILD, &job.action).await;
+    let start = daemon.start().await;
+    let result = output(&cell, "sized", 0).await;
+    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
+    done(&mut ops).await;
+
+    let inv = record(&cell, BUILD).await;
+    let [row] = inv.rows() else {
+        panic!("one row: {:?}", inv.rows());
+    };
+    let [attempt] = row.attempts.as_slice() else {
+        panic!("one attempt: {:?}", row.attempts);
+    };
+    let run = attempt.run.as_deref().expect("the report's run");
+    assert_eq!(
+        (run.booked_millicpus, run.booked_memory_bytes),
+        (Some(3_000), Some(6 * GIB))
+    );
+    assert_eq!((start.millicpus, start.memory_bytes), (3_000, 6 * GIB));
+    assert_eq!(attempt.memory_kill(), Some(Kill::None));
+}
+
 /// Catches (ui-data 9, U1 red): the attempt that ends the operation, killed at the
 /// largest node, recorded without its booking and cap (only a requeue had them), a
 /// cap taken from another run, and a requeued kill's cap not kept. With the default

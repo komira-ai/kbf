@@ -388,7 +388,10 @@ pub(crate) fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
                 wall_us: f.wall_micros.or((wall > 0).then_some(wall)),
             }),
         node_cpu_pressure_centi: usage.and_then(|u| u.node_cpu_pressure_centi),
-        booked_millicpus: usage.and_then(|u| u.booked_millicpus),
+        // What the daemon reported, else what the lease was granted.
+        booked_millicpus: usage
+            .and_then(|u| u.booked_millicpus)
+            .or(run.and_then(|r| r.booked_millicpus)),
         outputs: listing.map_or_else(Vec::new, |l| {
             l.outputs
                 .iter()

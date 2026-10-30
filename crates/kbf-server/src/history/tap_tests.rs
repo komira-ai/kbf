@@ -154,6 +154,7 @@ fn a_finished_attempt_keeps_what_the_row_and_the_attempt_hold() {
             ..RunUsage::default()
         }),
         booked_memory_bytes: Some(1 << 30),
+        booked_millicpus: None,
         cap_bytes: None,
     }));
     let mut r = row(
@@ -457,6 +458,38 @@ fn a_memory_kill_keeps_its_booking_cap_and_limit() {
     assert_eq!(rec.memory_kill(), MemoryKill::OwnLimit);
     assert_eq!(rec.reason, "the reason the daemon gave");
     assert_eq!((rec.memory_used_bytes, rec.memory_limit_bytes), (33, 32));
+}
+
+/// Catches: the booking written only for a memory kill (an accepted run's record without
+/// what its lease held), the CPU booking dropped or taken from the wrong place (the daemon's
+/// own report wins, the grant fills in when it reported none), and a booking mistaken for a
+/// kill's limit.
+#[test]
+fn an_accepted_run_records_the_booking_its_lease_was_granted() {
+    let ran = |usage: Option<RunUsage>| {
+        Some(Box::new(Run {
+            usage,
+            booked_memory_bytes: Some(6 << 30),
+            booked_millicpus: Some(3_000),
+            ..Run::default()
+        }))
+    };
+    let mut granted = attempt(Some(AttemptEnd::Accepted));
+    granted.run = ran(None);
+    let (rec, _) = record_of(&row(vec![granted], None), 0, EndedKind::Finished);
+    assert_eq!(
+        (rec.booked_memory_bytes, rec.booked_millicpus),
+        (6 << 30, Some(3_000))
+    );
+    assert_eq!(rec.memory_kill(), MemoryKill::None);
+    assert_eq!((rec.memory_used_bytes, rec.memory_limit_bytes), (0, 0));
+    let mut reported = attempt(Some(AttemptEnd::Accepted));
+    reported.run = ran(Some(RunUsage {
+        booked_millicpus: Some(2_000),
+        ..RunUsage::default()
+    }));
+    let (rec, _) = record_of(&row(vec![reported], None), 0, EndedKind::Finished);
+    assert_eq!(rec.booked_millicpus, Some(2_000));
 }
 
 /// Catches: NUMA bytes that do not follow node numbers, or a huge node number sizing a
