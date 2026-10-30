@@ -37,8 +37,9 @@ const UNDOCUMENTED_FLAGS: &[&str] = &[];
 /// Keys of the table the pages need not name.
 const UNDOCUMENTED_KEYS: &[&str] = &[];
 
-/// Pages that another change adds; a link to one of them is let stand until it exists.
-const PENDING_PAGES: &[&str] = &["metrics.md"];
+/// Pages that another change adds; a link to one of them is let stand until it exists. The last is
+/// a name that no change adds, for the test of this rule to link to whatever pages land.
+const PENDING_PAGES: &[&str] = &["metrics.md", "a-page-no-change-adds.md"];
 
 /// The tables of the file, and the keys of `[[policy]]`, which are not in the key table.
 const SECTIONS: &[&str] = &[
@@ -189,7 +190,8 @@ fn flags_in(text: &str) -> Vec<String> {
     found
 }
 
-/// The `tierstore_...` words of `text` that are metric names.
+/// The `tierstore_...` words of `text` that are metric names. A word that ends in `_` is a prefix
+/// (`tierstore_cache_` before the names that follow it) and keeps its `_`.
 fn metrics_in(text: &str) -> Vec<String> {
     let mut found = Vec::new();
     let mut at = 0;
@@ -199,13 +201,26 @@ fn metrics_in(text: &str) -> Vec<String> {
         let len = rest
             .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
             .unwrap_or(rest.len());
-        let word = rest[..len].trim_end_matches('_');
+        let word = &rest[..len];
         if word.len() > "tierstore_".len() {
             found.push(word.to_owned());
         }
         at = start + len.max(1);
     }
     found
+}
+
+/// Whether `source` has the metric `name`: as a whole name, with no letter, digit or `_` after it
+/// (`tierstore_cache_bytes` is not in `tierstore_cache_bytes_served_local_total`), or, for a
+/// prefix that ends in `_`, anywhere.
+fn has_metric(source: &str, name: &str) -> bool {
+    if name.ends_with('_') {
+        return source.contains(name);
+    }
+    source.match_indices(name).any(|(at, _)| {
+        let next = source[at + name.len()..].chars().next();
+        next.is_none_or(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+    })
 }
 
 /// The targets of the `[text](target)` links of a line.
@@ -299,7 +314,7 @@ fn check(docs: &[Doc], code: &Code) -> Vec<String> {
             .chain(page.blocks.iter().map(|b| b.body.as_str()));
         for text in metric_text {
             for metric in metrics_in(text) {
-                if !code.source.contains(&metric) {
+                if !has_metric(&code.source, &metric) {
                     problems.push(format!("{name}: the metric {metric} is not in the source"));
                 }
             }
@@ -655,8 +670,23 @@ fn a_link_that_names_nothing_is_found() {
         &check(&bad_anchor, &code()),
         "names no heading of configuration.md"
     ));
-    let pending = with_appended("overview.md", "\nSee [x](metrics.md).\n");
-    assert!(!said(&check(&pending, &code()), "metrics.md names no page"));
+    let pending = with_appended("overview.md", "\nSee [x](a-page-no-change-adds.md).\n");
+    let problems = check(&pending, &code());
+    assert!(!said(&problems, "a-page-no-change-adds.md"), "{problems:?}");
+}
+
+/// Asserts that a metric name that is only the start of a real one is found.
+#[test]
+fn a_metric_that_is_the_start_of_another_is_found() {
+    let prefix = with_appended("operations.md", "\n`tierstore_cache_bytes`\n");
+    let problems = check(&prefix, &code());
+    assert!(
+        said(
+            &problems,
+            "the metric tierstore_cache_bytes is not in the source"
+        ),
+        "{problems:?}"
+    );
 }
 
 /// Asserts that a `Not in a release yet` section is left out of the checks to its end, that the
@@ -701,6 +731,17 @@ fn the_scanners_read_flags_and_metrics() {
     assert_eq!(
         metrics_in("tierstore_x_total{a} and tierstore_* and tierstore_y."),
         ["tierstore_x_total", "tierstore_y"]
+    );
+    assert_eq!(metrics_in("`tierstore_cache_` and"), ["tierstore_cache_"]);
+    let source = "tierstore_cache_bytes_served_local_total 1\ntierstore_cache_{name}\n";
+    assert!(has_metric(
+        source,
+        "tierstore_cache_bytes_served_local_total"
+    ));
+    assert!(has_metric(source, "tierstore_cache_"));
+    assert!(
+        !has_metric(source, "tierstore_cache_bytes"),
+        "a name that is only the start of another is not found"
     );
     assert_eq!(
         slug("`[hot_store]`: The Start-up"),
