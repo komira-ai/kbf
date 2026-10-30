@@ -14,6 +14,21 @@
 //! in which GitHub answers an error is tried again, and the wait fails with that error only when
 //! [`FAILED_LOOKS`] looks in a row have failed: one bad reply is not the end of an hour's wait.
 //!
+//! **Artifacts of an earlier attempt.** A re-run of the run keeps the run id and the artifacts
+//! of its earlier attempts, so a name that is there is not proof that this attempt's shard made
+//! it. An `--artifact` may therefore say which job makes it, `NAME=JOBTEXT`: the job whose name
+//! contains `JOBTEXT`, in its latest attempt (the jobs reply of `filter=latest` holds one job
+//! of each name). The newest attempt is the highest `run_attempt` among the listed jobs (this
+//! job is one of them). For such an artifact:
+//!
+//! - a job of the newest attempt runs now or ran in it, so the artifact counts only when it was
+//!   created at or after the job started (a name left by an earlier attempt is older);
+//! - a job whose latest run is of an earlier attempt was not run again ("Re-run failed jobs"
+//!   leaves the shards that passed alone), so the artifact it made then still counts;
+//! - with no job of that text listed the artifact does not count.
+//!
+//! An `--artifact` with no `=` counts by its name alone.
+//!
 //! GitHub is spoken to with `gh api` ([`crate::advisories::Process`]); the job's token needs
 //! the `actions: read` permission.
 
@@ -25,8 +40,10 @@ use serde_json::Value;
 use crate::Error;
 use crate::advisories::{Call, Method, Process, Tools};
 
-/// How many looks in a row may fail (GitHub answers an error) before the wait fails with the last error.
-pub const FAILED_LOOKS: u32 = 4;
+/// How many looks in a row may fail (GitHub answers an error) before the wait fails with the
+/// last error. At the default interval that is about five minutes of errors, after a build of
+/// twenty minutes or more.
+pub const FAILED_LOOKS: u32 = 20;
 
 /// The arguments of `wait-artifacts`.
 #[derive(clap::Args)]
@@ -37,7 +54,9 @@ pub struct Args {
     /// The run whose artifacts and jobs are looked at (on Actions, `GITHUB_RUN_ID`).
     #[arg(long)]
     pub run_id: u64,
-    /// The exact name of an artifact to wait for; once for each.
+    /// The exact name of an artifact to wait for; once for each. `NAME=JOBTEXT` names the job
+    /// that makes it too (see the module docs: an artifact of an earlier attempt of a job that
+    /// runs again does not count).
     #[arg(long = "artifact", required = true)]
     pub artifacts: Vec<String>,
     /// A job whose name contains this and which did not succeed ends the wait.
@@ -93,37 +112,84 @@ fn items<'a>(reply: &'a Value, key: &str) -> impl Iterator<Item = &'a Value> {
         .flatten()
 }
 
-/// The jobs whose name contains `prefix`, as `(name, conclusion)`; the conclusion is `None`
-/// while the job has not finished.
-fn shards<'a>(jobs: &'a Value, prefix: &str) -> Vec<(&'a str, Option<&'a str>)> {
+/// A job whose name contains the prefix.
+struct Shard<'a> {
+    name: &'a str,
+    /// `None` while the job has not finished.
+    conclusion: Option<&'a str>,
+    /// The attempt of the run this job was last run in.
+    attempt: Option<u64>,
+    /// When the job started (an RFC 3339 time in UTC, which orders as text).
+    started: Option<&'a str>,
+}
+
+/// The jobs whose name contains `prefix`.
+fn shards<'a>(jobs: &'a Value, prefix: &str) -> Vec<Shard<'a>> {
     items(jobs, "jobs")
         .filter_map(|job| {
             let name = job.get("name")?.as_str()?;
-            name.contains(prefix)
-                .then(|| (name, job.get("conclusion").and_then(Value::as_str)))
+            name.contains(prefix).then(|| Shard {
+                name,
+                conclusion: job.get("conclusion").and_then(Value::as_str),
+                attempt: job.get("run_attempt").and_then(Value::as_u64),
+                started: job.get("started_at").and_then(Value::as_str),
+            })
         })
         .collect()
 }
 
+/// The newest attempt of the run: the highest attempt among the listed jobs (this job is one,
+/// and it runs in the newest attempt).
+fn newest_attempt(jobs: &Value) -> u64 {
+    items(jobs, "jobs")
+        .filter_map(|job| job.get("run_attempt").and_then(Value::as_u64))
+        .max()
+        .unwrap_or(1)
+}
+
 /// The first of the jobs that did not succeed, as `name (conclusion)`.
-fn failed(shards: &[(&str, Option<&str>)]) -> Option<String> {
-    shards.iter().find_map(|(name, conclusion)| {
-        let conclusion = (*conclusion)?;
+fn failed(shards: &[Shard]) -> Option<String> {
+    shards.iter().find_map(|s| {
+        let conclusion = s.conclusion?;
         matches!(conclusion, "failure" | "cancelled" | "timed_out")
-            .then(|| format!("{name} ({conclusion})"))
+            .then(|| format!("{} ({conclusion})", s.name))
     })
 }
 
-/// The wanted names that no live (not expired) artifact of the reply has.
-fn missing(reply: &Value, wanted: &[String]) -> Vec<String> {
-    let live: Vec<&str> = items(reply, "artifacts")
+/// An `--artifact`: its name, and the text of the name of the job that makes it.
+fn split(want: &str) -> (&str, Option<&str>) {
+    match want.split_once('=') {
+        Some((name, job)) => (name, Some(job)),
+        None => (want, None),
+    }
+}
+
+/// Whether `artifact` is what the job named by `job` makes in the newest attempt `newest`.
+fn made_by(artifact: &Value, job: &str, shards: &[Shard], newest: u64) -> bool {
+    let mine: Vec<&Shard> = shards.iter().filter(|s| s.name.contains(job)).collect();
+    let created = artifact.get("created_at").and_then(Value::as_str);
+    !mine.is_empty()
+        && mine.iter().all(|s| {
+            s.attempt.unwrap_or(newest) != newest
+                || matches!((s.started, created), (Some(start), Some(made)) if made >= start)
+        })
+}
+
+/// The names of `wanted` that no live (not expired) artifact of the reply counts for.
+fn missing(reply: &Value, wanted: &[String], shards: &[Shard], newest: u64) -> Vec<String> {
+    let live: Vec<&Value> = items(reply, "artifacts")
         .filter(|a| !a.get("expired").and_then(Value::as_bool).unwrap_or(false))
-        .filter_map(|a| a.get("name")?.as_str())
         .collect();
     wanted
         .iter()
-        .filter(|w| !live.contains(&w.as_str()))
-        .cloned()
+        .map(|w| split(w))
+        .filter(|(name, job)| {
+            !live.iter().any(|a| {
+                a.get("name").and_then(Value::as_str) == Some(name)
+                    && job.is_none_or(|j| made_by(a, j, shards, newest))
+            })
+        })
+        .map(|(name, _)| name.to_owned())
         .collect()
 }
 
@@ -146,19 +212,24 @@ fn tolerate(reply: Result<Value, Error>, failed_looks: &mut u32) -> Result<Optio
 /// Waits as the module docs say; the line to print when the artifacts are there.
 pub fn wait(github: &mut dyn Github, args: &Args) -> Result<String, Error> {
     let run = format!("repos/{}/actions/runs/{}", args.repo, args.run_id);
-    let mut absent = args.artifacts.clone();
+    let mut absent: Vec<String> = args
+        .artifacts
+        .iter()
+        .map(|a| split(a).0.to_owned())
+        .collect();
     let mut failed_looks = 0;
     for look in 0..args.polls {
         if look > 0 {
             github.pause();
         }
         let Some(jobs) = tolerate(
-            github.get(&format!("{run}/jobs?per_page=100")),
+            github.get(&format!("{run}/jobs?filter=latest&per_page=100")),
             &mut failed_looks,
         )?
         else {
             continue;
         };
+        let newest = newest_attempt(&jobs);
         let shards = shards(&jobs, &args.job_prefix);
         if let Some(job) = failed(&shards) {
             return Err(Error::Failed(format!(
@@ -173,15 +244,19 @@ pub fn wait(github: &mut dyn Github, args: &Args) -> Result<String, Error> {
             continue;
         };
         failed_looks = 0;
-        absent = missing(&reply, &args.artifacts);
+        absent = missing(&reply, &args.artifacts, &shards, newest);
         if absent.is_empty() {
             return Ok(format!(
                 "wait-artifacts: the {} artifact(s) are there: {}",
                 args.artifacts.len(),
-                args.artifacts.join(", ")
+                args.artifacts
+                    .iter()
+                    .map(|a| split(a).0)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
-        if !shards.is_empty() && shards.iter().all(|(_, conclusion)| conclusion.is_some()) {
+        if !shards.is_empty() && shards.iter().all(|s| s.conclusion.is_some()) {
             return Err(Error::Failed(format!(
                 "every job named {}* has finished and these artifacts did not come: {}",
                 args.job_prefix,

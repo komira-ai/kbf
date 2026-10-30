@@ -15,6 +15,14 @@
 //! - **A shard's profiles are its own and arrive.** Their file names carry the core and the part
 //!   (the process id alone repeats between machines); the shard's last step uploads them, with no
 //!   `if:`, so the job has succeeded exactly when they are up.
+//! - **A shard has the disk it needs.** The matrix entry's `min_free_gb`, which the early disk
+//!   check refuses below, is at least the core's measured need ([`CORES`]), so a runner that is
+//!   too short stops there and not with tests failing for want of room. The test step does not
+//!   pass when there are no tests (`--no-tests=pass`), so a part that ran nothing is red.
+//! - **A shard is found by its name.** The job is named `test-shard (<core>-<part>-of-<parts>)`,
+//!   and `test` asks for each artifact with that text (`--artifact <name>=<text>`), so that it
+//!   counts an artifact only when the shard's job of the latest attempt made it (a re-run of
+//!   the run leaves the earlier attempt's artifacts there).
 //! - **`test` takes every shard.** It builds each core's instrumented tests (the `args` of the
 //!   matrix), drops the profiles that listing them wrote, waits for the artifact of every shard of
 //!   the matrix (and fails when a shard failed), downloads them flat into the one directory the
@@ -33,14 +41,19 @@ const SHARD: &str = "test-shard";
 const GATE: &str = "test";
 const LINT: &str = "lint";
 /// The cores, and what a core's `args` must hold.
-const CORES: [(&str, &str); 2] = [
-    ("legacy", "--workspace"),
-    ("js", "--features kbf-server/farm-core-js"),
+/// The least `min_free_gb` of a core: its measured disk use (legacy about 67 GB: the build 59,
+/// the store floor 7.5; js about 50) and a margin.
+const CORES: [(&str, &str, usize); 2] = [
+    ("legacy", "--workspace", 75),
+    ("js", "--features kbf-server/farm-core-js", 55),
 ];
 /// The directory `llvm-cov report` merges every `*.profraw` of.
 const PROFILES: &str = "target/llvm-cov-target";
 /// What the shards name their artifacts, and the gate downloads.
 const ARTIFACT: &str = "profraw-${{ matrix.core }}-${{ matrix.part }}";
+/// The text of a shard job's name that tells it from the others, and the whole name.
+const JOB_KEY: &str = "(${{ matrix.core }}-${{ matrix.part }}-of-${{ matrix.parts }})";
+const JOB_NAME: &str = "test-shard (${{ matrix.core }}-${{ matrix.part }}-of-${{ matrix.parts }})";
 const PATTERN: &str = "profraw-*";
 /// What a shard's profile file names begin with.
 const FILE_PREFIX: &str = "kbf-${{ matrix.core }}-${{ matrix.part }}-";
@@ -71,10 +84,14 @@ fn entries(workflow: &str) -> Result<Vec<Entry>, String> {
         .collect())
 }
 
-/// The shards' artifact names and profile prefixes the matrix makes, in matrix order.
+/// The shards' `--artifact` values (the artifact name, `=`, the text of the job's name) and
+/// profile prefixes the matrix makes, in matrix order.
 fn expected(entries: &[Entry]) -> (Vec<String>, Vec<String>) {
     (
-        entries.iter().map(|e| e.expand(ARTIFACT)).collect(),
+        entries
+            .iter()
+            .map(|e| e.expand(&format!("{ARTIFACT}={JOB_KEY}")))
+            .collect(),
         entries.iter().map(|e| e.expand(FILE_PREFIX)).collect(),
     )
 }
@@ -83,14 +100,14 @@ fn expected(entries: &[Entry]) -> (Vec<String>, Vec<String>) {
 fn partition_rules(entries: &[Entry]) -> Result<(), String> {
     if let Some(e) = entries
         .iter()
-        .find(|e| !CORES.iter().any(|(c, _)| e.get("core") == Some(*c)))
+        .find(|e| !CORES.iter().any(|(c, _, _)| e.get("core") == Some(*c)))
     {
         return Err(format!(
             "a matrix entry names the core {:?}, which is neither `legacy` nor `js`",
             e.get("core")
         ));
     }
-    for (core, needs) in CORES {
+    for (core, needs, _) in CORES {
         let mine: Vec<&Entry> = entries
             .iter()
             .filter(|e| e.get("core") == Some(core))
@@ -127,6 +144,23 @@ fn partition_rules(entries: &[Entry]) -> Result<(), String> {
                 "the `{core}` entries do not run the same packages (`args`), so the parts are not parts of one set of tests"
             ));
         }
+        for e in &mine {
+            let least = CORES
+                .iter()
+                .find(|(c, _, _)| *c == core)
+                .map_or(0, |(_, _, gb)| *gb);
+            match number(e, "min_free_gb") {
+                None => {
+                    return Err(format!("a `{core}` entry has no numeric `min_free_gb`"));
+                }
+                Some(gb) if gb < least => {
+                    return Err(format!(
+                        "a `{core}` entry says `min_free_gb: {gb}`, under the {least} its build and tests need, so the early disk check would pass a runner that is too short"
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
         if !first.get("args").is_some_and(|a| a.contains(needs)) {
             return Err(format!(
                 "the `args` of the `{core}` entries do not contain `{needs}`"
@@ -140,12 +174,18 @@ fn partition_rules(entries: &[Entry]) -> Result<(), String> {
 pub fn shard_wiring(workflow: &str) -> Result<(), String> {
     let entries = entries(workflow)?;
     partition_rules(&entries)?;
+    if workflows::job_name(workflow, SHARD)?.as_deref() != Some(JOB_NAME) {
+        return Err(format!(
+            "the job `{SHARD}` is not named `{JOB_NAME}`, which `test` finds each shard's job by"
+        ));
+    }
     let env = workflows::job_env(workflow, SHARD)?;
     let var = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
     for (name, want) in [
         ("PART", "${{ matrix.part }}"),
         ("PARTS", "${{ matrix.parts }}"),
         ("ARGS", "${{ matrix.args }}"),
+        ("MIN_FREE_GB", "${{ matrix.min_free_gb }}"),
     ] {
         if var(name) != Some(want) {
             return Err(format!("the job `{SHARD}` does not set `{name}: {want}`"));
@@ -158,6 +198,19 @@ pub fn shard_wiring(workflow: &str) -> Result<(), String> {
         ));
     }
     let steps = workflows::job_steps(workflow, SHARD)?;
+    let disk = steps.iter().find(|s| {
+        s.run
+            .as_deref()
+            .is_some_and(|r| r.contains("xtask runner-disk"))
+    });
+    let disk_words = disk.and_then(|s| s.run.as_deref()).map(words);
+    if disk.is_none_or(|s| s.conditional)
+        || disk_words.as_deref().and_then(|w| flag(w, "--min-free-gb")) != Some("$MIN_FREE_GB")
+    {
+        return Err(format!(
+            "the job `{SHARD}` has no unconditional step `xtask runner-disk ... --min-free-gb \"$MIN_FREE_GB\"`, so the early disk check would not use the matrix's `min_free_gb`"
+        ));
+    }
     let run = steps
         .iter()
         .find(|s| {
@@ -178,6 +231,11 @@ pub fn shard_wiring(workflow: &str) -> Result<(), String> {
         if !w.contains(&need) {
             return Err(format!("the test step of `{SHARD}` lacks `{need}`: {text}"));
         }
+    }
+    if w.iter().any(|x| x.starts_with("--no-tests")) && !w.contains(&"--no-tests=fail") {
+        return Err(format!(
+            "the test step of `{SHARD}` passes when no test runs (`--no-tests`), so a part that ran nothing would be green"
+        ));
     }
     if flag(&w, "--profile") != Some("pr") {
         return Err(format!(
@@ -251,7 +309,7 @@ pub fn gate_wiring(workflow: &str) -> Result<(), String> {
     let find = |pred: &dyn Fn(&workflows::Step) -> bool| steps.iter().position(pred);
     let run = |s: &workflows::Step| s.run.clone().unwrap_or_default();
     let mut builds = Vec::new();
-    for (core, _) in CORES {
+    for (core, _, _) in CORES {
         let args = entries
             .iter()
             .find(|e| e.get("core") == Some(core))

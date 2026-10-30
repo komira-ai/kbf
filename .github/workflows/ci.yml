@@ -262,7 +262,7 @@ jobs:
   # here (clippy, in the lint job, enforces it). cargo-llvm-cov is the release binary,
   # checked against its SHA-256 before use.
   test-shard:
-    name: test-shard (${{ matrix.core }} ${{ matrix.part }}/${{ matrix.parts }})
+    name: test-shard (${{ matrix.core }}-${{ matrix.part }}-of-${{ matrix.parts }})
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -274,22 +274,22 @@ jobs:
           - core: legacy
             part: 1
             parts: 3
-            min_free_gb: 60
+            min_free_gb: 75
             args: --workspace --features tierstore/s3
           - core: legacy
             part: 2
             parts: 3
-            min_free_gb: 60
+            min_free_gb: 75
             args: --workspace --features tierstore/s3
           - core: legacy
             part: 3
             parts: 3
-            min_free_gb: 60
+            min_free_gb: 75
             args: --workspace --features tierstore/s3
           - core: js
             part: 1
             parts: 1
-            min_free_gb: 40
+            min_free_gb: 55
             args: -p kbf-server -p kbf-integration-test -p kbf-daemon -p kbf-node --features kbf-server/farm-core-js
     # A throwaway Postgres server for every test that needs one, the same container as
     # beta.yml's jobs use. KBF_TEST_POSTGRES_URL (below) names it; a test that needs it makes a
@@ -371,7 +371,9 @@ jobs:
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
       # The instrumented build (about 59 GB measured for the legacy core), the tests' temporary
       # files under it and the file store's 5% free-space floor (about 7.5 GB on this disk) need
-      # the room below (`min_free_gb` of the matrix). Short here means the restored cache or the
+      # the room below (`min_free_gb` of the matrix): measured use is about 67 GB for the legacy
+      # core and about 50 GB for the js core, and the values hold a margin over those (75 and
+      # 55; the lint refuses lower ones). Short here means the restored cache or the
       # image grew: the step says so and stops, instead of about 30 tests failing with "Full".
       - name: Refuse early when the disk is short for the tests
         run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --path . --min-free-gb "$MIN_FREE_GB"
@@ -417,7 +419,9 @@ jobs:
   # binaries on every runner, and a profile counts a function by its name and a hash of its code,
   # so the shards' profiles are read with this job's binaries. It then waits for every shard's
   # raw profiles (`cargo xtask wait-artifacts`: it fails at once when a shard fails, so `test`
-  # fails whenever a shard does, and none can be skipped into a pass), puts them in the one
+  # fails whenever a shard does, and none can be skipped into a pass; each artifact is named with
+  # the text of its shard's job name, so that after a re-run of the run an artifact of the first
+  # attempt counts only for a shard that was not run again), puts them in the one
   # directory `llvm-cov report` merges every `*.profraw` of, refuses a directory in which a
   # shard's profiles are missing (`profiles-complete`), and makes ONE report: a line counts once
   # with the hits of every shard and both cores, which is what the gate reads (kbf-coverage also
@@ -490,7 +494,7 @@ jobs:
       - name: Wait for the shards' raw profiles
         env:
           GH_TOKEN: ${{ github.token }}
-        run: cargo "+$COVERAGE_TOOLCHAIN" xtask wait-artifacts --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" --job-prefix test-shard --artifact profraw-legacy-1 --artifact profraw-legacy-2 --artifact profraw-legacy-3 --artifact profraw-js-1
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask wait-artifacts --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" --job-prefix test-shard --artifact "profraw-legacy-1=(legacy-1-of-3)" --artifact "profraw-legacy-2=(legacy-2-of-3)" --artifact "profraw-legacy-3=(legacy-3-of-3)" --artifact "profraw-js-1=(js-1-of-1)"
       # Into the directory `llvm-cov report` merges every `*.profraw` of.
       - name: Download the shards' raw profiles
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
