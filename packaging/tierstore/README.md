@@ -375,7 +375,8 @@ when the object is larger than the budget or would take the cache, with the fill
 above `critical`. The free-space floor is a trigger of the eviction and nothing else: it does not
 stop a fill, so on a disk that the jobs fill, the cache may fill the file system below the floor
 until the next pass (every 10 seconds) frees it. The start refuses (exit status 2) a `budget` larger
-than the size of the file system less `free_floor` percent of it. The files of
+than the size of the file system less `free_floor` percent of it; a file system whose size cannot be
+read, or that reports 0 bytes, is not judged: the start warns on stderr and goes on. The files of
 `.stage/` are never evicted and are removed at start. `scrub_rate` is accepted; this release does not
 scrub.
 
@@ -387,7 +388,7 @@ scrub.
 | `local_cache.high_water` | percent of the budget above which a pass evicts (default 90) |
 | `local_cache.low_water` | percent of the budget a pass evicts down to (default 75, below `high_water`) |
 | `local_cache.critical` | percent of the budget above which a fill is skipped (default 95, not below `high_water`) |
-| `local_cache.free_floor` | percent of the file system that is kept free (0 to 99, default 10): below it a pass evicts, even under the budget; it does not stop a fill, and `budget` may not be above the file system's size less the floor (exit status 2) |
+| `local_cache.free_floor` | percent of the file system that is kept free (0 to 99, default 10): below it a pass evicts, even under the budget; it does not stop a fill, and `budget` may not be above the file system's size less the floor (exit status 2), unless its size cannot be read or is 0, which the start warns of and does not judge |
 | `local_cache.max_concurrent_fills` | the most fills that run at once (1 to 64, default 4); a miss that finds them all running is served from the upstream and kept nowhere |
 | `local_cache.cache` | `true`, the default; `false` is refused (leave `[local_cache]` out to run without a cache) |
 | `local_cache.scrub_rate` | a size and `/s`, such as `"50MiB/s"`: accepted, and not used by this release |

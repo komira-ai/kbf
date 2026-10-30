@@ -172,7 +172,8 @@ struct Flight {
 
 impl Drop for Flight {
     fn drop(&mut self) {
-        drop(locked(&self.inner.flights).remove(&self.hex));
+        let gone = locked(&self.inner.flights).remove(&self.hex);
+        drop(gone);
     }
 }
 

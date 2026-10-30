@@ -9,8 +9,9 @@
 //! the key is accepted (an upstream that does not answer is exit status 1: a restart may mend
 //! it). A `budget` above the size of the file system less the `free_floor` is refused as
 //! flags that cannot go together (exit status 2); a file system whose size cannot be read, or
-//! that reports 0 bytes, is not judged: the start says so on stderr and goes on. The build node's upstream is read with a
-//! read-only key, so the write checks of the storage node's self-test are not run against it.
+//! that reports 0 bytes, is not judged: the start says so on stderr and goes on. The build
+//! node's upstream is read with a read-only key, so the write checks of the storage node's
+//! self-test are not run against it.
 //!
 //! On SIGTERM or SIGINT the process drains as a storage node does; the eviction pass is the only
 //! thing running beside the server, and it stops with it. Nothing is owed to the upstream: no
@@ -59,6 +60,15 @@ pub(super) fn size_of_file_system(disk: &dyn Disk, path: &Path) -> Result<u64, S
     }
 }
 
+/// The line the start prints when the size of the file system is unknown and the budget is not
+/// checked against it.
+pub(super) fn unjudged_warning(why: &str, path: &Path) -> String {
+    format!(
+        "tierstore: warning: {why} (at {}); local_cache.budget is not checked against it",
+        path.display()
+    )
+}
+
 /// Opens the cache in `config`, checks its file system and the upstream, and says on stderr what
 /// the start found.
 async fn open(
@@ -91,10 +101,7 @@ async fn open(
             return Err(Box::new(InvalidFlags(text)));
         }
         Ok(_) => {}
-        Err(why) => eprintln!(
-            "tierstore: warning: {why} (at {}); local_cache.budget is not checked against it",
-            config.path.display()
-        ),
+        Err(why) => eprintln!("{}", unjudged_warning(&why, cache.path())),
     }
     let (bytes, objects) = cache.held();
     eprintln!(

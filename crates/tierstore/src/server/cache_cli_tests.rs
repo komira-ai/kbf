@@ -14,7 +14,7 @@ use kbf_testkit::dir::TestDir;
 use tokio::sync::oneshot;
 
 use super::Drained;
-use super::cache_cli::{run_cache, serve_cache, size_of_file_system};
+use super::cache_cli::{run_cache, serve_cache, size_of_file_system, unjudged_warning};
 use super::cli::Error;
 use super::cli::exit_status;
 use super::config::{PerRun, settings_from_text};
@@ -376,6 +376,11 @@ async fn a_file_system_whose_size_is_unknown_is_not_judged_and_the_node_starts()
     empty.set_space(0, 0);
     let why = size_of_file_system(&empty, &path).unwrap_err();
     assert!(why.contains("reports a size of 0 bytes"), "{why}");
+    let line = unjudged_warning(&why, &path);
+    assert!(line.starts_with("tierstore: warning: "), "{line}");
+    assert!(line.contains(&why), "{line}");
+    assert!(line.contains(&path.display().to_string()), "{line}");
+    assert!(line.ends_with("local_cache.budget is not checked against it"), "{line}");
 
     let sized = FakeDisk::new();
     sized.set_space(5000, 100);
