@@ -12,6 +12,13 @@ install-sh-fixture = { max-threads = 1 }
 # name share a directory (crates/kbf-mac-provision/tests/support/mod.rs).
 mac-provision-scratch = { max-threads = 1 }
 
+# Hang guards for the tests of the tierstore local cache that wait for a task: no test asserts how
+# long it takes, and a test that waits for something that never comes is stopped after a minute
+# and fails. Named overrides go before any override that matches more.
+[[profile.default.overrides]]
+filter = 'package(tierstore) & (test(~local_cache::) | test(~cache_cli_tests::) | test(~cache_node::))'
+slow-timeout = { period = "60s", terminate-after = 2 }
+
 [[profile.default.overrides]]
 filter = 'package(xtask) & binary(install_sh)'
 test-group = 'install-sh-fixture'
@@ -31,6 +38,12 @@ test-group = 'mac-provision-scratch'
 [[profile.default.overrides]]
 filter = 'binary_id(=kbf-front::large_blobs)'
 slow-timeout = { period = "450s", terminate-after = 4 }
+
+# The backfill tests wait on the put's own signal, with no deadline of their own, so a put that
+# never ends hangs the test: nextest kills it after 30 s x 4 (the whole test takes milliseconds).
+[[profile.default.overrides]]
+filter = 'package(kbf-front) & (binary(large_backfill) | test(/^large_backfill::tests::/))'
+slow-timeout = { period = "30s", terminate-after = 4 }
 
 # A hang guard, not a bound: this test waits for a run that ends once the daemon has
 # killed it; a daemon that loses the kill leaves it waiting for ever.

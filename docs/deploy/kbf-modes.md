@@ -316,10 +316,10 @@ two more flags that have defaults:
   again every `--tls-reload-interval-secs` like the other listeners' (the names are checked at
   start only).
 - `--job-plain-http`, in place of the two: serves the same listener in plain HTTP, with no TLS,
-  for a farm on its own network (the CEO's call that TLS is optional there). It serves the same
+  for a farm on its own network: TLS is optional on a trusted job network, and a read grant is a
+  bearer token, so whoever can read that network can use a grant until it expires. It serves the same
   routes and the same bounds, and every request still needs a valid read grant, checked as over
-  TLS; what changes is that the grant and the blobs cross the network unencrypted, so anyone who
-  can read the job network can read a grant until it expires. Given with `--job-tls-cert` or
+  TLS; what changes is that the grant and the blobs cross the network unencrypted. Given with `--job-tls-cert` or
   `--job-tls-key` it is refused when the flags are read (which of the two to serve is not a
   guess to make); there are no IP-name checks and no TLS reload series in this mode. The
   executor must agree, and `--executor js-agent` refuses at the flags when it does not:

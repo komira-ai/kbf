@@ -191,6 +191,17 @@ fn a_plain_read_url_needs_the_plain_http_grant_opt_in() {
         why.contains("--task-read-url") && why.contains("--executor-allow-plain-http-grant"),
         "{why}"
     );
+    // The hint says what passes the next check too: against a TLS listener the opt-in alone would
+    // be refused at the scheme, so the hint asks for an https:// url (or the plain listener).
+    let tls_why = refused(&[], &http);
+    assert!(
+        tls_why.contains("use an https:// url") && tls_why.contains("--job-plain-http"),
+        "{tls_why}"
+    );
+    assert!(
+        !why.contains("use an https:// url") && why.contains("--executor-allow-plain-http-grant"),
+        "a plain listener is told the opt-in: {why}"
+    );
     let mut with = http.to_vec();
     with.extend(["--executor-allow-plain-http-grant", plain_listener[0]]);
     let flags = parsed(argv(&tls_files, &with)).expect("accepted with the opt-in");
@@ -344,4 +355,24 @@ fn the_read_url_scheme_is_the_one_the_job_listener_serves() {
         parsed(argv(&tls_files, &[http, allow, plain])).is_ok(),
         "http against plain"
     );
+}
+
+/// Pins that `--job-plain-http` is accepted beside `--executor kbf-daemon` (and with no executor,
+/// which the flag tests of the listener parse): the listener is independent of the executor, and
+/// the daemon executor takes no read grant, so the plain listener leaks nothing it would not
+/// serve anyway. The listener's plain mode stays what the flag says.
+#[test]
+fn a_plain_job_listener_is_accepted_beside_the_daemon_executor() {
+    let flags = parsed(argv(
+        &[
+            "--executor",
+            "--job-tls-cert",
+            "--job-tls-key",
+            "--task-read-url",
+        ],
+        &["--executor=kbf-daemon", "--job-plain-http"],
+    ))
+    .expect("accepted");
+    assert!(flags.executor.js.is_none());
+    assert!(flags.job_read.expect("the listener").tls.is_none());
 }

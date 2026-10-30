@@ -9,9 +9,11 @@ use tokio::net::TcpStream;
 
 use std::sync::Arc;
 
+use kbf_front::job_read::MAX_BATCH_REQUEST_BYTES;
 use kbf_objstore::s3::fake::FakeS3;
 use kbf_types::Digest;
 
+use super::batch::{digests, json_headers};
 use super::{
     Blobs, Got, JobReadFlags, SECRET, Serving, Timeouts, ca, exchange, files, ip, listening,
     path_of, prepare, world,
@@ -20,6 +22,7 @@ use crate::frontend::pack_tests::{flags_of, index, pack_flags, scrape, started, 
 use crate::frontend::{command, parse};
 use crate::listen::Latch;
 use crate::test_dir::scratch_dir;
+use crate::test_log::capture_at;
 
 /// The flags of a plain listener at `listen` with a grant secret in `dir` and no certificate.
 fn plain_flags(dir: &Path, listen: &str) -> JobReadFlags {
@@ -78,9 +81,39 @@ async fn a_plain_listener_with_no_certificate_serves_an_input_to_a_valid_grant()
     assert_eq!(got.header("content-type"), Some("application/octet-stream"));
 }
 
+/// One request of the parity tests: method, path, bearer, extra header lines and body.
+struct Ask<'a> {
+    method: &'a str,
+    path: String,
+    bearer: Option<&'a str>,
+    extra: String,
+    body: Vec<u8>,
+}
+
+fn get<'a>(path: String, bearer: Option<&'a str>) -> Ask<'a> {
+    Ask {
+        method: "GET",
+        path,
+        bearer,
+        extra: String::new(),
+        body: Vec::new(),
+    }
+}
+
+fn batch<'a>(body: &str, bearer: Option<&'a str>) -> Ask<'a> {
+    Ask {
+        method: "POST",
+        path: "/batch".to_owned(),
+        bearer,
+        extra: json_headers(body),
+        body: body.as_bytes().to_vec(),
+    }
+}
+
 /// Catches: a plain listener whose authorization or routes differ from the TLS listener's: the
 /// same requests (no grant, a bad grant, a grant for another Action's blob, a wrong method, an
-/// unknown path, a good grant) are answered with the same status, headers and body by both.
+/// unknown path, a good grant, a batch with a good and with a bad grant, and a batch body over
+/// the bound) are answered with the same status, headers and body by both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_plain_listener_answers_every_request_as_the_tls_listener_does() {
     let dir = scratch_dir("job-read-plain-same");
@@ -90,28 +123,98 @@ async fn a_plain_listener_answers_every_request_as_the_tls_listener_does() {
     let (tls_addr, _tls_latch) = listening(&tls_files, world.source(), Timeouts::default());
     let (plain_addr, _plain_latch, _) = plain_listening(&dir.path().join("plain"), world.source());
     let token = world.token();
-    let asks: Vec<(&str, String, Option<&str>)> = vec![
-        ("GET", path_of(&world.input), None),
-        ("GET", path_of(&world.input), Some("not-a-grant")),
-        ("GET", path_of(&world.stranger), Some(token.as_str())),
-        ("POST", path_of(&world.input), Some(token.as_str())),
-        ("GET", "/metrics".to_owned(), Some(token.as_str())),
-        ("GET", path_of(&world.input), Some(token.as_str())),
+    let good = Some(token.as_str());
+    let wanted = digests(&[&world.input, &world.stranger]);
+    let oversize = "x".repeat(MAX_BATCH_REQUEST_BYTES + 1);
+    let mut post_input = get(path_of(&world.input), good);
+    post_input.method = "POST";
+    let asks: Vec<Ask<'_>> = vec![
+        get(path_of(&world.input), None),
+        get(path_of(&world.input), Some("not-a-grant")),
+        get(path_of(&world.stranger), good),
+        post_input,
+        get("/metrics".to_owned(), good),
+        get(path_of(&world.input), good),
+        batch(&wanted, good),
+        batch(&wanted, Some("not-a-grant")),
+        batch(&oversize, good),
     ];
     let mut statuses = Vec::new();
-    for (method, path, bearer) in asks {
-        let over_tls = super::request(tls_addr, &farm.pem, method, &path, bearer)
+    for ask in asks {
+        let Ask {
+            method,
+            path,
+            bearer,
+            extra,
+            body,
+        } = &ask;
+        let over_tls = super::send(tls_addr, &farm.pem, method, path, *bearer, extra, body)
             .await
             .expect("tls connects");
-        let plain = plain_request(plain_addr, method, &path, bearer)
+        let mut tcp = TcpStream::connect(plain_addr)
             .await
             .expect("plain connects");
+        let plain = exchange(&mut tcp, plain_addr, method, path, *bearer, extra, body)
+            .await
+            .expect("plain answers");
         assert_eq!(plain.status, over_tls.status, "{method} {path}");
         assert_eq!(plain.headers, over_tls.headers, "{method} {path}");
         assert_eq!(plain.body, over_tls.body, "{method} {path}");
         statuses.push(plain.status);
     }
-    assert_eq!(statuses, [401, 401, 403, 405, 404, 200]);
+    assert_eq!(&statuses[..8], [401, 401, 403, 405, 404, 200, 200, 401]);
+    assert_ne!(statuses[8], 200, "a body over the bound is not served");
+}
+
+/// Catches: a plain listener that keeps its socket open once the drain begins (the latch
+/// closes) while the TLS listener closes it: after the close neither takes a new connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drain_closes_the_plain_socket_as_it_closes_the_tls_one() {
+    let dir = scratch_dir("job-read-plain-drain");
+    let farm = ca("farm CA");
+    let tls_files = files(&dir.path().join("tls"), &farm, vec![ip("127.0.0.1")]);
+    let world = world();
+    let (tls_addr, tls_latch) = listening(&tls_files, world.source(), Timeouts::default());
+    let (plain_addr, plain_latch, _) = plain_listening(&dir.path().join("plain"), world.source());
+    let token = world.token();
+    let ok = plain_request(plain_addr, "GET", &path_of(&world.input), Some(&token))
+        .await
+        .expect("answers before the drain");
+    assert_eq!(ok.status, 200);
+    tls_latch.close();
+    plain_latch.close();
+    for addr in [tls_addr, plain_addr] {
+        let mut refused = false;
+        for _ in 0..200 {
+            if TcpStream::connect(addr).await.is_err() {
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(refused, "{addr} is still accepting");
+    }
+}
+
+/// Catches: a plain listener that starts without saying the grants it serves cross the network
+/// unencrypted, and a TLS listener that says so: the warning names the address, and only the
+/// plain start writes it.
+#[tokio::test]
+async fn only_a_plain_start_warns_that_grants_travel_unencrypted() {
+    let dir = scratch_dir("job-read-plain-warn");
+    let farm = ca("farm CA");
+    let log = capture_at(tracing::Level::WARN);
+    let tls_files = files(&dir.path().join("tls"), &farm, vec![ip("127.0.0.1")]);
+    let (_, _tls_latch) = listening(&tls_files, world().source(), Timeouts::default());
+    assert!(!log.text().contains("unencrypted"), "{}", log.text());
+    let prepared = prepare(&plain_flags(&dir.path().join("plain"), "127.0.0.1:0")).expect("ok");
+    let addr = prepared.local();
+    let started = prepared.start(world().source(), Timeouts::default());
+    let _serving = started.expect("started");
+    let text = log.text();
+    assert!(text.contains("--job-plain-http"), "{text}");
+    assert!(text.contains("unencrypted"), "{text}");
+    assert!(text.contains(&addr.to_string()), "{text}");
 }
 
 /// Catches: a start that accepts a TLS file beside the plain flag, or a plain flag without what

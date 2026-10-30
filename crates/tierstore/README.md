@@ -28,6 +28,17 @@ a key or a table it does not know. The format, the table of the key of each flag
 in "The configuration file" in `packaging/tierstore/README.md`; the flags stay accepted for one
 release along with the file.
 
+## A build node: a read cache
+
+A file with `[local_cache]` and `[cold_store]` and no `[hot_store]` runs the same binary as a read
+cache in front of one upstream (`src/server/local_cache/`, the file's tables in
+`src/server/config_cache.rs`): GET and HEAD of the keys a `[[policy]]` with `cache = true` holds are
+served from a directory of raw files (`<path>/obj/<aa>/<bb>/<hex>`), filled from the upstream on a
+miss, hashed as they are filled and evicted oldest-use first under a byte budget and a free-space
+floor; every other call is refused 403. It has no journal and no lease. The keys of the table and
+the rules are in "A build node" in `packaging/tierstore/README.md`; `GET /metricz` shows its
+counters.
+
 ## Roles of a key
 
 | role | flag | may do |

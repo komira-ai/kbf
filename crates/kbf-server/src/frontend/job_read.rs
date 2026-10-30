@@ -48,10 +48,12 @@ use futures::future::BoxFuture;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
+use kbf_front::Packs;
 use kbf_front::grants::{GrantKey, Grants, KeyError};
 use kbf_front::job_read::{
     BATCH_PATH, BlobSource, JobRead, Limits, MAX_BATCH_REQUEST_BYTES, Reply,
 };
+use kbf_front::large_backfill::LargeBackfill;
 use kbf_tls::{Alpn, Conn, TlsError, TlsFiles, TlsSource};
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 
@@ -120,15 +122,16 @@ pub(super) fn args() -> [Arg; 7] {
             .requires_all([TRANSPORT, GRANT_SECRET])
             .help(
                 "Serves the inputs of an action to the task that runs it, over HTTPS (or, with \
-                 `--job-plain-http`, plain HTTP) at this address: `GET /<hex>/<size>` and `POST /batch` (many small blobs in one \
-                 request) with `Authorization: Bearer <read grant>`, and nothing else (any \
-                 other path is 404 and any other method 405). A read grant \
-                 is the token a run is given; until it expires it reads the Action it was \
-                 issued for, its Command and its input tree, and no other blob. The TLS is the \
-                 server's alone and no client certificate is asked for. The task dials an IP \
-                 address, so give the address the jobs dial, and a `--job-tls-cert` that names \
-                 it as an IP subjectAltName. Needs `--job-tls-cert` and `--job-tls-key` or \
-                 `--job-plain-http`, and `--job-grant-secret-file`. Left out, no such listener is opened",
+                 `--job-plain-http`, plain HTTP) at this address: `GET /<hex>/<size>` and \
+                 `POST /batch` (many small blobs in one request) with `Authorization: Bearer \
+                 <read grant>`, and nothing else (any other path is 404 and any other method \
+                 405). A read grant is the token a run is given; until it expires it reads the \
+                 Action it was issued for, its Command and its input tree, and no other blob. \
+                 The TLS is the server's alone and no client certificate is asked for. The task \
+                 dials an IP address, so give the address the jobs dial, and a `--job-tls-cert` \
+                 that names it as an IP subjectAltName. Needs `--job-tls-cert` and \
+                 `--job-tls-key` or `--job-plain-http`, and `--job-grant-secret-file`. Left \
+                 out, no such listener is opened",
             ),
         Arg::new(TLS_CERT)
             .long("job-tls-cert")
@@ -205,6 +208,11 @@ pub(super) fn args() -> [Arg; 7] {
     ]
 }
 
+/// Whether `m` has a job listener that serves TLS: `--job-listen` without `--job-plain-http`.
+pub(super) fn serves_tls(m: &ArgMatches) -> bool {
+    m.contains_id(LISTEN) && !m.get_flag(PLAIN)
+}
+
 /// The flags `m` makes, or `None` without `--job-listen` (clap makes the secret and one of
 /// the certificate and `--job-plain-http` come with it).
 pub(super) fn from_matches(m: &ArgMatches) -> Option<JobReadFlags> {
@@ -269,6 +277,8 @@ pub(super) struct Prepared {
     grants: Arc<Grants>,
     /// What the flags bound: the reads open at once and the largest blob served.
     limits: Limits,
+    /// The copy of large blobs to tierstore, when there are packs to take it from.
+    backfill: Option<LargeBackfill>,
 }
 
 /// The waits that bound a client of the listener.
@@ -329,7 +339,20 @@ impl Prepared {
             tls,
             grants,
             limits,
+            backfill: None,
         })
+    }
+
+    /// This listener, copying the large blobs it streams to the packs' store through `packs`
+    /// ([`kbf_front::large_backfill`]); `None` copies nothing.
+    pub(super) fn with_backfill(mut self, packs: Option<Packs>) -> Self {
+        self.backfill = packs.map(|packs| {
+            LargeBackfill::new(
+                Arc::new(packs),
+                kbf_front::large_backfill::DEFAULT_CONCURRENCY,
+            )
+        });
+        self
     }
 
     /// Where the listener listens.
@@ -346,7 +369,15 @@ impl Prepared {
         source: Arc<dyn BlobSource>,
         timeouts: Timeouts,
     ) -> Result<Serving, JobReadError> {
-        let read = Arc::new(JobRead::new(source, self.grants, self.limits));
+        if self.tls.is_none() {
+            tracing::warn!(
+                address = %self.socket.local,
+                "--job-plain-http: the job-facing read listener serves plain HTTP, so read \
+                 grants and blobs are sent unencrypted"
+            );
+        }
+        let read =
+            Arc::new(JobRead::new(source, self.grants, self.limits).with_backfill(self.backfill));
         let (incoming, latch) = self.socket.grpc(self.tls.clone())?;
         let task = accept(
             incoming,
