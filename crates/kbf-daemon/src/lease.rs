@@ -584,16 +584,19 @@ mod tests {
         assert!(!leases.cancel(id()), "a finished lease");
     }
 
-    /// A runtime that takes a turn of the executor before a run can be stopped: its
-    /// `kill` of a run that has not got that far does nothing, as the trait says of a
-    /// lease that is not running.
-    struct Preparing {
+    /// A runtime whose first poll of `run` blocks its thread until released, as a run
+    /// that does work before it can be stopped. It says when that poll has begun, and
+    /// when `kill` is called.
+    struct Gated {
+        entered: tokio::sync::Notify,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        kill_called: tokio::sync::Notify,
         stops: std::sync::Mutex<BTreeMap<LeaseId, tokio::sync::oneshot::Sender<()>>>,
     }
 
-    impl Runtime for Preparing {
+    impl Runtime for Gated {
         fn driver(&self) -> &'static str {
-            "preparing"
+            "gated"
         }
 
         fn serves(&self, _kind: &str) -> bool {
@@ -601,7 +604,8 @@ mod tests {
         }
 
         async fn run(&self, work: Work) -> Result<ActionResult, RuntimeError> {
-            tokio::task::yield_now().await;
+            self.entered.notify_one();
+            self.release.lock().expect("lock").recv().expect("released");
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.stops.lock().expect("lock").insert(work.lease_id, tx);
             let _ = rx.await;
@@ -609,25 +613,31 @@ mod tests {
         }
 
         async fn kill(&self, lease_id: LeaseId) {
+            self.kill_called.notify_one();
             if let Some(stop) = self.stops.lock().expect("lock").remove(&lease_id) {
                 let _ = stop.send(());
             }
         }
     }
 
-    /// Catches a `Cancel` of a lease whose run is listed as running but has not yet
-    /// reached the point where its runtime can stop it: the kill finds nothing to stop
-    /// and, sent once, is lost, so the run goes on and a draining daemon waits on it for
-    /// ever (kbf#2013). The kill must be repeated until the run has ended. The executor
-    /// runs the run's first turn, then the kill, then the run's second, so the kill is
-    /// early by construction. The wait is a hang guard on a paused clock.
-    #[tokio::test(start_paused = true)]
-    async fn a_cancel_before_the_run_can_be_stopped_still_ends_it() {
-        let runtime = Arc::new(Preparing {
+    /// Catches a `Cancel` of a lease that is listed as running while its run is still on
+    /// its first poll, before its runtime can stop it: the runtime does nothing for a
+    /// lease it does not run, so a kill sent then is lost, the run goes on, and a
+    /// draining daemon waits on it for ever (kbf#2013). The run's first poll is held
+    /// until the kill has had its chance (or half a second has passed, for a daemon that
+    /// holds the kill back, which is not asserted); the run must then end, killed. The
+    /// last wait is a hang guard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_during_the_first_poll_of_the_run_still_ends_it() {
+        let (release, held) = std::sync::mpsc::channel();
+        let runtime = Arc::new(Gated {
+            entered: tokio::sync::Notify::new(),
+            release: std::sync::Mutex::new(held),
+            kill_called: tokio::sync::Notify::new(),
             stops: std::sync::Mutex::new(BTreeMap::new()),
         });
         let (done, mut done_rx) = mpsc::unbounded_channel();
-        let mut leases = Leases::new(Runtimes::new(runtime), done);
+        let mut leases = Leases::new(Runtimes::new(Arc::clone(&runtime)), done);
         let start = Start {
             lease_id: Some(proto_lease_id(id())),
             kind: "action".to_owned(),
@@ -635,9 +645,16 @@ mod tests {
             ..Start::default()
         };
         assert_eq!(leases.start(start), None);
+        runtime.entered.notified().await;
         assert!(leases.cancel(id()));
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            runtime.kill_called.notified(),
+        )
+        .await;
+        release.send(()).expect("the run waits");
         let (ended, outcome, usage, phases) =
-            tokio::time::timeout(std::time::Duration::from_secs(60), done_rx.recv())
+            tokio::time::timeout(std::time::Duration::from_secs(30), done_rx.recv())
                 .await
                 .expect("the cancelled run ends")
                 .expect("open");
