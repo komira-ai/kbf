@@ -28,6 +28,33 @@ fn pieces(bytes: &[u8]) -> PartBody<'static> {
     stream::iter(items).boxed()
 }
 
+/// The turns of the scheduler a test gives an event before it fails.
+const SPINS: u32 = 1_000_000;
+
+/// Waits, by giving up the thread, until the stage directory is empty: the writer of a copy that
+/// was dropped is aborted and removes its file when the runtime next runs it.
+async fn drained(config: &CacheConfig) {
+    let stage = config.path.join(".stage");
+    for _ in 0..SPINS {
+        if std::fs::read_dir(&stage).unwrap().count() == 0 {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("after {SPINS} turns of the scheduler, the stage directory was not empty");
+}
+
+/// A cache of 64 MiB that keeps `cas/` and writes through, over a bucket of `s3`.
+fn node(s3: &FakeS3, name: &str) -> (LocalCache, CacheConfig, TestDir) {
+    let dir = TestDir::under(std::env::temp_dir(), name);
+    let policies = vec![("cas/".to_owned(), true)];
+    let mut config = CacheConfig::new(dir.path().join("cache"), 64 << 20, policies);
+    config.write_through = true;
+    let clock = Arc::new(TestClock::new());
+    let cache = LocalCache::open(config.clone(), s3_backend(s3), Arc::new(SystemDisk), clock);
+    (cache.unwrap(), config, dir)
+}
+
 /// A backend over the bucket of the loopback S3 service.
 fn s3_backend(s3: &FakeS3) -> Arc<S3Backend> {
     let store = S3Config {
@@ -97,10 +124,36 @@ async fn a_put_over_s3_is_kept_with_the_upstreams_tag_also_when_sent_as_parts() 
     assert_eq!(read(&cache.counters().hits), 2);
     assert_eq!(cache.held(), ((17 + 3) << 20, 2));
     assert_eq!(cache.inner.reserved.load(Ordering::SeqCst), 0);
-    let staged = std::fs::read_dir(config.path.join(".stage"))
-        .unwrap()
-        .count();
-    assert_eq!(staged, 0);
+    drained(&config).await;
+}
+
+/// Asserts that a key named by its content whose body hashes to another name stores nothing at an
+/// S3 upstream, for a body that goes as one PUT and for one that goes as a multipart upload: the
+/// put is `BadDigest`, the bucket has no object, no upload is left open, none was completed, and
+/// the cache has nothing. It fails if the S3 backend makes the object when the error comes with
+/// the last chunk.
+#[tokio::test]
+async fn a_name_mismatch_stores_nothing_over_s3() {
+    for (label, size) in [("single", 1usize << 20), ("parts", 17 << 20)] {
+        let s3 = FakeS3::start().await;
+        let (cache, config, _dir) = node(&s3, &format!("tscache-keep-s3-bad-{label}"));
+        let key = format!("cas/l/{}", digest(b"what the name says"));
+        let bytes = pattern(size);
+        let made = cache.put_stream(&key, Some(size as u64), pieces(&bytes));
+        assert_eq!(
+            made.await,
+            Err(crate::Error::BadDigest(key.clone())),
+            "{label}"
+        );
+
+        assert_eq!(s3.keys(), Vec::<String>::new(), "{label}");
+        assert_eq!(s3.incomplete_uploads(), 0, "{label}");
+        let stats = s3.stats();
+        assert_eq!((stats.single_puts, stats.completed), (0, 0), "{label}");
+        assert_eq!(cache.held(), (0, 0), "{label}");
+        assert_eq!(cache.inner.reserved.load(Ordering::SeqCst), 0, "{label}");
+        drained(&config).await;
+    }
 }
 
 /// Asserts that a body over 16 MiB that is cut part of the way through leaves no object and no
@@ -134,8 +187,5 @@ async fn a_cut_multipart_sized_body_leaves_nothing_over_s3() {
     assert_eq!(s3.incomplete_uploads(), 0);
     assert_eq!(cache.held(), (0, 0));
     assert_eq!(cache.inner.reserved.load(Ordering::SeqCst), 0);
-    let staged = std::fs::read_dir(config.path.join(".stage"))
-        .unwrap()
-        .count();
-    assert_eq!(staged, 0);
+    drained(&config).await;
 }

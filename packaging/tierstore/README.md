@@ -319,15 +319,19 @@ What a put keeps. The body of a create-only put under a `cache = true` policy is
 asks it for the object's tag and time (one HEAD, so the tag in the cache is the one the upstream
 gave, which for a large body is not an MD5), puts the copy in the cache, and then answers 200. The
 copy is best effort and never fails the put: if every keep slot is busy (`max_concurrent_keeps`),
-the object does not fit the budget, the stage directory cannot be written, the HEAD fails, or the
-object was deleted meanwhile, the copy is dropped, the put is still 200 with the object at the
-upstream, and the skip is counted. A key named by its content (`cas/l/<sha256>`) is hashed as the
-body streams; a body that does not hash to the name ends the stream with an error, so the upstream
-stores nothing, and nothing is kept. A body that is cut leaves nothing at the upstream or in the
-cache. `/metricz` has `tierstore_cache_writes_through_total` (puts the upstream took),
+the object does not fit the budget, the stage directory cannot be written, the HEAD fails, the disk
+falls behind the body, or the object was deleted meanwhile, the copy is dropped, the put is still
+200 with the object at the upstream, and the skip is counted. The body is written to the stage file
+by a task of its own through a queue of 16 chunks, so a slow or hung disk never makes the upload
+wait: the copy is dropped instead. Once the upstream has acknowledged the object, the rest of the
+keep runs on its own task, so a client that goes away at that point does not leave a half-made
+copy. A key named by its content (`cas/l/<sha256>`) is hashed as the body streams, copied or not;
+a body that does not hash to the name is answered 400 `BadDigest`, the upstream stores nothing, and
+nothing is kept. A body that is cut leaves nothing at the upstream or in the cache.
+`/metricz` has `tierstore_cache_writes_through_total` (puts the upstream took),
 `tierstore_cache_write_exists_total` (puts answered 412) and
 `tierstore_cache_write_keep_skipped_total{reason}` with the reasons `budget` (also a body of no
-declared length), `io`, `busy`, `head` and `deleted`.
+declared length), `io`, `busy`, `head`, `deleted` and `slow` (the disk did not keep up).
 
 ```toml
 [server]

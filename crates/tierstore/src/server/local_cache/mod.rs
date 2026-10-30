@@ -280,6 +280,9 @@ pub(super) struct Inner {
     permits: Arc<Semaphore>,
     /// One permit for each put that may be copied to the stage directory; held until it ends.
     keeps: Arc<Semaphore>,
+    /// Run by a test just before a kept object is put in the index (see `keep`).
+    #[cfg(test)]
+    before_insert: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Whether a pass of the eviction is running.
     evicting: AtomicBool,
 }
@@ -331,6 +334,8 @@ impl LocalCache {
             reserved: AtomicU64::new(0),
             permits,
             keeps,
+            #[cfg(test)]
+            before_insert: Mutex::new(None),
             evicting: AtomicBool::new(false),
         };
         Ok(Self {

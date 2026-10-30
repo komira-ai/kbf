@@ -64,8 +64,9 @@ fn through(rig: &Rig) -> u64 {
 
 /// Asserts that no put is under way: nothing is staged, no byte is reserved and every keep
 /// permit is back.
-fn at_rest(rig: &Rig) {
-    assert_eq!(rig.staged_files(), 0);
+async fn at_rest(rig: &Rig) {
+    // The writer of a dropped copy is aborted, and removes its file when the runtime next runs it.
+    until("the stage files were removed", || rig.staged_files() == 0).await;
     assert_eq!(rig.cache.inner.reserved.load(Ordering::SeqCst), 0);
     let free = rig.cache.inner.keeps.available_permits();
     assert_eq!(free, rig.config.max_concurrent_keeps);
@@ -105,7 +106,7 @@ async fn a_put_is_a_local_hit_with_the_tag_the_upstream_gave() {
 
     assert_eq!(rig.calls(Op::Head), 4);
     assert_eq!(rig.cache.held(), (313, 2));
-    at_rest(&rig);
+    at_rest(&rig).await;
     assert_eq!(through(&rig), 2);
     for (key, want) in [
         ("cas/b/small", &b"one two three"[..]),
@@ -150,7 +151,7 @@ async fn a_cut_body_leaves_nothing_at_the_upstream_or_in_the_cache() {
     assert!(rig.tamper.memory.head("cas/b/cut").await.is_err());
     assert_eq!(rig.cache.held(), (0, 0));
     assert!(!rig.has_file("cas/b/cut"));
-    at_rest(&rig);
+    at_rest(&rig).await;
     assert_eq!(through(&rig), 0);
     assert_eq!(skipped(&rig, SkippedKeep::Head), 0);
     assert_eq!(rig.calls(Op::Head), 1);
@@ -166,11 +167,11 @@ async fn a_body_that_does_not_hash_to_its_name_leaves_nothing() {
     let key = content_key(b"good bytes");
     let refused = rig.cache.put_stream(&key, Some(10), whole(b"evil bytes"));
     let refused = refused.await;
-    assert!(matches!(refused, Err(Error::Other(_))), "{refused:?}");
+    assert_eq!(refused, Err(Error::BadDigest(key.clone())));
     assert!(rig.tamper.memory.head(&key).await.is_err());
     assert_eq!(rig.cache.held(), (0, 0));
     assert!(!rig.has_file(&key));
-    at_rest(&rig);
+    at_rest(&rig).await;
     assert_eq!(through(&rig), 0);
 
     let made = rig.cache.put_stream(&key, Some(10), whole(b"good bytes"));
@@ -192,10 +193,10 @@ async fn a_hash_mismatch_is_refused_when_the_body_is_not_copied() {
     });
     let key = content_key(b"good bytes");
     let refused = rig.cache.put_stream(&key, Some(10), whole(b"evil bytes"));
-    assert!(matches!(refused.await, Err(Error::Other(_))));
+    assert_eq!(refused.await, Err(Error::BadDigest(key.clone())));
     assert!(rig.tamper.memory.head(&key).await.is_err());
     assert_eq!(skipped(&rig, SkippedKeep::Budget), 0);
-    at_rest(&rig);
+    at_rest(&rig).await;
 }
 
 /// Asserts that a stage directory that cannot be written, and a link that fails, each still give
@@ -231,7 +232,7 @@ async fn an_unwritable_stage_or_a_failed_link_still_succeeds_and_is_counted() {
     assert!(!rig.has_file("cas/b/nolink"));
     let meta = meta_path(&rig.config.path, &name_of("cas/b/nolink").hex);
     assert!(!meta.exists());
-    at_rest(&rig);
+    at_rest(&rig).await;
     assert_eq!(through(&rig), 1);
     rig.disk.set(Quirk::None);
     assert_eq!(rig.get("cas/b/nolink").await.unwrap(), "bytes");
@@ -261,7 +262,7 @@ async fn a_body_over_the_budget_or_of_no_length_is_not_kept_and_is_counted() {
         assert!(!rig.has_file(key), "{key}");
     }
     assert_eq!(rig.cache.held(), (0, 0));
-    at_rest(&rig);
+    at_rest(&rig).await;
     assert_eq!(through(&rig), 2);
 }
 
@@ -284,7 +285,7 @@ async fn a_failed_head_after_the_put_keeps_nothing_and_is_counted() {
     assert_eq!(through(&rig), 1);
     assert_eq!(rig.cache.held(), (0, 0));
     assert!(!rig.has_file(key));
-    at_rest(&rig);
+    at_rest(&rig).await;
     assert!(super::locked(&rig.cache.inner.flights).is_empty());
     assert_eq!(rig.tamper.memory.get(key, None).await.unwrap(), "bytes");
     assert_eq!(rig.get(key).await.unwrap(), "bytes");
@@ -334,7 +335,7 @@ async fn a_put_that_finds_every_keep_busy_succeeds_and_is_counted() {
     assert_eq!(slow_put.await.unwrap(), Ok(()));
     assert_eq!(rig.cache.held(), (11, 1));
     assert!(rig.has_file("cas/b/slow"));
-    at_rest(&rig);
+    at_rest(&rig).await;
 }
 
 /// Asserts that the keeps have permits of their own: with a single fill allowed and that fill
@@ -395,10 +396,176 @@ async fn a_delete_that_races_a_keep_leaves_no_entry() {
     assert!(!rig.has_file(key));
     assert!(!meta_path(&rig.config.path, &name_of(key).hex).exists());
     assert_eq!(skipped(&rig, SkippedKeep::Deleted), 1);
-    at_rest(&rig);
+    at_rest(&rig).await;
     assert!(super::locked(&rig.cache.inner.flights).is_empty());
     assert!(super::locked(&rig.cache.inner.invalidated).is_empty());
     assert!(matches!(rig.get(key).await, Err(Error::NotFound(_))));
+}
+
+/// The data files and the sidecars in the object directory of the rig's cache.
+fn cache_files(rig: &Rig) -> (usize, usize) {
+    fn walk(dir: &std::path::Path, found: &mut (usize, usize)) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "meta") {
+                found.1 += 1;
+            } else {
+                found.0 += 1;
+            }
+        }
+    }
+    let mut found = (0, 0);
+    walk(&rig.config.path.join("obj"), &mut found);
+    found
+}
+
+/// Asserts that a put whose request is dropped after the upstream took the object, while its
+/// keep waits for the HEAD, still ends with the object kept whole: the keep runs on a task of
+/// its own, so when the HEAD is let go the object is in the index with its data file and its
+/// sidecar, and there is no other file in the cache, no stage file, no entry in the table of the
+/// fills, no mark, and the permit and the room are back. It fails on a keep that runs in the
+/// request, which is gone with it and leaves the object to be filled again, and (with a client
+/// that goes away while the files are being linked) files that nothing indexes.
+#[tokio::test]
+async fn a_put_dropped_after_the_ack_still_ends_with_the_object_kept_whole() {
+    let rig = Rig::writing("tscache-keep-dropped");
+    let key = "cas/b/orphan";
+    let held = rig.tamper.hold_heads();
+    let (cache, name) = (rig.cache.clone(), key.to_owned());
+    let putting =
+        tokio::spawn(async move { cache.put_stream(&name, Some(6), whole(b"orphan")).await });
+    until("the keep's HEAD found the object", || {
+        rig.tamper.heading() >= 1
+    })
+    .await;
+    putting.abort();
+    assert!(putting.await.unwrap_err().is_cancelled());
+
+    held.add_permits(16);
+    until("the keep ended", || {
+        rig.cache.held() == (6, 1) && super::locked(&rig.cache.inner.flights).is_empty()
+    })
+    .await;
+    assert_eq!(cache_files(&rig), (1, 1));
+    assert!(rig.has_file(key));
+    assert_eq!(sidecar(&rig, key).sha256, digest(b"orphan"));
+    assert!(super::locked(&rig.cache.inner.invalidated).is_empty());
+    at_rest(&rig).await;
+    let gets = rig.calls(Op::Get);
+    assert_eq!(rig.get(key).await.unwrap(), "orphan");
+    assert_eq!(rig.calls(Op::Get), gets);
+}
+
+/// Asserts that a disk that hangs costs the copy and not the put: with every write to the stage
+/// file held (and never let go), a body of more chunks than the queue holds is passed to the
+/// upstream whole and the put is answered, the copy is dropped and counted as `slow`, and the
+/// stage file is removed. It fails on a tee that waits for the disk, which never finishes the
+/// put.
+#[tokio::test]
+async fn a_hung_disk_drops_the_copy_and_never_stops_the_upstream() {
+    let rig = Rig::writing("tscache-keep-slow-disk");
+    let _held = rig.disk.hold_writes();
+    let pieces = super::keep::KEEP_QUEUE + 8;
+    let items: Vec<Result<Bytes, Error>> = (0..pieces)
+        .map(|n| Ok(Bytes::from(vec![n as u8; 100])))
+        .collect();
+    let length = (pieces * 100) as u64;
+    let made = rig
+        .cache
+        .put_stream("cas/b/slow", Some(length), stream::iter(items).boxed());
+    assert_eq!(made.await, Ok(()));
+
+    assert_eq!(skipped(&rig, SkippedKeep::Slow), 1);
+    assert_eq!(through(&rig), 1);
+    let stored = rig.tamper.memory.get("cas/b/slow", None).await.unwrap();
+    assert_eq!(stored.len() as u64, length);
+    assert_eq!(rig.cache.held(), (0, 0));
+    assert!(!rig.has_file("cas/b/slow"));
+    at_rest(&rig).await;
+    assert!(
+        rig.cache
+            .metrics()
+            .contains("write_keep_skipped_total{reason=\"slow\"} 1\n")
+    );
+}
+
+/// Asserts the check of a key named by its content against a backend that stops reading its body
+/// as soon as it has the declared length, and so never sees it end: the bytes are checked when
+/// they are all there, a body that is right is kept, and one that is wrong is `BadDigest` in
+/// place of its last chunk, so the backend stores nothing. It fails on a check that waits for
+/// the end of the stream, which this backend never reaches.
+#[tokio::test]
+async fn a_backend_that_stops_at_the_declared_length_is_still_checked() {
+    let rig = Rig::writing("tscache-keep-stops-at-length");
+    rig.tamper.stop_after.store(2, Ordering::SeqCst);
+    let good = content_key(b"good bytes");
+    let made = rig
+        .cache
+        .put_stream(&good, Some(10), chunks(&[b"good ", b"bytes"]));
+    assert_eq!(made.await, Ok(()));
+    assert_eq!(rig.cache.held(), (10, 1));
+    assert_eq!(sidecar(&rig, &good).sha256, digest(b"good bytes"));
+
+    let other = content_key(b"other data");
+    let wrong = rig
+        .cache
+        .put_stream(&other, Some(10), chunks(&[b"evil ", b"data!"]));
+    assert_eq!(wrong.await, Err(Error::BadDigest(other.clone())));
+    assert!(rig.tamper.memory.head(&other).await.is_err());
+    assert_eq!(rig.cache.held(), (10, 1));
+    at_rest(&rig).await;
+}
+
+/// Asserts what is done with a backend that takes a put without reading the body to the
+/// declared length: for a key named by its content the put is `BadDigest` (the body was never
+/// checked); for any other key the put succeeds and is not kept, counted as `head`. It fails on
+/// a keep that publishes bytes it did not see whole, or skips the check of a key it did not
+/// hash.
+#[tokio::test]
+async fn a_backend_that_stops_short_of_the_length_is_not_trusted() {
+    let rig = Rig::writing("tscache-keep-stops-short");
+    rig.tamper.stop_after.store(1, Ordering::SeqCst);
+    let made = rig
+        .cache
+        .put_stream("cas/b/short", Some(10), chunks(&[b"short", b"ened!"]));
+    assert_eq!(made.await, Ok(()));
+    assert_eq!(skipped(&rig, SkippedKeep::Head), 1);
+    assert_eq!(rig.cache.held(), (0, 0));
+    assert!(!rig.has_file("cas/b/short"));
+
+    let key = content_key(b"shortened!");
+    let checked = rig
+        .cache
+        .put_stream(&key, Some(10), chunks(&[b"short", b"ened!"]));
+    assert_eq!(checked.await, Err(Error::BadDigest(key.clone())));
+    assert_eq!(rig.cache.held(), (0, 0));
+    assert!(!rig.has_file(&key));
+    at_rest(&rig).await;
+}
+
+/// Asserts that a delete which finishes after the copy is linked and before the entry is put in
+/// the index (the hook runs in that gap, and does what the end of a delete does) leaves no entry:
+/// the check for the delete's mark is made after the insert, and removes what the insert put
+/// there. A check made before the insert does not see this delete, and the index then holds an
+/// object whose files the delete removed.
+#[tokio::test]
+async fn a_delete_just_before_the_index_insert_is_caught_by_the_check_after_it() {
+    let rig = Rig::writing("tscache-keep-delete-gap");
+    let key = "cas/b/gap";
+    let inner = Arc::clone(&rig.cache.inner);
+    let deleting = Arc::clone(&inner);
+    *super::locked(&inner.before_insert) = Some(Box::new(move || deleting.forget(key)));
+    let made = rig.cache.put_stream(key, Some(3), whole(b"gap"));
+    assert_eq!(made.await, Ok(()));
+    *super::locked(&inner.before_insert) = None;
+
+    assert_eq!(rig.cache.held(), (0, 0));
+    assert!(!rig.has_file(key));
+    assert_eq!(skipped(&rig, SkippedKeep::Deleted), 1);
+    assert_eq!(cache_files(&rig), (0, 0));
+    at_rest(&rig).await;
 }
 
 /// Asserts that a put whose upstream answers "already exists" after the HEAD found nothing (it
@@ -423,7 +590,7 @@ async fn a_put_that_exists_is_counted_and_keeps_nothing() {
     assert_eq!(read(&rig.cache.counters().write_exists), 2);
     assert_eq!(through(&rig), 0);
     assert_eq!(rig.cache.held(), (0, 0));
-    at_rest(&rig);
+    at_rest(&rig).await;
     let stored = rig.tamper.memory.get("cas/b/there", None).await;
     assert_eq!(stored.unwrap(), "first");
 }
@@ -439,7 +606,7 @@ async fn a_put_under_an_uncached_prefix_is_never_kept() {
     assert_eq!(rig.calls(Op::Head), 1);
     assert_eq!(rig.cache.held(), (0, 0));
     assert!(!rig.has_file("other/obj"));
-    at_rest(&rig);
+    at_rest(&rig).await;
     assert_eq!(through(&rig), 1);
     for why in [
         SkippedKeep::Budget,

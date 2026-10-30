@@ -40,14 +40,18 @@ pub(super) enum SkippedKeep {
     Io,
     /// Every keep the cache may run was running, or a fill of the key was.
     Busy,
-    /// The upstream's HEAD after the put failed or did not describe the bytes that were sent.
+    /// The upstream's HEAD after the put failed or did not describe the bytes that were sent, or
+    /// the upstream did not read the body to its end.
     Head,
     /// The object was deleted while it was being kept.
     Deleted,
+    /// The disk did not keep up with the body: the copy fell too far behind and was dropped,
+    /// so that the upstream was never made to wait for the disk.
+    Slow,
 }
 
 /// The label of each [`SkippedKeep`], in the order of the enum.
-const SKIPPED_KEEP: [&str; 5] = ["budget", "io", "busy", "head", "deleted"];
+const SKIPPED_KEEP: [&str; 6] = ["budget", "io", "busy", "head", "deleted", "slow"];
 
 /// Why an object was evicted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

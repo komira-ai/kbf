@@ -4,11 +4,14 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::FutureExt as _;
+use futures::StreamExt as _;
+use futures::future::BoxFuture;
 use kbf_testkit::dir::TestDir;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
@@ -55,6 +58,9 @@ pub(in crate::server) struct Tamper {
     pub(in crate::server) lose_delete_answer: AtomicBool,
     /// What `needs_length` says.
     pub(in crate::server) needs_len: AtomicBool,
+    /// If not 0, a streamed put stops reading its body after this many chunks and stores what
+    /// it has read, as a backend that does not read to the end of the body does.
+    pub(in crate::server) stop_after: AtomicUsize,
     /// The gate that holds a HEAD that found its object, after it has read it.
     heads: Mutex<Option<Arc<Semaphore>>>,
     /// The HEADs that wait at `heads`, counted when they arrive.
@@ -78,6 +84,7 @@ impl Tamper {
             deleting: AtomicU64::new(0),
             lose_delete_answer: AtomicBool::new(false),
             needs_len: AtomicBool::new(false),
+            stop_after: AtomicUsize::new(0),
             heads: Mutex::new(None),
             heading: AtomicU64::new(0),
         }
@@ -154,6 +161,24 @@ impl Backend for Tamper {
 
     async fn put(&self, key: &str, body: Bytes) -> Result<(), Error> {
         self.memory.put(key, body).await
+    }
+
+    async fn put_stream(
+        &self,
+        key: &str,
+        _len: Option<u64>,
+        mut body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        let stop = self.stop_after.load(Ordering::SeqCst);
+        let (mut whole, mut chunks) = (BytesMut::new(), 0);
+        while let Some(chunk) = body.next().await {
+            whole.extend_from_slice(&chunk?);
+            chunks += 1;
+            if stop != 0 && chunks >= stop {
+                break;
+            }
+        }
+        self.memory.put(key, whole.freeze()).await
     }
 
     async fn put_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<String, Error> {
@@ -295,6 +320,8 @@ pub(in crate::server) struct FakeDisk {
     pub(in crate::server) touched: Mutex<Vec<(PathBuf, u64)>>,
     /// The number of calls of `link`.
     links_made: Mutex<u32>,
+    /// The gate that holds every write to a stage file, once set.
+    write_gate: Mutex<Option<Arc<Semaphore>>>,
     /// The names of every call of `link`, in order: from and to.
     pub(in crate::server) linked: Mutex<Vec<(PathBuf, PathBuf)>>,
 }
@@ -306,8 +333,21 @@ impl FakeDisk {
             space: Mutex::new(None),
             touched: Mutex::new(Vec::new()),
             links_made: Mutex::new(0),
+            write_gate: Mutex::new(None),
             linked: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Holds every write to a stage file from now on until a permit is added to the gate that is
+    /// returned: a disk that hangs.
+    pub(in crate::server) fn hold_writes(&self) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        let mut held = self
+            .write_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *held = Some(Arc::clone(&gate));
+        gate
     }
 
     pub(in crate::server) fn set(&self, quirk: Quirk) {
@@ -369,6 +409,25 @@ impl Disk for FakeDisk {
             _ => {}
         }
         Ok(())
+    }
+
+    fn write_stage<'a>(
+        &'a self,
+        file: &'a mut tokio::fs::File,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, io::Result<()>> {
+        async move {
+            let gate = self
+                .write_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(gate) = gate {
+                gate.acquire().await.expect("the gate stays open").forget();
+            }
+            tokio::io::AsyncWriteExt::write_all(file, bytes).await
+        }
+        .boxed()
     }
 
     fn links(&self, path: &Path) -> io::Result<u64> {
