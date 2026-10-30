@@ -117,7 +117,7 @@ impl RunPrepare for RunPrep {
             grant_url: run.read_grant.url,
             grant_token: Secret::new(run.read_grant.token.expose()),
             not_after: run.read_grant.not_after,
-            input_bytes: None,
+            input_bytes: Some(run.closure.input_bytes()),
         })
     }
 }

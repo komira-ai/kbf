@@ -77,6 +77,8 @@ executor-lease-ttl-secs = 3600
 # executor-lease-url = "URL"
 # The longest action timeout the executor runs, in seconds; an action that asks for more is refused. Used only with `--executor js-agent`
 executor-max-run-secs = 3000
+# The scratch disk a run books for what it writes, in bytes: its outputs, the pack and the private home, tmp and cache. A run books this, the bytes of its inputs and a fixed 1 GiB margin against the host's scratch, and the lease server refuses a run the host's disk cannot hold. Used only with `--executor js-agent`
+executor-output-disk-bytes = 8589934592
 # What a run's wall time adds to the action's timeout, in seconds: the fetch of the inputs and the upload of the pack. An action that fetches or uploads for longer than this ends at the wall time and is answered to the caller as a timeout. Used only with `--executor js-agent`
 executor-run-margin-secs = 300
 # Where the task tool works in the container, if not in its own default: the kbf image must have a writable directory there. Used only with `--executor js-agent`

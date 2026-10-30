@@ -429,8 +429,13 @@ impl State {
             .gpu_indices
             .iter()
             .any(|index| u64::from(*index) >= shape.gpus);
+        let disk_beyond = limits
+            .disk_bytes
+            .zip(shape.disk_bytes)
+            .is_some_and(|(asked, held)| asked > held);
         if limits.cpu_millis > shape.cpu_millis
             || limits.memory_bytes > shape.memory_bytes
+            || disk_beyond
             || gpu_beyond
         {
             return Err(Refusal::new(422, "limits-exceed-shape"));

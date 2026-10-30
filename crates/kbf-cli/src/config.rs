@@ -286,6 +286,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "executor-lease-ttl-secs",
             "executor-lease-url",
             "executor-max-run-secs",
+            "executor-output-disk-bytes",
             "executor-run-margin-secs",
             "executor-work-dir",
         ],

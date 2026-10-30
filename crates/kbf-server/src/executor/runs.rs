@@ -384,8 +384,15 @@ impl HostWorker {
             memory_bytes: Config::hard_memory(w.memory_bytes),
             pids: None,
             wall_ms: Some(u64::try_from(wall.as_millis()).unwrap_or(u64::MAX)),
-            disk_bytes: None,
+            disk_bytes: Some(ctx.cfg.disk_bytes(grant.input_bytes)),
         };
+        if grant.input_bytes.is_none() {
+            tracing::warn!(
+                worker = %self.id,
+                %lease,
+                "the size of the inputs is not known; the run books the allowance and the margin only"
+            );
+        }
         let mut spec = RunSpec::new(image, limits);
         spec.args = args.argv(ctx.cfg.delivery);
         // The labels are listed back with every run and are not secret-safe: the nonce only.

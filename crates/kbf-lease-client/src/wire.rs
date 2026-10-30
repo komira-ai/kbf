@@ -429,7 +429,7 @@ pub struct RunLimits {
     /// Bytes of scratch disk the run books on its host (inputs, outputs and the private
     /// home, tmp and cache). Absent books none; a server that does not know the field is not
     /// sent it.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_bytes: Option<u64>,
 }
 

@@ -358,8 +358,11 @@ impl Config {
     /// The scratch disk a run books: its `input_bytes` (`None` when the size of its input
     /// closure is not known), [`Config::output_disk_bytes`] and [`DISK_MARGIN`].
     #[must_use]
-    pub fn disk_bytes(&self, _input_bytes: Option<u64>) -> u64 {
-        0
+    pub fn disk_bytes(&self, input_bytes: Option<u64>) -> u64 {
+        input_bytes
+            .unwrap_or(0)
+            .saturating_add(self.output_disk_bytes)
+            .saturating_add(DISK_MARGIN)
     }
 
     /// The wall time of a run of an action of `timeout`. Never the time a lease has left:
