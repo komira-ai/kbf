@@ -10,7 +10,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -43,10 +42,22 @@ fn limits() -> Limits {
     }
 }
 
-/// A source whose blobs stream in chunks of [`CHUNK`] bytes, with one flipped byte when told.
+/// What the source does to the bytes of a streamed blob.
+#[derive(Clone, Copy)]
+enum Fault {
+    None,
+    /// Changes the byte at this offset.
+    Flip(usize),
+    /// Ends after this many chunks.
+    Truncate(usize),
+    /// Fails in place of this chunk.
+    FailAt(usize),
+}
+
+/// A source whose blobs stream in chunks of [`CHUNK`] bytes, with a fault when told.
 struct Source {
     blobs: HashMap<Digest, Bytes>,
-    flip: Mutex<Option<usize>>,
+    fault: Mutex<Fault>,
     opened: AtomicUsize,
 }
 
@@ -71,13 +82,22 @@ impl BlobSource for Source {
                 .get(digest)
                 .ok_or(StorageError::NotFound(*digest))?
                 .to_vec();
-            if let Some(at) = *self.flip.lock().unwrap_or_else(PoisonError::into_inner) {
+            let fault = *self.fault.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Fault::Flip(at) = fault {
                 bytes[at] ^= 0xff;
             }
-            let items: Vec<Result<Bytes, StorageError>> = bytes
+            let mut items: Vec<Result<Bytes, StorageError>> = bytes
                 .chunks(CHUNK)
                 .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
                 .collect();
+            match fault {
+                Fault::Truncate(n) => items.truncate(n),
+                Fault::FailAt(n) => {
+                    items.truncate(n);
+                    items.push(Err(StorageError::Unreachable(*digest)));
+                }
+                Fault::None | Fault::Flip(_) => {}
+            }
             Ok(stream::iter(items).boxed())
         })
     }
@@ -105,10 +125,10 @@ struct Bucket {
 }
 
 impl Bucket {
-    fn new() -> Arc<Self> {
+    fn new(conditional: bool) -> Arc<Self> {
         Arc::new(Self {
             memory: MemoryStore::new(Capabilities {
-                conditional_put: true,
+                conditional_put: conditional,
                 object_lock: false,
             }),
             puts: AtomicUsize::new(0),
@@ -264,10 +284,25 @@ struct Rig {
     source: Arc<Source>,
     bucket: Arc<Bucket>,
     read: JobRead,
+    backfill: LargeBackfill,
     grants: Arc<Grants>,
 }
 
+/// The bytes a tee buffers in these tests: 32 pieces of a chunk.
+const BUFFER: usize = 32 * CHUNK;
+
 fn rig(blobs: HashMap<Digest, Bytes>, concurrency: usize) -> Rig {
+    rig_with(blobs, concurrency, BUFFER, true)
+}
+
+/// A rig whose tees buffer `buffer` bytes, over a bucket that refuses an existing key when
+/// `conditional`.
+fn rig_with(
+    blobs: HashMap<Digest, Bytes>,
+    concurrency: usize,
+    buffer: usize,
+    conditional: bool,
+) -> Rig {
     let key = GrantKey::from_secret(&[1; MIN_SECRET_LEN]).expect("a long enough secret");
     let clock = Arc::new(AtomicU64::new(100));
     let grants = Arc::new(Grants::new(
@@ -276,17 +311,18 @@ fn rig(blobs: HashMap<Digest, Bytes>, concurrency: usize) -> Rig {
     ));
     let source = Arc::new(Source {
         blobs,
-        flip: Mutex::new(None),
+        fault: Mutex::new(Fault::None),
         opened: AtomicUsize::new(0),
     });
-    let bucket = Bucket::new();
-    let backfill = LargeBackfill::new(bucket.clone(), concurrency);
-    let read =
-        JobRead::new(source.clone(), Arc::clone(&grants), limits()).with_backfill(Some(backfill));
+    let bucket = Bucket::new(conditional);
+    let backfill = LargeBackfill::with_buffer_bytes(bucket.clone(), concurrency, buffer);
+    let read = JobRead::new(source.clone(), Arc::clone(&grants), limits())
+        .with_backfill(Some(backfill.clone()));
     Rig {
         source,
         bucket,
         read,
+        backfill,
         grants,
     }
 }
@@ -307,12 +343,12 @@ impl Rig {
             .await
     }
 
-    fn flip(&self, at: usize) {
+    fn set_fault(&self, fault: Fault) {
         *self
             .source
-            .flip
+            .fault
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(at);
+            .unwrap_or_else(PoisonError::into_inner) = fault;
     }
 
     /// The count of `kbf_large_backfill_total{result}`.
@@ -327,22 +363,9 @@ impl Rig {
             .expect("a count")
     }
 
-    fn total(&self) -> u64 {
-        ["backfilled", "already_present", "failed", "skipped"]
-            .iter()
-            .map(|result| self.count(result))
-            .sum()
-    }
-
-    /// Waits for the background puts to have ended `n` times in all.
+    /// Waits for the background puts to have ended `n` times in all: the put signals each end.
     async fn settled(&self, n: u64) {
-        for _ in 0..500 {
-            if self.total() >= n {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("{} of {n} backfills ended", self.total());
+        self.backfill.ended(n).await;
     }
 }
 
@@ -523,7 +546,7 @@ async fn a_corrupt_source_never_leaves_an_object() {
     ] {
         let w = world();
         let rig = rig(w.blobs.clone(), 2);
-        rig.flip(at);
+        rig.set_fault(Fault::Flip(at));
         let token = rig.token(w.action);
         let stream = rig.get(&w.one, &token).await.stream.expect("streamed");
         let (_, ended) = drain(stream).await;
@@ -555,34 +578,39 @@ async fn a_put_that_cannot_keep_up_is_abandoned_and_the_read_goes_on() {
     assert_eq!(rig.bucket.keys().await, 0);
 }
 
-/// Catches: an object of another length under the key being taken for the blob. The length
-/// check does not match, so the put is made; the create-only store refuses it (the key is
-/// taken), which is `already_present`, and the object that was there is left as it was.
+/// Catches: an object of another length under the key being taken for the blob, or written
+/// over. The length check does not match, so nothing is put (a store that does not refuse an
+/// existing key would replace the object): the copy is `failed`, and the object that was there is
+/// left as it was, over a store that refuses an existing key and over one that does not.
 #[tokio::test]
-async fn an_object_of_another_length_is_not_taken_for_the_blob() {
-    let w = world();
-    let rig = rig(w.blobs.clone(), 2);
-    let key = large_key(&w.one);
-    let body: BodyStream = stream::iter([Ok(Bytes::from_static(b"short"))]).boxed();
-    rig.bucket
-        .memory
-        .put_stream(&key, 5, body)
-        .await
-        .expect("seeded");
-    let token = rig.token(w.action);
-    let (_, bytes) = read_all(&rig, &w.one, &token).await;
-    assert_eq!(bytes, w.blobs[&w.one]);
-    rig.settled(1).await;
-    assert_eq!(
-        rig.bucket.puts.load(Ordering::SeqCst),
-        1,
-        "the length did not match"
-    );
-    assert_eq!(rig.count("already_present"), 1);
-    assert_eq!(
-        rig.bucket.object(&w.one).await,
-        Some(Bytes::from_static(b"short"))
-    );
+async fn an_object_of_another_length_is_not_written_over() {
+    for conditional in [true, false] {
+        let w = world();
+        let rig = rig_with(w.blobs.clone(), 2, BUFFER, conditional);
+        let key = large_key(&w.one);
+        let body: BodyStream = stream::iter([Ok(Bytes::from_static(b"short"))]).boxed();
+        rig.bucket
+            .memory
+            .put_stream(&key, 5, body)
+            .await
+            .expect("seeded");
+        let token = rig.token(w.action);
+        let (_, bytes) = read_all(&rig, &w.one, &token).await;
+        assert_eq!(bytes, w.blobs[&w.one], "conditional {conditional}");
+        rig.settled(1).await;
+        assert_eq!(rig.count("failed"), 1, "conditional {conditional}");
+        assert_eq!(rig.count("already_present"), 0, "conditional {conditional}");
+        assert_eq!(
+            rig.bucket.puts.load(Ordering::SeqCst),
+            0,
+            "conditional {conditional}: nothing is put over it"
+        );
+        assert_eq!(
+            rig.bucket.object(&w.one).await,
+            Some(Bytes::from_static(b"short")),
+            "conditional {conditional}"
+        );
+    }
 }
 
 /// Catches: a put whose body takes a closed channel for the end of the blob. Every chunk of a
@@ -593,7 +621,7 @@ async fn an_object_of_another_length_is_not_taken_for_the_blob() {
 async fn a_reader_that_stops_before_the_verdict_on_a_corrupt_source_leaves_no_object() {
     let w = world();
     let rig = rig(w.blobs.clone(), 2);
-    rig.flip(2 * CHUNK + 3);
+    rig.set_fault(Fault::Flip(2 * CHUNK + 3));
     let token = rig.token(w.action);
     let stream = rig.get(&w.one, &token).await.stream.expect("streamed");
     let mut chunks = stream.chunks;
@@ -604,4 +632,99 @@ async fn a_reader_that_stops_before_the_verdict_on_a_corrupt_source_leaves_no_ob
     rig.settled(1).await;
     assert_eq!(rig.count("backfilled"), 0);
     assert_eq!(rig.bucket.keys().await, 0);
+}
+
+/// Catches: a tee too small for the pieces it is given. The blob is 40 pieces, more than the
+/// 16 the buffer used to count, but fits the byte budget; the put is held before it takes a
+/// byte, as a store busy with one part and setting up the next is, and then the whole blob is
+/// there to send: it is backfilled.
+#[tokio::test]
+async fn small_pieces_that_fit_the_byte_budget_are_backfilled_while_the_put_is_slow() {
+    let w = world();
+    let rig = rig_with(w.blobs.clone(), 2, 2 * LONG_CHUNKS * CHUNK, true);
+    let gate = rig.bucket.hold_puts();
+    let token = rig.token(w.action);
+    let (_, bytes) = read_all(&rig, &w.long, &token).await;
+    assert_eq!(bytes, w.blobs[&w.long]);
+    gate.notify_one();
+    rig.settled(1).await;
+    assert_eq!(rig.count("backfilled"), 1);
+    assert_eq!(rig.count("skipped"), 0);
+    assert_eq!(
+        rig.bucket.object(&w.long).await,
+        Some(w.blobs[&w.long].clone())
+    );
+}
+
+/// Catches: a copy lost when the client stops reading at its Content-Length, which is what an
+/// HTTP server does: every chunk has been taken, the stream is dropped without being polled
+/// for its end. The last chunk is passed on only after the digest checked, and with it the
+/// marker, so the object is stored.
+#[tokio::test]
+async fn a_reader_that_stops_after_the_last_chunk_still_backfills() {
+    let w = world();
+    let rig = rig(w.blobs.clone(), 2);
+    let token = rig.token(w.action);
+    let stream = rig.get(&w.one, &token).await.stream.expect("streamed");
+    let mut chunks = stream.chunks;
+    for _ in 0..BLOB_CHUNKS {
+        chunks.next().await.expect("a chunk").expect("ok");
+    }
+    drop(chunks);
+    rig.settled(1).await;
+    assert_eq!(rig.count("backfilled"), 1);
+    assert_eq!(
+        rig.bucket.object(&w.one).await,
+        Some(w.blobs[&w.one].clone())
+    );
+}
+
+/// Catches: a source that fails part way, or ends short of the blob, leaving a partial object.
+/// Neither is a failed put: the copy was abandoned before the blob verified, and nothing is
+/// under the key.
+#[tokio::test]
+async fn a_source_that_fails_or_ends_short_leaves_no_object() {
+    for (what, fault) in [
+        ("an error part way", Fault::FailAt(4)),
+        ("an upstream that ends short", Fault::Truncate(7)),
+    ] {
+        let w = world();
+        let rig = rig(w.blobs.clone(), 2);
+        rig.set_fault(fault);
+        let token = rig.token(w.action);
+        let stream = rig.get(&w.one, &token).await.stream.expect("streamed");
+        let (_, ended) = drain(stream).await;
+        assert!(ended.is_some(), "{what}");
+        rig.settled(1).await;
+        assert_eq!(rig.count("backfilled"), 0, "{what}");
+        assert_eq!(rig.count("failed"), 0, "{what}");
+        assert_eq!(rig.count("skipped"), 1, "{what}");
+        assert_eq!(rig.bucket.keys().await, 0, "{what}");
+    }
+}
+
+/// Catches: a failed put keeping the blob's claim or the put's place, so that the blob is never
+/// copied again. With one place, a read after a failed put is backfilled.
+#[tokio::test]
+async fn a_read_after_a_failed_put_backfills_again() {
+    let w = world();
+    let rig = rig(w.blobs.clone(), 1);
+    rig.bucket.set_mode(Put::Fail);
+    let token = rig.token(w.action);
+    read_all(&rig, &w.one, &token).await;
+    rig.settled(1).await;
+    assert_eq!(rig.count("failed"), 1);
+    rig.bucket.set_mode(Put::Store);
+    read_all(&rig, &w.one, &token).await;
+    rig.settled(2).await;
+    assert_eq!(rig.count("backfilled"), 1);
+    assert_eq!(
+        rig.count("skipped"),
+        0,
+        "the claim and the place were given back"
+    );
+    assert_eq!(
+        rig.bucket.object(&w.one).await,
+        Some(w.blobs[&w.one].clone())
+    );
 }
