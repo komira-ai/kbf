@@ -77,7 +77,8 @@
 //! - the S3 client and object store trait (`objstore-s3`, which `kbf-objstore` re-exports)
 //!   depending, directly or through another crate, on any other crate of this workspace, which
 //!   would stop it from leaving with `tierstore`; a walk that cannot see its dependencies; and
-//!   `kbf-objstore` not being built on it;
+//!   `kbf-objstore` not being built on it; and its workspace dev-dependencies being more than
+//!   `kbf-testkit`;
 //! - the state store (`kbf-state`, a re-export of `js-state`) depending on any other crate of
 //!   this workspace (with its test-database feature too, which brings `js-testkit` and not
 //!   `kbf-testkit`), which would stop it from being extracted, and the pack index (`kbf-pack-index`) depending on any but the state store;
@@ -798,6 +799,50 @@ fn the_s3_client_links_no_other_workspace_crate() {
     assert!(
         objstore.contains("objstore-s3"),
         "kbf-objstore must re-export the client of objstore-s3: {objstore:?}"
+    );
+}
+
+/// Asserts that the workspace crates among the dev-dependencies of `objstore-s3` (read from
+/// `cargo metadata`, which the tree walk above does not see) are exactly `kbf-testkit`, which
+/// supplies the loopback port helpers of `tests/s3_wire.rs`. Wave 1 of the plan to move
+/// `tierstore` to a repository of its own removes it (PR 3, which then makes this set empty);
+/// until then a new dev-dependency on another crate of this workspace trips this test. The
+/// crate's dev-dependency on itself (the `testkit` feature) is not another crate.
+#[test]
+fn the_s3_client_has_one_workspace_dev_dependency() {
+    let cargo = std::env::var("CARGO").expect("CARGO is set when cargo runs a test");
+    let out = Command::new(cargo)
+        .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run cargo metadata");
+    assert!(
+        out.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta: Value = serde_json::from_slice(&out.stdout).expect("cargo metadata emits JSON");
+    let packages = meta["packages"].as_array().expect("packages");
+    let members: BTreeSet<&str> = packages
+        .iter()
+        .map(|p| p["name"].as_str().expect("package name"))
+        .collect();
+    let pkg = packages
+        .iter()
+        .find(|p| p["name"] == "objstore-s3")
+        .expect("objstore-s3 is a workspace member");
+    let dev: BTreeSet<&str> = pkg["dependencies"]
+        .as_array()
+        .expect("dependencies")
+        .iter()
+        .filter(|d| d["kind"] == "dev")
+        .filter_map(|d| d["name"].as_str())
+        .filter(|name| members.contains(name) && *name != "objstore-s3")
+        .collect();
+    assert_eq!(
+        dev,
+        BTreeSet::from(["kbf-testkit"]),
+        "objstore-s3's workspace dev-dependencies"
     );
 }
 

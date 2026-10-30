@@ -187,7 +187,8 @@ impl PageSize {
 
 /// Where the next [`ObjectStore::list`](crate::ObjectStore::list) page starts: a token a
 /// store issued with a page (opaque: only the store that issued it can read it), or
-/// [`ListToken::after`] a key, which every store reads.
+/// [`ListToken::after`] a key, which every store reads. A token is a position hint, not a
+/// capability: a forged one can only resume a listing at a key, or be refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListToken(pub(crate) Token);
 
@@ -220,6 +221,7 @@ impl ListToken {
 
     /// The token an S3 store issues: its continuation token, opaque to every other store.
     #[must_use]
+    #[doc(hidden)]
     pub fn continuation(token: impl Into<String>) -> Self {
         Self(Token::Continue(token.into()))
     }
@@ -228,6 +230,7 @@ impl ListToken {
     /// last key is `after`: the next page is cut from that listing's kept keys. Any other
     /// store reads it as [`ListToken::after`] `after`.
     #[must_use]
+    #[doc(hidden)]
     pub fn kept(listing: u64, after: ObjectKey) -> Self {
         Self(Token::Kept { listing, after })
     }
@@ -237,6 +240,7 @@ impl ListToken {
     /// # Errors
     /// [`ObjectStoreError::Protocol`] for a continuation token, which only an S3 store
     /// issues and only it can read.
+    #[doc(hidden)]
     pub fn local_after(&self) -> Result<&ObjectKey, ObjectStoreError> {
         match &self.0 {
             Token::After(key) | Token::Kept { after: key, .. } => Ok(key),
@@ -248,6 +252,7 @@ impl ListToken {
 
     /// The `FsStore` listing this token continues, if it came with one of its pages.
     #[must_use]
+    #[doc(hidden)]
     pub fn listing(&self) -> Option<u64> {
         match &self.0 {
             Token::Kept { listing, .. } => Some(*listing),
