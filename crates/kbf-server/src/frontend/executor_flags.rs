@@ -46,6 +46,7 @@ const SLOTS: &str = "executor_host_slots";
 const ARCH: &str = "executor_arch";
 const WORK_DIR: &str = "executor_work_dir";
 const PLAIN_PUT: &str = "executor_allow_plain_http_put";
+const PLAIN_GRANT: &str = "executor_allow_plain_http_grant";
 const INSECURE: &str = "executor_insecure_argv_secrets";
 const BASE_IMAGE: &str = "executor_base_image";
 const KBF_IMAGE: &str = "executor_kbf_image";
@@ -54,6 +55,7 @@ const TTL: &str = "executor_lease_ttl_secs";
 const MAX_RUN: &str = "executor_max_run_secs";
 const DEFAULT_TIMEOUT: &str = "executor_default_timeout_secs";
 const CALL_TIMEOUT: &str = "executor_call_timeout_secs";
+const OUTPUT_DISK: &str = "executor_output_disk_bytes";
 
 /// The flags a `js-agent` executor cannot do without, in the order their absence is named.
 const REQUIRED: [(&str, &str); 9] = [
@@ -220,7 +222,17 @@ pub(super) fn args() -> Vec<Arg> {
             PLAIN_PUT,
             "executor-allow-plain-http-put",
             "Lets the task write its pack to an `http://` url, until the store serves TLS. The \
-             reads stay https. Used only with `--executor js-agent`",
+             reads stay https unless `--executor-allow-plain-http-grant` says otherwise. Used \
+             only with `--executor js-agent`",
+        ),
+        switch(
+            PLAIN_GRANT,
+            "executor-allow-plain-http-grant",
+            "Lets the task read its inputs through a read grant served over `http://`: an \
+             `http://` `--task-read-url` is accepted, and the task tool is given \
+             `--allow-plain-http-grant`. The read token then crosses the job network in clear, so \
+             this is for a farm on its own network. Off by default, and an `http://` read url is \
+             refused without it. Used only with `--executor js-agent`",
         ),
         switch(
             INSECURE,
@@ -288,7 +300,25 @@ pub(super) fn args() -> Vec<Arg> {
              seconds. Under the fence time. Used only with `--executor js-agent`",
             "5",
         ),
+        Arg::new(OUTPUT_DISK)
+            .long("executor-output-disk-bytes")
+            .value_name("BYTES")
+            .value_parser(clap::value_parser!(u64).range(1..))
+            .default_value("8589934592")
+            .help(
+                "The scratch disk a run books for what it writes, in bytes: its outputs, the \
+                 pack and the private home, tmp and cache. A run books this, the bytes of its \
+                 inputs and a fixed 1 GiB margin against the host's scratch, and the lease \
+                 server refuses a run the host's disk cannot hold. Used only with `--executor \
+                 js-agent`",
+            ),
     ]
+}
+
+/// Whether the flags say a read grant may be served over plain http: `--executor js-agent` with
+/// `--executor-allow-plain-http-grant`. With daemons nothing reads the flag, so it opens nothing.
+pub(super) fn plain_http_grant(m: &ArgMatches) -> bool {
+    m.get_one::<String>(KIND).is_some_and(|k| k == "js-agent") && m.get_flag(PLAIN_GRANT)
 }
 
 /// What `--executor js-agent` and its companions say.
@@ -415,12 +445,14 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
         return Err("--executor-work-dir is not an absolute path".to_owned());
     }
     config.allow_plain_http_put = m.get_flag(PLAIN_PUT);
+    config.allow_plain_http_grant = m.get_flag(PLAIN_GRANT);
     config.insecure_argv_secrets = m.get_flag(INSECURE);
     config.run_margin = secs(MARGIN);
     config.lease_ttl = secs(TTL);
     config.max_run = secs(MAX_RUN);
     config.default_timeout = secs(DEFAULT_TIMEOUT);
     config.call_timeout = secs(CALL_TIMEOUT);
+    config.output_disk_bytes = count(OUTPUT_DISK);
     Ok(JsAgentFlags {
         config,
         lease_url,

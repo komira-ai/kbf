@@ -131,6 +131,9 @@ pub(crate) struct Watching {
     pub(crate) refuse: AtomicBool,
     /// Reads the whole blob, then fails.
     pub(crate) refuse_after: AtomicBool,
+    /// Takes the blob's last byte and stops polling for more, as a client that sends the end of
+    /// the write with the last chunk does, then fails.
+    pub(crate) stop_at_size: AtomicBool,
 }
 
 impl Storage for Watching {
@@ -167,6 +170,21 @@ impl Storage for Watching {
         if self.refuse.load(Ordering::SeqCst) {
             let down = std::io::Error::other("the node is down");
             return Box::pin(async move { Err(StorageError::Unavailable(Arc::new(down))) });
+        }
+        if self.stop_at_size.load(Ordering::SeqCst) {
+            return Box::pin(async move {
+                let mut bytes = bytes;
+                let mut got = 0;
+                while got < size {
+                    let Some(Ok(piece)) = bytes.next().await else {
+                        break;
+                    };
+                    got += piece.len() as u64;
+                }
+                drop(bytes);
+                let down = std::io::Error::other("the stream was left after its last byte");
+                Err(StorageError::Unavailable(Arc::new(down)))
+            });
         }
         if self.refuse_after.load(Ordering::SeqCst) {
             return Box::pin(async move {
@@ -244,6 +262,7 @@ impl Multi {
             notes,
             refuse: AtomicBool::new(false),
             refuse_after: AtomicBool::new(false),
+            stop_at_size: AtomicBool::new(false),
         });
         let node = Arc::clone(&watching) as Arc<dyn Storage>;
         let backend = Backend::remote_over(node, Some(rig.packs.clone()));

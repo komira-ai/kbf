@@ -70,6 +70,7 @@ fn scheduler(tokio: &tokio::runtime::Runtime, dir: &Path) -> (SocketAddr, Socket
         format!("--worker-tls-key={}", at("server.key")),
         format!("--worker-client-ca={}", at("ca.pem")),
         format!("--cold-store=file://{}", at("server-cold")),
+        "--cold-store-floor-bytes=1".to_owned(),
         format!("--meta-dir={}", at("server-meta")),
     ])
     .expect("the server's flags");
@@ -103,6 +104,7 @@ fn node_flags(dir: &Path, worker: SocketAddr) -> Vec<String> {
         format!("{}={}", STORAGE_TLS[1], at("server.key")),
         format!("{}={}", STORAGE_TLS[2], at("ca.pem")),
         format!("--cold-store=file://{}", at("cold")),
+        "--cold-store-floor-bytes=1".to_owned(),
         format!("--hot-store=file://{}", at("hot")),
         // Every blob its own block, flushed at once.
         "--write-own-segment-bytes=1".to_owned(),

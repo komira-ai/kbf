@@ -1,5 +1,6 @@
 use kbf_proto::reapi::{Platform, platform::Property};
 
+#[cfg(target_os = "linux")]
 use super::seccomp::filter;
 use super::*;
 
@@ -651,4 +652,48 @@ mod forked {
             strict.as_slice()
         ));
     }
+}
+
+/// Where no confine is built, a Command denied the network is refused with `NoConfine`, and nothing
+/// is printed or run for it.
+#[test]
+fn without_a_confine_a_denied_command_is_refused() {
+    let error = without_confine(Network::Denied, false).expect_err("refused");
+    assert!(matches!(error, RunError::NoConfine), "{error}");
+}
+
+/// A Command that is allowed the network needs no confine, with the test feature or without it,
+/// and no warning is made for it.
+#[test]
+fn without_a_confine_an_allowed_command_is_unaffected() {
+    assert_eq!(without_confine(Network::Allowed, false).unwrap(), None);
+    assert_eq!(without_confine(Network::Allowed, true).unwrap(), None);
+}
+
+/// With the test-only feature a denied Command is let through with the warning line, which says
+/// the Command has the network and names the feature.
+#[test]
+fn the_test_feature_warns_and_lets_a_denied_command_run() {
+    let line = without_confine(Network::Denied, true)
+        .unwrap()
+        .expect("a warning");
+    assert_eq!(line, UNCONFINED_WARNING);
+    assert!(line.contains("runs with it"), "{line}");
+    assert!(line.contains("unconfined-for-tests"), "{line}");
+}
+
+/// The system's own `confine` on a non-Linux machine: refused without the feature, run with it.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn confine_refuses_a_denied_command_unless_the_test_feature_is_on() {
+    let mut process = Process::new("true");
+    let result = confine(&mut process, Network::Denied);
+    if cfg!(feature = "unconfined-for-tests") {
+        assert_eq!(result.expect("tolerated").layers(), Layers::Unavailable);
+    } else {
+        assert!(matches!(result, Err(RunError::NoConfine)));
+    }
+    let mut process = Process::new("true");
+    let allowed = confine(&mut process, Network::Allowed).expect("allowed");
+    assert_eq!(allowed.layers(), Layers::Open);
 }

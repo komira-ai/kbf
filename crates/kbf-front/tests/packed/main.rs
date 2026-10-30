@@ -12,6 +12,7 @@
 #[path = "../proxy/harness.rs"]
 mod harness;
 
+mod backend_many;
 mod bytestream;
 mod cas;
 mod closure;
@@ -24,3 +25,4 @@ mod untrusted;
 mod untrusted_mint;
 mod untrusted_multi;
 mod untrusted_task;
+mod untrusted_writethrough;

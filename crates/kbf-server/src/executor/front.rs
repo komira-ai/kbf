@@ -51,6 +51,9 @@ pub struct PreparedRun {
     pub grant_token: Secret,
     /// The Unix second the write and the grant stop working at.
     pub not_after: u64,
+    /// The bytes of the input closure the task fetches; `None` when the preparation did not
+    /// measure it.
+    pub input_bytes: Option<u64>,
 }
 
 /// Why a run could not be prepared.
@@ -114,6 +117,7 @@ impl RunPrepare for RunPrep {
             grant_url: run.read_grant.url,
             grant_token: Secret::new(run.read_grant.token.expose()),
             not_after: run.read_grant.not_after,
+            input_bytes: Some(run.closure.input_bytes()),
         })
     }
 }
@@ -266,6 +270,7 @@ impl Ingest for Front {
                 grant: Some(ReadGrant {
                     url: prepared.grant_url,
                     token: prepared.grant_token,
+                    input_bytes: prepared.input_bytes,
                 }),
                 not_after: prepared.not_after,
             },

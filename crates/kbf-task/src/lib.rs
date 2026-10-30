@@ -97,6 +97,12 @@
 //! a stopgap until the job scheduler delivers job secrets as files, and are removed then. A
 //! process of the Command that leaves its process group (for example with `setsid`) survives the
 //! group kill at the deadline; only such a sandbox ends it.
+//!
+//! # The confinement probe
+//!
+//! `kbf-task --probe-confinement` runs a Command under the same confinement as an action's and
+//! prints whether it holds, one `probe <name>: ok|FAIL|n/a` line per check ([`probe`]). It needs
+//! no grant, server or network.
 
 pub mod digest;
 pub mod fetch;
@@ -104,7 +110,21 @@ pub mod network;
 pub mod outputs;
 pub mod pack;
 pub mod plan;
+pub mod probe;
 pub mod put;
 pub mod put_urls;
 pub mod run;
 pub mod task;
+
+// The feature that lets a denied Command run with the network where no confine exists is for tests:
+// a non-Linux build without debug assertions (a release build) that turns it on does not compile; on
+// Linux the feature does nothing, so it is allowed there (a workspace-wide `--all-features` build).
+#[cfg(all(
+    feature = "unconfined-for-tests",
+    not(target_os = "linux"),
+    not(debug_assertions),
+    not(test)
+))]
+compile_error!(
+    "the `unconfined-for-tests` feature of kbf-task is for test builds only; a release build must not enable it"
+);
