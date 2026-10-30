@@ -27,6 +27,8 @@ use crate::version::Version;
 /// A storage host's own view: its member active on the commit `aaaaaaaaaaaa`, nothing owed.
 const OWN: &str = r#"{"node":"n1","half":"member","member":{"id":1,"state":"active","build_commit":"aaaaaaaaaaaa"},"storage":{"members_active":3,"under_replicated_blobs":0}}"#;
 
+const SERVING: &str = r#"{"placement":{"state":"serving"},"leases":[],"connected":true}"#;
+
 const NODE: &str = r#"{"placement":{"state":"draining"},"leases":["a","b"],"connected":true}"#;
 
 struct Rig {
@@ -192,15 +194,23 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
         assert_eq!(text, NO_CREDENTIAL);
     }
 
-    let (addr, server) = rig.frontend(vec![ok("{}")]);
+    // The drain reads the node first (to tell its own cordon from an operator's), then drains.
+    let (addr, server) = rig.frontend(vec![ok(SERVING), ok("{}")]);
     let with_frontend = rig.config(Some(addr));
     let (drain, _) = node_ports(&with_frontend, &rig.identity(), Role::Daemon, &local).unwrap();
     assert_eq!(drain.drain(&h, Some(Duration::from_secs(1))), Ok(()));
-    assert_eq!(server.join().unwrap().len(), 1);
+    let seen = server.join().unwrap();
+    assert_eq!(head_of(&seen[0]).0[0], "GET /v1/nodes/n1 HTTP/1.1");
+    assert_eq!(head_of(&seen[1]).0[0], "POST /v1/nodes/n1:drain HTTP/1.1");
+    assert_eq!(seen.len(), 2);
 
     // A storage host is built the same way: its drain and its health are calls to the frontend
     // too, and it refuses nothing for want of the token.
-    let (addr, server) = rig.frontend(vec![http("404 Not Found", "", "{}"), ok(OWN)]);
+    let (addr, server) = rig.frontend(vec![
+        http("404 Not Found", "", "{}"),
+        http("404 Not Found", "", "{}"),
+        ok(OWN),
+    ]);
     let with_frontend = rig.config(Some(addr));
     let (storage_drain, storage_health) =
         node_ports(&with_frontend, &rig.identity(), Role::Storage, &local).unwrap();
@@ -216,9 +226,10 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
         Ok(crate::ports::Health::Healthy)
     );
     let seen = server.join().unwrap();
-    assert_eq!(head_of(&seen[0]).0[0], "POST /v1/nodes/n1:drain HTTP/1.1");
+    assert_eq!(head_of(&seen[0]).0[0], "GET /v1/nodes/n1 HTTP/1.1");
+    assert_eq!(head_of(&seen[1]).0[0], "POST /v1/nodes/n1:drain HTTP/1.1");
     assert_eq!(
-        head_of(&seen[1]).0[0],
+        head_of(&seen[2]).0[0],
         "GET /v1/nodes/n1/storage-health HTTP/1.1"
     );
 
