@@ -294,6 +294,7 @@ pub async fn execute(
         },
         packs: 1,
         large: Vec::new(),
+        inputs: None,
     };
     for file in &result.output_files {
         manifest.output_files.push(OutputFile {
