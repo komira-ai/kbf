@@ -64,6 +64,9 @@ pub enum Alpn {
     /// `h2`, then `http/1.1`: gRPC, and plain HTTP/1.1 requests on the same port (the node
     /// calls of a host's updater on the worker listener).
     H2AndHttp1,
+    /// `http/1.1` only: a plain HTTPS server that speaks no HTTP/2 (the job-facing read
+    /// listener, whose clients are simple HTTP/1.1 downloaders).
+    Http1,
 }
 
 impl Alpn {
@@ -72,6 +75,7 @@ impl Alpn {
         match self {
             Self::H2 => vec![b"h2".to_vec()],
             Self::H2AndHttp1 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            Self::Http1 => vec![b"http/1.1".to_vec()],
         }
     }
 }
