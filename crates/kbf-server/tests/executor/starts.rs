@@ -40,7 +40,7 @@ async fn an_action_runs_end_to_end() {
     let url = run.arg("--pack-url").expect("a pack url");
     let lease = run.arg("--lease").expect("a lease");
     assert!(
-        url.starts_with(&format!("http://store.test/cas/b/{lease}/")),
+        url.starts_with(&format!("https://store.test/cas/b/{lease}/")),
         "{url}"
     );
     assert!(!lease.contains('.'), "{lease}");
@@ -67,6 +67,15 @@ async fn an_action_runs_end_to_end() {
         rig.exec.hosts()[0].runs == 0,
         "the acknowledged result is forgotten"
     );
+    let counted = rig.counted();
+    for row in [
+        "kbf_executor_leases_held 1\n",
+        "kbf_executor_runs_total{outcome=\"ran\"} 1\n",
+        "kbf_executor_ingests_total{result=\"ok\"} 1\n",
+        "kbf_executor_late_starts_total 0\n",
+    ] {
+        assert!(counted.contains(row), "{row} in {counted}");
+    }
 }
 
 /// Catches a `Start` that the lease server cannot take yet (its budget comes back only when a
@@ -144,6 +153,11 @@ async fn a_late_start_never_runs_twice() {
     rig.host_finishes(&runs[0].run, Outcome::Succeeded, Some(0));
     assert!(matches!(rig.until_done(&c, 6).await, Finished::Ran(_)));
     assert_eq!(rig.runs_of(3).await.len(), 1, "the action ran once");
+    let counted = rig.counted();
+    assert!(
+        counted.contains("kbf_executor_late_starts_total 1\n"),
+        "the dropped Start is counted once: {counted}"
+    );
 }
 
 /// Catches a `Start` posted past its window because the window was judged once, at the start
@@ -181,6 +195,7 @@ async fn a_start_whose_inputs_were_slow_is_not_posted_past_its_window() {
     rig.host_finishes(&runs[0].run, Outcome::Succeeded, Some(0));
     assert!(matches!(rig.until_done(&caller, 6).await, Finished::Ran(_)));
     assert_eq!(rig.runs_of(1).await.len(), 1, "the action ran once");
+    assert!(rig.counted().contains("kbf_executor_late_starts_total 1\n"));
 }
 
 /// Catches a lease found gone only when the run is to be posted: the renewal that comes before
@@ -239,6 +254,7 @@ async fn a_start_whose_renewal_outlasted_its_window_is_not_posted() {
     assert_eq!(runs.len(), 1, "{runs:?}");
     rig.host_finishes(&runs[0].run, Outcome::Succeeded, Some(0));
     assert!(matches!(rig.until_done(&caller, 6).await, Finished::Ran(_)));
+    assert!(rig.counted().contains("kbf_executor_late_starts_total 1\n"));
 }
 
 /// Catches a read of the CAS that never answers holding the pass, and with it the heartbeats
