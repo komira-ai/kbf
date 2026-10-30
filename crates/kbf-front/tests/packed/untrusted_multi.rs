@@ -288,6 +288,7 @@ impl Multi {
                 .iter()
                 .map(|&(slot, digest)| LargeEntry { slot, digest })
                 .collect(),
+            inputs: None,
         }
     }
 

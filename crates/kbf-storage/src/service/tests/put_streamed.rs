@@ -140,3 +140,18 @@ async fn a_size_that_is_not_the_digests_is_refused() {
     assert!(matches!(error, StorageError::Invalid(_)), "{error:?}");
     assert!(mem.blobs.lock().expect("lock").is_empty());
 }
+
+/// Asserts that an empty blob is refused: it has no bytes to stream and is `Storage::put`'s, and
+/// nothing is sent.
+#[tokio::test]
+async fn an_empty_blob_is_not_streamed() {
+    let (mem, remote) = remote().await;
+
+    let error = remote
+        .put_streamed(0, stream::empty().boxed(), named(sha(b"")))
+        .await
+        .expect_err("refused");
+
+    assert!(matches!(error, StorageError::Invalid(_)), "{error:?}");
+    assert!(mem.blobs.lock().expect("lock").is_empty());
+}
