@@ -46,6 +46,15 @@ slow-timeout = { period = "30s", terminate-after = 1 }
 filter = 'package(kbf-task) & test(/^fetch::tests::/)'
 slow-timeout = { period = "30s", terminate-after = 4 }
 
+# The kbf-daemon cache tests wait on the cache's own counters (tests/support/cache_kit.rs,
+# wait_for_fill_waits), never on a deadline in the test: a cache that never makes two leases
+# meet would hang, and this guard ends such a test (2 minutes) instead. Applies to every
+# profile, the pull-request one included. Keep it above any catch-all override: the first
+# matching override wins.
+[[profile.default.overrides]]
+filter = 'package(kbf-daemon) & binary(cache)'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
 # The general budget: every other test, of every package, is ended after eight minutes
 # (120 seconds x 4). The slowest of them in the full run on main takes about 240 seconds
 # (kbf-server::frontend, a_frontend_dialing_a_node_with_another_nodes_certificate_is_refused),
