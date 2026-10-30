@@ -103,6 +103,13 @@ pub(super) fn check(js: &mut JsAgentFlags, beside: &Beside<'_>) -> Result<Vec<St
         ),
         _ => {}
     }
+    if config.allow_plain_http_grant && task.read_url.starts_with("https://") {
+        warnings.push(
+            "--executor-allow-plain-http-grant is set and --task-read-url is https://: the \
+             flag is not needed"
+                .to_owned(),
+        );
+    }
     for (flag, url) in [
         ("--task-read-url", &task.read_url),
         ("--task-put-endpoint", &task.put_endpoint),

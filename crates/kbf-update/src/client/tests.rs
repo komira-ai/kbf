@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use super::harness::{PROMPT, Rig, status_json};
+use super::harness::{Rig, status_json};
 use super::*;
 use crate::fixtures::{PLATFORM, commit, offer_of, scratch};
 use crate::types::{Available, Staged};
@@ -249,8 +249,8 @@ async fn the_package_and_the_source_the_helper_reports_reach_the_status() {
 }
 
 /// Catches the poll loop not running: a status file written while the worker runs is
-/// seen without anyone asking.
-#[tokio::test]
+/// seen without anyone asking. Time is paused, so the poll interval costs no wall time.
+#[tokio::test(start_paused = true)]
 async fn the_worker_watches_the_status_file() {
     let dir = scratch("poll");
     let mut config = Rig::config(&dir);
@@ -259,9 +259,8 @@ async fn the_worker_watches_the_status_file() {
     let task = tokio::spawn(worker.run());
     let mut rx = handle.status();
     fs::write(dir.join("status.json"), status_json("confirmed", "", "", 0)).expect("write");
-    tokio::time::timeout(PROMPT, rx.wait_for(|s| s.state == State::Confirmed))
+    rx.wait_for(|s| s.state == State::Confirmed)
         .await
-        .expect("seen in time")
         .expect("runs");
     task.abort();
 }
