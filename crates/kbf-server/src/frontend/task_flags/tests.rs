@@ -32,6 +32,7 @@ const TASK: [&str; 5] = [
     "--task-read-url=https://127.0.0.1:8443",
 ];
 
+const LARGE_KEYS: &str = r#"{"access_key_id": "large-presign", "secret_access_key": "hunter3"}"#;
 const LEASE: &str = "00000000000000010000000000000002";
 const SECRET: &str = "0123456789abcdef0123456789abcdef";
 const KEYS: &str = r#"{"access_key_id": "pack-presign", "secret_access_key": "hunter2",
@@ -60,8 +61,16 @@ fn the_task_flags_are_off_unless_the_secret_file_is_given() {
         "--task-url-slack-secs=5",
         "--task-closure-max-digests=10",
         "--task-closure-max-bytes=1024",
+        "--task-max-packs=2",
+        "--task-max-large=2",
+        "--task-large-max-bytes=100000000",
     ];
     assert_eq!(parsed(&companions).expect("parses").task, None);
+    assert_eq!(
+        refused(&["--task-large-credentials-file=/etc/kbf/large.json"]),
+        ErrorKind::MissingRequiredArgument,
+        "the large credentials need the switch"
+    );
 }
 
 /// Asserts what each flag needs, so that the preparation is never half configured: the switch
@@ -100,6 +109,11 @@ fn the_flags_make_the_setting_and_the_defaults_are_the_constants() {
     assert_eq!(set.url_slack, Duration::from_secs(DEFAULT_URL_SLACK_SECS));
     assert_eq!(set.max_digests, ClosureLimits::DEFAULT.max_digests);
     assert_eq!(set.max_bytes, ClosureLimits::DEFAULT.max_bytes);
+    assert_eq!(set.max_packs, 8);
+    assert_eq!(set.max_large, 8);
+    assert_eq!(set.large_credentials_file, None);
+    assert_eq!(set.large_max_bytes, 536_870_912);
+    assert_eq!(set.large_max_bytes, DEFAULT_LARGE_MAX_BYTES);
 
     let mut every = TASK.to_vec();
     every.extend([
@@ -108,6 +122,10 @@ fn the_flags_make_the_setting_and_the_defaults_are_the_constants() {
         "--task-url-slack-secs=0",
         "--task-closure-max-digests=1000",
         "--task-closure-max-bytes=1048576",
+        "--task-max-packs=3",
+        "--task-max-large=0",
+        "--task-large-credentials-file=/etc/kbf/large.json",
+        "--task-large-max-bytes=67108865",
     ]);
     let set = parsed(&every).expect("parses").task.expect("task flags");
     assert_eq!(set.put_region, "eu-west-1");
@@ -115,6 +133,43 @@ fn the_flags_make_the_setting_and_the_defaults_are_the_constants() {
     assert_eq!(set.url_slack, Duration::ZERO);
     assert_eq!(set.max_digests, 1_000);
     assert_eq!(set.max_bytes, 1 << 20);
+    assert_eq!(set.max_packs, 3);
+    assert_eq!(set.max_large, 0);
+    assert_eq!(
+        set.large_credentials_file,
+        Some(PathBuf::from("/etc/kbf/large.json"))
+    );
+    assert_eq!(set.large_max_bytes, 64 * 1024 * 1024 + 1);
+}
+
+/// Asserts the bounds of the key-set flags: 1 to 8 packs, 0 to 8 large objects, and a large cap
+/// above the 64 MiB a pack record may hold (a blob at the cap is a record, not a large object).
+#[test]
+fn the_key_set_flags_are_bounded() {
+    for bad in [
+        "--task-max-packs=0",
+        "--task-max-packs=9",
+        "--task-max-large=9",
+        "--task-large-max-bytes=0",
+        "--task-large-max-bytes=67108864",
+        "--task-large-max-bytes=1024",
+    ] {
+        let mut given = TASK.to_vec();
+        given.push(bad);
+        assert_eq!(refused(&given), ErrorKind::ValueValidation, "{bad}");
+    }
+    let mut edges = TASK.to_vec();
+    edges.extend([
+        "--task-max-packs=1",
+        "--task-max-large=8",
+        "--task-large-max-bytes=67108865",
+    ]);
+    let set = parsed(&edges).expect("parses").task.expect("task flags");
+    assert_eq!((set.max_packs, set.max_large), (1, 8));
+    let mut edges = TASK.to_vec();
+    edges.extend(["--task-max-packs=8", "--task-max-large=0"]);
+    let set = parsed(&edges).expect("parses").task.expect("task flags");
+    assert_eq!((set.max_packs, set.max_large), (8, 0));
 }
 
 /// Asserts the bounds of the numeric flags: the wall is 1 to 14400 seconds, the slack 0 to 14400,
@@ -157,6 +212,18 @@ fn a_read_url_that_is_not_https_is_refused_at_start() {
     }
 }
 
+/// Asserts that `--executor-allow-plain-http-grant` opens nothing for a frontend that runs
+/// placed actions on daemons: the opt-in is for `--executor js-agent`, and an `http://` read url
+/// stays refused at start without it.
+#[test]
+fn the_plain_http_grant_opt_in_is_for_the_host_executor() {
+    let mut given = TASK[..4].to_vec();
+    given.push("--task-read-url=http://127.0.0.1:8443");
+    given.push("--executor-allow-plain-http-grant");
+    let error = parsed(&given).expect_err("refused");
+    assert!(error.to_string().contains("--task-read-url"), "{error}");
+}
+
 /// The file called `name` in `dir` of this text and mode.
 fn file(dir: &Path, name: &str, text: &str, mode: u32) -> PathBuf {
     let path = dir.join(name);
@@ -174,10 +241,15 @@ fn flags(dir: &Path) -> TaskFlags {
         put_region: DEFAULT_REGION.to_owned(),
         put_credentials_file: file(dir, "presign.json", KEYS, 0o600),
         read_url: "https://127.0.0.1:8443".to_owned(),
+        allow_plain_http_grant: false,
         run_wall: Duration::from_secs(DEFAULT_RUN_WALL_SECS),
         url_slack: Duration::from_secs(DEFAULT_URL_SLACK_SECS),
         max_digests: ClosureLimits::DEFAULT.max_digests,
         max_bytes: ClosureLimits::DEFAULT.max_bytes,
+        max_packs: 8,
+        max_large: 8,
+        large_credentials_file: Some(file(dir, "large.json", LARGE_KEYS, 0o600)),
+        large_max_bytes: 536_870_912,
     }
 }
 
@@ -330,4 +402,104 @@ async fn the_preparer_refuses_what_the_flags_cannot_check_alone() {
     let mut bucket = flags(dir.path());
     bucket.put_bucket = String::new();
     assert!(bucket.open(backend).is_err());
+}
+
+/// The URL's access key id: the first part of its credential scope.
+fn access_key_id(url: &str) -> String {
+    let (_, query) = url.split_once('?').expect("a query");
+    let pair = query
+        .split('&')
+        .find(|pair| pair.starts_with("X-Amz-Credential="));
+    let scope = pair
+        .expect("a credential")
+        .trim_start_matches("X-Amz-Credential=");
+    scope.split("%2F").next().expect("an id").to_owned()
+}
+
+/// Asserts that the flags open a preparer whose runs get as many pack grants and large grants as
+/// `--task-max-packs` and `--task-max-large` say, the large ones signed with the large
+/// credentials file and the pack ones with the pack credentials file.
+#[tokio::test]
+async fn the_flags_open_a_preparer_that_gives_each_run_a_key_set() {
+    let dir = scratch_dir("task-key-set");
+    let (backend, action) = farm().await;
+    let mut set = flags(dir.path());
+    set.max_packs = 3;
+    set.max_large = 2;
+    let prep = set.open(backend).expect("opened");
+    assert_eq!(prep.large_max_bytes(), Some(536_870_912));
+    let now = UNIX_EPOCH + Duration::from_secs(1_790_000_040);
+    let inputs = prep.prepare_run(LEASE, &action, now).await.expect("run");
+    assert_eq!(inputs.packs.len(), 3);
+    assert_eq!(inputs.large.len(), 2);
+    let mint = PackKeyMint::new(SECRET.as_bytes()).expect("a mint");
+    for key in inputs.keys() {
+        assert!(mint.verify(&key, &action).is_ok(), "{}", key.key());
+    }
+    for grant in &inputs.packs {
+        assert_eq!(access_key_id(&grant.put_url), "pack-presign");
+    }
+    for grant in &inputs.large {
+        assert_eq!(access_key_id(&grant.put_url), "large-presign");
+    }
+}
+
+/// Asserts that without `--task-large-credentials-file` no run gets a large key, whatever
+/// `--task-max-large` says, and the packs are as many as asked.
+#[tokio::test]
+async fn without_the_large_credentials_file_a_run_has_no_large_keys() {
+    let dir = scratch_dir("task-no-large");
+    let (backend, action) = farm().await;
+    let mut set = flags(dir.path());
+    set.large_credentials_file = None;
+    set.max_large = 8;
+    let prep = set.open(backend).expect("opened");
+    assert_eq!(prep.large_max_bytes(), None);
+    let now = UNIX_EPOCH + Duration::from_secs(1_790_000_040);
+    let inputs = prep.prepare_run(LEASE, &action, now).await.expect("run");
+    assert_eq!(inputs.packs.len(), 8);
+    assert!(inputs.large.is_empty());
+}
+
+/// Asserts that a large credentials file others can read, a file that is not there and a file
+/// that is not a key are refused with the flag and the file named and no part of the secret in
+/// the text.
+#[tokio::test]
+async fn the_large_credentials_come_from_a_private_file_of_a_key() {
+    let dir = scratch_dir("task-large-credentials");
+    let (backend, _) = farm().await;
+    let mut set = flags(dir.path());
+    let cases = [
+        ("wide-large.json", LARGE_KEYS, 0o640, "mode 0640"),
+        ("junk-large.json", "hunter3 is not JSON", 0o600, "not JSON"),
+        (
+            "blank-large.json",
+            r#"{"access_key_id": "large-presign", "secret_access_key": ""}"#,
+            0o600,
+            "both not empty",
+        ),
+    ];
+    for (name, text, mode, expected) in cases {
+        set.large_credentials_file = Some(file(dir.path(), name, text, mode));
+        let said = set.open(backend.clone()).expect_err("refused").to_string();
+        assert!(said.contains("--task-large-credentials-file"), "{said}");
+        assert!(said.contains(name), "{said}");
+        assert!(said.contains(expected), "{name}: {said}");
+        assert!(!said.contains("hunter3"), "{said}");
+    }
+    set.large_credentials_file = Some(dir.path().join("none-large.json"));
+    let said = set.open(backend).expect_err("refused").to_string();
+    assert!(said.contains("none-large.json"), "{said}");
+}
+
+/// Asserts that the preparer's own checks of the key set are reached from the flags: a large cap
+/// at or under a pack record's, which the flag refuses too, does not open.
+#[tokio::test]
+async fn a_large_cap_at_a_pack_record_does_not_open() {
+    let dir = scratch_dir("task-large-cap");
+    let (backend, _) = farm().await;
+    let mut set = flags(dir.path());
+    set.large_max_bytes = 64 << 20;
+    let error = set.open(backend).expect_err("refused");
+    assert!(matches!(error, TaskFlagError::Config(_)), "{error}");
 }

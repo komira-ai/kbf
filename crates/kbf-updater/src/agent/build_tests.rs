@@ -3,6 +3,7 @@
 //! each role drains, and the exit codes of the mode.
 
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,8 +11,8 @@ use kbf_testkit::dir::TestDir;
 use kbf_types::HostRole;
 
 use super::build::{
-    NO_CREDENTIAL, NoCredential, build, drain_for, frontend_ports, identity_of_files, run_agent,
-    run_config, service_ports, unix_now,
+    NO_CREDENTIAL, NoCredential, build, cordon_dir, drain_for, frontend_ports, identity_of_files,
+    node_ports, run_agent, run_config, service_ports, unix_now,
 };
 use super::coordinator::{Endpoint, TlsFiles};
 use super::flags::{Config, NodeApi, ServiceConfig, ServiceDrain, ServiceHealth, Timing};
@@ -48,6 +49,7 @@ impl Rig {
             frontend: None,
             enroll_frontend: None,
             state_dir: None,
+            cordon_dir: None,
             daemon_node: None,
             node_api: Some(NodeApi {
                 addr: "127.0.0.1:1".parse().unwrap(),
@@ -302,6 +304,7 @@ fn an_agent_with_a_state_directory_renews_what_it_was_enrolled_with() {
         frontend: Some(Endpoint::parse("localhost:1").unwrap()),
         enroll_frontend: Some(Endpoint::parse("localhost:1").unwrap()),
         state_dir: Some(state.clone()),
+        cordon_dir: None,
         node_api: None,
         daemon_node: None,
         timing: Timing {
@@ -437,4 +440,38 @@ fn a_services_ports_follow_its_settings() {
         "/run/db.sock",
     )];
     assert!(build(&config).is_ok());
+}
+
+/// The marks of the agent's cordons are kept in `--cordon-dir`, else the state directory, else
+/// the directory the placed key is in.
+#[test]
+fn the_cordon_marks_go_where_the_flags_say() {
+    let mut rig = Rig::new("bd-cordon", HostRole::Daemon);
+    assert_eq!(
+        cordon_dir(&rig.config),
+        rig.config.files.key.parent().unwrap()
+    );
+    rig.config.state_dir = Some(PathBuf::from("/state"));
+    assert_eq!(cordon_dir(&rig.config), PathBuf::from("/state"));
+    rig.config.cordon_dir = Some(PathBuf::from("/cordons"));
+    assert_eq!(cordon_dir(&rig.config), PathBuf::from("/cordons"));
+}
+
+/// An agent whose cordon directory it cannot write does not start with a drain it could not
+/// use: the error names `--cordon-dir`, whatever the node is drained through.
+///
+/// Catches: every drain refused at the first update, with nothing at start to say why.
+#[test]
+fn a_cordon_directory_the_agent_cannot_write_stops_the_build_naming_the_flag() {
+    let mut rig = Rig::new("bd-cordon-ro", HostRole::Daemon);
+    rig.config.cordon_dir = Some(rig.dir.join("missing"));
+    let local = Arc::new(SocketLocal::new(
+        &rig.config.helper_socket,
+        Limits::default(),
+    ));
+    let identity = identity_of_files(&rig.config.files).unwrap();
+    let why = node_ports(&rig.config, &identity, Role::Daemon, "kbf", &local)
+        .err()
+        .expect("refused");
+    assert!(why.contains("--cordon-dir"), "{why}");
 }

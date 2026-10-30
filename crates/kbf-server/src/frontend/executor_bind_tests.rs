@@ -8,7 +8,7 @@ use super::*;
 /// A frontend that runs placed actions on hosts, with everything it needs and nothing it can
 /// do without. The tier store and the read listener are at IP addresses, the store `http://`
 /// as it is today.
-const BASE: [&str; 26] = [
+const BASE: [&str; 28] = [
     "frontend",
     "--storage=http://127.0.0.1:1",
     "--state-store=postgres:///kbf?host=/run/postgresql",
@@ -33,6 +33,8 @@ const BASE: [&str; 26] = [
     "--executor-hosts=2",
     "--executor-host-cpus=8",
     "--executor-host-memory-gib=32",
+    "--executor-base-image=registry.test/base@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "--executor-kbf-image=registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
     "--executor-insecure-argv-secrets",
     "--executor-allow-plain-http-put",
 ];
@@ -172,6 +174,53 @@ fn a_plain_put_endpoint_needs_the_plain_http_opt_in() {
     assert!(
         warnings.iter().any(|w| w.contains("is not needed")),
         "{warnings:?}"
+    );
+}
+
+/// Catches an `http://` read url accepted with no word from the operator: the grant's bearer
+/// token would cross the job network in clear. It is refused when the flags are parsed, naming
+/// the flag that allows it; `--executor-allow-plain-http-grant` accepts it, and is no more than a
+/// warning when the read url is `https`.
+#[test]
+fn a_plain_read_url_needs_the_plain_http_grant_opt_in() {
+    let http = ["--task-read-url=http://192.0.2.6:9400"];
+    let why = refused(&[], &http);
+    assert!(
+        why.contains("--task-read-url") && why.contains("--executor-allow-plain-http-grant"),
+        "{why}"
+    );
+    let mut with = http.to_vec();
+    with.push("--executor-allow-plain-http-grant");
+    let flags = parsed(argv(&[], &with)).expect("accepted with the opt-in");
+    assert_eq!(
+        flags.task.as_ref().map(|t| t.read_url.as_str()),
+        Some("http://192.0.2.6:9400")
+    );
+    let js = flags.executor.js.as_ref().expect("js-agent");
+    assert!(js.config.allow_plain_http_grant);
+
+    let mut https = parsed(argv(&[], &["--executor-allow-plain-http-grant"])).expect("parses");
+    let js = https.executor.js.as_mut().expect("js-agent");
+    let beside = Beside {
+        task: https.task.as_ref(),
+        job_read: https.job_read.as_ref(),
+        packs: https.packs.as_ref(),
+    };
+    let warnings = check(js, &beside).expect("checks");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("--executor-allow-plain-http-grant") && w.contains("not needed")),
+        "{warnings:?}"
+    );
+    let bare = parsed(argv(&[], &[])).expect("parses");
+    assert!(
+        !bare
+            .executor
+            .js
+            .expect("js-agent")
+            .config
+            .allow_plain_http_grant
     );
 }
 

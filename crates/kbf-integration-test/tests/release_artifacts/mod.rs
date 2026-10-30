@@ -113,9 +113,10 @@ pub const IDENTIFIED: &[&str] = &["kbf", "kbf-installer"];
 /// as `--source-ref` (`refs/heads/<branch>`).
 pub const PUSH_BRANCHES: &[&str] = &["main"];
 
-/// The one `if:` of the jobs that sign and verify: a push, to one of [`PUSH_BRANCHES`].
-pub const SIGNING_IF: &str =
-    "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
+/// The one `if:` of the jobs that sign and verify: a push, to one of [`PUSH_BRANCHES`], in the
+/// `sign` stage of the pipeline's second call of this workflow (`inputs.stage`; a pull request
+/// or merge-queue run has no `inputs`, so it is never in that stage either).
+pub const SIGNING_IF: &str = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage == 'sign' }}";
 
 /// The platforms whose job builds the `kbf` deb and makes it an asset: the
 /// `cargo xtask pkg-kbf-asset` lines name exactly these.
@@ -1099,6 +1100,8 @@ mod rules {
                 "if: ${{ github.ref == 'refs/heads/main' }}",
                 "if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}",
                 "if: ${{ github.event_name != 'push' }}",
+                "if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}",
+                "if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage != 'sign' }}",
             ] {
                 // The k-th `if:` of the signing jobs, replaced.
                 let w = good();

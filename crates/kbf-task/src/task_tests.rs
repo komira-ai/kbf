@@ -13,6 +13,7 @@ use prost::Message;
 
 use kbf_task_pack::ManifestError;
 
+use super::recording_sink::Fake;
 use super::*;
 use crate::fetch::label;
 
@@ -42,33 +43,6 @@ impl BlobSource for Mem {
                 digest: label(digest),
                 why: "absent".to_owned(),
             })
-    }
-}
-
-/// A sink that keeps what it was given, or refuses.
-struct Fake {
-    stored: Mutex<Vec<Vec<u8>>>,
-    refuse: bool,
-}
-
-impl Fake {
-    fn new(refuse: bool) -> Self {
-        Self {
-            stored: Mutex::new(Vec::new()),
-            refuse,
-        }
-    }
-}
-
-impl PackSink for Fake {
-    fn store(&self, body: &[u8]) -> Result<(), PutError> {
-        if self.refuse {
-            return Err(PutError::Exists {
-                url: "https://store.example/pack".to_owned(),
-            });
-        }
-        self.stored.lock().unwrap().push(body.to_vec());
-        Ok(())
     }
 }
 
@@ -452,6 +426,21 @@ fn each_failure_class_has_its_own_exit_code() {
     assert_eq!(codes, [14, 10, 11, 12, 12, 12, 13]);
 }
 
+/// A Command refused for want of a confine has an exit code of its own, so the farm can tell
+/// "this system cannot confine" from a Command that could not be started.
+#[test]
+fn a_run_refused_for_want_of_a_confine_has_its_own_exit_code() {
+    let failure = Failure::Run(RunError::NoConfine);
+    assert_eq!(failure.exit_code(), EXIT_NO_CONFINE);
+    assert_eq!(EXIT_NO_CONFINE, 15);
+    assert_ne!(EXIT_NO_CONFINE, EXIT_RUN);
+    assert!(
+        failure
+            .to_string()
+            .contains("cannot deny the Command the network")
+    );
+}
+
 #[test]
 fn a_result_digest_that_is_absent_or_malformed_is_refused() {
     let good = reapi_of(b"x");
@@ -710,11 +699,11 @@ fn the_plain_http_opt_in_lets_the_sink_reach_an_http_store() {
     let http = "http://127.0.0.1:9/pack?sig=s\n";
     std::fs::write(&url_file, http).expect("write");
     let (_, sink) = connect(&flags).expect("connect");
-    let refused = sink.store(b"x").expect_err("https only");
+    let refused = sink.store_pack(0, b"x").expect_err("https only");
     flags.allow_plain_http_put = true;
     std::fs::write(&url_file, http).expect("write");
     let (_, sink) = connect(&flags).expect("connect");
-    let failed = sink.store(b"x").expect_err("nothing listens");
+    let failed = sink.store_pack(0, b"x").expect_err("nothing listens");
     assert_ne!(refused.to_string(), failed.to_string());
     assert!(!failed.to_string().contains("sig=s"), "{failed}");
 }
@@ -766,6 +755,11 @@ async fn main_with_reports_a_setup_failure_by_exit_code() {
     assert_eq!(main_with(&flags).await, ExitCode::from(EXIT_SETUP));
 }
 
+/// The source and the sink as `finish` takes them.
+fn boxed(mem: Mem, sink: Fake) -> Connected {
+    (Box::new(mem), Box::new(sink))
+}
+
 /// Catches: a task that ran and stored its pack not exiting 0.
 #[tokio::test]
 async fn a_task_that_stores_its_pack_exits_zero() {
@@ -773,7 +767,7 @@ async fn a_task_that_stores_its_pack_exits_zero() {
     let digest = action(&mut mem, COPY, &["out"]);
     let dir = scratch("finish-ok");
     let flags = cli(&dir, digest);
-    let connected = Ok::<_, Failure>((mem, Fake::new(false)));
+    let connected = Ok::<_, Failure>(boxed(mem, Fake::new(false)));
     assert_eq!(finish(&flags, connected).await, ExitCode::SUCCESS);
 }
 
@@ -785,9 +779,9 @@ async fn finish_exits_with_the_code_of_the_failure() {
     let digest = action(&mut mem, COPY, &["out"]);
     let dir = scratch("finish-fail");
     let flags = cli(&dir, digest);
-    let refused = Ok::<_, Failure>((mem, Fake::new(true)));
+    let refused = Ok::<_, Failure>(boxed(mem, Fake::new(true)));
     assert_eq!(finish(&flags, refused).await, ExitCode::from(EXIT_PUT));
-    let not_connected: Result<(Mem, Fake), Failure> = Err(Failure::Setup("no".to_owned()));
+    let not_connected = Err(Failure::Setup("no".to_owned()));
     assert_eq!(
         finish(&flags, not_connected).await,
         ExitCode::from(EXIT_SETUP)
@@ -830,10 +824,13 @@ fn the_http_sink_puts_the_pack_to_the_url() {
     });
     let sink = HttpSink {
         agent: agent(None),
-        url,
+        urls: PutUrls {
+            packs: vec![url],
+            large: Vec::new(),
+        },
         sleeper: Arc::new(ThreadSleeper),
     };
-    sink.store(b"ok").expect("stored");
+    sink.store_pack(0, b"ok").expect("stored");
     let request = server.join().expect("server");
     assert!(request.starts_with("PUT /pack "), "{request}");
 }
@@ -950,7 +947,10 @@ impl Sleeper for Arc<Waits> {
 fn recording_sink(url: String, waits: &Arc<Waits>) -> HttpSink {
     HttpSink {
         agent: agent(None),
-        url,
+        urls: PutUrls {
+            packs: vec![url],
+            large: Vec::new(),
+        },
         sleeper: Arc::new(Arc::clone(waits)),
     }
 }
@@ -961,7 +961,9 @@ fn recording_sink(url: String, waits: &Arc<Waits>) -> HttpSink {
 fn the_http_sink_retries_a_503_after_the_wait_the_store_asked_for() {
     let (url, server) = serve_statuses(vec![503, 201]);
     let waits = Arc::new(Waits::default());
-    recording_sink(url, &waits).store(b"ok").expect("stored");
+    recording_sink(url, &waits)
+        .store_pack(0, b"ok")
+        .expect("stored");
     assert_eq!(server.join().expect("server"), 2);
     assert_eq!(*waits.0.lock().unwrap(), [Duration::from_secs(4)]);
 }
@@ -974,7 +976,7 @@ fn a_store_that_keeps_answering_503_fails_the_task_as_a_put_after_a_bounded_numb
     let (url, server) = serve_statuses(vec![503; attempts]);
     let waits = Arc::new(Waits::default());
     let err = recording_sink(url, &waits)
-        .store(b"ok")
+        .store_pack(0, b"ok")
         .expect_err("still full");
     assert_eq!(server.join().expect("server"), attempts);
     assert_eq!(waits.0.lock().unwrap().len(), attempts - 1);
@@ -988,9 +990,15 @@ fn the_http_sink_does_not_retry_a_412() {
     let (url, server) = serve_statuses(vec![412]);
     let waits = Arc::new(Waits::default());
     let err = recording_sink(url, &waits)
-        .store(b"ok")
+        .store_pack(0, b"ok")
         .expect_err("exists");
     assert_eq!(server.join().expect("server"), 1);
     assert!(waits.0.lock().unwrap().is_empty());
     assert!(matches!(err, PutError::Exists { .. }), "{err:?}");
 }
+
+#[path = "multipack_tests.rs"]
+mod multipack;
+
+#[path = "http_sink_tests.rs"]
+mod http_sink;

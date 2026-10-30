@@ -85,7 +85,7 @@ the key that `tierstore` checks only if it has exactly those two non-empty field
 file that has another field must be trimmed to be shared. `tierstore` takes the values of the
 JSON form as they are, without trimming. No message of the process carries a secret.
 
-A role belongs to a key, not to a prefix: a read-only key may read every object of the bucket.
+A role belongs to a key, not to a prefix: a read-only key may read every object of the bucket. A key limited to prefixes is a GC key or a scoped key (below).
 A write limited to one object under a prefix is a presigned PUT URL (below).
 
 ## Presigned PUT URLs
@@ -143,6 +143,271 @@ query (400, or 404 for an unknown bucket), the checksum headers (400 or 501), an
 list prefix; so a call that is both refused and malformed may get the malformed-request error. A delete by a GC key is not
 create-only; it is the only way an object leaves the prefix that presigned PUTs write.
 
+## Scoped keys
+
+A scoped key (`--scoped-key-file`, once per key; mode 0600, not a symbolic link, owned by the user
+the server runs as) reads, creates and deletes under prefixes that its file lists, and does nothing
+else. It is for a process that must touch some prefixes of the bucket and not the rest, and that
+neither replaces nor deletes what it did not write. It signs in the header only (a presigned URL
+signed with it is refused). The file is JSON of exactly these five fields, all required:
+
+```json
+{"access_key_id": "frontend-packs", "secret_access_key": "the secret",
+ "read_prefixes": ["cas/"],
+ "write_prefixes": ["cas/f/frontend/"],
+ "delete_prefixes": []}
+```
+
+Every prefix ends in `/` and is not empty. None may be `_journal/` or `_tiering/`, be under one, be
+a prefix of one, or have one as a segment (`cas/_journal/`); a file that has one is refused at
+start. A list may be empty, but a key whose three lists are all empty is refused, since it could do
+nothing. The lists may overlap: a prefix in `read_prefixes` and in `write_prefixes` is one the key
+reads and creates under. A key file that is refused (bad JSON, a missing or unknown field, a bad
+prefix, a mode other than 0600) exits 1 at start with a message that names the flag and the file and
+never the secret, as a bad GC key file does. The access key id differs from those of all other
+keys: two keys with one id are refused with exit status 2 (the command line does this; a
+`ServerConfig` built in code, as a library user does, is not checked for distinct ids by the server).
+
+A call is allowed only for a key (or, for a listing, a `prefix` parameter) that starts with a prefix
+of the list the call needs, after the path is percent-decoded and with no `..`, no `.` segment and
+no control character in it. A key must be longer than the prefix: the prefix itself is not an object.
+A key or a listing `prefix` that has `..` anywhere in it, even inside a prefix, is refused.
+
+| call | list | allowed |
+|---|---|---|
+| GetObject, HeadObject | `read_prefixes` | yes, whole or by range |
+| ListObjectsV2 | `read_prefixes` | with a `prefix` parameter inside a read prefix; no prefix or another is 403, not filtered |
+| ListMultipartUploads | `read_prefixes` | the same rule: a `prefix` inside a read prefix |
+| PutObject | `write_prefixes` | create-only: no `If-Match`, and `If-None-Match` absent or `*`; a key that exists is `412 PreconditionFailed` |
+| CreateMultipartUpload, UploadPart, CompleteMultipartUpload | `write_prefixes` | of a key inside a write prefix, each call checked |
+| AbortMultipartUpload | `write_prefixes` | of an upload of such a key (a delete prefix does not allow an abort) |
+| DeleteObject | `delete_prefixes` | from both tiers, journaled as for any delete |
+| a put with `If-Match` or any other `If-None-Match`, a copy (`x-amz-copy-source`, also on a part) | none | no: a scoped key never replaces or copies |
+| the calls on the bucket (CreateBucket, HeadBucket, delete) and the root, any other method | none | no |
+| `_journal/`, `_tiering/`, any key outside the list the call needs | none | no |
+
+The lists are not interchangeable: a write prefix does not let the key read what it wrote (add the
+prefix to `read_prefixes` too), and a read prefix does not let it write. A key with a write
+prefix and no read prefix can still learn that a key exists, by the `412` of a put over it. A
+call the key may not do is refused with 403 `AccessDenied` without its body being read. The refusals are made in the order
+of the GC key's (see above): the signature and key id, the method, the decoding of the path and
+query, the checksum headers, and last the key, the listing prefix and the conditions of the put; so
+a call that is both refused and malformed may get the malformed-request error.
+
+Two uses, for the pieces of kbf that keep their objects in a tierstore bucket:
+
+- **The frontend's pack store** (`--pack-store-endpoint`, with `--pack-store-credentials-file` set
+  to a file in the JSON form of the key above). A frontend reads packs that daemons and tasks
+  wrote under `cas/` and writes its own packs under `cas/f/<writer>/`, where `<writer>` is its
+  `--pack-writer` (`frontend` if left out), one key `cas/f/<writer>/<boot>/<sequence>` for each
+  pack. It writes with a plain `PUT` with `If-None-Match: *`, one request for a pack, and reads
+  with ranged `GET`s. So the key is `read_prefixes: ["cas/"]`, `write_prefixes:
+  ["cas/f/<writer>/"]`, `delete_prefixes: []`. With no delete prefix, two best-effort deletes the
+  frontend makes are refused with a logged warning and change nothing: the removal of its
+  create-only self-test object (`cas/f/<writer>/<boot>/selftest`, one small object left for each
+  start of the frontend) and of the object of a pack whose write failed. To have both removed,
+  give `delete_prefixes: ["cas/f/<writer>/"]`: the key then deletes only what the frontend itself
+  wrote.
+- **Build history** (`kbf-server --history-objects
+  's3://<bucket>/kbf-history?endpoint=...&conditional-put=true'`, the key
+  pair in `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`). The history objects are under
+  `kbf-history/history/`. The writer makes only create-only single `PUT`s with `If-None-Match: *`
+  (without `conditional-put=true` it is a plain `PUT`, and tierstore answers a retry of a chunk
+  whose first reply was lost with `412`, which the writer does not take for "already there", so it
+  retries the chunk for good: keep `conditional-put=true`) and the reader makes only ranged
+  `GET`s; neither lists, deletes, overwrites or starts a multipart upload (the code makes no list or
+  delete call at all, so the expiry of old objects is for a lifecycle rule of the bucket, not the
+  server, and a sweeper that deletes would need `delete_prefixes: ["kbf-history/"]`). So the key is
+  `read_prefixes: ["kbf-history/"]`, `write_prefixes: ["kbf-history/"]`, `delete_prefixes: []`.
+
+## The configuration file
+
+`tierstore --config <path>` reads one TOML file in place of the flags that describe the data path
+(the listen address, the tiers, the key files, the limits and the reconciler's settings). A server
+started from a file runs the code of one started from the same settings as flags: the file is read
+into the settings the flags make, and the defaults are the flags' defaults. The unit above keeps
+its flags; a file is for a setup that would rather keep its settings in one place.
+
+A file holds no secret, and a message about it repeats no value except a `[[policy]]` prefix (a prefix is
+a key name, not a secret): a syntax refusal names the line, the column and the key; any other refusal names
+the key. A number above 9223372036854775807 (the largest TOML integer) cannot go in a file; as a flag it
+is accepted, and `--print-config` refuses it with exit 2. A `--print-config` that cannot write its output
+(a closed pipe, a full disk) exits 1; a refusal of the file or the flags exits 2.
+
+This release reads the storage-node shape: `[server]`, `[hot_store]` and `[cold_store]`, and an
+optional `[oci]` (the read-only registry front) and `[[policy]]`. A file for a storage node:
+
+```toml
+[server]
+listen              = "192.0.2.10:9000"
+proxy_id            = "tierstore-1"
+bucket              = "tierstore"
+region              = "us-east-1"
+max_request_bytes   = 268435456
+access_key_file     = "/etc/tierstore/access.key"
+read_only_key_files = ["/etc/tierstore/daemons.key"]
+presign_key_files   = ["/etc/tierstore/pack-presign.key"]
+gc_key_files        = ["/etc/tierstore/pack-gc.key"]
+
+[hot_store]
+kind              = "s3"
+bucket            = "tierstore-hot"
+endpoint          = "http://s3-hot.example:9000"
+region            = "us-east-1"
+credentials_file  = "/etc/tierstore/hot.credentials"
+budget            = "1TiB"
+high_water        = 80
+low_water         = 70
+critical          = 95
+copy_parallel     = 16
+lease_ttl         = "30s"
+reconcile_interval = "5s"
+usage_stale_after = "2m"
+journal_linger    = "20ms"
+journal_retention = "24h"
+
+[cold_store]
+kind             = "s3"
+bucket           = "tierstore-cold"
+endpoint         = "http://s3-cold.example:9000"
+credentials_file = "/etc/tierstore/cold.credentials"
+skip_checks      = []
+```
+
+A key that is left out has the default of its flag (`tierstore --help` lists them); `listen`,
+`proxy_id`, `bucket` and `access_key_file` of `[server]`, `kind` of each tier and `budget` of
+`[hot_store]` are needed. Durations are a whole number and `ms`, `s`, `m` or `h`, as in the flags.
+The water marks are percents, as in the flags (1 to 100).
+
+The registry front (see The OCI read front) is the optional `[oci]` table, left out for a server
+with no front. A key of it that is left out has the default of its flag:
+
+```toml
+[oci]
+listen              = "192.0.2.10:5000"
+tls_cert_file       = "/etc/tierstore/oci.crt"
+tls_key_file        = "/etc/tierstore/oci.key"
+prefix              = "oci/"
+max_connections     = 64
+connection_lifetime = "1h"
+```
+
+The table has the rules of the `--oci-*` flags: `listen` is needed in it, and the other keys are
+refused without it; `tls_cert_file` and `tls_key_file` go together; `max_connections` is at least
+one; `connection_lifetime` is a duration as elsewhere. The certificate and the key are named by
+path, as every key file is, so the names end in `_file`.
+
+### Which key each flag has
+
+Every flag that describes the data path has the key or keys below, and no other has one. A flag
+that takes a list (`--read-only-key-file`, given once for each key) is a list in the file. A tier
+flag is a `kind` and the key its kind needs: `--hot dir:<path>` is `kind = "dir"` and `path`,
+`--hot s3:<bucket>` is `kind = "s3"` and `bucket`. The keys of the reconciler, the journal and the
+lease are in `[hot_store]`, since only a process with a hot tier has them. The crate's tests walk
+the flags of the binary against this table, so a flag added without a key fails them.
+
+| flag | key | what |
+|---|---|---|
+| `--listen` | `server.listen` | the address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on |
+| `--proxy-id` | `server.proxy_id` | names the journal and the lease of this process |
+| `--hot` | `hot_store.kind`, `hot_store.path`, `hot_store.bucket` | the hot tier: `kind` is `memory`, `dir` (with `path`) or `s3` (with `bucket`, `endpoint` and `credentials_file`); in a flag, `memory`, `dir:<path>` or `s3:<bucket>` |
+| `--cold` | `cold_store.kind`, `cold_store.path`, `cold_store.bucket` | the cold tier, in the same three kinds |
+| `--hot-endpoint` | `hot_store.endpoint` | `http://host[:port]` of an `s3` hot tier |
+| `--hot-region` | `hot_store.region` | the signing region of an `s3` hot tier |
+| `--hot-credentials-file` | `hot_store.credentials_file` | the key file of an `s3` hot tier |
+| `--cold-endpoint` | `cold_store.endpoint` | `http://host[:port]` of an `s3` cold tier |
+| `--cold-region` | `cold_store.region` | the signing region of an `s3` cold tier |
+| `--cold-credentials-file` | `cold_store.credentials_file` | the key file of an `s3` cold tier |
+| `--s3-request-timeout` | `server.s3_request_timeout` | the limit on a request to an `s3` tier (both tiers) |
+| `--hot-bytes` | `hot_store.budget` | the bytes the hot tier is meant to hold: a number, or a string such as `"500GiB"` |
+| `--high-water` | `hot_store.high_water` | percent of the budget above which eviction begins |
+| `--low-water` | `hot_store.low_water` | percent of the budget eviction goes down to |
+| `--critical` | `hot_store.critical` | percent of the budget above which a put waits and a cold read is not copied back |
+| `--bucket` | `server.bucket` | the name of the bucket served |
+| `--region` | `server.region` | the region of a request's signature |
+| `--access-key-file` | `server.access_key_file` | the full key file |
+| `--read-only-key-file` | `server.read_only_key_files` | a list of read-only key files |
+| `--presign-key-file` | `server.presign_key_files` | a list of presigning key files |
+| `--gc-key-file` | `server.gc_key_files` | a list of GC key files |
+| `--scoped-key-file` | `server.scoped_key_files` | a list of scoped key files |
+| `--presign-max-expires` | `server.presign_max_expires` | the longest expiry of any presigned URL |
+| `--journal-linger` | `hot_store.journal_linger` | how long a batch of journal entries waits for more |
+| `--journal-retention` | `hot_store.journal_retention` | how long an applied journal object is kept |
+| `--copy-parallel` | `hot_store.copy_parallel` | the most objects the reconciler copies at once |
+| `--lease-ttl` | `hot_store.lease_ttl` | how long the reconciler's lease lasts without a renewal |
+| `--reconcile-interval` | `hot_store.reconcile_interval` | how often the reconciler works |
+| `--usage-stale-after` | `hot_store.usage_stale_after` | how old the published usage may be before `/usagez` says 503 |
+| `--max-request-bytes` | `server.max_request_bytes` | the longest body of a request |
+| `--max-concurrent-puts` | `server.max_concurrent_puts` | the most put bodies and parts taken at once |
+| `--put-min-bytes-per-sec` | `server.put_min_bytes_per_sec` | the least average rate of a body (0 turns it off) |
+| `--put-rate-grace` | `server.put_rate_grace` | the time waiting for the client before that rate is held |
+| `--body-idle-timeout` | `server.body_idle_timeout` | how long a body or an answer may go without a byte |
+| `--skip-backend-check` | `cold_store.skip_checks` | a list of `CHECK=REASON` texts: the start-up check that is left out, with its reason (only `multipart-conditional`; it runs on the cold tier) |
+| `--backend-check-wait` | `server.backend_check_wait` | how long the start-up self-test asks again of a tier that does not answer |
+| `--oci-listen` | `oci.listen` | where the registry front listens; the front is off without the `[oci]` table |
+| `--oci-tls-cert` | `oci.tls_cert_file` | the certificate chain (PEM) of the front; with `oci.tls_key_file`, or neither |
+| `--oci-tls-key` | `oci.tls_key_file` | the private key (PEM) of the front |
+| `--oci-prefix` | `oci.prefix` | the key prefix the front reads, ending in `/` (`oci/` if left out) |
+| `--oci-max-connections` | `oci.max_connections` | the most connections the front has open at once (64 if left out; at least 1) |
+| `--oci-connection-lifetime` | `oci.connection_lifetime` | the longest a connection of the front lives (`1h` if left out) |
+
+These stay flags, since they describe one run and not the data path: `--config`,
+`--print-config`, `--drain-lb-wait` and `--drain-deadline`. A start that gives `--config` and any
+other flag is refused with status 2 and a message that names the flags (`--drain-lb-wait` and
+`--drain-deadline` may go with it). A refusal that the checks of the start make (water marks out of
+order, a key file others can read) names the keys of the file where the flag-mode message names the
+flags.
+
+### What the loader refuses
+
+Each of these exits with status 2 and names the file and the key:
+
+- a key or a table the format does not have (the file is a closed set), and a value of the wrong
+  type;
+- a key that holds a secret: keys and credentials are paths of files, whose names end in `_file`
+  or `_files`; `secret_access_key`, `access_key_id`, `password`, a name with `token` in it and the
+  like are refused wherever they are;
+- `[local_cache]`, which is reserved for a later release and refused as not supported yet, and a
+  file without both `[hot_store]` and `[cold_store]`;
+- a key of a tier that its `kind` does not take (`path` for a `memory` tier, `endpoint` for a `dir`
+  tier), a `dir` tier without `path`, an `s3` tier without `bucket`, `endpoint` or
+  `credentials_file`, and a key only one tier has in the other (`budget` and the reconciler's keys
+  are `[hot_store]`'s; `skip_checks` is `[cold_store]`'s, since the check it skips runs there);
+- a water mark outside 1 to 100, and a budget, a count or a limit of zero;
+- an `[oci]` table without `listen`, with a key but no `listen` (the message names that key), with
+  only one of `tls_cert_file` and `tls_key_file`, or with `max_connections = 0`;
+- a `[[policy]]` prefix that is listed twice, that lies inside another listed prefix (or holds
+  one), that does not end in `/`, or that is under `_journal/` or `_tiering/`, which tierstore
+  keeps for itself.
+
+`[[policy]]` has a `prefix` (empty for all the rest) and `cache`. In this release a policy is read
+and checked and has no effect, since nothing is cached yet; `cache = true` is refused as not
+supported yet. The empty prefix may be listed along with others (it is the rest); two non-empty
+prefixes may not nest.
+
+### Moving from flags to a file
+
+`tierstore --print-config` with the flags of a unit (without `--config`) prints the file that is
+equivalent to them on stdout and exits 0 without starting anything; it prints the key files by
+path, never what is in them, and the file it prints is loaded back before it is printed, so it
+loads. Take the flags out of `ExecStart=`:
+
+```sh
+/usr/libexec/kbf/tierstore --print-config --listen 192.0.2.10:9000 ... > /etc/tierstore/tierstore.toml
+```
+
+and switch the unit by changing `ExecStart=` to
+
+```
+ExecStart=/usr/libexec/kbf/tierstore --config /etc/tierstore/tierstore.toml --drain-lb-wait 10s --drain-deadline 15m
+```
+
+The flags and the file are both accepted in this release, so a unit may stay as it is and move
+when it is convenient; the flags are to go in the release after, and `--config` is then the way to
+configure the data path. The shipped `tierstore.service` keeps its flags, and
+`crates/tierstore/tests/packaging.rs` parses them as the binary parses them. `--print-config` does
+not convert anything else in a unit (a drop-in, the firewall rules).
+
 ## Filling in the flags
 
 The unit's `ExecStart=` is a complete command line. The flags to edit:
@@ -155,11 +420,13 @@ The unit's `ExecStart=` is a complete command line. The flags to edit:
 | `--access-key-file`, `--read-only-key-file` | the full key, and (given once for each) the read-only keys; see above |
 | `--presign-key-file`, `--presign-max-expires` | a presigning key with its ceiling (given once for each key), and the longest expiry of any URL; see Presigned PUT URLs |
 | `--gc-key-file` | a GC key (given once for each key); see GC keys |
+| `--scoped-key-file` | a scoped key (given once for each key); see Scoped keys |
 | `--hot`, `--cold` | the tiers: `s3:<bucket>` for a bucket of an S3-compatible store (also `dir:<path>` and `memory`; a `dir:` path must also be writable under `ProtectSystem=strict`, so add it to `ReadWritePaths=`) |
 | `--hot-endpoint`, `--cold-endpoint` | where the tier's store is, `http://host[:port]` (TLS is not built yet); `--hot-region` and `--cold-region` set the signing region of a tier, `us-east-1` if not given |
 | `--hot-bytes` | the bytes the hot tier is meant to hold; the water marks are shares of it (`--high-water`, `--low-water`, `--critical`) |
 | `--drain-lb-wait`, `--drain-deadline` | the drain on SIGTERM: how long `/readyz` says 503 while the server goes on serving, and how long it then waits for requests in flight |
 | `--usage-stale-after` | how old the usage that the reconciler publishes may be (2m by default, longer than `--lease-ttl`) before `/usagez` says 503 with the reason (200 and the age while fresh). Puts ignore a usage older than 30 s, so a stopped reconciler means a hot tier that is never taken to be full; puts are not refused. A load balancer probes `/readyz`, which does not look at the usage (one stopped reconciler would otherwise take every node out); alerting probes `/usagez` |
+| `--oci-listen`, `--oci-tls-cert`, `--oci-tls-key`, `--oci-prefix` | the read-only registry front, off unless `--oci-listen` is given; see The OCI read front |
 
 `tierstore --help` lists them all, with their defaults.
 
@@ -253,6 +520,158 @@ stop it, and the front answers that parameter with 501 `NotImplemented`. If that
 ls` and `list_objects_v2` fail against the front, and the calls that name a key (`get_object`,
 `put_object`, `head_object`, `delete_object`, multipart) are not affected. Check it with a real
 client before relying on either.
+
+## The OCI read front
+
+With `--oci-listen`, the process also serves the objects of the store as a read-only container
+registry, over HTTPS or over plain HTTP (see Two modes), so that podman (and the
+other clients of the OCI distribution API) pulls an image by digest from the same hot and cold tiers the S3 front writes to. It reads through the
+proxy in the process: no S3 credential and no hop through the S3 listener. It is off unless
+`--oci-listen` is given, and then nothing else about the process changes.
+
+With `--config` the front is the `[oci]` table of the file and the `--oci-*` flags are refused
+(see The configuration file, which lists the key of each flag below). `--print-config` writes
+the front's flags as that table.
+
+| flag | what |
+|---|---|
+| `--oci-listen ADDR` | where the registry front listens. With `--oci-tls-cert` and `--oci-tls-key` it is HTTPS; with neither it is plain HTTP, at any address; off loopback (127/8 and `::1` are loopback; `0.0.0.0` and `::` are not) the start prints one warning line, and a certificate and key are advised |
+| `--oci-tls-cert PATH`, `--oci-tls-key PATH` | both or neither (one without the other is refused at start, exit 2). The certificate chain (leaf first) and the private key, PEM. Clients dial an IP address, so the leaf must carry an IP subjectAltName for `--oci-listen` (any IP subjectAltName, if the address is `0.0.0.0` or `::`); a certificate without one, one that is expired or not yet valid, a key file any user can read (the "other" mode bits; a group may), or an unreadable file, is refused at start. The files are read once: a new certificate takes a restart, so renew it before it expires |
+| `--oci-prefix PREFIX` | the key prefix, ending in `/`, `oci/` if not given. A prefix inside `_journal/` or `_tiering/`, or one that is not plain path segments, is refused at start (exit 2) |
+| `--oci-max-connections N` | connections open at once, 64 if not given; the others wait in the kernel's backlog. Memory is bounded by connections times the buffer a connection holds (up to 4 MiB), about 256 MiB at the default |
+| `--oci-connection-lifetime D` | the longest a connection lives, 1h if not given; a request being answered is finished first |
+
+A client has 10 seconds to finish the TLS handshake and then the S3 front's header timeout (a
+minute) to send the head of a request, which is also how long an idle connection may wait for its
+next request. A connection holds one of the `--oci-max-connections` slots from accept to close and
+there is no limit per client address, so a host that opens that many connections and says nothing
+can keep the others waiting: the host's firewall rules are the control for that. A client that takes no byte of an answer for `--body-idle-timeout`
+is cut. A connection that reaches its lifetime finishes the answer it is sending for at most
+`--drain-deadline`, and is cut then. On the drain the front goes on serving through `--drain-lb-wait`, takes no new connection,
+lets the requests being answered finish, and closes what is left at `--drain-deadline`. The start
+line on stdout gets ` oci-listen=<address> (https)` or ` (http)` after `listen=<address>`, and `/metricz`
+has `tierstore_oci_front_info{mode="https"}` or `{mode="http"}`. In plain mode there is no handshake,
+so the handshake time does not apply; the other limits are the same.
+
+### Two modes
+
+- **HTTPS**: with `--oci-tls-cert` and `--oci-tls-key`, at any address.
+- **Plain HTTP**: with neither, at any address. A node's own container engine can pull from the
+  front of its own tierstore over loopback, so the pull is a connection from the host to itself and
+  the traffic never leaves it. A connection to any address beyond loopback can be read and changed on
+  its way: the process starts, prints one warning line on stderr, and a certificate and key are
+  advised there. Loopback is reachable by every local process, and by containers that
+  share the host's network namespace; the front is anonymous in either mode.
+
+A container engine that pulls over plain HTTP has to be told it may:
+
+- podman: mark the registry insecure for that location in `registries.conf`, e.g.
+
+  ```toml
+  [[registry]]
+  location = "127.0.0.1:9500"
+  insecure = true
+  ```
+
+  or pull with `--tls-verify=false`. No `certs.d` directory is needed.
+- js-oci needs to be allowed plain HTTP to a loopback registry address for such a pull; that is a
+  setting of js-oci, not of tierstore.
+
+What it serves, and nothing else (any other path is 404 and any method but GET and HEAD is 405
+`UNSUPPORTED` with `Allow: GET, HEAD`, both with the OCI error document):
+
+| request | answer |
+|---|---|
+| `/v2/` | 200, `{}`, `Docker-Distribution-API-Version: registry/2.0` |
+| `/v2/<name>/manifests/sha256:<hex>` | the manifest (at most 4 MiB), with `Content-Type` from its `mediaType`, `Content-Length`, `Docker-Content-Digest` and an `ETag` of the digest. A tag is 404 `MANIFEST_UNKNOWN`: tags are not served |
+| `/v2/<name>/blobs/sha256:<hex>` | the blob, streamed, `application/octet-stream`, with `Accept-Ranges: bytes`; one `Range` is 206 with `Content-Range`, one past the end 416 |
+
+The `Content-Type` of a manifest is its `mediaType` when that is the OCI image manifest or index or
+the Docker schema 2 manifest or manifest list. A manifest with none, or another, is served as an OCI
+image manifest if it is `schemaVersion` 2 with a `config` object and a `layers` array, as an OCI
+image index if it is `schemaVersion` 2 with a `manifests` array (an index may leave `mediaType`
+out), and is 500 `MANIFEST_INVALID` with the reason otherwise.
+
+A malformed digest (not `sha256:` and 64 lowercase hex digits) is 400 `DIGEST_INVALID`, a repository
+name that is not valid by the distribution grammar is 400 `NAME_INVALID`, an object that is not in
+the store is 404 `BLOB_UNKNOWN` or `MANIFEST_UNKNOWN`, a store that cannot be reached is 503, and
+what the store said stays in the log.
+
+### Keys, and one namespace
+
+An object is at `<prefix>blobs/sha256/<64 lowercase hex digits>`, the same for a manifest, an index,
+a layer and a config: manifests are blobs. The `<name>` in a URL is checked against the grammar and
+then ignored, so there is one content-addressed namespace and any name pulls any digest. A key is
+built only from a validated digest, so nothing outside the prefix can be named.
+
+### Integrity
+
+A manifest is read whole and its SHA-256 is checked against its digest before a byte is sent; one
+that does not match is 500 `DIGEST_INVALID`, is never served and is counted. The size is asked
+before the read, so a manifest replaced by an object of another size between the two can be
+answered 500 `DIGEST_INVALID` once; a retry succeeds. A blob is hashed as it is
+read, in chunks of 4 MiB, and its last chunk is held back until the hash is right: a blob that does
+not match its digest ends the connection before the response is complete, so no client receives a
+whole wrong body, and the mismatch is counted. That holds for a read of the whole blob, and for a
+`Range` that covers all of it (which is still 206). A blob `HEAD` and a `Range` of part of a blob
+report what the store holds and verify nothing; the client verifies the digest of what it
+assembles. (A manifest `HEAD` reads and verifies the manifest.) A client that sends several ranges
+(as a partial pull of a `zstd:chunked` or `estargz` layer does) is sent the whole blob with 200,
+which the specification allows, and falls back to splitting it. `If-Range`, `If-None-Match` and
+`Accept` are ignored.
+
+### Anonymous reads
+
+The front never asks for a token: a request with an `Authorization` header is served as one without.
+Anyone who can connect can read any digest under the prefix, and nothing else. That is the intent:
+the images in it are public (a public registry's images are the first thing put there), and the
+network decides who can connect (the host's firewall rules). Do not put an image in
+the prefix that is not meant to be read by whoever can reach the port.
+
+### Putting an image in the store
+
+Take the blobs of an OCI layout (the files under `blobs/sha256/` of a layout made with
+`skopeo copy ... oci:<dir>` or `podman save --format oci-dir`) and put each, create-only, at
+`<prefix>blobs/sha256/<hex>` through the S3 front with the full key: the layers, the config, the
+manifest, and the index of a multi-platform image, all by the file's own name, which is its digest.
+`index.json` of the layout is not put; the digest of the manifest (or index) to pull is in it, and
+is what a client is given. A layer larger than `--max-request-bytes` (256 MiB if not given) needs the
+flag raised, or a multipart upload, or a presigned PUT whose key has a `max_object_bytes` of up to
+5 GiB (see Presigned PUT URLs; the ceiling prefix must cover `oci/`). An object that is already
+there is refused (412), which is a retry that is safe.
+
+Check a put with `HEAD` on the front: the `Docker-Content-Digest` of a manifest is the digest of the
+bytes it read, after they were checked.
+
+### Pulling
+
+Over plain HTTP on loopback there is no CA to trust; see Two modes for the client settings.
+
+podman, from a host that trusts the CA of the certificate:
+
+```sh
+# the CA that issued --oci-tls-cert, in the directory named like the registry in the reference
+# (the address, with :port when the reference has one)
+install -D -m 0644 farm-ca.crt /etc/containers/certs.d/192.0.2.10/ca.crt
+podman pull 192.0.2.10/library/app@sha256:<manifest digest>
+```
+
+The reference is by digest: a tag is refused. The repository name (`library/app`) is any name that
+fits the grammar and means nothing to the store. A registry on another port than 443 is written
+`192.0.2.10:8443/library/app@sha256:...` and its directory is `certs.d/192.0.2.10:8443`.
+
+A client that allows only `https` registries on port 443 (or the port in the reference), and
+registries at a private address only when told to, pulls the same references; allow the address in
+that client's own settings.
+
+### Counters
+
+`GET /metricz` on the S3 listener (unsigned, like `/healthz`; a bucket cannot be called `metricz`)
+shows, in the Prometheus text format, `tierstore_oci_requests_total{route,outcome}` (routes `ping`,
+`manifest`, `blob`, `other`; outcomes `ok`, `partial`, `not_found`, `invalid`, `not_allowed`,
+`range_not_satisfiable`, `failed`), `tierstore_oci_bytes_served_total` (bytes of blobs read for
+responses), `tierstore_oci_digest_mismatches_total` and `tierstore_oci_front_info{mode="https"|"http"}` (1; the mode the front runs in). They are not on the registry listener,
+which serves nothing else. Without `--oci-listen` the path says the front is not enabled.
 
 ## Starting it
 

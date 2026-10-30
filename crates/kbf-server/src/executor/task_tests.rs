@@ -6,24 +6,17 @@ use kbf_types::LeaseId;
 
 use super::{Delivery, Nonce, PackKey, Secret, TaskArgs, build_id};
 
-fn args<'a>(
-    action: &'a Digest,
-    grant: &'a Secret,
-    url: &'a Secret,
-    root: Option<&'a str>,
-    plain: bool,
-) -> TaskArgs<'a> {
+fn args<'a>(action: &'a Digest, grant: &'a Secret, url: &'a Secret, plain: bool) -> TaskArgs<'a> {
     TaskArgs {
-        tool: "/mnt/kbf-tools/kbf-task",
         action,
         lease: LeaseId::new(7, 3),
         grant_url: "https://grant.test:9400",
         grant_token: grant,
         pack_url: url,
         deadline: Duration::from_secs(90),
-        root_der: root,
         work_dir: None,
         allow_plain_http_put: plain,
+        allow_plain_http_grant: false,
     }
 }
 
@@ -76,8 +69,9 @@ fn a_secret_never_prints() {
     assert_eq!(secret.expose(), "https://store/pack?sig=hunter2");
 }
 
-/// Catches an argument vector that does not match the task tool's command line: the tool
-/// first, the action as `<hash>/<size>`, the interim secret flags, and the optional flags
+/// Catches an argument vector that does not match the task tool's command line: flags only,
+/// the first one `--action` (the kbf image's entrypoint is the tool, and the lease server puts
+/// these after it, so a path in front would be taken for a flag), the action as `<hash>/<size>`, the interim secret flags, and the optional flags
 /// only when asked for.
 #[test]
 fn the_argv_is_the_task_tools_command_line() {
@@ -86,11 +80,10 @@ fn the_argv_is_the_task_tools_command_line() {
         Secret::new("grant-token"),
         Secret::new("http://p/key"),
     );
-    let plain = args(&action, &grant, &url, None, false).argv(Delivery::InsecureArgv);
+    let plain = args(&action, &grant, &url, false).argv(Delivery::InsecureArgv);
     assert_eq!(
         plain,
         [
-            "/mnt/kbf-tools/kbf-task",
             "--action",
             &format!("{}/12", "ab".repeat(32)),
             "--lease",
@@ -106,28 +99,53 @@ fn the_argv_is_the_task_tools_command_line() {
             "grant-token",
         ]
     );
-    let full = args(
-        &action,
-        &grant,
-        &url,
-        Some("/mnt/kbf-tools/farm-ca.der"),
-        true,
-    )
-    .argv(Delivery::InsecureArgv);
-    assert_eq!(
-        &full[plain.len()..],
-        [
-            "--root-der",
-            "/mnt/kbf-tools/farm-ca.der",
-            "--allow-plain-http-put"
-        ]
+    let full = args(&action, &grant, &url, true).argv(Delivery::InsecureArgv);
+    assert_eq!(&full[plain.len()..], ["--allow-plain-http-put"]);
+    assert!(
+        !full
+            .iter()
+            .any(|a| a == "--root-der" || a.starts_with("/mnt/")),
+        "{full:?}"
     );
     let worked = TaskArgs {
         work_dir: Some("/work"),
-        ..args(&action, &grant, &url, None, false)
+        ..args(&action, &grant, &url, false)
     }
     .argv(Delivery::InsecureArgv);
     assert_eq!(&worked[plain.len()..], ["--work-dir", "/work"]);
+}
+
+/// Catches the plain-http grant flag leaking into runs that did not ask for it, or being passed
+/// twice or under another spelling: it is the task tool's own `--allow-plain-http-grant`, once,
+/// after the other optional flags, and only when the config allows it, whether or not the put
+/// is plain.
+#[test]
+fn the_plain_http_grant_flag_is_passed_once_and_only_when_allowed() {
+    let (action, grant, url) = (
+        digest(),
+        Secret::new("grant-token"),
+        Secret::new("https://p/key"),
+    );
+    let count = |argv: &[String]| {
+        argv.iter()
+            .filter(|a| a.contains("plain-http-grant"))
+            .count()
+    };
+    for put in [false, true] {
+        let off = args(&action, &grant, &url, put).argv(Delivery::InsecureArgv);
+        assert_eq!(count(&off), 0, "{off:?}");
+        let on = TaskArgs {
+            allow_plain_http_grant: true,
+            ..args(&action, &grant, &url, put)
+        }
+        .argv(Delivery::InsecureArgv);
+        assert_eq!(count(&on), 1, "{on:?}");
+        assert_eq!(
+            on.last().map(String::as_str),
+            Some("--allow-plain-http-grant")
+        );
+        assert_eq!(on.iter().any(|a| a == "--allow-plain-http-put"), put);
+    }
 }
 
 /// Catches a Debug of the task arguments that shows the pack url or the read token.
@@ -138,7 +156,7 @@ fn the_arguments_never_print_a_secret() {
         Secret::new("grant-token-xyz"),
         Secret::new("http://p/key?sig=zz"),
     );
-    let shown = format!("{:?}", args(&action, &grant, &url, None, false));
+    let shown = format!("{:?}", args(&action, &grant, &url, false));
     assert!(!shown.contains("grant-token-xyz"), "{shown}");
     assert!(!shown.contains("sig=zz"), "{shown}");
     assert!(shown.contains("<redacted>"));

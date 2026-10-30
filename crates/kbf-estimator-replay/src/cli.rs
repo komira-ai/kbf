@@ -1,4 +1,4 @@
-//! The command line: `export` today.
+//! The command line: `export`, `replay` and `slowdown`.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -15,6 +15,7 @@ use crate::export::{Export, Window, export};
 use crate::readonly::{Api, ReadOnly, Transport};
 use crate::replay::{Arm, Params, report, sim, trace};
 use crate::row::Row;
+use crate::slowdown;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -33,6 +34,29 @@ enum Command {
     Export(ExportArgs),
     /// Replays an export through the real scheduler, memory only, and prints the report.
     Replay(ReplayArgs),
+    /// For each successful run, how much slower it was than the same key on a quiet host;
+    /// prints a table, or JSON with every run.
+    Slowdown(SlowdownArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct SlowdownArgs {
+    /// A directory of `runs-*.jsonl` files (an export), or one such file.
+    #[arg(long)]
+    from: PathBuf,
+    /// A run is quiet if the node's CPU pressure at its start, in hundredths of a percent,
+    /// was at most this.
+    #[arg(long, default_value_t = slowdown::DEFAULT_QUIET_PRESSURE_CENTI)]
+    quiet_pressure_centi: u64,
+    /// ... and at most this many other exported attempts overlapped it on its node.
+    #[arg(long, default_value_t = slowdown::DEFAULT_MAX_OVERLAP)]
+    max_overlap: u64,
+    /// The percentile (nearest rank) of a key's quiet walls that is its baseline.
+    #[arg(long, default_value_t = slowdown::DEFAULT_BASELINE_PERCENTILE, value_parser = clap::value_parser!(u64).range(1..=100))]
+    baseline_percentile: u64,
+    /// Print one JSON document, with every run, instead of the table.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -121,7 +145,24 @@ where
             export_to(&api, &args, out).map_err(Failure::Run)
         }
         Command::Replay(args) => replay(&args, out).map_err(Failure::Run),
+        Command::Slowdown(args) => slowdown_to(&args, out).map_err(Failure::Run),
     }
+}
+
+fn slowdown_to(args: &SlowdownArgs, out: &mut impl Write) -> Result<(), String> {
+    let rows = trace::read_rows(&args.from).map_err(|e| format!("{}: {e}", args.from.display()))?;
+    let params = slowdown::Params {
+        quiet_pressure_centi: args.quiet_pressure_centi,
+        max_overlap: args.max_overlap,
+        baseline_percentile: args.baseline_percentile,
+    };
+    let report = slowdown::analyze(&rows, &params);
+    let text = if args.json {
+        slowdown::render_json(&report)
+    } else {
+        slowdown::render_text(&report)
+    };
+    out.write_all(text.as_bytes()).map_err(|e| e.to_string())
 }
 
 fn replay(args: &ReplayArgs, out: &mut impl Write) -> Result<(), String> {
