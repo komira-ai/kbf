@@ -65,6 +65,7 @@ pub struct Spy {
     overstated: Mutex<Vec<(String, u64)>>,
     hidden: Mutex<Vec<String>>,
     puts: AtomicU32,
+    stream_puts: AtomicU32,
     largest_piece: AtomicU64,
     ranges: Mutex<Vec<(String, u64, u64)>>,
 }
@@ -106,6 +107,7 @@ impl Spy {
             overstated: Mutex::new(Vec::new()),
             hidden: Mutex::new(Vec::new()),
             puts: AtomicU32::new(0),
+            stream_puts: AtomicU32::new(0),
             largest_piece: AtomicU64::new(0),
             ranges: Mutex::new(Vec::new()),
         }
@@ -158,6 +160,11 @@ impl Spy {
     pub fn hide_len_of(&self, key: &str) {
         let mut hidden = self.hidden.lock().unwrap_or_else(PoisonError::into_inner);
         hidden.push(key.to_owned());
+    }
+
+    /// How many streamed writes were tried (not the writes the pack index makes).
+    pub fn stream_puts(&self) -> u32 {
+        self.stream_puts.load(SeqCst)
     }
 
     /// How many writes were tried.
@@ -234,6 +241,7 @@ impl ObjectStore for Spy {
         mut body: BodyStream,
     ) -> Result<(), ObjectStoreError> {
         self.puts.fetch_add(1, SeqCst);
+        self.stream_puts.fetch_add(1, SeqCst);
         if fires(&self.reject_puts) {
             return Err(injected());
         }

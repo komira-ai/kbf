@@ -69,7 +69,7 @@ async fn a_key_held_at_the_right_length_is_not_uploaded_again() {
     assert_eq!(count(&farm, LargeWriteThrough::Exists), 1);
     assert_eq!(count(&farm, LargeWriteThrough::Ok), 0);
     assert_eq!(count(&farm, LargeWriteThrough::Failed), 0);
-    assert_eq!(farm.rig.store.puts(), 0, "no write was tried");
+    assert_eq!(farm.rig.store.stream_puts(), 0, "no write was tried");
     assert_eq!(farm.rig.store.largest_piece(), 0);
     let held = farm.rig.store.held(&key_of(digest)).await;
     assert_eq!(held.as_ref(), Some(bytes));
@@ -88,7 +88,7 @@ async fn a_create_only_refusal_of_the_key_is_exists_and_the_ingest_succeeds() {
     let got = farm.run().await;
 
     assert!(matches!(got, Ingested::Ran { cached: true, .. }), "{got:?}");
-    assert_eq!(farm.rig.store.puts(), 1, "the write was tried");
+    assert_eq!(farm.rig.store.stream_puts(), 1, "the write was tried");
     assert_eq!(count(&farm, LargeWriteThrough::Exists), 1);
     assert_eq!(count(&farm, LargeWriteThrough::Failed), 0);
     let held = farm.rig.store.held(&key_of(digest)).await;
@@ -110,7 +110,7 @@ async fn a_key_held_at_another_length_is_a_failure_and_the_ingest_succeeds() {
     let got = farm.run().await;
 
     assert!(matches!(got, Ingested::Ran { cached: true, .. }), "{got:?}");
-    assert_eq!(farm.rig.store.puts(), 0);
+    assert_eq!(farm.rig.store.stream_puts(), 0);
     assert_eq!(count(&farm, LargeWriteThrough::Failed), 1);
     assert_eq!(count(&farm, LargeWriteThrough::Exists), 0);
     let held = farm.rig.store.held(&key_of(digest)).await.expect("held");
@@ -168,8 +168,8 @@ async fn the_write_through_is_streamed_in_windows_from_the_one_read() {
 }
 
 /// Asserts that bytes that do not hash to the digest never land under `cas/l/<sha256>`: the ingest
-/// is refused, the put is abandoned before the object is whole (counted `aborted`, not `failed`), and the store
-/// holds nothing under `cas/l/`, though all but the last window had been sent.
+/// is refused, the put is abandoned before the object is whole (counted `aborted`, not `failed`),
+/// and the store holds nothing under `cas/l/`, though all but the last window had been sent.
 #[tokio::test]
 async fn bytes_that_do_not_hash_are_not_left_under_the_key() {
     let farm = Multi::new().await;
@@ -185,7 +185,8 @@ async fn bytes_that_do_not_hash_are_not_left_under_the_key() {
     let (_, digest) = large();
     assert!(farm.rig.store.held(&key_of(digest)).await.is_none());
     assert_eq!(count(&farm, LargeWriteThrough::Ok), 0);
-    assert_eq!(count(&farm, LargeWriteThrough::Failed), 1);
+    assert_eq!(count(&farm, LargeWriteThrough::Aborted), 1);
+    assert_eq!(count(&farm, LargeWriteThrough::Failed), 0);
     let listed = farm.rig.store.keys().await;
     assert!(
         listed.iter().all(|k| !k.starts_with("cas/l/")),
