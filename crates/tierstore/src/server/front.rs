@@ -11,6 +11,7 @@ use crate::Clock;
 use super::ServerConfig;
 use super::cli::{Cli, Error};
 use super::gc::{ensure_distinct as gc_distinct, gc_keys, ids as gc_ids};
+use super::grant::{ensure_distinct as grant_distinct, grant_keys, ids as grant_ids};
 use super::keys::{ensure_distinct, read_credentials, read_only_keys};
 use super::presign::{ensure_distinct as presign_distinct, presign_keys};
 use super::scoped::{ensure_distinct as scoped_distinct, ids as scoped_ids, scoped_keys};
@@ -39,6 +40,7 @@ pub(super) struct FrontSettings {
     pub presign_key_file: Vec<PathBuf>,
     pub gc_key_file: Vec<PathBuf>,
     pub scoped_key_file: Vec<PathBuf>,
+    pub grant_key_file: Vec<PathBuf>,
     pub presign_max_expires: Duration,
     pub max_request_bytes: u64,
     pub max_concurrent_puts: u32,
@@ -62,6 +64,7 @@ impl Cli {
             presign_key_file: self.presign_key_file.clone(),
             gc_key_file: self.gc_key_file.clone(),
             scoped_key_file: self.scoped_key_file.clone(),
+            grant_key_file: self.grant_key_file.clone(),
             presign_max_expires: self.presign_max_expires,
             max_request_bytes: self.max_request_bytes,
             max_concurrent_puts: self.max_concurrent_puts,
@@ -96,6 +99,7 @@ pub(super) fn server_config(
     let presign = presign_keys(&front.presign_key_file)?;
     let gc = gc_keys(&front.gc_key_file)?;
     let scoped = scoped_keys(&front.scoped_key_file)?;
+    let grant = grant_keys(&front.grant_key_file)?;
     let mut others: Vec<&str> = std::iter::once(key_id.as_str())
         .chain(read_only.iter().map(|key| key.id.as_str()))
         .collect();
@@ -103,12 +107,15 @@ pub(super) fn server_config(
     others.extend(gc_ids(&gc));
     scoped_distinct(&others, &scoped).map_err(InvalidFlags)?;
     others.extend(scoped_ids(&scoped));
+    grant_distinct(&others, &grant).map_err(InvalidFlags)?;
+    others.extend(grant_ids(&grant));
     presign_distinct(&others, &presign).map_err(InvalidFlags)?;
     let mut server = ServerConfig::new(&front.bucket, &key_id, &secret, clock);
     server.read_only_keys = read_only;
     server.presign_keys = presign;
     server.gc_keys = gc;
     server.scoped_keys = scoped;
+    server.grant_keys = grant;
     server.presign_max_expires = front.presign_max_expires;
     server.region = front.region.clone();
     server.max_request_bytes = usize::try_from(front.max_request_bytes).unwrap_or(usize::MAX);

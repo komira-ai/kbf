@@ -32,6 +32,7 @@ use crate::journal::is_reserved;
 use super::ServerConfig;
 use super::auth::{READ_ONLY, Refusal};
 use super::gc::{NOT_ALLOWED, OUT_OF_SCOPE};
+use super::grant::NOT_ALLOWED as GRANT_NOT_ALLOWED;
 use super::presign::PUT_ONLY;
 use super::scoped::{NOT_ALLOWED as SCOPED_NOT_ALLOWED, Scopes};
 
@@ -96,6 +97,8 @@ pub(crate) enum Role {
     Gc(String),
     /// A scoped key: read, create and delete under the prefixes of its lists (see `scoped`).
     Scoped(Arc<Scopes>),
+    /// A read grant: `GET` and `HEAD` of the objects it lists, in ascending order (see `grant`).
+    Grant(Arc<Vec<String>>),
 }
 
 impl Role {
@@ -115,6 +118,7 @@ impl Role {
                 Err(NOT_ALLOWED)
             }
             Self::Scoped(_) if !SCOPED_METHODS.contains(method) => Err(SCOPED_NOT_ALLOWED),
+            Self::Grant(_) if !reads => Err(GRANT_NOT_ALLOWED),
             _ => Ok(()),
         }
     }
@@ -139,6 +143,7 @@ impl Role {
             Self::Gc(own) if prefix.starts_with(own.as_str()) && !is_reserved(prefix) => Ok(()),
             Self::Gc(_) => Err(OUT_OF_SCOPE),
             Self::Scoped(scopes) => scopes.may_list(prefix),
+            Self::Grant(_) => Err(GRANT_NOT_ALLOWED),
         }
     }
 }

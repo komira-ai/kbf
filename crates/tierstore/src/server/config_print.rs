@@ -102,6 +102,7 @@ pub(super) fn render(cli: &Cli) -> Result<String, ConfigError> {
         presign_key_files: cli.presign_key_file.clone(),
         gc_key_files: cli.gc_key_file.clone(),
         scoped_key_files: cli.scoped_key_file.clone(),
+        grant_key_files: cli.grant_key_file.clone(),
         presign_max_expires: Some(Dur(cli.presign_max_expires)),
         max_request_bytes: Some(cli.max_request_bytes),
         max_concurrent_puts: Some(cli.max_concurrent_puts),

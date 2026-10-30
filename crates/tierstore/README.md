@@ -34,6 +34,11 @@ counters.
 | presigning | `--presign-key-file` | sign presigned PUT URLs for one object each under a prefix |
 | GC | `--gc-key-file` | list, head, delete and abort uploads under one prefix |
 | scoped | `--scoped-key-file` | read, create and delete under the prefixes of three lists |
+| grant | `--grant-key-file` | signs no request; its signature on a read grant (`x-tierstore-grant`) lets the bearer GET and HEAD the objects the grant lists, and nothing else |
+
+A read grant is a token the process that starts a job makes with `server::mint_grant`; the byte
+format is in "Read grants" in `packaging/tierstore/README.md`. It works on the storage front and on
+the front of a build node alike.
 
 ### Scoped keys
 

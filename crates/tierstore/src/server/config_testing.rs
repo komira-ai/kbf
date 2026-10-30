@@ -28,6 +28,7 @@ read_only_key_files   = ["/etc/tierstore/daemons.key", "/etc/tierstore/other.key
 presign_key_files     = ["/etc/tierstore/pack-presign.key"]
 gc_key_files          = ["/etc/tierstore/pack-gc.key"]
 scoped_key_files      = ["/etc/tierstore/scoped.key"]
+grant_key_files       = ["/etc/tierstore/grant.key"]
 presign_max_expires   = "10m"
 max_concurrent_puts   = 8
 put_min_bytes_per_sec = 2048
@@ -77,6 +78,7 @@ pub(crate) fn golden_flags() -> Vec<&'static str> {
         "--presign-key-file=/etc/tierstore/pack-presign.key",
         "--gc-key-file=/etc/tierstore/pack-gc.key",
         "--scoped-key-file=/etc/tierstore/scoped.key",
+        "--grant-key-file=/etc/tierstore/grant.key",
         "--presign-max-expires=10m",
         "--max-concurrent-puts=8",
         "--put-min-bytes-per-sec=2048",
