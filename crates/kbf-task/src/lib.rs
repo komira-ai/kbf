@@ -44,6 +44,20 @@
 //! storing failed. Nothing the tool writes is trusted: the frontend hashes every record of the pack,
 //! checks its footer, and builds the action's result from its own hashing.
 //!
+//! # The v2 key set (in progress)
+//!
+//! A v2 run is issued a fixed key set: several pack URLs and several large-object URLs
+//! (`--put-urls-file`, or `--put-urls` with `--insecure-argv-secrets`; [`put_urls`]). Three
+//! pieces for it exist, and only the first is used:
+//!
+//! - the key set flags, parsed and validated at startup. **Used, in part:** only the first pack
+//!   slot, exactly as v1 uses its one pack URL; the rest of the set is checked and ignored;
+//! - [`put::put_file`], a create-only PUT streamed from a file, for a blob over the record cap.
+//!   **Not used yet:** nothing calls it;
+//! - [`plan::plan`], the pure placement of output blobs into packs and large objects. **Not used
+//!   yet:** nothing calls it, and the manifest has no field to name the packs or large objects,
+//!   so a run still writes the one v1 pack.
+//!
 //! # What a failure means
 //!
 //! - A 412 means the pack key already holds an object, and it is final: the frontend mints a new
@@ -77,6 +91,8 @@ pub mod fetch;
 pub mod network;
 pub mod outputs;
 pub mod pack;
+pub mod plan;
 pub mod put;
+pub mod put_urls;
 pub mod run;
 pub mod task;

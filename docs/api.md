@@ -1714,13 +1714,24 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_executor_stray_leases_released_total` | counter | leases released because none of the executor's slots held them (a lost acquire answer, an undelivered release, a lease beyond the pool's size at a restart) |
 
 **What ingest of a run holds and refuses.** A digest is in one place: a record of one pack or one
-large object. A digest that is a record twice, in two packs or twice in one, is `malformed` (a
-repeat inside one pack was accepted until the multi-pack ingest; a task builds each pack from
-distinct blobs, so an honest pack has none). Large objects are streamed into the CAS before the
+large object. A digest that is a record twice, in two packs or twice in one, is `malformed` (a task builds each pack from distinct blobs, so an honest pack has none; the check now runs across packs and before anything is stored). Large objects are streamed into the CAS before the
 packs are recorded and the result is cached, so a run that fails after that point leaves them
 there: valid blobs, each under the digest its own bytes hash to, that no result names. A hostile
 task can leave up to 8 large objects of the large cap (512 MiB) each, 4 GiB, of such bytes per run,
 until a janitor removes them (komira-ai/kbf#1980).
+
+**Legacy reads, on a storage node's `--metrics-listen`.** `kbf_storage_legacy_read_total{kind,source}`
+(counter) counts the reads a storage node (`kbf storage`, `kbf storage-and-daemon`) serves from its
+own copy of the data. Its five rows are always printed, 0 included: `kind="cas",source="bytestream"`
+(a ByteStream `Read` that found its blob, one per call), `kind="cas",source="segments"` (a `Segments`
+`ReadRange` that returned bytes, one per call), `kind="ac",source="action_store"` (an `ActionStore`
+`Get` that found an entry), and `kind="cas",source="in_process"` and `kind="ac",source="in_process"`
+(the same blob and entry reads made by the daemon half of a `storage-and-daemon` process, which reaches
+its own node without a connection). A read that finds nothing, a read of the empty blob,
+`FindMissingBlobs`, `QueryWriteStatus`, `Segments` `Locate`, every write, and the node's own reads for
+flushing and repair are not counted; a read a frontend or a daemon serves from a pack never reaches a
+node. The sum over all rows staying at 0 is how an operator sees that nothing reads the storage nodes
+any more.
 
 **Job-facing read.** On a frontend given `--job-listen` ([kbf-modes.md](deploy/kbf-modes.md)) the
 listener a task fetches its action's inputs from counts requests and bytes; without the flag these

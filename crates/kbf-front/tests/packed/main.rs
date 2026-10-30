@@ -16,6 +16,7 @@ mod bytestream;
 mod cas;
 mod closure;
 mod commit;
+mod legacy_reads;
 mod multi;
 mod store;
 mod support;
