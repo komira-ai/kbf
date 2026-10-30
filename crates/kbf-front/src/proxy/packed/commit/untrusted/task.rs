@@ -226,6 +226,10 @@ pub async fn ingest(
 /// lease `lease`; the module docs give the steps. `keys` and `lease` come from the frontend's own
 /// lease row, never from the task. `mint` is the frontend's, and `limits` bound the run.
 ///
+/// Every key of `keys` is held in [`Packs::verifying_keys`] from the start of the call until it
+/// returns or is dropped, so the janitor of `cas/b/` never deletes a pack or a large object this
+/// ingest is reading or copying, however old its key says it is.
+///
 /// Every ending is counted: an ingest (`kbf_pack_ingests_total`, with the packs of the run in
 /// `kbf_pack_ingest_packs_total` and the bytes of its large objects in
 /// `kbf_pack_ingest_large_bytes_total`), a refusal by reason (`kbf_pack_ingest_rejects_total`) or a
@@ -239,6 +243,15 @@ pub async fn ingest_set(
     action: &Digest,
     limits: &UntrustedLimits,
 ) -> Ingested {
+    // Every key of the set is held from here to the end of the call, or its being dropped, so the
+    // janitor of `cas/b/` never deletes what this ingest is reading or copying.
+    let _verifying = packs.verifying.hold(
+        keys.packs()
+            .iter()
+            .chain(keys.large())
+            .map(|key| key.key().to_owned())
+            .collect(),
+    );
     let done = Ingest {
         packs,
         backend,

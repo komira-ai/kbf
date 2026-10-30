@@ -59,6 +59,7 @@ mod hit;
 mod metrics;
 mod room;
 mod store;
+mod verifying;
 
 pub(in crate::proxy) use self::bytestream::{applies, read as read_stream, write as write_stream};
 pub(in crate::proxy) use self::cas::{Served, find_missing, read_blob, read_many, store_batch};
@@ -75,3 +76,4 @@ pub use self::store::{
     DEFAULT_UPLOAD_IDLE_TIMEOUT, MAX_PACKED_BLOB_BYTES, MAX_UPLOAD_IDLE_TIMEOUT, PackSettings,
     PackStore, Packs,
 };
+pub use self::verifying::{Held, VerifyingKeys};

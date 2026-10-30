@@ -12,7 +12,9 @@ use std::time::{Duration, SystemTime};
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt as _;
 use kbf_auth::Authorizers;
-use kbf_front::{Cache, CacheStorage, Owner, Owners, PackSettings, Packs, Proxy, SegmentsConfig};
+use kbf_front::{
+    Cache, CacheStorage, Owner, Owners, PackSettings, Packs, Proxy, SegmentsConfig, VerifyingKeys,
+};
 use kbf_objstore::{
     BodyStream, ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey,
     ObjectStore, ObjectStoreError, PageSize,
@@ -80,6 +82,8 @@ pub struct Spy {
     stream_puts: AtomicU32,
     largest_piece: AtomicU64,
     ranges: Mutex<Vec<(String, u64, u64)>>,
+    watching: Mutex<Option<(Arc<VerifyingKeys>, Vec<String>)>>,
+    held_when_asked: Mutex<Vec<bool>>,
 }
 
 impl Spy {
@@ -125,7 +129,23 @@ impl Spy {
             stream_puts: AtomicU32::new(0),
             largest_piece: AtomicU64::new(0),
             ranges: Mutex::new(Vec::new()),
+            watching: Mutex::new(None),
+            held_when_asked: Mutex::new(Vec::new()),
         }
+    }
+
+    /// From now on, each length asked of the store notes whether every one of `keys` is held by
+    /// `registry` at that moment.
+    pub fn watch_verifying(&self, registry: Arc<VerifyingKeys>, keys: Vec<String>) {
+        *self.watching.lock().unwrap_or_else(PoisonError::into_inner) = Some((registry, keys));
+    }
+
+    /// What each length asked since `watch_verifying` found: whether all the keys were held.
+    pub fn held_when_asked(&self) -> Vec<bool> {
+        self.held_when_asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The next `n` writes fail before they store anything.
@@ -323,6 +343,18 @@ impl ObjectStore for Spy {
     }
 
     async fn len(&self, key: &ObjectKey) -> Result<Option<u64>, ObjectStoreError> {
+        let watching = self
+            .watching
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some((registry, keys)) = watching {
+            let all = keys.iter().all(|key| registry.is_held(key));
+            self.held_when_asked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(all);
+        }
         if fires(&self.reject_lens) {
             return Err(injected());
         }

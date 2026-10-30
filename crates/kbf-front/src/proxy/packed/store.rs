@@ -21,6 +21,7 @@ use tonic::Status;
 
 use super::metrics::PackMetrics;
 use super::room::{Budget, DEFAULT_INFLIGHT_BYTES, Room};
+use super::verifying::VerifyingKeys;
 
 /// The largest blob a frontend puts in a pack or serves from one by default: 64 MiB, the
 /// most it holds in memory to hash a blob before the first byte of it is sent.
@@ -163,6 +164,7 @@ pub struct Packs {
     upload_idle_timeout: Duration,
     budget: Budget,
     pub(super) metrics: Arc<PackMetrics>,
+    pub(super) verifying: Arc<VerifyingKeys>,
 }
 
 impl fmt::Debug for Packs {
@@ -210,7 +212,15 @@ impl Packs {
             upload_idle_timeout: settings.upload_idle_timeout.min(MAX_UPLOAD_IDLE_TIMEOUT),
             budget: Budget::new(settings.inflight_bytes, Arc::clone(&metrics)),
             metrics,
+            verifying: Arc::default(),
         })
+    }
+
+    /// The task pack keys an ingest through these packs is verifying now: the janitor of
+    /// `cas/b/` never deletes one. Shared by every clone.
+    #[must_use]
+    pub fn verifying_keys(&self) -> Arc<VerifyingKeys> {
+        Arc::clone(&self.verifying)
     }
 
     /// The largest blob, in bytes, that is packed or served from a pack. A larger one is
