@@ -44,6 +44,7 @@ fn request(qos: Qos, kind: LeaseKind) -> Request {
         needs: kbf_caps::Request::parse([("arch", "arm64")]).expect("request"),
         hermetic: true,
         do_not_cache: true,
+        whole_worker: false,
     }
 }
 

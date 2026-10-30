@@ -165,6 +165,12 @@ pub struct Cli {
     /// it, only `https` URLs are used. Blobs are read over `https` either way.
     #[arg(long)]
     pub allow_plain_http_put: bool,
+    /// Read the grant over `http` as well as `https`: for a farm on its own network, where the
+    /// bearer token crosses that network in the clear. The token is scoped to one action's inputs
+    /// and expires. Without it, an `http` grant URL is refused at startup (exit 14), before any
+    /// request. Applies to `--fetch-batch` too.
+    #[arg(long)]
+    pub allow_plain_http_grant: bool,
     /// The lease id the frontend gave; it is copied into the manifest. It must be a build id, 1 to
     /// 128 bytes of `0-9A-Za-z_-`, the only lease the frontend accepts in a manifest; any other is
     /// refused at startup (exit 14), before anything is fetched.
@@ -616,6 +622,23 @@ fn check_lease(cli: &Cli) -> Result<(), Failure> {
     check_build(&cli.lease).map_err(|e| Failure::Setup(format!("--lease: {e}")))
 }
 
+/// Refuses an `http` grant URL unless `--allow-plain-http-grant` was given, before anything is
+/// requested. The message names the flag, not the URL, whose query may be a credential.
+fn check_grant_scheme(cli: &Cli) -> Result<(), Failure> {
+    let plain = cli
+        .grant_url
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"));
+    if plain && !cli.allow_plain_http_grant {
+        return Err(Failure::Setup(
+            "--grant-url is an http URL, which would send the bearer token in the clear; \
+             pass --allow-plain-http-grant to read the grant without TLS"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// A credential from the file or the flag value the command line named, a trailing newline
 /// dropped, and the file (when it was one) left in place. `what` names the credential. The
 /// file's protection is the executor's per-run directory, not its mode (the executor delivers it
@@ -659,6 +682,7 @@ fn put_urls(cli: &Cli) -> Result<PutUrls, Failure> {
 fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
     check_lease(cli)?;
     check_argv_secrets(cli)?;
+    check_grant_scheme(cli)?;
     let token = credential(
         "grant token",
         cli.grant_token_file.as_deref(),
@@ -671,7 +695,9 @@ fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
         );
     }
     let urls = put_urls(cli)?;
-    let source = HttpBlobSource::new(&cli.grant_url, &token, &roots)?.with_batch(cli.fetch_batch);
+    let source =
+        HttpBlobSource::new_with(&cli.grant_url, &token, &roots, cli.allow_plain_http_grant)?
+            .with_batch(cli.fetch_batch);
     let sink = HttpSink {
         agent: if cli.allow_plain_http_put {
             agent_with_plain_http(tls_config(&roots))
@@ -752,6 +778,10 @@ fn start(runtime: std::io::Result<tokio::runtime::Runtime>, cli: &Cli) -> ExitCo
 #[cfg(test)]
 #[path = "task_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "plain_grant_tests.rs"]
+mod plain_grant_tests;
 
 #[cfg(test)]
 #[path = "put_urls_flag_tests.rs"]

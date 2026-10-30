@@ -129,10 +129,11 @@ fn on_is_refused_without_placement_load_on_and_shadow_is_not() {
     assert!(listeners(&shadow).is_ok());
 }
 
-/// Catches `shadow` or `on` accepted for the js core, whose arm does not read the flag: the
-/// flag would do nothing there and say it did.
+/// Catches the js core refused or the flag's other rules dropped under it: `shadow` and `on`
+/// are accepted with `--scheduler-core js` (its adapter reads the flag), and still refused
+/// there without the estimator (`on` also without the load).
 #[test]
-fn shadow_and_on_are_refused_on_the_js_core() {
+fn shadow_and_on_are_accepted_on_the_js_core_under_the_same_rules() {
     for mode in ["shadow", "on"] {
         let flag = format!("--placement-predictions={mode}");
         let args = [
@@ -141,13 +142,25 @@ fn shadow_and_on_are_refused_on_the_js_core() {
             "--scheduler-core=js",
             flag.as_str(),
         ];
-        let error = refused(&args);
+        assert!(listeners(&args).is_ok(), "{mode}");
+        let blind = ["--scheduler-core=js", "--placement-load=on", flag.as_str()];
         assert!(
-            matches!(&error, ConfigError::PredictionsNeedLegacyCore(m) if *m == mode),
-            "{mode}: {error:?}"
+            matches!(
+                refused(&blind),
+                ConfigError::PredictionsNeedLearnedSizes(m) if m == mode
+            ),
+            "{mode}"
         );
-        assert!(error.to_string().contains("--scheduler-core legacy"));
     }
+    let dark = [
+        "--learned-sizes=shadow",
+        "--scheduler-core=js",
+        "--placement-predictions=on",
+    ];
+    assert!(matches!(
+        refused(&dark),
+        ConfigError::PredictionsNeedPlacementLoad
+    ));
     let off = ["--scheduler-core=js", "--placement-predictions=off"];
     assert!(listeners(&off).is_ok(), "off asks nothing of the core");
 }

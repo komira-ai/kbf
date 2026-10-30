@@ -7,7 +7,7 @@ use tokio::time::Instant;
 use super::HostWorker;
 use crate::executor::View;
 use crate::executor::runs::Stage;
-use crate::executor::test_support::{Harness, start};
+use crate::executor::test_support::{GIB, Harness, start};
 
 fn message(message: server_message::Message) -> Result<ServerMessage, tonic::Status> {
     Ok(ServerMessage {
@@ -207,4 +207,84 @@ async fn the_sends_remembered_cover_the_start_window_at_any_heartbeat_interval()
         "a send from outside the window was kept"
     );
     assert!(worker.sent_at(worker.seq).is_some());
+}
+
+/// A load as the lease server lists it, of `seq`.
+fn listed(seq: u64) -> kbf_lease_client::HostLoad {
+    kbf_lease_client::HostLoad {
+        seq,
+        mono_usec: seq * 1_000_000,
+        cpu_usage_usec: seq * 500_000,
+        memory_working_set_bytes: 2 * GIB,
+        memory_active_file_bytes: 0,
+        actions_cpu_limited: false,
+        covered: Vec::new(),
+        lease_clocks: Vec::new(),
+        minutes: Vec::new(),
+    }
+}
+
+/// The lease server's host list as one pass reads it.
+async fn polled(harness: &Harness) -> View {
+    View {
+        leases: None,
+        hosts: harness.deps.client.hosts().await.expect("hosts"),
+    }
+}
+
+/// The working set the farm shows for the worker, if it holds a reading of it.
+fn farm_working_set(harness: &Harness, worker: &HostWorker) -> Option<u64> {
+    harness
+        .farm
+        .node_loads()
+        .into_iter()
+        .find(|(id, _)| *id == worker.id)
+        .map(|(_, load)| load.memory_working_set_bytes)
+}
+
+/// Catches a host's listed load that never reaches the farm (the worker heartbeats with
+/// none, as it did before the feed), and one that reaches it as another figure: the farm
+/// holds the reading the lease server listed for the worker's own host.
+#[tokio::test(start_paused = true)]
+async fn the_load_the_host_reports_reaches_the_farm_with_the_heartbeat() {
+    let harness = Harness::new().await;
+    let (mut worker, _messages) = harness.worker().await;
+    assert_eq!(farm_working_set(&harness, &worker), None);
+    assert!(harness.fake.set_host_load("node1", Some(listed(5))));
+    let view = polled(&harness).await;
+    worker.step(&harness.ctx(), &view, Instant::now()).await;
+    assert_eq!(farm_working_set(&harness, &worker), Some(2 * GIB));
+}
+
+/// Catches a zero invented for a host that reports nothing: a host listed with no load, and
+/// a pass whose host list was not read, leave the farm with no reading at all.
+#[tokio::test(start_paused = true)]
+async fn a_host_with_no_load_gives_the_farm_none() {
+    let harness = Harness::new().await;
+    let (mut worker, _messages) = harness.worker().await;
+    let ctx = harness.ctx();
+    let view = polled(&harness).await;
+    worker.step(&ctx, &view, Instant::now()).await;
+    assert_eq!(farm_working_set(&harness, &worker), None);
+    tokio::time::advance(harness.cfg.heartbeat).await;
+    worker.step(&ctx, &View::default(), Instant::now()).await;
+    assert_eq!(farm_working_set(&harness, &worker), None);
+}
+
+/// Catches a reading that outlives the agent's silence: one seen long ago (more than three
+/// windows and a poll) is not handed with a later heartbeat. The limit itself is pinned in
+/// `load_tests.rs`.
+#[tokio::test(start_paused = true)]
+async fn a_stale_reading_gives_the_farm_none() {
+    let mut harness = Harness::new().await;
+    harness.cfg.host_check = Duration::from_secs(1);
+    let ctx = harness.ctx();
+    assert!(harness.fake.set_host_load("node1", Some(listed(5))));
+    let view = polled(&harness).await;
+
+    let (mut late, _messages) = harness.worker().await;
+    assert!(late.watch(&ctx, &view, Instant::now()).is_continue());
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert!(late.beat(&ctx).await.is_continue());
+    assert_eq!(farm_working_set(&harness, &late), None);
 }

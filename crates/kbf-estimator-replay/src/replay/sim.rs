@@ -349,6 +349,7 @@ impl Sim<'_> {
             resources: Resources::new(op.cpu_millis, memory),
             needs: self.needs.clone(),
             hermetic: true,
+            whole_worker: false,
             do_not_cache: false,
         };
         let effects = self.feed(Event::Submit {

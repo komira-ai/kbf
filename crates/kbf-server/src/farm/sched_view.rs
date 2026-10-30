@@ -72,6 +72,13 @@ impl Farm {
         self.lock().engine.sched.load_counters()
     }
 
+    /// What the js core counted for the ablation's rows, with the scheduler's load counters
+    /// they are read beside; `None` on the farm's own driver.
+    pub(crate) fn ablation(&self) -> Option<(crate::farm_js::ablation::Ablation, LoadCounters)> {
+        js_arm!(self, views::ablation());
+        None
+    }
+
     /// The whole-node view of the queue now; `None` unless the farm runs with whole-node
     /// settings.
     pub fn whole_view(&self) -> Option<WholeView> {
