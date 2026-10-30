@@ -66,6 +66,17 @@ pub enum PutError {
         /// The URL, redacted.
         url: String,
     },
+    /// The store answered 412 to a retry that followed an attempt of the same PUT whose
+    /// connection broke ([`PutError::Interrupted`]): the object may be the one that attempt
+    /// stored, or another writer's; the task cannot tell which. It is a failure like
+    /// [`PutError::Exists`] (same exit code); the message is distinct so that it can be counted.
+    #[error(
+        "412 after an interrupted attempt of this put; the earlier attempt may have stored it: the object already exists at {url}"
+    )]
+    ExistsAfterInterrupt {
+        /// The URL, redacted.
+        url: String,
+    },
     /// The store answered 503: it had no room, and nothing was stored.
     #[error("the store answered 503 to the PUT of {url}{}", retry_text(.retry_after_secs))]
     Unavailable {
@@ -406,9 +417,10 @@ fn jittered(wait: Duration, unit: f64) -> Duration {
 ///
 /// A retry is safe because every attempt is the create-only PUT (`If-None-Match: *`) of the same
 /// key: a 503 stored nothing, and if an earlier attempt had in fact stored the object (an
-/// interrupted connection may follow a store that did), the retry meets a 412, which is reported
-/// as [`PutError::Exists`] like any 412 and is not taken for success: the task fails (exit 13)
-/// instead of overwriting, as it would have for the interrupted connection itself.
+/// interrupted connection may follow a store that did), the retry meets a 412. It is not taken
+/// for success: the task fails (exit 13) instead of overwriting. A 412 on the first attempt, or
+/// after only 503s, is [`PutError::Exists`]; a 412 after an attempt that was interrupted is
+/// [`PutError::ExistsAfterInterrupt`], the same failure with a message that says so.
 ///
 /// The URL's expiry is not checked. The waits of this function add up to at most
 /// [`MAX_TOTAL_WAIT`] (60 s), but the time from the first attempt to the last is longer: each
@@ -430,8 +442,15 @@ pub fn put_retrying(
 ) -> Result<(), PutError> {
     let mut retries = 0;
     let mut waited = Duration::ZERO;
+    let mut interrupted = false;
     loop {
-        let outcome = attempt();
+        let outcome = match attempt() {
+            Err(PutError::Exists { url }) if interrupted => {
+                Err(PutError::ExistsAfterInterrupt { url })
+            }
+            other => other,
+        };
+        interrupted |= matches!(outcome, Err(PutError::Interrupted { .. }));
         let retry_after = match &outcome {
             Err(PutError::Unavailable {
                 retry_after_secs, ..
@@ -918,18 +937,43 @@ mod tests {
     }
 
     /// Catches a 412 that follows an interrupted connection being taken for success or hidden:
-    /// the retry that meets the object an earlier attempt stored is the failure, `Exists`.
+    /// the retry that meets the object an earlier attempt stored is the failure, and it is
+    /// `ExistsAfterInterrupt`, with a message that says so, also when 503s lie between; a 412 on
+    /// the first attempt, or after only 503s, is the plain `Exists` with its old message.
     #[test]
-    fn a_412_after_an_interrupted_connection_is_the_failure() {
-        let sleeper = Recorded::default();
-        let exists = PutError::Exists { url: "u".into() };
-        let broken = PutError::Interrupted {
+    fn a_412_after_an_interrupted_connection_is_the_failure_with_its_own_reason() {
+        let exists = || PutError::Exists { url: "u".into() };
+        let broken = || PutError::Interrupted {
             url: "u".into(),
             reason: "reset".into(),
         };
-        let (attempt, calls) = answering(vec![Err(broken), Err(exists.clone())]);
-        assert_eq!(put_retrying(attempt, &sleeper, &MIDDLE), Err(exists));
-        assert_eq!(calls.get(), 2);
+        let after = PutError::ExistsAfterInterrupt { url: "u".into() };
+        for (answers, calls_made) in [
+            (vec![Err(broken()), Err(exists())], 2),
+            (vec![Err(broken()), busy(Some(1)), Err(exists())], 3),
+        ] {
+            let sleeper = Recorded::default();
+            let (attempt, calls) = answering(answers);
+            assert_eq!(put_retrying(attempt, &sleeper, &MIDDLE), Err(after.clone()));
+            assert_eq!(calls.get(), calls_made);
+        }
+        let text = after.to_string();
+        assert!(
+            text.contains("412 after an interrupted attempt of this put"),
+            "{text}"
+        );
+        assert!(
+            text.contains("the earlier attempt may have stored it"),
+            "{text}"
+        );
+        assert_ne!(text, exists().to_string());
+
+        for answers in [vec![Err(exists())], vec![busy(Some(1)), Err(exists())]] {
+            let sleeper = Recorded::default();
+            let (attempt, _) = answering(answers);
+            assert_eq!(put_retrying(attempt, &sleeper, &MIDDLE), Err(exists()));
+        }
+        assert_eq!(exists().to_string(), "the object already exists at u");
     }
 
     /// Catches the wrong errors being retried: a reset, an abort and a broken pipe are

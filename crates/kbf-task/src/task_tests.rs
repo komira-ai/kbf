@@ -1000,6 +1000,24 @@ fn the_http_sink_does_not_retry_a_412() {
     assert!(matches!(err, PutError::Exists { .. }), "{err:?}");
 }
 
+/// Catches the two 412s sharing a line or an exit code: both are a put failure with exit 13, and
+/// the line a 412 after an interrupted attempt writes names it (greppable), while a plain 412
+/// writes the old line.
+#[test]
+fn a_412_after_an_interrupted_attempt_has_its_own_line_and_the_same_exit_code() {
+    let plain = Failure::from(PutError::Exists { url: "u".into() });
+    let after = Failure::from(PutError::ExistsAfterInterrupt { url: "u".into() });
+    assert_eq!(plain.exit_code(), EXIT_PUT);
+    assert_eq!(after.exit_code(), EXIT_PUT);
+    assert_eq!(plain.to_string(), "put: the object already exists at u");
+    assert!(
+        after
+            .to_string()
+            .starts_with("put: 412 after an interrupted attempt of this put; "),
+        "{after}"
+    );
+}
+
 #[path = "multipack_tests.rs"]
 mod multipack;
 

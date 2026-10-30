@@ -43,8 +43,11 @@
 //!    times the store's `Retry-After` (whole seconds, taken as at most 30; 2 s when it names
 //!    none), chosen at random for each wait. A connection that broke after it was made (a store
 //!    that answers 503 and closes while the body is still being sent) is retried the same way.
-//!    Every other answer, 412 included, is final; 429, 500, 502 and 504 are deliberately not
-//!    retried. The retries do not look at the URL's expiry: the task's own waits add up to at
+//!    Every other answer, 412 included, is final (exit 13; a 412 that follows an interrupted
+//!    attempt of the same PUT writes the line `put: 412 after an interrupted attempt of this
+//!    put; the earlier attempt may have stored it: ...`, so that it can be counted, and a
+//!    first-attempt 412 the line `put: the object already exists at ...`); 429, 500, 502 and 504
+//!    are deliberately not retried. The retries do not look at the URL's expiry: the task's own waits add up to at
 //!    most 60 s, after which the 503 is the failure, but each refused attempt can also wait at
 //!    the store for a put permit before it is answered (15 s by default), so the last attempt
 //!    begins at most about 165 s after the first by default; the URL is good for the run's wall
