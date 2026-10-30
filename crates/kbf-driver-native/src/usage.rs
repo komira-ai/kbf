@@ -25,8 +25,10 @@
 //!   missing. One last read runs before the watch ends the processes, which closes that
 //!   for any process still alive when the leader exits.
 //!   A process that outlived its parent by less than a poll interval, and exited within
-//!   it, was last read under that parent and is taken to have been reaped by it: its
-//!   CPU is missing when it was not ([`Meter::usage`] says why it is not added).
+//!   it, was last read under that parent and is taken to have been reaped by it: when
+//!   it was not, all of its own CPU is missing, not only what it used after the last
+//!   poll. Only the window is bounded (both exit within one poll interval), not the
+//!   amount ([`Meter::usage`] says why it is not added).
 //! - A pid the kernel reuses for a new process whose counters are not below the old
 //!   one's within a lease is taken for the same process.
 //!
@@ -235,8 +237,9 @@ impl Meter {
     ///   parent no poll saw. A process that left before that poll under a parent some
     ///   poll saw is taken to be inside the parent's reaped children (and so in `reaped`),
     ///   not added again. That reading of the parent can be stale: if the parent exited
-    ///   and the child outlived it within one poll interval, the child's CPU is in no total
-    ///   and nothing a poll saw tells it from a child reaped by its parent first (the
+    ///   and the child outlived it within one poll interval, all of the child's own CPU
+    ///   is in no total (its last reading is skipped whole), and nothing a poll saw tells
+    ///   it from a child reaped by its parent first (the
     ///   other way round would add every short-lived child on top of `reaped`).
     /// - `after`: the processes last read after the reap: alive when the leader was gone,
     ///   so in no reaped total.
