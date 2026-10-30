@@ -338,12 +338,6 @@ impl HostWorker {
         require(timeout <= ctx.cfg.max_run, || {
             format!("the action's timeout {timeout:?} is over the executor's limit")
         })?;
-        // The lease server appends the arguments to the image's entrypoint: with one, the
-        // secrets would go to that program and the task tool would not run.
-        require(!facts.has_entrypoint, || {
-            "the action's image sets an entrypoint, which the task tool cannot be run under"
-                .to_owned()
-        })?;
         let image = pinned(&facts.image)?;
         let wall = ctx.cfg.wall(timeout);
         let nonce = Nonce::random();
@@ -375,16 +369,13 @@ impl HostWorker {
                 "the read grant is not served over https".to_owned(),
             ));
         }
-        let (tool, root) = (ctx.cfg.tool_path(), ctx.cfg.root_mount());
         let args = TaskArgs {
-            tool: &tool,
             action,
             lease,
             grant_url: &grant.url,
             grant_token: &grant.token,
             pack_url: &pack,
             deadline: timeout,
-            root_der: root.as_ref().map(|(_, path)| path.as_str()),
             work_dir: ctx.cfg.work_dir.as_deref(),
             allow_plain_http_put: ctx.cfg.allow_plain_http_put,
         };
@@ -396,9 +387,6 @@ impl HostWorker {
         };
         let mut spec = RunSpec::new(image, limits);
         spec.args = args.argv(ctx.cfg.delivery);
-        spec.mounts = std::iter::once(ctx.cfg.tool_mount.clone())
-            .chain(root.map(|(mount, _)| mount))
-            .collect();
         // The labels are listed back with every run and are not secret-safe: the nonce only.
         spec.labels = BTreeMap::from([(RUN_LABEL.to_owned(), nonce.to_string())]);
         Ok(Prepared {

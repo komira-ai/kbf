@@ -4,7 +4,6 @@
 
 use std::time::Duration;
 
-use kbf_lease_client::Mount;
 use kbf_proto::worker::{Capability, Hello};
 use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE, SELF_FENCE, START_GRACE, START_VALIDITY};
 
@@ -24,11 +23,6 @@ pub const PRESIGN_LIMIT: Duration = Duration::from_secs(4 * 3600);
 /// sent, so the executor sends the same one and an out-of-memory run is the same event
 /// on either executor.
 const HARD_CAP_PAD: u64 = 512 << 20;
-
-/// Where the agent of the lease server puts `mount` in the container.
-fn container_path(mount: &Mount) -> String {
-    format!("/mnt/{}/{}", mount.root_name, mount.rel)
-}
 
 /// The executor's settings. Every duration is an upper or lower bound the executor holds
 /// itself to; [`Config::validate`] refuses a set that breaks the ones the scheduler's
@@ -108,14 +102,8 @@ pub struct Config {
     /// delivery there is until the lease server's job takes a secret field. False by
     /// default, and [`Config::validate`] refuses a config that leaves it so.
     pub insecure_argv_secrets: bool,
-    /// The mount that puts the task tool in the container, at `/mnt/<root_name>/<rel>`: the
-    /// lease server mounts one path to one place, and nothing else of its root is there.
-    pub tool_mount: Mount,
-    /// The farm's root certificate, for the task's `https` reads: a file beside the tool in
-    /// the tool mount's root, mounted read-only next to it. `None` if the reads need none.
-    pub root_der: Option<String>,
     /// Where the task tool works in the container, if not in the tool's own default: the
-    /// action image must have a writable directory there.
+    /// kbf image must have a writable directory there.
     pub work_dir: Option<String>,
     /// Whether the task may `PUT` over plain http.
     pub allow_plain_http_put: bool,
@@ -180,9 +168,6 @@ pub enum ConfigError {
     /// Secrets as arguments, which the operator has not allowed.
     #[error("the secrets travel as arguments: set insecure_argv_secrets to say so")]
     InsecureArgv,
-    /// A tool mount the action could write to.
-    #[error("the tool mount must be read-only: the action could replace the tool")]
-    ToolMount,
     /// A presign ceiling or a run longer than a url may be good for.
     #[error("the presign ceiling and the longest run's wall time must be at most 4 hours")]
     PresignLimit,
@@ -225,12 +210,6 @@ impl Config {
             fence_after: SELF_FENCE,
             delivery: Delivery::InsecureArgv,
             insecure_argv_secrets: false,
-            tool_mount: Mount {
-                root_name: "kbf-tools".to_owned(),
-                rel: "kbf-task".to_owned(),
-                ro: true,
-            },
-            root_der: None,
             work_dir: None,
             allow_plain_http_put: false,
             max_pack_bytes: 128 << 20,
@@ -321,7 +300,6 @@ impl Config {
                 ConfigError::Bounds,
             ),
             (self.insecure_argv_secrets, ConfigError::InsecureArgv),
-            (self.tool_mount.ro, ConfigError::ToolMount),
             (
                 self.max_wall > self.drain_before_end && self.drain_before_end > longest,
                 ConfigError::Drain,
@@ -341,25 +319,6 @@ impl Config {
             .into_iter()
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect()
-    }
-
-    /// The path of the task tool in the container.
-    #[must_use]
-    pub fn tool_path(&self) -> String {
-        container_path(&self.tool_mount)
-    }
-
-    /// The mount of the root certificate, and its path in the container, if one is set.
-    #[must_use]
-    pub fn root_mount(&self) -> Option<(Mount, String)> {
-        let rel = self.root_der.as_ref()?;
-        let mount = Mount {
-            root_name: self.tool_mount.root_name.clone(),
-            rel: rel.clone(),
-            ro: true,
-        };
-        let path = container_path(&mount);
-        Some((mount, path))
     }
 
     /// How many whole GiB of memory the farm may book on a host.
