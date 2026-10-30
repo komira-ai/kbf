@@ -52,6 +52,10 @@ pub(in crate::server) struct Tamper {
     deleting: AtomicU64,
     /// What `needs_length` says.
     pub(in crate::server) needs_len: AtomicBool,
+    /// The gate that holds a HEAD that found its object, after it has read it.
+    heads: Mutex<Option<Arc<Semaphore>>>,
+    /// The HEADs that wait at `heads`, counted when they arrive.
+    heading: AtomicU64,
 }
 
 /// A semaphore that reads wait on, and the key whose reads wait (every key if none).
@@ -70,7 +74,24 @@ impl Tamper {
             deletes: Mutex::new(None),
             deleting: AtomicU64::new(0),
             needs_len: AtomicBool::new(false),
+            heads: Mutex::new(None),
+            heading: AtomicU64::new(0),
         }
+    }
+
+    /// Holds every HEAD that finds its object from now on, after it has the answer, until a
+    /// permit is added to the gate that is returned (a HEAD of a key that is not there is not
+    /// held).
+    pub(in crate::server) fn hold_heads(&self) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        let mut held = self.heads.lock().unwrap_or_else(PoisonError::into_inner);
+        *held = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// How many HEADs wait at the gate of [`hold_heads`](Self::hold_heads).
+    pub(in crate::server) fn heading(&self) -> u64 {
+        self.heading.load(Ordering::SeqCst)
     }
 
     /// Holds every delete from now on, before it deletes, until a permit is added to the gate
@@ -171,7 +192,17 @@ impl Backend for Tamper {
     }
 
     async fn head(&self, key: &str) -> Result<Meta, Error> {
-        self.memory.head(key).await
+        let meta = self.memory.head(key).await?;
+        let gate = self
+            .heads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(gate) = gate {
+            let _ = self.heading.fetch_add(1, Ordering::SeqCst);
+            gate.acquire().await.expect("the gate stays open").forget();
+        }
+        Ok(meta)
     }
 
     async fn delete(&self, key: &str) -> Result<(), Error> {

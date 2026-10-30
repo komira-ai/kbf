@@ -293,7 +293,9 @@ the body is read. The key files of `[server]` are those of the front, as for a s
 
 With `write_through = true` in `[local_cache]` (default `false`) the node takes the writes its keys
 may do and sends each to the upstream; the answer is given only after the upstream has the object,
-and the cache keeps nothing of what is written (the first read of an object fills it). Create-only
+and a create-only put under a `cache = true` policy is also kept on the node, so the next read of
+it is a hit (a multipart upload is not kept: the first read fills it; see "What a put keeps"
+below). Create-only
 puts (with or without `If-None-Match: *`), presigned PUTs, multipart uploads (start, part,
 completion, abort) and deletes go to the upstream; the roles of the full, read-only, scoped,
 presigning and GC keys apply as on a storage node, and a put that replaces (`If-Match`) and a copy
@@ -311,6 +313,21 @@ before the address is bound; one that cannot be reached is status 1. The upstrea
 a store that takes writes under `_tiering/` (an S3 bucket, not the front of a storage node). The
 upstream's key is also the cache's: only the front's roles keep one client from another's objects.
 The start line then says `mode=write-through-cache`.
+
+What a put keeps. The body of a create-only put under a `cache = true` policy is copied into
+`.stage/` as it streams to the upstream. When the upstream has acknowledged the object, the node
+asks it for the object's tag and time (one HEAD, so the tag in the cache is the one the upstream
+gave, which for a large body is not an MD5), puts the copy in the cache, and then answers 200. The
+copy is best effort and never fails the put: if every keep slot is busy (`max_concurrent_keeps`),
+the object does not fit the budget, the stage directory cannot be written, the HEAD fails, or the
+object was deleted meanwhile, the copy is dropped, the put is still 200 with the object at the
+upstream, and the skip is counted. A key named by its content (`cas/l/<sha256>`) is hashed as the
+body streams; a body that does not hash to the name ends the stream with an error, so the upstream
+stores nothing, and nothing is kept. A body that is cut leaves nothing at the upstream or in the
+cache. `/metricz` has `tierstore_cache_writes_through_total` (puts the upstream took),
+`tierstore_cache_write_exists_total` (puts answered 412) and
+`tierstore_cache_write_keep_skipped_total{reason}` with the reasons `budget` (also a body of no
+declared length), `io`, `busy`, `head` and `deleted`.
 
 ```toml
 [server]
@@ -411,6 +428,7 @@ scrub.
 | `local_cache.critical` | percent of the budget above which a fill is skipped (default 95, not below `high_water`) |
 | `local_cache.free_floor` | percent of the file system that is kept free (0 to 99, default 10): below it a pass evicts, even under the budget; it does not stop a fill, and `budget` may not be above the file system's size less the floor (exit status 2), unless its size cannot be read or is 0, which the start warns of and does not judge |
 | `local_cache.max_concurrent_fills` | the most fills that run at once (1 to 64, default 4); a miss that finds them all running is served from the upstream and kept nowhere |
+| `local_cache.max_concurrent_keeps` | the most create-only puts that are copied into the cache at once (1 to 64, default 8), apart from the fills; a put that finds them all running succeeds and is not kept |
 | `local_cache.write_through` | `false` by default: a read cache that refuses every write with 403 before the role of the key is looked at. `true`: the node takes the writes its keys may do and sends each to the upstream, which must be written with a key that may write; the start runs the upstream's self-test (create-only and multipart-conditional included) and exits with status 3 if the upstream answers one wrongly |
 | `local_cache.cache` | `true`, the default; `false` is refused (leave `[local_cache]` out to run without a cache) |
 | `local_cache.scrub_rate` | a size and `/s`, such as `"50MiB/s"`: accepted, and not used by this release |

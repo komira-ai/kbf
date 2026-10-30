@@ -65,9 +65,9 @@ impl From<Error> for Stop {
 }
 
 /// A file of the stage directory, removed when it is dropped, and counted while it exists.
-struct Staged {
+pub(super) struct Staged {
     inner: Arc<Inner>,
-    file: tokio::fs::File,
+    pub(super) file: tokio::fs::File,
     path: PathBuf,
     /// Where the sidecar is written before it is renamed into place.
     sidecar: PathBuf,
@@ -76,7 +76,7 @@ struct Staged {
 impl Staged {
     /// A new file, read-only for everyone once it is made (mode 0444: the descriptor that made
     /// it can still write).
-    async fn create(inner: &Arc<Inner>) -> io::Result<Self> {
+    pub(super) async fn create(inner: &Arc<Inner>) -> io::Result<Self> {
         let number = inner.staged.fetch_add(1, Ordering::Relaxed);
         let path = stage_dir(&inner.config.path).join(format!("{number:016x}"));
         let sidecar = stage_dir(&inner.config.path).join(format!("{number:016x}.meta"));
@@ -101,7 +101,7 @@ impl Staged {
 
     /// Writes the end of the file to the disk, so that a name linked to it is whole after a
     /// crash.
-    async fn finish(&mut self) -> io::Result<()> {
+    pub(super) async fn finish(&mut self) -> io::Result<()> {
         self.file.flush().await?;
         self.file.sync_data().await
     }
@@ -165,9 +165,9 @@ impl Drop for Reserved {
 
 /// A fill's place in the table of the fills that run: taken out when it is dropped, whether the
 /// fill ended, panicked or was cancelled, so that no key stays marked as being filled.
-struct Flight {
-    inner: Arc<Inner>,
-    hex: String,
+pub(super) struct Flight {
+    pub(super) inner: Arc<Inner>,
+    pub(super) hex: String,
 }
 
 impl Drop for Flight {
@@ -402,7 +402,7 @@ impl Inner {
     }
 
     /// Links the staged file into the cache, on a thread that may block.
-    async fn commit(
+    pub(super) async fn commit(
         self: &Arc<Self>,
         staged: &Staged,
         name: &Name,
@@ -420,7 +420,7 @@ impl Inner {
     }
 
     /// Runs a pass of the eviction if the cache is above its high water mark.
-    async fn relieve(self: &Arc<Self>) {
+    pub(super) async fn relieve(self: &Arc<Self>) {
         let held = locked(&self.index).bytes();
         if held > percent_of(self.config.budget, self.config.high_water) {
             let inner = Arc::clone(self);
