@@ -9,7 +9,7 @@ use tokio::net::TcpStream;
 
 use std::sync::Arc;
 
-use kbf_front::job_read::MAX_BATCH_REQUEST_BYTES;
+use kbf_front::job_read::{Limits, MAX_BATCH_REQUEST_BYTES};
 use kbf_objstore::s3::fake::FakeS3;
 use kbf_types::Digest;
 
@@ -36,6 +36,8 @@ fn plain_flags(dir: &Path, listen: &str) -> JobReadFlags {
         grant_secret_file: secret,
         max_blob_bytes: 536_870_912,
         reads_in_flight: 32,
+        read_budget_bytes: Limits::default().read_budget_bytes,
+        read_idle_secs: Limits::default().held_idle.as_secs(),
     }
 }
 

@@ -70,6 +70,8 @@ const TRANSPORT: &str = "job_transport";
 const GRANT_SECRET: &str = "job_grant_secret_file";
 const MAX_BLOB: &str = "job_max_blob_bytes";
 const READS: &str = "job_reads_in_flight";
+const BUDGET: &str = "job_read_budget_bytes";
+const IDLE: &str = "job_read_idle_secs";
 
 /// The default of `--job-max-blob-bytes`, as clap takes a default (a string); a test parses
 /// it back and compares it with [`Limits::default`].
@@ -77,6 +79,12 @@ const DEFAULT_MAX_BLOB: &str = "536870912";
 
 /// The default of `--job-reads-in-flight`, likewise.
 const DEFAULT_READS: &str = "32";
+
+/// The default of `--job-read-budget-bytes`, likewise (1 GiB).
+const DEFAULT_BUDGET: &str = "1073741824";
+
+/// The default of `--job-read-idle-secs`, likewise.
+const DEFAULT_IDLE: &str = "60";
 
 /// The most bytes the grant secret's file may hold, surrounding whitespace included.
 const MAX_SECRET_FILE_BYTES: usize = 4096;
@@ -97,7 +105,7 @@ pub struct JobTls {
 }
 
 /// The job-facing read's flags: the listen address, the transport and the grant secret, or
-/// none; the last two have defaults.
+/// none; the last four have defaults.
 #[derive(Clone, Debug)]
 pub struct JobReadFlags {
     /// `--job-listen`: where the listener listens.
@@ -110,10 +118,14 @@ pub struct JobReadFlags {
     pub max_blob_bytes: u64,
     /// `--job-reads-in-flight`: the blob reads open at once.
     pub reads_in_flight: u32,
+    /// `--job-read-budget-bytes`: the bytes of blob reads open at once.
+    pub read_budget_bytes: u64,
+    /// `--job-read-idle-secs`: how long a held response may go with no chunk taken.
+    pub read_idle_secs: u64,
 }
 
-/// The seven flags.
-pub(super) fn args() -> [Arg; 7] {
+/// The nine flags.
+pub(super) fn args() -> [Arg; 9] {
     [
         Arg::new(LISTEN)
             .long("job-listen")
@@ -205,6 +217,32 @@ pub(super) fn args() -> [Arg; 7] {
                  holds its place until its response ends, and a request over the bound waits \
                  for one to end. Needs `--job-listen`",
             ),
+        Arg::new(BUDGET)
+            .long("job-read-budget-bytes")
+            .value_name("BYTES")
+            .value_parser(clap::value_parser!(u64).range(1..))
+            .default_value(DEFAULT_BUDGET)
+            .requires(LISTEN)
+            .help(
+                "The bytes of blob reads this listener has open at once, at least 1: a read \
+                 takes its blob's size (a streamed blob a bounded window of it, and the scope \
+                 walk's reads their own sizes) and a request over the budget waits for room, it \
+                 never fails; a blob larger than the whole budget is read alone. Needs \
+                 `--job-listen`",
+            ),
+        Arg::new(IDLE)
+            .long("job-read-idle-secs")
+            .value_name("SECONDS")
+            .value_parser(clap::value_parser!(u64).range(1..))
+            .default_value(DEFAULT_IDLE)
+            .requires(LISTEN)
+            .help(
+                "How long, in seconds, a response that holds read budget may go with no chunk taken by its \
+                 client before it is dropped, its budget given back and its response ended, at \
+                 least 1: a client that does not read does not hold the budget for ever, and one \
+                 that reads is not cut off however long its response takes. Needs \
+                 `--job-listen`",
+            ),
     ]
 }
 
@@ -231,6 +269,8 @@ pub(super) fn from_matches(m: &ArgMatches) -> Option<JobReadFlags> {
         grant_secret_file: path(GRANT_SECRET),
         max_blob_bytes: *m.get_one::<u64>(MAX_BLOB).expect("clap gives it a default"),
         reads_in_flight: *m.get_one::<u32>(READS).expect("clap gives it a default"),
+        read_budget_bytes: *m.get_one::<u64>(BUDGET).expect("clap gives it a default"),
+        read_idle_secs: *m.get_one::<u64>(IDLE).expect("clap gives it a default"),
     })
 }
 
@@ -332,6 +372,8 @@ impl Prepared {
         let limits = Limits {
             reads_in_flight: usize::try_from(flags.reads_in_flight).unwrap_or(usize::MAX),
             max_blob_bytes: flags.max_blob_bytes,
+            read_budget_bytes: flags.read_budget_bytes,
+            held_idle: Duration::from_secs(flags.read_idle_secs),
             ..Limits::default()
         };
         Ok(Self {
@@ -503,11 +545,14 @@ async fn batch_body(body: Body, wait: Duration) -> Bytes {
 
 /// The HTTP response of `reply`: its status and body, the headers a client needs to read
 /// a refusal (`WWW-Authenticate` on 401, `Allow: <allow>` on 405) and a content type.
-fn response(reply: Reply, allow: &'static str) -> Response {
+fn response(mut reply: Reply, allow: &'static str) -> Response {
     let status = reply.status;
     // A streamed blob states its length before its first byte: a response that ends short of
     // it is a broken one to the client, which is how a blob that fails its digest is refused.
-    let (body, length) = match reply.stream {
+    // A body whose bytes are charged to the read budget is sent in pieces that keep the charge
+    // until the connection has taken the last of them.
+    let streamed = reply.stream.take().or_else(|| reply.held_stream());
+    let (body, length) = match streamed {
         Some(stream) => (Body::from_stream(stream.chunks), Some(stream.size)),
         None => (Body::from(reply.body), None),
     };

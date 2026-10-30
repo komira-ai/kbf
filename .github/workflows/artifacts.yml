@@ -122,6 +122,12 @@ env:
   NFPM_VERSION: 2.48.0
   NFPM_SHA256_X86_64_LINUX: 6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750
   NFPM_SHA256_AARCH64_LINUX: a9a75213763783b7669719e505474c748c5ad7dc66591a195619deb50f85c2f4
+  # syft reads the task image and writes its CycloneDX SBOM (the base's packages too: the SBOM of the kbf-task tarball
+  # describes the binary alone). A release archive checked against its SHA-256 before use (the digests the project
+  # publishes in syft_<version>_checksums.txt, recomputed when pinned; the archive's, not the program's).
+  SYFT_VERSION: 1.55.0
+  SYFT_SHA256_X86_64_LINUX: bb65249542db5fedeeb4d3f9b018b75e7264dbfbbb10486f044581a92f90490d
+  SYFT_SHA256_AARCH64_LINUX: 929bd163db2d7cd2255d3bcb8967208079813d7b46b0c952f7b794d8e2c7d304
 
 defaults:
   run:
@@ -461,6 +467,15 @@ jobs:
         run: cmp target/task-image-out/1.oci.tar target/task-image-out/2.oci.tar
       - name: The task image is the built kbf-task, and is an asset
         run: cargo xtask pkg-image-asset --service task --image target/task-image-out/1.oci.tar --platform linux-x86_64 --commit "$GITHUB_SHA" --binary "target/$STATIC_TARGET/release/kbf-task" --out dist
+      # The task image's CycloneDX SBOM, read from the image the release ships (its layers: the Ubuntu base's
+      # packages and the kbf-task), with the pinned syft. `pkg-image-sbom` gives it the serial number and the time
+      # of the image and the commit, so the same image has the same SBOM bytes, refuses a document that is not this
+      # image's or lists no deb package, and lists it in SHA256SUMS.linux-x86_64 beside the image. The attest job
+      # signs an SBOM attestation whose subject is the image tarball.
+      - name: Fetch syft (pinned version, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/anchore/syft/releases/download/v$SYFT_VERSION/syft_${SYFT_VERSION}_linux_amd64.tar.gz" --sha256 "$SYFT_SHA256_X86_64_LINUX" --out "$RUNNER_TEMP/tools/syft" --extract tar.gz --member syft
+      - name: The task image's SBOM lists its packages and is an asset
+        run: cargo xtask pkg-image-sbom --service task --image "dist/kbf-task-image-$GITHUB_SHA-linux-x86_64.oci.tar" --platform linux-x86_64 --commit "$GITHUB_SHA" --syft "$RUNNER_TEMP/tools/syft" --source-date-epoch "$SOURCE_DATE_EPOCH"
       # `docker image load` reads the file the release ships, as a host does.
       - name: Load the coordinator image with docker
         run: docker image load --input "dist/kbf-coordinator-image-$GITHUB_SHA-linux-x86_64.oci.tar"
@@ -671,6 +686,15 @@ jobs:
         run: cmp target/task-image-out/1.oci.tar target/task-image-out/2.oci.tar
       - name: The task image is the built kbf-task, and is an asset
         run: cargo xtask pkg-image-asset --service task --image target/task-image-out/1.oci.tar --platform linux-arm64 --commit "$GITHUB_SHA" --binary "target/$STATIC_TARGET/release/kbf-task" --out dist
+      # The task image's CycloneDX SBOM, read from the image the release ships (its layers: the Ubuntu base's
+      # packages and the kbf-task), with the pinned syft. `pkg-image-sbom` gives it the serial number and the time
+      # of the image and the commit, so the same image has the same SBOM bytes, refuses a document that is not this
+      # image's or lists no deb package, and lists it in SHA256SUMS.linux-arm64 beside the image. The attest job
+      # signs an SBOM attestation whose subject is the image tarball.
+      - name: Fetch syft (pinned version, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/anchore/syft/releases/download/v$SYFT_VERSION/syft_${SYFT_VERSION}_linux_arm64.tar.gz" --sha256 "$SYFT_SHA256_AARCH64_LINUX" --out "$RUNNER_TEMP/tools/syft" --extract tar.gz --member syft
+      - name: The task image's SBOM lists its packages and is an asset
+        run: cargo xtask pkg-image-sbom --service task --image "dist/kbf-task-image-$GITHUB_SHA-linux-arm64.oci.tar" --platform linux-arm64 --commit "$GITHUB_SHA" --syft "$RUNNER_TEMP/tools/syft" --source-date-epoch "$SOURCE_DATE_EPOCH"
       # `docker image load` reads the file the release ships, as a host does.
       - name: Load the coordinator image with docker
         run: docker image load --input "dist/kbf-coordinator-image-$GITHUB_SHA-linux-arm64.oci.tar"
@@ -874,6 +898,10 @@ jobs:
           sbom-path: dist/kbf-task-${{ github.sha }}-linux-x86_64.cdx.json
       - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
+          subject-path: dist/kbf-task-image-${{ github.sha }}-linux-x86_64.oci.tar
+          sbom-path: dist/kbf-task-image-${{ github.sha }}-linux-x86_64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
           subject-path: dist/kbf-daemon-${{ github.sha }}-linux-arm64.tar.gz
           sbom-path: dist/kbf-daemon-${{ github.sha }}-linux-arm64.cdx.json
       - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
@@ -908,6 +936,10 @@ jobs:
         with:
           subject-path: dist/kbf-task-${{ github.sha }}-linux-arm64.tar.gz
           sbom-path: dist/kbf-task-${{ github.sha }}-linux-arm64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/kbf-task-image-${{ github.sha }}-linux-arm64.oci.tar
+          sbom-path: dist/kbf-task-image-${{ github.sha }}-linux-arm64.cdx.json
       # Each tarball is also attested as its own subject, and the bundle of that attestation
       # (the file `gh attestation verify --bundle` takes offline) is copied beside the tarball
       # as `<tarball>.sigstore.json`, for the release and for a host that verifies without GitHub.
@@ -1312,6 +1344,8 @@ jobs:
         run: cargo xtask pkg-image-asset --verify-only --service coordinator --image "dist/kbf-coordinator-image-$GITHUB_SHA-linux-x86_64.oci.tar" --platform linux-x86_64 --commit "$GITHUB_SHA"
       - name: The signed linux-x86_64 task image runs the task as a user that is not root
         run: cargo xtask pkg-image-asset --verify-only --service task --image "dist/kbf-task-image-$GITHUB_SHA-linux-x86_64.oci.tar" --platform linux-x86_64 --commit "$GITHUB_SHA"
+      - name: The SBOM beside the signed linux-x86_64 task image is the SBOM of that image
+        run: cargo xtask pkg-image-sbom --verify-only --service task --image "dist/kbf-task-image-$GITHUB_SHA-linux-x86_64.oci.tar" --platform linux-x86_64 --commit "$GITHUB_SHA"
       - name: The signed linux-arm64 kbf package holds the attested kbf, the units of the modes and a trust directory for this branch
         run: cargo xtask pkg-kbf-asset --verify-only --package "dist/kbf-$GITHUB_SHA-linux-arm64.deb" --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$GITHUB_REF"
       - name: The signed linux-arm64 frontend image holds the attested kbf
@@ -1320,6 +1354,8 @@ jobs:
         run: cargo xtask pkg-image-asset --verify-only --service coordinator --image "dist/kbf-coordinator-image-$GITHUB_SHA-linux-arm64.oci.tar" --platform linux-arm64 --commit "$GITHUB_SHA"
       - name: The signed linux-arm64 task image runs the task as a user that is not root
         run: cargo xtask pkg-image-asset --verify-only --service task --image "dist/kbf-task-image-$GITHUB_SHA-linux-arm64.oci.tar" --platform linux-arm64 --commit "$GITHUB_SHA"
+      - name: The SBOM beside the signed linux-arm64 task image is the SBOM of that image
+        run: cargo xtask pkg-image-sbom --verify-only --service task --image "dist/kbf-task-image-$GITHUB_SHA-linux-arm64.oci.tar" --platform linux-arm64 --commit "$GITHUB_SHA"
 
   # Push to main only, after attest-darwin-arm64: the checks the planned deployment
   # job is to make (cargo xtask verify-assets, crates/xtask/src/sums.rs), for the branch

@@ -1,4 +1,4 @@
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::*;
 use crate::mdm::tests::config_text;
@@ -114,9 +114,15 @@ fn pair_args(server: &HttpServer) -> PushCert {
     }
 }
 
+/// The run's fixed instant: 2026-01-01T00:00:00Z, after the expired cert's 2001 and before
+/// the good cert's default expiry.
+fn now() -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(1_767_225_600)
+}
+
 fn run_it(exec: &mut FakeExec, a: &PushCert, mode: Mode) -> (Result<(), MdmError>, String) {
     let mut out = Vec::new();
-    let got = run(exec, a, SystemTime::now(), mode, &mut out);
+    let got = run(exec, a, now(), mode, &mut out);
     (got, String::from_utf8_lossy(&out).into_owned())
 }
 

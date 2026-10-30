@@ -24,17 +24,17 @@ use crate::test_dir::scratch_dir;
 
 const CAP: u64 = 16 * 1024;
 
-struct Large {
-    action: Digest,
-    big: Digest,
-    over_cap: Digest,
-    bytes: Bytes,
-    blobs: Vec<(Digest, Bytes)>,
+pub(super) struct Large {
+    pub(super) action: Digest,
+    pub(super) big: Digest,
+    pub(super) over_cap: Digest,
+    pub(super) bytes: Bytes,
+    pub(super) blobs: Vec<(Digest, Bytes)>,
 }
 
 /// An Action whose input root has a file of 10 KiB, and one a byte over the cap that is held by
 /// no one.
-fn large() -> Large {
+pub(super) fn large() -> Large {
     let mut blobs = Vec::new();
     let mut keep = |bytes: Vec<u8>| {
         let bytes = Bytes::from(bytes);
@@ -73,7 +73,7 @@ fn large() -> Large {
 }
 
 impl Large {
-    fn token(&self) -> String {
+    pub(super) fn token(&self) -> String {
         let key = GrantKey::from_secret(SECRET).expect("the secret is long enough");
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -88,7 +88,7 @@ impl Large {
 
     /// The store of every blob; with `corrupt`, the large one is stored with one byte changed,
     /// under the digest of the real bytes.
-    fn source(&self, corrupt: bool) -> Arc<dyn BlobSource> {
+    pub(super) fn source(&self, corrupt: bool) -> Arc<dyn BlobSource> {
         let mut map: std::collections::HashMap<Digest, Bytes> =
             self.blobs.iter().cloned().collect();
         if corrupt {
@@ -233,15 +233,37 @@ fn the_cap_and_the_reads_in_flight_are_flags_with_the_design_defaults() {
     let default = job(&[]);
     assert_eq!(default.max_blob_bytes, 536_870_912);
     assert_eq!(default.reads_in_flight, 32);
+    assert_eq!(default.read_budget_bytes, 1_073_741_824);
+    assert_eq!(default.read_idle_secs, 60);
+    assert_eq!(
+        default.read_idle_secs,
+        Limits::default().held_idle.as_secs()
+    );
+    assert_eq!(
+        default.read_budget_bytes,
+        Limits::default().read_budget_bytes
+    );
     assert_eq!(default.max_blob_bytes, Limits::default().max_blob_bytes);
     assert_eq!(
         default.reads_in_flight as usize,
         Limits::default().reads_in_flight
     );
-    let set = job(&["--job-max-blob-bytes=1048576", "--job-reads-in-flight=4"]);
+    let set = job(&[
+        "--job-max-blob-bytes=1048576",
+        "--job-reads-in-flight=4",
+        "--job-read-budget-bytes=4096",
+        "--job-read-idle-secs=5",
+    ]);
+    assert_eq!(set.read_idle_secs, 5);
+    assert_eq!(set.read_budget_bytes, 4096);
     assert_eq!(set.max_blob_bytes, 1_048_576);
     assert_eq!(set.reads_in_flight, 4);
-    for zero in ["--job-max-blob-bytes=0", "--job-reads-in-flight=0"] {
+    for zero in [
+        "--job-max-blob-bytes=0",
+        "--job-reads-in-flight=0",
+        "--job-read-budget-bytes=0",
+        "--job-read-idle-secs=0",
+    ] {
         assert!(with(&[zero]).is_err(), "{zero}");
     }
     // Alone, without --job-listen, they have no listener to bound.
@@ -258,8 +280,12 @@ async fn the_flags_are_the_limits_of_the_listener() {
     let mut flags = flags(&files, "127.0.0.1:0");
     flags.max_blob_bytes = 1_048_576;
     flags.reads_in_flight = 4;
+    flags.read_budget_bytes = 4096;
+    flags.read_idle_secs = 5;
     let prepared = prepare(&flags).expect("prepared");
     assert_eq!(prepared.limits.max_blob_bytes, 1_048_576);
     assert_eq!(prepared.limits.reads_in_flight, 4);
+    assert_eq!(prepared.limits.read_budget_bytes, 4096);
+    assert_eq!(prepared.limits.held_idle, std::time::Duration::from_secs(5));
     assert_eq!(prepared.limits.stream_over, Limits::default().stream_over);
 }
