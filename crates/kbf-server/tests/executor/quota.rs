@@ -158,3 +158,21 @@ async fn an_unknown_refusal_is_still_infrastructure_and_the_host_is_kept() {
     assert!(ended(&rig, "infra", 1), "{}", rig.counted());
     assert!(!rig.exec.hosts()[0].draining);
 }
+
+/// Catches a shutdown that leaves the lease of a held-out host booked (it would keep the
+/// host busy until its ttl ends): it is released with the rest.
+#[tokio::test(start_paused = true)]
+async fn a_shutdown_releases_the_lease_of_a_host_held_out() {
+    let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
+    rig.pump().await;
+    let lease = rig.exec.hosts()[0].lease;
+    let _caller = rig.submit(1);
+    rig.pump().await;
+    let first = rig.runs_of(1).await.remove(0);
+    rig.host_finishes_with(&first.run, Outcome::FailedToStart, None, QUOTA);
+    rig.elapse(15).await;
+    let delete = format!("DELETE /v1/leases/{lease}");
+    assert_eq!(count(&rig.requests(), &delete), 0);
+    rig.exec.shutdown().await;
+    assert_eq!(count(&rig.requests(), &delete), 1);
+}

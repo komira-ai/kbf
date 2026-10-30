@@ -43,8 +43,8 @@ mod traits;
 #[path = "support_tests.rs"]
 mod test_support;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures::future::join_all;
@@ -135,6 +135,7 @@ pub(crate) struct Ctx<'a> {
     pub(crate) deps: &'a Deps,
     pub(crate) clock: &'a Clock,
     pub(crate) strays: &'a Strays,
+    pub(crate) bench: &'a Bench,
 }
 
 impl Ctx<'_> {
@@ -159,6 +160,42 @@ impl Strays {
 
     fn take(&self) -> bool {
         self.0.swap(false, Ordering::Relaxed)
+    }
+}
+
+/// Leases of hosts that are held out of use: each host's scratch quota is out of order, and
+/// its lease is kept, idle, until its time. The lease server is not asked for a named host, so
+/// the only way to get a different one is to keep this one booked; at the time the lease is
+/// released and the host may be leased again.
+#[derive(Default)]
+pub(crate) struct Bench(Mutex<Vec<(LeaseId, Instant)>>);
+
+impl Bench {
+    pub(crate) fn put(&self, lease: LeaseId, until: Instant) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((lease, until));
+    }
+
+    /// The leases held out, whatever their time.
+    pub(crate) fn leases(&self) -> Vec<LeaseId> {
+        let held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        held.iter().map(|(lease, _)| *lease).collect()
+    }
+
+    /// Takes the leases whose time has come.
+    fn take_due(&self, now: Instant) -> Vec<LeaseId> {
+        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let (due, kept) = held.drain(..).partition(|(_, until)| now >= *until);
+        *held = kept;
+        due.into_iter().map(|(lease, _)| lease).collect()
+    }
+
+    /// Takes every lease, due or not.
+    fn take_all(&self) -> Vec<LeaseId> {
+        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        held.drain(..).map(|(lease, _)| lease).collect()
     }
 }
 
@@ -253,6 +290,7 @@ pub struct Executor {
     /// Why the executor stopped itself: another process runs under this frontend's id.
     twin: Option<String>,
     strays: Strays,
+    bench: Bench,
     /// When the leases were last compared with the slots'.
     reconciled: Option<Instant>,
     /// When the host list was last read.
@@ -276,6 +314,7 @@ impl Executor {
             inherited: Vec::new(),
             twin: None,
             strays: Strays::default(),
+            bench: Bench::default(),
             reconciled: None,
             hosts_read: None,
         })
@@ -316,6 +355,7 @@ impl Executor {
             deps: &self.deps,
             clock: &self.clock,
             strays: &self.strays,
+            bench: &self.bench,
         };
         let leases = ctx.api().leases().await.ok()?;
         let held: Vec<LeaseId> = self.slots.iter().filter_map(Slot::lease).collect();
@@ -378,6 +418,7 @@ impl Executor {
             inherited,
             twin,
             strays,
+            bench,
             reconciled,
             hosts_read,
         } = self;
@@ -389,6 +430,7 @@ impl Executor {
             deps,
             clock,
             strays,
+            bench,
         };
         if !adoption.is_done() {
             match pool::adopt(&ctx, now, adoption).await {
@@ -415,6 +457,11 @@ impl Executor {
                 strays.suspect();
             }
         }
+        // Before the slots are driven, so a host whose hold has ended is free to lease again
+        // in this pass.
+        for lease in bench.take_due(now) {
+            release_lease(&ctx, lease).await;
+        }
         let view = read(&ctx, slots, hosts_read, now).await;
         join_all(slots.iter_mut().map(|slot| slot.drive(&ctx, &view, now))).await;
         deps.metrics
@@ -429,9 +476,13 @@ impl Executor {
             deps: &self.deps,
             clock: &self.clock,
             strays: &self.strays,
+            bench: &self.bench,
         };
         let slots = std::mem::take(&mut self.slots);
         join_all(slots.into_iter().map(|slot| slot.release(&ctx))).await;
+        for lease in self.bench.take_all() {
+            release_lease(&ctx, lease).await;
+        }
         self.adoption = Adoption::Unread;
         self.inherited.clear();
         self.twin = None;

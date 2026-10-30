@@ -75,6 +75,9 @@ pub(super) enum Retire {
     Ambiguous,
     /// The host stopped taking work and is idle: a rotation, or a taint.
     Drained,
+    /// The host's scratch quota is out of order and it is idle: its lease is kept, unused,
+    /// until the given time, so the lease server cannot hand the same host out again.
+    Benched(Instant),
 }
 
 /// Why a worker stopped taking work.
@@ -84,6 +87,10 @@ pub(super) enum Drain {
     Rotation,
     /// The host reports a taint.
     Tainted,
+    /// The host refused a start because its scratch quota is out of order. Not a taint: it
+    /// recovers by itself, so the lease is kept idle until the time given, and not handed
+    /// back to be leased again at once.
+    Quota(Instant),
 }
 
 type Inbox = mpsc::UnboundedReceiver<Result<ServerMessage, tonic::Status>>;
@@ -327,6 +334,12 @@ impl HostWorker {
         }
     }
 
+    /// The host refused a start because its scratch quota is out of order: it takes no more
+    /// work, and is held out for [`Config::quota_hold`] from `now`.
+    pub(super) fn quota_unavailable(&mut self, ctx: &Ctx<'_>, now: Instant) {
+        self.begin_drain(ctx, Drain::Quota(now + ctx.cfg.quota_hold));
+    }
+
     /// Starts the drain when the lease nears the end of its wall time, and ends the worker
     /// once it is draining and idle.
     fn rotate(&mut self, ctx: &Ctx<'_>, now: Instant) -> ControlFlow<Retire> {
@@ -334,8 +347,9 @@ impl HostWorker {
         if rotate_at.is_none_or(|at| now >= at) {
             self.begin_drain(ctx, Drain::Rotation);
         }
-        match (self.draining.is_some(), self.tasks.is_empty()) {
-            (true, true) => ControlFlow::Break(Retire::Drained),
+        match (self.draining, self.tasks.is_empty()) {
+            (Some(Drain::Quota(until)), true) => ControlFlow::Break(Retire::Benched(until)),
+            (Some(_), true) => ControlFlow::Break(Retire::Drained),
             _ => ControlFlow::Continue(()),
         }
     }
@@ -382,9 +396,12 @@ impl HostWorker {
                 self.stop_all(ctx).await;
             }
             Retire::Lost | Retire::Fenced => self.stop_all(ctx).await,
-            Retire::Drained => {}
+            Retire::Drained | Retire::Benched(_) => {}
         }
-        release_lease(ctx, self.lease).await;
+        // A benched host's lease is kept, and the pool releases it when the hold ends.
+        if !matches!(why, Retire::Benched(_)) {
+            release_lease(ctx, self.lease).await;
+        }
         self.forget();
     }
 }

@@ -106,6 +106,7 @@ const CODES: &[(&str, ErrorCode)] = &[
     ("host-not-registered", ErrorCode::HostNotRegistered),
     ("host-tainted", ErrorCode::HostTainted),
     ("not-ready", ErrorCode::NotReady),
+    ("quota-unavailable", ErrorCode::QuotaUnavailable),
     ("run-exists", ErrorCode::RunExists),
     ("invalid-job", ErrorCode::InvalidJob),
     ("invalid-image", ErrorCode::InvalidImage),

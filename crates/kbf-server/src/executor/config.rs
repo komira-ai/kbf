@@ -335,6 +335,10 @@ impl Config {
                 self.max_wall > self.drain_before_end && self.drain_before_end > longest,
                 ConfigError::Drain,
             ),
+            (
+                !self.quota_hold.is_zero() && self.quota_hold <= self.lease_ttl / 3,
+                ConfigError::QuotaHold,
+            ),
         ];
         checks
             .into_iter()
