@@ -5209,6 +5209,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tierstore-bench"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "kbf-objstore",
+ "kbf-testkit",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "time"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"

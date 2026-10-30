@@ -1,0 +1,32 @@
+[package]
+name = "tierstore-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# A measurement tool for tierstore, an S3 client of its front and of the two stores behind it.
+# It depends on no tierstore code (it talks to the binary over HTTP, as any client does) and on
+# `kbf-objstore` only for the SigV4 client; crates/kbf-integration-test/tests/layering.rs does not
+# constrain it.
+
+[dependencies]
+bytes.workspace = true
+clap.workspace = true
+# The S3 client (`s3`): SigV4, multipart, ranged reads, listings.
+kbf-objstore.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+# `FakeS3`, a loopback S3 service, for the tests of the client wrapper.
+kbf-objstore = { workspace = true, features = ["testkit"] }
+# Scratch directories of the tests.
+kbf-testkit.workspace = true
+
+[lints]
+workspace = true
