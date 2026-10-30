@@ -5,12 +5,12 @@ use hyper::StatusCode;
 use crate::Backend;
 
 use super::AccessKey;
-use super::ScopedKey;
 use super::auth::sign_as;
 use super::ops_tests::completion;
 use super::presign::presign_url;
 use super::presign::tests::request;
 use super::testing::{BUCKET, Reply, Rig, Scripted, Step, texts};
+use super::{Prefixes, ScopedKey};
 
 const MEBIBYTE: u64 = 1 << 20;
 
@@ -22,8 +22,18 @@ const NO_DELETE: (&str, &str) = ("scoped-b", "other-secret-0123456789");
 
 async fn rig() -> Rig {
     let made = Rig::with(MEBIBYTE, |config| {
-        let a = ScopedKey::new(KEY.0, KEY.1, &["r/", "rw/"], &["w/", "rw/"], &["d/"]);
-        let b = ScopedKey::new(NO_DELETE.0, NO_DELETE.1, &["r/"], &["w/"], &[]);
+        let a = Prefixes {
+            read: &["r/", "rw/"],
+            write: &["w/", "rw/"],
+            delete: &["d/"],
+        };
+        let b = Prefixes {
+            read: &["r/"],
+            write: &["w/"],
+            delete: &[],
+        };
+        let a = ScopedKey::new(KEY.0, KEY.1, &a);
+        let b = ScopedKey::new(NO_DELETE.0, NO_DELETE.1, &b);
         config.scoped_keys = vec![a.unwrap(), b.unwrap()];
     });
     made.await
@@ -112,6 +122,7 @@ async fn a_read_or_a_list_outside_the_read_prefixes_is_refused() {
         "r",
         "r/../other/d",
         "r/%2e%2e/other/d",
+        "r/./a",
         "_journal/p1/x",
         "_tiering/x",
     ] {
@@ -131,6 +142,8 @@ async fn a_read_or_a_list_outside_the_read_prefixes_is_refused() {
         "list-type=2&prefix=%2F",
         "list-type=2&prefix=r%2F..%2Fother%2F",
         "list-type=2&prefix=r%2F%00",
+        "list-type=2&prefix=r%2F.%2F",
+        "list-type=2&prefix=other%2F&prefix=r%2F",
         "list-type=2&prefix=_journal%2F",
         "list-type=2&prefix=_tiering%2F",
         "uploads",
@@ -142,6 +155,49 @@ async fn a_read_or_a_list_outside_the_read_prefixes_is_refused() {
         assert_eq!(denied(&reply), access_denied(), "{query}");
         assert!(!reply.body.contains("other/"), "{query}");
     }
+}
+
+/// Asserts that the first `prefix` of a listing is the one that counts, for the check and for
+/// the answer alike: a listing that names `r/` first and another prefix after lists `r/` only,
+/// and `.` segments are refused for the delete and the multipart calls as for the others.
+#[tokio::test(start_paused = true)]
+async fn the_first_list_prefix_counts_and_dot_segments_are_refused_on_every_call() {
+    let rig = rig().await;
+    rig.put("r/a", b"one").await;
+    rig.put("other/b", b"two").await;
+    let query = listing("list-type=2&prefix=r%2F&prefix=other%2F");
+    let first = scoped(&rig, "GET", &query, &[], b"").await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    assert_eq!(texts(&first.body, "Key"), ["r/a"]);
+    for (method, key) in [
+        ("DELETE", "d/./e"),
+        ("DELETE", "d/../r/a"),
+        ("POST", "w/./big?uploads"),
+        ("PUT", "w/./x"),
+    ] {
+        let reply = scoped(&rig, method, &uri(key), &[("if-none-match", "*")], b"").await;
+        assert_eq!(denied(&reply), access_denied(), "{method} {key}");
+    }
+    assert!(exists(&rig, "r/a").await);
+}
+
+/// Asserts that finishing a multipart upload never replaces an object: for a key under a write
+/// prefix that already holds an object, the completion is not 200 and the object is as it was.
+#[tokio::test(start_paused = true)]
+async fn completing_an_upload_over_an_existing_key_does_not_replace_it() {
+    let rig = rig().await;
+    rig.put("w/there", b"old").await;
+    let started = scoped(&rig, "POST", &uri("w/there?uploads"), &[], b"").await;
+    assert_eq!(started.status, StatusCode::OK, "{}", started.body);
+    let id = texts(&started.body, "UploadId").concat();
+    let part = uri(&format!("w/there?partNumber=1&uploadId={id}"));
+    let sent = scoped(&rig, "PUT", &part, &[], b"new").await;
+    assert_eq!(sent.status, StatusCode::OK, "{}", sent.body);
+    let done = completion(&[(1, sent.header("etag"))]);
+    let complete = uri(&format!("w/there?uploadId={id}"));
+    let end = scoped(&rig, "POST", &complete, &[], done.as_bytes()).await;
+    assert_ne!(end.status, StatusCode::OK, "{}", end.body);
+    assert_eq!(rig.get("w/there", None).await.body, "old");
 }
 
 /// Asserts that a write prefix is no read prefix: an object a scoped key created under `w/` is
@@ -345,7 +401,16 @@ async fn a_scoped_key_deletes_inside_its_delete_prefixes_only() {
 #[tokio::test(start_paused = true)]
 async fn a_refused_scoped_call_is_403_without_its_body_being_read() {
     let rig = Rig::with(MEBIBYTE, |config| {
-        let key = ScopedKey::new(KEY.0, KEY.1, &["r/"], &["w/"], &["d/"]).unwrap();
+        let key = ScopedKey::new(
+            KEY.0,
+            KEY.1,
+            &Prefixes {
+                read: &["r/"],
+                write: &["w/"],
+                delete: &["d/"],
+            },
+        )
+        .unwrap();
         config.scoped_keys = vec![key];
         config.max_request_bytes = 4;
     })

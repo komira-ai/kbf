@@ -50,14 +50,12 @@ use crate::journal::is_reserved;
 use super::ServerConfig;
 use super::auth::Refusal;
 use super::keys::{AccessKey, read_private_text};
+use super::ops::MULTIPART;
 use super::presign::{PresignError, check_name, validate_prefix};
 use super::request::{Query, Target};
 
 /// The flag whose files hold the GC keys.
 const FLAG: &str = "--gc-key-file";
-
-/// The query parameters that make a request part of a multipart upload.
-const MULTIPART: [&str; 3] = ["partNumber", "uploadId", "uploads"];
 
 pub(crate) const NOT_ALLOWED: Refusal = Refusal {
     code: "AccessDenied",

@@ -185,8 +185,9 @@ no control character in it. A key must be longer than the prefix: the prefix its
 | `_journal/`, `_tiering/`, any key outside the list the call needs | none | no |
 
 The lists are not interchangeable: a write prefix does not let the key read what it wrote (add the
-prefix to `read_prefixes` too), and a read prefix does not let it write. A call the key may not do
-is refused with 403 `AccessDenied` without its body being read. The refusals are made in the order
+prefix to `read_prefixes` too), and a read prefix does not let it write. A key with a write
+prefix and no read prefix can still learn that a key exists, by the `412` of a put over it. A
+call the key may not do is refused with 403 `AccessDenied` without its body being read. The refusals are made in the order
 of the GC key's (see above): the signature and key id, the method, the decoding of the path and
 query, the checksum headers, and last the key, the listing prefix and the conditions of the put; so
 a call that is both refused and malformed may get the malformed-request error.
@@ -205,10 +206,13 @@ Two uses, for the pieces of kbf that keep their objects in a tierstore bucket:
   start of the frontend) and of the object of a pack whose write failed. To have both removed,
   give `delete_prefixes: ["cas/f/<writer>/"]`: the key then deletes only what the frontend itself
   wrote.
-- **Build history** (`kbf-server --history-objects s3://<bucket>/kbf-history?endpoint=...`, the key
+- **Build history** (`kbf-server --history-objects
+  's3://<bucket>/kbf-history?endpoint=...&conditional-put=true'`, the key
   pair in `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`). The history objects are under
   `kbf-history/history/`. The writer makes only create-only single `PUT`s with `If-None-Match: *`
-  (when the URI says `conditional-put=true`, else a plain `PUT`) and the reader makes only ranged
+  (without `conditional-put=true` it is a plain `PUT`, and tierstore answers a retry of a chunk
+  whose first reply was lost with `412`, which the writer does not take for "already there", so it
+  retries the chunk for good: keep `conditional-put=true`) and the reader makes only ranged
   `GET`s; neither lists, deletes, overwrites or starts a multipart upload (the code makes no list or
   delete call at all, so the expiry of old objects is for a lifecycle rule of the bucket, not the
   server, and a sweeper that deletes would need `delete_prefixes: ["kbf-history/"]`). So the key is

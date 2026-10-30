@@ -9,7 +9,9 @@ use hyper::Method;
 use kbf_testkit::dir::TestDir;
 
 use super::keys::Role;
-use super::scoped::{NOT_ALLOWED, OUT_OF_SCOPE, ScopedKey, ensure_distinct, ids, scoped_keys};
+use super::scoped::{
+    NOT_ALLOWED, OUT_OF_SCOPE, Prefixes, ScopedKey, ensure_distinct, ids, scoped_keys,
+};
 
 const SECRET: &str = "scoped-secret-0123456789";
 const FLAG: &str = "--scoped-key-file";
@@ -68,6 +70,7 @@ fn a_scoped_key_file_that_is_not_valid_is_refused() {
         "cas",
         "/cas/",
         "cas/../",
+        "../cas/",
         "cas/./x/",
         "_journal/",
         "_tiering/",
@@ -88,6 +91,33 @@ fn a_scoped_key_file_that_is_not_valid_is_refused() {
                 "{{\"access_key_id\": \"k\", \"secret_access_key\": \"{SECRET}\", \
                  \"read_prefixes\": [\"a/\"], \"write_prefixes\": []}}"
             ),
+        ),
+        (
+            "noread",
+            format!(
+                "{{\"access_key_id\": \"k\", \"secret_access_key\": \"{SECRET}\", \
+                 \"write_prefixes\": [\"w/\"], \"delete_prefixes\": [\"d/\"]}}"
+            ),
+        ),
+        (
+            "nowrite",
+            format!(
+                "{{\"access_key_id\": \"k\", \"secret_access_key\": \"{SECRET}\", \
+                 \"read_prefixes\": [\"r/\"], \"delete_prefixes\": [\"d/\"]}}"
+            ),
+        ),
+        (
+            "noid",
+            format!(
+                "{{\"secret_access_key\": \"{SECRET}\", \"read_prefixes\": [\"r/\"], \
+                 \"write_prefixes\": [], \"delete_prefixes\": []}}"
+            ),
+        ),
+        (
+            "nosecret",
+            "{\"access_key_id\": \"k\", \"read_prefixes\": [\"r/\"], \
+             \"write_prefixes\": [], \"delete_prefixes\": []}"
+                .to_owned(),
         ),
         (
             "extra",
@@ -131,7 +161,11 @@ fn a_scoped_key_file_that_is_not_valid_is_refused() {
 #[test]
 fn a_scoped_key_made_in_code_is_checked_as_a_file_is() {
     let made = |id: &str, secret: &str, read: &[&str]| {
-        ScopedKey::new(id, secret, read, &[], &[]).map(|_| ())
+        let prefixes = Prefixes {
+            read,
+            ..Prefixes::default()
+        };
+        ScopedKey::new(id, secret, &prefixes).map(|_| ())
     };
     assert!(made("a", "s", &["x/"]).is_ok());
     assert!(made("a", "s", &["_journal_x/", "journal/"]).is_ok());
@@ -144,8 +178,12 @@ fn a_scoped_key_made_in_code_is_checked_as_a_file_is() {
         made("a", "s", &["x/_journal/"]),
     ]
     .map(|made| made.unwrap_err().to_string());
-    let distinct: std::collections::BTreeSet<_> = reasons.iter().collect();
-    assert_eq!(distinct.len(), 4, "{reasons:?}");
+    assert_eq!(reasons[0], reasons[1], "{reasons:?}");
+    assert_eq!(reasons[0], reasons[2], "{reasons:?}");
+    assert!(reasons[3].contains("all empty"), "{reasons:?}");
+    assert!(reasons[4].contains("ending in /"), "{reasons:?}");
+    assert!(reasons[5].contains("_journal/"), "{reasons:?}");
+    assert_ne!(reasons[0], reasons[3], "{reasons:?}");
 }
 
 /// Asserts that the ids of the scoped keys must differ from each other and from the other keys,
@@ -178,7 +216,16 @@ fn scoped_key_ids_must_differ_from_each_other_and_from_the_other_keys() {
 /// prefixes.
 #[test]
 fn the_scoped_role_allows_five_methods_and_lists_uploads_under_read_prefixes() {
-    let key = ScopedKey::new("a", "s", &["r/"], &["w/"], &[]).unwrap();
+    let key = ScopedKey::new(
+        "a",
+        "s",
+        &Prefixes {
+            read: &["r/"],
+            write: &["w/"],
+            delete: &[],
+        },
+    )
+    .unwrap();
     let config = super::ServerConfig {
         scoped_keys: vec![key],
         ..super::ServerConfig::new("b", "k", "s", Arc::new(crate::TestClock::new()))

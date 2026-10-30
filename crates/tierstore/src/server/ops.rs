@@ -51,7 +51,7 @@ const PRESIGN_PARAMS: [&str; 6] = [
 ];
 
 /// The query parameters that make a request part of a multipart upload.
-const MULTIPART: [&str; 3] = ["partNumber", "uploadId", "uploads"];
+pub(super) const MULTIPART: [&str; 3] = ["partNumber", "uploadId", "uploads"];
 
 /// The most keys in a page of a listing, and the number of parts of an upload.
 const PAGE_LIMIT: usize = 1000;

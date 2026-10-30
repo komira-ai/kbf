@@ -54,15 +54,12 @@ use super::ServerConfig;
 use super::auth::Refusal;
 use super::gc::{check_credentials, ensure_ids_distinct};
 use super::keys::{AccessKey, read_private_text};
-use super::ops::creates_only;
+use super::ops::{MULTIPART, creates_only};
 use super::presign::{PresignError, check_name, validate_prefix};
 use super::request::{Query, Target, header};
 
 /// The flag whose files hold the scoped keys.
 const FLAG: &str = "--scoped-key-file";
-
-/// The query parameters that make a request part of a multipart upload.
-const MULTIPART: [&str; 3] = ["partNumber", "uploadId", "uploads"];
 
 pub(crate) const NOT_ALLOWED: Refusal = Refusal {
     code: "AccessDenied",
@@ -140,6 +137,17 @@ struct KeyFile {
     delete_prefixes: Vec<String>,
 }
 
+/// The prefixes of a [`ScopedKey`], by what the key may do under them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Prefixes<'a> {
+    /// Where the key may read and list.
+    pub read: &'a [&'a str],
+    /// Where the key may create objects and uploads.
+    pub write: &'a [&'a str],
+    /// Where the key may delete objects.
+    pub delete: &'a [&'a str],
+}
+
 impl ScopedKey {
     /// The key with this id and secret, limited to the prefixes it may read, create under and
     /// delete under.
@@ -148,14 +156,13 @@ impl ScopedKey {
     /// [`PresignError::Key`] for an empty id or secret, an id with a `/`, `,`, `=` or a
     /// character that is not printable ASCII, a prefix that is not valid, does not end in `/`, or
     /// is or contains `_journal/` or `_tiering/`, and three lists that are all empty.
-    pub fn new(
-        id: &str,
-        secret: &str,
-        read: &[&str],
-        write: &[&str],
-        delete: &[&str],
-    ) -> Result<Self, PresignError> {
+    pub fn new(id: &str, secret: &str, prefixes: &Prefixes<'_>) -> Result<Self, PresignError> {
         check_credentials(id, secret)?;
+        let Prefixes {
+            read,
+            write,
+            delete,
+        } = *prefixes;
         let lists = [read, write, delete];
         if lists.iter().all(|list| list.is_empty()) {
             return Err(PresignError::Key("the three prefix lists are all empty"));
@@ -199,14 +206,13 @@ impl ScopedKey {
         ]
         .map(|list| list.iter().map(String::as_str).collect::<Vec<_>>());
         let [read, write, delete] = &lists;
-        Self::new(
-            &file.access_key_id,
-            &file.secret_access_key,
+        let prefixes = Prefixes {
             read,
             write,
             delete,
-        )
-        .map_err(|why| fail(&why.to_string()))
+        };
+        Self::new(&file.access_key_id, &file.secret_access_key, &prefixes)
+            .map_err(|why| fail(&why.to_string()))
     }
 
     /// The id of the key.

@@ -248,7 +248,7 @@ pub use gc::GcKey;
 pub use keys::AccessKey;
 use keys::Role;
 pub use presign::{Grant, PresignKey, PresignRequest, presign_put};
-pub use scoped::ScopedKey;
+pub use scoped::{Prefixes, ScopedKey};
 
 use idle::Watched;
 use reply::{Answer, S3Error, answer};
