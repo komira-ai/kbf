@@ -917,8 +917,8 @@ The service asks for this with `--listen-from-systemd` (or `listen_from_systemd 
 
 - The process reads `LISTEN_PID`, `LISTEN_FDS` and `LISTEN_FDNAMES`, which systemd sets, and
   nothing else of the environment. They are a platform's mode markers and not configuration, and
-  they are read only with the flag: without it they are ignored. The three are removed from the
-  environment once read.
+  they are read only with the flag: without it they are ignored. The process starts no child
+  process, so the variables reach nothing else. The hand-over is taken once per process.
 - The S3 API is the socket named `s3` (`FileDescriptorName=s3` in the socket unit) and the registry
   front, if `--oci-listen` is given, the one named `oci`. The manager must pass exactly these
   sockets, each once, to this process; each must be a listening TCP stream socket, bound to the

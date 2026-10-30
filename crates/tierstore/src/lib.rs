@@ -74,8 +74,10 @@
 //! loopback (`--oci-listen`, `server::oci`), which serves the objects under a key prefix by
 //! their SHA-256 digest, so that a container engine pulls an image from the tiers.
 
-// Denied, not forbidden: the one module that takes the listening sockets a service manager passes
-// (`server::activation`) allows it for three small functions with a `SAFETY` comment each.
+// Denied, not forbidden: no safe API adopts a descriptor a service manager passes (std, rustix,
+// socket2 and tokio all take one through an unsafe `from_raw_fd`), so the one function that does
+// (`server::activation::take`) is allowed `unsafe`, with a `SAFETY` comment. A test pins that it
+// is the only allowance.
 #![deny(unsafe_code)]
 
 mod backend;

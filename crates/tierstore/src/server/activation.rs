@@ -28,8 +28,9 @@
 //! - the socket is bound to another address than the flag says (`--listen` and `ListenStream=`
 //!   are two places for one address, and they have to agree).
 //!
-//! The descriptors are made close-on-exec and non-blocking, and the three variables are removed
-//! from the environment, so that nothing this process starts takes them for its own.
+//! The descriptors are made close-on-exec and non-blocking. The three variables stay in the
+//! environment: the process starts no child process (a test pins that, so that a child added
+//! later is noticed), and so nothing can take them for its own.
 //!
 //! # The drain
 //!
@@ -38,14 +39,19 @@
 //! calls `shutdown` on it, which would be the manager's too.
 
 use std::net::{SocketAddr, TcpListener};
-use std::os::fd::{BorrowedFd, RawFd};
+use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use rustix::fs::{FileType, fstat};
 use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::net::sockopt::{socket_acceptconn, socket_type};
 use rustix::net::{SocketType, getsockname};
 
 use super::cli::Error;
 use super::front::InvalidFlags;
+
+/// Whether this process has taken the hand-over (see [`Sockets::from_process`]).
+static TAKEN: AtomicBool = AtomicBool::new(false);
 
 /// The name of the socket of the S3 API.
 pub(super) const S3: &str = "s3";
@@ -65,16 +71,13 @@ pub(super) struct Passed {
 }
 
 impl Passed {
-    /// The three variables of the environment, which are removed from it. Called by `main`
-    /// before it starts a thread.
-    pub(super) fn take_from_process() -> Self {
-        let passed = Self {
+    /// The three variables of the environment.
+    pub(super) fn from_env() -> Self {
+        Self {
             pid: std::env::var("LISTEN_PID").ok(),
             fds: std::env::var("LISTEN_FDS").ok(),
             names: std::env::var("LISTEN_FDNAMES").ok(),
-        };
-        forget_variables();
-        passed
+        }
     }
 }
 
@@ -90,10 +93,16 @@ impl Sockets {
     /// The sockets for a start that serves `s3` and, if given, `oci`, taken from the environment
     /// of this process (see the module docs for the rules).
     ///
+    /// The hand-over is taken once per process: a second call is refused, whatever the first
+    /// found, since the descriptors are owned by whoever took them first.
+    ///
     /// # Errors
-    /// An [`InvalidFlags`] that says what the manager passed wrongly.
+    /// An [`InvalidFlags`] that says what the manager passed wrongly, or that they were taken.
     pub(super) fn from_process(s3: SocketAddr, oci: Option<SocketAddr>) -> Result<Self, Error> {
-        let passed = Passed::take_from_process();
+        if TAKEN.swap(true, Ordering::SeqCst) {
+            return Err(refuse("the sockets were already taken by this process".to_owned()).into());
+        }
+        let passed = Passed::from_env();
         let me = std::process::id();
         Ok(Self::from_passed(&passed, me, FIRST_FD, s3, oci)?)
     }
@@ -214,17 +223,28 @@ pub(super) fn plan(
 ///
 /// A descriptor that is refused is left as it is: it is not closed.
 ///
+/// This is the one place in the crate that is allowed `unsafe` (the crate denies it, and a test
+/// pins that this is the only allowance): a number the manager passed becomes an owner here.
+///
 /// # Errors
 /// Why the descriptor is not a listening TCP stream socket bound to `expected`.
+#[allow(unsafe_code)]
 pub(super) fn take(fd: RawFd, name: &str, expected: SocketAddr) -> Result<TcpListener, String> {
-    let bound = check(borrow(fd), fd, name)?;
+    // SAFETY: the borrow only asks the system what `fd` is (`fstat`, `getsockopt`, `getsockname`),
+    // all of which answer `EBADF` for a number that is not open, which is how a closed descriptor
+    // is refused; it is not kept, and nothing is closed through it.
+    let bound = check(unsafe { BorrowedFd::borrow_raw(fd) }, fd, name)?;
     if bound != expected {
         return Err(format!(
             "the socket {name:?} (descriptor {fd}) is bound to {bound} but this start serves \
              {expected}: ListenStream= and the address of the flag must be one address"
         ));
     }
-    let listener = TcpListener::from(own(fd));
+    // SAFETY: `fd` is open and is a listening TCP socket (`check`). It comes from the service
+    // manager through LISTEN_FDS and LISTEN_FDNAMES, and LISTEN_PID named this process (`plan`),
+    // so the manager passed it to this process alone; `Sockets::from_process` takes the hand-over
+    // once per process, so no other owner is made of it, and the owner made here closes it once.
+    let listener = TcpListener::from(unsafe { OwnedFd::from_raw_fd(fd) });
     // The socket of a manager is not close-on-exec, and is blocking.
     fcntl_setfd(&listener, FdFlags::CLOEXEC)
         .map_err(std::io::Error::from)
@@ -236,8 +256,11 @@ pub(super) fn take(fd: RawFd, name: &str, expected: SocketAddr) -> Result<TcpLis
 /// The address `fd` is bound to, if it is a listening TCP stream socket.
 fn check(fd: BorrowedFd<'_>, raw: RawFd, name: &str) -> Result<SocketAddr, String> {
     let not = |what: &str| format!("the socket {name:?} (descriptor {raw}) is {what}");
-    let kind = socket_type(fd).map_err(|why| not(&format!("not a socket: {why}")))?;
-    if kind != SocketType::STREAM {
+    let status = fstat(fd).map_err(|why| not(&format!("not an open descriptor: {why}")))?;
+    if FileType::from_raw_mode(status.st_mode) != FileType::Socket {
+        return Err(not("not a socket"));
+    }
+    if socket_type(fd).ok() != Some(SocketType::STREAM) {
         return Err(not("not a stream socket"));
     }
     if !socket_acceptconn(fd).unwrap_or(false) {
@@ -249,41 +272,6 @@ fn check(fd: BorrowedFd<'_>, raw: RawFd, name: &str) -> Result<SocketAddr, Strin
         .and_then(|any| SocketAddr::try_from(any).ok());
     bound.ok_or_else(|| not("not a TCP socket (it is not bound to an IP address)"))
 }
-
-// The descriptors are the one thing here the language cannot vouch for: a number the manager
-// passed is made an owner only once it has been looked at. The crate denies unsafe code; these
-// two functions and the removal of the variables are what it allows.
-#[allow(unsafe_code)]
-mod raw {
-    use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd, RawFd};
-
-    /// A borrow of `fd`, to ask the system what it is.
-    pub(super) fn borrow<'a>(fd: RawFd) -> BorrowedFd<'a> {
-        // SAFETY: the borrow is only used for system calls that report `EBADF` for a number
-        // that is not open, and that is how a closed descriptor is refused; nothing is read
-        // through it that the descriptor could change the meaning of, and it is not kept.
-        unsafe { BorrowedFd::borrow_raw(fd) }
-    }
-
-    /// The owner of `fd`.
-    pub(super) fn own(fd: RawFd) -> OwnedFd {
-        // SAFETY: the caller has asked the system about `fd` (`check`: it is open and it is a
-        // listening socket), and `LISTEN_PID` named this process, so the manager passed it to
-        // this process alone: nothing else owns it, and it is closed once, by the owner made here.
-        unsafe { OwnedFd::from_raw_fd(fd) }
-    }
-
-    /// Removes the three variables of the hand-over from the environment.
-    pub(super) fn forget_variables() {
-        for name in ["LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"] {
-            // SAFETY: `main` calls this before the runtime or any other thread is started, so no
-            // thread reads or writes the environment while it changes.
-            unsafe { std::env::remove_var(name) };
-        }
-    }
-}
-
-use raw::{borrow, forget_variables, own};
 
 #[cfg(test)]
 #[path = "activation_tests.rs"]

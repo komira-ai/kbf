@@ -1057,8 +1057,7 @@ pub fn main(args: Vec<OsString>) -> ExitCode {
 }
 
 /// The sockets the service manager passed, if the settings say they are to be taken from it:
-/// none otherwise, and the three variables of the hand-over are left alone. Called before any
-/// thread is started, as the variables are removed from the environment.
+/// none otherwise, and the three variables of the hand-over are left alone. Called once, by `main`.
 fn sockets_of(front: &FrontSettings, oci: Option<SocketAddr>) -> Result<Sockets, Error> {
     if front.listen_from_systemd {
         Sockets::from_process(front.listen, oci)

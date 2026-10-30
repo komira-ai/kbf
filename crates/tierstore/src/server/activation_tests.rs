@@ -217,3 +217,67 @@ async fn a_passed_socket_is_the_listener_of_the_start() {
     let (_, peer) = listener.accept().await.unwrap();
     assert_eq!(peer, client.local_addr().unwrap());
 }
+
+/// Asserts that the hand-over is taken once: the second call of `from_process` in a process is
+/// refused, whatever the first one found (here no `LISTEN_PID`, which the first call refuses).
+#[test]
+fn the_handover_is_taken_once_per_process() {
+    let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let first = Sockets::from_process(addr, None).unwrap_err();
+    assert!(first.to_string().contains("LISTEN_PID"), "{first}");
+    let second = Sockets::from_process(addr, None).unwrap_err();
+    assert!(
+        second.to_string().contains("already taken by this process"),
+        "{second}"
+    );
+}
+
+/// The `.rs` files under `dir`, with their text.
+fn sources(dir: &std::path::Path, found: &mut Vec<(std::path::PathBuf, String)>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            sources(&path, found);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            found.push((path.clone(), std::fs::read_to_string(&path).unwrap()));
+        }
+    }
+}
+
+/// Asserts that `unsafe` is allowed in exactly one place in the crate, the function of
+/// `activation.rs` that adopts a descriptor, and used nowhere else; and that no file of the crate
+/// starts a child process, which is why the variables of the hand-over need not be removed from
+/// the environment.
+#[test]
+fn unsafe_is_allowed_once_and_no_child_process_is_started() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    sources(&root, &mut files);
+    let allow = ["allow(unsafe", "_code)"].concat();
+    let block = ["unsafe", " {"].concat();
+    let function = ["unsafe", " fn"].concat();
+    let child = ["Command", "::new"].concat();
+    let mut allowed = Vec::new();
+    for (path, text) in &files {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        // This file names the patterns; it is checked for the others.
+        let own = name == "activation_tests.rs";
+        if text.contains(&allow) && !own {
+            allowed.push(name.clone());
+        }
+        if !own && name != "activation.rs" {
+            assert!(
+                !text.contains(&block) && !text.contains(&function),
+                "{name}"
+            );
+        }
+        assert!(!text.contains(&child), "{name} starts a child process");
+    }
+    assert_eq!(allowed, ["activation.rs"]);
+    let text = files
+        .iter()
+        .find(|(p, _)| p.ends_with("activation.rs"))
+        .unwrap();
+    assert_eq!(text.1.matches(&allow).count(), 1);
+    assert!(!text.1.contains(&function));
+}
