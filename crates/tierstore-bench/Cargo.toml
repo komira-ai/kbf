@@ -15,10 +15,13 @@ publish.workspace = true
 [dependencies]
 bytes.workspace = true
 clap.workspace = true
+# Digests of binaries and unit listings: SHA-256 (`sha2`) as lowercase hex (`hex`).
+hex.workspace = true
 # The S3 client (`s3`): SigV4, multipart, ranged reads, listings.
 kbf-objstore.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
@@ -27,6 +30,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 kbf-objstore = { workspace = true, features = ["testkit"] }
 # Scratch directories of the tests.
 kbf-testkit.workspace = true
+# The loopback S3 stub of the operations tests (`tests/ops_support`).
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
 
 [lints]
 workspace = true

@@ -1,4 +1,5 @@
-//! The six verbs, in process: each reaches its module, and the stubs say which one is not built.
+//! The six verbs, in process: each reaches its module; the ops verbs begin with the ops file of the
+//! result directory, and the stubs say which one is not built.
 
 use clap::Parser;
 use kbf_testkit::dir::TestDir;
@@ -28,22 +29,19 @@ async fn every_verb_reaches_its_module_and_a_stub_says_so() {
     let snapshot = dir.path().join("before.json");
     let snapshot = snapshot.to_str().unwrap();
 
-    assert_eq!(
-        not_yet(run(&["preflight", "--result-dir", out]).await),
-        "preflight"
-    );
-    assert_eq!(
-        not_yet(run(&["provision", "--result-dir", out]).await),
-        "provision"
-    );
-    assert_eq!(
-        not_yet(run(&["provision", "--result-dir", out, "--apply"]).await),
-        "provision"
-    );
-    assert_eq!(
-        not_yet(run(&["verify-teardown", "--result-dir", out, "--before", snapshot]).await),
-        "verify-teardown"
-    );
+    // The ops verbs read `ops.json` of the result directory first; there is none here.
+    let ops_verbs: [&[&str]; 4] = [
+        &["preflight", "--result-dir", out],
+        &["provision", "--result-dir", out],
+        &["provision", "--result-dir", out, "--apply"],
+        &["verify-teardown", "--result-dir", out, "--before", snapshot],
+    ];
+    for args in ops_verbs {
+        match run(args).await {
+            Err(BenchError::Io { path, .. }) => assert!(path.ends_with("ops.json"), "{args:?}"),
+            other => panic!("{args:?}: {other:?}"),
+        }
+    }
     assert_eq!(
         not_yet(run(&["report", "--result-dir", out]).await),
         "report"

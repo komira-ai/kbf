@@ -36,6 +36,11 @@ pub enum BenchError {
     /// proves nothing.
     #[error("request log: {0}")]
     Log(#[source] std::io::Error),
+    /// An operation of the ops verbs (`preflight`, `provision`, `verify-teardown`) stopped: the
+    /// ops file is unusable, a command failed, or checks failed. The text names what, with no
+    /// secret in it.
+    #[error("{0}")]
+    Ops(String),
     /// A result file is not JSON of the schema this build writes.
     #[error("result file: {0}")]
     Result(String),
