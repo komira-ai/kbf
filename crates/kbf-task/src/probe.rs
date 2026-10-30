@@ -52,7 +52,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::Parser;
 use kbf_proto::reapi::Command;
 
 use crate::network::{Layers, Network};
@@ -81,24 +80,79 @@ const REQUIRED: [&str; 7] = [
 ];
 
 /// The flags of the probe (see the module documentation).
-#[derive(Parser)]
-#[command(
-    name = "kbf-task",
-    about = "Probe the confinement of an action's Command"
-)]
+///
+/// Built with clap's builder, not its derive: the code the derive expands to has branches no
+/// test of this crate reaches (the coverage gate counts them), and there are four flags.
 pub struct ProbeCli {
     /// Run the probe.
-    #[arg(long)]
     pub probe_confinement: bool,
     /// The Command's side of the probe; started by the probe itself.
-    #[arg(long, hide = true)]
     pub probe_confinement_child: bool,
     /// A path to ask whether the Command can read; never its contents.
-    #[arg(long)]
     pub probe_secret_path: Option<PathBuf>,
     /// Where the scratch directory is made; the system temporary directory by default.
-    #[arg(long)]
     pub probe_work_dir: Option<PathBuf>,
+}
+
+impl ProbeCli {
+    /// The flags as a clap command (`--help` prints them).
+    #[must_use]
+    pub fn command() -> clap::Command {
+        let flag = |id: &'static str, long: &'static str, help: &'static str| {
+            clap::Arg::new(id)
+                .long(long)
+                .action(clap::ArgAction::SetTrue)
+                .help(help)
+        };
+        let path = |id: &'static str, long: &'static str, help: &'static str| {
+            clap::Arg::new(id)
+                .long(long)
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help(help)
+        };
+        clap::Command::new("kbf-task")
+            .about("Probe the confinement of an action's Command")
+            .arg(flag(
+                "probe_confinement",
+                "probe-confinement",
+                "Run the probe",
+            ))
+            .arg(
+                flag(
+                    "probe_confinement_child",
+                    "probe-confinement-child",
+                    "The Command's side of the probe; started by the probe itself",
+                )
+                .hide(true),
+            )
+            .arg(path(
+                "probe_secret_path",
+                "probe-secret-path",
+                "A path to ask whether the Command can read; never its contents",
+            ))
+            .arg(path(
+                "probe_work_dir",
+                "probe-work-dir",
+                "Where the scratch directory is made (default: the temporary directory)",
+            ))
+    }
+
+    /// Reads the flags from `args` (the program name first); a wrong flag prints the usage and
+    /// exits with 2, as the task's own flags do.
+    pub fn parse_from<I, T>(args: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let found = Self::command().get_matches_from(args);
+        ProbeCli {
+            probe_confinement: found.get_flag("probe_confinement"),
+            probe_confinement_child: found.get_flag("probe_confinement_child"),
+            probe_secret_path: found.get_one::<PathBuf>("probe_secret_path").cloned(),
+            probe_work_dir: found.get_one::<PathBuf>("probe_work_dir").cloned(),
+        }
+    }
 }
 
 /// Whether the first argument selects the probe (or its Command side).

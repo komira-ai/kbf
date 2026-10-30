@@ -9,7 +9,10 @@ fn main() -> std::process::ExitCode {
     // `--probe-confinement` (first argument) is the confinement probe, not a task; see
     // `kbf_task::probe`.
     if kbf_task::probe::selected(std::env::args_os().nth(1).as_deref()) {
-        return kbf_task::probe::run_cli_with(protection, &kbf_task::probe::ProbeCli::parse());
+        return kbf_task::probe::run_cli_with(
+            protection,
+            &kbf_task::probe::ProbeCli::parse_from(std::env::args_os()),
+        );
     }
     kbf_task::task::run_cli_with(protection, &kbf_task::task::Cli::parse())
 }
