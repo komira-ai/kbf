@@ -55,7 +55,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt as _};
 use kbf_storage::{ReadStream, StorageError};
 use kbf_types::{Digest, DigestFunction};
@@ -63,7 +62,6 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::{AcquireError, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::codegen::http::{Method, StatusCode};
 
-use crate::backend::Backend;
 use crate::cache::is_empty_blob;
 use crate::grants::{Claims, GrantError, Grants, Scope};
 use crate::large_backfill::{LargeBackfill, Tee};
@@ -72,9 +70,11 @@ use crate::proxy::MAX_UNTRUSTED_BLOB_BYTES;
 
 mod idle;
 mod locate;
+mod source;
 mod walk;
 
-pub use self::locate::{LOCATE_PATH, Span, large_key};
+pub use self::locate::{HEADS_IN_FLIGHT, LOCATE_PATH, MAX_LOCATE_LINE_BYTES, Span, large_key};
+pub use self::source::BlobSource;
 
 pub use self::walk::MAX_SCOPE_BLOB_BYTES;
 use self::walk::{Budget, ScopeError, walk};
@@ -118,103 +118,6 @@ pub const STREAM_WINDOW_BYTES: u64 = 16 << 20;
 /// (a 165 MiB toolchain binary).
 pub const DEFAULT_MAX_BLOB_BYTES: u64 = 512 << 20;
 
-/// Where the blobs a job reads come from.
-///
-/// An implementation returns the bytes that hash to `digest`, or [`StorageError::NotFound`]
-/// when it holds none.
-pub trait BlobSource: Send + Sync {
-    /// The blob `digest`, read whole and checked against its digest.
-    fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Result<Bytes, StorageError>>;
-
-    /// The blob `digest` as a stream of chunks, for one too large to hold: the answer is
-    /// [`StorageError::NotFound`] when the source holds none, and an error item ends a stream
-    /// that fails part way. The bytes are not trusted to be the blob's: the listener hashes
-    /// them as they pass.
-    fn read_stream<'a>(
-        &'a self,
-        digest: &'a Digest,
-    ) -> BoxFuture<'a, Result<ReadStream, StorageError>>;
-
-    /// The blobs `digests`, one answer each in the order asked, as [`BlobSource::read_blob`]
-    /// answers: for a batch, so that a source that can read blobs together (the packs a
-    /// frontend keeps, where blobs that lie close are one ranged read) does. The default reads
-    /// them one by one, all at once.
-    fn read_many<'a>(
-        &'a self,
-        digests: &'a [Digest],
-    ) -> BoxFuture<'a, Vec<Result<Bytes, StorageError>>> {
-        Box::pin(futures::future::join_all(
-            digests.iter().map(|digest| self.read_blob(digest)),
-        ))
-    }
-
-    /// Where each of `digests` lies in a pack, one answer each in the order asked, `None` for a
-    /// blob with no row: for `GET /locate`, one batched ask of the pack index. The default
-    /// has no packs.
-    fn locate_packed<'a>(
-        &'a self,
-        digests: &'a [Digest],
-    ) -> BoxFuture<'a, Result<Vec<Option<Span>>, StorageError>> {
-        Box::pin(async move { Ok(vec![None; digests.len()]) })
-    }
-
-    /// The length of the object [`large_key`] names for `digest` in tierstore, `None` if there
-    /// is none (a HEAD, not a read): for `GET /locate`. The default holds no large objects.
-    fn large_len<'a>(
-        &'a self,
-        digest: &'a Digest,
-    ) -> BoxFuture<'a, Result<Option<u64>, StorageError>> {
-        let _ = digest;
-        Box::pin(async { Ok(None) })
-    }
-}
-
-impl BlobSource for Backend {
-    fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Result<Bytes, StorageError>> {
-        Box::pin(Backend::read_blob(self, digest))
-    }
-
-    fn read_stream<'a>(
-        &'a self,
-        digest: &'a Digest,
-    ) -> BoxFuture<'a, Result<ReadStream, StorageError>> {
-        Box::pin(Backend::read_stream(self, digest))
-    }
-
-    fn read_many<'a>(
-        &'a self,
-        digests: &'a [Digest],
-    ) -> BoxFuture<'a, Vec<Result<Bytes, StorageError>>> {
-        Box::pin(Backend::read_many(self, digests))
-    }
-
-    fn locate_packed<'a>(
-        &'a self,
-        digests: &'a [Digest],
-    ) -> BoxFuture<'a, Result<Vec<Option<Span>>, StorageError>> {
-        Box::pin(async move {
-            let located = Backend::locate_packed(self, digests).await?;
-            Ok(located
-                .into_iter()
-                .map(|at| {
-                    at.map(|at| Span {
-                        key: at.pack_key,
-                        offset: at.offset,
-                        length: at.length,
-                    })
-                })
-                .collect())
-        })
-    }
-
-    fn large_len<'a>(
-        &'a self,
-        digest: &'a Digest,
-    ) -> BoxFuture<'a, Result<Option<u64>, StorageError>> {
-        Box::pin(async move { Backend::object_len(self, &large_key(digest)).await })
-    }
-}
-
 /// The bounds of a [`JobRead`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -240,7 +143,8 @@ pub struct Limits {
     /// is read.
     pub max_blob_bytes: u64,
     /// The size over which a blob is streamed, not read whole. Not a flag: it is the bound of
-    /// the whole-blob read ([`STREAM_OVER_BYTES`]), a test lowers it to stream small blobs.
+    /// the whole-blob read ([`STREAM_OVER_BYTES`]), a test lowers it to stream small blobs. It must equal the pack store's `max_blob_bytes`:
+    /// `GET /locate` asks the index for the blobs up to it.
     pub stream_over: u64,
     /// The most digests a scope may hold: an input tree past it gives its Action no scope.
     pub scope_digests: usize,
@@ -254,6 +158,14 @@ pub struct Limits {
     /// How long `GET /locate` remembers that tierstore lacks a large object: short, because an
     /// ingest or a backfill may write it.
     pub locate_absent_for: std::time::Duration,
+    /// The digests whose presence in tierstore `GET /locate` remembers, at most: past it the
+    /// oldest answer goes.
+    pub locate_remembered: usize,
+    /// The most large digests one `GET /locate` checks in tierstore; the others are `absent`.
+    pub locate_heads_per_request: usize,
+    /// How long a presence check may take before its blob is answered `absent` (and the answer
+    /// not remembered).
+    pub locate_head_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -269,6 +181,9 @@ impl Default for Limits {
             scopes: 256,
             locate_present_for: std::time::Duration::from_secs(10),
             locate_absent_for: std::time::Duration::from_secs(2),
+            locate_remembered: 4096,
+            locate_heads_per_request: 256,
+            locate_head_timeout: Duration::from_secs(10),
         }
     }
 }

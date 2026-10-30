@@ -27,6 +27,13 @@ impl Scope {
         }
     }
 
+    /// At most how many digests the scope holds (the closure and the Action and Command, which
+    /// may be in it): for a bound that is taken before [`Scope::digests`] allocates.
+    #[must_use]
+    pub fn most_digests(&self) -> usize {
+        self.closure.len() + 2
+    }
+
     /// Every digest in the scope (the Action, its Command and the closure), once each, in
     /// digest order.
     #[must_use]

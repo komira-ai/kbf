@@ -11,7 +11,10 @@ use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use kbf_front::digest_to_proto;
 use kbf_front::grants::{GrantKey, Grants, MIN_SECRET_LEN};
-use kbf_front::job_read::{BlobSource, JobRead, LOCATE_PATH, Limits, Reply, Span, large_key};
+use kbf_front::job_read::{
+    BlobSource, HEADS_IN_FLIGHT, JobRead, LOCATE_PATH, Limits, MAX_LOCATE_LINE_BYTES, Reply, Span,
+    large_key,
+};
 use kbf_proto::reapi::{Action, Directory, DirectoryNode, FileNode};
 use kbf_storage::{ReadStream, StorageError};
 use kbf_types::Digest;
@@ -33,6 +36,11 @@ struct Source {
     heads: Mutex<Vec<Digest>>,
     index_down: AtomicBool,
     blobs_down: AtomicBool,
+    /// Presence checks wait here when it is set, and are counted while they wait.
+    head_gate: Option<tokio::sync::Semaphore>,
+    head_open: Mutex<(usize, usize)>,
+    /// Presence checks that are never answered.
+    head_hang: AtomicBool,
     head_down: AtomicBool,
 }
 
@@ -112,6 +120,24 @@ impl BlobSource for Source {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(*digest);
+            if self.head_hang.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if let Some(gate) = &self.head_gate {
+                {
+                    let mut open = self
+                        .head_open
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    open.0 += 1;
+                    open.1 = open.1.max(open.0);
+                }
+                gate.acquire().await.expect("the gate is open").forget();
+                self.head_open
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0 -= 1;
+            }
             if self.head_down.load(Ordering::SeqCst) {
                 return Err(down());
             }
@@ -270,9 +296,13 @@ fn table(reply: &Reply) -> HashMap<String, Value> {
     lines
 }
 
+/// Limits that stream over 1000 bytes and remember presence for an hour, so that no test is
+/// timed by the clock.
 fn small() -> Limits {
     Limits {
         stream_over: 1000,
+        locate_present_for: Duration::from_secs(3600),
+        locate_absent_for: Duration::from_secs(3600),
         ..Limits::default()
     }
 }
@@ -291,8 +321,12 @@ async fn the_table_is_exactly_the_scope_with_the_indexs_spans() {
     let b = build(&source, "b", &[b"other-1".to_vec(), b"other-2".to_vec()]);
     pack(&source, &a.files[0], span("cas/f/w/1", 0, 5));
     pack(&source, &a.files[1], span("cas/f/w/1", 5, 4));
-    pack(&source, &a.deep, span("cas/f/w/2", 77, 19));
-    pack(&source, &a.command, span("cas/f/w/2", 0, 77));
+    pack(&source, &a.deep, span("cas/f/w/2", 77, a.deep.size_bytes));
+    pack(
+        &source,
+        &a.command,
+        span("cas/f/w/2", 0, a.command.size_bytes),
+    );
     for digest in b.scope() {
         pack(&source, &digest, span("cas/f/w/9", 1, 1));
     }
@@ -313,10 +347,10 @@ async fn the_table_is_exactly_the_scope_with_the_indexs_spans() {
     );
     assert_eq!(
         pack_of(&a.deep),
-        serde_json::json!({"key": "cas/f/w/2", "offset": 77, "length": 19})
+        serde_json::json!({"key": "cas/f/w/2", "offset": 77, "length": a.deep.size_bytes})
     );
     assert_eq!(pack_of(&a.files[0])["offset"], 0);
-    assert_eq!(pack_of(&a.command)["length"], 77);
+    assert_eq!(pack_of(&a.command)["length"], a.command.size_bytes);
     for absent in [a.files[2], a.action, a.root, a.sub] {
         assert_eq!(
             table[&absent.to_string()],
@@ -629,9 +663,9 @@ async fn a_scope_that_cannot_be_read_is_unavailable() {
     assert_eq!(&reply.body[..], b"store_unavailable\n");
 }
 
-/// Catches: a presence memory that grows without bound: a scope of more large blobs than the
-/// memory holds is answered whole and correctly, and the memory is forgotten at its bound (the
-/// next request asks about nearly all of them again).
+/// Catches: a scope of more large blobs than the memory holds answered wrongly or partly: with
+/// room for every check (the per-request cap is lifted), 4100 large blobs are each answered
+/// large, once, and the lines are the scope and nothing else.
 #[tokio::test]
 async fn a_scope_of_many_large_blobs_is_answered_whole() {
     const MANY: usize = 4100;
@@ -643,7 +677,11 @@ async fn a_scope_of_many_large_blobs_is_answered_whole() {
     for file in &a.files {
         source.large.lock().unwrap().insert(*file, 1100);
     }
-    let rig = rig(source, small());
+    let limits = Limits {
+        locate_heads_per_request: MANY + 10,
+        ..small()
+    };
+    let rig = rig(source, limits);
     let token = rig.token(a.action);
     let table = table(&rig.locate(&token).await);
     assert!(
@@ -651,15 +689,196 @@ async fn a_scope_of_many_large_blobs_is_answered_whole() {
             .iter()
             .all(|f| table[&f.to_string()]["large"].is_object())
     );
-    // Every line is one digest of the scope, once: none missing, none extra.
     let named: BTreeSet<String> = table.keys().cloned().collect();
     let expected: BTreeSet<String> = a.scope().iter().map(ToString::to_string).collect();
     assert_eq!(named, expected);
     // The files and the root Directory (which is itself over the size) are each asked about.
-    let asked = MANY + 1;
-    let heads = |rig: &Rig| rig.source.heads.lock().unwrap().len();
-    assert_eq!(heads(&rig), asked);
+    assert_eq!(rig.source.heads.lock().unwrap().len(), MANY + 1);
     assert_eq!(table[&a.root.to_string()]["absent"], true);
-    rig.locate(&token).await;
-    assert!(heads(&rig) >= asked + 4096, "{}", heads(&rig));
+}
+
+/// Catches: a full memory that forgets everything (so that one big scope costs every other
+/// Action its answers) or that keeps the oldest: with room for four answers, a scope of three
+/// large blobs and then one of two leave the newest four, so the second Action asked again is
+/// not checked again.
+#[tokio::test]
+async fn a_full_memory_drops_the_oldest_answer_and_keeps_the_rest() {
+    let source = Source::default();
+    let a = build(&source, "a", &[vec![1; 2000], vec![2; 2001], vec![3; 2002]]);
+    let b = build(&source, "b", &[vec![4; 2003], vec![5; 2004]]);
+    for file in a.files.iter().chain(&b.files) {
+        source.large.lock().unwrap().insert(*file, file.size_bytes);
+    }
+    let limits = Limits {
+        locate_remembered: 4,
+        ..small()
+    };
+    let rig = rig(source, limits);
+    rig.locate(&rig.token(a.action)).await;
+    rig.locate(&rig.token(b.action)).await;
+    let heads = |rig: &Rig| rig.source.heads.lock().unwrap().len();
+    assert_eq!(heads(&rig), 5);
+    let again = table(&rig.locate(&rig.token(b.action)).await);
+    assert_eq!(heads(&rig), 5, "the newest answers were kept");
+    assert!(
+        b.files
+            .iter()
+            .all(|f| again[&f.to_string()]["large"].is_object())
+    );
+}
+
+/// Catches: presence checks that are limited for each request and not for all: two requests that
+/// each name 20 large blobs, with a store that holds every check open, never have more than
+/// [`HEADS_IN_FLIGHT`] open together, and all of them are answered once the store answers.
+#[tokio::test]
+async fn presence_checks_of_all_requests_share_the_places() {
+    let source = Source {
+        head_gate: Some(tokio::sync::Semaphore::new(0)),
+        ..Source::default()
+    };
+    let one: Vec<Vec<u8>> = (0..20).map(|i| vec![i; 2000 + usize::from(i)]).collect();
+    let two: Vec<Vec<u8>> = (0..20).map(|i| vec![i; 3000 + usize::from(i)]).collect();
+    let a = build(&source, "a", &one);
+    let b = build(&source, "b", &two);
+    for file in a.files.iter().chain(&b.files) {
+        source.large.lock().unwrap().insert(*file, file.size_bytes);
+    }
+    let rig = Arc::new(rig(source, small()));
+    let ask = |action: Digest| {
+        let rig = Arc::clone(&rig);
+        tokio::spawn(async move { rig.locate(&rig.token(action)).await })
+    };
+    let (first, second) = (ask(a.action), ask(b.action));
+    let open = |rig: &Rig| rig.source.head_open.lock().unwrap().0;
+    while open(&rig) < HEADS_IN_FLIGHT {
+        tokio::task::yield_now().await;
+    }
+    // Checks past the places would have started by now.
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(open(&rig), HEADS_IN_FLIGHT);
+    rig.source.head_gate.as_ref().unwrap().add_permits(1000);
+    let (first, second) = (first.await.unwrap(), second.await.unwrap());
+    assert_eq!(rig.source.head_open.lock().unwrap().1, HEADS_IN_FLIGHT);
+    for (reply, built) in [(first, &a), (second, &b)] {
+        let table = table(&reply);
+        assert!(
+            built
+                .files
+                .iter()
+                .all(|f| table[&f.to_string()]["large"].is_object())
+        );
+    }
+}
+
+/// Catches: a request that checks every large digest it names (a Directory can name a million
+/// that do not exist): with a cap of three, six present large blobs are three `large` and three
+/// `absent`, and tierstore was asked three times.
+#[tokio::test]
+async fn a_request_checks_at_most_the_cap_of_large_blobs() {
+    let source = Source::default();
+    let contents: Vec<Vec<u8>> = (0..6).map(|i| vec![i; 2000 + usize::from(i)]).collect();
+    let a = build(&source, "a", &contents);
+    for file in &a.files {
+        source.large.lock().unwrap().insert(*file, file.size_bytes);
+    }
+    let limits = Limits {
+        locate_heads_per_request: 3,
+        ..small()
+    };
+    let rig = rig(source, limits);
+    let table = table(&rig.locate(&rig.token(a.action)).await);
+    let large = table
+        .values()
+        .filter(|line| line["large"].is_object())
+        .count();
+    let absent = a
+        .files
+        .iter()
+        .filter(|f| table[&f.to_string()]["absent"] == true)
+        .count();
+    assert_eq!((large, absent), (3, 3));
+    assert_eq!(rig.source.heads.lock().unwrap().len(), 3);
+}
+
+/// Catches: a presence check with no deadline, which a store that never answers turns into a
+/// request that never ends: the blob is `absent` once the check's time is up (on a paused
+/// clock), the request is a 200, and the missing answer is not remembered (the next request
+/// asks again).
+#[tokio::test(start_paused = true)]
+async fn a_check_that_is_not_answered_in_time_is_absent_and_not_remembered() {
+    let source = Source::default();
+    let a = build(&source, "a", &[vec![7; 2000], b"small".to_vec()]);
+    pack(&source, &a.files[1], span("cas/f/w/1", 0, 5));
+    source.large.lock().unwrap().insert(a.files[0], 2000);
+    source.head_hang.store(true, Ordering::SeqCst);
+    let limits = Limits {
+        locate_head_timeout: Duration::from_secs(5),
+        ..small()
+    };
+    let rig = rig(source, limits);
+    let token = rig.token(a.action);
+    let first = table(&rig.locate(&token).await);
+    assert_eq!(first[&a.files[0].to_string()]["absent"], true);
+    assert!(first[&a.files[1].to_string()]["pack"].is_object());
+    rig.source.head_hang.store(false, Ordering::SeqCst);
+    let second = table(&rig.locate(&token).await);
+    assert!(second[&a.files[0].to_string()]["large"].is_object());
+    assert_eq!(rig.source.heads_of(&a.files[0]), 2);
+}
+
+/// Catches: a span the pack reader would not read as the blob (it reads the digest's size from
+/// the offset, so a length that is not the size is the index disagreeing with the digest), and a
+/// pack key longer than an object key can be, passed on; and a line longer than the most the
+/// budget is charged for: those two are `absent`, and a key of the longest length is a pack
+/// entry whose line fits [`MAX_LOCATE_LINE_BYTES`].
+#[tokio::test]
+async fn a_span_that_does_not_fit_its_digest_is_absent() {
+    let source = Source::default();
+    let a = build(
+        &source,
+        "a",
+        &[b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()],
+    );
+    let longest = "k".repeat(1024);
+    pack(&source, &a.files[0], span(&longest, u64::MAX - 5, 5));
+    pack(&source, &a.files[1], span("cas/f/w/1", 0, 99));
+    pack(&source, &a.files[2], span(&"k".repeat(1025), 0, 5));
+    let rig = rig(source, small());
+    let reply = rig.locate(&rig.token(a.action)).await;
+    let text = std::str::from_utf8(&reply.body).expect("utf-8").to_owned();
+    let table = table(&reply);
+    assert!(table[&a.files[0].to_string()]["pack"].is_object());
+    assert_eq!(table[&a.files[1].to_string()]["absent"], true);
+    assert_eq!(table[&a.files[2].to_string()]["absent"], true);
+    let longest_line = text.lines().map(|l| l.len() + 1).max().expect("lines");
+    assert!(
+        longest_line as u64 <= MAX_LOCATE_LINE_BYTES,
+        "{longest_line}"
+    );
+}
+
+/// Catches: a table built before its bytes are charged to the budget: with a budget of one
+/// table, a second request waits (while the first reply is held) and goes on when the first is
+/// dropped.
+#[tokio::test]
+async fn the_table_is_charged_to_the_budget_before_it_is_built() {
+    let source = Source::default();
+    let a = build(&source, "a", &[b"alpha".to_vec()]);
+    let limits = Limits {
+        read_budget_bytes: 8 * 1024,
+        ..small()
+    };
+    let rig = rig(source, limits);
+    let token = rig.token(a.action);
+    let first = rig.locate(&token).await;
+    assert_eq!(first.status, StatusCode::OK);
+    let mut second = Box::pin(rig.locate(&token));
+    assert!(
+        futures::poll!(second.as_mut()).is_pending(),
+        "the held table holds the budget"
+    );
+    drop(first);
+    assert_eq!(second.await.status, StatusCode::OK);
 }
