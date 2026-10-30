@@ -242,6 +242,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "job-grant-secret-file",
             "job-listen",
             "job-max-blob-bytes",
+            "job-plain-http",
             "job-read-budget-bytes",
             "job-read-idle-secs",
             "job-reads-in-flight",
