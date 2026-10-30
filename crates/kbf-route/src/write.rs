@@ -8,7 +8,7 @@ use bytes::Bytes;
 use futures::{StreamExt as _, TryStreamExt as _};
 use kbf_meta::{ActionRecord, Role};
 use kbf_storage::service::MAX_FIND_MISSING_DIGESTS;
-use kbf_storage::{Storage, StorageError};
+use kbf_storage::{OpenPieces, Storage, StorageError};
 use kbf_types::Digest;
 
 use crate::router::{Router, unavailable, write_order};
@@ -77,6 +77,29 @@ impl Router {
             )));
         }
         Ok(stored)
+    }
+
+    /// Streams the blob `digest` to the first of its write owners that is not `Down`, as
+    /// [`Router::put`] sends bytes, but taking the blob from `open` a piece at a time so
+    /// that this process never holds it whole.
+    ///
+    /// `open` is called once for each attempt (the next owner after one that could not be
+    /// reached, and the whole call again after `STALE_MAP`) and must give the blob from its
+    /// first byte. The owner is given `digest` as the digest the bytes must hash to, and
+    /// stores nothing if they do not.
+    ///
+    /// # Errors
+    /// As [`Router::put`]; a node that answers without having stored the blob is an
+    /// internal error.
+    pub async fn put_streamed(
+        &self,
+        digest: &Digest,
+        open: &OpenPieces,
+    ) -> Result<(), StorageError> {
+        let _ = (digest, open);
+        Err(StorageError::Internal(
+            "put_streamed is not written".to_owned(),
+        ))
     }
 
     /// The second half of an action-cache write: commits the entry for `action` at the

@@ -64,7 +64,7 @@ use kbf_segments::{Footer, IndexEntry};
 use kbf_types::Digest;
 use prost::Message as _;
 
-use super::{CommitError, IssuedPackKey, PackKeyMint, Packs, UntrustedLimits};
+use super::{CommitError, IssuedKeySet, IssuedPackKey, PackKeyMint, Packs, UntrustedLimits};
 use crate::backend::Backend;
 use crate::closure;
 use crate::wire::digest_to_proto;
@@ -208,6 +208,22 @@ pub async fn ingest(
             metrics.ingest_unavailable.add(1);
             Ingested::Unavailable(error)
         }
+    }
+}
+
+/// Reads, verifies and commits the whole run `keys` names (red-first stub: only pack 0 is read).
+pub async fn ingest_set(
+    packs: &Packs,
+    backend: &Backend,
+    mint: &PackKeyMint,
+    lease: &str,
+    keys: &IssuedKeySet,
+    action: &Digest,
+    limits: &UntrustedLimits,
+) -> Ingested {
+    match keys.packs().first() {
+        Some(key) => ingest(packs, backend, mint, lease, key, action, limits).await,
+        None => Ingested::Reject(RejectReason::WrongKey),
     }
 }
 

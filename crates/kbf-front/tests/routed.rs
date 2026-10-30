@@ -728,6 +728,44 @@ async fn the_storage_node_is_the_bootstrap_until_the_map_has_two_members() {
     assert_eq!(format!("{:?}", farm.routed), "Routed(..)");
 }
 
+/// The pieces of `bytes`, from the first byte each time the source is opened.
+fn pieces_of(bytes: Vec<u8>) -> impl Fn() -> kbf_storage::PieceStream + Send + Sync {
+    use futures::StreamExt as _;
+    let bytes = Bytes::from(bytes);
+    move || {
+        let items: Vec<std::io::Result<Bytes>> = vec![Ok(bytes.slice(..5)), Ok(bytes.slice(5..))];
+        futures::stream::iter(items).boxed()
+    }
+}
+
+/// Catches a streamed blob that does not follow the map: with no map it lands on the node
+/// `--storage` names; with two members or more it lands on the first owner the map says is not
+/// down, whole, and on no other node.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_blob_lands_on_its_writer() {
+    let farm = Farm::new(None);
+    let backend = farm.backend();
+    let (bytes, digest) = blob(1);
+    backend
+        .put_streamed(&digest, &pieces_of(bytes))
+        .await
+        .expect("stored");
+    assert_eq!(farm.holders(&digest).await, BTreeSet::from([1]));
+
+    let map = farm.set(2, &ALL_ACTIVE, 1);
+    let (bytes, digest) = (2..100)
+        .map(blob)
+        .find(|(_, d)| map.write_owners(d)[0] == MemberId(2))
+        .expect("a blob owned by node 2");
+    backend
+        .put_streamed(&digest, &pieces_of(bytes.clone()))
+        .await
+        .expect("stored");
+    assert_eq!(farm.holders(&digest).await, BTreeSet::from([2]));
+    let held = backend.read_blob(&digest).await.expect("read back");
+    assert_eq!(held.as_ref(), &bytes[..]);
+}
+
 /// Catches a frontend that calls the `--storage` node at generation 0 while the map has one
 /// member: a node that judges calls by its map refuses 0 as behind (STALE_MAP), so a farm of
 /// one would answer nothing. The node holds the map of generation 5 with one member, and the

@@ -14,6 +14,7 @@ mod reading;
 mod repair;
 mod sinking;
 mod stale;
+mod streaming;
 mod tls;
 mod verifying;
 mod writing;

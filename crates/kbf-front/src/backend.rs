@@ -46,7 +46,7 @@ use kbf_meta::{ActionRecord, ActionWriteError, Role};
 use kbf_objstore::ObjectStore;
 use kbf_proto::reapi::ActionResult;
 use kbf_route::Router;
-use kbf_storage::{Storage, StorageError};
+use kbf_storage::{OpenPieces, Storage, StorageError};
 use kbf_types::Digest;
 use prost::Message as _;
 
@@ -189,6 +189,21 @@ impl Backend {
 
     pub(crate) async fn walk_inputs(&self, root: Digest) -> Result<Walked, StorageError> {
         self.0.walk_inputs(root).await
+    }
+
+    /// Stores the blob `digest` from the pieces `open` gives (red-first stub: stores nothing).
+    ///
+    /// # Errors
+    /// Always, until it is written.
+    pub async fn put_streamed(
+        &self,
+        digest: &Digest,
+        open: &OpenPieces,
+    ) -> Result<(), StorageError> {
+        let _ = (digest, open);
+        Err(StorageError::Internal(
+            "put_streamed is not written".to_owned(),
+        ))
     }
 
     /// What the service counts: the cache's own metrics, or this frontend's.

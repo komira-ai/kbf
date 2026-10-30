@@ -42,11 +42,14 @@ use kbf_segments::{Footer, MAX_SEGMENT_BYTES, SegmentError};
 use super::{CommitError, MAX_COMMIT_BLOBS, Packs, offload, recording_failed};
 use crate::proxy::packed::metrics::Reason;
 
+mod large;
 mod mint;
+mod set;
 mod task;
 
 pub use self::mint::{MIN_SECRET_BYTES, MintError, PackKeyMint};
-pub use self::task::{Ingested, RejectReason, StoreError, ingest};
+pub use self::set::IssuedKeySet;
+pub use self::task::{Ingested, RejectReason, StoreError, ingest, ingest_set};
 
 /// The most bytes a pack of an untrusted writer may have: the most a segment may have.
 pub const MAX_UNTRUSTED_PACK_BYTES: u64 = MAX_SEGMENT_BYTES;
@@ -64,6 +67,10 @@ pub const MAX_UNTRUSTED_MANIFEST_BYTES: u64 = 4 << 20;
 /// of [`MAX_UNTRUSTED_PACK_BYTES`] once, and the trailer twice (the read of the trailer, which
 /// also shows that the pack is not longer than said by one byte, and the read of the footer).
 pub const MAX_UNTRUSTED_READ_BYTES: u64 = MAX_UNTRUSTED_PACK_BYTES + TRAILER_LEN as u64 + 1;
+
+/// The most bytes one large object of a task may have by default (`--task-large-max-bytes`): 512
+/// MiB, which the object store's own cap for the large-object key must equal.
+pub const MAX_UNTRUSTED_LARGE_BYTES: u64 = 512 << 20;
 
 /// The key the frontend issued for one build's write of one pack: `cas/b/<build>/<nonce>`.
 ///
@@ -121,6 +128,9 @@ pub struct UntrustedLimits {
     pub max_blob_bytes: u64,
     /// The most bytes one commit may read from the store, checked before the first read.
     pub read_budget: u64,
+    /// The most bytes of one large object of a run ([`MAX_UNTRUSTED_LARGE_BYTES`]): a manifest
+    /// that names a larger one is refused as a bad manifest. 0 refuses every large object.
+    pub max_large_bytes: u64,
 }
 
 impl Default for UntrustedLimits {
@@ -130,6 +140,7 @@ impl Default for UntrustedLimits {
             max_blobs: MAX_COMMIT_BLOBS,
             max_blob_bytes: MAX_UNTRUSTED_BLOB_BYTES,
             read_budget: MAX_UNTRUSTED_READ_BYTES,
+            max_large_bytes: MAX_UNTRUSTED_LARGE_BYTES,
         }
     }
 }
