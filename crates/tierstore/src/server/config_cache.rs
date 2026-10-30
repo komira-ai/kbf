@@ -92,7 +92,9 @@ impl Visitor<'_> for RateVisitor {
         let size = text.strip_suffix("/s").map(parse_size);
         match size {
             Some(Ok(bytes)) => Ok(Rate(bytes)),
-            _ => Err(E::custom("not a rate; use a size and /s, as in 50MiB/s")),
+            // An invalid value, not a custom message: the refusal of a file names the key and
+            // the kind of value it takes and never shows what was written (see `syntax`).
+            _ => Err(E::invalid_value(de::Unexpected::Str(text), &self)),
         }
     }
 }
