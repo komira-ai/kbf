@@ -169,6 +169,7 @@
 //! [`ServerConfig::drain_deadline`] at most. `serve` returns, with the number of requests that
 //! the deadline cut: those still running, or still being sent.
 
+mod activation;
 mod auth;
 mod cache_cli;
 pub mod cli;

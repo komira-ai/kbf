@@ -92,7 +92,31 @@ impl OciListener {
         front: Arc<OciFront>,
         limits: OciLimits,
     ) -> Result<Self, OciError> {
-        let bound = TcpListener::bind(addr).await;
+        Self::with(addr, TcpListener::bind(addr).await, acceptor, front, limits)
+    }
+
+    /// Serves on `socket`, a listening socket the service manager passed, which is bound to
+    /// `addr`; plain HTTP if `acceptor` is `None`. Nothing is bound.
+    ///
+    /// # Errors
+    /// [`OciError::Bind`] if the socket cannot be registered with the runtime.
+    pub fn adopt(
+        addr: SocketAddr,
+        socket: std::net::TcpListener,
+        acceptor: Option<TlsAcceptor>,
+        front: Arc<OciFront>,
+        limits: OciLimits,
+    ) -> Result<Self, OciError> {
+        Self::with(addr, TcpListener::from_std(socket), acceptor, front, limits)
+    }
+
+    fn with(
+        addr: SocketAddr,
+        bound: std::io::Result<TcpListener>,
+        acceptor: Option<TlsAcceptor>,
+        front: Arc<OciFront>,
+        limits: OciLimits,
+    ) -> Result<Self, OciError> {
         let listener = bound.map_err(|source| OciError::Bind { addr, source })?;
         Ok(Self {
             listener,

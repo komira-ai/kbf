@@ -33,11 +33,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
 
 use crate::{Backend, Clock, Error as BackendError, SelfTestOptions, SystemClock, self_test};
 
+use super::activation::Sockets;
 use super::cli::{
     Addresses, Error, S3Flags, bind_oci, oci_cut_note, oci_setup_of, open_tier, probe_run_id,
     serve_oci, signals,
@@ -159,6 +159,7 @@ pub(super) async fn serve_cache(
     disk: Arc<dyn Disk>,
     stop: impl Future<Output = ()> + Send + 'static,
     ready: impl FnOnce(Addresses),
+    mut sockets: Sockets,
 ) -> Result<Drained, Error> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut config = server_config(&settings.front, Arc::clone(&clock))?;
@@ -179,10 +180,8 @@ pub(super) async fn serve_cache(
     // The registry front reads what the S3 front reads: through the cache.
     let backend: Arc<dyn Backend> = Arc::new(cache.clone());
     let server = Server::new(Arc::clone(&backend), config);
-    let address = settings.front.listen;
-    let bound = TcpListener::bind(address).await;
-    let listener = bound.map_err(|why| format!("binding {address}: {why}"))?;
-    let oci = bind_oci(oci, backend).await?;
+    let listener = sockets.s3_or_bind(settings.front.listen).await?;
+    let oci = bind_oci(oci, backend, sockets.oci()).await?;
     let oci_addr = oci.as_ref().map(OciListener::local_addr).transpose()?;
     let oci_mode = oci.as_ref().map(OciListener::mode);
     ready(Addresses {
@@ -222,6 +221,7 @@ pub(super) async fn run_cache(
     settings: &CacheSettings,
     stop: impl Future<Output = ()> + Send + 'static,
     ready: impl FnOnce(Addresses),
+    sockets: Sockets,
 ) -> Result<Drained, Error> {
     if settings.s3_request_timeout.is_zero() {
         return Err("--s3-request-timeout must be longer than zero".into());
@@ -234,11 +234,14 @@ pub(super) async fn run_cache(
     };
     let upstream = open_tier("--cold", &tier.spec, &s3, settings.s3_request_timeout)?;
     let disk: Arc<dyn Disk> = Arc::new(SystemDisk);
-    serve_cache(settings, upstream, disk, stop, ready).await
+    serve_cache(settings, upstream, disk, stop, ready, sockets).await
 }
 
 /// Runs the cache until SIGTERM or SIGINT.
-pub(super) async fn serve_cache_until_signalled(settings: CacheSettings) -> Result<(), Error> {
+pub(super) async fn serve_cache_until_signalled(
+    settings: CacheSettings,
+    sockets: Sockets,
+) -> Result<(), Error> {
     let stop = signals()?;
     let version = env!("CARGO_PKG_VERSION");
     let mode = if settings.cache.write_through {
@@ -254,7 +257,7 @@ pub(super) async fn serve_cache_until_signalled(settings: CacheSettings) -> Resu
         }
         println!("{line}");
     };
-    let drained = run_cache(&settings, stop, announce).await?;
+    let drained = run_cache(&settings, stop, announce, sockets).await?;
     eprint!("{}", super::cli::cut_note(drained));
     Ok(())
 }

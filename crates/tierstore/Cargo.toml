@@ -89,7 +89,7 @@ percent-encoding = { workspace = true, optional = true }
 ring = { workspace = true, optional = true }
 # The user id the server runs as, which a key file must belong to, and the free space, the link count and
 # the times of the files of the local cache (`server`).
-rustix = { workspace = true, features = ["fs", "process"], optional = true }
+rustix = { workspace = true, features = ["fs", "net", "process"], optional = true }
 # The body of a CompleteMultipartUpload request (`server`).
 roxmltree = { workspace = true, optional = true }
 # The TLS of the OCI read front (`server`): the certificate and key are read at start, and the

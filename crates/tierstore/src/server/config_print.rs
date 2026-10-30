@@ -94,6 +94,7 @@ pub(super) fn render(cli: &Cli) -> Result<String, ConfigError> {
     cold.skip_checks = Some(skipped);
     let server = ServerTable {
         listen: cli.listen,
+        listen_from_systemd: cli.listen_from_systemd,
         proxy_id: cli.proxy_id.clone(),
         bucket: cli.bucket.clone(),
         region: Some(cli.region.clone()),

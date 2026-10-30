@@ -74,7 +74,9 @@
 //! loopback (`--oci-listen`, `server::oci`), which serves the objects under a key prefix by
 //! their SHA-256 digest, so that a container engine pulls an image from the tiers.
 
-#![forbid(unsafe_code)]
+// Denied, not forbidden: the one module that takes the listening sockets a service manager passes
+// (`server::activation`) allows it for three small functions with a `SAFETY` comment each.
+#![deny(unsafe_code)]
 
 mod backend;
 mod cache;

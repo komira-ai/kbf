@@ -67,6 +67,7 @@ pub(super) const PER_RUN: &[&str] = &[
 /// (`--hot`) has a key for each part of its spec.
 pub(super) const KEYS: &[(&str, &[&str])] = &[
     ("listen", &["server.listen"]),
+    ("listen-from-systemd", &["server.listen_from_systemd"]),
     ("proxy-id", &["server.proxy_id"]),
     (
         "hot",
@@ -334,6 +335,9 @@ pub(super) struct File {
 #[serde(deny_unknown_fields)]
 pub(super) struct ServerTable {
     pub listen: SocketAddr,
+    /// Left out when false, so that a file printed for flags without it is the file it always was.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub listen_from_systemd: bool,
     pub proxy_id: String,
     pub bucket: String,
     pub region: Option<String>,
@@ -869,6 +873,7 @@ fn storage(
         print_config: false,
         check_config: false,
         listen: front.listen,
+        listen_from_systemd: front.listen_from_systemd,
         proxy_id: front.proxy_id,
         hot: hot_parts.spec,
         cold: cold_parts.spec,
@@ -947,6 +952,7 @@ pub(super) fn front_of(server: ServerTable, per_run: PerRun) -> Result<Shared, C
     )?;
     let front = FrontSettings {
         listen: server.listen,
+        listen_from_systemd: server.listen_from_systemd,
         proxy_id: server.proxy_id,
         bucket: server.bucket,
         region: server.region.unwrap_or_else(|| DEFAULT_REGION.to_owned()),

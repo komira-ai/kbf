@@ -31,6 +31,9 @@ pub(super) fn read_key(path: &Path) -> Result<(String, String), String> {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct FrontSettings {
     pub listen: SocketAddr,
+    /// Whether the listening sockets come from the service manager (see
+    /// [`activation`](super::activation)).
+    pub listen_from_systemd: bool,
     pub proxy_id: String,
     pub bucket: String,
     pub region: String,
@@ -54,6 +57,7 @@ impl Cli {
     pub(super) fn front(&self) -> FrontSettings {
         FrontSettings {
             listen: self.listen,
+            listen_from_systemd: self.listen_from_systemd,
             proxy_id: self.proxy_id.clone(),
             bucket: self.bucket.clone(),
             region: self.region.clone(),

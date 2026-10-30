@@ -8,14 +8,16 @@ These files go beside the binary.
 
 | file | what |
 |---|---|
+| `tierstore.socket` | the listening socket of the service: systemd binds it and keeps it while the service restarts, so that a restart refuses no connection (Restarting without refusing connections, below) |
 | `tierstore.service` | the unit: the binary as `tierstore`, an account that is not root, a two-tier S3 setup, a stop that waits for the drain, and the hardening of the other example units |
 | `tierstore.conf` | the sysusers.d entry of the `tierstore` account (no login, no home) |
 
 The values in the unit are examples (`192.0.2.10`, `s3-hot.example`, the bucket names, the
 sizes): edit them to the setup's. `crates/tierstore/tests/packaging.rs` reads these files and
 checks that the command line parses as the binary parses it, that no secret is on it (every key
-and credential flag names a file), that the stop timeout covers the drain, and that nothing
-starts the unit by itself.
+and credential flag names a file), that the stop timeout covers the drain, that the socket unit
+and the service agree on the address, the socket's name and each other's names, and that nothing
+starts a unit by itself.
 
 ## Placing the binary
 
@@ -41,6 +43,7 @@ the unit.
 install -m 0644 tierstore.conf /etc/sysusers.d/tierstore.conf
 systemd-sysusers /etc/sysusers.d/tierstore.conf
 install -d -m 0750 -o root -g tierstore /etc/tierstore
+install -m 0644 tierstore.socket /etc/systemd/system/tierstore.socket
 install -m 0644 tierstore.service /etc/systemd/system/tierstore.service
 systemctl daemon-reload
 ```
@@ -116,7 +119,8 @@ call, `If-Match`, read, list or delete is allowed. The signature does not cover 
 reader of the object must check its content. The query string is never logged.
 
 A secret is never on the command line or in the environment: the process reads no environment
-variable, and the unit sets none.
+variable but the three with which a service manager passes it sockets (and only with
+`--listen-from-systemd`, see Restarting without refusing connections), and the unit sets none.
 
 ## GC keys
 
@@ -503,6 +507,7 @@ the flags of the binary against this table, so a flag added without a key fails 
 | flag | key | what |
 |---|---|---|
 | `--listen` | `server.listen` | the address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on |
+| `--listen-from-systemd` | `server.listen_from_systemd` | takes the listening sockets (this one, and the registry front's if there is one) from systemd instead of binding them; see Restarting without refusing connections |
 | `--proxy-id` | `server.proxy_id` | names the journal and the lease of this process |
 | `--hot` | `hot_store.kind`, `hot_store.path`, `hot_store.bucket` | the hot tier: `kind` is `memory`, `dir` (with `path`) or `s3` (with `bucket`, `endpoint` and `credentials_file`); in a flag, `memory`, `dir:<path>` or `s3:<bucket>` |
 | `--cold` | `cold_store.kind`, `cold_store.path`, `cold_store.bucket` | the cold tier, in the same three kinds |
@@ -633,6 +638,7 @@ The unit's `ExecStart=` is a complete command line. The flags to edit:
 | `--hot`, `--cold` | the tiers: `s3:<bucket>` for a bucket of an S3-compatible store (also `dir:<path>` and `memory`; a `dir:` path must also be writable under `ProtectSystem=strict`, so add it to `ReadWritePaths=`) |
 | `--hot-endpoint`, `--cold-endpoint` | where the tier's store is, `http://host[:port]` (TLS is not built yet); `--hot-region` and `--cold-region` set the signing region of a tier, `us-east-1` if not given |
 | `--hot-bytes` | the bytes the hot tier is meant to hold; the water marks are shares of it (`--high-water`, `--low-water`, `--critical`) |
+| `--listen-from-systemd` | the sockets come from systemd (`tierstore.socket`), by the names `s3` and `oci`; `--listen` and `--oci-listen` still say the addresses, which must be those of the sockets |
 | `--drain-lb-wait`, `--drain-deadline` | the drain on SIGTERM: how long `/readyz` says 503 while the server goes on serving, and how long it then waits for requests in flight |
 | `--usage-stale-after` | how old the usage that the reconciler publishes may be (2m by default, longer than `--lease-ttl`) before `/usagez` says 503 with the reason (200 and the age while fresh). Puts ignore a usage older than 30 s, so a stopped reconciler means a hot tier that is never taken to be full; puts are not refused. A load balancer probes `/readyz`, which does not look at the usage (one stopped reconciler would otherwise take every node out); alerting probes `/usagez` |
 | `--oci-listen`, `--oci-tls-cert`, `--oci-tls-key`, `--oci-prefix` | the read-only registry front, off unless `--oci-listen` is given; see The OCI read front |
@@ -896,6 +902,48 @@ systemctl start tierstore
 To start it at boot, add the section in a drop-in (`systemctl edit tierstore` takes
 `[Install]` and `WantedBy=multi-user.target`) and run `systemctl enable tierstore`; that is
 the operator's choice, and the shipped file does not make it.
+
+## Restarting without refusing connections
+
+Without a socket unit the process binds its address, and between the exit of one process and the
+start of the next nothing listens there: a client that connects then is refused. With
+`tierstore.socket` systemd binds the address instead and keeps the socket open while the service
+is stopped and started. A connection made in between is completed by the kernel and waits in the
+socket's queue, and the next process accepts it; the client sees a slow answer, not a refusal.
+
+The service asks for this with `--listen-from-systemd` (or `listen_from_systemd = true` in
+`[server]` of a file, for a storage node and a build node alike; the flag cannot be given with
+`--config`). Then:
+
+- The process reads `LISTEN_PID`, `LISTEN_FDS` and `LISTEN_FDNAMES`, which systemd sets, and
+  nothing else of the environment. They are a platform's mode markers and not configuration, and
+  they are read only with the flag: without it they are ignored. The three are removed from the
+  environment once read.
+- The S3 API is the socket named `s3` (`FileDescriptorName=s3` in the socket unit) and the registry
+  front, if `--oci-listen` is given, the one named `oci`. The manager must pass exactly these
+  sockets, each once, to this process; each must be a listening TCP stream socket, bound to the
+  address `--listen` or `--oci-listen` says. Anything else is refused at start with exit status
+  2 and a message that names what was passed wrong, before a tier is asked for anything, and the
+  unit does not restart a start that exits 2.
+- The address is in two places, `ListenStream=` and the flag, and the process checks that they
+  are one.
+- On SIGTERM the process drains as it always has (see Stopping it). When it stops accepting it
+  closes its own descriptor of the socket and nothing else: it never calls `shutdown` on it, so
+  the socket is left listening in systemd and the connections queued on it are neither refused
+  nor reset.
+
+The registry front is a second socket unit, because a socket unit has one name. For
+`--oci-listen 192.0.2.10:5000`, a `tierstore-oci.socket` with `ListenStream=192.0.2.10:5000` and
+`FileDescriptorName=oci`, and `Sockets=tierstore.socket tierstore-oci.socket` in the service's
+`[Service]` section, with `Requires=` and `After=` of the second socket as for the first.
+
+What a restart does not do. The old process answers the requests it has in flight, for at most
+`--drain-deadline` (`TimeoutStopSec=` is set above it); the new process starts after the old one
+has exited, so a request that takes longer than that is cut, and the new process is not serving
+before it has passed the start-up checks of its tiers, while the connections wait. A connection
+that the old process had accepted and that sent its first request after the end of
+`--drain-lb-wait` is answered 503 `ServiceUnavailable` with `Connection: close`, which the
+clients of kbf retry.
 
 ## Stopping it
 

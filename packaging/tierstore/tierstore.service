@@ -8,7 +8,15 @@
 # nothing and `systemctl enable` has nothing to link; start it with `systemctl start tierstore`
 # once the files below are in place.
 #
-# Edit before use: the listen address (192.0.2.10 is a documentation address), the proxy id (keep
+# The listening socket is not the process's: tierstore.socket binds it and keeps it while the
+# process is stopped and started again, so the connections made in between wait in the kernel's
+# queue and are accepted by the next process. `systemctl restart tierstore` is the restart; the
+# socket stays up. Start the socket first (`systemctl start tierstore.socket`) or the service,
+# which pulls it in.
+#
+# Edit before use: the listen address (192.0.2.10 is a documentation address; the same address is
+# --listen here and ListenStream= in tierstore.socket, and the process refuses a start in which
+# they differ), the proxy id (keep
 # it across restarts, and give each process over the same tiers one of its own), the buckets, the
 # endpoints (http://host[:port], no path) and --hot-bytes (the bytes the hot tier is meant to hold).
 #
@@ -26,8 +34,9 @@
 [Unit]
 Description=tierstore, an S3 server over a hot and a cold tier
 Documentation=https://github.com/komira-ai/kbf/blob/main/packaging/tierstore/README.md
-After=network-online.target
+After=network-online.target tierstore.socket
 Wants=network-online.target
+Requires=tierstore.socket
 ConditionPathExists=/etc/tierstore/access.key
 # Restart=on-failure below tries a start that failed again after RestartSec=30. The process itself
 # asks a store that does not answer again for --backend-check-wait (5 minutes by default), so a
@@ -45,6 +54,7 @@ Type=simple
 User=tierstore
 ExecStart=/usr/libexec/kbf/tierstore \
   --listen 192.0.2.10:9000 \
+  --listen-from-systemd \
   --proxy-id tierstore-1 \
   --bucket tierstore \
   --access-key-file /etc/tierstore/access.key \
