@@ -61,6 +61,14 @@ endpoint         = "http://127.0.0.1:30900"
 region           = "us-west-2"
 credentials_file = "/etc/tierstore/cold.credentials"
 skip_checks      = ["multipart-conditional=store-ignores-if-none-match-on-completion"]
+
+[oci]
+listen              = "192.0.2.10:5000"
+tls_cert_file       = "/etc/tierstore/oci.crt"
+tls_key_file        = "/etc/tierstore/oci.key"
+prefix              = "images/"
+max_connections     = 16
+connection_lifetime = "30m"
 "#;
 
 /// The flags that say what `GOLDEN` says.
@@ -105,6 +113,12 @@ pub(crate) fn golden_flags() -> Vec<&'static str> {
         "--cold-region=us-west-2",
         "--cold-credentials-file=/etc/tierstore/cold.credentials",
         "--skip-backend-check=multipart-conditional=store-ignores-if-none-match-on-completion",
+        "--oci-listen=192.0.2.10:5000",
+        "--oci-tls-cert=/etc/tierstore/oci.crt",
+        "--oci-tls-key=/etc/tierstore/oci.key",
+        "--oci-prefix=images/",
+        "--oci-max-connections=16",
+        "--oci-connection-lifetime=30m",
     ]
 }
 
