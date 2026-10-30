@@ -20,6 +20,12 @@ test-group = 'install-sh-fixture'
 filter = 'package(kbf-mac-provision)'
 test-group = 'mac-provision-scratch'
 
+# A hang guard, not a bound: this test waits for a run that ends once the daemon has
+# killed it; a daemon that loses the kill leaves it waiting for ever.
+[[profile.default.overrides]]
+filter = 'binary_id(=kbf-daemon) & test(=lease::tests::a_cancel_during_the_first_poll_of_the_run_still_ends_it)'
+slow-timeout = { period = "30s", terminate-after = 1 }
+
 # The pull-request profile (`cargo nextest run --profile pr`, and `cargo llvm-cov nextest
 # --profile pr`): the fast gate. A pull request runs every test except the slow ones named
 # below; the push to main runs them all, with the default profile

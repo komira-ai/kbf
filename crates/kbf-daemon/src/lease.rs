@@ -67,6 +67,9 @@ struct Running {
     /// Becomes true once the run has been polled for the first time, which is where a
     /// runtime registers what its `kill` stops.
     begun: watch::Receiver<bool>,
+    /// Test seam: notified when a kill of this lease is about to wait for the first poll.
+    #[cfg(test)]
+    waiting: Arc<tokio::sync::Notify>,
 }
 
 impl Leases {
@@ -134,7 +137,15 @@ impl Leases {
             let _ = done.send((id, outcome, usage, phases));
         });
         tracing::info!(lease = %id, driver = runtime.driver(), "lease started");
-        self.running.insert(id, Running { runtime, begun });
+        self.running.insert(
+            id,
+            Running {
+                runtime,
+                begun,
+                #[cfg(test)]
+                waiting: Arc::default(),
+            },
+        );
         None
     }
 
@@ -246,7 +257,11 @@ async fn begun_after_first_poll<F: std::future::Future>(
 fn kill_once_begun(id: LeaseId, running: &Running) {
     let runtime = Arc::clone(&running.runtime);
     let mut begun = running.begun.clone();
+    #[cfg(test)]
+    let waiting = Arc::clone(&running.waiting);
     tokio::spawn(async move {
+        #[cfg(test)]
+        waiting.notify_one();
         // An error is the run's task gone before its first poll: nothing to wait for.
         let _ = begun.wait_for(|begun| *begun).await;
         runtime.kill(id).await;
@@ -657,9 +672,9 @@ mod tests {
     /// its first poll, before its runtime can stop it: the runtime does nothing for a
     /// lease it does not run, so a kill sent then is lost, the run goes on, and a
     /// draining daemon waits on it for ever (kbf#2013). The run's first poll is held
-    /// until the kill has had its chance (or half a second has passed, for a daemon that
-    /// holds the kill back, which is not asserted); the run must then end, killed. The
-    /// last wait is a hang guard.
+    /// until either the kill has reached the runtime (the bug: asserted not to happen) or
+    /// the cancel is waiting for that poll (the seam `Running::waiting`); no wait here
+    /// depends on time. The run must then end, killed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cancel_during_the_first_poll_of_the_run_still_ends_it() {
         let (release, held) = std::sync::mpsc::channel();
@@ -679,18 +694,18 @@ mod tests {
         };
         assert_eq!(leases.start(start), None);
         runtime.entered.notified().await;
+        let waiting = Arc::clone(&leases.running[&id()].waiting);
         assert!(leases.cancel(id()));
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            runtime.kill_called.notified(),
-        )
-        .await;
+        let killed_early = tokio::select! {
+            () = runtime.kill_called.notified() => true,
+            () = waiting.notified() => false,
+        };
         release.send(()).expect("the run waits");
-        let (ended, outcome, usage, phases) =
-            tokio::time::timeout(std::time::Duration::from_secs(30), done_rx.recv())
-                .await
-                .expect("the cancelled run ends")
-                .expect("open");
+        assert!(
+            !killed_early,
+            "the kill reached the runtime while the run's first poll was still held"
+        );
+        let (ended, outcome, usage, phases) = done_rx.recv().await.expect("the run ends");
         let result = leases.finished(ended, outcome, usage, &phases);
         assert_eq!(code(&result), Code::Aborted as i32);
     }
