@@ -1,0 +1,47 @@
+<h1>Operations</h1>
+<p class="lede">Starting and stopping tierstore, what it answers to a probe, what it prints, and what it does not export.</p>
+<p class="toc">On this page: <a href="#start">starting</a> <a href="#stop">stopping</a> <a href="#probes">probes</a> <a href="#selftest">the start-up self-test</a> <a href="#exit">exit statuses</a> <a href="#metrics">metrics</a> <a href="#upgrade">upgrading</a></p>
+
+<h2 id="start">Starting</h2>
+<p>The example unit does not start at install or at boot, and it is skipped while <code>/etc/tierstore/access.key</code> does not exist. Start it by hand when the key files are in place: <code>systemctl start tierstore</code>. A start that fails is tried again after 30 seconds, up to 5 starts in an hour, then systemd gives up until <code>systemctl reset-failed tierstore</code>. Exit status 2 (a command line the parser refused, or two keys with one access key id) and exit status 3 (a tier that answered the self-test wrongly) are not retried: <code>RestartPreventExitStatus=2 3</code>.</p>
+<p>The process prints <code>tierstore &lt;version&gt; listen=&lt;address&gt;</code> on stdout once it is bound, and its other messages on stderr. It reads no environment variable. No message of the process carries a secret.</p>
+
+<h2 id="stop">Stopping</h2>
+<p>systemd sends SIGTERM. The process answers <code>/readyz</code> 503, serves for <code>--drain-lb-wait</code> so that a load balancer sees it, refuses new requests, waits for those in flight for at most <code>--drain-deadline</code>, gives up the reconciler's lease and exits 0. <code>TimeoutStopSec=</code> in the example unit is set above the sum of the two flags and the lease's wait, so that systemd does not send SIGKILL to a drain in progress: if you raise <code>--drain-deadline</code>, raise it too.</p>
+
+<h2 id="probes">Probes</h2>
+<p>None of these is signed, so a bucket cannot be called <code>healthz</code>, <code>readyz</code> or <code>usagez</code>.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Request</th><th>Answer</th><th>Use it for</th></tr></thead>
+<tbody>
+<tr><td><code>GET /healthz</code></td><td>200 <code>ok</code> while the process runs</td><td>liveness</td></tr>
+<tr><td><code>GET /readyz</code></td><td>200 <code>ready</code> until the drain begins, then 503 <code>draining</code>. It does not look at the usage</td><td>a load balancer</td></tr>
+<tr><td><code>GET /usagez</code></td><td>200 and the age of the usage object the reconciler publishes (<code>_tiering/usage</code>), such as <code>usage published 3s ago</code>; 503 with the reason once it is older than <code>--usage-stale-after</code> (2 minutes by default). Before the first pass of the reconciler it is 200 (<code>no usage yet</code>) for that long. Without a proxy it is 200 and says the usage is not watched</td><td>alerting, not a load balancer</td></tr>
+</tbody></table></div>
+<p>Why <code>/usagez</code> is separate: puts ignore a usage older than 30 seconds, as if the hot tier were not full, so a stopped reconciler would otherwise show nowhere. A load balancer probes <code>/readyz</code>, because one stopped reconciler would otherwise take every node out. Puts are not refused when the usage is stale.</p>
+<p class="source-note">From <code>crates/tierstore/src/server/mod.rs</code> and "Filling in the flags" in <code>packaging/tierstore/README.md</code>.</p>
+
+<h2 id="selftest">The start-up self-test</h2>
+<p>Before it binds its address the process asks each tier the questions its guarantees rest on: a create-only put of a key that exists must be refused, a replace on a wrong ETag must be refused and one on the right ETag must work, a ranged read must give exactly the range, a HEAD must give the size and the ETag of what was written, a listing after a key must page right, and on the cold tier the completion of a multipart upload over a key that exists must be refused. (Only the create-only completion is probed, not the refusal of a bad part list.) It uses keys under <code>_tiering/selftest/</code>, which clients never see; they are deleted afterwards, and keys a killed start left more than an hour ago (by the store's clock) are swept. Only keys under that prefix are ever deleted.</p>
+<ul>
+<li><strong>A tier answers one wrongly:</strong> exit 3, with the tier, the check and the answer on stderr, and no restart. Fix or replace the store. That includes answers that are a configuration error, such as 403 <code>AccessDenied</code> or <code>NoSuchBucket</code>.</li>
+<li><strong>A tier cannot be reached</strong> (down, a timeout, 408, 429, any 5xx but 501 and 507): it is asked again after pauses from one second doubling to thirty, for <code>--backend-check-wait</code> (five minutes by default, for each tier; <code>0s</code> asks once). Then the start exits 1 with <code>tier unreachable: &lt;tier&gt;: &lt;error&gt;</code> and the unit tries again.</li>
+<li><strong>A tier is full</strong> (a full hot tier is a designed state): it starts, and the checks that need a write are skipped, with a line on stderr that says so. For a full cold tier the line is a warning that writes to the cold tier will fail.</li>
+</ul>
+<p><code>--skip-backend-check multipart-conditional=&lt;reason&gt;</code> leaves out the multipart check, for a store that lacks a conditional completion; the reason is written to stderr at every start. No other check can be skipped (exit 2). Without that check a multipart upload to the cold tier may replace an object that exists.</p>
+
+<h2 id="exit">Exit statuses</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Status</th><th>Meaning</th><th>Retried by the example unit</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>after a drain</td><td>no (it stopped)</td></tr>
+<tr><td>1</td><td>a start that failed, an unreachable tier included, or a key file or flag combination refused after parsing</td><td>yes, after 30 seconds</td></tr>
+<tr><td>2</td><td>flags that cannot go together: one the parser refused, two keys with one access key id, a configuration file that is refused or given with flags that describe the data path</td><td>no</td></tr>
+<tr><td>3</td><td>a tier answered the start-up self-test wrongly</td><td>no</td></tr>
+</tbody></table></div>
+
+<h2 id="metrics">Metrics</h2>
+<p>There is no metrics endpoint. What there is to watch from outside: the three probes above, the process's stderr, and the objects tierstore keeps in the hot tier (<code>_tiering/usage</code> for the hot tier's usage, <code>_tiering/proxies/</code> and <code>_journal/</code> for each proxy's checkpoint and journal). The reconciler's hot-tier size and copy lag are values in the library (<code>Reconciler::hot_bytes</code> and <code>Reconciler::copy_lag</code>, "for metrics" in its documentation); the binary does not export them.</p>
+
+<h2 id="upgrade">Upgrading</h2>
+<p>Nothing updates tierstore. Place the next binary as on the <a href="install.html">install page</a> and restart the unit; the drain above makes the stop orderly. A release of kbf is a release of tierstore, so the version is kbf's.</p>
