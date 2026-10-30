@@ -235,6 +235,64 @@ const GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        // The frontend's job-facing read listener (`kbf_server::frontend`'s `job_read`).
+        "job-read",
+        &[
+            "job-grant-secret-file",
+            "job-listen",
+            "job-max-blob-bytes",
+            "job-reads-in-flight",
+            "job-tls-cert",
+            "job-tls-key",
+        ],
+    ),
+    (
+        // Preparing the runs of a host executor: `kbf_server::frontend`'s `task_flags`.
+        "task-runs",
+        &[
+            "task-closure-max-bytes",
+            "task-closure-max-digests",
+            "task-put-bucket",
+            "task-put-credentials-file",
+            "task-put-endpoint",
+            "task-put-region",
+            "task-read-url",
+            "task-run-wall-secs",
+            "task-secret-file",
+            "task-url-slack-secs",
+        ],
+    ),
+    (
+        // Where the frontend runs placed actions (`kbf_server::frontend`'s `executor_flags`): the
+        // daemons of the nodes, or hosts leased from the job scheduler's lease server.
+        "executor",
+        &[
+            "executor",
+            "executor-allow-plain-http-put",
+            "executor-arch",
+            "executor-call-timeout-secs",
+            "executor-class",
+            "executor-default-image",
+            "executor-default-timeout-secs",
+            "executor-frontend-id",
+            "executor-host-cpus",
+            "executor-host-memory-gib",
+            "executor-host-slots",
+            "executor-hosts",
+            "executor-images-have-no-entrypoint",
+            "executor-insecure-argv-secrets",
+            "executor-lease-ca-file",
+            "executor-lease-token-file",
+            "executor-lease-ttl-secs",
+            "executor-lease-url",
+            "executor-max-run-secs",
+            "executor-root-der",
+            "executor-run-margin-secs",
+            "executor-task-tool",
+            "executor-work-dir",
+        ],
+    ),
+    (
         // Not `enroll` or `frontend`: those tables are the enrollment client's own.
         "enroll-service",
         &[

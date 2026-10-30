@@ -103,6 +103,7 @@ mod http_history;
 pub mod http_invocations;
 pub mod http_sched;
 pub mod identity;
+mod input_cache_metrics;
 pub mod join;
 pub mod learned;
 mod listen;

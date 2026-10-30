@@ -1209,6 +1209,7 @@ impl FakeDaemon {
             pack_reads: None,
             pack_writes: None,
             node_load: load,
+            input_cache: None,
         }));
         self.expect("HeartbeatAck", ack_of(seq)).await;
     }
@@ -1234,6 +1235,7 @@ impl FakeDaemon {
             pack_reads,
             pack_writes,
             node_load: None,
+            input_cache: None,
         }));
         seq
     }
