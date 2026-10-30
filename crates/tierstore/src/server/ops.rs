@@ -203,7 +203,7 @@ where
 
 /// Whether a put only creates, which is what it does when it has no `If-Match` and its
 /// `If-None-Match` is absent or `*`: the body of such a put is streamed to the backend.
-fn creates_only(headers: &HeaderMap) -> bool {
+pub(super) fn creates_only(headers: &HeaderMap) -> bool {
     let conditions = (
         header(headers, "if-match"),
         header(headers, "if-none-match"),
