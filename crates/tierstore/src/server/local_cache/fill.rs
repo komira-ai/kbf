@@ -215,7 +215,13 @@ struct Flight {
 
 impl Drop for Flight {
     fn drop(&mut self) {
-        let gone = locked(&self.inner.flights).remove(&self.hex);
+        let gone = {
+            let mut flights = locked(&self.inner.flights);
+            // The mark of a delete is of this fill only: it goes with it (lock order: flights,
+            // then invalidated).
+            locked(&self.inner.invalidated).remove(&self.hex);
+            flights.remove(&self.hex)
+        };
         drop(gone);
     }
 }
@@ -439,6 +445,13 @@ impl Inner {
         };
         let fresh = self.commit(&staged, name, &sidecar).await?;
         locked(&self.index).insert(&name.hex, meta.size, meta.tag, meta.modified);
+        // A delete that came while the object was being read marked this fill: what it read is
+        // gone from the upstream, so it is not kept (the mark is looked for after the entry is
+        // in the index; see `forget`).
+        if self.is_invalidated(&name.hex) {
+            self.drop_entry(&name.hex);
+            return Err(Stop::Changed);
+        }
         drop(reservation);
         if fresh {
             bump(&self.counters.fills);
