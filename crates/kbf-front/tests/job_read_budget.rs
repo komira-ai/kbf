@@ -822,7 +822,7 @@ async fn a_reader_that_stalls_gives_its_budget_back_after_the_idle_limit() {
 async fn a_reader_that_makes_progress_keeps_its_budget() {
     let mut blobs = HashMap::new();
     let big = pattern(1, 3 * HELD_CHUNK_BYTES + 100);
-    let t = build(&mut blobs, "a", &[big.clone()], 0);
+    let t = build(&mut blobs, "a", std::slice::from_ref(&big), 0);
     let limits = Limits {
         read_budget_bytes: 4 * HELD_CHUNK_BYTES as u64,
         held_idle: Duration::from_secs(30),
