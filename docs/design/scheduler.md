@@ -754,7 +754,10 @@ turns it into one of two outcomes, and the scheduler decides on the committed re
   held by the legacy core's scheduler, which a restart builds again from the flag. The js
   core builds its scheduler inside `js-server-core`, whose configuration has no setting
   for it yet, so a server given `--no-memory-climb` with `--scheduler-core js` refuses to
-  start (exit status 2). A start logs `memory climb: on` or `memory climb: off`.
+  start (exit status 2). A start logs `memory climb: on` or `memory climb: off`. With
+  `--exclusive-actions` as well, an action books the whole worker, so its booking is its
+  cap: an own-limit kill reads as a kill at the cap, with the original message, not the
+  ladder-off one.
 - **The memory floor.** Each raised booking is kept as the memory floor of the
   action's key (instance name and action digest), and a later submission of that key
   books at least the floor, so a known-big action starts at the rung that ran it
