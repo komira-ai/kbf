@@ -118,15 +118,18 @@ pub enum RejectReason {
     /// A pack beyond the first, or a large object, is not in the store, or a digest the manifest
     /// or a tree names is in no pack and no large object.
     Incomplete,
-    /// A key is older than the longest it can be in use ([`kbf_pack::MIN_GRACE`]), or the
-    /// janitor of `cas/b/` has claimed it for its delete. Either way the run is not
-    /// ingested, and the action is run again under a new key set.
+    /// A key is as old as the longest it can be in use ([`kbf_pack::MIN_GRACE`]): the janitor
+    /// of `cas/b/` may delete it, so the run is not ingested, and the action is run again under
+    /// a new key set.
     Expired,
+    /// The janitor of `cas/b/` has claimed a key of the run for its delete: the run is not
+    /// ingested, and the action is run again under a new key set.
+    Claimed,
 }
 
 impl RejectReason {
     /// Every reason, in the order of the variants (the order of the counters).
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Missing,
         Self::WrongKey,
         Self::TooLarge,
@@ -135,6 +138,7 @@ impl RejectReason {
         Self::BadManifest,
         Self::Incomplete,
         Self::Expired,
+        Self::Claimed,
     ];
 
     /// The label of the reason in the metrics.
@@ -149,6 +153,7 @@ impl RejectReason {
             Self::BadManifest => "bad_manifest",
             Self::Incomplete => "incomplete",
             Self::Expired => "expired",
+            Self::Claimed => "claimed",
         }
     }
 }

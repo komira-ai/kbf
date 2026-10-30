@@ -337,6 +337,7 @@ fn reason(why: kbf_front::RejectReason) -> RejectReason {
         Front::BadManifest => RejectReason::BadManifest,
         Front::Incomplete => RejectReason::Incomplete,
         Front::Expired => RejectReason::Expired,
+        Front::Claimed => RejectReason::Claimed,
     }
 }
 

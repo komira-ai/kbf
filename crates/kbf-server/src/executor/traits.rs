@@ -44,6 +44,8 @@ pub enum RejectReason {
     /// A key is as old as the longest it can be in use, or the janitor of `cas/b/` has claimed
     /// it for its delete: the pack is not read.
     Expired,
+    /// The janitor of `cas/b/` has claimed a key of the run for its delete: the pack is not read.
+    Claimed,
 }
 
 impl fmt::Display for RejectReason {
@@ -57,6 +59,7 @@ impl fmt::Display for RejectReason {
             Self::BadManifest => "bad manifest",
             Self::Incomplete => "an output is missing",
             Self::Expired => "the key is too old to be ingested",
+            Self::Claimed => "the key is claimed for deletion",
         })
     }
 }

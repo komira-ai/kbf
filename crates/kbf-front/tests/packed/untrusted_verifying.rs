@@ -63,10 +63,12 @@ impl Run {
     /// A sweep of the store `grace` after the keys were minted, claiming through the registry of
     /// the packs, over the index of the rig.
     async fn sweep(&self) -> SweepReport {
-        sweeper(&self.rig)
-            .sweep(now() + MIN_GRACE * 2)
-            .await
-            .expect("swept")
+        self.sweep_at(MIN_GRACE * 2).await
+    }
+
+    /// A sweep made `age` after the keys were minted.
+    async fn sweep_at(&self, age: Duration) -> SweepReport {
+        sweeper(&self.rig).sweep(now() + age).await.expect("swept")
     }
 }
 
@@ -234,7 +236,7 @@ async fn an_ingest_that_starts_inside_the_delete_is_refused_and_records_nothing(
     let seen = std::mem::take(&mut *seen.lock().unwrap_or_else(PoisonError::into_inner));
     assert_eq!(seen.len(), 2, "an ingest began inside each delete");
     for got in seen.iter() {
-        assert_eq!(*got, Ingested::Reject(RejectReason::Expired));
+        assert_eq!(*got, Ingested::Reject(RejectReason::Claimed));
     }
     assert!(run.rig.store.keys().await.is_empty());
     for name in run.names() {
@@ -270,4 +272,67 @@ async fn a_sweep_inside_an_ingest_keeps_its_keys_and_one_after_it_deletes_them()
 
     assert_eq!(after.deleted, 2);
     assert!(run.rig.store.keys().await.is_empty());
+}
+
+/// Asserts that a hold taken after the page's answer from the index and before the janitor's
+/// claim (an ingest that starts in that gap, with the real registry) keeps the key: the claim
+/// fails, the key is counted verifying and is not deleted, and once the hold is let go a sweep
+/// deletes it. The hold is taken by the index's hook the first time it answers.
+#[tokio::test]
+async fn a_hold_taken_between_the_pages_answer_and_the_claim_keeps_the_key() {
+    let run = Run::new().await;
+    let name = run.names().remove(0);
+    run.rig.store.seed(&name, b"an orphan").await;
+    let registry = run.rig.packs.verifying_keys();
+    let holds: Arc<Mutex<Vec<kbf_front::Held>>> = Arc::default();
+    let (taken, calls) = (Arc::clone(&holds), std::sync::atomic::AtomicU32::new(0));
+    let held_name = name.clone();
+    run.rig.index.after_unreferenced(Arc::new(move || {
+        // The first answer is the page's; the ones after are the re-asks.
+        if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            let hold = registry
+                .hold(vec![held_name.clone()])
+                .expect("not claimed yet");
+            taken
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(hold);
+        }
+    }));
+
+    let report = run.sweep().await;
+
+    assert_eq!((report.verifying, report.deleted), (1, 0));
+    assert_eq!(run.rig.store.keys().await, vec![name.clone()]);
+    holds.lock().unwrap_or_else(PoisonError::into_inner).clear();
+
+    let after = run.sweep().await;
+
+    assert_eq!(after.deleted, 1);
+    assert!(run.rig.store.keys().await.is_empty());
+}
+
+/// Asserts, for ages on both sides of [`MIN_GRACE`] and at it, that the ingest refuses a key
+/// exactly when the sweeper (whose grace is `MIN_GRACE`) deletes it: no age is both ingestible and
+/// deletable, and none is neither.
+#[tokio::test]
+async fn the_ingest_refuses_a_key_exactly_when_the_sweep_would_delete_it() {
+    let minute = Duration::from_secs(60);
+    for age in [MIN_GRACE - minute, MIN_GRACE, MIN_GRACE + minute] {
+        let run = Run::new().await;
+        let name = run.names().remove(0);
+        run.rig.store.seed(&name, b"an orphan").await;
+
+        let deleted = run.sweep_at(age).await.deleted > 0;
+        let packs = run
+            .rig
+            .packs
+            .clone()
+            .with_clock(Arc::new(move || now() + age));
+        let got = run.ingest(&packs).await;
+        let refused = got == Ingested::Reject(RejectReason::Expired);
+
+        assert_eq!(refused, deleted, "at {age:?}");
+        assert_eq!(deleted, age >= MIN_GRACE, "at {age:?}");
+    }
 }

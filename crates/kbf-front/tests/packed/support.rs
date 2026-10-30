@@ -454,6 +454,7 @@ pub struct Index {
     fail_find: AtomicU32,
     fail_locate: AtomicU32,
     held: Mutex<Vec<bool>>,
+    after_unreferenced: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Index {
@@ -465,7 +466,16 @@ impl Index {
             fail_find: AtomicU32::new(0),
             fail_locate: AtomicU32::new(0),
             held: Mutex::new(Vec::new()),
+            after_unreferenced: Mutex::new(None),
         }
+    }
+
+    /// Runs `hook` after every answer to which keys are unreferenced, before it is returned.
+    pub fn after_unreferenced(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .after_unreferenced
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(hook);
     }
 
     /// The next `n` records fail.
@@ -551,7 +561,16 @@ impl PackIndex for Index {
     }
 
     fn unreferenced_keys(&self, keys: &[String]) -> Result<Vec<String>, PackIndexError> {
-        self.inner.unreferenced_keys(keys)
+        let answer = self.inner.unreferenced_keys(keys);
+        let hook = self
+            .after_unreferenced
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+        answer
     }
 }
 

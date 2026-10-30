@@ -979,6 +979,9 @@ async fn a_403_on_delete_aborts_the_sweep() {
 
     assert_eq!(rig.store.deletes.load(Ordering::SeqCst), 1);
     assert_eq!(rig.count("sweep_errors"), 1);
+    assert_eq!(rig.count("sweeps"), 0, "a sweep that failed did not end");
+    // What the sweep did before it stopped is counted: the page it listed.
+    assert_eq!(rig.count("listed"), 4);
     assert_eq!(rig.store.keys().await.len(), 4);
     rig.janitor.sweep_once().await;
     assert_eq!(rig.store.deletes.load(Ordering::SeqCst), 2);
@@ -1002,5 +1005,9 @@ async fn deletes_that_keep_failing_stop_the_sweep() {
 
     assert_eq!(rig.store.deletes.load(Ordering::SeqCst), 3);
     assert_eq!(rig.count("sweep_errors"), 1);
+    // What the sweep did before it stopped is counted: the page it listed, the deletes refused.
+    assert_eq!(rig.count("listed"), 6);
+    assert_eq!(rig.count("reap_errors"), 3);
+    assert_eq!(rig.count("reaped"), 0);
     assert_eq!(rig.store.keys().await.len(), 6);
 }
