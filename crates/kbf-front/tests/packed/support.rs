@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -44,9 +44,18 @@ fn fires(armed: &AtomicU32) -> bool {
 }
 
 fn injected() -> ObjectStoreError {
+    injected_with(503)
+}
+
+fn injected_with(status: u32) -> ObjectStoreError {
+    let code = if status == 507 {
+        "InsufficientStorage"
+    } else {
+        "SlowDown"
+    };
     ObjectStoreError::Service {
-        status: 503,
-        code: "SlowDown".to_owned(),
+        status: u16::try_from(status).expect("a status"),
+        code: code.to_owned(),
         message: "injected".to_owned(),
     }
 }
@@ -64,6 +73,9 @@ pub struct Spy {
     reject_large_lens: AtomicU32,
     overstated: Mutex<Vec<(String, u64)>>,
     hidden: Mutex<Vec<String>>,
+    failing_len: Mutex<Vec<String>>,
+    put_status: AtomicU32,
+    stall_streams: AtomicBool,
     puts: AtomicU32,
     stream_puts: AtomicU32,
     largest_piece: AtomicU64,
@@ -106,6 +118,9 @@ impl Spy {
             reject_large_lens: AtomicU32::new(0),
             overstated: Mutex::new(Vec::new()),
             hidden: Mutex::new(Vec::new()),
+            failing_len: Mutex::new(Vec::new()),
+            put_status: AtomicU32::new(503),
+            stall_streams: AtomicBool::new(false),
             puts: AtomicU32::new(0),
             stream_puts: AtomicU32::new(0),
             largest_piece: AtomicU64::new(0),
@@ -160,6 +175,27 @@ impl Spy {
     pub fn hide_len_of(&self, key: &str) {
         let mut hidden = self.hidden.lock().unwrap_or_else(PoisonError::into_inner);
         hidden.push(key.to_owned());
+    }
+
+    /// The length question about `key` fails (every time it is asked).
+    pub fn fail_len_of(&self, key: &str) {
+        let mut failing = self
+            .failing_len
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        failing.push(key.to_owned());
+    }
+
+    /// The next `n` writes fail with the HTTP `status` (503 and 507 are the answers of a store
+    /// that is slow and one that is full).
+    pub fn reject_puts_with(&self, n: u32, status: u32) {
+        self.put_status.store(status, SeqCst);
+        self.reject_puts.store(n, SeqCst);
+    }
+
+    /// A streamed write takes every byte of its body and then never finishes.
+    pub fn stall_streams(&self) {
+        self.stall_streams.store(true, SeqCst);
     }
 
     /// How many streamed writes were tried (not the writes the pack index makes).
@@ -243,7 +279,7 @@ impl ObjectStore for Spy {
         self.puts.fetch_add(1, SeqCst);
         self.stream_puts.fetch_add(1, SeqCst);
         if fires(&self.reject_puts) {
-            return Err(injected());
+            return Err(injected_with(self.put_status.load(SeqCst)));
         }
         let mut out = BytesMut::new();
         while let Some(piece) = body.next().await {
@@ -256,6 +292,9 @@ impl ObjectStore for Spy {
         }
         if (out.len() as u64) < len {
             return Err(ObjectStoreError::Body("shorter than its length".to_owned()));
+        }
+        if self.stall_streams.load(SeqCst) {
+            std::future::pending::<()>().await;
         }
         self.inner.put_new(key, out.freeze(), None).await
     }
@@ -285,6 +324,16 @@ impl ObjectStore for Spy {
 
     async fn len(&self, key: &ObjectKey) -> Result<Option<u64>, ObjectStoreError> {
         if fires(&self.reject_lens) {
+            return Err(injected());
+        }
+        let failing = {
+            let failing = self
+                .failing_len
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            failing.iter().any(|named| named == key.as_str())
+        };
+        if failing {
             return Err(injected());
         }
         let large = key.as_str().rsplit('-').next();

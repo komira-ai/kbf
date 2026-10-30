@@ -234,3 +234,72 @@ async fn a_write_given_up_with_the_cas_write_is_aborted_and_not_failed() {
     assert_eq!(count(&farm, LargeWriteThrough::Ok), 0);
     assert!(farm.rig.store.held(&key_of(digest)).await.is_none());
 }
+
+/// Asserts that the end of the object is explicit for the write-through: when the CAS side takes
+/// the last byte of a corrupt object (the right length, one byte changed) and stops polling the
+/// stream without reading it to its end, so the hash is never compared, nothing is put under
+/// `cas/l/<sha256>`. A write whose body merely ends at the declared length is not complete.
+#[tokio::test]
+async fn a_stream_left_after_its_last_byte_never_completes_the_write() {
+    let farm = Multi::new().await;
+    let (_, zero) = farm.large_run();
+    farm.put(farm.pack_key(0), &zero).await;
+    let mut wrong = large().0.to_vec();
+    wrong[LARGE_LEN / 2] ^= 1;
+    farm.put(farm.large_key(0), &wrong).await;
+    farm.watching
+        .stop_at_size
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let got = farm.run().await;
+
+    assert!(matches!(got, Ingested::Unavailable(_)), "{got:?}");
+    let (_, digest) = large();
+    assert!(farm.rig.store.held(&key_of(digest)).await.is_none());
+    let listed = farm.rig.store.keys().await;
+    assert!(
+        listed.iter().all(|k| !k.starts_with("cas/l/")),
+        "{listed:?}"
+    );
+    assert_eq!(count(&farm, LargeWriteThrough::Ok), 0);
+}
+
+/// Asserts that a length question that fails is not a reason to skip the write: the put is
+/// tried, the object lands under the key with exactly the bytes, `ok` is counted and the ingest
+/// is cached.
+#[tokio::test]
+async fn a_failing_length_question_is_followed_by_the_put() {
+    let farm = farm_with_large().await;
+    let (bytes, digest) = large();
+    farm.rig.store.fail_len_of(&key_of(digest));
+
+    let got = farm.run().await;
+
+    assert!(matches!(got, Ingested::Ran { cached: true, .. }), "{got:?}");
+    assert_eq!(farm.rig.store.stream_puts(), 1);
+    assert_eq!(count(&farm, LargeWriteThrough::Ok), 1);
+    let held = farm.rig.store.held(&key_of(digest)).await;
+    assert_eq!(held.as_ref(), Some(bytes));
+}
+
+/// Asserts that a store that answers 503 (slow down) and one that answers 507 (full) to the put
+/// each count `failed` (a store failure, not `aborted`), leave nothing under the key, and do not
+/// change the ingest, which is cached.
+#[tokio::test]
+async fn a_503_and_a_507_from_the_store_are_failures_that_leave_the_ingest_alone() {
+    for status in [503, 507] {
+        let farm = farm_with_large().await;
+        let (_, digest) = large();
+        farm.rig.store.reject_puts_with(1, status);
+
+        let got = farm.run().await;
+
+        assert!(
+            matches!(got, Ingested::Ran { cached: true, .. }),
+            "{status}: {got:?}"
+        );
+        assert_eq!(count(&farm, LargeWriteThrough::Failed), 1, "{status}");
+        assert_eq!(count(&farm, LargeWriteThrough::Aborted), 0, "{status}");
+        assert!(farm.rig.store.held(&key_of(digest)).await.is_none());
+    }
+}
