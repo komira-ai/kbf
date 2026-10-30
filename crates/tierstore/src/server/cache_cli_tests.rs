@@ -380,7 +380,10 @@ async fn a_file_system_whose_size_is_unknown_is_not_judged_and_the_node_starts()
     assert!(line.starts_with("tierstore: warning: "), "{line}");
     assert!(line.contains(&why), "{line}");
     assert!(line.contains(&path.display().to_string()), "{line}");
-    assert!(line.ends_with("local_cache.budget is not checked against it"), "{line}");
+    assert!(
+        line.ends_with("local_cache.budget is not checked against it"),
+        "{line}"
+    );
 
     let sized = FakeDisk::new();
     sized.set_space(5000, 100);
