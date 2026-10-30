@@ -117,6 +117,31 @@ reader of the object must check its content. The query string is never logged.
 A secret is never on the command line or in the environment: the process reads no environment
 variable, and the unit sets none.
 
+## GC keys
+
+A GC key (`--gc-key-file`, once per key; JSON of `access_key_id`, `secret_access_key` and `prefix`,
+mode 0600, not a symbolic link, owned by the user the server runs as) is for the process that
+collects the objects that presigned PUTs wrote. It signs in the header only (a presigned URL signed
+with it is refused) and may do these, only for a key that starts with its prefix (which ends in `/`)
+and is longer than it:
+
+| call | allowed |
+|---|---|
+| ListObjectsV2 | with a `prefix` inside the key's; a list with no prefix or another is 403, not filtered |
+| ListMultipartUploads | authorized the same way, but served once ListMultipartUploads lands; the front answers 501 until then |
+| HeadObject | yes |
+| DeleteObject | yes: from both tiers, journaled as for any delete |
+| AbortMultipartUpload | of an upload of such a key |
+| GetObject | no: a GC key never reads a body |
+| put, part, start or completion of an upload, copy, CreateBucket, HeadBucket | no |
+| `_journal/`, `_tiering/`, any key outside the prefix, the prefix itself | no |
+
+A call the key may not do is refused with 403 `AccessDenied` without its body being read. The
+refusals are made in this order: the signature and key id, the method, the decoding of the path and
+query (400, or 404 for an unknown bucket), the checksum headers (400 or 501), and last the key or
+list prefix; so a call that is both refused and malformed may get the malformed-request error. A delete by a GC key is not
+create-only; it is the only way an object leaves the prefix that presigned PUTs write.
+
 ## Filling in the flags
 
 The unit's `ExecStart=` is a complete command line. The flags to edit:
@@ -128,6 +153,7 @@ The unit's `ExecStart=` is a complete command line. The flags to edit:
 | `--bucket` | the name of the one bucket clients see |
 | `--access-key-file`, `--read-only-key-file` | the full key, and (given once for each) the read-only keys; see above |
 | `--presign-key-file`, `--presign-max-expires` | a presigning key with its ceiling (given once for each key), and the longest expiry of any URL; see Presigned PUT URLs |
+| `--gc-key-file` | a GC key (given once for each key); see GC keys |
 | `--hot`, `--cold` | the tiers: `s3:<bucket>` for a bucket of an S3-compatible store (also `dir:<path>` and `memory`; a `dir:` path must also be writable under `ProtectSystem=strict`, so add it to `ReadWritePaths=`) |
 | `--hot-endpoint`, `--cold-endpoint` | where the tier's store is, `http://host[:port]` (TLS is not built yet); `--hot-region` and `--cold-region` set the signing region of a tier, `us-east-1` if not given |
 | `--hot-bytes` | the bytes the hot tier is meant to hold; the water marks are shares of it (`--high-water`, `--low-water`, `--critical`) |
