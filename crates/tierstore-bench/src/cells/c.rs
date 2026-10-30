@@ -177,7 +177,7 @@ impl Burst {
     async fn run(&self, pass: u32) -> Result<Vec<Step>, BenchError> {
         let acked = self.send(pass).await?;
         if let Some(switch) = &self.fault {
-            switch.set_mode(FaultMode::Pass);
+            switch.set_mode(FaultMode::Pass)?;
         }
         let started_unix_ms = unix_ms();
         let (lag, backlog, drained) = self.watch(pass, &acked).await?;
@@ -299,16 +299,17 @@ fn arm(label: String, mode: &str, burst: &Arc<Burst>) -> Arm {
             async move { burst.run(unit.pass).await }
         }),
         before: Some(hook(move |_| {
-            if let Some(switch) = &before.fault {
-                switch.set_mode(FaultMode::Refuse);
-            }
-            std::future::ready(Ok::<_, BenchError>(vec![]))
+            let set = before
+                .fault
+                .as_ref()
+                .map_or(Ok(()), |switch| switch.set_mode(FaultMode::Refuse));
+            std::future::ready(set.map(|()| vec![]))
         })),
         after: Some(hook(move |pass| {
             let burst = after.clone();
             async move {
                 if let Some(switch) = &burst.fault {
-                    switch.set_mode(FaultMode::Pass);
+                    switch.set_mode(FaultMode::Pass)?;
                 }
                 let mut notes = burst
                     .note

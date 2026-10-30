@@ -343,11 +343,11 @@ fn arm(
             );
             async move {
                 if let Some((_, switch)) = &fault {
-                    switch.set_mode(FaultMode::Pass);
+                    switch.set_mode(FaultMode::Pass)?;
                 }
                 set.ensure().await?;
                 if let Some((mode, switch)) = &fault {
-                    switch.set_mode(*mode);
+                    switch.set_mode(*mode)?;
                     seen.store(switch.request_count(), Ordering::SeqCst);
                 }
                 Ok(vec![])
@@ -356,15 +356,18 @@ fn arm(
         after: Some(hook(move |_| {
             let (switch, seen) = (after_fault.clone(), after_seen.clone());
             async move {
-                Ok(switch.map_or_else(Vec::new, |switch| {
-                    let went = switch
-                        .request_count()
-                        .saturating_sub(seen.load(Ordering::SeqCst));
-                    switch.set_mode(FaultMode::Pass);
-                    vec![format!(
-                        "{went} requests went through the fault proxy in the pass"
-                    )]
-                }))
+                switch.map_or_else(
+                    || Ok(Vec::new()),
+                    |switch| {
+                        let went = switch
+                            .request_count()
+                            .saturating_sub(seen.load(Ordering::SeqCst));
+                        switch.set_mode(FaultMode::Pass)?;
+                        Ok(vec![format!(
+                            "{went} requests went through the fault proxy in the pass"
+                        )])
+                    },
+                )
             }
         })),
         notes,
@@ -378,7 +381,7 @@ fn cleanup(sets: Vec<Arc<ObjectSet>>, faults: Option<Arc<dyn FaultSwitch>>) -> H
         let (sets, faults) = (sets.clone(), faults.clone());
         async move {
             if let Some(switch) = &faults {
-                switch.set_mode(FaultMode::Pass);
+                switch.set_mode(FaultMode::Pass)?;
             }
             let (mut deleted, mut total) = (0, 0);
             for set in sets.iter() {

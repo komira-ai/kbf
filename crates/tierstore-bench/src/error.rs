@@ -49,6 +49,11 @@ pub enum BenchError {
     /// disk) could not be made. The text names the step, with roles and counts only.
     #[error("{0}")]
     Setup(String),
+    /// An operation of the ops verbs (`preflight`, `provision`, `verify-teardown`) stopped: the
+    /// ops file is unusable, a command failed, or checks failed. The text names what, with no
+    /// secret in it.
+    #[error("{0}")]
+    Ops(String),
     /// A result file is not JSON of the schema this build writes.
     #[error("result file: {0}")]
     Result(String),

@@ -4,9 +4,10 @@ use std::process::Command;
 
 use kbf_testkit::dir::TestDir;
 
-/// Catches `main` that swallows a stopped verb: exit status 2 and the error on stderr.
+/// Catches `main` that swallows a stopped verb: exit status 2 and the error on stderr (here the
+/// ops file a preflight reads first, which is not there).
 #[test]
-fn a_stub_verb_exits_2_and_says_what_is_not_built() {
+fn a_stopped_verb_exits_2_and_says_what_stopped_it() {
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-bin");
     let out = Command::new(env!("CARGO_BIN_EXE_tierstore-bench"))
         .args(["preflight", "--result-dir"])
@@ -15,10 +16,7 @@ fn a_stub_verb_exits_2_and_says_what_is_not_built() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("preflight: not yet implemented"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("ops.json"), "{stderr}");
 }
 
 /// Catches a report that is built and not printed: the table of an empty result directory is on

@@ -4,8 +4,7 @@ A measurement tool for tierstore: the put-to-ack, cold-read, copy-lag and tree-r
 tierstore paper, run against a test instance of the binary, and the verbs around them (preflight,
 provision, fault proxy, teardown check, report).
 
-The cells (`run`) and `report` are built; `preflight`, `provision`, `fault-proxy` and
-`verify-teardown` are stubs that say "not yet" and exit 2. Each module's header says what it holds.
+Every verb is built. Each module's header says what it holds.
 
 ## What it never holds
 
@@ -71,7 +70,14 @@ interleaved across passes, the load gate is read before a pass and every few com
 its cold bytes are over the pass, cell or campaign cap, requests are held to the rate caps, and
 a p99 is filled in only from quiet passes with 1,000 requests or more. Fault arms (`latency`,
 `bandwidth`, `refused`, `blackhole`, and `proxy-pass` as the control) need the fault proxy as a
-`FaultSwitch`; a plain `run` has none and measures the healthy arms.
+`FaultSwitch`. `run --fault-control FILE --fault-result-dir DIR` names the control file and the
+result directory of a running `fault-proxy` (its `--control` and `--result-dir`): a fault arm
+writes the file, waits until the proxy's counters say it is in the mode, and fails the arm if it
+does not get there. The cold store the cell reaches must be behind that proxy. Without the two
+flags a `run` measures the healthy arms.
+
+`run` needs `--run-id` and `--git-sha`, and a passed `preflight` in the result directory: its
+`preflight.json` gives the binary digest, versions and hardware that every result carries.
 
 `report --result-dir DIR` prints one table per cell: per arm and window, requests, failures with
 their time to failure, p50 and p95 with a bootstrap interval, p99 where it may be claimed, the

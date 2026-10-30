@@ -275,10 +275,7 @@ fn arm(
     };
     let sender = putter.clone();
     let before = fault.clone().map(|(mode, switch)| {
-        hook(move |_| {
-            switch.set_mode(mode);
-            std::future::ready(Ok::<_, BenchError>(vec![]))
-        })
+        hook(move |_| std::future::ready(switch.set_mode(mode).map(|()| vec![])))
     });
     let switch = fault.map(|(_, switch)| switch);
     Arm {
@@ -294,11 +291,14 @@ fn arm(
         }),
         before,
         after: Some(hook(move |pass| {
-            if let Some(switch) = &switch {
-                switch.set_mode(FaultMode::Pass);
-            }
             let putter = putter.clone();
-            async move { putter.clean(pass, requests).await }
+            let switch = switch.clone();
+            async move {
+                if let Some(switch) = &switch {
+                    switch.set_mode(FaultMode::Pass)?;
+                }
+                putter.clean(pass, requests).await
+            }
         })),
         notes,
     }

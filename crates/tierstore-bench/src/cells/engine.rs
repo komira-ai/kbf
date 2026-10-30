@@ -109,10 +109,14 @@ impl LoadSource for ProcLoad {
 }
 
 /// The fault proxy as a cell sees it: it sets the fault between passes and counts what went
-/// through. [`crate::proxy`] implements it for its handle.
+/// through. [`crate::faultfile::FileSwitch`] implements it for a proxy process.
 pub trait FaultSwitch: Send + Sync {
     /// From now on, the fault of `mode`.
-    fn set_mode(&self, mode: FaultMode);
+    ///
+    /// # Errors
+    /// [`BenchError`] if the proxy cannot be told or does not take the mode: the arm must not
+    /// be measured as if it had.
+    fn set_mode(&self, mode: FaultMode) -> Result<(), BenchError>;
     /// Requests that went through the proxy so far.
     fn request_count(&self) -> u64;
 }
@@ -1257,10 +1261,9 @@ mod tests {
         assert_eq!(env.prefix(), "tierstore-bench/unrecorded");
     }
 
-    /// Catches a client made for a role the run does not configure, and the real load source
-    /// answering as if it had read a machine while the reader is not built.
+    /// Catches a client made for a role the run does not configure.
     #[test]
-    fn an_unconfigured_role_has_no_client_and_the_real_gate_is_the_stub() {
+    fn an_unconfigured_role_has_no_client() {
         let dir = temp("tb-engine-roles");
         let env = env(dir.path(), Window::Busy, Arc::new(ProcLoad));
         assert!(matches!(
@@ -1271,7 +1274,6 @@ mod tests {
             env.stream(Role::Hot, Cap::Hot),
             Err(BenchError::Config(_))
         ));
-        assert!(matches!(env.gate(), Err(BenchError::NotYet(_))));
     }
 
     /// Catches a step that does not carry what its request did.

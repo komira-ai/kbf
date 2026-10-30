@@ -165,8 +165,9 @@ impl SwitchLog {
 }
 
 impl crate::cells::engine::FaultSwitch for SwitchLog {
-    fn set_mode(&self, mode: crate::proxy::FaultMode) {
+    fn set_mode(&self, mode: crate::proxy::FaultMode) -> Result<(), BenchError> {
         self.modes.lock().unwrap().push(mode);
+        Ok(())
     }
 
     /// Five more than the last time it was asked, so a pass that asks before and after sees five.

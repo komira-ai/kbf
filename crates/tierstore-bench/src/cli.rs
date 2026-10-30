@@ -1,24 +1,26 @@
 //! The command line: six verbs, each a thin call into its module.
 //!
-//! Exit status: 0 on success, 2 when the verb stopped (including a verb not built yet) and for
-//! usage errors, as clap reports them.
+//! Exit status: 0 on success, 2 when the verb stopped and for usage errors, as clap reports them.
 
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::cells::engine::FaultSwitch;
 use crate::cells::{self, CellContext, CellId, CellPlan};
 use crate::config::{ConfigArgs, RunConfig};
 use crate::error::BenchError;
+use crate::faultfile::FileSwitch;
+use crate::preflight::{self, PreflightReport};
 use crate::provision::{self, Mode};
 use crate::proxy::{self, FaultMode, ProxyConfig};
 use crate::requestlog::RequestLog;
 use crate::result::Provenance;
-use crate::{preflight, report, teardown};
+use crate::{report, teardown};
 
 /// A measurement tool for tierstore.
 #[derive(Debug, Parser)]
@@ -74,6 +76,20 @@ pub struct RunArgs {
     /// Object sizes in bytes, one arm each (comma separated).
     #[arg(long, value_delimiter = ',')]
     pub object_bytes: Vec<u64>,
+    /// Names the run in every result and in the keys it writes (role names and digits; no host).
+    #[arg(long)]
+    pub run_id: String,
+    /// The commit this binary was built from, copied into every result.
+    #[arg(long)]
+    pub git_sha: String,
+    /// The control file of the running fault proxy (its `--control`): the fault arms of the
+    /// cells that have them switch it. Without it only the healthy arms run.
+    #[arg(long, value_name = "FILE", requires = "fault_result_dir")]
+    pub fault_control: Option<PathBuf>,
+    /// The result directory of the running fault proxy (its `--result-dir`), where its counters
+    /// are.
+    #[arg(long, value_name = "DIR", requires = "fault_control")]
+    pub fault_result_dir: Option<PathBuf>,
 }
 
 /// Flags of `fault-proxy`.
@@ -120,6 +136,17 @@ pub struct ReportArgs {
     pub result_dir: PathBuf,
 }
 
+/// The provenance of a run: the facts of the passed preflight in the result directory, with the
+/// run's id and commit.
+fn provenance(result_dir: &Path, run_id: &str, git_sha: &str) -> Result<Provenance, BenchError> {
+    let path = result_dir.join(preflight::REPORT_FILE);
+    let text = std::fs::read(&path).map_err(|source| BenchError::Io { path, source })?;
+    let report: PreflightReport = serde_json::from_slice(&text)
+        .map_err(|_| BenchError::Result("preflight.json is not a preflight report".to_owned()))?;
+    preflight::all_passed("run", &report.checks)?;
+    Ok(report.provenance(run_id, git_sha))
+}
+
 /// Runs the verb.
 ///
 /// # Errors
@@ -151,12 +178,20 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
                 object_bytes: args.object_bytes,
             };
             let ctx = CellContext {
+                provenance: provenance(&config.result_dir, &args.run_id, &args.git_sha)?,
                 config,
                 log: Arc::new(log),
-                provenance: Provenance::unrecorded(),
             };
+            let faults = args
+                .fault_control
+                .zip(args.fault_result_dir)
+                .map(|(control, dir)| {
+                    Arc::new(FileSwitch::new(control, &dir)) as Arc<dyn FaultSwitch>
+                });
             for id in args.cells {
-                cells::run(id, &ctx, &plan).await.map(|_| ())?;
+                cells::run_with_faults(id, &ctx, &plan, faults.clone())
+                    .await
+                    .map(|_| ())?;
             }
             Ok(())
         }

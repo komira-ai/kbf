@@ -28,15 +28,17 @@
 //! - What a cell wrote to a store, it deletes after the pass or at the end, also when the run
 //!   stops early.
 //!
-//! The fault proxy is not part of a plain `run`: a cell takes it as a [`engine::FaultSwitch`]
-//! (`run_with`), which the proxy module implements for its handle. Without one only the healthy
-//! arms are run.
+//! The fault proxy is a process of its own: a cell takes it as a [`engine::FaultSwitch`]
+//! ([`run_with_faults`]), which [`crate::faultfile::FileSwitch`] implements over the proxy's
+//! control and counters files (`run --fault-control`). Without one only the healthy arms are
+//! run.
 
 use std::sync::Arc;
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
+use crate::cells::engine::{FaultSwitch, ProcLoad};
 use crate::config::RunConfig;
 use crate::error::BenchError;
 use crate::requestlog::RequestLog;
@@ -144,13 +146,29 @@ pub async fn run(
     ctx: &CellContext,
     plan: &CellPlan,
 ) -> Result<Vec<CellResult>, BenchError> {
+    run_with_faults(id, ctx, plan, None).await
+}
+
+/// Runs one cell with a fault proxy to drive. `cold-put`, `cold-read`, `a1` and `c` run their
+/// fault arms through it (the cold store they reach must be behind the proxy); `b` and `g` have
+/// no fault arms and ignore it. Without one only the healthy arms run.
+///
+/// # Errors
+/// What the cell's own `run_with` returns, and what the switch returns.
+pub async fn run_with_faults(
+    id: CellId,
+    ctx: &CellContext,
+    plan: &CellPlan,
+    faults: Option<Arc<dyn FaultSwitch>>,
+) -> Result<Vec<CellResult>, BenchError> {
+    let load = || Arc::new(ProcLoad);
     match id {
-        CellId::ColdPut => cold_put::run(ctx, plan).await,
-        CellId::ColdRead => cold_read::run(ctx, plan).await,
-        CellId::A1 => a1::run(ctx, plan).await,
-        CellId::B => b::run(ctx, plan).await,
-        CellId::C => c::run(ctx, plan).await,
-        CellId::G => g::run(ctx, plan).await,
+        CellId::ColdPut => cold_put::run_with(ctx, plan, load(), faults, None).await,
+        CellId::ColdRead => cold_read::run_with(ctx, plan, load(), faults, None).await,
+        CellId::A1 => a1::run_with(ctx, plan, load(), faults, None).await,
+        CellId::B => b::run_with(ctx, plan, load(), None).await,
+        CellId::C => c::run_with(ctx, plan, load(), faults, c::polling(), None).await,
+        CellId::G => g::run_with(ctx, plan, load(), None).await,
     }
 }
 
@@ -199,10 +217,19 @@ mod tests {
             assert!(matches!(err, BenchError::Setup(_)), "{name}: {err}");
             assert!(err.to_string().starts_with(name), "{name}: {err}");
         }
+        let err = run(CellId::B, &bare, &plan).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BenchError::Config(ConfigError::Missing {
+                    role: Role::Instance,
+                    ..
+                })
+            ),
+            "{err}"
+        );
         let instance = [(Role::Instance, "http://127.0.0.1:9")];
         let only_instance = testkit::ctx(dir.path(), &instance, Window::Busy);
-        let err = run(CellId::B, &only_instance, &plan).await.unwrap_err();
-        assert!(matches!(err, BenchError::NotYet("load sample")), "{err}");
         let err = run(CellId::C, &only_instance, &plan).await.unwrap_err();
         assert!(
             matches!(

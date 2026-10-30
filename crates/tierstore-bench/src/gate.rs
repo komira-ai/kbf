@@ -1,13 +1,18 @@
 //! The load gate: a run in normal hours stops when the machine is busier than a threshold.
 //!
 //! The thresholds are flags ([`crate::config::ConfigArgs`]); this module holds the rule, which
-//! is pure, and the sample it judges. Reading `/proc` for a sample is the preflight module
-//! owner's ([`LoadSample::read`]). A pass during which the gate trips is aborted, and its
+//! is pure, and the sample it judges. Reading `/proc` for a sample is [`LoadSample::read`], over
+//! [`crate::procload`]. A pass during which the gate trips is aborted, and its
 //! samples are marked busy: a p99 is claimed only from passes that stayed under every limit.
+
+use std::path::Path;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::BenchError;
+use crate::procload::Reader;
 
 /// The limits. A sample above any one of them trips the gate.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -81,14 +86,16 @@ impl LoadGate {
 
 impl LoadSample {
     /// Reads the sample from `/proc/loadavg`, `/proc/pressure/{cpu,io}` and `/proc/diskstats`
-    /// (utilisation over the interval since the previous call), for the disks the run names.
-    ///
-    /// Signature for the preflight owner; not built yet.
+    /// (utilisation over the interval since the previous call of this process).
     ///
     /// # Errors
-    /// [`BenchError::NotYet`] today.
+    /// [`BenchError`] if the machine has no such files or they are not `/proc` text.
     pub fn read() -> Result<Self, BenchError> {
-        Err(BenchError::NotYet("load sample"))
+        static START: OnceLock<Instant> = OnceLock::new();
+        static READER: Reader = Reader::new();
+        let now_ms = u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis())
+            .unwrap_or(u64::MAX);
+        READER.read(Path::new("/proc"), Path::new("/sys/block"), now_ms)
     }
 }
 
@@ -167,9 +174,11 @@ mod tests {
         }
     }
 
-    /// Catches the stub answering as if it had read a machine.
+    /// Catches the reader of this machine failing on a Linux host: the figures are there.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn reading_the_machine_is_not_built_yet() {
-        assert!(matches!(LoadSample::read(), Err(BenchError::NotYet(_))));
+    fn this_machine_can_be_read() {
+        let sample = LoadSample::read().unwrap();
+        assert!(sample.loadavg_1m >= 0.0);
     }
 }
