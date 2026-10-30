@@ -32,6 +32,12 @@ test-group = 'mac-provision-scratch'
 filter = 'binary_id(=kbf-front::large_blobs)'
 slow-timeout = { period = "450s", terminate-after = 4 }
 
+# A hang guard, not a bound: this test waits for a run that ends once the daemon has
+# killed it; a daemon that loses the kill leaves it waiting for ever.
+[[profile.default.overrides]]
+filter = 'binary_id(=kbf-daemon) & test(=lease::tests::a_cancel_during_the_first_poll_of_the_run_still_ends_it)'
+slow-timeout = { period = "30s", terminate-after = 1 }
+
 # A fetch test that waits for ever (a rendezvous that never gets its requests together, a pooled
 # connection that is never closed) is killed after two minutes and fails, where it would hang the
 # run. The tests hold no timeout of their own. The filter covers the keep-alive tests too, a child
