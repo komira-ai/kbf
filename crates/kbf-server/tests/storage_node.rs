@@ -31,6 +31,7 @@ fn flags(dir: &Path, more: &[String]) -> Result<StorageFlags, clap::Error> {
     }
     argv.extend([
         format!("--cold-store=file://{}", dir.join("cold").display()),
+        "--cold-store-floor-bytes=1".to_owned(),
         format!("--meta-dir={}", dir.join("meta").display()),
     ]);
     argv.extend_from_slice(more);

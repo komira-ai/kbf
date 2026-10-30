@@ -97,7 +97,7 @@ pub(super) const KEEP_QUEUE: usize = 16;
 pub(super) const KEEP_QUEUE_BYTES: u64 = 4 << 20;
 
 /// The task that writes the chunks of a body to the stage file, and the way to it.
-struct Writer {
+pub(super) struct Writer {
     /// The way to the task; none once the body has ended.
     chunks: Option<mpsc::Sender<Bytes>>,
     /// The bytes sent to the task and not yet written.
@@ -109,7 +109,7 @@ struct Writer {
 
 impl Writer {
     /// Starts the task that writes what it is sent to `staged`.
-    fn start(inner: &Arc<Inner>, staged: Staged) -> Self {
+    pub(super) fn start(inner: &Arc<Inner>, staged: Staged) -> Self {
         let (chunks, queue) = mpsc::channel(KEEP_QUEUE);
         let queued = Arc::new(AtomicU64::new(0));
         let task = tokio::spawn(write_chunks(
@@ -126,7 +126,7 @@ impl Writer {
     }
 
     /// Queues a chunk without waiting.
-    fn send(&self, chunk: Bytes) -> Result<(), SkippedKeep> {
+    pub(super) fn send(&self, chunk: Bytes) -> Result<(), SkippedKeep> {
         let Some(chunks) = &self.chunks else {
             return Err(SkippedKeep::Io);
         };
@@ -147,7 +147,7 @@ impl Writer {
 
     /// Waits for the task to write what was queued, and gives the stage file. If this future is
     /// dropped before it ends, the task is still the writer's and is aborted with it.
-    async fn finish(&mut self) -> io::Result<Staged> {
+    pub(super) async fn finish(&mut self) -> io::Result<Staged> {
         drop(self.chunks.take());
         let Some(task) = self.task.as_mut() else {
             return Err(io::Error::other("the writer was finished already"));
@@ -184,14 +184,14 @@ async fn write_chunks(
 
 /// The copy of a body that is being made: the writer of the stage file, the room reserved for
 /// it and the keep permit, all given back when it is dropped.
-struct Stage {
+pub(super) struct Stage {
     writer: Writer,
     _reservation: Reserved,
     _permit: OwnedSemaphorePermit,
 }
 
 /// What a put knows of its body while the body passes.
-struct Keeping {
+pub(super) struct Keeping {
     /// The copy, while it is being made and whole so far.
     stage: Option<Stage>,
     /// Why there is no copy, if there is none.
@@ -211,7 +211,11 @@ struct Keeping {
 }
 
 impl Keeping {
-    fn new(wanted: Option<String>, len: Option<u64>, stage: Result<Stage, SkippedKeep>) -> Self {
+    pub(super) fn new(
+        wanted: Option<String>,
+        len: Option<u64>,
+        stage: Result<Stage, SkippedKeep>,
+    ) -> Self {
         let (stage, lost) = match stage {
             Ok(stage) => (Some(stage), None),
             Err(why) => (None, Some(why)),
@@ -285,7 +289,7 @@ pub(super) fn counting<'a>(body: PartBody<'a>, bytes: &Arc<AtomicU64>) -> PartBo
 }
 
 /// The body, passed on as it is, with each chunk given to `keeping` on the way.
-fn tee<'a>(key: &'a str, body: PartBody<'a>, keeping: &'a mut Keeping) -> PartBody<'a> {
+pub(super) fn tee<'a>(key: &'a str, body: PartBody<'a>, keeping: &'a mut Keeping) -> PartBody<'a> {
     let state = (body, keeping, false);
     stream::unfold(state, move |(mut body, keeping, done)| async move {
         if done {

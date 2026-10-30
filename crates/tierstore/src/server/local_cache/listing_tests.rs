@@ -11,7 +11,9 @@ use super::listing::LISTING_CALLS;
 use super::metrics::read;
 use super::testing::{FakeDisk, Rig};
 use super::{CacheConfig, LocalCache};
-use crate::{Backend, ByteRange, Error, Listed, MemoryBackend, Meta, Op, TestClock};
+use crate::{
+    Backend, ByteRange, Error, Listed, MemoryBackend, Meta, Op, OpenUpload, TestClock, UploadsAfter,
+};
 
 /// The keys of a listing.
 fn keys(listed: &[Listed]) -> Vec<&str> {
@@ -195,6 +197,121 @@ async fn a_large_reserved_range_costs_about_one_call() {
     // The jump over a reserved range is not a call: the count is still the upstream's own.
     let counted = read(&rig.cache.counters().upstream_lists);
     assert_eq!(counted, rig.calls(Op::List));
+}
+
+/// Asserts that a page ending on a reserved key already past the end of its range (`_journal/~~a`
+/// sorts after `_journal/~`) continues after that key itself, not back at the end of the range: the
+/// listing reaches the data key behind the range in one call for each key. Continuing at the end
+/// of the range would be given `_journal/~~a` again and again until the call limit refused it.
+#[tokio::test]
+async fn a_reserved_key_past_the_end_of_its_range_continues_after_itself() {
+    let rig = Rig::new("tscache-list-past-end");
+    for key in ["A/1", "_journal/~~a", "_journal/~~b", "z/1"] {
+        rig.put(key, b"x").await;
+    }
+    let rest = rig.cache.list_page("", Some("A/1"), 1).await.unwrap();
+    assert_eq!(keys(&rest), ["z/1"]);
+    assert_eq!(rig.calls(Op::List), 3);
+}
+
+/// A store whose uploads are all under `_journal/~`, past the range the cache jumps over, and that
+/// gives a full page of them whatever it is asked: with `moving`, each call a key after the last
+/// (a listing that goes on for ever), else the same key every call (one that does not advance).
+struct StuckUploads {
+    inner: MemoryBackend,
+    calls: AtomicU64,
+    moving: bool,
+}
+
+#[async_trait]
+impl Backend for StuckUploads {
+    async fn put(&self, key: &str, body: Bytes) -> Result<(), Error> {
+        self.inner.put(key, body).await
+    }
+
+    async fn put_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<String, Error> {
+        self.inner.put_if_match(key, body, etag).await
+    }
+
+    async fn get(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
+        self.inner.get(key, range).await
+    }
+
+    async fn head(&self, key: &str) -> Result<Meta, Error> {
+        self.inner.head(key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), Error> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<Listed>, Error> {
+        self.inner.list(prefix).await
+    }
+
+    async fn list_uploads(
+        &self,
+        _prefix: &str,
+        _after: Option<UploadsAfter<'_>>,
+        max_uploads: usize,
+    ) -> Result<Vec<OpenUpload>, Error> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let key = if self.moving {
+            format!("_journal/~{call:06}")
+        } else {
+            "_journal/~fixed".to_owned()
+        };
+        let page = (0..max_uploads)
+            .map(|n| OpenUpload {
+                key: key.clone(),
+                id: format!("{n:04}"),
+                initiated: 0,
+            })
+            .collect();
+        Ok(page)
+    }
+}
+
+/// A cache over a [`StuckUploads`] in a scratch directory.
+fn over_stuck_uploads(name: &str, moving: bool) -> (Arc<StuckUploads>, LocalCache, TestDir) {
+    let stuck = Arc::new(StuckUploads {
+        inner: MemoryBackend::new(),
+        calls: AtomicU64::new(0),
+        moving,
+    });
+    let dir = TestDir::under(std::env::temp_dir(), name);
+    let config = CacheConfig::new(dir.path().join("cache"), 1 << 20, Vec::new());
+    let (upstream, disk, clock) = (
+        stuck.clone(),
+        Arc::new(FakeDisk::new()),
+        Arc::new(TestClock::new()),
+    );
+    let cache = LocalCache::open(config, upstream, disk, clock).unwrap();
+    (stuck, cache, dir)
+}
+
+/// Asserts the cap on the pages one listing of uploads reads: an upstream whose every page is full
+/// of reserved uploads, each page after the last, ends the listing after exactly the cap with
+/// `Unavailable`, and was asked that many times. It catches a cap that is gone or off by one.
+#[tokio::test]
+async fn a_listing_of_uploads_that_never_gets_past_the_reserved_ones_stops_at_the_cap() {
+    let (stuck, cache, _dir) = over_stuck_uploads("tscache-list-uploads-cap", true);
+    let found = cache.list_uploads("", None, 2).await;
+    assert!(matches!(found, Err(Error::Unavailable(_))), "{found:?}");
+    assert_eq!(stuck.calls.load(Ordering::SeqCst), u64::from(LISTING_CALLS));
+}
+
+/// Asserts that a listing of uploads whose upstream answers a full page that ends where the page
+/// before ended is ended with `Unavailable` at the second call, and not asked for ever.
+#[tokio::test]
+async fn a_listing_of_uploads_that_does_not_advance_is_an_error_at_the_second_page() {
+    let (stuck, cache, _dir) = over_stuck_uploads("tscache-list-uploads-stuck", false);
+    let found = cache.list_uploads("", None, 2).await;
+    match found {
+        Err(Error::Unavailable(text)) => assert!(text.contains("did not advance"), "{text}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(stuck.calls.load(Ordering::SeqCst), 2);
 }
 
 /// A store that ignores `start_after`: every page it gives is the first, and it counts the pages.

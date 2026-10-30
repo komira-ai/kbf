@@ -69,6 +69,8 @@ pub(in crate::server) struct Tamper {
     /// If not 0, a streamed put stops reading its body after this many chunks and stores what
     /// it has read, as a backend that does not read to the end of the body does.
     pub(in crate::server) stop_after: AtomicUsize,
+    /// Every HEAD that finds its object says it is one byte larger than it is.
+    pub(in crate::server) lie_size: AtomicBool,
     /// The gate that holds a HEAD that found its object, after it has read it.
     heads: Mutex<Option<Arc<Semaphore>>>,
     /// The HEADs that wait at `heads`, counted when they arrive.
@@ -93,6 +95,7 @@ impl Tamper {
             lose_delete_answer: AtomicBool::new(false),
             needs_len: AtomicBool::new(false),
             stop_after: AtomicUsize::new(0),
+            lie_size: AtomicBool::new(false),
             heads: Mutex::new(None),
             heading: AtomicU64::new(0),
         }
@@ -229,7 +232,10 @@ impl Backend for Tamper {
     }
 
     async fn head(&self, key: &str) -> Result<Meta, Error> {
-        let meta = self.memory.head(key).await?;
+        let mut meta = self.memory.head(key).await?;
+        if self.lie_size.load(Ordering::SeqCst) {
+            meta.size += 1;
+        }
         let gate = self
             .heads
             .lock()

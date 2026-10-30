@@ -8,11 +8,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::StreamExt as _;
 use futures::stream;
+use futures::{FutureExt as _, StreamExt as _};
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
+use super::fill::{Filled, Pending, Staged};
+use super::keep::{Keeping, Writer, tee};
 use super::layout::{Sidecar, meta_path, name_of};
 use super::metrics::{SkippedKeep, read};
 use super::testing::{Quirk, Rig, digest, pattern};
@@ -756,6 +758,99 @@ async fn a_hung_disk_drops_the_copy_when_the_queued_bytes_pass_the_bound() {
     assert_eq!(stored.len(), 8 << 20);
     assert_eq!(rig.cache.held(), (0, 0));
     at_rest(&rig).await;
+}
+
+/// Asserts what a writer does once it has been finished: the chunks it had are written and the
+/// stage file comes back; a chunk sent after that is refused as `io` (there is no way to the
+/// task any more); and finishing it again is an error, not a second stage file.
+#[tokio::test]
+async fn a_finished_writer_takes_no_chunk_and_finishes_once() {
+    let rig = Rig::writing("tscache-keep-writer");
+    let inner = Arc::clone(&rig.cache.inner);
+    let staged = Staged::create(&inner).await.unwrap();
+    let mut writer = Writer::start(&inner, staged);
+    assert_eq!(writer.send(Bytes::from_static(b"abc")), Ok(()));
+    let staged = writer.finish().await.unwrap();
+    assert_eq!(writer.send(Bytes::from_static(b"x")), Err(SkippedKeep::Io));
+    let again = writer.finish().await;
+    assert!(again.is_err(), "a second finish gave a stage file");
+    drop(staged);
+    at_rest(&rig).await;
+}
+
+/// Asserts that the teed body ends after an error: the error is given once, and a poll after it
+/// gives the end of the stream and not another chunk or error (a backend may poll a body again).
+#[tokio::test]
+async fn a_teed_body_that_failed_stays_ended() {
+    let mut keeping = Keeping::new(None, Some(10), Err(SkippedKeep::Busy));
+    let items: Vec<Result<Bytes, Error>> = vec![
+        Err(Error::Unavailable("the client went away".to_owned())),
+        Ok(Bytes::from_static(b"never given")),
+    ];
+    let mut teed = tee("cas/b/ended", stream::iter(items).boxed(), &mut keeping);
+    assert!(matches!(
+        teed.next().await,
+        Some(Err(Error::Unavailable(_)))
+    ));
+    assert!(teed.next().await.is_none());
+    assert!(teed.next().await.is_none());
+}
+
+/// Asserts that a keep that finds the key's place in the table of the fills taken (a fill is
+/// running for it) is skipped as `busy`, and drops the entry and marks the fill like the other
+/// skips: the put succeeds with the object at the upstream, nothing is kept, the fill's mark is
+/// set, and the permit and the room are back.
+#[tokio::test]
+async fn a_keep_that_finds_a_fill_running_for_the_key_is_skipped_as_busy() {
+    let rig = Rig::writing("tscache-keep-fill-running");
+    let key = "cas/b/taken";
+    let hex = name_of(key).hex;
+    let running: Pending = futures::future::ready(Ok::<Filled, Error>(Filled::Skipped))
+        .boxed()
+        .shared();
+    drop(super::locked(&rig.cache.inner.flights).insert(hex.clone(), running));
+
+    let made = rig.cache.put_stream(key, Some(5), whole(b"taken"));
+    assert_eq!(made.await, Ok(()));
+    assert_eq!(skipped(&rig, SkippedKeep::Busy), 1);
+    assert_eq!(rig.cache.held(), (0, 0));
+    assert!(!rig.has_file(key));
+    assert_eq!(rig.tamper.memory.get(key, None).await.unwrap(), "taken");
+    assert!(super::locked(&rig.cache.inner.invalidated).contains(&hex));
+    drop(super::locked(&rig.cache.inner.flights).remove(&hex));
+    let _ = super::locked(&rig.cache.inner.invalidated).remove(&hex);
+    at_rest(&rig).await;
+}
+
+/// Asserts that a HEAD after the put which says the object has a size other than the bytes that
+/// were sent is not trusted: the put succeeds, nothing is kept, and it is counted as `head`.
+#[tokio::test]
+async fn a_head_that_gives_another_size_than_the_body_is_not_kept() {
+    let rig = Rig::writing("tscache-keep-size");
+    rig.tamper.lie_size.store(true, Ordering::SeqCst);
+    let made = rig
+        .cache
+        .put_stream("cas/b/sized", Some(5), whole(b"sized"));
+    assert_eq!(made.await, Ok(()));
+    assert_eq!(skipped(&rig, SkippedKeep::Head), 1);
+    assert_eq!(rig.cache.held(), (0, 0));
+    assert!(!rig.has_file("cas/b/sized"));
+    assert_eq!(through(&rig), 1);
+    at_rest(&rig).await;
+}
+
+/// Asserts that deleting a key under a prefix the cache does not keep is passed to the upstream
+/// and touches nothing of the cache: the object is gone from the upstream, the delete is Ok, and
+/// there is no entry, file or mark.
+#[tokio::test]
+async fn a_delete_of_a_key_that_is_not_kept_only_reaches_the_upstream() {
+    let rig = Rig::writing("tscache-keep-delete-unkept");
+    rig.put("other/d", b"x").await;
+    assert_eq!(rig.cache.delete("other/d").await, Ok(()));
+    assert!(rig.tamper.memory.head("other/d").await.is_err());
+    assert_eq!(rig.cache.held(), (0, 0));
+    assert!(super::locked(&rig.cache.inner.invalidated).is_empty());
+    assert!(super::locked(&rig.cache.inner.flights).is_empty());
 }
 
 /// Asserts that a put whose upstream answers "already exists" after the HEAD found nothing (it
