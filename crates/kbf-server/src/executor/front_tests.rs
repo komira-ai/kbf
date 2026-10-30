@@ -12,7 +12,9 @@ use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
-use kbf_pack::{OutputDirectory, PackKeys, TaskManifest, Timing, Usage, WriterKind, write_pack};
+use kbf_pack::{
+    OutputDirectory, PackKeys, Slot, TaskManifest, Timing, Usage, WriterKind, write_pack,
+};
 use kbf_pack_index::PackIndex;
 use kbf_pack_index::memory::MemoryPackIndex;
 use kbf_proto::reapi::platform::Property;
@@ -628,7 +630,10 @@ async fn an_action_the_cas_cannot_give_is_unavailable_and_one_that_is_malformed_
 /// The key the real mint issues for the build, the action and the time.
 fn issued(rig: &Rig, build: &str, action: &Digest) -> PackKey {
     let action = super::cas_digest(action).expect("a digest");
-    let key = rig.mint.mint(build, &action, clock()).expect("a key");
+    let key = rig
+        .mint
+        .mint(build, &action, clock(), Slot::Pack(0))
+        .expect("a key");
     PackKey::new(key.key())
 }
 
@@ -722,6 +727,9 @@ async fn a_pack_under_the_issued_key_becomes_the_actions_result() {
             output_symlinks: Vec::new(),
             timing: Timing::default(),
             usage: Usage::default(),
+            packs: 1,
+            large: vec![],
+            inputs: None,
         };
         let pack = write_pack(&manifest, &[]).expect("a pack");
         let object = ObjectKey::new(key.as_str().to_owned()).expect("an object key");
@@ -776,6 +784,9 @@ fn manifest_of(build: &str, action: &Digest) -> TaskManifest {
         output_symlinks: Vec::new(),
         timing: Timing::default(),
         usage: Usage::default(),
+        packs: 1,
+        large: vec![],
+        inputs: None,
     }
 }
 
