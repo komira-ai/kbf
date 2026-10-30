@@ -24,17 +24,17 @@ use crate::test_dir::scratch_dir;
 
 const CAP: u64 = 16 * 1024;
 
-struct Large {
-    action: Digest,
-    big: Digest,
-    over_cap: Digest,
-    bytes: Bytes,
-    blobs: Vec<(Digest, Bytes)>,
+pub(super) struct Large {
+    pub(super) action: Digest,
+    pub(super) big: Digest,
+    pub(super) over_cap: Digest,
+    pub(super) bytes: Bytes,
+    pub(super) blobs: Vec<(Digest, Bytes)>,
 }
 
 /// An Action whose input root has a file of 10 KiB, and one a byte over the cap that is held by
 /// no one.
-fn large() -> Large {
+pub(super) fn large() -> Large {
     let mut blobs = Vec::new();
     let mut keep = |bytes: Vec<u8>| {
         let bytes = Bytes::from(bytes);
@@ -73,7 +73,7 @@ fn large() -> Large {
 }
 
 impl Large {
-    fn token(&self) -> String {
+    pub(super) fn token(&self) -> String {
         let key = GrantKey::from_secret(SECRET).expect("the secret is long enough");
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -88,7 +88,7 @@ impl Large {
 
     /// The store of every blob; with `corrupt`, the large one is stored with one byte changed,
     /// under the digest of the real bytes.
-    fn source(&self, corrupt: bool) -> Arc<dyn BlobSource> {
+    pub(super) fn source(&self, corrupt: bool) -> Arc<dyn BlobSource> {
         let mut map: std::collections::HashMap<Digest, Bytes> =
             self.blobs.iter().cloned().collect();
         if corrupt {
