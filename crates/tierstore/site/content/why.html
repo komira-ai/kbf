@@ -31,11 +31,11 @@
 
 <h2 id="guards">What keeps it honest</h2>
 <ul>
-  <li><strong>A start-up self-test</strong> asks each tier the questions the guarantees rest on (create-only puts, conditional replace, exact ranges, heads, paging, and on the cold tier a create-only multipart completion) and refuses to start if one is answered wrongly. See <a href="operations.html#selftest">operations</a>.</li>
-  <li><strong>Key roles</strong> limit what a client may do: full, read-only, presigning (one object under a prefix), garbage collection and scoped keys. See <a href="config.html#keys">configuration</a>.</li>
+  <li><strong>A start-up self-test</strong> asks each tier the questions the guarantees rest on (create-only puts, conditional replace, exact ranges, heads, paging, and on the cold tier a create-only multipart completion) and refuses to start if one is answered wrongly. See <a href="/docs/operations/#the-start-up-self-test">operations</a>.</li>
+  <li><strong>Key roles</strong> limit what a client may do: full, read-only, presigning (one object under a prefix), garbage collection and scoped keys. See <a href="/docs/keys/">configuration</a>.</li>
   <li><strong>Objects are immutable</strong> as the crate treats them: byte strings under string keys, written once.</li>
 </ul>
 
 <h2 id="limits">Where it stops</h2>
-<p>The S3 front serves one bucket, path-style, over plain HTTP. It does not do TLS, session tokens or STS. It has no metrics endpoint (the reconciler's hot-tier size and copy lag are values in the library). It is early software: read <a href="index.html#status">what is built and what is not</a> before you depend on it.</p>
+<p>The S3 front serves one bucket, path-style, over plain HTTP. It does not do TLS, session tokens or STS. Its <code>/metricz</code> serves the counters of the OCI read front and no others (the reconciler's hot-tier size and copy lag are values in the library, not exported); the <a href="/docs/operations/#metrics">operator guide</a> says what is there. It is early software: read <a href="index.html#status">what is built and what is not</a> before you depend on it.</p>
 <p class="source-note">Sources: <code>crates/tierstore/src/lib.rs</code> (module documentation), <code>crates/tierstore/README.md</code>, <code>packaging/tierstore/README.md</code> and <code>ARCHITECTURE.md</code> in the kbf repository. The defaults are the binary's flag defaults.</p>

@@ -6,6 +6,8 @@ import { join, relative, resolve, sep } from 'path';
 import { buildSite } from '../tools/build';
 
 export const SITE = resolve(__dirname, '..', '..', '..');
+/** The operator guide the docs pages are made from: crates/tierstore/docs, and docs/ once the crate is a repository of its own. */
+export const DOCS = resolve(SITE, '..', 'docs');
 /** The repository root: the nearest directory above the site that has .github/workflows. Found, not counted, so that
  *  moving the site to another depth (crates/tierstore/site to site/) changes no code. */
 function repoRoot(from: string): string {
@@ -33,6 +35,7 @@ export function buildReal(name: string): string {
     browserDir: join(SITE, 'build', 'browser'),
     staticDir: join(SITE, 'static'),
     contentDir: join(SITE, 'content'),
+    docsDir: DOCS,
     outDir: out,
     check: false,
   });

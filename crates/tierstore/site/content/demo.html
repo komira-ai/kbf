@@ -15,7 +15,7 @@ tierstore: tested the hot tier dir:./hot in &lt;N&gt; ms
 tierstore: testing the cold tier dir:./cold
 tierstore: tested the cold tier dir:./cold in &lt;N&gt; ms
 tierstore &lt;version&gt; listen=127.0.0.1:9000</span></pre></div>
-<p class="source-note">The flags are those of the example unit and <code>--help</code>. The first four lines are written to stderr by <code>probe_tiers</code> and the last to stdout by the binary (<code>crates/tierstore/src/server/cli.rs</code>). Before it binds the address, the process asks each tier the questions its guarantees rest on; see <a href="operations.html#selftest">the start-up self-test</a>.</p>
+<p class="source-note">The flags are those of the example unit and <code>--help</code>. The first four lines are written to stderr by <code>probe_tiers</code> and the last to stdout by the binary (<code>crates/tierstore/src/server/cli.rs</code>). Before it binds the address, the process asks each tier the questions its guarantees rest on; see <a href="/docs/operations/#the-start-up-self-test">the start-up self-test</a>.</p>
 
 <h2 id="probes">2. The probes</h2>
 <div class="code transcript"><pre><span class="p">$</span> curl -s http://127.0.0.1:9000/healthz
@@ -24,7 +24,7 @@ tierstore &lt;version&gt; listen=127.0.0.1:9000</span></pre></div>
 <span class="o">ready</span>
 <span class="p">$</span> curl -s http://127.0.0.1:9000/usagez
 <span class="o">no usage yet, &lt;N&gt;s since start</span></pre></div>
-<p class="source-note">The bodies are the strings of <code>crates/tierstore/src/server/mod.rs</code>. The probes are not signed. Once the reconciler has published the hot tier's usage, <code>/usagez</code> says <code>usage published &lt;N&gt;s ago</code>; if that usage goes stale it answers 503 with the reason. See <a href="operations.html#probes">operations</a>.</p>
+<p class="source-note">The bodies are the strings of <code>crates/tierstore/src/server/mod.rs</code>. The probes are not signed. Once the reconciler has published the hot tier's usage, <code>/usagez</code> says <code>usage published &lt;N&gt;s ago</code>; if that usage goes stale it answers 503 with the reason. See <a href="/docs/operations/#probes">operations</a>.</p>
 
 <h2 id="drain">3. Stop it: the drain</h2>
 <p>On SIGTERM or SIGINT the process drains. <code>/readyz</code> answers 503 at once while the server keeps serving for <code>--drain-lb-wait</code>, so a load balancer sees it; then it refuses new requests, waits for those in flight (at most <code>--drain-deadline</code>), gives up the reconciler's lease and exits 0.</p>
@@ -46,4 +46,4 @@ tierstore &lt;version&gt; listen=127.0.0.1:9000</span></pre></div>
 
 (the file follows: the tables [server], [hot_store] and [cold_store], as on the configuration page)</span></pre></div>
 <p class="source-note">The three comment lines are the header constant of <code>server/config_print.rs</code>; the last line is this page's summary of the rest, not program output. A test loads the printed file back and checks it makes the settings the flags made.</p>
-<p>Next: <a href="config.html">the configuration</a> and <a href="operations.html">operations</a>.</p>
+<p>Next: <a href="/docs/configuration/">the configuration</a> and <a href="/docs/operations/">operations</a>.</p>

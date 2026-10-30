@@ -1,10 +1,10 @@
 # Build and tests of the tierstore.dev website (crates/tierstore/site): the same stack as site.yml (kbf.dev): TypeScript
 # compiled by tsc, a build program that prerenders the pages, and node:test tests over the built tree (golden output,
 # links, the Content-Security-Policy rules, the pinned theme, the white-paper slot, a public-repo scan). Runs only when
-# the site (or this file, or the policy it is checked against) changes. The Node version is exactly the one in the
+# the site (or the guide it is made from, or this file, or the policy it is checked against) changes. The Node version is exactly the one in the
 # site's .node-version. The network is touched by `npm ci` alone, with install scripts off. Nothing here deploys: the
 # site is published by a held step (tools/held/tierstore in the internal repository), as kbf.dev's is.
-# When tierstore moves to a repository of its own the site moves to site/: change the three paths below and nothing else.
+# When tierstore moves to a repository of its own the site moves to site/: change the paths below and nothing else.
 # GitHub-hosted runner, commit-pinned actions, no token rights beyond reading the checkout.
 name: tierstore-site
 
@@ -12,12 +12,14 @@ on:
   pull_request:
     paths:
       - crates/tierstore/site/**
+      - crates/tierstore/docs/**
       - infra/site/lib/site-stack.ts
       - .github/workflows/tierstore-site.yml
   push:
     branches: [main, feature/arch-v2]
     paths:
       - crates/tierstore/site/**
+      - crates/tierstore/docs/**
       - infra/site/lib/site-stack.ts
       - .github/workflows/tierstore-site.yml
 

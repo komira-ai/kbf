@@ -18,6 +18,8 @@ An S3 front over a hot and a cold tier. It serves one bucket, path-style, and ch
 `Authorization` header (and presigned PUT URLs). The packaging notes, the flags and the key files
 are in `packaging/tierstore/README.md`; the roles of a key are in `src/server/keys.rs`.
 
+The operator guide (install, keys and roles, configuration, operations, troubleshooting, limits) is in `docs/`; a test of the crate (`src/server/docs_tests.rs`) holds every page of it to the code, and the site's docs pages are made from it.
+
 ## Flags or a file
 
 The settings that describe the data path are flags, or one TOML file given with `--config <path>`
