@@ -94,7 +94,7 @@ fn plain_front() -> (Arc<OciFront>, OciLimits) {
 
 /// Asserts that plain HTTP is allowed on the loopback addresses (anywhere in the IPv4 loopback
 /// block, and `::1`) and on no other: not on the unspecified addresses, a documentation address,
-/// or an IPv4-mapped address of a host that is not this one.
+/// or any IPv4-mapped address (the mapped loopback address included).
 #[test]
 fn plain_http_is_allowed_on_loopback_only() {
     let block = SocketAddr::from(([127, 255, 0, 9], 9500));
@@ -110,6 +110,7 @@ fn plain_http_is_allowed_on_loopback_only() {
         "198.51.100.7:9500",
         "[2001:db8::1]:9500",
         "[::ffff:192.0.2.1]:9500",
+        "[::ffff:127.0.0.1]:9500",
     ] {
         let addr: SocketAddr = refused.parse().expect("an address");
         let error = plain_allowed(addr).expect_err(refused);
@@ -136,7 +137,8 @@ async fn a_plain_listener_binds_on_loopback_only() {
     let off: SocketAddr = "0.0.0.0:0".parse().expect("an address");
     let refused = OciListener::bind_plain(off, Arc::clone(&front), limits).await;
     let error = refused.err().expect("refused");
-    assert!(matches!(error, OciError::PlainNotLoopback { addr } if addr == off));
+    assert!(matches!(error, OciError::PlainNotLoopback { .. }));
+    assert!(error.to_string().contains("0.0.0.0:0"), "{error}");
 
     let on: SocketAddr = "127.0.0.1:0".parse().expect("an address");
     let plain = OciListener::bind_plain(on, front, limits)

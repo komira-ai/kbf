@@ -401,11 +401,17 @@ async fn a_certificate_without_a_key_is_refused_at_start() {
     let files = files("oci-binary-half-pair");
     let cert = files.leaf.cert.to_str().expect("a path");
     let key = files.leaf.key.to_str().expect("a path");
-    for (flag, path) in [("--oci-tls-cert", cert), ("--oci-tls-key", key)] {
+    for (flag, path, partner) in [
+        ("--oci-tls-cert", cert, "--oci-tls-key"),
+        ("--oci-tls-key", key, "--oci-tls-cert"),
+    ] {
         let mut flags = files.plain("127.0.0.1:0");
         flags.extend([flag, path].map(str::to_owned));
         let (status, stderr) = refused(&flags);
         assert_eq!(status, Some(2), "{flag}: {stderr}");
-        assert!(stderr.contains(flag), "{flag}: {stderr}");
+        assert!(
+            stderr.contains("required arguments were not provided") && stderr.contains(partner),
+            "{flag}: {stderr}"
+        );
     }
 }

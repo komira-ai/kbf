@@ -258,8 +258,8 @@ client before relying on either.
 ## The OCI read front
 
 With `--oci-listen`, the process also serves the objects of the store as a read-only container
-registry, over HTTPS or over plain HTTP on loopback (see Two modes), so that podman (and the other clients of the OCI distribution API) pulls an
-image by digest from the same hot and cold tiers the S3 front writes to. It reads through the
+registry, over HTTPS or over plain HTTP on loopback (see Two modes), so that podman (and the
+other clients of the OCI distribution API) pulls an image by digest from the same hot and cold tiers the S3 front writes to. It reads through the
 proxy in the process: no S3 credential and no hop through the S3 listener. It is off unless
 `--oci-listen` is given, and then nothing else about the process changes.
 
@@ -289,7 +289,8 @@ so the handshake time does not apply; the other limits are the same.
 - **Plain HTTP**: with neither, on loopback only. A node's own container engine can pull from the
   front of its own tierstore, so the pull is a connection from the host to itself and the traffic
   never leaves it. A connection to any address beyond loopback can be read and changed on
-  its way, so it needs TLS.
+  its way, so it needs TLS. Loopback is reachable by every local process, and by containers that
+  share the host's network namespace; the front is anonymous in either mode.
 
 A container engine that pulls over plain HTTP has to be told it may:
 
@@ -370,6 +371,8 @@ Check a put with `HEAD` on the front: the `Docker-Content-Digest` of a manifest 
 bytes it read, after they were checked.
 
 ### Pulling
+
+Over plain HTTP on loopback there is no CA to trust; see Two modes for the client settings.
 
 podman, from a host that trusts the CA of the certificate:
 

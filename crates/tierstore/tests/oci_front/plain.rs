@@ -2,6 +2,7 @@
 //! of the listener hold. None of these asserts a time (see `limits`).
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use tokio::net::TcpListener;
 
@@ -25,6 +26,18 @@ async fn the_ping_answers_over_plain_http() {
     assert_eq!((head.status, head.body.len(), head.short), (200, 0, false));
     assert_eq!(head.must("content-length"), "2");
     assert_eq!(rig.metrics.requests("ping", "ok"), 2);
+    drop(conn);
+    assert_eq!(rig.stop().await, 0);
+}
+
+/// Asserts that the handshake timeout does not apply to plain HTTP: with it at zero (which closes
+/// every TLS connection) a plain connection is still served.
+#[tokio::test]
+async fn a_plain_connection_has_no_handshake_to_time() {
+    let rig = Rig::plain_with(|limits| limits.handshake_timeout = Duration::ZERO).await;
+    let mut conn = rig.conn().await;
+    let got = conn.request("GET", "/v2/", &[]).await.expect("an answer");
+    assert_eq!(got.status, 200);
     drop(conn);
     assert_eq!(rig.stop().await, 0);
 }
