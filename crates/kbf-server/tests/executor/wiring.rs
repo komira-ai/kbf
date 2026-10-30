@@ -16,7 +16,7 @@ use kbf_front::{
 use kbf_lease_client::fake::{FakeLeaseServer, Pool, TOKEN};
 use kbf_lease_client::{LeaseState, Mount, Outcome};
 use kbf_objstore::{Capabilities, MemoryStore, ObjectKey, ObjectStore as _};
-use kbf_pack::{PackKeys, TaskManifest, Timing, Usage, WriterKind, write_pack};
+use kbf_pack::{PackKeys, Slot, TaskManifest, Timing, Usage, WriterKind, write_pack};
 use kbf_pack_index::PackIndex;
 use kbf_pack_index::memory::MemoryPackIndex;
 use kbf_proto::reapi::platform::Property;
@@ -58,7 +58,7 @@ impl RunPrepare for Preparing {
             .push((lease.to_owned(), *action, wall));
         let key = self
             .mint
-            .mint(lease, action, now)
+            .mint(lease, action, now, Slot::Pack(0))
             .map_err(|e| PrepareError::Refused(e.to_string()))?;
         let since = now.duration_since(UNIX_EPOCH).expect("after the epoch");
         Ok(PreparedRun {
@@ -304,6 +304,9 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         output_symlinks: Vec::new(),
         timing: Timing::default(),
         usage: Usage::default(),
+        packs: 1,
+        large: vec![],
+        inputs: None,
     };
     let pack = write_pack(&manifest, &[]).expect("a pack");
     let object = ObjectKey::new(pack_key).expect("an object key");

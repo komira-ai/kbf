@@ -1,7 +1,7 @@
 //! What the invocation record keeps of one lease's report (`docs/design/ui-data.md`
 //! 4.2, phase U1): the nine REAPI times of the run, its `ResourceUsage` with the
-//! cgroup block whole, and for a run killed for memory its booking and, at its own
-//! limit, the cap. [`of`] reads the report before it is judged (the judging drops a
+//! cgroup block whole, the booking its lease was granted (every run) and, for a run
+//! killed for memory at its own limit, the cap. [`of`] reads the report before it is judged (the judging drops a
 //! killed run's result); [`killed`] adds the booking once the scheduler has taken it.
 
 use std::time::SystemTime;
@@ -14,10 +14,12 @@ use kbf_proto::worker::{self, ResourceUsage, UsageBasis};
 use kbf_types::{MemoryKill, MemoryRun};
 use prost_types::Timestamp;
 
+use crate::machine::Booked;
 use crate::stamp::Stamp;
 
 /// What `result`, for a run whose server times are `stamp` and taken in at
-/// `received`, measured; `usage` is the `ResourceUsage` its result carried, as
+/// `received`, measured; `booked` is what its lease was granted (`None` for a lease the
+/// server never started) and `usage` the `ResourceUsage` its result carried, as
 /// [`crate::action_usage::Measured`] decoded it. The times are those its
 /// `ActionResult` would carry once stamped ([`Stamp::times`]): the daemon's own,
 /// `queued` from the server, and the worker start and completion the server saw when
@@ -27,6 +29,7 @@ pub(crate) fn of(
     usage: Option<&ResourceUsage>,
     stamp: Stamp,
     received: SystemTime,
+    booked: Option<Booked>,
 ) -> Run {
     let none = ExecutedActionMetadata::default();
     let m = result
@@ -48,7 +51,8 @@ pub(crate) fn of(
             worker_completed: wall(Some(stamped.worker_completed)),
         },
         usage: usage.map(run_usage),
-        booked_memory_bytes: None,
+        booked_memory_bytes: booked.map(|b| b.memory_bytes),
+        booked_millicpus: booked.map(|b| b.cpu_millis),
         cap_bytes: None,
     }
 }
@@ -210,7 +214,7 @@ mod tests {
             .action_result
             .as_ref()
             .and_then(ResourceUsage::in_result);
-        let run = of(&result, decoded.as_ref(), stamp, secs(60));
+        let run = of(&result, decoded.as_ref(), stamp, secs(60), None);
         let times = run.times.named().map(|(_, t)| t);
         assert_eq!(
             times,
@@ -256,6 +260,7 @@ mod tests {
                 started: secs(2),
             },
             secs(3),
+            None,
         );
         assert_eq!(
             run.times,
@@ -267,6 +272,47 @@ mod tests {
             }
         );
         assert_eq!(run.usage, None);
+    }
+
+    /// Catches: the grant dropped from a run record (an accepted run without what its
+    /// lease held), the two axes swapped, a lease the server never started given a made-up
+    /// booking, and a memory kill's booking changing the CPU one.
+    #[test]
+    fn a_run_keeps_what_its_lease_was_granted() {
+        let stamp = Stamp {
+            queued: secs(1),
+            started: secs(2),
+        };
+        let booked = Booked {
+            cpu_millis: 2_500,
+            memory_bytes: 3 << 30,
+        };
+        let granted = of(
+            &worker::Result::default(),
+            None,
+            stamp,
+            secs(3),
+            Some(booked),
+        );
+        assert_eq!(
+            (granted.booked_millicpus, granted.booked_memory_bytes),
+            (Some(2_500), Some(3 << 30))
+        );
+        let unknown = of(&worker::Result::default(), None, stamp, secs(3), None);
+        assert_eq!(
+            (unknown.booked_millicpus, unknown.booked_memory_bytes),
+            (None, None)
+        );
+        let kill = MemoryRun {
+            worker: WorkerId::new("n"),
+            booked: 4 << 30,
+            kill: MemoryKill::NodePressure,
+        };
+        let killed = super::killed(granted, &kill);
+        assert_eq!(
+            (killed.booked_millicpus, killed.booked_memory_bytes),
+            (Some(2_500), Some(4 << 30))
+        );
     }
 
     fn cgroup_block() -> CgroupUsage {

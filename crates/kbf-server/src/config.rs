@@ -370,7 +370,18 @@ pub struct Args {
     /// Whether placement reads the load the nodes report. `off`, the default, books by
     /// the CPUs a lease asks for, as the server always has, and reads no load. `on` admits
     /// and ranks nodes by the load they report and the load a lease is predicted to add;
-    /// a node that reports none is charged by prediction alone
+    /// a node that reports none is charged by prediction alone, and a node that has never sent
+    /// a reading the server accepted is charged at least 1000 m for each lease (the node's
+    /// whole CPU capacity, if that is less), so a prediction under one core changes nothing for
+    /// such a node. It is read under either `--scheduler-core`. With `js`, `on` is the
+    /// scheduler's placement by load as a whole, with settings the server fixes
+    /// (`placement_load.rs`; none is a flag): besides the reading it applies the guard that
+    /// keeps the flat memory charged to a node within its memory, and scores nodes by balance.
+    /// It also sets a learned time profile charged per minute and an expected-life charge that
+    /// ends a new lease at its key's expected life plus two minutes; both are idle, since the
+    /// farm gives the scheduler no learned profile and no curve source. The memory guard counts
+    /// only leases that carry a memory (a retry up the memory ladder, a VM) unless
+    /// `--placement-predictions on` gives leases one
     // The text above states the default; the help golden cannot hold the whitespace-only
     // line clap prints before a `[default: ...]` line.
     #[arg(
@@ -390,15 +401,16 @@ pub struct Args {
     /// it) or over (less than half of it) in `kbf_prediction_vs_run_total`; the operations
     /// given a prediction are counted in `kbf_prediction_made_total` and those given none,
     /// by why, in `kbf_prediction_unset_total`. Placement is exactly what `off` does. `on`
-    /// gives the scheduler the prediction as the cost of the operation's lease, at submit
-    /// and again for an operation read back from the state store at a start, which charges
-    /// the learned memory as well as the cores: a lease is admitted to a node only while the
-    /// memory charged to the node's leases stays within the node's memory. An operation the
-    /// estimator has no usable row for, or is not asked about (not an action, one that asks
-    /// for a GPU, no OS pinned, no subject), gets none and is charged as it is with `off`.
-    /// `shadow` and `on` need `--learned-sizes shadow` or `on`; `on` needs `--placement-load
-    /// on`; neither is available with `--scheduler-core js`. A server given a combination
-    /// that breaks one of these refuses to start
+    /// gives the scheduler the prediction as the cost of the operation's lease, at submit (on
+    /// the legacy core also again for an operation read back from the state store at a
+    /// start), which charges the learned memory as well as the cores: a lease is admitted to
+    /// a node only while the memory charged to the node's leases stays within the node's
+    /// memory. An operation the estimator has no usable row for, or is not asked about (not
+    /// an action, one that asks for a GPU, no OS pinned, no subject), gets none and is
+    /// charged as it is with `off`. `shadow` and `on` need `--learned-sizes shadow` or `on`;
+    /// `on` needs `--placement-load on`; a prediction only changes what the lease is charged:
+    /// the memory limit and the cores it is booked and run with stay the request's and the
+    /// ladder's. A server given a combination that breaks one of these refuses to start
     // The text above states the default; the help golden cannot hold the whitespace-only
     // line clap prints before a `[default: ...]` line.
     #[arg(
@@ -795,12 +807,6 @@ pub enum ConfigError {
          by cores and ignores a prediction"
     )]
     PredictionsNeedPlacementLoad,
-    /// `--placement-predictions shadow` or `on` with `--scheduler-core js`.
-    #[error(
-        "--placement-predictions {0} needs --scheduler-core legacy: the js core does not read \
-         the flag yet"
-    )]
-    PredictionsNeedLegacyCore(&'static str),
     /// `--learned-sizes on` was given with `--scheduler-core js`, which learns sizes in `shadow`
     /// only: it would book as `off` does while the flag says otherwise.
     #[error(

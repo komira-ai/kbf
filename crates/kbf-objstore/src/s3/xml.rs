@@ -3,6 +3,7 @@
 
 use roxmltree::{Document, Node};
 
+use super::parts::{OpenUpload, UploadsPage};
 use super::tagged::{StampedObject, StampedPage};
 use super::times;
 use crate::types::Token;
@@ -117,6 +118,49 @@ pub(crate) fn upload_id(body: &[u8]) -> Result<String, ObjectStoreError> {
         Some(id) if !id.is_empty() => Ok(id.to_owned()),
         _ => Err(bad("no <UploadId>".into())),
     }
+}
+
+/// A ListMultipartUploads answer as an [`UploadsPage`]: every upload must carry a key, an
+/// id and a readable `<Initiated>`, and a truncated answer must say where it goes on.
+pub(crate) fn uploads_page(body: &[u8]) -> Result<UploadsPage, ObjectStoreError> {
+    let bad =
+        |what: String| ObjectStoreError::Protocol(format!("ListMultipartUploads answer: {what}"));
+    let text = std::str::from_utf8(body).map_err(|e| bad(e.to_string()))?;
+    let doc = Document::parse(text).map_err(|e| bad(e.to_string()))?;
+    let root = doc.root_element();
+    if root.tag_name().name() != "ListMultipartUploadsResult" {
+        return Err(bad(format!("root element is <{}>", root.tag_name().name())));
+    }
+    let mut uploads = Vec::new();
+    for entry in root.children().filter(|n| is_named(*n, "Upload")) {
+        let key = child_text(entry, "Key").ok_or_else(|| bad("<Upload> without <Key>".into()))?;
+        let key = ObjectKey::new(key).map_err(|e| bad(format!("listed key: {e}")))?;
+        let id = child_text(entry, "UploadId").filter(|id| !id.is_empty());
+        let id = id.ok_or_else(|| bad(format!("{key}: no <UploadId>")))?;
+        let initiated = child_text(entry, "Initiated").and_then(times::iso8601_millis);
+        let initiated_millis =
+            initiated.ok_or_else(|| bad(format!("{key}: missing or bad <Initiated>")))?;
+        uploads.push(OpenUpload {
+            key,
+            upload_id: id.to_owned(),
+            initiated_millis,
+        });
+    }
+    let truncated = match child_text(root, "IsTruncated") {
+        Some("true") => true,
+        Some("false") | None => false,
+        Some(other) => return Err(bad(format!("<IsTruncated> is {other:?}"))),
+    };
+    let next = if truncated {
+        let key = child_text(root, "NextKeyMarker").filter(|k| !k.is_empty());
+        let key = key.ok_or_else(|| bad("truncated without <NextKeyMarker>".into()))?;
+        let key = ObjectKey::new(key).map_err(|e| bad(format!("next key marker: {e}")))?;
+        let id = child_text(root, "NextUploadIdMarker").unwrap_or_default();
+        Some((key, id.to_owned()))
+    } else {
+        None
+    };
+    Ok(UploadsPage { uploads, next })
 }
 
 /// The body of CompleteMultipartUpload: each part's number and ETag, in order.
@@ -422,5 +466,78 @@ mod tests {
             assert!(err.to_string().contains(why), "{err}");
         }
         assert!(stamped_page(b"not xml").is_err());
+    }
+
+    /// Catches: an uploads page that loses the id or the time of an upload, reads a truncated
+    /// answer as the last page (so a janitor stops after one page), reads a document that is
+    /// not a listing of uploads, or depends on the namespace.
+    #[test]
+    fn an_uploads_page_carries_keys_ids_times_and_the_markers_of_the_next_page() {
+        let body = format!(
+            "<ListMultipartUploadsResult {NS}><Bucket>b</Bucket><IsTruncated>true</IsTruncated>\
+             <NextKeyMarker>p/b</NextKeyMarker><NextUploadIdMarker>u2</NextUploadIdMarker>\
+             <Upload><Key>p/a</Key><UploadId>u1</UploadId>\
+             <Initiated>2009-10-12T17:50:30.000Z</Initiated></Upload>\
+             <Upload><Key>p/b</Key><UploadId>u2</UploadId>\
+             <Initiated>2009-10-12T17:50:31.500Z</Initiated></Upload>\
+             </ListMultipartUploadsResult>"
+        );
+        let page = uploads_page(body.as_bytes()).unwrap();
+        let got: Vec<_> = page
+            .uploads
+            .iter()
+            .map(|u| (u.key.as_str(), u.upload_id.as_str(), u.initiated_millis))
+            .collect();
+        let want = [
+            ("p/a", "u1", 1_255_369_830_000),
+            ("p/b", "u2", 1_255_369_831_500),
+        ];
+        assert_eq!(got, want);
+        let next = page.next.unwrap();
+        assert_eq!((next.0.as_str(), next.1.as_str()), ("p/b", "u2"));
+
+        let last = "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated>\
+                    </ListMultipartUploadsResult>";
+        let page = uploads_page(last.as_bytes()).unwrap();
+        assert_eq!((page.uploads.len(), page.next), (0, None));
+    }
+
+    /// Catches: an uploads page that accepts an answer that breaks the contract: a truncated
+    /// page with no key marker, an upload without a key, an id or a readable time, a flag
+    /// that is not true or false, and a document of another kind.
+    #[test]
+    fn uploads_answers_that_break_the_contract_are_protocol_errors() {
+        let at = "<Initiated>2009-10-12T17:50:30.000Z</Initiated>";
+        let wrap = |inner: &str| {
+            format!("<ListMultipartUploadsResult>{inner}</ListMultipartUploadsResult>")
+        };
+        let whole = format!("<Key>k</Key><UploadId>u</UploadId>{at}");
+        let broken = [
+            wrap("<IsTruncated>true</IsTruncated>"),
+            wrap("<IsTruncated>maybe</IsTruncated>"),
+            wrap(&format!("<Upload><UploadId>u</UploadId>{at}</Upload>")),
+            wrap(&format!("<Upload><Key>k</Key>{at}</Upload>")),
+            wrap(&format!(
+                "<Upload><Key>k</Key><UploadId></UploadId>{at}</Upload>"
+            )),
+            wrap("<Upload><Key>k</Key><UploadId>u</UploadId></Upload>"),
+            wrap("<Upload><Key>k</Key><UploadId>u</UploadId><Initiated>soon</Initiated></Upload>"),
+            wrap(&format!(
+                "<IsTruncated>true</IsTruncated><NextKeyMarker></NextKeyMarker>\
+                 <Upload>{whole}</Upload>"
+            )),
+            "<ListBucketResult></ListBucketResult>".to_owned(),
+            "not xml".to_owned(),
+        ];
+        for body in broken {
+            let err = uploads_page(body.as_bytes()).unwrap_err();
+            assert!(
+                matches!(err, ObjectStoreError::Protocol(_)),
+                "{body}: {err:?}"
+            );
+        }
+        assert!(uploads_page(&[0xff, 0xfe]).is_err());
+        let fine = wrap(&format!("<Upload>{whole}</Upload>"));
+        assert_eq!(uploads_page(fine.as_bytes()).unwrap().uploads.len(), 1);
     }
 }

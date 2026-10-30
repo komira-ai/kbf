@@ -6,7 +6,8 @@
 //!    every blob's SHA-256 against its digest, and lays the input tree out under the working
 //!    directory. The tree is read breadth-first with at most `--fetch-concurrency` requests in
 //!    flight (32 by default) over pooled connections, and each file streams from the response to
-//!    disk through its digest check instead of being held in memory;
+//!    disk through its digest check instead of being held in memory. With `--fetch-batch`, blobs
+//!    under 64 KiB are read in `/batch` requests of up to 256 digests;
 //! 2. runs the Command there ([`run`]): its argv, environment and working directory, stdout and
 //!    stderr to files, under a deadline. The environment is the Command's own, preceded by `HOME`,
 //!    `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`, which name fresh directories
@@ -44,6 +45,20 @@
 //! storing failed. Nothing the tool writes is trusted: the frontend hashes every record of the pack,
 //! checks its footer, and builds the action's result from its own hashing.
 //!
+//! # The v2 key set (in progress)
+//!
+//! A v2 run is issued a fixed key set: several pack URLs and several large-object URLs
+//! (`--put-urls-file`, or `--put-urls` with `--insecure-argv-secrets`; [`put_urls`]). Three
+//! pieces for it exist, and only the first is used:
+//!
+//! - the key set flags, parsed and validated at startup. **Used, in part:** only the first pack
+//!   slot, exactly as v1 uses its one pack URL; the rest of the set is checked and ignored;
+//! - [`put::put_file`], a create-only PUT streamed from a file, for a blob over the record cap.
+//!   **Not used yet:** nothing calls it;
+//! - [`plan::plan`], the pure placement of output blobs into packs and large objects. **Not used
+//!   yet:** nothing calls it, and the manifest has no field to name the packs or large objects,
+//!   so a run still writes the one v1 pack.
+//!
 //! # What a failure means
 //!
 //! - A 412 means the pack key already holds an object, and it is final: the frontend mints a new
@@ -77,6 +92,8 @@ pub mod fetch;
 pub mod network;
 pub mod outputs;
 pub mod pack;
+pub mod plan;
 pub mod put;
+pub mod put_urls;
 pub mod run;
 pub mod task;
