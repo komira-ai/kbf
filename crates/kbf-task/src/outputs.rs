@@ -447,7 +447,7 @@ mod tests {
             .await
             .expect_err("one byte over");
         assert!(matches!(why, OutputsError::Store { .. }), "{why}");
-        assert!(why.to_string().contains("one pack"), "{why}");
+        assert!(why.to_string().contains("pass the 117 bytes"), "{why}");
         assert!(why.to_string().contains("output-too-large"), "{why}");
     }
 

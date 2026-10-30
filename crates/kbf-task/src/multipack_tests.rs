@@ -134,8 +134,12 @@ async fn outputs_that_need_two_packs_are_put_to_slot_1_then_slot_0() {
         read_manifest_with(&bodies[1], MAX_LARGE_BYTES).expect("pack 0"),
         manifest
     );
-    // The v1 reader refuses a manifest of two packs.
-    assert!(read_manifest(&bodies[1]).is_err());
+    // The manifest is written as version 2.
+    let json: serde_json::Value =
+        serde_json::from_slice(&manifest.to_json_with(MAX_LARGE_BYTES).expect("json"))
+            .expect("json");
+    assert_eq!(json["version"], 2);
+    assert_eq!(json["packs"], 2);
 
     let pack_1 = records_of(&bodies[0]);
     let pack_0 = records_of(&bodies[1]);
