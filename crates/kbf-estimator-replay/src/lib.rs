@@ -40,5 +40,6 @@ pub mod export;
 pub mod readonly;
 pub mod replay;
 pub mod row;
+pub mod slowdown;
 
 pub use cli::main;
