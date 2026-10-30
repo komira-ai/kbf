@@ -20,6 +20,10 @@ A scoped key's file is JSON of exactly `access_key_id`, `secret_access_key`, `re
 `write_prefixes` and `delete_prefixes`; the lists may be empty, but not all three, and every prefix
 ends in `/`, is not, or under, or over `_journal/` or `_tiering/`, and has neither as a segment.
 
+A call whose key or listing `prefix` has `..` anywhere in it is refused, even inside a prefix.
+The server library does not itself force the access key ids of its keys to differ (`ServerConfig`
+is plain data); the command line does, and exits 2.
+
 - `read_prefixes`: GetObject, HeadObject, ListObjectsV2 and ListMultipartUploads (a listing's
   `prefix` parameter must be inside one);
 - `write_prefixes`: create-only PutObject (`If-None-Match: *` or no condition; `412` if the key

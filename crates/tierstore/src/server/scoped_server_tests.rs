@@ -353,6 +353,39 @@ async fn a_multipart_call_outside_the_write_prefixes_is_refused_at_every_step() 
     assert_eq!(denied(&refused), access_denied());
 }
 
+/// Asserts that an upload id belongs to the key it was created for: an upload of `w/a` is
+/// `NoSuchUpload` for a part and for a completion naming `w/b`, both inside the write prefix, and
+/// `w/b` is not created; the upload still completes under its own key.
+#[tokio::test(start_paused = true)]
+async fn an_upload_id_made_for_one_key_is_refused_for_another_inside_the_write_prefix() {
+    let rig = rig().await;
+    let started = scoped(&rig, "POST", &uri("w/a?uploads"), &[], b"").await;
+    let id = texts(&started.body, "UploadId").concat();
+    let own = uri(&format!("w/a?partNumber=1&uploadId={id}"));
+    let sent = scoped(&rig, "PUT", &own, &[], b"p").await;
+    assert_eq!(sent.status, StatusCode::OK, "{}", sent.body);
+    let tag = sent.header("etag").to_owned();
+    let other = uri(&format!("w/b?partNumber=1&uploadId={id}"));
+    let part = scoped(&rig, "PUT", &other, &[], b"p").await;
+    assert_eq!(
+        (part.status.as_u16(), part.code()),
+        (404, "NoSuchUpload".to_owned())
+    );
+    let done = completion(&[(1, tag.as_str())]);
+    let complete = uri(&format!("w/b?uploadId={id}"));
+    let ended = scoped(&rig, "POST", &complete, &[], done.as_bytes()).await;
+    assert_eq!(
+        (ended.status.as_u16(), ended.code()),
+        (404, "NoSuchUpload".to_owned())
+    );
+    assert!(!exists(&rig, "w/b").await);
+    let complete = uri(&format!("w/a?uploadId={id}"));
+    let ended = scoped(&rig, "POST", &complete, &[], done.as_bytes()).await;
+    assert_eq!(ended.status, StatusCode::OK, "{}", ended.body);
+    assert!(exists(&rig, "w/a").await);
+    assert!(!exists(&rig, "w/b").await);
+}
+
 /// Asserts that DeleteObject is allowed inside a delete prefix only: the object leaves both tiers
 /// and the delete is journaled; a delete under a read prefix, a write prefix, another prefix or the
 /// prefix itself is 403 and leaves the object; a key whose delete list is empty cannot delete
