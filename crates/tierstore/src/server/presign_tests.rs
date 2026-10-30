@@ -353,6 +353,8 @@ fn names_and_prefixes_are_checked() {
     for bad in [
         "",
         "_",
+        "/",
+        "/cas/b/",
         "_jou",
         "_journal/",
         "_journal/p1/",
