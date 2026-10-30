@@ -36,6 +36,10 @@ pub enum BenchError {
     /// proves nothing.
     #[error("request log: {0}")]
     Log(#[source] std::io::Error),
+    /// A cell stopped the run on purpose (the load gate, a stop file, a byte budget that left
+    /// no room for the next level). Its result files are written first; the text says why.
+    #[error("halted: {0}")]
+    Halted(String),
     /// A result file is not JSON of the schema this build writes.
     #[error("result file: {0}")]
     Result(String),

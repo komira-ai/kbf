@@ -21,7 +21,7 @@ fn a_stub_verb_exits_2_and_says_what_is_not_built() {
 /// Catches a binary that cannot print its help, which means a clap definition that does not
 /// build.
 #[test]
-fn help_lists_the_six_verbs() {
+fn help_lists_the_verbs() {
     let out = Command::new(env!("CARGO_BIN_EXE_tierstore-bench"))
         .arg("--help")
         .output()
@@ -32,6 +32,7 @@ fn help_lists_the_six_verbs() {
         "preflight",
         "provision",
         "run",
+        "cleanup",
         "fault-proxy",
         "verify-teardown",
         "report",
