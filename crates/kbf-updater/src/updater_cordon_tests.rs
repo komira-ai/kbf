@@ -56,9 +56,10 @@ fn marks(dir: &Path) -> usize {
         .count()
 }
 
-/// The host's health is judged as for a node that is not serving until the roll gives it back:
-/// asked to be serving, it would never be.
+/// A node the roll left out is never serving: the host is healthy only when it is not asked to
+/// be serving (the held check), and a check that asks for it never says so.
 fn serving_never_answers(rig: &Rig) {
+    rig.health.script_held("dm", vec![], Ok(Health::Healthy));
     rig.health.script(
         "dm",
         vec![],
