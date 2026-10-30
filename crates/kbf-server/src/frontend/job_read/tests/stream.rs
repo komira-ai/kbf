@@ -233,15 +233,29 @@ fn the_cap_and_the_reads_in_flight_are_flags_with_the_design_defaults() {
     let default = job(&[]);
     assert_eq!(default.max_blob_bytes, 536_870_912);
     assert_eq!(default.reads_in_flight, 32);
+    assert_eq!(default.read_budget_bytes, 1_073_741_824);
+    assert_eq!(
+        default.read_budget_bytes,
+        Limits::default().read_budget_bytes
+    );
     assert_eq!(default.max_blob_bytes, Limits::default().max_blob_bytes);
     assert_eq!(
         default.reads_in_flight as usize,
         Limits::default().reads_in_flight
     );
-    let set = job(&["--job-max-blob-bytes=1048576", "--job-reads-in-flight=4"]);
+    let set = job(&[
+        "--job-max-blob-bytes=1048576",
+        "--job-reads-in-flight=4",
+        "--job-read-budget-bytes=4096",
+    ]);
+    assert_eq!(set.read_budget_bytes, 4096);
     assert_eq!(set.max_blob_bytes, 1_048_576);
     assert_eq!(set.reads_in_flight, 4);
-    for zero in ["--job-max-blob-bytes=0", "--job-reads-in-flight=0"] {
+    for zero in [
+        "--job-max-blob-bytes=0",
+        "--job-reads-in-flight=0",
+        "--job-read-budget-bytes=0",
+    ] {
         assert!(with(&[zero]).is_err(), "{zero}");
     }
     // Alone, without --job-listen, they have no listener to bound.
@@ -258,8 +272,10 @@ async fn the_flags_are_the_limits_of_the_listener() {
     let mut flags = flags(&files, "127.0.0.1:0");
     flags.max_blob_bytes = 1_048_576;
     flags.reads_in_flight = 4;
+    flags.read_budget_bytes = 4096;
     let prepared = prepare(&flags).expect("prepared");
     assert_eq!(prepared.limits.max_blob_bytes, 1_048_576);
     assert_eq!(prepared.limits.reads_in_flight, 4);
+    assert_eq!(prepared.limits.read_budget_bytes, 4096);
     assert_eq!(prepared.limits.stream_over, Limits::default().stream_over);
 }

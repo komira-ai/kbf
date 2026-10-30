@@ -88,6 +88,8 @@ invocation-memory = 268435456
 # job-listen = "ADDR"
 # The most bytes of one blob the listener serves, at least 1: a blob of more is refused 413 `too_large` before anything is read. A blob of more than 67108864 bytes is streamed from the store through SHA-256 and never held whole; one whose bytes are not its digest's ends its response early, and is counted. Needs `--job-listen`
 job-max-blob-bytes = 536870912
+# The bytes of blob reads this listener has open at once, at least 1: a read takes its blob's size (a streamed blob a bounded window of it, and the scope walk's reads their own sizes) and a request over the budget waits for room, it never fails; a blob larger than the whole budget is read alone. Needs `--job-listen`
+job-read-budget-bytes = 1073741824
 # The blob reads this listener has open at once, at least 1: a streamed blob holds its place until its response ends, and a request over the bound waits for one to end. Needs `--job-listen`
 job-reads-in-flight = 32
 # The certificate chain (PEM) of `--job-listen`, issued by the farm CA that the jobs trust. It must carry an IP subjectAltName for each address a job dials the frontend at: the start is refused if it has none, or if `--job-listen` is on one address and the certificate does not name it, since a client that dials an IP address accepts only a certificate that names it. Read again every `--tls-reload-interval-secs`, as the other listeners' are; the names are checked at start only

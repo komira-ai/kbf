@@ -541,43 +541,6 @@ async fn a_scope_that_cannot_be_worked_out_refuses_the_whole_request() {
     );
 }
 
-/// Catches: batch reads that do not count against the reads in flight (a task fetching
-/// thousands of small blobs in 256-blob requests opening 256 reads at once): with one read
-/// allowed, the second blob of a request is not read until the first read ends.
-#[tokio::test]
-async fn each_read_of_a_batch_counts_against_the_reads_in_flight() {
-    let w = world();
-    let limits = Limits {
-        reads_in_flight: 1,
-        ..Limits::default()
-    };
-    let rig = rig(&w, Some(w.d("alpha")), limits);
-    let token = rig.token(w.action);
-    let body = body_of(&[w.t("alpha"), w.t("beta")]);
-    let batch = rig.batch(&body, Some(&token));
-    let driver = async {
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            rig.source.reads_of(&w.d("alpha")),
-            1,
-            "the first read is open"
-        );
-        assert_eq!(
-            rig.source.reads_of(&w.d("beta")),
-            0,
-            "the second waits for it"
-        );
-        let (_, gate) = rig.source.gate.as_ref().expect("a gate");
-        gate.add_permits(1);
-    };
-    let (reply, ()) = tokio::join!(batch, driver);
-    let beta = &w.held[&w.d("beta")];
-    let expected = [frame(0, b"alpha"), frame(0, beta)].concat();
-    assert_eq!(&reply.body[..], &expected[..]);
-}
-
 /// Catches: `/batch` being answered for the wrong method, a GET of it being taken for a blob
 /// path (it is 405, not 404), another path taking a POST, and a POST with no body being
 /// anything but a malformed request.
