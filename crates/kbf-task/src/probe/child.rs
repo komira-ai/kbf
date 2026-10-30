@@ -40,23 +40,22 @@ fn inet() -> String {
 
 /// Make a socket of `domain`.
 fn socket(domain: libc::c_int) -> String {
-    // SAFETY: `socket` takes three integers; a descriptor it returns is closed at once.
-    let fd = unsafe { libc::socket(domain, libc::SOCK_RAW, 0) };
-    if fd < 0 {
-        return errno(&std::io::Error::last_os_error());
-    }
-    // SAFETY: `fd` was just returned by `socket` and is not used again.
-    unsafe { libc::close(fd) };
-    "ok".to_owned()
+    // SAFETY: `socket` takes three integers and returns a descriptor or -1.
+    fd_outcome(libc::c_long::from(unsafe {
+        libc::socket(domain, libc::SOCK_RAW, 0)
+    }))
 }
 
 /// `io_uring_setup` with a zeroed parameter block (`struct io_uring_params` is 120 bytes), so
 /// that a kernel and a profile that allow it make a ring: the answer is `ok` then, not `EFAULT`.
 fn io_uring() -> String {
     let mut params = [0u64; 15];
-    // SAFETY: `params` is writable and at least as large as `struct io_uring_params`; the
-    // descriptor a successful call returns is closed at once.
-    let fd = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, params.as_mut_ptr()) };
+    // SAFETY: `params` is writable and at least as large as `struct io_uring_params`.
+    fd_outcome(unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, params.as_mut_ptr()) })
+}
+
+/// The value for a call that returns a descriptor or -1 with `errno`: the descriptor is closed.
+pub(super) fn fd_outcome(fd: libc::c_long) -> String {
     if fd < 0 {
         return errno(&std::io::Error::last_os_error());
     }

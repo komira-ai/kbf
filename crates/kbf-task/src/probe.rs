@@ -353,30 +353,27 @@ fn read(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-/// The facts of this process, named with `prefix` (`""` or `"child_"`), read from `/proc`.
-fn process_facts(prefix: &str) -> Vec<Check> {
+/// The facts of this process read from `/proc`: `euid`, `uid_map`, `gid_map` and `cap_eff`.
+fn process_facts() -> Vec<Check> {
     let status = read("/proc/self/status");
-    let name = |n: &str| format!("{prefix}{n}");
-    let mut facts = Vec::new();
-    if prefix.is_empty() {
-        facts.push(fact("euid", status.as_deref().and_then(euid)));
-    }
-    facts.push(fact(
-        &name("uid_map"),
-        read("/proc/self/uid_map").map(|t| squeeze_map(&t)),
-    ));
-    facts.push(fact(
-        &name("gid_map"),
-        read("/proc/self/gid_map").map(|t| squeeze_map(&t)),
-    ));
-    facts.push(fact(&name("cap_eff"), status.as_deref().and_then(cap_eff)));
-    facts
+    vec![
+        fact("euid", status.as_deref().and_then(euid)),
+        fact(
+            "uid_map",
+            read("/proc/self/uid_map").map(|t| squeeze_map(&t)),
+        ),
+        fact(
+            "gid_map",
+            read("/proc/self/gid_map").map(|t| squeeze_map(&t)),
+        ),
+        fact("cap_eff", status.as_deref().and_then(cap_eff)),
+    ]
 }
 
 /// The facts the Command prints for itself, as `observe` lines.
 #[cfg(target_os = "linux")]
 fn child_facts() -> Vec<String> {
-    process_facts("")
+    process_facts()
         .into_iter()
         .filter(|c| c.name != "euid")
         .filter(|c| c.status == Status::Ok)
@@ -404,7 +401,7 @@ fn facts(observed: &BTreeMap<String, String>) -> Vec<Check> {
             trimmed("/proc/sys/user/max_user_namespaces"),
         ),
     ];
-    all.extend(process_facts(""));
+    all.extend(process_facts());
     for name in ["uid_map", "gid_map", "cap_eff"] {
         all.push(child_fact(observed, name));
     }
@@ -433,53 +430,57 @@ fn observe(_secret_path: Option<&Path>) -> Vec<String> {
     Vec::new()
 }
 
-/// Runs the Command side inside the confinement of a real action's Command and returns the
-/// checks. The scratch directory `dir` is new.
-async fn run_confined(dir: &Path, secret_path: Option<&Path>) -> Vec<Check> {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => return evaluate_failed(format!("cannot find this program: {e}"), secret_path),
-    };
-    let mut arguments = vec![exe.to_string_lossy().into_owned(), CHILD_FLAG.to_owned()];
+/// The argv of the Command side: this program, with the hidden flag.
+fn child_argv(secret_path: Option<&Path>) -> Vec<String> {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
+    let mut argv = vec![exe.to_string_lossy().into_owned(), CHILD_FLAG.to_owned()];
     if let Some(path) = secret_path {
-        arguments.push("--probe-secret-path".to_owned());
-        arguments.push(path.to_string_lossy().into_owned());
+        argv.push("--probe-secret-path".to_owned());
+        argv.push(path.to_string_lossy().into_owned());
     }
-    let root = dir.join("root");
-    let stdout = dir.join("stdout");
-    let ran = match std::fs::create_dir(&root) {
-        Ok(()) => run(
-            &Command {
-                arguments,
-                ..Command::default()
-            },
-            &Run {
-                root: &root,
-                private: &dir.join("private"),
-                stdout: &stdout,
-                stderr: &dir.join("stderr"),
-                deadline: Duration::from_secs(60),
-                network: Network::Denied,
-            },
-        )
-        .await
-        .map_err(|e| e.to_string()),
-        Err(e) => Err(format!("cannot make {}: {e}", root.display())),
+    argv
+}
+
+/// Runs `argv` as an action's Command with the network denied, as [`run`] does for a real one,
+/// under `dir` (which holds an empty `root`, and in which `private`, `stdout` and `stderr` are
+/// made), and returns the checks that follow.
+async fn run_confined(
+    dir: &Path,
+    argv: Vec<String>,
+    deadline: Duration,
+    secret_path: Option<&Path>,
+) -> Vec<Check> {
+    let command = Command {
+        arguments: argv,
+        ..Command::default()
     };
+    let stdout = dir.join("stdout");
+    let ran = run(
+        &command,
+        &Run {
+            root: &dir.join("root"),
+            private: &dir.join("private"),
+            stdout: &stdout,
+            stderr: &dir.join("stderr"),
+            deadline,
+            network: Network::Denied,
+        },
+    )
+    .await;
     match ran {
         Ok(ran) => {
-            let text = std::fs::read_to_string(&stdout).unwrap_or_default();
+            let observed =
+                parse_observations(&std::fs::read_to_string(&stdout).unwrap_or_default());
             let ended = if ran.timed_out {
                 Err("timed out".to_owned())
             } else {
                 Ok(ran.exit_code)
             };
-            let observed = parse_observations(&text);
             let mut checks = evaluate(&ran.layers, ended, &observed, secret_path);
             checks.extend(facts(&observed));
             checks
         }
-        Err(error) => evaluate_failed(error, secret_path),
+        Err(error) => evaluate_failed(error.to_string(), secret_path),
     }
 }
 
@@ -503,25 +504,26 @@ pub fn run_probe(cli: &ProbeCli) -> ExitCode {
         .clone()
         .unwrap_or_else(std::env::temp_dir)
         .join(format!("kbf-task-probe-{}", std::process::id()));
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build();
-    let checks = match (std::fs::create_dir(&dir), runtime) {
-        (Ok(()), Ok(runtime)) => {
-            let checks = runtime.block_on(run_confined(&dir, cli.probe_secret_path.as_deref()));
-            // Best effort: a leftover directory in a job's scratch is harmless.
-            let _ = std::fs::remove_dir_all(&dir);
-            checks
-        }
-        (Err(e), _) => evaluate_failed(
-            format!("cannot make {}: {e}", dir.display()),
-            cli.probe_secret_path.as_deref(),
-        ),
-        (_, Err(e)) => evaluate_failed(
-            format!("cannot start the runtime: {e}"),
-            cli.probe_secret_path.as_deref(),
-        ),
-    };
+    let secret_path = cli.probe_secret_path.as_deref();
+    let checks =
+        match std::fs::create_dir(&dir).and_then(|()| std::fs::create_dir(dir.join("root"))) {
+            Ok(()) => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a single-threaded runtime starts");
+                let checks = runtime.block_on(run_confined(
+                    &dir,
+                    child_argv(secret_path),
+                    Duration::from_secs(60),
+                    secret_path,
+                ));
+                // Best effort: a leftover directory in a job's scratch is harmless.
+                let _ = std::fs::remove_dir_all(&dir);
+                checks
+            }
+            Err(e) => evaluate_failed(format!("cannot make {}: {e}", dir.display()), secret_path),
+        };
     for check in &checks {
         println!("{}", check.line());
     }

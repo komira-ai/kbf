@@ -358,3 +358,91 @@ fn the_flags_parse() {
     );
     assert_eq!(cli.probe_work_dir.as_deref(), Some(Path::new("/scratch")));
 }
+
+/// Catches: the Command's argv losing the hidden flag or the secret path.
+#[test]
+fn the_childs_argv_is_this_program_with_the_hidden_flag() {
+    let bare = child_argv(None);
+    assert_eq!(bare.len(), 2);
+    assert_eq!(bare[1], CHILD_FLAG);
+    let with = child_argv(Some(Path::new("/run/js-files")));
+    assert_eq!(
+        with[1..],
+        [CHILD_FLAG, "--probe-secret-path", "/run/js-files"]
+    );
+}
+
+#[cfg(target_os = "linux")]
+mod confined {
+    use kbf_testkit::dir::TestDir;
+
+    use super::*;
+
+    /// A scratch directory shaped as `run_probe` makes it, and the checks of `argv` run in it.
+    async fn checks_of(name: &str, argv: &[&str], deadline: Duration) -> Vec<Check> {
+        let dir = TestDir::under(std::env::temp_dir(), &format!("kbf-task-probe-unit-{name}"));
+        std::fs::create_dir(dir.join("root")).expect("root");
+        let argv = argv.iter().map(|a| (*a).to_owned()).collect();
+        run_confined(&dir, argv, deadline, None).await
+    }
+
+    /// Catches: a Command that cannot start passing, or its error being lost.
+    #[tokio::test]
+    async fn a_command_that_cannot_start_fails_the_child_check() {
+        let checks = checks_of(
+            "nostart",
+            &["/nonexistent/kbf-probe"],
+            Duration::from_secs(5),
+        )
+        .await;
+        let child = by_name(&checks, "child").line();
+        assert!(child.starts_with("probe child: FAIL "), "{child}");
+        assert!(child.contains("/nonexistent/kbf-probe"), "{child}");
+        assert_eq!(by_name(&checks, "layers").status, Status::Fail);
+        assert!(!passes(&checks));
+    }
+
+    /// Catches: a Command that outlives its deadline being reported as having exited.
+    #[tokio::test]
+    async fn a_command_past_its_deadline_is_a_timeout() {
+        let checks = checks_of("timeout", &["/bin/sleep", "30"], Duration::from_millis(200)).await;
+        assert_eq!(
+            by_name(&checks, "child").line(),
+            "probe child: FAIL timed out"
+        );
+        assert!(!passes(&checks));
+    }
+
+    /// Catches: a Command that exits 0 and says nothing passing: every call it owns fails.
+    #[tokio::test]
+    async fn a_command_that_reports_nothing_fails_the_checks_it_owns() {
+        let checks = checks_of("silent", &["/bin/true"], Duration::from_secs(30)).await;
+        assert_eq!(by_name(&checks, "child").line(), "probe child: ok exit 0");
+        for name in ["inet_unreachable", "netlink", "packet", "io_uring"] {
+            assert_eq!(
+                by_name(&checks, name).line(),
+                format!("probe {name}: FAIL the Command reported nothing")
+            );
+        }
+        assert!(!passes(&checks));
+        // The facts follow the checks, whatever the Command did.
+        assert_eq!(
+            checks.last().map(|c| c.name.as_str()),
+            Some("child_cap_eff")
+        );
+    }
+
+    /// Catches: a descriptor leaked or an error lost by the call helper both sockets and the ring use.
+    #[test]
+    fn a_call_that_returns_a_descriptor_is_closed_and_one_that_fails_names_its_errno() {
+        // SAFETY: opens a file read-only; the descriptor is handed to the helper, which closes it.
+        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        assert!(fd >= 0);
+        assert_eq!(child::fd_outcome(libc::c_long::from(fd)), "ok");
+        // SAFETY: `fcntl` on a closed descriptor only fails with `EBADF`.
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        // SAFETY: `__errno_location` is this thread's `errno`, which is writable.
+        unsafe { *libc::__errno_location() = libc::EBADF };
+        assert_eq!(child::fd_outcome(-1), format!("errno {}", libc::EBADF));
+    }
+}

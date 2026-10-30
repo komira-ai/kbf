@@ -246,6 +246,42 @@ fn the_command_side_prints_one_observation_per_call() {
     }
     assert!(text.contains("observe secret readable"));
     assert!(!text.contains(SENTINEL));
+    // A directory is listed, and a path that is not there names its errno.
+    for (path, want) in [
+        (dir.path().to_owned(), "readable"),
+        (dir.join("nothing"), "errno 2"),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_kbf-task"))
+            .args(["--probe-confinement-child", "--probe-secret-path"])
+            .arg(&path)
+            .output()
+            .expect("kbf-task starts");
+        let text = String::from_utf8(out.stdout).expect("utf-8");
+        assert!(
+            text.contains(&format!("observe secret {want}\n")),
+            "{path:?}: {text}"
+        );
+    }
+}
+
+/// Catches: the default scratch directory (the system temporary directory) not being used or
+/// not being cleaned up, and a probe that needs the work-dir flag.
+#[test]
+fn without_a_work_directory_the_probe_uses_the_temporary_directory() {
+    let dir = scratch("tmpdir");
+    let out = Command::new(env!("CARGO_BIN_EXE_kbf-task"))
+        .arg("--probe-confinement")
+        .env("TMPDIR", dir.path())
+        .output()
+        .expect("kbf-task starts");
+    let (checks, last) = checks(&out);
+    assert_eq!(checks.len(), NAMES.len(), "{checks:?}");
+    assert!(last.starts_with("probe result: "));
+    assert_eq!(
+        std::fs::read_dir(dir.path()).expect("tmp").count(),
+        0,
+        "left over"
+    );
 }
 
 /// The pass, where the namespace is expected.
