@@ -440,6 +440,13 @@ impl Rig {
         self.tamper.put(key, body).await.expect("a put");
     }
 
+    /// Writes other bytes over an object the upstream holds (its `put` refuses a key that exists,
+    /// so the old object is deleted first).
+    pub(in crate::server) async fn replace(&self, key: &str, body: &[u8]) {
+        self.tamper.delete(key).await.expect("a delete");
+        self.put(key, body).await;
+    }
+
     /// A whole read through the cache.
     pub(in crate::server) async fn get(&self, key: &str) -> Result<Bytes, Error> {
         self.cache.get(key, None).await
