@@ -36,6 +36,8 @@ critical   = 97
 free_floor = 15
 max_concurrent_fills = 6
 max_concurrent_keeps = 3
+keep_wait  = "45s"
+keep_deadline = "5m"
 write_through = true
 cache      = true
 scrub_rate = "50MiB/s"
@@ -150,6 +152,8 @@ fn a_build_node_file_makes_a_cache() {
     assert_eq!((FILL_CHUNK, WHOLE_FILL_LIMIT), (8 << 20, 64 << 20));
     assert_eq!(config.max_concurrent_fills, 6);
     assert_eq!(config.max_concurrent_keeps, 3);
+    assert_eq!(config.keep_wait, Duration::from_secs(45));
+    assert_eq!(config.keep_deadline, Duration::from_secs(300));
     assert!(config.write_through);
     let upstream = &cache.upstream;
     assert_eq!(upstream.spec, "s3:tierstore");
@@ -186,6 +190,8 @@ fn a_build_node_file_has_the_defaults_of_the_flags_and_of_the_cache() {
     );
     assert_eq!(config.max_concurrent_fills, 4);
     assert_eq!(config.max_concurrent_keeps, 8);
+    assert_eq!(config.keep_wait, Duration::from_secs(5));
+    assert_eq!(config.keep_deadline, Duration::from_secs(60));
     assert!(
         !config.write_through,
         "a file that leaves it out is a read cache"
@@ -362,6 +368,10 @@ fn the_water_marks_are_judged_at_their_edges() {
         cache_with("max_concurrent_fills = 6", "max_concurrent_fills = 64"),
         cache_with("max_concurrent_keeps = 3", "max_concurrent_keeps = 1"),
         cache_with("max_concurrent_keeps = 3", "max_concurrent_keeps = 64"),
+        cache_with("keep_wait  = \"45s\"", "keep_wait  = \"1ms\""),
+        cache_with("keep_wait  = \"45s\"", "keep_wait  = \"5m\""),
+        cache_with("keep_deadline = \"5m\"", "keep_deadline = \"45s\""),
+        cache_with("keep_deadline = \"5m\"", "keep_deadline = \"2h\""),
     ];
     for text in accepted {
         let made = settings_from_text(&text, DEFAULTS);
@@ -403,6 +413,22 @@ fn the_water_marks_are_judged_at_their_edges() {
         (
             cache_with("max_concurrent_keeps = 3", "max_concurrent_keeps = 65"),
             "local_cache.max_concurrent_keeps",
+        ),
+        (
+            cache_with("keep_wait  = \"45s\"", "keep_wait  = \"0s\""),
+            "local_cache.keep_wait",
+        ),
+        (
+            cache_with("keep_wait  = \"45s\"", "keep_wait  = \"soon\""),
+            "keep_wait",
+        ),
+        (
+            cache_with("keep_deadline = \"5m\"", "keep_deadline = \"0s\""),
+            "local_cache.keep_deadline",
+        ),
+        (
+            cache_with("keep_deadline = \"5m\"", "keep_deadline = \"44s\""),
+            "local_cache.keep_deadline",
         ),
     ];
     for (text, key) in refused {
@@ -460,7 +486,7 @@ fn a_build_node_file_written_back_makes_the_same_settings() {
 }
 
 /// The keys of `[local_cache]`, which the README of the packaging must document each in a row.
-const LOCAL_CACHE_KEYS: [&str; 12] = [
+const LOCAL_CACHE_KEYS: [&str; 14] = [
     "path",
     "layout",
     "budget",
@@ -470,6 +496,8 @@ const LOCAL_CACHE_KEYS: [&str; 12] = [
     "free_floor",
     "max_concurrent_fills",
     "max_concurrent_keeps",
+    "keep_wait",
+    "keep_deadline",
     "write_through",
     "cache",
     "scrub_rate",

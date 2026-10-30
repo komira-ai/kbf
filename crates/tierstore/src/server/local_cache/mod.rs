@@ -118,6 +118,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -146,6 +147,14 @@ pub const MAX_CONCURRENT_FILLS: usize = 4;
 
 /// The keeps of a put that may run at once, unless the settings say otherwise.
 pub const MAX_CONCURRENT_KEEPS: usize = 8;
+
+/// How long a put waits for its keep after the upstream has the object, unless the settings say
+/// otherwise.
+pub const KEEP_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a keep may run in all, from the upstream's acknowledgement, before it is abandoned,
+/// unless the settings say otherwise.
+pub const KEEP_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The text of the refusal of a write at the Backend level (the front refuses it earlier).
 const READ_ONLY: &str = "this tierstore is a read cache";
@@ -178,6 +187,14 @@ pub struct CacheConfig {
     /// The most create-only puts that are copied to the stage directory at once, apart from the
     /// fills. A put that finds them all running is not kept. At least one (0 is read as 1).
     pub max_concurrent_keeps: usize,
+    /// The longest a put waits, after the upstream has the object, for its copy to be put in the
+    /// cache. Past it the put is answered and the keep goes on in the background; the object is
+    /// at the upstream either way, so a read that misses costs only the trip.
+    pub keep_wait: Duration,
+    /// The longest a keep runs, from the upstream's acknowledgement, before it is abandoned (its
+    /// stage file removed, its permit and room given back, its place in the table of the fills
+    /// freed) and counted as `deadline`. Not below `keep_wait`.
+    pub keep_deadline: Duration,
     /// Whether the cache takes writes and sends them to the upstream. Off, every write call is
     /// `Unsupported`. The binary sets the front's `cache_writes` from the same setting, so that
     /// the front does not refuse the writes either.
@@ -201,6 +218,8 @@ impl CacheConfig {
             whole_limit: WHOLE_FILL_LIMIT,
             max_concurrent_fills: MAX_CONCURRENT_FILLS,
             max_concurrent_keeps: MAX_CONCURRENT_KEEPS,
+            keep_wait: KEEP_WAIT,
+            keep_deadline: KEEP_DEADLINE,
             write_through: false,
         }
     }

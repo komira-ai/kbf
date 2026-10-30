@@ -322,16 +322,21 @@ copy is best effort and never fails the put: if every keep slot is busy (`max_co
 the object does not fit the budget, the stage directory cannot be written, the HEAD fails, the disk
 falls behind the body, or the object was deleted meanwhile, the copy is dropped, the put is still
 200 with the object at the upstream, and the skip is counted. The body is written to the stage file
-by a task of its own through a queue of 16 chunks, so a slow or hung disk never makes the upload
-wait: the copy is dropped instead. Once the upstream has acknowledged the object, the rest of the
-keep runs on its own task, so a client that goes away at that point does not leave a half-made
-copy. A key named by its content (`cas/l/<sha256>`) is hashed as the body streams, copied or not;
+by a task of its own through a queue of at most 16 chunks and 4 MiB (the bytes bound the memory,
+whatever the size of the chunks; at most `max_concurrent_keeps` times 4 MiB in all), so a slow or
+hung disk never makes the upload wait: the copy is dropped instead. Once the upstream has
+acknowledged the object, the rest of the keep runs on its own task, so a client that goes away at
+that point does not leave a half-made copy. The put waits for that task for `keep_wait` and is then
+answered; the task ends within `keep_deadline` with the object kept or abandoned. A read of a key
+whose copy is still being made never waits for it: it is answered from the upstream. The eviction
+pass that a kept object may call for runs on its own task, and the put does not wait for it. A key named by its content (`cas/l/<sha256>`) is hashed as the body streams, copied or not;
 a body that does not hash to the name is answered 400 `BadDigest`, the upstream stores nothing, and
 nothing is kept. A body that is cut leaves nothing at the upstream or in the cache.
 `/metricz` has `tierstore_cache_writes_through_total` (puts the upstream took),
 `tierstore_cache_write_exists_total` (puts answered 412) and
 `tierstore_cache_write_keep_skipped_total{reason}` with the reasons `budget` (also a body of no
-declared length), `io`, `busy`, `head`, `deleted` and `slow` (the disk did not keep up).
+declared length), `io`, `busy`, `head`, `deleted`, `slow` (the disk did not keep up) and `deadline` (the copy was abandoned);
+`tierstore_cache_keeps_expired_total` counts the puts answered before their copy was done.
 
 ```toml
 [server]
@@ -433,6 +438,8 @@ scrub.
 | `local_cache.free_floor` | percent of the file system that is kept free (0 to 99, default 10): below it a pass evicts, even under the budget; it does not stop a fill, and `budget` may not be above the file system's size less the floor (exit status 2), unless its size cannot be read or is 0, which the start warns of and does not judge |
 | `local_cache.max_concurrent_fills` | the most fills that run at once (1 to 64, default 4); a miss that finds them all running is served from the upstream and kept nowhere |
 | `local_cache.max_concurrent_keeps` | the most create-only puts that are copied into the cache at once (1 to 64, default 8), apart from the fills; a put that finds them all running succeeds and is not kept |
+| `local_cache.keep_wait` | the longest a put waits, once the upstream has the object, for its copy to be put in the cache (default `5s`, above 0). Past it the put is answered 200 and the copy is finished in the background; counted in `tierstore_cache_keeps_expired_total`. Safe because the upstream already holds the object: a read of it that misses costs only the trip, so read-your-write on the node is best effort past this wait |
+| `local_cache.keep_deadline` | the longest a copy takes in all, from the upstream's acknowledgement (default `60s`, above 0 and not below `keep_wait`); a copy that is not done by then (a hung disk or upstream) is abandoned: its stage file is removed, its slot and room are given back, and it is counted as `deadline` |
 | `local_cache.write_through` | `false` by default: a read cache that refuses every write with 403 before the role of the key is looked at. `true`: the node takes the writes its keys may do and sends each to the upstream, which must be written with a key that may write; the start runs the upstream's self-test (create-only and multipart-conditional included) and exits with status 3 if the upstream answers one wrongly |
 | `local_cache.cache` | `true`, the default; `false` is refused (leave `[local_cache]` out to run without a cache) |
 | `local_cache.scrub_rate` | a size and `/s`, such as `"50MiB/s"`: accepted, and not used by this release |

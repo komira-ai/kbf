@@ -150,6 +150,8 @@ async fn a_name_mismatch_stores_nothing_over_s3() {
         assert_eq!(s3.incomplete_uploads(), 0, "{label}");
         let stats = s3.stats();
         assert_eq!((stats.single_puts, stats.completed), (0, 0), "{label}");
+        // The multipart upload that was begun is aborted; a single PUT has nothing to abort.
+        assert_eq!(stats.aborted, u64::from(size > 16 << 20), "{label}");
         assert_eq!(cache.held(), (0, 0), "{label}");
         assert_eq!(cache.inner.reserved.load(Ordering::SeqCst), 0, "{label}");
         drained(&config).await;

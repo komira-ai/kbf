@@ -5,7 +5,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -322,6 +322,12 @@ pub(in crate::server) struct FakeDisk {
     links_made: Mutex<u32>,
     /// The gate that holds every write to a stage file, once set.
     write_gate: Mutex<Option<Arc<Semaphore>>>,
+    /// The gate that holds every `link`, once set (the thread that calls it waits).
+    link_gate: Mutex<Option<Arc<BlockingGate>>>,
+    /// The gate that holds every `space`, once set (the thread that calls it waits).
+    space_gate: Mutex<Option<Arc<BlockingGate>>>,
+    /// The calls of `space` that wait at `space_gate`, counted when they arrive.
+    space_waiting: AtomicU64,
     /// The names of every call of `link`, in order: from and to.
     pub(in crate::server) linked: Mutex<Vec<(PathBuf, PathBuf)>>,
 }
@@ -334,6 +340,9 @@ impl FakeDisk {
             touched: Mutex::new(Vec::new()),
             links_made: Mutex::new(0),
             write_gate: Mutex::new(None),
+            link_gate: Mutex::new(None),
+            space_gate: Mutex::new(None),
+            space_waiting: AtomicU64::new(0),
             linked: Mutex::new(Vec::new()),
         }
     }
@@ -350,6 +359,34 @@ impl FakeDisk {
         gate
     }
 
+    /// Holds every `link` from now on, on its thread, until the gate that is returned is opened.
+    pub(in crate::server) fn hold_links(&self) -> Arc<BlockingGate> {
+        let gate = Arc::new(BlockingGate::new());
+        let mut held = self
+            .link_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *held = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Holds every `space` from now on, on its thread (the eviction pass asks for it), until the
+    /// gate that is returned is opened.
+    pub(in crate::server) fn hold_space(&self) -> Arc<BlockingGate> {
+        let gate = Arc::new(BlockingGate::new());
+        let mut held = self
+            .space_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *held = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// How many calls of `space` wait at the gate of [`hold_space`](Self::hold_space).
+    pub(in crate::server) fn space_waiting(&self) -> u64 {
+        self.space_waiting.load(Ordering::SeqCst)
+    }
+
     pub(in crate::server) fn set(&self, quirk: Quirk) {
         *self.quirk.lock().unwrap_or_else(PoisonError::into_inner) = quirk;
     }
@@ -364,8 +401,49 @@ impl FakeDisk {
     }
 }
 
+/// A gate that a thread (not a task) waits at until a test opens it: the calls of `Disk` that
+/// are made on threads that may block.
+pub(in crate::server) struct BlockingGate {
+    open: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl BlockingGate {
+    fn new() -> Self {
+        Self {
+            open: Mutex::new(false),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) {
+        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        while !*open {
+            open = self
+                .changed
+                .wait(open)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Lets every thread at the gate go, and every one that comes.
+    pub(in crate::server) fn open(&self) {
+        *self.open.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.changed.notify_all();
+    }
+}
+
 impl Disk for FakeDisk {
     fn space(&self, path: &Path) -> io::Result<Space> {
+        let gate = self
+            .space_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(gate) = gate {
+            let _ = self.space_waiting.fetch_add(1, Ordering::SeqCst);
+            gate.wait();
+        }
         if self.quirk() == Quirk::SpaceFails {
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
         }
@@ -389,6 +467,14 @@ impl Disk for FakeDisk {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((from.to_path_buf(), to.to_path_buf()));
+        let gate = self
+            .link_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(gate) = gate {
+            gate.wait();
+        }
         let quirk = self.quirk();
         if let Quirk::LinkFails(kind) = quirk {
             return Err(io::Error::from(kind));

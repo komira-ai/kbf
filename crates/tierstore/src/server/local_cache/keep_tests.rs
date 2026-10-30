@@ -5,11 +5,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream;
 use tokio::sync::Semaphore;
+use tokio::time::Instant;
 
 use super::layout::{Sidecar, meta_path, name_of};
 use super::metrics::{SkippedKeep, read};
@@ -565,6 +567,194 @@ async fn a_delete_just_before_the_index_insert_is_caught_by_the_check_after_it()
     assert!(!rig.has_file(key));
     assert_eq!(skipped(&rig, SkippedKeep::Deleted), 1);
     assert_eq!(cache_files(&rig), (0, 0));
+    at_rest(&rig).await;
+}
+
+/// Asserts that a keep that is held past `keep_wait` does not hold the put: the put is answered
+/// 200 at exactly `keep_wait` of the (paused) clock, counted as expired, with nothing in the cache
+/// yet; and when the keep is let go it ends alone with the object whole in the cache (one data
+/// file, one sidecar), no stage file and no mark. It fails on a put that waits for the keep.
+#[tokio::test(start_paused = true)]
+async fn a_keep_held_past_keep_wait_answers_the_put_then_completes_alone() {
+    let rig = Rig::with("tscache-keep-wait", |config| {
+        config.write_through = true;
+        config.keep_wait = Duration::from_secs(7);
+    });
+    let key = "cas/b/waited";
+    let held = rig.tamper.hold_heads();
+    let start = Instant::now();
+    let made = rig.cache.put_stream(key, Some(6), whole(b"waited"));
+    assert_eq!(made.await, Ok(()));
+    assert_eq!(start.elapsed(), Duration::from_secs(7));
+    assert_eq!(read(&rig.cache.counters().keeps_expired), 1);
+    assert!(
+        rig.cache
+            .metrics()
+            .contains("tierstore_cache_keeps_expired_total 1\n")
+    );
+    assert_eq!(rig.cache.held(), (0, 0));
+
+    held.add_permits(16);
+    until("the keep ended", || {
+        rig.cache.held() == (6, 1) && super::locked(&rig.cache.inner.flights).is_empty()
+    })
+    .await;
+    assert_eq!(cache_files(&rig), (1, 1));
+    assert_eq!(sidecar(&rig, key).sha256, digest(b"waited"));
+    assert!(super::locked(&rig.cache.inner.invalidated).is_empty());
+    assert_eq!(skipped(&rig, SkippedKeep::Deadline), 0);
+    at_rest(&rig).await;
+}
+
+/// Asserts that a keep that is abandoned after the put was answered leaves nothing: the put is
+/// answered at `keep_wait`, the object is deleted while the keep is held, and when the keep is let
+/// go it ends without an entry, a data file, a sidecar or a stage file, with its permit and room
+/// back, counted as expired (the put) and `deleted` (the keep).
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_keep_leaves_no_orphan() {
+    let rig = Rig::with("tscache-keep-abandoned", |config| {
+        config.write_through = true;
+        config.keep_wait = Duration::from_secs(3);
+    });
+    let key = "cas/b/abandoned";
+    let held = rig.tamper.hold_heads();
+    let made = rig.cache.put_stream(key, Some(9), whole(b"abandoned"));
+    assert_eq!(made.await, Ok(()));
+    assert_eq!(read(&rig.cache.counters().keeps_expired), 1);
+    assert_eq!(rig.cache.delete(key).await, Ok(()));
+
+    held.add_permits(16);
+    until("the keep ended", || {
+        super::locked(&rig.cache.inner.flights).is_empty()
+    })
+    .await;
+    assert_eq!(skipped(&rig, SkippedKeep::Deleted), 1);
+    assert_eq!(rig.cache.held(), (0, 0));
+    assert_eq!(cache_files(&rig), (0, 0));
+    assert!(super::locked(&rig.cache.inner.invalidated).is_empty());
+    at_rest(&rig).await;
+}
+
+/// Asserts what a disk that hangs does to a body too small to fill the queue: the put is answered
+/// at `keep_wait`; a reader that comes meanwhile is served from the upstream at once (the clock
+/// has not moved when it is answered, so it did not wait for the keep); and the keep is abandoned
+/// at `keep_deadline`, counted as `deadline`, with no stage file, no entry in the table of the
+/// fills, no mark, no file in the cache, and permit and room back; the next read fills as usual.
+/// It fails on a keep that waits for the writer for ever, or on a reader that waits for the keep.
+#[tokio::test(start_paused = true)]
+async fn a_keep_on_a_hung_disk_is_abandoned_at_its_deadline_and_readers_do_not_wait() {
+    let rig = Rig::with("tscache-keep-deadline", |config| {
+        config.write_through = true;
+        config.keep_wait = Duration::from_secs(5);
+        config.keep_deadline = Duration::from_secs(60);
+    });
+    let key = "cas/b/hung";
+    let _held = rig.disk.hold_writes();
+    let start = Instant::now();
+    let parts: [&'static [u8]; 3] = [b"small ", b"body ", b"here"];
+    let made = rig.cache.put_stream(key, Some(15), chunks(&parts));
+    assert_eq!(made.await, Ok(()));
+    assert_eq!(start.elapsed(), Duration::from_secs(5));
+    assert_eq!(read(&rig.cache.counters().keeps_expired), 1);
+    assert!(!super::locked(&rig.cache.inner.flights).is_empty());
+
+    assert_eq!(rig.get(key).await.unwrap(), "small body here");
+    assert_eq!(start.elapsed(), Duration::from_secs(5));
+    assert_eq!(rig.cache.held(), (0, 0));
+
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    until("the keep was abandoned", || {
+        super::locked(&rig.cache.inner.flights).is_empty()
+    })
+    .await;
+    assert_eq!(skipped(&rig, SkippedKeep::Deadline), 1);
+    assert_eq!(rig.cache.held(), (0, 0));
+    assert_eq!(cache_files(&rig), (0, 0));
+    assert!(super::locked(&rig.cache.inner.invalidated).is_empty());
+    at_rest(&rig).await;
+
+    assert_eq!(rig.get(key).await.unwrap(), "small body here");
+    assert_eq!(rig.cache.held(), (15, 1));
+}
+
+/// Asserts that a request dropped while the files of the copy are being linked (on a thread that
+/// is held there) still ends with the object kept whole: when the link is let go the object is
+/// in the index with one data file and one sidecar, and no stage file, mark or fill-table entry
+/// is left. It fails on a keep that is part of the request, which leaves the linked files with no
+/// entry.
+#[tokio::test]
+async fn a_put_dropped_while_the_files_are_linked_still_ends_kept_whole() {
+    let rig = Rig::writing("tscache-keep-dropped-link");
+    let key = "cas/b/linking";
+    let gate = rig.disk.hold_links();
+    let (cache, name) = (rig.cache.clone(), key.to_owned());
+    let putting =
+        tokio::spawn(async move { cache.put_stream(&name, Some(7), whole(b"linking")).await });
+    until("the link began", || {
+        !rig.disk.linked.lock().unwrap().is_empty()
+    })
+    .await;
+    putting.abort();
+    assert!(putting.await.unwrap_err().is_cancelled());
+
+    gate.open();
+    until("the keep ended", || {
+        rig.cache.held() == (7, 1) && super::locked(&rig.cache.inner.flights).is_empty()
+    })
+    .await;
+    assert_eq!(cache_files(&rig), (1, 1));
+    assert!(rig.has_file(key));
+    assert!(super::locked(&rig.cache.inner.invalidated).is_empty());
+    at_rest(&rig).await;
+}
+
+/// Asserts that the put does not wait for the eviction pass its object calls for: the pass is held
+/// on its thread (at the question about free space), the put returns, the object is in the cache
+/// over the high water mark; when the pass is let go it evicts. It fails on a put that waits for
+/// the pass.
+#[tokio::test]
+async fn a_put_does_not_wait_for_the_eviction_pass() {
+    let rig = Rig::writing("tscache-keep-eviction");
+    let gate = rig.disk.hold_space();
+    let bytes = pattern(960_000);
+    let made = rig
+        .cache
+        .put_stream("cas/b/over", Some(960_000), whole(&bytes));
+    assert_eq!(made.await, Ok(()));
+    until("the pass asked for the free space", || {
+        rig.disk.space_waiting() >= 1
+    })
+    .await;
+    assert_eq!(rig.cache.held(), (960_000, 1));
+
+    gate.open();
+    until("the pass evicted the object", || rig.cache.held() == (0, 0)).await;
+    at_rest(&rig).await;
+}
+
+/// Asserts that the memory of the copy is bounded in bytes and not only in chunks: with the disk
+/// held, a body of four chunks of 2 MiB (far fewer than the chunks the queue takes) passes the
+/// queue's 4 MiB at its third chunk, and the copy is dropped as `slow` while the upstream gets
+/// the whole body.
+#[tokio::test]
+async fn a_hung_disk_drops_the_copy_when_the_queued_bytes_pass_the_bound() {
+    let rig = Rig::with("tscache-keep-queue-bytes", |config| {
+        config.write_through = true;
+        config.budget = 64 << 20;
+    });
+    let _held = rig.disk.hold_writes();
+    let items: Vec<Result<Bytes, Error>> = (0..4)
+        .map(|n| Ok(Bytes::from(vec![n as u8; 2 << 20])))
+        .collect();
+    let made = rig
+        .cache
+        .put_stream("cas/b/heavy", Some(8 << 20), stream::iter(items).boxed());
+    assert_eq!(made.await, Ok(()));
+
+    assert_eq!(skipped(&rig, SkippedKeep::Slow), 1);
+    let stored = rig.tamper.memory.get("cas/b/heavy", None).await.unwrap();
+    assert_eq!(stored.len(), 8 << 20);
+    assert_eq!(rig.cache.held(), (0, 0));
     at_rest(&rig).await;
 }
 

@@ -18,6 +18,8 @@
 //! free_floor = 10
 //! max_concurrent_fills = 4
 //! max_concurrent_keeps = 8
+//! keep_wait            = "5s"
+//! keep_deadline        = "60s"
 //! write_through        = false  # true: take writes and send them to the upstream
 //!
 //! [cold_store]                  # the upstream: an S3 endpoint
@@ -52,8 +54,8 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::config::{
-    ConfigError, PerRun, Policy, ServerTable, Size, TierParts, TierTable, check_policies, front_of,
-    invalid, parse_size, refuse, refuse_hot_keys, require, tier, within,
+    ConfigError, Dur, PerRun, Policy, ServerTable, Size, TierParts, TierTable, check_policies,
+    front_of, invalid, parse_size, refuse, refuse_hot_keys, require, tier, within,
 };
 use super::front::FrontSettings;
 use super::local_cache::CacheConfig;
@@ -122,6 +124,15 @@ pub(super) struct LocalCacheTable {
     /// The most create-only puts that are copied into the cache at once (1 to 64, default 8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_keeps: Option<u8>,
+    /// The longest a put waits for its copy to be put in the cache once the upstream has the
+    /// object, such as `5s` (default `5s`, above 0). Past it the put is answered and the copy is
+    /// finished in the background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_wait: Option<Dur>,
+    /// The longest a keep runs in all before it is abandoned, such as `60s` (default `60s`,
+    /// above 0 and not below `keep_wait`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_deadline: Option<Dur>,
     /// Whether the node takes writes and sends them to the upstream (default `false`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_through: Option<bool>,
@@ -245,6 +256,24 @@ impl CacheSettings {
         if let Some(keeps) = table.max_concurrent_keeps {
             let keeps = within("local_cache", "max_concurrent_keeps", keeps, 1, 64)?;
             cache.max_concurrent_keeps = usize::from(keeps);
+        }
+        if let Some(wait) = table.keep_wait {
+            if wait.0.is_zero() {
+                let why =
+                    "must be above 0; a short wait, such as 100ms, keeps the put from waiting";
+                return Err(invalid("local_cache.keep_wait", why));
+            }
+            cache.keep_wait = wait.0;
+        }
+        if let Some(deadline) = table.keep_deadline {
+            if deadline.0.is_zero() {
+                return Err(invalid("local_cache.keep_deadline", "must be above 0"));
+            }
+            cache.keep_deadline = deadline.0;
+        }
+        if cache.keep_deadline < cache.keep_wait {
+            let why = "must not be below keep_wait (the default is 60s: set both)";
+            return Err(invalid("local_cache.keep_deadline", why));
         }
         cache.write_through = table.write_through.unwrap_or(false);
         Ok(Self {

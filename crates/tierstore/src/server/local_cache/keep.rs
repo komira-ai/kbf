@@ -16,15 +16,32 @@
 //! dropped after the acknowledgement (a client that goes away) does not stop the keep half way:
 //! the task ends with the object in the index and its files in place, or with no file.
 //!
+//! The put waits for the task for `keep_wait` (5 s unless set) and no longer. Past it the put is
+//! answered 200, counted in `keeps_expired_total`, and the task goes on alone: it ends with the
+//! object kept or abandoned, and in either case no file, permit or reservation is left. This is
+//! safe because the upstream holds the object before the wait begins: a read that misses before
+//! the keep ends is a fill or a read through, which costs the trip to the upstream and nothing
+//! else. What past `keep_wait` stops being is the promise that the node reads what it wrote
+//! without the trip, which was best effort already. The eviction pass a kept object may call for
+//! runs on a task of its own, after the keep, and the put never waits for it.
+//!
 //! The copy is best effort. A put that finds every keep running, no room in the budget, a stage
 //! directory that cannot be written, a disk that falls behind the body, a HEAD that fails, or a
 //! key that a fill is running for, is answered as if the cache kept nothing: the stage file is
 //! removed, the skip is counted in `write_keep_skipped_total{reason}` and the put succeeds. The
 //! keeps have a limit of their own (`max_concurrent_keeps`), apart from the fills.
 //!
-//! - The body is written to the stage file by a task of its own, through a queue of
-//!   [`KEEP_QUEUE`] chunks. The body never waits for the disk: a chunk that finds the queue full
-//!   drops the copy (`slow`), so a hung disk costs the node the copy and the upstream nothing.
+//! - The body is written to the stage file by a task of its own, through a queue of at most
+//!   [`KEEP_QUEUE`] chunks and [`KEEP_QUEUE_BYTES`] bytes (the bytes bound the memory, whatever
+//!   the size of the chunks the front delivers). The body never waits for the disk: a chunk that
+//!   finds the queue full drops the copy (`slow`), so a hung disk costs the node the copy and
+//!   the upstream nothing.
+//! - The keep as a whole has `keep_deadline` (60 s unless set; not below `keep_wait`) from the
+//!   acknowledgement. A disk that hangs under a body too small to fill the queue, or an upstream
+//!   that does not answer the HEAD, would otherwise hold the keep for ever; at the deadline the
+//!   keep is abandoned: its stage file is removed, its permit and room are given back, its
+//!   place in the table of the fills is freed, and it is counted as `deadline`. A link that is
+//!   under way at the deadline cannot be called back; it is undone as soon as it ends.
 //! - A key named by its content (`cas/l/<sha256>`) is hashed as the body passes, whether or not
 //!   it is copied. The check is made when the declared length has passed, in place of the chunk
 //!   that completes the body, or when the body ends: a body that does not hash to the name ends
@@ -40,20 +57,23 @@
 //!   place in the table of the fills that run before it asks for the HEAD, so a delete that
 //!   finishes after the HEAD marks it (see [`forget`](Inner::forget)) and the keep removes its
 //!   own entry, whenever the delete comes before the check that follows the insert; a delete
-//!   that finishes before the HEAD makes the HEAD fail. Readers of the key wait for the keep as
-//!   they would for a fill.
+//!   that finishes before the HEAD makes the HEAD fail. Readers of the key never wait for the
+//!   keep (unlike a fill, which they share): they are answered from the upstream, at once.
 //! - A multipart upload is not kept: the first read of the object fills it.
 
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::{FutureExt as _, StreamExt as _, stream};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::{Error, PartBody};
 
@@ -62,14 +82,21 @@ use super::layout::{Name, Sidecar};
 use super::metrics::{SkippedKeep, bump};
 use super::{Inner, locked};
 
-/// The chunks of a body that may wait for the disk. A body of chunks of 64 KiB holds 1 MiB of
-/// memory at most in the queue of one put; a chunk that finds the queue full drops the copy.
+/// The chunks of a body that may wait for the disk.
 pub(super) const KEEP_QUEUE: usize = 16;
+
+/// The bytes of a body that may wait for the disk. A chunk that would take the queue past this
+/// (the first one is always taken) drops the copy. This, and not the number of chunks, bounds the
+/// memory of the copy of one put, whatever the size of the chunks the front delivers; the keeps
+/// that run at once hold at most `max_concurrent_keeps` times this, 32 MiB by default.
+pub(super) const KEEP_QUEUE_BYTES: u64 = 4 << 20;
 
 /// The task that writes the chunks of a body to the stage file, and the way to it.
 struct Writer {
     /// The way to the task; none once the body has ended.
     chunks: Option<mpsc::Sender<Bytes>>,
+    /// The bytes sent to the task and not yet written.
+    queued: Arc<AtomicU64>,
     /// The task, which ends with the stage file when the way to it is closed. Aborted if the
     /// copy is dropped before that, which removes the stage file with it.
     task: Option<JoinHandle<io::Result<Staged>>>,
@@ -79,9 +106,16 @@ impl Writer {
     /// Starts the task that writes what it is sent to `staged`.
     fn start(inner: &Arc<Inner>, staged: Staged) -> Self {
         let (chunks, queue) = mpsc::channel(KEEP_QUEUE);
-        let task = tokio::spawn(write_chunks(Arc::clone(inner), staged, queue));
+        let queued = Arc::new(AtomicU64::new(0));
+        let task = tokio::spawn(write_chunks(
+            Arc::clone(inner),
+            staged,
+            queue,
+            Arc::clone(&queued),
+        ));
         Self {
             chunks: Some(chunks),
+            queued,
             task: Some(task),
         }
     }
@@ -91,19 +125,31 @@ impl Writer {
         let Some(chunks) = &self.chunks else {
             return Err(SkippedKeep::Io);
         };
-        chunks.try_send(chunk).map_err(|error| match error {
-            TrySendError::Full(_) => SkippedKeep::Slow,
-            TrySendError::Closed(_) => SkippedKeep::Io,
+        let size = chunk.len() as u64;
+        let before = self.queued.fetch_add(size, Ordering::SeqCst);
+        if before != 0 && before + size > KEEP_QUEUE_BYTES {
+            let _ = self.queued.fetch_sub(size, Ordering::SeqCst);
+            return Err(SkippedKeep::Slow);
+        }
+        chunks.try_send(chunk).map_err(|error| {
+            let _ = self.queued.fetch_sub(size, Ordering::SeqCst);
+            match error {
+                TrySendError::Full(_) => SkippedKeep::Slow,
+                TrySendError::Closed(_) => SkippedKeep::Io,
+            }
         })
     }
 
-    /// Waits for the task to write what was queued, and gives the stage file.
+    /// Waits for the task to write what was queued, and gives the stage file. If this future is
+    /// dropped before it ends, the task is still the writer's and is aborted with it.
     async fn finish(&mut self) -> io::Result<Staged> {
         drop(self.chunks.take());
-        let Some(task) = self.task.take() else {
+        let Some(task) = self.task.as_mut() else {
             return Err(io::Error::other("the writer was finished already"));
         };
-        task.await.map_err(io::Error::other)?
+        let ended = task.await;
+        self.task = None;
+        ended.map_err(io::Error::other)?
     }
 }
 
@@ -121,9 +167,12 @@ async fn write_chunks(
     inner: Arc<Inner>,
     mut staged: Staged,
     mut queue: mpsc::Receiver<Bytes>,
+    queued: Arc<AtomicU64>,
 ) -> io::Result<Staged> {
     while let Some(chunk) = queue.recv().await {
-        inner.disk.write_stage(&mut staged.file, &chunk).await?;
+        let written = inner.disk.write_stage(&mut staged.file, &chunk).await;
+        let _ = queued.fetch_sub(chunk.len() as u64, Ordering::SeqCst);
+        written?;
     }
     Ok(staged)
 }
@@ -294,9 +343,17 @@ impl Inner {
             // On a task of its own, so that a request that is dropped from here on does not stop
             // the keep half way (a blocking publish would go on with nobody to index it).
             let (inner, owned) = (Arc::clone(self), key.to_owned());
-            let kept = tokio::spawn(async move { inner.keep(&owned, &name, keeping).await });
-            // A keep that panicked is a keep that did not happen; the put has succeeded.
-            let _ = kept.await;
+            let mut kept = tokio::spawn(async move { inner.keep(&owned, &name, keeping).await });
+            // The put waits for its keep, but not for ever: past `keep_wait` it is answered and
+            // the keep goes on alone. The object is at the upstream, so a read that misses
+            // before the keep ends costs the trip and nothing else. A keep that panicked is a
+            // keep that did not happen; the put has succeeded.
+            if tokio::time::timeout(self.config.keep_wait, &mut kept)
+                .await
+                .is_err()
+            {
+                bump(&self.counters.keeps_expired);
+            }
         }
         Ok(())
     }
@@ -328,33 +385,30 @@ impl Inner {
             self.forget(key);
             return;
         };
-        let Some((flight, sender)) = self.enter(name) else {
+        let Some(flight) = self.enter(name) else {
             self.counters.keep_skipped(SkippedKeep::Busy);
             self.forget(key);
             return;
         };
         let written = (keeping.seen, keeping.digest);
-        let kept = self.publish_put(key, name, stage, written).await;
-        let filled = match kept {
-            Ok(()) => Filled::Kept,
-            Err(why) => {
-                self.counters.keep_skipped(why);
-                self.forget(key);
-                Filled::Skipped
-            }
-        };
-        // The readers that waited for the keep find the entry, or go to the upstream.
-        let _ = sender.send(filled);
+        if let Err(why) = self.publish_put(key, name, stage, written).await {
+            self.counters.keep_skipped(why);
+            self.forget(key);
+        }
         drop(flight);
     }
 
     /// Takes the place of a fill of the key in the table of the fills that run, so that a
-    /// reader waits for the keep and a delete marks it. None if a fill is running for the key.
-    fn enter(self: &Arc<Self>, name: &Name) -> Option<(Flight, oneshot::Sender<Filled>)> {
-        let (sender, receiver) = oneshot::channel();
-        let waiting: BoxFuture<'static, Result<Filled, Error>> =
-            async move { Ok(receiver.await.unwrap_or(Filled::Skipped)) }.boxed();
-        let pending: Pending = waiting.shared();
+    /// delete marks the keep. None if a fill is running for the key.
+    ///
+    /// A reader that finds the place taken does not wait: the entry stands for a keep, which a
+    /// reader has no reason to wait for (the keep may be held up by a disk that hangs, and the
+    /// object is at the upstream), so it is a fill that is already over, with no object: the
+    /// reader is answered from the upstream and starts no fill.
+    fn enter(self: &Arc<Self>, name: &Name) -> Option<Flight> {
+        let over: BoxFuture<'static, Result<Filled, Error>> =
+            futures::future::ready(Ok(Filled::Skipped)).boxed();
+        let pending: Pending = over.shared();
         {
             let mut flights = locked(&self.flights);
             if flights.contains_key(&name.hex) {
@@ -362,11 +416,17 @@ impl Inner {
             }
             drop(flights.insert(name.hex.clone(), pending));
         }
-        let flight = Flight {
+        Some(Flight {
             inner: Arc::clone(self),
             hex: name.hex.clone(),
-        };
-        Some((flight, sender))
+        })
+    }
+
+    /// `step`, if it ends before `deadline`; else [`SkippedKeep::Deadline`], with `step` dropped.
+    async fn before<T>(deadline: Instant, step: impl Future<Output = T>) -> Result<T, SkippedKeep> {
+        tokio::time::timeout_at(deadline, step)
+            .await
+            .map_err(|_| SkippedKeep::Deadline)
     }
 
     /// Runs the hook a test set to act just before a kept object is put in the index.
@@ -386,12 +446,15 @@ impl Inner {
         written: (u64, String),
     ) -> Result<(), SkippedKeep> {
         let (size, digest) = written;
-        let meta = match self.upstream.head(key).await {
+        let deadline = Instant::now() + self.config.keep_deadline;
+        let meta = match Self::before(deadline, self.upstream.head(key)).await? {
             Ok(meta) if meta.size == size => meta,
             _ => return Err(SkippedKeep::Head),
         };
-        let mut staged = stage.writer.finish().await.map_err(|_| SkippedKeep::Io)?;
-        staged.finish().await.map_err(|_| SkippedKeep::Io)?;
+        let ended = Self::before(deadline, stage.writer.finish()).await?;
+        let mut staged = ended.map_err(|_| SkippedKeep::Io)?;
+        let synced = Self::before(deadline, staged.finish()).await?;
+        synced.map_err(|_| SkippedKeep::Io)?;
         // An entry for the key is of an object that is gone: it must not keep the new file's
         // place.
         self.drop_entry(&name.hex);
@@ -402,8 +465,24 @@ impl Inner {
             tag: meta.tag.clone(),
             modified: meta.modified,
         };
-        let committed = self.commit(&staged, name, &sidecar).await;
-        committed.map_err(|_| SkippedKeep::Io)?;
+        let mut publishing = self.begin_commit(&staged, name, &sidecar);
+        match tokio::time::timeout_at(deadline, &mut publishing).await {
+            Ok(joined) => joined
+                .expect("a publish does not panic")
+                .map_err(|_| SkippedKeep::Io)?,
+            Err(_) => {
+                // The link cannot be called back: it is left to end on its own, and then undone,
+                // so that it leaves no file that nothing indexes.
+                let inner = Arc::clone(self);
+                let hex = name.hex.clone();
+                drop(tokio::spawn(async move {
+                    let _ = publishing.await;
+                    inner.drop_entry(&hex);
+                    drop(staged);
+                }));
+                return Err(SkippedKeep::Deadline);
+            }
+        };
         #[cfg(test)]
         self.run_before_insert();
         locked(&self.index).insert(&name.hex, size, meta.tag, meta.modified);
@@ -415,7 +494,10 @@ impl Inner {
             return Err(SkippedKeep::Deleted);
         }
         drop(stage);
-        self.relieve().await;
+        // The pass is not the put's to wait for. A pass that is running makes another return
+        // at once (see `evict_pass`), so passes started here cannot run twice at the same time.
+        let inner = Arc::clone(self);
+        drop(tokio::spawn(async move { inner.relieve().await }));
         Ok(())
     }
 }

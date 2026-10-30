@@ -402,21 +402,32 @@ impl Inner {
     }
 
     /// Links the staged file into the cache, on a thread that may block.
-    pub(super) async fn commit(
+    async fn commit(
         self: &Arc<Self>,
         staged: &Staged,
         name: &Name,
         sidecar: &Sidecar,
     ) -> io::Result<bool> {
+        let publishing = self.begin_commit(staged, name, sidecar);
+        publishing.await.expect("a publish does not panic")
+    }
+
+    /// Starts the link of the staged file into the cache on a thread that may block, and gives
+    /// the handle of the job, which goes on when the handle is dropped.
+    pub(super) fn begin_commit(
+        self: &Arc<Self>,
+        staged: &Staged,
+        name: &Name,
+        sidecar: &Sidecar,
+    ) -> JoinHandle<io::Result<bool>> {
         let disk = Arc::clone(&self.disk);
         let root = self.config.path.clone();
         let hex = name.hex.clone();
         let (from, temporary) = (staged.path.clone(), staged.sidecar.clone());
         let text = serde_json::to_vec(sidecar).unwrap_or_default();
-        let publishing = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             publish(&*disk, &root, &hex, (&from, &temporary), &text)
-        });
-        publishing.await.expect("a publish does not panic")
+        })
     }
 
     /// Runs a pass of the eviction if the cache is above its high water mark.

@@ -48,10 +48,14 @@ pub(super) enum SkippedKeep {
     /// The disk did not keep up with the body: the copy fell too far behind and was dropped,
     /// so that the upstream was never made to wait for the disk.
     Slow,
+    /// The keep did not end within `keep_deadline` (a hung upstream or disk) and was abandoned.
+    Deadline,
 }
 
 /// The label of each [`SkippedKeep`], in the order of the enum.
-const SKIPPED_KEEP: [&str; 6] = ["budget", "io", "busy", "head", "deleted", "slow"];
+const SKIPPED_KEEP: [&str; 7] = [
+    "budget", "io", "busy", "head", "deleted", "slow", "deadline",
+];
 
 /// Why an object was evicted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +85,8 @@ pub struct Counters {
     pub(super) writes_through: AtomicU64,
     /// The create-only puts answered `AlreadyExists`.
     pub(super) write_exists: AtomicU64,
+    /// The puts answered before their keep ended, because it took longer than `keep_wait`.
+    pub(super) keeps_expired: AtomicU64,
     keep_skips: [AtomicU64; SKIPPED_KEEP.len()],
     failures: [AtomicU64; FAILED.len()],
     evictions: [AtomicU64; EVICTED.len()],
@@ -167,6 +173,7 @@ impl Counters {
             ("fills_skipped_busy_total", read(&self.fills_skipped_busy)),
             ("writes_through_total", read(&self.writes_through)),
             ("write_exists_total", read(&self.write_exists)),
+            ("keeps_expired_total", read(&self.keeps_expired)),
             ("pinned_skips_total", read(&self.pinned_skips)),
             ("discarded_at_start_total", read(&self.discarded_at_start)),
             ("bytes", cache_bytes),
