@@ -22,7 +22,10 @@
 //! 6. **Undrain** only if the node is healthy: on B after a confirm, or on A after a revert. A
 //!    node that is not healthy stays drained. A node that was out of placement before step 2
 //!    (an operator drained or cordoned it) is drained and waited for as any other but is never
-//!    undrained: it is left out, and the log says so.
+//!    undrained: it is left out, and the log says so. "Before step 2" means before the
+//!    updater's own drain: a node this updater drained on an earlier attempt (the drain
+//!    deadline passed, an undrain failed, the agent restarted) is still the updater's, and a
+//!    retry or a resume gives it back (`cordon`: the drain leaves a mark on disk).
 //!
 //! The result is [`UpdateResult`]: the target and whether it succeeded. It goes into the next
 //! heartbeat.
@@ -143,9 +146,16 @@ impl Update<'_> {
         ));
         self.status.update(|s| s.updating = Some(target.clone()));
         let deadline = trial.deadline_unix.unwrap_or(0);
-        // This process did not drain the node and cannot tell what it was before the roll:
-        // the node is given back, as it always was after a resume.
-        self.trial(&target, deadline, Placed::In)
+        // The drain was made by the process that began this A/B, perhaps this one before it
+        // restarted. The node reads as in placement if the updater cordoned it (its mark is on
+        // disk), and as out if an operator did. If it cannot be read, nothing says it is ours.
+        let placed = self.ports.drain.placed(self.host).unwrap_or_else(|e| {
+            self.log(&format!(
+                "update to {target}: the node could not be read, so it is not given back: {e}"
+            ));
+            Placed::Out
+        });
+        self.trial(&target, deadline, placed)
     }
 
     /// Steps 4 to 6 for `target` on trial until `deadline` (Unix seconds).
@@ -235,10 +245,11 @@ impl Update<'_> {
     }
 
     /// Read whether the node is in placement, then drain it and wait until it holds no lease,
-    /// however long that takes, or until the drain deadline, if the operator set one, is out. At that deadline the host is not
-    /// switched: the update fails with the node left drained (its leases run on), and the same
-    /// order is tried again after the retry time, which drains the node again and waits again.
-    /// What comes back is whether the node was in placement before this drain.
+    /// however long that takes, or until the drain deadline, if the operator set one, is out.
+    /// At that deadline the host is not switched: the update fails with the node left drained
+    /// (its leases run on), and the same order is tried again after the retry time, which
+    /// drains the node again and waits again. What comes back is whether the node was in
+    /// placement before this drain: a node the updater drained on an earlier attempt is.
     fn drain(&self) -> Result<Placed, PortError> {
         let placed = self.ports.drain.placed(self.host)?;
         self.ports

@@ -170,7 +170,8 @@ mode 755), come from the `updater_user` item of `kbf-mac-provision` (a release a
 kbf-updater agent --coordinator <dns name>:<port> --channel NAME
                   (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
                   [--frontend <dns name>:<port>] [--enroll-frontend <dns name>:<port>]
-                  [--operator-api http://IP:PORT --token-file FILE] [--helper-socket PATH]
+                  [--operator-api http://IP:PORT --token-file FILE] [--cordon-dir DIR]
+                  [--helper-socket PATH]
                   [--service NAME,helper-socket=PATH[,SETTING=VALUE...]]...
                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
                   [--health-poll-secs N] [--retry-secs N]
@@ -202,6 +203,12 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
   required with `--state-dir`.
 - `--channel`: the channel of the helper's allowlist. The version the coordinator names is looked
   up in it by the helper, never fetched by URL.
+- `--cordon-dir`: where the agent records that a cordon on the node is its own (one small file per
+  node, synced before the drain call and removed after the undrain worked). A retry of an update
+  that failed with the node left drained, and an agent restarted in the middle of an update, give
+  such a node back; a node an operator drained is left out. Default: the `--state-dir`, else the
+  directory of `--client-key`. The agent must be able to write there: a drain that cannot record
+  its mark is refused and the update fails before anything is switched.
 - `--daemon-node`: for the agent of a **frontend host** that also runs a daemon: the daemon's node
   id. The agent drains that node around the frontend's update (with the operator token if the
   agent has one, else with its certificate, which names its own node only). Without it a frontend

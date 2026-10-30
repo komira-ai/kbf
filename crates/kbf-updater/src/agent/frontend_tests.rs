@@ -77,6 +77,7 @@ impl Rig {
             frontend: addr.map(|a| Endpoint::parse(&format!("localhost:{}", a.port())).unwrap()),
             enroll_frontend: None,
             state_dir: None,
+            cordon_dir: None,
             node_api: None,
             daemon_node: None,
             timing: Timing::DEFAULT,

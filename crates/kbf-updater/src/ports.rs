@@ -215,8 +215,10 @@ pub enum Placed {
 
 /// Taking a daemon host's node out of placement at the frontend, and giving it back.
 pub trait Drain: Send + Sync {
-    /// Whether the node of `host` is in placement now. A caller reads this before
-    /// [`Drain::drain`] and calls [`Drain::undrain`] only for a node that was [`Placed::In`].
+    /// Whether the node of `host` is in placement now, or was put out by this caller. A caller
+    /// reads this before [`Drain::drain`] and calls [`Drain::undrain`] only for a node that was
+    /// [`Placed::In`]. A drain that can remember its own cordon (the agent's) reads a node it
+    /// cordoned earlier as [`Placed::In`]; one that cannot reads it as out.
     fn placed(&self, host: &Host) -> Result<Placed, PortError>;
     /// Cordon the node of `host` and ask the frontend to wait for its leases for `deadline`,
     /// or with no deadline (`None`) when the caller waits however long it takes.

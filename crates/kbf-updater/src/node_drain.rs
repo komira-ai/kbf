@@ -11,7 +11,9 @@
 //!   at once with the node as it is then.
 //! - **leases**: `GET /v1/nodes/<node>`, the length of `leases`. A node that is `serving`
 //!   is not drained (somebody returned it), and that is an error, not zero leases.
-//! - **undrain**: `POST /v1/nodes/<node>:uncordon`, for a node that was in placement.
+//! - **undrain**: `POST /v1/nodes/<node>:uncordon`. Unconditional: the caller does not call it
+//!   for a node that was out before its drain (the agent's `OwnCordon` tells the updater's own
+//!   cordon from an operator's).
 //!
 //! A storage host runs a daemon only sometimes (`storage-and-daemon` does; `storage` does not),
 //! and the host's role does not say which: [`NodeDrain::if_present`] drains the daemon if the

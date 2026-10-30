@@ -1,5 +1,6 @@
 //! The real ports of an agent, and the process around it.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -10,6 +11,7 @@ use rustls::pki_types::pem::PemObject;
 
 use super::container_health::ContainerHealth;
 use super::coordinator::{HttpsCoordinator, TlsFiles};
+use super::cordon::OwnCordon;
 use super::enroll::frontend_url;
 use super::flags::{Config, ServiceConfig, ServiceDrain, ServiceHealth};
 use super::local::{Limits, LocalInstaller, SocketLocal};
@@ -111,9 +113,12 @@ pub(super) fn node_ports(
     local: &Arc<SocketLocal>,
 ) -> Result<NodePorts, String> {
     let installer = || Arc::new(LocalInstaller(local.clone()));
+    let own = |drain: Arc<dyn Drain>| -> Arc<dyn Drain> {
+        Arc::new(OwnCordon::new(drain, cordon_dir(cfg)))
+    };
     if let Some(api) = &cfg.node_api {
         let api = OperatorApi::new(api.addr, api.token_file.clone())?;
-        let drain = drain_for(role, &api);
+        let drain = own(drain_for(role, &api));
         let health = Arc::new(NodeHealth::with_api(api, installer()));
         return Ok((drain, health));
     }
@@ -124,9 +129,19 @@ pub(super) fn node_ports(
         ));
     };
     let api = OperatorApi::as_updater(frontend.clone(), cfg.files.clone(), identity.clone());
-    let drain = drain_for(role, &api);
+    let drain = own(drain_for(role, &api));
     let health = Arc::new(NodeHealth::for_updater(api, installer()));
     Ok((drain, health))
+}
+
+/// Where the marks of the cordons the agent made are kept: `--cordon-dir`, else the state
+/// directory, else the directory of the key file (the one an operator placed the files in).
+pub(super) fn cordon_dir(cfg: &Config) -> PathBuf {
+    cfg.cordon_dir
+        .clone()
+        .or_else(|| cfg.state_dir.clone())
+        .or_else(|| cfg.files.key.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Who the updater certificate in `files` says this host is.
