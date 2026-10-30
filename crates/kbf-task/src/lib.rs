@@ -6,7 +6,8 @@
 //!    every blob's SHA-256 against its digest, and lays the input tree out under the working
 //!    directory. The tree is read breadth-first with at most `--fetch-concurrency` requests in
 //!    flight (32 by default) over pooled connections, and each file streams from the response to
-//!    disk through its digest check instead of being held in memory;
+//!    disk through its digest check instead of being held in memory. With `--fetch-batch`, blobs
+//!    under 64 KiB are read in `/batch` requests of up to 256 digests;
 //! 2. runs the Command there ([`run`]): its argv, environment and working directory, stdout and
 //!    stderr to files, under a deadline. The environment is the Command's own, preceded by `HOME`,
 //!    `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`, which name fresh directories
