@@ -455,6 +455,15 @@ fn changed(name: &str, from: &str, to: &str) -> Vec<Doc> {
     docs
 }
 
+/// The pages without the one named `name`.
+fn without_page(name: &str) -> Vec<Doc> {
+    let mut docs = read_docs();
+    let before = docs.len();
+    docs.retain(|d| d.name != name);
+    assert_eq!(docs.len() + 1, before, "the page {name} exists");
+    docs
+}
+
 /// The pages with every `from` taken out.
 fn without(from: &str) -> Vec<Doc> {
     let mut docs = read_docs();
@@ -504,6 +513,8 @@ fn a_flag_that_is_not_the_binarys_is_found() {
     let wrong = changed("configuration.md", "`--listen`", "`--listn`");
     let problems = check(&wrong, &code());
     assert!(said(&problems, "--listn is not a flag"), "{problems:?}");
+    // `--listen` is named in a span and in a block of this page, and in no other page.
+    let problems = check(&without_page("configuration.md"), &code());
     assert!(
         said(&problems, "no page names the flag --listen"),
         "{problems:?}"
@@ -522,6 +533,8 @@ fn a_key_that_is_not_in_the_table_is_found() {
     let span = changed("configuration.md", "`server.listen`", "`server.listn`");
     let problems = check(&span, &code());
     assert!(said(&problems, "server.listn is not a key"), "{problems:?}");
+    // `server.listen` is named in the table and in the TOML blocks of this page, and in no other.
+    let problems = check(&without_page("configuration.md"), &code());
     assert!(
         said(&problems, "no page names the key server.listen"),
         "{problems:?}"
