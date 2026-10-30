@@ -38,6 +38,54 @@ enroll-rate-per-minute = 60
 # A name this frontend serves, a DNS name or an IP address; repeat it for each. The enroll listener's certificate carries these names, and no node may advertise one or a host under one.
 # frontend-name = []
 
+[executor]
+# Where the farm runs the actions it places. `kbf-daemon`, the default, is the daemon of each node, over the worker listener: no executor is built and no lease server is contacted, whatever the other `--executor-*` flags say. `js-agent` runs them on hosts leased from the job scheduler's lease server, in the action's own image, by a task tool the agent mounts; it needs the lease server's flags (`--executor-lease-url`, `--executor-lease-token-file`, and `--executor-lease-ca-file` for https), the pool's (`--executor-class`, `--executor-hosts`, `--executor-host-cpus`, `--executor-host-memory-gib`), `--executor-frontend-id`, the packs (`--pack-store-endpoint`) and `--executor-insecure-argv-secrets`. The executor runs on exactly one frontend: a second frontend that holds hosts on the same lease server stops. A restart of the frontend fails the builds in flight. Switching back to `kbf-daemon` releases the leases when the frontend is stopped, not when it is killed: a killed frontend's leases stay held until their ttl ends (`--executor-lease-ttl-secs`), unless a later `js-agent` start releases them. `--executor-insecure-argv-secrets` is ignored with `kbf-daemon`
+executor = "kbf-daemon"
+# Lets the task write its pack to an `http://` url, until the store serves TLS. The reads stay https. Used only with `--executor js-agent`
+executor-allow-plain-http-put = false
+# The CPU architecture of the hosts. Every lease asks for a host of `os=linux` and this `arch`, and the hosts report them to the farm. Used only with `--executor js-agent`
+executor-arch = "x86_64"
+# How long one call to the lease server may take before it counts as unanswered, in seconds. Under the fence time. Used only with `--executor js-agent`
+executor-call-timeout-secs = 5
+# The lease server's class every lease asks for (the pool of hosts the executor draws from). Used only with `--executor js-agent`
+# executor-class = "CLASS"
+# The image, pinned by digest as `<repository>@sha256:<64 hex digits>` (a leading `docker://` is optional), that an action runs in when it names no `container-image` platform property. An action that names one runs in its own. A tag is refused, and an action with neither is refused as invalid. Like every image of the farm, it must not set an `ENTRYPOINT` (see `--executor-images-have-no-entrypoint`). Used only with `--executor js-agent`
+# executor-default-image = "IMAGE"
+# The timeout, in seconds, of an action that names none: at most `--executor-max-run-secs`. Used only with `--executor js-agent`
+executor-default-timeout-secs = 3000
+# The name of this frontend on the lease server: the value of the `kbf-frontend` label on its leases, by which a restarted frontend finds them and releases the ones it no longer needs. 1 to 63 of letters, digits, `-`, `_` and `.`. It must be different for each frontend (not copied with the config). Used only with `--executor js-agent`
+# executor-frontend-id = "ID"
+# The CPU cores a host's lease holds: the pool's shape. At least 1. Used only with `--executor js-agent`
+# executor-host-cpus = "CORES"
+# The memory, in GiB, a host's lease holds: the pool's shape. Each run is capped at 1.5 times its booking plus 512 MiB, and the bookings of a host add up to what is left after that. Used only with `--executor js-agent`
+# executor-host-memory-gib = "GIB"
+# The most runs a host takes at once, reported to the farm as the host's action slots. Used only with `--executor js-agent`
+executor-host-slots = 8
+# How many hosts to hold, a lease each. A host is leased whole for the shape below and released before its lease ends. Used only with `--executor js-agent`
+# executor-hosts = "HOSTS"
+# Says that no image of the farm sets an `ENTRYPOINT`. The lease server appends the task tool's arguments to the image's entrypoint, so the tool would not run under one, and the frontend does not read an image's config: without this every action is refused as such. Used only with `--executor js-agent`
+executor-images-have-no-entrypoint = false
+# Says the secrets of a task (the presigned write url, the read token) may travel as arguments of the run, where the action can read them from `/proc` and the engine's inspect shows them. The lease server's job has no secret field yet, so `--executor js-agent` cannot run without it; it is refused with `--executor kbf-daemon`. Off by default
+executor-insecure-argv-secrets = false
+# The CA certificate (PEM) the lease server's certificate chains to: the only trust anchor, no system roots are consulted. Needed for an `https` lease server and refused for an `http` one. Used only with `--executor js-agent`
+# executor-lease-ca-file = "PATH"
+# A file with the bearer token of the lease server, readable by its owner alone (mode 0600 or 0400). The secret is never a flag: a command line is world-readable. Used only with `--executor js-agent`
+# executor-lease-token-file = "PATH"
+# How long a lease lasts without a renewal, in seconds, asked at each renewal. It must cover the longest run and two heartbeats, and the lease server grants at most its own `--max-ttl`. Used only with `--executor js-agent`
+executor-lease-ttl-secs = 3600
+# The lease server, as `https://host[:port]`, or `http://` to a loopback host. Used only with `--executor js-agent`
+# executor-lease-url = "URL"
+# The longest action timeout the executor runs, in seconds; an action that asks for more is refused. Used only with `--executor js-agent`
+executor-max-run-secs = 3000
+# A file beside the task tool in its root (the farm's root certificate, DER) that the task trusts for its https reads; mounted read-only next to the tool. Left out, the task is given none. Used only with `--executor js-agent`
+# executor-root-der = "FILE"
+# What a run's wall time adds to the action's timeout, in seconds: the fetch of the inputs and the upload of the pack. An action that fetches or uploads for longer than this ends at the wall time and is answered to the caller as a timeout. Used only with `--executor js-agent`
+executor-run-margin-secs = 300
+# Where the task tool is in the action's container, as `/mnt/<root>/<file>`: the agent mounts `<file>` of its root `<root>` read-only at `/mnt/<root>/<file>`. Used only with `--executor js-agent`
+executor-task-tool = "/mnt/kbf-tools/kbf-task"
+# Where the task tool works in the container, if not in its own default: the action's image must have a writable directory there. Used only with `--executor js-agent`
+# executor-work-dir = "DIR"
+
 [handover]
 # Retired: no longer read, the handover was removed. Accepted and ignored for one release
 # (not in --help)
@@ -80,6 +128,16 @@ await-takeover = false
 # history-objects = "URI"
 # The memory, in bytes, the invocation records may take together (`docs/design/invocations.md`, section 3.5). At the bound, records of a minted id go first, then idle ones, least recently seen first; with only open builds left, the largest stops taking rows. Records are kept in memory only and lost on restart. Their heap was measured at up to 1.08 times this at 200 kB and above, and 1.12 at 50 kB (section 3.5)
 invocation-memory = 268435456
+
+[job-read]
+# A file with the farm secret that read grants are signed with, at least 32 bytes (surrounding whitespace is dropped), readable by its owner alone (mode 0600 or 0400). The frontends of a farm and whatever issues the grants must read the same secret. The secret is never a flag: a command line is world-readable
+# job-grant-secret-file = "PATH"
+# Serves the inputs of an action to the task that runs it, over HTTPS at this address: `GET /<hex>/<size>` with `Authorization: Bearer <read grant>`, and nothing else (any other path is 404 and any other method 405). A read grant is the token a run is given; until it expires it reads the Action it was issued for, its Command and its input tree, and no other blob. The TLS is the server's alone and no client certificate is asked for. The task dials an IP address, so give the address the jobs dial, and a `--job-tls-cert` that names it as an IP subjectAltName. Needs `--job-tls-cert`, `--job-tls-key` and `--job-grant-secret-file`. Left out, no such listener is opened
+# job-listen = "ADDR"
+# The certificate chain (PEM) of `--job-listen`, issued by the farm CA that the jobs trust. It must carry an IP subjectAltName for each address a job dials the frontend at: the start is refused if it has none, or if `--job-listen` is on one address and the certificate does not name it, since a client that dials an IP address accepts only a certificate that names it. Read again every `--tls-reload-interval-secs`, as the other listeners' are; the names are checked at start only
+# job-tls-cert = "PATH"
+# The private key (PEM) of `--job-tls-cert`
+# job-tls-key = "PATH"
 
 [listener]
 # The operator API listener (HTTP/JSON under `/v1`). Off unless given. Reads are open to whoever reaches it: bind it where only operators do
@@ -224,6 +282,28 @@ member-ttl-secs = 15
 [stores]
 # Turns on the object-store registration routes of the operator API (/v1/object-stores, docs/api.md) and names the directory where the secret key of each registered connection is kept, one file of mode 0600 each, in a directory made 0700. The directory must be readable by every frontend child that serves at once and left out of any backup of the host. The registration itself (endpoints, buckets, the audit log) is kept in the state store. Without it those routes answer 404.
 # object-store-secrets-dir = "DIR"
+
+[task-runs]
+# The most bytes of blobs, by their digests' sizes, the input tree of a run may have (each distinct blob once): a run whose tree has more is refused. Used only with `--task-secret-file`
+task-closure-max-bytes = 34359738368
+# The most distinct digests (directories and files) the input tree of a run may have: a run whose tree has more is refused, never run on a part of its inputs. Used only with `--task-secret-file`
+task-closure-max-digests = 500000
+# The bucket of `--task-put-endpoint` a task's pack is written to, under the key `cas/b/<lease>/<nonce>-0`
+# task-put-bucket = "BUCKET"
+# A file with the presign-only key of the tier store, as JSON `{"access_key_id": "...", "secret_access_key": "..."}`, owned by this user and readable by it alone (mode 0600 or 0400). The key signs a `PUT` of one object under its prefix and does nothing else; its ceiling (`max_expires_secs` of the store's `--presign-key-file`) must be at least 14400, and the store's `--presign-max-expires` too
+# task-put-credentials-file = "PATH"
+# The tier store's proxy, as `http://host:port` or `https://host:port`: the host a task's presigned write is signed for, and where it sends the pack. Used only with `--task-secret-file`
+# task-put-endpoint = "URL"
+# The region the presigned writes to `--task-put-endpoint` are signed for
+task-put-region = "us-east-1"
+# The base URL a task reads its inputs from: the job-facing read listener, as `https://host:port` with no path (a grant's token is a bearer secret and crosses only a TLS connection; `http://` is refused at start). A blob is `GET <url>/<hash>/<size>`
+# task-read-url = "URL"
+# The run wall limit a run is prepared for, in seconds, at least 1 and at most 14400: a task's presigned write and read grant are good for this plus `--task-url-slack-secs`. Used only with `--task-secret-file`
+task-run-wall-secs = 7200
+# Turns on the preparation of the runs of a host executor: for each run the frontend makes the key the task may write, one presigned write of it to the tier store, and a read grant for the task's inputs. The file holds one secret of at least 32 bytes (surrounding white space is dropped), owned by this user and readable by it alone (mode 0600 or 0400): the pack-key mint and the read-grant key are made from it, and it is the secret the job-facing listener verifies grants with. The secret is never a flag: a command line is world-readable. Needs `--task-put-endpoint`, `--task-put-bucket`, `--task-put-credentials-file` and `--task-read-url`. Left out, no run is prepared
+# task-secret-file = "PATH"
+# The time past the run wall, in seconds, that a task's presigned write and read grant stay good: the time a task takes to start and to put its pack. The wall and the slack together must not pass 14400, the ceiling of a presigned write, or the frontend does not start. Used only with `--task-secret-file`
+task-url-slack-secs = 600
 
 [tls]
 # A file holding the token operator API writes (cordon, drain, uncordon) must present as `Authorization: Bearer <token>`. It must be owned by the server's user with mode 0600 or 0400, or the server refuses to start; run the server as a user other than the daemon's, whose builds could read it. Without it, writes are refused
