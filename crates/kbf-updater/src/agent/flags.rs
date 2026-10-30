@@ -6,6 +6,7 @@
 //!                   (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
 //!                   [--frontend <dns name>:<port>] [--enroll-frontend <dns name>:<port>]
 //!                   [--operator-api http://IP:PORT --token-file FILE] [--daemon-node NODE_ID]
+//!                   [--cordon-dir DIR]
 //!                   [--helper-socket PATH] [--service NAME,helper-socket=PATH[,SETTING=VALUE...]]...
 //!                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
 //!                   [--health-poll-secs N] [--retry-secs N]
@@ -31,6 +32,11 @@
 //! - `--daemon-node`: for the agent of a frontend host that also runs a daemon: the daemon's
 //!   node id. The frontend's update drains that node around it (the frontend itself is drained
 //!   by the helper, inside the A/B); without the flag a frontend host's node is not drained.
+//! - `--cordon-dir`: where the agent records, one file per node and unit, that a cordon is its
+//!   own, so that a retry or a restart gives back a node it drained and leaves out one an
+//!   operator drained; the agent drops the marks of a node it reads serving (a cordon given back
+//!   by hand). Default: `--state-dir`, else the directory `--client-key` is in. It must be
+//!   writable by the agent, which checks at start and does not start otherwise.
 //! - `--channel`: the release channel the helper's allowlist names; the version the
 //!   coordinator names is looked up in it by the helper, never by URL.
 //! - `--helper-socket`: the socket of `kbf-host-install --serve` (default
@@ -72,10 +78,10 @@ pub const USAGE: &str = "usage: kbf-updater agent --coordinator DNSNAME:PORT --c
 (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE) [--frontend DNSNAME:PORT] \
 [--enroll-frontend DNSNAME:PORT] \
 [--operator-api http://IP:PORT --token-file FILE] \
-[--daemon-node NODE_ID] [--helper-socket PATH] [--service NAME,helper-socket=PATH[,SETTING=VALUE...]]... [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N] \
+[--daemon-node NODE_ID] [--cordon-dir DIR] [--helper-socket PATH] [--service NAME,helper-socket=PATH[,SETTING=VALUE...]]... [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N] \
 [--health-poll-secs N] [--retry-secs N]\n";
 
-const FLAGS: [&str; 17] = [
+const FLAGS: [&str; 18] = [
     "--coordinator",
     "--state-dir",
     "--frontend",
@@ -87,6 +93,7 @@ const FLAGS: [&str; 17] = [
     "--operator-api",
     "--token-file",
     "--daemon-node",
+    "--cordon-dir",
     "--helper-socket",
     "--heartbeat-secs",
     "--drain-deadline-secs",
@@ -145,6 +152,9 @@ pub struct Config {
     pub enroll_frontend: Option<Endpoint>,
     /// The enrollment's state directory, if the certificate is the agent's to renew.
     pub state_dir: Option<PathBuf>,
+    /// Where the agent keeps its marks of the cordons it made (`--cordon-dir`); when absent, the
+    /// state directory, else the directory of the key file.
+    pub cordon_dir: Option<PathBuf>,
     /// The frontend's operator API for the drain and the health, if the operator gave the agent
     /// the credential for it.
     pub node_api: Option<NodeApi>,
@@ -307,6 +317,7 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
     if daemon_node.as_deref().is_some_and(|id| !valid_node_id(id)) {
         return Err("--daemon-node must be a node id: a DNS label".to_owned());
     }
+    let cordon_dir = found.remove("--cordon-dir").map(PathBuf::from);
     let helper_socket = found
         .remove("--helper-socket")
         .map_or_else(|| PathBuf::from(DEFAULT_HELPER_SOCKET), PathBuf::from);
@@ -339,6 +350,7 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
         frontend,
         enroll_frontend,
         state_dir,
+        cordon_dir,
         node_api,
         daemon_node,
         timing,
