@@ -36,6 +36,9 @@ pub enum BenchError {
     /// proves nothing.
     #[error("request log: {0}")]
     Log(#[source] std::io::Error),
+    /// `fill-paper` stopped or its check found problems.
+    #[error(transparent)]
+    Fill(#[from] crate::fill::FillError),
     /// A result file is not JSON of the schema this build writes.
     #[error("result file: {0}")]
     Result(String),

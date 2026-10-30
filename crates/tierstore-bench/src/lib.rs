@@ -14,6 +14,7 @@ pub mod cells;
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod fill;
 pub mod gate;
 pub mod preflight;
 pub mod provision;
