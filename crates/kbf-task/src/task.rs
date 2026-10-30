@@ -370,8 +370,8 @@ fn held<'a>(blobs: &'a Blobs, digests: &[Digest]) -> Result<Vec<Cow<'a, [u8]>>, 
 /// A [`Failure`], whose [`Failure::exit_code`] names the step that failed.
 pub async fn execute(
     cli: &Cli,
-    source: &impl BlobSource,
-    sink: &impl PackSink,
+    source: &dyn BlobSource,
+    sink: &dyn PackSink,
 ) -> Result<TaskManifest, Failure> {
     let limits = Limits {
         packs: sink.pack_slots(),
@@ -386,8 +386,8 @@ pub async fn execute(
 /// failure (exit 14) before anything is fetched.
 pub(crate) async fn execute_with(
     cli: &Cli,
-    source: &impl BlobSource,
-    sink: &impl PackSink,
+    source: &dyn BlobSource,
+    sink: &dyn PackSink,
     limits: &Limits,
 ) -> Result<TaskManifest, Failure> {
     if limits.packs > usize::from(MAX_PACKS) || limits.large > usize::from(MAX_LARGE) {
@@ -513,7 +513,7 @@ fn store_outputs(
     manifest: &mut TaskManifest,
     blobs: &Blobs,
     limits: &Limits,
-    sink: &impl PackSink,
+    sink: &dyn PackSink,
 ) -> Result<(), Failure> {
     // Plan before anything is built or stored: pack 0 keeps room for the manifest as it will be
     // written, with its `packs` and `large` fields.
@@ -683,17 +683,22 @@ fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
 /// the outcome into the process exit code (see the module documentation). A failure is written to
 /// standard error; no message holds the token or the presigned URL's query.
 pub async fn main_with(cli: &Cli) -> ExitCode {
-    finish(cli, connect(cli)).await
+    let connected = connect(cli).map(|(source, sink)| {
+        let source: Box<dyn BlobSource> = Box::new(source);
+        let sink: Box<dyn PackSink> = Box::new(sink);
+        (source, sink)
+    });
+    finish(cli, connected).await
 }
+
+/// The source and the sink a run uses.
+type Connected = (Box<dyn BlobSource>, Box<dyn PackSink>);
 
 /// Runs the task over `connected` (what [`connect`] made, or why it could not) and turns the
 /// outcome into the exit code.
-async fn finish(
-    cli: &Cli,
-    connected: Result<(impl BlobSource, impl PackSink), Failure>,
-) -> ExitCode {
+async fn finish(cli: &Cli, connected: Result<Connected, Failure>) -> ExitCode {
     let outcome = match connected {
-        Ok((source, sink)) => execute(cli, &source, &sink).await,
+        Ok((source, sink)) => execute(cli, source.as_ref(), sink.as_ref()).await,
         Err(failure) => Err(failure),
     };
     match outcome {

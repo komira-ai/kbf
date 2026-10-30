@@ -721,6 +721,11 @@ async fn main_with_reports_a_setup_failure_by_exit_code() {
     assert_eq!(main_with(&flags).await, ExitCode::from(EXIT_SETUP));
 }
 
+/// The source and the sink as `finish` takes them.
+fn boxed(mem: Mem, sink: Fake) -> Connected {
+    (Box::new(mem), Box::new(sink))
+}
+
 /// Catches: a task that ran and stored its pack not exiting 0.
 #[tokio::test]
 async fn a_task_that_stores_its_pack_exits_zero() {
@@ -728,7 +733,7 @@ async fn a_task_that_stores_its_pack_exits_zero() {
     let digest = action(&mut mem, COPY, &["out"]);
     let dir = scratch("finish-ok");
     let flags = cli(&dir, digest);
-    let connected = Ok::<_, Failure>((mem, Fake::new(false)));
+    let connected = Ok::<_, Failure>(boxed(mem, Fake::new(false)));
     assert_eq!(finish(&flags, connected).await, ExitCode::SUCCESS);
 }
 
@@ -740,9 +745,9 @@ async fn finish_exits_with_the_code_of_the_failure() {
     let digest = action(&mut mem, COPY, &["out"]);
     let dir = scratch("finish-fail");
     let flags = cli(&dir, digest);
-    let refused = Ok::<_, Failure>((mem, Fake::new(true)));
+    let refused = Ok::<_, Failure>(boxed(mem, Fake::new(true)));
     assert_eq!(finish(&flags, refused).await, ExitCode::from(EXIT_PUT));
-    let not_connected: Result<(Mem, Fake), Failure> = Err(Failure::Setup("no".to_owned()));
+    let not_connected = Err(Failure::Setup("no".to_owned()));
     assert_eq!(
         finish(&flags, not_connected).await,
         ExitCode::from(EXIT_SETUP)
