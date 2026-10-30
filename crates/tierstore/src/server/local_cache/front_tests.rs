@@ -169,9 +169,10 @@ async fn a_listing_passes_through_and_keeps_nothing() {
 }
 
 /// Asserts that `GET /metricz` needs no signature and shows the counters of the cache, after
-/// the reads that made them; that HEAD answers it too; and that a server with no cache says so.
+/// the reads that made them; that HEAD answers it too; and that a storage node's `/metricz` has
+/// the series of its proxy and none of the cache's.
 #[tokio::test]
-async fn metricz_shows_the_counters_or_says_there_is_no_cache() {
+async fn metricz_shows_the_cache_block_on_a_cache_node_and_the_proxy_block_on_a_storage_node() {
     let front = Front::new("tscache-front-metrics").await;
     let uri = format!("/{BUCKET}/cas/b/obj");
     for _ in 0..2 {
@@ -199,5 +200,7 @@ async fn metricz_shows_the_counters_or_says_there_is_no_cache() {
         .send_raw(request.body(Full::new(Bytes::new())).unwrap())
         .await;
     assert_eq!(reply.status, StatusCode::OK);
-    assert!(reply.body.contains("no local cache"), "{}", reply.body);
+    let hits = r#"tierstore_hits_total{tier="hot",op="get"} 0"#;
+    assert!(reply.body.contains(hits), "{}", reply.body);
+    assert!(!reply.body.contains("tierstore_cache_"), "{}", reply.body);
 }

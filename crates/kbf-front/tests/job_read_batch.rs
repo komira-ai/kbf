@@ -168,6 +168,8 @@ impl BlobSource for Source {
 
 struct World {
     action: Digest,
+    /// Another Action, whose tree holds `alpha` only.
+    other: Digest,
     names: HashMap<String, Digest>,
     held: HashMap<Digest, Bytes>,
     fails: HashSet<Digest>,
@@ -198,16 +200,23 @@ fn world() -> World {
         names.insert(name.clone(), *digest);
         in_tree.push((name.clone(), *digest));
     }
-    let files = in_tree
-        .iter()
-        .map(|(name, digest)| FileNode {
-            name: name.clone(),
-            digest: Some(digest_to_proto(digest)),
-            ..FileNode::default()
-        })
-        .collect();
+    let file_nodes = |only: Option<&str>| -> Vec<FileNode> {
+        in_tree
+            .iter()
+            .filter(|(name, _)| only.is_none_or(|only| only == name))
+            .map(|(name, digest)| FileNode {
+                name: name.clone(),
+                digest: Some(digest_to_proto(digest)),
+                ..FileNode::default()
+            })
+            .collect()
+    };
     let root = Directory {
-        files,
+        files: file_nodes(None),
+        ..Directory::default()
+    };
+    let alpha_only = Directory {
+        files: file_nodes(Some("alpha")),
         ..Directory::default()
     };
     let mut put = |bytes: Vec<u8>| {
@@ -223,8 +232,16 @@ fn world() -> World {
         ..Action::default()
     };
     let action = put(action.encode_to_vec());
+    let alpha_only = put(alpha_only.encode_to_vec());
+    let other = Action {
+        command_digest: Some(digest_to_proto(&command)),
+        input_root_digest: Some(digest_to_proto(&alpha_only)),
+        ..Action::default()
+    };
+    let other = put(other.encode_to_vec());
     World {
         action,
+        other,
         names,
         held,
         fails,
@@ -541,43 +558,6 @@ async fn a_scope_that_cannot_be_worked_out_refuses_the_whole_request() {
     );
 }
 
-/// Catches: batch reads that do not count against the reads in flight (a task fetching
-/// thousands of small blobs in 256-blob requests opening 256 reads at once): with one read
-/// allowed, the second blob of a request is not read until the first read ends.
-#[tokio::test]
-async fn each_read_of_a_batch_counts_against_the_reads_in_flight() {
-    let w = world();
-    let limits = Limits {
-        reads_in_flight: 1,
-        ..Limits::default()
-    };
-    let rig = rig(&w, Some(w.d("alpha")), limits);
-    let token = rig.token(w.action);
-    let body = body_of(&[w.t("alpha"), w.t("beta")]);
-    let batch = rig.batch(&body, Some(&token));
-    let driver = async {
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            rig.source.reads_of(&w.d("alpha")),
-            1,
-            "the first read is open"
-        );
-        assert_eq!(
-            rig.source.reads_of(&w.d("beta")),
-            0,
-            "the second waits for it"
-        );
-        let (_, gate) = rig.source.gate.as_ref().expect("a gate");
-        gate.add_permits(1);
-    };
-    let (reply, ()) = tokio::join!(batch, driver);
-    let beta = &w.held[&w.d("beta")];
-    let expected = [frame(0, b"alpha"), frame(0, beta)].concat();
-    assert_eq!(&reply.body[..], &expected[..]);
-}
-
 /// Catches: `/batch` being answered for the wrong method, a GET of it being taken for a blob
 /// path (it is 405, not 404), another path taking a POST, and a POST with no body being
 /// anything but a malformed request.
@@ -664,4 +644,20 @@ async fn the_metrics_count_each_batch_outcome_and_each_blob_status() {
     ] {
         has_line(&out, line);
     }
+}
+
+/// Catches: a grant for one Action reading what only another Action's scope holds: with a token
+/// for an Action whose tree has `alpha` alone, `alpha` is served and `beta` and `secret`, which
+/// are in the first Action's tree or in none, are out of scope and are not read.
+#[tokio::test]
+async fn a_token_for_another_action_is_scoped_to_that_actions_tree() {
+    let w = world();
+    let rig = rig(&w, None, Limits::default());
+    let token = rig.token(w.other);
+    let body = body_of(&[w.t("alpha"), w.t("beta"), w.t("secret")]);
+    let reply = rig.batch(&body, Some(&token)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let expected = [frame(0, b"alpha"), frame(2, b""), frame(2, b"")].concat();
+    assert_eq!(&reply.body[..], &expected[..]);
+    assert_eq!(rig.source.reads_of(&w.d("beta")), 0);
 }

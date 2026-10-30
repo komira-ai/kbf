@@ -3,7 +3,7 @@
 //! without building the server, `verify-assets attestations` without GitHub, and
 //! `sudo-test` and `crun-tests` without root or systemd.
 //!
-//! - Run under any name but `kbf-server`, `gh`, `sudo`, `uname`, `id`, `systemd-sysusers` or
+//! - Run under any name but `kbf-server`, `gh`, `sudo`, `syft`, `uname`, `id`, `systemd-sysusers` or
 //!   `systemd-tmpfiles`, it is cargo: it
 //!   appends its arguments as one line to `target/debug/cargo-args` in its working
 //!   directory, "builds" by hard-linking itself to `target/debug/kbf-server`, and
@@ -85,6 +85,9 @@
 //! - Run as `uname` (by name, from PATH, or by path), it is a host that is no platform of
 //!   ours: `-s` prints `Linux` and `-m` prints `riscv64` (or `XTASK_FAKE_MACHINE` when set). Run as `id`, `-u` prints 1000
 //!   (a user that is not root).
+//! - Run as `syft`, it prints the file `syft.json` next to it on stdout: what syft prints of an
+//!   image. (`pkg-image-sbom` runs it with an empty environment, so what it was given is tested
+//!   with `env` in `src/pkg_image_sbom/tests.rs`.)
 //! - Run as `systemd-sysusers` or `systemd-tmpfiles` (by name, from PATH, or by path), it
 //!   appends `<name> <arguments>` as one line to `systemd-args` next to the fake's own
 //!   file and exits 0: the host's systemd, as `packaging/install.sh` calls it.
@@ -787,6 +790,13 @@ fn systemd(name: &str, args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `syft ...`: prints the SBOM a test wrote for it, the file `syft.json` next to it.
+fn syft(argv0: &str) -> ExitCode {
+    let json = std::fs::read_to_string(Path::new(argv0).with_file_name("syft.json"));
+    print!("{}", json.expect("syft.json"));
+    ExitCode::SUCCESS
+}
+
 /// `uname -s` and `uname -m` of a host with no platform of ours.
 fn uname(args: &[String]) -> ExitCode {
     match args {
@@ -826,6 +836,8 @@ fn main() -> ExitCode {
         gh(&argv0, &rest)
     } else if argv0.ends_with("/sudo") {
         sudo(&argv0, &rest)
+    } else if argv0.ends_with("/syft") {
+        syft(&argv0)
     } else if matches!(base, "systemd-sysusers" | "systemd-tmpfiles") {
         systemd(base, &rest)
     } else if argv0 == "uname" || argv0.ends_with("/uname") {

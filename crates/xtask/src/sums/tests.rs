@@ -131,6 +131,46 @@ fn a_kbf_tarball_and_its_version_facts_are_listed_together() {
 }
 
 #[test]
+fn a_task_image_and_its_sbom_are_listed_together() {
+    // Catches: the pairing in one direction only, the waiver skipping more than the SBOM of an
+    // image, a waiver that is ignored, and the SBOM of the `kbf-task` binary (a tarball's, named
+    // `kbf-task-<commit>-<platform>.cdx.json`) or an image that has no SBOM (the frontend's)
+    // taken for the pair. Rows: a task image with its facts and no SBOM is refused and passes when
+    // the pairing is waived; an SBOM without its image is refused either way; the set with both
+    // passes either way. Catches: either `if` dropped. (A tarball is listed in every row: the
+    // control that flips its last byte needs one.)
+    let image = "kbf-task-image-c0ffee012345-linux-x86_64.oci.tar";
+    let facts = "kbf-task-image-c0ffee012345-linux-x86_64.facts.json";
+    let sbom = "kbf-task-image-c0ffee012345-linux-x86_64.cdx.json";
+    let binary_sbom = "kbf-task-c0ffee012345-linux-x86_64.cdx.json";
+    let frontend = "kbf-frontend-image-c0ffee012345-linux-x86_64.oci.tar";
+    let no_sbom = format!("{image}: its image SBOM {sbom} is not listed in {SUMS}");
+    let no_image = format!("{sbom}: the image it describes, {image}, is not listed in {SUMS}");
+    let (no_sbom, no_image) = (no_sbom.as_str(), no_image.as_str());
+    let rows: [PairingRow; 5] = [
+        ("image", &[A, image, facts], Some(no_sbom), None),
+        ("sbom", &[A, sbom], Some(no_image), Some(no_image)),
+        ("both", &[A, image, facts, sbom], None, None),
+        ("binary-sbom", &[A, binary_sbom], None, None),
+        ("frontend", &[A, frontend], None, None),
+    ];
+    let bytes: &[u8] = b"bytes";
+    for (what, listed, required, waived) in rows {
+        let dir = scratch(&format!("verify-image-sbom-{what}"));
+        let files: Vec<(&str, &[u8])> = listed.iter().map(|n| (*n, bytes)).collect();
+        let sums: String = listed.iter().map(|n| line(n, bytes)).collect();
+        assets(&dir, &files, &sums);
+        for (pairing, wanted) in [(Pairing::Required, required), (Pairing::Waived, waived)] {
+            let got = verify_sums_with(&dir, Sha256::of, pairing);
+            match wanted {
+                Some(problem) => assert_eq!(refused(got), [problem], "{what} {pairing:?}"),
+                None => assert!(got.is_ok(), "{what} {pairing:?}: {got:?}"),
+            }
+        }
+    }
+}
+
+#[test]
 fn verify_sums_refuses_listed_not_equal_to_present() {
     // Catches: a file in the directory that SHA256SUMS does not list (it would be
     // shipped unsigned; a leftover SHA256SUMS.<platform> part included), a listed file that is missing, a line listed twice, and a
