@@ -429,7 +429,7 @@ impl Adapter for KbfAdapter {
             .for_each(|sent| self.machine.start(start.lease, sent));
         self.record_started(start);
         self.learning_started(start);
-        let cost = view.sched().lease_cost(start.lease);
+        let cost = None;
         self.ablation.booked(Booking::of(start.kind, cost));
     }
 
