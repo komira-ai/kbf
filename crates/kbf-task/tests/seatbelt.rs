@@ -145,3 +145,58 @@ async fn an_allowed_command_runs_and_is_not_denied_the_network() {
     .await;
     assert_eq!(ran.exit_code, EPERM, "{ran:?}");
 }
+
+/// Runs `mode <file> <dir>/moved` with `file` denied (or not, for the control); the exit code.
+async fn move_then_read(name: &str, mode: &str, file: &Path, denied: bool) -> i32 {
+    let moved = file.with_file_name(format!("{name}-moved"));
+    let unreadable = if denied {
+        vec![file.to_owned()]
+    } else {
+        Vec::new()
+    };
+    let args = [
+        mode,
+        file.to_str().expect("utf-8"),
+        moved.to_str().expect("utf-8"),
+    ];
+    probe_run(name, Network::Denied, &unreadable, &args)
+        .await
+        .exit_code
+}
+
+/// Catches a credential read through a hard link the Command makes to it: the sandbox names a
+/// file by path, so a second name for the same file must not be readable. The same link and read of
+/// a file that is not denied works.
+#[tokio::test]
+async fn a_denied_file_is_refused_through_a_hard_link_made_by_the_command() {
+    let dir = TestDir::under(std::env::temp_dir(), "kbf-task-seatbelt-hardlink");
+    let (secret, other) = (dir.join("secret"), dir.join("other"));
+    std::fs::write(&secret, "secret").expect("file");
+    std::fs::write(&other, "other").expect("file");
+    assert_eq!(
+        move_then_read("hl-control", "link-read", &other, false).await,
+        0
+    );
+    assert_ne!(
+        move_then_read("hl-denied", "link-read", &secret, true).await,
+        0
+    );
+}
+
+/// Catches a credential read after the Command renames it: the file, under its new name, must stay
+/// unreadable. The same rename and read of a file that is not denied works.
+#[tokio::test]
+async fn a_denied_file_cannot_be_renamed_and_read_by_the_command() {
+    let dir = TestDir::under(std::env::temp_dir(), "kbf-task-seatbelt-rename");
+    let (secret, other) = (dir.join("secret"), dir.join("other"));
+    std::fs::write(&secret, "secret").expect("file");
+    std::fs::write(&other, "other").expect("file");
+    assert_eq!(
+        move_then_read("rn-control", "rename-read", &other, false).await,
+        0
+    );
+    assert_ne!(
+        move_then_read("rn-denied", "rename-read", &secret, true).await,
+        0
+    );
+}

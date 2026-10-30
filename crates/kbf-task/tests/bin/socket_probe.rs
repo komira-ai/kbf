@@ -6,7 +6,7 @@
 //! (a socket of that domain), `pair-inet` or `pair-unix` (`socketpair`), `uring`
 //! (`io_uring_setup`), `x32` (`socket(AF_INET)` under the x32 number, `x86_64` only), or
 //! `child <mode>`: the same, in a copy of this program that this one starts and waits for, to
-//! show that a descendant has the same limits. Other modes: `read <path>` reads a file (exit 0, or the errno), `touch <path>` makes a file (to show
+//! show that a descendant has the same limits. Other modes: `read <path>` reads a file (exit 0, or the errno), `link-read <from> <to>` and `rename-read <from> <to>` make a hard link or rename and then read the new name (the errno of the first step that fails), `touch <path>` makes a file (to show
 //! the program ran), `ifaces` prints the network interfaces it sees, `ids` prints its user and
 //! group id, `tcp-loopback` (listen on 127.0.0.1, connect, accept: exit 0 or the errno) and
 //! `tcp-outside` (connect to an address outside any local network: the errno), `int80` (`x86_64`) makes a 32-bit system call, `steal <pid> <fd>` takes a
@@ -37,6 +37,12 @@ fn probe(args: &[&str]) -> u8 {
             Ok(_) => 0,
             Err(e) => errno_of(&e),
         },
+        ["link-read", from, to] => {
+            std::fs::hard_link(from, to).map_or_else(|e| errno_of(&e), |()| probe(&["read", to]))
+        }
+        ["rename-read", from, to] => {
+            std::fs::rename(from, to).map_or_else(|e| errno_of(&e), |()| probe(&["read", to]))
+        }
         ["touch", path] => u8::from(std::fs::File::create(path).is_err()),
         ["ifaces"] => ifaces(),
         ["tcp-loopback"] => tcp_loopback(),
