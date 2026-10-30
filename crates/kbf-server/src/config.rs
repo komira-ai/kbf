@@ -359,7 +359,18 @@ pub struct Args {
     /// Whether placement reads the load the nodes report. `off`, the default, books by
     /// the CPUs a lease asks for, as the server always has, and reads no load. `on` admits
     /// and ranks nodes by the load they report and the load a lease is predicted to add;
-    /// a node that reports none is charged by prediction alone
+    /// a node that reports none is charged by prediction alone, and a node that has never sent
+    /// a reading the server accepted is charged at least 1000 m for each lease (the node's
+    /// whole CPU capacity, if that is less), so a prediction under one core changes nothing for
+    /// such a node. It is read under either `--scheduler-core`. With `js`, `on` is the
+    /// scheduler's placement by load as a whole, with settings the server fixes
+    /// (`placement_load.rs`; none is a flag): besides the reading it applies the guard that
+    /// keeps the flat memory charged to a node within its memory, and scores nodes by balance.
+    /// It also sets a learned time profile charged per minute and an expected-life charge that
+    /// ends a new lease at its key's expected life plus two minutes; both are idle until the
+    /// farm gives the scheduler predictions and a curve source, and `--placement-predictions`
+    /// is refused with `js`. The memory guard counts only leases that carry a memory (a retry
+    /// up the memory ladder, a VM) until predictions give leases one
     // The text above states the default; the help golden cannot hold the whitespace-only
     // line clap prints before a `[default: ...]` line.
     #[arg(
