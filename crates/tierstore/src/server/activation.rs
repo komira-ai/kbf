@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustix::fs::{FileType, fstat};
 use rustix::io::{FdFlags, fcntl_setfd};
-use rustix::net::sockopt::{socket_acceptconn, socket_type};
+use rustix::net::sockopt::socket_type;
 use rustix::net::{SocketType, getsockname};
 
 use super::cli::Error;
@@ -253,6 +253,19 @@ pub(super) fn take(fd: RawFd, name: &str, expected: SocketAddr) -> Result<TcpLis
     Ok(listener)
 }
 
+/// Whether the stream socket `fd` listens (`SO_ACCEPTCONN`).
+#[cfg(not(target_vendor = "apple"))]
+fn listening(fd: BorrowedFd<'_>) -> bool {
+    rustix::net::sockopt::socket_acceptconn(fd).unwrap_or(false)
+}
+
+/// Apple platforms declare `SO_ACCEPTCONN` and do not implement it. tierstore is released for
+/// Linux only; this keeps the crate building elsewhere and asks nothing.
+#[cfg(target_vendor = "apple")]
+fn listening(_: BorrowedFd<'_>) -> bool {
+    true
+}
+
 /// The address `fd` is bound to, if it is a listening TCP stream socket.
 fn check(fd: BorrowedFd<'_>, raw: RawFd, name: &str) -> Result<SocketAddr, String> {
     let not = |what: &str| format!("the socket {name:?} (descriptor {raw}) is {what}");
@@ -263,7 +276,7 @@ fn check(fd: BorrowedFd<'_>, raw: RawFd, name: &str) -> Result<SocketAddr, Strin
     if socket_type(fd).ok() != Some(SocketType::STREAM) {
         return Err(not("not a stream socket"));
     }
-    if !socket_acceptconn(fd).unwrap_or(false) {
+    if !listening(fd) {
         return Err(not("not a listening socket"));
     }
     // A socket that has a name (it was asked about above) but not an IP address: a unix socket.
