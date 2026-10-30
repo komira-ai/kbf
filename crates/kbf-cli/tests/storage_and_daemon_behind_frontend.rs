@@ -87,6 +87,7 @@ fn node_flags(dir: &Path, addrs: &Addrs, extra: &[String]) -> Vec<String> {
         format!("--storage-listen={}", addrs.storage),
         format!("--metrics-listen={}", addrs.metrics),
         format!("--cold-store=file://{}", at("cold")),
+        "--cold-store-floor-bytes=1".to_owned(),
         format!("--hot-store=file://{}", at("hot")),
         "--driver=container".to_owned(),
         format!("--server=https://{}", addrs.worker),
