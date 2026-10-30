@@ -39,6 +39,14 @@ export function siteId(domain: string, explicit?: string): string {
   for (const [d, id] of Object.entries(SITES)) {
     if (id === explicit && d !== domain) throw new Error(`site id '${explicit}' belongs to ${d}; ${domain} needs its own id`);
   }
+  if (mapped === undefined) {
+    // An unlisted id must claim no name a listed site claims (id 'site' would take kbf's `prod-site` environment).
+    const mine = new Set(claimedNames(siteNames(explicit)));
+    for (const [d, id] of Object.entries(SITES)) {
+      const clash = claimedNames(siteNames(id)).find((n) => mine.has(n));
+      if (clash !== undefined) throw new Error(`site id '${explicit}' would claim '${clash}', which belongs to ${d}; choose another id`);
+    }
+  }
   return explicit;
 }
 
@@ -81,6 +89,14 @@ export function siteNames(id: string): SiteNames {
     varPrefix,
     variables: [`${varPrefix}_BUCKET`, `${varPrefix}_DISTRIBUTION_ID`, `${varPrefix}_PUBLISH_ROLE_ARN`],
   };
+}
+
+/** Every name a site claims (account-scoped ones for a placeholder account), for collision checks. */
+export function claimedNames(n: SiteNames): string[] {
+  return [
+    n.zoneStack, n.siteStack, n.bucket('000000000000'), n.headersPolicy, n.router, n.role,
+    n.approvalEnvironment, n.githubEnvironment, n.publishWorkflow, ...n.variables,
+  ];
 }
 
 // kbf.dev's names under their original constant names (the pins in test/kbf-names.test.ts use these).

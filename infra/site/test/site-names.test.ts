@@ -37,6 +37,25 @@ describe('site ids', () => {
     expect(() => c.siteId('docs.example.org', 'kbf')).toThrow(/kbf/);
     expect(c.siteId('kbf.dev', 'kbf')).toBe('kbf');
   });
+  test('an id whose derived names collide with a listed site is refused (site would take kbf\'s prod-site environment)', () => {
+    expect(() => c.siteId('docs.example.org', 'site')).toThrow(/prod-site/);
+  });
+  test('every name claimed by an unlisted id is disjoint from every listed site\'s', () => {
+    const listed = new Set(Object.values(c.SITES).flatMap((id) => c.claimedNames(c.siteNames(id))));
+    const ids = ['site', 'prod', 'docs', 'a', 'kbfx', 'tier', 'tierstore2', 'publish', 'dns', 'x1', 'router', 'headers'];
+    let accepted = 0;
+    for (const id of ids) {
+      let ok = true;
+      try { c.siteId('docs.example.org', id); } catch { ok = false; }
+      if (!ok) continue; // refused ids are fine; accepted ones must be disjoint
+      accepted++;
+      for (const n of c.claimedNames(c.siteNames(id))) expect(listed.has(n)).toBe(false);
+    }
+    expect(accepted).toBeGreaterThan(5);
+  });
+  test('the held CLI refuses --site site on an unlisted domain', () => {
+    expect(() => parse(['github', '--repo', REPO, '--reviewer', 'someone', '--domain', 'docs.example.org', '--site', 'site'])).toThrow(Refused);
+  });
   test.each(['', 'Bad', '1abc', 'a-b', 'a_b', 'x'.repeat(17)])('id %j is refused', (id) => {
     expect(() => c.siteNames(id)).toThrow(/site id/);
   });

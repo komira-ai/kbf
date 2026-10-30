@@ -34,7 +34,9 @@ One account and one GitHub repository can host several sites. Every name is deri
 | `tierstore.dev` | `tierstore` |
 
 A domain that is not in that table (`SITES` in `lib/config.ts`) must pass `--site <id>`: it is never silently given another
-site's names. `--site` may not contradict a known domain, nor reuse another site's id. An id is lower-case letters and digits,
+site's names. `--site` may not contradict a known domain, nor reuse another listed site's id (two unlisted domains with the
+same id cannot be detected), and an id on an unlisted domain is refused if any name derived from it (stack, bucket, role,
+GitHub environment, workflow, variable) equals a name of a listed site: `--site site` would take kbf.dev's `prod-site`. An id is lower-case letters and digits,
 starting with a letter, at most 16.
 
 | name | kbf.dev (`kbf`) | tierstore.dev (`tierstore`) |
@@ -61,6 +63,9 @@ Everything else is shared by all sites on purpose: the Content-Security-Policy a
 cache and error behavior, the role's permissions, the OIDC provider (one per account, imported by ARN) and the
 `prod`-style policies (approval: `main` branch and `v*` tag; site: `v*` tag only). A site that needs a different policy
 changes `lib/site-stack.ts` for that site deliberately. `site/test/csp.test.ts` reads the CSP from `lib/site-stack.ts`.
+
+`.github/workflows/tierstore-site-publish.yml`, the workflow tierstore's publish role trusts, does not exist yet; until it does,
+tierstore.dev is published by the held `upload` step only.
 
 Each site has its own GitHub environments and variables, so two sites in one repository share no reviewer rule or variable.
 Every step is per site: pass `--domain` (or `--site`) to `github`, `dns`, `site`, `vars` and `upload`. `oidc-provider`
