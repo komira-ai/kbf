@@ -20,6 +20,7 @@ const FAMILIES: [&str; 9] = [
     PROMOTIONS_SKIPPED_TOTAL,
 ];
 
+/// Asserts that the nine family names differ, start with `tierstore_` and end with `_total`.
 #[test]
 fn the_family_names_are_distinct_and_start_with_the_prefix() {
     let distinct: BTreeSet<&str> = FAMILIES.into_iter().collect();
@@ -30,6 +31,8 @@ fn the_family_names_are_distinct_and_start_with_the_prefix() {
     }
 }
 
+/// Asserts that the rendered text is, line by line and in order, the text built from the family
+/// names and the labels, for counters driven to a different value in every cell.
 #[test]
 fn the_rendered_text_is_the_text_built_from_the_names() {
     let tiers = [(Tier::Hot, "hot"), (Tier::Cold, "cold")];
@@ -86,4 +89,18 @@ fn the_rendered_text_is_the_text_built_from_the_names() {
         ));
     }
     assert_eq!(counters.render(), expected);
+}
+
+/// Asserts that every family name is on the metrics page outside its "Not in a release yet"
+/// section, so a name the code exports is never missing from the page.
+#[test]
+fn every_family_name_is_on_the_metrics_page() {
+    let page = include_str!("../docs/metrics.md");
+    let released = page
+        .split("\n## Not in a release yet")
+        .next()
+        .expect("a page has a start");
+    for name in FAMILIES {
+        assert!(released.contains(name), "{name} is not on the metrics page");
+    }
 }

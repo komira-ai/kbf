@@ -7,7 +7,7 @@
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The full name of each family, written out so that a page of the docs can be held to it.
+/// The full name of each family, written out in the source; a test holds `docs/metrics.md` to them.
 pub(crate) const HITS_TOTAL: &str = "tierstore_hits_total";
 pub(crate) const MISSES_TOTAL: &str = "tierstore_misses_total";
 pub(crate) const READ_ERRORS_TOTAL: &str = "tierstore_read_errors_total";

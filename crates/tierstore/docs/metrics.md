@@ -233,9 +233,11 @@ sum(rate(tierstore_bytes_read_total{tier="cold"}[5m]))
 
 ## On `/metricz` today
 
-The OCI read front, when it is enabled, exports these series. Without it, `/metricz` has one
-comment line that says the front is not enabled. After that block, a node that runs no local
-cache has one more comment line, "this tierstore has no local cache".
+`/metricz` shows the blocks of the sources a process has, one after the other: the proxy's (the
+hot and cold tier series above), then the OCI read front's, then the cache's. A source a process
+does not have shows nothing. When it has none, the whole text is one line, "this server has no
+proxy, no OCI read front and no local cache". The OCI read front, when it is enabled, exports
+these series:
 
 | name | type | labels | what it counts |
 |---|---|---|---|
