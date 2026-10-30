@@ -123,6 +123,39 @@ async fn the_pack_counts_of_a_node_are_those_of_its_newest_stream() {
     assert!(kept_reads.is_empty() && kept_writes.is_empty(), "forgotten");
 }
 
+/// Asserts that the input cache counts follow the same rules as the pack counts: kept for the
+/// newest stream, ignored from a replaced one, forgotten by a heartbeat without them, and shown
+/// for the node detail.
+#[tokio::test(start_paused = true)]
+async fn input_cache_counts_follow_the_newest_stream() {
+    use kbf_proto::worker::InputCacheCounts;
+    let rig = rig();
+    let worker = WorkerId::new("node-a");
+    let old = register(&rig, "node-a", 0).stream;
+    let new = register(&rig, "node-a", 0).stream;
+    let counts = InputCacheCounts {
+        fills: 4,
+        ..Default::default()
+    };
+    let drive = |f: &dyn Fn(&mut super::KbfAdapter)| rig.core.with(|_, a| f(a));
+    drive(&|a| a.note_input_cache(&worker, new, Some(counts)));
+    drive(&|a| a.note_input_cache(&worker, old, None));
+    let kept = rig
+        .core
+        .with(|_, a| (a.input_caches(), a.input_cache_of(&worker)));
+    assert_eq!(
+        kept.0,
+        [(worker.clone(), counts)],
+        "the old stream's is ignored"
+    );
+    assert_eq!(kept.1.map(|view| view.fills), Some(4));
+    drive(&|a| a.note_input_cache(&worker, new, None));
+    let kept = rig
+        .core
+        .with(|_, a| (a.input_caches(), a.input_cache_of(&worker)));
+    assert!(kept.0.is_empty() && kept.1.is_none(), "forgotten");
+}
+
 /// Asserts that a node whose newest stream has closed is no longer connected in the
 /// machine's registry once the adapter is told to look, and one whose stream is open still
 /// is.
