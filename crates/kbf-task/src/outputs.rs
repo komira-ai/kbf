@@ -16,7 +16,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::Seek;
+use std::io::{Read, Seek};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Mutex;
@@ -100,6 +100,60 @@ impl Blobs {
             }
         }))
     }
+
+    /// A reader over the bytes recorded under `digest`, from the first byte; the blob is not
+    /// loaded.
+    ///
+    /// # Errors
+    /// `NotFound` when `digest` is not recorded.
+    pub fn reader(&self, digest: &Digest) -> std::io::Result<BlobReader<'_>> {
+        let blob = self
+            .blobs
+            .get(&(digest.hash.clone(), digest.size_bytes))
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+        Ok(match blob {
+            Blob::Bytes(bytes) => BlobReader::Bytes(bytes),
+            Blob::File { file, start } => BlobReader::File {
+                file,
+                next: *start,
+                end: *start + digest.size_bytes.unsigned_abs(),
+            },
+        })
+    }
+}
+
+/// A reader over one recorded blob's bytes from the start. A held file is read where it was
+/// recorded with `pread`, never loaded whole, and every [`Blobs::reader`] call starts again from
+/// the first byte, so a retried PUT re-sends the whole blob.
+#[derive(Debug)]
+pub enum BlobReader<'a> {
+    /// Bytes held in memory.
+    Bytes(&'a [u8]),
+    /// A held file: the next offset to read and where the blob ends.
+    File {
+        /// The open descriptor the blob was hashed from.
+        file: &'a File,
+        /// The next offset to read.
+        next: u64,
+        /// The offset after the blob's last byte.
+        end: u64,
+    },
+}
+
+impl Read for BlobReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            BlobReader::Bytes(bytes) => bytes.read(buf),
+            BlobReader::File { file, next, end } => {
+                let want = buf
+                    .len()
+                    .min(usize::try_from(*end - *next).unwrap_or(usize::MAX));
+                let n = file.read_at(&mut buf[..want], *next)?;
+                *next += n as u64;
+                Ok(n)
+            }
+        }
+    }
 }
 
 /// A [`Store`] that keeps what it is given, up to a byte cap, and uploads nothing.
@@ -128,7 +182,7 @@ impl Recorder {
         let size = u64::try_from(digest.size_bytes).unwrap_or(0);
         if blobs.bytes.saturating_add(size) > self.cap {
             return Err(format!(
-                "output-too-large: the outputs do not fit in one pack: they pass {} bytes",
+                "output-too-large: the outputs pass the {} bytes the run's packs and large objects hold",
                 self.cap
             )
             .into());
@@ -427,3 +481,7 @@ mod tests {
         assert_eq!(recorder.in_flight(), IN_FLIGHT);
     }
 }
+
+#[cfg(test)]
+#[path = "outputs_reader_tests.rs"]
+mod reader_tests;

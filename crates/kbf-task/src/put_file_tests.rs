@@ -251,3 +251,37 @@ fn a_missing_file_is_a_local_error_naming_the_path() {
     assert!(err.to_string().contains("absent"), "{err}");
     assert!(!err.to_string().contains("secret"), "{err}");
 }
+
+/// Catches a held-open body not being streamed with its length, and the cap not applying to it:
+/// the first `len` bytes of the reader arrive create-only with `Content-Length: len` even when
+/// the reader holds more, and a length over the cap is refused before connecting.
+#[test]
+fn put_reader_sends_the_announced_length_and_refuses_over_the_cap() {
+    let bytes = pattern(70_000);
+    let (base, server) = serve_each(vec![(201, "")]);
+    let mut reader: &[u8] = &bytes;
+    assert_eq!(
+        put_reader(&agent(None), &format!("{base}/k"), 60_000, &mut reader),
+        Ok(())
+    );
+    let seen = server.join().expect("server");
+    assert_eq!(seen[0].header("content-length"), Some("60000"));
+    assert_eq!(seen[0].header("if-none-match"), Some("*"));
+    assert!(seen[0].body == bytes[..60_000], "the body differs");
+
+    let mut empty: &[u8] = &[];
+    let err = put_reader(
+        &agent(None),
+        "http://127.0.0.1:9/k?X-Sig=secret",
+        MAX_LARGE_BYTES + 1,
+        &mut empty,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        PutError::TooLarge {
+            size: MAX_LARGE_BYTES + 1,
+            limit: MAX_LARGE_BYTES
+        }
+    );
+}

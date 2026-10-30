@@ -15,12 +15,13 @@
 //! The URLs are credentials, so no error here contains any part of the input: a refusal names
 //! the field and the rule, and a JSON syntax error only its line and column.
 //!
-//! # What is used today
+//! # How the run uses it
 //!
-//! Only the first pack slot. When a key set is given, the run uses `packs[0]` exactly as the v1
-//! run uses its single pack URL, and ignores the rest: the planning of several packs
-//! ([`crate::plan`]) and the streaming PUT of a large object ([`crate::put::put_file`]) exist
-//! but nothing calls them yet.
+//! Slot `i` of `packs` is where pack `i` is PUT (pack 0 holds the manifest and is the commit
+//! point), and slot `i` of `large` is where large object `i` is PUT. The run needs at most as
+//! many of each as its outputs call for ([`crate::plan`]); URLs it does not need are not used.
+//! The lengths of the lists are `N` and `M` for the plan, up to 8 of each. The v1 flag
+//! `--pack-url-file` is a key set of one pack and no large object.
 
 use std::fmt;
 use std::path::Path;

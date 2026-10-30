@@ -90,38 +90,37 @@ async fn main_with_refuses_put_urls_without_the_opt_in() {
     assert_eq!(main_with(&flags).await, ExitCode::from(EXIT_SETUP));
 }
 
-/// Catches the run taking another slot than the first, or the file being consumed: with a key
-/// set from the file or from the flag, the pack URL is `packs[0]`, and the file stays.
+/// Catches the key set being cut to its first slot, or the file being consumed: with a key set
+/// from the file or from the flag, the run gets every pack and large URL, in order, and the file
+/// stays.
 #[test]
-fn today_the_run_uses_the_first_pack_slot() {
-    let dir = scratch("first");
+fn the_run_gets_the_whole_key_set() {
+    let dir = scratch("whole");
     let file = dir.join("keys.json");
     std::fs::write(&file, SET).expect("write");
     let flags = parse(&[&format!("--put-urls-file={}", file.display())]).expect("flags");
-    assert_eq!(
-        pack_url(&flags).expect("url"),
-        "https://store.example/p0?X-Sig=very-secret"
-    );
+    let urls = put_urls(&flags).expect("urls");
+    assert_eq!(urls.packs.len(), 2);
+    assert_eq!(urls.packs[0], "https://store.example/p0?X-Sig=very-secret");
+    assert_eq!(urls.packs[1], "https://store.example/p1?X-Sig=other");
+    assert_eq!(urls.large, ["https://store.example/l0?X-Sig=third"]);
     assert!(file.exists());
 
     let flag = parse(&[&format!("--put-urls={SET}"), "--insecure-argv-secrets"]).expect("flags");
-    assert_eq!(
-        pack_url(&flag).expect("url"),
-        "https://store.example/p0?X-Sig=very-secret"
-    );
+    assert_eq!(put_urls(&flag).expect("urls"), urls);
 }
 
-/// Catches the v1 pack URL being ignored when no key set is given.
+/// Catches the v1 pack URL being ignored when no key set is given, or becoming more than one
+/// pack: it is a key set of one pack and no large object.
 #[test]
-fn without_a_key_set_the_run_uses_the_v1_pack_url() {
+fn without_a_key_set_the_v1_pack_url_is_a_set_of_one_pack() {
     let dir = scratch("v1");
     let file = dir.join("url");
     std::fs::write(&file, "https://store.example/v1?X-Sig=s\n").expect("write");
     let flags = parse(&[&format!("--pack-url-file={}", file.display())]).expect("flags");
-    assert_eq!(
-        pack_url(&flags).expect("url"),
-        "https://store.example/v1?X-Sig=s"
-    );
+    let urls = put_urls(&flags).expect("urls");
+    assert_eq!(urls.packs, ["https://store.example/v1?X-Sig=s"]);
+    assert!(urls.large.is_empty());
 }
 
 /// Catches a bad key set starting a run, and its refusal carrying the input: a set with no
@@ -132,7 +131,7 @@ fn a_bad_key_set_is_a_setup_failure_without_the_value() {
     let dir = scratch("bad");
     let missing = dir.join("absent.json");
     let flags = parse(&[&format!("--put-urls-file={}", missing.display())]).expect("flags");
-    let failure = pack_url(&flags).unwrap_err();
+    let failure = put_urls(&flags).unwrap_err();
     assert_eq!(failure.exit_code(), EXIT_SETUP);
     assert!(failure.to_string().contains("absent.json"), "{failure}");
 
@@ -142,7 +141,7 @@ fn a_bad_key_set_is_a_setup_failure_without_the_value() {
     ] {
         let flags =
             parse(&[&format!("--put-urls={bad}"), "--insecure-argv-secrets"]).expect("flags");
-        let failure = pack_url(&flags).unwrap_err();
+        let failure = put_urls(&flags).unwrap_err();
         assert_eq!(failure.exit_code(), EXIT_SETUP);
         let text = failure.to_string();
         assert!(text.contains("key set"), "{text}");
@@ -150,15 +149,13 @@ fn a_bad_key_set_is_a_setup_failure_without_the_value() {
     }
 }
 
-/// Catches the help hiding what is and is not used: both flags are listed, and say that today
-/// only the first pack slot is used.
+/// Catches the help not describing the key set: both flags are listed, and the help says what a
+/// run that needs more slots than the set has does.
 #[test]
-fn the_help_says_only_the_first_pack_slot_is_used() {
+fn the_help_describes_the_key_set() {
     let help = Cli::command().render_long_help().to_string();
     assert!(help.contains("--put-urls-file"), "{help}");
     assert!(help.contains("--put-urls "), "{help}");
-    assert!(
-        help.contains("v2 key set: today only the first pack slot is used"),
-        "{help}"
-    );
+    assert!(help.contains("output-too-large"), "{help}");
+    assert!(!help.contains("today only"), "{help}");
 }

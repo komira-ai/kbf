@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use kbf_segments::{SegmentReader, WriteError, sha256};
 use kbf_task_pack::{
     EMPTY_DIGEST, MAX_PACK_RECORDS, MAX_PATH_BYTES, MAX_RECORD_BYTES, OutputDirectory, OutputFile,
-    OutputSymlink, Timing, Usage, check_shape,
+    OutputSymlink, Timing, Usage, check_shape, read_manifest,
 };
 use kbf_types::{Digest, DigestFunction};
 

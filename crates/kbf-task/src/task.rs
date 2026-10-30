@@ -17,7 +17,7 @@
 //! | 2 | the flags are wrong (clap) |
 //! | 10 | fetch: the Action, the Command or an input could not be read or checked, or laid out |
 //! | 11 | run-start: the Command could not be started (bad paths, no program) |
-//! | 12 | pack: the outputs could not be collected, did not fit one pack (`output-too-large`), or made a manifest or pack the frontend would refuse (`invalid-manifest`, `invalid-pack`) |
+//! | 12 | pack: the outputs could not be collected, did not fit the run's packs and large objects (`output-too-large`), or made a manifest or pack the frontend would refuse (`invalid-manifest`, `invalid-pack`) |
 //! | 13 | put: the pack could not be stored (refused, key already taken, still no room after the retries of a 503, unreachable) |
 //! | 14 | setup: `--lease` is not a build id, a credential or root certificate is unusable, a credential given as a flag value without `--insecure-argv-secrets`, or the runtime did not start |
 
@@ -30,7 +30,8 @@ use std::time::{Duration, Instant};
 use clap::{ArgGroup, Parser};
 use kbf_proto::reapi::{self, Action, Command};
 use kbf_task_pack::{
-    OutputDirectory, OutputFile, OutputSymlink, TaskManifest, Timing, Usage, check_build,
+    LargeEntry, MAX_LARGE, MAX_PACKS, OutputDirectory, OutputFile, OutputSymlink, TaskManifest,
+    Timing, Usage, check_build,
 };
 use kbf_types::Digest;
 
@@ -38,10 +39,12 @@ use crate::digest;
 use crate::fetch::{
     BlobSource, FetchError, HttpBlobSource, fetch_message, materialize, native_roots,
 };
-use crate::outputs::{OutputLimits, collect_outputs};
-use crate::pack::{MAX_PACK_BYTES, PackError, build};
+use crate::outputs::{Blobs, OutputLimits, collect_outputs};
+use crate::pack::{MAX_LARGE_BYTES, PackError, build, build_extra};
+use crate::plan::{Limits, plan};
 use crate::put::{
-    PutError, Sleeper, ThreadSleeper, agent, agent_with_plain_http, put, put_retrying, tls_config,
+    PutError, Sleeper, ThreadSleeper, agent, agent_with_plain_http, put, put_reader, put_retrying,
+    tls_config,
 };
 use crate::put_urls::PutUrls;
 use crate::run::{Run, RunError, output_paths, run};
@@ -76,8 +79,12 @@ pub const EXIT_SETUP: u8 = 14;
 /// `--put-urls-file` (or, with `--insecure-argv-secrets`, `--put-urls`) takes the place of
 /// `--pack-url-file`/`--pack-url`: the JSON key set of the pack and large-object URLs the
 /// frontend issued for the run (see [`crate::put_urls`]). It is read and validated at startup.
-/// Today only the first pack slot is used, exactly as v1 uses its one pack URL; the other slots
-/// are ignored, and the planning of several packs and the large-object PUT are not wired in.
+/// The run plans its outputs into those slots ([`crate::plan`]): a blob over the record cap is
+/// one large object, PUT as raw bytes streamed from the file it was read from; the other blobs
+/// are packed into packs 1.. and then pack 0, which holds the manifest. The PUTs go in this order:
+/// the large objects, packs `N-1` down to 1, then pack 0, the commit point. The v1 flags are a key
+/// set of one pack and no large object, and give the pack the v1 tool wrote, byte for byte; so
+/// does a key set of that shape.
 ///
 /// # What the manifest claims
 ///
@@ -113,13 +120,14 @@ pub struct Cli {
     #[arg(long)]
     pub pack_url: Option<String>,
     /// A file holding the v2 key set, JSON `{"packs":[url,...],"large":[url,...]}`, instead of
-    /// `--pack-url-file`: read, never deleted, and a credential like the pack URL. v2 key set:
-    /// today only the first pack slot is used, as the single pack URL of the v1 flags; the other
-    /// pack slots and the large slots are checked and ignored.
+    /// `--pack-url-file`: read, never deleted, and a credential like the pack URL. The pack URLs
+    /// are, in order, the slots of packs 0..; the large URLs, the slots of large objects 0.. . A
+    /// run that needs more packs or large objects than the set has fails with `output-too-large`
+    /// before anything is stored. At most 8 of each are used.
     #[arg(long)]
     pub put_urls_file: Option<PathBuf>,
     /// The v2 key set itself. Stopgap (komira-ai/kbf#1934): it is in argv, so it needs
-    /// `--insecure-argv-secrets`. v2 key set: today only the first pack slot is used.
+    /// `--insecure-argv-secrets`.
     #[arg(long)]
     pub put_urls: Option<String>,
     /// The base URL of the read grant: blobs are read from `<base>/<hex>/<size>`.
@@ -211,34 +219,101 @@ impl Failure {
     }
 }
 
-/// Where the finished pack goes.
+/// Where the finished packs and large objects go: one slot for each URL of the run's key set.
 pub trait PackSink {
-    /// Stores `body`, once.
+    /// How many pack slots the run was issued (`N`).
+    fn pack_slots(&self) -> usize;
+
+    /// How many large-object slots the run was issued (`M`).
+    fn large_slots(&self) -> usize;
+
+    /// Stores `body`, once, as pack `slot` (0 is the one with the manifest).
     ///
     /// # Errors
     /// The pack was not stored.
-    fn store(&self, body: &[u8]) -> Result<(), PutError>;
+    fn store_pack(&self, slot: usize, body: &[u8]) -> Result<(), PutError>;
+
+    /// Stores the blob `digest` of `blobs`, once, as large object `slot`: its raw bytes, streamed,
+    /// never read whole.
+    ///
+    /// # Errors
+    /// The object was not stored.
+    fn store_large(&self, slot: usize, blobs: &Blobs, digest: &Digest) -> Result<(), PutError>;
 }
 
-/// The real sink: the create-only PUT ([`put`]) to the presigned URL it holds, repeated after a
-/// 503 only ([`put_retrying`]), with `sleeper` between the attempts.
+/// The real sink: the create-only PUT ([`put`], [`put_reader`]) to the presigned URL of each
+/// slot, repeated after a 503 only ([`put_retrying`]), with `sleeper` between the attempts.
 pub struct HttpSink {
     agent: ureq::Agent,
-    url: String,
+    urls: PutUrls,
     sleeper: Arc<dyn Sleeper>,
 }
 
 impl PackSink for HttpSink {
-    fn store(&self, body: &[u8]) -> Result<(), PutError> {
-        put_retrying(|| put(&self.agent, &self.url, body), self.sleeper.as_ref())
+    fn pack_slots(&self) -> usize {
+        self.urls.packs.len()
     }
+
+    fn large_slots(&self) -> usize {
+        self.urls.large.len()
+    }
+
+    fn store_pack(&self, slot: usize, body: &[u8]) -> Result<(), PutError> {
+        put_retrying(
+            || put(&self.agent, &self.urls.packs[slot], body),
+            self.sleeper.as_ref(),
+        )
+    }
+
+    fn store_large(&self, slot: usize, blobs: &Blobs, digest: &Digest) -> Result<(), PutError> {
+        // Each attempt reads the blob again from its first byte.
+        put_retrying(
+            || {
+                let mut reader =
+                    blobs
+                        .reader(&digest::to_reapi(digest))
+                        .map_err(|e| PutError::File {
+                            path: format!("output blob {digest}"),
+                            reason: e.to_string(),
+                        })?;
+                put_reader(
+                    &self.agent,
+                    &self.urls.large[slot],
+                    digest.size_bytes,
+                    &mut reader,
+                )
+            },
+            self.sleeper.as_ref(),
+        )
+    }
+}
+
+/// What the manifest of a run with several large objects can take beyond a manifest without:
+/// the `packs` field and up to [`MAX_LARGE`] entries of about 110 bytes each.
+const MANIFEST_SLACK: u64 = 2048;
+
+/// The bytes of outputs the recorder may hold: what the run's packs and large objects can.
+fn output_cap(limits: &Limits) -> u64 {
+    let packs = (limits.packs as u64).saturating_mul(limits.pack_bytes);
+    let large = (limits.large as u64).saturating_mul(limits.large_bytes);
+    packs.saturating_add(large)
+}
+
+/// The recorded blobs `digests` in memory, for one pack.
+fn held<'a>(blobs: &'a Blobs, digests: &[Digest]) -> Result<Vec<Cow<'a, [u8]>>, Failure> {
+    let mut held = Vec::new();
+    for digest in digests {
+        held.extend(blobs.read(&digest::to_reapi(digest))?);
+    }
+    Ok(held)
 }
 
 /// Runs the task `cli` names, against `source` and `sink`, and returns the manifest that went into
 /// the pack.
 ///
 /// The steps run in this order: fetch the Action, its Command and the input tree; run; collect the
-/// outputs; build the manifest and the pack; store the pack. The Command's own exit code, or a
+/// outputs; plan where each blob goes; build the manifest and pack 0; store the large objects,
+/// then packs `N-1` down to 1, then pack 0. The Command's own exit code, or a
 /// deadline kill, is in the manifest and is not a failure. The manifest has no time for the PUT: the
 /// pack holds the manifest, so it cannot hold the time the pack took to store. An empty stdout or
 /// stderr is left out of the manifest, and no empty blob is a record of the pack.
@@ -249,6 +324,21 @@ pub async fn execute(
     cli: &Cli,
     source: &impl BlobSource,
     sink: &impl PackSink,
+) -> Result<TaskManifest, Failure> {
+    let limits = Limits {
+        packs: sink.pack_slots().min(usize::from(MAX_PACKS)),
+        large: sink.large_slots().min(usize::from(MAX_LARGE)),
+        ..Limits::real()
+    };
+    execute_with(cli, source, sink, &limits).await
+}
+
+/// [`execute`] within `limits`: the placement limits are a parameter so a test can use small packs.
+pub(crate) async fn execute_with(
+    cli: &Cli,
+    source: &impl BlobSource,
+    sink: &impl PackSink,
+    limits: &Limits,
 ) -> Result<TaskManifest, Failure> {
     let fetching = Instant::now();
     let action_digest = digest::to_reapi(&cli.action);
@@ -282,15 +372,10 @@ pub async fn execute(
         &stdout,
         &stderr,
         cli.limits,
-        MAX_PACK_BYTES,
+        output_cap(limits),
     )
     .await?;
-    let mut held: Vec<Cow<'_, [u8]>> = Vec::new();
-    for digest in outputs.blobs.digests() {
-        held.extend(outputs.blobs.read(&digest)?);
-    }
-    let blobs: Vec<&[u8]> = held.iter().map(|bytes| bytes.as_ref()).collect();
-    // The manifest is part of the pack, so the time to build the pack ends here.
+    // The manifest is part of pack 0, so the time to build the packs ends here.
     let pack_ms = millis(packing.elapsed());
     let result = &outputs.result;
     let mut manifest = TaskManifest {
@@ -333,7 +418,52 @@ pub async fn execute(
             target: link.target.clone(),
         });
     }
-    sink.store(&build(&manifest, &blobs)?)?;
+    // Plan before anything is built or stored: pack 0 keeps room for the manifest as it will be
+    // written, with its `packs` and `large` fields.
+    let reserve = manifest
+        .to_json_with(MAX_LARGE_BYTES)
+        .map_err(PackError::from)?
+        .len() as u64
+        + MANIFEST_SLACK;
+    let sizes = outputs
+        .blobs
+        .digests()
+        .map(|d| digest_of(Some(&d)).map(|d| (d, d.size_bytes)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let planned = plan(&sizes, reserve, limits).map_err(PackError::from)?;
+    manifest.packs = u8::try_from(planned.packs.len()).unwrap_or(u8::MAX);
+    manifest.large = planned
+        .large
+        .iter()
+        .zip(0..)
+        .map(|(digest, slot)| LargeEntry {
+            slot,
+            digest: *digest,
+        })
+        .collect();
+
+    // Pack 0 is built, validated and read back first, so a manifest or a pack ingest would
+    // refuse fails the task before anything is stored. It is kept until the end, and the other
+    // packs are built one at a time, so about three packs are in memory at once.
+    let pack_0 = {
+        let held = held(&outputs.blobs, &planned.packs[0])?;
+        let blobs: Vec<&[u8]> = held.iter().map(|bytes| bytes.as_ref()).collect();
+        build(&manifest, &blobs)?
+    };
+    // The order is the commit order: large objects, packs N-1 down to 1, then pack 0, so a run
+    // whose pack 0 is absent is lost whatever else was written.
+    for (slot, digest) in planned.large.iter().enumerate() {
+        sink.store_large(slot, &outputs.blobs, digest)?;
+    }
+    for slot in (1..planned.packs.len()).rev() {
+        let pack = {
+            let held = held(&outputs.blobs, &planned.packs[slot])?;
+            let blobs: Vec<&[u8]> = held.iter().map(|bytes| bytes.as_ref()).collect();
+            build_extra(&blobs)?
+        };
+        sink.store_pack(slot, &pack)?;
+    }
+    sink.store_pack(0, &pack_0)?;
     Ok(manifest)
 }
 
@@ -413,18 +543,21 @@ fn credential(what: &str, file: Option<&Path>, flag: Option<&str>) -> Result<Str
     Ok(value.to_owned())
 }
 
-/// The URL the pack is PUT to: the single pack URL of the v1 flags, or, with a v2 key set, its
-/// first pack slot. The other slots are validated with the set and not used yet.
-fn pack_url(cli: &Cli) -> Result<String, Failure> {
+/// The URLs the run PUTs to: the key set of `--put-urls-file`/`--put-urls`, else the single pack
+/// URL of the v1 flags as a key set of one pack and no large object.
+fn put_urls(cli: &Cli) -> Result<PutUrls, Failure> {
     let set = PutUrls::from_sources(cli.put_urls_file.as_deref(), cli.put_urls.as_deref())
         .map_err(|e| Failure::Setup(format!("the v2 key set: {e}")))?;
     match set {
-        Some(mut set) => Ok(set.packs.swap_remove(0)),
-        None => credential(
-            "pack URL",
-            cli.pack_url_file.as_deref(),
-            cli.pack_url.as_deref(),
-        ),
+        Some(set) => Ok(set),
+        None => Ok(PutUrls {
+            packs: vec![credential(
+                "pack URL",
+                cli.pack_url_file.as_deref(),
+                cli.pack_url.as_deref(),
+            )?],
+            large: Vec::new(),
+        }),
     }
 }
 
@@ -443,7 +576,7 @@ fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
             std::fs::read(path).map_err(|e| Failure::Setup(format!("{}: {e}", path.display())))?,
         );
     }
-    let url = pack_url(cli)?;
+    let urls = put_urls(cli)?;
     let source = HttpBlobSource::new(&cli.grant_url, &token, &roots)?;
     let sink = HttpSink {
         agent: if cli.allow_plain_http_put {
@@ -451,7 +584,7 @@ fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
         } else {
             agent(Some(tls_config(&roots)))
         },
-        url,
+        urls,
         sleeper: Arc::new(ThreadSleeper),
     };
     Ok((source, sink))
@@ -511,3 +644,7 @@ mod tests;
 #[cfg(test)]
 #[path = "put_urls_flag_tests.rs"]
 mod put_urls_flag_tests;
+
+#[cfg(test)]
+#[path = "recording_sink.rs"]
+mod recording_sink;
