@@ -719,10 +719,14 @@ impl<C: Cas> NativeRuntime<C> {
             .await?;
         self.report_ignored_sigterm(work.lease_id, dir, &ignored);
         // A leader the end reaped (a timeout, a kill): the last read was before it.
-        if reaped.is_none()
-            && let Ok(reaped) = child.wait().await
-        {
-            watch.reaped(leader, reaped);
+        // (Already reaped there, so the wait gives the answer it kept.)
+        let late = if reaped.is_none() {
+            child.wait().await.ok()
+        } else {
+            None
+        };
+        if let Some(late) = late {
+            watch.reaped(leader, late);
         }
         *measured = watch.usage(started.elapsed());
         let did_fail = match &ended {

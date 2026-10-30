@@ -346,3 +346,34 @@ fn without_a_reap_the_total_is_the_last_polls_own_and_children_cpu() {
     poll(&mut meter, &[(10, proc_row(S, 2 * S, 1))]);
     assert_eq!(user_micros(&meter), 3_000_000);
 }
+
+/// Catches: the leader's last reading added to its reaped total. The leader was read at
+/// the first poll (1 s) and not at the second (it had exited, so the second poll found no
+/// pid), then reaped at 3 s: its reading is inside the reaped figure, which is the whole
+/// total, and the child that was alive at the second poll (2 s) is added once.
+#[test]
+fn a_leader_read_only_before_its_exit_is_counted_by_its_reap_alone() {
+    let mut meter = Meter::default();
+    poll(&mut meter, &[(10, proc_row(S, 0, 1))]);
+    poll(&mut meter, &[(11, proc_row(2 * S, 0, 1))]);
+    reap(&mut meter, 10, 3);
+    assert_eq!(user_micros(&meter), 3_000_000);
+}
+
+/// Catches: a reap with no poll at all reporting nothing, or a peak invented for it. The
+/// CPU is the reaped total (system time too) and the peak, which no poll read, is absent.
+#[test]
+fn a_reap_with_no_poll_reports_its_cpu_and_no_peak() {
+    let mut meter = Meter::default();
+    meter.reaped(
+        10,
+        Reaped {
+            user_micros: 700,
+            system_micros: 300,
+        },
+    );
+    let f = footprint(&meter.usage(SECOND, ONE_TO_ONE));
+    assert_eq!(f.cpu_user_micros, Some(700));
+    assert_eq!(f.cpu_system_micros, Some(300));
+    assert_eq!(f.peak_footprint_bytes, None);
+}

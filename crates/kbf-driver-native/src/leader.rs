@@ -114,11 +114,21 @@ impl Drop for Leader {
     }
 }
 
+/// Calls `call` again for as long as a signal interrupts it (EINTR).
+fn retrying<T>(mut call: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    loop {
+        match call() {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            done => return done,
+        }
+    }
+}
+
 /// Blocks until `pid`, a child of this process, has exited; reaps it and sets `reaped`
 /// under its lock.
 fn reap(pid: i32, reaped: &Mutex<bool>) -> io::Result<Reaped> {
     let id = libc::id_t::try_from(pid).map_err(io::Error::other)?;
-    loop {
+    retrying(|| {
         let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
         // FFI-BOUNDARY: `info` is this frame's; waitid writes a siginfo_t into it and keeps
         // no pointer. WNOWAIT leaves the child unreaped, so its pid stays this process's.
@@ -131,52 +141,163 @@ fn reap(pid: i32, reaped: &Mutex<bool>) -> io::Result<Reaped> {
                 libc::WEXITED | libc::WNOWAIT,
             )
         };
-        if done == 0 {
-            break;
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
+        (done == 0)
+            .then_some(())
+            .ok_or_else(io::Error::last_os_error)
+    })?;
     let mut flag = reaped.lock().unwrap_or_else(PoisonError::into_inner);
-    let result = wait4(pid);
+    let result = retrying(|| wait4(pid));
     // Reaped or gone (ECHILD): the pid is no longer ours either way.
     *flag = true;
     result
 }
 
-/// `wait4` of `pid`, which has exited.
+/// One `wait4` of `pid`, which has exited.
 fn wait4(pid: i32) -> io::Result<Reaped> {
     use std::os::unix::process::ExitStatusExt as _;
-    loop {
-        let mut status: libc::c_int = 0;
-        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-        // FFI-BOUNDARY: `status` and `usage` are this frame's; wait4 writes them and
-        // keeps no pointer. The child is reaped by this call, once.
-        // SAFETY: both pointers are writable and outlive the call.
-        let got = unsafe { libc::wait4(pid, &raw mut status, 0, usage.as_mut_ptr()) };
-        if got == pid {
-            // SAFETY: the call succeeded, so it filled the struct.
-            let usage = unsafe { usage.assume_init() };
-            let micros = |t: libc::timeval| {
-                u64::try_from(t.tv_sec)
-                    .unwrap_or(0)
-                    .saturating_mul(1_000_000)
-                    .saturating_add(u64::try_from(t.tv_usec).unwrap_or(0))
-            };
-            return Ok(Reaped {
-                status: ExitStatus::from_raw(status),
-                user_micros: micros(usage.ru_utime),
-                system_micros: micros(usage.ru_stime),
-            });
-        }
-        if got >= 0 {
-            return Err(io::Error::other("wait4 returned another pid"));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
+    let mut status: libc::c_int = 0;
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // FFI-BOUNDARY: `status` and `usage` are this frame's; wait4 writes them and keeps no
+    // pointer. The child is reaped by this call, once.
+    // SAFETY: both pointers are writable and outlive the call.
+    let got = unsafe { libc::wait4(pid, &raw mut status, 0, usage.as_mut_ptr()) };
+    // Without WNOHANG, wait4 of one pid answers that pid or -1.
+    if got != pid {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the call succeeded, so it filled the struct.
+    let usage = unsafe { usage.assume_init() };
+    let micros = |t: libc::timeval| {
+        u64::try_from(t.tv_sec)
+            .unwrap_or_default()
+            .saturating_mul(1_000_000)
+            .saturating_add(u64::try_from(t.tv_usec).unwrap_or_default())
+    };
+    Ok(Reaped {
+        status: ExitStatus::from_raw(status),
+        user_micros: micros(usage.ru_utime),
+        system_micros: micros(usage.ru_stime),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::Command;
+
+    use super::*;
+
+    /// A pid no process holds (above the kernel's pid limit).
+    const NO_SUCH: i32 = 2_000_000_000;
+
+    fn sleeper() -> Leader {
+        Leader::new(Command::new("sleep").arg("60").spawn().expect("sleep"))
+    }
+
+    /// Catches: a leader that is not killed (the wait would last a minute) or a kill that
+    /// reports the signal as an exit; the exit status carries SIGKILL.
+    #[tokio::test]
+    async fn a_kill_before_the_reap_ends_the_leader_with_sigkill() {
+        let mut leader = sleeper();
+        leader.start_kill().expect("signalled");
+        let reaped = leader.wait().await.expect("reaped");
+        assert_eq!(reaped.status.signal(), Some(libc::SIGKILL));
+    }
+
+    /// Catches: a signal sent to the pid of a leader already reaped, which the kernel
+    /// may have handed to another process. After the reap `start_kill` succeeds and
+    /// sends nothing: with a pid that no longer names a child it would fail with ESRCH
+    /// if it did send.
+    #[tokio::test]
+    async fn a_kill_after_the_reap_signals_nothing() {
+        let mut leader = Leader::new(Command::new("true").spawn().expect("true"));
+        let reaped = leader.wait().await.expect("reaped");
+        assert!(reaped.status.success());
+        leader.pid = NO_SUCH;
+        assert!(
+            leader.start_kill().is_ok(),
+            "a reaped leader is not signalled"
+        );
+    }
+
+    /// Catches: a failed signal reported as success; a pid that names no process fails.
+    #[test]
+    fn a_kill_the_system_refuses_is_an_error() {
+        let mut leader = sleeper();
+        let real = std::mem::replace(&mut leader.pid, NO_SUCH);
+        assert!(leader.start_kill().is_err());
+        leader.pid = real;
+    }
+
+    /// Catches: a second wait that waits again (a reaped pid answers ECHILD, or blocks on
+    /// another process) instead of the first answer, and an error forgotten after the
+    /// first call. A leader that was never a child fails the wait, and fails it the same
+    /// way every time.
+    #[tokio::test]
+    async fn every_wait_gives_the_first_answer() {
+        let mut leader = Leader::new(Command::new("true").spawn().expect("true"));
+        let first = leader.wait().await.expect("first");
+        assert_eq!(leader.wait().await.expect("second"), first);
+
+        let mut stranger = sleeper();
+        let real = std::mem::replace(&mut stranger.pid, NO_SUCH);
+        let first = stranger.wait().await.expect_err("not a child");
+        let second = stranger.wait().await.expect_err("still not");
+        assert_eq!(first.kind(), second.kind());
+        assert_eq!(first.to_string(), second.to_string());
+        stranger.pid = real;
+    }
+
+    /// Catches: a wait whose cancellation loses the reap: a call dropped before the
+    /// leader exits (a timeout) must leave the wait running, and the next call joins it
+    /// and gets the leader's status.
+    #[tokio::test]
+    async fn a_dropped_wait_is_joined_by_the_next() {
+        let mut leader = sleeper();
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(50), leader.wait()).await;
+        assert!(waited.is_err(), "the sleeper is still running");
+        leader.start_kill().expect("signalled");
+        let reaped = leader.wait().await.expect("joined");
+        assert_eq!(reaped.status.signal(), Some(libc::SIGKILL));
+    }
+
+    /// Catches: an interrupted call given up on, and any other error retried for ever.
+    #[test]
+    fn only_an_interrupted_call_is_retried() {
+        let mut calls = 0;
+        let got = retrying(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(got.expect("third call"), 3);
+        let mut calls = 0;
+        let got: io::Result<()> = retrying(|| {
+            calls += 1;
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        });
+        assert_eq!(
+            got.expect_err("not retried").kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(calls, 1);
+    }
+
+    /// Catches: a pid that is not a child waited for as if it were (the wait4 after a
+    /// successful waitid failing is reported, not swallowed): with nothing to reap the
+    /// call fails.
+    #[test]
+    fn wait4_of_a_process_that_is_not_a_child_fails() {
+        assert!(wait4(NO_SUCH).is_err());
+    }
+
+    /// Catches: a negative pid accepted for waitid's unsigned id.
+    #[test]
+    fn a_negative_pid_cannot_be_waited_for() {
+        assert!(reap(-1, &Mutex::new(false)).is_err());
     }
 }
