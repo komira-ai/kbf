@@ -22,7 +22,7 @@ listen                = "192.0.2.10:9300"
 proxy_id              = "tierstore-1"
 bucket                = "tierstore"
 region                = "eu-west-1"
-max_request_bytes     = 268435456
+max_request_bytes     = 134217728
 access_key_file       = "/etc/tierstore/access.key"
 read_only_key_files   = ["/etc/tierstore/daemons.key", "/etc/tierstore/other.key"]
 presign_key_files     = ["/etc/tierstore/pack-presign.key"]
@@ -70,7 +70,7 @@ pub(crate) fn golden_flags() -> Vec<&'static str> {
         "--proxy-id=tierstore-1",
         "--bucket=tierstore",
         "--region=eu-west-1",
-        "--max-request-bytes=268435456",
+        "--max-request-bytes=134217728",
         "--access-key-file=/etc/tierstore/access.key",
         "--read-only-key-file=/etc/tierstore/daemons.key",
         "--read-only-key-file=/etc/tierstore/other.key",

@@ -96,7 +96,8 @@ fn a_file_is_read_from_its_path_and_its_refusals_name_it() {
     let bad = dir.path().join("bad.toml");
     std::fs::write(&bad, golden_with("[cold_store]", "[cold_store]\nwhat = 1")).unwrap();
     let why = load(&bad, DEFAULTS).unwrap_err().to_string();
-    assert!(why.contains("bad.toml") && why.contains("what"), "{why}");
+    assert!(why.contains("bad.toml"), "{why}");
+    assert!(why.contains("what"), "{why}");
 }
 
 /// Asserts that a key or a table the format does not have is refused with its name, whichever
@@ -115,10 +116,13 @@ fn an_unknown_key_or_table_is_refused_by_name() {
         let why = refusal(&text);
         assert!(why.contains("bogus"), "{why}");
     }
-    let why = refusal(&golden_with("[server]", "[server]\nlisten = \"nowhere\""));
+    let why = refusal(&golden_with(
+        "listen                = \"192.0.2.10:9300\"",
+        "listen = \"nowhere\"",
+    ));
     assert!(why.contains("listen"), "{why}");
     let syntax = from_text("this is = not toml [", DEFAULTS);
-    assert!(matches!(syntax, Err(ConfigError::Syntax(_))));
+    assert!(matches!(syntax, Err(ConfigError::Syntax { .. })));
     let lines: Vec<&str> = GOLDEN
         .lines()
         .filter(|line| !line.starts_with("access_key_file"))
@@ -172,6 +176,85 @@ fn a_secret_in_the_file_is_refused_and_a_path_to_one_is_not() {
     let policy = format!("{GOLDEN}\n[[policy]]\nprefix = \"a/\"\ntoken = \"x\"\n");
     assert!(refusal(&policy).contains("policy.token"));
     assert!(from_text(GOLDEN, DEFAULTS).is_ok());
+}
+
+/// Asserts that a key whose name is a secret by another spelling is refused as one (any case, and
+/// the words `key`, `credentials`, `passphrase`, `apikey`, `psk`), without its value.
+#[test]
+fn a_secret_by_another_name_is_refused_without_its_value() {
+    let names = [
+        "Secret_Key",
+        "key",
+        "credentials",
+        "passphrase",
+        "ApiKey",
+        "psk",
+    ];
+    for name in names {
+        let why = refusal(&golden_with(
+            "[server]",
+            &format!("[server]\n{name} = \"SENTINEL\""),
+        ));
+        assert!(why.contains(name), "{why}");
+        assert!(why.contains("never in the file"), "{why}");
+        assert!(!why.contains("SENTINEL"), "{why}");
+    }
+}
+
+/// Asserts that no message about a fault in the file repeats the line or the value of the key:
+/// a key that is unknown (and so a secret by a name no rule knows), a line that is not TOML, a
+/// value of the wrong type, a size, a duration, a kind and a skipped check that are not valid. Each
+/// still says which key (and, but for a skipped check, where).
+#[test]
+fn a_fault_in_the_file_is_reported_without_the_value() {
+    let cases = [
+        (
+            golden_with("[server]", "[server]\npasskey = \"SENTINEL\""),
+            "passkey",
+        ),
+        (
+            golden_with("[server]", "[server]\nbroken = SENTINEL"),
+            "line ",
+        ),
+        (
+            golden_with(
+                "max_concurrent_puts   = 8",
+                "max_concurrent_puts = \"SENTINEL\"",
+            ),
+            "max_concurrent_puts",
+        ),
+        (
+            golden_with("budget             = \"500GiB\"", "budget = \"SENTINEL\""),
+            "budget",
+        ),
+        (
+            golden_with(
+                "presign_max_expires   = \"10m\"",
+                "presign_max_expires = \"SENTINEL\"",
+            ),
+            "presign_max_expires",
+        ),
+        (
+            golden_with("presign_max_expires   = \"10m\"", "presign_max_expires = 5"),
+            "presign_max_expires",
+        ),
+        (
+            golden_with("kind               = \"s3\"", "kind = \"SENTINEL\""),
+            "kind",
+        ),
+        (
+            golden_with(
+                "skip_checks      = [\"multipart-conditional=store-ignores-if-none-match-on-completion\"]",
+                "skip_checks = [\"SENTINEL\"]",
+            ),
+            "skip_checks",
+        ),
+    ];
+    for (text, want) in cases {
+        let why = refusal(&text);
+        assert!(why.contains(want), "{want}: {why}");
+        assert!(!why.contains("SENTINEL"), "{want}: {why}");
+    }
 }
 
 /// Asserts that `[local_cache]` is refused as not supported yet, with or without the other
@@ -361,6 +444,13 @@ fn a_policy_is_checked_and_has_no_effect_yet() {
     let policies = "\n[[policy]]\nprefix = \"cas/b/\"\n\n[[policy]]\nprefix = \"cas/d/\"\ncache = false\n\n[[policy]]\nprefix = \"\"\n";
     let with = from_text(&format!("{GOLDEN}{policies}"), DEFAULTS).unwrap();
     assert_eq!(with, from_text(GOLDEN, DEFAULTS).unwrap());
+    // An empty prefix (all the rest) with another after it, in either order, is no overlap.
+    let rest_first =
+        format!("{GOLDEN}\n[[policy]]\nprefix = \"\"\n\n[[policy]]\nprefix = \"a/\"\n");
+    assert_eq!(
+        from_text(&rest_first, DEFAULTS).unwrap(),
+        from_text(GOLDEN, DEFAULTS).unwrap()
+    );
     let refused = [
         (
             "prefix = \"a/\"\n\n[[policy]]\nprefix = \"a/\"",
@@ -448,7 +538,8 @@ fn every_flag_has_one_key_or_is_a_per_run_knob() {
                 ["server", "hot_store", "cold_store"].contains(&table),
                 "{key}"
             );
-            assert!(!name.is_empty() && !name.contains('.'), "{key}");
+            assert!(!name.is_empty(), "{key}");
+            assert!(!name.contains('.'), "{key}");
         }
     }
 }
@@ -462,12 +553,14 @@ fn the_readmes_document_every_flag_and_key() {
         std::fs::read_to_string(root.join("../../packaging/tierstore/README.md")).unwrap();
     let package = std::fs::read_to_string(root.join("README.md")).unwrap();
     for text in [&packaging, &package] {
-        assert!(text.contains("--config") && text.contains("--print-config"));
+        assert!(text.contains("--config"));
+        assert!(text.contains("--print-config"));
     }
     for (flag, keys) in KEYS {
         let mut rows = packaging.lines().filter(|line| line.starts_with('|'));
         let row = rows.find(|line| line.contains(&format!("`--{flag}`")));
-        let row = row.unwrap_or_else(|| panic!("no row for --{flag}"));
+        assert!(row.is_some(), "no row for --{flag}");
+        let row = row.unwrap();
         for key in *keys {
             assert!(
                 row.contains(&format!("`{key}`")),

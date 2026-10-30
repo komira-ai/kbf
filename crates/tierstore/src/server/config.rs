@@ -32,7 +32,10 @@ use std::time::Duration;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use super::cli::{Cli, DEFAULT_REGION, SkippedCheck, parse_duration, parse_skip};
+use super::cli::{
+    Cli, DEFAULT_MAX_CONCURRENT_PUTS, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_PUT_MIN_BYTES_PER_SEC,
+    DEFAULT_REGION, SkippedCheck, parse_duration, parse_skip,
+};
 use crate::journal::{JOURNAL_PREFIX, TIERING_PREFIX};
 
 /// The flags that stay flags: the file is for the data path, and these are per run.
@@ -96,7 +99,7 @@ pub(super) const DEFAULT_DRAIN_DEADLINE: Duration = Duration::from_secs(15 * 60)
 const RESERVED: [&str; 2] = [JOURNAL_PREFIX, TIERING_PREFIX];
 
 /// Why a start from the file `--config` names, or `--print-config`, is refused. Every one of
-/// them is a start that a restart cannot mend: the process exits with status 2.
+/// them but an unreadable file is a start that a restart cannot mend; all exit with status 2.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// The file could not be read.
@@ -108,9 +111,17 @@ pub enum ConfigError {
         source: std::io::Error,
     },
     /// The file is not TOML, or has a key or a table it must not (the message names it), or lacks
-    /// one it must, or a value of the wrong type.
-    #[error("{0}")]
-    Syntax(#[from] toml::de::Error),
+    /// one it must, or a value of the wrong type. The message holds the place and the key, never
+    /// the line or the value: the line may hold a secret, and the message goes to a journal.
+    #[error("line {line}, column {column}: {what}")]
+    Syntax {
+        /// The line of the fault, from 1.
+        line: usize,
+        /// The column of the fault, from 1.
+        column: usize,
+        /// What is wrong, without the value.
+        what: String,
+    },
     /// A key that holds a secret.
     #[error(
         "{key}: a secret is never in the file; give the path of the file that holds it (a key whose name ends in _file)"
@@ -170,7 +181,10 @@ impl<'de> Deserialize<'de> for Dur {
         let text = String::deserialize(deserializer)?;
         match parse_duration(&text) {
             Ok(duration) => Ok(Dur(duration)),
-            Err(why) => Err(de::Error::custom(why)),
+            // Not the reason of the flag: it holds the text, which the file's messages never repeat.
+            Err(_) => Err(de::Error::custom(
+                "not a duration; use a number and ms, s, m or h, as in 15m",
+            )),
         }
     }
 }
@@ -237,9 +251,7 @@ impl Visitor<'_> for SizeVisitor {
 
 /// A size: a whole number and `B`, `KiB`, `MiB`, `GiB` or `TiB`.
 fn parse_size(text: &str) -> Result<u64, String> {
-    let bad = || {
-        format!("{text:?} is not a size; use a number and B, KiB, MiB, GiB or TiB, as in 500GiB")
-    };
+    let bad = || "not a size; use a number and B, KiB, MiB, GiB or TiB, as in 500GiB".to_owned();
     let unit_at = text.find(|c: char| !c.is_ascii_digit()).ok_or_else(bad)?;
     let (digits, unit) = text.split_at(unit_at);
     let count: u64 = digits.parse().map_err(|_| bad())?;
@@ -457,15 +469,66 @@ fn tier(name: &str, table: &TierTable) -> Result<TierParts, ConfigError> {
 }
 
 /// Whether a key's name says it holds a secret: it has a word of one, or is a key itself and
-/// not the path of a file.
+/// not the path of a file. A hint for a message that says what to do, not a gate: what keeps a
+/// secret out of the file is that an unknown key is refused, and the name of a known key that
+/// takes a path (`credentials_file`) cannot tell a path from a secret by its value. The messages
+/// of the file never repeat a value, so a secret that is given anyway is not echoed.
 fn looks_secret(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
     if key.ends_with("_file") || key.ends_with("_files") {
         return false;
     }
-    let words = ["secret", "password", "token"];
+    let words = [
+        "secret",
+        "password",
+        "passphrase",
+        "token",
+        "credentials",
+        "apikey",
+        "psk",
+    ];
     words.iter().any(|word| key.contains(word))
+        || key == "key"
         || key.starts_with("access_key")
         || key.ends_with("_key")
+}
+
+/// The fault `error` found in `text`, as a [`ConfigError::Syntax`] that does not repeat the line
+/// or the value (the display of the `toml` error does: it shows the line, and its messages for a
+/// value of the wrong type show the value).
+fn syntax(text: &str, error: &toml::de::Error) -> ConfigError {
+    let at = error.span().map_or(0, |span| span.start).min(text.len());
+    let before = &text.as_bytes()[..at];
+    let line = before.iter().filter(|byte| **byte == b'\n').count() + 1;
+    let column = before
+        .iter()
+        .rev()
+        .take_while(|byte| **byte != b'\n')
+        .count()
+        + 1;
+    let (key, value) = match text.lines().nth(line - 1).and_then(|l| l.split_once('=')) {
+        Some((key, value)) => (Some(key.trim()), value.trim().trim_matches('"')),
+        None => (None, ""),
+    };
+    let message = error.message();
+    let shows_value = [
+        "invalid type",
+        "invalid value",
+        "invalid length",
+        "unknown variant",
+    ];
+    let what = if shows_value.iter().any(|start| message.starts_with(start)) {
+        let expected = message
+            .rsplit_once(", expected ")
+            .map_or("another value", |(_, expected)| expected);
+        let key = key.unwrap_or("a value");
+        format!("{key}: not a value this key takes (it is not shown); expected {expected}")
+    } else if value.is_empty() {
+        message.to_owned()
+    } else {
+        message.replace(value, "(value)")
+    };
+    ConfigError::Syntax { line, column, what }
 }
 
 /// Refuses the first key of `table` (and of the tables inside it) that looks like a secret.
@@ -562,7 +625,11 @@ fn settings(file: File, per_run: PerRun) -> Result<Cli, ConfigError> {
     for text in cold.skip_checks.iter().flatten() {
         match parse_skip(text) {
             Ok(skipped) => skip_backend_check.push(skipped),
-            Err(why) => return Err(invalid("cold_store.skip_checks", why)),
+            // Not the reason of the flag: it holds the text, free text that is never repeated.
+            Err(_) => {
+                let why = "each is CHECK=REASON; only multipart-conditional can be skipped, and it needs a reason";
+                return Err(invalid("cold_store.skip_checks", why));
+            }
         }
     }
     let hot_parts = tier("hot_store", &hot)?;
@@ -572,8 +639,12 @@ fn settings(file: File, per_run: PerRun) -> Result<Cli, ConfigError> {
     let percent = |key: &str, value: Option<u8>, default: u8| {
         within("hot_store", key, value.unwrap_or(default), 1, 100)
     };
-    let max_request_bytes = server.max_request_bytes.unwrap_or(256 << 20);
-    let max_concurrent_puts = server.max_concurrent_puts.unwrap_or(32);
+    let max_request_bytes = server
+        .max_request_bytes
+        .unwrap_or(DEFAULT_MAX_REQUEST_BYTES);
+    let max_concurrent_puts = server
+        .max_concurrent_puts
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_PUTS);
     let copy_parallel = hot.copy_parallel.unwrap_or(16);
     Ok(Cli {
         config: None,
@@ -623,7 +694,9 @@ fn settings(file: File, per_run: PerRun) -> Result<Cli, ConfigError> {
             1,
             u32::MAX,
         )?,
-        put_min_bytes_per_sec: server.put_min_bytes_per_sec.unwrap_or(1024),
+        put_min_bytes_per_sec: server
+            .put_min_bytes_per_sec
+            .unwrap_or(DEFAULT_PUT_MIN_BYTES_PER_SEC),
         put_rate_grace: duration(server.put_rate_grace, Duration::from_secs(30)),
         body_idle_timeout: duration(server.body_idle_timeout, Duration::from_secs(30)),
         skip_backend_check,
@@ -636,9 +709,9 @@ fn settings(file: File, per_run: PerRun) -> Result<Cli, ConfigError> {
 /// # Errors
 /// A [`ConfigError`]: text that is not a file of this format.
 pub(super) fn from_text(text: &str, per_run: PerRun) -> Result<Cli, ConfigError> {
-    let table: toml::Table = toml::from_str(text)?;
+    let table: toml::Table = toml::from_str(text).map_err(|e| syntax(text, &e))?;
     find_secret("", &table)?;
-    let file: File = toml::from_str(text)?;
+    let file: File = toml::from_str(text).map_err(|e| syntax(text, &e))?;
     settings(file, per_run)
 }
 

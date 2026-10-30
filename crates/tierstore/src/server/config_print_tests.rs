@@ -90,7 +90,11 @@ fn every_flag_is_given_in_one_of_the_round_trips() {
         .map(|word| word.split('=').next().unwrap().to_owned())
         .collect();
     let command = Cli::command();
-    for arg in command.get_arguments() {
+    // `--config` is the file itself: a round trip never gives it.
+    for arg in command
+        .get_arguments()
+        .filter(|arg| arg.get_long() != Some("config"))
+    {
         let long = arg.get_long().unwrap();
         assert!(given.contains(long), "--{long} is in no set of flags");
     }
@@ -159,15 +163,11 @@ fn flags_that_no_file_can_say_are_refused() {
         render(&cli).unwrap_err()
     };
     let why = with(&|cli| cli.hot = "tape".to_owned());
-    assert!(
-        matches!(&why, ConfigError::Invalid { key, .. } if key == "--hot"),
-        "{why}"
-    );
+    assert!(matches!(&why, ConfigError::Invalid { .. }), "{why}");
+    assert!(why.to_string().starts_with("--hot: "), "{why}");
     let why = with(&|cli| cli.cold = "/var/cold".to_owned());
-    assert!(
-        matches!(&why, ConfigError::Invalid { key, .. } if key == "--cold"),
-        "{why}"
-    );
+    assert!(matches!(&why, ConfigError::Invalid { .. }), "{why}");
+    assert!(why.to_string().starts_with("--cold: "), "{why}");
     let why = with(&|cli| cli.hot = "memory".to_owned());
     assert!(why.to_string().contains("hot_store.endpoint"), "{why}");
     let why = with(&|cli| cli.cold_endpoint = None);
@@ -177,7 +177,7 @@ fn flags_that_no_file_can_say_are_refused() {
     assert!(why.to_string().starts_with("--print-config: "), "{why}");
     let why = with(&|cli| cli.max_request_bytes = u64::MAX);
     assert!(
-        matches!(why, ConfigError::Syntax(_) | ConfigError::Print(_)),
+        matches!(why, ConfigError::Syntax { .. } | ConfigError::Print(_)),
         "{why}"
     );
 }

@@ -94,13 +94,13 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 #[error("{0}")]
 struct InvalidFlags(String);
 
-const DEFAULT_MAX_REQUEST_BYTES: u64 = 256 << 20;
+pub(super) const DEFAULT_MAX_REQUEST_BYTES: u64 = 256 << 20;
 
 /// The streamed bodies taken at once: 32 of them hold at most 32 x (16 MiB + a few pieces).
-const DEFAULT_MAX_CONCURRENT_PUTS: u32 = 32;
+pub(super) const DEFAULT_MAX_CONCURRENT_PUTS: u32 = 32;
 
 /// The least average rate of a body, in bytes a second.
-const DEFAULT_PUT_MIN_BYTES_PER_SEC: u64 = 1024;
+pub(super) const DEFAULT_PUT_MIN_BYTES_PER_SEC: u64 = 1024;
 
 /// The signing region of an S3 tier whose region is not given.
 pub(super) const DEFAULT_REGION: &str = "us-east-1";
@@ -816,8 +816,14 @@ pub fn main(args: Vec<OsString>) -> ExitCode {
 fn print_config(cli: &Cli) -> ExitCode {
     match render(cli) {
         Ok(text) => {
-            let _ = std::io::stdout().write_all(text.as_bytes());
-            ExitCode::SUCCESS
+            // A closed pipe or a full disk is not a printed file: say so.
+            match std::io::stdout().write_all(text.as_bytes()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(why) => {
+                    eprintln!("tierstore: --print-config: writing the file: {why}");
+                    ExitCode::from(1)
+                }
+            }
         }
         Err(why) => {
             eprintln!("tierstore: {why}");

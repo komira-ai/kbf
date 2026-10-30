@@ -8,7 +8,7 @@ use kbf_testkit::dir::TestDir;
 
 use super::{Launch, Refused, resolve};
 use crate::server::cli::Cli;
-use crate::server::config::{ConfigError, from_text};
+use crate::server::config::from_text;
 use crate::server::config_testing::{DEFAULTS, GOLDEN, golden_flags};
 
 fn words(words: &[&str]) -> Vec<OsString> {
@@ -24,9 +24,13 @@ fn with_file(name: &str) -> (TestDir, String) {
     (dir, path)
 }
 
-/// The refusal of a command line that has none of settings.
-fn refused(args: &[&str]) -> Refused {
-    resolve(words(args)).unwrap_err()
+/// The refusal of a command line that has none of settings: which kind it is, whether the
+/// parser would write it to stderr, and its text.
+fn refused(args: &[&str]) -> (&'static str, bool, String) {
+    match resolve(words(args)).unwrap_err() {
+        Refused::Usage(usage) => ("usage", usage.use_stderr(), usage.to_string()),
+        Refused::Config(why) => ("config", true, why.to_string()),
+    }
 }
 
 /// Asserts that without `--config` the flags are parsed as the parser parses them, and
@@ -39,7 +43,8 @@ fn flags_without_a_file_are_the_flags() {
     let mut printing = golden_flags();
     printing.push("--print-config");
     let launch = resolve(words(&printing)).unwrap();
-    assert!(launch.cli.print_config && !launch.from_file);
+    assert!(launch.cli.print_config);
+    assert!(!launch.from_file);
 }
 
 /// Asserts that with `--config` the settings are the file's, with the two parts of the drain from
@@ -86,18 +91,35 @@ fn a_file_with_a_data_path_flag_is_refused_naming_the_flags() {
         "--skip-backend-check",
         "multipart-conditional=x",
     ];
-    let Refused::Config(why) = refused(&given) else {
-        panic!("not a config refusal");
-    };
-    let ConfigError::Conflict { flags } = &why else {
-        panic!("{why}");
-    };
-    assert_eq!(flags, &["--listen", "--hot", "--skip-backend-check"]);
-    let text = why.to_string();
+    let (kind, _, text) = refused(&given);
+    assert_eq!(kind, "config");
     assert!(
-        text.contains("--listen, --hot, --skip-backend-check"),
+        text.contains("cannot be given with --listen, --hot, --skip-backend-check:"),
         "{text}"
     );
+    assert!(!text.contains("--drain-lb-wait,"), "{text}");
+}
+
+/// Asserts that a flag that has a default still conflicts with the file when it is given, even
+/// with the default's own value (`--region us-east-1`), and so does a flag that may be repeated,
+/// and that each of them is named alone.
+#[test]
+fn a_flag_given_with_its_default_value_still_conflicts_with_a_file() {
+    let (_dir, path) = with_file("tierstore-launch-default");
+    let cases = [
+        ["--region", "us-east-1", "--region"],
+        ["--critical", "95", "--critical"],
+        ["--read-only-key-file", "/k", "--read-only-key-file"],
+        ["--max-concurrent-puts", "32", "--max-concurrent-puts"],
+    ];
+    for [flag, value, named] in cases {
+        let (kind, _, text) = refused(&["tierstore", "--config", &path, flag, value]);
+        assert_eq!(kind, "config", "{flag}");
+        assert!(
+            text.contains(&format!("cannot be given with {named}:")),
+            "{flag}: {text}"
+        );
+    }
 }
 
 /// Asserts that `--print-config` writes the file for flags and is refused with `--config`, and
@@ -105,17 +127,13 @@ fn a_file_with_a_data_path_flag_is_refused_naming_the_flags() {
 #[test]
 fn print_config_is_refused_with_a_file_and_a_missing_file_is_named() {
     let (_dir, path) = with_file("tierstore-launch-print");
-    let Refused::Config(why) = refused(&["tierstore", "--config", &path, "--print-config"]) else {
-        panic!("not a config refusal");
-    };
-    assert!(matches!(why, ConfigError::PrintWithConfig), "{why}");
-    assert!(why.to_string().contains("--print-config"), "{why}");
-    let Refused::Config(why) = refused(&["tierstore", "--config", "/no/such/tierstore.toml"])
-    else {
-        panic!("not a config refusal");
-    };
-    assert!(matches!(why, ConfigError::Read { .. }), "{why}");
-    assert!(why.to_string().contains("/no/such/tierstore.toml"), "{why}");
+    let (kind, _, why) = refused(&["tierstore", "--config", &path, "--print-config"]);
+    assert_eq!(kind, "config");
+    assert!(why.contains("do not give it with --config"), "{why}");
+    let (kind, _, why) = refused(&["tierstore", "--config", "/no/such/tierstore.toml"]);
+    assert_eq!(kind, "config");
+    assert!(why.contains("reading the config file"), "{why}");
+    assert!(why.contains("/no/such/tierstore.toml"), "{why}");
 }
 
 /// Asserts that the usage and the version are shown (status 0) with or without a file, that no
@@ -130,10 +148,9 @@ fn the_usage_is_the_parsers_with_or_without_a_file() {
         vec!["tierstore", "--config", &path, "--help"],
     ];
     for args in shown {
-        let Refused::Usage(usage) = refused(&args) else {
-            panic!("{args:?}");
-        };
-        assert!(!usage.use_stderr(), "{args:?}");
+        let (kind, stderr, _) = refused(&args);
+        assert_eq!(kind, "usage", "{args:?}");
+        assert!(!stderr, "{args:?}");
     }
     let wrong = [
         vec!["tierstore"],
@@ -142,9 +159,8 @@ fn the_usage_is_the_parsers_with_or_without_a_file() {
         vec!["tierstore", "--config", &path, "--drain-lb-wait", "soon"],
     ];
     for args in wrong {
-        let Refused::Usage(usage) = refused(&args) else {
-            panic!("{args:?}");
-        };
-        assert!(usage.use_stderr(), "{args:?}");
+        let (kind, stderr, _) = refused(&args);
+        assert_eq!(kind, "usage", "{args:?}");
+        assert!(stderr, "{args:?}");
     }
 }
