@@ -85,6 +85,7 @@ pub mod cold_apply;
 pub mod config;
 pub mod drain;
 pub mod enroll;
+pub mod executor;
 pub mod farm;
 pub mod farm_js;
 mod fault;
