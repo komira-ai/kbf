@@ -57,8 +57,8 @@ pub enum ConfigError {
     /// A flag or the run file names a store for a role that is a machine.
     #[error("role {0} is not a store: it has no endpoint, bucket or key")]
     NotAStore(Role),
-    /// The byte caps are not `cell <= pass <= campaign`.
-    #[error("byte caps must satisfy cell <= pass <= campaign")]
+    /// The byte caps are not `pass <= cell <= campaign`.
+    #[error("byte caps must satisfy pass <= cell <= campaign")]
     CapOrder,
 }
 
@@ -255,7 +255,7 @@ impl RunConfig {
             pass: args.pass_cap_gib.saturating_mul(GIB),
             cell: args.cell_cap_gib.saturating_mul(GIB),
         };
-        if bytes.cell > bytes.pass || bytes.pass > bytes.campaign {
+        if bytes.pass > bytes.cell || bytes.cell > bytes.campaign {
             return Err(ConfigError::CapOrder);
         }
         let file = file.unwrap_or_default();
@@ -499,10 +499,10 @@ mod tests {
         assert!(matches!(err, ConfigError::NotAStore(Role::Generator)));
     }
 
-    /// Catches caps out of order, where a cell could write more than its pass or the campaign.
+    /// Catches caps out of order, where one pass could write more than its cell, or a cell more than the campaign.
     #[test]
     fn caps_out_of_order_are_refused() {
-        for extra in [["--cell-cap-gib", "9"], ["--campaign-cap-gib", "7"]] {
+        for extra in [["--pass-cap-gib", "21"], ["--campaign-cap-gib", "19"]] {
             let err = RunConfig::resolve(&args(&extra), None).unwrap_err();
             assert!(matches!(err, ConfigError::CapOrder));
         }
