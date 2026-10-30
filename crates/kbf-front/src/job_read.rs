@@ -62,6 +62,7 @@ use tonic::codegen::http::{Method, StatusCode};
 use crate::backend::Backend;
 use crate::cache::is_empty_blob;
 use crate::grants::{Claims, GrantError, Grants, Scope};
+use crate::large_backfill::LargeBackfill;
 use crate::metrics::{Counter, Families};
 use crate::proxy::MAX_UNTRUSTED_BLOB_BYTES;
 use crate::wire;
@@ -318,6 +319,7 @@ pub struct JobRead {
     blobs: [Counter; BLOB_STATUSES.len()],
     bytes: Arc<Counter>,
     ended_early: Arc<EndedEarly>,
+    backfill: Option<LargeBackfill>,
 }
 
 impl JobRead {
@@ -335,7 +337,16 @@ impl JobRead {
             blobs: Default::default(),
             bytes: Arc::default(),
             ended_early: Arc::default(),
+            backfill: None,
         }
+    }
+
+    /// This read, copying each large blob it streams to tierstore through `backfill` once it
+    /// has hashed to its digest ([`crate::large_backfill`]); `None` copies nothing.
+    #[must_use]
+    pub fn with_backfill(mut self, backfill: Option<LargeBackfill>) -> Self {
+        self.backfill = backfill;
+        self
     }
 
     /// The answer to `method` `path` with the `Authorization` header `authorization`.
@@ -621,6 +632,9 @@ impl JobRead {
             );
         }
         *out = families.0;
+        if let Some(backfill) = &self.backfill {
+            backfill.render_metrics(out);
+        }
     }
 
     /// [`JobRead::render_metrics`] when there is a job-facing read, and nothing when there
