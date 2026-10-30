@@ -23,6 +23,7 @@ use crate::test_dir::scratch_dir;
 
 /// The flags of a plain listener at `listen` with a grant secret in `dir` and no certificate.
 fn plain_flags(dir: &Path, listen: &str) -> JobReadFlags {
+    std::fs::create_dir_all(dir).expect("the directory");
     let secret = dir.join("grant.secret");
     std::fs::write(&secret, SECRET).expect("secret");
     std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).expect("mode");
