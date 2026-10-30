@@ -46,6 +46,12 @@
 //! layer it is empty metadata. [`routes`] and [`routes_with_execution`] allow every
 //! call.
 //!
+//! **The job-facing read.** A task on a worker holds a read grant ([`grants`]), not a client
+//! certificate, and fetches the inputs of its Action with `GET /<hex>/<size>`: [`job_read::JobRead`]
+//! answers, over any [`job_read::BlobSource`] (a [`Backend`] in a running frontend), only for the
+//! blobs in the grant's scope (its Action, Command and input tree). `kbf frontend --job-listen`
+//! serves it over HTTPS.
+//!
 //! **The build a call belongs to.** [`RequestMetadataLayer`], beside the
 //! authentication layer, reads each call's REAPI `RequestMetadata` header into a
 //! [`CallMetadata`] ([`call_metadata`]); its `tool_invocation_id` is the invocation id
@@ -71,9 +77,11 @@ mod finished_row;
 pub mod grants;
 mod input_tree;
 mod input_walk;
+pub mod job_read;
 mod meta_log;
 pub mod metrics;
 mod operations;
+pub mod prepare_run;
 mod proxy;
 mod qos_header;
 mod recorder;

@@ -4,7 +4,9 @@
 //! inputs, and starts a job whose arguments name both. The tool then
 //! 1. reads the Action, its Command and its input root through the read grant ([`fetch`]), checking
 //!    every blob's SHA-256 against its digest, and lays the input tree out under the working
-//!    directory;
+//!    directory. The tree is read breadth-first with at most `--fetch-concurrency` requests in
+//!    flight (32 by default) over pooled connections, and each file streams from the response to
+//!    disk through its digest check instead of being held in memory;
 //! 2. runs the Command there ([`run`]): its argv, environment and working directory, stdout and
 //!    stderr to files, under a deadline. The environment is the Command's own, preceded by `HOME`,
 //!    `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`, which name fresh directories
@@ -32,7 +34,9 @@
 //! 5. PUTs that object to the presigned URL ([`put`]): one create-only PUT, repeated only after a
 //!    503 (the store's hot tier is full and nothing was stored), at most three more times, each
 //!    after the wait the store's `Retry-After` names (whole seconds, at most 30; 2 s when it names
-//!    none). Every other answer, 412 included, is final.
+//!    none). Every other answer, 412 included, is final. The retries do not look at the URL's
+//!    expiry: they wait at most 90 s in all, and a retry the store gets after the URL expired is
+//!    refused (403), which is final, so the task fails (exit 13) and nothing is stored.
 //!
 //! `js-agent` returns nothing but an exit code, so the manifest travels inside the pack, and the exit
 //! code says only whether the farm did its part: 0 when the action ran and its pack was stored

@@ -71,6 +71,7 @@ use crate::{
     ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SystemClock, self_test,
 };
 
+use super::gc::{ensure_distinct as gc_distinct, gc_keys, ids as gc_ids};
 use super::keys::{ensure_distinct, read_credentials, read_only_keys};
 use super::presign::{ensure_distinct as presign_distinct, presign_keys};
 use super::{Drained, Server, ServerConfig};
@@ -202,6 +203,15 @@ pub struct Cli {
     /// its owner may read it (mode 0600).
     #[arg(long)]
     pub presign_key_file: Vec<PathBuf>,
+    /// A file that holds a GC key, JSON of exactly `access_key_id`, `secret_access_key` and
+    /// `prefix` (ending in `/`): a header-signed key that lists (ListObjectsV2 and
+    /// ListMultipartUploads with a prefix inside its own: authorized, served once ListMultipartUploads
+    /// lands, 501 until then), heads, deletes and aborts uploads
+    /// under the prefix and does nothing else (no get, no put, no bucket call); it is refused on a
+    /// presigned URL. Give the flag once for each such key; all key ids must differ. Only its
+    /// owner may read it (mode 0600).
+    #[arg(long)]
+    pub gc_key_file: Vec<PathBuf>,
     /// The longest `X-Amz-Expires` that a presigned URL may have, whatever the ceiling of its key
     /// says: a number and `ms`, `s`, `m` or `h`.
     #[arg(long, default_value = "15m", value_parser = parse_duration)]
@@ -232,7 +242,8 @@ pub struct Cli {
     /// The longest body of a request, in bytes: the longest object, and the longest part of a
     /// multipart upload. An upper bound on the length of what is streamed, not a bound on
     /// memory: the body of a put or of a part is passed on to the tiers as it arrives and is
-    /// never held whole. A body over it is refused with 413 and nothing is stored; a request
+    /// never held whole. A presigning key with a larger `max_object_bytes` is held to this too: the smaller of the two
+    /// applies, so raise this with the key's cap. A body over it is refused with 413 and nothing is stored; a request
     /// that says in its `Content-Length` that its body is longer is refused before any byte of
     /// it is read.
     #[arg(
@@ -496,9 +507,12 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     let read_only = read_only_keys(&cli.read_only_key_file)?;
     ensure_distinct(&key_id, &read_only).map_err(InvalidFlags)?;
     let presign = presign_keys(&cli.presign_key_file)?;
-    let others: Vec<&str> = std::iter::once(key_id.as_str())
+    let gc = gc_keys(&cli.gc_key_file)?;
+    let mut others: Vec<&str> = std::iter::once(key_id.as_str())
         .chain(read_only.iter().map(|key| key.id.as_str()))
         .collect();
+    gc_distinct(&others, &gc).map_err(InvalidFlags)?;
+    others.extend(gc_ids(&gc));
     presign_distinct(&others, &presign).map_err(InvalidFlags)?;
     let timeout = cli.s3_request_timeout;
     let hot = open_tier("--hot", &cli.hot, &cli.hot_s3(), timeout)?;
@@ -507,6 +521,7 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     let mut server = ServerConfig::new(&cli.bucket, &key_id, &secret, Arc::clone(&clock));
     server.read_only_keys = read_only;
     server.presign_keys = presign;
+    server.gc_keys = gc;
     server.presign_max_expires = cli.presign_max_expires;
     server.region = cli.region.clone();
     server.max_request_bytes = usize::try_from(cli.max_request_bytes).unwrap_or(usize::MAX);
