@@ -143,7 +143,7 @@ pub struct CacheConfig {
     /// The most an object may be for a ranged read of it to fill it.
     pub whole_limit: u64,
     /// The most fills that run at once. A miss that finds all of them running is served from
-    /// the upstream and keeps nothing.
+    /// the upstream and keeps nothing. At least one (0 is read as 1).
     pub max_concurrent_fills: usize,
 }
 
@@ -271,7 +271,7 @@ impl LocalCache {
         }
         let counters = Counters::default();
         add(&counters.discarded_at_start, scanned.discarded + removed);
-        let permits = Arc::new(Semaphore::new(config.max_concurrent_fills));
+        let permits = Arc::new(Semaphore::new(config.max_concurrent_fills.max(1)));
         let inner = Inner {
             upstream,
             disk,

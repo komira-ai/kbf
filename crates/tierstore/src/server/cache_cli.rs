@@ -7,9 +7,9 @@
 //! that answers one wrongly is exit status 3, as for a tier that fails its self-test), and asks
 //! the upstream a HEAD of a key that is not there, which it answers with 404 when it is up and
 //! the key is accepted (an upstream that does not answer is exit status 1: a restart may mend
-//! it). A `budget` above the size of the file system less the `free_floor` is refused as flags that
-//! cannot go together (exit status 2). The build node's upstream is read with a read-only key, so the write checks of the
-//! storage node's self-test are not run against it.
+//! it). A `budget` above the size of the file system less the `free_floor` is refused as
+//! flags that cannot go together (exit status 2). The build node's upstream is read with a
+//! read-only key, so the write checks of the storage node's self-test are not run against it.
 //!
 //! On SIGTERM or SIGINT the process drains as a storage node does; the eviction pass is the only
 //! thing running beside the server, and it stops with it. Nothing is owed to the upstream: no

@@ -85,9 +85,11 @@ async fn a_fill_that_panics_frees_its_key_and_its_waiters_get_an_error() {
 /// Asserts the order of the reservation: the bytes are reserved before the index is read. A fill
 /// of 50 bytes holds a reservation in a cache of 100 bytes (critical 95); a second reservation of
 /// 50 starts, and between its two steps the first fill commits (its object is in the index and its
-/// reservation is gone). The second is refused and gives its bytes back: the object is counted
-/// in the index. With the steps the other way round, the index is read before the commit and the
-/// reservation after it, and the object is counted in neither. A reservation that fits is kept.
+/// reservation is gone). The second is refused and gives its bytes back. With the steps the
+/// other way round, the index is read before the commit and the reservation after it, and the
+/// object is counted in neither. The bytes held before the second reservation already refuse
+/// it, so this test is red for that order only; it does not tell the index read from the
+/// reserved bytes. A reservation that fits is kept.
 #[tokio::test]
 async fn a_fill_that_commits_between_the_steps_of_a_reservation_is_counted() {
     let rig = Rig::with("tscache-reserve-race", |config| {

@@ -182,7 +182,9 @@ impl Inner {
     /// [`reserve`](Self::reserve), running `between` after the bytes are reserved and before the
     /// index is read. The order matters: a fill that commits puts its object in the index before
     /// it drops its reservation, so an object is in the reserved bytes or in the index (possibly
-    /// both, which only makes the count high), never in neither.
+    /// both, which only makes the count high), never in neither. A refused reservation
+    /// is counted while it is held, so a reservation made at the same time can be refused for it:
+    /// that costs a skipped fill, never room.
     pub(super) fn reserve_between(
         self: &Arc<Self>,
         size: u64,
@@ -238,12 +240,14 @@ impl Inner {
     /// that waited for it, and is counted.
     fn start(self: &Arc<Self>, key: &str, name: &Name, permit: OwnedSemaphorePermit) -> Pending {
         let (inner, key, name) = (Arc::clone(self), key.to_owned(), name.clone());
+        // Built before the spawn, so a task dropped before its first poll still takes its key out.
+        let flight = Flight {
+            inner: Arc::clone(&inner),
+            hex: name.hex.clone(),
+        };
         let task = tokio::spawn(async move {
             let _permit = permit;
-            let _flight = Flight {
-                inner: Arc::clone(&inner),
-                hex: name.hex.clone(),
-            };
+            let _flight = flight;
             inner.fill(&key, &name).await
         });
         let inner = Arc::clone(self);
