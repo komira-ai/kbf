@@ -12,6 +12,8 @@
 mod crash;
 #[path = "cache/edges.rs"]
 mod edges;
+#[path = "cache/input_counts.rs"]
+mod input_counts;
 #[path = "cache/measure.rs"]
 mod measure;
 #[path = "cache/one_cache.rs"]
