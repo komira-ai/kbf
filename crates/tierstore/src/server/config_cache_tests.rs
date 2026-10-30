@@ -398,7 +398,12 @@ fn a_storage_node_refuses_a_list_of_endpoints_and_a_cache_policy() {
         "[hot_store]\nendpoints = [\"http://h:1\"]\n",
         1,
     );
-    let cold = format!("{GOLDEN}endpoints = [\"http://c:1\"]\n");
+    // Put in [cold_store] itself, not at the end of the file, which ends with another table.
+    let cold = GOLDEN.replacen(
+        "[cold_store]\n",
+        "[cold_store]\nendpoints = [\"http://c:1\"]\n",
+        1,
+    );
     for (text, key) in [(hot, "hot_store.endpoints"), (cold, "cold_store.endpoints")] {
         let why = refusal(&text);
         assert!(why.contains(key), "{why}");
