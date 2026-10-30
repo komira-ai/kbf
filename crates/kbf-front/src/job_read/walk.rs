@@ -77,6 +77,14 @@ impl Budget {
     }
 }
 
+/// The Action or Directory blob `digest` names is not over [`MAX_SCOPE_BLOB_BYTES`].
+fn within_cap(digest: &Digest) -> Result<(), ScopeError> {
+    if digest.size_bytes > MAX_SCOPE_BLOB_BYTES {
+        return Err(ScopeError::Unusable);
+    }
+    Ok(())
+}
+
 /// The digests of the files and of the subdirectories one Directory names.
 type Entries = (Vec<Digest>, Vec<Digest>);
 
@@ -88,9 +96,7 @@ pub(super) async fn walk(
     action: Digest,
     most: usize,
 ) -> Result<Scope, ScopeError> {
-    if action.size_bytes > MAX_SCOPE_BLOB_BYTES {
-        return Err(ScopeError::Unusable);
-    }
+    within_cap(&action)?;
     let bytes = {
         let _room = budget.take(action.size_bytes).await;
         source.read_blob(&action).await?
@@ -132,9 +138,7 @@ async fn directory(
     if is_empty_blob(&digest) {
         return Ok((Vec::new(), Vec::new()));
     }
-    if digest.size_bytes > MAX_SCOPE_BLOB_BYTES {
-        return Err(ScopeError::Unusable);
-    }
+    within_cap(&digest)?;
     let bytes = {
         let _room = budget.take(digest.size_bytes).await;
         source.read_blob(&digest).await?
