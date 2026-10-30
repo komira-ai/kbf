@@ -50,6 +50,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -66,6 +67,7 @@ use crate::grants::{Claims, GrantError, Grants, Scope};
 use crate::metrics::{Counter, Families};
 use crate::proxy::MAX_UNTRUSTED_BLOB_BYTES;
 
+mod idle;
 mod locate;
 mod walk;
 
@@ -98,6 +100,9 @@ pub const HELD_CHUNK_BYTES: usize = 256 << 10;
 /// What a batch is charged for each gap between its blobs: the pack layer reads blobs that lie
 /// within this of each other in one range, and the slices of that range pin the gap.
 pub const BATCH_GAP_BYTES: u64 = 64 << 10;
+
+/// The default of [`Limits::held_idle`]: a minute.
+pub const DEFAULT_HELD_IDLE: Duration = Duration::from_secs(60);
 
 /// The default of [`Limits::read_budget_bytes`]: 1 GiB.
 pub const DEFAULT_READ_BUDGET_BYTES: u64 = 1 << 30;
@@ -222,6 +227,11 @@ pub struct Limits {
     /// What a streamed blob takes from the budget, at most its size. Not a flag; a test
     /// lowers it.
     pub stream_window: u64,
+    /// How long a body that holds budget may go with no chunk taken by its connection before
+    /// it is dropped, its budget given back and its response ended: a client that does not
+    /// read does not hold the budget for ever. It counts from the last chunk taken, so a client
+    /// that reads makes progress however long its response takes in all.
+    pub held_idle: Duration,
     /// The most bytes of one blob a response carries: a blob of more is 413, before anything
     /// is read.
     pub max_blob_bytes: u64,
@@ -248,6 +258,7 @@ impl Default for Limits {
             reads_in_flight: 32,
             read_budget_bytes: DEFAULT_READ_BUDGET_BYTES,
             stream_window: STREAM_WINDOW_BYTES,
+            held_idle: DEFAULT_HELD_IDLE,
             max_blob_bytes: DEFAULT_MAX_BLOB_BYTES,
             stream_over: STREAM_OVER_BYTES,
             scope_digests: 1 << 20,
@@ -277,6 +288,8 @@ pub struct Reply {
 #[derive(Debug)]
 struct Hold {
     _permits: Vec<Result<OwnedSemaphorePermit, AcquireError>>,
+    /// How long a body that keeps them may go with no chunk taken ([`Limits::held_idle`]).
+    idle: Duration,
 }
 
 impl Reply {
@@ -287,6 +300,7 @@ impl Reply {
     /// still has the bytes.
     pub fn held_stream(&mut self) -> Option<BlobStream> {
         let hold = self.hold.take()?;
+        let idle_limit = hold.idle;
         let body = std::mem::take(&mut self.body);
         let size = body.len();
         let pieces: Vec<Bytes> = (0..size)
@@ -303,7 +317,7 @@ impl Reply {
         .boxed();
         Some(BlobStream {
             size: size as u64,
-            chunks,
+            chunks: idle::bounded(chunks, idle_limit),
         })
     }
 }
@@ -336,6 +350,9 @@ pub enum StreamError {
     /// The source failed part way.
     #[error("the store failed part way: {0}")]
     Store(#[from] StorageError),
+    /// The client took no chunk for [`Limits::held_idle`]: the body was dropped.
+    #[error("the client did not read for the idle limit")]
+    Idle,
 }
 
 /// The streams that ended early, by cause.
@@ -547,6 +564,7 @@ impl JobRead {
                 let mut reply = self.serve(bytes);
                 reply.hold = Some(Hold {
                     _permits: vec![room],
+                    idle: self.limits.held_idle,
                 });
                 reply
             }
@@ -588,7 +606,10 @@ impl JobRead {
             frames.extend_from_slice(&bytes);
         }
         let mut reply = self.tally(&self.batches, Outcome::Ok, Bytes::from(frames));
-        reply.hold = Some(Hold { _permits: held });
+        reply.hold = Some(Hold {
+            _permits: held,
+            idle: self.limits.held_idle,
+        });
         reply
     }
 
@@ -744,7 +765,7 @@ impl JobRead {
         let mut reply = self.answer(Outcome::Ok, Bytes::new());
         reply.stream = Some(BlobStream {
             size: digest.size_bytes,
-            chunks,
+            chunks: idle::bounded(chunks, self.limits.held_idle),
         });
         reply
     }

@@ -188,6 +188,7 @@ impl JobRead {
         let mut reply = self.tally(&self.locate.requests, Outcome::Ok, Bytes::from(body));
         reply.hold = Some(Hold {
             _permits: vec![room],
+            idle: self.limits.held_idle,
         });
         reply
     }

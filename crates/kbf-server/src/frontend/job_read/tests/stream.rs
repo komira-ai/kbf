@@ -234,6 +234,11 @@ fn the_cap_and_the_reads_in_flight_are_flags_with_the_design_defaults() {
     assert_eq!(default.max_blob_bytes, 536_870_912);
     assert_eq!(default.reads_in_flight, 32);
     assert_eq!(default.read_budget_bytes, 1_073_741_824);
+    assert_eq!(default.read_idle_secs, 60);
+    assert_eq!(
+        default.read_idle_secs,
+        Limits::default().held_idle.as_secs()
+    );
     assert_eq!(
         default.read_budget_bytes,
         Limits::default().read_budget_bytes
@@ -247,7 +252,9 @@ fn the_cap_and_the_reads_in_flight_are_flags_with_the_design_defaults() {
         "--job-max-blob-bytes=1048576",
         "--job-reads-in-flight=4",
         "--job-read-budget-bytes=4096",
+        "--job-read-idle-secs=5",
     ]);
+    assert_eq!(set.read_idle_secs, 5);
     assert_eq!(set.read_budget_bytes, 4096);
     assert_eq!(set.max_blob_bytes, 1_048_576);
     assert_eq!(set.reads_in_flight, 4);
@@ -255,6 +262,7 @@ fn the_cap_and_the_reads_in_flight_are_flags_with_the_design_defaults() {
         "--job-max-blob-bytes=0",
         "--job-reads-in-flight=0",
         "--job-read-budget-bytes=0",
+        "--job-read-idle-secs=0",
     ] {
         assert!(with(&[zero]).is_err(), "{zero}");
     }
@@ -273,9 +281,11 @@ async fn the_flags_are_the_limits_of_the_listener() {
     flags.max_blob_bytes = 1_048_576;
     flags.reads_in_flight = 4;
     flags.read_budget_bytes = 4096;
+    flags.read_idle_secs = 5;
     let prepared = prepare(&flags).expect("prepared");
     assert_eq!(prepared.limits.max_blob_bytes, 1_048_576);
     assert_eq!(prepared.limits.reads_in_flight, 4);
     assert_eq!(prepared.limits.read_budget_bytes, 4096);
+    assert_eq!(prepared.limits.held_idle, std::time::Duration::from_secs(5));
     assert_eq!(prepared.limits.stream_over, Limits::default().stream_over);
 }
