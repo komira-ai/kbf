@@ -60,6 +60,9 @@ const DEFAULT_RUN_WALL_SECS: u64 = 7_200;
 #[cfg(test)]
 const DEFAULT_URL_SLACK_SECS: u64 = 600;
 
+/// The cap of a large object when `--task-large-max-bytes` is left out: 512 MiB.
+const DEFAULT_LARGE_MAX_BYTES: u64 = 536_870_912;
+
 /// The longest wall or slack a flag takes, in seconds: the 4 hour ceiling of a presigned write
 /// ([`kbf_front::prepare_run::MAX_EXPIRY`]).
 const MAX_SECS: u64 = kbf_front::prepare_run::MAX_EXPIRY.as_secs();
@@ -208,6 +211,14 @@ pub struct TaskFlags {
     pub max_digests: usize,
     /// `--task-closure-max-bytes`.
     pub max_bytes: u64,
+    /// `--task-max-packs`.
+    pub max_packs: u8,
+    /// `--task-max-large`.
+    pub max_large: u8,
+    /// `--task-large-credentials-file`.
+    pub large_credentials_file: Option<PathBuf>,
+    /// `--task-large-max-bytes`.
+    pub large_max_bytes: u64,
 }
 
 /// The setting the flags in `m` make: `None` unless `--task-secret-file` is given.
@@ -238,6 +249,10 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<Option<TaskFlags>, String> 
         url_slack: secs(URL_SLACK),
         max_digests: usize::try_from(digests).unwrap_or(usize::MAX),
         max_bytes: m.get_one::<u64>(MAX_BYTES).copied().unwrap_or_default(),
+        max_packs: 1,
+        max_large: 0,
+        large_credentials_file: None,
+        large_max_bytes: DEFAULT_LARGE_MAX_BYTES,
     }))
 }
 
@@ -289,6 +304,8 @@ impl TaskFlags {
                 bucket: self.put_bucket.clone(),
                 key,
             },
+            max_packs: 1,
+            large: None,
             read_url: self.read_url.clone(),
             run_wall: self.run_wall,
             slack: self.url_slack,

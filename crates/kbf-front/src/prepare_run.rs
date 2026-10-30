@@ -36,7 +36,7 @@ mod closure;
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kbf_pack::{TaskKeyError, check_build};
+use kbf_pack::{MAX_LARGE, MAX_PACKS, MAX_RECORD_BYTES, TaskKeyError, check_build};
 use kbf_types::Digest;
 use tierstore::server::presign::PresignError;
 use tierstore::server::{PresignRequest, presign_put};
@@ -111,6 +111,16 @@ pub enum ConfigError {
     /// The configured wall and slack give no usable expiry.
     #[error(transparent)]
     Expiry(#[from] ExpiryError),
+    /// The number of pack keys a run gets is not 1 to [`MAX_PACKS`].
+    #[error("{0} packs per run is not 1 to {MAX_PACKS}")]
+    Packs(u8),
+    /// The number of large-object keys a run gets is more than [`MAX_LARGE`].
+    #[error("{0} large objects per run is more than {MAX_LARGE}")]
+    LargeObjects(u8),
+    /// The cap of a large object is not above what a pack record may hold, or it would not be
+    /// a large object.
+    #[error("a large object cap of {0} bytes is not above {MAX_RECORD_BYTES}")]
+    LargeCap(u64),
 }
 
 /// `(scheme, authority)` of `url` if it is `scheme://host[:port]` and nothing more: no path (not
@@ -193,6 +203,23 @@ pub struct PutTarget {
     pub key: AccessKey,
 }
 
+/// Where a task writes its large objects, and the credential that signs those writes.
+///
+/// A large object is a raw output blob over [`MAX_RECORD_BYTES`], which a pack cannot hold. It
+/// is signed with a credential of its own (a key of the tier store whose prefix allows objects
+/// up to [`LargeTarget::max_bytes`]); the endpoint, the region and the bucket are the pack
+/// target's.
+#[derive(Clone, Debug)]
+pub struct LargeTarget {
+    /// The presign-only credential for large objects.
+    pub key: AccessKey,
+    /// The large-object keys each run gets: 0 to [`MAX_LARGE`].
+    pub max_objects: u8,
+    /// The most bytes of one large object, above [`MAX_RECORD_BYTES`]: the cap the task and
+    /// [`crate::ingest`] hold an object to.
+    pub max_bytes: u64,
+}
+
 /// What a [`RunPrep`] is built from.
 #[derive(Debug)]
 pub struct RunPrepConfig {
@@ -201,8 +228,13 @@ pub struct RunPrepConfig {
     pub mint: PackKeyMint,
     /// The key the read grants are made under: the one the job-facing listener verifies with.
     pub grant_key: GrantKey,
-    /// Where a task writes its pack.
+    /// Where a task writes its packs.
     pub put: PutTarget,
+    /// The pack keys each run gets, 1 to [`MAX_PACKS`].
+    pub max_packs: u8,
+    /// Where a task writes its large objects; `None` gives every run no large key, and a run
+    /// the size of one pack set.
+    pub large: Option<LargeTarget>,
     /// The base URL of the job-facing read listener, `https://host[:port]`.
     pub read_url: String,
     /// The run wall limit every run is prepared for by [`RunPrep::prepare_run`].
@@ -277,17 +309,54 @@ pub struct ReadGrant {
     pub not_after: u64,
 }
 
-/// What the executor delivers to the task of one run.
-pub struct RunInputs {
-    /// The key the task may write, to pass to [`crate::ingest`] when the run ends.
+/// One object a task may write: its key and the presigned `PUT` of exactly that key.
+#[derive(Clone)]
+pub struct PutGrant {
+    /// The key, to pass to [`crate::ingest`] when the run ends.
     pub key: IssuedPackKey,
-    /// A presigned `PUT` of exactly [`RunInputs::key`]. Its query carries a signature: a secret
+    /// A presigned `PUT` of exactly [`PutGrant::key`]. Its query carries a signature: a secret
     /// until it expires.
     pub put_url: String,
+}
+
+impl fmt::Debug for PutGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PutGrant")
+            .field("key", &self.key)
+            .field("put_url", &"<redacted>")
+            .finish()
+    }
+}
+
+/// What the executor delivers to the task of one run.
+///
+/// The run's key set is [`RunInputs::packs`] (slots `0..N`) then [`RunInputs::large`] (slots
+/// `L0..L<M>`), each with its write; [`RunInputs::keys`] lists the keys in that order for
+/// [`crate::ingest`]. `key` and `put_url` are `packs[0]`, for a caller that writes one pack.
+pub struct RunInputs {
+    /// The key of pack 0, which holds the manifest: `packs[0].key`.
+    pub key: IssuedPackKey,
+    /// The write of pack 0: `packs[0].put_url`.
+    pub put_url: String,
+    /// The packs the task may write, in slot order: 1 to [`MAX_PACKS`] of them, never empty.
+    pub packs: Vec<PutGrant>,
+    /// The large objects the task may write, in slot order `L0..`: none unless the preparer
+    /// has a large credential.
+    pub large: Vec<PutGrant>,
     /// How the task reads the Action, its Command and its inputs.
     pub read_grant: ReadGrant,
     /// What the task may read.
     pub closure: InputClosure,
+}
+
+impl RunInputs {
+    /// Every key of the run, packs then large objects, each in slot order: the set
+    /// [`crate::ingest`] verifies.
+    #[must_use]
+    pub fn keys(&self) -> Vec<IssuedPackKey> {
+        let grants = self.packs.iter().chain(&self.large);
+        grants.map(|grant| grant.key.clone()).collect()
+    }
 }
 
 impl fmt::Debug for RunInputs {
@@ -295,6 +364,8 @@ impl fmt::Debug for RunInputs {
         f.debug_struct("RunInputs")
             .field("key", &self.key)
             .field("put_url", &"<redacted>")
+            .field("packs", &self.packs)
+            .field("large", &self.large)
             .field("read_grant", &self.read_grant)
             .field("inputs", &self.closure.input_count())
             .finish_non_exhaustive()
@@ -309,6 +380,8 @@ pub struct RunPrep {
     mint: PackKeyMint,
     grants: Grants,
     put: PutTarget,
+    max_packs: u8,
+    large: Option<LargeTarget>,
     read_url: String,
     run_wall: Duration,
     slack: Duration,
@@ -316,6 +389,13 @@ pub struct RunPrep {
 }
 
 impl RunPrep {
+    /// The most bytes of one large object, if runs get large keys: what a task and
+    /// [`crate::ingest`] hold an object to.
+    #[must_use]
+    pub fn large_max_bytes(&self) -> Option<u64> {
+        self.large.as_ref().map(|large| large.max_bytes)
+    }
+
     /// The mint that signs this preparer's keys: the one [`crate::ingest`] must verify a
     /// run's pack key with. It can mint as well as verify, so only the frontend's own code
     /// holds it (the executor beside it); nothing a task or a client reaches is given it.
@@ -335,6 +415,8 @@ impl RunPrep {
             mint,
             grant_key,
             put,
+            max_packs,
+            large,
             read_url,
             run_wall,
             slack,
@@ -353,11 +435,24 @@ impl RunPrep {
             return Err(ConfigError::Empty("region"));
         }
         expiry_secs(run_wall, slack)?;
+        if !(1..=MAX_PACKS).contains(&max_packs) {
+            return Err(ConfigError::Packs(max_packs));
+        }
+        if let Some(large) = &large {
+            if large.max_objects > MAX_LARGE {
+                return Err(ConfigError::LargeObjects(large.max_objects));
+            }
+            if large.max_bytes <= MAX_RECORD_BYTES {
+                return Err(ConfigError::LargeCap(large.max_bytes));
+            }
+        }
         Ok(Self {
             backend,
             mint,
             grants: Grants::system(grant_key),
             put,
+            max_packs,
+            large,
             read_url,
             run_wall,
             slack,
@@ -408,23 +503,41 @@ impl RunPrep {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| PrepareError::Clock)?;
         let closure = self.closure(action).await?;
-        let key = self.mint.mint(lease, action, now)?;
-        let put_url = presign_put(
-            &self.put.key,
-            &PresignRequest {
-                endpoint: &self.put.endpoint,
-                region: &self.put.region,
-                bucket: &self.put.bucket,
-                key: key.key(),
-                expires_secs,
-                now: u64::try_from(since.as_millis()).unwrap_or(u64::MAX),
-            },
-        )?;
+        // One key per object the task may write: packs `0..N`, then large objects `L0..L<M>`.
+        let (n_packs, n_large) = (1, 0);
+        let keys = self.mint.mint_set(lease, action, now, n_packs, n_large)?;
+        let now_ms = u64::try_from(since.as_millis()).unwrap_or(u64::MAX);
+        let mut grants = Vec::with_capacity(keys.len());
+        for (at, key) in keys.into_iter().enumerate() {
+            let signer = match self.large.as_ref() {
+                Some(large) if at >= usize::from(n_packs) => &large.key,
+                _ => &self.put.key,
+            };
+            let put_url = presign_put(
+                signer,
+                &PresignRequest {
+                    endpoint: &self.put.endpoint,
+                    region: &self.put.region,
+                    bucket: &self.put.bucket,
+                    key: key.key(),
+                    expires_secs,
+                    now: now_ms,
+                },
+            )?;
+            grants.push(PutGrant { key, put_url });
+        }
+        let large = grants.split_off(usize::from(n_packs));
         let not_after = since.as_secs().saturating_add(expires_secs);
         let token = self.grants.issue(lease, *action, not_after)?;
+        let first = grants.first().cloned().ok_or(MintError::SetSize {
+            packs: n_packs,
+            large: n_large,
+        })?;
         Ok(RunInputs {
-            key,
-            put_url,
+            key: first.key,
+            put_url: first.put_url,
+            packs: grants,
+            large,
             read_grant: ReadGrant {
                 url: self.read_url.clone(),
                 token,
