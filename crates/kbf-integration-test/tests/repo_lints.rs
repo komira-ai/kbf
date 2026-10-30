@@ -59,7 +59,7 @@
 //!   does not leak (module `scratch_dirs`, whose docs say what it misses);
 //! - a `.rs` file under `crates/` whose comments or names narrate how a test was checked
 //!   instead of the defect it catches (module `test_wording`, whose docs state the rule);
-//! - a `kbf-server` integration test that opens a `file://` cold store without naming its
+//! - a test that opens a `file://` cold store without naming its
 //!   free-space floor (module `store_floor`, whose docs say what it misses);
 //! - the scans passing vacuously because git listed nothing, no Markdown file was
 //!   scanned or the workflows moved;

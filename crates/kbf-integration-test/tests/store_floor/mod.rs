@@ -1,25 +1,55 @@
-//! A `kbf-server` integration test that opens a `file://` cold store names its free-space floor.
+//! A test that opens a `file://` cold store names its free-space floor.
 //!
 //! A cold store on a file system refuses a write once the free space would fall under its
 //! floor, by default 5% of the file system's size. On a CI runner the free space falls while
 //! the instrumented coverage build fills the disk, so a test that writes through a store at
 //! the default floor passes or fails with the state of the runner's disk. A rig that is not
-//! testing the floor passes `--cold-store-floor-bytes` (1 is enough); the rule is per file
-//! under `crates/kbf-server/tests/`: a file whose code names `--cold-store` and a
-//! `file://{..}` URI built from a directory must also name `cold-store-floor-bytes`.
+//! testing the floor passes `--cold-store-floor-bytes` (1 is enough), or opens its `FsStore`
+//! with `Floor::Bytes`; the rule is per test file (under a `tests/` directory, or named
+//! `*tests.rs`) in any crate: a file whose code names `--cold-store` and a `file://{..}`
+//! URI built from a directory must also name `cold-store-floor-bytes` or `Floor::Bytes`.
 //!
-//! What it catches: a new rig in that directory that builds a cold store directory and
-//! never sets a floor. What it misses: a floor set in one rig of a file and not another,
-//! a floor set in a file that has a second rig without one, rigs outside that directory,
-//! and a file that builds its flags some other way (`--config`, a variable URI scheme).
+//! What it catches: a new test rig that builds a cold store directory and never sets a
+//! floor. What it misses: a floor set in one rig of a file and not another, harness code
+//! outside test files (`kbf-integration-test/src`, `kbf-harness/src`, which build the
+//! cells' and units' flags), and a file that builds its flags some other way (`--config`,
+//! a variable URI scheme).
 
 /// Files that name a cold store directory and no floor, and why that is fine.
-const ALLOWED: &[(&str, &str)] = &[(
-    "crates/kbf-server/tests/scheduler_core_flag.rs",
-    "its cold store is a path that does not exist and the test only parses the flag set",
-)];
+const ALLOWED: &[(&str, &str)] = &[
+    (
+        "crates/kbf-server/tests/scheduler_core_flag.rs",
+        "its cold store is a path that does not exist and the test only parses the flag set",
+    ),
+    (
+        "crates/kbf-cli/src/node_tests.rs",
+        "its cold store is an s3 URI; the file:// URI is the hot store's, and nothing is started",
+    ),
+    (
+        "crates/kbf-cli/src/preflight/traverse_tests.rs",
+        "paths that do not exist, checked by the preflight and never opened",
+    ),
+    (
+        "crates/kbf-cli/tests/preflight.rs",
+        "its cold store is an s3 URI; the file:// URI is the hot store's, and nothing writes",
+    ),
+    (
+        "crates/kbf-cli/tests/config_process.rs",
+        "starts a node from a settings file and stops it, with no blob written; the file's values are strings",
+    ),
+    (
+        "crates/kbf-integration-test/tests/m2.rs",
+        "compares the cell's flag list with an exact expected line; the cell runs in its own job",
+    ),
+];
 
-const DIR: &str = "crates/kbf-server/tests/";
+/// Whether a path is test code: under a `tests/` directory, or a file named `*tests.rs`.
+fn is_test_file(path: &str) -> bool {
+    path.starts_with("crates/")
+        && path.ends_with(".rs")
+        && (path.contains("/tests/") || path.ends_with("tests.rs"))
+        && !path.starts_with("crates/kbf-integration-test/tests/store_floor/")
+}
 
 /// The scanned text of a file: its comment lines are blank.
 fn code_of(text: &str) -> String {
@@ -41,6 +71,7 @@ fn lacks_floor(text: &str) -> bool {
     code.contains("--cold-store")
         && code.contains("file://{")
         && !code.contains("cold-store-floor-bytes")
+        && !code.contains("Floor::Bytes")
 }
 
 /// What is wrong with the files, one line each.
@@ -48,7 +79,7 @@ fn problems(files: &[(String, Vec<u8>)], allowed: &[(&str, &str)]) -> Vec<String
     let mut out = Vec::new();
     let mut hit_allowed = Vec::new();
     for (path, bytes) in files {
-        if !path.starts_with(DIR) || !path.ends_with(".rs") {
+        if !is_test_file(path) {
             continue;
         }
         if !lacks_floor(&String::from_utf8_lossy(bytes)) {
@@ -80,12 +111,12 @@ fn server_test_rigs_set_the_cold_store_floor() {
     let root = super::repo_root();
     let files: Vec<(String, Vec<u8>)> = super::listed_files(&root)
         .into_iter()
-        .filter(|f| f.starts_with(DIR) && f.ends_with(".rs"))
+        .filter(|f| is_test_file(f))
         .filter_map(|f| super::read_bytes(&root.join(&f)).map(|b| (f, b)))
         .collect();
     assert!(
-        files.len() > 20,
-        "the scan read only {} files under {DIR}",
+        files.len() > 100,
+        "the scan read only {} test files",
         files.len()
     );
     assert_eq!(problems(&files, ALLOWED), Vec::<String>::new());
@@ -111,7 +142,11 @@ fn the_scan_finds_a_rig_without_a_floor() {
         ),
         (path, "// \"--cold-store\" file://{}"),
         (path, "format!(\"--cold-store=s3://b\")"),
-        ("crates/kbf-cli/tests/x.rs", bare),
+        ("crates/kbf-cli/src/lib.rs", bare),
+        (
+            path,
+            "Floor::Bytes(1); format!(\"--cold-store=file://{}\", d)",
+        ),
     ] {
         assert_eq!(
             problems(&file(p, text), &[]),
