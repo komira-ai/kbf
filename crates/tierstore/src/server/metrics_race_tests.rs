@@ -139,15 +139,16 @@ async fn a_get_dropped_during_the_copy_counts_the_hit_and_no_promotion() {
 /// Asserts that a copy refused because the hot tier answered "full" counts `full`, and that the
 /// next cold read, while the hot tier is taken to be full, counts `critical` and sends no put to
 /// the hot tier: `critical` is the skip under a latched full as well as under the usage. The
-/// usage is read again only after an hour, so the latch holds for the whole test. It would catch
-/// a latched skip counted as `full`, or a skip that still sends the put.
-#[tokio::test]
+/// test runs on the paused clock of tokio, which the latch reads and which never advances here,
+/// so the latch holds for the whole test and nothing waits. It would catch a latched skip counted
+/// as `full`, or a skip that still sends the put.
+#[tokio::test(start_paused = true)]
 async fn a_copy_skipped_under_a_latched_full_counts_critical() {
     let (hot_mem, cold) = (memory(), memory());
     cold.put("a", Bytes::from_static(b"aaa")).await.unwrap();
     cold.put("b", Bytes::from_static(b"bbb")).await.unwrap();
     let hot = Arc::new(FaultyBackend::new(hot_mem));
-    let proxy = proxy(hot.clone(), cold, Duration::from_secs(3600)).await;
+    let proxy = proxy(hot.clone(), cold, Duration::from_secs(60)).await;
     let before = hot.calls(Op::Put);
     hot.fail_next_with(Op::Put, Error::Full("a".to_owned()));
     assert_eq!(proxy.get("a", None).await.unwrap(), "aaa");

@@ -87,18 +87,24 @@ rate(tierstore_bytes_read_total{tier="cold"}[5m]) / rate(tierstore_bytes_served_
 
 ### Local cache
 
-A build node's cache counts under `tierstore_cache_*`. Until those series take the shared names, a
-query over every tier reads them as `tier="local"`:
+When the build-node cache (`local_cache`) is configured, its block of `tierstore_cache_*` series
+also renders, after the proxy's. Until those series take the shared names, a query over every tier
+reads them as follows:
 
 | shared series | `tierstore_cache_*` series |
 |---|---|
 | `tierstore_hits_total{tier="local",op="get"}` | `tierstore_cache_hits_total` |
 | `tierstore_misses_total{tier="local",op="get"}` | `tierstore_cache_misses_total` |
+| `tierstore_hits_total{tier="local",op="head"}`, `tierstore_misses_total{tier="local",op="head"}` | `tierstore_cache_head_hits_total`, `tierstore_cache_head_misses_total` |
 | `tierstore_bytes_served_total{tier="local"}` | `tierstore_cache_bytes_served_local_total` |
+| `tierstore_bytes_served_total{tier="cold"}` (the cache's upstream is the cold store) | `tierstore_cache_bytes_served_upstream_total` |
+| `tierstore_reads_total{tier="cold",op}` | `tierstore_cache_upstream_reads_total{op}` |
+| `tierstore_bytes_read_total{tier="cold"}` | `tierstore_cache_upstream_bytes_read_total` |
 
 Its hit rate is `rate(tierstore_cache_hits_total[5m]) / (rate(tierstore_cache_hits_total[5m]) +
-rate(tierstore_cache_misses_total[5m]))`. Its other series (fills, skips, evictions) have no
-counterpart here.
+rate(tierstore_cache_misses_total[5m]))`. `tierstore_cache_upstream_puts_total`, `_put_bytes_total`
+and `_put_failures_total` are writes to the cold side, which the proxy's block does not count (it
+counts reads), so they have no counterpart here; neither do the cache's fills, skips and evictions.
 
 ## Roles of a key
 

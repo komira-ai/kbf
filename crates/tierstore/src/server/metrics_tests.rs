@@ -83,6 +83,7 @@ pub(super) const COLD_ERR_HEAD: &str = "tierstore_read_errors_total{tier=\"cold\
 pub(super) const COLD_READS_HEAD: &str = "tierstore_reads_total{tier=\"cold\",op=\"head\"}";
 pub(super) const HOT_SERVED: &str = "tierstore_bytes_served_total{tier=\"hot\"}";
 pub(super) const COLD_SERVED: &str = "tierstore_bytes_served_total{tier=\"cold\"}";
+pub(super) const HOT_BYTES: &str = "tierstore_bytes_read_total{tier=\"hot\"}";
 pub(super) const COLD_BYTES: &str = "tierstore_bytes_read_total{tier=\"cold\"}";
 pub(super) const PROMOTIONS: &str = "tierstore_promotions_total";
 pub(super) const PROMOTED_BYTES: &str = "tierstore_promoted_bytes_total";
@@ -176,6 +177,8 @@ async fn a_get_of_a_hot_object_counts_only_a_hot_hit() {
     assert_eq!(value(&rig, HOT_HIT_GET).await, 1);
     assert_eq!(value(&rig, HOT_READS_GET).await, 1);
     assert_eq!(value(&rig, HOT_SERVED).await, 5);
+    assert_eq!(value(&rig, HOT_BYTES).await, 5);
+    assert_eq!(value(&rig, COLD_BYTES).await, 0);
     assert_eq!(value(&rig, HOT_MISS_GET).await, 0);
     assert_eq!(value(&rig, COLD_READS_GET).await, 0);
     assert_eq!(value(&rig, COLD_READS_HEAD).await, 0);
