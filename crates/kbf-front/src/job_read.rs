@@ -62,6 +62,7 @@ use tonic::codegen::http::{Method, StatusCode};
 use crate::backend::Backend;
 use crate::cache::is_empty_blob;
 use crate::grants::{Claims, GrantError, Grants, Scope};
+use crate::large_backfill::{LargeBackfill, Tee};
 use crate::metrics::{Counter, Families};
 use crate::proxy::MAX_UNTRUSTED_BLOB_BYTES;
 use crate::wire;
@@ -318,6 +319,7 @@ pub struct JobRead {
     blobs: [Counter; BLOB_STATUSES.len()],
     bytes: Arc<Counter>,
     ended_early: Arc<EndedEarly>,
+    backfill: Option<LargeBackfill>,
 }
 
 impl JobRead {
@@ -335,7 +337,16 @@ impl JobRead {
             blobs: Default::default(),
             bytes: Arc::default(),
             ended_early: Arc::default(),
+            backfill: None,
         }
+    }
+
+    /// This read, copying each large blob it streams to tierstore through `backfill` once it
+    /// has hashed to its digest ([`crate::large_backfill`]); `None` copies nothing.
+    #[must_use]
+    pub fn with_backfill(mut self, backfill: Option<LargeBackfill>) -> Self {
+        self.backfill = backfill;
+        self
     }
 
     /// The answer to `method` `path` with the `Authorization` header `authorization`.
@@ -522,6 +533,10 @@ impl JobRead {
             finished: false,
             bytes: Arc::clone(&self.bytes),
             ended_early: Arc::clone(&self.ended_early),
+            tee: self
+                .backfill
+                .as_ref()
+                .and_then(|backfill| backfill.tee(&digest)),
             _place: place,
         };
         let chunks = stream::unfold(Some(state), |state| async move {
@@ -621,6 +636,9 @@ impl JobRead {
             );
         }
         *out = families.0;
+        if let Some(backfill) = &self.backfill {
+            backfill.render_metrics(out);
+        }
     }
 
     /// [`JobRead::render_metrics`] when there is a job-facing read, and nothing when there
@@ -644,6 +662,9 @@ struct Streaming {
     finished: bool,
     bytes: Arc<Counter>,
     ended_early: Arc<EndedEarly>,
+    /// The copy of the blob to tierstore, fed what is passed on; dropped on any end but a
+    /// verified one, which abandons the copy.
+    tee: Option<Tee>,
     /// The read's place among [`Limits::reads_in_flight`], given back when the stream is dropped.
     _place: Result<OwnedSemaphorePermit, AcquireError>,
 }
@@ -673,6 +694,7 @@ impl Streaming {
                     self.hasher.update(&chunk);
                     if let Some(ready) = self.held.replace(chunk) {
                         self.bytes.add(ready.len() as u64);
+                        self.copy(&ready);
                         return Step::Chunk(ready);
                     }
                 }
@@ -680,6 +702,7 @@ impl Streaming {
                     return self.corrupt();
                 }
                 Some(Err(error)) => {
+                    self.tee = None;
                     self.ended_early.store_error.add(1);
                     return Step::Fail(StreamError::Store(error));
                 }
@@ -698,10 +721,25 @@ impl Streaming {
         // Held, as the blob is not empty ([`is_empty_blob`] is served before a read).
         let last = self.held.take().unwrap_or_default();
         self.bytes.add(last.len() as u64);
+        self.copy(&last);
+        if let Some(tee) = self.tee.take() {
+            tee.finish();
+        }
         Step::Chunk(last)
     }
 
-    fn corrupt(&self) -> Step {
+    /// Hands `chunk`, which the response is given, to the copy; a copy that cannot take it
+    /// is dropped, and the response goes on.
+    fn copy(&mut self, chunk: &Bytes) {
+        if let Some(tee) = &mut self.tee
+            && !tee.send(chunk.clone())
+        {
+            self.tee = None;
+        }
+    }
+
+    fn corrupt(&mut self) -> Step {
+        self.tee = None;
         self.ended_early.digest_mismatch.add(1);
         Step::Fail(StreamError::Corrupt)
     }
