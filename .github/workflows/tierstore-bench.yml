@@ -1,0 +1,47 @@
+# Builds the tierstore-bench binary (crates/tierstore-bench) for linux-x86_64 in release mode, logs its
+# SHA-256 on one line (`tierstore-bench sha256 <hex>`) and uploads it as the workflow artifact
+# `tierstore-bench-linux-x86_64`, so a measurement run copies the exact binary CI built:
+#   gh run download <run id> --name tierstore-bench-linux-x86_64
+#
+# Only a pull request that changes the crate (or this file) runs it, so no other pull request is
+# slowed. It is not a required check, which is why a `paths:` filter is safe here (see
+# js-core-gate-pr.yml for why a required check has none). It is not part of the release
+# artifacts (artifacts.yml): nothing is signed, attested or published, and the file is kept for the
+# default 90 days of a workflow artifact.
+name: tierstore-bench
+
+on:
+  pull_request:
+    paths:
+      - crates/tierstore-bench/**
+      - .github/workflows/tierstore-bench.yml
+
+permissions: {}
+
+concurrency:
+  group: tierstore-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo build --release --locked -p tierstore-bench
+      - name: Log the SHA-256 of the binary
+        run: target/release/tierstore-bench self-digest
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tierstore-bench-linux-x86_64
+          path: target/release/tierstore-bench
+          if-no-files-found: error

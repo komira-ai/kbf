@@ -15,12 +15,17 @@ publish.workspace = true
 [dependencies]
 bytes.workspace = true
 clap.workspace = true
+# `join_all`: the workers of a level run as futures of one task, not spawned tasks.
+futures.workspace = true
+hex.workspace = true
 # The S3 client (`s3`): SigV4, multipart, ranged reads, listings.
 kbf-objstore.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# `self-digest`: the SHA-256 of the executable, for the CI log.
+sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 # `FakeS3`, a loopback S3 service, for the tests of the client wrapper.

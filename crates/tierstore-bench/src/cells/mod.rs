@@ -11,7 +11,7 @@
 //! - Every request goes through [`crate::s3::BenchS3`], so it is timed and logged.
 //! - Pass 0 of each arm is a warm-up: it is run, reported with `discarded: true`, and left out of
 //!   every figure. Arms are interleaved across passes and the order is recorded in `notes`.
-//! - Before each pass and every few seconds in it the cell reads a [`crate::gate::LoadSample`]
+//! - Before each pass and every few seconds in it (cold-put: every `--gate-every` puts) the cell reads a [`crate::gate::LoadSample`]
 //!   and checks it against `ctx.config.gate`; a trip aborts the pass (`gate_tripped`) and its
 //!   samples are `Window::Busy` whatever the run's window.
 //! - Bytes written to the cold store are counted against `ctx.config.bytes`; a cell refuses to
@@ -111,6 +111,8 @@ pub struct CellPlan {
     pub in_flight: Vec<u32>,
     /// Object sizes in bytes, one arm per value (cell G reads a tree and ignores them).
     pub object_bytes: Vec<u64>,
+    /// What only cell cold-put reads.
+    pub cold_put: cold_put::ColdPutPlan,
 }
 
 /// Runs one cell.
