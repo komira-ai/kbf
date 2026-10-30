@@ -44,17 +44,15 @@
 //! `not_found`, `method_not_allowed` or `store_unavailable`. Requests by outcome, the
 //! bytes served and the streams that ended early are counted ([`JobRead::render_metrics`]).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use futures::stream::{self, BoxStream, StreamExt as _, TryStreamExt as _};
-use kbf_proto::reapi;
+use futures::stream::{self, BoxStream, StreamExt as _};
 use kbf_storage::{ReadStream, StorageError};
 use kbf_types::{Digest, DigestFunction};
-use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{AcquireError, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::codegen::http::{Method, StatusCode};
@@ -64,7 +62,11 @@ use crate::cache::is_empty_blob;
 use crate::grants::{Claims, GrantError, Grants, Scope};
 use crate::metrics::{Counter, Families};
 use crate::proxy::MAX_UNTRUSTED_BLOB_BYTES;
-use crate::wire;
+
+mod walk;
+
+pub use self::walk::MAX_SCOPE_BLOB_BYTES;
+use self::walk::{Budget, ScopeError, walk};
 
 /// The size above which a blob is streamed and below which (itself included) it is read
 /// whole: the per-blob cap of the packs a task's results are written into.
@@ -82,11 +84,6 @@ pub const BATCH_MAX_BYTES: u64 = 4 << 20;
 /// The most bytes of a batch request's body: far more than the largest valid one (256 digests
 /// of at most 90 bytes each), so that no body of any size is held.
 pub const MAX_BATCH_REQUEST_BYTES: usize = 64 << 10;
-
-/// The largest Action or Directory blob the scope walk reads: a tenant writes the sizes in
-/// the Directories it is asked to walk, and a read of one of 10^12 bytes would take the whole
-/// budget.
-pub const MAX_SCOPE_BLOB_BYTES: u64 = 4 << 20;
 
 /// The size of the pieces a held body is handed to a connection in: a connection takes the next
 /// when it has room, so what the budget no longer charges is no more than one piece.
@@ -106,9 +103,6 @@ pub const STREAM_WINDOW_BYTES: u64 = 16 << 20;
 /// The default of [`Limits::max_blob_bytes`]: 512 MiB, over the largest input a compile reads
 /// (a 165 MiB toolchain binary).
 pub const DEFAULT_MAX_BLOB_BYTES: u64 = 512 << 20;
-
-/// The Directory blobs of one level of an input tree read at once.
-const DIRECTORIES_IN_FLIGHT: usize = 16;
 
 /// Where the blobs a job reads come from.
 ///
@@ -372,52 +366,6 @@ impl Outcome {
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Malformed => StatusCode::BAD_REQUEST,
         }
-    }
-}
-
-/// Why an Action has no scope.
-enum ScopeError {
-    /// Its blobs are not in the store, are not what they must be, or name more than
-    /// [`Limits::scope_digests`].
-    Unusable,
-    /// The store could not answer.
-    Store,
-}
-
-impl From<StorageError> for ScopeError {
-    fn from(error: StorageError) -> Self {
-        match error {
-            StorageError::NotFound(_) => Self::Unusable,
-            _ => Self::Store,
-        }
-    }
-}
-
-/// The bytes of reads open at once ([`Limits::read_budget_bytes`]), in units of 1 KiB.
-struct Budget {
-    room: Arc<Semaphore>,
-    units: u32,
-}
-
-/// The size of a unit of the budget.
-const UNIT: u64 = 1024;
-
-impl Budget {
-    fn new(bytes: u64) -> Self {
-        let units = u32::try_from((bytes / UNIT).max(1)).unwrap_or(u32::MAX);
-        Self {
-            room: Arc::new(Semaphore::new(units as usize)),
-            units,
-        }
-    }
-
-    /// Room for `bytes` (rounded up to a unit, and at most the whole budget), waited for as
-    /// long as it takes; given back when the permit is dropped.
-    async fn take(&self, bytes: u64) -> Result<OwnedSemaphorePermit, AcquireError> {
-        let want = u32::try_from(bytes.div_ceil(UNIT).max(1)).unwrap_or(u32::MAX);
-        Arc::clone(&self.room)
-            .acquire_many_owned(want.min(self.units))
-            .await
     }
 }
 
@@ -924,85 +872,4 @@ fn bearer(authorization: Option<&str>) -> Option<&str> {
 /// The digest a path `/<hex>/<size>` names.
 fn digest_of(path: &str) -> Option<Digest> {
     Digest::parse(DigestFunction::Sha256, path.strip_prefix('/')?).ok()
-}
-
-/// The scope of `action`: the Action, its Command, and the Directory blobs and files of the
-/// tree under its input root, read from `source` a level at a time.
-async fn walk(
-    source: &dyn BlobSource,
-    budget: &Budget,
-    action: Digest,
-    most: usize,
-) -> Result<Scope, ScopeError> {
-    if action.size_bytes > MAX_SCOPE_BLOB_BYTES {
-        return Err(ScopeError::Unusable);
-    }
-    let bytes = {
-        let _room = budget.take(action.size_bytes).await;
-        source.read_blob(&action).await?
-    };
-    let decoded = reapi::Action::decode(bytes).map_err(|_| ScopeError::Unusable)?;
-    let command = proto(decoded.command_digest.as_ref())?;
-    let root = proto(decoded.input_root_digest.as_ref())?;
-    let mut seen = HashSet::from([root]);
-    let mut level = vec![root];
-    while !level.is_empty() {
-        let directories: Vec<reapi::Directory> = stream::iter(level)
-            .map(|digest| directory(source, budget, digest))
-            .buffer_unordered(DIRECTORIES_IN_FLIGHT)
-            .try_collect()
-            .await?;
-        level = Vec::new();
-        for directory in &directories {
-            seen.extend(files_of(directory)?);
-            for digest in directories_of(directory)? {
-                if seen.insert(digest) {
-                    level.push(digest);
-                }
-            }
-        }
-        if seen.len() > most {
-            return Err(ScopeError::Unusable);
-        }
-    }
-    Ok(Scope::new(action, command, seen))
-}
-
-/// The Directory blob `digest`, decoded; the empty blob is the empty Directory.
-async fn directory(
-    source: &dyn BlobSource,
-    budget: &Budget,
-    digest: Digest,
-) -> Result<reapi::Directory, ScopeError> {
-    if is_empty_blob(&digest) {
-        return Ok(reapi::Directory::default());
-    }
-    if digest.size_bytes > MAX_SCOPE_BLOB_BYTES {
-        return Err(ScopeError::Unusable);
-    }
-    let bytes = {
-        let _room = budget.take(digest.size_bytes).await;
-        source.read_blob(&digest).await?
-    };
-    reapi::Directory::decode(bytes).map_err(|_| ScopeError::Unusable)
-}
-
-fn files_of(directory: &reapi::Directory) -> Result<Vec<Digest>, ScopeError> {
-    directory
-        .files
-        .iter()
-        .map(|file| proto(file.digest.as_ref()))
-        .collect()
-}
-
-fn directories_of(directory: &reapi::Directory) -> Result<Vec<Digest>, ScopeError> {
-    directory
-        .directories
-        .iter()
-        .map(|child| proto(child.digest.as_ref()))
-        .collect()
-}
-
-fn proto(digest: Option<&reapi::Digest>) -> Result<Digest, ScopeError> {
-    wire::digest(digest).map_err(|_| ScopeError::Unusable)
 }
