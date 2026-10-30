@@ -257,6 +257,21 @@ fn a_fault_in_the_file_is_reported_without_the_value() {
     }
 }
 
+/// Asserts that a fault inside a multi-line string names no "key" taken from the string's text:
+/// the text before an `=` on such a line is part of a value (perhaps a pasted secret), so it is
+/// neither shown as the key nor repeated.
+#[test]
+fn a_fault_inside_a_multi_line_string_shows_nothing_of_the_string() {
+    let text = golden_with(
+        "[server]",
+        "[server]\nnote = \"\"\"\nabcdef=SENTINEL \\q\n\"\"\"",
+    );
+    let why = refusal(&text);
+    assert!(why.starts_with("line "), "{why}");
+    assert!(!why.contains("abcdef"), "{why}");
+    assert!(!why.contains("SENTINEL"), "{why}");
+}
+
 /// Asserts that `[local_cache]` along with `[hot_store]` is refused, with the reason, and that a
 /// file with neither shape's tables (`[local_cache]` alone, or a storage node's file missing
 /// `[hot_store]` or `[cold_store]`) is refused for the shape.
@@ -326,7 +341,11 @@ fn the_keys_of_a_tier_must_fit_its_kind() {
             "hot_store.path",
         ),
         ("kind = \"memory\"", "hot_store.budget"),
-        ("kind = \"tape\"\nbudget = 1", "tape"),
+        // The refused value is never shown; the key and the values it takes are.
+        (
+            "kind = \"tape\"\nbudget = 1",
+            "kind: not a value this key takes",
+        ),
     ];
     for (table, key) in cases {
         let why = refusal(&minimal_with(hot, table));

@@ -228,9 +228,10 @@ started from a file runs the code of one started from the same settings as flags
 into the settings the flags make, and the defaults are the flags' defaults. The unit above keeps
 its flags; a file is for a setup that would rather keep its settings in one place.
 
-A file holds no secret and no value is repeated in a message about it: a refusal names the line, the column
-and the key. A number above 9223372036854775807 (the largest TOML integer) cannot go in a file; as a flag it
-is accepted, and `--print-config` refuses it. A `--print-config` that cannot write its output
+A file holds no secret, and a message about it repeats no value except a `[[policy]]` prefix (a prefix is
+a key name, not a secret): a syntax refusal names the line, the column and the key; any other refusal names
+the key. A number above 9223372036854775807 (the largest TOML integer) cannot go in a file; as a flag it
+is accepted, and `--print-config` refuses it with exit 2. A `--print-config` that cannot write its output
 (a closed pipe, a full disk) exits 1; a refusal of the file or the flags exits 2.
 
 A file has one of two shapes, told apart by its tables: a storage node (`[server]`, `[hot_store]`

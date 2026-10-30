@@ -508,6 +508,16 @@ fn looks_secret(key: &str) -> bool {
         || key.ends_with("_key")
 }
 
+/// Whether `key` is a name some table of the file holds: the last part of a key in [`KEYS`], or a
+/// `[[policy]]` key.
+fn known_key(key: &str) -> bool {
+    matches!(key, "prefix" | "cache")
+        || KEYS
+            .iter()
+            .flat_map(|(_, keys)| keys.iter())
+            .any(|name| name.rsplit('.').next() == Some(key))
+}
+
 /// The fault `error` found in `text`, as a [`ConfigError::Syntax`] that does not repeat the line
 /// or the value (the display of the `toml` error does: it shows the line, and its messages for a
 /// value of the wrong type show the value).
@@ -525,6 +535,9 @@ fn syntax(text: &str, error: &toml::de::Error) -> ConfigError {
         Some((key, value)) => (Some(key.trim()), value.trim().trim_matches('"')),
         None => (None, ""),
     };
+    // Only a name the file can hold is shown as the key: inside a multi-line string the text before
+    // an `=` is part of a value, which may be a pasted secret.
+    let key = key.filter(|key| known_key(key));
     let message = error.message();
     let shows_value = [
         "invalid type",
@@ -538,10 +551,17 @@ fn syntax(text: &str, error: &toml::de::Error) -> ConfigError {
             .map_or("another value", |(_, expected)| expected);
         let key = key.unwrap_or("a value");
         format!("{key}: not a value this key takes (it is not shown); expected {expected}")
-    } else if value.is_empty() {
-        message.to_owned()
     } else {
-        message.replace(value, "(value)")
+        let message = if value.is_empty() {
+            message.to_owned()
+        } else {
+            message.replace(value, "(value)")
+        };
+        // A value's own parse error (a size, a duration, an address) does not name its key.
+        match key {
+            Some(key) => format!("{key}: {message}"),
+            None => message,
+        }
     };
     ConfigError::Syntax { line, column, what }
 }
