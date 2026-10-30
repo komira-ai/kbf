@@ -21,7 +21,7 @@ are in `packaging/tierstore/README.md`; the roles of a key are in `src/server/ke
 ## Flags or a file
 
 The settings that describe the data path are flags, or one TOML file given with `--config <path>`
-(`[server]`, `[hot_store]`, `[cold_store]` and `[[policy]]`; `src/server/config.rs`). The two make
+(`[server]`, `[hot_store]`, `[cold_store]`, `[oci]` and `[[policy]]`; `src/server/config.rs`). The two make
 the same settings and run the same code. `--print-config`, given the flags of a start, prints the
 file that is equivalent to them. A file holds no secret, only the paths of key files, and refuses
 a key or a table it does not know. The format, the table of the key of each flag and the rules are
@@ -81,6 +81,11 @@ same tiers. It runs in one of two modes:
   the other is refused (exit 2).
 
 The start line and `/metricz` say which mode runs.
+
+In a file given with `--config`, the front is the optional `[oci]` table (`listen`, `tls_cert_file`,
+`tls_key_file`, `prefix`, `max_connections`, `connection_lifetime`), with the rules of the flags
+(`listen` is needed in it, the certificate and the key go together, `max_connections` is at least
+1); the `--oci-*` flags are refused with the file, and `--print-config` writes them as the table.
 
 - `GET` and `HEAD` of `/v2/`, `/v2/<name>/manifests/sha256:<hex>` and
   `/v2/<name>/blobs/sha256:<hex>`; anything else is 404, and any other method 405.

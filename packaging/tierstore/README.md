@@ -235,7 +235,7 @@ is accepted, and `--print-config` refuses it with exit 2. A `--print-config` tha
 (a closed pipe, a full disk) exits 1; a refusal of the file or the flags exits 2.
 
 This release reads the storage-node shape: `[server]`, `[hot_store]` and `[cold_store]`, and an
-optional `[[policy]]`. A file for a storage node:
+optional `[oci]` (the read-only registry front) and `[[policy]]`. A file for a storage node:
 
 ```toml
 [server]
@@ -278,6 +278,24 @@ A key that is left out has the default of its flag (`tierstore --help` lists the
 `proxy_id`, `bucket` and `access_key_file` of `[server]`, `kind` of each tier and `budget` of
 `[hot_store]` are needed. Durations are a whole number and `ms`, `s`, `m` or `h`, as in the flags.
 The water marks are percents, as in the flags (1 to 100).
+
+The registry front (see The OCI read front) is the optional `[oci]` table, left out for a server
+with no front. A key of it that is left out has the default of its flag:
+
+```toml
+[oci]
+listen              = "192.0.2.10:5000"
+tls_cert_file       = "/etc/tierstore/oci.crt"
+tls_key_file        = "/etc/tierstore/oci.key"
+prefix              = "oci/"
+max_connections     = 64
+connection_lifetime = "1h"
+```
+
+The table has the rules of the `--oci-*` flags: `listen` is needed in it, and the other keys are
+refused without it; `tls_cert_file` and `tls_key_file` go together; `max_connections` is at least
+one; `connection_lifetime` is a duration as elsewhere. The certificate and the key are named by
+path, as every key file is, so the names end in `_file`.
 
 ### Which key each flag has
 
@@ -326,6 +344,12 @@ the flags of the binary against this table, so a flag added without a key fails 
 | `--body-idle-timeout` | `server.body_idle_timeout` | how long a body or an answer may go without a byte |
 | `--skip-backend-check` | `cold_store.skip_checks` | a list of `CHECK=REASON` texts: the start-up check that is left out, with its reason (only `multipart-conditional`; it runs on the cold tier) |
 | `--backend-check-wait` | `server.backend_check_wait` | how long the start-up self-test asks again of a tier that does not answer |
+| `--oci-listen` | `oci.listen` | where the registry front listens; the front is off without the `[oci]` table |
+| `--oci-tls-cert` | `oci.tls_cert_file` | the certificate chain (PEM) of the front; with `oci.tls_key_file`, or neither |
+| `--oci-tls-key` | `oci.tls_key_file` | the private key (PEM) of the front |
+| `--oci-prefix` | `oci.prefix` | the key prefix the front reads, ending in `/` (`oci/` if left out) |
+| `--oci-max-connections` | `oci.max_connections` | the most connections the front has open at once (64 if left out; at least 1) |
+| `--oci-connection-lifetime` | `oci.connection_lifetime` | the longest a connection of the front lives (`1h` if left out) |
 
 These stay flags, since they describe one run and not the data path: `--config`,
 `--print-config`, `--drain-lb-wait` and `--drain-deadline`. A start that gives `--config` and any
@@ -350,6 +374,8 @@ Each of these exits with status 2 and names the file and the key:
   `credentials_file`, and a key only one tier has in the other (`budget` and the reconciler's keys
   are `[hot_store]`'s; `skip_checks` is `[cold_store]`'s, since the check it skips runs there);
 - a water mark outside 1 to 100, and a budget, a count or a limit of zero;
+- an `[oci]` table without `listen`, with a key but no `listen` (the message names that key), with
+  only one of `tls_cert_file` and `tls_key_file`, or with `max_connections = 0`;
 - a `[[policy]]` prefix that is listed twice, that lies inside another listed prefix (or holds
   one), that does not end in `/`, or that is under `_journal/` or `_tiering/`, which tierstore
   keeps for itself.
@@ -502,6 +528,10 @@ registry, over HTTPS or over plain HTTP (see Two modes), so that podman (and the
 other clients of the OCI distribution API) pulls an image by digest from the same hot and cold tiers the S3 front writes to. It reads through the
 proxy in the process: no S3 credential and no hop through the S3 listener. It is off unless
 `--oci-listen` is given, and then nothing else about the process changes.
+
+With `--config` the front is the `[oci]` table of the file and the `--oci-*` flags are refused
+(see The configuration file, which lists the key of each flag below). `--print-config` writes
+the front's flags as that table.
 
 | flag | what |
 |---|---|
