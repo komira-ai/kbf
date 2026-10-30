@@ -3,7 +3,11 @@
 //! module is its flags, its checks at start and its HTTPS).
 //!
 //! It is off unless `--job-listen` is given, with `--job-tls-cert`, `--job-tls-key` and
-//! `--job-grant-secret-file`, and then no other listener changes. The jobs hold no client
+//! `--job-grant-secret-file`, and then no other listener changes. A farm on its own network
+//! may serve it in plain HTTP instead (`--job-plain-http`, in place of the certificate and
+//! the key): the same routes, bounds and grants, with nothing encrypted, so a read grant
+//! crosses the network in clear; the executor's `--task-read-url` must then be `http://`
+//! and the TLS that follows is the TLS mode's alone. The jobs hold no client
 //! certificate (they are untrusted code), so the TLS is the server's alone, from the farm CA
 //! the task is given (`kbf-task --root-der`), and no client is asked for a certificate.
 //! The task dials an IP address, so the certificate must name the addresses it dials as IP
@@ -37,7 +41,7 @@ use axum::http::header::{ALLOW, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, WWW
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::Response;
 use bytes::Bytes;
-use clap::{Arg, ArgMatches};
+use clap::{Arg, ArgAction, ArgMatches};
 use futures::FutureExt as _;
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
@@ -60,9 +64,14 @@ use crate::token::{TokenFileError, read_owner_only};
 const LISTEN: &str = "job_listen";
 const TLS_CERT: &str = "job_tls_cert";
 const TLS_KEY: &str = "job_tls_key";
+const PLAIN: &str = "job_plain_http";
+/// The group of `--job-tls-cert` and `--job-plain-http`: `--job-listen` needs one, and never both.
+const TRANSPORT: &str = "job_transport";
 const GRANT_SECRET: &str = "job_grant_secret_file";
 const MAX_BLOB: &str = "job_max_blob_bytes";
 const READS: &str = "job_reads_in_flight";
+const BUDGET: &str = "job_read_budget_bytes";
+const IDLE: &str = "job_read_idle_secs";
 
 /// The default of `--job-max-blob-bytes`, as clap takes a default (a string); a test parses
 /// it back and compares it with [`Limits::default`].
@@ -70,6 +79,12 @@ const DEFAULT_MAX_BLOB: &str = "536870912";
 
 /// The default of `--job-reads-in-flight`, likewise.
 const DEFAULT_READS: &str = "32";
+
+/// The default of `--job-read-budget-bytes`, likewise (1 GiB).
+const DEFAULT_BUDGET: &str = "1073741824";
+
+/// The default of `--job-read-idle-secs`, likewise.
+const DEFAULT_IDLE: &str = "60";
 
 /// The most bytes the grant secret's file may hold, surrounding whitespace included.
 const MAX_SECRET_FILE_BYTES: usize = 4096;
@@ -80,48 +95,62 @@ pub(super) const MAX_CONNECTIONS: usize = 256;
 /// The label of the listener's TLS files in `kbf_tls_reloads_total`.
 const TLS_LABEL: &str = "job";
 
-/// The job-facing read's flags: the first four, or none; the last two have defaults.
+/// The certificate and key of the listener's TLS.
+#[derive(Clone, Debug)]
+pub struct JobTls {
+    /// `--job-tls-cert`: its certificate chain (PEM), which names the addresses jobs dial.
+    pub cert: PathBuf,
+    /// `--job-tls-key`: the key of the certificate (PEM).
+    pub key: PathBuf,
+}
+
+/// The job-facing read's flags: the listen address, the transport and the grant secret, or
+/// none; the last four have defaults.
 #[derive(Clone, Debug)]
 pub struct JobReadFlags {
     /// `--job-listen`: where the listener listens.
     pub listen: SocketAddr,
-    /// `--job-tls-cert`: its certificate chain (PEM), which names the addresses jobs dial.
-    pub tls_cert: PathBuf,
-    /// `--job-tls-key`: the key of the certificate (PEM).
-    pub tls_key: PathBuf,
+    /// `--job-tls-cert` and `--job-tls-key`; `None` is `--job-plain-http`, plain HTTP.
+    pub tls: Option<JobTls>,
     /// `--job-grant-secret-file`: the farm secret the read grants are signed with.
     pub grant_secret_file: PathBuf,
     /// `--job-max-blob-bytes`: the largest blob a response carries.
     pub max_blob_bytes: u64,
     /// `--job-reads-in-flight`: the blob reads open at once.
     pub reads_in_flight: u32,
+    /// `--job-read-budget-bytes`: the bytes of blob reads open at once.
+    pub read_budget_bytes: u64,
+    /// `--job-read-idle-secs`: how long a held response may go with no chunk taken.
+    pub read_idle_secs: u64,
 }
 
-/// The six flags.
-pub(super) fn args() -> [Arg; 6] {
+/// The nine flags.
+pub(super) fn args() -> [Arg; 9] {
     [
         Arg::new(LISTEN)
             .long("job-listen")
             .value_name("ADDR")
             .value_parser(clap::value_parser!(SocketAddr))
-            .requires_all([TLS_CERT, TLS_KEY, GRANT_SECRET])
+            .requires_all([TRANSPORT, GRANT_SECRET])
             .help(
-                "Serves the inputs of an action to the task that runs it, over HTTPS at this \
-                 address: `GET /<hex>/<size>` and `POST /batch` (many small blobs in one \
-                 request) with `Authorization: Bearer <read grant>`, and nothing else (any \
-                 other path is 404 and any other method 405). A read grant \
-                 is the token a run is given; until it expires it reads the Action it was \
-                 issued for, its Command and its input tree, and no other blob. The TLS is the \
-                 server's alone and no client certificate is asked for. The task dials an IP \
-                 address, so give the address the jobs dial, and a `--job-tls-cert` that names \
-                 it as an IP subjectAltName. Needs `--job-tls-cert`, `--job-tls-key` and \
-                 `--job-grant-secret-file`. Left out, no such listener is opened",
+                "Serves the inputs of an action to the task that runs it, over HTTPS (or, with \
+                 `--job-plain-http`, plain HTTP) at this address: `GET /<hex>/<size>` and \
+                 `POST /batch` (many small blobs in one request) with `Authorization: Bearer \
+                 <read grant>`, and nothing else (any other path is 404 and any other method \
+                 405). A read grant is the token a run is given; until it expires it reads the \
+                 Action it was issued for, its Command and its input tree, and no other blob. \
+                 The TLS is the server's alone and no client certificate is asked for. The task \
+                 dials an IP address, so give the address the jobs dial, and a `--job-tls-cert` \
+                 that names it as an IP subjectAltName. Needs `--job-tls-cert` and \
+                 `--job-tls-key` or `--job-plain-http`, and `--job-grant-secret-file`. Left \
+                 out, no such listener is opened",
             ),
         Arg::new(TLS_CERT)
             .long("job-tls-cert")
             .value_name("PATH")
             .value_parser(clap::value_parser!(PathBuf))
-            .requires(LISTEN)
+            .requires_all([LISTEN, TLS_KEY])
+            .group(TRANSPORT)
             .help(
                 "The certificate chain (PEM) of `--job-listen`, issued by the farm CA that the \
                  jobs trust. It must carry an IP subjectAltName for each address a job dials \
@@ -135,8 +164,23 @@ pub(super) fn args() -> [Arg; 6] {
             .long("job-tls-key")
             .value_name("PATH")
             .value_parser(clap::value_parser!(PathBuf))
-            .requires(LISTEN)
+            .requires_all([LISTEN, TLS_CERT])
             .help("The private key (PEM) of `--job-tls-cert`"),
+        Arg::new(PLAIN)
+            .long("job-plain-http")
+            .action(ArgAction::SetTrue)
+            .requires(LISTEN)
+            .conflicts_with_all([TLS_CERT, TLS_KEY])
+            .group(TRANSPORT)
+            .help(
+                "Serves `--job-listen` in plain HTTP, with no TLS, in place of `--job-tls-cert` \
+                 and `--job-tls-key` (given with either it is refused): the same routes and the \
+                 same grants, each request still needs a valid read grant, but the grant and \
+                 the blobs cross the network unencrypted. For a farm on its own network; the \
+                 executor's `--task-read-url` must then be `http://` with \
+                 `--executor-allow-plain-http-grant`, and the other way round. Needs \
+                 `--job-listen` and `--job-grant-secret-file`",
+            ),
         Arg::new(GRANT_SECRET)
             .long("job-grant-secret-file")
             .value_name("PATH")
@@ -173,25 +217,60 @@ pub(super) fn args() -> [Arg; 6] {
                  holds its place until its response ends, and a request over the bound waits \
                  for one to end. Needs `--job-listen`",
             ),
+        Arg::new(BUDGET)
+            .long("job-read-budget-bytes")
+            .value_name("BYTES")
+            .value_parser(clap::value_parser!(u64).range(1..))
+            .default_value(DEFAULT_BUDGET)
+            .requires(LISTEN)
+            .help(
+                "The bytes of blob reads this listener has open at once, at least 1: a read \
+                 takes its blob's size (a streamed blob a bounded window of it, and the scope \
+                 walk's reads their own sizes) and a request over the budget waits for room, it \
+                 never fails; a blob larger than the whole budget is read alone. Needs \
+                 `--job-listen`",
+            ),
+        Arg::new(IDLE)
+            .long("job-read-idle-secs")
+            .value_name("SECONDS")
+            .value_parser(clap::value_parser!(u64).range(1..))
+            .default_value(DEFAULT_IDLE)
+            .requires(LISTEN)
+            .help(
+                "How long, in seconds, a response that holds read budget may go with no chunk taken by its \
+                 client before it is dropped, its budget given back and its response ended, at \
+                 least 1: a client that does not read does not hold the budget for ever, and one \
+                 that reads is not cut off however long its response takes. Needs \
+                 `--job-listen`",
+            ),
     ]
 }
 
-/// The flags `m` makes, or `None` without `--job-listen` (clap makes the other three come
-/// with it).
+/// Whether `m` has a job listener that serves TLS: `--job-listen` without `--job-plain-http`.
+pub(super) fn serves_tls(m: &ArgMatches) -> bool {
+    m.contains_id(LISTEN) && !m.get_flag(PLAIN)
+}
+
+/// The flags `m` makes, or `None` without `--job-listen` (clap makes the secret and one of
+/// the certificate and `--job-plain-http` come with it).
 pub(super) fn from_matches(m: &ArgMatches) -> Option<JobReadFlags> {
     let listen = *m.get_one::<SocketAddr>(LISTEN)?;
     let path = |id| {
         m.get_one::<PathBuf>(id)
-            .expect("clap requires it with --job-listen")
+            .expect("clap requires it with --job-listen or the certificate")
             .clone()
     };
     Some(JobReadFlags {
         listen,
-        tls_cert: path(TLS_CERT),
-        tls_key: path(TLS_KEY),
+        tls: m.contains_id(TLS_CERT).then(|| JobTls {
+            cert: path(TLS_CERT),
+            key: path(TLS_KEY),
+        }),
         grant_secret_file: path(GRANT_SECRET),
         max_blob_bytes: *m.get_one::<u64>(MAX_BLOB).expect("clap gives it a default"),
         reads_in_flight: *m.get_one::<u32>(READS).expect("clap gives it a default"),
+        read_budget_bytes: *m.get_one::<u64>(BUDGET).expect("clap gives it a default"),
+        read_idle_secs: *m.get_one::<u64>(IDLE).expect("clap gives it a default"),
     })
 }
 
@@ -233,7 +312,8 @@ pub enum JobReadError {
 /// the certificate checked, the socket bound.
 pub(super) struct Prepared {
     socket: Socket,
-    tls: TlsSource,
+    /// The TLS configuration; `None` in plain HTTP.
+    tls: Option<TlsSource>,
     grants: Arc<Grants>,
     /// What the flags bound: the reads open at once and the largest blob served.
     limits: Limits,
@@ -265,8 +345,8 @@ pub(super) struct Serving {
     pub latch: Latch,
     /// The accept loop, ending when the latch closes.
     pub task: BoxFuture<'static, ()>,
-    /// The listener's TLS configuration, for the reload counters.
-    pub tls: TlsSource,
+    /// The listener's TLS configuration, for the reload counters; `None` in plain HTTP.
+    pub tls: Option<TlsSource>,
     /// What answers, for the counters.
     pub read: Arc<JobRead>,
 }
@@ -283,24 +363,17 @@ impl Prepared {
         binder: &Binder,
     ) -> Result<Self, JobReadError> {
         let grants = Arc::new(Grants::system(grant_key(&flags.grant_secret_file)?));
-        let pem = std::fs::read(&flags.tls_cert).map_err(|source| JobReadError::Read {
-            path: flags.tls_cert.clone(),
-            source,
-        })?;
-        names_the_address(&pem, flags.listen).map_err(|why| JobReadError::Certificate {
-            path: flags.tls_cert.clone(),
-            why,
-        })?;
-        let files = TlsFiles {
-            cert: flags.tls_cert.clone(),
-            key: flags.tls_key.clone(),
-            client_ca: None,
-        };
-        let tls = TlsSource::files_alpn(TLS_LABEL, files, reload, Alpn::Http1)?;
+        let tls = flags
+            .tls
+            .as_ref()
+            .map(|tls| tls_source(tls, flags.listen, reload))
+            .transpose()?;
         let socket = Socket::bind(flags.listen, binder)?;
         let limits = Limits {
             reads_in_flight: usize::try_from(flags.reads_in_flight).unwrap_or(usize::MAX),
             max_blob_bytes: flags.max_blob_bytes,
+            read_budget_bytes: flags.read_budget_bytes,
+            held_idle: Duration::from_secs(flags.read_idle_secs),
             ..Limits::default()
         };
         Ok(Self {
@@ -338,9 +411,16 @@ impl Prepared {
         source: Arc<dyn BlobSource>,
         timeouts: Timeouts,
     ) -> Result<Serving, JobReadError> {
+        if self.tls.is_none() {
+            tracing::warn!(
+                address = %self.socket.local,
+                "--job-plain-http: the job-facing read listener serves plain HTTP, so read \
+                 grants and blobs are sent unencrypted"
+            );
+        }
         let read =
             Arc::new(JobRead::new(source, self.grants, self.limits).with_backfill(self.backfill));
-        let (incoming, latch) = self.socket.grpc(Some(self.tls.clone()))?;
+        let (incoming, latch) = self.socket.grpc(self.tls.clone())?;
         let task = accept(
             incoming,
             router(Arc::clone(&read), timeouts.header),
@@ -354,6 +434,33 @@ impl Prepared {
             read,
         })
     }
+}
+
+/// The TLS of `tls`: its certificate checked to name `listen`, and its files watched.
+fn tls_source(
+    tls: &JobTls,
+    listen: SocketAddr,
+    reload: Duration,
+) -> Result<TlsSource, JobReadError> {
+    let pem = std::fs::read(&tls.cert).map_err(|source| JobReadError::Read {
+        path: tls.cert.clone(),
+        source,
+    })?;
+    names_the_address(&pem, listen).map_err(|why| JobReadError::Certificate {
+        path: tls.cert.clone(),
+        why,
+    })?;
+    let files = TlsFiles {
+        cert: tls.cert.clone(),
+        key: tls.key.clone(),
+        client_ca: None,
+    };
+    Ok(TlsSource::files_alpn(
+        TLS_LABEL,
+        files,
+        reload,
+        Alpn::Http1,
+    )?)
 }
 
 /// The grant key the secret in the file `path` makes.
@@ -438,11 +545,14 @@ async fn batch_body(body: Body, wait: Duration) -> Bytes {
 
 /// The HTTP response of `reply`: its status and body, the headers a client needs to read
 /// a refusal (`WWW-Authenticate` on 401, `Allow: <allow>` on 405) and a content type.
-fn response(reply: Reply, allow: &'static str) -> Response {
+fn response(mut reply: Reply, allow: &'static str) -> Response {
     let status = reply.status;
     // A streamed blob states its length before its first byte: a response that ends short of
     // it is a broken one to the client, which is how a blob that fails its digest is refused.
-    let (body, length) = match reply.stream {
+    // A body whose bytes are charged to the read budget is sent in pieces that keep the charge
+    // until the connection has taken the last of them.
+    let streamed = reply.stream.take().or_else(|| reply.held_stream());
+    let (body, length) = match streamed {
         Some(stream) => (Body::from_stream(stream.chunks), Some(stream.size)),
         None => (Body::from(reply.body), None),
     };

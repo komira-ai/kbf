@@ -728,3 +728,27 @@ async fn a_read_after_a_failed_put_backfills_again() {
         Some(w.blobs[&w.one].clone())
     );
 }
+
+/// Catches: a reader that stops taking chunks (so the listener's idle limit drops its body)
+/// leaving a copy behind: with a tee attached, a client that takes three chunks and stalls past
+/// the idle limit (on a paused clock, no real waiting) is told `Idle`, the put is abandoned and
+/// counted `skipped`, nothing is stored under any large key, and the blob is not counted
+/// backfilled.
+#[tokio::test(start_paused = true)]
+async fn a_reader_that_stalls_past_the_idle_limit_leaves_no_object_and_an_abandoned_put() {
+    let w = world();
+    let rig = rig(w.blobs.clone(), 2);
+    let token = rig.token(w.action);
+    let reply = rig.get(&w.one, &token).await;
+    let mut chunks = reply.stream.expect("a streamed reply").chunks;
+    for _ in 0..3 {
+        chunks.next().await.expect("a chunk").expect("ok");
+    }
+    tokio::time::sleep(limits().held_idle + std::time::Duration::from_secs(1)).await;
+    assert!(matches!(chunks.next().await, Some(Err(StreamError::Idle))));
+    rig.settled(1).await;
+    assert_eq!(rig.count("skipped"), 1);
+    assert_eq!(rig.count("backfilled"), 0);
+    assert_eq!(rig.bucket.keys().await, 0);
+    assert!(rig.bucket.object(&w.one).await.is_none());
+}

@@ -280,6 +280,9 @@ kbf-unitfile = { path = "crates/kbf-unitfile" }
 kbf-update = { path = "crates/kbf-update" }
 kbf-updater = { path = "crates/kbf-updater" }
 kbf-usage = { path = "crates/kbf-usage" }
+# The object store trait and the S3 client, with no dependency on another workspace crate
+# (kbf-integration-test keeps it so); kbf-objstore re-exports it.
+objstore-s3 = { path = "crates/objstore-s3" }
 # The hot/cold object store library; it depends on no kbf crate unless its `s3` feature is on
 # (kbf-integration-test keeps it so).
 tierstore = { path = "crates/tierstore" }

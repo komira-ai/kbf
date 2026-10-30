@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{StreamExt as _, TryStreamExt as _};
-use kbf_objstore::s3::{Credentials, S3Config, S3Store};
-use kbf_objstore::{
+use objstore_s3::s3::{Credentials, S3Config, S3Store};
+use objstore_s3::{
     ByteRange, Capabilities, KeyPrefix, ListToken, ObjectKey, ObjectStore, ObjectStoreError,
     PageSize, listing,
 };
@@ -961,7 +961,7 @@ async fn an_answer_cut_short_is_a_transport_error_for_reads_and_listings() {
 async fn a_small_streamed_write_with_a_failing_body_sends_nothing() {
     let (endpoint, seen) = script(vec![]).await;
     let s = store(endpoint, Capabilities::default());
-    let body: kbf_objstore::BodyStream = futures::stream::iter(vec![
+    let body: objstore_s3::BodyStream = futures::stream::iter(vec![
         Ok(Bytes::from("ab")),
         Err(ObjectStoreError::Body("the source broke".into())),
     ])
@@ -1117,8 +1117,7 @@ async fn a_put_cut_before_its_answer_is_sent_once_and_fails_as_transport() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(reads.load(Ordering::SeqCst), 1, "the PUT was sent again");
     // Through put_stream too (the flusher's path for a small object).
-    let body: kbf_objstore::BodyStream =
-        futures::stream::iter(vec![Ok(Bytes::from("abc"))]).boxed();
+    let body: objstore_s3::BodyStream = futures::stream::iter(vec![Ok(Bytes::from("abc"))]).boxed();
     s.put_stream(&key(), 3, body).await.unwrap();
     assert_eq!(reads.load(Ordering::SeqCst), 2);
 }
