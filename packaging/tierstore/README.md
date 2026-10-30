@@ -165,11 +165,13 @@ nothing. The lists may overlap: a prefix in `read_prefixes` and in `write_prefix
 reads and creates under. A key file that is refused (bad JSON, a missing or unknown field, a bad
 prefix, a mode other than 0600) exits 1 at start with a message that names the flag and the file and
 never the secret, as a bad GC key file does. The access key id differs from those of all other
-keys: two keys with one id are refused with exit status 2.
+keys: two keys with one id are refused with exit status 2 (the command line does this; a
+`ServerConfig` built in code, as a library user does, is not checked for distinct ids by the server).
 
 A call is allowed only for a key (or, for a listing, a `prefix` parameter) that starts with a prefix
 of the list the call needs, after the path is percent-decoded and with no `..`, no `.` segment and
 no control character in it. A key must be longer than the prefix: the prefix itself is not an object.
+A key or a listing `prefix` that has `..` anywhere in it, even inside a prefix, is refused.
 
 | call | list | allowed |
 |---|---|---|

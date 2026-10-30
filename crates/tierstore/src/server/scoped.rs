@@ -35,10 +35,12 @@
 //! prefix does not let it read. A put over a key that exists is `412` as for every create-only
 //! put. The key is refused on a presigned URL (the URL's key must be a presigning key).
 //!
-//! The refusals come in the order of the GC key's: the signature and the key id, then the method,
-//! then the path and query are decoded, then the checksum headers of the request are read, and
-//! last the key, the list prefix and the headers are held to the lists. A call that is both
-//! refused and malformed may be answered with the malformed-request error rather than 403.
+//! The refusals come in this order: the signature and the key id, then the method, then the path
+//! and query are decoded, then a listing of uploads is held to its `prefix` (a role's
+//! `permit_list_uploads`, which runs before the checksum headers are read), then the checksum
+//! headers of the request are read, and last the key, the list prefix and the headers are held to
+//! the lists by [`permit`]. A call that is both refused and malformed may be answered with the
+//! malformed-request error rather than 403.
 
 use std::fmt;
 use std::path::{Path, PathBuf};

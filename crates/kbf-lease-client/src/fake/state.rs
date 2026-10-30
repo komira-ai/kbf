@@ -150,6 +150,8 @@ struct HostRow {
     /// Known, and silent since the server restarted.
     awaiting: bool,
     taint: Option<Taint>,
+    /// A code the host refuses every new run with, short of a taint.
+    refusing: Option<&'static str>,
     load: Option<HostLoad>,
 }
 
@@ -164,6 +166,7 @@ struct RunRow {
     memory_bytes: u64,
     wall_ms: u64,
     args: Vec<String>,
+    image: String,
     mounts: Vec<Mount>,
     labels: BTreeMap<String, String>,
 }
@@ -438,6 +441,9 @@ impl State {
         if host.taint.is_some() {
             return Err(Refusal::new(409, "host-tainted"));
         }
+        if let Some(code) = host.refusing {
+            return Err(Refusal::new(409, code));
+        }
         let live = self.runs.iter().filter(|run| run.lease == id && run.live());
         let (count, cpu, memory) = live.fold((0, 0, 0), |(count, cpu, memory), run| {
             (count + 1, cpu + run.cpu_millis, memory + run.memory_bytes)
@@ -462,6 +468,7 @@ impl State {
             memory_bytes: limits.memory_bytes,
             wall_ms: limits.wall_ms.map_or(cap, |asked| asked.min(cap)),
             args: spec.args.clone(),
+            image: spec.image.clone(),
             mounts: spec.mounts.clone(),
             labels: spec.labels.clone(),
         };
@@ -569,6 +576,13 @@ impl State {
             .is_some()
     }
 
+    pub(super) fn refuse_posts(&mut self, host: &str, code: Option<&'static str>) -> bool {
+        self.hosts
+            .get_mut(host)
+            .map(|row| row.refusing = code)
+            .is_some()
+    }
+
     pub(super) fn set_load(&mut self, host: &str, load: Option<HostLoad>) -> bool {
         self.hosts
             .get_mut(host)
@@ -641,6 +655,13 @@ impl State {
             .iter()
             .find(|row| row.id == *run)
             .map(|row| row.args.clone())
+    }
+
+    pub(super) fn run_image(&self, run: &RunId) -> Option<String> {
+        self.runs
+            .iter()
+            .find(|row| row.id == *run)
+            .map(|row| row.image.clone())
     }
 
     pub(super) fn run_mounts(&self, run: &RunId) -> Option<Vec<Mount>> {
