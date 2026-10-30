@@ -1,8 +1,7 @@
 # tierstore metrics and PromQL reference
 
 This page lists every series tierstore exports, says exactly what increments each one and what it
-does not count, and gives the PromQL queries that the measurements in the tierstore white paper
-use. It is written for operators who scrape a node and for anyone who repeats those measurements.
+does not count, and gives the PromQL queries used to measure tierstore. It is written for operators who scrape a node and for anyone who repeats those measurements.
 
 Every series is on `GET /metricz`, on the S3 listener, in the Prometheus text format. The path is
 not signed, like `/healthz`, and a bucket cannot be called `metricz`. Point a scrape job at it:
@@ -89,7 +88,9 @@ The reasons of a failed fill:
 and a changed object are failures, not skips. `evictions_total` counts objects, not bytes, and
 `budget` is the share of an eviction pass that brings the cache under its low water mark while
 `floor` is the share that restores the free space of the file system. `pinned_skips_total` goes
-up once for each pinned object on every pass, so it keeps rising while an object stays pinned.
+up once for each pinned object that a pass reaches. A pass walks the objects oldest first and
+stops once it has freed enough, so it does not reach every pinned object, and it keeps rising
+while an object that the passes reach stays pinned.
 `discarded_at_start_total` is a counter that is set once, when the cache is opened, and stays
 the same for the rest of the process.
 
@@ -107,7 +108,8 @@ These four are gauges, measured when `/metricz` is read.
 ## On `/metricz` today
 
 The OCI read front, when it is enabled, exports these series. Without it, `/metricz` has one
-comment line that says the front is not enabled.
+comment line that says the front is not enabled. After that block, a node that runs no local
+cache has one more comment line, "this tierstore has no local cache".
 
 | name | type | labels | what it counts |
 |---|---|---|---|
@@ -310,7 +312,7 @@ and map to `tier="cold"`:
 Cold-side bytes read, one query for both deployments:
 
 ```promql
-sum(rate(tierstore_bytes_read_total{tier="cold"}[5m]))
+sum by (tier) (rate(tierstore_bytes_read_total{tier="cold"}[5m]))
 or
 label_replace(sum(rate(tierstore_cache_upstream_bytes_read_total[5m])), "tier", "cold", "", "")
 ```
@@ -402,7 +404,10 @@ ignoring (reason) group_left
 
 The denominator counts a bad-digest put that the upstream took twice, once as a put and once as
 a failure, and does not count puts refused because the HEAD before the send found the key (see
-"v1: writes through the cache"). For the share of puts refused because the key exists, add `write_exists_total`:
+"v1: writes through the cache"). A completion that fails with "exists" counts in `put_failures` with reason `exists` and not in
+`write_exists_total`, which only whole-body puts feed. The share above counts such a completion as
+a failure, and the share below leaves it out, so they differ slightly when completions race. For the share of puts refused because the key exists, add
+`write_exists_total`:
 
 ```promql
 sum(rate(tierstore_cache_write_exists_total[5m]))
@@ -426,6 +431,7 @@ that were dropped while they copied:
 ```promql
 sum by (reason) (rate(tierstore_promotions_skipped_total[5m]))
   /
+ignoring (reason) group_left
 sum(rate(tierstore_hits_total{tier="cold",op="get"}[5m]))
 ```
 
