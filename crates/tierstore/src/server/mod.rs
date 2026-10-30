@@ -191,6 +191,8 @@ mod completion_tests;
 #[cfg(test)]
 mod config_testing;
 #[cfg(test)]
+mod docs_tests;
+#[cfg(test)]
 mod drain_tests;
 #[cfg(test)]
 mod gc_server_tests;
