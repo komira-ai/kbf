@@ -1,7 +1,7 @@
 //! The local cache of a build node: a read-through disk cache in front of one upstream.
 //!
 //! A [`LocalCache`] is a [`Backend`] over an upstream [`Backend`] (an S3 endpoint, in the
-//! binary: a storage node's tierstore). By default the S3 front serves it as a read cache and
+//! binary: any S3 store, such as a bucket of MinIO or a storage node's tierstore). By default the S3 front serves it as a read cache and
 //! refuses every write before it gets here (see `ServerConfig::cache`), so a cache has no
 //! journal, no lease and no reconciler, and nothing to recover but a directory of files it can
 //! delete. The only things that run on their own are the fills a miss starts and the eviction

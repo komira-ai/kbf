@@ -522,7 +522,9 @@ names; it binds nothing, makes no directory and calls no store or network. It pr
 exits 0 if the file would start; if the file is refused it prints the message a start prints and
 exits 2. `--check-config` without `--config` is a usage error (status 2). It does not reach the
 tiers, so a tier that is down, or a key that the store would refuse, is found by a start (its
-self-test) and not by the check.
+self-test) and not by the check. It does not look at the disk either: the start's refusal of a
+`budget` over the size of the file system less `free_floor` (exit status 2), the cache directory
+and the credentials file of a tier are checked by a start only.
 
 ### What the loader refuses
 

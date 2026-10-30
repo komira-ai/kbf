@@ -59,9 +59,12 @@ impl Inner {
     pub(super) async fn delete_through(&self, key: &str) -> Result<(), Error> {
         self.writable(key)?;
         self.forget(key);
-        self.upstream.delete(key).await?;
+        let deleted = self.upstream.delete(key).await;
+        // Also when the upstream answers with an error: a timeout, or a 5xx after the commit,
+        // may have deleted the object, and a fill that began in between must not keep it. An
+        // object that is still there is read in again by the next miss.
         self.forget(key);
-        Ok(())
+        deleted
     }
 
     /// Starts a multipart upload of `key` at the upstream.

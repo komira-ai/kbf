@@ -791,22 +791,29 @@ pub fn main(args: Vec<OsString>) -> ExitCode {
 /// `--check-config`: what a start refuses before it opens anything, asked of the settings of a
 /// file: the front's settings, which reads the key files it names, and the limits a start
 /// checks first. Status 0 and no output if there is nothing to refuse; else the start's message
-/// on stderr and status 2. It binds nothing and asks nothing of a tier.
+/// on stderr and status 2. It binds nothing and asks nothing of a tier. It does not make the
+/// checks that a start makes of the disk and the stores: the budget of a cache against the size
+/// of its file system (`free_floor`), the cache directory, the credentials of a tier, the
+/// self-test.
 fn check_config(settings: &Settings) -> ExitCode {
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let checked = match settings {
-        Settings::Storage(cli) => server_config(&cli.front(), clock).map(drop),
-        Settings::Cache(cache) if cache.s3_request_timeout.is_zero() => {
-            Err("--s3-request-timeout must be longer than zero".into())
-        }
-        Settings::Cache(cache) => server_config(&cache.front, clock).map(drop),
-    };
-    match checked {
+    match checked(settings) {
         Ok(()) => ExitCode::SUCCESS,
         Err(why) => {
             eprintln!("tierstore: {}", keys_for_flags(&why.to_string()));
             ExitCode::from(2)
         }
+    }
+}
+
+/// What `--check-config` finds wrong with the settings, if anything.
+pub(super) fn checked(settings: &Settings) -> Result<(), Error> {
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    match settings {
+        Settings::Storage(cli) => server_config(&cli.front(), clock).map(drop),
+        Settings::Cache(cache) if cache.s3_request_timeout.is_zero() => {
+            Err("--s3-request-timeout must be longer than zero".into())
+        }
+        Settings::Cache(cache) => server_config(&cache.front, clock).map(drop),
     }
 }
 
