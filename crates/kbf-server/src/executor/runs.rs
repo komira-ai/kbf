@@ -363,8 +363,9 @@ impl HostWorker {
             return Err(Settled::Infra("the pack url is not https".to_owned()));
         }
         let grant = ctx.deps.inputs.read_grant(lease, action, wall).await?;
-        // The bearer token goes into the arguments: not over a scheme that sends it in clear.
-        if !grant.url.starts_with("https://") {
+        // The bearer token goes into the arguments: not over a scheme that sends it in clear,
+        // unless the operator said the job network is trusted for it.
+        if !ctx.cfg.allow_plain_http_grant && !grant.url.starts_with("https://") {
             return Err(Settled::Infra(
                 "the read grant is not served over https".to_owned(),
             ));
@@ -378,6 +379,7 @@ impl HostWorker {
             deadline: timeout,
             work_dir: ctx.cfg.work_dir.as_deref(),
             allow_plain_http_put: ctx.cfg.allow_plain_http_put,
+            allow_plain_http_grant: ctx.cfg.allow_plain_http_grant,
         };
         let limits = RunLimits {
             cpu_millis: w.millicpus.max(1),
