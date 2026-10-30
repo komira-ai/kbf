@@ -10,7 +10,7 @@ use std::time::Duration;
 use super::coordinator::{Coordinator, CoordinatorError};
 use super::local::{Ended, HostState, Local, LocalError, Staged, Trial};
 use crate::inventory::{Host, Role};
-use crate::ports::{Clock, Drain, Health, HealthCheck, PortError};
+use crate::ports::{Clock, Drain, Health, HealthCheck, Placed, PortError};
 use crate::version::Version;
 use crate::wire::{self, Heartbeat, Reply, ServiceReply};
 
@@ -234,6 +234,9 @@ pub struct FakeDrain {
     pub drain_error: Arc<Mutex<Option<PortError>>>,
     pub leases_error: Arc<Mutex<Option<PortError>>>,
     pub undrain_error: Arc<Mutex<Option<PortError>>>,
+    pub placed_error: Arc<Mutex<Option<PortError>>>,
+    /// Whether the node is in placement before the roll; in placement unless a test says not.
+    pub placed: Arc<Mutex<Placed>>,
 }
 
 impl FakeDrain {
@@ -245,7 +248,15 @@ impl FakeDrain {
             drain_error: Arc::default(),
             leases_error: Arc::default(),
             undrain_error: Arc::default(),
+            placed_error: Arc::default(),
+            placed: Arc::new(Mutex::new(Placed::In)),
         }
+    }
+
+    /// The node is out of placement (an operator drained it) before the roll comes.
+    pub fn out_of_placement(&self) {
+        *lock(&self.placed) = Placed::Out;
+        *lock(&self.drained) = true;
     }
 
     pub fn is_drained(&self) -> bool {
@@ -254,6 +265,14 @@ impl FakeDrain {
 }
 
 impl Drain for FakeDrain {
+    fn placed(&self, _host: &Host) -> Result<Placed, PortError> {
+        self.events.push("placed");
+        if let Some(e) = lock(&self.placed_error).clone() {
+            return Err(e);
+        }
+        Ok(*lock(&self.placed))
+    }
+
     fn drain(&self, host: &Host, deadline: Option<Duration>) -> Result<(), PortError> {
         self.events.push(match deadline {
             Some(deadline) => format!("drain {} {}", host.alias, deadline.as_secs()),

@@ -22,7 +22,7 @@ use crate::inventory::{Host, Role};
 use crate::node_drain::NodeDrain;
 use crate::node_health::NodeHealth;
 use crate::operator::OperatorApi;
-use crate::ports::{Drain, Health, HealthCheck, PortError, SystemClock};
+use crate::ports::{Drain, Health, HealthCheck, Placed, PortError, SystemClock};
 use crate::version::Version;
 
 /// A host whose node is never drained (a frontend host that runs no daemon): the frontend's own
@@ -30,6 +30,10 @@ use crate::version::Version;
 pub struct NoDrain;
 
 impl Drain for NoDrain {
+    fn placed(&self, _host: &Host) -> Result<Placed, PortError> {
+        Ok(Placed::In)
+    }
+
     fn drain(&self, _host: &Host, _deadline: Option<Duration>) -> Result<(), PortError> {
         Ok(())
     }
@@ -72,6 +76,10 @@ impl HealthCheck for NoCredential {
 }
 
 impl Drain for NoCredential {
+    fn placed(&self, _host: &Host) -> Result<Placed, PortError> {
+        Err(PortError::other(self.0))
+    }
+
     fn drain(&self, _host: &Host, _deadline: Option<Duration>) -> Result<(), PortError> {
         Err(PortError::other(self.0))
     }

@@ -577,3 +577,115 @@ fn the_wire_health_is_two_words() {
         "\"unhealthy\""
     );
 }
+
+const LEFT_OUT: &str = "node was out of placement before the roll; left out";
+
+/// A node an operator took out of placement before the roll is drained and waited for as any
+/// other (a restart cuts no lease off), and after the confirm it is not uncordoned: the update
+/// succeeds, `undrain` is never called, the node ends out of placement, and the log says it was
+/// left out. The node is read before it is drained.
+#[test]
+fn a_node_out_of_placement_before_the_roll_is_not_given_back_after_the_confirm() {
+    let rig = Rig::new();
+    rig.drain.out_of_placement();
+    *rig.drain.leases.lock().unwrap() = [2, 0].into();
+    assert_eq!(rig.run(VB), succeeded(VB));
+    assert_eq!(
+        rig.steps(),
+        [
+            &format!("local:install {VB} stable"),
+            "drain n1 none",
+            &format!("local:switch {VB}"),
+            &format!("local:confirm {VB}"),
+        ]
+    );
+    assert_eq!(rig.events.count("leases"), 2, "its leases are waited for");
+    let all = rig.events.all();
+    let at = |needle: &str| all.iter().position(|e| e.starts_with(needle)).unwrap();
+    assert!(at("placed") < at("drain"), "{all:?}");
+    assert_eq!(rig.events.count("undrain"), 0);
+    assert!(rig.drain.is_drained());
+    assert!(rig.logged(LEFT_OUT));
+}
+
+/// ... and on every path that used to give the node back, a node that was out stays out: B
+/// unhealthy with A healthy, a switch the helper could not do, a confirm the helper refused,
+/// and a node whose leases could not be read.
+#[test]
+fn a_node_out_of_placement_before_the_roll_is_not_given_back_on_any_revert_path() {
+    // B never shows healthy; A does.
+    let rig = Rig::new();
+    rig.drain.out_of_placement();
+    rig.health
+        .say(VB, vec![Ok(Health::Abandoned("wrong build".to_owned()))]);
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(rig.events.count("local:revert"), 1);
+    assert_eq!(rig.events.count("undrain"), 0, "back on A");
+    assert!(rig.drain.is_drained());
+    assert!(rig.logged(LEFT_OUT));
+
+    // The switch fails and the helper has nothing to revert; A is healthy.
+    let rig = Rig::new();
+    rig.drain.out_of_placement();
+    rig.local.world().switch = Err(LocalError::Failed("switch_failed".to_owned()));
+    rig.local.world().revert = Err(LocalError::Refused("nothing_pending".to_owned()));
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(rig.events.count("undrain"), 0, "switch failed");
+    assert!(rig.drain.is_drained());
+    assert!(rig.logged(LEFT_OUT));
+
+    // The confirm is refused, so B is reverted.
+    let rig = Rig::new();
+    rig.drain.out_of_placement();
+    rig.local.world().confirm = Err(LocalError::Failed("state_unavailable".to_owned()));
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(rig.events.count("local:revert"), 1);
+    assert_eq!(rig.events.count("undrain"), 0, "confirm refused");
+    assert!(rig.drain.is_drained());
+    assert!(rig.logged(LEFT_OUT));
+
+    // The leases cannot be read: nothing is switched, and the node is not uncordoned.
+    let rig = Rig::new();
+    rig.drain.out_of_placement();
+    *rig.drain.leases_error.lock().unwrap() = Some(PortError::other("serving again"));
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(rig.events.count("local:switch"), 0);
+    assert_eq!(rig.events.count("undrain"), 0, "leases unreadable");
+    assert!(rig.drain.is_drained());
+    assert!(rig.logged(LEFT_OUT));
+}
+
+/// A node in placement before the roll is given back as ever: after the confirm, and after a
+/// revert to a healthy A; and the log does not say it was left out.
+#[test]
+fn a_node_in_placement_before_the_roll_is_given_back() {
+    let rig = Rig::new();
+    assert_eq!(rig.run(VB), succeeded(VB));
+    assert_eq!(rig.events.count("placed"), 1);
+    assert_eq!(rig.events.count("undrain"), 1);
+    assert!(!rig.drain.is_drained());
+    assert!(!rig.logged(LEFT_OUT));
+
+    let rig = Rig::new();
+    rig.health
+        .say(VB, vec![Ok(Health::Abandoned("wrong build".to_owned()))]);
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(rig.events.count("undrain"), 1);
+    assert!(!rig.drain.is_drained());
+    assert!(!rig.logged(LEFT_OUT));
+}
+
+/// A node that cannot be read is not guessed at: the update fails before the drain, and
+/// nothing is drained, switched or given back.
+#[test]
+fn a_node_that_cannot_be_read_stops_the_update_before_the_drain() {
+    let rig = Rig::new();
+    *rig.drain.placed_error.lock().unwrap() = Some(PortError::unreachable("the operator API"));
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(
+        rig.steps(),
+        [format!("local:install {VB} stable")],
+        "no drain, no switch, no undrain"
+    );
+    assert!(rig.logged("could not be drained"));
+}

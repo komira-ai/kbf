@@ -202,15 +202,30 @@ impl<T: Installer + ?Sized> Installer for std::sync::Arc<T> {
     }
 }
 
+/// Whether a node was in placement (taking new leases) when a roll came to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placed {
+    /// It was serving, or there is no node to ask about: the roll's drain is the only
+    /// thing keeping it out, so the roll gives it back.
+    In,
+    /// It was out already (cordoned, draining or drained by somebody else): the roll still
+    /// drains it, so that a restart cuts no lease off, but does not give it back.
+    Out,
+}
+
 /// Taking a daemon host's node out of placement at the frontend, and giving it back.
 pub trait Drain: Send + Sync {
+    /// Whether the node of `host` is in placement now. A caller reads this before
+    /// [`Drain::drain`] and calls [`Drain::undrain`] only for a node that was [`Placed::In`].
+    fn placed(&self, host: &Host) -> Result<Placed, PortError>;
     /// Cordon the node of `host` and ask the frontend to wait for its leases for `deadline`,
     /// or with no deadline (`None`) when the caller waits however long it takes.
     fn drain(&self, host: &Host, deadline: Option<Duration>) -> Result<(), PortError>;
     /// How many leases the node of `host` holds now.
     fn leases(&self, host: &Host) -> Result<usize, PortError>;
-    /// Return the node of `host` to placement. This is unconditional: a node an operator
-    /// cordoned before the roll is uncordoned after it, so cordon it again if it must stay out.
+    /// Return the node of `host` to placement. This is unconditional: it is the caller's job
+    /// not to call it for a node that [`Drain::placed`] said was [`Placed::Out`], because an
+    /// uncordon cannot tell the roll's cordon from an operator's.
     /// A storage host is never drained, even one that also runs a daemon, and needs no node id.
     fn undrain(&self, host: &Host) -> Result<(), PortError>;
 }

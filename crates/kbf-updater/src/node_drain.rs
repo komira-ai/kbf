@@ -26,7 +26,7 @@ use serde::Deserialize;
 
 use crate::inventory::{Host, valid_node_id};
 use crate::operator::{CHECK, OperatorApi, WHAT};
-use crate::ports::{Drain, PortError};
+use crate::ports::{Drain, Placed, PortError};
 use crate::reply::Reply;
 
 /// Draining over the operator API.
@@ -87,6 +87,10 @@ impl NodeDrain {
 }
 
 impl Drain for NodeDrain {
+    fn placed(&self, _host: &Host) -> Result<Placed, PortError> {
+        Ok(Placed::In)
+    }
+
     fn drain(&self, host: &Host, deadline: Option<Duration>) -> Result<(), PortError> {
         let node = Self::node(host)?;
         let body = deadline.map_or_else(String::new, |deadline| {
