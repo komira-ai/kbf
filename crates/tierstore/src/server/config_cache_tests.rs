@@ -257,10 +257,7 @@ fn a_build_node_file_is_refused_when_it_cannot_be_run() {
             cache_with("high_water = 85", "high_water = 101"),
             "local_cache.high_water",
         ),
-        (
-            cache_with("\"50MiB/s\"", "\"fast\""),
-            "expected a rate such as",
-        ),
+        (cache_with("\"50MiB/s\"", "\"fast\""), "not a rate"),
         (cache_with("\"50MiB/s\"", "50"), "scrub_rate"),
         (no_cache_policy, "no policy has cache = true"),
         (
