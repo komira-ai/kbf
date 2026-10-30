@@ -235,6 +235,32 @@ const GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        // The frontend's job-facing read listener (`kbf_server::frontend`'s `job_read`).
+        "job-read",
+        &[
+            "job-grant-secret-file",
+            "job-listen",
+            "job-tls-cert",
+            "job-tls-key",
+        ],
+    ),
+    (
+        // Preparing the runs of a host executor: `kbf_server::frontend`'s `task_flags`.
+        "task-runs",
+        &[
+            "task-closure-max-bytes",
+            "task-closure-max-digests",
+            "task-put-bucket",
+            "task-put-credentials-file",
+            "task-put-endpoint",
+            "task-put-region",
+            "task-read-url",
+            "task-run-wall-secs",
+            "task-secret-file",
+            "task-url-slack-secs",
+        ],
+    ),
+    (
         // Not `enroll` or `frontend`: those tables are the enrollment client's own.
         "enroll-service",
         &[
