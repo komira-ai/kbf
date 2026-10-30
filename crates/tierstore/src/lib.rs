@@ -81,6 +81,7 @@ mod faulty;
 mod journal;
 mod lease;
 mod memory;
+mod metrics;
 mod reconciler;
 #[cfg(feature = "s3")]
 pub mod s3;

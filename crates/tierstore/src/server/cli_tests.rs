@@ -382,6 +382,7 @@ fn flags_that_do_not_fit_together_are_refused() {
     assert!(refused(&|cli| cli.bucket = "readyz".to_owned()).contains("probe path"));
     assert!(refused(&|cli| cli.bucket = "healthz".to_owned()).contains("probe path"));
     assert!(refused(&|cli| cli.bucket = "usagez".to_owned()).contains("probe path"));
+    assert!(refused(&|cli| cli.bucket = "metricz".to_owned()).contains("probe path"));
     let idle = refused(&|cli| cli.body_idle_timeout = Duration::ZERO);
     assert!(idle.contains("--body-idle-timeout"), "{idle}");
     let wait = refused(&|cli| cli.s3_request_timeout = Duration::ZERO);

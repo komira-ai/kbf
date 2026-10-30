@@ -147,6 +147,12 @@
 //! Without [`ServerConfig::proxy`] it is 200 and says the usage is not watched. A bucket cannot
 //! be called `usagez` either.
 //!
+//! `GET /metricz` is 200 with the counters of the proxy's reads ([`Proxy::metrics`]: hits,
+//! misses and bytes of each tier, the reads that went on to the cold tier, the copies they made
+//! into the hot tier) in the Prometheus text format; it is not signed either, and a bucket
+//! cannot be called `metricz`. Without [`ServerConfig::proxy`] it is 200 and says there is no
+//! proxy. The README of the crate lists every name and label.
+//!
 //! # Drain
 //!
 //! [`Server::begin_drain`], which the binary calls on SIGTERM or SIGINT, starts a sequence that
@@ -193,6 +199,8 @@ mod gc_server_tests;
 mod gc_tests;
 #[cfg(test)]
 mod idle_tests;
+#[cfg(test)]
+mod metrics_tests;
 #[cfg(test)]
 mod ops_tests;
 #[cfg(test)]
@@ -750,10 +758,19 @@ impl Server {
             (true, "/readyz", true) => (StatusCode::OK, "ready".to_owned()),
             (true, "/readyz", false) => (StatusCode::SERVICE_UNAVAILABLE, "draining".to_owned()),
             (true, "/usagez", _) => self.usage_probe().await,
+            (true, "/metricz", _) => (StatusCode::OK, self.metrics_probe()),
             _ => return None,
         };
         let headers = [("content-type", "text/plain".to_owned())];
         Some(answer(status, &headers, Bytes::from(text)))
+    }
+
+    /// The text of `/metricz`: the counters of the proxy, or a line that says there is none.
+    fn metrics_probe(&self) -> String {
+        match &self.config.proxy {
+            Some(proxy) => proxy.metrics(),
+            None => "# this server has no proxy to count\n".to_owned(),
+        }
     }
 
     /// The answer of `/usagez`: 200 and the age of the usage object of the reconciler while it is

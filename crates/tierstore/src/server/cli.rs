@@ -532,7 +532,10 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     if cli.usage_stale_after <= cli.lease_ttl {
         return Err("--usage-stale-after must be longer than --lease-ttl".into());
     }
-    if matches!(cli.bucket.as_str(), "healthz" | "readyz" | "usagez") {
+    if matches!(
+        cli.bucket.as_str(),
+        "healthz" | "readyz" | "usagez" | "metricz"
+    ) {
         let name = &cli.bucket;
         return Err(format!("--bucket {name:?} is the name of a probe path").into());
     }
