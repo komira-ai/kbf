@@ -152,7 +152,7 @@ connection_lifetime = "1h"
 | `oci.listen` | `--oci-listen` | address | where the front listens. With a certificate and key it is HTTPS; with neither it is plain HTTP, and off loopback the start prints one warning line |
 | `oci.tls_cert_file` | `--oci-tls-cert` | path | the certificate chain (PEM), leaf first. It must carry an IP subjectAltName for the listen address. Both this and the key, or neither |
 | `oci.tls_key_file` | `--oci-tls-key` | path | the private key (PEM); a file any user can read is refused |
-| `oci.prefix` | `--oci-prefix` | string, `oci/` | the key prefix, ending in `/`; not inside `_journal/` or `_tiering/` |
+| `oci.prefix` | `--oci-prefx` | string, `oci/` | the key prefix, ending in `/`; not inside `_journal/` or `_tiering/` |
 | `oci.max_connections` | `--oci-max-connections` | count, 64 (at least 1) | connections open at once |
 | `oci.connection_lifetime` | `--oci-connection-lifetime` | duration, `1h` | the longest a connection lives |
 
