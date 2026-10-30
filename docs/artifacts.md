@@ -82,11 +82,9 @@ two tools above. Its tarball holds one member, the binary under its own name.
 
 `kbf-task` is the runner of one build action inside a job (`crates/kbf-task`). Its Linux tarballs hold
 one member, the binary under its own name, built for the musl target of the architecture, so it is
-statically linked: it needs no libc of the image it runs in, and a host installs the one file into the
-directory it mounts read-only into the images of the actions it runs (the action's own image, with
-`kbf-task` as the job's command). The frontend's js-agent executor no longer mounts it: it runs the
-kbf image, whose entrypoint is `kbf-task`, and gives the tool its flags only (`kbf-task` takes every
-path as a flag). It is built and
+statically linked: it needs no libc of the image it runs in. A host does not mount it into any image: the
+kbf image carries it as its `ENTRYPOINT`, and the frontend's js-agent executor runs the kbf image (by digest,
+built from the served base) and gives the tool its flags only (`kbf-task` takes every path as a flag). It is built and
 tested on a native runner of each architecture, which installs the target with `rustup target add` and
 `musl-tools` (ring compiles C for the target with `musl-gcc`); the job runs `build-commit check` on the
 binary, which runs it, and `cargo xtask static-elf`, which refuses it unless it has no program
@@ -283,7 +281,7 @@ renamed.
 | Event | What happens |
 |---|---|
 | Pull request, merge queue | A build check: every asset is built, signed, packaged and summed, and `SHA256SUMS` is checked. Nothing is attested, so nothing is published. |
-| Push to `main` | The same, as the second stage of the one pipeline (`pipeline.yml`: `ci` and `beta` (the source tests) together, `artifacts` after `ci`, `smoke` on these files after `artifacts`, then the release; `artifacts.yml` is called by it, and reads the push as its own event), then, per platform group (Linux: `sums-linux`, `attest-linux`, `verify-linux`; macOS: `sums-darwin-arm64`, `attest-darwin-arm64`, `verify-darwin-arm64`, so the Linux files are attested as soon as the Linux builds finish, however long the macOS runners queue), the `attest-*` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`), an SBOM attestation for every tarball (`actions/attest-sbom`) and a build provenance attestation of each tarball alone, whose bundle it saves (artifact `bundles-linux` or `bundles-darwin-arm64`), and nothing else. The `verify-*` job of the group then assembles the group's `SHA256SUMS` (artifact `sha256sums-linux` or `sha256sums-darwin-arm64`, listing only that group's files, each with the same subject as in the commit's one `SHA256SUMS`) again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below, for the branch that was pushed (`--source-ref "$GITHUB_REF"`), and every tarball against its bundle, offline, for the commit (`--commit "$GITHUB_SHA"`). |
+| Push to `main` | The same, as the second stage of the one pipeline (`pipeline.yml`: `ci` and `beta` (the source tests) together, `artifacts` (the builds and sums, `stage: build`) beside them, `artifacts-sign` (the attest and verify jobs, `stage: sign`) after `ci` and `artifacts`, `smoke` on these files after `artifacts-sign`, then the release; `artifacts.yml` is called twice by it, and reads the push as its own event; the attest jobs are in that file because it is the signer identity the installers verify), then, per platform group (Linux: `sums-linux`, `attest-linux`, `verify-linux`; macOS: `sums-darwin-arm64`, `attest-darwin-arm64`, `verify-darwin-arm64`, so the Linux files are attested as soon as the Linux builds finish, however long the macOS runners queue), the `attest-*` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`), an SBOM attestation for every tarball (`actions/attest-sbom`) and a build provenance attestation of each tarball alone, whose bundle it saves (artifact `bundles-linux` or `bundles-darwin-arm64`), and nothing else. The `verify-*` job of the group then assembles the group's `SHA256SUMS` (artifact `sha256sums-linux` or `sha256sums-darwin-arm64`, listing only that group's files, each with the same subject as in the commit's one `SHA256SUMS`) again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below, for the branch that was pushed (`--source-ref "$GITHUB_REF"`), and every tarball against its bundle, offline, for the commit (`--commit "$GITHUB_SHA"`). |
 
 An attestation names the ref it was signed on, and only `refs/heads/main` signs now.
 Until main became the only integration branch, pushes to a development branch,
@@ -700,8 +698,8 @@ rebuilt. Its assets are every tarball and SBOM in the table above, for that comm
 it.
 
 One run of `release.yml` cuts a release; nobody tags. A push to `main` runs one sequential pipeline
-(`pipeline.yml`, [design](design/kbf-cicd.md), section 8.0): `ci` and `beta` (the source tests) together, `artifacts` after `ci`, and `smoke`, which installs and
-tests the `kbf` of the files `artifacts` built in that same run, after `artifacts`; the run fails fast (its `watch` job cancels it when a job has failed). `release.yml`
+(`pipeline.yml`, [design](design/kbf-cicd.md), section 8.0): `ci` and `beta` (the source tests) together, `artifacts` (the builds) beside them, `artifacts-sign` (the attestations) after `ci` and `artifacts`, and `smoke`, which installs and
+tests the `kbf` of the files `artifacts` built and attested in that same run, after `artifacts-sign`; the run fails fast (its `watch` job cancels it when a job has failed). `release.yml`
 is started by the completion of a pipeline run (`workflow_run`, `branches: [main]`) and acts only when that run
 succeeded for a push to `main`; it reads the files from that run's artifacts by the run's id and publishes those same
 files. It is a workflow of its own so that nothing a push does can cancel a

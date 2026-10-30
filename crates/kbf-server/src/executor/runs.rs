@@ -21,7 +21,7 @@ use tokio::time::Instant;
 use crate::executor::config::Config;
 use crate::executor::host::{Drain, HostWorker, Retire};
 use crate::executor::metrics::{IngestEnd, Metrics, RunEnd};
-use crate::executor::outcome::{Settled, Verdict, judge, ran, result_of};
+use crate::executor::outcome::{Settled, Verdict, judge, ran, refused_for_quota, result_of};
 use crate::executor::task::{Nonce, PackKey, TaskArgs};
 use crate::executor::traits::{Ingested, InputsError, MintError, PresignError, UntrustedLimits};
 use crate::executor::{Ctx, note};
@@ -431,6 +431,10 @@ impl HostWorker {
                 self.begin_drain(ctx, Drain::Tainted);
                 Queued::Settled(Settled::Infra("the host is tainted".to_owned()))
             }
+            Some(ErrorCode::QuotaUnavailable) => {
+                self.quota_unavailable(ctx, ctx.clock.now());
+                Queued::Settled(Settled::Lost(Lost::Fenced))
+            }
             Some(ErrorCode::HostLost | ErrorCode::HostNotRegistered) => {
                 Queued::Retire(Retire::Lost)
             }
@@ -511,6 +515,9 @@ impl HostWorker {
         );
         if !ended {
             return;
+        }
+        if refused_for_quota(run) {
+            self.quota_unavailable(ctx, now);
         }
         match judge(run, truncated) {
             Verdict::Settled(settled) => {

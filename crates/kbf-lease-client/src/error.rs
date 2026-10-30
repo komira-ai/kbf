@@ -57,6 +57,9 @@ pub enum ErrorCode {
     HostTainted,
     /// 409: the host is not ready for runs yet.
     NotReady,
+    /// The host's scratch disk quota is out of order and it starts no run. Not a taint: the
+    /// host recovers by itself.
+    QuotaUnavailable,
     /// 409: a run with this id exists.
     RunExists,
     /// 422: the job breaks a rule of the run contract.
@@ -103,6 +106,7 @@ const CODES: &[(&str, ErrorCode)] = &[
     ("host-not-registered", ErrorCode::HostNotRegistered),
     ("host-tainted", ErrorCode::HostTainted),
     ("not-ready", ErrorCode::NotReady),
+    ("quota-unavailable", ErrorCode::QuotaUnavailable),
     ("run-exists", ErrorCode::RunExists),
     ("invalid-job", ErrorCode::InvalidJob),
     ("invalid-image", ErrorCode::InvalidImage),

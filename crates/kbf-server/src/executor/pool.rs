@@ -77,10 +77,14 @@ impl Slot {
                 None => Self::Active(worker),
                 Some(why) => {
                     let retry_at = match why {
-                        Retire::Drained => now,
+                        Retire::Drained | Retire::Benched(_) => now,
                         _ => now + ctx.cfg.acquire_retry,
                     };
+                    let lease = worker.lease;
                     worker.retire(ctx, why).await;
+                    if let Retire::Benched(until) = why {
+                        ctx.bench.put(lease, until);
+                    }
                     Self::Vacant { retry_at }
                 }
             },
@@ -292,7 +296,8 @@ pub(super) async fn reconcile(ctx: &Ctx<'_>, slots: &[Slot], inherited: &[LeaseI
     let Ok(own) = listed else {
         return false;
     };
-    let held: Vec<LeaseId> = slots.iter().filter_map(Slot::lease).collect();
+    let mut held: Vec<LeaseId> = slots.iter().filter_map(Slot::lease).collect();
+    held.extend(ctx.bench.leases());
     for lease in own {
         let live = matches!(lease.state, LeaseState::Held | LeaseState::Pending);
         // Only this process's leases, and those it took up: another process under the same

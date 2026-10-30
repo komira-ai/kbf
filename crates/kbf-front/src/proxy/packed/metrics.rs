@@ -84,6 +84,10 @@ pub struct PackMetrics {
     pub(super) ingest_rejects: [Counter; RejectReason::ALL.len()],
     /// Ingests that the store, the index or the action cache could not answer.
     pub(super) ingest_unavailable: Counter,
+    /// The packs of the runs `ingest` turned into a result (one for a run of one pack).
+    pub(super) ingest_packs: Counter,
+    /// The bytes of large objects `ingest` stored in the CAS for the runs it turned into a result.
+    pub(super) ingest_large_bytes: Counter,
 }
 
 /// Why a commit of an untrusted pack was refused: the key is not the one issued, the manifest
@@ -126,6 +130,20 @@ impl PackMetrics {
     #[must_use]
     pub fn ingest_unavailable(&self) -> u64 {
         self.ingest_unavailable.get()
+    }
+
+    /// The packs of the runs `ingest` turned into a result: with [`PackMetrics::ingests`], the
+    /// packs per run.
+    #[must_use]
+    pub fn ingest_packs(&self) -> u64 {
+        self.ingest_packs.get()
+    }
+
+    /// The bytes of large objects `ingest` stored in the CAS, for the runs it turned into a
+    /// result.
+    #[must_use]
+    pub fn ingest_large_bytes(&self) -> u64 {
+        self.ingest_large_bytes.get()
     }
 
     /// The bytes reserved for the uploads in flight now.
@@ -290,6 +308,18 @@ impl PackMetrics {
             "Ingests of a task's pack that the object store, the pack index or the action cache \
              could not answer",
             self.ingest_unavailable.get(),
+        );
+        families.counter(
+            "kbf_pack_ingest_packs_total",
+            "Packs of the runs a task wrote that were ingested into an action result: divided \
+             by the ingests, the packs per run",
+            self.ingest_packs.get(),
+        );
+        families.counter(
+            "kbf_pack_ingest_large_bytes_total",
+            "Bytes of large objects a task wrote that ingest stored in the CAS, for the runs \
+             it ingested into an action result",
+            self.ingest_large_bytes.get(),
         );
         *out = families.0;
     }
