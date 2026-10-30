@@ -161,10 +161,25 @@ pub fn mint_grant<S: AsRef<str>>(
     expires_at: u64,
     names: impl IntoIterator<Item = S>,
 ) -> Result<String, GrantError> {
+    let given: Vec<S> = names.into_iter().collect();
+    mint_sorted(
+        key,
+        bucket,
+        expires_at,
+        given.iter().map(AsRef::as_ref).collect(),
+    )
+}
+
+/// The body of [`mint_grant`], not generic over the type of the names, so that one instance of it
+/// holds every refusal.
+fn mint_sorted(
+    key: &AccessKey,
+    bucket: &str,
+    expires_at: u64,
+    mut names: Vec<&str>,
+) -> Result<String, GrantError> {
     check_credentials(&key.id, &key.secret).map_err(|_| GrantError::Key)?;
     check_bucket(bucket)?;
-    let given: Vec<S> = names.into_iter().collect();
-    let mut names: Vec<&str> = given.iter().map(AsRef::as_ref).collect();
     names.sort_unstable();
     names.dedup();
     check_names(&names)?;

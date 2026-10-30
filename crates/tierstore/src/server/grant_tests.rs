@@ -59,11 +59,26 @@ fn refusal_of_token(config: &ServerConfig, token: &str) -> Refusal {
     verify(config, &carrying_token(token)).unwrap_err()
 }
 
-fn names_of(signed: &Signed) -> Vec<String> {
-    match &signed.role {
-        Role::Grant(names) => names.to_vec(),
-        other => panic!("not a grant: {other:?}"),
-    }
+/// Asserts that the role of `signed` is a grant that lists exactly `names`, compared by `Debug`
+/// so that a role of another kind fails the comparison.
+fn assert_grants(signed: &Signed, names: &[&str]) {
+    let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+    assert_eq!(
+        format!("{:?}", signed.role),
+        format!("{:?}", Role::Grant(Arc::new(names)))
+    );
+}
+
+/// `body` signed, with the last character of its base64 changed to the same character with its
+/// lowest bit set: the bits that the length of the body leaves over are then not zero.
+fn with_trailing_bit(body: &str) -> String {
+    const ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let tag = signed(body).rsplit_once('.').unwrap().1.to_owned();
+    let mut encoded = URL_SAFE_NO_PAD.encode(body.as_bytes());
+    let last = encoded.pop().unwrap();
+    let sextet = ALPHABET.find(last).unwrap();
+    encoded.push(char::from(ALPHABET.as_bytes()[sextet | 1]));
+    format!("{encoded}.{tag}")
 }
 
 /// Asserts that a minted token is accepted by the server check with the role of a grant that
@@ -77,7 +92,7 @@ fn a_minted_token_is_accepted_with_its_names_sorted_and_once_each() {
     let accepted = verify(&config, &carrying_token(&token)).unwrap();
     assert_eq!(accepted.payload, UNSIGNED);
     assert!(accepted.presign.is_none());
-    assert_eq!(names_of(&accepted), ["cas/b/a", "cas/l/b"]);
+    assert_grants(&accepted, &["cas/b/a", "cas/l/b"]);
     let sorted = mint_grant(&key, BUCKET, EXPIRES, ["cas/b/a", "cas/l/b"]).unwrap();
     assert_eq!(token, sorted);
     let owned = vec!["cas/l/b".to_owned(), "cas/b/a".to_owned()];
@@ -135,11 +150,9 @@ fn a_grant_that_the_server_would_refuse_is_not_made() {
         long.as_str(),
     ] {
         let refused = mint(&key, BUCKET, &["fine", name]).unwrap_err();
-        assert!(
-            matches!(&refused, GrantError::Name { name: bad, .. } if bad == name),
-            "{name:?}: {refused:?}"
-        );
-        assert!(refused.to_string().contains("cannot be granted"));
+        let said = refused.to_string();
+        let start = format!("{name:?} cannot be granted: ");
+        assert!(said.starts_with(&start), "{name:?}: {refused:?}");
     }
     let many: Vec<String> = (0..=MAX_GRANT_KEYS).map(|i| format!("k{i:05}")).collect();
     let refused = mint_grant(&key, BUCKET, EXPIRES, &many).unwrap_err();
@@ -149,11 +162,12 @@ fn a_grant_that_the_server_would_refuse_is_not_made() {
         .map(|i| format!("{i:04}{}", "x".repeat(996)))
         .collect();
     let refused = mint_grant(&key, BUCKET, EXPIRES, &big).unwrap_err();
-    assert!(
-        matches!(refused, GrantError::TooLarge { len } if len > MAX_TOKEN_BYTES),
-        "{refused:?}"
-    );
-    assert!(refused.to_string().contains("bytes long"));
+    let said = refused.to_string();
+    let words: Vec<&str> = said.split(' ').collect();
+    assert_eq!(&words[..4], ["the", "token", "would", "be"], "{said}");
+    assert_eq!(&words[5..], ["bytes", "long"], "{said}");
+    let len: usize = words[4].parse().unwrap();
+    assert!(len > MAX_TOKEN_BYTES, "{said}");
     for refused in [
         GrantError::Key,
         GrantError::Bucket,
@@ -161,6 +175,24 @@ fn a_grant_that_the_server_would_refuse_is_not_made() {
         GrantError::TooManyKeys { count: 1 },
     ] {
         assert!(!refused.to_string().contains(SECRET));
+    }
+}
+
+/// Asserts that a body in base64 whose last character has bits the length leaves over that are
+/// not zero is malformed, as the format says, though the tag is the one of the body: the check
+/// only runs on bodies whose length is not a multiple of 3, since those have such bits.
+#[test]
+fn a_body_with_trailing_bits_that_are_not_zero_is_malformed() {
+    let (config, _) = server(BUCKET);
+    let bodies: Vec<String> = ["cas/a", "cas/ab", "cas/abc"]
+        .iter()
+        .map(|name| body_of(name))
+        .filter(|body| body.len() % 3 != 0)
+        .collect();
+    assert_eq!(bodies.len(), 2);
+    for body in bodies {
+        let token = with_trailing_bit(&body);
+        assert_eq!(refusal_of_token(&config, &token), MALFORMED, "{token}");
     }
 }
 
@@ -416,10 +448,8 @@ fn a_grant_key_file_is_a_private_file_with_an_id_and_a_secret() {
     }
     let open = file(&dir, "open", &json(ID, SECRET), 0o644);
     let refused = grant_keys(&[open]).unwrap_err();
-    assert!(
-        refused.starts_with(FLAG_TEXT) && refused.contains("0600"),
-        "{refused}"
-    );
+    assert!(refused.starts_with(FLAG_TEXT), "{refused}");
+    assert!(refused.contains("0600"), "{refused}");
     let link = dir.path().join("link");
     std::os::unix::fs::symlink(&as_json, &link).unwrap();
     let refused = grant_keys(&[link]).unwrap_err();
@@ -438,10 +468,8 @@ fn grant_key_ids_must_differ_from_each_other_and_from_the_other_keys() {
     assert_eq!(ids(&keys), [ID, "second"]);
     assert_eq!(ensure_distinct(&["FULL"], &keys), Ok(()));
     let twice = ensure_distinct(&[], &[one.clone(), one]).unwrap_err();
-    assert!(
-        twice.contains("\"build-grant\"") && !twice.contains(SECRET),
-        "{twice}"
-    );
+    assert!(twice.contains("\"build-grant\""), "{twice}");
+    assert!(!twice.contains(SECRET), "{twice}");
     assert!(ensure_distinct(&[ID], &keys).is_err());
 }
 
@@ -466,10 +494,7 @@ fn the_token_in_the_readme_is_the_one_the_documented_inputs_make() {
     let (mut config, clock) = server("tierstore");
     config.grant_keys = vec![key];
     let accepted = verify(&config, &carrying_token(documented)).unwrap();
-    assert_eq!(
-        names_of(&accepted),
-        ["cas/b/lease-7/pack-a", "cas/l/blob-1"]
-    );
+    assert_grants(&accepted, &["cas/b/lease-7/pack-a", "cas/l/blob-1"]);
     let body = URL_SAFE_NO_PAD
         .decode(documented.split_once('.').unwrap().0)
         .unwrap();

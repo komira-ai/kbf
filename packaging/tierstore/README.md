@@ -268,8 +268,10 @@ body   = "tierstore-grant-v1" LF key-id LF bucket LF expires LF name { LF name }
   start of second `expires`.
 - Each `name` is the exact key of an object, as it appears in the path of the request after
   percent-decoding: UTF-8, at most 1024 bytes, not empty, no control character, no `..`, no `.`
-  segment, not under `_journal/` or `_tiering/`. There is at least one name and at most 4096. The
-  names are in strictly ascending order of their bytes, so none is listed twice.
+  segment, not under `_journal/` or `_tiering/`. There is at least one name and at most 4096; the
+  limit on the header value below is reached first, at about 700 names of ordinary length (the
+  token is about 4/3 of the body), so plan for that many. The names are in strictly ascending
+  order of their bytes, so none is listed twice.
 - The header value (the token) is at most 65536 bytes. The server compares the tag in constant
   time, with the body exactly as received, and trusts no field of the body but `key-id`, which
   names the key to check it with, until the tag matches.
