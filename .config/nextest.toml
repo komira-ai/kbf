@@ -20,6 +20,14 @@ test-group = 'install-sh-fixture'
 filter = 'package(kbf-mac-provision)'
 test-group = 'mac-provision-scratch'
 
+# A fetch test that waits for ever (a rendezvous that never gets its requests together, a pooled
+# connection that is never closed) is killed after two minutes and fails, where it would hang the
+# run. The tests hold no timeout of their own. The filter covers the keep-alive tests too, a child
+# module of `fetch::tests`.
+[[profile.default.overrides]]
+filter = 'package(kbf-task) & test(/^fetch::tests::/)'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
 # The pull-request profile (`cargo nextest run --profile pr`, and `cargo llvm-cov nextest
 # --profile pr`): the fast gate. A pull request runs every test except the slow ones named
 # below; the push to main runs them all, with the default profile
