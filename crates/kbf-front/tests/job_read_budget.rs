@@ -12,11 +12,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::future::{BoxFuture, join_all};
 use futures::{StreamExt as _, stream};
-use kbf_front::digest_to_proto;
 use kbf_front::grants::{GrantKey, Grants, MIN_SECRET_LEN};
 use kbf_front::job_read::{
     BATCH_PATH, BlobSource, HELD_CHUNK_BYTES, JobRead, Limits, Reply, StreamError,
 };
+use kbf_front::{Backend, Cache, VerifiedBlob, digest_to_proto};
 use kbf_proto::reapi::{Action, Directory, DirectoryNode, FileNode};
 use kbf_storage::{ReadStream, StorageError};
 use kbf_types::Digest;
@@ -870,4 +870,50 @@ async fn a_stalled_stream_of_a_large_blob_gives_its_window_back() {
     let third = rig.get(&t.files[2], &token).await;
     assert!(third.stream.is_some(), "served after the idle limit");
     assert!(matches!(stalled.next().await, Some(Err(StreamError::Idle))));
+}
+
+/// Catches: the batch read through a [`Backend`] (the source of a running frontend, which reads
+/// a batch with its own `read_many`) answering anything but each blob's own bytes in order, a
+/// missing blob as anything but `not_found`, and a reply of a streamed blob being unprintable
+/// (it is logged when a request fails).
+#[tokio::test]
+async fn a_batch_reads_through_a_backend_and_a_streamed_reply_prints() {
+    let mut blobs = HashMap::new();
+    let contents: Vec<Vec<u8>> = (0..2).map(|i| pattern(i, 3000)).collect();
+    let t = build(&mut blobs, "a", &contents, 0);
+    let shared = rig(blobs.clone(), None, Limits::default());
+    let cache = Arc::new(Cache::memory());
+    let held: Vec<VerifiedBlob> = blobs
+        .iter()
+        .filter(|(digest, _)| **digest != t.files[1])
+        .map(|(digest, bytes)| VerifiedBlob::new(*digest, bytes.clone()).expect("verified"))
+        .collect();
+    cache.store_blobs(held).await.expect("stored");
+    let limits = Limits {
+        stream_over: 1024,
+        ..Limits::default()
+    };
+    let read = JobRead::new(
+        Arc::new(Backend::from(cache)),
+        Arc::clone(&shared.grants),
+        limits,
+    );
+    let header = format!("Bearer {}", shared.token(t.action));
+    let quoted: Vec<String> = t.files.iter().map(|d| format!("\"{d}\"")).collect();
+    let body = format!("{{\"digests\":[{}]}}", quoted.join(","));
+    let reply = read
+        .respond_with_body(&Method::POST, BATCH_PATH, Some(&header), body.as_bytes())
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let expected = [frame(0, &contents[0]), vec![1, 0, 0, 0, 0, 0, 0, 0, 0]].concat();
+    assert_eq!(&reply.body[..], &expected[..]);
+
+    let streamed = read
+        .respond(&Method::GET, &format!("/{}", t.files[0]), Some(&header))
+        .await;
+    let printed = format!("{streamed:?}");
+    assert!(
+        printed.contains("BlobStream") && printed.contains("3000"),
+        "{printed}"
+    );
 }
