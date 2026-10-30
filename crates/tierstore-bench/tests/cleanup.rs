@@ -176,3 +176,49 @@ async fn cleanup_after_a_same_key_run_deletes_the_one_object_the_winner_wrote() 
     assert_eq!((report.put_ok, report.deleted, report.failed), (1, 1, 0));
     assert_eq!(r.fake.keys(), ["bench/c1/r1/other"]);
 }
+
+/// Catches a per-node namespace that does not work or leaks into its neighbour's: a three-segment
+/// prefix (`bench/c1/<run>`) with run id `n01` is accepted, and a cleanup of `n01` deletes the
+/// key its log lists and leaves `n010`'s key, which shares the characters `n01` but not the
+/// prefix `bench/c1/<run>/n01/`.
+#[tokio::test]
+async fn a_node_namespace_cleanup_does_not_touch_the_node_whose_id_starts_the_same() {
+    assert_eq!(
+        cold_put::run_prefix("bench/c1/r1", "n01").unwrap(),
+        "bench/c1/r1/n01/"
+    );
+    let r = rig("tierstore-bench-cl-ns", &[]).await;
+    for key in [
+        "bench/c1/r1/n01/c4/00000000",
+        "bench/c1/r1/n010/c4/00000000",
+        "bench/c1/r1/n02/c4/00000000",
+    ] {
+        r.put_elsewhere(key).await;
+    }
+    write_log(
+        &r.out,
+        &[put_record("bench/c1/r1/n01/c4/00000000", Some(200))],
+    );
+    let report = cleanup::run(&r.ctx.config, &r.ctx.log, "bench/c1/r1", "n01", 2)
+        .await
+        .unwrap();
+    assert_eq!((report.put_ok, report.deleted, report.failed), (1, 1, 0));
+    assert_eq!(report.remaining, 0);
+    assert_eq!(
+        r.fake.keys(),
+        [
+            "bench/c1/r1/n010/c4/00000000",
+            "bench/c1/r1/n02/c4/00000000"
+        ]
+    );
+    // A log that lists n010's key is refused by the n01 cleanup, whole.
+    write_log(
+        &r.out,
+        &[put_record("bench/c1/r1/n010/c4/00000000", Some(200))],
+    );
+    let err = cleanup::run(&r.ctx.config, &r.ctx.log, "bench/c1/r1", "n01", 2)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BenchError::Request(_)), "{err:?}");
+    assert_eq!(r.fake.keys().len(), 2);
+}
