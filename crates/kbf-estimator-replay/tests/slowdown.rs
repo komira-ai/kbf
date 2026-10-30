@@ -443,3 +443,42 @@ fn a_history_with_no_quiet_run_says_so() {
         "{text}"
     );
 }
+
+/// Catches nearest rank done with floor division. Median of 3 ratios 1, 2, 3: rank
+/// ceil(50*3/100) = 2, so 2.0 (floor gives rank 1). p90 of 3: rank ceil(2.7) = 3, so 3.0.
+/// p90 of 11 ratios 1..=11: rank ceil(9.9) = 10, so 10.0 (floor gives 9).
+#[test]
+fn nearest_rank_rounds_up_when_the_rank_is_not_whole() {
+    let three: Vec<(u64, u64)> = [1, 2, 3].map(|w| (w * S, S)).into();
+    let s = Summary::of(&three);
+    assert_eq!((s.median, s.p90), (Some(2.0), Some(3.0)));
+    let eleven: Vec<(u64, u64)> = (1..=11).map(|w| (w * S, S)).collect();
+    let s = Summary::of(&eleven);
+    // Median of 11: rank ceil(5.5) = 6.
+    assert_eq!((s.median, s.p90), (Some(6.0), Some(10.0)));
+}
+
+/// Catches the baseline rank rounded down: 11 quiet walls of 10, 20, ..., 110 s; p10 is rank
+/// ceil(10*11/100) = 2, so 20 s (floor gives the minimum, 10 s).
+#[test]
+fn the_baseline_rank_rounds_up_when_not_whole() {
+    let rows: Vec<Row> = (1..=11)
+        .map(|i| ok(&format!("r{i:02}"), "n1", 1_000 * i, 10 * i, Some(CALM)))
+        .collect();
+    let report = analyze(&rows, &Params::default());
+    assert_eq!(report.keys[0].quiet_runs, 11);
+    assert_eq!(report.keys[0].baseline_us, Some(20 * S));
+}
+
+/// Catches `<=` turned into `<` on the pressure threshold: exactly 500 is quiet, 501 busy.
+#[test]
+fn the_pressure_threshold_is_inclusive() {
+    let rows = vec![
+        ok("at", "n1", 100, 100, Some(500)),
+        ok("over", "n1", 1_000, 100, Some(501)),
+    ];
+    let report = analyze(&rows, &Params::default());
+    let state = |id: &str| report.runs.iter().find(|r| r.run_id == id).unwrap().quiet;
+    assert_eq!(state("at"), Quiet::Quiet);
+    assert_eq!(state("over"), Quiet::Busy);
+}

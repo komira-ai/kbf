@@ -5,9 +5,12 @@
 //! * **Measured run**: an attempt of the export whose outcome is `ok`, that has a start and
 //!   an end apart, and a shape key. Its **wall** is `ended - started` of the record. Rows
 //!   that are not measured are counted by reason ([`Funnel`]).
-//! * **Key**: the estimator's key (`kbf_estimator::Key`): instance, platform class, basis,
-//!   shape and configuration. The basis is the row's tag (`mac_footprint`), else `cgroup`,
-//!   as the replay assumes.
+//! * **Key**: an approximation of the estimator's key (`kbf_estimator::Key`): instance,
+//!   platform class, basis, shape and configuration. The server's key carries the OS and the
+//!   CPU architecture in its platform class; the export's platform is the OS alone
+//!   (`linux`, `macos`, `-`), read from the node's state at export time. A row whose node
+//!   is no longer listed has platform `-` and forms its own key here; the server skips such
+//!   an attempt. The basis is the row's tag (`mac_footprint`), else `cgroup`.
 //! * **Quiet**: the node's CPU pressure at the lease start (`some avg10`, hundredths of a
 //!   percent) is recorded and at most `quiet_pressure_centi` (default 500 = 5.00%), and at
 //!   most `max_overlap` (default 0) other attempts of the export, whatever their outcome,
@@ -38,13 +41,15 @@ pub const DEFAULT_MAX_OVERLAP: u64 = 0;
 pub const DEFAULT_BASELINE_PERCENTILE: u64 = 10;
 
 /// What the report cannot see. Printed with every report.
-pub const LIMITS: [&str; 6] = [
+pub const LIMITS: [&str; 8] = [
     "Quiet is judged at the lease start only: the node's CPU pressure then (avg10) and the exported attempts that overlapped the run on its node. The record has no count of concurrent leases and no reading during the run, so a run that started quiet and got busy is counted quiet.",
     "Overlap counts only attempts in the export; attempts the history does not hold (no invocation id, aged out of retention) are invisible, so it is a lower bound.",
     "A run with no pressure reading (a server or daemon that predates it) is neither quiet nor busy; it can be slowed against a baseline, never be one.",
     "The platform class is the OS alone: no CPU architecture, no node speed. Runs of one key on different hardware differ for that reason too, and the report counts it as slowdown.",
     "Wall is the record's start to end of the attempt, whatever it covers (fetch, run, upload); only successful runs are measured.",
     "A key with no quiet run has no baseline; its runs are counted, not imputed.",
+    "Attempts with no end (lost, or still in flight at the export) are invisible to the overlap count, though they took the node's CPU.",
+    "Rows with an empty node name share one bucket for the overlap count.",
 ];
 
 /// The knobs of the report.
@@ -229,8 +234,8 @@ fn span(row: &Row) -> Option<(u64, u64)> {
         .filter(|(start, end)| start < end)
 }
 
-/// The estimator's key of a row and the text that names it: instance, platform class, basis,
-/// shape and configuration.
+/// The approximate estimator key of a row and the text that names it: instance, OS-only
+/// platform class, basis, shape and configuration.
 fn key_of(row: &Row) -> Option<(Key, String)> {
     let shape = u64::from_str_radix(&row.shape, 16)
         .ok()

@@ -36,7 +36,8 @@
 //! how much slower it took than the same estimator key on a quiet host: `wall / baseline`,
 //! with a per-key and an overall median, p90 and share of runs above 1.5x. The text form
 //! prints the definition, the funnel and one line per key; `--json` adds every run. The exact
-//! definition (what is measured, the key, the quiet rule, the baseline statistic, how a key
+//! definition (what is measured, the key, which approximates the estimator's with an OS-only
+//! platform class, the quiet rule, the baseline statistic, how a key
 //! with no quiet run is reported) is in the [`slowdown`] module documentation, and the report
 //! prints what it cannot see ([`slowdown::LIMITS`]). The quiet signal is the node's CPU
 //! pressure at the lease start plus the overlap of exported attempts on the node; the record
