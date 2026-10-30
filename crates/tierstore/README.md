@@ -1,5 +1,19 @@
 # tierstore
 
+A generic hot/cold object store over S3-compatible backends. It knows nothing of kbf: its normal
+dependencies include no other crate of this workspace unless the `s3` feature is on
+(`crates/kbf-integration-test/tests/layering.rs` keeps it that way), so it can move to a repository
+of its own.
+
+- The library: the `Backend` trait (create-only put, `If-Match` put, ranged get, head, delete, list,
+  multipart), an in-memory and a directory backend, `Proxy` (a journal per proxy, a get that copies a
+  cold hit back, a full hot tier sending puts to the cold tier), `Reconciler` (copies puts to the
+  cold tier, applies deletes, evicts what the cold tier holds, publishes usage) and `CachedStore`.
+- Feature `s3`: `S3Backend`, a bucket of an S3-compatible store as a `Backend`.
+- Feature `server` (turns `s3` on): `server`, the S3 API front of a proxy, and the `tierstore`
+  binary that runs a proxy, that front and a reconciler in one process.
+  `packaging/tierstore/README.md` has the flags, the keys and the unit.
+
 An S3 front over a hot and a cold tier. It serves one bucket, path-style, and checks SigV4 in the
 `Authorization` header (and presigned PUT URLs). The packaging notes, the flags and the key files
 are in `packaging/tierstore/README.md`; the roles of a key are in `src/server/keys.rs`.
@@ -7,7 +21,7 @@ are in `packaging/tierstore/README.md`; the roles of a key are in `src/server/ke
 ## Flags or a file
 
 The settings that describe the data path are flags, or one TOML file given with `--config <path>`
-(`[server]`, `[hot_store]`, `[cold_store]` and `[[policy]]`; `src/server/config.rs`). The two make
+(`[server]`, `[hot_store]`, `[cold_store]`, `[oci]` and `[[policy]]`; `src/server/config.rs`). The two make
 the same settings and run the same code. `--print-config`, given the flags of a start, prints the
 file that is equivalent to them. A file holds no secret, only the paths of key files, and refuses
 a key or a table it does not know. The format, the table of the key of each flag and the rules are
@@ -33,7 +47,7 @@ is the tier of the build node's cache), `op` is `get` or `head`.
 | `tierstore_read_errors_total` | `tier`, `op` | reads the tier failed with anything but "not found" (the tier is down, refused, timed out) |
 | `tierstore_reads_total` | `tier`, `op` | reads that reached the tier: hits, misses and errors. For `tier="cold"` these are the reads that had to go to the cold store |
 | `tierstore_bytes_served_total` | `tier` | bytes of object data that gets answered, by the tier that gave them (the range, if one was asked) |
-| `tierstore_bytes_read_total` | `tier` | bytes of object data gets read from the tier: for `cold`, whole objects, whatever range was asked, so the ratio to `bytes_served` is the read amplification of ranged gets |
+| `tierstore_bytes_read_total` | `tier` | bytes of object data gets read from the tier: for `cold`, whole objects whatever range was asked (the range alone when the hot tier is critical), so the ratio to `bytes_served` is the read amplification of ranged gets |
 | `tierstore_promotions_total` | none | objects a get copied from the cold tier into the hot tier |
 | `tierstore_promoted_bytes_total` | none | bytes of those objects: the whole object, whatever range the get asked |
 | `tierstore_promotions_skipped_total` | `reason` = `critical`, `full`, `raced`, `failed` | copies not made, by reason |
@@ -61,6 +75,8 @@ What the counts mean:
   can be deleted from the hot tier without a trace in these counters.
 - A get that is dropped while it copies has counted its cold hit and bytes, and neither a
   promotion nor a skip, so promotions plus skips can be less than cold hits.
+- A ranged get while the hot tier is at or above its critical mark reads only the range from the
+  cold tier: `bytes_read` is the range, nothing is promoted, and a `critical` skip is counted.
 - A head promotes nothing.
 
 PromQL, over the reads that fetch data (`op="get"`):
@@ -143,3 +159,47 @@ A scoped key never replaces (`If-Match`) and never copies (`x-amz-copy-source`).
   and `write_prefixes` of `["kbf-history/"]`, `delete_prefixes: []`.
 
 See "Scoped keys" in `packaging/tierstore/README.md` for the table of calls.
+
+## The OCI read front
+
+With `--oci-listen ADDR` the binary also serves the objects of the store as a read-only container
+registry (`server::oci`), so that podman and other registry clients pull an image by digest from the
+same tiers. It runs in one of two modes:
+
+- **HTTPS**, with `--oci-tls-cert PATH --oci-tls-key PATH`, at any address.
+- **Plain HTTP**, with neither flag, at any address. A node's own container engine pulls from the
+  front of its own store over loopback (127/8 or `::1`), so the traffic never leaves the host.
+  Off loopback (`0.0.0.0` and `::` included) the front still starts, and prints one warning line
+  on stderr saying it serves plain HTTP on a non-loopback address, since a plain connection can be
+  read and changed on its path: give the certificate and key there. One of the two flags without
+  the other is refused (exit 2).
+
+The start line and `/metricz` say which mode runs.
+
+In a file given with `--config`, the front is the optional `[oci]` table (`listen`, `tls_cert_file`,
+`tls_key_file`, `prefix`, `max_connections`, `connection_lifetime`), with the rules of the flags
+(`listen` is needed in it, the certificate and the key go together, `max_connections` is at least
+1); the `--oci-*` flags are refused with the file, and `--print-config` writes them as the table.
+
+- `GET` and `HEAD` of `/v2/`, `/v2/<name>/manifests/sha256:<hex>` and
+  `/v2/<name>/blobs/sha256:<hex>`; anything else is 404, and any other method 405.
+- An object is at `<--oci-prefix>blobs/sha256/<hex>` (`oci/` by default), manifests included. The
+  repository name in a URL is checked against the distribution grammar and then ignored: one
+  content-addressed namespace.
+- Anonymous: no token is asked for and `Authorization` is ignored. Only digest-named objects under
+  the prefix can be read.
+- A manifest is checked against its digest before it is sent; a blob is hashed as it is read and cut
+  short, not delivered whole, if it is not its digest. Tags are not served. A manifest is measured
+  and then read in two store calls, so one replaced between them can be answered 500
+  `DIGEST_INVALID` once; a retry succeeds.
+- Memory is bounded by `--oci-max-connections` (64 by default) times the buffer a connection holds,
+  up to 4 MiB (a blob chunk or a manifest).
+- In HTTPS mode the certificate must carry an IP subjectAltName for the listen address (clients dial
+  an IP), checked at start. The files are read once: a new certificate takes a restart. The
+  connection limits, timeouts and drain are the same in both modes (a plain connection has no
+  handshake to time).
+- `GET /metricz` on the S3 listener has the counters.
+
+Putting an image in, and pulling it with podman and js-oci, are in `packaging/tierstore/README.md`
+("The OCI read front"); the behaviour is specified by the tests in `tests/oci_front` (over real TLS and over plain HTTP, both
+on loopback) and `src/server/oci`.

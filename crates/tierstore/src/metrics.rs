@@ -124,21 +124,14 @@ impl Counters {
         for (tier, label) in tiers.clone() {
             for (kind, op) in READS.into_iter().enumerate() {
                 let labels = [("tier", label), ("op", op)];
-                sample(
-                    &mut text,
-                    "hits_total",
-                    &labels,
-                    read(&self.hits[tier][kind]),
-                );
-                sample(
-                    &mut text,
-                    "misses_total",
-                    &labels,
-                    read(&self.misses[tier][kind]),
-                );
+                // Each atomic is loaded once, so one scrape has reads = hits + misses + errors.
+                let hits = read(&self.hits[tier][kind]);
+                let misses = read(&self.misses[tier][kind]);
                 let failed = read(&self.errors[tier][kind]);
+                sample(&mut text, "hits_total", &labels, hits);
+                sample(&mut text, "misses_total", &labels, misses);
                 sample(&mut text, "read_errors_total", &labels, failed);
-                let reads = read(&self.hits[tier][kind]) + read(&self.misses[tier][kind]) + failed;
+                let reads = hits + misses + failed;
                 sample(&mut text, "reads_total", &labels, reads);
             }
         }

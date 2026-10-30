@@ -116,18 +116,41 @@ async fn metricz_lists_every_series_with_its_labels() {
     }
 }
 
-/// Asserts that a server with nothing to count answers `/metricz` 200 and says so. It would catch a
-/// probe that fails or an empty body when there is nothing to count.
+/// Asserts that a server with no proxy and no OCI front answers `/metricz` 200 with one comment
+/// line that names the sources and no series. It would catch a probe that fails or says nothing
+/// when there is nothing to count.
 #[tokio::test]
-async fn metricz_without_a_proxy_says_there_is_none() {
+async fn metricz_without_a_source_is_one_line_naming_them() {
     let rig = Rig::with(BUDGET, |config| config.proxy = None).await;
     let reply = metricz(&rig).await;
     assert_eq!(reply.status, StatusCode::OK);
-    assert!(
-        reply.body.contains("no proxy and no local cache"),
-        "{}",
-        reply.body
-    );
+    let lines: Vec<&str> = reply.body.lines().collect();
+    assert_eq!(lines.len(), 1, "{}", reply.body);
+    for name in ["proxy", "OCI read front", "local cache"] {
+        assert!(
+            lines[0].starts_with('#') && lines[0].contains(name),
+            "{}",
+            reply.body
+        );
+    }
+}
+
+/// Asserts that a server with a proxy and an OCI front shows both blocks, the proxy's first, each
+/// ending in a newline so that no two lines run together, and that the series of the one do not
+/// replace those of the other. It would catch a probe that picks one block.
+#[tokio::test]
+async fn metricz_renders_every_block_the_server_has() {
+    let oci = std::sync::Arc::new(super::oci::OciMetrics::default());
+    let rig = Rig::with(BUDGET, |config| config.oci_metrics = Some(oci)).await;
+    let body = metricz(&rig).await.body;
+    let proxy = body.find("tierstore_hits_total{").expect("the proxy block");
+    let front = body
+        .find("tierstore_oci_requests_total{")
+        .expect("the OCI block");
+    assert!(proxy < front, "{body}");
+    assert!(body.ends_with('\n'), "{body}");
+    assert_eq!(sample(&body, HOT_HIT_GET), 0);
+    assert!(!body.contains("no proxy"), "{body}");
 }
 
 /// Asserts that a GET of an object only in the cold tier counts a hot miss, a cold read, a cold
@@ -406,4 +429,29 @@ async fn no_series_is_emitted_twice() {
         assert!(seen.insert(name.to_owned()), "{name} twice in:\n{text}");
     }
     assert_eq!(seen.len(), SERIES.len());
+}
+
+/// Asserts that a ranged GET of a cold object while the hot tier is above its critical mark
+/// reads only the range from the cold tier (bytes read equal bytes served), copies nothing and
+/// counts a `critical` skip. It would catch bytes read counted as the whole object where the
+/// proxy asked for the part, and a promotion that did not happen.
+#[tokio::test]
+async fn a_ranged_get_of_a_cold_object_with_the_hot_tier_critical_reads_the_part() {
+    let rig = cold_only("obj", b"0123456789").await;
+    let hot_bytes = BUDGET / 100 * 96;
+    let json = format!(
+        r#"{{"hot_bytes":{hot_bytes},"copy_lag":0,"time":{}}}"#,
+        super::testing::NOW
+    );
+    rig.hot_mem
+        .put("_tiering/usage", Bytes::from(json))
+        .await
+        .unwrap();
+    let reply = rig.get("obj", Some("bytes=2-4")).await;
+    assert_eq!(reply.body, "234");
+    assert_eq!(value(&rig, COLD_BYTES).await, 3);
+    assert_eq!(value(&rig, COLD_SERVED).await, 3);
+    assert_eq!(value(&rig, COLD_HIT_GET).await, 1);
+    assert_eq!(value(&rig, PROMOTIONS).await, 0);
+    assert_eq!(value(&rig, &skipped("critical")).await, 1);
 }

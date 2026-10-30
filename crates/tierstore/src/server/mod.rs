@@ -147,12 +147,12 @@
 //! Without [`ServerConfig::proxy`] it is 200 and says the usage is not watched. A bucket cannot
 //! be called `usagez` either.
 //!
-//! `GET /metricz` is 200 with the counters of the proxy's reads ([`Proxy::metrics`]: hits,
-//! misses and bytes of each tier, the reads that went on to the cold tier, the copies they made
-//! into the hot tier) in the Prometheus text format; it is not signed either, and a bucket
-//! cannot be called `metricz`. Without [`ServerConfig::proxy`] it is 200 and says there is
-//! no proxy and no local cache. Every source of counters the server has shows, one block after the other.
-//! The README of the crate lists every name and label.
+//! `GET /metricz` is 200 with the counters of every source the server has, one block after the
+//! other, in the Prometheus text format: the proxy's reads ([`Proxy::metrics`]: hits, misses,
+//! errors and bytes of each tier, the copies cold reads made into the hot tier) and the OCI read
+//! front ([`oci`]). It is not signed either, and a bucket cannot be called `metricz`. A server
+//! that has none of them says so in one line. The README of the crate lists every name and
+//! label.
 //!
 //! # Drain
 //!
@@ -176,6 +176,7 @@ mod handover;
 mod idle;
 mod keys;
 mod launch;
+pub mod oci;
 mod ops;
 pub mod presign;
 mod reply;
@@ -341,6 +342,9 @@ pub struct ServerConfig {
     /// long without finding any usage object is judged the same way. Longer than the lease and
     /// the pass interval of the reconciler, so that a takeover of the lease does not show.
     pub usage_stale_after: Duration,
+    /// The counters of the OCI read front, which `GET /metricz` shows; none by default, and then
+    /// `/metricz` has no block of it. The binary sets them when it runs the front.
+    pub oci_metrics: Option<Arc<oci::OciMetrics>>,
     /// The time, for the age of a signature and of the usage object.
     pub clock: Arc<dyn Clock>,
     /// The time, for the rate of a request body (`put_min_bytes_per_sec`). It is a clock that
@@ -382,6 +386,7 @@ impl ServerConfig {
             drain_deadline: Duration::from_secs(900),
             proxy: None,
             usage_stale_after: Duration::from_secs(120),
+            oci_metrics: None,
             clock,
             rate_clock: Arc::new(MonotonicClock::new()),
         }
@@ -769,17 +774,26 @@ impl Server {
     }
 
     /// The text of `/metricz`: the block of every source of counters the server has, one after
-    /// the other, or a line that says there is none. Every block that exists renders, never
-    /// one of them: a server with a proxy and a local cache shows both. A new source adds one
-    /// entry to `blocks`.
+    /// the other, each ending in a newline, or one line that names them all when there is none.
+    /// Every block that exists renders, never one of them: a server with a proxy and an OCI
+    /// front shows both, and a source added later (the local cache) is one more entry of
+    /// `blocks`.
     fn metrics_probe(&self) -> String {
-        let blocks = [self.config.proxy.as_ref().map(|proxy| proxy.metrics())];
-        let text: String = blocks.into_iter().flatten().collect();
-        if text.is_empty() {
-            "# this server has no proxy and no local cache\n".to_owned()
-        } else {
-            text
+        let blocks = [
+            self.config.proxy.as_ref().map(|proxy| proxy.metrics()),
+            self.config.oci_metrics.as_ref().map(|oci| oci.render()),
+        ];
+        let mut text = String::new();
+        for block in blocks.into_iter().flatten() {
+            text.push_str(&block);
+            if !block.ends_with('\n') {
+                text.push('\n');
+            }
         }
+        if text.is_empty() {
+            text = "# this server has no proxy, no OCI read front and no local cache\n".to_owned();
+        }
+        text
     }
 
     /// The answer of `/usagez`: 200 and the age of the usage object of the reconciler while it is

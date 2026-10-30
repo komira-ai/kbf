@@ -653,6 +653,25 @@ impl Inner {
         }
     }
 
+    /// A get of the cold tier, counted as a hit, a miss or an error of it.
+    async fn cold_get(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
+        match self.cold.get(key, range).await {
+            Ok(body) => {
+                self.counters.hit(Tier::Cold, Read::Get);
+                self.counters.bytes_read(Tier::Cold, body.len());
+                Ok(body)
+            }
+            Err(error @ Error::NotFound(_)) => {
+                self.counters.miss(Tier::Cold, Read::Get);
+                Err(error)
+            }
+            Err(error) => {
+                self.counters.error(Tier::Cold, Read::Get);
+                Err(error)
+            }
+        }
+    }
+
     async fn get_object(
         self: &Arc<Self>,
         key: &str,
@@ -671,19 +690,17 @@ impl Inner {
                 return Err(error);
             }
         }
-        let body = match self.cold.get(key, None).await {
-            Ok(body) => body,
-            Err(error @ Error::NotFound(_)) => {
-                self.counters.miss(Tier::Cold, Read::Get);
-                return Err(error);
-            }
-            Err(error) => {
-                self.counters.error(Tier::Cold, Read::Get);
-                return Err(error);
-            }
-        };
-        self.counters.hit(Tier::Cold, Read::Get);
-        self.counters.bytes_read(Tier::Cold, body.len());
+        if let Some(part) = range
+            && self.level().await >= Level::Critical
+        {
+            // A read of a part, with the hot tier too full to take a copy, asks the cold tier for
+            // that part alone: a whole read per chunk of a long blob would be quadratic.
+            self.counters.skipped(Skipped::Critical);
+            let body = self.cold_get(key, Some(part)).await?;
+            self.counters.served(Tier::Cold, body.len());
+            return Ok(body);
+        }
+        let body = self.cold_get(key, None).await?;
         self.copy_back(key, &body).await;
         let served = match range {
             Some(range) => range.slice(&body)?,
