@@ -17,6 +17,7 @@ use crate::learned::LearnedSizes;
 use crate::state_store::StateStore;
 use crate::{PlacementLoad, PlacementPredictions};
 
+mod ablation;
 mod hot;
 mod learned;
 
