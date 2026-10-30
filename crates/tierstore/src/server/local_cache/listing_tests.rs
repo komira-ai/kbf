@@ -299,6 +299,9 @@ async fn a_listing_of_uploads_that_never_gets_past_the_reserved_ones_stops_at_th
     let found = cache.list_uploads("", None, 2).await;
     assert!(matches!(found, Err(Error::Unavailable(_))), "{found:?}");
     assert_eq!(stuck.calls.load(Ordering::SeqCst), u64::from(LISTING_CALLS));
+    // The count is the cap, the calls the upstream itself counted.
+    let counted = read(&cache.counters().upstream_list_uploads);
+    assert_eq!(counted, stuck.calls.load(Ordering::SeqCst));
 }
 
 /// Asserts that a listing of uploads whose upstream answers a full page that ends where the page
