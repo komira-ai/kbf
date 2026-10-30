@@ -651,8 +651,15 @@ async fn a_scope_of_many_large_blobs_is_answered_whole() {
             .iter()
             .all(|f| table[&f.to_string()]["large"].is_object())
     );
+    // Every line is one digest of the scope, once: none missing, none extra.
+    let named: BTreeSet<String> = table.keys().cloned().collect();
+    let expected: BTreeSet<String> = a.scope().iter().map(ToString::to_string).collect();
+    assert_eq!(named, expected);
+    // The files and the root Directory (which is itself over the size) are each asked about.
+    let asked = MANY + 1;
     let heads = |rig: &Rig| rig.source.heads.lock().unwrap().len();
-    assert_eq!(heads(&rig), MANY);
+    assert_eq!(heads(&rig), asked);
+    assert_eq!(table[&a.root.to_string()]["absent"], true);
     rig.locate(&token).await;
-    assert!(heads(&rig) >= MANY + 4096, "{}", heads(&rig));
+    assert!(heads(&rig) >= asked + 4096, "{}", heads(&rig));
 }
