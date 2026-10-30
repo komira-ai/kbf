@@ -79,6 +79,7 @@ fn request(tag: u8) -> Request {
         resources: Resources::new(1_000, 4 * GIB),
         hermetic: true,
         do_not_cache: false,
+        whole_worker: false,
         needs: kbf_caps::Request::from_platform([("OSFamily", "linux")]).expect("a platform"),
     }
 }
