@@ -260,6 +260,7 @@ impl Session {
             hermetic: true,
             do_not_cache: job.do_not_cache,
             needs: kbf_caps::Request::default(),
+            whole_worker: false,
         };
         let described = Described {
             arguments: vec!["/bin/run".to_owned(), job.label.to_owned()],

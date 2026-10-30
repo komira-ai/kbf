@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use js_server_core::{Config, Core, Observer};
+use js_server_core::{Config, Core, Observer, OpenError};
 use js_store::{EpochPolicy as StoredEpoch, StateError};
 use kbf_front::Backend;
 use kbf_state::Store;
@@ -123,6 +123,15 @@ pub fn open(
     // Read before the core exists: no caller waits for the store behind its lock.
     adapter.restore_learned();
     let observer = KbfObserver::new(adapter.cache.clone());
-    let core = Core::open(config, adapter, storage(store, epoch), now)?;
+    let core =
+        Core::open(config, adapter, storage(store, epoch), now).map_err(|error| match error {
+            OpenError::State(state) => state,
+            // kbf never sets `memory_schedulable_percent`, whose default of 100 always
+            // validates, so this arm is not reached; it stays an error, not a panic.
+            OpenError::Config(percent) => StateError::Corrupt {
+                key: "memory_schedulable_percent".to_owned(),
+                why: percent.to_string(),
+            },
+        })?;
     Ok(core.with_observer(observer))
 }
