@@ -381,3 +381,111 @@ fn the_binary_fails_when_the_run_cannot_be_read() {
     assert_eq!(code, Some(1), "{err}");
     assert_eq!(calls(&root), "");
 }
+
+#[test]
+fn the_binary_reads_every_page_of_jobs_and_reruns_for_a_failure_on_a_later_page() {
+    // Catches: a job list read from the first page only (a failed artifact job on page 2 would
+    // be missed and, worse, a failed test job on page 2 would be missed beside an artifact one).
+    let root = scratch("pages");
+    let first: Vec<Value> = (0..100)
+        .map(|i| {
+            json!({"name": format!("j{i}"), "status": "completed", "conclusion": "success",
+            "html_url": "https://x"})
+        })
+        .collect();
+    let second = json!([{"name": SUMS, "status": "completed", "conclusion": "failure",
+        "html_url": url_of(SUMS)}]);
+    let answers = json!({
+        run_path(REPO, RUN): {"run_attempt": 1, "conclusion": "failure",
+            "head_branch": "main", "event": "push"},
+        jobs_path(REPO, RUN, 1): {"total_count": 101, "jobs": first},
+        jobs_path(REPO, RUN, 2): {"total_count": 101, "jobs": second},
+    });
+    std::fs::write(root.join("gh/gh-api.json"), answers.to_string()).expect("gh-api.json");
+    let (code, _, err) = xtask(&root, None);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(calls(&root).contains("rerun-failed-jobs"));
+    // The same, with a failed test job on page 2: nothing is rerun.
+    let second = json!([{"name": "ci / test", "status": "completed", "conclusion": "failure",
+        "html_url": "https://x"}]);
+    let full: Vec<Value> = (0..100)
+        .map(|_| {
+            json!({"name": SUMS, "status": "completed", "conclusion": "failure",
+            "html_url": "https://x"})
+        })
+        .collect();
+    let answers = json!({
+        run_path(REPO, RUN): {"run_attempt": 1, "conclusion": "failure",
+            "head_branch": "main", "event": "push"},
+        jobs_path(REPO, RUN, 1): {"total_count": 101, "jobs": full},
+        jobs_path(REPO, RUN, 2): {"total_count": 101, "jobs": second},
+    });
+    let other = scratch("pages-test");
+    std::fs::write(other.join("gh/gh-api.json"), answers.to_string()).expect("gh-api.json");
+    let (code, out, err) = xtask(&other, None);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("ci / test"), "{out}");
+    assert_eq!(calls(&other), "");
+}
+
+#[test]
+fn the_binary_fails_when_the_jobs_of_the_run_cannot_be_read() {
+    // Catches: a run that is listed but whose jobs are not (404) read as "no job failed", so a
+    // rerun that was wanted silently never happens.
+    let root = scratch("no-jobs");
+    let answers = json!({run_path(REPO, RUN): {"run_attempt": 1, "conclusion": "failure",
+        "head_branch": "main", "event": "push"}});
+    std::fs::write(root.join("gh/gh-api.json"), answers.to_string()).expect("gh-api.json");
+    let (code, _, err) = xtask(&root, None);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("not found"), "{err}");
+    assert_eq!(calls(&root), "");
+}
+
+#[test]
+fn the_rerun_is_made_and_printed_when_there_is_no_summary_file() {
+    // Catches: a run outside Actions (no GITHUB_STEP_SUMMARY) that fails or skips the rerun
+    // because it has nowhere to write the summary.
+    let root = scratch("no-summary");
+    github(&root, 1, "failure", &[(BUILD, "failure")]);
+    let (code, out, err) = xtask(&root, None);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains(BUILD) && out.contains(&url_of(BUILD)), "{out}");
+    assert_eq!(calls(&root).lines().count(), 1);
+}
+
+#[test]
+fn a_summary_file_that_cannot_be_written_is_an_error_after_the_rerun() {
+    // Catches: flakes that go uncounted without a trace: a summary that cannot be written must
+    // fail the run (the rerun itself has been made, so the call is there).
+    let root = scratch("bad-summary");
+    github(&root, 1, "failure", &[(SUMS, "failure")]);
+    let (code, _, err) = xtask(&root, Some(&root.join("no-such-dir/summary.md")));
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("append to"), "{err}");
+    assert_eq!(calls(&root).lines().count(), 1);
+}
+
+#[test]
+fn the_fake_refuses_only_the_rerun_and_a_bodyless_write_elsewhere() {
+    // Catches: a fake whose refuse-rerun fault also refuses the cancel (the watch tests would
+    // then fail for the wrong reason), and a fake that accepts a bodyless write to a path that
+    // needs a body, as GitHub refuses it.
+    let root = scratch("fake");
+    std::fs::write(root.join("gh/gh-fault"), "refuse-rerun").expect("fault");
+    let post = |path: &str| {
+        Command::new(root.join("gh/gh"))
+            .args(["api", "-X", "POST", path])
+            .env_remove("XTASK_FAKE_DEFECT")
+            .output()
+            .expect("run the fake")
+    };
+    assert!(
+        post(&format!("{}/cancel", run_path(REPO, RUN)))
+            .status
+            .success()
+    );
+    let out = post("repos/komira-ai/kbf/issues");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("HTTP 422"));
+}
