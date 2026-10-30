@@ -56,6 +56,21 @@
 //! pack index too, the frontend takes a daemon's `CommitPack` (it must read the pack to check it)
 //! and says so in `Welcome.pack_commit`.
 //!
+//! **The executor** is off unless `--executor js-agent` is given (`executor_flags` has the flags):
+//! the farm then runs the actions it places on hosts leased from the job scheduler's lease
+//! server ([`crate::executor`]), and `FrontendHandle::serve` steps it beside the listeners and
+//! releases its leases when the frontend stops. It needs the packs and the preparation of task
+//! runs (below, with the `--job-*` listener its read grants point at): `--executor js-agent` is
+//! refused when the flags are parsed without them, and where its settings disagree with them
+//! (`executor_bind` lists the checks). By default, `--executor kbf-daemon`, nothing is built and
+//! no lease server is contacted.
+//!
+//! **Task runs** are prepared only if `--task-secret-file` is given (`task_flags` has the flags
+//! and what they need): the started frontend then carries a [`kbf_front::prepare_run::RunPrep`]
+//! ([`FrontendHandle::run_prep`]) that gives a host executor, for each run, the key the task may
+//! write, one presigned write of it to the tier store and a read grant for its inputs; without
+//! the flag no secret file is read and the frontend serves exactly as it did.
+//!
 //! **Readiness** (`GET /readyz`, `grpc.health.v1`) fails when the storage node does not
 //! answer an action-cache lookup within `--readyz-store-timeout-ms`, when the state store (if
 //! configured) does not answer a read, and when the storage map is not loaded (always
@@ -102,6 +117,7 @@ use clap::{Arg, ArgMatches, Command, FromArgMatches as _};
 use futures::FutureExt as _;
 use futures::future::{AbortHandle, Abortable, BoxFuture};
 use kbf_auth::AuthenticateLayer;
+use kbf_front::prepare_run::RunPrep;
 use kbf_front::{
     Backend, MAX_MESSAGE_BYTES, Owner, Owners, Packs, Proxy, RECORDER_CHANNEL, Recorder,
     RequestMetadataLayer, Routed,
@@ -117,11 +133,14 @@ use kbf_tls::TlsSource;
 use tonic::service::Routes;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server};
 
+pub use self::executor_flags::{ExecutorFlags, JsAgentFlags};
 pub use self::job_read::{JobReadError, JobReadFlags};
 pub use self::pack_flags::{PackFlagError, PackFlags};
+pub use self::task_flags::{TaskFlagError, TaskFlags};
 use crate::drain::Drain;
 use crate::enroll::flags::EnrollFlags;
 use crate::enroll::start as enroll_start;
+use crate::executor::{Executor, Metrics as ExecutorMetrics, RunSource, Running};
 use crate::farm::Farm;
 use crate::front_maps::FrontMaps;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
@@ -248,9 +267,15 @@ pub struct FrontendFlags {
     /// `--pack-store-endpoint` and its companions: the blobs clients upload are kept in packs
     /// in an object store. `None` without the endpoint, where nothing is packed.
     pub packs: Option<PackFlags>,
+    /// `--executor` and its companions: where placed actions run.
+    pub executor: ExecutorFlags,
     /// `--job-listen` and its companions: the listener a task on a worker reads its action's
     /// inputs from with a read grant. `None` without `--job-listen`, where there is none.
     pub job_read: Option<JobReadFlags>,
+    /// `--task-secret-file` and its companions: the frontend prepares the runs of a host
+    /// executor (the key, the presigned write and the read grant of each). `None` without the
+    /// switch, where no run is prepared.
+    pub task: Option<TaskFlags>,
 }
 
 /// The long names of the flags of [`Args`] that `kbf frontend` hides and refuses by name
@@ -306,6 +331,8 @@ pub fn command() -> Command {
     .args(state_wait::args())
     .args(pack_flags::args())
     .args(job_read::args())
+    .args(task_flags::args())
+    .args(executor_flags::args())
     .arg(
         Arg::new(SECRETS_DIR)
             .long("object-store-secrets-dir")
@@ -353,6 +380,9 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         return Err(refuse(why.to_string()));
     }
     let enroll = crate::enroll::flags::from_matches(m).map_err(refuse)?;
+    let mut executor = executor_flags::from_matches(m).map_err(refuse)?;
+    let packs = pack_flags::from_matches(m);
+    let job_read = job_read::from_matches(m);
     let storage = server
         .storage()
         .map_err(|e| refuse(e.to_string()))?
@@ -364,6 +394,17 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
     // clap makes the three come together.
     let tls = <[PathBuf; 3]>::try_from(paths).ok();
     transport(&storage, tls.is_some()).map_err(refuse)?;
+    let task = task_flags::from_matches(m).map_err(refuse)?;
+    if let Some(js) = executor.js.as_mut() {
+        let beside = executor_bind::Beside {
+            task: task.as_ref(),
+            job_read: job_read.as_ref(),
+            packs: packs.as_ref(),
+        };
+        for warning in executor_bind::check(js, &beside).map_err(refuse)? {
+            tracing::warn!("{warning}");
+        }
+    }
     Ok(FrontendFlags {
         server,
         storage,
@@ -374,8 +415,10 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         drain: drain_flags::from_matches(m),
         state_store_wait: state_wait::from_matches(m),
         retired: RetiredHandoverFlags::from_arg_matches(m)?,
-        packs: pack_flags::from_matches(m),
-        job_read: job_read::from_matches(m),
+        packs,
+        executor,
+        job_read,
+        task,
     })
 }
 
@@ -520,8 +563,12 @@ pub struct FrontendHandle {
     pack_index: Option<Arc<dyn PackIndex>>,
     /// The packs `--pack-store-endpoint` describes, if the flag was given.
     packs: Option<Packs>,
+    /// The preparer of runs `--task-secret-file` describes, if the flag was given.
+    run_prep: Option<Arc<RunPrep>>,
     /// The count of intake polls the farm has run to the end ([`Farm::intake_polls`]).
     intake_polls: tokio::sync::watch::Receiver<u64>,
+    /// The executor `--executor js-agent` builds, stepped while the frontend serves.
+    executor: Option<Executor>,
 }
 
 impl FrontendHandle {
@@ -539,6 +586,14 @@ impl FrontendHandle {
     #[must_use]
     pub fn pack_index(&self) -> Option<Arc<dyn PackIndex>> {
         self.pack_index.clone()
+    }
+
+    /// The preparer of the runs of a host executor `--task-secret-file` describes, or `None`
+    /// without the flag: the executor asks it for the key, the presigned write and the read grant
+    /// of each run ([`RunPrep::prepare_run`]).
+    #[must_use]
+    pub fn run_prep(&self) -> Option<Arc<RunPrep>> {
+        self.run_prep.clone()
     }
 
     /// The frontend's drain ([`Drain`]): `POST /v1/frontend/drain` begins it, and the
@@ -591,7 +646,23 @@ impl FrontendHandle {
         let _tasks: Vec<AbortOnDrop> = tasks
             .map(|task| AbortOnDrop(tokio::spawn(task).abort_handle()))
             .collect();
-        escalating(self.serving, &self.drain, self.escalation).await
+        // Started with the listeners: a frontend that never serves leases no host. Stopped
+        // after the serving future (the listeners and their drain) is over, so the runs of
+        // builds still open are not cut before the drain ends; the background tasks above are
+        // not listeners and live to the end of this function.
+        let mut running = self.executor.map(Running::spawn);
+        let serving = escalating(self.serving, &self.drain, self.escalation);
+        let served = match running.as_mut() {
+            Some(running) => tokio::select! {
+                served = serving => served,
+                why = running.failed() => Err(ServeError::Executor(why)),
+            },
+            None => serving.await,
+        };
+        if let Some(running) = running {
+            running.stop().await;
+        }
+        served
     }
 }
 
@@ -647,8 +718,29 @@ where
     S: FnOnce() -> io::Result<F> + 'static,
     F: Future<Output = ()> + Send + 'static,
 {
+    start_frontend_with(flags, shutdown, None)
+}
+
+/// [`start_frontend`] with the preparation of runs given to `--executor js-agent` instead of the
+/// frontend's own ([`RunSource`]): the key mint and the preparation of a run's write and read
+/// grant, for a test that prepares them its own way. A frontend of `--executor kbf-daemon`
+/// takes none and ignores it.
+///
+/// # Errors
+/// As [`start_frontend`]; and `--executor js-agent` without a `source`, a lease server token
+/// that cannot be used, a CA file that cannot be read, or settings that break a rule of the
+/// executor.
+pub fn start_frontend_with<S, F>(
+    flags: &FrontendFlags,
+    shutdown: S,
+    source: Option<RunSource>,
+) -> Result<FrontendHandle, Box<dyn Error>>
+where
+    S: FnOnce() -> io::Result<F> + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
     // No branch here: this is the one generic function, and `bind_frontend` is the code.
-    bind_frontend(flags, boxed(shutdown))
+    bind_frontend(flags, boxed(shutdown), source)
 }
 
 fn boxed<S, F>(shutdown: S) -> Shutdown
@@ -664,6 +756,7 @@ where
 fn bind_frontend(
     flags: &FrontendFlags,
     shutdown: Shutdown,
+    source: Option<RunSource>,
 ) -> Result<FrontendHandle, Box<dyn Error>> {
     let prepared = Prepared::new(flags)?;
     // The flag's own refusals come before the wait for the store, as they did before it.
@@ -675,7 +768,7 @@ fn bind_frontend(
         .map(|uri| state_wait::open(uri, flags.state_store_wait))
         .transpose()?;
     let pack_index = flags.server.open_pack_index()?;
-    prepared.start(state, pack_index, shutdown)
+    prepared.start(state, pack_index, shutdown, source)
 }
 
 /// A frontend's start up to the state store: everything the flags decide that needs no
@@ -770,6 +863,7 @@ impl<'a> Prepared<'a> {
         state: Option<crate::StateStore>,
         pack_index: Option<Arc<dyn PackIndex>>,
         shutdown: Shutdown,
+        source: Option<RunSource>,
     ) -> Result<FrontendHandle, Box<dyn Error>> {
         let Self {
             flags,
@@ -805,6 +899,7 @@ impl<'a> Prepared<'a> {
             Some(routed) => Backend::routed_over(Arc::clone(routed), storage, packs.clone()),
             None => Backend::remote_over(storage, packs.clone()),
         };
+        let run_prep = task_flags::open(flags.task.as_ref(), &backend)?;
         // A failed run's logs are read from the storage node, under a budget of this
         // frontend's own: it serves no blob route to share one with.
         let history = history.map(|history| {
@@ -826,6 +921,8 @@ impl<'a> Prepared<'a> {
         crate::serve::log_core(&farm);
         let farm = Arc::new(farm.with_state(state)?);
         log_state(durable, farm.term(), farm.lease_epoch());
+        let source = source.or_else(|| run_prep.as_ref().map(RunSource::of));
+        let executor = executor_of(flags, &farm, packs.as_ref(), &backend, source)?;
 
         let (mut worker_server, peers, worker_tls) = worker_peers(
             keepalive(
@@ -940,8 +1037,11 @@ impl<'a> Prepared<'a> {
             history.as_ref().map(crate::history::History::stats),
             members.clone(),
             tls_sources,
-            packs.clone(),
-            job_stats,
+            Counters {
+                packs: packs.clone(),
+                job_read: job_stats,
+                executor: executor.as_ref().map(|built| Arc::clone(&built.metrics)),
+            },
             Arc::clone(&farm),
         ));
         // The storage health, if there are members.
@@ -1149,7 +1249,9 @@ impl<'a> Prepared<'a> {
             },
             pack_index,
             packs,
+            run_prep,
             intake_polls,
+            executor: executor.map(|built| built.executor),
         })
     }
 }
@@ -1192,9 +1294,56 @@ fn open_object_stores(
     })
 }
 
+/// A built executor, and the counts it keeps.
+struct ExecutorParts {
+    executor: Executor,
+    metrics: Arc<ExecutorMetrics>,
+}
+
+/// The executor `--executor js-agent` describes, over `farm`, with the metrics it counts into;
+/// none for `kbf-daemon`, which builds nothing and contacts no lease server. The seams are the
+/// frontend's own: the ingest of the packs, the CAS `backend` over the same packs, and the
+/// `source` of the keys, writes and grants.
+///
+/// # Errors
+/// `--executor js-agent` without the packs or without a `source` (the frontend makes one from
+/// the run preparation `--task-secret-file` opens, which the parse of the flags requires), or
+/// as [`JsAgentFlags::build`].
+fn executor_of(
+    flags: &FrontendFlags,
+    farm: &Arc<Farm>,
+    packs: Option<&Packs>,
+    backend: &Backend,
+    source: Option<RunSource>,
+) -> Result<Option<ExecutorParts>, Box<dyn Error>> {
+    let Some(js) = &flags.executor.js else {
+        return Ok(None);
+    };
+    let packs = packs.ok_or("--executor js-agent needs --pack-store-endpoint")?;
+    let source = source.ok_or(
+        "--executor js-agent: this frontend was started without the preparation of task runs \
+         (the key mint, the presigned write and the read grant): give --task-secret-file",
+    )?;
+    let front = js.front(packs.clone(), backend.clone(), source);
+    let metrics = Arc::new(ExecutorMetrics::default());
+    let executor = js.build(Arc::clone(farm), Arc::new(front), Arc::clone(&metrics))?;
+    Ok(Some(ExecutorParts { executor, metrics }))
+}
+
 /// The store `/readyz` probes: the open state store's, if there is one.
 fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Store>> {
     state.map(|state| Arc::clone(&state.store))
+}
+
+/// What `GET /metrics` counts beside the always-present families, each only when its part of
+/// the frontend is on.
+struct Counters {
+    /// The packs.
+    packs: Option<Packs>,
+    /// The job-facing read.
+    job_read: Option<Arc<kbf_front::job_read::JobRead>>,
+    /// The host executor.
+    executor: Option<Arc<ExecutorMetrics>>,
 }
 
 /// `GET /metrics`: what the service counts, in the Prometheus text format, history's
@@ -1207,14 +1356,19 @@ fn metrics_route(
     history: Option<Arc<crate::history::Stats>>,
     members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
-    packs: Option<Packs>,
-    job_read: Option<Arc<kbf_front::job_read::JobRead>>,
+    counters: Counters,
     farm: Arc<Farm>,
 ) -> axum::Router {
+    let Counters {
+        packs,
+        job_read,
+        executor,
+    } = counters;
     let tls = Arc::new(tls);
     let render = move || {
         let (backend, members, tls) = (backend.clone(), members.clone(), Arc::clone(&tls));
         let (history, packs, farm) = (history.clone(), packs.clone(), Arc::clone(&farm));
+        let executor = executor.clone();
         let job_read = job_read.clone();
         async move {
             let mut text = backend.render_metrics();
@@ -1224,6 +1378,9 @@ fn metrics_route(
             Packs::render_metrics_of(packs.as_ref(), &mut text);
             kbf_front::job_read::JobRead::render_metrics_of(job_read.as_deref(), &mut text);
             crate::metrics::render_farm(&mut text, &farm);
+            if let Some(executor) = executor {
+                executor.render(&mut text);
+            }
             crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);
             ([(CONTENT_TYPE, crate::metrics::TEXT_FORMAT)], text)
@@ -1295,11 +1452,16 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
 }
 
 mod drain_flags;
+mod executor_bind;
+mod executor_flags;
 mod handoff;
 mod job_read;
 mod pack_flags;
 mod state_wait;
+mod task_flags;
 
+#[cfg(test)]
+mod executor_tests;
 #[cfg(test)]
 mod pack_tests;
 #[cfg(test)]

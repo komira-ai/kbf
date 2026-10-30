@@ -2347,6 +2347,7 @@ dependencies = [
  "sha2 0.11.0",
  "subtle",
  "thiserror",
+ "tierstore",
  "tokio",
  "tonic",
  "tower-layer",
