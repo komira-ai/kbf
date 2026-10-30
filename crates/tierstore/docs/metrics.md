@@ -40,65 +40,41 @@ nothing, not 0.
 - Labels have a few fixed values each. None is a key, a bucket or a client, so the number of series stays small however busy the node is.
 - Sum a ratio's numerator and denominator separately (`sum(rate(a)) / sum(rate(b))`), never average per-series ratios.
 
-## On `/metricz` today
+## The build-node cache (v1)
 
-The OCI read front, when it is enabled, exports these series. Without it, `/metricz` has one
-comment line that says the front is not enabled.
+Every name in this section starts with `tierstore_cache_`, which the first column leaves out: `hits_total` is the series `tierstore_cache_` followed by `hits_total`. The text of the cache's series has no `# TYPE` line, so Prometheus stores them as untyped; `rate()` works on them anyway. An S3 GET reaches the cache as a HEAD (for the size and the conditions) and then a GET. These series count the GET, so a GET of a missing key, which the HEAD before it answers 404, is not in them.
 
-| name | type | labels | what it counts |
-|---|---|---|---|
-| `tierstore_oci_requests_total` | counter | `route`: `ping`, `manifest`, `blob`, `other`; `outcome`: `ok`, `partial`, `not_found`, `invalid`, `not_allowed`, `range_not_satisfiable`, `failed` | requests, by the status they were answered with (`ok` 200, `partial` 206, `not_found` 404, `invalid` 400, `not_allowed` 405, `range_not_satisfiable` 416, `failed` 5xx) |
-| `tierstore_oci_bytes_served_total` | counter | none | bytes of blobs read for responses |
-| `tierstore_oci_digest_mismatches_total` | counter | none | objects whose bytes were not the digest they are named by |
-| `tierstore_oci_front_info` | gauge | `mode`: `https`, `http` | always 1; the label is the mode the front runs in |
-
-## Not in a release yet
-
-Everything below describes series that are being added and are not in a released tierstore. The
-names and labels are those of the changes under review and can still change; this page is
-updated when they land. Do not build alerts on them until they are in a release.
-
-The text of the cache's series has one `# TYPE` line for each family (a counter, or a gauge for
-the four named as gauges below). The text of the v2 series has no `# TYPE` line, so Prometheus
-stores them as untyped; `rate()` works on them anyway.
-
-### v1: the build-node cache
-
-The cache's series start with `tierstore_cache_`. An S3 GET reaches the cache as a HEAD (for the
-size and the conditions) and then a GET, so some series count the HEAD and some the GET; the
-tables say which.
-
-### v1: reads and bytes
+### Cache reads and bytes
 
 | name | type | labels | increments when |
 |---|---|---|---|
-| `tierstore_cache_hits_total` | counter | none | a GET of an object the cache holds is answered from disk, whole or ranged |
-| `tierstore_cache_misses_total` | counter | none | a GET of a key the cache is set to keep is not answered from disk: the key is not held, or its file could not be read. Counted once, right after the lookup and before any call to the upstream |
-| `tierstore_cache_bytes_served_local_total` | counter | none | bytes of the answers that counted as hits |
-| `tierstore_cache_bytes_served_upstream_total` | counter | none | bytes of every answer that was not a hit: a pass-through read, and the read from disk that follows a fill |
+| `hits_total` | counter | none | a GET of an object the cache holds is answered from disk, whole or ranged |
+| `misses_total` | counter | none | a GET of a key the cache is set to keep is not answered from disk: the key is not held, or its file could not be read. |
+| `bytes_served_local_total` | counter | none | bytes of the answers that counted as hits |
+| `bytes_served_upstream_total` | counter | none | bytes of every answer that was not a hit: a pass-through read, and the read from disk that follows a fill |
 
 What they do not count:
 
 - A key the cache is not set to keep (outside every keep policy, or under a reserved prefix) is passed through to the upstream. It counts bytes under `bytes_served_upstream` and is neither a hit nor a miss.
 - A miss counts once for each reader. Readers that share one fill each count a miss, and the fill counts once.
-- A read of a kept key that the cache does not serve is one miss on every path: a ranged GET whose size HEAD to the upstream then fails, a ranged GET of an object over the whole-object limit (passed through, fills nothing, and counts bytes under `bytes_served_upstream`), and a fill that then fails. The miss is counted before any of those calls, so a failure after it does not remove it.
+- A ranged GET of a key that is not held first asks the upstream for the size. If that HEAD fails (the key does not exist, the upstream is down) the GET counts no miss. A ranged GET of an object over the whole-object limit counts a miss and is passed through: it fills nothing and counts bytes under `bytes_served_upstream`. Any other GET of a key that is not held counts its miss before the fill starts, so a failed fill still shows as a miss. A file that could not be read from disk is a miss on the paths that count one.
 - A range past the end of an object the cache holds is an error of the client: it is neither a hit nor a miss.
-- A GET of a missing key never reaches the GET: the HEAD before it answers 404. It shows only in the HEAD series below, so the hit and miss counters are rates of GETs that went on to read data.
+- A GET of a missing key never reaches the GET: the HEAD before it answers 404. So the hit and miss counters are rates of GETs that went on to read data.
 - Bytes are counted when the cache hands them to the front, so a client that disconnects while they are sent still has them counted.
-- `bytes_served_upstream` means "answered after going upstream", not "fetched". The read that follows a fill is served from the file the fill just wrote, and counts here although it came from disk. What the cache fetched from the upstream is `tierstore_cache_upstream_bytes_read_total` below.
-- A ranged miss of an object at or under the whole-object limit fills the whole object, then answers the range. Its bytes served are the range; its bytes fetched are the object.
+- `bytes_served_upstream` means "answered after going upstream", not "fetched". The read that follows a fill is served from the file the fill just wrote, and counts here although it came from disk. The bytes the cache fetched from the upstream are not exported yet.
+- A ranged miss of an object at or under the whole-object limit fills the whole object, then answers the range. Its bytes served are the range; it fetches the object.
 
-### v1: fills, failures and eviction
+### Cache fills, failures and eviction
 
 | name | type | labels | increments when |
 |---|---|---|---|
-| `tierstore_cache_fills_total` | counter | none | a fill wrote a new object into the cache |
-| `tierstore_cache_fills_skipped_total` | counter | none | a fill was not started or not kept and nothing went wrong: every fill slot was running, or there was no room |
-| `tierstore_cache_fills_skipped_busy_total` | counter | none | of the skipped fills, those that found every fill slot taken |
-| `tierstore_cache_fill_failures_total` | counter | `reason`: `hash_mismatch`, `upstream_error`, `short_body`, `local_io`, `changed`, `aborted` | a fill ended without leaving an object in the cache |
-| `tierstore_cache_evictions_total` | counter | `reason`: `budget`, `floor` | an object was evicted |
-| `tierstore_cache_pinned_skips_total` | counter | none | an eviction pass passed over an object because it has more than one hard link |
-| `tierstore_cache_discarded_at_start_total` | counter | none | a file was removed at start: a file the scan did not find whole, or what a fill left in the stage directory at the last stop |
+| `fills_total` | counter | none | a fill wrote a new object into the cache |
+| `fills_skipped_total` | counter | none | a fill was not started or not kept and nothing went wrong: every fill slot was running, or there was no room |
+| `fills_skipped_busy_total` | counter | none | of the skipped fills, those that found every fill slot taken |
+| `fill_failures_total` | counter | `reason`: `hash_mismatch`, `upstream_error`, `short_body`, `local_io`, `changed`, `aborted` | a fill ended without leaving an object in the cache |
+| `evictions_total` | counter | `reason`: `budget`, `floor` | an object was evicted |
+| `pinned_skips_total` | counter | none | an eviction pass passed over an object because it has more than one hard link |
+| `discarded_at_start_total` | counter | none | a file was removed at start: a file the scan did not find whole, or what a fill left in the stage directory at the last stop |
 
 The reasons of a failed fill:
 
@@ -117,16 +93,46 @@ up once for each pinned object on every pass, so it keeps rising while an object
 `discarded_at_start_total` is a counter that is set once, when the cache is opened, and stays
 the same for the rest of the process.
 
-### v1: gauges
+### Cache gauges
 
 These four are gauges, measured when `/metricz` is read.
 
 | name | type | what it is |
 |---|---|---|
-| `tierstore_cache_bytes` | gauge | bytes of objects in the cache |
-| `tierstore_cache_objects` | gauge | objects in the cache |
-| `tierstore_cache_fs_free_bytes` | gauge | free bytes of the file system of the cache directory |
-| `tierstore_cache_staging_files` | gauge | files in the stage directory now: fills that are running |
+| `bytes` | gauge | bytes of objects in the cache |
+| `objects` | gauge | objects in the cache |
+| `fs_free_bytes` | gauge | free bytes of the file system of the cache directory |
+| `staging_files` | gauge | files in the stage directory now: fills that are running |
+
+## On `/metricz` today
+
+The OCI read front, when it is enabled, exports these series. Without it, `/metricz` has one
+comment line that says the front is not enabled.
+
+| name | type | labels | what it counts |
+|---|---|---|---|
+| `tierstore_oci_requests_total` | counter | `route`: `ping`, `manifest`, `blob`, `other`; `outcome`: `ok`, `partial`, `not_found`, `invalid`, `not_allowed`, `range_not_satisfiable`, `failed` | requests, by the status they were answered with (`ok` 200, `partial` 206, `not_found` 404, `invalid` 400, `not_allowed` 405, `range_not_satisfiable` 416, `failed` 5xx) |
+| `tierstore_oci_bytes_served_total` | counter | none | bytes of blobs read for responses |
+| `tierstore_oci_digest_mismatches_total` | counter | none | objects whose bytes were not the digest they are named by |
+| `tierstore_oci_front_info` | gauge | `mode`: `https`, `http` | always 1; the label is the mode the front runs in |
+
+## Not in a release yet
+
+Everything below describes series that are being added and are not in a released tierstore. The
+names and labels are those of the changes under review and can still change; this page is
+updated when they land. Do not build alerts on them until they are in a release.
+
+The text of the v2 series has no `# TYPE` line, so Prometheus stores them as untyped; `rate()`
+works on them anyway.
+
+### v1: changes in the next release
+
+The series of "The build-node cache (v1)" above change as follows, and the cache gains the series
+of the sections after this one. They all start with `tierstore_cache_`.
+
+- Each family gets one `# TYPE` line: a counter, or a gauge for `tierstore_cache_bytes`, `tierstore_cache_objects`, `tierstore_cache_fs_free_bytes` and `tierstore_cache_staging_files`. `tierstore_cache_discarded_at_start_total` is declared a counter that is set once, when the cache is opened.
+- A read of a kept key that the cache does not serve is one miss on every path, counted right after the lookup and before any call to the upstream: a ranged GET whose size HEAD to the upstream then fails, a ranged GET of an object over the whole-object limit, and a fill that then fails. So a ranged GET whose HEAD fails now counts a miss. A range past the end of a held object is still neither a hit nor a miss.
+- The bytes the cache fetched from the upstream are `tierstore_cache_upstream_bytes_read_total`, in the next section.
 
 ### v1: the cache's calls to the upstream
 
@@ -179,7 +185,7 @@ What they do not count:
 ### v2: the hot and cold tiers
 
 One labelled family per measure. `tier` is `hot` or `cold`, and `op` is `get` or `head`. The
-value `local` of `tier` is reserved for the build node's cache, whose series are the ones above;
+value `local` of `tier` is reserved for the build node's cache, whose series are those of the cache;
 see "Query: one dashboard for both" below.
 
 | name | type | labels | increments when |
