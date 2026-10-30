@@ -16,6 +16,7 @@ use kbf_task_pack::ManifestError;
 use super::recording_sink::Fake;
 use super::*;
 use crate::fetch::label;
+use crate::put::FixedJitter;
 
 /// The REAPI digest of `bytes`.
 fn reapi_of(bytes: &[u8]) -> Digest {
@@ -829,6 +830,7 @@ fn the_http_sink_puts_the_pack_to_the_url() {
             large: Vec::new(),
         },
         sleeper: Arc::new(ThreadSleeper),
+        jitter: Arc::new(RandomJitter),
     };
     sink.store_pack(0, b"ok").expect("stored");
     let request = server.join().expect("server");
@@ -952,6 +954,7 @@ fn recording_sink(url: String, waits: &Arc<Waits>) -> HttpSink {
             large: Vec::new(),
         },
         sleeper: Arc::new(Arc::clone(waits)),
+        jitter: Arc::new(FixedJitter(0.5)),
     }
 }
 

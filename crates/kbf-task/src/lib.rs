@@ -38,10 +38,12 @@
 //!    stored, and pack 0 is read back through the shape check ingest applies to its footer: a
 //!    manifest or a pack ingest would refuse fails the task (exit 12) instead of being stored;
 //! 5. PUTs each object to its presigned URL ([`put`]): one create-only PUT per object, repeated only after a
-//!    503 (the store's hot tier is full and nothing was stored), at most three more times, each
-//!    after the wait the store's `Retry-After` names (whole seconds, at most 30; 2 s when it names
-//!    none). Every other answer, 412 included, is final. The retries do not look at the URL's
-//!    expiry: they wait at most 90 s in all, and a retry the store gets after the URL expired is
+//!    503 (the store's hot tier is full or it is taking as many puts as it may, and nothing was
+//!    stored), at most seven more times, each after a wait of between half and one and a half
+//!    times the store's `Retry-After` (whole seconds, taken as at most 30; 2 s when it names
+//!    none), chosen at random for each wait. Every other answer, 412 included, is final. The
+//!    retries do not look at the URL's expiry: their waits add up to at most 60 s, after which
+//!    the 503 is the failure, and a retry the store gets after the URL expired is
 //!    refused (403), which is final, so the task fails (exit 13) and nothing is stored.
 //!
 //! `js-agent` returns nothing but an exit code, so the manifest travels inside the pack, and the exit

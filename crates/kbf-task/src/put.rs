@@ -5,8 +5,11 @@
 //! as [`redact`] renders it. The PUT carries `Content-Length` and `If-None-Match: *`, so the
 //! store refuses it when the key already holds an object.
 //!
-//! One answer is retried: 503, which the store gives when its hot tier is full and nothing was
-//! stored ([`put_retrying`]). Every other answer, a 412 (the key exists, and a re-attempt of the
+//! One answer is retried: 503, which the store gives when its hot tier is full or it is taking as
+//! many puts as it may, and nothing was stored ([`put_retrying`]): up to [`MAX_RETRIES`] more
+//! times, each after the store's `Retry-After` moved by a random share of -50% to +50%
+//! ([`Jitter`]), so that tasks that were refused together do not come back together, and
+//! stopping when the waits have added up to [`MAX_TOTAL_WAIT`]. Every other answer, a 412 (the key exists, and a re-attempt of the
 //! task gets a new key, so it is final) and a transport error included, is reported on the first
 //! attempt.
 //!
@@ -27,10 +30,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const PUT_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// How many times a 503 is retried after the first attempt.
-pub const MAX_RETRIES: u32 = 3;
+pub const MAX_RETRIES: u32 = 7;
 
-/// The longest the tool waits before one retry, however long the store asks.
+/// The longest `Retry-After` the tool honours before one retry, however long the store asks; the
+/// wait is that moved by the jitter, so it can be half as long or half as long again.
 pub const MAX_WAIT: Duration = Duration::from_secs(30);
+
+/// The most the waits before the retries of one PUT add up to: when they have, the 503 is the
+/// failure, even if retries are left, and the wait that reaches it is cut short to end there.
+pub const MAX_TOTAL_WAIT: Duration = Duration::from_secs(60);
 
 /// How long the tool waits before a retry when the 503 names no usable `Retry-After`.
 pub const DEFAULT_WAIT: Duration = Duration::from_secs(2);
@@ -318,30 +326,82 @@ fn wait_for(retry_after_secs: Option<u64>) -> Duration {
     retry_after_secs.map_or(DEFAULT_WAIT, |s| Duration::from_secs(s).min(MAX_WAIT))
 }
 
+/// Where the randomness of a retry's wait comes from; a parameter so tests give the numbers.
+pub trait Jitter {
+    /// A number from 0 up to 1. A value outside that range is taken as the nearest end of it, and
+    /// one that is not a number as 0.5.
+    fn unit(&self) -> f64;
+}
+
+/// The real [`Jitter`]: a number that differs from run to run and from process to process (the
+/// random keys the standard library gives each hash map).
+pub struct RandomJitter;
+
+impl Jitter for RandomJitter {
+    fn unit(&self) -> f64 {
+        use std::hash::{BuildHasher, Hasher};
+        let bits = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        // The top 53 bits are what an f64 holds exactly: a number from 0 up to, not including, 1.
+        (bits >> 11) as f64 / (1_u64 << 53) as f64
+    }
+}
+
+/// A [`Jitter`] that gives the same number every time, for the tests: 0.5 leaves a wait as it is.
+#[cfg(test)]
+pub(crate) struct FixedJitter(pub f64);
+
+#[cfg(test)]
+impl Jitter for FixedJitter {
+    fn unit(&self) -> f64 {
+        self.0
+    }
+}
+
+/// `wait` moved by `unit` (0 to 1) to a point between half of it and one and a half times it:
+/// `unit` 0 gives half, 0.5 the wait itself, 1 one and a half times.
+fn jittered(wait: Duration, unit: f64) -> Duration {
+    let unit = if unit.is_finite() {
+        unit.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    wait.mul_f64(0.5 + unit)
+}
+
 /// Runs `attempt` (one PUT) and runs it again after a 503, up to [`MAX_RETRIES`] more times,
-/// waiting with `sleeper` before each. Any other outcome is returned at once.
+/// waiting with `sleeper` before each: the store's `Retry-After` (at most [`MAX_WAIT`]; 2 s when
+/// it gave none) moved by `jitter` to between half and one and a half times as long. The waits
+/// add up to at most [`MAX_TOTAL_WAIT`]: the wait that would pass it is cut to end there, and
+/// when they have added up to it no retry follows. Any other outcome is returned at once.
 ///
 /// A retry is safe because every attempt is the create-only PUT (`If-None-Match: *`) of the same
 /// key: a 503 stored nothing, and if an earlier attempt had in fact stored the object, the retry
 /// meets a 412 and fails instead of overwriting it.
 ///
-/// The URL's expiry is not checked: the waits add up to at most [`MAX_RETRIES`] times
-/// [`MAX_WAIT`] (90 s), and an attempt the store gets after the URL expired is refused with a
-/// 403, which is not retried. A late retry therefore fails the task and stores nothing.
+/// The URL's expiry is not checked: the waits add up to at most [`MAX_TOTAL_WAIT`] (60 s), and an
+/// attempt the store gets after the URL expired is refused with a 403, which is not retried. A
+/// late retry therefore fails the task and stores nothing.
 ///
 /// # Errors
 /// The last attempt's [`PutError`].
 pub fn put_retrying(
     mut attempt: impl FnMut() -> Result<(), PutError>,
     sleeper: &dyn Sleeper,
+    jitter: &dyn Jitter,
 ) -> Result<(), PutError> {
     let mut retries = 0;
+    let mut waited = Duration::ZERO;
     loop {
         match attempt() {
             Err(PutError::Unavailable {
                 retry_after_secs, ..
-            }) if retries < MAX_RETRIES => {
-                sleeper.sleep(wait_for(retry_after_secs));
+            }) if retries < MAX_RETRIES && waited < MAX_TOTAL_WAIT => {
+                let wait = jittered(wait_for(retry_after_secs), jitter.unit())
+                    .min(MAX_TOTAL_WAIT - waited);
+                sleeper.sleep(wait);
+                waited += wait;
                 retries += 1;
             }
             outcome => return outcome,
@@ -691,9 +751,112 @@ mod tests {
     fn a_503_then_a_201_is_stored_after_the_wait_the_store_asked_for() {
         let sleeper = Recorded::default();
         let (attempt, calls) = answering(vec![busy(Some(5)), Ok(())]);
-        assert_eq!(put_retrying(attempt, &sleeper), Ok(()));
+        assert_eq!(put_retrying(attempt, &sleeper, &MIDDLE), Ok(()));
         assert_eq!(calls.get(), 2);
         assert_eq!(sleeper.waits(), [Duration::from_secs(5)]);
+    }
+
+    /// The jitter that leaves a wait as the store asked for it.
+    const MIDDLE: FixedJitter = FixedJitter(0.5);
+
+    /// A [`Jitter`] that gives the numbers it was given, one for each draw, and fails the test
+    /// when it is asked for more.
+    struct Sequence(std::sync::Mutex<std::collections::VecDeque<f64>>);
+
+    impl Sequence {
+        fn of(units: &[f64]) -> Self {
+            Self(std::sync::Mutex::new(units.iter().copied().collect()))
+        }
+    }
+
+    impl Jitter for Sequence {
+        fn unit(&self) -> f64 {
+            self.0
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .expect("a draw that was given")
+        }
+    }
+
+    /// Catches a wait that leaves the band around the `Retry-After`: for each `Retry-After`
+    /// (the cap included, and past it) and each number the jitter may give (the ends, the
+    /// middle, numbers outside 0 to 1, and not a number) the one wait is from half of the
+    /// `Retry-After` (cut at `MAX_WAIT`) to one and a half times it.
+    #[test]
+    fn a_wait_is_within_half_and_one_and_a_half_times_the_retry_after() {
+        for secs in [0_u64, 1, 5, 29, 30, 3600] {
+            let base = Duration::from_secs(secs).min(MAX_WAIT);
+            for unit in [0.0, 0.1, 0.25, 0.5, 0.75, 0.999, 1.0, -3.0, 7.0, f64::NAN] {
+                let sleeper = Recorded::default();
+                let (attempt, _) = answering(vec![busy(Some(secs)), Ok(())]);
+                let jitter = FixedJitter(unit);
+                assert_eq!(put_retrying(attempt, &sleeper, &jitter), Ok(()));
+                let waits = sleeper.waits();
+                assert_eq!(waits.len(), 1);
+                assert!(
+                    waits[0] >= base.mul_f64(0.5),
+                    "{secs} {unit}: {:?}",
+                    waits[0]
+                );
+                assert!(
+                    waits[0] <= base.mul_f64(1.5),
+                    "{secs} {unit}: {:?}",
+                    waits[0]
+                );
+            }
+        }
+    }
+
+    /// Catches the jitter being ignored or mis-scaled: a draw of 0 halves the `Retry-After`, 0.5
+    /// leaves it, 1 makes it one and a half times, and a quarter and three quarters are on the
+    /// line between them. Each wait of one PUT takes a draw of its own, in order.
+    #[test]
+    fn each_wait_takes_its_own_draw_and_scales_the_retry_after_with_it() {
+        let sleeper = Recorded::default();
+        let units = Sequence::of(&[0.0, 0.5, 1.0, 0.25, 0.75]);
+        let answers = vec![busy(Some(10)); 5];
+        let (attempt, calls) = answering([answers, vec![Ok(())]].concat());
+        assert_eq!(put_retrying(attempt, &sleeper, &units), Ok(()));
+        assert_eq!(calls.get(), 6);
+        let secs = |s: f64| Duration::from_secs_f64(s);
+        assert_eq!(
+            sleeper.waits(),
+            [secs(5.0), secs(10.0), secs(15.0), secs(7.5), secs(12.5)]
+        );
+        assert!(units.0.lock().expect("lock").is_empty());
+    }
+
+    /// Catches waits that add up past `MAX_TOTAL_WAIT`, or that go on when it is reached: a store
+    /// that asks for 30 s and a jitter that stretches it to 45 s gets waits of 45 s and then 15 s
+    /// (the wait that would pass the cap is cut), then a third attempt, which is the last, and the
+    /// 503 it answers is the failure, the same error as when the retries run out.
+    #[test]
+    fn the_waits_stop_at_the_total_cap_and_the_last_503_is_the_failure() {
+        let sleeper = Recorded::default();
+        let answers = (0..=MAX_RETRIES).map(|_| busy(Some(30))).collect();
+        let (attempt, calls) = answering(answers);
+        let err = put_retrying(attempt, &sleeper, &FixedJitter(1.0)).unwrap_err();
+        assert_eq!(
+            err,
+            PutError::Unavailable {
+                url: "u".into(),
+                retry_after_secs: Some(30)
+            }
+        );
+        assert_eq!(calls.get(), 3);
+        let waits = sleeper.waits();
+        assert_eq!(waits, [Duration::from_secs(45), Duration::from_secs(15)]);
+        assert_eq!(waits.iter().sum::<Duration>(), MAX_TOTAL_WAIT);
+    }
+
+    /// Catches the real jitter being constant or outside 0 to under 1: 64 draws are all in range
+    /// and are not all the same number.
+    #[test]
+    fn the_random_jitter_draws_from_zero_up_to_one_and_varies() {
+        let draws: Vec<f64> = (0..64).map(|_| RandomJitter.unit()).collect();
+        assert!(draws.iter().all(|u| (0.0..1.0).contains(u)), "{draws:?}");
+        assert!(draws.iter().any(|u| *u != draws[0]), "{draws:?}");
     }
 
     /// Catches an unbounded retry: a store that stays full is asked `MAX_RETRIES` + 1 times,
@@ -703,7 +866,7 @@ mod tests {
         let sleeper = Recorded::default();
         let answers = (0..=MAX_RETRIES).map(|_| busy(Some(1))).collect();
         let (attempt, calls) = answering(answers);
-        let err = put_retrying(attempt, &sleeper).unwrap_err();
+        let err = put_retrying(attempt, &sleeper, &MIDDLE).unwrap_err();
         assert_eq!(
             err,
             PutError::Unavailable {
@@ -721,7 +884,7 @@ mod tests {
         let sleeper = Recorded::default();
         let exists = PutError::Exists { url: "u".into() };
         let (attempt, calls) = answering(vec![Err(exists.clone())]);
-        assert_eq!(put_retrying(attempt, &sleeper), Err(exists));
+        assert_eq!(put_retrying(attempt, &sleeper, &MIDDLE), Err(exists));
         assert_eq!(calls.get(), 1);
         assert!(sleeper.waits().is_empty());
     }
@@ -734,7 +897,7 @@ mod tests {
         let sleeper = Recorded::default();
         let exists = PutError::Exists { url: "u".into() };
         let (attempt, calls) = answering(vec![busy(Some(4)), Err(exists.clone())]);
-        assert_eq!(put_retrying(attempt, &sleeper), Err(exists));
+        assert_eq!(put_retrying(attempt, &sleeper, &MIDDLE), Err(exists));
         assert_eq!(calls.get(), 2);
         assert_eq!(sleeper.waits(), [Duration::from_secs(4)]);
     }
@@ -755,7 +918,7 @@ mod tests {
         ] {
             let sleeper = Recorded::default();
             let (attempt, calls) = answering(vec![Err(error.clone())]);
-            assert_eq!(put_retrying(attempt, &sleeper), Err(error));
+            assert_eq!(put_retrying(attempt, &sleeper, &MIDDLE), Err(error));
             assert_eq!(calls.get(), 1);
             assert!(sleeper.waits().is_empty());
         }
@@ -767,7 +930,7 @@ mod tests {
     fn the_wait_is_the_retry_after_capped_or_a_default() {
         let sleeper = Recorded::default();
         let (attempt, _) = answering(vec![busy(None), busy(Some(3600)), busy(Some(0)), Ok(())]);
-        assert_eq!(put_retrying(attempt, &sleeper), Ok(()));
+        assert_eq!(put_retrying(attempt, &sleeper, &MIDDLE), Ok(()));
         assert_eq!(sleeper.waits(), [DEFAULT_WAIT, MAX_WAIT, Duration::ZERO]);
     }
 
