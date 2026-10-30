@@ -86,10 +86,29 @@ fn download(g: &str) -> String {
     )
 }
 
+/// The download of the group's sums and the two checks the attest job makes before it signs.
+fn sums_checks(g: &str) -> String {
+    format!(
+        "      - uses: actions/download-artifact@{DOWNLOAD_PIN}\n        with:\n          name: sha256sums-{g}\n          path: dist\n{}{SUMS_FILES_STEP}",
+        sums_digest_step(g)
+    )
+}
+
+/// The digest check of the group `g`.
+fn sums_digest_step(g: &str) -> String {
+    format!(
+        "      - name: Refuse sums other than the build's\n        env:\n          SUMS_SHA256: ${{{{ inputs.{} }}}}\n        run: /usr/bin/sha256sum --check --strict <<< \"$SUMS_SHA256  dist/SHA256SUMS\"\n",
+        digest_input(g)
+    )
+}
+
+/// The file check.
+const SUMS_FILES_STEP: &str = "      - name: Refuse files other than the sums list\n        working-directory: dist\n        run: /usr/bin/sha256sum --check --strict SHA256SUMS\n";
+
 /// artifacts.yml as the rules want it.
 fn good_artifacts() -> String {
     let mut w = String::from(
-        "on: push\npermissions: {}\njobs:\n  build:\n    runs-on: ubuntu-24.04\n    steps:\n",
+        "on: push\npermissions: {}\ndefaults:\n  run:\n    shell: bash\njobs:\n  build:\n    runs-on: ubuntu-24.04\n    steps:\n",
     );
     for (name, platform) in PACKAGES {
         w.push_str(&format!(
@@ -104,7 +123,8 @@ fn good_artifacts() -> String {
     w.push_str("      - name: Package macos\n        run: cargo xtask pkg-macos-asset --package p.pkg --commit \"$GITHUB_SHA\" --binary-tarball t.tar.gz --expect-ref \"$PKG_SOURCE_REF\" --gh gh --out dist\n      - name: Check macos\n        run: cargo xtask pkg-macos-asset --verify-only --package p.pkg --commit \"$GITHUB_SHA\" --binary-tarball t.tar.gz --expect-ref \"$GITHUB_REF\"\n");
     for g in ["linux", "darwin-arm64"] {
         w.push_str(&format!(
-            "  attest-{g}:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/attest-build-provenance@{ATTEST_PIN}\n        with:\n          subject-checksums: dist/SHA256SUMS\n"
+            "  attest-{g}:\n    runs-on: ubuntu-24.04\n    steps:\n{}      - uses: actions/attest-build-provenance@{ATTEST_PIN}\n        with:\n          subject-checksums: dist/SHA256SUMS\n",
+            sums_checks(g)
         ));
         for (name, platform) in PACKAGES.iter().filter(|(_, p)| group(p) == g) {
             w.push_str(&provenance(name, platform));
@@ -145,6 +165,18 @@ fn broken(from: &str, to: &str) -> String {
     let w = good_artifacts();
     assert!(w.contains(from), "{from:?} is not in the planted workflow");
     w.replacen(from, to, 1)
+}
+
+/// [`broken`] for the `nth` (from 0) occurrence of `from`, for text both attest jobs share.
+fn broken_at(from: &str, to: &str, nth: usize) -> String {
+    let mut w = good_artifacts();
+    let at = w
+        .match_indices(from)
+        .nth(nth)
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| panic!("{from:?} has no occurrence {nth} in the planted workflow"));
+    w.replace_range(at..at + from.len(), to);
+    w
 }
 
 /// Defects checked one after the other, every one that goes unnamed reported
@@ -833,4 +865,231 @@ fn the_kbf_deb_lines_are_read_apart_from_the_checks() {
         said.contains("a pkg-kbf-asset line without --platform"),
         "{said}"
     );
+}
+
+#[test]
+fn the_attest_job_checks_the_downloaded_sums_and_files_before_it_signs() {
+    // Catches: an attest job that signs what the artifact store holds without checking it. The
+    // build call's files wait there for the length of the beta jobs, which run repository code;
+    // `subject-checksums` signs the digests the sums file lists without opening the files, so a
+    // consistent swap of files and sums would be signed. Each defect below leaves every other rule
+    // satisfied.
+    let mut cases = Cases::default();
+    let digest = sums_digest_step("linux");
+    let files = SUMS_FILES_STEP;
+    let first_attest = "      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2\n        with:\n          subject-checksums: dist/SHA256SUMS\n";
+    let wrong =
+        "does not run `/usr/bin/sha256sum --check --strict <<< \"$SUMS_SHA256  dist/SHA256SUMS\"`";
+    let wrong_files = "does not run `/usr/bin/sha256sum --check --strict SHA256SUMS` in `dist`";
+    cases.artifacts("no digest check", &broken(&digest, ""), wrong, true);
+    cases.artifacts("no file check", &broken(files, ""), wrong_files, true);
+    cases.artifacts(
+        "the digest check after the first attestation",
+        &broken(&digest, "").replacen(first_attest, &format!("{first_attest}{digest}"), 1),
+        "the digest check of `attest-linux` comes after an attestation step",
+        true,
+    );
+    cases.artifacts(
+        "the file check after the first attestation",
+        &broken(files, "").replacen(first_attest, &format!("{first_attest}{files}"), 1),
+        "the file check of `attest-linux` comes after an attestation step",
+        true,
+    );
+    let sums_download = "          name: sha256sums-linux\n          path: dist\n";
+    cases.artifacts(
+        "the checks before the last download",
+        &broken(&format!("{sums_download}{digest}{files}"), sums_download).replacen(
+            "  attest-linux:\n    runs-on: ubuntu-24.04\n    steps:\n",
+            &format!("  attest-linux:\n    runs-on: ubuntu-24.04\n    steps:\n{digest}{files}"),
+            1,
+        ),
+        "comes before its last download",
+        false,
+    );
+    cases.artifacts(
+        "a skippable digest check",
+        &broken(
+            &digest,
+            &digest.replace("        env:", "        if: always()\n        env:"),
+        ),
+        "the digest check of `attest-linux` is to be an unconditional step",
+        true,
+    );
+    cases.artifacts(
+        "a skippable file check",
+        &broken(
+            files,
+            &files.replace(
+                "        working-directory",
+                "        continue-on-error: true\n        working-directory",
+            ),
+        ),
+        "the file check of `attest-linux` is to be an unconditional step",
+        true,
+    );
+    cases.artifacts(
+        "the digest of the other group",
+        &broken(&digest, &digest.replace("sums_linux_sha256", "sums_darwin_arm64_sha256")),
+        "the digest check of `attest-linux` is to be an unconditional step with exactly `env: SUMS_SHA256: ${{ inputs.sums_linux_sha256 }}`",
+        true,
+    );
+    cases.artifacts(
+        "a digest that is not the input",
+        &broken(
+            &digest,
+            &digest.replace("${{ inputs.sums_linux_sha256 }}", ""),
+        ),
+        "the digest check of `attest-linux` is to be an unconditional step",
+        true,
+    );
+    cases.artifacts(
+        "a file check outside dist",
+        &broken(files, &files.replace("        working-directory: dist\n", "")),
+        "the file check of `attest-linux` is to be an unconditional step with `working-directory: dist`",
+        true,
+    );
+    cases.artifacts(
+        "the darwin job without its digest check",
+        &broken(&sums_digest_step("darwin-arm64"), ""),
+        "`attest-darwin-arm64` does not run",
+        true,
+    );
+    cases.artifacts(
+        "a weaker command",
+        &broken(
+            "run: /usr/bin/sha256sum --check --strict SHA256SUMS",
+            "run: /usr/bin/sha256sum --check SHA256SUMS",
+        ),
+        wrong_files,
+        false,
+    );
+    cases.done();
+}
+
+#[test]
+fn the_sums_checks_cannot_be_turned_into_no_ops_by_a_shell_or_a_startup_variable() {
+    // Catches: both `sha256sum` checks passing without checking. A step-level `shell: true {0}`
+    // (or `echo {0}`), a job-level `defaults.run.shell` or `env`, a workflow default other than
+    // `bash` (the here-string is bash), and any workflow-level variable outside the allow-list
+    // (`BASH_ENV` runs a file first, `SHELLOPTS`/`BASHOPTS`/`POSIXLY_CORRECT`/`BASH_XTRACEFD`
+    // change how bash runs, `PATH`/`LD_*` pick or alter the program, `BASH_FUNC_sha256sum%%`
+    // imports a function that shadows it). Each plant leaves the checks as they are, so only
+    // these rules can see it, and it is made against both attest jobs.
+    let mut cases = Cases::default();
+    for (nth, g) in ["linux", "darwin-arm64"].into_iter().enumerate() {
+        let job = format!("attest-{g}");
+        let digest = sums_digest_step(g);
+        let files = SUMS_FILES_STEP;
+        let shell_wanted = format!("a `run:` step of `{job}` has `shell: ");
+        for shell in ["true {0}", "echo {0}", PINNED_SHELL] {
+            for (what, step) in [("digest", digest.as_str()), ("file", files)] {
+                cases.artifacts(
+                    &format!("a step shell `{shell}` on the {what} check of {job}"),
+                    &broken_at(
+                        step,
+                        &step.replace(
+                            "        run:",
+                            &format!("        shell: {shell}\n        run:"),
+                        ),
+                        // The digest step is the group's own; the file step is in both jobs.
+                        if what == "file" { nth } else { 0 },
+                    ),
+                    &shell_wanted,
+                    true,
+                );
+            }
+        }
+        let head = format!("  {job}:\n    runs-on: ubuntu-24.04\n");
+        cases.artifacts(
+            &format!("a job-level default shell on {job}"),
+            &broken(
+                &head,
+                &format!("{head}    defaults:\n      run:\n        shell: 'true {{0}}'\n"),
+            ),
+            &format!("`{job}` has `defaults:`"),
+            true,
+        );
+        for var in ["BASH_ENV", "SHELLOPTS", "PATH", "A"] {
+            cases.artifacts(
+                &format!("a job-level {var} on {job}"),
+                &broken(&head, &format!("{head}    env:\n      {var}: /x\n")),
+                &format!("`{job}` has a job-level `env:`"),
+                true,
+            );
+        }
+    }
+    let defaults = format!("defaults:\n  run:\n    shell: {PINNED_SHELL}\n");
+    let defaults = defaults.as_str();
+    cases.artifacts(
+        "another workflow default shell",
+        &broken(defaults, "defaults:\n  run:\n    shell: cmd\n"),
+        "`defaults.run.shell` is Some(\"cmd\"), not exactly",
+        false,
+    );
+    cases.artifacts(
+        "a workflow default shell that runs nothing",
+        &broken(defaults, "defaults:\n  run:\n    shell: 'true {0}'\n"),
+        "not exactly",
+        false,
+    );
+    cases.artifacts(
+        "no workflow default shell",
+        &broken(defaults, ""),
+        "`defaults.run.shell` is None, not exactly",
+        false,
+    );
+    for var in [
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "PATH",
+        "IFS",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "BASH_FUNC_sha256sum%%",
+        "BASH_FUNC_/usr/bin/sha256sum%%",
+        "BASH_XTRACEFD",
+        "POSIXLY_CORRECT",
+        "FOO",
+    ] {
+        cases.artifacts(
+            &format!("a workflow-level {var}"),
+            &broken(
+                defaults,
+                &format!("{defaults}env:\n  '{var}': '() {{ true; }}'\n"),
+            ),
+            &format!("the workflow's `env` sets `{var}`, which is not in the allow-list"),
+            false,
+        );
+    }
+    cases.done();
+    // Every name of the allow-list is accepted, and the lint reads them as the workflow sets them.
+    let all: String = WORKFLOW_ENV.iter().map(|n| format!("  {n}: x\n")).collect();
+    assert_eq!(
+        found(
+            &broken(defaults, &format!("{defaults}env:\n{all}")),
+            GOOD_RELEASE,
+            &LISTED
+        ),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn the_real_workflow_env_is_the_allow_list() {
+    // Catches: a variable added to (or dropped from) artifacts.yml's top-level `env:` without the
+    // allow-list being changed on purpose, which is what makes adding one a reviewed decision.
+    let text = std::fs::read_to_string(crate::repo_root().join(".github/workflows/artifacts.yml"))
+        .expect("artifacts.yml");
+    let mut names: Vec<String> = workflows::top_env(&text)
+        .expect("env")
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    names.sort();
+    let mut allowed: Vec<String> = WORKFLOW_ENV.iter().map(|n| (*n).to_owned()).collect();
+    allowed.sort();
+    assert_eq!(names, allowed);
 }
