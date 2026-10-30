@@ -33,7 +33,9 @@
 //!
 //! and may add an advisory `"inputs":{..}` ([`InputStats`]) after them, which only version 2
 //! may carry: a manifest with `inputs` is written as version 2, since a version 1 reader
-//! refuses a field it does not know.
+//! refuses a field it does not know. Version 2 is required exactly when `packs` is above 1, `large`
+//! is not empty or `inputs` is present: a body of either version that disagrees is refused, so a
+//! manifest has one spelling.
 //!
 //! `packs` is how many of packs `0..` were written (1 to [`MAX_PACKS`]); `large` names the
 //! large objects by slot (unique, below [`MAX_LARGE`]), each of a size above
@@ -418,6 +420,7 @@ impl TaskManifest {
     pub fn parse_with(bytes: &[u8], large_max: u64) -> Result<Self, ManifestError> {
         check_len(bytes.len() as u64)?;
         let wire: Wire = serde_json::from_slice(bytes)?;
+        let wire_version = wire.version;
         match wire.version {
             MANIFEST_VERSION => {
                 if wire.packs.is_some() {
@@ -442,6 +445,9 @@ impl TaskManifest {
         }
         let manifest = wire.into_manifest()?;
         manifest.validate_with(large_max)?;
+        if wire_version == MANIFEST_VERSION_2 && manifest.version() == MANIFEST_VERSION {
+            return Err(ManifestError::NotV2);
+        }
         Ok(manifest)
     }
 
