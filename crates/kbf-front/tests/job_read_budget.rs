@@ -937,4 +937,5 @@ async fn a_batch_reads_through_a_backend_and_a_streamed_reply_prints() {
     );
 }
 
+#[path = "job_read_budget/failures.rs"]
 mod failures;
