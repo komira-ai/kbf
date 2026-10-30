@@ -175,14 +175,7 @@ pub fn check_records(footer: &Footer, pack_len: u64) -> Result<&IndexEntry, Shap
             found: footer.records_len(),
         });
     }
-    let first = by_offset[0];
-    // Red-first stub: the manifest bound is applied to every pack until the implementation moves it.
-    if first.digest.size_bytes > MAX_MANIFEST_BYTES {
-        return Err(ShapeError::ManifestTooLarge {
-            size: first.digest.size_bytes,
-        });
-    }
-    Ok(first)
+    Ok(by_offset[0])
 }
 
 /// Reads the manifest of `pack`, the whole object: checks the footer, the shape, the manifest

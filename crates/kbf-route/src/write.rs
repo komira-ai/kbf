@@ -5,7 +5,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::{StreamExt as _, TryStreamExt as _};
+use futures::{FutureExt as _, StreamExt as _, TryStreamExt as _};
 use kbf_meta::{ActionRecord, Role};
 use kbf_storage::service::MAX_FIND_MISSING_DIGESTS;
 use kbf_storage::{OpenPieces, Storage, StorageError};
@@ -96,10 +96,8 @@ impl Router {
         digest: &Digest,
         open: &OpenPieces,
     ) -> Result<(), StorageError> {
-        let _ = (digest, open);
-        Err(StorageError::Internal(
-            "put_streamed is not written".to_owned(),
-        ))
+        self.routed(|view| self.put_streamed_in(view, *digest, open))
+            .await
     }
 
     /// The second half of an action-cache write: commits the entry for `action` at the
@@ -289,6 +287,28 @@ impl Router {
         self.at_a_write_owner(&view, &digest, |node| {
             let bytes = bytes.clone();
             async move { node.put(bytes).await.map_err(Tried::Node) }
+        })
+        .await
+    }
+
+    async fn put_streamed_in(
+        &self,
+        view: MapView,
+        digest: Digest,
+        open: &OpenPieces,
+    ) -> Result<(), StorageError> {
+        self.at_a_write_owner(&view, &digest, |node| {
+            let body = open();
+            async move {
+                let claim = futures::future::ready(Some(digest)).boxed();
+                match node.put_streamed(digest.size_bytes, body, claim).await {
+                    Ok(Some(stored)) if stored == digest => Ok(()),
+                    Ok(other) => Err(Tried::Elsewhere(StorageError::Internal(format!(
+                        "a node answered {other:?} for the streamed blob {digest}"
+                    )))),
+                    Err(e) => Err(Tried::Node(e)),
+                }
+            }
         })
         .await
     }
