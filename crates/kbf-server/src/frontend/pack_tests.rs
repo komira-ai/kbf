@@ -20,8 +20,8 @@ use kbf_proto::reapi::{
     batch_update_blobs_request,
 };
 use kbf_proto::worker::{
-    Capability, DaemonMessage, Heartbeat, Hello, PackReadCounts, PackWriteCounts, ServerMessage,
-    daemon_message, server_message, worker_client::WorkerClient,
+    Capability, DaemonMessage, Heartbeat, Hello, InputCacheCounts, PackReadCounts, PackWriteCounts,
+    ServerMessage, TreeCounts, daemon_message, server_message, worker_client::WorkerClient,
 };
 use kbf_state::ManualClock;
 use kbf_types::Digest;
@@ -76,7 +76,7 @@ pub(super) fn started(
     index: Option<Arc<dyn PackIndex>>,
 ) -> Result<FrontendHandle, Box<dyn Error>> {
     let shutdown = boxed(|| Ok(pending::<()>()));
-    Prepared::new(flags)?.start(None, index, shutdown)
+    Prepared::new(flags)?.start(None, index, shutdown, None)
 }
 
 async fn connect(addr: SocketAddr) -> ContentAddressableStorageClient<Channel> {
@@ -115,9 +115,14 @@ pub(super) async fn upload(addr: SocketAddr, blobs: &[(Digest, &[u8])]) -> Vec<i
 
 /// The text `GET /metrics` of the operator API at `addr` answers.
 pub(super) async fn scrape(addr: SocketAddr) -> String {
+    get(addr, "/metrics").await
+}
+
+/// The whole answer (head and body) of `GET path` on the operator listener at `addr`.
+async fn get(addr: SocketAddr, path: &str) -> String {
     let mut stream = TcpStream::connect(addr).await.expect("connects");
-    let request = b"GET /metrics HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n";
-    stream.write_all(request).await.expect("sent");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.expect("sent");
     let mut text = String::new();
     stream.read_to_string(&mut text).await.expect("answered");
     text
@@ -328,13 +333,27 @@ impl Daemon {
         pack_reads: Option<PackReadCounts>,
         pack_writes: Option<PackWriteCounts>,
     ) {
-        self.seq += 1;
-        let beat = Heartbeat {
-            seq: self.seq,
+        self.send_beat(Heartbeat {
             pack_reads,
             pack_writes,
             ..Heartbeat::default()
-        };
+        })
+        .await;
+    }
+
+    /// [`Self::beat`], carrying the input cache counts `counts` alone.
+    async fn beat_input_cache(&mut self, counts: Option<InputCacheCounts>) {
+        self.send_beat(Heartbeat {
+            input_cache: counts,
+            ..Heartbeat::default()
+        })
+        .await;
+    }
+
+    /// Sends `beat`, numbered, and waits for the server's acknowledgement of it.
+    async fn send_beat(&mut self, mut beat: Heartbeat) {
+        self.seq += 1;
+        beat.seq = self.seq;
         let message = DaemonMessage {
             message: Some(daemon_message::Message::Heartbeat(beat)),
         };
@@ -403,6 +422,80 @@ async fn a_frontend_exports_the_pack_reads_its_daemons_report() {
     reading.beat(None).await;
     let text = scrape(api).await;
     assert!(!text.contains("kbf_pack_daemon_"), "{text}");
+    served.abort();
+}
+
+/// Asserts that a frontend puts the input cache counts its daemons send on their heartbeats on
+/// `GET /metrics` as the `kbf_node_input_cache_*` counters of the node that sent them, and on
+/// `GET /v1/nodes/{id}` as its `input_cache` object: none of either before a daemon has sent
+/// any, a node that sent none has no sample and no object, the newest counts of a node are the
+/// ones shown, and a node whose next heartbeat carries none loses both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_exports_the_input_cache_counts_its_daemons_report() {
+    let flags = flags_of(&[]);
+    let handle = started(&flags, Some(index())).expect("starts");
+    let (worker, api) = (handle.worker, handle.api.expect("the operator API"));
+    let served = tokio::spawn(handle.serve());
+    let text = scrape(api).await;
+    assert!(!text.contains("kbf_node_input_cache_"), "{text}");
+
+    let mut cached = Daemon::open(worker, "node-a").await;
+    let mut plain = Daemon::open(worker, "node-b").await;
+    let counts = InputCacheCounts {
+        fills: 5,
+        fill_bytes: 4096,
+        hits: 7,
+        hit_bytes: 2048,
+        evictions: 2,
+        evicted_bytes: 512,
+        trees: Some(TreeCounts {
+            builds: 1,
+            hits: 3,
+            evictions: 0,
+        }),
+    };
+    cached.beat_input_cache(Some(counts)).await;
+    plain.beat_input_cache(None).await;
+    let text = scrape(api).await;
+    for (family, want) in [
+        ("fills", 5),
+        ("fill_bytes", 4096),
+        ("hits", 7),
+        ("hit_bytes", 2048),
+        ("evictions", 2),
+        ("evicted_bytes", 512),
+        ("tree_builds", 1),
+        ("tree_hits", 3),
+        ("tree_evictions", 0),
+    ] {
+        let header = format!("# TYPE kbf_node_input_cache_{family}_total counter\n");
+        assert!(text.contains(&header), "{header}{text}");
+        let sample = format!("kbf_node_input_cache_{family}_total{{node=\"node-a\"}} {want}\n");
+        assert!(text.contains(&sample), "{sample}{text}");
+    }
+    assert!(
+        !text.contains("input_cache_fills_total{node=\"node-b\"}"),
+        "{text}"
+    );
+
+    let detail = get(api, "/v1/nodes/node-a").await;
+    let shown = r#""input_cache":{"fills":5,"fill_bytes":4096,"hits":7,"hit_bytes":2048,"evictions":2,"evicted_bytes":512,"trees":{"builds":1,"hits":3,"evictions":0}}"#;
+    assert!(detail.contains(shown), "{detail}");
+    let silent = get(api, "/v1/nodes/node-b").await;
+    assert!(silent.starts_with("HTTP/1.1 200"), "{silent}");
+    assert!(!silent.contains("input_cache"), "{silent}");
+
+    let newer = InputCacheCounts { hits: 8, ..counts };
+    cached.beat_input_cache(Some(newer)).await;
+    let text = scrape(api).await;
+    let sample = "kbf_node_input_cache_hits_total{node=\"node-a\"} 8\n";
+    assert!(text.contains(sample), "{text}");
+
+    cached.beat_input_cache(None).await;
+    let text = scrape(api).await;
+    assert!(!text.contains("kbf_node_input_cache_"), "{text}");
+    let detail = get(api, "/v1/nodes/node-a").await;
+    assert!(!detail.contains("input_cache"), "{detail}");
     served.abort();
 }
 

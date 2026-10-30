@@ -40,6 +40,7 @@ fn new(pack_writes: Option<worker::PackWriteCounts>) -> worker::Heartbeat {
         pack_reads: old().pack_reads,
         pack_writes,
         node_load: None,
+        input_cache: None,
     }
 }
 

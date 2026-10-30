@@ -346,6 +346,7 @@ async fn a_start_names_the_newest_heartbeat_taken_and_the_window() {
         pack_reads: None,
         pack_writes: None,
         node_load: None,
+        input_cache: None,
     }));
     daemon
         .expect("the late heartbeat's ack", |m| match m {

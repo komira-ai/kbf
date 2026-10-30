@@ -196,8 +196,9 @@ not made by this server.
 
 ## `GET /v1/nodes/{id}`
 
-One node: every field of its entry in `GET /v1/nodes`, three more, and a `load` when its daemon
-has sent readings, a read open like the list:
+One node: every field of its entry in `GET /v1/nodes`, three more, a `load` when its daemon
+has sent readings, and an `input_cache` when it has sent input cache counts, a read open like the
+list:
 
 ```json
 { "node_id": "linux-1", "connected": true, "protocol": 1, "software": null,
@@ -257,6 +258,33 @@ times the node's memory. A lease's busiest window is not here: it is the usage r
 (`lists`) and handed to the scheduler with the reading; their records are not shown, and the server
 keeps no series of them. `covered` is cut to 96 leases, each once, before it is kept. A heartbeat is
 never refused, nor its acknowledgement changed, for what its load carries.
+
+### Input cache counts
+
+`input_cache` is what the node's input cache has done, from the `input_cache` of its heartbeats
+(`Heartbeat.input_cache`, [worker-protocol.md](design/worker-protocol.md)). It is left out when the
+node has sent none (a daemon whose cache is off, a runtime with no cache, a daemon built before the
+field, a node another frontend holds): absent is not zero. It is in memory: a server restart
+forgets it until the next heartbeat. The counts are cumulative since the daemon process started,
+so a restarted daemon counts again from 0 (a Prometheus counter handles the reset; nothing here
+keeps them across it).
+
+```json
+"input_cache": { "fills": 120, "fill_bytes": 734003200, "hits": 480, "hit_bytes": 3145728000,
+                 "evictions": 3, "evicted_bytes": 41943040,
+                 "trees": { "builds": 1, "hits": 9, "evictions": 0 } }
+```
+
+| Field | Meaning |
+|---|---|
+| `fills`, `fill_bytes` | entries written into the cache from the content store, and their bytes. An entry copied from its executable or plain sibling, or adopted from disk, is not a fill |
+| `hits`, `hit_bytes` | entries a lease found in the cache and used, and their bytes. The lease that filled an entry does not count it; a lease that waited for another's fill does |
+| `evictions`, `evicted_bytes` | entries removed to keep the byte budget or the free-space floor, and their bytes. An entry removed because it failed its check is not one |
+| `trees` | the shared tree store's own counts: `builds` (trees built from cache entries), `hits` (acquires that found the tree built) and `evictions`. Left out when the node has no tree store |
+
+The unit is the cache entry (one blob by digest and executable bit), not the file name a lease
+places it under: two names of one blob in a lease are one entry, and the per-lease `inputs:` log
+line counts names.
 
 `{id}` is the node id as `POST /v1/nodes/{node}:cordon` takes it, percent-encoded as one
 path segment. `404` with `{"error": "no_node"}` for a node that has not registered since
@@ -1677,6 +1705,11 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_pack_ingests_total` | counter | packs a task wrote through a presigned write that `ingest` turned into an action result: the action ran (any exit code), whether or not the result was written to the action cache |
 | `kbf_pack_ingest_rejects_total` | counter | packs `ingest` refused, labelled `reason`: `missing` (no object under the key), `wrong_key` (the key was not minted for this lease and action, the manifest is for another lease or action, or the key was recorded with another pack), `too_large` (the pack, its record count, a record or the manifest record is over its cap), `malformed` (a damaged footer or trailer, records out of order, overlapping, with a gap, or one of no bytes), `hash_mismatch` (a record is not its digest), `bad_manifest` (the record at offset 0 is not a valid manifest, or an output tree is not a `Tree`) or `incomplete` (a digest the manifest or a tree names is not a record of the pack) |
 | `kbf_pack_ingest_unavailable_total` | counter | ingests the object store, the pack index or the action cache could not answer; the pack is not judged and the lease is run again |
+| `kbf_executor_leases_held` | gauge | host leases the executor holds now (only with `--executor js-agent`; the `kbf_executor_*` families are absent otherwise) |
+| `kbf_executor_runs_total` | counter | runs the executor ended, labelled `outcome` by what the farm was told: `ran` (the frontend rebuilt the action's result), `infra` (an ending the farm runs again), `timeout` (the action's own), `out_of_memory`, `lost` (the host or the lease server) or `invalid` (an action that cannot run here) |
+| `kbf_executor_ingests_total` | counter | what the ingest of a task's pack came to, labelled `result`: `ok`, `unavailable`, `stopped` (the ingest panicked or was cancelled) or `rejected_<reason>` for each reason of `kbf_pack_ingest_rejects_total` |
+| `kbf_executor_late_starts_total` | counter | `Start`s dropped because their window ended before the run was posted; the farm runs the action again |
+| `kbf_executor_stray_leases_released_total` | counter | leases released because none of the executor's slots held them (a lost acquire answer, an undelivered release, a lease beyond the pool's size at a restart) |
 
 **Job-facing read.** On a frontend given `--job-listen` ([kbf-modes.md](deploy/kbf-modes.md)) the
 listener a task fetches its action's inputs from counts requests and bytes; without the flag these
@@ -1737,6 +1770,21 @@ not that nothing is left on the nodes. A read of a blob over 64 MiB, or of one w
 not SHA-256, is never asked of the packs and always counts in `kbf_pack_daemon_elsewhere_total`,
 so a farm that reads such blobs has a sum that keeps rising: the criterion is that it has stopped
 rising apart from those reads.
+
+**Input cache counts.** A frontend exports what each daemon says its input cache did, from the
+`input_cache` of its heartbeats ([`GET /v1/nodes/{id}`](#input-cache-counts) shows the same), as the
+counters of the daemon's process, one sample per node. They start again from 0 when the daemon
+restarts, as a counter may. A node that sent none (its cache is off, or its daemon predates the
+field) has no sample, and with no node sending any the families are absent; a node whose next
+heartbeat carries none loses its samples. A node whose stream has closed keeps the counts of its
+last heartbeat until the frontend restarts. The unit is the cache entry, not the file name.
+
+| Family | Type | What it measures |
+|---|---|---|
+| `kbf_node_input_cache_fills_total{node}`, `kbf_node_input_cache_fill_bytes_total{node}` | counter | entries the node's daemon wrote into its input cache from the content store (cold fills), and their bytes |
+| `kbf_node_input_cache_hits_total{node}`, `kbf_node_input_cache_hit_bytes_total{node}` | counter | entries a lease found in the cache and used, and their bytes |
+| `kbf_node_input_cache_evictions_total{node}`, `kbf_node_input_cache_evicted_bytes_total{node}` | counter | entries evicted for the byte budget or the free-space floor, and their bytes |
+| `kbf_node_input_cache_tree_builds_total{node}`, `kbf_node_input_cache_tree_hits_total{node}`, `kbf_node_input_cache_tree_evictions_total{node}` | counter | the shared tree store's builds, acquires that found the tree built, and evictions; samples only for nodes that have a tree store |
 
 **Measured load.** A frontend with a farm hands the scheduler each node load reading it accepts
 ([Node load](#node-load)), in every `--placement-load` mode, and exports what the scheduler has
