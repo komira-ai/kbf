@@ -16,7 +16,7 @@
 //! | 0 | the action ran (whatever its exit code, a timeout included) and its pack was stored |
 //! | 2 | the flags are wrong (clap) |
 //! | 10 | fetch: the Action, the Command or an input could not be read or checked, or laid out |
-//! | 11 | run-start: the Command could not be started (bad paths, no program) |
+//! | 11 | run-start: the Command could not be started (bad paths, no program, a `kbf-network` property other than `allow`), or the run's `private/` home, tmp and cache directories could not be made |
 //! | 12 | pack: the outputs could not be collected, did not fit one pack (`output-too-large`), or made a manifest or pack the frontend would refuse (`invalid-manifest`, `invalid-pack`) |
 //! | 13 | put: the pack could not be stored (refused, key already taken, still no room after the retries of a 503, unreachable) |
 //! | 14 | setup: `--lease` is not a build id, a credential or root certificate is unusable, a credential given as a flag value without `--insecure-argv-secrets`, or the runtime did not start |
@@ -38,6 +38,7 @@ use crate::digest;
 use crate::fetch::{
     BlobSource, FetchError, HttpBlobSource, fetch_message, materialize, native_roots,
 };
+use crate::network;
 use crate::outputs::{OutputLimits, collect_outputs};
 use crate::pack::{MAX_PACK_BYTES, PackError, build};
 use crate::put::{
@@ -136,7 +137,11 @@ pub struct Cli {
     /// The Action to run, as `<64 lowercase hex digits>/<size>`.
     #[arg(long, value_parser = digest::parse)]
     pub action: Digest,
-    /// Where the inputs are laid out (`in/` under it) and the output streams are written.
+    /// Where the inputs are laid out (`in/` under it) and the output streams are written. The
+    /// Command's `HOME`, `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH` name directories
+    /// under `private/` here, made new for the run (an existing `private` is refused) with mode 0700, beside `in/` and so never collected as outputs: a job's
+    /// image root is read-only and its `/tmp` is small and `noexec`. A variable the Command sets
+    /// itself keeps its value.
     #[arg(long, default_value = "/scratch/work")]
     pub work_dir: PathBuf,
     /// The longest the Command may run, in milliseconds: the Action's timeout when it sets a
@@ -241,6 +246,11 @@ pub async fn execute(
     let action: Action = fetch_message(source, &action_digest)?;
     let command: Command =
         fetch_message(source, &named("command", action.command_digest.as_ref())?)?;
+    // Read before the inputs are fetched: a refused property costs no download.
+    let network = network::from_platform(&action, &command)?;
+    if network == network::Network::Allowed {
+        eprintln!("{}", network::allowed_notice(&cli.action));
+    }
     let input_root = named("input root", action.input_root_digest.as_ref())?;
     let root = cli.work_dir.join("in");
     materialize(
@@ -253,16 +263,22 @@ pub async fn execute(
 
     let stdout = cli.work_dir.join("stdout");
     let stderr = cli.work_dir.join("stderr");
+    let private = cli.work_dir.join("private");
     let ran = run(
         &command,
         &Run {
             root: &root,
+            private: &private,
             stdout: &stdout,
             stderr: &stderr,
             deadline: deadline(&action, Duration::from_millis(cli.deadline_ms)),
+            network,
         },
     )
     .await?;
+    if network != network::Network::Allowed {
+        eprintln!("{}", network::layers_notice(&cli.action, &ran.layers));
+    }
 
     let packing = Instant::now();
     let paths: Vec<String> = output_paths(&command).into_iter().cloned().collect();
@@ -456,6 +472,19 @@ async fn finish(
         Err(failure) => {
             eprintln!("kbf-task: {failure}");
             ExitCode::from(failure.exit_code())
+        }
+    }
+}
+
+/// [`run_cli`] once `protection` (what [`network::protect_this_process`] returned, called before
+/// anything else) is known to have worked: if it did not, the tool stops with the setup exit code
+/// rather than run with the Command able to take its sockets.
+pub fn run_cli_with(protection: std::io::Result<()>, cli: &Cli) -> ExitCode {
+    match protection {
+        Ok(()) => run_cli(cli),
+        Err(e) => {
+            eprintln!("kbf-task: cannot make this process non-dumpable: {e}");
+            ExitCode::from(EXIT_SETUP)
         }
     }
 }

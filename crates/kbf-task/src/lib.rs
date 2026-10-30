@@ -8,7 +8,21 @@
 //!    flight (32 by default) over pooled connections, and each file streams from the response to
 //!    disk through its digest check instead of being held in memory;
 //! 2. runs the Command there ([`run`]): its argv, environment and working directory, stdout and
-//!    stderr to files, under a deadline;
+//!    stderr to files, under a deadline. The environment is the Command's own, preceded by `HOME`,
+//!    `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`, which name fresh directories
+//!    `private/{home,tmp,cache}` (the last holding `clang/ModuleCache`) under the working
+//!    directory, mode 0700, made new for the run (an existing `private` is refused), beside the input root and not in it. A job's image root is read-only
+//!    and its `/tmp` is a small `noexec` tmpfs, so a compiler that writes under `~` or the
+//!    temporary directory would otherwise fail; and since outputs are collected relative to the
+//!    input root, nothing written there is packed. A variable the Command sets itself keeps its
+//!    value. A directory that cannot be made fails the run start (exit 11). The Command has no
+//!    network: it runs in a user and network namespace of its own (only `lo`), where the host
+//!    allows one, and a seccomp filter lets it and everything it starts make Unix sockets and,
+//!    only when every namespace step succeeded, `AF_INET` and `AF_INET6` ones (loopback);
+//!    otherwise Unix sockets only. No netlink, no io_uring. One line per action says which mode
+//!    it ran in ([`network`]; this tool is non-dumpable from its first instruction, so the Command
+//!    cannot take its sockets; the platform property `kbf-network=allow` lifts that for one action, and any
+//!    other value of it fails the run start before the inputs are fetched);
 //! 3. collects the declared outputs as REAPI does ([`outputs`]): files, directories as Trees,
 //!    symlinks, the executable bit;
 //! 4. writes every output blob, stdout, stderr and Tree, and the manifest, into ONE kbf-segments
@@ -60,6 +74,7 @@
 
 pub mod digest;
 pub mod fetch;
+pub mod network;
 pub mod outputs;
 pub mod pack;
 pub mod put;
