@@ -129,6 +129,7 @@ fn the_flags_have_their_defaults() {
     assert_eq!(cli.reconcile_interval, Duration::from_secs(5));
     assert_eq!(cli.max_request_bytes, 256 << 20);
     assert_eq!(cli.max_concurrent_puts, 32);
+    assert_eq!(cli.put_permit_wait, Duration::from_secs(15));
     assert_eq!(cli.put_min_bytes_per_sec, 1024);
     assert_eq!(cli.put_rate_grace, Duration::from_secs(30));
     assert_eq!(cli.body_idle_timeout, Duration::from_secs(30));
@@ -189,6 +190,7 @@ fn the_flags_can_all_be_given() {
         ("--reconcile-interval", "1s"),
         ("--max-request-bytes", "10"),
         ("--max-concurrent-puts", "3"),
+        ("--put-permit-wait", "4s"),
         ("--put-min-bytes-per-sec", "5"),
         ("--put-rate-grace", "2s"),
         ("--body-idle-timeout", "7s"),
@@ -215,6 +217,7 @@ fn the_flags_can_all_be_given() {
     assert_eq!(cli.reconcile_interval, Duration::from_secs(1));
     assert_eq!(cli.max_request_bytes, 10);
     assert_eq!(cli.max_concurrent_puts, 3);
+    assert_eq!(cli.put_permit_wait, Duration::from_secs(4));
     assert_eq!(cli.put_min_bytes_per_sec, 5);
     assert_eq!(cli.put_rate_grace, Duration::from_secs(2));
     assert_eq!(cli.body_idle_timeout, Duration::from_secs(7));
@@ -339,6 +342,7 @@ fn the_settings_are_made_from_the_flags() {
     assert_eq!(built.server.secret_access_key, "secret");
     assert_eq!(built.server.max_request_bytes, 256 << 20);
     assert_eq!(built.server.max_concurrent_puts, 32);
+    assert_eq!(built.server.put_permit_wait, Duration::from_secs(15));
     assert_eq!(built.server.put_min_bytes_per_sec, 1024);
     assert_eq!(built.server.put_rate_grace, Duration::from_secs(30));
     assert_eq!(built.server.body_idle_timeout, Duration::from_secs(30));

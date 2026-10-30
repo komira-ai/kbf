@@ -14,6 +14,15 @@ a key or a table it does not know. The format, the table of the key of each flag
 in "The configuration file" in `packaging/tierstore/README.md`; the flags stay accepted for one
 release along with the file.
 
+## When the puts are at their limit
+
+At most `--max-concurrent-puts` put bodies and upload parts are taken at once. A request that
+arrives when all are taken waits up to `--put-permit-wait` (`server.put_permit_wait`, 15s by
+default) for one to end, without reading its body, and is taken if one ends in that time. If none
+does, it is answered 503 `SlowDown` with `Retry-After: 1` and its body is never read. With a tier
+that is slow to take a body, clients queue here for up to that long instead of retrying at once.
+`0s` answers 503 at once. The requests that are refused for their head (411, 413) do not wait.
+
 ## Roles of a key
 
 | role | flag | may do |

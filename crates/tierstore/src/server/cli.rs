@@ -288,8 +288,9 @@ pub struct Cli {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub max_request_bytes: u64,
-    /// The most put bodies and upload parts taken at once. One more is answered 503 `SlowDown`
-    /// with `Retry-After: 1` and its body is not read. A body in flight holds a few pieces of
+    /// The most put bodies and upload parts taken at once. One more waits for a slot, at most
+    /// `--put-permit-wait`, and is then answered 503 `SlowDown` with `Retry-After: 1`; its body
+    /// is not read, while it waits or after. A body in flight holds a few pieces of
     /// at most the size the connection delivers (tens of KiB), and an S3 tier up to 16 MiB
     /// more, so 32 bodies hold about half a GiB at most, with S3 tiers, and a few MiB with
     /// directory tiers.
@@ -299,6 +300,13 @@ pub struct Cli {
         value_parser = clap::value_parser!(u32).range(1..)
     )]
     pub max_concurrent_puts: u32,
+    /// How long a put body or upload part that arrives when `--max-concurrent-puts` bodies are
+    /// already being taken waits for one of them to end: a number and `ms`, `s`, `m` or `h`. If a
+    /// slot is free in that time the body is taken; if not, it is answered 503 `SlowDown` with
+    /// `Retry-After: 1`. The request's body is not read while it waits, so a slow tier makes
+    /// clients queue here, up to this long, instead of retrying at once. 0 answers 503 at once.
+    #[arg(long, default_value = "15s", value_parser = parse_duration)]
+    pub put_permit_wait: Duration,
     /// The least average rate, in bytes a second, at which a request body may come in, counted
     /// over the time the server spends waiting for the client to send the next piece, once that
     /// time has passed `--put-rate-grace`. Time the server spends not waiting for the client (a
@@ -570,6 +578,7 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     server.max_request_bytes = usize::try_from(cli.max_request_bytes).unwrap_or(usize::MAX);
     server.body_idle_timeout = cli.body_idle_timeout;
     server.max_concurrent_puts = cli.max_concurrent_puts as usize;
+    server.put_permit_wait = cli.put_permit_wait;
     server.put_min_bytes_per_sec = cli.put_min_bytes_per_sec;
     server.put_rate_grace = cli.put_rate_grace;
     server.drain_lb_wait = cli.drain_lb_wait;

@@ -321,6 +321,7 @@ the flags of the binary against this table, so a flag added without a key fails 
 | `--usage-stale-after` | `hot_store.usage_stale_after` | how old the published usage may be before `/usagez` says 503 |
 | `--max-request-bytes` | `server.max_request_bytes` | the longest body of a request |
 | `--max-concurrent-puts` | `server.max_concurrent_puts` | the most put bodies and parts taken at once |
+| `--put-permit-wait` | `server.put_permit_wait` | how long a put that arrives with all of those taken waits for one to end (15s by default; 0 answers 503 at once). No byte of its body is read while it waits. If none ends in that time it is answered 503 `SlowDown` with `Retry-After: 1` |
 | `--put-min-bytes-per-sec` | `server.put_min_bytes_per_sec` | the least average rate of a body (0 turns it off) |
 | `--put-rate-grace` | `server.put_rate_grace` | the time waiting for the client before that rate is held |
 | `--body-idle-timeout` | `server.body_idle_timeout` | how long a body or an answer may go without a byte |

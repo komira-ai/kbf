@@ -82,6 +82,7 @@ pub(super) const KEYS: &[(&str, &[&str])] = &[
     ("usage-stale-after", &["hot_store.usage_stale_after"]),
     ("max-request-bytes", &["server.max_request_bytes"]),
     ("max-concurrent-puts", &["server.max_concurrent_puts"]),
+    ("put-permit-wait", &["server.put_permit_wait"]),
     ("put-min-bytes-per-sec", &["server.put_min_bytes_per_sec"]),
     ("put-rate-grace", &["server.put_rate_grace"]),
     ("body-idle-timeout", &["server.body_idle_timeout"]),
@@ -316,6 +317,7 @@ pub(super) struct ServerTable {
     pub presign_max_expires: Option<Dur>,
     pub max_request_bytes: Option<u64>,
     pub max_concurrent_puts: Option<u32>,
+    pub put_permit_wait: Option<Dur>,
     pub put_min_bytes_per_sec: Option<u64>,
     pub put_rate_grace: Option<Dur>,
     pub body_idle_timeout: Option<Dur>,
@@ -714,6 +716,7 @@ fn settings(file: File, per_run: PerRun) -> Result<Cli, ConfigError> {
             1,
             u32::MAX,
         )?,
+        put_permit_wait: duration(server.put_permit_wait, Duration::from_secs(15)),
         put_min_bytes_per_sec: server
             .put_min_bytes_per_sec
             .unwrap_or(DEFAULT_PUT_MIN_BYTES_PER_SEC),
