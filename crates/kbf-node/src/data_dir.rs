@@ -623,10 +623,8 @@ mod tests {
         assert!(!plan.cache().exists(), "the cache directory was made");
         assert!(!plan.trees().exists());
         let lines = plan.describe().join("\n");
-        assert!(
-            lines.contains("cache: off:--no-input-cache") && lines.contains("trees: off"),
-            "{lines}"
-        );
+        assert!(lines.contains("cache: off:--no-input-cache"), "{lines}");
+        assert!(lines.contains("trees: off:--no-input-cache"), "{lines}");
         #[cfg(target_os = "linux")]
         assert!(super::given(Some(&plan), &data).is_none());
         let on = Plan::new(&args(&[&dir]), true, &Fake(space)).expect("plan");
