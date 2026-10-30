@@ -398,6 +398,7 @@ mod netns {
     }
 
     /// One thing the child does to its own process.
+    #[derive(Debug, PartialEq, Eq)]
     pub enum Step {
         Dumpable(libc::c_ulong),
         Unshare,
@@ -453,33 +454,39 @@ mod netns {
     ) -> io::Result<(Plan, Report)> {
         let (read, write) = pipe()?;
         let path = |p: &str| CString::new(p).expect("a path without NUL");
+        let skip = skips_namespace(uid);
         let plan = Plan {
-            skip: skips_namespace(uid),
-            steps: vec![
-                (7, Step::Dumpable(1)),
-                (1, Step::Unshare),
-                (
-                    2,
-                    Step::Write(path("/proc/self/setgroups"), b"deny".to_vec()),
-                ),
-                (
-                    3,
-                    Step::Write(
-                        path("/proc/self/uid_map"),
-                        format!("{uid} {uid} 1").into_bytes(),
+            skip,
+            // A skipped plan has nothing to do.
+            steps: if skip {
+                Vec::new()
+            } else {
+                vec![
+                    (7, Step::Dumpable(1)),
+                    (1, Step::Unshare),
+                    (
+                        2,
+                        Step::Write(path("/proc/self/setgroups"), b"deny".to_vec()),
                     ),
-                ),
-                (
-                    4,
-                    Step::Write(
-                        path("/proc/self/gid_map"),
-                        format!("{gid} {gid} 1").into_bytes(),
+                    (
+                        3,
+                        Step::Write(
+                            path("/proc/self/uid_map"),
+                            format!("{uid} {uid} 1").into_bytes(),
+                        ),
                     ),
-                ),
-                // The `/proc/self` writes are done: back to non-dumpable before anything else.
-                (7, Step::Dumpable(0)),
-                (5, Step::Loopback),
-            ],
+                    (
+                        4,
+                        Step::Write(
+                            path("/proc/self/gid_map"),
+                            format!("{gid} {gid} 1").into_bytes(),
+                        ),
+                    ),
+                    // The `/proc/self` writes are done: back to non-dumpable before anything else.
+                    (7, Step::Dumpable(0)),
+                    (5, Step::Loopback),
+                ]
+            },
             write_end: write.as_raw_fd(),
         };
         Ok((plan, Report { read, write }))
@@ -489,6 +496,11 @@ mod netns {
         /// Whether the plan leaves the namespace layer out.
         pub fn skips(&self) -> bool {
             self.skip
+        }
+
+        /// The steps, each with the number it is reported by, in the order they run.
+        pub fn steps(&self) -> &[(u8, Step)] {
+            &self.steps
         }
     }
 
@@ -523,7 +535,7 @@ mod netns {
             if self.skips() {
                 return (SKIPPED_FOR_ROOT, 0);
             }
-            let outcome = run_steps(&self.steps);
+            let outcome = run_steps(self.steps());
             // Whatever happened, the child is not dumpable from here to its `exec`.
             let _ = set_dumpable(0);
             outcome

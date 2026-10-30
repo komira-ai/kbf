@@ -480,6 +480,42 @@ mod forked {
         assert_eq!(report.read(), Layers::Unreported);
     }
 
+    /// Catches the steps or their order changing: the child must be dumpable to write its own
+    /// `/proc` files, which need the namespace to exist first, and must be non-dumpable again
+    /// before `lo` and the filter. Root's plan has no steps. Each step has the number the
+    /// parent reads in the report.
+    #[test]
+    fn the_plan_is_these_steps_in_this_order() {
+        use netns::Step;
+        let path = |p: &str| CString::new(p).unwrap();
+        let (plan, _report) = netns::plan(1000, 2000, netns::make_pipe).unwrap();
+        assert!(!plan.skips());
+        assert_eq!(
+            plan.steps(),
+            [
+                (7, Step::Dumpable(1)),
+                (1, Step::Unshare),
+                (
+                    2,
+                    Step::Write(path("/proc/self/setgroups"), b"deny".to_vec())
+                ),
+                (
+                    3,
+                    Step::Write(path("/proc/self/uid_map"), b"1000 1000 1".to_vec())
+                ),
+                (
+                    4,
+                    Step::Write(path("/proc/self/gid_map"), b"2000 2000 1".to_vec())
+                ),
+                (7, Step::Dumpable(0)),
+                (5, Step::Loopback),
+            ]
+        );
+        let (root, _report) = netns::plan(0, 0, netns::make_pipe).unwrap();
+        assert!(root.skips());
+        assert!(root.steps().is_empty());
+    }
+
     #[test]
     fn the_dumpable_step_and_the_protection_set_the_flag() {
         assert_eq!(
