@@ -2,8 +2,6 @@
 //! object goes as a multipart upload of bounded parts, and every failure aborts the
 //! upload, so the service is left with no incomplete one.
 
-use std::time::Duration;
-
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream;
@@ -224,25 +222,15 @@ async fn a_write_dropped_mid_upload_aborts_it() {
     let writing = tokio::spawn(async move {
         let _ = store.put_stream(&k, 4 * PART_BYTES, pending.boxed()).await;
     });
-    // However slow the machine: the first part reaches the service, then the write
-    // waits for a body that never comes, and is dropped.
-    for _ in 0..1000 {
-        if s3.stats().parts == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(s3.stats().parts, 1, "the first part was sent");
+    // The first part reaches the service, then the write waits for a body that never
+    // comes, and is dropped.
+    s3.wait_for(|s3| s3.stats().parts == 1).await;
     assert_eq!(s3.incomplete_uploads(), 1, "the upload is open");
     writing.abort();
     assert!(writing.await.is_err_and(|e| e.is_cancelled()));
-    for _ in 0..500 {
-        if s3.incomplete_uploads() == 0 {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("the dropped write's upload was not aborted");
+    // The abort comes from a task of its own, after the write is gone.
+    s3.wait_for(|s3| s3.incomplete_uploads() == 0).await;
+    assert_eq!(s3.stats().aborted, 1);
 }
 
 /// Catches: a write dropped while its own abort is still on the wire (the body failed,
@@ -262,27 +250,11 @@ async fn a_write_dropped_while_its_abort_is_in_flight_aborts_the_upload_again() 
     let writing = tokio::spawn(async move {
         let _ = store.put_stream(&k, 4 * PART_BYTES, failing.boxed()).await;
     });
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while s3.held_aborts() == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the abort never reached the service"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    s3.wait_for(|s3| s3.held_aborts() > 0).await;
     assert_eq!(s3.incomplete_uploads(), 1, "the upload is open");
     writing.abort();
     assert!(writing.await.is_err_and(|e| e.is_cancelled()));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while s3.incomplete_uploads() > 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the upload was left behind: {} incomplete, requests {:?}",
-            s3.incomplete_uploads(),
-            s3.requests()
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    s3.wait_for(|s3| s3.incomplete_uploads() == 0).await;
     assert_eq!(s3.stats().aborted, 1);
 }
 

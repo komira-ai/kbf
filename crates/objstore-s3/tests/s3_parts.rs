@@ -19,6 +19,7 @@ use objstore_s3::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 
 const CONDITIONAL: Capabilities = Capabilities {
     conditional_put: true,
@@ -463,8 +464,8 @@ async fn a_completion_answered_without_an_etag_is_a_protocol_error() {
 
 /// Asserts that a part is on the wire before its stream has ended, which is the reason it is
 /// streamed: the server has the first piece, and only then does the stream go on to give the
-/// last, so a request that held the whole part before it sent any of it would wait for ever.
-/// The 60 s `timeout` around the call only stops that hang; the test does not wait for it.
+/// last, so a request that held the whole part before it sent any of it would wait for ever
+/// (nextest's hang guard for this package ends the test then, `.config/nextest.toml`).
 #[tokio::test]
 async fn a_part_is_on_the_wire_before_its_stream_has_ended() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -497,9 +498,10 @@ async fn a_part_is_on_the_wire_before_its_stream_has_ended() {
     let body = first.chain(stream::once(last)).boxed();
     let store = store(&endpoint, CONDITIONAL, Duration::from_secs(30));
     let k = key("streamed");
-    let sending = store.upload_part_stream(&k, "u-1", 1, 12, body);
-    let sent = tokio::time::timeout(Duration::from_secs(60), sending).await;
-    let tag = sent.expect("the part was held back").unwrap();
+    let tag = store
+        .upload_part_stream(&k, "u-1", 1, 12, body)
+        .await
+        .unwrap();
     assert_eq!(tag, "\"streamed\"");
     assert_eq!(serving.await.unwrap(), b"AAAABBBBCCCC");
 }
@@ -509,34 +511,46 @@ async fn a_part_is_on_the_wire_before_its_stream_has_ended() {
 /// sends the error it promised, each fail as a transport error that says no byte arrived
 /// within the request timeout, and not as the refusal of the store or an error of the body.
 ///
-/// It uses the real clock, and that is deliberate: the stalled leg is a real socket, where
-/// tokio's paused clock cannot be used, and nothing races: the peer never sends, so the cut
-/// always comes whatever the load, and the test checks only the outcome, never how long it
-/// took. That progress resets the time is proved on a clock the test drives, in `src/s3/parts.rs`
-/// (`the_watchdog_sees_progress_in_a_poll_or_a_wait_for_the_source`).
+/// The wait is not real. The store is a real socket, so the clock is paused only once the
+/// store has read the whole request (it says so): from then on the client has nothing to
+/// wait for but its timer, the runtime is idle, and the paused clock moves on to the
+/// timer by itself. The outcome is forced by the store never answering, not by how long
+/// anything took. That progress resets the time is proved on a clock the test drives, in
+/// `src/s3/parts.rs` (`the_watchdog_sees_progress_in_a_poll_or_a_wait_for_the_source`).
 #[tokio::test]
 async fn a_request_that_makes_no_progress_is_cut_as_a_timeout() {
+    let heard = Arc::new(Notify::new());
     let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let silent_at = format!("http://{}", silent.local_addr().unwrap());
+    let told = Arc::clone(&heard);
     tokio::spawn(async move {
         let (mut sock, _) = silent.accept().await.unwrap();
-        let mut sink = [0_u8; 4096];
-        while sock.read(&mut sink).await.unwrap_or(0) > 0 {}
+        read_request(&mut sock).await;
+        told.notify_one();
+        std::future::pending::<()>().await;
     });
     let hung = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let hung_at = format!("http://{}", hung.local_addr().unwrap());
+    let told = Arc::clone(&heard);
     tokio::spawn(async move {
         let (mut sock, _) = hung.accept().await.unwrap();
         read_request(&mut sock).await;
         let head = "HTTP/1.1 500 Oops\r\ncontent-length: 100\r\n\r\n";
         sock.write_all(head.as_bytes()).await.unwrap();
+        told.notify_one();
         std::future::pending::<()>().await;
     });
-    let k = key("k");
     for endpoint in [silent_at, hung_at] {
-        let store = store(&endpoint, CONDITIONAL, Duration::from_millis(200));
-        let sent = store.upload_part_stream(&k, "u-1", 1, 3, pieces(&["abc"]));
-        let error = sent.await.unwrap_err();
+        let store = store(&endpoint, CONDITIONAL, Duration::from_secs(30));
+        let sending = tokio::spawn(async move {
+            let k = key("k");
+            let sent = store.upload_part_stream(&k, "u-1", 1, 3, pieces(&["abc"]));
+            sent.await
+        });
+        heard.notified().await;
+        tokio::time::pause();
+        let error = sending.await.unwrap().unwrap_err();
+        tokio::time::resume();
         let transport = matches!(error, ObjectStoreError::Transport(_));
         assert!(transport, "{error:?}");
         let text = error.to_string();
@@ -550,8 +564,7 @@ async fn a_request_that_makes_no_progress_is_cut_as_a_timeout() {
 /// for it (the source has been asked for the piece), then lets it go only after three times
 /// the request timeout has passed; the part is then stored whole, with the tag of all its
 /// bytes. The wait is for the source, whose own limit is its owner's. The clock is paused
-/// once the upload is created, so the wait is virtual time and takes no real time, and the
-/// 60 s `timeout` around the call is virtual too: it only stops a hang.
+/// once the upload is created, so the wait is virtual time and takes no real time.
 #[tokio::test]
 async fn a_slow_source_does_not_stall_the_request() {
     let s3 = FakeS3::start().await;
@@ -573,9 +586,7 @@ async fn a_slow_source_does_not_stall_the_request() {
         tokio::time::sleep(Duration::from_millis(600)).await;
         release.send(()).unwrap();
     };
-    let both = futures::future::join(sending, letting_go);
-    let done = tokio::time::timeout(Duration::from_secs(60), both).await;
-    let (sent, ()) = done.expect("the part was held back");
+    let (sent, ()) = futures::future::join(sending, letting_go).await;
     assert_eq!(sent.unwrap(), part_etag(b"abcd"));
     assert_eq!(s3.stats().parts, 1);
 }

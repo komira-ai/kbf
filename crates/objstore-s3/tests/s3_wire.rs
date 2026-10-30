@@ -14,6 +14,7 @@ use objstore_s3::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 
 /// Serves `responses` in order, one per connection, and records each request head.
 async fn script(responses: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
@@ -493,18 +494,10 @@ async fn create_bucket_asks_for_object_lock_and_accepts_its_own_bucket() {
     assert!(!second.contains("object-lock"), "{second}");
 }
 
-/// A loopback port on which connecting is refused until [`serve_held`] turns it into a
-/// listener: its socket is kept bound, so no other test can take the number meanwhile
-/// (see [`kbf_testkit::port`]).
+/// A loopback port on which connecting is refused, and which no other test can take: its
+/// socket is kept bound (see [`kbf_testkit::port`]).
 fn held_port() -> kbf_testkit::port::Reserved {
     kbf_testkit::port::Reserved::new()
-}
-
-/// The held port, listening now.
-fn serve_held(held: kbf_testkit::port::Reserved) -> TcpListener {
-    let listener = held.listen();
-    listener.set_nonblocking(true).unwrap();
-    TcpListener::from_std(listener).unwrap()
 }
 
 /// Catches a held port that is free to take (the old bind-and-drop helper): a thief
@@ -516,62 +509,72 @@ fn a_held_port_cannot_be_taken_by_another_listener() {
 }
 
 /// Catches: `wait_answering` returning before the store answers (no wait at all, or a
-/// refused connection taken for an answer), and taking an error status for "not
-/// ready" (a running S3 service answers the unsigned `GET /` with 403, so such a wait
-/// would never end against a real store). The store refuses connections at first;
-/// the wait must still be running then, and end once a server answers 403.
+/// connection cut with no answer taken for an answer), and taking an error status for
+/// "not ready" (a running S3 service answers the unsigned `GET /` with 403, so such a wait
+/// would never end against a real store). The store cuts its first two connections with no
+/// answer; the wait must still be running when the second has been cut, and end once the
+/// store answers 403. The test waits for those events, never for a time: the pace of the
+/// retries is the wait's own.
 #[tokio::test]
 async fn wait_answering_waits_for_a_late_store_and_takes_403_as_an_answer() {
-    let held = held_port();
-    let addr = held.addr();
-    let s = store(format!("http://{addr}"), Capabilities::default());
-    let wait = tokio::spawn(async move { s.wait_answering(Duration::from_secs(20)).await });
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    assert!(
-        !wait.is_finished(),
-        "the wait ended while nothing listened: {:?}",
-        wait.await
-    );
-    let listener = serve_held(held);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cut_twice = Arc::new(Notify::new());
+    let told = Arc::clone(&cut_twice);
     let server = tokio::spawn(async move {
-        let (mut sock, _) = listener.accept().await.unwrap();
-        let mut chunk = [0u8; 4096];
-        let n = sock.read(&mut chunk).await.unwrap();
-        let head = String::from_utf8_lossy(&chunk[..n]).into_owned();
-        let resp = answer(
-            "403 Forbidden",
-            &[],
-            "<Error><Code>AccessDenied</Code></Error>",
-        );
-        sock.write_all(resp.as_bytes()).await.unwrap();
-        sock.shutdown().await.unwrap();
-        head
+        let mut cut = 0;
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut chunk = [0u8; 4096];
+            let n = sock.read(&mut chunk).await.unwrap_or(0);
+            let head = String::from_utf8_lossy(&chunk[..n]).into_owned();
+            if cut < 2 {
+                cut += 1;
+                if cut == 2 {
+                    told.notify_one();
+                }
+                continue;
+            }
+            let resp = answer(
+                "403 Forbidden",
+                &[],
+                "<Error><Code>AccessDenied</Code></Error>",
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.shutdown().await.unwrap();
+            return head;
+        }
     });
+    let s = store(format!("http://{addr}"), Capabilities::default());
+    // An hour is no bound on the test: the wait ends when the store answers.
+    let mut wait = tokio::spawn(async move { s.wait_answering(Duration::from_secs(3600)).await });
+    tokio::select! {
+        ended = &mut wait => panic!("the wait ended while the store answered nothing: {ended:?}"),
+        () = cut_twice.notified() => {}
+    }
     wait.await.unwrap().unwrap();
     let head = server.await.unwrap().to_ascii_lowercase();
     assert!(head.starts_with("get / http/1.1\r\n"), "{head}");
 }
 
 /// Catches: `wait_answering` ignoring its deadline (looping for ever on a store that
-/// never starts, which hangs the CI job until its timeout) or reporting success.
-#[tokio::test]
+/// never starts, which hangs the CI job until its timeout) or reporting success, and giving
+/// up before the deadline. The clock is paused from the start, so the deadline passes in
+/// virtual time: the wait must end with the last attempt's error once exactly `within` has
+/// passed on that clock. A wait that ignores its deadline never ends, and the hang guard of
+/// the test runner (`.config/nextest.toml`) fails the test.
+#[tokio::test(start_paused = true)]
 async fn wait_answering_gives_up_at_its_deadline() {
     let addr = kbf_testkit::port::dead_addr();
     let s = store(format!("http://{addr}"), Capabilities::default());
-    let started = std::time::Instant::now();
-    // Bounded here, so a wait that ignores its deadline fails this test, not hangs it.
-    let err = tokio::time::timeout(
-        Duration::from_secs(5),
-        s.wait_answering(Duration::from_millis(700)),
-    )
-    .await
-    .expect("the wait outlived its deadline")
-    .unwrap_err();
-    let took = started.elapsed();
+    let within = Duration::from_millis(700);
+    let started = tokio::time::Instant::now();
+    let err = s.wait_answering(within).await.unwrap_err();
+    let waited = started.elapsed();
     assert!(matches!(err, ObjectStoreError::Transport(_)), "{err}");
     assert!(
-        took >= Duration::from_millis(700) && took < Duration::from_secs(5),
-        "{took:?}"
+        waited >= within && waited < within + objstore_s3::s3::WAIT_RETRY,
+        "{waited:?}"
     );
 }
 
@@ -581,16 +584,23 @@ async fn wait_answering_gives_up_at_its_deadline() {
 /// slow store from a reset one ("request to the store failed" alone did not). Also
 /// catches the request URL in that text: it reaches REAPI clients, and must not name the
 /// store's address, bucket or key.
+///
+/// The request timeout passes in virtual time: the clock is paused once the store has the
+/// connection, from then on the client waits for nothing but its timer, and the paused clock
+/// moves on to it. The outcome is forced by the store never reading or answering.
 #[tokio::test]
 async fn a_put_the_store_never_answers_fails_saying_it_timed_out() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let endpoint = format!("http://{addr}");
     // Holds each connection open, unread, until the test ends.
+    let accepted = Arc::new(Notify::new());
+    let told = Arc::clone(&accepted);
     let held = tokio::spawn(async move {
         let mut held = Vec::new();
         while let Ok((sock, _)) = listener.accept().await {
             held.push(sock);
+            told.notify_one();
         }
     });
     let s = S3Store::new(S3Config {
@@ -600,16 +610,17 @@ async fn a_put_the_store_never_answers_fails_saying_it_timed_out() {
         credentials: Credentials::new("AKIDEXAMPLE", "secret"),
         capabilities: Capabilities::default(),
         connect_timeout: Duration::from_secs(5),
-        request_timeout: Duration::from_millis(300),
+        request_timeout: Duration::from_secs(30),
         min_body_rate: None,
     })
     .unwrap();
-    let k = key();
-    let put = s.put_new(&k, Bytes::from(vec![0u8; 4 << 20]), None);
-    let err = tokio::time::timeout(Duration::from_secs(10), put)
-        .await
-        .expect("the PUT outlived its request timeout")
-        .unwrap_err();
+    let putting = tokio::spawn(async move {
+        let k = key();
+        s.put_new(&k, Bytes::from(vec![0u8; 4 << 20]), None).await
+    });
+    accepted.notified().await;
+    tokio::time::pause();
+    let err = putting.await.unwrap().unwrap_err();
     held.abort();
     assert!(matches!(err, ObjectStoreError::Transport(_)), "{err}");
     let text = err.to_string();
@@ -622,13 +633,18 @@ async fn a_put_the_store_never_answers_fails_saying_it_timed_out() {
     }
 }
 
-/// A store that takes `delay` to answer each request after reading it whole, then says
-/// 200 with no body. Returns its endpoint.
-async fn slow_store(delay: Duration) -> String {
+/// A store that reads each request whole, then holds its answer until the test lets it go:
+/// `read` is notified when a request has been read, `release` lets the held answer out (200,
+/// no body). Returns its endpoint, `read` and `release`.
+async fn gated_store() -> (String, Arc<Notify>, Arc<Notify>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let read = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let (told, gate) = (Arc::clone(&read), Arc::clone(&release));
     tokio::spawn(async move {
         while let Ok((mut sock, _)) = listener.accept().await {
+            let (told, gate) = (Arc::clone(&told), Arc::clone(&gate));
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 65536];
@@ -654,7 +670,8 @@ async fn slow_store(delay: Duration) -> String {
                     }
                     buf.extend_from_slice(&chunk[..n]);
                 }
-                tokio::time::sleep(delay).await;
+                told.notify_one();
+                gate.notified().await;
                 let _ = sock
                     .write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
                     .await;
@@ -662,7 +679,7 @@ async fn slow_store(delay: Duration) -> String {
             });
         }
     });
-    endpoint
+    (endpoint, read, release)
 }
 
 fn timed_store(endpoint: String, base: Duration, rate: Option<u64>) -> S3Store {
@@ -679,30 +696,64 @@ fn timed_store(endpoint: String, base: Duration, rate: Option<u64>) -> S3Store {
     .unwrap()
 }
 
+/// The limits of the three tests below, and the time that passes at the store before it
+/// would answer: the base limit of a request, the floor rate in bytes a second, and the
+/// time the store keeps its answer. Nothing waits for them: the test moves tokio's clock
+/// forward by `SLOW` in one jump once the store holds the request (see [`jump`]), so each is
+/// a point on a clock the test drives.
+const BASE: Duration = Duration::from_secs(40);
+const RATE: u64 = 1024;
+const SLOW: Duration = Duration::from_secs(120);
+
+/// Moves tokio's clock forward by `by` in one jump, and lets it run again. A request whose
+/// limit is less than `by` has timed out afterwards; one whose limit is more has not, and
+/// keeps its limit, minus `by`, to meet the answer in. The clock is paused only for the
+/// jump: with a real socket in the test, a clock left paused would move on by itself
+/// whenever the runtime waited for the socket.
+async fn jump(by: Duration) {
+    tokio::time::pause();
+    tokio::time::advance(by).await;
+    tokio::time::resume();
+}
+
 /// Catches: one flat limit for every PUT (the 60 s that cut 16 to 128 MiB segments on a
-/// store that was slow but progressing). The store takes 1.2 s over a 256 KiB body, the
-/// base limit is 400 ms, and the floor rate of 128 KiB/s allows it 2.4 s more.
+/// store that was slow but progressing). The clock jumps [`SLOW`] while the store holds its
+/// answer to a 256 KiB body, the base limit is [`BASE`] (less than `SLOW`), and the floor
+/// rate allows 256 s more: the PUT is not cut, and meets its answer.
 #[tokio::test]
 async fn a_slow_put_within_the_floor_rate_is_not_cut() {
-    let endpoint = slow_store(Duration::from_millis(1200)).await;
-    let s = timed_store(endpoint, Duration::from_millis(400), Some(128 << 10));
-    s.put_new(&key(), Bytes::from(vec![7u8; 256 << 10]), None)
+    let (endpoint, read, release) = gated_store().await;
+    let s = timed_store(endpoint, BASE, Some(RATE));
+    let putting = tokio::spawn(async move {
+        s.put_new(&key(), Bytes::from(vec![7u8; 256 << 10]), None)
+            .await
+    });
+    read.notified().await;
+    jump(SLOW).await;
+    release.notify_one();
+    putting
         .await
+        .unwrap()
         .expect("a PUT inside body/rate + base was cut");
 }
 
 /// Catches: the allowance scaled by something other than the body (a fixed bonus, or a
 /// rate applied to bodiless requests), and a PUT slower than the floor rate allows
-/// being waited for without end. The same slow store, 64 KiB body at 128 KiB/s allows
-/// 400 ms + 0.5 s, under the 1.2 s the store takes.
+/// being waited for without end. The same store, a 64 KiB body at the floor rate allows
+/// [`BASE`] + 64 s, under the [`SLOW`] the clock jumps: the PUT is cut at once, though the
+/// store never answers. A limit above the jump leaves the PUT waiting for the store, and the
+/// hang guard of the test runner (`.config/nextest.toml`) ends the test.
 #[tokio::test]
 async fn a_put_slower_than_the_floor_rate_still_times_out() {
-    let endpoint = slow_store(Duration::from_millis(1200)).await;
-    let s = timed_store(endpoint, Duration::from_millis(400), Some(128 << 10));
-    let err = s
-        .put_new(&key(), Bytes::from(vec![7u8; 64 << 10]), None)
-        .await
-        .unwrap_err();
+    let (endpoint, read, _release) = gated_store().await;
+    let s = timed_store(endpoint, BASE, Some(RATE));
+    let putting = tokio::spawn(async move {
+        s.put_new(&key(), Bytes::from(vec![7u8; 64 << 10]), None)
+            .await
+    });
+    read.notified().await;
+    jump(SLOW).await;
+    let err = putting.await.unwrap().unwrap_err();
     assert!(
         matches!(err, ObjectStoreError::Transport(_)) && err.to_string().contains("timed out"),
         "{err}"
@@ -710,15 +761,17 @@ async fn a_put_slower_than_the_floor_rate_still_times_out() {
 }
 
 /// Catches: the rate applied to a request with no body, which would give a GET the
-/// same room as a PUT. A 1.2 s answer to a bodiless read is cut at the 400 ms base.
+/// same room as a PUT. A bodiless read the store holds for [`SLOW`] is cut at the [`BASE`]
+/// limit, with a floor rate of one byte a second.
 #[tokio::test]
 async fn a_request_without_a_body_gets_only_the_base_timeout() {
-    let endpoint = slow_store(Duration::from_millis(1200)).await;
-    let s = timed_store(endpoint, Duration::from_millis(400), Some(1));
-    let err = s
-        .get_range(&key(), ByteRange::new(0, 4).unwrap())
-        .await
-        .unwrap_err();
+    let (endpoint, read, _release) = gated_store().await;
+    let s = timed_store(endpoint, BASE, Some(1));
+    let reading =
+        tokio::spawn(async move { s.get_range(&key(), ByteRange::new(0, 4).unwrap()).await });
+    read.notified().await;
+    jump(SLOW).await;
+    let err = reading.await.unwrap().unwrap_err();
     assert!(matches!(err, ObjectStoreError::Transport(_)), "{err}");
 }
 
@@ -1047,18 +1100,24 @@ async fn a_ranged_read_that_timed_out_is_not_sent_again() {
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let accepted = Arc::new(Mutex::new(0usize));
     let count = Arc::clone(&accepted);
+    let first = Arc::new(Notify::new());
+    let told = Arc::clone(&first);
     let held = tokio::spawn(async move {
         let mut held = Vec::new();
         while let Ok((sock, _)) = listener.accept().await {
             *count.lock().unwrap() += 1;
             held.push(sock);
+            told.notify_one();
         }
     });
-    let s = timed_store(endpoint, Duration::from_millis(300), None);
-    let err = s
-        .get_range(&key(), ByteRange::new(2, 4).unwrap())
-        .await
-        .unwrap_err();
+    let s = timed_store(endpoint, Duration::from_secs(30), None);
+    let reading =
+        tokio::spawn(async move { s.get_range(&key(), ByteRange::new(2, 4).unwrap()).await });
+    // The store has the connection; from now on the client waits for nothing but its
+    // timer, and the paused clock moves on to it.
+    first.notified().await;
+    tokio::time::pause();
+    let err = reading.await.unwrap().unwrap_err();
     held.abort();
     assert!(err.to_string().contains("timed out"), "{err}");
     assert_eq!(*accepted.lock().unwrap(), 1);
@@ -1113,8 +1172,6 @@ async fn a_put_cut_before_its_answer_is_sent_once_and_fails_as_transport() {
         .await
         .unwrap_err();
     assert!(matches!(err, ObjectStoreError::Transport(_)), "{err}");
-    // A late resend would show here.
-    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(reads.load(Ordering::SeqCst), 1, "the PUT was sent again");
     // Through put_stream too (the flusher's path for a small object).
     let body: objstore_s3::BodyStream = futures::stream::iter(vec![Ok(Bytes::from("abc"))]).boxed();
