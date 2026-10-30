@@ -4,7 +4,8 @@ import { ZoneStack } from '../lib/dns-stack';
 import { SiteStack } from '../lib/site-stack';
 
 // Stacks are selected by name on the cdk command line (held/main.ts). Everything specific to an installation is
-// context: -c account=<12 digits>, -c domain=<name> (default kbf.dev), and for the site stack -c githubRepo=<owner>/<name>
+// context: -c account=<12 digits>, -c domain=<name> (default kbf.dev; the site id, and so every resource name, follows from it, or -c site=<id> for a
+// domain that is not a known site), and for the site stack -c githubRepo=<owner>/<name>
 // -c githubRepoId=<id> -c githubOwnerId=<id> (and optionally -c oidcProviderArn=<arn>). -c noDomain=true builds the site
 // stack with no certificate, alias or Route 53 use, so it serves on its *.cloudfront.net name before DNS exists.
 const app = new App();

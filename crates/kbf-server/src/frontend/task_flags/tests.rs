@@ -212,6 +212,18 @@ fn a_read_url_that_is_not_https_is_refused_at_start() {
     }
 }
 
+/// Asserts that `--executor-allow-plain-http-grant` opens nothing for a frontend that runs
+/// placed actions on daemons: the opt-in is for `--executor js-agent`, and an `http://` read url
+/// stays refused at start without it.
+#[test]
+fn the_plain_http_grant_opt_in_is_for_the_host_executor() {
+    let mut given = TASK[..4].to_vec();
+    given.push("--task-read-url=http://127.0.0.1:8443");
+    given.push("--executor-allow-plain-http-grant");
+    let error = parsed(&given).expect_err("refused");
+    assert!(error.to_string().contains("--task-read-url"), "{error}");
+}
+
 /// The file called `name` in `dir` of this text and mode.
 fn file(dir: &Path, name: &str, text: &str, mode: u32) -> PathBuf {
     let path = dir.join(name);
@@ -229,6 +241,7 @@ fn flags(dir: &Path) -> TaskFlags {
         put_region: DEFAULT_REGION.to_owned(),
         put_credentials_file: file(dir, "presign.json", KEYS, 0o600),
         read_url: "https://127.0.0.1:8443".to_owned(),
+        allow_plain_http_grant: false,
         run_wall: Duration::from_secs(DEFAULT_RUN_WALL_SECS),
         url_slack: Duration::from_secs(DEFAULT_URL_SLACK_SECS),
         max_digests: ClosureLimits::DEFAULT.max_digests,

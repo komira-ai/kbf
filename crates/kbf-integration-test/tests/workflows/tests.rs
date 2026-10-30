@@ -518,7 +518,7 @@ fn actions_write_needs_a_job_that_runs_only_for_a_push_to_main() {
         assert_eq!(
             scan(&workflow(&body)),
             vec![format!(
-                "line {}: `actions: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}`",
+                "line {}: `actions: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}` or exactly `{RERUN_ONLY}`",
                 if cond.is_empty() { 7 } else { 8 }
             )],
             "{body}"
@@ -978,4 +978,52 @@ fn unreadable_bytes_are_refused_and_a_bom_is_dropped() {
         .chain(w.encode_utf16().flat_map(u16::to_le_bytes))
         .collect();
     assert!(decode(&utf16).is_err());
+}
+
+/// The `if:` line under which a job may rerun the failed jobs of a pipeline run (`pipeline-rerun.yml`).
+const RERUN_IF: &str = "    if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}\n";
+
+#[test]
+fn actions_write_is_also_allowed_for_the_first_attempt_of_a_failed_pipeline_run_and_nothing_wider()
+{
+    // Catches: the rerun workflow's `actions: write` refused; the exception loosened so that it
+    // runs for any attempt (a rerun loop), a run that was not a push to main, another branch or
+    // repository, or a green run; and the exception taken for any other write scope.
+    assert_eq!(format!("    if: {RERUN_ONLY}\n"), RERUN_IF);
+    clean(&workflow(&format!(
+        "    runs-on: ubuntu-latest\n{RERUN_IF}    permissions: {{contents: read, actions: write}}\n"
+    )));
+    for cond in [
+        "if: ${{ github.event.workflow_run.conclusion == 'failure' }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 2 && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion != 'success') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 }}",
+        "if: ${{ github.ref == 'refs/heads/main' }}",
+    ] {
+        let body = format!(
+            "    runs-on: ubuntu-latest\n    {cond}\n    permissions: {{actions: write}}\n"
+        );
+        let found = scan(&workflow(&body));
+        assert!(
+            found
+                .iter()
+                .any(|m| m
+                    .contains("`actions: write` is allowed only in a job whose `if:` is exactly")),
+            "{body}\n-> {found:?}"
+        );
+    }
+    for scope in ["contents", "id-token", "attestations", "issues"] {
+        let body =
+            format!("    runs-on: ubuntu-latest\n{RERUN_IF}    permissions: {{{scope}: write}}\n");
+        let found = scan(&workflow(&body));
+        assert!(
+            found
+                .iter()
+                .any(|m| m.contains(&format!("`{scope}: write` is allowed only"))),
+            "{body}\n-> {found:?}"
+        );
+    }
 }

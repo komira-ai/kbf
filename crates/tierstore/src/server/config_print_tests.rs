@@ -78,6 +78,56 @@ fn the_printed_file_loads_to_the_settings_of_the_flags() {
     }
 }
 
+/// Asserts that the front's flags are written as an `[oci]` table and only then: every flag of it
+/// gives its key, `--oci-listen` alone gives the table with `listen` only (a plain-HTTP front)
+/// and loads back to the same settings, and flags without the front give no table.
+#[test]
+fn the_oci_flags_are_printed_as_the_oci_table() {
+    let (cli, _) = parse(s3_flags());
+    let table: toml::Table = toml::from_str(&render(&cli).unwrap()).unwrap();
+    let oci = table["oci"].as_table().expect("an [oci] table");
+    let keys: Vec<&str> = oci.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        [
+            "connection_lifetime",
+            "listen",
+            "max_connections",
+            "prefix",
+            "tls_cert_file",
+            "tls_key_file"
+        ]
+    );
+    assert_eq!(oci["listen"].as_str(), Some("192.0.2.10:5000"));
+    assert_eq!(
+        oci["tls_cert_file"].as_str(),
+        Some("/etc/tierstore/oci.crt")
+    );
+    assert_eq!(oci["connection_lifetime"].as_str(), Some("30m"));
+
+    let mut flags = dir_flags();
+    flags.push("--oci-listen=127.0.0.1:5000");
+    let (cli, per_run) = parse(flags);
+    let text = render(&cli).unwrap();
+    let table: toml::Table = toml::from_str(&text).unwrap();
+    let keys: Vec<&str> = table["oci"]
+        .as_table()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, ["listen"]);
+    let expected = Cli {
+        print_config: false,
+        ..cli
+    };
+    assert_eq!(from_text(&text, per_run).unwrap(), expected);
+
+    let (cli, _) = parse(dir_flags());
+    let table: toml::Table = toml::from_str(&render(&cli).unwrap()).unwrap();
+    assert!(!table.contains_key("oci"));
+}
+
 /// Asserts that, across the sets of flags of these tests, every flag of the binary is given at
 /// least once, so that the round trip tests all of them: a flag added without being added to a
 /// set fails here.
