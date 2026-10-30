@@ -232,7 +232,7 @@ see "One dashboard for both" below.
 | `tierstore_read_errors_total` | counter | `tier`, `op` | the tier failed with anything but "not found": it is down, refused, or timed out |
 | `tierstore_reads_total` | counter | `tier`, `op` | a read reached the tier: its hits, misses and errors added up. For `tier="cold"`, the reads that had to go to the cold store |
 | `tierstore_bytes_served_total` | counter | `tier` | bytes of object data that gets answered, by the tier that gave them, after a range is applied |
-| `tierstore_bytes_read_total` | counter | `tier` | bytes of object data that gets read from the tier. For `cold`, the whole object, whatever range was asked |
+| `tierstore_bytes_read_total` | counter | `tier` | bytes of object data that gets read from the tier. For `cold`, the whole object, whatever range was asked, except a ranged read made while the hot tier is at its critical mark, which reads only the range |
 | `tierstore_promotions_total` | counter | none | a get copied an object from the cold tier into the hot tier |
 | `tierstore_promoted_bytes_total` | counter | none | bytes of those objects: the whole object, whatever range the get asked |
 | `tierstore_promotions_skipped_total` | counter | `reason`: `critical`, `full`, `raced`, `failed` | a get found the object in the cold tier and did not copy it into the hot tier |
@@ -250,7 +250,10 @@ What they do not count, and how to read them:
 - Bytes are counted when the proxy hands them to the front, so a client that disconnects while
   they are sent still has them counted. A range that cannot be satisfied after a cold read has
   counted the cold hit and the cold bytes read, and no bytes served.
-- A ranged GET that misses the hot tier reads the whole object from the cold tier, promotes the
+- A ranged GET that misses the hot tier, while the hot tier is at its critical mark, asks the
+  cold tier for the range alone and copies nothing: it counts a `critical` skip, and its
+  `bytes_read` and `bytes_served` are both the range.
+- Otherwise a ranged GET that misses the hot tier reads the whole object from the cold tier, promotes the
   whole object, and serves the range. Its `bytes_read` and `promoted_bytes` are the object's
   size, and its `bytes_served` is the range.
 - A HEAD promotes nothing.
