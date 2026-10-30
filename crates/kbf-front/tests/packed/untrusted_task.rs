@@ -201,6 +201,7 @@ impl Farm {
             usage: Usage::default(),
             packs: 1,
             large: Vec::new(),
+            inputs: None,
         }
     }
 

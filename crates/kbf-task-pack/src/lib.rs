@@ -19,9 +19,9 @@ pub use task_key::{
     mac_input, mac_input_v1, minute_of,
 };
 pub use task_manifest::{
-    EMPTY_DIGEST, LargeEntry, MANIFEST_VERSION, MANIFEST_VERSION_2, MAX_MANIFEST_BYTES,
+    EMPTY_DIGEST, InputStats, LargeEntry, MANIFEST_VERSION, MANIFEST_VERSION_2, MAX_MANIFEST_BYTES,
     MAX_PATH_BYTES, ManifestError, OutputDirectory, OutputFile, OutputSymlink, PathError,
-    TaskManifest, Timing, Usage,
+    SourceBytes, TaskManifest, Timing, Usage,
 };
 pub use task_pack::{
     MAX_PACK_BYTES, MAX_PACK_RECORDS, MAX_RECORD_BYTES, ShapeError, TaskPackError, WritePackError,
