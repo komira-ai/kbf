@@ -184,14 +184,16 @@ fn a_plain_put_endpoint_needs_the_plain_http_opt_in() {
 #[test]
 fn a_plain_read_url_needs_the_plain_http_grant_opt_in() {
     let http = ["--task-read-url=http://192.0.2.6:9400"];
-    let why = refused(&[], &http);
+    let plain_listener = ["--job-plain-http"];
+    let tls_files = ["--job-tls-cert", "--job-tls-key"];
+    let why = refused(&tls_files, &[http[0], plain_listener[0]]);
     assert!(
         why.contains("--task-read-url") && why.contains("--executor-allow-plain-http-grant"),
         "{why}"
     );
     let mut with = http.to_vec();
-    with.push("--executor-allow-plain-http-grant");
-    let flags = parsed(argv(&[], &with)).expect("accepted with the opt-in");
+    with.extend(["--executor-allow-plain-http-grant", plain_listener[0]]);
+    let flags = parsed(argv(&tls_files, &with)).expect("accepted with the opt-in");
     assert_eq!(
         flags.task.as_ref().map(|t| t.read_url.as_str()),
         Some("http://192.0.2.6:9400")
@@ -313,4 +315,33 @@ fn a_put_endpoint_is_http_or_https_exactly() {
             "{endpoint}: {why}"
         );
     }
+}
+
+/// Catches a read url whose scheme is not the one the job listener serves, which would otherwise
+/// fail every run's first read: an `http://` url against a TLS listener sends plain HTTP to a TLS
+/// port, and an `https://` url against a plain listener starts a handshake nobody answers. Each is
+/// refused when the flags are parsed, naming both flags; the matching pairs start.
+#[test]
+fn the_read_url_scheme_is_the_one_the_job_listener_serves() {
+    let http = "--task-read-url=http://192.0.2.6:9400";
+    let https = "--task-read-url=https://192.0.2.6:9400";
+    let allow = "--executor-allow-plain-http-grant";
+    let tls_files = ["--job-tls-cert", "--job-tls-key"];
+    let plain = "--job-plain-http";
+
+    let why = refused(&[], &[http, allow]);
+    assert!(
+        why.contains("--task-read-url is http://") && why.contains("--job-plain-http"),
+        "{why}"
+    );
+    let why = refused(&tls_files, &[https, plain]);
+    assert!(
+        why.contains("--task-read-url is https://") && why.contains("--job-plain-http"),
+        "{why}"
+    );
+    assert!(parsed(argv(&[], &[https])).is_ok(), "https against TLS");
+    assert!(
+        parsed(argv(&tls_files, &[http, allow, plain])).is_ok(),
+        "http against plain"
+    );
 }
