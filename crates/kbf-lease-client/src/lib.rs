@@ -49,7 +49,7 @@ pub use config::{Config, Origin, Token};
 pub use error::{ApiError, ConfigError, Error, ErrorCode};
 pub use ids::{BadLeaseId, BadRunId, LeaseId, RunId};
 pub use wire::{
-    AcquireRequest, Acquired, Granted, Host, HostSource, HostState, Isolation, Lease, LeaseState,
-    Mount, Outcome, PendingLease, ReleaseState, Released, Renewed, Resources, Run, RunAccepted,
-    RunLimits, RunSpec, RunState, Shape, Taint,
+    AcquireRequest, Acquired, Granted, Host, HostLeaseClock, HostLeaseMinute, HostLoad, HostSource,
+    HostState, Isolation, Lease, LeaseState, Mount, Outcome, PendingLease, ReleaseState, Released,
+    Renewed, Resources, Run, RunAccepted, RunLimits, RunSpec, RunState, Shape, Taint,
 };
