@@ -4,7 +4,8 @@
 //! - [`config`], [`role`], [`result`], [`requestlog`], [`gate`]: the shared types, built.
 //! - [`s3`]: the timed, logged S3 client the cells use, built for put, ranged get, head, delete
 //!   and list; streaming bodies, multipart and presigned requests are the cell owners' to add.
-//! - [`cells`] (`cold_put`, `cold_read`, `g`, then `a1`, `b`, `c`), [`proxy`], [`preflight`], [`provision`], [`teardown`],
+//! - [`proxy`]: the fault proxy, built.
+//! - [`cells`] (`cold_put`, `cold_read`, `g`, then `a1`, `b`, `c`), [`preflight`], [`provision`], [`teardown`],
 //!   [`report`]: stubs whose signatures are final; each module's header says what goes in it.
 //! - [`cli`]: the verbs.
 

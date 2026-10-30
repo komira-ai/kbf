@@ -18,8 +18,8 @@ fn not_yet(result: Result<(), BenchError>) -> &'static str {
     }
 }
 
-/// Catches a verb wired to the wrong module, or a stub that reports success: each verb names
-/// itself in the refusal.
+/// Catches a verb wired to the wrong module, or a stub that reports success: each stub verb
+/// names itself in the refusal, and the fault proxy refuses an upstream it cannot dial.
 #[tokio::test]
 async fn every_verb_reaches_its_module_and_a_stub_says_so() {
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-verbs");
@@ -53,11 +53,9 @@ async fn every_verb_reaches_its_module_and_a_stub_says_so() {
         "--listen",
         "127.0.0.1:0",
         "--upstream",
-        "http://store.example:9000",
+        "store.example:9000",
     ];
-    assert_eq!(not_yet(run(&proxy).await), "fault-proxy");
-    let latency = [proxy.as_slice(), &["--mode", "latency=50"]].concat();
-    assert_eq!(not_yet(run(&latency).await), "fault-proxy");
+    assert!(matches!(run(&proxy).await, Err(BenchError::Proxy(_))));
 }
 
 /// Catches a cell flag that runs another cell, and the request log not being made where a run's
