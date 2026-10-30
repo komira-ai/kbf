@@ -32,6 +32,7 @@ mod config;
 mod driver;
 mod front;
 mod host;
+mod load;
 mod metrics;
 mod outcome;
 mod pool;
