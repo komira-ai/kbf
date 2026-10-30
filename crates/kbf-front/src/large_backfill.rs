@@ -8,7 +8,7 @@
 //! ([`ObjectStore::put_stream`](kbf_objstore::ObjectStore::put_stream), a multipart upload for
 //! any blob of this size, so no single request is as large as the blob).
 //!
-//! **Only verified bytes are stored.** The listener holds back the last chunk until the whole
+//! **Only verified bytes are stored.** The put's body ends cleanly only at an explicit marker ([`Piece::Done`]) that the listener sends after the digest check; a channel that closes without it is an error in the body, never an end of stream. The listener holds back the last chunk until the whole
 //! has hashed to the digest, and the tee is fed from the same points, so the put's body is one
 //! byte short until the verdict. A blob that does not hash to its digest, a source that fails,
 //! and a reader that goes away all drop the [`Tee`] before its last chunk: the body ends short
@@ -42,6 +42,16 @@ use crate::metrics::{Counter, Families};
 /// The puts running at once: a large blob is hundreds of MiB, and a few uploads are all the
 /// frontend's uplink is worth. Not a flag.
 pub const DEFAULT_CONCURRENCY: usize = 2;
+
+/// What the put's body says when its tee went away before the blob verified.
+const ABANDONED: &str = "the copy was abandoned before the blob hashed to its digest";
+
+/// What a [`Tee`] hands its put: the blob's bytes in order, and then, only once the blob has
+/// hashed to its digest, the marker that ends the body. A body does not end without it.
+enum Piece {
+    Window(Bytes),
+    Done,
+}
 
 /// The chunks a tee buffers between the reader and its put.
 const BUFFERED_CHUNKS: usize = 16;
@@ -113,7 +123,7 @@ impl LargeBackfill {
             self.counts.skipped.add(1);
             return None;
         }
-        let (sender, chunks) = mpsc::channel(BUFFERED_CHUNKS);
+        let (sender, chunks) = mpsc::channel::<Piece>(BUFFERED_CHUNKS);
         let abandoned = Arc::new(AtomicBool::new(false));
         let put = Put {
             store: Arc::clone(&self.store),
@@ -167,7 +177,7 @@ impl LargeBackfill {
 /// The hand-over of one read's verified chunks to its put. Dropped before [`Tee::finish`], it
 /// abandons the put.
 pub(crate) struct Tee {
-    sender: mpsc::Sender<Result<Bytes, ObjectStoreError>>,
+    sender: mpsc::Sender<Piece>,
     abandoned: Arc<AtomicBool>,
     finished: bool,
 }
@@ -176,12 +186,16 @@ impl Tee {
     /// Hands `chunk` to the put. `false` when the put is gone or cannot keep up: the tee is
     /// then of no use and the reader drops it.
     pub(crate) fn send(&mut self, chunk: Bytes) -> bool {
-        self.sender.try_send(Ok(chunk)).is_ok()
+        self.sender.try_send(Piece::Window(chunk)).is_ok()
     }
 
     /// The blob has hashed to its digest and every chunk was sent: the put may end its body.
+    ///
+    /// The marker is what ends the put's body cleanly: a channel that closes without it (the
+    /// tee dropped, or no room for the marker) ends the body in an error, so that the store
+    /// aborts and keeps nothing.
     pub(crate) fn finish(mut self) {
-        self.finished = true;
+        self.finished = self.sender.try_send(Piece::Done).is_ok();
     }
 }
 
@@ -217,7 +231,7 @@ struct Put {
 }
 
 impl Put {
-    async fn run(self, chunks: mpsc::Receiver<Result<Bytes, ObjectStoreError>>) {
+    async fn run(self, chunks: mpsc::Receiver<Piece>) {
         let key = large_key(&self.digest);
         // An object of the right length is the blob (the key is content-bound); a store that
         // cannot say is left to the create-only put to decide.
@@ -228,7 +242,12 @@ impl Put {
             return;
         }
         let body: BodyStream = stream::unfold(chunks, |mut chunks| async move {
-            chunks.recv().await.map(|item| (item, chunks))
+            match chunks.recv().await {
+                Some(Piece::Window(bytes)) => Some((Ok(bytes), chunks)),
+                Some(Piece::Done) => None,
+                // An error ends a body; a closed channel stays closed if it is polled again.
+                None => Some((Err(ObjectStoreError::Body(ABANDONED.to_owned())), chunks)),
+            }
         })
         .boxed();
         match self.store.put(&key, self.digest.size_bytes, body).await {

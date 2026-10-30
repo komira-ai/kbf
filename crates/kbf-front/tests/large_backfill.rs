@@ -584,3 +584,24 @@ async fn an_object_of_another_length_is_not_taken_for_the_blob() {
         Some(Bytes::from_static(b"short"))
     );
 }
+
+/// Catches: a put whose body takes a closed channel for the end of the blob. Every chunk of a
+/// corrupt blob has been pulled and hashed when the reader has the one before the last, but the
+/// digest is checked only on the poll after it; a reader that stops there (the stream dropped
+/// without being polled to its end) must leave nothing under `cas/l/`.
+#[tokio::test]
+async fn a_reader_that_stops_before_the_verdict_on_a_corrupt_source_leaves_no_object() {
+    let w = world();
+    let rig = rig(w.blobs.clone(), 2);
+    rig.flip(2 * CHUNK + 3);
+    let token = rig.token(w.action);
+    let stream = rig.get(&w.one, &token).await.stream.expect("streamed");
+    let mut chunks = stream.chunks;
+    for _ in 0..BLOB_CHUNKS - 1 {
+        chunks.next().await.expect("a chunk").expect("ok");
+    }
+    drop(chunks);
+    rig.settled(1).await;
+    assert_eq!(rig.count("backfilled"), 0);
+    assert_eq!(rig.bucket.keys().await, 0);
+}
