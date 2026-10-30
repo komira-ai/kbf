@@ -145,6 +145,7 @@ fn the_flags_have_their_defaults() {
     assert!(cli.read_only_key_file.is_empty());
     assert!(cli.presign_key_file.is_empty());
     assert!(cli.gc_key_file.is_empty());
+    assert!(cli.scoped_key_file.is_empty());
     assert_eq!(cli.presign_max_expires, Duration::from_secs(900));
     assert!(
         cli.skip_backend_check.is_empty(),
@@ -424,6 +425,79 @@ fn two_keys_with_one_id_are_invalid_flags_refused_before_a_tier_is_opened() {
         assert!(text.contains("--read-only-key-file"), "{text}");
         assert!(!text.contains("secret"), "{text}");
         assert!(!made.exists());
+    }
+}
+
+/// Asserts that `--scoped-key-file` puts the keys of its files on the server, in the order of the
+/// flags; that a file that is not a valid scoped key is refused with a message that names the flag
+/// (as a bad key file is, not as invalid flags); and that a scoped key whose id is the full
+/// key's, a read-only key's, a GC key's or another scoped key's is invalid flags (status 2).
+#[test]
+fn scoped_key_files_are_built_into_the_server_and_their_ids_must_differ() {
+    let dir = TestDir::under(std::env::temp_dir(), "tierstore-scoped-flag");
+    let text = |id: &str| {
+        format!(
+            "{{\"access_key_id\": \"{id}\", \"secret_access_key\": \"s3cret\", \
+             \"read_prefixes\": [\"cas/\"], \"write_prefixes\": [\"cas/f/a/\"], \
+             \"delete_prefixes\": []}}"
+        )
+    };
+    let one = key_file(&dir, "one", &text("SC1"), 0o600);
+    let two = key_file(&dir, "two", &text("SC2"), 0o600);
+    let mut ok = cli(&dir);
+    ok.scoped_key_file = vec![one.clone(), two.clone()];
+    let built = build(&ok).expect("built");
+    let ids: Vec<&str> = built
+        .server
+        .scoped_keys
+        .iter()
+        .map(|key| key.id())
+        .collect();
+    assert_eq!(ids, ["SC1", "SC2"]);
+    assert_eq!(built.server.scoped_keys[0].write_prefixes(), ["cas/f/a/"]);
+
+    let empty = key_file(
+        &dir,
+        "empty",
+        &text("SC3")
+            .replace("[\"cas/\"]", "[]")
+            .replace("[\"cas/f/a/\"]", "[]"),
+        0o600,
+    );
+    let mut bad = cli(&dir);
+    bad.scoped_key_file = vec![empty];
+    let why = build(&bad).err().expect("refused");
+    assert!(why.to_string().starts_with("--scoped-key-file "), "{why}");
+    assert!(why.downcast_ref::<InvalidFlags>().is_none(), "{why}");
+
+    let full = key_file(&dir, "full", &text("AKID"), 0o600);
+    let reader = key_file(&dir, "reader", "SC1\nread-secret\n", 0o600);
+    let gc = key_file(
+        &dir,
+        "gc",
+        r#"{"access_key_id": "SC1", "secret_access_key": "g", "prefix": "cas/b/"}"#,
+        0o600,
+    );
+    for (scoped, setup) in [
+        (vec![full], 0),
+        (vec![one.clone()], 1),
+        (vec![one.clone()], 2),
+        (vec![one.clone(), one], 0),
+    ] {
+        let mut cli = cli(&dir);
+        cli.scoped_key_file = scoped;
+        match setup {
+            1 => cli.read_only_key_file = vec![reader.clone()],
+            2 => cli.gc_key_file = vec![gc.clone()],
+            _ => {}
+        }
+        let why = build(&cli).err().expect("refused");
+        assert!(why.downcast_ref::<InvalidFlags>().is_some(), "{why}");
+        let text = why.to_string();
+        assert!(
+            text.contains("used twice") && !text.contains("s3cret"),
+            "{text}"
+        );
     }
 }
 

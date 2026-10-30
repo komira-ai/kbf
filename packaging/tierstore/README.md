@@ -85,7 +85,7 @@ the key that `tierstore` checks only if it has exactly those two non-empty field
 file that has another field must be trimmed to be shared. `tierstore` takes the values of the
 JSON form as they are, without trimming. No message of the process carries a secret.
 
-A role belongs to a key, not to a prefix: a read-only key may read every object of the bucket.
+A role belongs to a key, not to a prefix: a read-only key may read every object of the bucket. A key limited to prefixes is a GC key or a scoped key (below).
 A write limited to one object under a prefix is a presigned PUT URL (below).
 
 ## Presigned PUT URLs
@@ -143,6 +143,83 @@ query (400, or 404 for an unknown bucket), the checksum headers (400 or 501), an
 list prefix; so a call that is both refused and malformed may get the malformed-request error. A delete by a GC key is not
 create-only; it is the only way an object leaves the prefix that presigned PUTs write.
 
+## Scoped keys
+
+A scoped key (`--scoped-key-file`, once per key; mode 0600, not a symbolic link, owned by the user
+the server runs as) reads, creates and deletes under prefixes that its file lists, and does nothing
+else. It is for a process that must touch some prefixes of the bucket and not the rest, and that
+neither replaces nor deletes what it did not write. It signs in the header only (a presigned URL
+signed with it is refused). The file is JSON of exactly these five fields, all required:
+
+```json
+{"access_key_id": "frontend-packs", "secret_access_key": "the secret",
+ "read_prefixes": ["cas/"],
+ "write_prefixes": ["cas/f/frontend/"],
+ "delete_prefixes": []}
+```
+
+Every prefix ends in `/` and is not empty. None may be `_journal/` or `_tiering/`, be under one, be
+a prefix of one, or have one as a segment (`cas/_journal/`); a file that has one is refused at
+start. A list may be empty, but a key whose three lists are all empty is refused, since it could do
+nothing. The lists may overlap: a prefix in `read_prefixes` and in `write_prefixes` is one the key
+reads and creates under. A key file that is refused (bad JSON, a missing or unknown field, a bad
+prefix, a mode other than 0600) exits 1 at start with a message that names the flag and the file and
+never the secret, as a bad GC key file does. The access key id differs from those of all other
+keys: two keys with one id are refused with exit status 2 (the command line does this; a
+`ServerConfig` built in code, as a library user does, is not checked for distinct ids by the server).
+
+A call is allowed only for a key (or, for a listing, a `prefix` parameter) that starts with a prefix
+of the list the call needs, after the path is percent-decoded and with no `..`, no `.` segment and
+no control character in it. A key must be longer than the prefix: the prefix itself is not an object.
+A key or a listing `prefix` that has `..` anywhere in it, even inside a prefix, is refused.
+
+| call | list | allowed |
+|---|---|---|
+| GetObject, HeadObject | `read_prefixes` | yes, whole or by range |
+| ListObjectsV2 | `read_prefixes` | with a `prefix` parameter inside a read prefix; no prefix or another is 403, not filtered |
+| ListMultipartUploads | `read_prefixes` | the same rule: a `prefix` inside a read prefix |
+| PutObject | `write_prefixes` | create-only: no `If-Match`, and `If-None-Match` absent or `*`; a key that exists is `412 PreconditionFailed` |
+| CreateMultipartUpload, UploadPart, CompleteMultipartUpload | `write_prefixes` | of a key inside a write prefix, each call checked |
+| AbortMultipartUpload | `write_prefixes` | of an upload of such a key (a delete prefix does not allow an abort) |
+| DeleteObject | `delete_prefixes` | from both tiers, journaled as for any delete |
+| a put with `If-Match` or any other `If-None-Match`, a copy (`x-amz-copy-source`, also on a part) | none | no: a scoped key never replaces or copies |
+| the calls on the bucket (CreateBucket, HeadBucket, delete) and the root, any other method | none | no |
+| `_journal/`, `_tiering/`, any key outside the list the call needs | none | no |
+
+The lists are not interchangeable: a write prefix does not let the key read what it wrote (add the
+prefix to `read_prefixes` too), and a read prefix does not let it write. A key with a write
+prefix and no read prefix can still learn that a key exists, by the `412` of a put over it. A
+call the key may not do is refused with 403 `AccessDenied` without its body being read. The refusals are made in the order
+of the GC key's (see above): the signature and key id, the method, the decoding of the path and
+query, the checksum headers, and last the key, the listing prefix and the conditions of the put; so
+a call that is both refused and malformed may get the malformed-request error.
+
+Two uses, for the pieces of kbf that keep their objects in a tierstore bucket:
+
+- **The frontend's pack store** (`--pack-store-endpoint`, with `--pack-store-credentials-file` set
+  to a file in the JSON form of the key above). A frontend reads packs that daemons and tasks
+  wrote under `cas/` and writes its own packs under `cas/f/<writer>/`, where `<writer>` is its
+  `--pack-writer` (`frontend` if left out), one key `cas/f/<writer>/<boot>/<sequence>` for each
+  pack. It writes with a plain `PUT` with `If-None-Match: *`, one request for a pack, and reads
+  with ranged `GET`s. So the key is `read_prefixes: ["cas/"]`, `write_prefixes:
+  ["cas/f/<writer>/"]`, `delete_prefixes: []`. With no delete prefix, two best-effort deletes the
+  frontend makes are refused with a logged warning and change nothing: the removal of its
+  create-only self-test object (`cas/f/<writer>/<boot>/selftest`, one small object left for each
+  start of the frontend) and of the object of a pack whose write failed. To have both removed,
+  give `delete_prefixes: ["cas/f/<writer>/"]`: the key then deletes only what the frontend itself
+  wrote.
+- **Build history** (`kbf-server --history-objects
+  's3://<bucket>/kbf-history?endpoint=...&conditional-put=true'`, the key
+  pair in `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`). The history objects are under
+  `kbf-history/history/`. The writer makes only create-only single `PUT`s with `If-None-Match: *`
+  (without `conditional-put=true` it is a plain `PUT`, and tierstore answers a retry of a chunk
+  whose first reply was lost with `412`, which the writer does not take for "already there", so it
+  retries the chunk for good: keep `conditional-put=true`) and the reader makes only ranged
+  `GET`s; neither lists, deletes, overwrites or starts a multipart upload (the code makes no list or
+  delete call at all, so the expiry of old objects is for a lifecycle rule of the bucket, not the
+  server, and a sweeper that deletes would need `delete_prefixes: ["kbf-history/"]`). So the key is
+  `read_prefixes: ["kbf-history/"]`, `write_prefixes: ["kbf-history/"]`, `delete_prefixes: []`.
+
 ## Filling in the flags
 
 The unit's `ExecStart=` is a complete command line. The flags to edit:
@@ -155,6 +232,7 @@ The unit's `ExecStart=` is a complete command line. The flags to edit:
 | `--access-key-file`, `--read-only-key-file` | the full key, and (given once for each) the read-only keys; see above |
 | `--presign-key-file`, `--presign-max-expires` | a presigning key with its ceiling (given once for each key), and the longest expiry of any URL; see Presigned PUT URLs |
 | `--gc-key-file` | a GC key (given once for each key); see GC keys |
+| `--scoped-key-file` | a scoped key (given once for each key); see Scoped keys |
 | `--hot`, `--cold` | the tiers: `s3:<bucket>` for a bucket of an S3-compatible store (also `dir:<path>` and `memory`; a `dir:` path must also be writable under `ProtectSystem=strict`, so add it to `ReadWritePaths=`) |
 | `--hot-endpoint`, `--cold-endpoint` | where the tier's store is, `http://host[:port]` (TLS is not built yet); `--hot-region` and `--cold-region` set the signing region of a tier, `us-east-1` if not given |
 | `--hot-bytes` | the bytes the hot tier is meant to hold; the water marks are shares of it (`--high-water`, `--low-water`, `--critical`) |

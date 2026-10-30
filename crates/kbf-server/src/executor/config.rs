@@ -79,6 +79,12 @@ pub struct Config {
     pub poll: Duration,
     /// How long before a vacant host is asked for again.
     pub acquire_retry: Duration,
+    /// How long a host whose scratch quota is out of order (a run refused `quota-unavailable`)
+    /// is kept out of use: its lease is held idle, so the lease server hands out another
+    /// host, and released when this has passed (at most a third of [`Config::lease_ttl`]: see
+    /// [`Config::held_out_for`]). The host recovers by itself and re-checks
+    /// about once a minute, so this is a little over two of its checks.
+    pub quota_hold: Duration,
     /// How often the lease server's host list is read, to see a host lost or tainted.
     pub host_check: Duration,
     /// How often the leases under this frontend's label are compared with the slots', to
@@ -150,6 +156,9 @@ pub enum ConfigError {
         "the lease ttl must be at least 30 s, three times the step, and cover the longest run and two heartbeats"
     )]
     Ttl,
+    /// A hold on a host with a sick quota of zero.
+    #[error("the quota hold must be above zero")]
+    QuotaHold,
     /// A renewal interval of zero.
     #[error("the renewal interval must be above zero")]
     Renew,
@@ -203,6 +212,7 @@ impl Config {
             heartbeat: Duration::from_secs(5),
             poll: Duration::from_millis(500),
             acquire_retry: Duration::from_secs(5),
+            quota_hold: Duration::from_secs(150),
             host_check: Duration::from_secs(5),
             reconcile_every: Duration::from_secs(60),
             call_timeout: Duration::from_secs(5),
@@ -216,6 +226,14 @@ impl Config {
             max_blob_bytes: 64 << 20,
             presign_ceiling: PRESIGN_LIMIT,
         }
+    }
+
+    /// How long a lease is kept idle for a host with a sick quota: [`Config::quota_hold`], cut
+    /// to a third of the lease ttl. The idle lease is not renewed, and a renewed lease has at
+    /// least a third of its ttl left.
+    #[must_use]
+    pub fn held_out_for(&self) -> Duration {
+        self.quota_hold.min(self.lease_ttl / 3)
     }
 
     /// How long a process that finds another's leases under its own frontend id watches them
@@ -304,6 +322,7 @@ impl Config {
                 self.max_wall > self.drain_before_end && self.drain_before_end > longest,
                 ConfigError::Drain,
             ),
+            (!self.quota_hold.is_zero(), ConfigError::QuotaHold),
         ];
         checks
             .into_iter()

@@ -236,8 +236,25 @@ impl BlobSource for Mem {
 struct Kept(Mutex<Vec<Vec<u8>>>);
 
 impl PackSink for Kept {
-    fn store(&self, body: &[u8]) -> Result<(), kbf_task::put::PutError> {
+    fn pack_slots(&self) -> usize {
+        1
+    }
+
+    fn large_slots(&self) -> usize {
+        0
+    }
+
+    fn store_pack(&self, _slot: usize, body: &[u8]) -> Result<(), kbf_task::put::PutError> {
         self.0.lock().expect("lock").push(body.to_vec());
+        Ok(())
+    }
+
+    fn store_large(
+        &self,
+        _slot: usize,
+        _blobs: &kbf_task::outputs::Blobs,
+        _digest: &kbf_types::Digest,
+    ) -> Result<(), kbf_task::put::PutError> {
         Ok(())
     }
 }

@@ -103,6 +103,7 @@ const GROUPS: &[(&str, &[&str])] = &[
         "scheduler",
         &[
             "default-platform",
+            "exclusive-actions",
             "finished-retention-secs",
             "heartbeat-interval-ms",
             "input-tree-cache-bytes",
@@ -252,6 +253,10 @@ const GROUPS: &[(&str, &[&str])] = &[
         &[
             "task-closure-max-bytes",
             "task-closure-max-digests",
+            "task-large-credentials-file",
+            "task-large-max-bytes",
+            "task-max-large",
+            "task-max-packs",
             "task-put-bucket",
             "task-put-credentials-file",
             "task-put-endpoint",
@@ -377,6 +382,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "memory-limit-percent",
             "memory-poll-ms",
             "memory-pressure-pause-percent",
+            "no-memory-climb",
         ],
     ),
     (
