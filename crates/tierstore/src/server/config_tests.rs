@@ -257,6 +257,21 @@ fn a_fault_in_the_file_is_reported_without_the_value() {
     }
 }
 
+/// Asserts that a fault inside a multi-line string names no "key" taken from the string's text:
+/// the text before an `=` on such a line is part of a value (perhaps a pasted secret), so it is
+/// neither shown as the key nor repeated.
+#[test]
+fn a_fault_inside_a_multi_line_string_shows_nothing_of_the_string() {
+    let text = golden_with(
+        "[server]",
+        "[server]\nnote = \"\"\"\nabcdef=SENTINEL \\q\n\"\"\"",
+    );
+    let why = refusal(&text);
+    assert!(why.starts_with("line "), "{why}");
+    assert!(!why.contains("abcdef"), "{why}");
+    assert!(!why.contains("SENTINEL"), "{why}");
+}
+
 /// Asserts that `[local_cache]` is refused as not supported yet, with or without the other
 /// tables, and that a file missing `[hot_store]` or `[cold_store]` is refused for the shape.
 #[test]
