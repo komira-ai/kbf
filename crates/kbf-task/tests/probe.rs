@@ -36,7 +36,6 @@ fn probe_raw(work: &Path, extra: &[&str]) -> Output {
         .arg("--probe-work-dir")
         .arg(work)
         .args(extra)
-        .env_clear()
         .output()
         .expect("kbf-task starts")
 }
