@@ -1163,6 +1163,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 binary.as_deref(),
                 verify_only,
             )?;
+            let base = service.base(platform)?;
             pkg_image_asset::asset(
                 &image,
                 &commit,
@@ -1174,6 +1175,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                     image: service,
                     platform,
                     reference,
+                    base: base.as_ref(),
                 },
             )
         }

@@ -3,8 +3,11 @@
 //! One process runs three things over the same pair of tiers: a [`Proxy`] with the given id,
 //! the S3 front of that proxy ([`Server`]), and a [`Reconciler`], which works only while it
 //! holds the lease in the hot tier, so that any number of these processes may run over the same
-//! tiers. Everything is a flag; the process reads no environment variable, and the secret
-//! access key is read from a file, not from the command line.
+//! tiers. The settings are flags, or one TOML file given with `--config` (see
+//! [`config`](super::config) for the format, and `--print-config`, which prints the file for
+//! the flags given); the process reads no environment variable, and the secret access key is
+//! read from a file, not from the command line or the config file. The file is read into the
+//! same [`Cli`] the flags make.
 //!
 //! The tiers are `memory`, `dir:<path>` and `s3:<bucket>`. A memory tier keeps nothing when the
 //! process stops, and its objects carry the time zero. A directory tier keeps its objects, and
@@ -36,7 +39,8 @@
 //! it serves for `--drain-lb-wait`, refuses new requests, waits for those in flight and for the
 //! answers it is sending for at most `--drain-deadline`, gives the reconciler's lease up and
 //! exits with status 0. A start that fails exits with status 1. Flags that are not valid exit
-//! with status 2: those the parser refuses, and two keys that have one id.
+//! with status 2: those the parser refuses, two keys that have one id, and a config file that is
+//! refused or given with flags that describe the data path.
 //!
 //! Before it opens the proxy or binds the address, the process asks each tier the questions its
 //! guarantees rest on (see [`self_test`]) under a probe key in `_tiering/selftest/` that is
@@ -54,6 +58,7 @@
 
 use std::ffi::OsString;
 use std::future::Future;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -71,8 +76,11 @@ use crate::{
     ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SystemClock, self_test,
 };
 
+use super::config::keys_for_flags;
+use super::config_print::render;
 use super::gc::{ensure_distinct as gc_distinct, gc_keys, ids as gc_ids};
 use super::keys::{ensure_distinct, read_credentials, read_only_keys};
+use super::launch::{Launch, Refused, resolve};
 use super::presign::{ensure_distinct as presign_distinct, presign_keys};
 use super::scoped::{ensure_distinct as scoped_distinct, ids as scoped_ids, scoped_keys};
 use super::{Drained, Server, ServerConfig};
@@ -86,16 +94,16 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 #[error("{0}")]
 struct InvalidFlags(String);
 
-const DEFAULT_MAX_REQUEST_BYTES: u64 = 256 << 20;
+pub(super) const DEFAULT_MAX_REQUEST_BYTES: u64 = 256 << 20;
 
 /// The streamed bodies taken at once: 32 of them hold at most 32 x (16 MiB + a few pieces).
-const DEFAULT_MAX_CONCURRENT_PUTS: u32 = 32;
+pub(super) const DEFAULT_MAX_CONCURRENT_PUTS: u32 = 32;
 
 /// The least average rate of a body, in bytes a second.
-const DEFAULT_PUT_MIN_BYTES_PER_SEC: u64 = 1024;
+pub(super) const DEFAULT_PUT_MIN_BYTES_PER_SEC: u64 = 1024;
 
 /// The signing region of an S3 tier whose region is not given.
-const DEFAULT_REGION: &str = "us-east-1";
+pub(super) const DEFAULT_REGION: &str = "us-east-1";
 
 /// How long a connection to an S3 tier may take to be opened.
 const S3_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -109,9 +117,20 @@ const S3_MIN_BODY_RATE: Option<NonZeroU64> = NonZeroU64::new(1 << 20);
 /// It serves one bucket to the clients that sign with its full access key or with one of its
 /// read-only keys, writes new objects to the hot tier, copies them to the cold tier in the
 /// background, and frees the hot tier when it fills.
-#[derive(Clone, Debug, Parser)]
+#[derive(Clone, Debug, PartialEq, Parser)]
 #[command(name = "tierstore", version)]
 pub struct Cli {
+    /// The configuration file: a TOML file with the tables `[server]`, `[hot_store]` and
+    /// `[cold_store]` that holds what the flags below hold, except `--drain-lb-wait` and
+    /// `--drain-deadline`, which stay flags. A start that gives it together with any other
+    /// flag but those is refused with status 2. `--print-config` writes the file for the flags
+    /// given. `None` in the settings a file makes.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+    /// Prints the configuration file that is equivalent to the flags given (the key files by
+    /// path, never their contents), and exits with status 0 without starting anything.
+    #[arg(long)]
+    pub print_config: bool,
     /// The address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on.
     #[arg(long)]
     pub listen: SocketAddr,
@@ -331,7 +350,7 @@ pub struct SkippedCheck {
 
 /// A skipped check: `multipart-conditional`, `=`, and a reason that is not empty. Any other
 /// check is refused.
-fn parse_skip(text: &str) -> Result<SkippedCheck, String> {
+pub(super) fn parse_skip(text: &str) -> Result<SkippedCheck, String> {
     let names: Vec<&str> = Check::ALL.iter().map(|check| check.name()).collect();
     let usage = format!(
         "{text:?} is not CHECK=REASON; the checks are {}",
@@ -761,18 +780,54 @@ fn blocking(cli: Cli) -> Result<(), Error> {
 /// The binary: flags in, exit status out.
 #[must_use]
 pub fn main(args: Vec<OsString>) -> ExitCode {
-    let cli = match Cli::try_parse_from(args) {
-        Ok(cli) => cli,
-        Err(usage) => {
+    let launch = match resolve(args) {
+        Ok(launch) => launch,
+        Err(Refused::Usage(usage)) => {
             let _ = usage.print();
             return ExitCode::from(if usage.use_stderr() { 2 } else { 0 });
         }
+        Err(Refused::Config(why)) => {
+            eprintln!("tierstore: {why}");
+            return ExitCode::from(2);
+        }
     };
+    let Launch { cli, from_file } = launch;
+    if cli.print_config {
+        return print_config(&cli);
+    }
     match blocking(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(why) => {
-            eprintln!("tierstore: {why}");
+            // The messages of the flags' checks name flags; in a start from a file they name keys.
+            let text = why.to_string();
+            let text = if from_file {
+                keys_for_flags(&text)
+            } else {
+                text
+            };
+            eprintln!("tierstore: {text}");
             ExitCode::from(exit_status(&why))
+        }
+    }
+}
+
+/// `--print-config`: the file for the flags on stdout and status 0, or the reason there is none
+/// on stderr and status 2.
+fn print_config(cli: &Cli) -> ExitCode {
+    match render(cli) {
+        Ok(text) => {
+            // A closed pipe or a full disk is not a printed file: say so.
+            match std::io::stdout().write_all(text.as_bytes()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(why) => {
+                    eprintln!("tierstore: --print-config: writing the file: {why}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Err(why) => {
+            eprintln!("tierstore: {why}");
+            ExitCode::from(2)
         }
     }
 }

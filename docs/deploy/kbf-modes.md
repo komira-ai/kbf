@@ -173,10 +173,12 @@ presigned write and the read token are never part of an error, a log line or a m
 `--executor-run-margin-secs` (300; what a run's wall time adds to the action's timeout),
 `--executor-lease-ttl-secs` (3600), `--executor-max-run-secs` and
 `--executor-default-timeout-secs` (3000), `--executor-call-timeout-secs` (5),
-`--executor-work-dir` (for the task tool), and
+`--executor-work-dir` (for the task tool),
+`--executor-output-disk-bytes` (8 GiB; the scratch disk a run books for its outputs, the pack and its
+private home, on top of the bytes of its inputs and a fixed 1 GiB margin),
 `--executor-allow-plain-http-put` (until the store serves TLS), and
 `--executor-allow-plain-http-grant` (a read listener without TLS, on a farm's own network; both
-off by default). A setting that breaks a rule
+plain-http flags are off by default). A setting that breaks a rule
 the executor's safety rests on (the fence time against the scheduler's grace, the lease ttl
 against the longest run) is refused at start, exit status 2.
 
