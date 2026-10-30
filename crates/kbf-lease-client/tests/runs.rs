@@ -447,3 +447,21 @@ async fn a_queue_call_is_checked_in_the_servers_order() {
     let (status, _) = raw_json(&server, "POST", &format!("/v1/leases/{id}/runs"), "{").await;
     assert_eq!(status, 400);
 }
+
+/// Asserts the fake's refusal of runs short of a taint: a host told to refuse with a code
+/// answers every new run with it, keeps the runs it has, and takes runs again when told to.
+/// It catches a client that cannot read `quota-unavailable` as a code of its own.
+#[tokio::test]
+async fn a_host_refusing_with_a_code_takes_no_run_until_told_to() {
+    let (server, client) = fake().await;
+    let id = lease(&client).await;
+    let run = client.queue_run(id, &run_of(1000, 1)).await.unwrap().run_id;
+    assert!(server.run_started(&run));
+    assert!(server.refuse_posts("node1", Some("quota-unavailable")));
+    let refusal = client.queue_run(id, &run_of(1000, 1)).await.unwrap_err();
+    assert_eq!(refused(refusal), (409, ErrorCode::QuotaUnavailable));
+    assert_eq!(client.run(id, &run).await.unwrap().state, RunState::Running);
+    assert!(server.refuse_posts("node1", None));
+    client.queue_run(id, &run_of(1000, 1)).await.unwrap();
+    assert!(!server.refuse_posts("nowhere", None));
+}

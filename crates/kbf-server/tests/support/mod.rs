@@ -685,6 +685,7 @@ impl Cell {
             memory_climb: climb,
             vm_host_floor: kbf_server::HostFloor::default(),
             learned_sizes: learned,
+            exclusive_actions: false,
             // The js core cannot be told not to climb (the server refuses the flag with it).
             scheduler_core: if climb {
                 kbf_server::SchedulerCore::under_test()
