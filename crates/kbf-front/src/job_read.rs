@@ -3,8 +3,8 @@
 //! A task holds a read grant ([`crate::grants`]), not a client certificate, so it cannot use
 //! the REAPI listener. The job-facing listener of `kbf frontend` (`--job-listen`) answers it
 //! over HTTPS, and this module is what answers: `GET /<hex>/<size>` with
-//! `Authorization: Bearer <grant>`, the form `kbf-task` requests, and nothing else. Every
-//! other path is 404 and every other method 405.
+//! `Authorization: Bearer <grant>`, the form `kbf-task` requests, and `POST /batch` (below),
+//! and nothing else. Every other path is 404 and every other method 405.
 //!
 //! A request is served only when the grant verifies (a forged, garbled, expired or revoked
 //! one is 401), and the digest asked for is in the grant's scope (403): the Action the grant
@@ -24,6 +24,20 @@
 //! end is counted. A response is never larger than [`Limits::max_blob_bytes`] (413 above it,
 //! before anything is read), and at most [`Limits::reads_in_flight`] reads are open at once,
 //! a streamed one until its response ends or is dropped; the others wait for one to end.
+//!
+//! `POST /batch` answers many small blobs of the Action in one request, so that a task is not
+//! held up by the round trips of thousands of GETs. The body is JSON, `{"digests":
+//! ["<64 hex>/<size>", ...]}`, with 1 to [`BATCH_MAX_DIGESTS`] entries (a repeated one is
+//! answered each time). The whole request is refused, before any blob is read, with the reason
+//! codes of a GET (401, 403) or `malformed` (400: bad JSON or digest, no entries or too many)
+//! or `too_large` (413: the sizes asked for add up to more than [`BATCH_MAX_BYTES`]; a blob
+//! that alone is over it is not added, it is answered `too_large` below, so that the status is
+//! reachable). Otherwise it is 200 `application/octet-stream` with one frame per digest, in
+//! request order: one status byte (0 ok, 1 not_found, 2 out_of_scope, 3 too_large, 4
+//! store_unavailable), the length as eight bytes big-endian (the blob's size when ok, else 0)
+//! and the bytes. Scope is checked for each digest, each read counts against
+//! [`Limits::reads_in_flight`], and an ok blob is hashed against its digest here: bytes that
+//! are not the blob's are `store_unavailable`, never an ok frame.
 //!
 //! An answer carries a reason code in its body and no other detail: `missing_token`,
 //! `invalid_token`, `expired`, `revoked`, `no_scope`, `out_of_scope`, `too_large`,
@@ -55,6 +69,19 @@ use crate::wire;
 /// The size above which a blob is streamed and below which (itself included) it is read
 /// whole: the per-blob cap of the packs a task's results are written into.
 pub const STREAM_OVER_BYTES: u64 = MAX_UNTRUSTED_BLOB_BYTES;
+
+/// The path of the batch read, which takes a POST.
+pub const BATCH_PATH: &str = "/batch";
+
+/// The most digests a batch names.
+pub const BATCH_MAX_DIGESTS: usize = 256;
+
+/// The most bytes a batch asks for, and the largest blob it answers: 4 MiB.
+pub const BATCH_MAX_BYTES: u64 = 4 << 20;
+
+/// The most bytes of a batch request's body: far more than the largest valid one (256 digests
+/// of at most 90 bytes each), so that no body of any size is held.
+pub const MAX_BATCH_REQUEST_BYTES: usize = 64 << 10;
 
 /// The default of [`Limits::max_blob_bytes`]: 512 MiB, over the largest input a compile reads
 /// (a 165 MiB toolchain binary).
@@ -184,20 +211,66 @@ enum Outcome {
     TooLarge,
     MethodNotAllowed,
     Unavailable,
+    Malformed,
 }
 
-/// The label of each [`Outcome`], in the order of the variants.
-const OUTCOMES: [&str; 7] = [
+/// The outcomes of a GET, in the order they are counted.
+const GET_OUTCOMES: [Outcome; 7] = [
+    Outcome::Ok,
+    Outcome::Unauthorized,
+    Outcome::Forbidden,
+    Outcome::NotFound,
+    Outcome::TooLarge,
+    Outcome::MethodNotAllowed,
+    Outcome::Unavailable,
+];
+
+/// The outcomes of a batch.
+const BATCH_OUTCOMES: [Outcome; 6] = [
+    Outcome::Ok,
+    Outcome::Unauthorized,
+    Outcome::Forbidden,
+    Outcome::Malformed,
+    Outcome::TooLarge,
+    Outcome::Unavailable,
+];
+
+/// The counters of the variants of [`Outcome`].
+type Tally = [Counter; 8];
+
+/// How one blob of a batch was answered. The discriminants are the status bytes of a frame.
+#[derive(Clone, Copy)]
+enum BlobStatus {
+    Ok = 0,
+    NotFound = 1,
+    OutOfScope = 2,
+    TooLarge = 3,
+    StoreUnavailable = 4,
+}
+
+/// The label of each [`BlobStatus`], in the order of the variants.
+const BLOB_STATUSES: [&str; 5] = [
     "ok",
-    "unauthorized",
-    "forbidden",
     "not_found",
+    "out_of_scope",
     "too_large",
-    "method_not_allowed",
-    "unavailable",
+    "store_unavailable",
 ];
 
 impl Outcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::NotFound => "not_found",
+            Self::TooLarge => "too_large",
+            Self::MethodNotAllowed => "method_not_allowed",
+            Self::Unavailable => "unavailable",
+            Self::Malformed => "malformed",
+        }
+    }
+
     fn status(self) -> StatusCode {
         match self {
             Self::Ok => StatusCode::OK,
@@ -207,6 +280,7 @@ impl Outcome {
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Malformed => StatusCode::BAD_REQUEST,
         }
     }
 }
@@ -239,7 +313,9 @@ pub struct JobRead {
     limits: Limits,
     scopes: Mutex<Cells>,
     reads: Arc<Semaphore>,
-    requests: [Counter; OUTCOMES.len()],
+    requests: Tally,
+    batches: Tally,
+    blobs: [Counter; BLOB_STATUSES.len()],
     bytes: Arc<Counter>,
     ended_early: Arc<EndedEarly>,
 }
@@ -255,6 +331,8 @@ impl JobRead {
             limits,
             scopes: Mutex::new(HashMap::new()),
             requests: Default::default(),
+            batches: Default::default(),
+            blobs: Default::default(),
             bytes: Arc::default(),
             ended_early: Arc::default(),
         }
@@ -263,6 +341,26 @@ impl JobRead {
     /// The answer to `method` `path` with the `Authorization` header `authorization`.
     /// `path` is the request's path alone, without its query.
     pub async fn respond(&self, method: &Method, path: &str, authorization: Option<&str>) -> Reply {
+        self.respond_with_body(method, path, authorization, &[])
+            .await
+    }
+
+    /// [`JobRead::respond`] for a request that has a body: `body` is what a `POST /batch`
+    /// carries, and is read by the caller, at most [`MAX_BATCH_REQUEST_BYTES`] of it (a body
+    /// that is longer or does not arrive is passed as empty, which is a malformed request).
+    pub async fn respond_with_body(
+        &self,
+        method: &Method,
+        path: &str,
+        authorization: Option<&str>,
+        body: &[u8],
+    ) -> Reply {
+        if path == BATCH_PATH {
+            if *method != Method::POST {
+                return self.refuse(Outcome::MethodNotAllowed, "method_not_allowed");
+            }
+            return self.batch(authorization, body).await;
+        }
         if *method != Method::GET {
             return self.refuse(Outcome::MethodNotAllowed, "method_not_allowed");
         }
@@ -300,6 +398,68 @@ impl JobRead {
             Ok(bytes) => self.serve(bytes),
             Err(error) => self.unreadable(&error),
         }
+    }
+
+    /// The answer to a `POST /batch` with `body`, from [`JobRead::respond_with_body`].
+    async fn batch(&self, authorization: Option<&str>, body: &[u8]) -> Reply {
+        let claims = match self.claims(authorization) {
+            Ok(claims) => claims,
+            Err(reason) => return self.refuse_batch(Outcome::Unauthorized, reason),
+        };
+        let Some(digests) = batch_digests(body) else {
+            return self.refuse_batch(Outcome::Malformed, "malformed");
+        };
+        let asked: u64 = digests
+            .iter()
+            .map(|digest| digest.size_bytes)
+            .filter(|size| *size <= BATCH_MAX_BYTES)
+            .sum();
+        if asked > BATCH_MAX_BYTES {
+            return self.refuse_batch(Outcome::TooLarge, "too_large");
+        }
+        let scope = match self.scope(claims.action).await {
+            Ok(scope) => scope,
+            Err(ScopeError::Unusable) => return self.refuse_batch(Outcome::Forbidden, "no_scope"),
+            Err(ScopeError::Store) => {
+                return self.refuse_batch(Outcome::Unavailable, "store_unavailable");
+            }
+        };
+        let answers =
+            futures::future::join_all(digests.iter().map(|digest| self.batch_blob(&scope, digest)))
+                .await;
+        let mut frames = Vec::new();
+        for (status, bytes) in answers {
+            self.blobs[status as usize].add(1);
+            self.bytes.add(bytes.len() as u64);
+            frames.push(status as u8);
+            frames.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+            frames.extend_from_slice(&bytes);
+        }
+        self.tally(&self.batches, Outcome::Ok, Bytes::from(frames))
+    }
+
+    /// One blob of a batch: how it is answered, and its bytes when that is ok.
+    async fn batch_blob(&self, scope: &Scope, digest: &Digest) -> (BlobStatus, Bytes) {
+        if !scope.allows(digest) {
+            return (BlobStatus::OutOfScope, Bytes::new());
+        }
+        if digest.size_bytes > BATCH_MAX_BYTES {
+            return (BlobStatus::TooLarge, Bytes::new());
+        }
+        if is_empty_blob(digest) {
+            return (BlobStatus::Ok, Bytes::new());
+        }
+        let _place = self.reads.acquire().await;
+        match self.source.read_blob(digest).await {
+            Ok(bytes) if kbf_segments::sha256(&bytes) == *digest => (BlobStatus::Ok, bytes),
+            Ok(_) => (BlobStatus::StoreUnavailable, Bytes::new()),
+            Err(StorageError::NotFound(_)) => (BlobStatus::NotFound, Bytes::new()),
+            Err(_) => (BlobStatus::StoreUnavailable, Bytes::new()),
+        }
+    }
+
+    fn refuse_batch(&self, outcome: Outcome, reason: &'static str) -> Reply {
+        self.tally(&self.batches, outcome, Bytes::from(format!("{reason}\n")))
     }
 
     /// The refusal for a blob the source could not give.
@@ -386,7 +546,12 @@ impl JobRead {
     }
 
     fn answer(&self, outcome: Outcome, body: Bytes) -> Reply {
-        self.requests[outcome as usize].add(1);
+        self.tally(&self.requests, outcome, body)
+    }
+
+    /// `body` as the answer of `outcome`, counted in `counters`.
+    fn tally(&self, counters: &Tally, outcome: Outcome, body: Bytes) -> Reply {
+        counters[outcome as usize].add(1);
         Reply {
             status: outcome.status(),
             body,
@@ -404,18 +569,40 @@ impl JobRead {
             "counter",
             "Job-facing read requests answered, by outcome",
         );
-        for (outcome, counter) in OUTCOMES.iter().zip(&self.requests) {
-            let _ = writeln!(
-                families.0,
-                "{name}{{outcome=\"{outcome}\"}} {}",
-                counter.get()
-            );
+        for outcome in GET_OUTCOMES {
+            let count = self.requests[outcome as usize].get();
+            let label = outcome.label();
+            let _ = writeln!(families.0, "{name}{{outcome=\"{label}\"}} {count}");
         }
         families.counter(
             "kbf_job_read_bytes_total",
             "Blob bytes served to jobs",
             self.bytes.get(),
         );
+        let name = "kbf_job_batch_requests_total";
+        families.head(
+            name,
+            "counter",
+            "Job-facing batch read requests answered, by outcome",
+        );
+        for outcome in BATCH_OUTCOMES {
+            let count = self.batches[outcome as usize].get();
+            let label = outcome.label();
+            let _ = writeln!(families.0, "{name}{{outcome=\"{label}\"}} {count}");
+        }
+        let name = "kbf_job_batch_blobs_total";
+        families.head(
+            name,
+            "counter",
+            "Blobs of job-facing batch reads, by the status they were answered with",
+        );
+        for (status, counter) in BLOB_STATUSES.iter().zip(&self.blobs) {
+            let _ = writeln!(
+                families.0,
+                "{name}{{status=\"{status}\"}} {}",
+                counter.get()
+            );
+        }
         let name = "kbf_job_read_stream_ended_early_total";
         families.head(
             name,
@@ -518,6 +705,20 @@ impl Streaming {
         self.ended_early.digest_mismatch.add(1);
         Step::Fail(StreamError::Corrupt)
     }
+}
+
+/// The digests of a batch request's body, `{"digests": ["<hex>/<size>", ...]}`: none if it is
+/// not that, has no entries or more than [`BATCH_MAX_DIGESTS`], or has an entry that is not a
+/// digest in the form of a GET path.
+fn batch_digests(body: &[u8]) -> Option<Vec<Digest>> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let list = value.get("digests")?.as_array()?;
+    if list.is_empty() || list.len() > BATCH_MAX_DIGESTS {
+        return None;
+    }
+    list.iter()
+        .map(|entry| Digest::parse(DigestFunction::Sha256, entry.as_str()?).ok())
+        .collect()
 }
 
 /// The token of an `Authorization: Bearer <token>` header (the scheme in any case).

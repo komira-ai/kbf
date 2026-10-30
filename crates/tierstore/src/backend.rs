@@ -106,6 +106,47 @@ pub struct Listed {
     pub modified: u64,
 }
 
+/// A multipart upload that was started and is neither completed nor aborted, as
+/// [`Backend::list_uploads`] lists it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OpenUpload {
+    /// The key of the object the upload is for.
+    pub key: String,
+    /// The id of the upload, which names it in the calls of [`Backend::upload_part`],
+    /// [`Backend::complete_upload`] and [`Backend::abort_upload`].
+    pub id: String,
+    /// When the upload was started, in milliseconds since the Unix epoch, as the backend's
+    /// clock counts them (as for [`Meta::modified`]).
+    pub initiated: u64,
+}
+
+/// Where a page of [`Backend::list_uploads`] starts: after this key and, if there is one, this
+/// upload id, which is the last upload of the page before.
+pub type UploadsAfter<'a> = (&'a str, Option<&'a str>);
+
+/// The uploads of `uploads` that a page of [`Backend::list_uploads`] holds, for a backend that
+/// orders the uploads of a key by id: those of a key under `prefix` that come after `after`, in
+/// ascending order of key and id, at most `max_uploads`.
+pub(crate) fn upload_page(
+    uploads: impl IntoIterator<Item = OpenUpload>,
+    prefix: &str,
+    after: Option<UploadsAfter<'_>>,
+    max_uploads: usize,
+) -> Vec<OpenUpload> {
+    let is_after = |upload: &OpenUpload| match after {
+        None => true,
+        Some((key, None)) => upload.key.as_str() > key,
+        Some((key, Some(id))) => (upload.key.as_str(), upload.id.as_str()) > (key, id),
+    };
+    let mut page: Vec<OpenUpload> = uploads
+        .into_iter()
+        .filter(|upload| upload.key.starts_with(prefix) && is_after(upload))
+        .collect();
+    page.sort_by(|a, b| (&a.key, &a.id).cmp(&(&b.key, &b.id)));
+    page.truncate(max_uploads);
+    page
+}
+
 /// Whether `key` sorts after the key a listing is to start after, if there is one.
 fn is_after(key: &str, start_after: Option<&str>) -> bool {
     start_after.is_none_or(|after| key > after)
@@ -342,5 +383,28 @@ pub trait Backend: Send + Sync {
     /// the backend does multipart uploads.
     async fn abort_upload(&self, _key: &str, _id: &str) -> Result<(), Error> {
         Err(not_supported("abort_upload"))
+    }
+
+    /// A page of the uploads that are open (started, and neither completed nor aborted) for a
+    /// key that starts with `prefix`: at most `max_uploads` of them, in ascending order of
+    /// key, and within a key in the order the backend keeps (by id for the in-memory and the
+    /// directory backend, by the time of the start for a store over S3).
+    ///
+    /// `after` is the last upload of the page before: the page starts after that upload,
+    /// or, where `after` names a key and no id, after every upload of that key. A page of
+    /// fewer than `max_uploads` uploads is the last. The order within a key is the backend's,
+    /// so the marker of a page is read by the backend that gave it. An upload that is started
+    /// or ended while the listing is read may or may not be in it. Like the other multipart
+    /// calls, this one is [`Error::Unsupported`] unless the backend overrides it.
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] unless the backend does multipart uploads.
+    async fn list_uploads(
+        &self,
+        _prefix: &str,
+        _after: Option<UploadsAfter<'_>>,
+        _max_uploads: usize,
+    ) -> Result<Vec<OpenUpload>, Error> {
+        Err(not_supported("list_uploads"))
     }
 }
