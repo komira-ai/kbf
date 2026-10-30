@@ -171,13 +171,23 @@ pub fn check_shape(footer: &Footer, pack_len: u64) -> Result<&IndexEntry, ShapeE
 /// # Errors
 /// [`TaskPackError::Segment`], [`TaskPackError::Shape`] or [`TaskPackError::Manifest`].
 pub fn read_manifest(pack: &[u8]) -> Result<TaskManifest, TaskPackError> {
+    let manifest = read_manifest_with(pack, 0)?;
+    manifest.check_single_pack()?;
+    Ok(manifest)
+}
+
+/// [`read_manifest`] for a reader that accepts large objects of up to `large_max` bytes.
+///
+/// # Errors
+/// Those of [`read_manifest`].
+pub fn read_manifest_with(pack: &[u8], large_max: u64) -> Result<TaskManifest, TaskPackError> {
     let reader = SegmentReader::open(pack)?;
     let entry = check_shape(reader.footer(), pack.len() as u64)?;
     let range = entry.range();
     // The footer checked that every record lies inside the object, so the slice is in bounds.
     let record = &pack[range.start as usize..range.end as usize];
     entry.verify(record)?;
-    Ok(TaskManifest::parse(record)?)
+    Ok(TaskManifest::parse_with(record, large_max)?)
 }
 
 /// Writes a task pack: the manifest first, so it is the record at offset 0, then `blobs`, each
@@ -192,8 +202,21 @@ pub fn read_manifest(pack: &[u8]) -> Result<TaskManifest, TaskPackError> {
 /// [`WritePackError::RecordTooLarge`] for a blob over [`MAX_RECORD_BYTES`];
 /// [`WritePackError::Segment`] when the records pass [`MAX_PACK_BYTES`].
 pub fn write_pack(manifest: &TaskManifest, blobs: &[&[u8]]) -> Result<Vec<u8>, WritePackError> {
+    manifest.validate()?;
+    write_pack_with(manifest, blobs, 0)
+}
+
+/// [`write_pack`] for a writer whose manifest may name large objects of up to `large_max` bytes.
+///
+/// # Errors
+/// Those of [`write_pack`].
+pub fn write_pack_with(
+    manifest: &TaskManifest,
+    blobs: &[&[u8]],
+    large_max: u64,
+) -> Result<Vec<u8>, WritePackError> {
     let mut writer = SegmentWriter::new(MAX_PACK_BYTES);
-    writer.push(&manifest.to_json()?)?;
+    writer.push(&manifest.to_json_with(large_max)?)?;
     for blob in blobs.iter().filter(|b| !b.is_empty()) {
         let size = blob.len() as u64;
         if size > MAX_RECORD_BYTES {

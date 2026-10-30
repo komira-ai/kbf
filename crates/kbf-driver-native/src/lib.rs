@@ -145,6 +145,7 @@ pub mod denials;
 pub mod grace;
 pub mod home;
 mod keeper;
+pub mod leader;
 pub mod mounts;
 pub mod network;
 mod pace;

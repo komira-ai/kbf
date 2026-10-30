@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
 use kbf_objstore::PageSize;
-use kbf_pack::{SweepConfig, SweepError, SweepGates, Sweeper};
+use kbf_pack::{Slot, SweepConfig, SweepError, SweepGates, Sweeper, TaskPackKey, task_key_age};
 use kbf_pack_index::memory::MemoryPackIndex;
 use kbf_pack_index::{
     BlobDigest, Location, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo, Recorded,
@@ -319,4 +319,52 @@ async fn a_key_minted_in_the_future_is_young() {
     let report = sweeper(&rig, gates(true, None)).sweep(now()).await.unwrap();
     assert_eq!(report.young, 1);
     assert_eq!(report.deleted, 0);
+}
+
+/// The task pack key of `slot` minted at `minute`, as the frontend writes it.
+fn task_key(minute: u32, slot: Slot) -> String {
+    TaskPackKey::new("lease1", [0xab; 16], minute, slot)
+        .expect("a key")
+        .to_string()
+}
+
+/// Asserts that the age of a task pack key is read from its minute whatever the slot: packs
+/// `-<k>` and large objects `-L<i>`; and that a name that is not a task pack key says none.
+#[test]
+fn the_age_of_a_large_key_is_read_from_its_minute() {
+    let at = |minute: u32| SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(minute) * 60);
+    for slot in [Slot::Pack(0), Slot::Pack(7), Slot::Large(0), Slot::Large(7)] {
+        let key = task_key(29_833_335, slot);
+        assert_eq!(task_key_age(&key), Some(at(29_833_335)), "{key}");
+    }
+    assert!(task_key(1, Slot::Large(3)).ends_with("00000001-L3"));
+    for name in [
+        "cas/b/lease1/100-0",
+        "cas/b/lease1/ab-L3",
+        "cas/b/lease1/readme",
+        "cas/d/node/x",
+    ] {
+        assert_eq!(task_key_age(name), None, "{name}");
+    }
+}
+
+/// Asserts that a sweep gated by `task_key_age` deletes an orphan large object older than the
+/// grace and keeps a young one, as it does packs: a large object is an orphan as soon as ingest
+/// has copied it.
+#[tokio::test]
+async fn an_old_large_object_is_swept_and_a_young_one_kept() {
+    let rig = Rig::new();
+    let old = task_key(u32::try_from(OLD).expect("fits"), Slot::Large(1));
+    let young = task_key(u32::try_from(YOUNG).expect("fits"), Slot::Large(2));
+    rig.store.seed(&old, b"old large").await;
+    rig.store.seed(&young, b"young large").await;
+    let gates = SweepGates {
+        age_of: Box::new(task_key_age),
+        is_leader: Box::new(|| true),
+        verifying: Box::new(|_| false),
+    };
+    let report = sweeper(&rig, gates).sweep(now()).await.unwrap();
+    assert!(!rig.store.holds(&old).await);
+    assert!(rig.store.holds(&young).await);
+    assert_eq!((report.deleted, report.young), (1, 1));
 }

@@ -15,7 +15,14 @@ use crate::journal::{
     USAGE_KEY, Usage, encode_journal, is_reserved, journal_key, journal_prefix, load_checkpoint,
     proxy_key, seq_of,
 };
-use crate::{Backend, ByteRange, Clock, Error, JournalEntry, JournalOp, Listed, Meta, PartBody};
+use crate::{
+    Backend, ByteRange, Clock, Error, JournalEntry, JournalOp, Listed, Meta, OpenUpload, PartBody,
+    UploadsAfter,
+};
+
+/// The most calls to the cold tier that one listing of uploads makes to fill a page that the
+/// filter of reserved keys cut short.
+const UPLOAD_LISTING_CALLS: u32 = 100;
 
 /// The settings of a [`Proxy`].
 #[derive(Clone)]
@@ -80,6 +87,9 @@ struct Capacity {
     read: Option<(Instant, Option<u64>)>,
     /// Until when the hot tier is taken to be full, after it said so.
     full_until: Option<Instant>,
+    /// When the usage object read last was published, by the clock of the reconciler: none if
+    /// it was missing or unreadable. Unlike the bytes of `read`, it is kept whatever the age.
+    published: Option<u64>,
 }
 
 /// One journal object being filled, and the outcome of writing it.
@@ -164,6 +174,8 @@ fn refuse_reserved(key: &str) -> Result<(), Error> {
 ///   the object is in the cold tier, so a get, a head, a listing and a delete find it, and the
 ///   reconciler has nothing to copy. It is in the hot tier only after a get copies it back.
 ///   The cold tier must do multipart uploads (the provided methods of [`Backend`] do not).
+///   [`Backend::list_uploads`] lists the cold tier's open uploads, which are the only ones: the
+///   proxy keeps no state of an upload.
 ///
 /// The journal is written in batches of at most [`ProxyConfig::batch_entries`] entries, each
 /// batch after [`ProxyConfig::linger`] at most, as `_journal/<proxy_id>/<seq>`, create-only,
@@ -173,7 +185,9 @@ fn refuse_reserved(key: &str) -> Result<(), Error> {
 ///
 /// **Capacity.** The proxy reads the usage that the reconciler publishes (`_tiering/usage`,
 /// at most every [`ProxyConfig::usage_refresh`]); a usage that is missing, unreadable or
-/// older than [`ProxyConfig::usage_stale_after`] counts as not full. Above
+/// older than [`ProxyConfig::usage_stale_after`] counts as not full (a dead reconciler thus
+/// leaves puts unrestrained: [`Proxy::usage_age`] is how a caller sees it, and the server's
+/// `/usagez` reports it). Above
 /// [`ProxyConfig::critical`] of the budget a put waits [`ProxyConfig::back_pressure`] first.
 /// At the budget, or when the hot tier answers a put (of the object, or of the journal object
 /// that holds its entry) with [`Error::Full`], puts go straight to the cold tier, create-only
@@ -298,6 +312,17 @@ impl Proxy {
             inner: Arc::new(inner),
         })
     }
+
+    /// How long ago the reconciler published the usage object (`_tiering/usage`), by the clock
+    /// of the proxy, as of a read that is at most [`ProxyConfig::usage_refresh`] old. None if the
+    /// object is missing or cannot be read.
+    ///
+    /// A usage older than [`ProxyConfig::usage_stale_after`] is ignored by the puts, so a
+    /// reconciler that has stopped means a hot tier that is never taken to be full; this is the
+    /// age that tells it, whatever it is.
+    pub async fn usage_age(&self) -> Option<Duration> {
+        self.inner.usage_age().await
+    }
 }
 
 impl Inner {
@@ -385,9 +410,28 @@ impl Inner {
     async fn refresh_usage(&self, now: Instant) -> Option<u64> {
         let fetched = self.hot.get(USAGE_KEY, None).await.ok();
         let usage = fetched.and_then(|body| serde_json::from_slice::<Usage>(&body).ok());
+        let published = usage.as_ref().map(|u| u.time);
         let hot_bytes = usage.filter(|u| self.is_fresh(u)).map(|u| u.hot_bytes);
-        locked(&self.capacity).read = Some((now, hot_bytes));
+        let mut capacity = locked(&self.capacity);
+        capacity.read = Some((now, hot_bytes));
+        capacity.published = published;
         hot_bytes
+    }
+
+    /// The bytes of the usage object, as of a read that is at most `usage_refresh` old.
+    async fn cached_hot_bytes(&self, now: Instant) -> Option<u64> {
+        let read = locked(&self.capacity).read;
+        match read {
+            Some((at, bytes)) if now.duration_since(at) < self.config.usage_refresh => bytes,
+            _ => self.refresh_usage(now).await,
+        }
+    }
+
+    async fn usage_age(&self) -> Option<Duration> {
+        self.cached_hot_bytes(Instant::now()).await;
+        let published = locked(&self.capacity).published?;
+        let age = self.config.clock.now().saturating_sub(published);
+        Some(Duration::from_millis(age))
     }
 
     fn classify(&self, hot_bytes: Option<u64>) -> Level {
@@ -402,17 +446,11 @@ impl Inner {
 
     async fn level(&self) -> Level {
         let now = Instant::now();
-        let (full_until, read) = {
-            let capacity = locked(&self.capacity);
-            (capacity.full_until, capacity.read)
-        };
+        let full_until = locked(&self.capacity).full_until;
         if full_until.is_some_and(|until| now < until) {
             return Level::Full;
         }
-        let hot_bytes = match read {
-            Some((at, bytes)) if now.duration_since(at) < self.config.usage_refresh => bytes,
-            _ => self.refresh_usage(now).await,
-        };
+        let hot_bytes = self.cached_hot_bytes(now).await;
         self.classify(hot_bytes)
     }
 
@@ -784,5 +822,50 @@ impl Backend for Proxy {
     async fn abort_upload(&self, key: &str, id: &str) -> Result<(), Error> {
         refuse_reserved(key)?;
         self.inner.cold.abort_upload(key, id).await
+    }
+
+    /// The open uploads are the cold tier's own (see the type), so this asks the cold tier, and
+    /// leaves out an upload of a reserved key: none is made through the proxy, but the tier is
+    /// shared with other writers. A page that the filter cut short is made up from the next
+    /// page of the tier, so that a short page is the last, as the trait says.
+    async fn list_uploads(
+        &self,
+        prefix: &str,
+        after: Option<UploadsAfter<'_>>,
+        max_uploads: usize,
+    ) -> Result<Vec<OpenUpload>, Error> {
+        let cold = &self.inner.cold;
+        let mut after = after.map(|(key, id)| (key.to_owned(), id.map(str::to_owned)));
+        let mut found: Vec<OpenUpload> = Vec::new();
+        let mut calls = 0;
+        while found.len() < max_uploads {
+            calls += 1;
+            if calls > UPLOAD_LISTING_CALLS {
+                let text = format!(
+                    "the cold tier's listing of uploads took over {UPLOAD_LISTING_CALLS} calls"
+                );
+                return Err(Error::Unavailable(text));
+            }
+            let want = max_uploads - found.len();
+            let marker = after
+                .as_ref()
+                .map(|(key, id)| (key.as_str(), id.as_deref()));
+            let page = cold.list_uploads(prefix, marker, want).await?;
+            let last = page.last().map(|up| (up.key.clone(), Some(up.id.clone())));
+            let full = page.len() == want;
+            found.extend(page.into_iter().filter(|up| !is_reserved(&up.key)));
+            match last {
+                Some(last) if full => {
+                    // A full page that ends where the last one did would be asked for for ever.
+                    if after.as_ref().is_some_and(|before| last <= *before) {
+                        let text = "the cold tier's listing of uploads did not advance";
+                        return Err(Error::Unavailable(text.to_owned()));
+                    }
+                    after = Some(last);
+                }
+                _ => break,
+            }
+        }
+        Ok(found)
     }
 }

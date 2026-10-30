@@ -2,7 +2,8 @@
 //! message its MAC covers.
 
 use kbf_task_pack::{
-    MAC_LEN, MAX_BUILD_BYTES, TaskKeyError, TaskPackKey, check_build, mac_input, minute_of,
+    MAC_LEN, MAX_BUILD_BYTES, MAX_LARGE, MAX_PACKS, Slot, TaskKeyError, TaskPackKey, check_build,
+    mac_input, mac_input_v1, minute_of,
 };
 use kbf_types::{Digest, DigestFunction};
 
@@ -31,7 +32,7 @@ fn a_minted_key_roundtrips_and_names_its_minute() {
     // 1790000123 s after the epoch is in minute 29833335, which starts at 1790000100.
     let minute = minute_of(1_790_000_123).expect("in range");
     assert_eq!(minute, MINUTE);
-    let key = TaskPackKey::new(BUILD, mac(), minute, 0).expect("a key");
+    let key = TaskPackKey::new(BUILD, mac(), minute, Slot::Pack(0)).expect("a key");
     let text = key.to_string();
     assert_eq!(text, key_text(BUILD, &format!("{MAC_HEX}{MINUTE_HEX}-0")));
 
@@ -40,7 +41,7 @@ fn a_minted_key_roundtrips_and_names_its_minute() {
     assert_eq!(parsed.build(), BUILD);
     assert_eq!(parsed.mac(), &mac());
     assert_eq!(parsed.minute(), MINUTE);
-    assert_eq!(parsed.slot(), 0);
+    assert_eq!(parsed.slot(), Slot::Pack(0));
     assert_eq!(parsed.minted_unix_secs(), 1_790_000_100);
 }
 
@@ -50,11 +51,56 @@ fn a_minted_key_roundtrips_and_names_its_minute() {
 fn a_parsed_key_prints_as_it_was_written() {
     for (minute_hex, slot) in [
         ("00000000", "0"),
-        ("ffffffff", "4294967295"),
-        ("01c73877", "7"),
+        ("ffffffff", "7"),
+        ("01c73877", "3"),
+        ("00000000", "L0"),
+        ("ffffffff", "L7"),
+        ("01c73877", "L3"),
     ] {
         let text = key_text(BUILD, &format!("{MAC_HEX}{minute_hex}-{slot}"));
         assert_eq!(TaskPackKey::parse(&text).expect(&text).to_string(), text);
+    }
+}
+
+/// Asserts the text form of every slot of a run, and that it parses back: `<k>` for pack `k`,
+/// `L<i>` for large object `i`, and the values the key reads out of the text.
+#[test]
+fn a_slot_prints_as_k_or_l_i_and_parses_back() {
+    for k in 0..MAX_PACKS {
+        let slot = Slot::Pack(k);
+        assert_eq!(slot.to_string(), k.to_string());
+        assert_eq!(Slot::parse(&slot.to_string()), Ok(slot));
+        assert!(slot.in_range());
+    }
+    for i in 0..MAX_LARGE {
+        let slot = Slot::Large(i);
+        assert_eq!(slot.to_string(), format!("L{i}"));
+        assert_eq!(Slot::parse(&slot.to_string()), Ok(slot));
+        assert!(slot.in_range());
+    }
+    let key =
+        TaskPackKey::parse(&key_text(BUILD, &format!("{MAC_HEX}{MINUTE_HEX}-L5"))).expect("key");
+    assert_eq!(key.slot(), Slot::Large(5));
+}
+
+/// Asserts that a key cannot be made for a slot a run does not have, and that the slot is
+/// refused in the MAC message too.
+#[test]
+fn a_slot_past_the_run_is_refused_to_make() {
+    for slot in [
+        Slot::Pack(MAX_PACKS),
+        Slot::Large(MAX_LARGE),
+        Slot::Pack(255),
+    ] {
+        assert!(!slot.in_range());
+        assert_eq!(
+            TaskPackKey::new(BUILD, mac(), 0, slot),
+            Err(TaskKeyError::SlotRange(slot))
+        );
+        assert_eq!(
+            mac_input(BUILD, &action(1, 5), 0, slot),
+            Err(TaskKeyError::SlotRange(slot))
+        );
     }
 }
 
@@ -63,7 +109,7 @@ fn a_parsed_key_prints_as_it_was_written() {
 #[test]
 fn the_key_has_no_slash_in_build_or_nonce() {
     assert_eq!(
-        TaskPackKey::new("a/b", mac(), 0, 0),
+        TaskPackKey::new("a/b", mac(), 0, Slot::Pack(0)),
         Err(TaskKeyError::BuildCharacter('/'))
     );
     let nonce = format!("{MAC_HEX}{MINUTE_HEX}-0");
@@ -144,10 +190,35 @@ fn a_malformed_nonce_is_refused() {
     }
 }
 
-/// Asserts that a slot is a canonical decimal u32: not empty, signed, zero-padded, past u32.
+/// Asserts that a slot is `<k>` or `L<i>` with a canonical decimal in range: not empty, signed,
+/// zero-padded, lowercase `l`, doubled `L`, a bare `L`, 8 or more, past u8.
 #[test]
-fn a_slot_that_is_not_a_canonical_decimal_is_refused() {
-    for slot in ["", "+1", "-1", "01", "00", "4294967296", "1x"] {
+fn a_slot_that_is_not_k_or_l_i_in_canonical_form_is_refused() {
+    let bad = [
+        "",
+        "+1",
+        "-1",
+        "01",
+        "00",
+        "4294967296",
+        "256",
+        "8",
+        "1x",
+        "L",
+        "L01",
+        "L00",
+        "L8",
+        "L255",
+        "L256",
+        "L-1",
+        "L+1",
+        "l1",
+        "LL1",
+        "L1x",
+        " 1",
+        "1 ",
+    ];
+    for slot in bad {
         let nonce = format!("{MAC_HEX}{MINUTE_HEX}-{slot}");
         assert!(
             matches!(
@@ -175,31 +246,59 @@ fn a_time_past_the_last_minute_is_refused() {
 }
 
 /// Asserts that the message the MAC covers changes with each of the lease, the action's hash,
-/// the action's size and the mint minute, so a key minted for one lease, action and minute is
-/// not valid for another once the frontend recomputes the MAC over this message; and that its
-/// bytes are the documented ones (domain, NUL, build, NUL, hash, size, minute).
+/// the action's size, the mint minute and the slot (a pack and a large object of one index
+/// differ too), so a key minted for one of them is not valid for another once the frontend
+/// recomputes the MAC over this message; and that its bytes are the documented ones (domain,
+/// NUL, build, NUL, hash, size, minute, kind byte, index).
 #[test]
-fn a_changed_lease_action_or_minute_changes_the_mac_input() {
-    let base = mac_input("lease", &action(1, 5), 10).expect("input");
-    assert_eq!(base, mac_input("lease", &action(1, 5), 10).expect("input"));
+fn a_changed_lease_action_minute_or_slot_changes_the_mac_input() {
+    let base = mac_input("lease", &action(1, 5), 10, Slot::Pack(0)).expect("input");
+    assert_eq!(
+        base,
+        mac_input("lease", &action(1, 5), 10, Slot::Pack(0)).expect("input")
+    );
 
-    let mut expected = b"kbf-task-pack/v1\0lease\0".to_vec();
+    let mut expected = b"kbf-task-pack/v2\0lease\0".to_vec();
     expected.extend_from_slice(&[1; 32]);
     expected.extend_from_slice(&5u64.to_be_bytes());
     expected.extend_from_slice(&10u32.to_be_bytes());
+    expected.extend_from_slice(&[0, 0]);
     assert_eq!(base, expected);
 
+    let large = mac_input("lease", &action(1, 5), 10, Slot::Large(3)).expect("input");
+    assert_eq!(&large[large.len() - 2..], &[1, 3]);
+
     let others = [
-        mac_input("lease2", &action(1, 5), 10),
-        mac_input("lease", &action(2, 5), 10),
-        mac_input("lease", &action(1, 6), 10),
-        mac_input("lease", &action(1, 5), 11),
+        mac_input("lease2", &action(1, 5), 10, Slot::Pack(0)),
+        mac_input("lease", &action(2, 5), 10, Slot::Pack(0)),
+        mac_input("lease", &action(1, 6), 10, Slot::Pack(0)),
+        mac_input("lease", &action(1, 5), 11, Slot::Pack(0)),
+        mac_input("lease", &action(1, 5), 10, Slot::Pack(1)),
+        mac_input("lease", &action(1, 5), 10, Slot::Large(0)),
     ];
     for other in others {
         assert_ne!(base, other.expect("input"));
     }
     assert_eq!(
-        mac_input("a/b", &action(1, 5), 10),
+        mac_input("a/b", &action(1, 5), 10, Slot::Pack(0)),
+        Err(TaskKeyError::BuildCharacter('/'))
+    );
+}
+
+/// Asserts that the first message is kept as it was minted by the code before the slot: the
+/// domain tag `kbf-task-pack/v1` and no slot, and that it differs from the v2 message of slot 0.
+#[test]
+fn the_v1_mac_input_has_the_old_tag_and_no_slot() {
+    let v1 = mac_input_v1("lease", &action(1, 5), 10).expect("input");
+    let mut expected = b"kbf-task-pack/v1\0lease\0".to_vec();
+    expected.extend_from_slice(&[1; 32]);
+    expected.extend_from_slice(&5u64.to_be_bytes());
+    expected.extend_from_slice(&10u32.to_be_bytes());
+    assert_eq!(v1, expected);
+    let v2 = mac_input("lease", &action(1, 5), 10, Slot::Pack(0)).expect("input");
+    assert_ne!(v1, v2);
+    assert_eq!(
+        mac_input_v1("a/b", &action(1, 5), 10),
         Err(TaskKeyError::BuildCharacter('/'))
     );
 }
