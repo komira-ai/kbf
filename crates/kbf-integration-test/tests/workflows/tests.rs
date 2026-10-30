@@ -472,7 +472,7 @@ fn signing_scopes_need_a_job_that_runs_only_for_a_push() {
             assert_eq!(
                 scan(&workflow(&body)),
                 vec![format!(
-                    "line {}: `{scope}: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}`",
+                    "line {}: `{scope}: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}` or exactly `{SIGNING_STAGE_ONLY}`",
                     if cond.is_empty() { 7 } else { 8 }
                 )],
                 "{body}"
@@ -530,6 +530,60 @@ fn actions_write_needs_a_job_that_runs_only_for_a_push_to_main() {
             "a job's `permissions`",
         );
     }
+}
+
+/// The `if:` line under which a job of a twice-called workflow may sign: a push to main, in the sign stage.
+const SIGNING_STAGE_IF: &str = "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage == 'sign' }}\n";
+
+#[test]
+fn signing_scopes_are_also_allowed_in_the_sign_stage_of_a_push_to_main_and_nothing_wider() {
+    // Catches: the sign-stage `if:` refused where artifacts.yml's attest jobs need it; the
+    // exception taken for `actions: write` (the watch job's scope stays on the plain push
+    // condition); and a loosened spelling accepted: the stage test alone, the stage test with
+    // another ref or event, a different stage, `!=` for `==`, or a trailing `|| true`.
+    let signing = "{contents: read, id-token: write, attestations: write}";
+    clean(&workflow(&format!(
+        "    runs-on: ubuntu-latest\n{SIGNING_STAGE_IF}    permissions: {signing}\n"
+    )));
+    for cond in [
+        "    if: ${{ inputs.stage == 'sign' }}\n",
+        "    if: ${{ github.event_name == 'push' && inputs.stage == 'sign' }}\n",
+        "    if: ${{ github.ref == 'refs/heads/main' && inputs.stage == 'sign' }}\n",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage == 'build' }}\n",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage != 'sign' }}\n",
+        "    if: ${{ github.event_name == 'pull_request' && github.ref == 'refs/heads/main' && inputs.stage == 'sign' }}\n",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/feature/x' && inputs.stage == 'sign' }}\n",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage == 'sign' || true }}\n",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' || inputs.stage == 'sign' }}\n",
+    ] {
+        for scope in ["id-token", "attestations"] {
+            let body =
+                format!("    runs-on: ubuntu-latest\n{cond}    permissions: {{{scope}: write}}\n");
+            let found = scan(&workflow(&body));
+            assert!(
+                found.iter().any(|m| m.contains(&format!(
+                    "`{scope}: write` is allowed only in a job whose `if:` is exactly"
+                ))),
+                "{body}\n-> {found:?}"
+            );
+        }
+    }
+    refused(
+        &format!(
+            "    runs-on: ubuntu-latest\n{SIGNING_STAGE_IF}    permissions: {{actions: write}}\n"
+        ),
+        &format!(
+            "`actions: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}`"
+        ),
+    );
+    refused(
+        &format!(
+            "    runs-on: ubuntu-latest\n{SIGNING_STAGE_IF}    permissions: {{contents: write}}\n"
+        ),
+        &format!(
+            "`contents: write` is allowed only in a job whose `if:` is exactly `{RELEASE_PUSH_ONLY}`"
+        ),
+    );
 }
 
 /// The `if:` line under which a job may sign provenance: a push to main.
