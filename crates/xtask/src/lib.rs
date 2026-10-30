@@ -41,6 +41,11 @@
 //! - `package --binary <path> --sbom <path> --platform <platform> --commit <sha> --out
 //!   <dir>` ([`package`]): one binary as a release asset, a tarball that is the same
 //!   bytes on every runner, and its SBOM, with their lines in `SHA256SUMS.<platform>`.
+//! - `package-task-bundle --layout <dir> --sbom <path> --commit <sha> --out <dir>` ([`task_bundle`]):
+//!   the signed darwin `kbf-task`, packed by the pinned `js-bundle` into an OCI image layout, as
+//!   a tarball of that layout that is the same bytes on every runner, and the SBOM of the binary,
+//!   with their lines in `SHA256SUMS.darwin-arm64`. Refused unless the layout is one bundle of
+//!   `kbf-task` for darwin arm64.
 //! - `installer-tarball --binary <path> --platform <platform> --commit <sha> --units
 //!   <dir> --trust <dir> --sysusers <file> --tmpfiles <file> --needrestart <file> --out <dir>`
 //!   ([`installer_tarball`]): the files the Debian package ships, at the same paths and
@@ -160,6 +165,7 @@ pub mod runner_disk;
 pub mod static_elf;
 pub mod sudo_test;
 pub mod sums;
+pub mod task_bundle;
 pub mod version_facts;
 pub mod wait_artifacts;
 
@@ -280,6 +286,22 @@ enum Verb {
         /// The platform it was built for.
         #[arg(long, value_enum)]
         platform: package::Platform,
+        /// The commit it was built from (on Actions, `GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// The directory the assets go in; created when missing.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Package the signed darwin `kbf-task` bundle (an OCI image layout `js-bundle pack` wrote) and
+    /// its SBOM as release assets in `--out`.
+    PackageTaskBundle {
+        /// The layout directory (`oci-layout`, `index.json`, `blobs/sha256/`).
+        #[arg(long)]
+        layout: PathBuf,
+        /// The CycloneDX SBOM of the `kbf-task` binary.
+        #[arg(long)]
+        sbom: PathBuf,
         /// The commit it was built from (on Actions, `GITHUB_SHA`).
         #[arg(long)]
         commit: String,
@@ -1115,6 +1137,12 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             commit,
             out,
         } => package::package(&binary, &sbom, platform, &commit, &out),
+        Verb::PackageTaskBundle {
+            layout,
+            sbom,
+            commit,
+            out,
+        } => task_bundle::package_task_bundle(&layout, &sbom, &commit, &out),
         Verb::InstallerTarball {
             binary,
             platform,
