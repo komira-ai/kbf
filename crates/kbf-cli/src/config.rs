@@ -235,6 +235,16 @@ const GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        // The frontend's job-facing read listener (`kbf_server::frontend`'s `job_read`).
+        "job-read",
+        &[
+            "job-grant-secret-file",
+            "job-listen",
+            "job-tls-cert",
+            "job-tls-key",
+        ],
+    ),
+    (
         // Not `enroll` or `frontend`: those tables are the enrollment client's own.
         "enroll-service",
         &[
