@@ -380,7 +380,9 @@ until the next pass (every 10 seconds) frees it. The start refuses (exit status 
 than the size of the file system less `free_floor` percent of it; a file system whose size cannot be
 read, or that reports 0 bytes, is not judged: the start warns on stderr and goes on. The files of
 `.stage/` are never evicted and are removed at start. `scrub_rate` is accepted; this release does not
-scrub.
+scrub. `put_permit_wait`, like `max_concurrent_puts` and `put_min_bytes_per_sec`, is accepted in
+`[server]` of a build node and does nothing there without write-through, since the node answers every
+put 403.
 
 | key | what |
 |---|---|
