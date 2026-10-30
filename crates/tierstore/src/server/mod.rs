@@ -775,9 +775,9 @@ impl Server {
 
     /// The text of `/metricz`: the block of every source of counters the server has, one after
     /// the other, each ending in a newline, or one line that names them all when there is none.
-    /// Every block that exists renders, never one of them: a server with a proxy and an OCI
-    /// front shows both, and a source added later (the local cache) is one more entry of
-    /// `blocks`.
+    /// Every block that exists renders, never one of them: a storage node with an OCI front
+    /// shows both, and a source added later (the local cache, which a process has instead of the
+    /// proxy) is one more entry of `blocks`.
     fn metrics_probe(&self) -> String {
         let blocks = [
             self.config.proxy.as_ref().map(|proxy| proxy.metrics()),

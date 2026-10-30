@@ -31,10 +31,12 @@ release along with the file.
 ## Metrics
 
 `GET /metricz` on the S3 listener (not signed; a bucket cannot be called `metricz`) is the
-Prometheus text of the counters of the server. All are counters since the process started. A
-storage node with a hot and a cold tier shows the block below; a build node that runs a local
-cache shows the cache's `tierstore_cache_*` block (see "Local cache" below). A server that has
-both shows both blocks, one after the other.
+Prometheus text of the counters of the process. All are counters since the process started.
+`/metricz` renders whichever blocks the process has: the proxy's (a storage node, with a hot and
+a cold tier; the block below), the OCI read front's, and the local cache's `tierstore_cache_*`
+block (a build node; see "Local cache" below). A cache node and a storage node are different
+processes: a file with `[local_cache]` is refused together with `[hot_store]`, so one process does
+not have both the proxy's and the cache's block.
 
 The block of the proxy is one labelled family per measure, so one query serves every tier. The
 labels have a few fixed values, never a key or a client: `tier` is `hot` or `cold` here (`local`
