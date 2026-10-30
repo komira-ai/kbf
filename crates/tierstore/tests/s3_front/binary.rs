@@ -9,10 +9,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream;
-use kbf_objstore::s3::fake::FakeS3;
-use kbf_objstore::s3::{Credentials, MULTIPART_THRESHOLD, S3Config, S3Store};
-use kbf_objstore::{BodyStream, ByteRange, Capabilities, ObjectKey, ObjectStore, ObjectStoreError};
 use kbf_testkit::reaped::{Reaped, first_line, spawn};
+use objstore_s3::s3::fake::FakeS3;
+use objstore_s3::s3::{Credentials, MULTIPART_THRESHOLD, S3Config, S3Store};
+use objstore_s3::{BodyStream, ByteRange, Capabilities, ObjectKey, ObjectStore, ObjectStoreError};
 use reqwest::Client;
 use rustix::process::{Pid, Signal, kill_process};
 

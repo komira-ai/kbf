@@ -4,8 +4,8 @@
 use std::path::Path;
 
 use bytes::Bytes;
-use kbf_objstore::s3::fake::FakeS3;
-use kbf_objstore::{ByteRange, Capabilities, ObjectKey, ObjectStore};
+use objstore_s3::s3::fake::FakeS3;
+use objstore_s3::{ByteRange, Capabilities, ObjectKey, ObjectStore};
 use reqwest::Client;
 use rustix::process::Signal;
 

@@ -9,10 +9,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use clap::Parser;
-use kbf_objstore::s3::{Credentials, S3Config, S3Store};
-use kbf_objstore::{Capabilities, ObjectKey, ObjectStore};
 use kbf_testkit::dir::TestDir;
 use kbf_testkit::reaped::{first_line, spawn};
+use objstore_s3::s3::{Credentials, S3Config, S3Store};
+use objstore_s3::{Capabilities, ObjectKey, ObjectStore};
 use rustix::process::{Pid, Signal, kill_process};
 use tierstore::server::Drained;
 use tierstore::server::cli::{Addresses, Cli, run_serving};
