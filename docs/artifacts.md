@@ -761,6 +761,12 @@ its bytes, the config's `os`, `architecture`, `name` and entrypoint) and writes 
 path, mode 0644 (0755 for a directory), owner and group 0, time 0, in a gzip stream with no name and time 0, so
 the same layout is the same bytes on every runner.
 
+**What the network level means.** `--network on` sets the bundle's `seatbelt.network_max`, a ceiling the agent
+clamps a job's request to; a job's own level (`NativeSpec.network`) defaults to off. It does not bound what
+`kbf-task` itself can reach: that bound is the pf anchor for the pool uid range, not Seatbelt. Not yet verified,
+to be proven on a farm Mac in the M7/M8 slice: whether the agent runs a bundle program under its own Seatbelt,
+which would refuse the confine's nested `sandbox-exec` (`sandbox_apply: Operation not permitted`).
+
 **The digest rule.** A file is taken by the SHA-256 `SHA256SUMS` lists for its tarball. What a host places in
 its store is named by the bundle's manifest digest (`sha256:<hex>`, the one entry of `index.json`, which
 `js-bundle pack` prints and `js-bundle inspect` shows); the manifest names the config and the layer by digest,

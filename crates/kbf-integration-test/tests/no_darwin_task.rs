@@ -512,15 +512,29 @@ fn the_guard_allows_the_bundle_and_names_each_other_way_a_darwin_kbf_task_would_
             "{step}"
         );
     }
-    for step in [
-        "cargo build --locked --release -p kbf-task",
-        "cargo b -p kbf-task",
-        "cargo install --path crates/kbf-task",
-        "cargo xtask package --binary target/release/kbf-task",
-        "cargo test -p kbf-task --features unconfined-for-tests",
+    for (step, rules) in [
+        (
+            "cargo build --locked --release -p kbf-task",
+            vec![MAC_NAMES],
+        ),
+        ("cargo b -p kbf-task", vec![MAC_NAMES]),
+        ("cargo install --path crates/kbf-task", vec![MAC_NAMES]),
+        (
+            "cargo xtask package --binary target/release/kbf-task",
+            vec![MAC_NAMES, PACKAGED],
+        ),
+        (
+            "cargo test -p kbf-task --features unconfined-for-tests",
+            vec![FEATURE],
+        ),
     ] {
         let got = problems(&with(".github/workflows/other.yml", &mac_job(step)));
-        assert!(!got.is_empty(), "{step}: {got:?}");
+        for rule in rules {
+            assert!(
+                got.iter().any(|p| p.contains(rule)),
+                "{step}: wanted {rule:?}: {got:?}"
+            );
+        }
     }
     let got = problems(&with(
         ".github/workflows/other.yml",

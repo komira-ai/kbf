@@ -75,8 +75,8 @@ fn write_layout(dir: &Path, files: &Files) {
 
 #[test]
 fn a_layout_of_one_darwin_arm64_kbf_task_bundle_is_accepted() {
-    // Asserts: the shape `js-bundle pack` writes passes, so every refusal below is the planted
-    // defect's and not the fixture's.
+    // Asserts: the shape `js-bundle pack` writes passes, so every refusal below comes from the change made to it
+    // and not from the fixture.
     assert_eq!(check_layout(&good()), Vec::<String>::new());
 }
 

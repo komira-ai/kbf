@@ -11,7 +11,7 @@
 //! 3. fetch the pinned `js-bundle` archive (`cargo xtask fetch`, url `v$JS_BUNDLE_VERSION`, sha256
 //!    `$JS_BUNDLE_SHA256_AARCH64_DARWIN`), verify its attestation (`gh attestation verify` for the jobscheduler
 //!    repository, its `release.yml`, `refs/heads/main` and the commit `$JS_BUNDLE_SOURCE_DIGEST`), and only then
-//!    take the program out of the same archive (the same url and sha256, `--extract tar.gz`);
+//!    take the program out of that same local file (`tar -xzf`), not out of a second download;
 //! 4. copy the signed binary into the tree directory, and `js-bundle pack` that directory
 //!    (`--tree task=<dir>`), with the bundle named `kbf-task`, the entrypoint `kbf-task` and the macOS the
 //!    binaries are built for (`--os-version "$MACOSX_DEPLOYMENT_TARGET"`);
@@ -186,27 +186,15 @@ pub fn rules(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
             .is_some_and(|a| a.first().is_some_and(|b| base(b) == "kbf-task"))
     };
     let sign = one("sign kbf-task", &steps, out, is_sign);
-    let fetch_all: Vec<usize> = steps
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| lines(s).any(is_fetch_of_archive))
-        .map(|(i, _)| i)
-        .collect();
-    let is_unpack = |l: &str| {
-        is_fetch_of_archive(l)
-            && args(l, "cargo xtask fetch ")
-                .is_some_and(|a| flag(&a, "--extract") == Some("tar.gz"))
-    };
-    let is_download = |l: &str| is_fetch_of_archive(l) && !is_unpack(l);
+    let is_download = is_fetch_of_archive;
     let download = one(
         "fetch the pinned js-bundle archive",
         &steps,
         out,
         is_download,
     );
-    let unpack = one("take js-bundle out of the archive", &steps, out, is_unpack);
-    for &i in &fetch_all {
-        for line in lines(&steps[i]).filter(|l| is_fetch_of_archive(l)) {
+    for step in &steps {
+        for line in lines(step).filter(|l| is_fetch_of_archive(l)) {
             let a = args(line, "cargo xtask fetch ").unwrap_or_default();
             if flag(&a, "--sha256") != Some(SHA_VAR) {
                 out.push(format!(
@@ -215,13 +203,23 @@ pub fn rules(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
             }
         }
     }
+    // The program is taken out of the file the attestation check read, not out of a second download.
+    let is_unpack = |l: &str| l.contains("&& tar ") || l.starts_with("tar ");
+    let unpack = one("take js-bundle out of the archive", &steps, out, is_unpack);
     if let Some(line) = line_of(&steps, unpack, is_unpack) {
-        let a = args(line, "cargo xtask fetch ").unwrap_or_default();
-        if flag(&a, "--member") != Some("js-bundle-$JS_BUNDLE_VERSION-$TARGET/js-bundle")
-            || flag(&a, "--out") != Some("$RUNNER_TEMP/tools/js-bundle")
+        let a = words(line);
+        let downloaded = download
+            .and_then(|d| line_of(&steps, Some(d), is_download))
+            .and_then(|l| flag(&words(l), "--out"));
+        let member = "js-bundle-$JS_BUNDLE_VERSION-$TARGET/js-bundle";
+        if flag(&a, "-xzf").is_none()
+            || flag(&a, "-xzf") != downloaded
+            || flag(&a, "-C") != Some("$RUNNER_TEMP/tools")
+            || !a.contains(&"--strip-components=1")
+            || a.last() != Some(&member)
         {
             out.push(format!(
-                "`{DARWIN_JOB}`: the unpack of the archive does not take `js-bundle-$JS_BUNDLE_VERSION-$TARGET/js-bundle` to `$RUNNER_TEMP/tools/js-bundle`: {line}"
+                "`{DARWIN_JOB}`: the unpack does not take `{member}` out of the archive the attestation check read ({downloaded:?}) into `$RUNNER_TEMP/tools`: {line}"
             ));
         }
     }
@@ -482,7 +480,7 @@ fn the_asset_table_the_workflow_and_the_pin_agree_on_the_darwin_kbf_task_bundle(
 
 #[test]
 fn a_bundle_step_that_breaks_a_rule_is_named() {
-    // Asserts: each planted change to the committed workflow is reported with the rule's own text:
+    // Asserts: each changed copy of the committed workflow is reported with the rule's own text:
     // the unconfined feature in the kbf-task build, the build for another target, the unsigned binary (the
     // signing step removed), the pack before the attestation check, the archive pinned by another
     // variable, a missing source commit, a pack of another directory, a verify of another layout, a
@@ -537,10 +535,18 @@ fn a_bundle_step_that_breaks_a_rule_is_named() {
         (
             changed(
                 &w,
-                "--sha256 \"$JS_BUNDLE_SHA256_AARCH64_DARWIN\" --out \"$RUNNER_TEMP/tools/js-bundle\"",
-                "--sha256 \"$GH_SHA256_AARCH64_DARWIN\" --out \"$RUNNER_TEMP/tools/js-bundle\"",
+                "--sha256 \"$JS_BUNDLE_SHA256_AARCH64_DARWIN\" --out \"$RUNNER_TEMP/js-bundle-release",
+                "--sha256 \"$GH_SHA256_AARCH64_DARWIN\" --out \"$RUNNER_TEMP/js-bundle-release",
             ),
             "not pinned by `--sha256",
+        ),
+        (
+            changed(
+                &w,
+                "tar -xzf \"$RUNNER_TEMP/js-bundle-release/js-bundle-$JS_BUNDLE_VERSION-$TARGET.tar.gz\"",
+                "tar -xzf \"$RUNNER_TEMP/other.tar.gz\"",
+            ),
+            "the unpack does not take",
         ),
         (
             changed(

@@ -288,7 +288,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: $RUNNER_TEMP/tools/gh attestation verify "$RUNNER_TEMP/js-bundle-release/js-bundle-$JS_BUNDLE_VERSION-$TARGET.tar.gz" --repo komira-ai/jobscheduler --signer-workflow komira-ai/jobscheduler/.github/workflows/release.yml --cert-oidc-issuer https://token.actions.githubusercontent.com --source-ref refs/heads/main --source-digest "$JS_BUNDLE_SOURCE_DIGEST" --deny-self-hosted-runners
       - name: Take js-bundle out of the verified archive
-        run: cargo xtask fetch --url "https://github.com/komira-ai/jobscheduler/releases/download/v$JS_BUNDLE_VERSION/js-bundle-$JS_BUNDLE_VERSION-$TARGET.tar.gz" --sha256 "$JS_BUNDLE_SHA256_AARCH64_DARWIN" --out "$RUNNER_TEMP/tools/js-bundle" --extract tar.gz --member "js-bundle-$JS_BUNDLE_VERSION-$TARGET/js-bundle"
+        run: mkdir -p "$RUNNER_TEMP/tools" && tar -xzf "$RUNNER_TEMP/js-bundle-release/js-bundle-$JS_BUNDLE_VERSION-$TARGET.tar.gz" -C "$RUNNER_TEMP/tools" --strip-components=1 "js-bundle-$JS_BUNDLE_VERSION-$TARGET/js-bundle"
       - name: The one tree of the bundle is the signed kbf-task
         run: mkdir -p "$RUNNER_TEMP/task-tree" && cp "target/$TARGET/release/kbf-task" "$RUNNER_TEMP/task-tree/kbf-task"
       - name: Pack the signed kbf-task into a bundle in an OCI layout
