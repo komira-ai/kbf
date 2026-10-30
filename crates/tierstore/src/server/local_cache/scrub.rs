@@ -117,7 +117,7 @@ pub struct Scrubber {
     /// for.
     credit: i128,
     /// Set to end the walk: looked at before each chunk of an object and each object.
-    stop: Arc<AtomicBool>,
+    pub(super) stop: Arc<AtomicBool>,
     /// Runs after each chunk of an object is hashed.
     #[cfg(test)]
     pub(super) on_chunk: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -183,19 +183,19 @@ impl Scrubber {
     /// was told to stop first.
     fn hash(&self, file: &mut File) -> io::Result<Option<(String, u64)>> {
         let mut hasher = Sha256::new();
-        let mut buffer = vec![0; CHUNK];
+        let mut buffer = Vec::with_capacity(CHUNK);
         let mut total = 0;
         loop {
             if self.stop.load(Ordering::SeqCst) {
                 return Ok(None);
             }
-            let read = match file.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => read,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            };
-            hasher.update(&buffer[..read]);
+            // `read_to_end` of a `take` retries a read that was interrupted.
+            buffer.clear();
+            let read = file.by_ref().take(CHUNK as u64).read_to_end(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer);
             total += read as u64;
             #[cfg(test)]
             if let Some(hook) = &self.on_chunk {
@@ -281,9 +281,8 @@ impl Inner {
             }
             Err(_) => return self.scrub_error(),
         };
-        let Ok(opened) = file.metadata() else {
-            return self.scrub_error();
-        };
+        // Without the file's identity nothing is dropped: it is not the one that is on the path.
+        let opened = file.metadata().ok().map(|meta| identity(&meta));
         let (matches, read, key) = match self.recorded(hex) {
             Recorded::Unreadable => return self.scrub_error(),
             Recorded::Bad => (false, 0, hex.to_owned()),
@@ -297,7 +296,7 @@ impl Inner {
             return Verdict::Intact(read);
         }
         between();
-        if !self.drop_if_unchanged(hex, Some(identity(&opened))) {
+        if !self.drop_if_unchanged(hex, opened) {
             return Verdict::Left;
         }
         eprintln!("tierstore: scrub dropped {key}: its bytes no longer match their digest");

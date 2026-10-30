@@ -551,3 +551,32 @@ fn nothing_says_the_scrub_is_not_done() {
         assert!(!text.contains("No scrub"));
     }
 }
+
+/// Asserts that a fill that starts between the scrub's hash and its drop (its flight is in the
+/// table when the drop looks) keeps the object: nothing is dropped or counted as a mismatch.
+#[tokio::test]
+async fn a_fill_that_starts_before_the_drop_keeps_the_object() {
+    let rig = Rig::new("tscache-scrub-late-flight");
+    let keys = fill(&rig, 1, 100).await;
+    rot(&rig, &keys[0]);
+    let hex = name_of(&keys[0]).hex;
+    let inner = &rig.cache.inner;
+    let verdict = inner.scrub_object_between(&hex, &Scrubber::new(1 << 20), || {
+        let held = futures::future::pending().boxed().shared();
+        super::locked(&inner.flights).insert(hex.clone(), held);
+    });
+    assert_eq!(verdict, Verdict::Left);
+    assert!(rig.has_file(&keys[0]));
+    assert_eq!(read(&rig.cache.counters().scrub_mismatches), 0);
+}
+
+/// Asserts that a walk that was told to stop reads nothing.
+#[tokio::test]
+async fn a_walk_that_is_told_to_stop_reads_nothing() {
+    let rig = Rig::new("tscache-scrub-stopped");
+    fill(&rig, 2, 100).await;
+    let mut state = Scrubber::new(1 << 20);
+    state.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(rig.cache.scrub_once(&mut state), ScrubPass::default());
+    assert_eq!(read(&rig.cache.counters().scrubbed_objects), 0);
+}
