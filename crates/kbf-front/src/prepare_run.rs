@@ -183,7 +183,8 @@ fn base_of(url: &str) -> Result<(&str, &str), &'static str> {
 ///
 /// # Errors
 /// [`ConfigError::ReadUrl`] for a URL that is not, `http://` ones included: a grant's token is
-/// a bearer secret and crosses only a TLS connection.
+/// a bearer secret and crosses only a TLS connection unless the operator said otherwise
+/// ([`check_read_url_allowing`]).
 pub fn check_read_url(url: &str) -> Result<(), ConfigError> {
     check_read_url_allowing(url, false)
 }
@@ -194,13 +195,13 @@ pub fn check_read_url(url: &str) -> Result<(), ConfigError> {
 /// [`ConfigError::ReadUrl`] for a URL that is neither `https://host[:port]` nor, with
 /// `allow_plain`, `http://host[:port]`.
 pub fn check_read_url_allowing(url: &str, allow_plain: bool) -> Result<(), ConfigError> {
-    let _ = allow_plain;
     let refuse = |why| ConfigError::ReadUrl {
         url: url.to_owned(),
         why,
     };
     match base_of(url) {
         Ok(("https", _)) => Ok(()),
+        Ok(("http", _)) if allow_plain => Ok(()),
         Ok(_) => Err(refuse("is not https")),
         Err(why) => Err(refuse(why)),
     }
@@ -253,7 +254,8 @@ pub struct RunPrepConfig {
     /// Where a task writes its large objects; `None` gives every run no large key, and a run
     /// the size of one pack set.
     pub large: Option<LargeTarget>,
-    /// The base URL of the job-facing read listener, `https://host[:port]`.
+    /// The base URL of the job-facing read listener, `https://host[:port]` (`http://` only with
+    /// `allow_plain_read_url`).
     pub read_url: String,
     /// Whether `read_url` may be `http://host[:port]`: a farm on its own network that serves
     /// the read listener without TLS. Off, only `https://` is accepted.
@@ -439,12 +441,12 @@ impl RunPrep {
             max_packs,
             large,
             read_url,
-            allow_plain_read_url: _,
+            allow_plain_read_url,
             run_wall,
             slack,
             limits,
         } = config;
-        check_read_url(&read_url)?;
+        check_read_url_allowing(&read_url, allow_plain_read_url)?;
         match base_of(&put.endpoint) {
             Ok(("http" | "https", _)) => {}
             Ok(_) => return Err(put_endpoint(&put, "is not http or https")),

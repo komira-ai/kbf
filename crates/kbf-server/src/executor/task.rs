@@ -134,7 +134,8 @@ pub struct TaskArgs<'a> {
     pub work_dir: Option<&'a str>,
     /// Whether the `PUT` goes over plain http (until the store serves TLS).
     pub allow_plain_http_put: bool,
-    /// Whether the read grant may be served over plain http.
+    /// Whether the read grant may be served over plain http: the tool is told with
+    /// `--allow-plain-http-grant`.
     pub allow_plain_http_grant: bool,
 }
 
@@ -164,6 +165,9 @@ impl TaskArgs<'_> {
         }
         if self.allow_plain_http_put {
             argv.push("--allow-plain-http-put".to_owned());
+        }
+        if self.allow_plain_http_grant {
+            argv.push("--allow-plain-http-grant".to_owned());
         }
         argv
     }

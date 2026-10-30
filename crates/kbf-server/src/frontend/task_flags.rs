@@ -33,7 +33,7 @@ use clap::{Arg, ArgMatches};
 use kbf_front::grants::{GrantKey, KeyError};
 use kbf_front::prepare_run::{
     AccessKey, ClosureLimits, ConfigError, LargeTarget, PutTarget, RunPrep, RunPrepConfig,
-    check_read_url,
+    check_read_url_allowing,
 };
 use kbf_front::{Backend, MintError, PackKeyMint};
 use zeroize::Zeroizing;
@@ -298,7 +298,15 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<Option<TaskFlags>, String> 
     let text = |id: &str| m.get_one::<String>(id).cloned().unwrap_or_default();
     let secs = |id: &str| Duration::from_secs(m.get_one::<u64>(id).copied().unwrap_or_default());
     let read_url = text(READ_URL);
-    check_read_url(&read_url).map_err(|error| format!("--task-read-url: {error}"))?;
+    let plain = super::executor_flags::plain_http_grant(m);
+    check_read_url_allowing(&read_url, plain).map_err(|error| {
+        let hint = if read_url.starts_with("http://") {
+            " (--executor-allow-plain-http-grant with --executor js-agent accepts it)"
+        } else {
+            ""
+        };
+        format!("--task-read-url: {error}{hint}")
+    })?;
     let digests = m.get_one::<u32>(MAX_DIGESTS).copied().unwrap_or_default();
     Ok(Some(TaskFlags {
         secret_file: secret_file.clone(),
@@ -310,7 +318,7 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<Option<TaskFlags>, String> 
             .cloned()
             .unwrap_or_default(),
         read_url,
-        allow_plain_http_grant: false,
+        allow_plain_http_grant: plain,
         run_wall: secs(RUN_WALL),
         url_slack: secs(URL_SLACK),
         max_digests: usize::try_from(digests).unwrap_or(usize::MAX),
