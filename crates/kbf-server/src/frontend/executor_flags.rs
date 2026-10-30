@@ -54,6 +54,7 @@ const TTL: &str = "executor_lease_ttl_secs";
 const MAX_RUN: &str = "executor_max_run_secs";
 const DEFAULT_TIMEOUT: &str = "executor_default_timeout_secs";
 const CALL_TIMEOUT: &str = "executor_call_timeout_secs";
+const OUTPUT_DISK: &str = "executor_output_disk_bytes";
 
 /// The flags a `js-agent` executor cannot do without, in the order their absence is named.
 const REQUIRED: [(&str, &str); 9] = [
@@ -288,6 +289,18 @@ pub(super) fn args() -> Vec<Arg> {
              seconds. Under the fence time. Used only with `--executor js-agent`",
             "5",
         ),
+        Arg::new(OUTPUT_DISK)
+            .long("executor-output-disk-bytes")
+            .value_name("BYTES")
+            .value_parser(clap::value_parser!(u64).range(1..))
+            .default_value("8589934592")
+            .help(
+                "The scratch disk a run books for what it writes, in bytes: its outputs, the \
+                 pack and the private home, tmp and cache. A run books this, the bytes of its \
+                 inputs and a fixed 1 GiB margin against the host's scratch, and the lease \
+                 server refuses a run the host's disk cannot hold. Used only with `--executor \
+                 js-agent`",
+            ),
     ]
 }
 
@@ -421,6 +434,7 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     config.max_run = secs(MAX_RUN);
     config.default_timeout = secs(DEFAULT_TIMEOUT);
     config.call_timeout = secs(CALL_TIMEOUT);
+    config.output_disk_bytes = count(OUTPUT_DISK);
     Ok(JsAgentFlags {
         config,
         lease_url,

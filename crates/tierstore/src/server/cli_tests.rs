@@ -263,6 +263,8 @@ fn flags_that_are_not_valid_are_refused() {
 fn the_help_names_every_flag_and_the_version_the_package() {
     let help = Cli::command().render_long_help().to_string();
     let names = [
+        "--config",
+        "--print-config",
         "--listen",
         "--proxy-id",
         "--hot",

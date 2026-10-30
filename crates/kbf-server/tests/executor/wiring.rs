@@ -69,6 +69,7 @@ impl RunPrepare for Preparing {
             grant_url: "https://grant.test:9400".to_owned(),
             grant_token: Secret::new("read-token"),
             not_after: since.as_secs() + wall.as_secs() + 600,
+            input_bytes: None,
         })
     }
 }
