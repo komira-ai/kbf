@@ -2,6 +2,7 @@
 //! from the rest of the server.
 
 use std::collections::{BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -12,8 +13,8 @@ use kbf_proto::reapi::{ActionResult, Digest};
 use kbf_sched::Request;
 use kbf_server::Farm;
 use kbf_server::executor::{
-    ActionFacts, Clock, Config, Deps, Executor, Ingest, Ingested, Inputs, InputsError, MintError,
-    Nonce, PackKey, Presign, PresignError, ReadGrant, Secret, UntrustedLimits, build_id,
+    ActionFacts, Clock, Config, Deps, Executor, Ingest, Ingested, Inputs, InputsError, Metrics,
+    MintError, Nonce, PackKey, Presign, PresignError, ReadGrant, Secret, UntrustedLimits, build_id,
 };
 use kbf_types::{ActionKey, LeaseKind, Qos, Resources};
 use tokio::sync::watch;
@@ -88,6 +89,8 @@ pub struct FakePresign {
     pub minted: Mutex<Vec<Minted>>,
     pub written: Mutex<BTreeSet<String>>,
     pub fail: Mutex<Option<PresignError>>,
+    /// While set, the urls are `http://`: a store that does not serve TLS.
+    pub plain: AtomicBool,
 }
 
 impl FakePresign {
@@ -96,6 +99,7 @@ impl FakePresign {
             minted: Mutex::new(Vec::new()),
             written: Mutex::new(BTreeSet::new()),
             fail: Mutex::new(None),
+            plain: AtomicBool::new(false),
         }
     }
 
@@ -103,7 +107,8 @@ impl FakePresign {
     /// store refuses it.
     pub fn put(&self, url: &str) -> Result<(), &'static str> {
         let key = url
-            .strip_prefix("http://store.test/")
+            .strip_prefix("https://store.test/")
+            .or_else(|| url.strip_prefix("http://store.test/"))
             .and_then(|rest| rest.split('?').next())
             .expect("a url this store minted");
         match locked(&self.written).insert(key.to_owned()) {
@@ -135,7 +140,14 @@ impl Presign for FakePresign {
             expires,
             max_bytes,
         });
-        Ok(Secret::new(format!("http://store.test/{key}?sig=s3cr3t")))
+        let scheme = if self.plain.load(Ordering::Relaxed) {
+            "http"
+        } else {
+            "https"
+        };
+        Ok(Secret::new(format!(
+            "{scheme}://store.test/{key}?sig=s3cr3t"
+        )))
     }
 }
 
@@ -148,7 +160,7 @@ pub struct FakeIngest {
     pub panics: std::sync::atomic::AtomicUsize,
     pub script: Mutex<VecDeque<Ingested>>,
     /// The reason the next mint fails for, if any.
-    pub mint_fails: Mutex<Option<String>>,
+    pub mint_fails: Mutex<Option<MintError>>,
     pub calls: Mutex<Vec<(kbf_types::LeaseId, String, UntrustedLimits)>>,
 }
 
@@ -177,9 +189,14 @@ impl FakeIngest {
 
 #[tonic::async_trait]
 impl Ingest for FakeIngest {
-    fn mint(&self, lease: kbf_types::LeaseId, _action: &Digest) -> Result<PackKey, MintError> {
+    async fn mint(
+        &self,
+        lease: kbf_types::LeaseId,
+        _action: &Digest,
+        _wall: Duration,
+    ) -> Result<PackKey, MintError> {
         match locked(&self.mint_fails).take() {
-            Some(why) => Err(MintError(why)),
+            Some(why) => Err(why),
             None => Ok(PackKey::new(format!(
                 "cas/b/{}/{}-0",
                 build_id(lease),
@@ -252,6 +269,7 @@ pub struct Rig {
     pub inputs: Arc<FakeInputs>,
     pub presign: Arc<FakePresign>,
     pub ingest: Arc<FakeIngest>,
+    pub metrics: Arc<Metrics>,
     _hold: ClockHold,
 }
 
@@ -345,7 +363,8 @@ impl Rig {
             Arc::new(FakePresign::new()),
             Arc::new(FakeIngest::new()),
         );
-        let exec = Self::executor(&fake, &farm, &cfg, &inputs, &presign, &ingest);
+        let metrics = Arc::new(Metrics::default());
+        let exec = Self::executor(&fake, &farm, &cfg, &inputs, &presign, &ingest, &metrics);
         Self {
             fake,
             api,
@@ -355,6 +374,7 @@ impl Rig {
             inputs,
             presign,
             ingest,
+            metrics,
             _hold: hold,
         }
     }
@@ -366,6 +386,7 @@ impl Rig {
         inputs: &Arc<FakeInputs>,
         presign: &Arc<FakePresign>,
         ingest: &Arc<FakeIngest>,
+        metrics: &Arc<Metrics>,
     ) -> Executor {
         let deps = Deps {
             farm: Arc::clone(farm),
@@ -373,21 +394,40 @@ impl Rig {
             ingest: ingest.clone(),
             presign: presign.clone(),
             inputs: inputs.clone(),
+            metrics: Arc::clone(metrics),
         };
         Executor::new(cfg.clone(), deps, Clock::from_unix_ms(fake.now_ms()))
             .expect("a valid config")
     }
 
-    /// A new executor over the same farm and lease server, as a restarted frontend has.
+    /// A new executor over the same farm and lease server, as a restarted frontend has: the
+    /// same frontend id, and a process of its own.
     pub fn restarted_executor(&self) -> Executor {
+        self.other_executor(&self.cfg.frontend)
+    }
+
+    /// A new executor over the same farm and lease server, of the frontend `frontend` and a
+    /// process of its own.
+    pub fn other_executor(&self, frontend: &str) -> Executor {
+        let mut cfg = self.cfg.clone();
+        cfg.frontend = frontend.to_owned();
+        cfg.instance = kbf_server::executor::Nonce::random().to_string();
         Self::executor(
             &self.fake,
             &self.farm,
-            &self.cfg,
+            &cfg,
             &self.inputs,
             &self.presign,
             &self.ingest,
+            &self.metrics,
         )
+    }
+
+    /// Lets pass the time an executor watches the leases of an earlier process for a renewal.
+    /// Nothing is stepped: the process that made them is gone, and renews nothing.
+    pub async fn watch_over(&self) {
+        self.advance(self.cfg.adopt_watch() + Duration::from_secs(1))
+            .await;
     }
 
     /// One step of the executor and of the farm, with the tasks they spawn run to rest.
@@ -545,6 +585,13 @@ impl Rig {
 
     pub fn requests(&self) -> Vec<String> {
         self.fake.requests()
+    }
+
+    /// What the executor counts, as `GET /metrics` shows it.
+    pub fn counted(&self) -> String {
+        let mut text = String::new();
+        self.metrics.render(&mut text);
+        text
     }
 
     /// Every action the rig is asked about runs for `timeout`.

@@ -13,15 +13,26 @@
 //! [`Executor`] never opens a connection to a lease server: [`ExecutorKind::KbfDaemon`] is the
 //! path every server runs today.
 //!
-//! The executor runs on exactly one frontend: it holds its leases under its frontend id, and
-//! on start stops every run of the leases it finds under that id, which nothing of the farm
-//! maps to any more.
+//! The executor runs on exactly one frontend: it holds its leases under its frontend id and a
+//! label of the process that made them, and on start stops every run of the leases an earlier
+//! process left under that id, which nothing of the farm maps to any more. Those are taken only
+//! once they are seen not to be renewed over [`Config::adopt_watch`]: a lease that is renewed
+//! belongs to a live process under the same id (a copied config), and the executor stops
+//! instead of killing its runs. [`Executor::rival`] finds another frontend's leases on the lease
+//! server, and the task that steps the executor ([`Running`]) stops when it does. The id must be
+//! different for each frontend.
 //!
-//! Nothing wires it yet: there is no flag, and no server builds one.
+//! The frontend builds one only for `--executor js-agent` (`frontend/executor_flags.rs`), over
+//! [`Front`], which implements the three seams ([`Ingest`], [`Presign`], [`Inputs`]) with the
+//! frontend's own packs, CAS, key mint and run preparation, and steps it from
+//! [`FrontendHandle::serve`](crate::frontend::FrontendHandle::serve) until the frontend stops.
 
 mod api;
 mod config;
+mod driver;
+mod front;
 mod host;
+mod metrics;
 mod outcome;
 mod pool;
 mod runs;
@@ -37,14 +48,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::future::join_all;
-use kbf_lease_client::{Client, Error, ErrorCode, Host, Lease, LeaseId};
+use kbf_lease_client::{Client, Error, ErrorCode, Host, Lease, LeaseId, LeaseState};
 use kbf_types::WorkerId;
 use tokio::time::Instant;
 
 use crate::Farm;
-use pool::Slot;
+use pool::{Adopted, Adoption, Slot};
 
 pub use config::{Config, ConfigError};
+pub use driver::Running;
+pub use front::{Front, FrontParts, PrepareError, PreparedRun, RunPrepare, RunSource};
+pub use metrics::Metrics;
 pub use task::{Delivery, Nonce, PackKey, Secret, TaskArgs, build_id};
 pub use traits::{
     ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, Presign, PresignError,
@@ -111,6 +125,8 @@ pub struct Deps {
     pub presign: Arc<dyn Presign>,
     /// The CAS read of an action, and the read grant.
     pub inputs: Arc<dyn Inputs>,
+    /// What the executor counts.
+    pub metrics: Arc<Metrics>,
 }
 
 /// What one pass reads once for every worker.
@@ -230,7 +246,12 @@ pub struct Executor {
     deps: Deps,
     clock: Clock,
     slots: Vec<Slot>,
-    adopted: bool,
+    /// Whether the leases an earlier process of this frontend left have been taken up.
+    adoption: Adoption,
+    /// The leases taken up from an earlier process: this frontend releases them like its own.
+    inherited: Vec<LeaseId>,
+    /// Why the executor stopped itself: another process runs under this frontend's id.
+    twin: Option<String>,
     strays: Strays,
     /// When the leases were last compared with the slots'.
     reconciled: Option<Instant>,
@@ -251,7 +272,9 @@ impl Executor {
             deps,
             clock,
             slots: Vec::new(),
-            adopted: false,
+            adoption: Adoption::Unread,
+            inherited: Vec::new(),
+            twin: None,
             strays: Strays::default(),
             reconciled: None,
             hosts_read: None,
@@ -262,6 +285,81 @@ impl Executor {
     #[must_use]
     pub fn hosts(&self) -> Vec<HostInfo> {
         self.slots.iter().filter_map(Slot::info).collect()
+    }
+
+    /// How often the caller steps the executor.
+    #[must_use]
+    pub fn poll(&self) -> Duration {
+        self.cfg.poll
+    }
+
+    /// How often the caller checks that no other frontend holds hosts.
+    #[must_use]
+    pub fn rival_check(&self) -> Duration {
+        self.cfg.reconcile_every
+    }
+
+    /// Why this executor must stop, if another frontend (or another process under this
+    /// frontend's id) holds hosts on the lease server and is older: the executor runs on
+    /// exactly one frontend, and two would each stop the other's runs on restart and share
+    /// hosts the farm knows one of. Of two that hold hosts the one whose oldest lease is
+    /// younger stops (ties go to the lower frontend id, then instance), so two that started
+    /// together and both leased are not both stopped, and a frontend that finds hosts held
+    /// before it holds any stops at once. Nothing is concluded from a list that could not be
+    /// read.
+    ///
+    /// Leases of another process under this frontend's own id are not judged here until the
+    /// leases of an earlier process have been taken up: that is [`Adoption`]'s question.
+    pub async fn rival(&self) -> Option<String> {
+        let ctx = Ctx {
+            cfg: &self.cfg,
+            deps: &self.deps,
+            clock: &self.clock,
+            strays: &self.strays,
+        };
+        let leases = ctx.api().leases().await.ok()?;
+        let held: Vec<LeaseId> = self.slots.iter().filter_map(Slot::lease).collect();
+        let me = (self.cfg.frontend.as_str(), self.cfg.instance.as_str());
+        let mut mine = u64::MAX;
+        let mut others = Vec::new();
+        for lease in leases {
+            let live = matches!(lease.state, LeaseState::Held | LeaseState::Pending);
+            let Some(frontend) = lease.labels.get(pool::FRONTEND_LABEL).filter(|_| live) else {
+                continue;
+            };
+            let instance = lease
+                .labels
+                .get(pool::INSTANCE_LABEL)
+                .map_or("", String::as_str);
+            if held.contains(&lease.id) || (frontend.as_str(), instance) == me {
+                mine = mine.min(lease.acquired_at_ms);
+            } else if *frontend != self.cfg.frontend || self.adoption.is_done() {
+                others.push((lease.acquired_at_ms, frontend.clone(), instance.to_owned()));
+            }
+        }
+        let older = others
+            .into_iter()
+            .filter(|(since, frontend, instance)| {
+                (*since, frontend.as_str(), instance.as_str()) < (mine, me.0, me.1)
+            })
+            .min()?;
+        Some(match older.1 == self.cfg.frontend {
+            true => format!(
+                "another frontend holds hosts under the same id {:?}: --executor-frontend-id must be different for each frontend",
+                older.1
+            ),
+            false => format!(
+                "the frontend {:?} holds hosts on the lease server too: the executor runs on exactly one frontend",
+                older.1
+            ),
+        })
+    }
+
+    /// Why the executor stopped itself without being asked, if it did: another process runs
+    /// under this frontend's id ([`Executor::new`]'s `Config::frontend`).
+    #[must_use]
+    pub fn twin(&self) -> Option<&str> {
+        self.twin.as_deref()
     }
 
     /// One pass over every slot: leases are asked for, kept and released, the farm's
@@ -276,31 +374,51 @@ impl Executor {
             deps,
             clock,
             slots,
-            adopted,
+            adoption,
+            inherited,
+            twin,
             strays,
             reconciled,
             hosts_read,
         } = self;
+        if twin.is_some() {
+            return;
+        }
         let ctx = Ctx {
             cfg,
             deps,
             clock,
             strays,
         };
-        if !*adopted {
-            *slots = pool::adopt(&ctx, now).await.unwrap_or_default();
-            *adopted = !slots.is_empty();
+        if !adoption.is_done() {
+            match pool::adopt(&ctx, now, adoption).await {
+                Adopted::Slots { held, left } => {
+                    *slots = held;
+                    *inherited = left;
+                    *adoption = Adoption::Done;
+                }
+                // The leases of an earlier process are not yet known to be nobody's: nothing is
+                // asked for, so no host is taken while a live twin might hold them.
+                Adopted::Watching => return,
+                Adopted::Twin(why) => {
+                    *twin = Some(why);
+                    return;
+                }
+                Adopted::Unread => {}
+            }
             *reconciled = Some(now);
         }
         let due = reconciled.is_none_or(|at| now >= at + cfg.reconcile_every);
         if strays.take() || due {
             *reconciled = Some(now);
-            if !pool::reconcile(&ctx, slots).await {
+            if !pool::reconcile(&ctx, slots, inherited).await {
                 strays.suspect();
             }
         }
         let view = read(&ctx, slots, hosts_read, now).await;
         join_all(slots.iter_mut().map(|slot| slot.drive(&ctx, &view, now))).await;
+        deps.metrics
+            .hold(slots.iter().filter(|slot| slot.is_active()).count());
     }
 
     /// Stops what runs and releases every lease. The executor holds nothing afterwards, and
@@ -314,7 +432,10 @@ impl Executor {
         };
         let slots = std::mem::take(&mut self.slots);
         join_all(slots.into_iter().map(|slot| slot.release(&ctx))).await;
-        self.adopted = false;
+        self.adoption = Adoption::Unread;
+        self.inherited.clear();
+        self.twin = None;
+        self.deps.metrics.hold(0);
     }
 }
 

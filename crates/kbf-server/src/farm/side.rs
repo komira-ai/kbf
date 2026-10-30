@@ -90,6 +90,9 @@ pub(in crate::farm) struct Side {
     /// The pack-write counts on the newest heartbeat of each node that sent any
     /// ([`Farm::note_pack_writes`](super::Farm::note_pack_writes)).
     pub pack_writes: BTreeMap<WorkerId, worker::PackWriteCounts>,
+    /// The input cache counts on the newest heartbeat of each node that sent any
+    /// ([`Farm::note_input_cache`](super::Farm::note_input_cache)).
+    pub input_caches: BTreeMap<WorkerId, worker::InputCacheCounts>,
     /// What the accepted node-load readings of each node that sent any come to
     /// ([`Farm::note_node_load`](super::Farm::note_node_load)).
     pub node_loads: super::node_load::NodeLoads,
@@ -115,6 +118,7 @@ impl Side {
             watched: BTreeMap::new(),
             pack_reads: BTreeMap::new(),
             pack_writes: BTreeMap::new(),
+            input_caches: BTreeMap::new(),
             node_loads: BTreeMap::new(),
             failed: FailedActions::default(),
         }

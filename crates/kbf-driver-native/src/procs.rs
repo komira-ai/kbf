@@ -431,6 +431,9 @@ mod platform {
                 max_footprint: info.ri_lifetime_max_phys_footprint,
                 user_ticks: info.ri_user_time,
                 system_ticks: info.ri_system_time,
+                child_user_ticks: info.ri_child_user_time,
+                child_system_ticks: info.ri_child_system_time,
+                ppid: process(pid).map_or(0, |p| p.ppid),
             }),
         })
     }

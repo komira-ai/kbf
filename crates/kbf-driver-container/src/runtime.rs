@@ -40,7 +40,7 @@ use kbf_daemon::cpu_pool::{CpuPool, DEFAULT_CPU_THREADS};
 use kbf_daemon::trees::{TreeConfig, TreeLease, Trees};
 use kbf_daemon::{NodeLoadError, NodeReading, Runtime, RuntimeError, Work, upload_within};
 use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata, Platform};
-use kbf_proto::worker::ResourceUsage;
+use kbf_proto::worker::{InputCacheCounts, ResourceUsage, TreeCounts};
 use kbf_types::LeaseId;
 use prost_types::Timestamp;
 use tokio::sync::oneshot;
@@ -827,6 +827,19 @@ impl<C: Cas> Runtime for ContainerRuntime<C> {
 
     async fn welcomed_placement_load(&self, on: bool) {
         self.config.welcomed(on).await;
+    }
+
+    fn input_cache(&self) -> Option<InputCacheCounts> {
+        let cached = self.cache.as_ref()?;
+        let trees = self.tree_stats().map(|t| TreeCounts {
+            builds: t.builds,
+            hits: t.hits,
+            evictions: t.evictions,
+        });
+        Some(InputCacheCounts {
+            trees,
+            ..cached.cache.input_counts()
+        })
     }
 
     async fn node_load(&self) -> Result<Option<NodeReading>, NodeLoadError> {

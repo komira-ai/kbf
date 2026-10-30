@@ -10,9 +10,12 @@
 //! best-covered instantiation.
 
 mod classes;
+mod driver;
 mod keys;
 mod pool;
+mod real_prep;
 mod recovery;
 mod rig;
 mod spec;
 mod starts;
+mod wiring;

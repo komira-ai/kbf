@@ -16,6 +16,12 @@ use crate::executor::{Ctx, HostInfo, Listing, View, note, release_lease};
 /// restarted frontend finds the leases it made.
 pub(super) const FRONTEND_LABEL: &str = "kbf-frontend";
 
+/// The label every lease carries beside the frontend's: valued with an id this process made
+/// up when it started. Two processes started with the same frontend id (a copied config) are
+/// told apart by it, and a lease made by a process that is not this one is never taken for
+/// this one's.
+pub(super) const INSTANCE_LABEL: &str = "kbf-instance";
+
 pub(super) enum Slot {
     /// No lease; asking for one is due at `retry_at`.
     Vacant { retry_at: Instant },
@@ -35,7 +41,7 @@ impl Slot {
     }
 
     /// The lease the slot holds or has booked.
-    fn lease(&self) -> Option<LeaseId> {
+    pub(super) fn lease(&self) -> Option<LeaseId> {
         match self {
             Self::Active(worker) => Some(worker.lease),
             Self::Pending { lease } => Some(*lease),
@@ -106,6 +112,7 @@ async fn acquire(ctx: &Ctx<'_>, now: Instant) -> Slot {
     };
     let mut request = AcquireRequest::new(&ctx.cfg.class, resources, ctx.cfg.max_wall)
         .label(FRONTEND_LABEL, &ctx.cfg.frontend)
+        .label(INSTANCE_LABEL, &ctx.cfg.instance)
         .ttl(ctx.cfg.lease_ttl);
     // Exactly what the node report claims, and what the task tool and its static binary
     // need: a host of another system or architecture is not one this executor can use.
@@ -143,16 +150,90 @@ fn activate(ctx: &Ctx<'_>, held: &Lease, now: Instant) -> Slot {
     Slot::Active(Box::new(HostWorker::start(ctx, held.id, host, ends, now)))
 }
 
+/// Whether the leases an earlier process left under this frontend's id have been taken up.
+pub(super) enum Adoption {
+    /// Not yet looked at.
+    Unread,
+    /// Leases of another process under this id were seen with these expiry times: a process
+    /// that is alive renews its leases, so they are looked at again at `until`.
+    Watching {
+        seen: Vec<(LeaseId, u64)>,
+        until: Instant,
+    },
+    /// Taken up.
+    Done,
+}
+
+impl Adoption {
+    pub(super) fn is_done(&self) -> bool {
+        matches!(self, Self::Done)
+    }
+}
+
+/// What taking up the earlier leases came to.
+pub(super) enum Adopted {
+    /// The slots, and the leases of another process they hold.
+    Slots { held: Vec<Slot>, left: Vec<LeaseId> },
+    /// Leases of another process under this id are being watched for a renewal.
+    Watching,
+    /// One of them was renewed, or a new one made, in the watch: that process is alive.
+    Twin(String),
+    /// The lease server could not be asked.
+    Unread,
+}
+
 /// The leases this frontend made before it started: held ones get a worker (after their runs
 /// are stopped: the lease server forgets none of them, and nothing of the farm maps to them),
-/// booked ones wait, and any beyond the pool's size are released. `None` if the lease server
-/// could not be asked.
-pub(super) async fn adopt(ctx: &Ctx<'_>, now: Instant) -> Option<Vec<Slot>> {
-    let own = ctx
+/// booked ones wait, and any beyond the pool's size are released.
+///
+/// A lease made by another process under the same frontend id is not taken at once: that
+/// process may be alive (two frontends given one config), and its runs would be stopped. The
+/// leases are seen, and seen again after the longest a live executor goes without renewing
+/// ([`Config::adopt_watch`]); if any was renewed in between, or a new one made, the other
+/// process is alive and the caller stops. Otherwise it is gone, and they are taken.
+pub(super) async fn adopt(ctx: &Ctx<'_>, now: Instant, adoption: &mut Adoption) -> Adopted {
+    let Ok(own) = ctx
         .api()
         .leases_labelled(FRONTEND_LABEL, &ctx.cfg.frontend)
         .await
-        .ok()?;
+    else {
+        return Adopted::Unread;
+    };
+    let live = |lease: &Lease| matches!(lease.state, LeaseState::Held | LeaseState::Pending);
+    let ours = |lease: &Lease| lease.labels.get(INSTANCE_LABEL) == Some(&ctx.cfg.instance);
+    let strangers: Vec<&Lease> = own
+        .iter()
+        .filter(|lease| live(lease) && !ours(lease))
+        .collect();
+    if !strangers.is_empty() {
+        match adoption {
+            Adoption::Watching { seen, until } if now >= *until => {
+                let alive = strangers.iter().any(|lease| {
+                    seen.iter()
+                        .find(|(id, _)| *id == lease.id)
+                        .is_none_or(|(_, expires)| lease.expires_at_ms > *expires)
+                });
+                if alive {
+                    return Adopted::Twin(format!(
+                        "another frontend runs under the same id {:?}: --executor-frontend-id must be different for each frontend",
+                        ctx.cfg.frontend
+                    ));
+                }
+            }
+            Adoption::Watching { .. } => return Adopted::Watching,
+            _ => {
+                *adoption = Adoption::Watching {
+                    seen: strangers
+                        .iter()
+                        .map(|lease| (lease.id, lease.expires_at_ms))
+                        .collect(),
+                    until: now + ctx.cfg.adopt_watch(),
+                };
+                return Adopted::Watching;
+            }
+        }
+    }
+    let left = strangers.iter().map(|lease| lease.id).collect();
     let mut slots = Vec::new();
     for lease in own {
         let room = slots.len() < ctx.cfg.hosts;
@@ -171,13 +252,14 @@ pub(super) async fn adopt(ctx: &Ctx<'_>, now: Instant) -> Option<Vec<Slot>> {
             },
             (LeaseState::Pending, true) => slots.push(Slot::Pending { lease: lease.id }),
             (LeaseState::Held | LeaseState::Pending, false) => {
+                ctx.deps.metrics.stray_released();
                 release_lease(ctx, lease.id).await;
             }
             _ => {}
         }
     }
     slots.resize_with(ctx.cfg.hosts, || Slot::Vacant { retry_at: now });
-    Some(slots)
+    Adopted::Slots { held: slots, left }
 }
 
 /// Stops every run of `lease`: they belong to the frontend that made it, which is gone.
@@ -197,11 +279,11 @@ async fn stop_runs(ctx: &Ctx<'_>, lease: LeaseId) -> bool {
     stopped
 }
 
-/// Releases every lease under this frontend's label that no slot holds: the lease server
+/// Releases every lease of this process (or taken up from an earlier one) that no slot holds: the lease server
 /// books on a request whose answer may be lost, and a release can fail, and either leaves a
 /// lease that nothing renews or releases and that keeps a host busy until its ttl ends. False
 /// if the lease server could not be asked.
-pub(super) async fn reconcile(ctx: &Ctx<'_>, slots: &[Slot]) -> bool {
+pub(super) async fn reconcile(ctx: &Ctx<'_>, slots: &[Slot], inherited: &[LeaseId]) -> bool {
     let listed = ctx
         .api()
         .leases_labelled(FRONTEND_LABEL, &ctx.cfg.frontend)
@@ -213,8 +295,13 @@ pub(super) async fn reconcile(ctx: &Ctx<'_>, slots: &[Slot]) -> bool {
     let held: Vec<LeaseId> = slots.iter().filter_map(Slot::lease).collect();
     for lease in own {
         let live = matches!(lease.state, LeaseState::Held | LeaseState::Pending);
-        if live && !held.contains(&lease.id) {
+        // Only this process's leases, and those it took up: another process under the same
+        // id may be alive, and its leases are not strays.
+        let mine = lease.labels.get(INSTANCE_LABEL) == Some(&ctx.cfg.instance)
+            || inherited.contains(&lease.id);
+        if live && mine && !held.contains(&lease.id) {
             tracing::warn!(lease = %lease.id, "releasing a lease no slot holds");
+            ctx.deps.metrics.stray_released();
             release_lease(ctx, lease.id).await;
         }
     }
