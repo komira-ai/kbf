@@ -80,7 +80,6 @@ skip_checks      = []</pre></div>
 <tr><td><code>--usage-stale-after</code></td><td><code>hot_store.usage_stale_after</code></td><td>how old the published usage may be before <code>/usagez</code> says 503</td></tr>
 <tr><td><code>--max-request-bytes</code></td><td><code>server.max_request_bytes</code></td><td>the longest body of a request</td></tr>
 <tr><td><code>--max-concurrent-puts</code></td><td><code>server.max_concurrent_puts</code></td><td>the most put bodies and parts taken at once</td></tr>
-<tr><td><code>--put-permit-wait</code></td><td><code>server.put_permit_wait</code></td><td>how long a put that arrives with all of those taken waits for one to end (15s by default; 0 answers 503 at once); if none ends in that time it is answered 503 <code>SlowDown</code> with <code>Retry-After: 1</code>, and no byte of its body is read</td></tr>
 <tr><td><code>--put-min-bytes-per-sec</code></td><td><code>server.put_min_bytes_per_sec</code></td><td>the least average rate of a body (0 turns it off)</td></tr>
 <tr><td><code>--put-rate-grace</code></td><td><code>server.put_rate_grace</code></td><td>the time waiting for the client before that rate is held</td></tr>
 <tr><td><code>--body-idle-timeout</code></td><td><code>server.body_idle_timeout</code></td><td>how long a body or an answer may go without a byte</td></tr>
