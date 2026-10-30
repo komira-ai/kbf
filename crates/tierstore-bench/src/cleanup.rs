@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use tokio::task::JoinSet;
+use futures::future::join_all;
 
 use crate::cells::cold_put::run_prefix;
 use crate::config::RunConfig;
@@ -41,6 +41,8 @@ pub struct CleanupReport {
     pub failed: u64,
     /// Objects listed under the run prefix after the deletes.
     pub remaining: u64,
+    /// The listing after the deletes failed, so `remaining` is not known.
+    pub list_failed: bool,
 }
 
 impl CleanupReport {
@@ -48,6 +50,43 @@ impl CleanupReport {
     #[must_use]
     pub fn written(&self) -> u64 {
         self.put_ok + self.put_unanswered
+    }
+
+    /// The line the `cleanup` verb prints, which the farm script reads.
+    #[must_use]
+    pub fn summary_line(&self) -> String {
+        let remaining = if self.list_failed {
+            "unknown".to_owned()
+        } else {
+            self.remaining.to_string()
+        };
+        format!(
+            "cleanup: written={} (acknowledged {}, unanswered {}) deleted={} failed={} remaining_under_prefix={remaining}",
+            self.written(),
+            self.put_ok,
+            self.put_unanswered,
+            self.deleted,
+            self.failed
+        )
+    }
+
+    /// Why the cleanup is not complete, if it is not: a delete was not acknowledged, or what
+    /// is left could not be listed.
+    #[must_use]
+    pub fn halted_reason(&self) -> Option<String> {
+        if self.failed > 0 {
+            Some(format!(
+                "{} deletes were not acknowledged; run cleanup again",
+                self.failed
+            ))
+        } else if self.list_failed {
+            Some(
+                "the run prefix could not be listed after the deletes; run cleanup again"
+                    .to_owned(),
+            )
+        } else {
+            None
+        }
     }
 }
 
@@ -121,31 +160,18 @@ pub fn open_log(config: &RunConfig) -> Result<Arc<RequestLog>, BenchError> {
             source: std::io::Error::from(std::io::ErrorKind::NotFound),
         });
     }
-    Ok(Arc::new(RequestLog::create(&path)?))
-}
-
-/// Adds one finished delete task to the report.
-fn tally(
-    done: Result<Result<bool, BenchError>, tokio::task::JoinError>,
-    report: &mut CleanupReport,
-) -> Result<(), BenchError> {
-    let acknowledged = done.map_err(|_| BenchError::Request("a delete task panicked"))??;
-    if acknowledged {
-        report.deleted += 1;
-    } else {
-        report.failed += 1;
-    }
-    Ok(())
+    RequestLog::create(&path).map(Arc::new)
 }
 
 /// Deletes what the request log in `config.result_dir` lists under `<prefix>/<run_id>/`, with
 /// `in_flight` deletes at a time, records each delete in `log`, then counts what is left under
-/// the run prefix.
+/// the run prefix. A delete that is not acknowledged, and a listing that fails, are in the
+/// report ([`CleanupReport::halted_reason`]), not errors: the counts are what the caller needs.
 ///
 /// # Errors
 /// [`BenchError`]: no cold store is configured, the log is missing or has a line that is not a
-/// record, the log lists a written key outside the run prefix (nothing is deleted then), the
-/// request log cannot be written, or the listing after the deletes fails.
+/// record, the log lists a written key outside the run prefix (nothing is deleted then), or the
+/// request log cannot be written.
 pub async fn run(
     config: &RunConfig,
     log: &Arc<RequestLog>,
@@ -170,40 +196,36 @@ pub async fn run(
         deleted: 0,
         failed: 0,
         remaining: 0,
+        list_failed: false,
     };
 
-    let s3 = Arc::new(BenchS3::new(
-        Role::Cold,
-        spec,
-        Timeouts::default(),
-        log.clone(),
-    )?);
+    let s3 = BenchS3::new(Role::Cold, spec, Timeouts::default(), log.clone())?;
     let width = usize::try_from(in_flight.max(1)).unwrap_or(1);
-    let mut tasks: JoinSet<Result<bool, BenchError>> = JoinSet::new();
-    for key in keys.into_keys() {
-        while tasks.len() >= width {
-            if let Some(done) = tasks.join_next().await {
-                tally(done, &mut report)?;
+    let keys: Vec<String> = keys.into_keys().collect();
+    for batch in keys.chunks(width) {
+        for outcome in join_all(batch.iter().map(|key| s3.delete(key))).await {
+            if outcome?.is_ok() {
+                report.deleted += 1;
+            } else {
+                report.failed += 1;
             }
         }
-        let s3 = s3.clone();
-        tasks.spawn(async move { Ok(s3.delete(&key).await?.is_ok()) });
-    }
-    while let Some(done) = tasks.join_next().await {
-        tally(done, &mut report)?;
     }
 
     let mut token = None;
     loop {
-        let page = s3
-            .list_page(&under, token.as_ref(), 1000)
-            .await?
-            .result
-            .map_err(|_| BenchError::Request("cannot list the run prefix after the deletes"))?;
-        report.remaining += u64::try_from(page.objects.len()).unwrap_or(u64::MAX);
-        match page.next {
-            Some(next) => token = Some(next),
-            None => break,
+        match s3.list_page(&under, token.as_ref(), 1000).await?.result {
+            Ok(page) => {
+                report.remaining += u64::try_from(page.objects.len()).unwrap_or(u64::MAX);
+                match page.next {
+                    Some(next) => token = Some(next),
+                    None => break,
+                }
+            }
+            Err(_) => {
+                report.list_failed = true;
+                break;
+            }
         }
     }
     Ok(report)
@@ -252,5 +274,71 @@ mod tests {
         assert_eq!(parse_log(&format!("{good}\n{torn}")).unwrap().len(), 1);
         assert!(parse_log(&format!("{torn}\n{good}\n")).is_err());
         assert_eq!(parse_log("").unwrap().len(), 0);
+    }
+
+    /// Catches a record of another method, another role or another bucket being read as a
+    /// write of ours: each is skipped, and only a PUT to this bucket's cold role is a key.
+    #[test]
+    fn only_a_cold_put_to_the_configured_bucket_is_a_written_key() {
+        let mut hot = record("PUT", "p/r/hot", Some(200));
+        hot.role = Role::Hot;
+        let mut other = record("PUT", "p/r/other", Some(200));
+        other.bucket = "elsewhere".to_owned();
+        let records = [
+            hot,
+            other,
+            record("GET", "p/r/get", Some(200)),
+            record("PUT", "p/r/refused", Some(503)),
+            record("PUT", "p/r/taken", Some(412)),
+            record("PUT", "p/r/ours", Some(200)),
+        ];
+        let keys = keys_to_delete(&records, "b", "p/r/").unwrap();
+        assert_eq!(keys.keys().collect::<Vec<_>>(), ["p/r/ours"]);
+        // A written key outside the prefix is an error; a refused one outside it is not.
+        let outside = [record("PUT", "q/x", Some(200))];
+        assert!(keys_to_delete(&outside, "b", "p/r/").is_err());
+        let refused = [record("PUT", "q/x", Some(403))];
+        assert!(keys_to_delete(&refused, "b", "p/r/").unwrap().is_empty());
+    }
+
+    /// Catches the line the farm script reads changing, and a report that is not complete being
+    /// called complete: a failed delete or a failed listing each halts, with their words.
+    #[test]
+    fn the_summary_line_and_the_reasons_a_cleanup_is_incomplete() {
+        let clean = CleanupReport {
+            put_ok: 5,
+            put_unanswered: 2,
+            deleted: 7,
+            failed: 0,
+            remaining: 3,
+            list_failed: false,
+        };
+        assert_eq!(clean.written(), 7);
+        assert_eq!(
+            clean.summary_line(),
+            "cleanup: written=7 (acknowledged 5, unanswered 2) deleted=7 failed=0 remaining_under_prefix=3"
+        );
+        assert_eq!(clean.halted_reason(), None);
+        let failed = CleanupReport {
+            failed: 2,
+            deleted: 5,
+            ..clean
+        };
+        assert!(failed.halted_reason().unwrap().starts_with("2 deletes"));
+        let unlisted = CleanupReport {
+            list_failed: true,
+            ..clean
+        };
+        assert!(
+            unlisted
+                .summary_line()
+                .ends_with("remaining_under_prefix=unknown")
+        );
+        assert!(
+            unlisted
+                .halted_reason()
+                .unwrap()
+                .contains("could not be listed")
+        );
     }
 }

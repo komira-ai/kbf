@@ -40,8 +40,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures::future::{join, join_all};
 use tokio::sync::Barrier;
-use tokio::task::JoinSet;
 use tokio::time::{Instant as TokioInstant, sleep, sleep_until};
 
 use crate::cells::{CellContext, CellId, CellPlan};
@@ -85,21 +85,10 @@ pub struct ColdPutPlan {
     pub start_at_unix_ms: Option<u64>,
     /// A file whose presence ends the run before the next put.
     pub stop_file: Option<PathBuf>,
-}
-
-impl Default for ColdPutPlan {
-    fn default() -> Self {
-        Self {
-            run_id: String::new(),
-            prefix: "bench/c1".to_owned(),
-            puts: 1000,
-            level_secs: 600,
-            gate_every: 50,
-            same_key: false,
-            start_at_unix_ms: None,
-            stop_file: None,
-        }
-    }
+    /// Where the machine's load is read from (`/proc`; another directory for a test).
+    pub proc_dir: PathBuf,
+    /// Where the disks are listed (`/sys/block`; another directory for a test).
+    pub sys_block_dir: PathBuf,
 }
 
 /// What the concurrent-create check saw.
@@ -496,6 +485,23 @@ fn summarize(
     (pass, notes)
 }
 
+/// With exactly one winner, whether the stored bytes are that writer's; `None` with none or several.
+fn winner_check(winners: &[usize], equal_to: &[usize]) -> Option<bool> {
+    match winners {
+        [winner] => Some(equal_to.contains(winner)),
+        _ => None,
+    }
+}
+
+/// The words for [`winner_check`]'s answer in the notes.
+fn winner_text(check: Option<bool>, winners: usize) -> String {
+    match check {
+        Some(true) => "yes".to_owned(),
+        Some(false) => "no".to_owned(),
+        None => format!("n/a ({winners} winners here)"),
+    }
+}
+
 /// Shared pieces of the run, built once.
 struct Run<'a> {
     ctx: &'a CellContext,
@@ -616,13 +622,9 @@ impl Run<'_> {
             stop: Mutex::new(None),
         });
         let clock = Instant::now();
-        let mut tasks = JoinSet::new();
-        for _ in 0..level {
-            tasks.spawn(worker(lv.clone()));
-        }
         let mut samples = Vec::new();
-        while let Some(done) = tasks.join_next().await {
-            samples.extend(done.map_err(|_| BenchError::Request("a put task panicked"))??);
+        for done in join_all((0..level).map(|_| worker(lv.clone()))).await {
+            samples.extend(done?);
         }
         let elapsed_us = u64::try_from(clock.elapsed().as_micros()).unwrap_or(u64::MAX);
         samples.sort_by_key(|s| s.started_unix_ms);
@@ -690,22 +692,19 @@ impl Run<'_> {
         let bodies: Vec<Bytes> = (0..u64::from(writers))
             .map(|i| body(config.seed, writers, i, self.size))
             .collect();
-        let release = Arc::new(Barrier::new(
-            usize::try_from(writers).unwrap_or(usize::MAX) + 1,
-        ));
-        let mut tasks = JoinSet::new();
-        for (i, payload) in bodies.iter().cloned().enumerate() {
-            let (s3, release, key, arm) =
-                (self.s3.clone(), release.clone(), key.clone(), arm.clone());
-            let (size, window) = (self.size, config.window);
-            tasks.spawn(async move {
+        // The writers wait at a barrier that the starter joins last, after `start_at_unix_ms`.
+        let release = Barrier::new(usize::try_from(writers).unwrap_or(usize::MAX) + 1);
+        let (s3, size, window) = (&self.s3, self.size, config.window);
+        let put_all = join_all(bodies.iter().cloned().enumerate().map(|(i, payload)| {
+            let (release, key, arm) = (&release, &key, &arm);
+            async move {
                 release.wait().await;
-                let outcome = s3.put(&key, payload).await?;
+                let outcome = s3.put(key, payload).await?;
                 Ok::<_, BenchError>((
                     i,
                     Sample {
                         cell: CellId::ColdPut,
-                        arm,
+                        arm: arm.clone(),
                         pass: 0,
                         window,
                         role: Role::Cold,
@@ -717,21 +716,23 @@ impl Run<'_> {
                         status: outcome.status,
                     },
                 ))
-            });
-        }
-        if let Some(at) = cp.start_at_unix_ms {
-            let now = unix_ms();
-            if at > now {
-                sleep(Duration::from_millis(at - now)).await;
             }
-        }
-        let clock = Instant::now();
-        release.wait().await;
+        }));
+        let start_at = cp.start_at_unix_ms;
+        let starter = async {
+            if let Some(at) = start_at {
+                sleep(Duration::from_millis(at.saturating_sub(unix_ms()))).await;
+            }
+            let released = Instant::now();
+            release.wait().await;
+            released
+        };
+        let (released, put_results) = join(starter, put_all).await;
+        let elapsed_us = u64::try_from(released.elapsed().as_micros()).unwrap_or(u64::MAX);
         let mut answered: Vec<(usize, Sample)> = Vec::new();
-        while let Some(done) = tasks.join_next().await {
-            answered.push(done.map_err(|_| BenchError::Request("a put task panicked"))??);
+        for done in put_results {
+            answered.push(done?);
         }
-        let elapsed_us = u64::try_from(clock.elapsed().as_micros()).unwrap_or(u64::MAX);
         answered.sort_by_key(|(i, _)| *i);
         let samples: Vec<Sample> = answered.iter().map(|(_, s)| s.clone()).collect();
         self.samples_out.append(&self.provenance, &samples)?;
@@ -742,9 +743,9 @@ impl Run<'_> {
             .map(|(i, _)| *i)
             .collect();
         let stored_len = self.s3.head(&key).await?.result.ok().flatten();
-        let stored = match stored_len {
-            Some(len) if len > 0 => self.s3.get_range(&key, 0, len).await?.result.ok(),
-            _ => None,
+        let stored = match stored_len.filter(|len| *len > 0) {
+            Some(len) => self.s3.get_range(&key, 0, len).await?.result.ok(),
+            None => None,
         };
         let equal_to: Vec<usize> = stored.as_ref().map_or_else(Vec::new, |bytes| {
             bodies
@@ -754,10 +755,7 @@ impl Run<'_> {
                 .map(|(i, _)| i)
                 .collect()
         });
-        let stored_equals_winner = match winners.as_slice() {
-            [winner] => Some(equal_to.contains(winner)),
-            _ => None,
-        };
+        let stored_equals_winner = winner_check(&winners, &equal_to);
         let report = SameKeyReport {
             writers,
             statuses: count_statuses(&samples),
@@ -776,11 +774,7 @@ impl Run<'_> {
         ));
         notes.push(format!(
             "stored bytes equal the winner's: {}",
-            match stored_equals_winner {
-                Some(true) => "yes".to_owned(),
-                Some(false) => "no".to_owned(),
-                None => format!("n/a ({} winners here)", winners.len()),
-            }
+            winner_text(stored_equals_winner, winners.len())
         ));
         notes.push(format!(
             "stored bytes equal the bytes of this process's writers: {equal_to:?}"
@@ -885,7 +879,11 @@ pub async fn run_levels(
 /// # Errors
 /// What [`run_levels`] returns, and [`BenchError::Halted`].
 pub async fn run(ctx: &CellContext, plan: &CellPlan) -> Result<Vec<CellResult>, BenchError> {
-    let run = run_levels(ctx, plan, ProcLoad::new()).await?;
+    let load = ProcLoad::at(
+        plan.cold_put.proc_dir.clone(),
+        plan.cold_put.sys_block_dir.clone(),
+    );
+    let run = run_levels(ctx, plan, load).await?;
     match run.halted {
         Some(why) => Err(BenchError::Halted(why)),
         None => Ok(run.results),
@@ -959,5 +957,62 @@ mod tests {
         ] {
             assert!(run_prefix(prefix, run_id).is_err(), "{prefix:?} {run_id:?}");
         }
+    }
+
+    /// Catches the rate cap not spacing requests: after a first request, the next two are due
+    /// a gap apart each, so the pacer's due time moves forward by two gaps and the waits end.
+    #[tokio::test]
+    async fn the_pacer_spaces_request_starts_by_its_gap() {
+        let pacer = Pacer::new(1000);
+        assert_eq!(pacer.gap, Duration::from_millis(1));
+        let first = *pacer.next.lock().unwrap();
+        pacer.wait().await;
+        pacer.wait().await;
+        pacer.wait().await;
+        let after = *pacer.next.lock().unwrap();
+        assert!(
+            after - first >= Duration::from_millis(3),
+            "{:?}",
+            after - first
+        );
+        // A rate of zero is read as one per second, not as a division by zero.
+        assert_eq!(Pacer::new(0).gap, Duration::from_secs(1));
+    }
+
+    /// Catches the three answers about the stored bytes being mixed up: a single winner whose
+    /// bytes are stored, a single winner whose bytes are not (the failure the check exists to
+    /// find), and no winner or several (no answer).
+    #[test]
+    fn the_stored_bytes_are_compared_only_with_a_single_winner() {
+        assert_eq!(winner_check(&[3], &[3]), Some(true));
+        assert_eq!(winner_check(&[3], &[5]), Some(false));
+        assert_eq!(winner_check(&[3], &[]), Some(false));
+        assert_eq!(winner_check(&[], &[1]), None);
+        assert_eq!(winner_check(&[1, 2], &[1]), None);
+        assert_eq!(winner_text(Some(true), 1), "yes");
+        assert_eq!(winner_text(Some(false), 1), "no");
+        assert_eq!(winner_text(None, 2), "n/a (2 winners here)");
+    }
+
+    /// Catches a stop's name or its reach changing: which endings stop the whole run and which
+    /// only the level, and the measure a gate trip names.
+    #[test]
+    fn a_stop_names_itself_and_says_whether_it_ends_the_run() {
+        let cases = [
+            (Stop::TimeCap, "level-time-cap", false),
+            (Stop::ByteCap, "byte-cap", false),
+            (Stop::FileFound, "stop-file", true),
+            (Stop::Gate("psi_io_avg10"), "load gate: psi_io_avg10", true),
+            (Stop::LoadUnreadable, "load figures unreadable", true),
+        ];
+        for (stop, name, ends_run) in cases {
+            assert_eq!(stop.name(), name);
+            assert_eq!(stop.halts_run(), ends_run, "{name}");
+        }
+        assert_eq!(
+            Stop::Gate("loadavg_1m").tripped_measure().as_deref(),
+            Some("loadavg_1m")
+        );
+        assert_eq!(Stop::TimeCap.tripped_measure(), None);
     }
 }

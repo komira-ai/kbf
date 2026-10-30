@@ -3,11 +3,15 @@
 
 mod common;
 
-use common::{BUCKET, Script, rig};
+use std::sync::Arc;
+
+use clap::Parser as _;
+use common::{BUCKET, Refusing, Script, rig};
 use tierstore_bench::cells::cold_put;
 use tierstore_bench::cleanup;
+use tierstore_bench::cli::{self, Cli};
 use tierstore_bench::error::BenchError;
-use tierstore_bench::requestlog::RequestRecord;
+use tierstore_bench::requestlog::{RequestLog, RequestRecord};
 use tierstore_bench::role::Role;
 
 fn put_record(key: &str, status: Option<u16>) -> RequestRecord {
@@ -221,4 +225,218 @@ async fn a_node_namespace_cleanup_does_not_touch_the_node_whose_id_starts_the_sa
         .unwrap_err();
     assert!(matches!(err, BenchError::Request(_)), "{err:?}");
     assert_eq!(r.fake.keys().len(), 2);
+}
+
+/// Catches a cleanup that carries on when its own log of deletes cannot be written: it stops with
+/// that error rather than delete what it cannot record.
+#[tokio::test]
+async fn a_log_that_cannot_record_the_deletes_stops_the_cleanup() {
+    let r = rig("tierstore-bench-cl-logfail", &[]).await;
+    r.put_elsewhere("bench/c1/r1/a").await;
+    write_log(&r.out, &[put_record("bench/c1/r1/a", Some(200))]);
+    let log = Arc::new(RequestLog::to_writer(Refusing));
+    let err = cleanup::run(&r.ctx.config, &log, "bench/c1", "r1", 2)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BenchError::Log(_)), "{err:?}");
+}
+
+/// Catches deletes that got no answer being counted as deleted, or the run being lost for it: the
+/// report counts them as failed, says the listing failed too, and halts with both in words.
+#[tokio::test]
+async fn deletes_and_a_listing_that_get_no_answer_are_in_the_report_not_a_lost_run() {
+    let mut r = rig("tierstore-bench-cl-gone", &[]).await;
+    write_log(
+        &r.out,
+        &[
+            put_record("bench/c1/r1/a", Some(200)),
+            put_record("bench/c1/r1/b", None),
+            put_record("bench/c1/r1/c", Some(200)),
+        ],
+    );
+    r.store_goes_away();
+    let report = cleanup::run(&r.ctx.config, &r.ctx.log, "bench/c1", "r1", 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            report.put_ok,
+            report.put_unanswered,
+            report.deleted,
+            report.failed
+        ),
+        (2, 1, 0, 3)
+    );
+    assert!(report.list_failed);
+    assert!(
+        report
+            .summary_line()
+            .ends_with("remaining_under_prefix=unknown")
+    );
+    let why = report.halted_reason().expect("incomplete");
+    assert!(why.starts_with("3 deletes"), "{why}");
+}
+
+/// Catches a count of what is left that stops at the first page of the listing: 1,001 objects
+/// under the run prefix that the log does not list are all counted, over two pages.
+#[tokio::test]
+async fn what_is_left_is_counted_over_every_page_of_the_listing() {
+    let r = rig("tierstore-bench-cl-pages", &[]).await;
+    r.put_many_elsewhere("bench/c1/r1/n02/", 1001).await;
+    write_log(&r.out, &[]);
+    let report = cleanup::run(&r.ctx.config, &r.ctx.log, "bench/c1", "r1", 4)
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.written(), report.deleted, report.remaining),
+        (0, 0, 1001)
+    );
+    assert!(report.halted_reason().is_none());
+}
+
+fn run_file_for(r: &common::Rig, endpoint: &str) -> std::path::PathBuf {
+    let path = r.dir.path().join("cli-run.json");
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{"stores": {{"cold": {{"endpoint": "{endpoint}", "bucket": "{BUCKET}",
+                 "access_key_id": "k", "secret_access_key": "s"}}}}}}"#
+        ),
+    )
+    .unwrap();
+    path
+}
+
+async fn cli_cleanup(r: &common::Rig, run_file: &std::path::Path) -> Result<(), BenchError> {
+    let argv = [
+        "tierstore-bench",
+        "cleanup",
+        "--result-dir",
+        r.out.to_str().unwrap(),
+        "--run-file",
+        run_file.to_str().unwrap(),
+        "--run-id",
+        "r1",
+    ];
+    cli::run(Cli::try_parse_from(argv).unwrap()).await
+}
+
+/// Catches a cleanup that starts on a configuration or a log it cannot trust: a run id that
+/// could name another run's keys, no cold store, a log with a line in the middle that is not a
+/// record, a bucket the client refuses, and (with nothing to delete) a log of deletes that
+/// cannot be written when the listing is recorded. Each is an error, and nothing is deleted.
+#[tokio::test]
+async fn a_cleanup_that_cannot_start_or_record_is_an_error_and_deletes_nothing() {
+    let mut r = rig("tierstore-bench-cl-refuse", &[]).await;
+    r.put_elsewhere("bench/c1/r1/a").await;
+    write_log(&r.out, &[put_record("bench/c1/r1/a", Some(200))]);
+
+    let err = cleanup::run(&r.ctx.config, &r.ctx.log, "bench/c1", "a/b", 2)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BenchError::Request(_)), "{err:?}");
+
+    let good = serde_json::to_string(&put_record("bench/c1/r1/a", Some(200))).unwrap();
+    std::fs::write(
+        r.out.join("requests.jsonl"),
+        format!("{good}\nnot a record\n{good}\n"),
+    )
+    .unwrap();
+    let err = cleanup::run(&r.ctx.config, &r.ctx.log, "bench/c1", "r1", 2)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BenchError::Result(_)), "{err:?}");
+
+    write_log(&r.out, &[]);
+    let refusing = Arc::new(RequestLog::to_writer(Refusing));
+    let err = cleanup::run(&r.ctx.config, &refusing, "bench/c1", "r1", 2)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BenchError::Log(_)), "{err:?}");
+
+    r.ctx.config.stores.get_mut(&Role::Cold).unwrap().bucket = "B".to_owned();
+    let err = cleanup::run(&r.ctx.config, &r.ctx.log, "bench/c1", "r1", 2)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BenchError::Store(_)), "{err:?}");
+
+    r.ctx.config.stores.clear();
+    let err = cleanup::run(&r.ctx.config, &r.ctx.log, "bench/c1", "r1", 2)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BenchError::Config(_)), "{err:?}");
+    assert_eq!(r.fake.keys(), ["bench/c1/r1/a"]);
+}
+
+/// Catches the verbs hiding a bad configuration: a run file that is not there is a config error
+/// for `cleanup` and for `run`, and a run id that could leave its prefix is refused by `cleanup`.
+#[tokio::test]
+async fn the_verbs_refuse_a_missing_run_file_and_a_bad_run_id() {
+    let r = rig("tierstore-bench-cl-verb-bad", &[]).await;
+    write_log(&r.out, &[]);
+    let out = r.out.to_str().unwrap();
+    let ok_file = r.dir.path().join("run.json");
+    let missing = r.dir.path().join("none.json");
+    let cases: [Vec<&str>; 3] = [
+        vec![
+            "cleanup",
+            "--result-dir",
+            out,
+            "--run-file",
+            missing.to_str().unwrap(),
+            "--run-id",
+            "r1",
+        ],
+        vec![
+            "cleanup",
+            "--result-dir",
+            out,
+            "--run-file",
+            ok_file.to_str().unwrap(),
+            "--run-id",
+            ".x",
+        ],
+        vec![
+            "run",
+            "--result-dir",
+            out,
+            "--run-file",
+            missing.to_str().unwrap(),
+            "--cell",
+            "cold-put",
+        ],
+    ];
+    let want_config = [true, false, true];
+    for (argv, config) in cases.into_iter().zip(want_config) {
+        let mut full = vec!["tierstore-bench"];
+        full.extend(argv);
+        let err = cli::run(Cli::try_parse_from(full).unwrap())
+            .await
+            .unwrap_err();
+        if config {
+            assert!(matches!(err, BenchError::Config(_)), "{err:?}");
+        } else {
+            assert!(matches!(err, BenchError::Request(_)), "{err:?}");
+        }
+    }
+}
+
+/// Catches the `cleanup` verb reporting success when it is not, and failing when it is: with the
+/// store reachable it deletes the logged key and succeeds; with the store gone it fails as a
+/// halt that names the deletes not acknowledged.
+#[tokio::test]
+async fn the_cleanup_verb_succeeds_when_complete_and_halts_when_not() {
+    let r = rig("tierstore-bench-cl-verb", &[]).await;
+    r.put_elsewhere("bench/c1/r1/a").await;
+    write_log(&r.out, &[put_record("bench/c1/r1/a", Some(200))]);
+    let reachable = run_file_for(&r, r.fake.endpoint());
+    cli_cleanup(&r, &reachable).await.unwrap();
+    assert!(r.fake.keys().is_empty());
+
+    write_log(&r.out, &[put_record("bench/c1/r1/a", Some(200))]);
+    let gone = run_file_for(&r, "http://127.0.0.1:9");
+    match cli_cleanup(&r, &gone).await {
+        Err(BenchError::Halted(why)) => assert!(why.starts_with("1 deletes"), "{why}"),
+        other => panic!("expected a halt, got {other:?}"),
+    }
 }

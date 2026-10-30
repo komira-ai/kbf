@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
@@ -37,7 +37,7 @@ pub enum Command {
     /// Create the test buckets, scoped accounts and quotas (a dry run unless `--apply`).
     Provision(ProvisionArgs),
     /// Run cells.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Delete the objects a run of cell cold-put wrote, as its request log lists them.
     Cleanup(CleanupArgs),
     /// Serve the fault proxy in front of a store.
@@ -57,12 +57,20 @@ pub enum Command {
 /// # Errors
 /// [`BenchError::Io`] if the executable cannot be found or read.
 pub fn self_digest_line() -> Result<String, BenchError> {
+    // An executable that cannot be named is an empty path, which `digest_line` cannot read.
+    digest_line(&std::env::current_exe().unwrap_or_default())
+}
+
+/// `tierstore-bench sha256 <hex>` for the file at `path`.
+///
+/// # Errors
+/// [`BenchError::Io`] if the file cannot be read.
+pub fn digest_line(path: &Path) -> Result<String, BenchError> {
     use sha2::{Digest as _, Sha256};
-    let path = std::env::current_exe().map_err(|source| BenchError::Io {
-        path: PathBuf::from("current executable"),
+    let bytes = std::fs::read(path).map_err(|source| BenchError::Io {
+        path: path.to_owned(),
         source,
     })?;
-    let bytes = std::fs::read(&path).map_err(|source| BenchError::Io { path, source })?;
     Ok(format!(
         "tierstore-bench sha256 {}",
         hex::encode(Sha256::digest(bytes))
@@ -129,6 +137,12 @@ pub struct RunArgs {
     /// SHA-256 of this binary, copied into the results.
     #[arg(long)]
     pub binary_digest: Option<String>,
+    /// Where the machine's load is read from; for tests, which point it at a made-up tree.
+    #[arg(long, hide = true, default_value = "/proc", value_name = "DIR")]
+    pub proc_dir: PathBuf,
+    /// Where the disks are listed; for tests, as `--proc-dir`.
+    #[arg(long, hide = true, default_value = "/sys/block", value_name = "DIR")]
+    pub sys_block_dir: PathBuf,
 }
 
 impl RunArgs {
@@ -148,6 +162,8 @@ impl RunArgs {
                 same_key: self.same_key,
                 start_at_unix_ms: self.start_at_unix_ms,
                 stop_file: self.stop_file.clone(),
+                proc_dir: self.proc_dir.clone(),
+                sys_block_dir: self.sys_block_dir.clone(),
             },
         }
     }
@@ -256,22 +272,11 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
             let log = cleanup::open_log(&config)?;
             let report =
                 cleanup::run(&config, &log, &args.prefix, &args.run_id, args.in_flight).await?;
-            println!(
-                "cleanup: written={} (acknowledged {}, unanswered {}) deleted={} failed={} remaining_under_prefix={}",
-                report.written(),
-                report.put_ok,
-                report.put_unanswered,
-                report.deleted,
-                report.failed,
-                report.remaining
-            );
-            if report.failed > 0 {
-                return Err(BenchError::Halted(format!(
-                    "{} deletes were not acknowledged; run cleanup again",
-                    report.failed
-                )));
+            println!("{}", report.summary_line());
+            match report.halted_reason() {
+                Some(why) => Err(BenchError::Halted(why)),
+                None => Ok(()),
             }
-            Ok(())
         }
         Command::FaultProxy(args) => {
             proxy::run(ProxyConfig {
@@ -287,9 +292,6 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
             Ok(())
         }
         Command::Report(args) => report::render(&args.result_dir).map(|_| ()),
-        Command::SelfDigest => {
-            println!("{}", self_digest_line()?);
-            Ok(())
-        }
+        Command::SelfDigest => self_digest_line().map(|line| println!("{line}")),
     }
 }

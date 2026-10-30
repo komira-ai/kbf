@@ -5,6 +5,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -152,5 +153,138 @@ impl Script {
 impl LoadSource for Script {
     fn sample(&self) -> Result<LoadSample, BenchError> {
         Ok(self.0.lock().unwrap().pop_front().unwrap_or_else(calm))
+    }
+}
+
+/// Calm for the first `ok` samples, then unreadable.
+pub struct Unreadable {
+    ok: usize,
+    seen: AtomicUsize,
+}
+
+impl Unreadable {
+    pub fn after(ok: usize) -> Self {
+        Self {
+            ok,
+            seen: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl LoadSource for Unreadable {
+    fn sample(&self) -> Result<LoadSample, BenchError> {
+        if self.seen.fetch_add(1, Ordering::SeqCst) < self.ok {
+            Ok(calm())
+        } else {
+            Err(BenchError::Request("the load cannot be read"))
+        }
+    }
+}
+
+/// Calm, and creates `file` on its `nth` sample (the first is 1).
+pub struct TouchOn {
+    file: PathBuf,
+    nth: usize,
+    seen: AtomicUsize,
+}
+
+impl TouchOn {
+    pub fn new(file: PathBuf, nth: usize) -> Self {
+        Self {
+            file,
+            nth,
+            seen: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl LoadSource for TouchOn {
+    fn sample(&self) -> Result<LoadSample, BenchError> {
+        if self.seen.fetch_add(1, Ordering::SeqCst) + 1 == self.nth {
+            std::fs::write(&self.file, "").unwrap();
+        }
+        Ok(calm())
+    }
+}
+
+/// A made-up `/proc` and `/sys/block` under `root`, calm except for the load average given:
+/// `(proc, sys_block)`. One whole disk, `sda`, and the loop, ram and zram devices the gate leaves
+/// out, and `ghost`, which `diskstats` lists and `/sys/block` does not.
+pub fn proc_tree(root: &std::path::Path, loadavg: &str) -> (PathBuf, PathBuf) {
+    let proc = root.join("proc");
+    let sys = root.join("sys_block");
+    std::fs::create_dir_all(proc.join("pressure")).unwrap();
+    for disk in ["sda", "loop0", "ram0", "zram0"] {
+        std::fs::create_dir_all(sys.join(disk)).unwrap();
+    }
+    std::fs::write(
+        proc.join("loadavg"),
+        format!("{loadavg} 0.40 0.30 1/100 999\n"),
+    )
+    .unwrap();
+    let psi = |some: &str| {
+        format!(
+            "some avg10={some} avg60=0.00 avg300=0.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=1\n"
+        )
+    };
+    std::fs::write(proc.join("pressure/cpu"), psi("0.50")).unwrap();
+    std::fs::write(proc.join("pressure/io"), psi("1.50")).unwrap();
+    let mut stats = String::new();
+    for (i, name) in ["sda", "loop0", "ram0", "zram0", "ghost"]
+        .iter()
+        .enumerate()
+    {
+        stats.push_str(&format!(
+            "   8 {i} {name} 1 0 2 3 4 0 5 6 0 {} 7\n",
+            1000 * (i + 1)
+        ));
+    }
+    std::fs::write(proc.join("diskstats"), stats).unwrap();
+    (proc, sys)
+}
+
+/// A writer whose writes all fail, for a request log that cannot be kept.
+pub struct Refusing;
+
+impl std::io::Write for Refusing {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("disk full"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Rig {
+    /// Writes `count` objects named `<prefix><00000..>` the way another client would.
+    pub async fn put_many_elsewhere(&self, prefix: &str, count: usize) {
+        let s3 = BenchS3::new(
+            Role::Cold,
+            self.ctx.config.store(Role::Cold).unwrap(),
+            Timeouts::default(),
+            Arc::new(RequestLog::to_writer(std::io::sink())),
+        )
+        .unwrap();
+        for i in 0..count {
+            let out = s3
+                .put(&format!("{prefix}{i:05}"), Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+            assert!(out.is_ok());
+        }
+    }
+
+    /// Points the cold store at a port nothing listens on.
+    pub fn store_goes_away(&mut self) {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        self.ctx
+            .config
+            .stores
+            .get_mut(&Role::Cold)
+            .unwrap()
+            .endpoint = endpoint;
     }
 }

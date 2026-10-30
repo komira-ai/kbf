@@ -74,24 +74,34 @@ pub fn busiest_disk_pct(
     pct.min(100.0)
 }
 
-/// Whether `name` is a device whose busy time the gate should count.
-fn counted_device(name: &str) -> bool {
+/// Whether `name` is a device whose busy time the gate should count: not a loop, ram or zram
+/// device, and a whole disk, which is what a directory of that name in `sys_block` says.
+fn counted_device(sys_block: &Path, name: &str) -> bool {
     !(name.starts_with("loop") || name.starts_with("ram") || name.starts_with("zram"))
-        && Path::new("/sys/block").join(name).exists()
+        && sys_block.join(name).exists()
 }
 
-/// A [`LoadSource`] over the real `/proc`.
+/// A [`LoadSource`] over `/proc` and `/sys/block`.
 pub struct ProcLoad {
     root: PathBuf,
+    sys_block: PathBuf,
     previous: Mutex<Option<(Instant, BTreeMap<String, u64>)>>,
 }
 
 impl ProcLoad {
-    /// Reads `/proc`.
+    /// Reads the real `/proc` and `/sys/block`.
     #[must_use]
     pub fn new() -> Self {
+        Self::at(PathBuf::from("/proc"), PathBuf::from("/sys/block"))
+    }
+
+    /// Reads the files of a `/proc` (`loadavg`, `pressure/cpu`, `pressure/io`, `diskstats`) and
+    /// a `/sys/block` that are under other directories.
+    #[must_use]
+    pub fn at(root: PathBuf, sys_block: PathBuf) -> Self {
         Self {
-            root: PathBuf::from("/proc"),
+            root,
+            sys_block,
             previous: Mutex::new(None),
         }
     }
@@ -119,7 +129,7 @@ impl LoadSource for ProcLoad {
         let now_at = Instant::now();
         let now: Vec<(String, u64)> = parse_diskstats(&self.read("diskstats")?)
             .into_iter()
-            .filter(|(name, _)| counted_device(name))
+            .filter(|(name, _)| counted_device(&self.sys_block, name))
             .collect();
         let mut previous = self.previous.lock().unwrap_or_else(PoisonError::into_inner);
         let disk_util_pct = match previous.as_ref() {
@@ -168,7 +178,9 @@ mod tests {
     fn diskstats_gives_the_io_milliseconds_of_each_device() {
         let text = "   8       0 sda 100 1 2000 30 400 5 6000 70 0 8888 99\n\
                     259       0 nvme0n1 1 2 3 4 5 6 7 8 9 4242 11\n\
-                    short line\n";
+                    short line\n\
+                    8 1 sdb 1 2 3\n\
+                    8 2 sdc 1 0 2 3 4 0 5 6 0 not-a-number 7\n";
         assert_eq!(
             parse_diskstats(text),
             [("sda".to_owned(), 8888), ("nvme0n1".to_owned(), 4242)]
@@ -190,5 +202,13 @@ mod tests {
         assert!((busiest_disk_pct(&before, &now, 100) - 100.0).abs() < 1e-9);
         assert!(busiest_disk_pct(&before, &now, 0).abs() < 1e-9);
         assert!(busiest_disk_pct(&BTreeMap::new(), &now, 1000).abs() < 1e-9);
+    }
+
+    /// Catches the default source not being the real `/proc` and `/sys/block`.
+    #[test]
+    fn the_default_source_reads_the_real_proc_and_sys_block() {
+        let load = ProcLoad::default();
+        assert_eq!(load.root, PathBuf::from("/proc"));
+        assert_eq!(load.sys_block, PathBuf::from("/sys/block"));
     }
 }

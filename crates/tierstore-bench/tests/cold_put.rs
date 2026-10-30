@@ -4,12 +4,16 @@
 
 mod common;
 
-use common::{Script, calm, rig};
+use std::sync::Arc;
+
+use common::{Refusing, Script, TouchOn, Unreadable, calm, proc_tree, rig};
 use kbf_testkit::dir::TestDir;
-use tierstore_bench::cells::{CellId, cold_put};
+use tierstore_bench::cells::{self, CellId, cold_put};
 use tierstore_bench::error::BenchError;
 use tierstore_bench::gate::LoadSample;
+use tierstore_bench::requestlog::RequestLog;
 use tierstore_bench::result::{CellResult, Window};
+use tierstore_bench::s3::unix_ms;
 
 fn busy_io() -> LoadSample {
     LoadSample {
@@ -512,4 +516,366 @@ async fn in_flight_times_object_size_over_a_gibibyte_is_refused_before_any_reque
         .await
         .unwrap();
     assert_eq!(run.halted.as_deref(), Some("stop-file"));
+}
+
+/// Catches a load that cannot be read being taken for a calm machine: at the start no request is
+/// sent and the run is halted with that reason; with no measure named as tripped.
+#[tokio::test]
+async fn a_load_that_cannot_be_read_at_the_start_halts_the_run() {
+    let r = rig("tierstore-bench-cp-unread-start", &["--in-flight", "4,8"]).await;
+    let run = cold_put::run_levels(&r.ctx, &r.plan, Unreadable::after(0))
+        .await
+        .unwrap();
+    assert_eq!(run.halted.as_deref(), Some("load figures unreadable"));
+    assert_eq!(run.results.len(), 1);
+    let pass = &run.results[0].passes[0];
+    assert_eq!((pass.requests, pass.gate_tripped.clone()), (0, None));
+    let notes = run.results[0].notes.join("\n");
+    assert!(
+        notes.contains("ended by: load figures unreadable, before any request"),
+        "{notes}"
+    );
+    assert!(r.fake.keys().is_empty());
+}
+
+/// Catches the gate being read once and trusted: a load that is readable at the start and not
+/// after the first batch ends the level and the run, and the end-of-level reading, which also
+/// fails, is left out of the notes rather than invented.
+#[tokio::test]
+async fn a_load_that_becomes_unreadable_between_batches_halts_the_run() {
+    let r = rig(
+        "tierstore-bench-cp-unread-mid",
+        &[
+            "--in-flight",
+            "4,8",
+            "--puts",
+            "400",
+            "--gate-every",
+            "10",
+            "--object-bytes",
+            "64",
+        ],
+    )
+    .await;
+    let run = cold_put::run_levels(&r.ctx, &r.plan, Unreadable::after(1))
+        .await
+        .unwrap();
+    assert_eq!(run.halted.as_deref(), Some("load figures unreadable"));
+    assert_eq!(run.results.len(), 1);
+    let pass = &run.results[0].passes[0];
+    assert!((10..400).contains(&pass.requests), "{}", pass.requests);
+    let notes = run.results[0].notes.join("\n");
+    assert!(notes.contains("load at start"), "{notes}");
+    assert!(!notes.contains("load at end"), "{notes}");
+}
+
+/// Catches a stop file that is looked for only at the start: one that appears while a level
+/// runs ends the level before the next put, and the run is halted by it.
+#[tokio::test]
+async fn a_stop_file_that_appears_during_a_level_halts_the_run() {
+    let dir = TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        "tierstore-bench-cp-stop-mid-dir",
+    );
+    let stop = dir.path().join("stop");
+    let r = rig(
+        "tierstore-bench-cp-stop-mid",
+        &[
+            "--in-flight",
+            "4",
+            "--puts",
+            "400",
+            "--gate-every",
+            "10",
+            "--object-bytes",
+            "64",
+            "--stop-file",
+            stop.to_str().unwrap(),
+        ],
+    )
+    .await;
+    // The second reading of the load, the first inside the level, puts the file down.
+    let run = cold_put::run_levels(&r.ctx, &r.plan, TouchOn::new(stop.clone(), 2))
+        .await
+        .unwrap();
+    assert!(stop.exists());
+    assert_eq!(run.halted.as_deref(), Some("stop-file"));
+    let pass = &run.results[0].passes[0];
+    assert!((10..400).contains(&pass.requests), "{}", pass.requests);
+}
+
+/// Catches a level that starts with a byte budget too small for one object: no request, the
+/// reason in the notes, and the run halted by the byte cap rather than a silent empty pass.
+#[tokio::test]
+async fn a_byte_budget_that_holds_no_object_ends_the_run_before_any_put() {
+    let mut r = rig(
+        "tierstore-bench-cp-nobudget",
+        &["--in-flight", "2,4", "--object-bytes", "1000"],
+    )
+    .await;
+    r.ctx.config.bytes.pass = 100;
+    let run = cold_put::run_levels(&r.ctx, &r.plan, Script::calm())
+        .await
+        .unwrap();
+    assert_eq!(run.halted.as_deref(), Some("byte-cap"));
+    assert_eq!(run.results.len(), 1);
+    assert_eq!(run.results[0].passes[0].requests, 0);
+    let notes = run.results[0].notes.join("\n");
+    assert!(notes.contains("holds less than one object"), "{notes}");
+    assert!(r.fake.keys().is_empty());
+}
+
+/// Catches the concurrent-create check starting without room for a body per writer, and a
+/// load gate that is not read for it: each ends it before any request, with its reason.
+#[tokio::test]
+async fn the_same_key_check_does_not_start_without_room_or_on_a_busy_machine() {
+    let mut r = rig(
+        "tierstore-bench-sk-nobudget",
+        &["--same-key", "--in-flight", "4", "--object-bytes", "1000"],
+    )
+    .await;
+    r.ctx.config.bytes.pass = 3999;
+    let run = cold_put::run_levels(&r.ctx, &r.plan, Script::calm())
+        .await
+        .unwrap();
+    assert_eq!(run.halted.as_deref(), Some("byte-cap"));
+    assert!(run.same_key.is_none());
+    let notes = run.results[0].notes.join("\n");
+    assert!(notes.contains("less than one object per writer"), "{notes}");
+    assert!(r.fake.keys().is_empty());
+
+    let busy = rig(
+        "tierstore-bench-sk-busy",
+        &["--same-key", "--in-flight", "4", "--object-bytes", "100"],
+    )
+    .await;
+    let run = cold_put::run_levels(&busy.ctx, &busy.plan, Script::new([busy_load()]))
+        .await
+        .unwrap();
+    assert!(
+        run.halted
+            .as_deref()
+            .is_some_and(|h| h.contains("loadavg_1m")),
+        "{:?}",
+        run.halted
+    );
+    assert!(run.same_key.is_none());
+    assert_eq!(
+        run.results[0].passes[0].gate_tripped.as_deref(),
+        Some("loadavg_1m")
+    );
+    assert!(busy.fake.keys().is_empty());
+}
+
+/// Catches a store that cannot be reached being reported as having a winner or a stored object:
+/// all writers get no answer, no stored object is found, and the notes say so.
+#[tokio::test]
+async fn a_same_key_check_against_a_store_that_is_gone_reports_no_winner_and_no_object() {
+    let mut r = rig(
+        "tierstore-bench-sk-gone",
+        &["--same-key", "--in-flight", "4", "--object-bytes", "64"],
+    )
+    .await;
+    r.store_goes_away();
+    let run = cold_put::run_levels(&r.ctx, &r.plan, Script::calm())
+        .await
+        .unwrap();
+    let report = run.same_key.expect("a report");
+    assert_eq!(report.statuses.get(&None), Some(&4));
+    assert_eq!(report.statuses.len(), 1);
+    assert!(report.winners.is_empty());
+    assert_eq!(report.stored_len, None);
+    assert!(report.equal_to.is_empty());
+    assert_eq!(report.stored_equals_winner, None);
+    let pass = &run.results[0].passes[0];
+    assert_eq!((pass.failures, pass.bytes), (4, 0));
+    let notes = run.results[0].notes.join("\n");
+    assert!(
+        notes.contains("stored length (HEAD after the race): none"),
+        "{notes}"
+    );
+    assert!(notes.contains("n/a (0 winners here)"), "{notes}");
+}
+
+/// Catches the shared start time being ignored or breaking a start time already past: with a
+/// start in the past the writers go at once, with one a little ahead they go after it, and
+/// either way one writer wins.
+#[tokio::test]
+async fn the_same_key_writers_can_be_released_at_a_given_time() {
+    for (n, start) in [1u64, unix_ms() + 30].into_iter().enumerate() {
+        let r = rig(
+            &format!("tierstore-bench-sk-start-{n}"),
+            &[
+                "--same-key",
+                "--in-flight",
+                "4",
+                "--object-bytes",
+                "64",
+                "--start-at-unix-ms",
+                &start.to_string(),
+            ],
+        )
+        .await;
+        let run = cold_put::run_levels(&r.ctx, &r.plan, Script::calm())
+            .await
+            .unwrap();
+        let report = run.same_key.expect("a report");
+        assert_eq!(report.winners.len(), 1, "start {start}");
+        assert_eq!(report.stored_equals_winner, Some(true));
+    }
+}
+
+/// Catches a request log that cannot be written being survived: the run stops with the log's
+/// error, for a level and for the concurrent-create check.
+#[tokio::test]
+async fn a_request_log_that_cannot_be_written_stops_the_cell() {
+    for (n, extra) in [
+        vec!["--in-flight", "2", "--puts", "4", "--object-bytes", "8"],
+        vec!["--same-key", "--in-flight", "2", "--object-bytes", "8"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut r = rig(&format!("tierstore-bench-cp-logfail-{n}"), &extra).await;
+        r.ctx.log = Arc::new(RequestLog::to_writer(Refusing));
+        let err = cold_put::run_levels(&r.ctx, &r.plan, Script::calm())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BenchError::Log(_)), "{err:?}");
+    }
+}
+
+/// Catches plans the cell must refuse before any request: a size of zero or several sizes, no
+/// level or a level of zero, and several levels for the concurrent-create check.
+#[tokio::test]
+async fn a_plan_with_a_bad_size_or_level_is_refused_before_any_request() {
+    let r = rig("tierstore-bench-cp-badplan", &["--puts", "2"]).await;
+    let mut plans = Vec::new();
+    for sizes in [vec![0], vec![8, 16]] {
+        let mut p = r.plan.clone();
+        p.object_bytes = sizes;
+        plans.push(p);
+    }
+    for levels in [vec![], vec![2, 0]] {
+        let mut p = r.plan.clone();
+        p.in_flight = levels;
+        plans.push(p);
+    }
+    let mut p = r.plan.clone();
+    p.in_flight = vec![2, 4];
+    p.cold_put.same_key = true;
+    plans.push(p);
+    for plan in &plans {
+        let err = cold_put::run_levels(&r.ctx, plan, Script::calm())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BenchError::Request(_)), "{err:?}");
+    }
+    assert_eq!(r.ctx.log.count(), 0);
+    assert!(r.fake.keys().is_empty());
+}
+
+/// Catches a run id given by the context being overwritten by the plan's: the CSV carries the
+/// provenance the caller gave. Also a level time cap too large to add to the clock is no cap.
+#[tokio::test]
+async fn a_given_provenance_is_kept_and_a_huge_time_cap_is_no_cap() {
+    let mut r = rig(
+        "tierstore-bench-cp-prov",
+        &[
+            "--in-flight",
+            "2",
+            "--puts",
+            "4",
+            "--object-bytes",
+            "8",
+            "--level-secs",
+            "18446744073709551615",
+        ],
+    )
+    .await;
+    r.ctx.provenance.run_id = "given".to_owned();
+    let run = cold_put::run_levels(&r.ctx, &r.plan, Script::calm())
+        .await
+        .unwrap();
+    assert_eq!(run.halted, None);
+    assert_eq!(run.results[0].passes[0].requests, 4);
+    assert_eq!(run.results[0].provenance.run_id, "given");
+    assert!(r.csv_rows().iter().all(|row| row[0] == "given"));
+}
+
+/// Catches the p99 being claimed from too little or from a busy window, or never: 1,000 puts in
+/// a window declared quiet give a `p99_us` in the result, at least as large as the median.
+#[tokio::test]
+async fn a_quiet_window_with_a_thousand_puts_claims_a_p99() {
+    let r = rig(
+        "tierstore-bench-cp-p99",
+        &[
+            "--in-flight",
+            "16",
+            "--puts",
+            "1000",
+            "--object-bytes",
+            "8",
+            "--window",
+            "quiet",
+            "--gate-every",
+            "0",
+        ],
+    )
+    .await;
+    let run = cold_put::run_levels(&r.ctx, &r.plan, Script::calm())
+        .await
+        .unwrap();
+    let pass = &run.results[0].passes[0];
+    assert_eq!((pass.requests, pass.window), (1000, Window::Quiet));
+    let p = pass.percentiles.expect("percentiles");
+    assert!(p.p99_us.expect("a p99") >= p.p50_us);
+    assert!(p.max_us >= p.p99_us.unwrap());
+}
+
+/// Catches the cell run through `cells::run` not reading the machine's load from the tree it is
+/// pointed at, and not stopping on a busy one: on a calm made-up `/proc` the levels run and the
+/// results come back; on one with a high load average the run is a halted error naming it.
+#[tokio::test]
+async fn the_cell_reads_the_load_from_the_proc_it_is_given() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-cp-proc");
+    let (calm_proc, sys) = proc_tree(&dir.path().join("calm"), "0.50");
+    let (busy_proc, _) = proc_tree(&dir.path().join("busy"), "99.00");
+    let args = |proc: &std::path::Path| {
+        vec![
+            "--in-flight".to_owned(),
+            "2".to_owned(),
+            "--puts".to_owned(),
+            "4".to_owned(),
+            "--object-bytes".to_owned(),
+            "8".to_owned(),
+            "--proc-dir".to_owned(),
+            proc.to_str().unwrap().to_owned(),
+            "--sys-block-dir".to_owned(),
+            sys.to_str().unwrap().to_owned(),
+        ]
+    };
+    let calm_args = args(&calm_proc);
+    let r = rig(
+        "tierstore-bench-cp-proc-calm",
+        &calm_args.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .await;
+    let results = cells::run(CellId::ColdPut, &r.ctx, &r.plan).await.unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].passes[0].requests, 4);
+    let notes = results[0].notes.join("\n");
+    assert!(notes.contains("psi_io_avg10=1.50"), "{notes}");
+
+    let busy_args = args(&busy_proc);
+    let b = rig(
+        "tierstore-bench-cp-proc-busy",
+        &busy_args.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .await;
+    match cells::run(CellId::ColdPut, &b.ctx, &b.plan).await {
+        Err(BenchError::Halted(why)) => assert!(why.contains("loadavg_1m"), "{why}"),
+        other => panic!("expected a halt, got {other:?}"),
+    }
+    assert!(b.fake.keys().is_empty());
 }

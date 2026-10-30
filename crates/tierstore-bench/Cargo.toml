@@ -15,6 +15,8 @@ publish.workspace = true
 [dependencies]
 bytes.workspace = true
 clap.workspace = true
+# `join_all`: the workers of a level run as futures of one task, not spawned tasks.
+futures.workspace = true
 hex.workspace = true
 # The S3 client (`s3`): SigV4, multipart, ranged reads, listings.
 kbf-objstore.workspace = true
