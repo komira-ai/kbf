@@ -1,11 +1,19 @@
 //! The local cache of a build node: a read-through disk cache in front of one upstream.
 //!
 //! A [`LocalCache`] is a [`Backend`] over an upstream [`Backend`] (an S3 endpoint, in the
-//! binary: a storage node's tierstore). The S3 front serves it like any other backend, and
+//! binary: any S3 store, such as a bucket of MinIO or a storage node's tierstore). By default the S3 front serves it as a read cache and
 //! refuses every write before it gets here (see `ServerConfig::cache`), so a cache has no
 //! journal, no lease and no reconciler, and nothing to recover but a directory of files it can
 //! delete. The only things that run on their own are the fills a miss starts, the eviction
 //! pass ([`LocalCache::maintain`]) and the scrub ([`LocalCache::scrub`]).
+//!
+//! # Writes
+//!
+//! With [`CacheConfig::write_through`] (`write_through = true` in `[local_cache]`) the cache
+//! accepts writes and sends every one of them to the upstream: nothing is acknowledged before
+//! the upstream has it, and nothing is only local. The module `write` has what each call does.
+//! Without the setting every write call of the [`Backend`] is `Unsupported`, as the front
+//! refuses it before.
 //!
 //! # What is kept
 //!
@@ -70,9 +78,11 @@ mod evict;
 mod fill;
 mod index;
 pub(super) mod layout;
+mod listing;
 mod metrics;
 mod scrub;
 mod selfcheck;
+mod write;
 
 #[cfg(test)]
 mod evict_tests;
@@ -85,6 +95,8 @@ mod hit_tests;
 #[cfg(test)]
 mod limits_tests;
 #[cfg(test)]
+mod listing_tests;
+#[cfg(test)]
 mod scrub_tests;
 #[cfg(test)]
 mod selfcheck_tests;
@@ -92,8 +104,14 @@ mod selfcheck_tests;
 mod start_tests;
 #[cfg(test)]
 pub(in crate::server) mod testing;
+#[cfg(test)]
+mod write_front_tests;
+#[cfg(test)]
+mod write_race_tests;
+#[cfg(test)]
+mod write_tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -105,7 +123,7 @@ use bytes::Bytes;
 use tokio::sync::Semaphore;
 
 use crate::journal::is_reserved;
-use crate::{Backend, ByteRange, Clock, Error, Listed, Meta, OpenUpload, UploadsAfter};
+use crate::{Backend, ByteRange, Clock, Error, Listed, Meta, OpenUpload, PartBody, UploadsAfter};
 
 pub use disk::{Disk, Space, SystemDisk};
 pub use metrics::Counters;
@@ -154,11 +172,15 @@ pub struct CacheConfig {
     /// The most fills that run at once. A miss that finds all of them running is served from
     /// the upstream and keeps nothing. At least one (0 is read as 1).
     pub max_concurrent_fills: usize,
+    /// Whether the cache takes writes and sends them to the upstream. Off, every write call is
+    /// `Unsupported`. The binary sets the front's `cache_writes` from the same setting, so that
+    /// the front does not refuse the writes either.
+    pub write_through: bool,
 }
 
 impl CacheConfig {
     /// A cache in `path` of `budget` bytes, with the water marks at 90, 75 and 95 percent, a
-    /// floor of 10 percent free, and the fill sizes of the binary.
+    /// floor of 10 percent free, the fill sizes of the binary, and no writes.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>, budget: u64, policies: Vec<(String, bool)>) -> Self {
         Self {
@@ -172,6 +194,7 @@ impl CacheConfig {
             fill_chunk: FILL_CHUNK,
             whole_limit: WHOLE_FILL_LIMIT,
             max_concurrent_fills: MAX_CONCURRENT_FILLS,
+            write_through: false,
         }
     }
 
@@ -238,6 +261,10 @@ pub(super) struct Inner {
     counters: Counters,
     /// The fills that are running, by the name of the object.
     flights: Mutex<HashMap<String, Pending>>,
+    /// The fills that are running for an object that was deleted or replaced since they began:
+    /// they must not keep what they read. A name is put here only while it has a fill in
+    /// `flights`, and leaves with it; the lock is taken with `flights` held.
+    invalidated: Mutex<HashSet<String>>,
     /// The number of the next file in `.stage/`.
     staged: AtomicU64,
     /// The bytes of the fills that are running and have no object in the index yet.
@@ -289,6 +316,7 @@ impl LocalCache {
             index: Mutex::new(index),
             counters,
             flights: Mutex::new(HashMap::new()),
+            invalidated: Mutex::new(HashSet::new()),
             staged: AtomicU64::new(0),
             reserved: AtomicU64::new(0),
             permits,
@@ -405,16 +433,72 @@ impl Inner {
 
 #[async_trait]
 impl Backend for LocalCache {
-    async fn put(&self, _key: &str, _body: Bytes) -> Result<(), Error> {
-        Err(Error::Unsupported(READ_ONLY.to_owned()))
+    /// Whether a streamed body must come with its length: the upstream's answer once the cache
+    /// takes writes, and `false` for a read cache, which takes no body.
+    fn needs_length(&self) -> bool {
+        let inner = &self.inner;
+        inner.config.write_through && inner.upstream.needs_length()
+    }
+
+    async fn put(&self, key: &str, body: Bytes) -> Result<(), Error> {
+        self.inner.put_whole(key, body).await
+    }
+
+    async fn put_stream(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        self.inner.put_through(key, len, body).await
     }
 
     async fn put_if_match(&self, _key: &str, _body: Bytes, _etag: &str) -> Result<String, Error> {
         Err(Error::Unsupported(READ_ONLY.to_owned()))
     }
 
-    async fn delete(&self, _key: &str) -> Result<(), Error> {
-        Err(Error::Unsupported(READ_ONLY.to_owned()))
+    async fn delete(&self, key: &str) -> Result<(), Error> {
+        self.inner.delete_through(key).await
+    }
+
+    async fn create_upload(&self, key: &str) -> Result<String, Error> {
+        self.inner.create_through(key).await
+    }
+
+    async fn upload_part(
+        &self,
+        key: &str,
+        id: &str,
+        number: u32,
+        body: PartBody<'_>,
+    ) -> Result<String, Error> {
+        let sent = self.inner.part_through(key, id, number, None, body);
+        sent.await
+    }
+
+    async fn upload_part_with_len(
+        &self,
+        key: &str,
+        id: &str,
+        number: u32,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<String, Error> {
+        let sent = self.inner.part_through(key, id, number, len, body);
+        sent.await
+    }
+
+    async fn complete_upload(
+        &self,
+        key: &str,
+        id: &str,
+        parts: &[(u32, String)],
+    ) -> Result<String, Error> {
+        self.inner.complete_through(key, id, parts).await
+    }
+
+    async fn abort_upload(&self, key: &str, id: &str) -> Result<(), Error> {
+        self.inner.abort_through(key, id).await
     }
 
     async fn get(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
@@ -451,7 +535,7 @@ impl Backend for LocalCache {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<Listed>, Error> {
-        self.inner.upstream.list(prefix).await
+        self.inner.list_data(prefix).await
     }
 
     async fn list_page(
@@ -460,8 +544,8 @@ impl Backend for LocalCache {
         start_after: Option<&str>,
         max_keys: usize,
     ) -> Result<Vec<Listed>, Error> {
-        let upstream = &self.inner.upstream;
-        upstream.list_page(prefix, start_after, max_keys).await
+        let page = self.inner.list_data_page(prefix, start_after, max_keys);
+        page.await
     }
 
     async fn list_uploads(
@@ -470,7 +554,7 @@ impl Backend for LocalCache {
         after: Option<UploadsAfter<'_>>,
         max_uploads: usize,
     ) -> Result<Vec<OpenUpload>, Error> {
-        let upstream = &self.inner.upstream;
-        upstream.list_uploads(prefix, after, max_uploads).await
+        let found = self.inner.list_data_uploads(prefix, after, max_uploads);
+        found.await
     }
 }

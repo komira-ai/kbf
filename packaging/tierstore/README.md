@@ -293,6 +293,27 @@ every call but GET and HEAD (a put, a part, the start or completion of an upload
 CreateBucket) is refused 403 `AccessDenied` with a message that says this is a read cache, before
 the body is read. The key files of `[server]` are those of the front, as for a storage node.
 
+With `write_through = true` in `[local_cache]` (default `false`) the node takes the writes its keys
+may do and sends each to the upstream; the answer is given only after the upstream has the object,
+and the cache keeps nothing of what is written (the first read of an object fills it). Create-only
+puts (with or without `If-None-Match: *`), presigned PUTs, multipart uploads (start, part,
+completion, abort) and deletes go to the upstream; the roles of the full, read-only, scoped,
+presigning and GC keys apply as on a storage node, and a put that replaces (`If-Match`) and a copy
+are still refused. A create-only put makes one HEAD of the key at the upstream before the body is
+read, and answers 412 at once if the object is there; the upstream's conditional put is the
+arbiter of two writers. A full upstream (507) is 503 `SlowDown` with `Retry-After`; an upstream that
+does not answer is 503. A delete drops the cache's copy and then deletes at the upstream, and a fill
+that was reading the object does not keep it; the completion of an upload drops the cache's copy of
+the key. Listings leave out the keys under `_journal/` and `_tiering/`, always. The upstream key
+must now be one that writes: with `write_through` the start runs the self-test of the storage node
+against the upstream, under `_tiering/selftest/` (a create-only put that refuses a key that exists,
+a replace on a tag, ranged reads, paging, and a multipart completion that refuses a key that
+exists), and a store that answers one wrongly, a key that may not write included, is exit status 3
+before the address is bound; one that cannot be reached is status 1. The upstream must therefore be
+a store that takes writes under `_tiering/` (an S3 bucket, not the front of a storage node). The
+upstream's key is also the cache's: only the front's roles keep one client from another's objects.
+The start line then says `mode=write-through-cache`.
+
 ```toml
 [server]
 listen          = "127.0.0.1:9400"
@@ -401,12 +422,13 @@ read, or that reports 0 bytes, is not judged: the start warns on stderr and goes
 | `local_cache.critical` | percent of the budget above which a fill is skipped (default 95, not below `high_water`) |
 | `local_cache.free_floor` | percent of the file system that is kept free (0 to 99, default 10): below it a pass evicts, even under the budget; it does not stop a fill, and `budget` may not be above the file system's size less the floor (exit status 2), unless its size cannot be read or is 0, which the start warns of and does not judge |
 | `local_cache.max_concurrent_fills` | the most fills that run at once (1 to 64, default 4); a miss that finds them all running is served from the upstream and kept nowhere |
+| `local_cache.write_through` | `false` by default: a read cache that refuses every write with 403 before the role of the key is looked at. `true`: the node takes the writes its keys may do and sends each to the upstream, which must be written with a key that may write; the start runs the upstream's self-test (create-only and multipart-conditional included) and exits with status 3 if the upstream answers one wrongly |
 | `local_cache.cache` | `true`, the default; `false` is refused (leave `[local_cache]` out to run without a cache) |
 | `local_cache.scrub_rate` | the bytes a second the scrub reads, a size and `/s` such as `"50MiB/s"` (default `"16MiB/s"`); `"off"` turns the scrub off |
 | `cold_store.endpoints` | a list of exactly one endpoint, in place of `endpoint`: several are refused as not supported yet, since the cache reads from one upstream |
 
 `[cold_store]` is the upstream: any `kind` (an `s3` bucket, with `endpoint` and a `credentials_file`
-of a read-only key, in practice), and without `skip_checks` and the keys of the reconciler. `[server]`
+of a read-only key, in practice, or of a key that writes with `write_through`), and without `skip_checks` and the keys of the reconciler. `[server]`
 is as for a storage node, without `backend_check_wait`. A `[[policy]]` with `cache = true` is needed.
 The three tables `[hot_store]`, `[local_cache]` and `[cold_store]` together are refused: the hot
 store is already local disk.
@@ -511,11 +533,25 @@ the flags of the binary against this table, so a flag added without a key fails 
 | `--oci-connection-lifetime` | `oci.connection_lifetime` | the longest a connection of the front lives (`1h` if left out) |
 
 These stay flags, since they describe one run and not the data path: `--config`,
-`--print-config`, `--drain-lb-wait` and `--drain-deadline`. A start that gives `--config` and any
-other flag is refused with status 2 and a message that names the flags (`--drain-lb-wait` and
-`--drain-deadline` may go with it). A refusal that the checks of the start make (water marks out of
-order, a key file others can read) names the keys of the file where the flag-mode message names the
-flags.
+`--print-config`, `--check-config`, `--drain-lb-wait` and `--drain-deadline`. A start that gives
+`--config` and any other flag is refused with status 2 and a message that names the flags
+(`--drain-lb-wait`, `--drain-deadline` and `--check-config` may go with it). A refusal that the
+checks of the start make (water marks out of order, a key file others can read) names the keys of
+the file where the flag-mode message names the flags.
+
+`tierstore --config <path> --check-config` loads the file as a start does (the same loader and the
+same refusals, the build-node checks and `write_through` included) and reads the key files it
+names; it binds nothing, makes no directory and calls no store or network. It prints nothing and
+exits 0 if the file would start; if the file is refused it prints the message a start prints and
+exits 2. `--check-config` without `--config` is a usage error (status 2). It does not reach the
+tiers, so a tier that is down, or a key that the store would refuse, is found by a start (its
+self-test) and not by the check. It does not look at the disk either: the start's refusal of a
+`budget` over the size of the file system less `free_floor` (exit status 2), the cache directory
+and the credentials file of a tier are checked by a start only. For a storage node with an `[oci]`
+table the check does validate the OCI front as a start does (the prefix, the connection lifetime,
+and the TLS certificate and key files, which it reads and parses), without binding the address
+and without the warning that a start gives for plain HTTP off loopback. A TLS file that is not
+there or cannot be used is exit status 2 under `--check-config`, where a start exits 1.
 
 ### What the loader refuses
 
