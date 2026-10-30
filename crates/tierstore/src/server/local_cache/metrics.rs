@@ -75,6 +75,75 @@ const COUNTER: &str = "counter";
 /// The kind of a family that is measured now and goes up and down.
 const GAUGE: &str = "gauge";
 
+// The full name of each family, in the source as the page shows it, so that a name that the docs
+// test or a reader looks for is found by search.
+const HITS: &str = "tierstore_cache_hits_total";
+const MISSES: &str = "tierstore_cache_misses_total";
+const BYTES_SERVED_LOCAL: &str = "tierstore_cache_bytes_served_local_total";
+const BYTES_SERVED_UPSTREAM: &str = "tierstore_cache_bytes_served_upstream_total";
+const FILLS: &str = "tierstore_cache_fills_total";
+const FILLS_SKIPPED: &str = "tierstore_cache_fills_skipped_total";
+const FILLS_SKIPPED_BUSY: &str = "tierstore_cache_fills_skipped_busy_total";
+const UPSTREAM_BYTES_READ: &str = "tierstore_cache_upstream_bytes_read_total";
+const HEAD_HITS: &str = "tierstore_cache_head_hits_total";
+const HEAD_MISSES: &str = "tierstore_cache_head_misses_total";
+const UPSTREAM_PUTS: &str = "tierstore_cache_upstream_puts_total";
+const UPSTREAM_PUT_BYTES: &str = "tierstore_cache_upstream_put_bytes_total";
+const WRITES_THROUGH: &str = "tierstore_cache_writes_through_total";
+const WRITE_EXISTS: &str = "tierstore_cache_write_exists_total";
+const KEEPS_EXPIRED: &str = "tierstore_cache_keeps_expired_total";
+const PINNED_SKIPS: &str = "tierstore_cache_pinned_skips_total";
+const DISCARDED_AT_START: &str = "tierstore_cache_discarded_at_start_total";
+pub(super) const BYTES: &str = "tierstore_cache_bytes";
+pub(super) const OBJECTS: &str = "tierstore_cache_objects";
+pub(super) const FS_FREE_BYTES: &str = "tierstore_cache_fs_free_bytes";
+const STAGING_FILES: &str = "tierstore_cache_staging_files";
+const FILL_FAILURES: &str = "tierstore_cache_fill_failures_total";
+const UPSTREAM_READS: &str = "tierstore_cache_upstream_reads_total";
+const UPSTREAM_PUT_FAILURES: &str = "tierstore_cache_upstream_put_failures_total";
+const WRITE_KEEP_SKIPPED: &str = "tierstore_cache_write_keep_skipped_total";
+const EVICTIONS: &str = "tierstore_cache_evictions_total";
+
+/// The families that have one sample, with their kinds, in the order of the page.
+pub(super) const FAMILIES: [(&str, &str); 21] = [
+    (HITS, COUNTER),
+    (MISSES, COUNTER),
+    (BYTES_SERVED_LOCAL, COUNTER),
+    (BYTES_SERVED_UPSTREAM, COUNTER),
+    (FILLS, COUNTER),
+    (FILLS_SKIPPED, COUNTER),
+    (FILLS_SKIPPED_BUSY, COUNTER),
+    (UPSTREAM_BYTES_READ, COUNTER),
+    (HEAD_HITS, COUNTER),
+    (HEAD_MISSES, COUNTER),
+    (UPSTREAM_PUTS, COUNTER),
+    (UPSTREAM_PUT_BYTES, COUNTER),
+    (WRITES_THROUGH, COUNTER),
+    (WRITE_EXISTS, COUNTER),
+    (KEEPS_EXPIRED, COUNTER),
+    (PINNED_SKIPS, COUNTER),
+    (DISCARDED_AT_START, COUNTER),
+    (BYTES, GAUGE),
+    (OBJECTS, GAUGE),
+    (FS_FREE_BYTES, GAUGE),
+    (STAGING_FILES, GAUGE),
+];
+
+/// The families that have a sample for each label, with the label's name, the labels and the
+/// kind, in the order of the page after [`FAMILIES`].
+#[cfg(test)]
+pub(super) const LABELLED: [(&str, &str, &[&str]); 5] = [
+    (FILL_FAILURES, "reason", &FAILED),
+    (
+        UPSTREAM_READS,
+        "op",
+        &["get", "head", "list", "list_uploads"],
+    ),
+    (UPSTREAM_PUT_FAILURES, "reason", &PUT_FAILED),
+    (WRITE_KEEP_SKIPPED, "reason", &SKIPPED_KEEP),
+    (EVICTIONS, "reason", &EVICTED),
+];
+
 /// Why a put or a completion that reached the upstream was refused or failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PutFailed {
@@ -231,64 +300,39 @@ impl Counters {
         let mut text = String::new();
         // Each family has one `# TYPE` line, before its first sample, as the OCI series have.
         let plain = [
-            ("hits_total", COUNTER, read(&self.hits)),
-            ("misses_total", COUNTER, read(&self.misses)),
-            (
-                "bytes_served_local_total",
-                COUNTER,
-                read(&self.bytes_served_local),
-            ),
-            (
-                "bytes_served_upstream_total",
-                COUNTER,
-                read(&self.bytes_served_upstream),
-            ),
-            ("fills_total", COUNTER, read(&self.fills)),
-            ("fills_skipped_total", COUNTER, read(&self.fills_skipped)),
-            (
-                "fills_skipped_busy_total",
-                COUNTER,
-                read(&self.fills_skipped_busy),
-            ),
-            (
-                "upstream_bytes_read_total",
-                COUNTER,
-                read(&self.upstream_bytes_read),
-            ),
-            ("head_hits_total", COUNTER, read(&self.head_hits)),
-            ("head_misses_total", COUNTER, read(&self.head_misses)),
-            ("upstream_puts_total", COUNTER, read(&self.upstream_puts)),
-            (
-                "upstream_put_bytes_total",
-                COUNTER,
-                read(&self.upstream_put_bytes),
-            ),
-            ("writes_through_total", COUNTER, read(&self.writes_through)),
-            ("write_exists_total", COUNTER, read(&self.write_exists)),
-            ("keeps_expired_total", COUNTER, read(&self.keeps_expired)),
-            ("pinned_skips_total", COUNTER, read(&self.pinned_skips)),
+            (HITS, read(&self.hits)),
+            (MISSES, read(&self.misses)),
+            (BYTES_SERVED_LOCAL, read(&self.bytes_served_local)),
+            (BYTES_SERVED_UPSTREAM, read(&self.bytes_served_upstream)),
+            (FILLS, read(&self.fills)),
+            (FILLS_SKIPPED, read(&self.fills_skipped)),
+            (FILLS_SKIPPED_BUSY, read(&self.fills_skipped_busy)),
+            (UPSTREAM_BYTES_READ, read(&self.upstream_bytes_read)),
+            (HEAD_HITS, read(&self.head_hits)),
+            (HEAD_MISSES, read(&self.head_misses)),
+            (UPSTREAM_PUTS, read(&self.upstream_puts)),
+            (UPSTREAM_PUT_BYTES, read(&self.upstream_put_bytes)),
+            (WRITES_THROUGH, read(&self.writes_through)),
+            (WRITE_EXISTS, read(&self.write_exists)),
+            (KEEPS_EXPIRED, read(&self.keeps_expired)),
+            (PINNED_SKIPS, read(&self.pinned_skips)),
             // Set once, when the cache is opened, and the same for the rest of the process.
-            (
-                "discarded_at_start_total",
-                COUNTER,
-                read(&self.discarded_at_start),
-            ),
-            ("bytes", GAUGE, cache_bytes),
-            ("objects", GAUGE, cache_objects),
-            ("fs_free_bytes", GAUGE, fs_free_bytes),
-            ("staging_files", GAUGE, read(&self.staging_files)),
+            (DISCARDED_AT_START, read(&self.discarded_at_start)),
+            (BYTES, cache_bytes),
+            (OBJECTS, cache_objects),
+            (FS_FREE_BYTES, fs_free_bytes),
+            (STAGING_FILES, read(&self.staging_files)),
         ];
-        for (name, kind, value) in plain {
-            let _ = writeln!(text, "# TYPE tierstore_cache_{name} {kind}");
-            let _ = writeln!(text, "tierstore_cache_{name} {value}");
+        // The kinds are in `FAMILIES`, in the same order.
+        for ((name, kind), (named, value)) in FAMILIES.iter().zip(plain) {
+            debug_assert_eq!(*name, named);
+            let _ = writeln!(text, "# TYPE {name} {kind}");
+            let _ = writeln!(text, "{name} {value}");
         }
-        let _ = writeln!(text, "# TYPE tierstore_cache_fill_failures_total {COUNTER}");
+        let _ = writeln!(text, "# TYPE {FILL_FAILURES} {COUNTER}");
         for (label, counter) in FAILED.iter().zip(&self.failures) {
             let value = read(counter);
-            let _ = writeln!(
-                text,
-                "tierstore_cache_fill_failures_total{{reason=\"{label}\"}} {value}"
-            );
+            let _ = writeln!(text, "{FILL_FAILURES}{{reason=\"{label}\"}} {value}");
         }
         let reads = [
             ("get", &self.upstream_gets),
@@ -296,42 +340,28 @@ impl Counters {
             ("list", &self.upstream_lists),
             ("list_uploads", &self.upstream_list_uploads),
         ];
-        let _ = writeln!(
-            text,
-            "# TYPE tierstore_cache_upstream_reads_total {COUNTER}"
-        );
+        let _ = writeln!(text, "# TYPE {UPSTREAM_READS} {COUNTER}");
         for (op, counter) in reads {
             let value = read(counter);
-            let _ = writeln!(
-                text,
-                "tierstore_cache_upstream_reads_total{{op=\"{op}\"}} {value}"
-            );
+            let _ = writeln!(text, "{UPSTREAM_READS}{{op=\"{op}\"}} {value}");
         }
-        let family = "tierstore_cache_upstream_put_failures_total";
-        let _ = writeln!(text, "# TYPE {family} {COUNTER}");
+        let _ = writeln!(text, "# TYPE {UPSTREAM_PUT_FAILURES} {COUNTER}");
         for (label, counter) in PUT_FAILED.iter().zip(&self.put_failures) {
             let value = read(counter);
             let _ = writeln!(
                 text,
-                "tierstore_cache_upstream_put_failures_total{{reason=\"{label}\"}} {value}"
+                "{UPSTREAM_PUT_FAILURES}{{reason=\"{label}\"}} {value}"
             );
         }
-        let family = "tierstore_cache_write_keep_skipped_total";
-        let _ = writeln!(text, "# TYPE {family} {COUNTER}");
+        let _ = writeln!(text, "# TYPE {WRITE_KEEP_SKIPPED} {COUNTER}");
         for (label, counter) in SKIPPED_KEEP.iter().zip(&self.keep_skips) {
             let value = read(counter);
-            let _ = writeln!(
-                text,
-                "tierstore_cache_write_keep_skipped_total{{reason=\"{label}\"}} {value}"
-            );
+            let _ = writeln!(text, "{WRITE_KEEP_SKIPPED}{{reason=\"{label}\"}} {value}");
         }
-        let _ = writeln!(text, "# TYPE tierstore_cache_evictions_total {COUNTER}");
+        let _ = writeln!(text, "# TYPE {EVICTIONS} {COUNTER}");
         for (label, counter) in EVICTED.iter().zip(&self.evictions) {
             let value = read(counter);
-            let _ = writeln!(
-                text,
-                "tierstore_cache_evictions_total{{reason=\"{label}\"}} {value}"
-            );
+            let _ = writeln!(text, "{EVICTIONS}{{reason=\"{label}\"}} {value}");
         }
         text
     }

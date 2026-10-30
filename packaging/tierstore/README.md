@@ -540,6 +540,17 @@ were not hits), are the series of `tier="local"`. The `upstream_reads_total`,
 upstream, the cold side: they are not `tier="local"` series, and a query that sums the local tier
 over them would count the cache's own reads twice. They have no `tier` label.
 
+The rows for these counters in the mapping of "Local cache" (shared series to `tierstore_cache_*`
+series):
+
+| shared series | `tierstore_cache_*` series |
+|---|---|
+| `tierstore_hits_total{tier="local",op="head"}` | `tierstore_cache_head_hits_total` (the HEADs the cache is asked, the front's own pre-GET HEADs included) |
+| `tierstore_misses_total{tier="local",op="head"}` | `tierstore_cache_head_misses_total` |
+| `tierstore_bytes_read_total{tier="cold"}` | `tierstore_cache_upstream_bytes_read_total` |
+| cold side, calls (no shared series): `op="head"` is the cache's HEADs of the upstream | `tierstore_cache_upstream_reads_total{op="get\|head\|list\|list_uploads"}` |
+| cold side, writes (no shared series) | `tierstore_cache_upstream_puts_total`, `tierstore_cache_upstream_put_bytes_total`, `tierstore_cache_upstream_put_failures_total{reason}` |
+
 ### Which key each flag has
 
 Every flag that describes the data path has the key or keys below, and no other has one. A flag

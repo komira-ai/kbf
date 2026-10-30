@@ -9,7 +9,9 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream;
 
-use super::metrics::{PutFailed, read};
+use super::metrics::{
+    BYTES, Counters, FAMILIES, FS_FREE_BYTES, LABELLED, OBJECTS, PutFailed, read,
+};
 use super::testing::{Rig, digest, pattern};
 use crate::{Backend, ByteRange, Error, Op, PartBody};
 
@@ -313,6 +315,38 @@ async fn a_multipart_counts_one_put_with_the_bytes_of_its_parts() {
     // The completions the upstream saw are the ones taken and the ones that failed.
     let failed = failures(&rig).iter().sum::<u64>();
     assert_eq!(rig.calls(Op::CompleteUpload), puts(&rig).0 + failed);
+}
+
+/// Asserts that the page is the families of the constants, each once and in their order, byte for
+/// byte: a `# TYPE` line and a sample for each family with one sample, then for each labelled
+/// family a `# TYPE` line and a sample for each label. A family that is renamed in the page and
+/// not in its constant, or left out or repeated, fails here.
+#[test]
+fn the_page_is_the_families_of_the_constants_in_order() {
+    let text = Counters::default().render(4, 5, 6);
+    let mut expected = String::new();
+    for (name, kind) in FAMILIES {
+        let value = match name {
+            BYTES => 4,
+            OBJECTS => 5,
+            FS_FREE_BYTES => 6,
+            _ => 0,
+        };
+        expected.push_str(&format!("# TYPE {name} {kind}\n{name} {value}\n"));
+    }
+    for (name, key, labels) in LABELLED {
+        expected.push_str(&format!("# TYPE {name} counter\n"));
+        for label in labels {
+            expected.push_str(&format!("{name}{{{key}=\"{label}\"}} 0\n"));
+        }
+    }
+    assert_eq!(text, expected);
+    let names: BTreeSet<&str> = FAMILIES
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(LABELLED.iter().map(|(name, _, _)| *name))
+        .collect();
+    assert_eq!(names.len(), FAMILIES.len() + LABELLED.len());
 }
 
 /// Asserts the form of the page: every family has exactly one `# TYPE` line, before its first
