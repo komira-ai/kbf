@@ -255,8 +255,9 @@ fn the_metrics_path_is_not_a_bucket_name() {
         }
     });
     let cli = Cli::try_parse_from(args).expect("flags");
+    // Status 1, as for healthz, readyz and usagez: the probe-path refusal is not a flag-parse error.
     let (status, why) = refused(&cli);
-    assert_eq!(status, 2, "{why}");
+    assert_eq!(status, 1, "{why}");
     assert!(why.contains("probe path"), "{why}");
 }
 
