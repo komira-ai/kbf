@@ -124,6 +124,14 @@ fn refusal(text: &str) -> String {
     settings_from_text(text, DEFAULTS).unwrap_err().to_string()
 }
 
+/// `message` without the leading `line N, column M: ` of a refusal of the syntax, if it has one.
+fn without_position(message: &str) -> &str {
+    match message.split_once(": ") {
+        Some((position, rest)) if position.starts_with("line ") => rest,
+        _ => message,
+    }
+}
+
 /// `CACHE` with the text `from` replaced by `to`, which must be in it.
 fn cache_with(from: &str, to: &str) -> String {
     assert!(CACHE.contains(from), "{from}");
@@ -260,6 +268,11 @@ fn a_build_node_file_is_refused_when_it_cannot_be_run() {
     .replacen(
         "prefix = \"cas/d/\"\ncache  = true",
         "prefix = \"cas/d/\"\ncache  = false",
+        1,
+    )
+    .replacen(
+        "prefix = \"images/\"\ncache  = true",
+        "prefix = \"images/\"\ncache  = false",
         1,
     );
     let cases = [
@@ -546,7 +559,12 @@ fn a_build_node_oci_table_is_refused_as_a_storage_nodes_is() {
         let build = refusal(&format!("{LEAST}\n[oci]\n{oci}\n"));
         let storage = refusal(&format!("{MINIMAL}\n[oci]\n{oci}\n"));
         assert!(build.contains(want), "{oci}: {build}");
-        assert_eq!(build, storage, "{oci}");
+        // A refusal of the syntax says where it is, and the two files are not laid out alike.
+        assert_eq!(
+            without_position(&build),
+            without_position(&storage),
+            "{oci}"
+        );
     }
 }
 
@@ -599,14 +617,12 @@ fn an_oci_front_over_keys_the_cache_does_not_keep_is_refused() {
     assert!(why.contains("oci.prefix"), "{why}");
     assert!(why.contains("cache = false"), "{why}");
 
-    // A policy that keeps everything else, and a narrower one inside the blobs that keeps nothing:
-    // the blobs under it would never be kept.
+    // A policy prefix must end in `/` and the blobs are flat under `blobs/sha256/`, so no policy
+    // can cover some of the blobs: the one that covers them all decides.
     let rest = "[[policy]]\nprefix = \"\"\ncache = true\n";
     let inside = "[[policy]]\nprefix = \"oci/blobs/sha256/0\"\ncache = false\n";
     let why = refusal(&format!("{LEAST}\n{rest}\n{inside}\n{front}"));
-    assert!(why.contains("oci.prefix"), "{why}");
-    assert!(why.contains("\"oci/blobs/sha256/0\""), "{why}");
-    assert!(why.contains("cache = false"), "{why}");
+    assert!(why.contains("does not end in /"), "{why}");
     let outside = "[[policy]]\nprefix = \"other/\"\ncache = false\n";
     let loaded = cache_of(&format!("{LEAST}\n{rest}\n{outside}\n{front}"));
     assert!(loaded.oci.listen.is_some());

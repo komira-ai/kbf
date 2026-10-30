@@ -309,8 +309,10 @@ async fn a_cached_blob_whose_file_is_removed_is_filled_again() {
     node.pull_whole(&hex, &blob).await;
     let kept = node.metrics().await;
     let gets_kept = node.blob_gets(&hex);
-    let file = node.cache_dir.join("obj").join(&hex[..2]).join(&hex[2..4]);
-    let file = file.join(&hex);
+    // The file is named by the SHA-256 of the key, which is not the digest of the blob.
+    let named = hex_of(format!("oci/blobs/sha256/{hex}").as_bytes());
+    let file = node.cache_dir.join("obj").join(&named[..2]);
+    let file = file.join(&named[2..4]).join(&named);
     assert!(file.is_file(), "the blob is not in the cache directory");
 
     std::fs::remove_file(&file).expect("removed");

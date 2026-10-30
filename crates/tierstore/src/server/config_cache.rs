@@ -191,19 +191,7 @@ fn check_oci_is_kept(oci: &OciFlags, policy: &[Policy]) -> Result<(), ConfigErro
         .filter(|policy| probe.starts_with(policy.prefix.as_str()));
     let longest = holding.max_by_key(|policy| policy.prefix.len());
     match longest {
-        Some(kept) if kept.cache => {
-            let inside = policy
-                .iter()
-                .find(|other| !other.cache && other.prefix.starts_with(probe.as_str()));
-            let Some(off) = inside else {
-                return Ok(());
-            };
-            let why = format!(
-                "the [[policy]] with prefix {:?} has cache = false inside the blobs under {probe:?}, so some blobs would never be kept; leave it out or move it outside the blobs",
-                off.prefix
-            );
-            Err(invalid("oci.prefix", why))
-        }
+        Some(policy) if policy.cache => Ok(()),
         Some(policy) => {
             let why = format!(
                 "the blobs under {probe:?} are covered by the [[policy]] with prefix {:?}, which has cache = false, so every pull would go to the upstream; give a [[policy]] with prefix = {prefix:?} and cache = true",
