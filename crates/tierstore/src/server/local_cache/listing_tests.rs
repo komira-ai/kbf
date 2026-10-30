@@ -180,6 +180,21 @@ async fn a_large_reserved_range_costs_about_one_call() {
     assert_eq!(keys(&rest), ["b/1", "b/2"]);
 }
 
+/// Asserts that a page ending on a reserved key already past the end of its range (`_journal/~~a`
+/// sorts after `_journal/~`) continues after that key itself, not back at the end of the range: the
+/// listing reaches the data key behind the range in one call for each key. Continuing at the end
+/// of the range would be given `_journal/~~a` again and again until the call limit refused it.
+#[tokio::test]
+async fn a_reserved_key_past_the_end_of_its_range_continues_after_itself() {
+    let rig = Rig::new("tscache-list-past-end");
+    for key in ["A/1", "_journal/~~a", "_journal/~~b", "z/1"] {
+        rig.put(key, b"x").await;
+    }
+    let rest = rig.cache.list_page("", Some("A/1"), 1).await.unwrap();
+    assert_eq!(keys(&rest), ["z/1"]);
+    assert_eq!(rig.calls(Op::List), 3);
+}
+
 /// A store that ignores `start_after`: every page it gives is the first, and it counts the pages.
 struct Stuck {
     inner: MemoryBackend,
