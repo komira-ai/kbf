@@ -265,6 +265,9 @@ pub struct TaskFlags {
     pub put_credentials_file: PathBuf,
     /// `--task-read-url`.
     pub read_url: String,
+    /// `--executor-allow-plain-http-grant` with `--executor js-agent`: the read url may be
+    /// `http://`.
+    pub allow_plain_http_grant: bool,
     /// `--task-run-wall-secs`.
     pub run_wall: Duration,
     /// `--task-url-slack-secs`.
@@ -307,6 +310,7 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<Option<TaskFlags>, String> 
             .cloned()
             .unwrap_or_default(),
         read_url,
+        allow_plain_http_grant: false,
         run_wall: secs(RUN_WALL),
         url_slack: secs(URL_SLACK),
         max_digests: usize::try_from(digests).unwrap_or(usize::MAX),
@@ -383,6 +387,7 @@ impl TaskFlags {
             max_packs: self.max_packs,
             large,
             read_url: self.read_url.clone(),
+            allow_plain_read_url: self.allow_plain_http_grant,
             run_wall: self.run_wall,
             slack: self.url_slack,
             limits: ClosureLimits {

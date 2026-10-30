@@ -60,7 +60,12 @@ async fn a_run_mounts_nothing_and_holds_no_secret_outside_its_flags() {
             .values()
             .all(|v| !v.contains(&url) && !v.contains(&token))
     );
-    for flag in ["--allow-plain-http-put", "--root-der", "--work-dir"] {
+    for flag in [
+        "--allow-plain-http-put",
+        "--allow-plain-http-grant",
+        "--root-der",
+        "--work-dir",
+    ] {
         assert!(!run.args.iter().any(|a| a == flag), "{flag} was passed");
     }
 }
@@ -100,6 +105,34 @@ async fn a_read_grant_that_is_not_https_is_never_posted() {
     let finished = rig.until_done(&caller, 3).await;
     assert_eq!(code(&finished), Code::Internal, "{finished:?}");
     assert!(rig.runs().await.is_empty());
+}
+
+/// Catches a read grant over plain http posted without the operator's word, and the opt-in not
+/// reaching the task: with `allow_plain_http_grant` set an `http://` grant is posted, its url
+/// is the task's `--grant-url`, and the task tool is given exactly one
+/// `--allow-plain-http-grant`; an `https://` grant with the flag set is posted too, with the
+/// same one flag (the flag is the config's, not the url's).
+#[tokio::test(start_paused = true)]
+async fn a_plain_http_grant_is_posted_only_when_allowed_and_the_task_is_told() {
+    for url in ["http://grant.test:9400", "https://grant.test:9400"] {
+        let mut rig = Rig::start(&["node1"], 1, |cfg| cfg.allow_plain_http_grant = true).await;
+        rig.pump().await;
+        rig.inputs
+            .grant
+            .lock()
+            .expect("grant")
+            .as_mut()
+            .expect("ok")
+            .url = url.to_owned();
+        let run = posted(&mut rig).await;
+        assert_eq!(run.arg("--grant-url"), Some(url));
+        let given = run
+            .args
+            .iter()
+            .filter(|a| *a == "--allow-plain-http-grant")
+            .count();
+        assert_eq!(given, 1, "{:?}", run.args.len());
+    }
 }
 
 /// Catches a write url sent in clear without the operator's word: a pack url that is not

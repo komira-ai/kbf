@@ -176,6 +176,7 @@ fn js_agent_settings_become_the_executors_config() {
         "--executor-arch=arm64",
         "--executor-work-dir=/scratch",
         "--executor-allow-plain-http-put",
+        "--executor-allow-plain-http-grant",
         "--executor-run-margin-secs=120",
         "--executor-lease-ttl-secs=7200",
         "--executor-max-run-secs=1800",
@@ -200,6 +201,7 @@ fn js_agent_settings_become_the_executors_config() {
     assert_eq!(config.arch, "arm64");
     assert_eq!(config.work_dir.as_deref(), Some("/scratch"));
     assert!(config.allow_plain_http_put);
+    assert!(config.allow_plain_http_grant);
     assert!(config.insecure_argv_secrets);
     assert_eq!(config.run_margin, Duration::from_secs(120));
     assert_eq!(config.lease_ttl, Duration::from_secs(7200));
@@ -225,6 +227,8 @@ fn the_defaults_are_the_executors_own() {
     assert_eq!(config.arch, own.arch);
     assert_eq!(config.work_dir, own.work_dir);
     assert_eq!(config.allow_plain_http_put, own.allow_plain_http_put);
+    assert_eq!(config.allow_plain_http_grant, own.allow_plain_http_grant);
+    assert!(!config.allow_plain_http_grant, "off by default");
     assert_eq!(config.run_margin, own.run_margin);
     assert_eq!(config.lease_ttl, own.lease_ttl);
     assert_eq!(config.max_run, own.max_run);

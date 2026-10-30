@@ -134,6 +134,8 @@ pub struct TaskArgs<'a> {
     pub work_dir: Option<&'a str>,
     /// Whether the `PUT` goes over plain http (until the store serves TLS).
     pub allow_plain_http_put: bool,
+    /// Whether the read grant may be served over plain http.
+    pub allow_plain_http_grant: bool,
 }
 
 impl TaskArgs<'_> {

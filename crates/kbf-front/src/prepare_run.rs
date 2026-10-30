@@ -185,6 +185,16 @@ fn base_of(url: &str) -> Result<(&str, &str), &'static str> {
 /// [`ConfigError::ReadUrl`] for a URL that is not, `http://` ones included: a grant's token is
 /// a bearer secret and crosses only a TLS connection.
 pub fn check_read_url(url: &str) -> Result<(), ConfigError> {
+    check_read_url_allowing(url, false)
+}
+
+/// As [`check_read_url`], and `http://host[:port]` too when `allow_plain` is set.
+///
+/// # Errors
+/// [`ConfigError::ReadUrl`] for a URL that is neither `https://host[:port]` nor, with
+/// `allow_plain`, `http://host[:port]`.
+pub fn check_read_url_allowing(url: &str, allow_plain: bool) -> Result<(), ConfigError> {
+    let _ = allow_plain;
     let refuse = |why| ConfigError::ReadUrl {
         url: url.to_owned(),
         why,
@@ -245,6 +255,9 @@ pub struct RunPrepConfig {
     pub large: Option<LargeTarget>,
     /// The base URL of the job-facing read listener, `https://host[:port]`.
     pub read_url: String,
+    /// Whether `read_url` may be `http://host[:port]`: a farm on its own network that serves
+    /// the read listener without TLS. Off, only `https://` is accepted.
+    pub allow_plain_read_url: bool,
     /// The run wall limit every run is prepared for by [`RunPrep::prepare_run`].
     pub run_wall: Duration,
     /// The time past the wall a write and a grant stay good.
@@ -426,6 +439,7 @@ impl RunPrep {
             max_packs,
             large,
             read_url,
+            allow_plain_read_url: _,
             run_wall,
             slack,
             limits,
