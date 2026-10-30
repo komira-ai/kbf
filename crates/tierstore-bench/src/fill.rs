@@ -489,6 +489,12 @@ impl Results {
                     file: name.clone(),
                     reason: e.to_string(),
                 })?;
+            if name != format!("{}-{}.json", result.cell.as_str(), result.arm) {
+                return Err(FillError::Result {
+                    file: name,
+                    reason: "named for another cell or arm than it holds".to_owned(),
+                });
+            }
             files.insert(name, result);
         }
         Ok(Results { files })
@@ -509,7 +515,6 @@ impl Results {
         let name = format!("{}-{arm}.json", cell.as_str());
         self.files
             .get_key_value(&name)
-            .filter(|(_, r)| r.cell == cell && r.arm == arm)
             .map(|(k, v)| (k.as_str(), v))
     }
 }
@@ -566,7 +571,7 @@ fn measure(result: &CellResult, metric: Metric) -> Result<f64, String> {
     figure.ok_or_else(|| format!("no pass has a {}", metric.name()))
 }
 
-/// `1234.5` as `1,235`, `12.34` as `12.3`, `1.234` as `1.23`: three significant figures at
+/// `1234.6` as `1,235`, `12.34` as `12.3`, `1.234` as `1.23`: three significant figures at
 /// least, the integer part grouped by thousands.
 fn format_value(value: f64, unit: Unit) -> String {
     let decimals = if unit.integral || value >= 100.0 {
@@ -596,20 +601,18 @@ fn format_value(value: f64, unit: Unit) -> String {
     grouped
 }
 
-/// What a mapping gives for the results: the text, where from, the label; or why nothing.
-enum Evaluated {
-    Value {
-        text: String,
-        source: String,
-        label: String,
-    },
-    Missing(String),
+/// What a mapping gives for the results: the text, where from and the label.
+struct Found {
+    text: String,
+    source: String,
+    label: String,
 }
 
-fn evaluate(mapping: &Mapping, results: &Results) -> Evaluated {
+/// The figure a mapping asks for, or why there is none.
+fn evaluate(mapping: &Mapping, results: &Results) -> Result<Found, String> {
     let arms = mapping.arms();
     let Some((file, result)) = arms.iter().find_map(|a| results.find(mapping.cell, a)) else {
-        return Evaluated::Missing(format!(
+        return Err(format!(
             "no result for cell {} arm {}",
             mapping.cell.as_str(),
             arms.join(" or ")
@@ -619,16 +622,16 @@ fn evaluate(mapping: &Mapping, results: &Results) -> Evaluated {
     for (metric, unit) in &mapping.metrics {
         match measure(result, *metric) {
             Ok(v) => {
-                return Evaluated::Value {
+                return Ok(Found {
                     text: format_value(v / unit.divisor, *unit),
                     source: format!("{file}#{}", metric.name()),
                     label: mapping.label(&result.arm),
-                };
+                });
             }
             Err(e) => why.push(e),
         }
     }
-    Evaluated::Missing(why.join("; "))
+    Err(why.join("; "))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -805,9 +808,10 @@ fn parse_start_tag(html: &str, start: usize) -> Result<StartTag, FillError> {
     }
 }
 
-/// For each start tag, the index of its end tag among the tokens: an end tag closes the nearest
+/// For each token, the start of the end tag of the element it opens: an end tag closes the nearest
 /// open element of its name, and what was open inside it (an unclosed `<p>`) is dropped.
 fn pair_closes(tokens: &[Token]) -> Vec<Option<usize>> {
+    // Each entry is the byte offset where the matching end tag starts.
     let mut closes = vec![None; tokens.len()];
     let mut open: Vec<usize> = Vec::new();
     for (idx, token) in tokens.iter().enumerate() {
@@ -816,12 +820,12 @@ fn pair_closes(tokens: &[Token]) -> Vec<Option<usize>> {
                 open.push(idx);
             }
             Token::Open(_) => {}
-            Token::Close { name, .. } => {
+            Token::Close { name, start } => {
                 let found = open
                     .iter()
                     .rposition(|&o| matches!(&tokens[o], Token::Open(t) if &t.name == name));
                 if let Some(pos) = found {
-                    closes[open[pos]] = Some(idx);
+                    closes[open[pos]] = Some(*start);
                     open.truncate(pos);
                 }
             }
@@ -846,10 +850,7 @@ fn placeholders(tokens: &[Token]) -> Vec<Placeholder<'_>> {
         .filter_map(|(idx, token)| {
             let Token::Open(tag) = token else { return None };
             let id = tag.attr("data-cell")?.value.clone().unwrap_or_default();
-            let inner = closes[idx].and_then(|c| match &tokens[c] {
-                Token::Close { start, .. } => Some((tag.end, *start)),
-                Token::Open(_) => None,
-            });
+            let inner = closes[idx].map(|close| (tag.end, close));
             Some(Placeholder { id, tag, inner })
         })
         .collect()
@@ -900,7 +901,8 @@ fn attribute_edits(html: &str, tag: &StartTag, set: &[(&str, &str)], remove: &[&
     for name in remove {
         if let Some(a) = tag.attr(name) {
             let mut start = a.start;
-            while start > tag.start + 1 && is_space(html.as_bytes()[start - 1]) {
+            // An attribute follows the tag name, so this stops at the latest there.
+            while is_space(html.as_bytes()[start - 1]) {
                 start -= 1;
             }
             edits.push(Edit {
@@ -979,11 +981,11 @@ pub fn fill(
             )));
         };
         match evaluate(mapping, results) {
-            Evaluated::Value {
+            Ok(Found {
                 text,
                 source,
                 label,
-            } => {
+            }) => {
                 edits.extend(attribute_edits(
                     html,
                     ph.tag,
@@ -997,7 +999,7 @@ pub fn fill(
                 });
                 report.filled += 1;
             }
-            Evaluated::Missing(why) => {
+            Err(why) => {
                 edits.extend(attribute_edits(html, ph.tag, &[("data-note", &why)], &[]));
                 report.noted += 1;
             }
@@ -1024,7 +1026,7 @@ pub fn check(
         }
     }
     for m in mappings.iter().filter(|m| !m.blocked) {
-        if let Evaluated::Missing(why) = evaluate(m, results) {
+        if let Err(why) = evaluate(m, results) {
             findings.push(format!("mapping {:?} has no result: {why}", m.id));
         }
     }
@@ -1238,10 +1240,7 @@ mod tests {
         let r = results();
         let get = |metric, unit| {
             let m = one("a", metric, unit, "direct");
-            match evaluate(&m[0], &r) {
-                Evaluated::Value { text, .. } => text,
-                Evaluated::Missing(w) => panic!("{w}"),
-            }
+            evaluate(&m[0], &r).unwrap().text
         };
         assert_eq!(get("p50", "us"), "2,000 us");
         assert_eq!(get("p50", "s"), "0.00 s");
@@ -1331,10 +1330,8 @@ mod tests {
             text.contains("mapping \"few\" has no result: p99 needs"),
             "{text}"
         );
-        assert!(
-            text.contains("<u> at byte") && text.contains("no file cold-put-gone.json"),
-            "{text}"
-        );
+        assert!(text.contains("<u> at byte"), "{text}");
+        assert!(text.contains("no file cold-put-gone.json"), "{text}");
         assert!(
             text.contains("\"g2\" cites \"cold-put-direct.json#p99\""),
             "{text}"
@@ -1393,6 +1390,55 @@ mod tests {
         assert!(out.ends_with(
             "<P>two</DIV><?php x ?><![CDATA[ <b data-cell=\"a\"> ]]><textarea><b data-cell=\"a\"></textarea>"
         ));
+    }
+
+    type Attrs = Vec<(String, Option<String>)>;
+
+    fn tags(html: &str) -> Vec<(String, Attrs)> {
+        tokenize(html)
+            .unwrap()
+            .into_iter()
+            .filter_map(|t| match t {
+                Token::Open(t) => Some((
+                    t.name,
+                    t.attrs.into_iter().map(|a| (a.name, a.value)).collect(),
+                )),
+                Token::Close { .. } => None,
+            })
+            .collect()
+    }
+
+    fn attr(name: &str, value: Option<&str>) -> (String, Option<String>) {
+        (name.to_owned(), value.map(str::to_owned))
+    }
+
+    /// Catches a scanner that loops, panics or mis-reads on the malformed corners of real
+    /// pages: a lone `<`, self-closing tags, a slash inside a tag, a stray `=`, spaces around
+    /// `=`, unquoted values, a stray end tag, and a page that stops inside a tag.
+    #[test]
+    fn the_scanner_survives_malformed_markup() {
+        assert_eq!(tags("1 < 2 <i>x</i> a<"), [("i".to_owned(), vec![])]);
+        assert_eq!(tags("<b a/b>")[0].1, [attr("a", None), attr("b", None)]);
+        assert_eq!(tags("<b =x>")[0].1, [attr("=", None), attr("x", None)]);
+        assert_eq!(
+            tags("<b a = \"1\" c= 2 d =3>")[0].1,
+            [
+                attr("a", Some("1")),
+                attr("c", Some("2")),
+                attr("d", Some("3"))
+            ]
+        );
+        for cut in ["<b", "<b ", "<b a", "<b a  ", "<b a=1", "<b a='1", "<b a= "] {
+            let err = tokenize(cut).unwrap_err();
+            assert!(err.to_string().contains("not terminated"), "{cut}: {err}");
+        }
+        // Self-closing tags and a stray end tag do not capture the cell; a self-closing
+        // `<script />` does not swallow what follows it as raw text.
+        let html = "</p><br/><x /><script src=x /><b data-cell=\"a\">?</b>";
+        let (out, report) = fill(html, &one("a", "p50", "ms", "instance"), &results()).unwrap();
+        assert_eq!(report.filled, 1);
+        assert!(out.ends_with(">2.00 ms</b>"), "{out}");
+        assert!(out.starts_with("</p><br/><x /><script src=x />"), "{out}");
     }
 
     /// Catches a result with nothing countable (only the warm-up, or all gate-aborted) filled

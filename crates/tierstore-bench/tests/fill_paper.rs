@@ -154,6 +154,27 @@ fn results_load_from_a_directory() {
     std::fs::write(results_dir.join("cold-read-x.json"), "{}").unwrap();
     let err = Results::load(&results_dir).unwrap_err();
     assert!(err.to_string().starts_with("cold-read-x.json: "), "{err}");
+    std::fs::remove_file(results_dir.join("cold-read-x.json")).unwrap();
+    // A result under another cell's or arm's name would be looked up wrongly: refused.
+    std::fs::write(results_dir.join("cold-put-wrong.json"), RESULT).unwrap();
+    let err = Results::load(&results_dir).unwrap_err();
+    assert!(err.to_string().contains("named for another"), "{err}");
     let missing = Results::load(&dir.path().join("none")).unwrap_err();
     assert!(matches!(missing, FillError::Io { .. }));
+}
+
+/// Catches an unreadable input or an unwritable target that is swallowed: each exits 2 naming the
+/// file, and nothing is created.
+#[test]
+fn files_that_cannot_be_read_or_written_stop_the_verb() {
+    let dir = setup("fill-paper-io");
+    let nowhere = dir.path().join("no-such-dir/out.html");
+    let run = fill_paper(dir.path(), &["--out", nowhere.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&run.stderr).contains("no-such-dir"));
+
+    std::fs::remove_file(dir.path().join("paper.html")).unwrap();
+    let run = fill_paper(dir.path(), &["--check"]);
+    assert_eq!(run.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&run.stderr).contains("paper.html"));
 }
