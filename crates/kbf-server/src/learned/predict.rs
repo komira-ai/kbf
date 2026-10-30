@@ -87,6 +87,9 @@ impl From<Fallback> for Unset {
     }
 }
 
+/// What [`Learned::forecast`] says of a new operation: the prediction, or why there is none.
+pub type Forecast = Result<Prediction, Unset>;
+
 /// The figure of a run a prediction is compared with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Axis {
@@ -166,6 +169,44 @@ impl Learned {
         self.predictions.mode
     }
 
+    /// What the estimator would predict for an operation of `key` whose client named `hint`,
+    /// asked about on nodes as `bounds` says: the learned row, with the cores clamped to the
+    /// largest node's. Counts nothing and changes nothing, so the farm may ask before it
+    /// knows the operation is a new one ([`Learned::note_forecast`] counts it after).
+    ///
+    /// # Errors
+    /// The reason the estimator has no usable row.
+    pub fn forecast(&self, key: &Key, hint: &Hint, bounds: &Bounds) -> Forecast {
+        self.summaries
+            .estimate(key, self.day(), bounds, hint)
+            .map(|estimate| prediction_of(&estimate, bounds))
+            .map_err(Unset::from)
+    }
+
+    /// Counts a [`Learned::forecast`] of the new operation `operation` as a prediction made,
+    /// or unset by its reason, and returns what to give the scheduler for it
+    /// ([`Learned::to_set`]). Nothing while predictions are off.
+    pub fn note_forecast(
+        &mut self,
+        operation: OperationId,
+        forecast: Forecast,
+    ) -> Option<Prediction> {
+        if !self.predictions.mode.predicts() {
+            return None;
+        }
+        self.calls += 1;
+        match forecast {
+            Ok(prediction) => {
+                self.predictions.made += 1;
+                self.to_set(operation, Some(prediction))
+            }
+            Err(why) => {
+                self.predictions.unset[why as usize] += 1;
+                None
+            }
+        }
+    }
+
     /// The prediction for an operation of `key` whose client named `hint`, asked about on
     /// nodes as `bounds` says: the estimator's learned row, with the cores clamped to the
     /// largest node's. `None` when the estimator has no usable row (counted by its reason),
@@ -175,14 +216,13 @@ impl Learned {
             return None;
         }
         self.calls += 1;
-        let day = self.day();
-        match self.summaries.estimate(key, day, bounds, hint) {
-            Ok(estimate) => {
+        match self.forecast(key, hint, bounds) {
+            Ok(prediction) => {
                 self.predictions.made += 1;
-                Some(prediction_of(&estimate, bounds))
+                Some(prediction)
             }
             Err(why) => {
-                self.predictions.unset[Unset::from(why) as usize] += 1;
+                self.predictions.unset[why as usize] += 1;
                 None
             }
         }
