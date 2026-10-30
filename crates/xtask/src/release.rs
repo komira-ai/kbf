@@ -260,9 +260,10 @@ pub fn main_control(gh: &Path, repo: &str, on: &str, off: &str) -> Result<String
 /// `.tar.gz`, `.cdx.json`, `.deb`, `.pkg` or `.oci.tar` (the packages; and the frontend or coordinator image,
 /// [`crate::pkg_image_asset`], which exists for the Linux platforms only; nfpm's own `kbf-installer_<version>_
 /// <arch>.deb` and `pkg build`'s `kbf-installer-<version>-macos-arm64.pkg` name no commit and are
-/// not one), or the version facts of `kbf` for a platform ([`version_facts::is_facts_of`]).
+/// not one), the version facts of `kbf` for a platform ([`version_facts::is_facts_of`]) or the facts of
+/// the task image ([`pkg_image_asset::is_facts_of`]).
 fn is_asset_of(name: &str, commit: &str) -> bool {
-    if version_facts::is_facts_of(name, commit) {
+    if version_facts::is_facts_of(name, commit) || pkg_image_asset::is_facts_of(name, commit) {
         return true;
     }
     let stem = name
