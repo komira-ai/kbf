@@ -9,14 +9,13 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use kbf_testkit::dir::TestDir;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 
 use super::listener::{OciLimits, accept_loop};
 use super::test_pki::{ca, ip, leaf};
-use super::{
-    OciError, OciFront, OciListener, OciMetrics, OciMode, OciPrefix, acceptor, plain_allowed,
-};
+use super::{OciFront, OciListener, OciMetrics, OciMode, OciPrefix, acceptor, plain_warning};
 use crate::MemoryBackend;
 use crate::server::{ACCEPT_PAUSE, Incoming};
 
@@ -92,53 +91,72 @@ fn plain_front() -> (Arc<OciFront>, OciLimits) {
     (front, limits)
 }
 
-/// Asserts that plain HTTP is allowed on the loopback addresses (anywhere in the IPv4 loopback
-/// block, and `::1`) and on no other: not on the unspecified addresses, a documentation address,
-/// or any IPv4-mapped address (the mapped loopback address included).
+/// Asserts that the start warning for a plain front is for the addresses off loopback and for no
+/// other: it names the unspecified addresses, documentation addresses and an IPv4-mapped address
+/// that is not loopback, and is absent for anywhere in the IPv4 loopback block, `::1` and the
+/// mapped loopback address.
 #[test]
-fn plain_http_is_allowed_on_loopback_only() {
-    let block = SocketAddr::from(([127, 255, 0, 9], 9500));
-    for allowed in ["127.0.0.1:0", "[::1]:9500"] {
-        let addr: SocketAddr = allowed.parse().expect("an address");
-        assert!(plain_allowed(addr).is_ok(), "{allowed}");
+fn the_plain_warning_is_for_non_loopback_addresses_only() {
+    for quiet in [
+        "127.0.0.1:0",
+        "127.255.0.9:9500",
+        "[::1]:9500",
+        "[::ffff:127.0.0.1]:9500",
+    ] {
+        let addr: SocketAddr = quiet.parse().expect("an address");
+        assert_eq!(plain_warning(addr), None, "{quiet}");
     }
-    assert!(plain_allowed(block).is_ok(), "{block}");
-    for refused in [
+    for warned in [
         "0.0.0.0:9500",
         "[::]:9500",
         "192.0.2.1:9500",
         "198.51.100.7:9500",
         "[2001:db8::1]:9500",
         "[::ffff:192.0.2.1]:9500",
-        "[::ffff:127.0.0.1]:9500",
     ] {
-        let addr: SocketAddr = refused.parse().expect("an address");
-        let error = plain_allowed(addr).expect_err(refused);
-        assert!(matches!(error, OciError::PlainNotLoopback { .. }));
-        assert!(error.is_invalid_flags());
-        let text = error.to_string();
-        assert!(text.contains(refused), "{text}");
+        let addr: SocketAddr = warned.parse().expect("an address");
+        let text = plain_warning(addr).expect(warned);
+        assert!(!text.contains('\n'), "{text}");
+        assert!(text.contains(&addr.to_string()), "{text}");
         assert!(
-            text.contains("plain HTTP is served only on loopback"),
+            text.contains("serves plain HTTP on a non-loopback address"),
             "{text}"
         );
-        assert!(
-            text.contains("needs --oci-tls-cert and --oci-tls-key"),
-            "{text}"
-        );
+        assert!(text.contains("--oci-tls-cert and --oci-tls-key"), "{text}");
     }
 }
 
-/// Asserts that the listener refuses a plain bind off loopback before it binds anything, serves
-/// plain on loopback, and says its mode.
+/// One plain request of the front at `port` on loopback, answered and closed: the whole reply.
+async fn get_v2(port: u16) -> String {
+    let mut conn = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connected");
+    let request = "GET /v2/ HTTP/1.1\r\nHost: front\r\nConnection: close\r\n\r\n";
+    conn.write_all(request.as_bytes()).await.expect("written");
+    let mut reply = Vec::new();
+    conn.read_to_end(&mut reply).await.expect("read");
+    String::from_utf8_lossy(&reply).into_owned()
+}
+
+/// Asserts that the listener binds a plain address that is not loopback (the unspecified
+/// address), says its mode is plain HTTP, and answers a request there; and that it serves plain
+/// on loopback and TLS where a certificate is given.
 #[tokio::test]
-async fn a_plain_listener_binds_on_loopback_only() {
+async fn a_plain_listener_binds_off_loopback_and_serves() {
     let (front, limits) = plain_front();
     let off: SocketAddr = "0.0.0.0:0".parse().expect("an address");
-    let refused = OciListener::bind_plain(off, Arc::clone(&front), limits).await;
-    let error = refused.err().expect("refused");
-    assert!(matches!(error, OciError::PlainNotLoopback { .. }));
-    assert!(error.to_string().contains("0.0.0.0:0"), "{error}");
+    let wide = OciListener::bind_plain(off, Arc::clone(&front), limits)
+        .await
+        .expect("bound");
+    assert_eq!(wide.mode(), OciMode::Http);
+    let bound = wide.local_addr().expect("an address");
+    assert!(bound.ip().is_unspecified() && bound.port() != 0, "{bound}");
+    let (stop, stopped) = watch::channel(false);
+    let serving = tokio::spawn(wide.serve(stopped));
+    let reply = get_v2(bound.port()).await;
+    assert!(reply.starts_with("HTTP/1.1 200 "), "{reply}");
+    stop.send(true).expect("a listener");
+    assert_eq!(serving.await.expect("served"), 0);
 
     let on: SocketAddr = "127.0.0.1:0".parse().expect("an address");
     let plain = OciListener::bind_plain(on, front, limits)

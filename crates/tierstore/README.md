@@ -21,10 +21,12 @@ registry (`server::oci`), so that podman and other registry clients pull an imag
 same tiers. It runs in one of two modes:
 
 - **HTTPS**, with `--oci-tls-cert PATH --oci-tls-key PATH`, at any address.
-- **Plain HTTP**, with neither flag, and only on a loopback address (127/8 or `::1`). A node's
-  own container engine pulls from the front of its own store over loopback, so the traffic never
-  leaves the host. Any other address, `0.0.0.0` and `::` included, is refused at start (exit 2) and
-  needs the certificate and key. One of the two flags without the other is refused too.
+- **Plain HTTP**, with neither flag, at any address. A node's own container engine pulls from the
+  front of its own store over loopback (127/8 or `::1`), so the traffic never leaves the host.
+  Off loopback (`0.0.0.0` and `::` included) the front still starts, and prints one warning line
+  on stderr saying it serves plain HTTP on a non-loopback address, since a plain connection can be
+  read and changed on its path: give the certificate and key there. One of the two flags without
+  the other is refused (exit 2).
 
 The start line and `/metricz` say which mode runs.
 
@@ -36,7 +38,11 @@ The start line and `/metricz` say which mode runs.
 - Anonymous: no token is asked for and `Authorization` is ignored. Only digest-named objects under
   the prefix can be read.
 - A manifest is checked against its digest before it is sent; a blob is hashed as it is read and cut
-  short, not delivered whole, if it is not its digest. Tags are not served.
+  short, not delivered whole, if it is not its digest. Tags are not served. A manifest is measured
+  and then read in two store calls, so one replaced between them can be answered 500
+  `DIGEST_INVALID` once; a retry succeeds.
+- Memory is bounded by `--oci-max-connections` (64 by default) times the buffer a connection holds,
+  up to 4 MiB (a blob chunk or a manifest).
 - In HTTPS mode the certificate must carry an IP subjectAltName for the listen address (clients dial
   an IP), checked at start. The files are read once: a new certificate takes a restart. The
   connection limits, timeouts and drain are the same in both modes (a plain connection has no

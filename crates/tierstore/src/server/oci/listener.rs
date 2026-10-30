@@ -1,4 +1,4 @@
-//! The OCI front's socket: HTTPS connections, or plain HTTP ones on loopback, bounded in number,
+//! The OCI front's socket: HTTPS connections, or plain HTTP ones, bounded in number,
 //! in the time a client has to send a request, in how long a client may leave an answer unread,
 //! and in lifetime.
 
@@ -19,7 +19,7 @@ use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
-use super::{OciError, OciFront, OciMode, plain_allowed};
+use super::{OciError, OciFront, OciMode};
 use crate::server::idle::Watched;
 use crate::server::{ACCEPT_PAUSE, Incoming};
 
@@ -73,17 +73,16 @@ impl OciListener {
         Self::bind_as(addr, Some(acceptor), front, limits).await
     }
 
-    /// Binds `addr`, to serve plain HTTP; `addr` must be a loopback address.
+    /// Binds `addr`, to serve plain HTTP; any address is bound (the start warns about one that
+    /// is not loopback, see [`plain_warning`](super::plain_warning)).
     ///
     /// # Errors
-    /// [`OciError::PlainNotLoopback`] if `addr` is not loopback (nothing is bound then), and
     /// [`OciError::Bind`] if the address cannot be bound.
     pub async fn bind_plain(
         addr: SocketAddr,
         front: Arc<OciFront>,
         limits: OciLimits,
     ) -> Result<Self, OciError> {
-        plain_allowed(addr)?;
         Self::bind_as(addr, None, front, limits).await
     }
 

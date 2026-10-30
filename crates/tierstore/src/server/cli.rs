@@ -36,9 +36,10 @@
 //! [`oci`](super::oci)), served from the same proxy, so that podman pulls an image by digest from
 //! the tiers. With `--oci-tls-cert` and `--oci-tls-key` it is HTTPS (the certificate must carry an
 //! IP subjectAltName for the address and be valid now, and the key file must not be readable by
-//! every user; the start checks). With neither it is plain HTTP, and the address must be
-//! loopback. One of the two flags without the other, a plain address that is not loopback, and a
-//! certificate, key or prefix that cannot work exit with status 2; a file that cannot be read
+//! every user; the start checks). With neither it is plain HTTP, at any address; off loopback
+//! the start prints one warning line on stderr, and a certificate is advised. One of the two
+//! flags without the other, and a certificate, key or prefix that cannot work, exit with status
+//! 2; a file that cannot be read
 //! with status 1. The start line gets ` oci-listen=<address> (http)` or ` (https)`.
 //!
 //! On SIGTERM or SIGINT the process drains (see the [`server`](super) docs): `/readyz` says 503,
@@ -327,9 +328,10 @@ pub struct Cli {
     /// `<--oci-prefix>blobs/sha256/<hex>`. With `--oci-tls-cert` and `--oci-tls-key` it is
     /// HTTPS, and clients dial an IP address, so the certificate must carry an IP subjectAltName
     /// for this address (any IP, if it is unspecified), which the start checks. With neither it
-    /// is plain HTTP, served only on a loopback address (127/8 or `::1`): a node's own
-    /// engine pulls from its own store, and the traffic never leaves the host; any other address
-    /// needs the certificate and key. Left out, no such listener is opened.
+    /// is plain HTTP, served at any address: on loopback (127/8 or `::1`) a node's own engine
+    /// pulls from its own store and the traffic never leaves the host; off loopback the start
+    /// prints one warning line, since a plain connection can be read and changed on its path,
+    /// and the certificate and key are advised. Left out, no such listener is opened.
     #[arg(long, value_name = "ADDR")]
     pub oci_listen: Option<SocketAddr>,
     /// The certificate chain (PEM) of `--oci-listen`, leaf first, issued by the CA the clients
@@ -346,8 +348,9 @@ pub struct Cli {
     /// `_journal/` or `_tiering/` is refused at start (exit 2).
     #[arg(long, value_name = "PREFIX", requires = "oci_listen")]
     pub oci_prefix: Option<String>,
-    /// The most connections the OCI front has open at once (256 if not given); the others wait
-    /// in the kernel's backlog.
+    /// The most connections the OCI front has open at once (64 if not given); the others wait
+    /// in the kernel's backlog. Memory is bounded by connections times the buffer a connection
+    /// holds (up to 4 MiB: a blob chunk or a manifest), so the default is about 256 MiB at worst.
     #[arg(long, requires = "oci_listen", value_parser = clap::value_parser!(u32).range(1..))]
     pub oci_max_connections: Option<u32>,
     /// The longest an OCI connection lives (1h if not given): a number and `ms`, `s`, `m` or
@@ -629,7 +632,7 @@ fn build(cli: &Cli) -> Result<Built, Error> {
 const DEFAULT_OCI_PREFIX: &str = "oci/";
 
 /// The default of `--oci-max-connections`.
-const DEFAULT_OCI_CONNECTIONS: u32 = 256;
+const DEFAULT_OCI_CONNECTIONS: u32 = 64;
 
 /// The default of `--oci-connection-lifetime`.
 const DEFAULT_OCI_LIFETIME: Duration = Duration::from_secs(3600);
@@ -662,7 +665,9 @@ fn oci_setup(cli: &Cli, server: &ServerConfig) -> Result<Option<OciSetup>, Error
     let acceptor = match (&cli.oci_tls_cert, &cli.oci_tls_key) {
         (Some(cert), Some(key)) => Some(oci::acceptor(cert, key, listen).map_err(refuse)?),
         (None, None) => {
-            oci::plain_allowed(listen).map_err(refuse)?;
+            if let Some(warning) = oci::plain_warning(listen) {
+                eprintln!("{warning}");
+            }
             None
         }
         _ => {

@@ -10,6 +10,7 @@ use clap::Parser;
 use kbf_testkit::dir::TestDir;
 
 use super::{Cli, Error, build, exit_status, oci_cut_note, run_serving};
+use crate::server::oci::plain_warning;
 use crate::server::oci::test_pki::{Leaf, ca, dns, ip, leaf};
 
 /// A directory with a key file and a certificate and key that name 127.0.0.1.
@@ -91,7 +92,7 @@ fn there_is_no_front_without_its_flags() {
     assert!(built.server.oci_metrics.is_none());
 }
 
-/// Asserts the settings the flags make: the defaults (prefix `oci/`, 256 connections, an hour,
+/// Asserts the settings the flags make: the defaults (prefix `oci/`, 64 connections, an hour,
 /// the S3 front's header and idle timeouts) and the values given, and that the counters in the
 /// server's settings are the front's.
 #[test]
@@ -101,7 +102,7 @@ fn the_flags_make_the_front() {
     let setup = built.oci.expect("a front");
     assert_eq!(setup.prefix.as_str(), "oci/");
     assert_eq!(setup.listen.to_string(), "127.0.0.1:0");
-    assert_eq!(setup.limits.max_connections, 256);
+    assert_eq!(setup.limits.max_connections, 64);
     assert_eq!(setup.limits.lifetime, Duration::from_secs(3600));
     assert_eq!(setup.limits.handshake_timeout, Duration::from_secs(10));
     assert_eq!(setup.limits.header_timeout, built.server.header_timeout);
@@ -315,29 +316,29 @@ fn a_loopback_front_without_a_certificate_is_plain() {
     }
 }
 
-/// Asserts that a plain front off loopback is refused at start with status 2, before anything is
-/// bound, whatever the port: the unspecified addresses and the documentation ranges of
-/// both IP versions. The message says plain HTTP is for loopback and what a wider listener needs.
+/// Asserts that a plain front off loopback is not refused: the start succeeds with no TLS
+/// acceptor and `/metricz` says `http`, whatever the address (the unspecified addresses and the
+/// documentation ranges of both IP versions), and each of these addresses has a warning to print.
 #[test]
-fn a_plain_front_off_loopback_is_refused_at_start() {
-    let rig = Rig::new("oci-flags-plain-refused");
+fn a_plain_front_off_loopback_starts_with_a_warning() {
+    let rig = Rig::new("oci-flags-plain-off");
     for listen in [
         "0.0.0.0:0",
         "[::]:0",
         "192.0.2.1:9500",
         "[2001:db8::1]:9500",
     ] {
-        let (status, why) = refused(&plain_cli(&rig, listen));
-        assert_eq!(status, 2, "{listen}: {why}");
+        let built = build(&plain_cli(&rig, listen)).expect("built");
+        let setup = built.oci.expect("a front");
+        assert!(setup.acceptor.is_none(), "{listen}");
+        assert_eq!(setup.listen.to_string(), listen);
+        let warning = plain_warning(setup.listen).expect("a warning");
+        assert!(warning.contains(listen), "{warning}");
+        let shown = built.server.oci_metrics.expect("counters").render();
         assert!(
-            why.contains("plain HTTP is served only on loopback"),
-            "{why}"
+            shown.contains("tierstore_oci_front_info{mode=\"http\"} 1\n"),
+            "{shown}"
         );
-        assert!(
-            why.contains("needs --oci-tls-cert and --oci-tls-key"),
-            "{why}"
-        );
-        assert!(why.contains(listen), "{why}");
     }
 }
 

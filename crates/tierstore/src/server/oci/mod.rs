@@ -1,15 +1,16 @@
 //! A read-only OCI distribution front over the objects of a [`Backend`], served by
-//! `--oci-listen` over HTTPS, or over plain HTTP on loopback, so that a container engine (podman
+//! `--oci-listen` over HTTPS, or over plain HTTP, so that a container engine (podman
 //! through `certs.d`, or any client of the distribution API) pulls an image by digest from the
 //! store.
 //!
 //! # Two modes
 //!
 //! With `--oci-tls-cert` and `--oci-tls-key` the front serves HTTPS ([`OciMode::Https`]) at any
-//! address. With neither it serves plain HTTP/1.1 ([`OciMode::Http`]), and only on a loopback
-//! address (127/8 or `::1`): a node's own container engine pulls from the front of its own
-//! store, and that traffic never leaves the host. A plain listener on any other address is refused
-//! at start. Everything else, the routes, the limits and the drain, is the same in both modes,
+//! address. With neither it serves plain HTTP/1.1 ([`OciMode::Http`]) at any address. A node's
+//! own container engine pulls from the front of its own store over loopback (127/8 or `::1`),
+//! and that traffic never leaves the host; on any other address a plain connection can be read
+//! and changed on its path, so the start prints one warning line and a certificate is advised.
+//! Everything else, the routes, the limits and the drain, is the same in both modes,
 //! except that a plain connection has no handshake to time.
 //!
 //! # What it serves
@@ -42,7 +43,9 @@
 //! as it is read, in chunks of 4 MiB, and its last chunk is held back until the hash is right:
 //! if it is not, the connection is cut before the response is complete (its `Content-Length`
 //! has been sent), so a client never gets a whole body that is wrong, and a blob of one chunk
-//! delivers no body byte. Both are counted. A manifest `HEAD` reads and verifies the object; a blob
+//! delivers no body byte. Both are counted. A manifest is measured with a `head` before it is
+//! read, so a manifest replaced between the two calls by an object of another size can be
+//! answered 500 `DIGEST_INVALID` once; a retry succeeds. A manifest `HEAD` reads and verifies the object; a blob
 //! `HEAD` or a read of part of a blob reports what the store holds without reading it all, and so
 //! verifies nothing (a range that covers the whole blob is read and checked like a whole read): the
 //! client checks the digest of what it assembles. `If-Range`, `If-None-Match` and `Accept` are
@@ -102,7 +105,7 @@ use crate::{Backend, ByteRange, Error};
 pub use body::{BodyError, OciBody};
 pub use listener::{OciLimits, OciListener};
 pub use metrics::OciMetrics;
-pub use tls::{OciError, OciMode, acceptor, plain_allowed};
+pub use tls::{OciError, OciMode, acceptor, plain_warning};
 
 use body::BlobRead;
 use metrics::{Outcome, RouteKind};
@@ -253,7 +256,10 @@ impl OciFront {
                 error(StatusCode::NOT_FOUND, UNKNOWN, &message, detail),
             );
         }
-        // Bounded by the limit even if the object has grown since it was measured.
+        // Bounded by the limit even if the object has grown since it was measured. The head and
+        // the get are two calls: if the object is replaced between them, the bytes read may not
+        // hash to the digest and the answer is 500 DIGEST_INVALID for that one request; a retry
+        // reads the new object and succeeds.
         let range = ByteRange::new(0, MAX_MANIFEST_BYTES);
         let body = match self.backend.get(&key, Some(range)).await {
             Ok(body) => body,

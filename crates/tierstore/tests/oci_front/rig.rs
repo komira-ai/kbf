@@ -61,7 +61,7 @@ impl Rig {
         Self::build(false, listen, change).await
     }
 
-    /// A plain front at `listen`, which must be loopback.
+    /// A plain front at `listen`.
     pub async fn plain_at(listen: SocketAddr) -> Self {
         Self::build(true, listen, |_| {}).await
     }

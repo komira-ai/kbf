@@ -258,17 +258,17 @@ client before relying on either.
 ## The OCI read front
 
 With `--oci-listen`, the process also serves the objects of the store as a read-only container
-registry, over HTTPS or over plain HTTP on loopback (see Two modes), so that podman (and the
+registry, over HTTPS or over plain HTTP (see Two modes), so that podman (and the
 other clients of the OCI distribution API) pulls an image by digest from the same hot and cold tiers the S3 front writes to. It reads through the
 proxy in the process: no S3 credential and no hop through the S3 listener. It is off unless
 `--oci-listen` is given, and then nothing else about the process changes.
 
 | flag | what |
 |---|---|
-| `--oci-listen ADDR` | where the registry front listens. With `--oci-tls-cert` and `--oci-tls-key` it is HTTPS; with neither it is plain HTTP and ADDR must be a loopback address (127/8 or `::1`): anything else, `0.0.0.0` and `::` included, is refused at start (exit 2) |
+| `--oci-listen ADDR` | where the registry front listens. With `--oci-tls-cert` and `--oci-tls-key` it is HTTPS; with neither it is plain HTTP, at any address; off loopback (127/8 and `::1` are loopback; `0.0.0.0` and `::` are not) the start prints one warning line, and a certificate and key are advised |
 | `--oci-tls-cert PATH`, `--oci-tls-key PATH` | both or neither (one without the other is refused at start, exit 2). The certificate chain (leaf first) and the private key, PEM. Clients dial an IP address, so the leaf must carry an IP subjectAltName for `--oci-listen` (any IP subjectAltName, if the address is `0.0.0.0` or `::`); a certificate without one, one that is expired or not yet valid, a key file any user can read (the "other" mode bits; a group may), or an unreadable file, is refused at start. The files are read once: a new certificate takes a restart, so renew it before it expires |
 | `--oci-prefix PREFIX` | the key prefix, ending in `/`, `oci/` if not given. A prefix inside `_journal/` or `_tiering/`, or one that is not plain path segments, is refused at start (exit 2) |
-| `--oci-max-connections N` | connections open at once, 256 if not given; the others wait in the kernel's backlog |
+| `--oci-max-connections N` | connections open at once, 64 if not given; the others wait in the kernel's backlog. Memory is bounded by connections times the buffer a connection holds (up to 4 MiB), about 256 MiB at the default |
 | `--oci-connection-lifetime D` | the longest a connection lives, 1h if not given; a request being answered is finished first |
 
 A client has 10 seconds to finish the TLS handshake and then the S3 front's header timeout (a
@@ -286,10 +286,11 @@ so the handshake time does not apply; the other limits are the same.
 ### Two modes
 
 - **HTTPS**: with `--oci-tls-cert` and `--oci-tls-key`, at any address.
-- **Plain HTTP**: with neither, on loopback only. A node's own container engine can pull from the
-  front of its own tierstore, so the pull is a connection from the host to itself and the traffic
-  never leaves it. A connection to any address beyond loopback can be read and changed on
-  its way, so it needs TLS. Loopback is reachable by every local process, and by containers that
+- **Plain HTTP**: with neither, at any address. A node's own container engine can pull from the
+  front of its own tierstore over loopback, so the pull is a connection from the host to itself and
+  the traffic never leaves it. A connection to any address beyond loopback can be read and changed on
+  its way: the process starts, prints one warning line on stderr, and a certificate and key are
+  advised there. Loopback is reachable by every local process, and by containers that
   share the host's network namespace; the front is anonymous in either mode.
 
 A container engine that pulls over plain HTTP has to be told it may:
@@ -336,7 +337,9 @@ built only from a validated digest, so nothing outside the prefix can be named.
 ### Integrity
 
 A manifest is read whole and its SHA-256 is checked against its digest before a byte is sent; one
-that does not match is 500 `DIGEST_INVALID`, is never served and is counted. A blob is hashed as it is
+that does not match is 500 `DIGEST_INVALID`, is never served and is counted. The size is asked
+before the read, so a manifest replaced by an object of another size between the two can be
+answered 500 `DIGEST_INVALID` once; a retry succeeds. A blob is hashed as it is
 read, in chunks of 4 MiB, and its last chunk is held back until the hash is right: a blob that does
 not match its digest ends the connection before the response is complete, so no client receives a
 whole wrong body, and the mismatch is counted. That holds for a read of the whole blob, and for a

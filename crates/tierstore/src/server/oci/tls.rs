@@ -1,6 +1,6 @@
 //! The transport of the OCI front: the certificate and key of TLS, read once at start, and the
-//! check that the certificate names the address clients dial; or, with no certificate, the check
-//! that the plain HTTP listener is on loopback.
+//! check that the certificate names the address clients dial; or, with no certificate, the
+//! warning that a plain HTTP listener is off loopback.
 
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::PermissionsExt as _;
@@ -27,15 +27,6 @@ pub enum OciError {
     /// Only one of `--oci-tls-cert` and `--oci-tls-key` is given.
     #[error("{0}")]
     Missing(String),
-    /// A plain HTTP listener is asked for on an address that is not loopback.
-    #[error(
-        "--oci-listen {addr}: plain HTTP is served only on loopback (127/8 or ::1); a \
-         non-loopback listener needs --oci-tls-cert and --oci-tls-key"
-    )]
-    PlainNotLoopback {
-        /// The address.
-        addr: SocketAddr,
-    },
     /// A certificate or key file cannot be read.
     #[error("{flag} {path}: {source}")]
     Read {
@@ -83,7 +74,7 @@ impl OciError {
 /// How the front's connections are carried.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OciMode {
-    /// Plain HTTP/1.1, on loopback only.
+    /// Plain HTTP/1.1.
     Http,
     /// HTTP/1.1 over TLS.
     #[default]
@@ -101,17 +92,20 @@ impl OciMode {
     }
 }
 
-/// Whether the front may serve plain HTTP at `listen`: only on loopback (127/8 or `::1`),
-/// since a plain connection can be read and changed by whoever is on its path.
-///
-/// # Errors
-/// [`OciError::PlainNotLoopback`] if `listen` is not a loopback address (the unspecified
-/// addresses `0.0.0.0` and `::` are not).
-pub fn plain_allowed(listen: SocketAddr) -> Result<(), OciError> {
-    if listen.ip().is_loopback() {
-        Ok(())
+/// The line to print at start when the front serves plain HTTP at `listen`, or `None` when
+/// `listen` is loopback (127/8, `::1`, or an IPv4-mapped loopback address). Plain HTTP is served
+/// on any address; off loopback a connection can be read and changed by whoever is on its path,
+/// so the line advises a certificate. The unspecified addresses `0.0.0.0` and `::` are not
+/// loopback.
+#[must_use]
+pub fn plain_warning(listen: SocketAddr) -> Option<String> {
+    if listen.ip().to_canonical().is_loopback() {
+        None
     } else {
-        Err(OciError::PlainNotLoopback { addr: listen })
+        Some(format!(
+            "tierstore: warning: --oci-listen {listen} serves plain HTTP on a non-loopback \
+             address; give --oci-tls-cert and --oci-tls-key to serve HTTPS"
+        ))
     }
 }
 

@@ -368,29 +368,54 @@ fn refused(flags: &[String]) -> (Option<i32>, String) {
     )
 }
 
-/// Asserts that a plain front on an address that is not loopback (unspecified ones and a
-/// documentation range among them) is refused at start with status 2, and the message says why
-/// and what to give instead.
+/// Asserts that the process starts a plain front on the unspecified address, serves a request
+/// there and exits 0 on SIGTERM, and prints the plain-HTTP warning exactly once; and that on
+/// loopback it prints no such warning.
 #[tokio::test]
-async fn a_plain_front_off_loopback_is_refused_at_start() {
-    let files = files("oci-binary-plain-refused");
-    for listen in [
-        "0.0.0.0:0",
-        "[::]:0",
-        "192.0.2.1:9500",
-        "[2001:db8::1]:9500",
-    ] {
-        let (status, stderr) = refused(&files.plain(listen));
-        assert_eq!(status, Some(2), "{listen}: {stderr}");
-        assert!(
-            stderr.contains("plain HTTP is served only on loopback"),
-            "{listen}: {stderr}"
+async fn a_plain_front_off_loopback_starts_and_warns_once() {
+    let files = files("oci-binary-plain-wide");
+    let marker = "serves plain HTTP on a non-loopback address";
+    for (listen, warnings) in [("0.0.0.0:0", 1), ("127.0.0.1:0", 0)] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tierstore"));
+        command
+            .args(&files.plain(listen)[1..])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = spawn(&mut command, 3).expect("spawned");
+        let stdout = child.stdout.take().expect("stdout");
+        let mut stderr = child.stderr.take().expect("stderr");
+        let (line, _reader) = first_line(stdout, Duration::from_secs(30)).expect("a start line");
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(words.len(), 5, "{line}");
+        assert_eq!(words[4], "(http)", "{line}");
+        let bound: SocketAddr = words[3]
+            .strip_prefix("oci-listen=")
+            .expect("oci-listen=")
+            .parse()
+            .expect("an address");
+        let dial = SocketAddr::from(([127, 0, 0, 1], bound.port()));
+        let mut conn = Conn::open_plain(dial).await.expect("a connection");
+        assert_eq!(
+            conn.request("GET", "/v2/", &[])
+                .await
+                .expect("an answer")
+                .status,
+            200,
+            "{listen}"
         );
-        assert!(
-            stderr.contains("needs --oci-tls-cert and --oci-tls-key"),
-            "{listen}: {stderr}"
-        );
-        assert!(stderr.contains(listen), "{listen}: {stderr}");
+        drop(conn);
+        let pid = Pid::from_raw(i32::try_from(child.id()).expect("a pid")).expect("a pid");
+        kill_process(pid, Signal::TERM).expect("signalled");
+        let (status, text) = tokio::task::spawn_blocking(move || {
+            let status = child.wait().expect("waited");
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut stderr, &mut text).expect("stderr");
+            (status, text)
+        })
+        .await
+        .expect("joined");
+        assert_eq!(status.code(), Some(0), "{listen}: {text}");
+        assert_eq!(text.matches(marker).count(), warnings, "{listen}: {text}");
     }
 }
 
