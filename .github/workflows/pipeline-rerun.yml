@@ -1,0 +1,75 @@
+# The one rerun of a pipeline run whose failed jobs all build or move artifacts (pipeline.yml).
+#
+# A flaky download or upload of an artifact fails one job, and the pipeline's fail-fast (`watch`)
+# cancels the rest: an hour lost for a flake. A job cannot be rerun while its run is in progress,
+# and `watch` keeps the run open, so the rerun is made after the run: this workflow starts when a
+# pipeline run completes (`workflow_run`) and runs `cargo xtask pipeline-rerun`, which asks GitHub
+# to rerun the failed jobs of the run once, only when
+#   - the run is a push to main that failed, or was cancelled by `watch` for a failed job,
+#   - it is the first attempt (a rerun completes as attempt 2 and is ignored: no loop), and
+#   - EVERY failed job builds or moves artifacts (the exact names of RERUNNABLE in
+#     crates/xtask/src/pipeline_rerun.rs). A failed test, lint or smoke job, or a job nobody
+#     listed, means nothing is rerun and the pipeline stays failed, so a flaky test still fails
+#     loudly and gets fixed.
+# Each rerun is a line in this run's summary with the jobs and the logs of their first failure,
+# so flakes stay visible and countable. The rerun reruns every job that did not pass, the ones
+# `watch` cancelled included, so a rerun costs the rest of the pipeline again.
+#
+# `workflow_run` runs this file as it is on main, with this repository's token, whatever commit the
+# pipeline run was for, so the job NEVER checks out or runs the code of the run's head commit: it
+# checks out main (the default of `actions/checkout` in a `workflow_run`) and builds xtask from it,
+# before the step that holds the token. Its token is `actions: write` (the rerun) and
+# `contents: read`, held under the exact `if:` the workflow lint allows (tests/workflows,
+# `RERUN_ONLY`), and no secret but the token.
+name: pipeline-rerun
+
+on:
+  workflow_run:
+    workflows: [pipeline]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+# One rerun decision per pipeline run.
+concurrency:
+  group: pipeline-rerun-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  rerun:
+    if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      # Built before any step holds the token, so no build script runs beside it.
+      - run: cargo build -p xtask --locked
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+      - name: Rerun the failed jobs once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: cargo xtask pipeline-rerun --repo "$GITHUB_REPOSITORY" --run-id "$RUN_ID"
