@@ -245,6 +245,12 @@ impl FakeLeaseServer {
         locked(&self.shared.state).run_args(run)
     }
 
+    /// The image the run was queued with, as the server received it.
+    #[must_use]
+    pub fn run_image(&self, run: &RunId) -> Option<String> {
+        locked(&self.shared.state).run_image(run)
+    }
+
     /// The mounts the run was queued with, as the server received them.
     #[must_use]
     pub fn run_mounts(&self, run: &RunId) -> Option<Vec<Mount>> {
