@@ -584,6 +584,67 @@ mod tests {
         assert!(!leases.cancel(id()), "a finished lease");
     }
 
+    /// A runtime that takes a turn of the executor before a run can be stopped: its
+    /// `kill` of a run that has not got that far does nothing, as the trait says of a
+    /// lease that is not running.
+    struct Preparing {
+        stops: std::sync::Mutex<BTreeMap<LeaseId, tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl Runtime for Preparing {
+        fn driver(&self) -> &'static str {
+            "preparing"
+        }
+
+        fn serves(&self, _kind: &str) -> bool {
+            true
+        }
+
+        async fn run(&self, work: Work) -> Result<ActionResult, RuntimeError> {
+            tokio::task::yield_now().await;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.stops.lock().expect("lock").insert(work.lease_id, tx);
+            let _ = rx.await;
+            Err(RuntimeError::Killed)
+        }
+
+        async fn kill(&self, lease_id: LeaseId) {
+            if let Some(stop) = self.stops.lock().expect("lock").remove(&lease_id) {
+                let _ = stop.send(());
+            }
+        }
+    }
+
+    /// Catches a `Cancel` of a lease whose run is listed as running but has not yet
+    /// reached the point where its runtime can stop it: the kill finds nothing to stop
+    /// and, sent once, is lost, so the run goes on and a draining daemon waits on it for
+    /// ever (kbf#2013). The kill must be repeated until the run has ended. The executor
+    /// runs the run's first turn, then the kill, then the run's second, so the kill is
+    /// early by construction. The wait is a hang guard on a paused clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_before_the_run_can_be_stopped_still_ends_it() {
+        let runtime = Arc::new(Preparing {
+            stops: std::sync::Mutex::new(BTreeMap::new()),
+        });
+        let (done, mut done_rx) = mpsc::unbounded_channel();
+        let mut leases = Leases::new(Runtimes::new(runtime), done);
+        let start = Start {
+            lease_id: Some(proto_lease_id(id())),
+            kind: "action".to_owned(),
+            action_digest: Some(Digest::default()),
+            ..Start::default()
+        };
+        assert_eq!(leases.start(start), None);
+        assert!(leases.cancel(id()));
+        let (ended, outcome, usage, phases) =
+            tokio::time::timeout(std::time::Duration::from_secs(60), done_rx.recv())
+                .await
+                .expect("the cancelled run ends")
+                .expect("open");
+        let result = leases.finished(ended, outcome, usage, &phases);
+        assert_eq!(code(&result), Code::Aborted as i32);
+    }
+
     /// Asks every callsite again whether the subscriber just installed wants it.
     /// tracing caches each callsite's interest when it is first reached; a test on
     /// another thread that reaches the callsite while no subscriber (or only that
