@@ -253,6 +253,7 @@ fn a_load_at_every_cap_is_9001_bytes_and_its_beat_under_12_kib() {
             missing_unasked: u64::MAX,
         }),
         node_load: Some(load),
+        input_cache: None,
     };
     let size = beat.encoded_len();
     assert!(size < 12 * 1024, "{size} bytes");
