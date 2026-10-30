@@ -184,7 +184,7 @@ impl Rig {
                 mint: PackKeyMint::new(SECRET).expect("a mint"),
                 prepare: prepared.clone(),
                 base_image: ImageRef::parse(IMAGE).expect("an image"),
-                kbf_image: ImageRef::parse(KBF_IMAGE).expect("an image"),
+                kbf_image: ImageRef::parse(&format!("docker://{KBF_IMAGE}")).expect("an image"),
             },
             clock,
         );

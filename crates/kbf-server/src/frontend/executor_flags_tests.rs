@@ -113,6 +113,7 @@ fn the_daemon_executor_keeps_the_lease_servers_settings_unread() {
         }
         assert!(all.contains(&"--executor-insecure-argv-secrets"));
         // A tag, which the js-agent parse refuses: the daemon executor must never read it.
+        all.retain(|flag| !flag.starts_with("--executor-base-image"));
         all.push("--executor-base-image=registry.test/base:22.04");
         let flags = parsed(argv(&all)).expect("flags");
         assert_eq!(flags.executor.kind, ExecutorKind::KbfDaemon);
@@ -239,8 +240,10 @@ fn the_defaults_are_the_executors_own() {
 #[test]
 fn the_base_and_kbf_images_are_pinned_by_digest() {
     let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    // Neither image the other flag of `JS` names.
+    let fresh = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     for flag in ["--executor-base-image", "--executor-kbf-image"] {
-        let own = format!("registry.test/image@sha256:{digest}");
+        let own = format!("registry.test/image@sha256:{fresh}");
         for given in [own.clone(), format!("docker://{own}")] {
             let flags = js_with(&[&format!("{flag}={given}")]).expect("flags");
             let js = flags.executor.js.expect("js-agent");
