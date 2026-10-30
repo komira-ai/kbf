@@ -319,9 +319,15 @@ async fn require_held(
     wanted.retain(|digest| !is_empty_blob(digest));
     wanted.sort();
     wanted.dedup();
-    let asks = wanted.chunks(FILES_PER_ASK).map(|chunk| async move {
+    // Owned chunks: a closure over a borrowed chunk makes the future's `Send` unprovable where
+    // it is boxed (`kbf_server`'s `RunPrepare`, an `async_trait`).
+    let chunks: Vec<Vec<Digest>> = wanted
+        .chunks(FILES_PER_ASK)
+        .map(<[Digest]>::to_vec)
+        .collect();
+    let asks = chunks.into_iter().map(|chunk| async move {
         backend
-            .find_missing(chunk)
+            .find_missing(&chunk)
             .await
             .map_err(|error| store_fault("a blob of the inputs", &chunk[0], &error))
     });

@@ -276,6 +276,49 @@ async fn an_action_that_cannot_be_read_fails_as_a_fetch_and_stores_nothing() {
     assert!(sink.stored.lock().unwrap().is_empty());
 }
 
+/// Catches an input blob that is gone, or is not the bytes its digest names, ending a task any way
+/// but a fetch failure (exit 10) that stores nothing, and a bad `--fetch-concurrency` being taken.
+#[tokio::test]
+async fn an_input_blob_that_is_missing_or_corrupt_fails_as_a_fetch() {
+    let mut mem = Mem::default();
+    let digest = action(&mut mem, COPY, &["out"]);
+    let data = label(&reapi_of(b"hi\n"));
+    for (name, replacement) in [("missing", None), ("corrupt", Some(b"HI\n".to_vec()))] {
+        let mut broken = Mem(mem.0.clone());
+        broken.0.remove(&data);
+        if let Some(bytes) = replacement {
+            broken.0.insert(data.clone(), bytes);
+        }
+        let sink = Fake::new(false);
+        let dir = scratch(name);
+        let mut flags = cli(&dir, digest.clone());
+        flags.fetch_concurrency = 2;
+        let failure = execute(&flags, &broken, &sink).await.expect_err(name);
+        assert!(matches!(failure, Failure::Fetch(_)), "{name}: {failure}");
+        assert_eq!(failure.exit_code(), EXIT_FETCH);
+        assert!(sink.stored.lock().unwrap().is_empty());
+    }
+    let dir = scratch("default");
+    assert_eq!(cli(&dir, digest).fetch_concurrency, 32);
+}
+
+#[test]
+fn the_fetch_concurrency_flag_takes_one_to_256() {
+    for (value, accepted) in [("0", false), ("1", true), ("256", true), ("257", false)] {
+        let parsed = Cli::try_parse_from([
+            "kbf-task",
+            "--pack-url-file=u",
+            "--grant-url=https://g",
+            "--grant-token-file=t",
+            "--lease=l",
+            "--action=0000000000000000000000000000000000000000000000000000000000000000/0",
+            "--fetch-concurrency",
+            value,
+        ]);
+        assert_eq!(parsed.is_ok(), accepted, "{value}");
+    }
+}
+
 #[tokio::test]
 async fn an_action_without_a_command_or_an_input_root_fails_as_a_fetch() {
     for (command, root, what) in [(false, true, "command"), (true, false, "input root")] {
@@ -308,6 +351,65 @@ async fn a_command_with_no_program_fails_as_a_run_start() {
         .expect_err("run");
     assert!(matches!(failure, Failure::Run(_)), "{failure}");
     assert_eq!(failure.exit_code(), EXIT_RUN);
+}
+
+/// The home and tmp directories are outside the input root, so files a Command writes there are
+/// not in the manifest's outputs and not a record of the pack.
+#[tokio::test]
+async fn files_written_into_home_and_tmp_are_not_packed_or_listed() {
+    let dir = scratch("private-unpacked");
+    let in_home = dir.join("private/home/cc-cache");
+    let in_tmp = dir.join("private/tmp/cc-scratch");
+    let mut mem = Mem::default();
+    let digest = action(
+        &mut mem,
+        &[
+            "touch",
+            in_home.to_str().unwrap(),
+            in_tmp.to_str().unwrap(),
+            "out",
+        ],
+        &["out"],
+    );
+    let sink = Fake::new(false);
+    let manifest = execute(&cli(&dir, digest), &mem, &sink)
+        .await
+        .expect("task");
+    assert!(in_home.exists());
+    assert!(in_tmp.exists());
+    assert_eq!(manifest.exit_code, 0);
+    assert_eq!(manifest.output_files.len(), 1);
+    assert_eq!(manifest.output_files[0].path, "out");
+    assert!(manifest.output_directories.is_empty());
+    assert!(manifest.output_symlinks.is_empty());
+    let stored = sink.stored.lock().unwrap();
+    let reader = SegmentReader::open(&stored[0]).expect("segment");
+    // Only the manifest: `out` is empty, and the files in `private/` have no record.
+    assert_eq!(reader.footer().entries().len(), 1);
+    let json = manifest.to_json().expect("json");
+    assert!(!String::from_utf8_lossy(&json).contains("private"));
+}
+
+/// Catches: a task whose home, tmp and cache directories cannot be made (a file where the
+/// `private` directory belongs) starting the Command anyway, or failing in a class other than
+/// the run start.
+#[tokio::test]
+async fn private_directories_that_cannot_be_made_fail_as_a_run_start() {
+    let mut mem = Mem::default();
+    let digest = action(&mut mem, COPY, &["out"]);
+    let dir = scratch("private-blocked");
+    std::fs::write(dir.join("private"), b"in the way").expect("file");
+    let sink = Fake::new(false);
+    let failure = execute(&cli(&dir, digest), &mem, &sink)
+        .await
+        .expect_err("run");
+    assert!(
+        matches!(failure, Failure::Run(RunError::Io { .. })),
+        "{failure}"
+    );
+    assert_eq!(failure.exit_code(), EXIT_RUN);
+    assert!(!dir.join("in/out").exists());
+    assert!(sink.stored.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

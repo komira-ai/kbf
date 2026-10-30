@@ -4,9 +4,18 @@
 //! inputs, and starts a job whose arguments name both. The tool then
 //! 1. reads the Action, its Command and its input root through the read grant ([`fetch`]), checking
 //!    every blob's SHA-256 against its digest, and lays the input tree out under the working
-//!    directory;
+//!    directory. The tree is read breadth-first with at most `--fetch-concurrency` requests in
+//!    flight (32 by default) over pooled connections, and each file streams from the response to
+//!    disk through its digest check instead of being held in memory;
 //! 2. runs the Command there ([`run`]): its argv, environment and working directory, stdout and
-//!    stderr to files, under a deadline;
+//!    stderr to files, under a deadline. The environment is the Command's own, preceded by `HOME`,
+//!    `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`, which name fresh directories
+//!    `private/{home,tmp,cache}` (the last holding `clang/ModuleCache`) under the working
+//!    directory, mode 0700, made new for the run (an existing `private` is refused), beside the input root and not in it. A job's image root is read-only
+//!    and its `/tmp` is a small `noexec` tmpfs, so a compiler that writes under `~` or the
+//!    temporary directory would otherwise fail; and since outputs are collected relative to the
+//!    input root, nothing written there is packed. A variable the Command sets itself keeps its
+//!    value. A directory that cannot be made fails the run start (exit 11);
 //! 3. collects the declared outputs as REAPI does ([`outputs`]): files, directories as Trees,
 //!    symlinks, the executable bit;
 //! 4. writes every output blob, stdout, stderr and Tree, and the manifest, into ONE kbf-segments
