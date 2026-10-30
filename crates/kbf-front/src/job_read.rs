@@ -63,7 +63,10 @@ use crate::grants::{Claims, GrantError, Grants, Scope};
 use crate::metrics::{Counter, Families};
 use crate::proxy::MAX_UNTRUSTED_BLOB_BYTES;
 
+mod locate;
 mod walk;
+
+pub use self::locate::{LOCATE_PATH, Span, large_key};
 
 pub use self::walk::MAX_SCOPE_BLOB_BYTES;
 use self::walk::{Budget, ScopeError, walk};
@@ -133,6 +136,26 @@ pub trait BlobSource: Send + Sync {
             digests.iter().map(|digest| self.read_blob(digest)),
         ))
     }
+
+    /// Where each of `digests` lies in a pack, one answer each in the order asked, `None` for a
+    /// blob with no row: for `GET /locate`, one batched ask of the pack index. The default
+    /// has no packs.
+    fn locate_packed<'a>(
+        &'a self,
+        digests: &'a [Digest],
+    ) -> BoxFuture<'a, Result<Vec<Option<Span>>, StorageError>> {
+        Box::pin(async move { Ok(vec![None; digests.len()]) })
+    }
+
+    /// The length of the object [`large_key`] names for `digest` in tierstore, `None` if there
+    /// is none (a HEAD, not a read): for `GET /locate`. The default holds no large objects.
+    fn large_len<'a>(
+        &'a self,
+        digest: &'a Digest,
+    ) -> BoxFuture<'a, Result<Option<u64>, StorageError>> {
+        let _ = digest;
+        Box::pin(async { Ok(None) })
+    }
 }
 
 impl BlobSource for Backend {
@@ -182,6 +205,12 @@ pub struct Limits {
     /// that are done (those in progress stay, so that a second ask joins them) and begins
     /// again.
     pub scopes: usize,
+    /// How long `GET /locate` remembers that tierstore holds a large object (seconds, not
+    /// forever: an object can be removed).
+    pub locate_present_for: std::time::Duration,
+    /// How long `GET /locate` remembers that tierstore lacks a large object: short, because an
+    /// ingest or a backfill may write it.
+    pub locate_absent_for: std::time::Duration,
 }
 
 impl Default for Limits {
@@ -194,6 +223,8 @@ impl Default for Limits {
             stream_over: STREAM_OVER_BYTES,
             scope_digests: 1 << 20,
             scopes: 256,
+            locate_present_for: std::time::Duration::from_secs(10),
+            locate_absent_for: std::time::Duration::from_secs(2),
         }
     }
 }
