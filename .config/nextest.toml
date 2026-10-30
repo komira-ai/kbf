@@ -55,6 +55,14 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 filter = 'package(kbf-daemon) & binary(cache)'
 slow-timeout = { period = "30s", terminate-after = 4 }
 
+# The janitor tests wait on the janitor's own counters, never on a deadline in the test: the loop
+# test on its paused clock until the third sweep, the frontend test on `GET /metrics` until the
+# orphans are counted as deleted. A janitor that never sweeps would leave one waiting for ever, and
+# this guard (2 minutes) ends it instead. Above the general budget: the first match wins.
+[[profile.default.overrides]]
+filter = 'package(kbf-server) & test(/^frontend::janitor::tests::/)'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
 # The general budget: every other test, of every package, is ended after eight minutes
 # (120 seconds x 4). The slowest of them in the full run on main takes about 240 seconds
 # (kbf-server::frontend, a_frontend_dialing_a_node_with_another_nodes_certificate_is_refused),

@@ -245,6 +245,31 @@ and readable by it alone; the pack-key mint and the grant key are made from it, 
 job-facing listener must verify grants with the same secret. No secret is a flag. Left out, no
 secret file is read and the frontend serves exactly as before.
 
+**The `cas/b/` janitor** (off by default; the `[task-runs]` table of `kbf.toml`). The packs and
+large objects tasks write under `cas/b/` are not all kept: a refused run, a run that failed after
+its write, the unused keys of a key set, and a large object the ingest has already copied into the
+CAS leave keys nothing refers to. With `--task-janitor-key-file` the leader (the server that holds
+the scheduler role) lists `cas/b/` every `--task-janitor-interval-secs` (default 900) and deletes
+a key that is older than `--task-janitor-grace-secs` (default 21600, at least 18000: the 4 hours
+a presigned write is good for and an hour for the ingest), is not one an ingest is verifying
+right now, and is not recorded in the pack index (asked again for that key just before the
+delete; a pack the ingest recorded stays where it lies and is never deleted). The age is the
+minute in the key's own name, for a pack (`-<k>`) and a large object (`-L<i>`) alike; a key under
+`cas/b/` whose name does not parse is kept and counted. It never lists or deletes under `cas/l/`
+(content-bound large objects), `cas/f/<writer>/` (frontend packs) or `cas/d/` (daemon packs). The
+key file is the JSON of the tier store's GC key (`--gc-key-file` there), whose prefix must be
+exactly `cas/b/`, owned by the server's user, mode 0600 or 0400; it signs the janitor's requests to
+the store of `--pack-store-endpoint` (same endpoint, bucket and region), which the janitor needs,
+as it needs `--task-secret-file` and `--pack-index`. A sweep lists `--task-janitor-page-size`
+(default 500) keys at a time and waits `--task-janitor-page-pause-ms` (default 1000) after each
+page, which bounds how fast it lists and deletes. `--task-janitor-dry-run` counts and logs what a
+sweep would delete and deletes nothing. `GET /metrics` has `kbf_cas_b_janitor_listed_total`,
+`..._reaped_total`, `..._kept_young_total`, `..._kept_verifying_total`,
+`..._kept_referenced_total`, `..._kept_unparsed_total`, `..._kept_outside_total`,
+`..._would_reap_total`, `..._reap_errors_total` (deletes the store refused, retried by the next
+sweep), `..._sweeps_total` and `..._sweep_errors_total` (sweeps the listing or the pack index
+stopped).
+
 A daemon writes its outputs into packs with `--pack-write` (off by default; the `[packs]`
 table of `kbf.toml`), which needs `--pack-read` and `--pack-store-write-credentials-file`, a
 key pair file of the same form as `--pack-store-credentials-file` but of a key that may

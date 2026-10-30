@@ -71,6 +71,11 @@
 //! write, one presigned write of it to the tier store and a read grant for its inputs; without
 //! the flag no secret file is read and the frontend serves exactly as it did.
 //!
+//! **The `cas/b/` janitor** is off unless `--task-janitor-key-file` is given (`janitor` has the
+//! flags and the rule for an orphan): the leader then sweeps the task packs and large objects
+//! under `cas/b/` that nothing recorded and are older than the grace, on an interval, through the
+//! tier store's GC key, and counts what it did (`kbf_cas_b_janitor_*` on `GET /metrics`).
+//!
 //! **Readiness** (`GET /readyz`, `grpc.health.v1`) fails when the storage node does not
 //! answer an action-cache lookup within `--readyz-store-timeout-ms`, when the state store (if
 //! configured) does not answer a read, and when the storage map is not loaded (always
@@ -134,6 +139,7 @@ use tonic::service::Routes;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server};
 
 pub use self::executor_flags::{ExecutorFlags, JsAgentFlags};
+pub use self::janitor::{Janitor, JanitorFlagError, JanitorFlags, JanitorMetrics};
 pub use self::job_read::{JobReadError, JobReadFlags};
 pub use self::pack_flags::{PackFlagError, PackFlags};
 pub use self::task_flags::{TaskFlagError, TaskFlags};
@@ -278,6 +284,9 @@ pub struct FrontendFlags {
     /// executor (the key, the presigned write and the read grant of each). `None` without the
     /// switch, where no run is prepared.
     pub task: Option<TaskFlags>,
+    /// `--task-janitor-key-file` and its companions: the sweep of the task packs under `cas/b/`
+    /// that nothing recorded. `None` without the key file, where nothing is swept.
+    pub janitor: Option<JanitorFlags>,
 }
 
 /// The long names of the flags of [`Args`] that `kbf frontend` hides and refuses by name
@@ -334,6 +343,7 @@ pub fn command() -> Command {
     .args(pack_flags::args())
     .args(job_read::args())
     .args(task_flags::args())
+    .args(janitor::args())
     .args(executor_flags::args())
     .arg(
         Arg::new(SECRETS_DIR)
@@ -397,6 +407,8 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
     let tls = <[PathBuf; 3]>::try_from(paths).ok();
     transport(&storage, tls.is_some()).map_err(refuse)?;
     let task = task_flags::from_matches(m).map_err(refuse)?;
+    let janitor = janitor::from_matches(m);
+    janitor::check(janitor.as_ref(), packs.as_ref()).map_err(refuse)?;
     if let Some(js) = executor.js.as_mut() {
         let beside = executor_bind::Beside {
             task: task.as_ref(),
@@ -421,6 +433,7 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         executor,
         job_read,
         task,
+        janitor,
     })
 }
 
@@ -890,6 +903,14 @@ impl<'a> Prepared<'a> {
         let state_store = store_of(state.as_ref());
         let routed = routed_of(members.as_ref(), flags, &storage)?;
         let packs = pack_flags::open(flags.packs.as_ref(), pack_index.as_ref())?;
+        let janitor = janitor::open(
+            flags.janitor.as_ref(),
+            flags.packs.as_ref(),
+            packs.as_ref(),
+            pack_index.as_ref(),
+            &readiness,
+        )?;
+        let janitor_metrics = janitor.as_ref().map(Janitor::metrics);
         let checks = Arc::new(checks(
             Arc::clone(&readiness),
             storage.clone(),
@@ -1045,6 +1066,7 @@ impl<'a> Prepared<'a> {
                 packs: packs.clone(),
                 job_read: job_stats,
                 executor: executor.as_ref().map(|built| Arc::clone(&built.metrics)),
+                janitor: janitor_metrics,
             },
             Arc::clone(&farm),
         ));
@@ -1138,6 +1160,7 @@ impl<'a> Prepared<'a> {
         }
         background.extend(enroll_renewal);
         background.extend(job_task);
+        background.extend(janitor.map(|janitor| janitor.run().boxed()));
 
         let intake_polls = farm.intake_polls();
         let shutdown = shutdown()?;
@@ -1348,6 +1371,8 @@ struct Counters {
     job_read: Option<Arc<kbf_front::job_read::JobRead>>,
     /// The host executor.
     executor: Option<Arc<ExecutorMetrics>>,
+    /// The janitor of `cas/b/`.
+    janitor: Option<Arc<JanitorMetrics>>,
 }
 
 /// `GET /metrics`: what the service counts, in the Prometheus text format, history's
@@ -1367,6 +1392,7 @@ fn metrics_route(
         packs,
         job_read,
         executor,
+        janitor,
     } = counters;
     let tls = Arc::new(tls);
     let render = move || {
@@ -1374,6 +1400,7 @@ fn metrics_route(
         let (history, packs, farm) = (history.clone(), packs.clone(), Arc::clone(&farm));
         let executor = executor.clone();
         let job_read = job_read.clone();
+        let janitor = janitor.clone();
         async move {
             let mut text = backend.render_metrics();
             if let Some(history) = history {
@@ -1384,6 +1411,9 @@ fn metrics_route(
             crate::metrics::render_farm(&mut text, &farm);
             if let Some(executor) = executor {
                 executor.render(&mut text);
+            }
+            if let Some(janitor) = janitor {
+                janitor.render(&mut text);
             }
             crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);
@@ -1459,6 +1489,7 @@ mod drain_flags;
 mod executor_bind;
 mod executor_flags;
 mod handoff;
+mod janitor;
 mod job_read;
 mod pack_flags;
 mod state_wait;
