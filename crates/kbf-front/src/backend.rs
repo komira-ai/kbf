@@ -46,7 +46,7 @@ use kbf_meta::{ActionRecord, ActionWriteError, Role};
 use kbf_objstore::ObjectStore;
 use kbf_proto::reapi::ActionResult;
 use kbf_route::Router;
-use kbf_storage::{Storage, StorageError};
+use kbf_storage::{ReadStream, Storage, StorageError};
 use kbf_types::Digest;
 use prost::Message as _;
 
@@ -76,6 +76,7 @@ impl fmt::Debug for Backend {
 trait Plane: Send + Sync {
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Answer<Vec<Digest>>>;
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<bytes::Bytes>>;
+    fn read_stream<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<ReadStream>>;
     fn action_result<'a>(
         &'a self,
         action: &'a Digest,
@@ -157,6 +158,21 @@ impl Backend {
         self.0.read_blob(digest).await
     }
 
+    /// The blob `digest` as a stream of chunks, read in windows and never held whole: for a
+    /// blob too large for [`Backend::read_blob`]. The store checks the blob as a whole
+    /// against its digest ([`Storage::read_range`]); a router does not, so the caller that
+    /// holds the digest hashes what it receives.
+    ///
+    /// The packs are not looked in: what a frontend packs is at most
+    /// [`crate::MAX_PACKED_BLOB_BYTES`], which is what a caller reads whole.
+    ///
+    /// # Errors
+    /// [`StorageError::NotFound`] if it is not held, or as the store answers; a failure after
+    /// the first chunk is an error item of the stream.
+    pub async fn read_stream(&self, digest: &Digest) -> Result<ReadStream, StorageError> {
+        self.0.read_stream(digest).await
+    }
+
     pub(crate) async fn action_result(
         &self,
         action: &Digest,
@@ -232,6 +248,13 @@ impl<M: MetaLog, O: ObjectStore + 'static> Plane for Local<M, O> {
 
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<bytes::Bytes>> {
         Box::pin(async move { self.0.read_blob(digest).await.map_err(StorageError::from) })
+    }
+
+    fn read_stream<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<ReadStream>> {
+        Box::pin(async move {
+            let read = self.0.read_windows(digest, 0, digest.size_bytes).await?;
+            Ok(crate::storage::chunks(read))
+        })
     }
 
     fn action_result<'a>(
@@ -332,6 +355,10 @@ impl Plane for Remote {
                 layered.read_blob(digest).await
             }),
         }
+    }
+
+    fn read_stream<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<ReadStream>> {
+        self.storage.read_range(digest, 0, 0)
     }
 
     fn action_result<'a>(
@@ -464,6 +491,13 @@ impl Plane for RoutedPlane {
                 layered.read_blob(digest).await
             }),
             (None, _) => self.bootstrap.read_blob(digest),
+        }
+    }
+
+    fn read_stream<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<ReadStream>> {
+        match self.routing() {
+            Some(router) => Box::pin(router.read_range(digest, 0, 0)),
+            None => self.bootstrap.read_stream(digest),
         }
     }
 
