@@ -188,6 +188,7 @@ pub fn problems(workflow: &str) -> Result<Vec<String>, String> {
     facts::rules(workflow, &mut out)?;
     kbf_package::rules(workflow, &mut out)?;
     images::rules(workflow, &mut out)?;
+    image_sbom::rules(workflow, &mut out)?;
     mac_package(workflow, &mut out)?;
     darwin(workflow, &mut out)?;
     pull_request_gate(workflow, &mut out)?;
@@ -1903,6 +1904,7 @@ mod rules {
 }
 
 mod facts;
+mod image_sbom;
 mod images;
 #[cfg(test)]
 mod installer;
