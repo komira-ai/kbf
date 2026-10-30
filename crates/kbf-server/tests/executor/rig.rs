@@ -531,6 +531,18 @@ impl Rig {
         );
     }
 
+    /// As [`Rig::host_finishes`], with the detail the host gives (a refusal code, for a start).
+    pub fn host_finishes_with(
+        &self,
+        run: &RunId,
+        outcome: Outcome,
+        exit_code: Option<i32>,
+        detail: &str,
+    ) {
+        self.fake.run_started(run);
+        assert!(self.fake.finish_run(run, outcome, exit_code, Some(detail)));
+    }
+
     pub fn host_ends(&self, run: &RunId) {
         assert!(self.fake.end_run(run));
     }

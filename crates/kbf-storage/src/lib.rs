@@ -66,6 +66,13 @@ pub struct ActionEntry {
 /// the stream ends after one.
 pub type ReadStream = BoxStream<'static, Result<Bytes, StorageError>>;
 
+/// The pieces of a blob in order, as [`Storage::put_streamed`] takes them.
+pub type PieceStream = BoxStream<'static, std::io::Result<Bytes>>;
+
+/// Opens a [`PieceStream`] of one blob from its first byte, each time it is called: for a writer
+/// that may have to send the blob again, to the next owner of it or after a newer map.
+pub type OpenPieces<'a> = dyn Fn() -> PieceStream + Send + Sync + 'a;
+
 /// The largest chunk of a [`ReadStream`]: what a ByteStream `Read` sends in one message.
 pub const READ_CHUNK_BYTES: usize = 1 << 20;
 

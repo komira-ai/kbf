@@ -160,6 +160,20 @@ async fn a_start_logs_the_core_it_runs_for_each_core() {
     let said = log.text();
     assert_eq!(said.matches("scheduler core: js").count(), 1, "{said}");
     assert_eq!(said.matches("scheduler core: legacy").count(), 1, "{said}");
+    assert_eq!(said.matches("memory climb: on").count(), 2, "{said}");
+    assert_eq!(said.matches("memory climb: off").count(), 0, "{said}");
+
+    let (meta, store, prefix, id) = open("no-climb").await;
+    let args = Args::parse_from(["kbf-server", "--no-memory-climb"].into_iter().chain(flags));
+    let server = serve_with(&args, None, meta, store, prefix, id, || {
+        Ok(std::future::pending::<()>())
+    })
+    .await
+    .expect("legacy without the climb starts");
+    drop(server);
+    let said = log.text();
+    assert_eq!(said.matches("memory climb: off").count(), 1, "{said}");
+    assert_eq!(said.matches("memory climb: on").count(), 2, "{said}");
 }
 
 /// Catches a refusal of `--learned-sizes on` with the js core that comes after anything is

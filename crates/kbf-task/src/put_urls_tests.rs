@@ -61,26 +61,30 @@ fn packs_must_be_present_and_not_empty() {
     );
 }
 
-/// Catches a list longer than a one-byte slot can name being accepted, and the limit being off
-/// by one: 255 is accepted and 256 is not, in each list.
+/// Catches a list longer than a manifest can name being accepted, and the limit being off by
+/// one: 8 packs and 8 large are accepted, 9 of either is refused, naming the list and the limit.
 #[test]
-fn more_than_255_urls_are_refused() {
+fn more_than_8_urls_are_refused() {
     let many = |n: usize| vec!["https://s/k"; n];
-    PutUrls::parse(&json(&many(255), &many(255))).expect("255 each");
+    PutUrls::parse(&json(&many(8), &many(8))).expect("8 each");
     assert_eq!(
-        refused(&json(&many(256), &[])),
+        refused(&json(&many(9), &[])),
         PutUrlsError::TooMany {
             field: "packs",
-            count: 256
+            count: 9,
+            max: 8
         }
     );
+    let err = refused(&json(&["https://s/p0"], &many(9)));
     assert_eq!(
-        refused(&json(&["https://s/p0"], &many(256))),
+        err,
         PutUrlsError::TooMany {
             field: "large",
-            count: 256
+            count: 9,
+            max: 8
         }
     );
+    assert!(err.to_string().contains("more than the 8"), "{err}");
 }
 
 /// Catches an empty string, a URL of another scheme, a scheme with nothing after it and a URL

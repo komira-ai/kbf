@@ -4,12 +4,14 @@
 //! A sums file is `<64 lowercase hex digits><two spaces><file name>` lines, each ending
 //! in a newline, as `sha256sum` writes them; a name holds no `/` ([`parse`]).
 //!
-//! - `sums assemble <dir> [--expect <file>] [--summary <file>]` ([`assemble`]): merges
+//! - `sums assemble <dir> [--expect <file>] [--summary <file>] [--digest-output <file>]` ([`assemble`]): merges
 //!   the `SHA256SUMS.<platform>` files `package` wrote into `<dir>/SHA256SUMS`, sorted
 //!   by name, and removes them. A name in two of them, or a `SHA256SUMS.<suffix>` that
 //!   names no platform, is refused. `--expect` refuses a result that is not byte for
 //!   byte that file (the published one); `--summary` appends the result to a file (the
-//!   job summary).
+//!   job summary); `--digest-output` appends `sha256=<hex>`, the SHA-256 of the `SHA256SUMS` it
+//!   wrote, to a file (on Actions, `GITHUB_OUTPUT`: the sums job hands the digest on, and the
+//!   attest job of the sign call compares the sums it downloads with it).
 //! - `verify-assets sums <dir>` ([`verify_sums`]): `<dir>/SHA256SUMS` lists every other
 //!   file in `<dir>` (but the provenance bundles, which are made after the sums and so
 //!   cannot be listed: [`crate::bundles`]), each once, and each matches its line, and
@@ -171,6 +173,7 @@ pub fn assemble(
     dir: &Path,
     expect: Option<&Path>,
     summary: Option<&Path>,
+    digest_output: Option<&Path>,
 ) -> Result<Vec<String>, Error> {
     let prefix = format!("{SUMS}.");
     let mut parts = Vec::new();
@@ -223,6 +226,15 @@ pub fn assemble(
             .open(summary)
             .and_then(|mut f| write!(f, "```text\n{text}```\n"))
             .map_err(Error::spawn(format!("append to {}", summary.display())))?;
+    }
+    if let Some(output) = digest_output {
+        let digest = Sha256::of(text.as_bytes());
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(output)
+            .and_then(|mut f| writeln!(f, "sha256={digest}"))
+            .map_err(Error::spawn(format!("append to {}", output.display())))?;
     }
     Ok(text.lines().map(str::to_owned).collect())
 }

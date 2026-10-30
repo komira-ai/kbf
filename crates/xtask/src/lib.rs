@@ -624,6 +624,10 @@ enum Sums {
         /// Append the result to this file (on Actions, `GITHUB_STEP_SUMMARY`).
         #[arg(long)]
         summary: Option<PathBuf>,
+        /// Append `sha256=<hex>`, the digest of the result, to this file (on Actions,
+        /// `GITHUB_OUTPUT`).
+        #[arg(long)]
+        digest_output: Option<PathBuf>,
     },
 }
 
@@ -1298,7 +1302,13 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             dir,
             expect,
             summary,
-        }) => sums::assemble(&dir, expect.as_deref(), summary.as_deref()),
+            digest_output,
+        }) => sums::assemble(
+            &dir,
+            expect.as_deref(),
+            summary.as_deref(),
+            digest_output.as_deref(),
+        ),
         Verb::VerifyAssets(VerifyAssets::Sums { dir }) => {
             Ok(vec![sums::verify_sums(&dir, fetch::Sha256::of)?])
         }

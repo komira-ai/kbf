@@ -74,6 +74,7 @@ use crate::{
 use super::gc::{ensure_distinct as gc_distinct, gc_keys, ids as gc_ids};
 use super::keys::{ensure_distinct, read_credentials, read_only_keys};
 use super::presign::{ensure_distinct as presign_distinct, presign_keys};
+use super::scoped::{ensure_distinct as scoped_distinct, ids as scoped_ids, scoped_keys};
 use super::{Drained, Server, ServerConfig};
 
 /// A start-up error, for the operator.
@@ -211,6 +212,15 @@ pub struct Cli {
     /// owner may read it (mode 0600).
     #[arg(long)]
     pub gc_key_file: Vec<PathBuf>,
+    /// A file that holds a scoped key, JSON of exactly `access_key_id`, `secret_access_key`,
+    /// `read_prefixes`, `write_prefixes` and `delete_prefixes` (lists of prefixes, each ending in
+    /// `/`; all five required, the lists may be empty but not all three): a header-signed key that
+    /// gets, heads and lists under its read prefixes, creates objects and multipart uploads under
+    /// its write prefixes (create-only: no `If-Match`, no copy) and deletes objects under its
+    /// delete prefixes; it is refused on a presigned URL. Give the flag once for each such key;
+    /// all key ids must differ. Only its owner may read it (mode 0600).
+    #[arg(long)]
+    pub scoped_key_file: Vec<PathBuf>,
     /// The longest `X-Amz-Expires` that a presigned URL may have, whatever the ceiling of its key
     /// says: a number and `ms`, `s`, `m` or `h`.
     #[arg(long, default_value = "15m", value_parser = parse_duration)]
@@ -518,11 +528,14 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     ensure_distinct(&key_id, &read_only).map_err(InvalidFlags)?;
     let presign = presign_keys(&cli.presign_key_file)?;
     let gc = gc_keys(&cli.gc_key_file)?;
+    let scoped = scoped_keys(&cli.scoped_key_file)?;
     let mut others: Vec<&str> = std::iter::once(key_id.as_str())
         .chain(read_only.iter().map(|key| key.id.as_str()))
         .collect();
     gc_distinct(&others, &gc).map_err(InvalidFlags)?;
     others.extend(gc_ids(&gc));
+    scoped_distinct(&others, &scoped).map_err(InvalidFlags)?;
+    others.extend(scoped_ids(&scoped));
     presign_distinct(&others, &presign).map_err(InvalidFlags)?;
     let timeout = cli.s3_request_timeout;
     let hot = open_tier("--hot", &cli.hot, &cli.hot_s3(), timeout)?;
@@ -532,6 +545,7 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     server.read_only_keys = read_only;
     server.presign_keys = presign;
     server.gc_keys = gc;
+    server.scoped_keys = scoped;
     server.presign_max_expires = cli.presign_max_expires;
     server.region = cli.region.clone();
     server.max_request_bytes = usize::try_from(cli.max_request_bytes).unwrap_or(usize::MAX);

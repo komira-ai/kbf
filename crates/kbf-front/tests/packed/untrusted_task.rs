@@ -41,12 +41,12 @@ pub(crate) fn now() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(NOW_SECS)
 }
 
-fn wire(digest: &Digest) -> reapi::Digest {
+pub(crate) fn wire(digest: &Digest) -> reapi::Digest {
     kbf_front::digest_to_proto(digest)
 }
 
 /// The `Tree` that names `files` (one directory, no children), and its digest.
-fn tree_of(files: &[Digest]) -> (Digest, Bytes) {
+pub(crate) fn tree_of(files: &[Digest]) -> (Digest, Bytes) {
     let named = |digest: &Digest| FileNode {
         name: digest.hash_hex(),
         digest: Some(wire(digest)),
@@ -64,7 +64,7 @@ fn tree_of(files: &[Digest]) -> (Digest, Bytes) {
 }
 
 /// The record of `bytes` at `offset`, as the footer lists it.
-fn entry_of(bytes: &[u8], offset: u64) -> IndexEntry {
+pub(crate) fn entry_of(bytes: &[u8], offset: u64) -> IndexEntry {
     IndexEntry {
         digest: sha256(bytes),
         offset,
@@ -74,7 +74,7 @@ fn entry_of(bytes: &[u8], offset: u64) -> IndexEntry {
 
 /// A pack of `records` back to back as given and a footer that lists `entries`, whatever the
 /// records are: the footer is made, not derived, so it can lie about the layout.
-fn forged(records: &[u8], entries: &[IndexEntry]) -> Vec<u8> {
+pub(crate) fn forged(records: &[u8], entries: &[IndexEntry]) -> Vec<u8> {
     let mut sorted = entries.to_vec();
     sorted.sort_by_key(|entry| entry.digest);
     let mut bytes = records.to_vec();
@@ -83,7 +83,7 @@ fn forged(records: &[u8], entries: &[IndexEntry]) -> Vec<u8> {
 }
 
 /// A pack of `records` pushed in order (the first is the record at offset 0).
-fn segment_of(records: &[&[u8]]) -> Vec<u8> {
+pub(crate) fn segment_of(records: &[&[u8]]) -> Vec<u8> {
     let mut writer = SegmentWriter::new(MAX_SEGMENT_BYTES);
     for record in records {
         writer.push(record).expect("pushed");
@@ -99,7 +99,7 @@ fn patch_count(pack: &mut [u8], count: u32) {
 }
 
 /// The bytes of an Action that says `do_not_cache` as given.
-fn action_bytes(do_not_cache: bool) -> Bytes {
+pub(crate) fn action_bytes(do_not_cache: bool) -> Bytes {
     let action = reapi::Action {
         command_digest: Some(wire(&blob("the command").0)),
         input_root_digest: Some(wire(&blob("the inputs").0)),
