@@ -597,3 +597,16 @@ fn an_error_without_an_errno_is_not_a_refusal() {
         "probe netlink: FAIL not refused: other TimedOut"
     );
 }
+
+/// Catches: a host with no confinement (the run refuses a network-denied Command, exit 15 in a
+/// task) reading as anything but a FAIL that says why.
+#[test]
+fn a_run_refused_for_want_of_a_confine_is_a_fail_with_the_reason() {
+    let checks = after_run(Err(RunError::NoConfine), "", None);
+    let child = by_name(&checks, "child").line();
+    assert!(child.starts_with("probe child: FAIL "), "{child}");
+    assert!(child.contains(&RunError::NoConfine.to_string()), "{child}");
+    assert_eq!(by_name(&checks, "layers").status, Status::Fail);
+    assert!(!passes(&checks));
+    assert_eq!(result_line(&checks), "probe result: FAIL");
+}
