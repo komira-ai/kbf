@@ -8,7 +8,7 @@
 //! of using what the farm learned in placement; they are shipped and measured alone, before
 //! any per-minute profile is read.
 
-use crate::{Args, ConfigError, LearnedSizes, PlacementLoad, SchedulerCore};
+use crate::{Args, ConfigError, LearnedSizes, PlacementLoad};
 
 /// What `--placement-predictions` does with the estimator's answer for a new operation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -19,8 +19,9 @@ pub enum PlacementPredictions {
     /// The prediction is computed and counted at submit and compared with the run when it
     /// ends; the scheduler is given nothing, so placement is what `off` does.
     Shadow,
-    /// The prediction is computed at submit (and again for an operation read back from the
-    /// state store) and given to the scheduler as the cost of the operation's lease.
+    /// The prediction is computed at submit (on the legacy core, and again for an operation
+    /// read back from the state store) and given to the scheduler as the cost of the
+    /// operation's lease.
     On,
 }
 
@@ -50,9 +51,7 @@ impl Args {
     /// [`ConfigError::PredictionsNeedLearnedSizes`]: `shadow` or `on` with
     /// `--learned-sizes off`, where the estimator has no rows to predict from;
     /// [`ConfigError::PredictionsNeedPlacementLoad`]: `on` with `--placement-load off`,
-    /// where the scheduler books by cores and ignores the prediction;
-    /// [`ConfigError::PredictionsNeedLegacyCore`]: `shadow` or `on` with
-    /// `--scheduler-core js`, whose arm does not read the flag yet.
+    /// where the scheduler books by cores and ignores the prediction.
     pub(crate) fn placement_predictions_fit(&self) -> Result<(), ConfigError> {
         let mode = self.placement_predictions;
         if !mode.predicts() {
@@ -63,9 +62,6 @@ impl Args {
         }
         if mode == PlacementPredictions::On && self.placement_load == PlacementLoad::Off {
             return Err(ConfigError::PredictionsNeedPlacementLoad);
-        }
-        if self.scheduler_core != SchedulerCore::Legacy {
-            return Err(ConfigError::PredictionsNeedLegacyCore(mode.name()));
         }
         Ok(())
     }

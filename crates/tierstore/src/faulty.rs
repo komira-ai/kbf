@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::{Backend, ByteRange, Error, Listed, Meta, PartBody};
+use crate::{Backend, ByteRange, Error, Listed, Meta, OpenUpload, PartBody, UploadsAfter};
 
 /// The kinds of call a [`FaultyBackend`] tells apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -33,6 +33,8 @@ pub enum Op {
     CompleteUpload,
     /// [`Backend::abort_upload`].
     AbortUpload,
+    /// [`Backend::list_uploads`].
+    ListUploads,
 }
 
 /// The error of a call that fails because its backend is down or was told to fail it.
@@ -294,5 +296,16 @@ impl Backend for FaultyBackend {
     async fn abort_upload(&self, key: &str, id: &str) -> Result<(), Error> {
         self.enter(Op::AbortUpload, key).await?;
         self.inner.abort_upload(key, id).await
+    }
+
+    async fn list_uploads(
+        &self,
+        prefix: &str,
+        after: Option<UploadsAfter<'_>>,
+        max_uploads: usize,
+    ) -> Result<Vec<OpenUpload>, Error> {
+        self.enter(Op::ListUploads, prefix).await?;
+        let listing = self.inner.list_uploads(prefix, after, max_uploads);
+        listing.await
     }
 }

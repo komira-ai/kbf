@@ -54,7 +54,7 @@ supervisor-memory-min-mib = 256
 # cpu-threads = "N"
 # This daemon's own user, which keeps read and remove access to what a whole-machine lease's user writes in its lease directory (native-whole-machine)
 daemon-user = "_kbf"
-# The directory the daemon keeps everything in, on a local disk: `leases/` (lease directories, the container and native drivers), and under the container driver (and the native driver on macOS) `cache/` (the input cache, `docs/design/worker-cache.md`) and `trees/` (shared read-only input trees, `docs/design/fast-sandbox.md#4-shared-trees`). Made if missing; absolute. The cache and trees are on, sized from the filesystem: half and a quarter of its size less what it keeps free (5%, at least 1 GiB), and the cache evicts entries no running lease links to keep that much free. A directory another daemon owns, or that cannot be used, is left alone: the daemon warns and runs uncached
+# The directory the daemon keeps everything in, on a local disk: `leases/` (lease directories, the container and native drivers), and under the container driver (and the native driver on macOS) `cache/` (the input cache, `docs/design/worker-cache.md`) and `trees/` (shared read-only input trees, `docs/design/fast-sandbox.md#4-shared-trees`). Made if missing; absolute. The cache and trees are on (unless `--no-input-cache`), sized from the filesystem: half and a quarter of its size less what it keeps free (5%, at least 1 GiB), and the cache evicts entries no running lease links to keep that much free. A directory another daemon owns, or that cannot be used, is left alone: the daemon warns and runs uncached
 # data-dir = "DIR"
 # Lowers the size the cache and the trees are budgeted from (half and a quarter of it), under the filesystem's automatic one
 # data-max-bytes = "BYTES"
@@ -66,6 +66,8 @@ daemon-user = "_kbf"
 # image = []
 # How long a lease's processes are given to end after SIGTERM before they are killed, in milliseconds; 0 kills them at once (native). A workload that cleans up when asked to end, such as Python's multiprocessing resource tracker with the shared memory it made, does so in this time; one that ignores SIGTERM is named in the lease's stderr. A slot's clean uses the same value (at most its own time limit). More than 60000 is taken as 60000. The wait comes after the action's timeout and its memory watch have ended it (neither runs during it), and on top of the time given to the kill that follows. A lease past its memory limit is killed at once. Applies on every platform
 native-term-grace-ms = 2000
+# Switches the host input cache off: no `cache/` and no `trees/`, so every action fetches its inputs from the CAS into its own input root and no later action reuses them (no hard link or clone from either). Leaves what an earlier start put in `<data-dir>/cache` and `<data-dir>/trees` alone. Without a cache a lease reports no input statistics (`cache_hits` and the rest exist only with a cache). For measuring what the cache saves
+no-input-cache = false
 # Retired: no longer read, the node's update client was removed. Accepted and ignored for one release
 # (not in --help)
 # orders-dir = "DIR"

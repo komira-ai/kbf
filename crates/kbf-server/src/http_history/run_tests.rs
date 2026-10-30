@@ -97,6 +97,19 @@ fn a_run_says_what_the_record_has_and_leaves_out_what_it_has_not() {
     assert!(v.get("exit_code").is_none(), "a lost run has no exit code");
 }
 
+/// Catches: the CPU booking of a run left out of its answer, written as 0 when the record
+/// has none, or in other units than thousandths of a CPU.
+#[test]
+fn a_run_says_the_cpu_its_lease_booked_and_leaves_it_out_when_unknown() {
+    let mut r = base();
+    assert!(render(&r).get("booked_millicpus").is_none());
+    r.booked_millicpus = Some(2_500);
+    r.booked_memory_bytes = 4 << 30;
+    let v = render(&r);
+    assert_eq!(v["booked_millicpus"], 2_500);
+    assert_eq!(v["booked_memory_bytes"], 4u64 << 30);
+}
+
 /// Catches: a memory kill, its booking, cap and raised booking, the memory the run used
 /// and its limit, the farm reruns, the wait reason, the partition and the presubmit
 /// time dropped; a class given another name; and the digests, shape and target

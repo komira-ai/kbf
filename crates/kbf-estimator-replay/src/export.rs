@@ -286,7 +286,11 @@ fn row_of(v: &Value, nodes: &BTreeMap<String, Node>) -> Result<Row, String> {
         node_capacity: known.and_then(|n| n.capacity),
         basis: usage.and_then(|u| str_of(u, "basis")).map(str::to_owned),
         operation: str_of(v, "operation").map(str::to_owned),
-        booked_millicpus: usage.and_then(|u| u["booked_millicpus"].as_u64()),
+        // The run's own key is the lease's grant, written for every attempt; the usage block's
+        // is what the daemon reported, which an older server wrote for a Mac only.
+        booked_millicpus: v["booked_millicpus"]
+            .as_u64()
+            .or_else(|| usage.and_then(|u| u["booked_millicpus"].as_u64())),
         node_cpu_pressure_centi: usage.and_then(|u| u["node_cpu_pressure_centi"].as_u64()),
     })
 }

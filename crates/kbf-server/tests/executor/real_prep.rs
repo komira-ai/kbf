@@ -413,6 +413,9 @@ async fn an_action_runs_and_ingests_over_the_real_run_preparation() {
         output_symlinks: Vec::new(),
         timing: Timing::default(),
         usage: Usage::default(),
+        packs: 1,
+        large: vec![],
+        inputs: None,
     };
     let pack = write_pack(&manifest, &[]).expect("a pack");
     world

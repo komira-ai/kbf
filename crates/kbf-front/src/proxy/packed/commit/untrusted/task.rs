@@ -306,6 +306,9 @@ impl Ingest<'_> {
             .verify(&record)
             .map_err(|_| RejectReason::HashMismatch)?;
         let manifest = TaskManifest::parse(&record).map_err(|_| RejectReason::BadManifest)?;
+        // The plain `parse` is the one-pack path: a manifest that names more packs or any large
+        // object is refused above, so no object of a run is silently dropped. `inputs` is advisory
+        // and not read here.
         if manifest.lease != self.lease || manifest.action != *self.action {
             return Err(RejectReason::WrongKey.into());
         }

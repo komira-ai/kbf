@@ -3233,6 +3233,7 @@ dependencies = [
  "prost-types",
  "rustls",
  "rustls-native-certs",
+ "serde_json",
  "sha2 0.11.0",
  "thiserror",
  "tokio",

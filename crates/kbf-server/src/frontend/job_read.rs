@@ -36,6 +36,7 @@ use axum::extract::State;
 use axum::http::header::{ALLOW, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::Response;
+use bytes::Bytes;
 use clap::{Arg, ArgMatches};
 use futures::FutureExt as _;
 use futures::StreamExt as _;
@@ -44,7 +45,9 @@ use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use kbf_front::grants::{GrantKey, Grants, KeyError};
-use kbf_front::job_read::{BlobSource, JobRead, Limits, Reply};
+use kbf_front::job_read::{
+    BATCH_PATH, BlobSource, JobRead, Limits, MAX_BATCH_REQUEST_BYTES, Reply,
+};
 use kbf_tls::{Alpn, Conn, TlsError, TlsFiles, TlsSource};
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 
@@ -102,8 +105,9 @@ pub(super) fn args() -> [Arg; 6] {
             .requires_all([TLS_CERT, TLS_KEY, GRANT_SECRET])
             .help(
                 "Serves the inputs of an action to the task that runs it, over HTTPS at this \
-                 address: `GET /<hex>/<size>` with `Authorization: Bearer <read grant>`, and \
-                 nothing else (any other path is 404 and any other method 405). A read grant \
+                 address: `GET /<hex>/<size>` and `POST /batch` (many small blobs in one \
+                 request) with `Authorization: Bearer <read grant>`, and nothing else (any \
+                 other path is 404 and any other method 405). A read grant \
                  is the token a run is given; until it expires it reads the Action it was \
                  issued for, its Command and its input tree, and no other blob. The TLS is the \
                  server's alone and no client certificate is asked for. The task dials an IP \
@@ -319,7 +323,12 @@ impl Prepared {
     ) -> Result<Serving, JobReadError> {
         let read = Arc::new(JobRead::new(source, self.grants, self.limits));
         let (incoming, latch) = self.socket.grpc(Some(self.tls.clone()))?;
-        let task = accept(incoming, router(Arc::clone(&read)), timeouts).boxed();
+        let task = accept(
+            incoming,
+            router(Arc::clone(&read), timeouts.header),
+            timeouts,
+        )
+        .boxed();
         Ok(Serving {
             latch,
             task,
@@ -361,23 +370,57 @@ fn names_the_address(pem: &[u8], listen: SocketAddr) -> Result<(), String> {
     ))
 }
 
-fn router(read: Arc<JobRead>) -> Router {
-    Router::new().fallback(answer).with_state(read)
+/// What a request is answered with: the read, and how long a request's body is waited for.
+#[derive(Clone)]
+struct Served {
+    read: Arc<JobRead>,
+    body_wait: Duration,
+}
+
+fn router(read: Arc<JobRead>, body_wait: Duration) -> Router {
+    Router::new()
+        .fallback(answer)
+        .with_state(Served { read, body_wait })
 }
 
 async fn answer(
-    State(read): State<Arc<JobRead>>,
+    State(served): State<Served>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
+    body: Body,
 ) -> Response {
     let authorization = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
-    response(read.respond(&method, uri.path(), authorization).await)
+    let path = uri.path();
+    // Only a batch has a body to read, and it is read within a size and a time: a body that is
+    // longer, or does not arrive, is none, which the read answers as a malformed request (after
+    // the token, which is checked first).
+    let bytes = if method == Method::POST && path == BATCH_PATH {
+        batch_body(body, served.body_wait).await
+    } else {
+        Bytes::new()
+    };
+    let reply = served
+        .read
+        .respond_with_body(&method, path, authorization, &bytes)
+        .await;
+    response(reply, if path == BATCH_PATH { "POST" } else { "GET" })
+}
+
+/// The body of a batch request: at most [`MAX_BATCH_REQUEST_BYTES`], within `wait`; empty if it
+/// is longer, or is not all there in time.
+async fn batch_body(body: Body, wait: Duration) -> Bytes {
+    let read = axum::body::to_bytes(body, MAX_BATCH_REQUEST_BYTES);
+    tokio::time::timeout(wait, read)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
 }
 
 /// The HTTP response of `reply`: its status and body, the headers a client needs to read
-/// a refusal (`WWW-Authenticate` on 401, `Allow` on 405) and a content type.
-fn response(reply: Reply) -> Response {
+/// a refusal (`WWW-Authenticate` on 401, `Allow: <allow>` on 405) and a content type.
+fn response(reply: Reply, allow: &'static str) -> Response {
     let status = reply.status;
     // A streamed blob states its length before its first byte: a response that ends short of
     // it is a broken one to the client, which is how a blob that fails its digest is refused.
@@ -401,7 +444,7 @@ fn response(reply: Reply) -> Response {
         headers.insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
     }
     if status == StatusCode::METHOD_NOT_ALLOWED {
-        headers.insert(ALLOW, HeaderValue::from_static("GET"));
+        headers.insert(ALLOW, HeaderValue::from_static(allow));
     }
     response
 }

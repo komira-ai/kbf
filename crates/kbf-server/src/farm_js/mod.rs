@@ -11,6 +11,8 @@
 //!   says an operation is) and `doneof/` (the name and action of a finished operation).
 //! - [`load`]: the load of the store, with the checks `js-store` leaves to its embedder and
 //!   this server's reader makes.
+//! - [`ablation`]: the `kbf_ablation_*` counters that tell the rows of the placement ablation
+//!   apart on `/metrics`.
 //! - [`adapter`]: [`KbfAdapter`], the core's `Adapter`; [`host`]: what a host does around
 //!   the core's calls with it; [`record`]: the events it tells the invocation recorder;
 //!   [`open`]: the core's configuration, storage, metrics and admission.
@@ -20,6 +22,7 @@
 //! golden files through `js-store` and require the same rows, and the scripted sessions of
 //! `tests/farm_core_trace` through the core and require the same text.
 
+pub(crate) mod ablation;
 pub mod adapter;
 pub mod codec;
 pub mod dispatch;
@@ -39,6 +42,8 @@ pub(crate) use learning::{Gate, write_behind_now, write_learned};
 pub use open::KbfObserver;
 
 #[cfg(test)]
+mod ablation_tests;
+#[cfg(test)]
 mod adapter_tests;
 #[cfg(test)]
 mod codec_tests;
@@ -56,6 +61,10 @@ mod host_tests;
 mod learning_tests;
 #[cfg(test)]
 mod load_tests;
+#[cfg(test)]
+mod placement_load_tests;
+#[cfg(test)]
+mod prediction_tests;
 #[cfg(test)]
 mod report_hooks_tests;
 #[cfg(test)]

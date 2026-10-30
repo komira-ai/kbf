@@ -43,6 +43,9 @@ fn manifest() -> TaskManifest {
             cpu_usage_us: 5,
             memory_peak_bytes: 6,
         },
+        packs: 1,
+        large: Vec::new(),
+        inputs: None,
     }
 }
 
