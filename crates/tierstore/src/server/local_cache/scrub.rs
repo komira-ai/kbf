@@ -13,9 +13,11 @@
 //!
 //! An object that does not match, whose sidecar cannot be read any more, is dropped from the index
 //! and the disk, counted in `scrub_mismatches` and named on the standard error stream; the next
-//! read of its key is a miss and fills it again. An object whose file cannot be read for another
-//! reason (out of descriptors, a failing disk) is left alone and not counted: the scrub says
-//! nothing it does not know.
+//! read of its key is a miss and fills it again. An object whose file or sidecar cannot be read for
+//! another reason than being absent (out of descriptors, a failing disk) is left alone and counted
+//! in `scrub_errors`: the scrub says nothing it does not know. Only a sidecar that is not there or
+//! does not parse, with the data file there, makes an object that cannot be vouched for, and it is
+//! dropped.
 //!
 //! # The rate
 //!
@@ -23,23 +25,30 @@
 //! worth is kept), and an object is scrubbed while there is credit, which its size then spends: an
 //! object bigger than the credit is read whole and leaves a debt that the next ticks pay before
 //! anything else is read. The average is therefore `per_tick` bytes a tick and the largest burst
-//! is one object. The walk takes the names in the index at its start, in order, and starts over
+//! is one object: inside one object the read is not paced (it runs at the speed of the disk), in
+//! chunks of 1 MiB, and the stop flag is looked at before each chunk, so a halt ends it at the
+//! next chunk and shutdown does not wait out a big object. The walk takes the names in the index at its start, in order, and starts over
 //! when it is done, so each object is visited once a round whatever eviction and fills do between.
 //!
 //! # Races
 //!
-//! The bytes are hashed from one open descriptor, with no lock held. To drop the object the scrub
-//! then takes the table of the fills that run, which no fill can start or end a flight in while it
-//! is held, and drops only if no fill of the name runs and the path still names the file that was
-//! hashed. A reader therefore sees the object whole (before the drop) or absent (after it), a
+//! The bytes are hashed from one open descriptor, with no lock held, and the descriptor stays open
+//! until the drop is decided (the inode number of a file that is open cannot be given to another
+//! file). To drop the object the scrub then takes the table of the fills that run, which no fill
+//! can start or end a flight in while it is held, and drops only if no fill of the name runs and
+//! the path still names the file that was hashed. Whatever puts a file at `data_path` (a fill, and
+//! so a write that a fill follows) does it inside a flight, which the scrub leaves alone; a
+//! delete or a write-through put that marks a running fill ([`Inner::forget`]) finds that flight
+//! still in the table, because the scrub never takes one out. A reader therefore sees the object whole (before the drop) or absent (after it), a
 //! file linked by a fill that ran between the hash and the drop is never removed for the old
 //! file's bytes, and an object whose fill is still ending is left for the next round.
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -96,8 +105,10 @@ pub struct ScrubPass {
     pub dropped: usize,
 }
 
+/// The bytes read between two looks at the stop flag.
+const CHUNK: usize = 1 << 20;
+
 /// Where the walk is and what credit it has.
-#[derive(Debug)]
 pub struct Scrubber {
     per_tick: u64,
     /// The names still to visit in this round, in order.
@@ -105,6 +116,11 @@ pub struct Scrubber {
     /// The bytes that may be read now; negative while an object bigger than a tick's worth is paid
     /// for.
     credit: i128,
+    /// Set to end the walk: looked at before each chunk of an object and each object.
+    stop: Arc<AtomicBool>,
+    /// Runs after each chunk of an object is hashed.
+    #[cfg(test)]
+    pub(super) on_chunk: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Scrubber {
@@ -115,34 +131,46 @@ impl Scrubber {
             per_tick: per_tick.max(1),
             queue: VecDeque::new(),
             credit: 0,
+            stop: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            on_chunk: None,
         }
+    }
+
+    /// The same walk after a tick that panicked: the position is lost, the stop flag is kept.
+    fn restarted(&self) -> Self {
+        let mut fresh = Self::new(self.per_tick);
+        fresh.stop = Arc::clone(&self.stop);
+        #[cfg(test)]
+        {
+            fresh.on_chunk = self.on_chunk.clone();
+        }
+        fresh
     }
 }
 
 /// What one object came to.
 #[derive(Debug, PartialEq, Eq)]
-enum Verdict {
+pub(super) enum Verdict {
     /// The bytes match; this many were read.
     Intact(u64),
     /// The bytes did not match and the object was dropped; this many were read.
     Dropped(u64),
-    /// Not judged: a fill of the name is running, the file could not be read, or it changed while
-    /// it was read.
+    /// Not judged: a fill of the name is running, the file changed while it was read, or
+    /// something that is not the object's fault failed (counted in `scrub_errors`).
     Left,
+    /// The walk was told to stop in the middle of the object.
+    Stopped,
 }
 
-/// A writer that hashes what it is given.
-struct Hashing(Sha256);
-
-impl Write for Hashing {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.update(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+/// What the sidecar of an object says.
+enum Recorded {
+    /// The key and the digest the bytes must have.
+    Digest(String, String),
+    /// The sidecar is not there or is not a sidecar: the bytes cannot be vouched for.
+    Bad,
+    /// The sidecar could not be read (out of descriptors, a failing disk): no judgment.
+    Unreadable,
 }
 
 /// The device and inode of a file: which file a name is.
@@ -150,12 +178,32 @@ fn identity(meta: &std::fs::Metadata) -> (u64, u64) {
     (meta.dev(), meta.ino())
 }
 
-/// The hex of the SHA-256 of what `file` holds, the bytes read, and which file it is.
-fn hash_file(mut file: File) -> io::Result<(String, u64, (u64, u64))> {
-    let opened = identity(&file.metadata()?);
-    let mut hashing = Hashing(Sha256::new());
-    let read = io::copy(&mut file, &mut hashing)?;
-    Ok((hex::encode(hashing.0.finalize()), read, opened))
+impl Scrubber {
+    /// The hex of the SHA-256 of what `file` holds, in chunks, and the bytes read; none if the walk
+    /// was told to stop first.
+    fn hash(&self, file: &mut File) -> io::Result<Option<(String, u64)>> {
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0; CHUNK];
+        let mut total = 0;
+        loop {
+            if self.stop.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+            let read = match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            hasher.update(&buffer[..read]);
+            total += read as u64;
+            #[cfg(test)]
+            if let Some(hook) = &self.on_chunk {
+                hook();
+            }
+        }
+        Ok(Some((hex::encode(hasher.finalize()), total)))
+    }
 }
 
 impl Inner {
@@ -164,10 +212,13 @@ impl Inner {
         locked(&self.flights).contains_key(hex)
     }
 
-    /// Drops the object `hex` if no fill of it runs and its data file is still the one that was
-    /// hashed (`hashed`: none if there was no file). Gives whether it was dropped.
+    /// Drops the object `hex` if no fill of it runs and its data file is still the file `hashed`
+    /// says (none: no file). The caller keeps that file open until this returns, so its inode
+    /// number cannot have been given to another file meanwhile. Gives whether it was dropped.
     pub(super) fn drop_if_unchanged(&self, hex: &str, hashed: Option<(u64, u64)>) -> bool {
-        // Held until the files are gone: no fill of the name can start in the meantime.
+        // Held until the files are gone: no fill of the name can start in the meantime, and a
+        // delete or a write that marks a running fill (see `forget`) finds the fill, which this
+        // does not touch.
         let flights = locked(&self.flights);
         let now = std::fs::metadata(data_path(&self.config.path, hex))
             .ok()
@@ -179,22 +230,48 @@ impl Inner {
         drop_it
     }
 
-    /// The digest the bytes of `hex` must have, read from its sidecar: the name for a key named by
-    /// its content, else what the fill recorded. None if the sidecar cannot be read.
-    fn expected(&self, hex: &str) -> Option<(String, String)> {
-        let text = std::fs::read(meta_path(&self.config.path, hex)).ok()?;
-        let sidecar: Sidecar = serde_json::from_slice(&text).ok()?;
-        let digest = name_of(&sidecar.key).content.unwrap_or(sidecar.sha256);
-        Some((sidecar.key, digest))
+    /// What the sidecar of `hex` says the bytes must hash to: the name for a key named by its
+    /// content, else what the fill recorded.
+    fn recorded(&self, hex: &str) -> Recorded {
+        let text = match std::fs::read(meta_path(&self.config.path, hex)) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Recorded::Bad,
+            Err(_) => return Recorded::Unreadable,
+        };
+        match serde_json::from_slice::<Sidecar>(&text) {
+            Ok(sidecar) => {
+                let digest = name_of(&sidecar.key).content.unwrap_or(sidecar.sha256);
+                Recorded::Digest(sidecar.key, digest)
+            }
+            Err(_) => Recorded::Bad,
+        }
+    }
+
+    /// Counts something the scrub could not judge for a reason that is not the object's.
+    fn scrub_error(&self) -> Verdict {
+        bump(&self.counters.scrub_errors);
+        Verdict::Left
     }
 
     /// Hashes the object `hex` again and drops it if it does not match.
-    fn scrub_object(&self, hex: &str) -> Verdict {
+    fn scrub_object(&self, hex: &str, state: &Scrubber) -> Verdict {
+        self.scrub_object_between(hex, state, || {})
+    }
+
+    /// [`scrub_object`](Self::scrub_object), running `between` after the bytes are judged and
+    /// before the object is dropped.
+    pub(super) fn scrub_object_between(
+        &self,
+        hex: &str,
+        state: &Scrubber,
+        between: impl FnOnce(),
+    ) -> Verdict {
         if self.filling(hex) {
             return Verdict::Left;
         }
         let path = data_path(&self.config.path, hex);
-        let file = match File::open(&path) {
+        // Open until the end: the file's inode is not freed while it is.
+        let mut file = match File::open(&path) {
             Ok(file) => file,
             // The file is gone: the entry is a lie, and is forgotten if nothing has put a file
             // there since.
@@ -202,19 +279,27 @@ impl Inner {
                 let _ = self.drop_if_unchanged(hex, None);
                 return Verdict::Left;
             }
-            Err(_) => return Verdict::Left,
+            Err(_) => return self.scrub_error(),
         };
-        let Ok((found, read, opened)) = hash_file(file) else {
-            return Verdict::Left;
+        let Ok(opened) = file.metadata() else {
+            return self.scrub_error();
         };
-        let wanted = self.expected(hex);
-        if wanted.as_ref().is_some_and(|(_, digest)| *digest == found) {
+        let (matches, read, key) = match self.recorded(hex) {
+            Recorded::Unreadable => return self.scrub_error(),
+            Recorded::Bad => (false, 0, hex.to_owned()),
+            Recorded::Digest(key, digest) => match state.hash(&mut file) {
+                Ok(Some((found, read))) => (found == digest, read, key),
+                Ok(None) => return Verdict::Stopped,
+                Err(_) => return self.scrub_error(),
+            },
+        };
+        if matches {
             return Verdict::Intact(read);
         }
-        if !self.drop_if_unchanged(hex, Some(opened)) {
+        between();
+        if !self.drop_if_unchanged(hex, Some(identity(&opened))) {
             return Verdict::Left;
         }
-        let key = wanted.map_or_else(|| hex.to_owned(), |(key, _)| key);
         eprintln!("tierstore: scrub dropped {key}: its bytes no longer match their digest");
         Verdict::Dropped(read)
     }
@@ -225,7 +310,7 @@ impl Inner {
         state.credit = (state.credit + per_tick).min(per_tick);
         let mut pass = ScrubPass::default();
         let mut started = false;
-        while state.credit > 0 {
+        while state.credit > 0 && !state.stop.load(Ordering::SeqCst) {
             let Some(hex) = state.queue.pop_front() else {
                 // One new round at most for a tick: an empty or all-skipped cache must end it.
                 if started {
@@ -235,10 +320,11 @@ impl Inner {
                 state.queue = locked(&self.index).names().into();
                 continue;
             };
-            let (bytes, dropped) = match self.scrub_object(&hex) {
+            let (bytes, dropped) = match self.scrub_object(&hex, state) {
                 Verdict::Intact(bytes) => (bytes, false),
                 Verdict::Dropped(bytes) => (bytes, true),
                 Verdict::Left => continue,
+                Verdict::Stopped => break,
             };
             state.credit -= i128::from(bytes);
             pass.scrubbed += 1;
@@ -263,12 +349,23 @@ impl LocalCache {
 
     /// Scrubs `per_tick` bytes of objects at each tick of `ticker`, until `halt` is notified or
     /// the ticker ends. `None` is the scrub turned off: it returns at once and never asks the
-    /// ticker for anything.
-    pub async fn scrub(&self, per_tick: Option<u64>, mut ticker: impl Ticker, halt: Arc<Notify>) {
+    /// ticker for anything. A halt ends the pass that is running at the next chunk. A tick that
+    /// panics is reported on the standard error stream and the walk starts over: the scrub never
+    /// takes the cache down with it.
+    pub async fn scrub(&self, per_tick: Option<u64>, ticker: impl Ticker, halt: Arc<Notify>) {
         let Some(per_tick) = per_tick else {
             return;
         };
-        let mut state = Scrubber::new(per_tick);
+        self.scrub_with(Scrubber::new(per_tick), ticker, halt).await;
+    }
+
+    /// [`scrub`](Self::scrub) from a walk that is already made.
+    pub(super) async fn scrub_with(
+        &self,
+        mut state: Scrubber,
+        mut ticker: impl Ticker,
+        halt: Arc<Notify>,
+    ) {
         loop {
             let more = tokio::select! {
                 biased;
@@ -279,11 +376,28 @@ impl LocalCache {
                 break;
             }
             let inner = Arc::clone(&self.inner);
-            let tick = tokio::task::spawn_blocking(move || {
+            let fresh = state.restarted();
+            let mut running = tokio::task::spawn_blocking(move || {
                 let pass = inner.scrub_tick(&mut state);
                 (state, pass)
             });
-            (state, _) = tick.await.expect("a scrub tick does not panic");
+            let finished = tokio::select! {
+                biased;
+                () = halt.notified() => None,
+                done = &mut running => Some(done),
+            };
+            let Some(done) = finished else {
+                fresh.stop.store(true, Ordering::SeqCst);
+                let _ = running.await;
+                break;
+            };
+            state = match done {
+                Ok((state, _)) => state,
+                Err(error) => {
+                    eprintln!("tierstore: a scrub tick failed, the walk starts over: {error}");
+                    fresh
+                }
+            };
         }
     }
 }

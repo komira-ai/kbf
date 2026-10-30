@@ -391,10 +391,13 @@ sidecar has it, so every object is checked). An object whose bytes do not match,
 can no longer be read, is removed from the index and the disk, counted in
 `scrub_mismatches_total` and named on stderr; the next read of its key fills it again from the
 upstream. The scrub walks the objects in name order, takes the names at the start of a round, and
-starts over when it is done; it reads an object whole, so one object larger than the rate is read
+starts over when it is done; it reads an object to its end, so one object larger than the rate is read
 in one go and the next reads wait until the rate has paid for it. It never drops an object whose
-fill is still ending, and never one whose file was replaced after it was read. A file that cannot
-be read (a failing disk, out of descriptors) is left alone and not counted. `scrub_rate = "off"`
+fill is still ending, and never one whose file was replaced after it was read. A file or a sidecar that
+cannot be read (a failing disk, out of descriptors) is left alone and counted in
+`scrub_errors_total`; a sidecar that is missing or does not parse drops the object. The bytes are
+hashed in chunks of 1 MiB and a shutdown ends the pass at the next chunk; inside one object the
+read is not paced. `scrub_rate = "off"`
 turns it off; a restart still checks sizes only. A hard link that a job holds to a dropped object
 keeps the old bytes for that job: the scrub removes the cache's name only.
 
@@ -450,7 +453,7 @@ text format, `tierstore_cache_<name>`, with: `hits_total`, `misses_total`, `byte
 fill included, so the byte hit ratio is the first over the sum of the two), `fills_total`,
 `fills_skipped_total`, `fills_skipped_busy_total` (those of the skipped fills that found every fill
 slot taken), `fill_failures_total{reason}` (`hash_mismatch`, `upstream_error`,
-`short_body`, `local_io`, `changed`, `aborted`), `evictions_total{reason}` (`budget`, `floor`), `pinned_skips_total`, `scrubbed_objects_total`, `scrubbed_bytes_total`, `scrub_mismatches_total`,
+`short_body`, `local_io`, `changed`, `aborted`), `evictions_total{reason}` (`budget`, `floor`), `pinned_skips_total`, `scrubbed_objects_total`, `scrubbed_bytes_total`, `scrub_mismatches_total`, `scrub_errors_total`,
 `discarded_at_start_total`, and the gauges `bytes`, `objects`, `fs_free_bytes` and `staging_files`.
 On a storage node it says there is no cache. The same path on a storage node with the OCI front
 has the OCI counters (see Counters); a node with neither has a line for each that says it is not

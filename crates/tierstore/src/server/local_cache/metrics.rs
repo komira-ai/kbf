@@ -62,6 +62,8 @@ pub struct Counters {
     pub(super) scrubbed_bytes: AtomicU64,
     /// The objects the scrub dropped because their bytes did not match.
     pub(super) scrub_mismatches: AtomicU64,
+    /// The objects the scrub could not judge because a read failed.
+    pub(super) scrub_errors: AtomicU64,
     pub(super) discarded_at_start: AtomicU64,
     /// The files in the stage directory now.
     pub(super) staging_files: AtomicU64,
@@ -135,6 +137,7 @@ impl Counters {
             ("scrubbed_objects_total", read(&self.scrubbed_objects)),
             ("scrubbed_bytes_total", read(&self.scrubbed_bytes)),
             ("scrub_mismatches_total", read(&self.scrub_mismatches)),
+            ("scrub_errors_total", read(&self.scrub_errors)),
             ("discarded_at_start_total", read(&self.discarded_at_start)),
             ("bytes", cache_bytes),
             ("objects", cache_objects),

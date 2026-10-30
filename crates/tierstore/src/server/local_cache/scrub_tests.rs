@@ -10,9 +10,9 @@ use tokio::sync::{Notify, mpsc};
 
 use super::layout::{Sidecar, data_path, meta_path, name_of};
 use super::metrics::read;
-use super::scrub::{Every, ScrubPass, Scrubber, Ticker};
+use super::scrub::{Every, ScrubPass, Scrubber, Ticker, Verdict};
 use super::testing::{Rig, digest, pattern};
-use crate::Op;
+use crate::{Backend as _, Op};
 
 /// A ticker that ticks when the test says so, and says when the scrub asks for the next tick (so
 /// the pass before it is over).
@@ -129,19 +129,21 @@ async fn a_content_named_object_is_judged_by_its_name() {
 }
 
 /// Asserts that for any other key the digest is the one the sidecar recorded at the fill: a
-/// sidecar that says another digest, or cannot be read, drops the object.
+/// sidecar that says another digest, is not there, or is not a sidecar, drops the object.
 #[tokio::test]
 async fn a_plain_key_is_judged_by_its_sidecar_and_an_unreadable_sidecar_drops_it() {
     let rig = Rig::new("tscache-scrub-sidecar");
-    let keys = fill(&rig, 2, 300).await;
+    let keys = fill(&rig, 3, 300).await;
     edit_sidecar(&rig, &keys[0], |sidecar| sidecar.sha256 = "0".repeat(64));
     let other = meta_path(&rig.config.path, &name_of(&keys[1]).hex);
     std::fs::write(other, b"not json").unwrap();
+    std::fs::remove_file(meta_path(&rig.config.path, &name_of(&keys[2]).hex)).unwrap();
     let mut state = Scrubber::new(1 << 20);
     let pass = rig.cache.scrub_once(&mut state);
-    assert_eq!((pass.scrubbed, pass.dropped), (2, 2));
+    assert_eq!((pass.scrubbed, pass.dropped), (3, 3));
     assert_eq!(rig.cache.held(), (0, 0));
-    assert!(!rig.has_file(&keys[0]) && !rig.has_file(&keys[1]));
+    assert!(keys.iter().all(|key| !rig.has_file(key)));
+    assert_eq!(read(&rig.cache.counters().scrub_errors), 0);
 }
 
 /// Asserts that an object whose bytes are as they were is kept, indexed and served from the disk
@@ -224,23 +226,66 @@ async fn a_fill_in_progress_survives_a_pass_that_drops_another_object() {
     assert!(rig.has_file("cas/b/new"));
 }
 
-/// Asserts that an object whose file was replaced after it was hashed (another inode under the
-/// name) is not dropped for the bytes of the old one, and that a missing file is forgotten.
+/// Asserts that a data file that is gone is forgotten by the scrub, with nothing counted.
 #[tokio::test]
-async fn the_scrub_drops_only_the_file_it_hashed_and_forgets_a_missing_one() {
-    let rig = Rig::new("tscache-scrub-identity");
+async fn a_missing_data_file_is_forgotten_by_the_scrub() {
+    let rig = Rig::new("tscache-scrub-missing");
     let keys = fill(&rig, 2, 200).await;
-    let inner = &rig.cache.inner;
-    let hex = name_of(&keys[0]).hex;
-    assert!(!inner.drop_if_unchanged(&hex, Some((0, 0))));
-    assert!(rig.has_file(&keys[0]));
-    assert_eq!(rig.cache.held(), (400, 2));
-
     std::fs::remove_file(rig.file(&keys[1])).unwrap();
     let mut state = Scrubber::new(1 << 20);
     let pass = rig.cache.scrub_once(&mut state);
     assert_eq!((pass.scrubbed, pass.dropped), (1, 0));
     assert_eq!(rig.cache.held(), (200, 1));
+}
+
+/// Asserts that a rotten object whose name gets another file while the scrub holds the old one
+/// (a new file renamed over it) is not dropped: the new file stays, indexed, with its bytes, and
+/// nothing is counted as a mismatch.
+#[tokio::test]
+async fn a_file_renamed_over_the_name_while_the_scrub_holds_the_old_one_is_kept() {
+    let rig = Rig::new("tscache-scrub-renamed");
+    let body = pattern(300);
+    rig.put("cas/b/obj", &body).await;
+    rig.get("cas/b/obj").await.unwrap();
+    rot(&rig, "cas/b/obj");
+    let hex = name_of("cas/b/obj").hex;
+    let path = rig.file("cas/b/obj");
+    let verdict = rig
+        .cache
+        .inner
+        .scrub_object_between(&hex, &Scrubber::new(1 << 20), || {
+            let fresh = rig.config.path.join("replacement");
+            std::fs::write(&fresh, &body).unwrap();
+            std::fs::rename(&fresh, &path).unwrap();
+        });
+    assert_eq!(verdict, Verdict::Left);
+    assert_eq!(std::fs::read(&path).unwrap(), body);
+    assert_eq!(rig.cache.held(), (300, 1));
+    assert_eq!(read(&rig.cache.counters().scrub_mismatches), 0);
+}
+
+/// Asserts that a sidecar that cannot be read for a reason other than being absent (a directory
+/// where it is: the read fails as a failing disk would) leaves a good object in place, counted in
+/// `scrub_errors` and not as a mismatch.
+#[tokio::test]
+async fn a_sidecar_that_cannot_be_read_leaves_the_object_and_is_counted() {
+    let rig = Rig::new("tscache-scrub-sidecar-io");
+    let keys = fill(&rig, 1, 300).await;
+    let meta = meta_path(&rig.config.path, &name_of(&keys[0]).hex);
+    std::fs::remove_file(&meta).unwrap();
+    std::fs::create_dir(&meta).unwrap();
+    let mut state = Scrubber::new(1 << 20);
+    assert_eq!(rig.cache.scrub_once(&mut state), ScrubPass::default());
+    assert!(rig.has_file(&keys[0]));
+    assert_eq!(rig.cache.held(), (300, 1));
+    let counters = rig.cache.counters();
+    assert_eq!(read(&counters.scrub_errors), 1);
+    assert_eq!(read(&counters.scrub_mismatches), 0);
+    assert!(
+        rig.cache
+            .metrics()
+            .contains("tierstore_cache_scrub_errors_total 1\n")
+    );
 }
 
 /// Asserts that an object that cannot be read for a reason other than being gone (a directory
@@ -261,6 +306,7 @@ async fn an_unreadable_object_is_left_alone_and_not_counted() {
     assert_eq!(rig.cache.scrub_once(&mut state), ScrubPass::default());
     assert_eq!(rig.cache.held(), (200, 2));
     assert_eq!(read(&rig.cache.counters().scrubbed_objects), 0);
+    assert_eq!(read(&rig.cache.counters().scrub_errors), 2);
 }
 
 /// Asserts the rate by counting: with a credit of 250 bytes a tick and objects of 100 bytes, the
@@ -359,4 +405,149 @@ async fn the_timer_ticker_ticks_each_period() {
     let mut every = Every::new(Duration::from_secs(1));
     assert!(every.tick().await);
     assert!(every.tick().await);
+}
+
+/// Asserts that a halt in the middle of an object ends the pass at the next chunk: a 3 MiB object
+/// is read for one chunk, held there by a gate, and after the halt only that chunk was read, the
+/// loop ended, and nothing was counted or dropped. No time is measured: the gate is a channel.
+#[tokio::test]
+async fn a_halt_in_the_middle_of_a_big_object_ends_the_pass_at_the_next_chunk() {
+    let rig = Rig::with("tscache-scrub-halt-big", |config| config.budget = 8 << 20);
+    fill(&rig, 1, 3 << 20).await;
+    rot(&rig, "cas/b/0");
+    let (reached, mut reaches) = mpsc::unbounded_channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = std::sync::Mutex::new(released);
+    let chunks = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counting = Arc::clone(&chunks);
+    let mut state = Scrubber::new(1 << 30);
+    state.on_chunk = Some(Arc::new(move || {
+        counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        reached.send(()).unwrap();
+        let _ = released.lock().unwrap().recv();
+    }));
+    let (ticker, tick, mut asks) = hand();
+    let cache = rig.cache.clone();
+    let halt = Arc::new(Notify::new());
+    let halting = Arc::clone(&halt);
+    let running = tokio::spawn(async move { cache.scrub_with(state, ticker, halting).await });
+    asks.recv().await.unwrap();
+    tick.send(()).await.unwrap();
+    reaches.recv().await.unwrap();
+    halt.notify_one();
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    release.send(()).unwrap();
+    running.await.unwrap();
+    assert_eq!(chunks.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(read(&rig.cache.counters().scrubbed_objects), 0);
+    assert!(rig.has_file("cas/b/0"));
+    assert_eq!(rig.cache.held().1, 1);
+}
+
+/// Asserts that a tick that panics does not end the scrub or the cache: the loop reports it, starts
+/// the walk over, and the next tick scrubs.
+#[tokio::test]
+async fn a_tick_that_panics_does_not_end_the_scrub() {
+    let rig = Rig::new("tscache-scrub-panic");
+    fill(&rig, 1, 100).await;
+    let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut state = Scrubber::new(1 << 20);
+    state.on_chunk = Some(Arc::new(move || {
+        assert!(
+            !first.swap(false, std::sync::atomic::Ordering::SeqCst),
+            "the first chunk panics"
+        );
+    }));
+    let (ticker, tick, mut asks) = hand();
+    let cache = rig.cache.clone();
+    let halt = Arc::new(Notify::new());
+    let running = tokio::spawn(async move { cache.scrub_with(state, ticker, halt).await });
+    asks.recv().await.unwrap();
+    tick.send(()).await.unwrap();
+    asks.recv().await.unwrap();
+    assert_eq!(read(&rig.cache.counters().scrubbed_objects), 0);
+    tick.send(()).await.unwrap();
+    asks.recv().await.unwrap();
+    assert_eq!(read(&rig.cache.counters().scrubbed_objects), 1);
+    drop(tick);
+    running.await.unwrap();
+}
+
+/// Asserts that a delete that runs between the scrub's hash and its drop (a write-through cache
+/// forgets the key) wins: the object is gone once, nothing is counted as a mismatch, and the next
+/// read fills the key again.
+#[tokio::test]
+async fn a_forget_racing_a_scrub_of_the_same_key_is_not_a_mismatch() {
+    let rig = Rig::with("tscache-scrub-forget", |config| config.write_through = true);
+    let body = pattern(200);
+    rig.put("cas/b/obj", &body).await;
+    rig.get("cas/b/obj").await.unwrap();
+    rot(&rig, "cas/b/obj");
+    let hex = name_of("cas/b/obj").hex;
+    let verdict = rig
+        .cache
+        .inner
+        .scrub_object_between(&hex, &Scrubber::new(1 << 20), || {
+            rig.cache.inner.forget("cas/b/obj");
+        });
+    assert_eq!(verdict, Verdict::Left);
+    assert_eq!(rig.cache.held(), (0, 0));
+    assert_eq!(read(&rig.cache.counters().scrub_mismatches), 0);
+    assert_eq!(rig.get("cas/b/obj").await.unwrap(), body);
+}
+
+/// Asserts the window of a fill that has put its object in the index and has not yet looked for
+/// the mark a forget leaves: the scrub leaves the object, rotten or not, and does not clear the
+/// mark, so the fill finds it and removes its own entry.
+#[tokio::test]
+async fn a_scrub_does_not_touch_the_object_of_a_fill_that_a_forget_marked() {
+    let rig = Rig::with("tscache-scrub-marked", |config| config.write_through = true);
+    let keys = fill(&rig, 1, 100).await;
+    rot(&rig, &keys[0]);
+    let hex = name_of(&keys[0]).hex;
+    let inner = &rig.cache.inner;
+    let held = futures::future::pending().boxed().shared();
+    super::locked(&inner.flights).insert(hex.clone(), held);
+    super::locked(&inner.invalidated).insert(hex.clone());
+    let mut state = Scrubber::new(1 << 20);
+    assert_eq!(rig.cache.scrub_once(&mut state), ScrubPass::default());
+    assert!(rig.has_file(&keys[0]));
+    assert_eq!(rig.cache.held(), (100, 1));
+    assert!(inner.is_invalidated(&hex));
+}
+
+/// Asserts that a write-through put of a key whose cache entry is stale (the object was deleted
+/// behind the cache's back) drops the entry, so a scrub finds nothing to drop and counts no
+/// mismatch, and the next read fills the new bytes, which the next scrub keeps.
+#[tokio::test]
+async fn a_write_through_put_is_never_dropped_by_the_scrub() {
+    let rig = Rig::with("tscache-scrub-put", |config| config.write_through = true);
+    rig.put("cas/b/obj", &pattern(100)).await;
+    rig.get("cas/b/obj").await.unwrap();
+    rot(&rig, "cas/b/obj");
+    rig.tamper.delete("cas/b/obj").await.unwrap();
+    let fresh = pattern(150);
+    rig.cache
+        .put("cas/b/obj", fresh.clone().into())
+        .await
+        .unwrap();
+    let mut state = Scrubber::new(1 << 20);
+    assert_eq!(rig.cache.scrub_once(&mut state), ScrubPass::default());
+    assert_eq!(rig.get("cas/b/obj").await.unwrap(), fresh);
+    let pass = rig.cache.scrub_once(&mut state);
+    assert_eq!((pass.scrubbed, pass.dropped), (1, 0));
+    assert_eq!(read(&rig.cache.counters().scrub_mismatches), 0);
+}
+
+/// Asserts that neither the binary's source nor the README says any more that the scrub is not
+/// done.
+#[test]
+fn nothing_says_the_scrub_is_not_done() {
+    let cli = include_str!("../cache_cli.rs");
+    let readme = include_str!("../../../../../packaging/tierstore/README.md");
+    for text in [cli, readme] {
+        assert!(!text.contains("does not scrub"));
+        assert!(!text.contains("No scrub"));
+    }
 }
