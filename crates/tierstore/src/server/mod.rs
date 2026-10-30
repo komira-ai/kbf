@@ -91,7 +91,8 @@
 //! answered 403 `AccessDenied` with the S3 error document before its body is read, and changes
 //! nothing. The roles of those keys are of the key and not of a prefix. A put by the full key
 //! is create-only but, when the hot tier is full, can race another put of the same key into the
-//! cold tier (see [`Proxy`](crate::Proxy)); a presigned PUT never goes to the cold tier.
+//! cold tier (see [`Proxy`](crate::Proxy)); a presigned PUT never goes to the cold tier of a
+//! proxy, and on a cache with `write_through` it goes to the upstream like every other put.
 //! A credential that may write one object under a prefix, and expires, is a presigned PUT URL: see [`presign`], and
 //! [`ServerConfig::presign_keys`] for the keys that sign them (`--presign-key-file` in the binary).
 //! A key that lists, heads and deletes under one prefix, and does nothing else (no get, no put), is a
@@ -153,7 +154,9 @@
 //! ([`local_cache`]) in the Prometheus text format, each block or else a line that says it is
 //! not there; it is not signed either, and a bucket cannot be called `metricz`. A server that is
 //! the front of a local cache is a read cache: it answers GET and HEAD and refuses every other
-//! method, copies and multipart calls included, with 403 `AccessDenied`.
+//! method, copies and multipart calls included, with 403 `AccessDenied`, before the role of the
+//! key is looked at. With [`ServerConfig::cache_writes`] it takes the writes its keys may do (see
+//! [`local_cache`]): the roles apply as on any front.
 //!
 //! # Drain
 //!
@@ -355,6 +358,12 @@ pub struct ServerConfig {
     /// its body is read, and `/metricz` shows the cache's counters. The binary sets the cache it
     /// serves, which is also the server's backend.
     pub cache: Option<LocalCache>,
+    /// Whether a server that is the front of a local cache takes writes: false by default, and
+    /// then the refusal of `cache` stands, before the role of the key is looked at. With it the
+    /// roles of the keys decide, as on a storage node. It does nothing without `cache`. The
+    /// binary sets it from `write_through` in `[local_cache]`, the setting that also lets the
+    /// cache send the writes on.
+    pub cache_writes: bool,
     /// The age of the usage object past which `/usagez` says 503. A server that has run this
     /// long without finding any usage object is judged the same way. Longer than the lease and
     /// the pass interval of the reconciler, so that a takeover of the lease does not show.
@@ -404,6 +413,7 @@ impl ServerConfig {
             drain_deadline: Duration::from_secs(900),
             proxy: None,
             cache: None,
+            cache_writes: false,
             usage_stale_after: Duration::from_secs(120),
             oci_metrics: None,
             clock,
@@ -742,7 +752,7 @@ impl Server {
         }
         let signed = auth::verify(&self.config, parts)?;
         let reads = matches!(parts.method, Method::GET | Method::HEAD);
-        if self.config.cache.is_some() && !reads {
+        if self.config.cache.is_some() && !self.config.cache_writes && !reads {
             return Err(S3Error::read_cache());
         }
         signed.role.permit(&parts.method)?;
