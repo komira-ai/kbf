@@ -237,9 +237,8 @@ is accepted, and `--print-config` refuses it with exit 2. A `--print-config` tha
 A file has one of two shapes, told apart by its tables: a storage node (`[server]`, `[hot_store]`
 and `[cold_store]`, as the flags are, and an optional `[oci]` (the read-only registry front) and
 `[[policy]]`) and a build node (`[server]`, `[local_cache]` and `[cold_store]` with no
-`[hot_store]`, and `[[policy]]`), which is a read cache and has no flag form (see "A build node"
-below). A build node has no OCI front: its file with an `[oci]` table is refused. A file for a
-storage node:
+`[hot_store]`, an optional `[oci]`, and `[[policy]]`), which is a read cache and has no flag form (see
+"A build node" below). Both shapes take the same `[oci]` table. A file for a storage node:
 
 ```toml
 [server]
@@ -421,16 +420,20 @@ fill included, so the byte hit ratio is the first over the sum of the two), `fil
 slot taken), `fill_failures_total{reason}` (`hash_mismatch`, `upstream_error`,
 `short_body`, `local_io`, `changed`, `aborted`), `evictions_total{reason}` (`budget`, `floor`), `pinned_skips_total`,
 `discarded_at_start_total`, and the gauges `bytes`, `objects`, `fs_free_bytes` and `staging_files`.
-On a storage node it says there is no cache. The same path on a storage node with the OCI front
-has the OCI counters (see Counters); a node with neither has a line for each that says it is not
-there.
+On a storage node it says there is no cache. The same path on a node with the OCI front (a storage
+node, or a build node with an `[oci]` table) has the OCI counters (see Counters), above the cache's
+block on a build node; a node with neither has a line for each that says it is not there.
 
 ### The registry front
 
-The registry front (see The OCI read front) is the optional `[oci]` table of a storage node's file,
-left out for a server with no front. A build node's file may not have it: the front is a storage
-node's, and the file is refused with a message that names `oci`. A key of the table that is left
-out has the default of its flag:
+The registry front (see The OCI read front) is the optional `[oci]` table of a storage node's file
+or of a build node's, left out for a server with no front. The two shapes have the same keys and
+the same rules. On a storage node the front reads through the proxy; on a build node it reads
+through the local cache, so a blob or a manifest under a `[[policy]]` prefix with `cache = true`
+is served from the disk when it is there and filled from the upstream when it is not, as an S3 GET
+is. The front is another listener of the same process: it starts with the node, drains with it,
+and its counters are on the `/metricz` of the S3 listener beside the cache's. A key of the table
+that is left out has the default of its flag:
 
 ```toml
 [oci]
@@ -682,7 +685,8 @@ proxy in the process: no S3 credential and no hop through the S3 listener. It is
 
 With `--config` the front is the `[oci]` table of the file and the `--oci-*` flags are refused
 (see The configuration file, which lists the key of each flag below). `--print-config` writes
-the front's flags as that table.
+the front's flags as that table. A build node's file takes the same `[oci]` table (it has no flags):
+the front then reads through the node's local cache, not a proxy (see The registry front).
 
 | flag | what |
 |---|---|

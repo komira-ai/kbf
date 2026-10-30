@@ -98,6 +98,14 @@ In a file given with `--config`, the front is the optional `[oci]` table (`liste
 (`listen` is needed in it, the certificate and the key go together, `max_connections` is at least
 1); the `--oci-*` flags are refused with the file, and `--print-config` writes them as the table.
 
+The front runs on both shapes of the file. On a storage node it reads through the proxy. On a
+build node (`[local_cache]` and `[cold_store]`, see above) the same `[oci]` table, with the same
+keys and rules, starts the front beside the S3 listener over the node's local cache: a blob or a
+manifest is a hit on the disk when the cache holds it, and a miss under a `[[policy]]` prefix with
+`cache = true` is filled from the upstream, as an S3 GET is. A build node has no flag form, so its
+front is set only in the file; the start line ends with ` oci-listen=<address> (http|https)`, and
+`/metricz` shows the OCI block and the cache block.
+
 - `GET` and `HEAD` of `/v2/`, `/v2/<name>/manifests/sha256:<hex>` and
   `/v2/<name>/blobs/sha256:<hex>`; anything else is 404, and any other method 405.
 - An object is at `<--oci-prefix>blobs/sha256/<hex>` (`oci/` by default), manifests included. The

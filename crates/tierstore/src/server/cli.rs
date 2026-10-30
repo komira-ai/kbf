@@ -92,7 +92,7 @@ use crate::{
 };
 
 use super::cache_cli::serve_cache_until_signalled;
-use super::config::{Settings, keys_for_flags};
+use super::config::{OciFlags, Settings, keys_for_flags};
 use super::config_print::render;
 #[cfg(test)]
 use super::front::read_key;
@@ -462,12 +462,12 @@ struct Built {
 }
 
 /// The OCI front, as far as the flags and files go: the proxy it reads is not open yet.
-struct OciSetup {
+pub(super) struct OciSetup {
     listen: SocketAddr,
     /// `None` serves plain HTTP.
     acceptor: Option<tokio_rustls::TlsAcceptor>,
     prefix: OciPrefix,
-    metrics: Arc<OciMetrics>,
+    pub(super) metrics: Arc<OciMetrics>,
     limits: OciLimits,
 }
 
@@ -636,7 +636,24 @@ const OCI_HANDSHAKE: Duration = Duration::from_secs(10);
 /// certificate or key that cannot work is an `InvalidFlags` (exit 2, as a restart cannot mend it);
 /// a file that cannot be read is exit 1.
 fn oci_setup(cli: &Cli, server: &ServerConfig) -> Result<Option<OciSetup>, Error> {
-    let Some(listen) = cli.oci_listen else {
+    let flags = OciFlags {
+        listen: cli.oci_listen,
+        tls_cert: cli.oci_tls_cert.clone(),
+        tls_key: cli.oci_tls_key.clone(),
+        prefix: cli.oci_prefix.clone(),
+        max_connections: cli.oci_max_connections,
+        connection_lifetime: cli.oci_connection_lifetime,
+    };
+    oci_setup_of(&flags, server)
+}
+
+/// [`oci_setup`] for the values the flags or the `[oci]` table of a file make: the one place the
+/// front's rules are applied, for a storage node and for a build node.
+pub(super) fn oci_setup_of(
+    flags: &OciFlags,
+    server: &ServerConfig,
+) -> Result<Option<OciSetup>, Error> {
+    let Some(listen) = flags.listen else {
         return Ok(None);
     };
     let refuse = |why: OciError| -> Error {
@@ -646,15 +663,15 @@ fn oci_setup(cli: &Cli, server: &ServerConfig) -> Result<Option<OciSetup>, Error
             why.into()
         }
     };
-    let lifetime = cli.oci_connection_lifetime.unwrap_or(DEFAULT_OCI_LIFETIME);
+    let lifetime = flags.connection_lifetime.unwrap_or(DEFAULT_OCI_LIFETIME);
     if lifetime.is_zero() {
         return Err(
             InvalidFlags("--oci-connection-lifetime must be longer than zero".into()).into(),
         );
     }
-    let prefix = cli.oci_prefix.as_deref().unwrap_or(DEFAULT_OCI_PREFIX);
+    let prefix = flags.prefix.as_deref().unwrap_or(DEFAULT_OCI_PREFIX);
     let prefix = OciPrefix::new(prefix).map_err(refuse)?;
-    let acceptor = match (&cli.oci_tls_cert, &cli.oci_tls_key) {
+    let acceptor = match (&flags.tls_cert, &flags.tls_key) {
         (Some(cert), Some(key)) => Some(oci::acceptor(cert, key, listen).map_err(refuse)?),
         (None, None) => {
             if let Some(warning) = oci::plain_warning(listen) {
@@ -672,7 +689,7 @@ fn oci_setup(cli: &Cli, server: &ServerConfig) -> Result<Option<OciSetup>, Error
     } else {
         OciMode::Http
     };
-    let connections = cli.oci_max_connections.unwrap_or(DEFAULT_OCI_CONNECTIONS);
+    let connections = flags.max_connections.unwrap_or(DEFAULT_OCI_CONNECTIONS);
     let limits = OciLimits {
         max_connections: connections as usize,
         handshake_timeout: OCI_HANDSHAKE,
@@ -839,24 +856,12 @@ pub async fn run_serving(
     let opened = Proxy::open(hot, cold, built.proxy).await;
     let proxy = Arc::new(opened.map_err(|why| format!("opening the proxy: {why}"))?);
     built.server.proxy = Some(Arc::clone(&proxy));
-    let oci = built.oci.map(|setup| {
-        let front = OciFront::new(proxy.clone(), setup.prefix, setup.metrics);
-        (setup.listen, setup.acceptor, Arc::new(front), setup.limits)
-    });
+    let oci_backend: Arc<dyn Backend> = proxy.clone();
     let server = Server::new(proxy, built.server);
     let address = cli.listen;
     let bound = TcpListener::bind(address).await;
     let listener = bound.map_err(|why| format!("binding {address}: {why}"))?;
-    let oci = match oci {
-        Some((listen, acceptor, front, limits)) => {
-            let bound = match acceptor {
-                Some(tls) => OciListener::bind(listen, tls, front, limits).await,
-                None => OciListener::bind_plain(listen, front, limits).await,
-            };
-            Some(bound?)
-        }
-        None => None,
-    };
+    let oci = bind_oci(built.oci, oci_backend).await?;
     let oci_addr = oci.as_ref().map(OciListener::local_addr).transpose()?;
     let oci_mode = oci.as_ref().map(OciListener::mode);
     ready(Addresses {
@@ -880,12 +885,7 @@ pub async fn run_serving(
         halting.notify_one();
         drained
     };
-    let oci_serving = async move {
-        match oci {
-            Some(listener) => listener.serve(oci_stopped).await,
-            None => 0,
-        }
-    };
+    let oci_serving = serve_oci(oci, oci_stopped);
     let reconciler = Reconciler::new(built.hot, built.cold, built.reconciler);
     let reconciling = reconcile(reconciler, cli.reconcile_interval, halt);
     let (drained, (), oci_cut) = tokio::join!(serving, reconciling, oci_serving);
@@ -904,8 +904,39 @@ pub(super) fn cut_note(drained: Drained) -> String {
     }
 }
 
+/// Binds the OCI front over `backend` as `setup` says: none when there is no setup. The backend
+/// is whatever the node reads from: the proxy of a storage node, the cache of a build node.
+///
+/// # Errors
+/// An address that cannot be bound.
+pub(super) async fn bind_oci(
+    setup: Option<OciSetup>,
+    backend: Arc<dyn Backend>,
+) -> Result<Option<OciListener>, Error> {
+    let Some(setup) = setup else {
+        return Ok(None);
+    };
+    let front = Arc::new(OciFront::new(backend, setup.prefix, setup.metrics));
+    let bound = match setup.acceptor {
+        Some(tls) => OciListener::bind(setup.listen, tls, front, setup.limits).await,
+        None => OciListener::bind_plain(setup.listen, front, setup.limits).await,
+    };
+    Ok(Some(bound?))
+}
+
+/// Serves the OCI front until `stopped` says so; the connections it cut. 0 when there is none.
+pub(super) async fn serve_oci(
+    listener: Option<OciListener>,
+    stopped: watch::Receiver<bool>,
+) -> usize {
+    match listener {
+        Some(listener) => listener.serve(stopped).await,
+        None => 0,
+    }
+}
+
 /// The same for the connections of the OCI front.
-fn oci_cut_note(cut: usize) -> String {
+pub(super) fn oci_cut_note(cut: usize) -> String {
     match cut {
         0 => String::new(),
         cut => format!("tierstore: {cut} OCI connections were cut at the drain deadline\n"),

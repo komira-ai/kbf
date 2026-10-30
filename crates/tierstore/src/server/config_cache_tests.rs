@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::config::{File, from_text, settings_from_text};
 use super::config_cache::{CacheSettings, Rate};
-use super::config_testing::{DEFAULTS, GOLDEN};
+use super::config_testing::{DEFAULTS, GOLDEN, MINIMAL};
 use super::local_cache::{FILL_CHUNK, WHOLE_FILL_LIMIT};
 
 /// A build node's file with every key given a value that is not the default.
@@ -56,6 +56,14 @@ cache  = true
 [[policy]]
 prefix = ""
 cache  = false
+
+[oci]
+listen              = "192.0.2.10:5000"
+tls_cert_file       = "/etc/tierstore-cache/oci.crt"
+tls_key_file        = "/etc/tierstore-cache/oci.key"
+prefix              = "images/"
+max_connections     = 16
+connection_lifetime = "30m"
 "#;
 
 /// The least a build node's file can say.
@@ -413,14 +421,77 @@ fn a_storage_node_refuses_a_list_of_endpoints_and_a_cache_policy() {
     assert!(why.contains("keeps no cache"), "{why}");
 }
 
-/// Asserts that a build node's file with an `[oci]` table is refused, with a message that names
-/// `oci`, whether or not the table has `listen`.
+/// Asserts that a build node's file takes the `[oci]` table with the keys of a storage node's,
+/// each to the field the `--oci-*` flag has, and that a file without the table has no front.
 #[test]
-fn a_build_node_refuses_an_oci_table() {
-    for table in ["listen = \"127.0.0.1:5000\"", "prefix = \"cas/\""] {
-        let why = refusal(&format!("{CACHE}\n[oci]\n{table}\n"));
-        assert!(why.contains("oci"), "{why}");
-        assert!(why.contains("build node"), "{why}");
+fn a_build_node_file_with_an_oci_table_makes_the_front() {
+    let oci = cache_of(CACHE).oci;
+    assert_eq!(oci.listen, Some("192.0.2.10:5000".parse().unwrap()));
+    assert_eq!(
+        oci.tls_cert.as_deref(),
+        Some(Path::new("/etc/tierstore-cache/oci.crt"))
+    );
+    assert_eq!(
+        oci.tls_key.as_deref(),
+        Some(Path::new("/etc/tierstore-cache/oci.key"))
+    );
+    assert_eq!(oci.prefix.as_deref(), Some("images/"));
+    assert_eq!(oci.max_connections, Some(16));
+    assert_eq!(oci.connection_lifetime, Some(Duration::from_secs(1800)));
+
+    let plain = format!("{LEAST}\n[oci]\nlisten = \"127.0.0.1:5000\"\n");
+    let oci = cache_of(&plain).oci;
+    assert_eq!(oci.listen, Some("127.0.0.1:5000".parse().unwrap()));
+    assert_eq!((oci.tls_cert, oci.tls_key, oci.prefix), (None, None, None));
+    assert_eq!((oci.max_connections, oci.connection_lifetime), (None, None));
+
+    assert_eq!(cache_of(LEAST).oci.listen, None);
+}
+
+/// Asserts that a build node's `[oci]` table is refused exactly as a storage node's is: for each
+/// table below the build node's message equals the storage node's and names the key, so a
+/// certificate without a key, a key without a certificate, any key without `listen`, a count of
+/// zero and a key the table does not have are refused by the one set of rules.
+#[test]
+fn a_build_node_oci_table_is_refused_as_a_storage_nodes_is() {
+    let listen = "listen = \"127.0.0.1:5000\"\n";
+    let cases = [
+        (
+            format!("{listen}tls_cert_file = \"/c\""),
+            "oci.tls_key_file: it is needed with oci.tls_cert_file",
+        ),
+        (
+            format!("{listen}tls_key_file = \"/k\""),
+            "oci.tls_cert_file: it is needed with oci.tls_key_file",
+        ),
+        (
+            "tls_cert_file = \"/c\"\ntls_key_file = \"/k\"".to_owned(),
+            "oci.tls_cert_file: it needs oci.listen",
+        ),
+        (
+            "prefix = \"oci/\"".to_owned(),
+            "oci.prefix: it needs oci.listen",
+        ),
+        (
+            "max_connections = 4".to_owned(),
+            "oci.max_connections: it needs",
+        ),
+        (
+            "connection_lifetime = \"1h\"".to_owned(),
+            "oci.connection_lifetime: it needs",
+        ),
+        (String::new(), "oci.listen: it is needed"),
+        (
+            format!("{listen}max_connections = 0"),
+            "oci.max_connections",
+        ),
+        (format!("{listen}bogus = 1"), "bogus"),
+    ];
+    for (oci, want) in cases {
+        let build = refusal(&format!("{LEAST}\n[oci]\n{oci}\n"));
+        let storage = refusal(&format!("{MINIMAL}\n[oci]\n{oci}\n"));
+        assert!(build.contains(want), "{oci}: {build}");
+        assert_eq!(build, storage, "{oci}");
     }
 }
 

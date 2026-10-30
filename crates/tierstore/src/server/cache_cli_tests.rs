@@ -133,7 +133,7 @@ where
             let _ = stopped.await;
         },
         move |bound| {
-            let _ = told.send(bound);
+            let _ = told.send(bound.s3);
         },
     );
     let driving = async {
@@ -211,7 +211,7 @@ async fn run_cache_opens_the_upstream_the_file_names() {
             let _ = stopped.await;
         },
         move |bound| {
-            let _ = told.send(bound);
+            let _ = told.send(bound.s3);
         },
     );
     let driving = async {
@@ -406,4 +406,28 @@ async fn a_file_system_whose_size_is_unknown_is_not_judged_and_the_node_starts()
     let disk: Arc<dyn Disk> = zero;
     let drained = serving(&settings, upstream, disk, nothing).await.unwrap();
     assert_eq!(drained, Drained { abandoned: 0 });
+}
+
+/// Asserts that a build node whose `[oci]` certificate is not a certificate is refused at start
+/// with exit status 2, before the cache directory is made, as a storage node's front is.
+#[tokio::test]
+async fn a_build_node_with_a_bad_oci_certificate_is_refused_before_the_cache_opens() {
+    let node = Node::new("tscache-cli-oci-cert");
+    let key = node.key.display();
+    let text = format!(
+        "{}\n[oci]\nlisten = \"127.0.0.1:0\"\ntls_cert_file = \"{key}\"\ntls_key_file = \"{key}\"\n",
+        node.text("", "")
+    );
+    let settings = settings_from_text(&text, QUICK)
+        .unwrap()
+        .into_cache()
+        .unwrap();
+    let upstream: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let disk: Arc<dyn Disk> = Arc::new(SystemDisk);
+    let nothing = |_addr: SocketAddr| async {};
+    let why = serving(&settings, upstream, disk, nothing)
+        .await
+        .unwrap_err();
+    assert_eq!(exit_status(&why), 2, "{why}");
+    assert!(!node.cache_dir().exists());
 }

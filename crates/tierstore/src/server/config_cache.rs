@@ -24,12 +24,16 @@
 //! endpoint         = "http://192.0.2.20:9300"
 //! credentials_file = "/etc/tierstore-cache/upstream-read.key"
 //!
+//! [oci]                         # optional: the registry front, served from the cache
+//! listen = "127.0.0.1:5000"
+//!
 //! [[policy]]
 //! prefix = "cas/b/"
 //! cache  = true
 //! ```
 //!
-//! The file is read into a [`CacheSettings`]. It has no flag form. What it refuses, besides what
+//! The file is read into a [`CacheSettings`]. It has no flag form. The `[oci]` table is the
+//! storage node's, with its rules (see [`config`](super::config)). What it refuses, besides what
 //! every file does: a `[hot_store]` along with `[local_cache]`, a layout that is not `digest-v1`,
 //! `cache = false`, marks out of order, no `[[policy]]` with `cache = true`, a list of more than
 //! one `endpoints` in `[cold_store]` (the cache reads from one upstream), and the keys of the
@@ -43,8 +47,9 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::config::{
-    ConfigError, PerRun, Policy, ServerTable, Size, TierParts, TierTable, check_policies, front_of,
-    invalid, parse_size, refuse, refuse_hot_keys, require, tier, within,
+    ConfigError, OciFlags, OciTable, PerRun, Policy, ServerTable, Size, TierParts, TierTable,
+    check_policies, front_of, invalid, oci as oci_of, parse_size, refuse, refuse_hot_keys, require,
+    tier, within,
 };
 use super::front::FrontSettings;
 use super::local_cache::CacheConfig;
@@ -132,6 +137,8 @@ pub(super) struct CacheSettings {
     pub upstream: TierParts,
     /// The cache.
     pub cache: CacheConfig,
+    /// The OCI front, as `[oci]` and the `--oci-*` flags make it: `listen` is `None` for none.
+    pub oci: OciFlags,
     /// The rate at which a scrubber would run, in bytes a second, if the file gave one.
     pub scrub_rate: Option<u64>,
 }
@@ -167,6 +174,7 @@ impl CacheSettings {
     pub(super) fn new(
         server: ServerTable,
         tables: (LocalCacheTable, TierTable),
+        oci_table: Option<OciTable>,
         policy: &[Policy],
         per_run: PerRun,
     ) -> Result<Self, ConfigError> {
@@ -215,6 +223,7 @@ impl CacheSettings {
                 "must not be above critical",
             ));
         }
+        let oci = oci_of(oci_table)?;
         let shared = front_of(server, per_run)?;
         let policies = policy
             .iter()
@@ -234,6 +243,7 @@ impl CacheSettings {
             s3_request_timeout: shared.s3_request_timeout,
             upstream,
             cache,
+            oci,
             scrub_rate: table.scrub_rate.map(|rate| rate.0),
         })
     }
