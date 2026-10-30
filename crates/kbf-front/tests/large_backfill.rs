@@ -33,6 +33,7 @@ const BUILD: &str = "build-0010";
 const CHUNK: usize = 1024;
 const STREAM_OVER: u64 = 1024;
 const BLOB_CHUNKS: usize = 10;
+const LONG_CHUNKS: usize = 40;
 
 fn limits() -> Limits {
     Limits {
@@ -200,7 +201,11 @@ impl LargeStore for Bucket {
 }
 
 fn pattern(seed: usize) -> Vec<u8> {
-    (0..BLOB_CHUNKS * CHUNK)
+    pattern_of(BLOB_CHUNKS, seed)
+}
+
+fn pattern_of(chunks: usize, seed: usize) -> Vec<u8> {
+    (0..chunks * CHUNK)
         .map(|i| ((i + seed) * 31 % 251) as u8)
         .collect()
 }
@@ -224,6 +229,8 @@ struct World {
     action: Digest,
     one: Digest,
     two: Digest,
+    /// More chunks than a tee buffers.
+    long: Digest,
     blobs: HashMap<Digest, Bytes>,
 }
 
@@ -231,8 +238,9 @@ fn world() -> World {
     let mut blobs = HashMap::new();
     let one = put(&mut blobs, pattern(1));
     let two = put(&mut blobs, pattern(2));
+    let long = put(&mut blobs, pattern_of(LONG_CHUNKS, 3));
     let root = Directory {
-        files: vec![file("one", &one), file("two", &two)],
+        files: vec![file("one", &one), file("two", &two), file("long", &long)],
         ..Directory::default()
     };
     let root = put(&mut blobs, root.encode_to_vec());
@@ -247,6 +255,7 @@ fn world() -> World {
         action,
         one,
         two,
+        long,
         blobs,
     }
 }
@@ -524,4 +533,54 @@ async fn a_corrupt_source_never_leaves_an_object() {
         assert_eq!(rig.bucket.keys().await, 0, "{what}");
         assert_eq!(rig.bucket.object(&w.one).await, None, "{what}");
     }
+}
+
+/// Catches: a put that cannot keep up slowing or failing the reader. The put is held before it
+/// takes a byte, so the tee's buffer fills; the read is served in full, the copy is abandoned
+/// (skipped, never failed) and no object results once the put is let go.
+#[tokio::test]
+async fn a_put_that_cannot_keep_up_is_abandoned_and_the_read_goes_on() {
+    let w = world();
+    let rig = rig(w.blobs.clone(), 2);
+    let gate = rig.bucket.hold_puts();
+    let token = rig.token(w.action);
+    let (status, bytes) = read_all(&rig, &w.long, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, w.blobs[&w.long]);
+    gate.notify_one();
+    rig.settled(1).await;
+    assert_eq!(rig.count("skipped"), 1);
+    assert_eq!(rig.count("failed"), 0);
+    assert_eq!(rig.count("backfilled"), 0);
+    assert_eq!(rig.bucket.keys().await, 0);
+}
+
+/// Catches: an object of another length under the key being taken for the blob. The length
+/// check does not match, so the put is made; the create-only store refuses it (the key is
+/// taken), which is `already_present`, and the object that was there is left as it was.
+#[tokio::test]
+async fn an_object_of_another_length_is_not_taken_for_the_blob() {
+    let w = world();
+    let rig = rig(w.blobs.clone(), 2);
+    let key = large_key(&w.one);
+    let body: BodyStream = stream::iter([Ok(Bytes::from_static(b"short"))]).boxed();
+    rig.bucket
+        .memory
+        .put_stream(&key, 5, body)
+        .await
+        .expect("seeded");
+    let token = rig.token(w.action);
+    let (_, bytes) = read_all(&rig, &w.one, &token).await;
+    assert_eq!(bytes, w.blobs[&w.one]);
+    rig.settled(1).await;
+    assert_eq!(
+        rig.bucket.puts.load(Ordering::SeqCst),
+        1,
+        "the length did not match"
+    );
+    assert_eq!(rig.count("already_present"), 1);
+    assert_eq!(
+        rig.bucket.object(&w.one).await,
+        Some(Bytes::from_static(b"short"))
+    );
 }
