@@ -350,3 +350,37 @@ fn placed_fails_when_it_cannot_read_the_node() {
     }
     assert!(server.requests().is_empty());
 }
+
+/// `placed_if_known` tells a node that is there from one the frontend does not know: the
+/// state of the first, `None` for a 404 of a host that may run no daemon, and the failure
+/// it is for any other host. One call each.
+///
+/// Catches: an absent node read as one in placement by a caller that records a cordon for
+/// every node in placement.
+#[test]
+fn placed_if_known_is_none_for_an_unknown_node_of_a_host_that_may_have_none() {
+    let host = dm(Some("dm-node"));
+    let server = answering(404, "{\"error\":\"no_node\"}");
+    assert_eq!(
+        adapter_if_present(&server, "nd-known-absent").placed_if_known(&host),
+        Ok(None)
+    );
+    assert_eq!(server.requests().len(), 1);
+
+    let server = answering(200, &node("serving", &[]));
+    assert_eq!(
+        adapter_if_present(&server, "nd-known-in").placed_if_known(&host),
+        Ok(Some(Placed::In))
+    );
+    let server = answering(200, &node("cordoned", &[]));
+    assert_eq!(
+        adapter(&server, "nd-known-out").placed_if_known(&host),
+        Ok(Some(Placed::Out))
+    );
+    let server = answering(404, "{\"error\":\"no_node\"}");
+    assert!(
+        adapter(&server, "nd-known-unknown")
+            .placed_if_known(&host)
+            .is_err()
+    );
+}

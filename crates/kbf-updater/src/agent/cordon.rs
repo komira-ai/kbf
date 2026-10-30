@@ -36,11 +36,19 @@ pub struct OwnCordon {
 }
 
 impl OwnCordon {
-    pub fn new(inner: Arc<dyn Drain>, dir: impl Into<PathBuf>) -> Self {
+    pub fn new(inner: Arc<dyn Drain>, dir: impl Into<PathBuf>, _unit: &str) -> Self {
         Self {
             inner,
             dir: dir.into(),
         }
+    }
+
+    /// Whether the directory takes marks.
+    ///
+    /// # Errors
+    /// It does not.
+    pub fn check_writable(&self) -> Result<(), String> {
+        Ok(())
     }
 
     /// The mark of `host`'s node. A host with no usable node id has none: the inner drain

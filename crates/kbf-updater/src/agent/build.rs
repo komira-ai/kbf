@@ -26,6 +26,7 @@ use crate::node_health::NodeHealth;
 use crate::operator::OperatorApi;
 use crate::ports::{Drain, Health, HealthCheck, Placed, PortError, SystemClock};
 use crate::version::Version;
+use crate::wire::KBF_SERVICE;
 
 /// A host whose node is never drained (a frontend host that runs no daemon): the frontend's own
 /// drain is the helper's, and there is no node to give back.
@@ -110,11 +111,12 @@ pub(super) fn node_ports(
     cfg: &Config,
     identity: &Identity,
     role: Role,
+    unit: &str,
     local: &Arc<SocketLocal>,
 ) -> Result<NodePorts, String> {
     let installer = || Arc::new(LocalInstaller(local.clone()));
     let own = |drain: Arc<dyn Drain>| -> Arc<dyn Drain> {
-        Arc::new(OwnCordon::new(drain, cordon_dir(cfg)))
+        Arc::new(OwnCordon::new(drain, cordon_dir(cfg), unit))
     };
     if let Some(api) = &cfg.node_api {
         let api = OperatorApi::new(api.addr, api.token_file.clone())?;
@@ -217,7 +219,7 @@ pub(super) fn frontend_ports(
     local: &Arc<SocketLocal>,
 ) -> Result<NodePorts, String> {
     let drain = match &cfg.daemon_node {
-        Some(_) => node_ports(cfg, identity, Role::Daemon, local)?.0,
+        Some(_) => node_ports(cfg, identity, Role::Daemon, KBF_SERVICE, local)?.0,
         None => no_drain(),
     };
     let health = Arc::new(ContainerHealth::new(Arc::new(LocalInstaller(
@@ -265,7 +267,7 @@ pub fn build(cfg: &Config) -> Result<Agent, String> {
     let (drain, health) = if role == Role::Frontend {
         frontend_ports(cfg, &identity, &local)?
     } else {
-        node_ports(cfg, &identity, host.role, &local)?
+        node_ports(cfg, &identity, host.role, KBF_SERVICE, &local)?
     };
     let renewer = renewer_for(cfg)?;
     let coordinator = Arc::new(
@@ -308,7 +310,7 @@ pub(super) fn service_ports(
     service: &ServiceConfig,
 ) -> Result<ServicePorts, String> {
     let local = Arc::new(SocketLocal::new(&service.helper_socket, Limits::default()));
-    let node = || node_ports(cfg, identity, host.role, &local);
+    let node = || node_ports(cfg, identity, host.role, &service.name, &local);
     let drain = match service.drain {
         ServiceDrain::None => no_drain(),
         ServiceDrain::Node => node()?.0,

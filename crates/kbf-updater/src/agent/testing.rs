@@ -322,6 +322,8 @@ pub struct ServingNode {
     /// A directory to look into whenever a drain call arrives, and whether it held anything.
     pub watch: Arc<Mutex<Option<std::path::PathBuf>>>,
     pub seen_at_drain: Arc<Mutex<Option<bool>>>,
+    /// The frontend knows no node here: reads say in placement, drain and undrain do nothing.
+    pub absent: Arc<Mutex<bool>>,
 }
 
 impl ServingNode {
@@ -334,7 +336,18 @@ impl ServingNode {
             drain_calls: Arc::default(),
             watch: Arc::default(),
             seen_at_drain: Arc::default(),
+            absent: Arc::default(),
         }
+    }
+
+    /// The frontend has no node for the host.
+    pub fn no_node(&self) {
+        *lock(&self.absent) = true;
+    }
+
+    /// An operator uncordons it by hand.
+    pub fn operator_uncordons(&self) {
+        *lock(&self.serving) = true;
     }
 
     /// An operator cordons and drains it.
@@ -356,8 +369,18 @@ impl Drain for ServingNode {
         })
     }
 
+    fn placed_if_known(&self, host: &Host) -> Result<Option<Placed>, PortError> {
+        if *lock(&self.absent) {
+            return Ok(None);
+        }
+        self.placed(host).map(Some)
+    }
+
     fn drain(&self, _host: &Host, _deadline: Option<Duration>) -> Result<(), PortError> {
         *lock(&self.drain_calls) += 1;
+        if *lock(&self.absent) {
+            return Ok(());
+        }
         if let Some(dir) = lock(&self.watch).clone() {
             let held = std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some());
             *lock(&self.seen_at_drain) = Some(held);

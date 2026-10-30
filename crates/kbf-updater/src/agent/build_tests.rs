@@ -12,7 +12,7 @@ use kbf_types::HostRole;
 
 use super::build::{
     NO_CREDENTIAL, NoCredential, build, cordon_dir, drain_for, frontend_ports, identity_of_files,
-    run_agent, run_config, service_ports, unix_now,
+    node_ports, run_agent, run_config, service_ports, unix_now,
 };
 use super::coordinator::{Endpoint, TlsFiles};
 use super::flags::{Config, NodeApi, ServiceConfig, ServiceDrain, ServiceHealth, Timing};
@@ -455,4 +455,23 @@ fn the_cordon_marks_go_where_the_flags_say() {
     assert_eq!(cordon_dir(&rig.config), PathBuf::from("/state"));
     rig.config.cordon_dir = Some(PathBuf::from("/cordons"));
     assert_eq!(cordon_dir(&rig.config), PathBuf::from("/cordons"));
+}
+
+/// An agent whose cordon directory it cannot write does not start with a drain it could not
+/// use: the error names `--cordon-dir`, whatever the node is drained through.
+///
+/// Catches: every drain refused at the first update, with nothing at start to say why.
+#[test]
+fn a_cordon_directory_the_agent_cannot_write_stops_the_build_naming_the_flag() {
+    let mut rig = Rig::new("bd-cordon-ro", HostRole::Daemon);
+    rig.config.cordon_dir = Some(rig.dir.join("missing"));
+    let local = Arc::new(SocketLocal::new(
+        &rig.config.helper_socket,
+        Limits::default(),
+    ));
+    let identity = identity_of_files(&rig.config.files).unwrap();
+    let why = node_ports(&rig.config, &identity, Role::Daemon, "kbf", &local)
+        .err()
+        .expect("refused");
+    assert!(why.contains("--cordon-dir"), "{why}");
 }

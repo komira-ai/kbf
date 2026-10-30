@@ -160,7 +160,7 @@ fn a_daemon_hosts_health_is_read_from_its_own_node_through_the_frontend() {
         &rig.dir.join("none.sock"),
         Limits::default(),
     ));
-    let (_, health) = node_ports(&config, &rig.identity(), Role::Daemon, &local).unwrap();
+    let (_, health) = node_ports(&config, &rig.identity(), Role::Daemon, "kbf", &local).unwrap();
     let target = Version::parse("0.1.5+gaaaaaaaaaaaa-2").unwrap();
     // The helper is not there, so the commit cannot be read: the check fails there, after it
     // asked the frontend for the node, and not before.
@@ -183,7 +183,7 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
     let h = host(Role::Daemon);
 
     let none = rig.config(None);
-    let (drain, health) = node_ports(&none, &rig.identity(), Role::Daemon, &local).unwrap();
+    let (drain, health) = node_ports(&none, &rig.identity(), Role::Daemon, "kbf", &local).unwrap();
     for text in [
         drain
             .drain(&h, Some(Duration::from_secs(1)))
@@ -197,7 +197,8 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
     // The drain reads the node first (to tell its own cordon from an operator's), then drains.
     let (addr, server) = rig.frontend(vec![ok(SERVING), ok("{}")]);
     let with_frontend = rig.config(Some(addr));
-    let (drain, _) = node_ports(&with_frontend, &rig.identity(), Role::Daemon, &local).unwrap();
+    let (drain, _) =
+        node_ports(&with_frontend, &rig.identity(), Role::Daemon, "kbf", &local).unwrap();
     assert_eq!(drain.drain(&h, Some(Duration::from_secs(1))), Ok(()));
     let seen = server.join().unwrap();
     assert_eq!(head_of(&seen[0]).0[0], "GET /v1/nodes/n1 HTTP/1.1");
@@ -216,8 +217,14 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
     std::fs::create_dir(&marks).unwrap();
     let mut with_frontend = rig.config(Some(addr));
     with_frontend.cordon_dir = Some(marks);
-    let (storage_drain, storage_health) =
-        node_ports(&with_frontend, &rig.identity(), Role::Storage, &local).unwrap();
+    let (storage_drain, storage_health) = node_ports(
+        &with_frontend,
+        &rig.identity(),
+        Role::Storage,
+        "kbf",
+        &local,
+    )
+    .unwrap();
     let st = host(Role::Storage);
     assert_eq!(storage_health.refusal(&st), None);
     assert_eq!(
@@ -248,7 +255,7 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
         addr: "127.0.0.1:1".parse().unwrap(),
         token_file: token,
     });
-    let (drain, _) = node_ports(&with_token, &rig.identity(), Role::Daemon, &local).unwrap();
+    let (drain, _) = node_ports(&with_token, &rig.identity(), Role::Daemon, "kbf", &local).unwrap();
     let err = drain.drain(&h, Some(Duration::from_secs(1))).unwrap_err();
     assert_eq!(err.kind(), PortErrorKind::Unreachable);
     assert!(err.to_string().contains("the operator API"), "{err}");

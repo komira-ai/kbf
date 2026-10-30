@@ -8,9 +8,11 @@ use std::time::Duration;
 use super::cordon::OwnCordon;
 use super::flags::Timing;
 use super::local::Trial;
+use super::run::{Agent, World};
 use super::status::{Shared, Status};
 use super::testing::{
-    COMMIT_B, Events, FakeHealth, FakeLocal, ManualClock, ServingNode, VA, VB, host, version,
+    COMMIT_B, Events, FakeCoordinator, FakeHealth, FakeLocal, ManualClock, ServingNode, VA, VB,
+    host, version,
 };
 use super::update::{Ports, Update};
 use crate::inventory::Role;
@@ -22,7 +24,11 @@ use kbf_types::ReleasePlatform;
 const NOW: u64 = 10_000;
 
 fn cordon(node: &ServingNode, dir: &Path) -> OwnCordon {
-    OwnCordon::new(Arc::new(node.clone()), dir)
+    unit_cordon(node, dir, "kbf")
+}
+
+fn unit_cordon(node: &ServingNode, dir: &Path, unit: &str) -> OwnCordon {
+    OwnCordon::new(Arc::new(node.clone()), dir, unit)
 }
 
 fn marks(dir: &Path) -> usize {
@@ -168,7 +174,7 @@ fn a_mark_that_cannot_be_read_or_cleared_is_an_error() {
     assert!(w.undrain(&h).is_err());
 
     let dir = scratch("cordon-dirmark");
-    std::fs::create_dir(dir.join("cordon-n1")).unwrap();
+    std::fs::create_dir(dir.join("cordon-n1.kbf")).unwrap();
     let node = ServingNode::new();
     let w = cordon(&node, &dir);
     assert_eq!(w.placed(&h).unwrap(), Placed::In);
@@ -303,4 +309,169 @@ fn a_restart_in_the_middle_of_a_trial_tells_its_own_cordon_from_an_operators() {
     assert_eq!(rig.run(VB, None), result(VB, Outcome::Succeeded));
     assert!(!rig.node.is_serving());
     assert_eq!(rig.events.count("local:install"), 0);
+}
+
+/// A cordon given back by hand (the documented way, `:uncordon` or `kbf cluster`) leaves the
+/// updater's mark behind; the next time the node is read serving the mark is dropped, so an
+/// operator's later drain reads as theirs. A node still cordoned keeps its mark.
+///
+/// Catches: a mark that outlives its cordon, which made the next roll uncordon a maintenance
+/// drain of an operator's.
+#[test]
+fn a_mark_is_dropped_when_the_node_is_read_serving_and_kept_while_it_is_cordoned() {
+    let dir = scratch("cordon-stale");
+    let h = host(Role::Daemon);
+    let node = ServingNode::new();
+    let w = cordon(&node, &dir);
+    w.drain(&h, None).unwrap();
+    assert_eq!(w.placed(&h).unwrap(), Placed::In);
+    assert_eq!(marks(&dir), 1, "cordoned: still ours");
+
+    node.operator_uncordons();
+    assert_eq!(w.placed(&h).unwrap(), Placed::In);
+    assert_eq!(marks(&dir), 0, "given back by hand: the mark is gone");
+    node.operator_drains();
+    assert_eq!(
+        w.placed(&h).unwrap(),
+        Placed::Out,
+        "a later maintenance drain"
+    );
+    assert_eq!(
+        cordon(&node, &dir).placed(&h).unwrap(),
+        Placed::Out,
+        "also to a restarted agent"
+    );
+}
+
+/// `observe` (what the agent calls when it looks at its node outside an update) drops the mark
+/// of a node read serving, keeps that of one still cordoned, and does nothing with no mark.
+///
+/// Catches: a stale mark that only an update's own read could clear.
+#[test]
+fn observing_a_node_drops_the_mark_only_once_the_node_serves() {
+    let dir = scratch("cordon-observe");
+    let h = host(Role::Daemon);
+    let node = ServingNode::new();
+    let w = cordon(&node, &dir);
+    w.observe(&h).unwrap();
+    w.drain(&h, None).unwrap();
+    w.observe(&h).unwrap();
+    assert_eq!(marks(&dir), 1);
+    node.operator_uncordons();
+    w.observe(&h).unwrap();
+    assert_eq!(marks(&dir), 0);
+}
+
+/// The agent's idle refresh looks at the node: the mark of a cordon given back by hand is gone
+/// after it, with no update and no order.
+///
+/// Catches: the observation not being wired into the agent's loop.
+#[test]
+fn the_agents_refresh_drops_the_mark_of_a_cordon_given_back_by_hand() {
+    let events = Events::default();
+    let health = FakeHealth::new(&events);
+    health.say(VA, vec![Ok(Health::Healthy)]);
+    let local = FakeLocal::new(&events);
+    let dir = scratch("cordon-refresh");
+    let h = host(Role::Daemon);
+    let node = ServingNode::new();
+    let own = Arc::new(cordon(&node, &dir));
+    own.drain(&h, None).unwrap();
+    let agent = Agent::new(
+        h,
+        "stable".to_owned(),
+        Timing::DEFAULT,
+        World {
+            coordinator: Arc::new(FakeCoordinator::default()),
+            local: Arc::new(local),
+            drain: own,
+            health: Arc::new(health),
+            clock: Arc::new(ManualClock::default()),
+            unix_now: Arc::new(|| NOW),
+            renewer: None,
+            log: Arc::new(|_| {}),
+        },
+        Status::unknown(ReleasePlatform::LinuxX86_64, version(VA)),
+    );
+    agent.refresh();
+    assert_eq!(marks(&dir), 1, "still cordoned");
+    node.operator_uncordons();
+    agent.refresh();
+    assert_eq!(marks(&dir), 0);
+}
+
+/// A directory the agent cannot write is found out at start, by a name that says which flag to
+/// set, and the probe leaves nothing behind.
+///
+/// Catches: every drain refused at the first update because the default directory is read-only.
+#[test]
+fn an_unwritable_cordon_directory_is_refused_at_start_naming_the_flag() {
+    let node = ServingNode::new();
+    let dir = scratch("cordon-probe");
+    cordon(&node, &dir).check_writable().unwrap();
+    assert_eq!(marks(&dir), 0);
+
+    let missing = dir.join("missing");
+    let why = cordon(&node, &missing).check_writable().unwrap_err();
+    assert!(why.contains("--cordon-dir"), "{why}");
+    assert!(why.contains(&missing.display().to_string()), "{why}");
+
+    let file = crate::testutil::file(&dir, "not-a-dir", "x", 0o600);
+    assert!(cordon(&node, &file).check_writable().is_err());
+}
+
+/// A host the frontend knows no node for is read in placement and drained as nothing, and no
+/// mark is made for the node that does not exist; once a node appears and an operator drains
+/// it, it is the operator's.
+///
+/// Catches: a mark for an absent node, which a daemon installed later and drained by an
+/// operator would then be taken to be the updater's cordon for.
+#[test]
+fn a_host_with_no_node_gets_no_mark() {
+    let dir = scratch("cordon-absent");
+    let h = host(Role::Storage);
+    let node = ServingNode::new();
+    node.no_node();
+    let w = cordon(&node, &dir);
+    assert_eq!(w.placed(&h).unwrap(), Placed::In);
+    w.drain(&h, None).unwrap();
+    assert_eq!(*node.drain_calls.lock().unwrap(), 1);
+    assert_eq!(marks(&dir), 0);
+    w.undrain(&h).unwrap();
+
+    *node.absent.lock().unwrap() = false;
+    node.operator_drains();
+    assert_eq!(cordon(&node, &dir).placed(&h).unwrap(), Placed::Out);
+}
+
+/// The kbf update and a service's update each keep a mark of their own. The node is the
+/// updater's while either is there; one unit's undrain clears only its own mark and gives the
+/// node back only when no other mark remains.
+///
+/// Catches: one unit's undrain clearing the other's mark and uncordoning a node the other is
+/// still rolling on.
+#[test]
+fn each_unit_has_its_own_mark_and_the_node_is_given_back_with_the_last() {
+    let dir = scratch("cordon-units");
+    let h = host(Role::Daemon);
+    let node = ServingNode::new();
+    let kbf = unit_cordon(&node, &dir, "kbf");
+    let db = unit_cordon(&node, &dir, "db");
+    kbf.drain(&h, None).unwrap();
+    db.drain(&h, None).unwrap();
+    assert_eq!(marks(&dir), 2, "one mark each");
+    assert_eq!(
+        db.placed(&h).unwrap(),
+        Placed::In,
+        "ours, whoever marked it"
+    );
+
+    kbf.undrain(&h).unwrap();
+    assert!(!node.is_serving(), "the other unit's mark remains");
+    assert_eq!(marks(&dir), 1);
+    assert_eq!(kbf.placed(&h).unwrap(), Placed::In);
+
+    db.undrain(&h).unwrap();
+    assert!(node.is_serving());
+    assert_eq!(marks(&dir), 0);
 }

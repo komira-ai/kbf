@@ -230,6 +230,18 @@ pub trait Drain: Send + Sync {
     /// uncordon cannot tell the roll's cordon from an operator's.
     /// A storage host is never drained, even one that also runs a daemon, and needs no node id.
     fn undrain(&self, host: &Host) -> Result<(), PortError>;
+    /// As [`Drain::placed`], but `None` when the frontend knows no node for `host` (a storage
+    /// host that runs no daemon): [`Drain::placed`] reads such a host as in placement, and a
+    /// caller that records a cordon must tell that from a node that is there. The default
+    /// has no such case.
+    fn placed_if_known(&self, host: &Host) -> Result<Option<Placed>, PortError> {
+        self.placed(host).map(Some)
+    }
+    /// Look at the node the caller cordoned earlier, outside any update, so that a drain that
+    /// remembers its own cordon can forget one that is gone. The default does nothing.
+    fn observe(&self, _host: &Host) -> Result<(), PortError> {
+        Ok(())
+    }
 }
 
 /// What a frontend says of its own drain: `GET /v1/frontend/drain`.
