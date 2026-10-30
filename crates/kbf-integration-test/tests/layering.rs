@@ -74,6 +74,10 @@
 //!   the check reads the tree of the crate built alone, so the features that its own tests
 //!   turn on do not count); and a walk that cannot see its dependencies, which would make
 //!   that check pass vacuously;
+//! - the S3 client and object store trait (`objstore-s3`, which `kbf-objstore` re-exports)
+//!   depending, directly or through another crate, on any other crate of this workspace, which
+//!   would stop it from leaving with `tierstore`; a walk that cannot see its dependencies; and
+//!   `kbf-objstore` not being built on it;
 //! - the state store (`kbf-state`, a re-export of `js-state`) depending on any other crate of
 //!   this workspace (with its test-database feature too, which brings `js-testkit` and not
 //!   `kbf-testkit`), which would stop it from being extracted, and the pack index (`kbf-pack-index`) depending on any but the state store;

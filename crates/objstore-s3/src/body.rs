@@ -37,12 +37,12 @@ pub async fn gather(mut body: BodyStream, len: u64) -> Result<Bytes, ObjectStore
 }
 
 /// A body that gave more bytes than its declared `len`.
-pub(crate) fn too_long(len: u64) -> ObjectStoreError {
+pub fn too_long(len: u64) -> ObjectStoreError {
     ObjectStoreError::Body(format!("the body gave more than its {len} bytes"))
 }
 
 /// A body that ended after `got` of its declared `len` bytes.
-pub(crate) fn too_short(len: u64, got: u64) -> ObjectStoreError {
+pub fn too_short(len: u64, got: u64) -> ObjectStoreError {
     ObjectStoreError::Body(format!("the body ended after {got} of its {len} bytes"))
 }
 

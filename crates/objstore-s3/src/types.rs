@@ -218,12 +218,26 @@ impl ListToken {
         Self(Token::After(key.clone()))
     }
 
+    /// The token an S3 store issues: its continuation token, opaque to every other store.
+    #[must_use]
+    pub fn continuation(token: impl Into<String>) -> Self {
+        Self(Token::Continue(token.into()))
+    }
+
+    /// The token of a page of the local-directory store's listing number `listing`, whose
+    /// last key is `after`: the next page is cut from that listing's kept keys. Any other
+    /// store reads it as [`ListToken::after`] `after`.
+    #[must_use]
+    pub fn kept(listing: u64, after: ObjectKey) -> Self {
+        Self(Token::Kept { listing, after })
+    }
+
     /// The key a local store's listing resumes after.
     ///
     /// # Errors
     /// [`ObjectStoreError::Protocol`] for a continuation token, which only an S3 store
     /// issues and only it can read.
-    pub(crate) fn local_after(&self) -> Result<&ObjectKey, ObjectStoreError> {
+    pub fn local_after(&self) -> Result<&ObjectKey, ObjectStoreError> {
         match &self.0 {
             Token::After(key) | Token::Kept { after: key, .. } => Ok(key),
             Token::Continue(_) => Err(ObjectStoreError::Protocol(
@@ -233,7 +247,8 @@ impl ListToken {
     }
 
     /// The `FsStore` listing this token continues, if it came with one of its pages.
-    pub(crate) fn listing(&self) -> Option<u64> {
+    #[must_use]
+    pub fn listing(&self) -> Option<u64> {
         match &self.0 {
             Token::Kept { listing, .. } => Some(*listing),
             Token::After(_) | Token::Continue(_) => None,

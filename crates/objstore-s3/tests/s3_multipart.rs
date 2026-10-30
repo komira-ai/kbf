@@ -7,9 +7,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream;
-use kbf_objstore::s3::fake::{Failure, FakeS3};
-use kbf_objstore::s3::{MULTIPART_THRESHOLD, PART_BYTES};
-use kbf_objstore::{BodyStream, ByteRange, Capabilities, ObjectKey, ObjectStore, ObjectStoreError};
+use objstore_s3::s3::fake::{Failure, FakeS3};
+use objstore_s3::s3::{MULTIPART_THRESHOLD, PART_BYTES};
+use objstore_s3::{BodyStream, ByteRange, Capabilities, ObjectKey, ObjectStore, ObjectStoreError};
 
 const CONDITIONAL: Capabilities = Capabilities {
     conditional_put: true,
