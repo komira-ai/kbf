@@ -440,8 +440,30 @@ fn a_parent_unknown_in_a_later_reading_keeps_the_one_known_before() {
         &mut meter,
         &[(10, proc_row(S, 0, 1)), (11, proc_row(S, 0, 10))],
     );
-    poll(&mut meter, &[(10, proc_row(S, 0, 1)), (11, proc_row(2 * S, 0, 0))]);
+    poll(
+        &mut meter,
+        &[(10, proc_row(S, 0, 1)), (11, proc_row(2 * S, 0, 0))],
+    );
     poll(&mut meter, &[(10, proc_row(S, 0, 1))]);
     reap(&mut meter, 10, 4);
     assert_eq!(user_micros(&meter), 4_000_000);
+}
+
+/// Catches: a process below an orphan taken for part of the leader's chain because its
+/// parent is a process of the same poll. The orphan (pid 12, parent launchd) and its
+/// child (14, 1 s) were alive at the last poll; neither is in the reap (4 s), so both are
+/// added: 4 + 2 + 1 = 7 s.
+#[test]
+fn what_runs_below_an_orphan_is_added_to_the_reap_too() {
+    let mut meter = Meter::default();
+    poll(
+        &mut meter,
+        &[
+            (10, proc_row(S, 0, 1)),
+            (12, proc_row(2 * S, 0, 1)),
+            (14, proc_row(S, 0, 12)),
+        ],
+    );
+    reap(&mut meter, 10, 4);
+    assert_eq!(user_micros(&meter), 7_000_000);
 }

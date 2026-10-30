@@ -24,6 +24,9 @@
 //!   reaped it) and exited between two polls has its CPU after the poll that last read it
 //!   missing. One last read runs before the watch ends the processes, which closes that
 //!   for any process still alive when the leader exits.
+//!   A process that outlived its parent by less than a poll interval, and exited within
+//!   it, was last read under that parent and is taken to have been reaped by it: its
+//!   CPU is missing when it was not ([`Meter::usage`] says why it is not added).
 //! - A pid the kernel reuses for a new process whose counters are not below the old
 //!   one's within a lease is taken for the same process.
 //!
@@ -33,7 +36,7 @@
 //! The pure accounting here is tested on every platform with a fake process table; only
 //! the reading ([`crate::procs::rusage`]) and the timebase are macOS.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use std::sync::Mutex;
 
@@ -149,18 +152,24 @@ impl Meter {
 
     /// Records `now` as the latest reading of `pid`. A reading below the one before
     /// (less memory at the high-water mark, or less CPU) cannot be the same process: the
-    /// pid was reused, and the earlier process is kept apart.
+    /// pid was reused, and the earlier process is kept apart. A reading whose parent is
+    /// unknown (0: the table lookup lost the race with the process's exit) keeps the
+    /// parent the reading before gave.
     pub fn record(&mut self, pid: i32, now: Lifetime) {
-        let now = Seen {
+        let mut now = Seen {
             life: now,
             poll: self.polls,
         };
-        if let Some(before) = self.live.insert(pid, now)
-            && (now.life.max_footprint < before.life.max_footprint
-                || now.life.cpu() < before.life.cpu())
-        {
-            self.retired.push((pid, before));
+        if let Some(before) = self.live.get(&pid).copied() {
+            if now.life.max_footprint < before.life.max_footprint
+                || now.life.cpu() < before.life.cpu()
+            {
+                self.retired.push((pid, before));
+            } else if now.life.ppid == 0 {
+                now.life.ppid = before.life.ppid;
+            }
         }
+        self.live.insert(pid, now);
     }
 
     /// Records that the lease's leader, `leader`, was reaped with `total`: its own CPU and
@@ -175,6 +184,37 @@ impl Meter {
         });
     }
 
+    /// The pids read at poll `last` that the leader's chain cannot reap, once the leader
+    /// is known: those whose parent, as that very poll read it, is neither the leader nor
+    /// a process of the same poll, and everything below them. They were alive at the
+    /// poll, so the parent is not stale; a parent of 0 (unknown) is taken to be in the
+    /// chain. Empty without a leader.
+    fn orphans_at(&self, last: u64, leader: Option<i32>) -> BTreeSet<i32> {
+        let Some(leader) = leader else {
+            return BTreeSet::new();
+        };
+        let at_last: BTreeMap<i32, i32> = self
+            .live
+            .iter()
+            .chain(self.retired.iter().map(|(p, s)| (p, s)))
+            .filter(|(_, s)| s.poll == last)
+            .map(|(&pid, s)| (pid, s.life.ppid))
+            .collect();
+        let mut orphans = BTreeSet::new();
+        loop {
+            let before = orphans.len();
+            for (&pid, &ppid) in &at_last {
+                let outside = ppid != 0 && ppid != leader && !at_last.contains_key(&ppid);
+                if pid != leader && (outside || orphans.contains(&ppid)) {
+                    orphans.insert(pid);
+                }
+            }
+            if orphans.len() == before {
+                return orphans;
+            }
+        }
+    }
+
     /// The usage to report after `wall`, with `timebase` (numerator, denominator) turning
     /// mach ticks into nanoseconds. Peak and CPU are absent when no process was ever read.
     ///
@@ -183,14 +223,21 @@ impl Meter {
     ///   chain of parents reaped, the leader's last tick and all the children that ran
     ///   and exited between two polls; exact for those.
     /// - `alive`: the CPU, own and reaped children's, of the processes the last poll before
-    ///   the reap read. Each is a lower bound of the same CPU `reaped` counts when the
-    ///   leader's chain reaped them, so the larger of the two is taken, never the sum (a
-    ///   killed leader's children may or may not have been reaped into `reaped`). With no
-    ///   reap, that last poll is the last one made.
-    /// - `orphans`: the last reading of a process that left before that poll and whose
-    ///   parent no poll saw: reparented to the system, its CPU is in nobody's reaped total.
-    ///   A process whose parent was polled is taken to be inside the parent's reaped
-    ///   children (and so in `reaped`), so it is not added again.
+    ///   the reap read, but not the orphans (below). Each is a lower bound of the same CPU
+    ///   `reaped` counts when the leader's chain reaped them, so the larger of the two is
+    ///   taken, never the sum (a killed leader's children may or may not have been reaped
+    ///   into `reaped`). With no reap, that last poll is the last one made.
+    /// - `orphans`: a process whose parent is no process of the lease: reparented to the
+    ///   system, its CPU is in nobody's reaped total, so it is added to the larger of the
+    ///   two, once. Two kinds. One alive at the last poll before the reap whose parent,
+    ///   as that poll read it (so not stale), is neither the leader nor a process of that
+    ///   poll, with everything below it. One that left before that poll, last read with a
+    ///   parent no poll saw. A process that left before that poll under a parent some
+    ///   poll saw is taken to be inside the parent's reaped children (and so in `reaped`),
+    ///   not added again. That reading of the parent can be stale: if the parent exited
+    ///   and the child outlived it within one poll interval, the child's CPU is in no total
+    ///   and nothing a poll saw tells it from a child reaped by its parent first (the
+    ///   other way round would add every short-lived child on top of `reaped`).
     /// - `after`: the processes last read after the reap: alive when the leader was gone,
     ///   so in no reaped total.
     #[must_use]
@@ -214,15 +261,19 @@ impl Meter {
 
         let last = self.reap.map_or(self.polls, |r| r.after_poll);
         let leader = self.reap.map(|r| r.leader);
-        let polled: std::collections::BTreeSet<i32> =
-            all().map(|(&pid, _)| pid).chain(leader).collect();
+        let polled: BTreeSet<i32> = all().map(|(&pid, _)| pid).chain(leader).collect();
+        let orphans = self.orphans_at(last, leader);
         let (mut alive, mut extra) = ((0_u64, 0_u64), (0_u64, 0_u64));
         for (&pid, seen) in all() {
             let (user, system) = seen.life.split();
             let into = if seen.poll > last {
                 &mut extra
             } else if seen.poll == last {
-                &mut alive
+                if orphans.contains(&pid) {
+                    &mut extra
+                } else {
+                    &mut alive
+                }
             } else if Some(pid) == leader || polled.contains(&seen.life.ppid) {
                 continue;
             } else {
