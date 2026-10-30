@@ -609,11 +609,10 @@ async fn only_post_reaches_batch_and_only_batch_takes_a_post() {
         .await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     assert_eq!(rig.source.total_reads(), 0);
-    assert!(
-        MAX_BATCH_REQUEST_BYTES >= BATCH_MAX_DIGESTS * 100,
-        "256 digests fit"
-    );
 }
+
+/// The largest request body (256 digests of at most 100 bytes each) fits the bound on a body.
+const _: () = assert!(MAX_BATCH_REQUEST_BYTES >= BATCH_MAX_DIGESTS * 100);
 
 /// Catches: batches counted under the wrong outcome, blobs counted under the wrong status,
 /// bytes served not counting the batch's, and GET's counters moving for a batch.
