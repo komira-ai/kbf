@@ -134,7 +134,7 @@ mod tests {
                 result
                     .passes
                     .iter()
-                    .all(|p| p.requests == 4 && p.failures == 0)
+                    .all(|p| (p.requests, p.failures) == (4, 0))
             );
             assert!(result.passes[1].percentiles.is_some());
         }
@@ -157,13 +157,13 @@ mod tests {
             .map(|l| l.split(',').collect())
             .collect();
         assert_eq!(rows.len(), 24);
-        assert!(rows.iter().all(|r| r[8] == "put" && r[9] == "4096"));
+        assert!(rows.iter().all(|r| (r[8], r[9]) == ("put", "4096")));
         let by_role = |role: &str| rows.iter().filter(|r| r[7] == role).count();
         assert_eq!((by_role("cold"), by_role("instance")), (16, 8));
         let sent = testkit::requests(dir.path());
         assert!(
             sent.iter()
-                .any(|r| r.role == Role::Instance && r.method == "POST")
+                .any(|r| (r.role, r.method.as_str()) == (Role::Instance, "POST"))
         );
         assert!(sent.iter().all(|r| r.bucket == "kbf-fake"));
     }

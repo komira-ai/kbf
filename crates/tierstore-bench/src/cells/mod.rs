@@ -196,10 +196,8 @@ mod tests {
             (CellId::A1, "a1"),
         ] {
             let err = run(id, &bare, &plan).await.unwrap_err();
-            assert!(
-                matches!(&err, BenchError::Setup(m) if m.starts_with(name)),
-                "{name}: {err}"
-            );
+            assert!(matches!(err, BenchError::Setup(_)), "{name}: {err}");
+            assert!(err.to_string().starts_with(name), "{name}: {err}");
         }
         let instance = [(Role::Instance, "http://127.0.0.1:9")];
         let only_instance = testkit::ctx(dir.path(), &instance, Window::Busy);

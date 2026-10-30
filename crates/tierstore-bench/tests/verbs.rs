@@ -76,6 +76,20 @@ async fn the_run_makes_its_request_log_and_the_cell_says_what_it_needs() {
     assert!(out.join("requests.jsonl").is_file());
 }
 
+/// Catches the report verb not reaching its module: an empty result directory is a table with
+/// no cells, and a directory that is not there stops it.
+#[tokio::test]
+async fn the_report_verb_renders_a_directory_and_stops_on_a_missing_one() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-report-verb");
+    let there = dir.path().to_str().unwrap();
+    run(&["report", "--result-dir", there]).await.unwrap();
+    let absent = dir.path().join("absent");
+    let err = run(&["report", "--result-dir", absent.to_str().unwrap()])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BenchError::Io { .. }), "{err}");
+}
+
 /// Catches a result directory that cannot be made being ignored.
 #[tokio::test]
 async fn a_result_directory_that_cannot_be_made_stops_the_run() {

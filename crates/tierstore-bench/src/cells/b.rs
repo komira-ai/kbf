@@ -27,7 +27,7 @@ use crate::cells::content;
 use crate::cells::engine::{
     Arm, Cap, Charger, Env, LoadSource, Pace, ProcLoad, Step, hook, run_cell, slug, work,
 };
-use crate::cells::modes::{KIB, MIB};
+use crate::cells::modes::{KIB, MIB, width_ok};
 use crate::cells::putcell::size_label;
 use crate::cells::streamget::StreamGet;
 use crate::cells::{CellContext, CellId, CellPlan};
@@ -154,7 +154,7 @@ pub fn arms(env: &Env, plan: &CellPlan, limit: Option<u64>) -> Result<Vec<Arm>, 
     let read_instance = env.stream(Role::Instance, Cap::Hot)?;
     let mut out = Vec::new();
     for &size in &sizes {
-        for &in_flight in plan.in_flight.iter().filter(|&&n| n <= 16 || size <= MIB) {
+        for &in_flight in plan.in_flight.iter().filter(|&&n| width_ok(n, size)) {
             let objects = objects_for(size).min(limit.unwrap_or(u64::MAX));
             let label = slug(&format!("{}-c{in_flight}", size_label(size)));
             let misses = Arc::new(Misses {
@@ -313,21 +313,22 @@ mod tests {
                 result
                     .passes
                     .iter()
-                    .all(|p| p.requests == 3 && p.failures == 0),
+                    .all(|p| (p.requests, p.failures) == (3, 0)),
                 "{}",
                 result.arm
             );
         }
         let stats = instance.stats();
         assert_eq!((stats.single_puts, stats.parts, stats.completed), (0, 6, 6));
-        assert!(instance.keys().is_empty() && cold.keys().is_empty());
+        assert!(instance.keys().is_empty());
+        assert!(cold.keys().is_empty());
         assert_eq!(
             std::fs::read_to_string(dir.path().join("ledger.json")).unwrap(),
             "{\"cold_written_bytes\":24576}"
         );
         let roles: std::collections::BTreeSet<String> = testkit::requests(dir.path())
             .iter()
-            .filter(|r| r.method == "GET" && r.bytes == 4096)
+            .filter(|r| (r.method.as_str(), r.bytes) == ("GET", 4096))
             .map(|r| r.role.to_string())
             .collect();
         assert_eq!(roles.into_iter().collect::<Vec<_>>(), ["cold", "instance"]);
@@ -362,7 +363,7 @@ mod tests {
             direct
                 .passes
                 .iter()
-                .all(|p| p.requests == 2 && p.failures == 2)
+                .all(|p| (p.requests, p.failures) == (2, 2))
         );
         let others = results.iter().filter(|r| !r.arm.ends_with(".cold-direct"));
         assert!(others.flat_map(|r| &r.passes).all(|p| p.failures == 0));

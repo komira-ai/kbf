@@ -44,6 +44,13 @@ pub enum Counts {
     BySize(&'static [(u64, u64)]),
 }
 
+/// Whether an arm of `in_flight` workers is run at `size`: up to 16 in flight at any size, more
+/// only up to 1 MiB (64 in flight of 128 MiB bodies is memory the generator does not have).
+#[must_use]
+pub fn width_ok(in_flight: u32, size: u64) -> bool {
+    in_flight <= 16 || size <= MIB
+}
+
 impl Mode {
     /// Whether the mode is run at `size`, `smallest` being the smallest of the run.
     #[must_use]
@@ -184,6 +191,16 @@ mod tests {
         assert!(!by_name("latency-50ms").wants(4096, 4096));
         assert!(by_name("refused").wants(4096, 4096));
         assert!(!by_name("refused").wants(MIB, 4096));
+    }
+
+    /// Catches a width allowed where it must not be: 16 in flight at any size, 64 only up to
+    /// 1 MiB.
+    #[test]
+    fn wide_arms_are_for_small_objects_only() {
+        assert!(width_ok(1, 128 * MIB));
+        assert!(width_ok(16, 128 * MIB));
+        assert!(width_ok(64, MIB));
+        assert!(!width_ok(64, MIB + 1));
     }
 
     /// Catches a count taken from the wrong place: the plan's function, a fixed count, and the

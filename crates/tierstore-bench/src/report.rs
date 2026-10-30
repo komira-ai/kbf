@@ -462,10 +462,8 @@ mod tests {
             quiet.contains("| 1 | 1000 | 1 (time to failure p50 7.00 ms, max 7.00 ms) |"),
             "{quiet}"
         );
-        assert!(
-            quiet.contains("500 us [") && quiet.contains("990 us ["),
-            "{quiet}"
-        );
+        assert!(quiet.contains("500 us ["), "{quiet}");
+        assert!(quiet.contains("990 us ["), "{quiet}");
         assert!(quiet.contains(", per-pass 990 us..990 us"), "{quiet}");
         assert!(!quiet.contains("9999"), "the warm-up is left out: {quiet}");
         assert!(quiet.contains("500.0 req/s, 0.49 MiB/s"), "{quiet}");
@@ -494,10 +492,8 @@ mod tests {
             line.contains("594 us ["),
             "the p99 of 1200 pooled quiet samples: {line}"
         );
-        assert!(
-            !line.contains("per-pass") && !line.contains("not claimed"),
-            "{line}"
-        );
+        assert!(!line.contains("per-pass"), "{line}");
+        assert!(!line.contains("not claimed"), "{line}");
 
         let thin = result("thin", vec![pass(1, Window::Quiet, 5, None)], &[]);
         let text = format_report(&[thin], &rows("thin", 1, &[100, 200, 300], "200"));

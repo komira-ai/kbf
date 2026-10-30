@@ -32,18 +32,26 @@ impl FileServer {
     /// # Errors
     /// [`BenchError::Setup`] if no port can be bound.
     pub async fn start(root: PathBuf) -> Result<Self, BenchError> {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .map_err(|e| BenchError::Setup(format!("file server: {e}")))?;
-        let addr = listener
-            .local_addr()
-            .map_err(|e| BenchError::Setup(format!("file server: {e}")))?;
+        Self::start_on(root, SocketAddr::from(([127, 0, 0, 1], 0))).await
+    }
+
+    /// Starts serving `root` on `addr`.
+    ///
+    /// # Errors
+    /// [`BenchError::Setup`] if `addr` cannot be bound.
+    pub async fn start_on(root: PathBuf, addr: SocketAddr) -> Result<Self, BenchError> {
+        let listener = TcpListener::bind(addr).await.map_err(unavailable)?;
+        let addr = listener.local_addr().map_err(unavailable)?;
         let connections = Arc::new(AtomicU64::new(0));
         let counted = connections.clone();
         let task = tokio::spawn(async move {
-            while let Ok((socket, _)) = listener.accept().await {
-                counted.fetch_add(1, Ordering::SeqCst);
-                tokio::spawn(serve(socket, root.clone()));
+            loop {
+                // An accept that fails (out of descriptors) is tried again after other tasks ran.
+                listener.accept().await.into_iter().for_each(|(socket, _)| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(serve(socket, root.clone()));
+                });
+                tokio::task::yield_now().await;
             }
         });
         Ok(Self {
@@ -69,6 +77,10 @@ impl FileServer {
     pub fn stop(&self) {
         self.task.abort();
     }
+}
+
+fn unavailable(e: std::io::Error) -> BenchError {
+    BenchError::Setup(format!("file server: {e}"))
 }
 
 /// The relative path a request line asks for, if it is `GET /<path> HTTP/1.x` and the path stays
@@ -220,5 +232,19 @@ mod tests {
         assert_eq!(again.bytes().await.unwrap().as_ref(), b"hello");
         assert_eq!(server.connections(), 2);
         server.stop();
+    }
+
+    /// Catches a port that cannot be bound being taken for a server: starting on an address that
+    /// is in use is a setup error.
+    #[tokio::test]
+    async fn an_address_in_use_is_a_setup_error() {
+        let dir = dir("tb-fileserver-busy");
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = taken.local_addr().unwrap();
+        let err = FileServer::start_on(dir.path().to_owned(), addr)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().starts_with("file server: "), "{err}");
     }
 }

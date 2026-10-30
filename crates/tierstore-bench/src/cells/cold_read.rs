@@ -31,7 +31,7 @@ use crate::cells::engine::{
     Arm, Cap, Charger, Env, FaultSwitch, Hook, LoadSource, Pace, ProcLoad, Step, hook, run_cell,
     slug, work,
 };
-use crate::cells::modes::{KIB, MIB, Mode, read_modes};
+use crate::cells::modes::{KIB, MIB, Mode, read_modes, width_ok};
 use crate::cells::putcell::size_label;
 use crate::cells::streamget::StreamGet;
 use crate::cells::{CellContext, CellId, CellPlan};
@@ -262,7 +262,7 @@ pub fn arms(
                     .map_or_else(|| plan.in_flight.clone(), |n| vec![n]);
                 let mut variants: Vec<(u32, Option<u64>)> = flights
                     .iter()
-                    .filter(|&&n| n <= 16 || size <= MIB)
+                    .filter(|&&n| width_ok(n, size))
                     .map(|&n| (n, None))
                     .collect();
                 if size >= RANGE_FROM && mode.in_flight.is_none() {
@@ -483,13 +483,14 @@ mod tests {
                 result
                     .passes
                     .iter()
-                    .all(|p| p.requests == 3 && p.failures == 0)
+                    .all(|p| (p.requests, p.failures) == (3, 0))
             );
         }
         let (c, i) = (cold.stats(), instance.stats());
         assert_eq!((c.single_puts, c.parts), (3, 0));
         assert_eq!((i.single_puts, i.parts, i.completed), (0, 3, 3));
-        assert!(cold.keys().is_empty() && instance.keys().is_empty());
+        assert!(cold.keys().is_empty());
+        assert!(instance.keys().is_empty());
         assert_eq!(
             std::fs::read_to_string(dir.path().join("ledger.json")).unwrap(),
             "{\"cold_written_bytes\":24576}"
@@ -508,7 +509,7 @@ mod tests {
         );
         let reads = testkit::requests(dir.path())
             .into_iter()
-            .filter(|r| r.method == "GET" && r.bytes == 4096)
+            .filter(|r| (r.method.as_str(), r.bytes) == ("GET", 4096))
             .count();
         assert_eq!(reads, 12);
     }
@@ -542,7 +543,7 @@ mod tests {
         assert!(
             results
                 .iter()
-                .all(|r| r.passes.iter().all(|p| p.failures == 0 && p.requests == 2))
+                .all(|r| r.passes.iter().all(|p| (p.failures, p.requests) == (0, 2)))
         );
         assert_eq!(results[2].passes[1].bytes, 2 * RANGE_LEN);
         assert_eq!(results[0].passes[1].bytes, 2 * 16 * MIB);
@@ -563,20 +564,20 @@ mod tests {
         let switch = Arc::new(SwitchLog::default());
         let results = run_with(
             &ctx,
-            &plan(&[1], &[MIB]),
+            &plan(&[1], &[4096, MIB]),
             Script::calm(),
             Some(switch.clone()),
             Some(2),
         )
         .await
         .unwrap();
-        assert_eq!(results.len(), 20);
+        assert_eq!(results.len(), 24);
         let note = "5 requests went through the fault proxy in the pass";
         let noted = results
             .iter()
             .filter(|r| r.notes.iter().any(|n| n.ends_with(note)))
             .count();
-        assert_eq!(noted, 20);
+        assert_eq!(noted, 24);
         let modes = switch.modes();
         assert_eq!(modes.last(), Some(&FaultMode::Pass));
         for mode in [
@@ -587,11 +588,70 @@ mod tests {
         ] {
             assert_eq!(modes.iter().filter(|m| **m == mode).count(), 4, "{mode:?}");
         }
-        assert!(cold.keys().is_empty() && instance.keys().is_empty());
+        assert!(cold.keys().is_empty());
+        assert!(instance.keys().is_empty());
         assert!(
             results
                 .iter()
-                .any(|r| r.arm == "instance-1mib-c6-blackhole")
+                .any(|r| r.arm == "instance-4kib-c6-blackhole")
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| r.arm == "instance-1mib-c1-latency-500ms")
+        );
+        assert!(
+            results
+                .iter()
+                .all(|r| r.arm != "instance-4kib-c1-latency-50ms")
+        );
+    }
+
+    /// Catches the rules of which arms exist drifting: 64 in flight not for 16 MiB objects, the
+    /// ranged arm made once per path for the large ones (and not for a fault that fixes its own
+    /// width), the modes of a fault proxy at the sizes they name.
+    #[test]
+    fn wide_arms_are_for_small_objects_and_the_ranged_arm_for_large_ones() {
+        let dir = temp("tb-cold-read-arms");
+        let stores = [
+            (Role::Cold, "http://127.0.0.1:9"),
+            (Role::Instance, "http://127.0.0.1:9"),
+        ];
+        let ctx = testkit::ctx(dir.path(), &stores, Window::Busy);
+        let env = Env::new(&ctx, Script::calm()).unwrap();
+        let labels = |arms: Vec<Arm>| {
+            let mut labels: Vec<String> = arms.into_iter().map(|a| a.label).collect();
+            labels.sort();
+            labels
+        };
+        let (arms, _) = arms(&env, &plan(&[1, 64], &[4096, 16 * MIB]), None, None).unwrap();
+        let direct: Vec<String> = labels(arms)
+            .into_iter()
+            .filter(|l| l.starts_with("direct"))
+            .collect();
+        assert_eq!(
+            direct,
+            [
+                "direct-16mib-c1-healthy",
+                "direct-16mib-range4kib-c1-healthy",
+                "direct-4kib-c1-healthy",
+                "direct-4kib-c64-healthy"
+            ]
+        );
+        let switch: Arc<dyn FaultSwitch> = Arc::new(SwitchLog::default());
+        let (arms, _) = self::arms(&env, &plan(&[1], &[16 * MIB]), Some(switch), None).unwrap();
+        let direct: Vec<String> = labels(arms)
+            .into_iter()
+            .filter(|l| l.starts_with("direct"))
+            .collect();
+        assert_eq!(
+            direct,
+            [
+                "direct-16mib-c1-proxy-pass",
+                "direct-16mib-c6-blackhole",
+                "direct-16mib-c6-refused",
+                "direct-16mib-range4kib-c1-proxy-pass"
+            ]
         );
     }
 

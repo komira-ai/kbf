@@ -443,9 +443,8 @@ fn cleanup(stored: Vec<Arc<Stored>>, server: FileServer, root: PathBuf) -> Hook 
         let state = state.clone();
         async move {
             let (stored, server, root) = &*state;
-            if let Some(server) = server.lock().unwrap_or_else(PoisonError::into_inner).take() {
-                server.stop();
-            }
+            let running = server.lock().unwrap_or_else(PoisonError::into_inner).take();
+            running.iter().for_each(FileServer::stop);
             let removed = std::fs::remove_dir_all(root).is_ok();
             let (mut deleted, mut total) = (0, 0);
             for set in stored {
@@ -668,7 +667,7 @@ mod tests {
                 result
                     .passes
                     .iter()
-                    .all(|p| p.requests == 5 && p.failures == 0),
+                    .all(|p| (p.requests, p.failures) == (5, 0)),
                 "{}",
                 result.arm
             );

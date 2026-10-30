@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::cells::content;
 use crate::cells::engine::{Arm, Cap, Env, FaultSwitch, Pace, Step, hook, slug, work};
-use crate::cells::modes::{Mode, put_modes};
+use crate::cells::modes::{Mode, put_modes, width_ok};
 use crate::cells::{CellId, CellPlan};
 use crate::error::BenchError;
 use crate::proxy::FaultMode;
@@ -184,7 +184,7 @@ pub fn arms(
                 let flights: Vec<u32> = mode
                     .in_flight
                     .map_or_else(|| plan.in_flight.clone(), |n| vec![n]);
-                for &in_flight in flights.iter().filter(|&&n| n <= 16 || size <= MIB) {
+                for &in_flight in flights.iter().filter(|&&n| width_ok(n, size)) {
                     let requests = mode
                         .requests(size, in_flight, requests_for)
                         .min(limit.unwrap_or(u64::MAX));
@@ -407,7 +407,8 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("open loop: 20 puts per second for 600 s"))
         );
-        assert!(arms.iter().all(|a| a.before.is_none() && a.after.is_some()));
+        assert!(arms.iter().all(|a| a.before.is_none()));
+        assert!(arms.iter().all(|a| a.after.is_some()));
     }
 
     /// Catches a 1 MiB open loop at the wrong rate, and a limit that does not cap the count of a
@@ -429,9 +430,8 @@ mod tests {
             (open.label.as_str(), open.requests),
             ("instance-1mib-open10-healthy", 3000)
         );
-        assert!(
-            open.notes[0].contains("through the instance") && open.notes[0].contains("two-tier")
-        );
+        assert!(open.notes[0].contains("through the instance"));
+        assert!(open.notes[0].contains("two-tier"));
         let capped = self::arms(
             &env,
             CellId::ColdPut,
@@ -500,7 +500,8 @@ mod tests {
             .into_iter()
             .collect::<Vec<_>>()
         );
-        assert!(arms.iter().all(|a| a.before.is_some() && a.after.is_some()));
+        assert!(arms.iter().all(|a| a.before.is_some()));
+        assert!(arms.iter().all(|a| a.after.is_some()));
         let slow = arms
             .iter()
             .find(|a| a.label.contains("latency-50ms"))

@@ -36,7 +36,7 @@ use crate::cells::engine::{
     Arm, Cap, Env, FaultSwitch, LoadSource, Pace, ProcLoad, Step, hook, micros, run_cell, slug,
     work,
 };
-use crate::cells::modes::MIB;
+use crate::cells::modes::{MIB, width_ok};
 use crate::cells::putcell::size_label;
 use crate::cells::{CellContext, CellId, CellPlan};
 use crate::error::BenchError;
@@ -253,7 +253,7 @@ pub fn arms(
     let mut out = Vec::new();
     for (mode, fault) in modes {
         for &size in &sizes {
-            for &in_flight in plan.in_flight.iter().filter(|&&n| n <= 16 || size <= MIB) {
+            for &in_flight in plan.in_flight.iter().filter(|&&n| width_ok(n, size)) {
                 let count = burst_for(size).min(limit.unwrap_or(u64::MAX));
                 let label = slug(&format!("{count}x{}-c{in_flight}-{mode}", size_label(size)));
                 let burst = Arc::new(Burst {
@@ -478,7 +478,7 @@ mod tests {
         );
         let lists = testkit::requests(dir.path())
             .iter()
-            .filter(|r| r.method == "GET" && r.role == Role::Cold)
+            .filter(|r| (r.method.as_str(), r.role) == ("GET", Role::Cold))
             .count();
         assert!(lists >= 4, "every poll is two pages at least: {lists}");
     }
@@ -512,7 +512,7 @@ mod tests {
             result
                 .passes
                 .iter()
-                .all(|p| p.requests == 3 && p.failures == 3 && p.percentiles.is_none())
+                .all(|p| (p.requests, p.failures, p.percentiles) == (3, 3, None))
         );
         assert!(
             result
@@ -526,7 +526,8 @@ mod tests {
                 .iter()
                 .any(|n| n.ends_with("1 objects deleted from the cold bucket"))
         );
-        assert!(instance.keys().is_empty() && cold.keys().is_empty());
+        assert!(instance.keys().is_empty());
+        assert!(cold.keys().is_empty());
         let samples = std::fs::read_to_string(dir.path().join("samples.csv")).unwrap();
         assert!(samples.lines().skip(1).all(|l| l.ends_with(',')));
     }
@@ -587,7 +588,7 @@ mod tests {
             results[0]
                 .passes
                 .iter()
-                .all(|p| p.requests == 2 && p.failures == 2)
+                .all(|p| (p.requests, p.failures) == (2, 2))
         );
     }
 

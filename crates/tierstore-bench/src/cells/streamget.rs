@@ -419,7 +419,8 @@ mod tests {
         let missing = get.get("k/none", None).await.unwrap();
         assert_eq!(missing.error, Some("not-found"));
         assert_eq!(missing.status, Some(404));
-        assert!(missing.ttfb.is_none() && !missing.is_ok());
+        assert!(missing.ttfb.is_none());
+        assert!(!missing.is_ok());
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead = format!("http://{}", listener.local_addr().unwrap());
@@ -485,5 +486,12 @@ mod tests {
             get.get("a//b", None).await,
             Err(BenchError::Key(_))
         ));
+        let portless = StreamGet::new(
+            Role::Cold,
+            &spec("http://127.0.0.1"),
+            Timeouts::default(),
+            log(),
+        );
+        assert!(portless.is_ok());
     }
 }

@@ -131,7 +131,8 @@ mod tests {
     fn the_bootstrap_interval_brackets_the_median_and_repeats() {
         let values: Vec<u64> = (1..=500).collect();
         let (low, high) = bootstrap_ci(&values, 50, 1).unwrap();
-        assert!(low <= 250 && 250 <= high, "{low}..{high}");
+        assert!(low <= 250, "{low}..{high}");
+        assert!(250 <= high, "{low}..{high}");
         assert!(low < high);
         assert_eq!(bootstrap_ci(&values, 50, 1), Some((low, high)));
         assert_eq!(bootstrap_ci(&[], 50, 1), None);

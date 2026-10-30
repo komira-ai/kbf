@@ -517,7 +517,8 @@ async fn drive(env: &Env, arm: &Arm, pass: u32) -> Result<Driven, BenchError> {
     while let Some(result) = rx.recv().await {
         steps.extend(result?);
         done += 1;
-        if done.is_multiple_of(every) && trip.is_none() {
+        // `&`: both are plain reads of a number and an option.
+        if done.is_multiple_of(every) & trip.is_none() {
             trip = env.gate()?;
             stop.store(trip.is_some(), Ordering::SeqCst);
         }
@@ -834,20 +835,21 @@ mod tests {
         assert!(
             passes
                 .iter()
-                .all(|p| p.requests == 10 && p.failures == 0 && p.bytes == 100)
+                .all(|p| (p.requests, p.failures, p.bytes) == (10, 0, 100))
         );
         assert!(
             passes
                 .iter()
-                .all(|p| p.window == Window::Quiet && p.gate_tripped.is_none())
+                .all(|p| (p.window, p.gate_tripped.as_deref()) == (Window::Quiet, None))
         );
         let p = passes[1].percentiles.unwrap();
         assert_eq!((p.p50_us, p.max_us, p.p99_us), (104, 109, None));
         let rows = csv_rows(dir.path());
         assert_eq!(rows.len(), 30);
         assert!(
-            rows.iter()
-                .all(|r| r[3] == "cold-put" && r[4] == "a" && r[6] == "quiet")
+            rows.iter().all(
+                |r| (r[3].as_str(), r[4].as_str(), r[6].as_str()) == ("cold-put", "a", "quiet")
+            )
         );
         assert!(
             rows.iter()
@@ -873,7 +875,8 @@ mod tests {
             notes[1].ends_with("pass 0: a b; pass 1: b a; pass 2: a b"),
             "{notes:?}"
         );
-        assert!(dir.path().join("g-a.json").exists() && dir.path().join("g-b.json").exists());
+        assert!(dir.path().join("g-a.json").exists());
+        assert!(dir.path().join("g-b.json").exists());
         assert!(results[1].passes.iter().all(|p| p.window == Window::Busy));
     }
 
@@ -935,9 +938,10 @@ mod tests {
         let err = run_cell(&env, CellId::ColdPut, vec![arm("a", 4, 2, &seen)], 2, None)
             .await
             .unwrap_err();
-        assert!(
-            matches!(&err, BenchError::Gate(t) if t.metric == "loadavg_1m"),
-            "{err}"
+        assert!(matches!(err, BenchError::Gate(_)), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "load gate: loadavg_1m is 99, over the limit 8"
         );
         assert!(seen.lock().unwrap().is_empty());
         assert_eq!(csv_rows(dir.path()).len(), 0);
@@ -971,15 +975,17 @@ mod tests {
         let err = run_cell(&env, CellId::ColdPut, vec![a], 3, None)
             .await
             .unwrap_err();
-        assert!(
-            matches!(&err, BenchError::Gate(t) if t.metric == "loadavg_1m"),
-            "{err}"
+        assert!(matches!(err, BenchError::Gate(_)), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "load gate: loadavg_1m is 99, over the limit 8"
         );
         let written = std::fs::read_to_string(dir.path().join("cold-put-a.json")).unwrap();
         let result = CellResult::from_json(&written).unwrap();
         assert_eq!(result.passes.len(), 1);
         let pass = &result.passes[0];
-        assert!(pass.requests < 8 && pass.requests >= 4, "{}", pass.requests);
+        assert!(pass.requests < 8, "{}", pass.requests);
+        assert!(pass.requests >= 4, "{}", pass.requests);
         assert_eq!(pass.window, Window::Busy);
         assert_eq!(after_ran.load(Ordering::SeqCst), 1);
         assert!(csv_rows(dir.path()).iter().all(|r| r[6] == "busy"));
