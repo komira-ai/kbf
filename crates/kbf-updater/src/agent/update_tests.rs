@@ -689,3 +689,34 @@ fn a_node_that_cannot_be_read_stops_the_update_before_the_drain() {
     );
     assert!(rig.logged("could not be drained"));
 }
+
+/// A restart with B on trial reads the node as the first run does: one an operator drained is
+/// finished the same way and left out, with the log saying so; one in placement is given back.
+///
+/// Catches: a resume that takes every node for the updater's own and uncordons an operator's.
+#[test]
+fn a_restart_in_the_middle_does_not_give_back_a_node_an_operator_drained() {
+    for (out, undrains) in [(true, 0), (false, 1)] {
+        let rig = Rig::new();
+        {
+            let mut world = rig.local.world();
+            world.state.version = Some(version(VB));
+            world.state.commit = Some(COMMIT_B.to_owned());
+            world.state.pending = Some(Trial {
+                version: Some(version(VB)),
+                commit: COMMIT_B.to_owned(),
+                deadline_unix: Some(NOW + 400),
+            });
+            world.before = Some(version(VA));
+        }
+        if out {
+            rig.drain.out_of_placement();
+        } else {
+            *rig.drain.drained.lock().unwrap() = true;
+        }
+        assert_eq!(rig.run(VB), succeeded(VB));
+        assert_eq!(rig.events.count("undrain"), undrains, "out: {out}");
+        assert_eq!(rig.events.count("drain "), 0, "out: {out}");
+        assert_eq!(rig.logged(LEFT_OUT), out, "out: {out}");
+    }
+}

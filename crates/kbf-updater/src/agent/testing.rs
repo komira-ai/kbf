@@ -308,6 +308,83 @@ impl Drain for FakeDrain {
     }
 }
 
+/// A node as the frontend keeps it: serving until drained, serving again when uncordoned.
+/// Unlike [`FakeDrain`], what it says of its placement follows what was done to it.
+#[derive(Clone)]
+pub struct ServingNode {
+    pub serving: Arc<Mutex<bool>>,
+    /// The leases it holds; they run on while it is drained.
+    pub leases: Arc<Mutex<usize>>,
+    pub drain_error: Arc<Mutex<Option<PortError>>>,
+    pub undrain_error: Arc<Mutex<Option<PortError>>>,
+    /// How many drain calls reached it.
+    pub drain_calls: Arc<Mutex<usize>>,
+    /// A directory to look into whenever a drain call arrives, and whether it held anything.
+    pub watch: Arc<Mutex<Option<std::path::PathBuf>>>,
+    pub seen_at_drain: Arc<Mutex<Option<bool>>>,
+}
+
+impl ServingNode {
+    pub fn new() -> Self {
+        Self {
+            serving: Arc::new(Mutex::new(true)),
+            leases: Arc::default(),
+            drain_error: Arc::default(),
+            undrain_error: Arc::default(),
+            drain_calls: Arc::default(),
+            watch: Arc::default(),
+            seen_at_drain: Arc::default(),
+        }
+    }
+
+    /// An operator cordons and drains it.
+    pub fn operator_drains(&self) {
+        *lock(&self.serving) = false;
+    }
+
+    pub fn is_serving(&self) -> bool {
+        *lock(&self.serving)
+    }
+}
+
+impl Drain for ServingNode {
+    fn placed(&self, _host: &Host) -> Result<Placed, PortError> {
+        Ok(if self.is_serving() {
+            Placed::In
+        } else {
+            Placed::Out
+        })
+    }
+
+    fn drain(&self, _host: &Host, _deadline: Option<Duration>) -> Result<(), PortError> {
+        *lock(&self.drain_calls) += 1;
+        if let Some(dir) = lock(&self.watch).clone() {
+            let held = std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some());
+            *lock(&self.seen_at_drain) = Some(held);
+        }
+        if let Some(e) = lock(&self.drain_error).clone() {
+            return Err(e);
+        }
+        *lock(&self.serving) = false;
+        Ok(())
+    }
+
+    fn leases(&self, _host: &Host) -> Result<usize, PortError> {
+        if self.is_serving() {
+            return Err(PortError::other("serving again"));
+        }
+        Ok(*lock(&self.leases))
+    }
+
+    fn undrain(&self, _host: &Host) -> Result<(), PortError> {
+        if let Some(e) = lock(&self.undrain_error).clone() {
+            return Err(e);
+        }
+        *lock(&self.serving) = true;
+        Ok(())
+    }
+}
+
 /// The answers a health check gives for a version, in turn.
 pub type Answers = VecDeque<Result<Health, PortError>>;
 
