@@ -7,6 +7,7 @@ use std::time::Duration;
 use super::config::{File, from_text, settings_from_text};
 use super::config_cache::{CacheSettings, Rate};
 use super::config_testing::{DEFAULTS, GOLDEN};
+use super::endpoints::EndpointsConfig;
 use super::local_cache::{FILL_CHUNK, WHOLE_FILL_LIMIT};
 
 /// A build node's file with every key given a value that is not the default.
@@ -44,6 +45,8 @@ bucket           = "tierstore"
 endpoint         = "http://192.0.2.20:9300"
 region           = "us-west-2"
 credentials_file = "/etc/tierstore-cache/upstream-read.key"
+unready_backoff  = "750ms"
+readyz_interval  = "1500ms"
 
 [[policy]]
 prefix = "cas/b/"
@@ -156,6 +159,10 @@ fn a_build_node_file_makes_a_cache() {
         Some(Path::new("/etc/tierstore-cache/upstream-read.key"))
     );
     assert_eq!(cache.scrub_rate, Some(50 << 20));
+    assert_eq!(cache.endpoints, ["http://192.0.2.20:9300"]);
+    let failover = cache.failover;
+    assert_eq!(failover.unready_backoff, Duration::from_millis(750));
+    assert_eq!(failover.readyz_interval, Duration::from_millis(1500));
 
     let why = from_text(CACHE, DEFAULTS).unwrap_err().to_string();
     assert!(why.contains("no flag form"), "{why}");
@@ -188,6 +195,21 @@ fn a_build_node_file_has_the_defaults_of_the_flags_and_of_the_cache() {
     assert_eq!(cache.s3_request_timeout, Duration::from_secs(60));
     assert_eq!(cache.scrub_rate, None);
     assert_eq!(cache.upstream.spec, "memory");
+    assert!(cache.endpoints.is_empty());
+    assert_eq!(cache.failover, EndpointsConfig::default());
+}
+
+/// Asserts that an S3 upstream without the timing keys fails over with 5 seconds of backoff and
+/// a poll every 2 seconds, and keeps the one `endpoint` as the one endpoint.
+#[test]
+fn an_s3_upstream_has_the_default_failover() {
+    let text = CACHE
+        .replacen("unready_backoff  = \"750ms\"\n", "", 1)
+        .replacen("readyz_interval  = \"1500ms\"\n", "", 1);
+    let cache = cache_of(&text);
+    assert_eq!(cache.failover.unready_backoff, Duration::from_secs(5));
+    assert_eq!(cache.failover.readyz_interval, Duration::from_secs(2));
+    assert_eq!(cache.endpoints, ["http://192.0.2.20:9300"]);
 }
 
 /// Asserts that a single `endpoints` entry is the upstream, as `endpoint` is.
@@ -202,6 +224,31 @@ fn a_list_of_one_endpoint_is_the_upstream() {
         cache.upstream.endpoint.as_deref(),
         Some("http://192.0.2.21:9300")
     );
+    assert_eq!(cache.endpoints, ["http://192.0.2.21:9300"]);
+}
+
+/// Asserts that a list of endpoints is kept in the order of the file, the first is the
+/// upstream's `endpoint`, an IPv6 address and a name with no port are accepted, and the greatest
+/// list is 16.
+#[test]
+fn a_list_of_endpoints_is_kept_in_order() {
+    let list = r#"endpoints        = ["http://192.0.2.23:9300", "http://[2001:db8::1]:9300", "http://proxy-a.example", "http://192.0.2.21:9300"]"#;
+    let text = cache_with("endpoint         = \"http://192.0.2.20:9300\"", list);
+    let cache = cache_of(&text);
+    let want = [
+        "http://192.0.2.23:9300",
+        "http://[2001:db8::1]:9300",
+        "http://proxy-a.example",
+        "http://192.0.2.21:9300",
+    ];
+    assert_eq!(cache.endpoints, want);
+    assert_eq!(cache.upstream.endpoint.as_deref(), Some(want[0]));
+    let many: Vec<String> = (1..=16)
+        .map(|n| format!("\"http://192.0.2.{n}:9300\""))
+        .collect();
+    let line = format!("endpoints = [{}]", many.join(", "));
+    let text = cache_with("endpoint         = \"http://192.0.2.20:9300\"", &line);
+    assert_eq!(cache_of(&text).endpoints.len(), 16);
 }
 
 /// Asserts each refusal of a build node's file, each naming the key and what is wrong, and none
@@ -220,6 +267,10 @@ fn a_build_node_file_is_refused_when_it_cannot_be_run() {
         "prefix = \"cas/d/\"\ncache  = false",
         1,
     );
+    let (head, tail) = CACHE.split_once("[cold_store]").unwrap();
+    let policies = tail.split_once("[[policy]]").unwrap().1;
+    let memory = "[cold_store]\nkind = \"memory\"\nunready_backoff = \"1s\"\n\n[[policy]]";
+    let timing_on_memory = format!("{head}{memory}{policies}");
     let cases = [
         (
             cache_with(
@@ -295,17 +346,54 @@ fn a_build_node_file_is_refused_when_it_cannot_be_run() {
         (
             cache_with(
                 "endpoint         = \"http://192.0.2.20:9300\"",
-                "endpoints = [\"http://a:1\", \"http://b:2\"]",
+                "endpoints = []",
             ),
-            "give exactly one endpoint",
+            "give 1 to 16 endpoints",
         ),
         (
             cache_with(
                 "endpoint         = \"http://192.0.2.20:9300\"",
-                "endpoints = []",
+                &format!("endpoints = [{}]", vec!["\"http://a:1\""; 17].join(", ")),
             ),
-            "give exactly one endpoint",
+            "give 1 to 16 endpoints",
         ),
+        (
+            cache_with(
+                "endpoint         = \"http://192.0.2.20:9300\"",
+                "endpoints = [\"http://a:1\", \"ftp://b:2\"]",
+            ),
+            "cold_store.endpoints[1]: not an endpoint",
+        ),
+        (
+            cache_with(
+                "endpoint         = \"http://192.0.2.20:9300\"",
+                "endpoints = [\"http://a:1\", \"http://b:2/path\"]",
+            ),
+            "cold_store.endpoints[1]: not an endpoint",
+        ),
+        (
+            cache_with(
+                "endpoint         = \"http://192.0.2.20:9300\"",
+                "endpoints = [\"http://a:1\", \"http://b:2\", \"http://a:1\"]",
+            ),
+            "cold_store.endpoints[2]: is given twice",
+        ),
+        (
+            cache_with(
+                "endpoint         = \"http://192.0.2.20:9300\"",
+                "endpoint         = \"http://user@192.0.2.20:9300\"",
+            ),
+            "cold_store.endpoint: not an endpoint",
+        ),
+        (
+            cache_with("\"750ms\"", "\"0s\""),
+            "cold_store.unready_backoff: must be longer than zero",
+        ),
+        (
+            cache_with("\"1500ms\"", "\"61m\""),
+            "cold_store.readyz_interval: must be longer than zero and at most 1h",
+        ),
+        (timing_on_memory, "only for kind \"s3\""),
         (
             cache_with(
                 "credentials_file = ",
@@ -386,7 +474,8 @@ fn the_water_marks_are_judged_at_their_edges() {
 }
 
 /// Asserts that a storage node refuses what only a build node has: a list of endpoints in either
-/// tier, and a policy that asks for a cache, with the reason.
+/// tier, the two timing keys of the failover in either tier, and a policy that asks for a cache,
+/// with the reason.
 #[test]
 fn a_storage_node_refuses_a_list_of_endpoints_and_a_cache_policy() {
     let hot = GOLDEN.replacen(
@@ -399,6 +488,19 @@ fn a_storage_node_refuses_a_list_of_endpoints_and_a_cache_policy() {
         let why = refusal(&text);
         assert!(why.contains(key), "{why}");
         assert!(why.contains("build node"), "{why}");
+    }
+    for key in ["unready_backoff", "readyz_interval"] {
+        let hot = GOLDEN.replacen(
+            "[hot_store]\n",
+            &format!("[hot_store]\n{key} = \"1s\"\n"),
+            1,
+        );
+        let cold = format!("{GOLDEN}{key} = \"1s\"\n");
+        for (text, table) in [(hot, "hot_store"), (cold, "cold_store")] {
+            let why = refusal(&text);
+            assert!(why.contains(&format!("{table}.{key}")), "{why}");
+            assert!(why.contains("build node"), "{why}");
+        }
     }
     let policy = format!("{GOLDEN}\n[[policy]]\nprefix = \"a/\"\ncache = true\n");
     let why = refusal(&policy);

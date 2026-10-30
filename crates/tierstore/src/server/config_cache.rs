@@ -31,10 +31,17 @@
 //!
 //! The file is read into a [`CacheSettings`]. It has no flag form. What it refuses, besides what
 //! every file does: a `[hot_store]` along with `[local_cache]`, a layout that is not `digest-v1`,
-//! `cache = false`, marks out of order, no `[[policy]]` with `cache = true`, a list of more than
-//! one `endpoints` in `[cold_store]` (the cache reads from one upstream), and the keys of the
-//! storage node that do nothing here: `skip_checks`, the reconciler's keys and
-//! `backend_check_wait`.
+//! `cache = false`, marks out of order, no `[[policy]]` with `cache = true`, an `endpoints` list
+//! of none or more than 16, or with an entry that is not `http://host[:port]` (no path, user or
+//! query) or that is given twice, and the keys of the storage node that do nothing here:
+//! `skip_checks`, the reconciler's keys and `backend_check_wait`.
+//!
+//! `[cold_store]` names the upstream by `endpoint` or by `endpoints`, a list of 1 to 16 storage
+//! proxies over the same store; the cache tries them in an order that depends on the key (see
+//! [`endpoints`](super::endpoints)). Two keys of an S3 upstream set the failover:
+//! `unready_backoff` (how long an endpoint that failed is skipped, default `5s`) and
+//! `readyz_interval` (the time between two polls of every endpoint's `/readyz`, default `2s`),
+//! each longer than zero and at most `1h`.
 
 use std::fmt;
 use std::time::Duration;
@@ -43,8 +50,11 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::config::{
-    ConfigError, PerRun, Policy, ServerTable, Size, TierParts, TierTable, check_policies, front_of,
-    invalid, parse_size, refuse, refuse_hot_keys, require, tier, within,
+    ConfigError, Dur, PerRun, Policy, ServerTable, Size, TierParts, TierTable, check_policies,
+    duration, front_of, invalid, parse_size, refuse, refuse_hot_keys, require, tier, within,
+};
+use super::endpoints::{
+    DEFAULT_READYZ_INTERVAL, DEFAULT_UNREADY_BACKOFF, EndpointsConfig, MAX_ENDPOINTS, authority,
 };
 use super::front::FrontSettings;
 use super::local_cache::CacheConfig;
@@ -126,33 +136,68 @@ pub(super) struct CacheSettings {
     pub front: FrontSettings,
     /// The limit on a request to an S3 upstream.
     pub s3_request_timeout: Duration,
-    /// The upstream: the spec and the flags of an S3 bucket.
+    /// The upstream: the spec and the flags of an S3 bucket. Its `endpoint` is the first of
+    /// `endpoints`.
     pub upstream: TierParts,
+    /// The endpoints of an S3 upstream, in the order of the file: one for `endpoint`, none for
+    /// an upstream that is not S3.
+    pub endpoints: Vec<String>,
+    /// How the endpoints fail over.
+    pub failover: EndpointsConfig,
     /// The cache.
     pub cache: CacheConfig,
     /// The rate at which a scrubber would run, in bytes a second, if the file gave one.
     pub scrub_rate: Option<u64>,
 }
 
-/// The `endpoint` of the upstream: `endpoint`, or the one entry of `endpoints`.
-fn upstream_table(mut cold: TierTable) -> Result<TierTable, ConfigError> {
+/// The table of the upstream with its `endpoint` set to the first of its `endpoints` (if it has
+/// a list), and the endpoints it names, in order.
+fn upstream_table(mut cold: TierTable) -> Result<(TierTable, Vec<String>), ConfigError> {
     let Some(list) = cold.endpoints.take() else {
-        return Ok(cold);
+        let single = cold.endpoint.iter().cloned().collect();
+        return Ok((cold, single));
     };
     if cold.endpoint.is_some() {
         let why = "give endpoint or endpoints, not both";
         return Err(invalid("cold_store.endpoints", why));
     }
-    match <[String; 1]>::try_from(list) {
-        Ok([only]) => {
-            cold.endpoint = Some(only);
-            Ok(cold)
+    if list.is_empty() || list.len() > MAX_ENDPOINTS {
+        let why = format!("give 1 to {MAX_ENDPOINTS} endpoints");
+        return Err(invalid("cold_store.endpoints", why));
+    }
+    cold.endpoint = list.first().cloned();
+    Ok((cold, list))
+}
+
+/// Refuses an endpoint of an S3 upstream that is not `http://host[:port]`, and one that is
+/// given twice (the second would only take keys from the first). `listed` says whether the file
+/// gave a list, which names the key in the refusal.
+fn check_endpoints(endpoints: &[String], listed: bool) -> Result<(), ConfigError> {
+    for (place, url) in endpoints.iter().enumerate() {
+        let key = if listed {
+            format!("cold_store.endpoints[{place}]")
+        } else {
+            "cold_store.endpoint".to_owned()
+        };
+        if authority(url).is_none() {
+            let why = "not an endpoint; use http://host[:port] with no path, user or query";
+            return Err(invalid(&key, why));
         }
-        Err(_) => {
-            let why = "the cache reads from one upstream: give exactly one endpoint (a list of several is not supported yet)";
-            Err(invalid("cold_store.endpoints", why))
+        if endpoints[..place].contains(url) {
+            return Err(invalid(&key, "is given twice"));
         }
     }
+    Ok(())
+}
+
+/// A time of the failover from the file or its default: longer than zero, at most an hour.
+fn span(key: &str, value: Option<Dur>, default: Duration) -> Result<Duration, ConfigError> {
+    let time = duration(value, default);
+    if time.is_zero() || time > Duration::from_secs(3600) {
+        let why = "must be longer than zero and at most 1h";
+        return Err(invalid(&format!("cold_store.{key}"), why));
+    }
+    Ok(time)
 }
 
 /// The percent in `value`, or `default`, from `low` to `high`.
@@ -179,7 +224,25 @@ impl CacheSettings {
         refuse_hot_keys(&cold)?;
         let skipping = [("skip_checks", cold.skip_checks.is_some())];
         refuse("cold_store", "not for a build node", &skipping)?;
-        let upstream = tier("cold_store", &upstream_table(cold)?)?;
+        let timing = (cold.unready_backoff, cold.readyz_interval);
+        let as_list = cold.endpoints.is_some();
+        let (cold, listed) = upstream_table(cold)?;
+        let upstream = tier("cold_store", &cold)?;
+        let (endpoints, failover) = if upstream.spec.starts_with("s3:") {
+            check_endpoints(&listed, as_list)?;
+            let failover = EndpointsConfig {
+                unready_backoff: span("unready_backoff", timing.0, DEFAULT_UNREADY_BACKOFF)?,
+                readyz_interval: span("readyz_interval", timing.1, DEFAULT_READYZ_INTERVAL)?,
+            };
+            (listed, failover)
+        } else {
+            let given = [
+                ("unready_backoff", timing.0.is_some()),
+                ("readyz_interval", timing.1.is_some()),
+            ];
+            refuse("cold_store", "only for kind \"s3\"", &given)?;
+            (Vec::new(), EndpointsConfig::default())
+        };
         if table
             .layout
             .as_deref()
@@ -231,6 +294,8 @@ impl CacheSettings {
             front: shared.front,
             s3_request_timeout: shared.s3_request_timeout,
             upstream,
+            endpoints,
+            failover,
             cache,
             scrub_rate: table.scrub_rate.map(|rate| rate.0),
         })

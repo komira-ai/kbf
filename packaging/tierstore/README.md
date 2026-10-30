@@ -392,13 +392,36 @@ scrub.
 | `local_cache.max_concurrent_fills` | the most fills that run at once (1 to 64, default 4); a miss that finds them all running is served from the upstream and kept nowhere |
 | `local_cache.cache` | `true`, the default; `false` is refused (leave `[local_cache]` out to run without a cache) |
 | `local_cache.scrub_rate` | a size and `/s`, such as `"50MiB/s"`: accepted, and not used by this release |
-| `cold_store.endpoints` | a list of exactly one endpoint, in place of `endpoint`: several are refused as not supported yet, since the cache reads from one upstream |
+| `cold_store.endpoints` | a list of 1 to 16 `http://host[:port]` endpoints of an `s3` upstream, in place of `endpoint` (not both; each once; no path, user or query): see below |
+| `cold_store.unready_backoff` | how long an endpoint that failed a request is skipped (default `"5s"`; longer than zero, at most `"1h"`); an `s3` upstream only |
+| `cold_store.readyz_interval` | the time between two polls of every endpoint's `/readyz` (default `"2s"`; longer than zero, at most `"1h"`); an `s3` upstream only |
 
 `[cold_store]` is the upstream: any `kind` (an `s3` bucket, with `endpoint` and a `credentials_file`
 of a read-only key, in practice), and without `skip_checks` and the keys of the reconciler. `[server]`
 is as for a storage node, without `backend_check_wait`. A `[[policy]]` with `cache = true` is needed.
 The three tables `[hot_store]`, `[local_cache]` and `[cold_store]` together are refused: the hot
 store is already local disk.
+
+**Several endpoints.** `endpoints` lists storage proxies over the same store, so any one of them
+serves any key. For each call the cache ranks the endpoints by rendezvous (highest-random-weight)
+hashing of the key and tries them in that order. The weight of an endpoint for a key is the first
+eight bytes, as a big-endian number, of the SHA-256 of the endpoint's URL as the file writes it, a
+zero byte and the key; the greatest weight is tried first. A listing is ranked by its prefix. The
+same key goes to the same endpoint while it is usable, so the ranged reads of one pack meet one
+proxy and the keys spread evenly. The order does not depend on the order of the list, and when an
+endpoint is taken out of the list only the keys it was first for move.
+
+A call goes on to the next endpoint after a failure: a connection that could not be made, a request
+that timed out, a 408 or 429, or a 5xx other than 501 and 507. Any other answer is the answer: a 404
+is final (the endpoints share the store), and so are 403, 412 and 413. An endpoint that failed is
+skipped for `unready_backoff`, and the next call that ranks it after that tries it again. An
+endpoint is also skipped while its `GET /readyz` did not answer 200 at the last poll (a draining
+proxy answers 503 there while it still serves). The poll runs every `readyz_interval`, the first
+one an interval after the start; every endpoint is taken to be ready until then. A call that finds
+no endpoint to try is answered 503 `ServiceUnavailable`; the objects the cache holds are still
+served, and the cache's own `GET /readyz` is 503 (`no upstream endpoint is ready`) until an
+endpoint is usable again. The cache is read-only in this release, so there is no failover of a
+write.
 
 At start the process makes the directory, removes what a fill that was running left in `.stage/`,
 reads `obj/` back (an object whose sidecar does not say what the file holds is deleted), and asks
@@ -419,7 +442,10 @@ fill included, so the byte hit ratio is the first over the sum of the two), `fil
 slot taken), `fill_failures_total{reason}` (`hash_mismatch`, `upstream_error`,
 `short_body`, `local_io`, `changed`, `aborted`), `evictions_total{reason}` (`budget`, `floor`), `pinned_skips_total`,
 `discarded_at_start_total`, and the gauges `bytes`, `objects`, `fs_free_bytes` and `staging_files`.
-On a storage node it says there is no cache.
+With an `s3` upstream it adds `upstream_failovers_total{reason}` (the endpoints a call went past
+before one answered: `request_failed`, `not_ready`, `backoff`), `upstream_unavailable_total` (the
+calls that found no endpoint to answer) and the gauge `upstream_endpoint_ready{endpoint}` (1 for an
+endpoint a call would try now). On a storage node it says there is no cache.
 
 ### Which key each flag has
 

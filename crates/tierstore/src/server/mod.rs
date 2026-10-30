@@ -172,6 +172,7 @@ pub mod cli;
 mod config;
 mod config_cache;
 mod config_print;
+mod endpoints;
 mod front;
 pub mod gc;
 mod handover;
@@ -270,6 +271,7 @@ pub use local_cache::LocalCache;
 pub use presign::{Grant, PresignKey, PresignRequest, presign_put};
 pub use scoped::{Prefixes, ScopedKey};
 
+use endpoints::Endpoints;
 use idle::Watched;
 use reply::{Answer, S3Error, answer};
 use request::{BoxError, Check, Query, Reader, Target, resolve};
@@ -346,6 +348,9 @@ pub struct ServerConfig {
     /// its body is read, and `/metricz` shows the cache's counters. The binary sets the cache it
     /// serves, which is also the server's backend.
     pub cache: Option<LocalCache>,
+    /// The upstream endpoints of the cache, when there is a list of them: `/readyz` says 503
+    /// while none is usable, and `/metricz` shows their counters. None by default.
+    upstream: Option<Arc<Endpoints>>,
     /// The age of the usage object past which `/usagez` says 503. A server that has run this
     /// long without finding any usage object is judged the same way. Longer than the lease and
     /// the pass interval of the reconciler, so that a takeover of the lease does not show.
@@ -391,6 +396,7 @@ impl ServerConfig {
             drain_deadline: Duration::from_secs(900),
             proxy: None,
             cache: None,
+            upstream: None,
             usage_stale_after: Duration::from_secs(120),
             clock,
             rate_clock: Arc::new(MonotonicClock::new()),
@@ -772,6 +778,10 @@ impl Server {
         let read = matches!(parts.method, Method::GET | Method::HEAD);
         let (status, text) = match (read, parts.uri.path(), self.is_ready()) {
             (true, "/healthz", _) => (StatusCode::OK, "ok".to_owned()),
+            (true, "/readyz", true) if self.upstream_down() => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no upstream endpoint is ready".to_owned(),
+            ),
             (true, "/readyz", true) => (StatusCode::OK, "ready".to_owned()),
             (true, "/readyz", false) => (StatusCode::SERVICE_UNAVAILABLE, "draining".to_owned()),
             (true, "/usagez", _) => self.usage_probe().await,
@@ -782,12 +792,25 @@ impl Server {
         Some(answer(status, &headers, Bytes::from(text)))
     }
 
-    /// The text of `/metricz`: the counters of the local cache, or a line that says there is none.
+    /// The text of `/metricz`: the counters of the local cache, or a line that says there is none,
+    /// and those of the upstream endpoints if the cache has a list of them.
     fn metrics_probe(&self) -> String {
-        match &self.config.cache {
+        let mut text = match &self.config.cache {
             Some(cache) => cache.metrics(),
             None => "# this tierstore has no local cache\n".to_owned(),
+        };
+        if let Some(upstream) = &self.config.upstream {
+            text.push_str(&upstream.metrics());
         }
+        text
+    }
+
+    /// Whether the cache has a list of upstream endpoints and none of them is usable.
+    fn upstream_down(&self) -> bool {
+        let upstream = &self.config.upstream;
+        upstream
+            .as_ref()
+            .is_some_and(|endpoints| !endpoints.is_ready())
     }
 
     /// The answer of `/usagez`: 200 and the age of the usage object of the reconciler while it is
