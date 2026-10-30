@@ -1,9 +1,9 @@
-//! The XML bodies of S3: the error body, the answers of ListObjectsV2 and of a multipart
-//! upload, and the one body that is read, `CompleteMultipartUpload`.
+//! The XML bodies of S3: the error body, the answers of ListObjectsV2, ListMultipartUploads and
+//! the other calls of a multipart upload, and the one body that is read, `CompleteMultipartUpload`.
 
 use roxmltree::{Document, Node};
 
-use crate::Listed;
+use crate::{Listed, OpenUpload};
 
 use super::time::iso8601;
 
@@ -74,6 +74,47 @@ impl Listing<'_> {
 fn next_token(next: Option<&str>) -> String {
     next.map(|token| element("NextContinuationToken", &escape(token)))
         .unwrap_or_default()
+}
+
+/// One page of a ListMultipartUploads answer.
+pub(crate) struct UploadListing<'a> {
+    pub(crate) bucket: &'a str,
+    pub(crate) prefix: &'a str,
+    /// The `key-marker` and the `upload-id-marker` of the request, as they were sent.
+    pub(crate) key_marker: &'a str,
+    pub(crate) id_marker: &'a str,
+    pub(crate) max_uploads: usize,
+    pub(crate) uploads: &'a [OpenUpload],
+    /// The last upload of the page, if the listing goes on after it.
+    pub(crate) next: Option<&'a OpenUpload>,
+}
+
+impl UploadListing<'_> {
+    pub(crate) fn to_xml(&self) -> String {
+        let mut xml = format!("{PROLOG}<ListMultipartUploadsResult xmlns=\"{NAMESPACE}\">");
+        xml.push_str(&element("Bucket", &escape(self.bucket)));
+        xml.push_str(&element("KeyMarker", &escape(self.key_marker)));
+        xml.push_str(&element("UploadIdMarker", &escape(self.id_marker)));
+        if let Some(last) = self.next {
+            xml.push_str(&element("NextKeyMarker", &escape(&last.key)));
+            xml.push_str(&element("NextUploadIdMarker", &escape(&last.id)));
+        }
+        xml.push_str(&element("Prefix", &escape(self.prefix)));
+        let max_uploads = self.max_uploads;
+        xml.push_str(&format!("<MaxUploads>{max_uploads}</MaxUploads>"));
+        let truncated = self.next.is_some();
+        xml.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
+        for upload in self.uploads {
+            let (key, id) = (escape(&upload.key), escape(&upload.id));
+            let initiated = iso8601(upload.initiated);
+            xml.push_str(&format!(
+                "<Upload><Key>{key}</Key><UploadId>{id}</UploadId>\
+                 <StorageClass>STANDARD</StorageClass><Initiated>{initiated}</Initiated></Upload>"
+            ));
+        }
+        xml.push_str("</ListMultipartUploadsResult>");
+        xml
+    }
 }
 
 /// The answer of CreateMultipartUpload.

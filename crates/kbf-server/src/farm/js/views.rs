@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use js_server_core::View;
 use kbf_proto::update::UpdateStatus;
-use kbf_proto::worker::{NodeStatus, PackReadCounts, PackWriteCounts};
+use kbf_proto::worker::{InputCacheCounts, NodeStatus, PackReadCounts, PackWriteCounts};
 use kbf_sched::{LoadCounters, QueueView};
 use kbf_types::{MemoryRun, OperationId, WorkerId};
 
@@ -94,11 +94,13 @@ pub(crate) fn node_detail(
         let detail = |_| {
             let capacity = view.sched().capacity(worker).unwrap_or_default();
             let load = node_load::shown(adapter.node_loads(), worker, &capacity, js.now());
+            let input_cache = adapter.input_cache_of(worker);
             detail_of(
                 listed(js, view, adapter, worker),
                 view.sched(),
                 worker,
                 load,
+                input_cache,
             )
         };
         Ok(node.map(detail))
@@ -257,4 +259,23 @@ pub(crate) fn note_pack_writes(
 /// [`Farm::pack_writes`](crate::farm::Farm::pack_writes).
 pub(crate) fn pack_writes(js: &JsFarm) -> Vec<(WorkerId, PackWriteCounts)> {
     js.core.with(|_, adapter| adapter.pack_writes())
+}
+
+/// [`Farm::note_input_cache`](crate::farm::Farm::note_input_cache).
+pub(crate) fn note_input_cache(
+    js: &JsFarm,
+    worker: &WorkerId,
+    stream: StreamId,
+    counts: Option<InputCacheCounts>,
+) {
+    js.core.with(|_, adapter| {
+        if let Some(stream) = adapter.current_stream(worker, stream.0) {
+            adapter.note_input_cache(worker, stream, counts);
+        }
+    });
+}
+
+/// [`Farm::input_caches`](crate::farm::Farm::input_caches).
+pub(crate) fn input_caches(js: &JsFarm) -> Vec<(WorkerId, InputCacheCounts)> {
+    js.core.with(|_, adapter| adapter.input_caches())
 }

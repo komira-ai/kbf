@@ -50,7 +50,7 @@ use crate::farm::NodeLoads;
 use crate::farm::durable::{named, subject};
 use crate::farm::failed_actions::{Class, FailedActions, class_of};
 use crate::fleet::quarantine_change;
-use crate::machine::{FarmMachine, Platform, Sent, Waiter, stored_name};
+use crate::machine::{Booked, FarmMachine, Platform, Sent, Waiter, stored_name};
 use crate::stamp::Stamp;
 
 /// Where the farm sends a worker's messages: the outbound half of its stream.
@@ -97,6 +97,7 @@ pub struct KbfAdapter {
     pub(super) recorded: BTreeSet<OperationId>,
     pub(super) pack_reads: BTreeMap<WorkerId, worker::PackReadCounts>,
     pub(super) pack_writes: BTreeMap<WorkerId, worker::PackWriteCounts>,
+    pub(super) input_caches: BTreeMap<WorkerId, worker::InputCacheCounts>,
     /// What each registered worker's newest stream said of itself ([`WorkerFacts`]).
     pub(super) facts: BTreeMap<WorkerId, WorkerFacts>,
     /// What each node's load readings have come to, under the accept rule the farm's own
@@ -167,6 +168,7 @@ impl KbfAdapter {
             recorded: BTreeSet::new(),
             pack_reads: BTreeMap::new(),
             pack_writes: BTreeMap::new(),
+            input_caches: BTreeMap::new(),
             facts: BTreeMap::new(),
             node_loads: NodeLoads::new(),
             failed: FailedActions::default(),
@@ -415,6 +417,10 @@ impl Adapter for KbfAdapter {
                     queued: w.queued,
                     started: now,
                 },
+                booked: Some(Booked {
+                    cpu_millis: start.resources.cpu_millis,
+                    memory_bytes: start.resources.memory_bytes,
+                }),
             });
         sent.into_iter()
             .for_each(|sent| self.machine.start(start.lease, sent));

@@ -213,7 +213,7 @@ fn pull_request_gate(workflow: &str, out: &mut Vec<String>) -> Result<(), String
 /// The jobs of beta.yml that run on a Mac. A pull request never runs them (the macOS pool is
 /// small and a pull request runs the fast gate only); a push to main
 /// always does, so none may carry an `if:` that skips it.
-pub const MACOS_JOBS: [&str; 2] = ["native-macos", "pkg-macos"];
+pub const MACOS_JOBS: [&str; 1] = ["native-macos"];
 
 /// What is wrong with beta.yml's macOS jobs: a condition on one (which could skip it on a
 /// push), or a `pull_request` trigger on the workflow (which would queue them for a pull
@@ -681,7 +681,7 @@ fn every_component_a_platform_needs_is_in_its_release_set() {
 
 #[test]
 fn the_macos_jobs_run_on_every_push_and_on_no_pull_request() {
-    // Catches: a condition added to native-macos or pkg-macos in beta.yml (a push that
+    // Catches: a condition added to native-macos in beta.yml (a push that
     // skips the only real-Mac test), or a `pull_request` trigger on beta.yml, which
     // would queue the small macOS pool for every pull request.
     let path = ".github/workflows/beta.yml";
@@ -1040,9 +1040,9 @@ mod rules {
 
     #[test]
     fn a_macos_job_with_a_condition_or_a_pull_request_trigger_is_refused() {
-        // Catches: an `if:` on either macOS job, and a `pull_request` trigger, each
+        // Catches: an `if:` on the macOS job, and a `pull_request` trigger, each
         // accepted; and a clean push-only workflow refused.
-        let beta = "name: beta\non:\n  push:\n    branches: [main]\njobs:\n  native-macos:\n    runs-on: macos-latest\n  pkg-macos:\n    runs-on: macos-latest\n";
+        let beta = "name: beta\non:\n  push:\n    branches: [main]\njobs:\n  native-macos:\n    runs-on: macos-latest\n";
         assert_eq!(
             macos_problems(beta).expect("readable"),
             Vec::<String>::new()

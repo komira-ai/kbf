@@ -28,6 +28,12 @@
 //!   and `NoSuchUpload` is the answer for an id the backend does not hold. The ETag of a part
 //!   is the content tag the backend gives it, and that of the completion is the content tag of
 //!   the object;
+//! - ListMultipartUploads (`GET /<bucket>?uploads`) with `prefix`, `max-uploads`, `key-marker`
+//!   and `upload-id-marker`, without `delimiter`: the open uploads of the backend (for the
+//!   [`Proxy`](crate::Proxy), those of its cold tier), by key and then by id, paged by the two
+//!   markers, so that a janitor can find the uploads a job left open and abort them. Uploads of
+//!   a key under `_journal/` or `_tiering/` are not listed. ListParts (`GET /<key>?uploadId=`) is
+//!   `NotImplemented`;
 //! - CreateBucket and HeadBucket of the served bucket (always successful), for setup tools.
 //!
 //! Every other call, a copy (`x-amz-copy-source`), and a query parameter this front does not
@@ -77,14 +83,18 @@
 //!
 //! The server has one full key, which may do everything above, and any number of read-only
 //! keys ([`ServerConfig::read_only_keys`], `--read-only-key-file` in the binary), which may do
-//! GetObject, HeadObject, ListObjectsV2 and HeadBucket and nothing else. Any other call signed
-//! by a read-only key (a put, a delete, CreateBucket, and every call of a multipart upload) is
+//! GetObject, HeadObject, ListObjectsV2, ListMultipartUploads and HeadBucket and nothing else.
+//! Any other call signed by a read-only key (a put, a delete, CreateBucket, and every call of a
+//! multipart upload but the listing, which reads) is
 //! answered 403 `AccessDenied` with the S3 error document before its body is read, and changes
 //! nothing. The roles of those keys are of the key and not of a prefix. A put by the full key
 //! is create-only but, when the hot tier is full, can race another put of the same key into the
 //! cold tier (see [`Proxy`](crate::Proxy)); a presigned PUT never goes to the cold tier.
 //! A credential that may write one object under a prefix, and expires, is a presigned PUT URL: see [`presign`], and
 //! [`ServerConfig::presign_keys`] for the keys that sign them (`--presign-key-file` in the binary).
+//! A key that lists, heads and deletes under one prefix, and does nothing else (no get, no put), is a
+//! GC key: see [`gc`], and [`ServerConfig::gc_keys`] (`--gc-key-file` in the binary). Its deletes are
+//! not create-only: they are the only way an object leaves a prefix that presigned PUTs write.
 //!
 //! # Checksums
 //!
@@ -124,6 +134,16 @@
 //! `GET /healthz` is 200 while the process runs. `GET /readyz` is 200 until the drain begins and
 //! 503 after. Neither is signed, so a bucket cannot have either name.
 //!
+//! `GET /usagez`, for alerting and not for a load balancer, is 200 with the age of the usage
+//! object that the reconciler publishes (`_tiering/usage`), and 503 with the reason once that
+//! object is older than [`ServerConfig::usage_stale_after`]. The puts ignore a stale usage, as if
+//! the hot tier were not full, so a stopped reconciler would otherwise show nowhere. A usage
+//! object that is missing is judged by the time the server has run, so that a server that starts
+//! before the first pass of the reconciler is 200 for that long. `/readyz` does not look at the
+//! usage (one stopped reconciler would make every node unready), and the puts are not refused.
+//! Without [`ServerConfig::proxy`] it is 200 and says the usage is not watched. A bucket cannot
+//! be called `usagez` either.
+//!
 //! # Drain
 //!
 //! [`Server::begin_drain`], which the binary calls on SIGTERM or SIGINT, starts a sequence that
@@ -139,6 +159,7 @@
 
 mod auth;
 pub mod cli;
+pub mod gc;
 mod handover;
 mod idle;
 mod keys;
@@ -158,6 +179,10 @@ mod completion_tests;
 #[cfg(test)]
 mod drain_tests;
 #[cfg(test)]
+mod gc_server_tests;
+#[cfg(test)]
+mod gc_tests;
+#[cfg(test)]
 mod idle_tests;
 #[cfg(test)]
 mod ops_tests;
@@ -165,6 +190,8 @@ mod ops_tests;
 mod pipes;
 #[cfg(test)]
 mod presign_server_tests;
+#[cfg(test)]
+mod ready_tests;
 #[cfg(test)]
 mod reply_tests;
 #[cfg(test)]
@@ -181,6 +208,8 @@ mod stream_put_tests;
 mod testing;
 #[cfg(test)]
 mod time_tests;
+#[cfg(test)]
+mod uploads_tests;
 #[cfg(test)]
 mod xml_tests;
 
@@ -205,9 +234,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, Semaphore, watch};
 
-use crate::{Backend, Clock, MonotonicClock};
+use crate::{Backend, Clock, MonotonicClock, Proxy};
 
+pub use gc::GcKey;
 pub use keys::AccessKey;
+use keys::Role;
 pub use presign::{Grant, PresignKey, PresignRequest, presign_put};
 
 use idle::Watched;
@@ -232,6 +263,9 @@ pub struct ServerConfig {
     /// The keys that sign presigned PUT URLs (see [`presign`]); a URL is accepted only if one of
     /// them signed it. None by default. Their ids differ from each other's and from the other keys'.
     pub presign_keys: Vec<PresignKey>,
+    /// The GC keys (see [`gc`]): header-signed keys that list, head and delete under one prefix.
+    /// None by default. Their ids differ from each other's and from the other keys'.
+    pub gc_keys: Vec<GcKey>,
     /// The longest `X-Amz-Expires` a presigned URL may have, whatever the ceiling of its key says.
     pub presign_max_expires: Duration,
     /// The most bytes of a request body: the longest object that one put takes, and the
@@ -271,7 +305,14 @@ pub struct ServerConfig {
     /// How long the server waits for requests in flight, and for the answers it is sending, after
     /// it began refusing new requests.
     pub drain_deadline: Duration,
-    /// The time, for the age of a signature.
+    /// The proxy whose usage object `/usagez` judges: none by default, and then `/usagez` says
+    /// the usage is not watched. The binary sets the proxy it serves.
+    pub proxy: Option<Arc<Proxy>>,
+    /// The age of the usage object past which `/usagez` says 503. A server that has run this
+    /// long without finding any usage object is judged the same way. Longer than the lease and
+    /// the pass interval of the reconciler, so that a takeover of the lease does not show.
+    pub usage_stale_after: Duration,
+    /// The time, for the age of a signature and of the usage object.
     pub clock: Arc<dyn Clock>,
     /// The time, for the rate of a request body (`put_min_bytes_per_sec`). It is a clock that
     /// only goes forward ([`MonotonicClock`](crate::MonotonicClock) from [`ServerConfig::new`]),
@@ -299,6 +340,7 @@ impl ServerConfig {
             secret_access_key: secret_access_key.to_owned(),
             read_only_keys: Vec::new(),
             presign_keys: Vec::new(),
+            gc_keys: Vec::new(),
             presign_max_expires: Duration::from_secs(900),
             max_request_bytes: 256 << 20,
             body_idle_timeout: Duration::from_secs(30),
@@ -308,6 +350,8 @@ impl ServerConfig {
             header_timeout: Duration::from_secs(60),
             drain_lb_wait: Duration::from_secs(10),
             drain_deadline: Duration::from_secs(900),
+            proxy: None,
+            usage_stale_after: Duration::from_secs(120),
             clock,
             rate_clock: Arc::new(MonotonicClock::new()),
         }
@@ -368,6 +412,8 @@ async fn pause_after(failed: bool) {
 pub struct Server {
     backend: Arc<dyn Backend>,
     config: ServerConfig,
+    /// When the server was made, by the clock of the config.
+    started: u64,
     phase: AtomicU8,
     /// Notified once, when the drain begins.
     drain_requested: Notify,
@@ -429,6 +475,7 @@ impl Server {
         Arc::new(Self {
             puts,
             backend,
+            started: config.clock.now(),
             config,
             phase: AtomicU8::new(SERVING),
             drain_requested: Notify::new(),
@@ -633,7 +680,7 @@ impl Server {
         B::Data: Send,
         B::Error: Into<BoxError>,
     {
-        if let Some(answer) = self.probe(parts) {
+        if let Some(answer) = self.probe(parts).await {
             return Ok(answer);
         }
         if self.phase() == REFUSING {
@@ -646,8 +693,17 @@ impl Server {
         if let Some(grant) = &signed.presign {
             grant.permit(parts, &target, &query)?;
         }
+        // After the presigning grant, which refuses a listing: a presigned request may only PUT.
+        if parts.method == Method::GET && query.has("uploads") && target == Target::Bucket {
+            signed
+                .role
+                .permit_list_uploads(query.get("prefix").unwrap_or_default())?;
+        }
         let data = matches!((&parts.method, &target), (&Method::PUT, Target::Object(_)));
         let check = Check::new(&signed.payload, &parts.headers, data)?;
+        if let Role::Gc(prefix) = &signed.role {
+            gc::permit(prefix, parts, &target, &query)?;
+        }
         let limit = self.config.max_request_bytes;
         let limit = signed.presign.as_ref().map_or(limit, |grant| {
             limit.min(usize::try_from(grant.max_object_bytes).unwrap_or(usize::MAX))
@@ -665,15 +721,45 @@ impl Server {
     }
 
     /// The answer to a health or readiness probe, which are not signed.
-    fn probe(&self, parts: &Parts) -> Option<Answer> {
+    async fn probe(&self, parts: &Parts) -> Option<Answer> {
         let read = matches!(parts.method, Method::GET | Method::HEAD);
         let (status, text) = match (read, parts.uri.path(), self.is_ready()) {
-            (true, "/healthz", _) => (StatusCode::OK, "ok"),
-            (true, "/readyz", true) => (StatusCode::OK, "ready"),
-            (true, "/readyz", false) => (StatusCode::SERVICE_UNAVAILABLE, "draining"),
+            (true, "/healthz", _) => (StatusCode::OK, "ok".to_owned()),
+            (true, "/readyz", true) => (StatusCode::OK, "ready".to_owned()),
+            (true, "/readyz", false) => (StatusCode::SERVICE_UNAVAILABLE, "draining".to_owned()),
+            (true, "/usagez", _) => self.usage_probe().await,
             _ => return None,
         };
         let headers = [("content-type", "text/plain".to_owned())];
         Some(answer(status, &headers, Bytes::from(text)))
+    }
+
+    /// The answer of `/usagez`: 200 and the age of the usage object of the reconciler while it is
+    /// within the limit, 503 and the reason once it is older, or missing for longer than the
+    /// limit since the server started. It does not depend on the drain.
+    async fn usage_probe(&self) -> (StatusCode, String) {
+        let Some(proxy) = &self.config.proxy else {
+            return (StatusCode::OK, "usage not watched".to_owned());
+        };
+        let limit = self.config.usage_stale_after;
+        let published = proxy.usage_age().await;
+        let since_start = self.config.clock.now().saturating_sub(self.started);
+        let age = published.unwrap_or(Duration::from_millis(since_start));
+        let (secs, max) = (age.as_secs(), limit.as_secs());
+        let down = StatusCode::SERVICE_UNAVAILABLE;
+        match (age <= limit, published.is_some()) {
+            (true, true) => (StatusCode::OK, format!("usage published {secs}s ago")),
+            (true, false) => (StatusCode::OK, format!("no usage yet, {secs}s since start")),
+            (false, true) => (
+                down,
+                format!("usage of the hot tier is stale: published {secs}s ago, limit {max}s"),
+            ),
+            (false, false) => (
+                down,
+                format!(
+                    "usage of the hot tier is missing: none published in {secs}s, limit {max}s"
+                ),
+            ),
+        }
     }
 }

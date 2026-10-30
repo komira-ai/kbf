@@ -29,9 +29,8 @@ macOS runner pool. Adding it to an open pull request starts a run.
 
 `artifacts.yml` runs on the `labeled` event so that the label starts something. Any label
 added to a pull request therefore starts a whole `artifacts` run, which replaces the pull
-request's earlier run: add labels together, before the run you want to keep. `native-macos`
-and `pkg-macos` run in `beta.yml` on every push and never on a pull request; that is pinned
-by `crates/kbf-integration-test/tests/release_artifacts`.
+request's earlier run: add labels together, before the run you want to keep. The `native-macos` job (which also runs
+the package tests) runs in `beta.yml` on every push and never on a pull request; that is pinned by `crates/kbf-integration-test/tests/release_artifacts`.
 
 ## What is built
 

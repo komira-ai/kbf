@@ -12,8 +12,11 @@ use futures::StreamExt;
 use futures::channel::oneshot;
 use futures::stream;
 use kbf_objstore::s3::fake::{Failure, FakeS3, part_etag};
-use kbf_objstore::s3::{Credentials, S3Config, S3Store};
-use kbf_objstore::{BodyStream, ByteRange, Capabilities, ObjectKey, ObjectStore, ObjectStoreError};
+use kbf_objstore::s3::{Credentials, OpenUpload, S3Config, S3Store, UploadsPage};
+use kbf_objstore::{
+    BodyStream, ByteRange, Capabilities, KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError,
+    PageSize,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -575,4 +578,175 @@ async fn a_slow_source_does_not_stall_the_request() {
     let (sent, ()) = done.expect("the part was held back");
     assert_eq!(sent.unwrap(), part_etag(b"abcd"));
     assert_eq!(s3.stats().parts, 1);
+}
+
+/// The open uploads of a listing, as keys and ids.
+fn open(page: &UploadsPage) -> Vec<(String, String)> {
+    let each = |up: &OpenUpload| (up.key.as_str().to_owned(), up.upload_id.clone());
+    page.uploads.iter().map(each).collect()
+}
+
+/// Asserts what `list_multipart_uploads` sends and reads: a GET of the bucket with `uploads`,
+/// the prefix, the page size and the two markers, and a page whose uploads carry their key, id
+/// and start time and whose markers say where the next page starts.
+#[tokio::test]
+async fn a_listing_of_uploads_sends_the_request_of_its_name() {
+    let page = "<ListMultipartUploadsResult><IsTruncated>true</IsTruncated>\
+                <NextKeyMarker>cas/b</NextKeyMarker><NextUploadIdMarker>u-9</NextUploadIdMarker>\
+                <Upload><Key>cas/b</Key><UploadId>u-9</UploadId>\
+                <Initiated>2009-10-12T17:50:30.000Z</Initiated></Upload>\
+                </ListMultipartUploadsResult>";
+    let (endpoint, seen) = script(vec![answer("200 OK", &[], page)]).await;
+    let store = store(&endpoint, CONDITIONAL, Duration::from_secs(5));
+    let prefix = KeyPrefix::new("cas/").unwrap();
+    let after = key("a");
+    let size = PageSize::new(2).unwrap();
+    let listed = store
+        .list_multipart_uploads(&prefix, Some((&after, Some("u-0"))), size)
+        .await
+        .unwrap();
+    assert_eq!(open(&listed), [("cas/b".to_owned(), "u-9".to_owned())]);
+    assert_eq!(listed.uploads[0].initiated_millis, 1_255_369_830_000);
+    let next = listed.next.unwrap();
+    assert_eq!((next.0.as_str(), next.1.as_str()), ("cas/b", "u-9"));
+    let head = seen.lock().unwrap()[0].head.to_ascii_lowercase();
+    assert!(head.starts_with("get /kbf-test?"), "{head}");
+    for piece in [
+        "uploads=",
+        "prefix=cas%2f",
+        "max-uploads=2",
+        "key-marker=cas%2fa",
+        "upload-id-marker=u-0",
+    ] {
+        assert!(head.contains(piece), "{piece}: {head}");
+    }
+}
+
+/// Asserts that a listing of uploads without a marker sends none, and that a key marker alone is
+/// sent alone, so that the store skips the uploads of that key.
+#[tokio::test]
+async fn a_listing_of_uploads_sends_only_the_markers_it_has() {
+    let last = "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated>\
+                </ListMultipartUploadsResult>";
+    let (endpoint, seen) = script(vec![
+        answer("200 OK", &[], last),
+        answer("200 OK", &[], last),
+    ])
+    .await;
+    let store = store(&endpoint, CONDITIONAL, Duration::from_secs(5));
+    let all = KeyPrefix::new("").unwrap();
+    let size = PageSize::MAX;
+    let first = store
+        .list_multipart_uploads(&all, None, size)
+        .await
+        .unwrap();
+    assert!(first.uploads.is_empty() && first.next.is_none());
+    let after = key("a");
+    let second = store
+        .list_multipart_uploads(&all, Some((&after, None)), size)
+        .await
+        .unwrap();
+    assert!(second.uploads.is_empty() && second.next.is_none());
+    let seen = seen.lock().unwrap();
+    let heads: Vec<String> = seen.iter().map(|s| s.head.to_ascii_lowercase()).collect();
+    assert!(!heads[0].contains("marker"), "{}", heads[0]);
+    assert!(heads[0].contains("max-uploads=1000"), "{}", heads[0]);
+    assert!(heads[1].contains("key-marker=cas%2fa"), "{}", heads[1]);
+    assert!(!heads[1].contains("upload-id-marker"), "{}", heads[1]);
+}
+
+/// Asserts, against the loopback service, that the uploads begun and not ended are listed in the
+/// order of key and id with the service's start time, page by page with the markers of each
+/// page, by prefix, and that a completed upload and an aborted one are not listed. A refusal of
+/// the store is its error.
+#[tokio::test]
+async fn open_uploads_are_listed_by_key_and_page_until_they_end() {
+    let s3 = FakeS3::start().await;
+    s3.set_min_part_bytes(0);
+    s3.set_time(1_255_369_830);
+    let store = s3.store(CONDITIONAL);
+    let (a, b, c) = (key("a"), key("b"), ObjectKey::new("other/c").unwrap());
+    let ids = [
+        store.create_multipart(&a).await.unwrap(),
+        store.create_multipart(&b).await.unwrap(),
+        store.create_multipart(&b).await.unwrap(),
+        store.create_multipart(&c).await.unwrap(),
+    ];
+    let everything = KeyPrefix::new("").unwrap();
+    let size = PageSize::new(3).unwrap();
+    let whole = store
+        .list_multipart_uploads(&everything, None, size)
+        .await
+        .unwrap();
+    let want: Vec<(String, String)> = [
+        ("cas/a", &ids[0]),
+        ("cas/b", &ids[1]),
+        ("cas/b", &ids[2]),
+        ("other/c", &ids[3]),
+    ]
+    .iter()
+    .map(|(k, id)| ((*k).to_owned(), (*id).clone()))
+    .collect();
+    assert_eq!(open(&whole), want[..3]);
+    assert_eq!(whole.uploads[0].initiated_millis, 1_255_369_830_000);
+    let (end_key, end_id) = whole.next.unwrap();
+    assert_eq!(
+        (end_key.as_str(), end_id.as_str()),
+        ("cas/b", ids[2].as_str())
+    );
+    let rest = store
+        .list_multipart_uploads(&everything, Some((&end_key, Some(&end_id))), size)
+        .await
+        .unwrap();
+    assert_eq!(open(&rest), want[3..]);
+    assert!(rest.next.is_none());
+
+    let under = KeyPrefix::new("cas/").unwrap();
+    let cas = store
+        .list_multipart_uploads(&under, None, PageSize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(open(&cas), want[..3]);
+    let by_key = store
+        .list_multipart_uploads(&everything, Some((&b, None)), PageSize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(open(&by_key), want[3..]);
+
+    let one = part(&store, &a, &ids[0], 1, "x").await.unwrap();
+    store
+        .complete_multipart(&a, &ids[0], &[(1, one)])
+        .await
+        .unwrap();
+    store.abort_multipart(&c, &ids[3]).await.unwrap();
+    let left = store
+        .list_multipart_uploads(&everything, None, PageSize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(open(&left), want[1..3]);
+}
+
+/// Asserts that a refusal of the store to a listing of uploads is its error, and an answer that
+/// is not a listing of uploads is a protocol error.
+#[tokio::test]
+async fn a_listing_of_uploads_the_store_refuses_or_garbles_is_an_error() {
+    let denied = "<Error><Code>AccessDenied</Code><Message>m</Message></Error>";
+    let (endpoint, _) = script(vec![
+        answer("403 Forbidden", &[], denied),
+        answer("200 OK", &[], "<ListBucketResult/>"),
+    ])
+    .await;
+    let store = store(&endpoint, CONDITIONAL, Duration::from_secs(5));
+    let all = KeyPrefix::new("").unwrap();
+    let refused = store
+        .list_multipart_uploads(&all, None, PageSize::MAX)
+        .await;
+    assert_eq!(refusal(refused), s3_error(403, "AccessDenied"));
+    let garbled = store
+        .list_multipart_uploads(&all, None, PageSize::MAX)
+        .await;
+    assert!(
+        matches!(garbled, Err(ObjectStoreError::Protocol(_))),
+        "{garbled:?}"
+    );
 }

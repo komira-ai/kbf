@@ -53,8 +53,9 @@ refuses a key file that its group or others can read):
   list, delete, and the calls of a multipart upload;
 - `/etc/tierstore/daemons.key`: a read-only key (`--read-only-key-file`), for the daemons that
   read blobs and must not write or delete them. A request signed with it may get and head an
-  object, list the bucket and head the bucket; a put, a delete, CreateBucket or any call of a
-  multipart upload is answered 403 `AccessDenied`, before its body is read, and changes nothing.
+  object, list the bucket (objects, and the open multipart uploads) and head the bucket; a put, a
+  delete, CreateBucket or any call that starts, feeds, completes or aborts a multipart upload is
+  answered 403 `AccessDenied`, before its body is read, and changes nothing.
   Give the flag once for each read-only key, to give each reader a key of its own. The access key
   ids of all the keys of one server must differ: a request names its key by its id, so a start
   with two keys that have one id is refused with exit status 2;
@@ -106,14 +107,41 @@ start):
 A URL is good for one `PUT` of a key that starts with the prefix (after the path is decoded: no
 `..`, no `.` segment, no control character, never `_journal/` or `_tiering/`), with an
 `X-Amz-Expires` of at most the smaller of `max_expires_secs` and `--presign-max-expires` (default
-15m), and a body of at most `max_object_bytes` (128 MiB at most), checked on `Content-Length` and on
-the bytes received. It is refused from `X-Amz-Date` plus `X-Amz-Expires` on, with no grace. The
+15m), and a body of at most `max_object_bytes` (5 GiB at most, the S3 single-PUT limit; each key file chooses its own), checked on
+`Content-Length` and on the bytes received (and held to `--max-request-bytes`, 256 MiB by default, too: a key with a larger
+cap needs that raised, and the smaller of the two applies; the body is streamed to the tier and
+never held whole). It is refused from `X-Amz-Date` plus `X-Amz-Expires` on, with no grace. The
 object appears only after a complete body, a second `PUT` of the key is `412`, and no multipart
 call, `If-Match`, read, list or delete is allowed. The signature does not cover the body, so the
 reader of the object must check its content. The query string is never logged.
 
 A secret is never on the command line or in the environment: the process reads no environment
 variable, and the unit sets none.
+
+## GC keys
+
+A GC key (`--gc-key-file`, once per key; JSON of `access_key_id`, `secret_access_key` and `prefix`,
+mode 0600, not a symbolic link, owned by the user the server runs as) is for the process that
+collects the objects that presigned PUTs wrote. It signs in the header only (a presigned URL signed
+with it is refused) and may do these, only for a key that starts with its prefix (which ends in `/`)
+and is longer than it:
+
+| call | allowed |
+|---|---|
+| ListObjectsV2 | with a `prefix` inside the key's; a list with no prefix or another is 403, not filtered |
+| ListMultipartUploads | with a `prefix` inside the key's, the open uploads under it; no prefix or another is 403, not filtered |
+| HeadObject | yes |
+| DeleteObject | yes: from both tiers, journaled as for any delete |
+| AbortMultipartUpload | of an upload of such a key |
+| GetObject | no: a GC key never reads a body |
+| put, part, start or completion of an upload, copy, CreateBucket, HeadBucket | no |
+| `_journal/`, `_tiering/`, any key outside the prefix, the prefix itself | no |
+
+A call the key may not do is refused with 403 `AccessDenied` without its body being read. The
+refusals are made in this order: the signature and key id, the method, the decoding of the path and
+query (400, or 404 for an unknown bucket), the checksum headers (400 or 501), and last the key or
+list prefix; so a call that is both refused and malformed may get the malformed-request error. A delete by a GC key is not
+create-only; it is the only way an object leaves the prefix that presigned PUTs write.
 
 ## Filling in the flags
 
@@ -126,10 +154,12 @@ The unit's `ExecStart=` is a complete command line. The flags to edit:
 | `--bucket` | the name of the one bucket clients see |
 | `--access-key-file`, `--read-only-key-file` | the full key, and (given once for each) the read-only keys; see above |
 | `--presign-key-file`, `--presign-max-expires` | a presigning key with its ceiling (given once for each key), and the longest expiry of any URL; see Presigned PUT URLs |
+| `--gc-key-file` | a GC key (given once for each key); see GC keys |
 | `--hot`, `--cold` | the tiers: `s3:<bucket>` for a bucket of an S3-compatible store (also `dir:<path>` and `memory`; a `dir:` path must also be writable under `ProtectSystem=strict`, so add it to `ReadWritePaths=`) |
 | `--hot-endpoint`, `--cold-endpoint` | where the tier's store is, `http://host[:port]` (TLS is not built yet); `--hot-region` and `--cold-region` set the signing region of a tier, `us-east-1` if not given |
 | `--hot-bytes` | the bytes the hot tier is meant to hold; the water marks are shares of it (`--high-water`, `--low-water`, `--critical`) |
 | `--drain-lb-wait`, `--drain-deadline` | the drain on SIGTERM: how long `/readyz` says 503 while the server goes on serving, and how long it then waits for requests in flight |
+| `--usage-stale-after` | how old the usage that the reconciler publishes may be (2m by default, longer than `--lease-ttl`) before `/usagez` says 503 with the reason (200 and the age while fresh). Puts ignore a usage older than 30 s, so a stopped reconciler means a hot tier that is never taken to be full; puts are not refused. A load balancer probes `/readyz`, which does not look at the usage (one stopped reconciler would otherwise take every node out); alerting probes `/usagez` |
 
 `tierstore --help` lists them all, with their defaults.
 

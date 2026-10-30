@@ -16,7 +16,7 @@
 //! | 0 | the action ran (whatever its exit code, a timeout included) and its pack was stored |
 //! | 2 | the flags are wrong (clap) |
 //! | 10 | fetch: the Action, the Command or an input could not be read or checked, or laid out |
-//! | 11 | run-start: the Command could not be started (bad paths, no program) |
+//! | 11 | run-start: the Command could not be started (bad paths, no program, a `kbf-network` property other than `allow`), or the run's `private/` home, tmp and cache directories could not be made |
 //! | 12 | pack: the outputs could not be collected, did not fit one pack (`output-too-large`), or made a manifest or pack the frontend would refuse (`invalid-manifest`, `invalid-pack`) |
 //! | 13 | put: the pack could not be stored (refused, key already taken, still no room after the retries of a 503, unreachable) |
 //! | 14 | setup: `--lease` is not a build id, a credential or root certificate is unusable, a credential given as a flag value without `--insecure-argv-secrets`, or the runtime did not start |
@@ -38,11 +38,13 @@ use crate::digest;
 use crate::fetch::{
     BlobSource, FetchError, HttpBlobSource, fetch_message, materialize, native_roots,
 };
+use crate::network;
 use crate::outputs::{OutputLimits, collect_outputs};
 use crate::pack::{MAX_PACK_BYTES, PackError, build};
 use crate::put::{
     PutError, Sleeper, ThreadSleeper, agent, agent_with_plain_http, put, put_retrying, tls_config,
 };
+use crate::put_urls::PutUrls;
 use crate::run::{Run, RunError, output_paths, run};
 
 /// Exit code: an input could not be read, checked or laid out.
@@ -70,6 +72,14 @@ pub const EXIT_SETUP: u8 = 14;
 /// not yet deliver job secrets as files (komira-ai/kbf#1934), and are removed when it does. Neither
 /// value is ever written to a log or an error message.
 ///
+/// # The v2 key set
+///
+/// `--put-urls-file` (or, with `--insecure-argv-secrets`, `--put-urls`) takes the place of
+/// `--pack-url-file`/`--pack-url`: the JSON key set of the pack and large-object URLs the
+/// frontend issued for the run (see [`crate::put_urls`]). It is read and validated at startup.
+/// Today only the first pack slot is used, exactly as v1 uses its one pack URL; the other slots
+/// are ignored, and the planning of several packs and the large-object PUT are not wired in.
+///
 /// # What the manifest claims
 ///
 /// The manifest's `exit_code`, `timing` and `usage` are written by this tool, which runs as the
@@ -87,7 +97,7 @@ pub const EXIT_SETUP: u8 = 14;
 #[command(
     name = "kbf-task",
     version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT")),
-    group(ArgGroup::new("pack_url_source").required(true).args(["pack_url_file", "pack_url"])),
+    group(ArgGroup::new("pack_url_source").required(true).args(["pack_url_file", "pack_url", "put_urls_file", "put_urls"])),
     group(ArgGroup::new("grant_token_source").required(true).args(["grant_token_file", "grant_token"]))
 )]
 pub struct Cli {
@@ -103,9 +113,24 @@ pub struct Cli {
     /// `--insecure-argv-secrets`.
     #[arg(long)]
     pub pack_url: Option<String>,
+    /// A file holding the v2 key set, JSON `{"packs":[url,...],"large":[url,...]}`, instead of
+    /// `--pack-url-file`: read, never deleted, and a credential like the pack URL. v2 key set:
+    /// today only the first pack slot is used, as the single pack URL of the v1 flags; the other
+    /// pack slots and the large slots are checked and ignored.
+    #[arg(long)]
+    pub put_urls_file: Option<PathBuf>,
+    /// The v2 key set itself. Stopgap (komira-ai/kbf#1934): it is in argv, so it needs
+    /// `--insecure-argv-secrets`. v2 key set: today only the first pack slot is used.
+    #[arg(long)]
+    pub put_urls: Option<String>,
     /// The base URL of the read grant: blobs are read from `<base>/<hex>/<size>`.
     #[arg(long)]
     pub grant_url: String,
+    /// The most requests to the read grant in flight at once while the input tree is fetched, 1 to
+    /// 256. The tree is read breadth-first: each level's Directory messages together, then every
+    /// distinct file blob, each streamed to disk.
+    #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u16).range(1..=256))]
+    pub fetch_concurrency: u16,
     /// A file holding the read grant's bearer token (a trailing newline is dropped).
     #[arg(long)]
     pub grant_token_file: Option<PathBuf>,
@@ -113,7 +138,7 @@ pub struct Cli {
     /// `--insecure-argv-secrets`.
     #[arg(long)]
     pub grant_token: Option<String>,
-    /// Accept `--pack-url` and `--grant-token`, whose values are visible in argv to the Command and
+    /// Accept `--pack-url`, `--put-urls` and `--grant-token`, whose values are visible in argv to the Command and
     /// to every process on the host. Removed when the job scheduler delivers job secrets as files
     /// (komira-ai/kbf#1934).
     #[arg(long)]
@@ -131,7 +156,11 @@ pub struct Cli {
     /// The Action to run, as `<64 lowercase hex digits>/<size>`.
     #[arg(long, value_parser = digest::parse)]
     pub action: Digest,
-    /// Where the inputs are laid out (`in/` under it) and the output streams are written.
+    /// Where the inputs are laid out (`in/` under it) and the output streams are written. The
+    /// Command's `HOME`, `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH` name directories
+    /// under `private/` here, made new for the run (an existing `private` is refused) with mode 0700, beside `in/` and so never collected as outputs: a job's
+    /// image root is read-only and its `/tmp` is small and `noexec`. A variable the Command sets
+    /// itself keeps its value.
     #[arg(long, default_value = "/scratch/work")]
     pub work_dir: PathBuf,
     /// The longest the Command may run, in milliseconds: the Action's timeout when it sets a
@@ -236,23 +265,39 @@ pub async fn execute(
     let action: Action = fetch_message(source, &action_digest)?;
     let command: Command =
         fetch_message(source, &named("command", action.command_digest.as_ref())?)?;
+    // Read before the inputs are fetched: a refused property costs no download.
+    let network = network::from_platform(&action, &command)?;
+    if network == network::Network::Allowed {
+        eprintln!("{}", network::allowed_notice(&cli.action));
+    }
     let input_root = named("input root", action.input_root_digest.as_ref())?;
     let root = cli.work_dir.join("in");
-    materialize(source, &input_root, &root)?;
+    materialize(
+        source,
+        &input_root,
+        &root,
+        usize::from(cli.fetch_concurrency),
+    )?;
     let fetch_ms = millis(fetching.elapsed());
 
     let stdout = cli.work_dir.join("stdout");
     let stderr = cli.work_dir.join("stderr");
+    let private = cli.work_dir.join("private");
     let ran = run(
         &command,
         &Run {
             root: &root,
+            private: &private,
             stdout: &stdout,
             stderr: &stderr,
             deadline: deadline(&action, Duration::from_millis(cli.deadline_ms)),
+            network,
         },
     )
     .await?;
+    if network != network::Network::Allowed {
+        eprintln!("{}", network::layers_notice(&cli.action, &ran.layers));
+    }
 
     let packing = Instant::now();
     let paths: Vec<String> = output_paths(&command).into_iter().cloned().collect();
@@ -292,6 +337,9 @@ pub async fn execute(
             cpu_usage_us: ran.cpu_us,
             memory_peak_bytes: ran.peak_rss_bytes,
         },
+        packs: 1,
+        large: Vec::new(),
+        inputs: None,
     };
     for file in &result.output_files {
         manifest.output_files.push(OutputFile {
@@ -355,6 +403,7 @@ fn millis(d: Duration) -> u64 {
 fn check_argv_secrets(cli: &Cli) -> Result<(), Failure> {
     let used = [
         ("--pack-url", cli.pack_url.is_some()),
+        ("--put-urls", cli.put_urls.is_some()),
         ("--grant-token", cli.grant_token.is_some()),
     ];
     match used.iter().find(|(_, set)| *set) {
@@ -391,6 +440,21 @@ fn credential(what: &str, file: Option<&Path>, flag: Option<&str>) -> Result<Str
     Ok(value.to_owned())
 }
 
+/// The URL the pack is PUT to: the single pack URL of the v1 flags, or, with a v2 key set, its
+/// first pack slot. The other slots are validated with the set and not used yet.
+fn pack_url(cli: &Cli) -> Result<String, Failure> {
+    let set = PutUrls::from_sources(cli.put_urls_file.as_deref(), cli.put_urls.as_deref())
+        .map_err(|e| Failure::Setup(format!("the v2 key set: {e}")))?;
+    match set {
+        Some(mut set) => Ok(set.packs.swap_remove(0)),
+        None => credential(
+            "pack URL",
+            cli.pack_url_file.as_deref(),
+            cli.pack_url.as_deref(),
+        ),
+    }
+}
+
 /// The trusted roots and the real source and sink the flags name.
 fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
     check_lease(cli)?;
@@ -406,11 +470,7 @@ fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
             std::fs::read(path).map_err(|e| Failure::Setup(format!("{}: {e}", path.display())))?,
         );
     }
-    let url = credential(
-        "pack URL",
-        cli.pack_url_file.as_deref(),
-        cli.pack_url.as_deref(),
-    )?;
+    let url = pack_url(cli)?;
     let source = HttpBlobSource::new(&cli.grant_url, &token, &roots)?;
     let sink = HttpSink {
         agent: if cli.allow_plain_http_put {
@@ -450,6 +510,19 @@ async fn finish(
     }
 }
 
+/// [`run_cli`] once `protection` (what [`network::protect_this_process`] returned, called before
+/// anything else) is known to have worked: if it did not, the tool stops with the setup exit code
+/// rather than run with the Command able to take its sockets.
+pub fn run_cli_with(protection: std::io::Result<()>, cli: &Cli) -> ExitCode {
+    match protection {
+        Ok(()) => run_cli(cli),
+        Err(e) => {
+            eprintln!("kbf-task: cannot make this process non-dumpable: {e}");
+            ExitCode::from(EXIT_SETUP)
+        }
+    }
+}
+
 /// Runs the task the flags describe on a fresh single-threaded runtime and returns the exit code;
 /// a runtime that cannot start is a setup failure.
 pub fn run_cli(cli: &Cli) -> ExitCode {
@@ -474,3 +547,7 @@ fn start(runtime: std::io::Result<tokio::runtime::Runtime>, cli: &Cli) -> ExitCo
 #[cfg(test)]
 #[path = "task_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "put_urls_flag_tests.rs"]
+mod put_urls_flag_tests;

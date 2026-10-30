@@ -96,6 +96,7 @@ async fn an_attempt_answers_what_its_run_measured() {
             ..RunUsage::default()
         }),
         booked_memory_bytes: Some(GIB),
+        booked_millicpus: None,
         cap_bytes: Some(2 * GIB),
     };
     let last = Run {
@@ -206,6 +207,33 @@ async fn an_attempt_answers_what_its_run_measured() {
         rows["actions"][0]["attempts"][0]["usage"]["memory_peak_bytes"], 777,
         "a page of rows lists the same attempts"
     );
+    server.stop().await;
+}
+
+/// Catches: an accepted attempt's booking left out of its answer (only a memory kill's
+/// had it), the CPU booking missing or in other units, and either key written for an
+/// attempt whose lease has no run.
+#[tokio::test]
+async fn an_accepted_attempt_answers_what_its_lease_booked() {
+    let server = Server::with(OPEN);
+    let (sized, bare) = (digest(20), digest(21));
+    let booked = Run {
+        booked_memory_bytes: Some(3 * GIB),
+        booked_millicpus: Some(2_500),
+        ..executed(1, 2)
+    };
+    let mut events = one_run("k", sized, 1, (0, 5), booked);
+    events.push(queued("k", "main", at(6), bare, 2));
+    events.push(granted(2, 1, "node-a", at(7)));
+    server.feed(events).await;
+    let rows = server.ok("/v1/invocations/k/actions").await;
+    let attempt = &rows["actions"][0]["attempts"][0];
+    assert_eq!(attempt["booked_memory_bytes"], 3 * GIB);
+    assert_eq!(attempt["booked_millicpus"], 2_500);
+    let held = &rows["actions"][1]["attempts"][0];
+    for key in ["booked_memory_bytes", "booked_millicpus"] {
+        assert!(held.get(key).is_none(), "{key}: {held}");
+    }
     server.stop().await;
 }
 

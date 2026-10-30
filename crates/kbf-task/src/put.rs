@@ -9,7 +9,14 @@
 //! stored ([`put_retrying`]). Every other answer, a 412 (the key exists, and a re-attempt of the
 //! task gets a new key, so it is final) and a transport error included, is reported on the first
 //! attempt.
+//!
+//! [`put_file`] is the same PUT for a large object: the body is streamed from a file, never read
+//! whole, and the file is reopened by each attempt of [`put_retrying`]. It is not yet called by
+//! the run.
 
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,6 +34,14 @@ pub const MAX_WAIT: Duration = Duration::from_secs(30);
 
 /// How long the tool waits before a retry when the 503 names no usable `Retry-After`.
 pub const DEFAULT_WAIT: Duration = Duration::from_secs(2);
+
+/// The largest large object: a blob over the record cap
+/// ([`kbf_task_pack::MAX_RECORD_BYTES`]) is PUT alone, as raw bytes, and this is the most such a
+/// PUT may carry. It covers the largest toolchain blob (about 165 MiB today) with room for the
+/// next toolchain bump, and equals the cap the store and the frontend enforce on the same key
+/// (the frontend's `--task-large-max-bytes`); a value that differs from theirs makes a task fail
+/// at the PUT instead of at the plan.
+pub const MAX_LARGE_BYTES: u64 = 512 << 20;
 
 /// The string that stands in for a URL's query string and fragment.
 const REDACTED: &str = "<redacted>";
@@ -56,6 +71,22 @@ pub enum PutError {
         status: u16,
         /// The URL, redacted.
         url: String,
+    },
+    /// The file to send is larger than the cap for a large object; nothing was sent.
+    #[error("the file has {size} bytes, more than the {limit} a large object may hold")]
+    TooLarge {
+        /// The file's size.
+        size: u64,
+        /// The cap.
+        limit: u64,
+    },
+    /// The file to send could not be opened or measured; nothing was sent.
+    #[error("{path}: {reason}")]
+    File {
+        /// The file.
+        path: String,
+        /// The operating system's reason.
+        reason: String,
     },
     /// The request did not complete: the store was not reached, or the connection failed.
     #[error("the PUT of {url} failed: {reason}")]
@@ -127,6 +158,15 @@ fn classify(status: u16, url: &str, retry_after: Option<&str>) -> Result<(), Put
     }
 }
 
+/// What the store's `response` to a PUT means; `shown` is the redacted URL.
+fn answer(response: &ureq::http::Response<ureq::Body>, shown: &str) -> Result<(), PutError> {
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok());
+    classify(response.status().as_u16(), shown, retry_after)
+}
+
 /// The TLS settings of a client that trusts the given DER certificates and nothing else, with
 /// the `ring` crypto provider.
 pub fn tls_config(roots: &[Vec<u8>]) -> ureq::tls::TlsConfig {
@@ -185,11 +225,50 @@ pub fn put(agent: &ureq::Agent, url: &str, body: &[u8]) -> Result<(), PutError> 
             url: shown.clone(),
             reason: scrub(&e.to_string(), url),
         })?;
-    let retry_after = response
-        .headers()
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok());
-    classify(response.status().as_u16(), &shown, retry_after)
+    answer(&response, &shown)
+}
+
+/// Store the file at `path` at the presigned `url`: one create-only PUT whose body is streamed
+/// from the file, with `Content-Length` taken from the opened file's metadata. The file is never
+/// read whole, and it is opened afresh by each call, so [`put_retrying`] re-sends all of it after
+/// a 503. Statuses map as in [`put`], and no error contains the URL's query string.
+///
+/// A file over [`MAX_LARGE_BYTES`] is refused before the store is contacted.
+///
+/// # Errors
+/// [`PutError::TooLarge`] and [`PutError::File`] for a file that is too big or cannot be
+/// opened; otherwise as [`put`].
+pub fn put_file(agent: &ureq::Agent, url: &str, path: &Path) -> Result<(), PutError> {
+    put_file_capped(agent, url, path, MAX_LARGE_BYTES)
+}
+
+/// [`put_file`] with the cap as a parameter, so a test needs no file of the real cap's size.
+fn put_file_capped(agent: &ureq::Agent, url: &str, path: &Path, cap: u64) -> Result<(), PutError> {
+    let shown = redact(url);
+    let (file, len) = File::open(path)
+        .and_then(|file| file.metadata().map(|meta| (file, meta.len())))
+        .map_err(|e| PutError::File {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        })?;
+    if len > cap {
+        return Err(PutError::TooLarge {
+            size: len,
+            limit: cap,
+        });
+    }
+    // `take` keeps a file that grew after the measure from sending more than it announced.
+    let mut body = file.take(len);
+    let response = agent
+        .put(url)
+        .header("If-None-Match", "*")
+        .header("Content-Length", len.to_string())
+        .send(ureq::SendBody::from_reader(&mut body))
+        .map_err(|e| PutError::Transport {
+            url: shown.clone(),
+            reason: scrub(&e.to_string(), url),
+        })?;
+    answer(&response, &shown)
 }
 
 /// What waits between the attempts of [`put_retrying`]; a parameter so tests record the waits
@@ -221,6 +300,10 @@ fn wait_for(retry_after_secs: Option<u64>) -> Duration {
 /// key: a 503 stored nothing, and if an earlier attempt had in fact stored the object, the retry
 /// meets a 412 and fails instead of overwriting it.
 ///
+/// The URL's expiry is not checked: the waits add up to at most [`MAX_RETRIES`] times
+/// [`MAX_WAIT`] (90 s), and an attempt the store gets after the URL expired is refused with a
+/// 403, which is not retried. A late retry therefore fails the task and stores nothing.
+///
 /// # Errors
 /// The last attempt's [`PutError`].
 pub fn put_retrying(
@@ -240,6 +323,10 @@ pub fn put_retrying(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "put_file_tests.rs"]
+mod file_tests;
 
 #[cfg(test)]
 mod tests {
@@ -612,6 +699,19 @@ mod tests {
         assert_eq!(put_retrying(attempt, &sleeper), Err(exists));
         assert_eq!(calls.get(), 1);
         assert!(sleeper.waits().is_empty());
+    }
+
+    /// Catches a retry that hides what the later attempt said: after a 503, the retry meets a
+    /// 412 (an earlier attempt's object, or another writer's, holds the key), and that 412 is the
+    /// failure, after exactly one wait and with no further attempt.
+    #[test]
+    fn a_412_after_a_503_is_the_failure_and_ends_the_retries() {
+        let sleeper = Recorded::default();
+        let exists = PutError::Exists { url: "u".into() };
+        let (attempt, calls) = answering(vec![busy(Some(4)), Err(exists.clone())]);
+        assert_eq!(put_retrying(attempt, &sleeper), Err(exists));
+        assert_eq!(calls.get(), 2);
+        assert_eq!(sleeper.waits(), [Duration::from_secs(4)]);
     }
 
     /// Catches a transport error or another status being retried: each is reported on the first

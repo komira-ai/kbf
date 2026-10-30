@@ -353,6 +353,8 @@ fn names_and_prefixes_are_checked() {
     for bad in [
         "",
         "_",
+        "/",
+        "/cas/b/",
         "_jou",
         "_journal/",
         "_journal/p1/",
@@ -422,7 +424,7 @@ fn a_presigning_key_needs_a_grant_that_can_be_used() {
             ..grant()
         },
         Grant {
-            max_object_bytes: (128 << 20) + 1,
+            max_object_bytes: (5 << 30) + 1,
             ..grant()
         },
     ];
@@ -441,7 +443,7 @@ fn a_presigning_key_needs_a_grant_that_can_be_used() {
     }
     let edge = Grant {
         max_expires_secs: 604_800,
-        max_object_bytes: 128 << 20,
+        max_object_bytes: 5 << 30,
         ..grant()
     };
     assert!(PresignKey::new("k", SECRET, edge).is_ok());

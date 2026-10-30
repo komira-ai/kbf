@@ -24,7 +24,7 @@ use super::handover::show;
 use super::{Detail, Outbound, START_VALIDITY_MS, StreamId, finished_of, refused_as, wire_lease};
 use crate::action_usage::Subject;
 use crate::learned::{Learned, Row};
-use crate::machine::{FarmMachine, Platform, Sent, Waiter, stored_name};
+use crate::machine::{Booked, FarmMachine, Platform, Sent, Waiter, stored_name};
 use crate::stamp::Stamp;
 
 /// A worker's newest stream.
@@ -90,6 +90,9 @@ pub(in crate::farm) struct Side {
     /// The pack-write counts on the newest heartbeat of each node that sent any
     /// ([`Farm::note_pack_writes`](super::Farm::note_pack_writes)).
     pub pack_writes: BTreeMap<WorkerId, worker::PackWriteCounts>,
+    /// The input cache counts on the newest heartbeat of each node that sent any
+    /// ([`Farm::note_input_cache`](super::Farm::note_input_cache)).
+    pub input_caches: BTreeMap<WorkerId, worker::InputCacheCounts>,
     /// What the accepted node-load readings of each node that sent any come to
     /// ([`Farm::note_node_load`](super::Farm::note_node_load)).
     pub node_loads: super::node_load::NodeLoads,
@@ -115,6 +118,7 @@ impl Side {
             watched: BTreeMap::new(),
             pack_reads: BTreeMap::new(),
             pack_writes: BTreeMap::new(),
+            input_caches: BTreeMap::new(),
             node_loads: BTreeMap::new(),
             failed: FailedActions::default(),
         }
@@ -303,6 +307,10 @@ impl Adapter for Side {
                     queued: w.queued,
                     started: now,
                 },
+                booked: Some(Booked {
+                    cpu_millis: start.resources.cpu_millis,
+                    memory_bytes: start.resources.memory_bytes,
+                }),
             });
         sent.into_iter()
             .for_each(|sent| self.machine.start(start.lease, sent));
@@ -450,6 +458,7 @@ impl Adapter for Side {
                 operation: op.operation,
                 action: key.action,
                 stamp,
+                booked: None,
             };
             self.machine.start(grant.lease, sent);
         }

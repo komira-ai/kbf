@@ -50,6 +50,23 @@ async fn fixture() -> Fixture {
 }
 
 /// A presigned `PUT` URL for `key`, good for `secs`, signed by the presigning key.
+/// Asserts that a presigned URL of the presigning key signed for the listing of the open
+/// uploads of the bucket (`GET /<bucket>?uploads`, with and without a prefix) is 403
+/// `AccessDenied` and tells nothing of the uploads: the key may only PUT. It catches a listing
+/// route that is reached by a key that has no read role.
+#[tokio::test(start_paused = true)]
+async fn a_presigning_key_cannot_list_the_open_uploads() {
+    let f = fixture().await;
+    let id = f.rig.cold_mem.create_upload("cas/b/open").await.unwrap();
+    let extras: [&[(&str, &str)]; 2] = [&[("uploads", "")], &[("uploads", ""), ("prefix", "cas/")]];
+    for extra in extras {
+        let url = presign_url("GET", &access("pack-presign"), &request("", 300), extra);
+        let reply = f.send("GET", &url.unwrap(), b"").await;
+        assert_eq!(refused(&reply), (403, "AccessDenied".to_owned()));
+        assert!(!reply.body.contains(&id) && !reply.body.contains("cas/b/open"));
+    }
+}
+
 fn put_url(key: &str, secs: u64) -> String {
     presign_url("PUT", &access("pack-presign"), &request(key, secs), &[]).unwrap()
 }
@@ -613,4 +630,23 @@ async fn the_conditions_and_the_calls_a_presigned_put_does_not_do() {
         assert!(!f.holds(key).await, "{key}");
     }
     assert_eq!(f.rig.get("cas/b/plain", None).await.body, "1");
+}
+
+/// Asserts that the cap of a key holds when `--max-request-bytes` is far larger: a presigned PUT
+/// that declares more than the cap of its key is 413 before any byte of the body is read (the
+/// body here fails if it is read, so a 400 would mean it was), nothing is stored, and a body of
+/// the cap itself is stored.
+#[tokio::test(start_paused = true)]
+async fn the_cap_of_a_key_holds_when_the_request_limit_is_larger() {
+    let f = fixture_with(|config| config.max_request_bytes = 1 << 30).await;
+    let url = put_url("cas/b/big", 300);
+    let (parts, _) = request_for("PUT", &url, &[("content-length", "17")], b"").into_parts();
+    let failing = Scripted::new(vec![Step::Fail]);
+    let reply = f.rig.send_raw(Request::from_parts(parts, failing)).await;
+    assert_eq!(refused(&reply), (413, "EntityTooLarge".to_owned()));
+    assert!(!f.holds("cas/b/big").await);
+    assert_eq!(
+        f.put(&put_url("cas/b/fits", 300), &[1_u8; 16]).await.status,
+        StatusCode::OK
+    );
 }

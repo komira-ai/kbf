@@ -71,6 +71,7 @@ use crate::{
     ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SystemClock, self_test,
 };
 
+use super::gc::{ensure_distinct as gc_distinct, gc_keys, ids as gc_ids};
 use super::keys::{ensure_distinct, read_credentials, read_only_keys};
 use super::presign::{ensure_distinct as presign_distinct, presign_keys};
 use super::{Drained, Server, ServerConfig};
@@ -110,7 +111,7 @@ const S3_MIN_BODY_RATE: Option<NonZeroU64> = NonZeroU64::new(1 << 20);
 #[derive(Clone, Debug, Parser)]
 #[command(name = "tierstore", version)]
 pub struct Cli {
-    /// The address the S3 API, `/healthz` and `/readyz` are served on.
+    /// The address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on.
     #[arg(long)]
     pub listen: SocketAddr,
     /// The id of this proxy, which names its journal in the hot tier and its lease. Keep it
@@ -202,6 +203,14 @@ pub struct Cli {
     /// its owner may read it (mode 0600).
     #[arg(long)]
     pub presign_key_file: Vec<PathBuf>,
+    /// A file that holds a GC key, JSON of exactly `access_key_id`, `secret_access_key` and
+    /// `prefix` (ending in `/`): a header-signed key that lists (ListObjectsV2 and
+    /// ListMultipartUploads, each with a prefix inside its own), heads, deletes and aborts uploads
+    /// under the prefix and does nothing else (no get, no put, no bucket call); it is refused on a
+    /// presigned URL. Give the flag once for each such key; all key ids must differ. Only its
+    /// owner may read it (mode 0600).
+    #[arg(long)]
+    pub gc_key_file: Vec<PathBuf>,
     /// The longest `X-Amz-Expires` that a presigned URL may have, whatever the ceiling of its key
     /// says: a number and `ms`, `s`, `m` or `h`.
     #[arg(long, default_value = "15m", value_parser = parse_duration)]
@@ -229,10 +238,19 @@ pub struct Cli {
     /// How often the reconciler works: shorter than `--lease-ttl`.
     #[arg(long, default_value = "5s", value_parser = parse_duration)]
     pub reconcile_interval: Duration,
+    /// How old the usage the reconciler publishes may be before `/usagez` says 503 with the
+    /// reason (`/readyz` does not look at it): a number and `ms`, `s`, `m` or `h`, longer than
+    /// `--lease-ttl`, so that a reconciler that takes over the lease does not show. A usage that
+    /// is older than 30 seconds is ignored by the puts as if the hot tier were not full, so a
+    /// reconciler that has stopped would otherwise show nowhere; the puts are not refused. A
+    /// process that has run this long without any usage is judged the same way.
+    #[arg(long, default_value = "2m", value_parser = parse_duration)]
+    pub usage_stale_after: Duration,
     /// The longest body of a request, in bytes: the longest object, and the longest part of a
     /// multipart upload. An upper bound on the length of what is streamed, not a bound on
     /// memory: the body of a put or of a part is passed on to the tiers as it arrives and is
-    /// never held whole. A body over it is refused with 413 and nothing is stored; a request
+    /// never held whole. A presigning key with a larger `max_object_bytes` is held to this too: the smaller of the two
+    /// applies, so raise this with the key's cap. A body over it is refused with 413 and nothing is stored; a request
     /// that says in its `Content-Length` that its body is longer is refused before any byte of
     /// it is read.
     #[arg(
@@ -482,7 +500,10 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     if cli.reconcile_interval >= cli.lease_ttl {
         return Err("--reconcile-interval must be shorter than --lease-ttl".into());
     }
-    if matches!(cli.bucket.as_str(), "healthz" | "readyz") {
+    if cli.usage_stale_after <= cli.lease_ttl {
+        return Err("--usage-stale-after must be longer than --lease-ttl".into());
+    }
+    if matches!(cli.bucket.as_str(), "healthz" | "readyz" | "usagez") {
         let name = &cli.bucket;
         return Err(format!("--bucket {name:?} is the name of a probe path").into());
     }
@@ -496,9 +517,12 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     let read_only = read_only_keys(&cli.read_only_key_file)?;
     ensure_distinct(&key_id, &read_only).map_err(InvalidFlags)?;
     let presign = presign_keys(&cli.presign_key_file)?;
-    let others: Vec<&str> = std::iter::once(key_id.as_str())
+    let gc = gc_keys(&cli.gc_key_file)?;
+    let mut others: Vec<&str> = std::iter::once(key_id.as_str())
         .chain(read_only.iter().map(|key| key.id.as_str()))
         .collect();
+    gc_distinct(&others, &gc).map_err(InvalidFlags)?;
+    others.extend(gc_ids(&gc));
     presign_distinct(&others, &presign).map_err(InvalidFlags)?;
     let timeout = cli.s3_request_timeout;
     let hot = open_tier("--hot", &cli.hot, &cli.hot_s3(), timeout)?;
@@ -507,6 +531,7 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     let mut server = ServerConfig::new(&cli.bucket, &key_id, &secret, Arc::clone(&clock));
     server.read_only_keys = read_only;
     server.presign_keys = presign;
+    server.gc_keys = gc;
     server.presign_max_expires = cli.presign_max_expires;
     server.region = cli.region.clone();
     server.max_request_bytes = usize::try_from(cli.max_request_bytes).unwrap_or(usize::MAX);
@@ -516,6 +541,7 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     server.put_rate_grace = cli.put_rate_grace;
     server.drain_lb_wait = cli.drain_lb_wait;
     server.drain_deadline = cli.drain_deadline;
+    server.usage_stale_after = cli.usage_stale_after;
     let mut proxy = ProxyConfig::new(&cli.proxy_id, cli.hot_bytes, Arc::clone(&clock));
     proxy.critical = share(cli.critical);
     proxy.linger = cli.journal_linger;
@@ -649,13 +675,14 @@ pub async fn run(
     stop: impl Future<Output = ()> + Send + 'static,
     ready: impl FnOnce(SocketAddr),
 ) -> Result<Drained, Error> {
-    let built = build(cli)?;
+    let mut built = build(cli)?;
     let (hot, cold) = (built.hot.as_ref(), built.cold.as_ref());
     probe_tiers(cli, hot, cold, cli.backend_check_wait).await?;
     let (hot, cold) = (Arc::clone(&built.hot), Arc::clone(&built.cold));
     let opened = Proxy::open(hot, cold, built.proxy).await;
-    let proxy = opened.map_err(|why| format!("opening the proxy: {why}"))?;
-    let server = Server::new(Arc::new(proxy), built.server);
+    let proxy = Arc::new(opened.map_err(|why| format!("opening the proxy: {why}"))?);
+    built.server.proxy = Some(Arc::clone(&proxy));
+    let server = Server::new(proxy, built.server);
     let address = cli.listen;
     let bound = TcpListener::bind(address).await;
     let listener = bound.map_err(|why| format!("binding {address}: {why}"))?;
