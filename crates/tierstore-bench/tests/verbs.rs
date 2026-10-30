@@ -25,10 +25,25 @@ async fn every_verb_reaches_its_module() {
 
     // The ops verbs read `ops.json` of the result directory first; there is none here.
     let ops_verbs: [&[&str]; 4] = [
-        &["preflight", "--result-dir", out],
-        &["provision", "--result-dir", out],
-        &["provision", "--result-dir", out, "--apply"],
-        &["verify-teardown", "--result-dir", out, "--before", snapshot],
+        &["preflight", "--result-dir", out, "--test-prefix", "tb-"],
+        &["provision", "--result-dir", out, "--test-prefix", "tb-"],
+        &[
+            "provision",
+            "--result-dir",
+            out,
+            "--test-prefix",
+            "tb-",
+            "--apply",
+        ],
+        &[
+            "verify-teardown",
+            "--result-dir",
+            out,
+            "--test-prefix",
+            "tb-",
+            "--before",
+            snapshot,
+        ],
     ];
     for args in ops_verbs {
         match run(args).await {
@@ -58,13 +73,27 @@ fn run_args(out: &std::path::Path, extra: &[&str]) -> Vec<String> {
         "a1",
         "--passes",
         "3",
+        "--test-prefix",
+        "tb-",
         "--result-dir",
     ]
     .map(String::from)
     .to_vec();
     args.push(out.to_str().unwrap().to_owned());
+    // The campaign ledger lies beside the result directory; the first run of a test begins it.
+    let ledger = ledger_of(out);
+    args.push("--campaign-ledger".to_owned());
+    args.push(ledger.to_str().unwrap().to_owned());
+    if !ledger.exists() {
+        args.push("--new-campaign".to_owned());
+    }
     args.extend(extra.iter().map(|s| (*s).to_owned()));
     args
+}
+
+/// The ledger file beside the result directory `out`.
+fn ledger_of(out: &std::path::Path) -> std::path::PathBuf {
+    out.with_file_name("campaign-ledger.json")
 }
 
 async fn run_owned(args: &[String]) -> Result<(), BenchError> {
@@ -237,4 +266,179 @@ fn bad_usage_is_refused_by_the_parser() {
         argv.extend_from_slice(args);
         assert!(Cli::try_parse_from(argv).is_err(), "{args:?}");
     }
+}
+
+/// The arguments with the value of `--campaign-ledger` replaced.
+fn with_ledger(args: &[String], ledger: &std::path::Path) -> Vec<String> {
+    let mut out = args.to_vec();
+    let at = out.iter().position(|a| a == "--campaign-ledger").unwrap();
+    out[at + 1] = ledger.to_str().unwrap().to_owned();
+    out
+}
+
+/// Catches a campaign that starts or is reset by accident: a ledger that is not there is a
+/// refusal without `--new-campaign` and nothing is made; one inside the result directory is
+/// refused; `--new-campaign` makes it, and then refuses to make it again, so a flag left in a
+/// command line cannot reset the count. The run itself goes on to the cell, which says it has no
+/// store.
+#[tokio::test]
+async fn a_campaign_ledger_is_begun_once_and_never_by_accident() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-campaign");
+    let out = dir.path().join("out");
+    write_report(&out, &PreflightReport::default());
+    let ledger = ledger_of(&out);
+
+    let begin = run_args(&out, &[]);
+    assert!(begin.contains(&"--new-campaign".to_owned()));
+    let without_new: Vec<String> = begin
+        .iter()
+        .filter(|a| *a != "--new-campaign")
+        .cloned()
+        .collect();
+    let err = run_owned(&without_new).await.unwrap_err();
+    assert!(matches!(err, BenchError::Budget(_)), "{err}");
+    assert!(err.to_string().contains("--new-campaign"), "{err}");
+    assert!(!ledger.exists());
+
+    let inside = out.join("ledger.json");
+    let err = run_owned(&with_ledger(&begin, &inside)).await.unwrap_err();
+    assert!(
+        err.to_string().contains("outside the result directory"),
+        "{err}"
+    );
+    assert!(!inside.exists());
+
+    let err = run_owned(&begin).await.unwrap_err();
+    assert!(matches!(err, BenchError::Setup(_)), "{err}");
+    let begun = std::fs::read_to_string(&ledger).unwrap();
+    assert_eq!(begun, "{\"cold_written_bytes\":0}");
+
+    let err = run_owned(&begin).await.unwrap_err();
+    assert!(err.to_string().contains("would reset it"), "{err}");
+    assert_eq!(std::fs::read_to_string(&ledger).unwrap(), begun);
+    let err = run_owned(&run_args(&out, &[])).await.unwrap_err();
+    assert!(
+        matches!(err, BenchError::Setup(_)),
+        "continued without the flag: {err}"
+    );
+}
+
+/// A `run` command line parsed.
+fn parsed_run(extra: &[&str]) -> Result<cli::RunArgs, clap::Error> {
+    let mut argv = vec![
+        "tierstore-bench",
+        "run",
+        "--result-dir",
+        "o",
+        "--test-prefix",
+        "tb-",
+        "--run-id",
+        "r",
+        "--git-sha",
+        "g",
+        "--cell",
+        "a1",
+    ];
+    argv.extend_from_slice(extra);
+    match Cli::try_parse_from(argv)?.command {
+        cli::Command::Run(args) => Ok(args),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Catches a run that can be started without a campaign ledger, a fault time to live that is not
+/// the flag's (a fault that outlives a dead run, or one that ends under a cell), and a time to
+/// live of zero, which the proxy would refuse.
+#[test]
+fn the_run_flags_name_the_ledger_and_the_fault_time_to_live() {
+    assert!(parsed_run(&[]).is_err(), "no --campaign-ledger");
+    let args = parsed_run(&["--campaign-ledger", "l"]).unwrap();
+    assert!(!args.new_campaign);
+    assert_eq!(args.fault_ttl_secs.get(), 300);
+    assert!(args.fault_switch().is_none(), "no proxy, no switch");
+
+    let args = parsed_run(&[
+        "--campaign-ledger",
+        "l",
+        "--new-campaign",
+        "--fault-control",
+        "c",
+        "--fault-result-dir",
+        "d",
+        "--fault-ttl-secs",
+        "7",
+    ])
+    .unwrap();
+    assert!(args.new_campaign);
+    assert_eq!(
+        args.fault_switch().unwrap().ttl(),
+        std::time::Duration::from_secs(7)
+    );
+    let default = parsed_run(&[
+        "--campaign-ledger",
+        "l",
+        "--fault-control",
+        "c",
+        "--fault-result-dir",
+        "d",
+    ])
+    .unwrap();
+    assert_eq!(
+        default.fault_switch().unwrap().ttl(),
+        tierstore_bench::faultfile::DEFAULT_TTL
+    );
+    assert!(parsed_run(&["--campaign-ledger", "l", "--fault-ttl-secs", "0"]).is_err());
+}
+
+/// Catches `plan` reaching a store or ignoring the prefix rule: it needs a test prefix, refuses a
+/// run file whose bucket is outside it (naming the value) and, given a good one, succeeds.
+#[tokio::test]
+async fn plan_refuses_a_name_outside_the_prefix_and_reads_a_good_run_file() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-plan");
+    let out = dir.path().join("out");
+    let out = out.to_str().unwrap();
+    let file = dir.path().join("run.json");
+    let write = |bucket: &str| {
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"stores": {{"cold": {{"endpoint": "http://store.example:9000",
+                "bucket": "{bucket}", "access_key_id": "tb-key", "secret_access_key": "s"}}}}}}"#
+            ),
+        )
+        .unwrap();
+    };
+    let file = file.to_str().unwrap();
+
+    write("tb-cold");
+    run(&[
+        "plan",
+        "--result-dir",
+        out,
+        "--run-file",
+        file,
+        "--test-prefix",
+        "tb-",
+    ])
+    .await
+    .unwrap();
+    let err = run(&["plan", "--result-dir", out, "--run-file", file])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("test_prefix"), "{err}");
+
+    write("farm-cold");
+    let err = run(&[
+        "plan",
+        "--result-dir",
+        out,
+        "--run-file",
+        file,
+        "--test-prefix",
+        "tb-",
+    ])
+    .await
+    .unwrap_err();
+    assert!(matches!(err, BenchError::Config(_)), "{err}");
+    assert!(err.to_string().contains("farm-cold"), "{err}");
 }

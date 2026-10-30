@@ -335,6 +335,28 @@ fn the_system_host_reads_files_runs_commands_and_tries_ports() {
         .run(&Cmd::new("env", &[]).with_env("TB_HOST_TEST", "set-by-test".to_owned()))
         .unwrap();
     assert!(with.stdout.contains("TB_HOST_TEST=set-by-test"));
+    let echoed = host
+        .run(&Cmd::new("cat", &[]).with_stdin("line one\nline two\n".to_owned()))
+        .unwrap();
+    assert_eq!(echoed.stdout, "line one\nline two\n");
+    let nothing = host.run(&Cmd::new("cat", &[])).unwrap();
+    assert_eq!(nothing.stdout, "", "no input is a closed input, not a hang");
+    let deaf = host
+        .run(&Cmd::new("false", &[]).with_stdin("x".repeat(1 << 20)))
+        .unwrap();
+    assert!(
+        !deaf.success,
+        "a child that never reads is not a failed write"
+    );
+    let shown = format!(
+        "{:?}",
+        Cmd::new("cat", &[]).with_stdin("TOPSECRET".to_owned())
+    );
+    assert!(
+        shown.contains("with input") && !shown.contains("TOPSECRET"),
+        "{shown}"
+    );
+    assert!(format!("{:?}", Cmd::new("cat", &[])).contains("no input"));
     let err = host
         .run(&Cmd::new("tierstore-bench-no-such-program", &[]))
         .unwrap_err();

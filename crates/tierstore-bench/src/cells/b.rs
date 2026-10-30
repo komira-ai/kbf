@@ -70,11 +70,12 @@ impl Misses {
     /// Writes the objects of `pass` through the instance as multipart uploads.
     async fn write(&self, pass: u32) -> Result<(), BenchError> {
         for index in 0..self.objects {
+            // Counted before it is sent: an upload that is cut off may have landed.
+            self.charger.charge(self.size)?;
             let put = self
                 .instance
                 .put_multipart(&self.key(pass, index), self.body.clone())
                 .await?;
-            self.charger.charge(self.size)?;
             if !put.is_ok() {
                 return Err(BenchError::Setup(
                     "b: the instance would not take the objects to read".to_owned(),

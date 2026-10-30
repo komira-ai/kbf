@@ -70,3 +70,55 @@ fn no_proxy_means_an_error_and_not_a_healthy_arm() {
     let err = nowhere.set_mode(FaultMode::Refuse).unwrap_err();
     assert!(matches!(err, BenchError::Io { .. }), "{err}");
 }
+
+/// Catches a control file that would leave a dead run's fault in force for ever (the line had no
+/// time to live), and one written in place (the proxy could read half a line): with no proxy
+/// listening the call fails, and what it wrote is the mode with its time to live, whole seconds,
+/// at least one; the directory holds the control file alone.
+#[test]
+fn every_line_carries_a_time_to_live_and_is_written_whole() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-faultfile-ttl");
+    let control = dir.path().join("control");
+    let line = |switch: &FileSwitch, mode| {
+        switch.set_mode(mode).unwrap_err();
+        std::fs::read_to_string(&control).unwrap()
+    };
+    let make = || FileSwitch::new(control.clone(), dir.path()).settling_within(Duration::ZERO);
+    assert_eq!(make().ttl(), tierstore_bench::faultfile::DEFAULT_TTL);
+    assert_eq!(line(&make(), FaultMode::Refuse), "refuse ttl=300\n");
+    let short = make().with_ttl(Duration::from_secs(42));
+    assert_eq!(
+        line(&short, FaultMode::Latency { ms: 5 }),
+        "latency=5 ttl=42\n"
+    );
+    assert_eq!(line(&short, FaultMode::Pass), "pass ttl=42\n");
+    let tiny = make().with_ttl(Duration::from_millis(1500));
+    assert_eq!(line(&tiny, FaultMode::Blackhole), "blackhole ttl=1\n");
+    let zero = make().with_ttl(Duration::ZERO);
+    assert_eq!(line(&zero, FaultMode::Refuse), "refuse ttl=1\n");
+
+    let mut names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["control"], "no temporary file is left beside it");
+}
+
+/// Catches a fault set through the file that the proxy does not end by itself: the proxy takes
+/// `refuse ttl=...` from the switch and reports the mode, so the line the switch writes is one the
+/// proxy's control parser accepts (a rejected line would leave the proxy healthy and the call
+/// would time out instead).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_proxy_accepts_the_line_with_its_time_to_live() {
+    let dir = TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        "tierstore-bench-faultfile-ttl-proxy",
+    );
+    let proxy = spawn(config(&dir)).await.unwrap();
+    let switch =
+        FileSwitch::new(dir.path().join("control"), dir.path()).with_ttl(Duration::from_secs(3600));
+    switch.set_mode(FaultMode::Refuse).unwrap();
+    assert_eq!(proxy.mode(), FaultMode::Refuse);
+    proxy.stop().await.unwrap();
+}

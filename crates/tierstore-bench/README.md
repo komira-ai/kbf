@@ -15,10 +15,26 @@ file only, never in argv. The request log (`requests.jsonl` in the result direct
 file that names buckets and keys; it is the harness-side proof of what the tool sent, and stays
 with the private run directory.
 
+## The test prefix
+
+Every verb that loads a configuration needs a test prefix: `test_prefix` in the run file, or
+`--test-prefix PREFIX` (the flag wins). It is lowercase letters, digits and dashes, a stem and a
+closing dash (`bench7-`). Every test bucket and every scoped account id (`hot`, `cold`) must start
+with it, or the verb stops before any store call and names the offending value. `plan` prints what
+the run file resolves to, one `key=value` per line and nothing else: `test_prefix=`, then for each
+store its `bucket=`, and for `hot` and `cold` its `account=`. It reads the run file and sends
+nothing, so a script can compare it with its own site file.
+
+`provision --apply` changes only what it made. It looks (read-only) for the bucket and the account
+before it makes either: one that is on the store and not in `provision-state.json` of the result
+directory is someone else's, and the verb stops before changing anything. The account's secret is
+given to `mc` on its standard input, never in its arguments.
+
 ## Commands
 
 ```
 tierstore-bench preflight        read-only checks and the before-snapshot
+tierstore-bench plan             the test prefix, bucket names and account ids a run file resolves to
 tierstore-bench provision        test buckets and scoped accounts (dry run unless --apply)
 tierstore-bench run              cells cold-put, cold-read, g (first stage); a1, b, c (with a hot tier)
 tierstore-bench fault-proxy      the loopback proxy that slows, refuses or blackholes the cold side
@@ -50,7 +66,14 @@ the binary digest, the pass index and a quiet or busy flag on every row.
 runs the cells in order. Every cell writes under `tierstore-bench/<run id>/` of its test bucket,
 deletes what it wrote, and leaves in the result directory `<cell>-<arm>.json` per arm,
 `samples.csv` (one row per counted request), `requests.jsonl` (every request the tool sent) and
-`ledger.json` (cold bytes written by the campaign so far, against the caps).
+the campaign ledger.
+
+The ledger counts the cold bytes written by the whole campaign against the caps. It is the file
+`--campaign-ledger FILE` names, outside every result directory (a result directory can be cleaned;
+the count must not restart). `run` stops if the file is missing, unless `--new-campaign` is given,
+which makes it and refuses if it is already there. A pass is counted before it is sent (its planned
+bytes), and the count is corrected to what was written when the pass ends; a run that dies leaves
+the reservation counted. The file is replaced atomically on every save.
 
 Tierstore at v0.0.37 has no cold-only mode (`--hot` is a required flag). So the cold cells label
 their paths in the arm names and the result notes say which they are:
@@ -62,7 +85,7 @@ their paths in the arm names and the result notes say which they are:
 | `g` | `instance`, `direct-cold`, `direct-hot`, `loopback-http`, `local-disk` | a read of the 18,105-file, 344,233,431-byte synthetic tree at each width, with the baselines |
 | `a1` | `instance`, `hot` | put-to-ack of a plain put, acknowledged from the hot tier |
 | `b` | `<size>-c<n>` and `.ttfb`, `.second`, `.cold-direct` | a read of a hot miss with copy-back, the second read, and the direct read |
-| `c` | `<N>x<size>-c<n>-<mode>` | copy lag of a burst, found by one prefix LIST of the cold bucket a second |
+| `c` | `<N>x<size>-c<n>-<mode>` | copy lag of a burst, found by one prefix LIST of the cold bucket every `1 / --list-poll-rps` seconds (2 a second unless set) |
 
 The rules (also in `cells/mod.rs`): pass 0 of every arm is a discarded warm-up, arms are
 interleaved across passes, the load gate is read before a pass and every few completions in it
@@ -74,9 +97,12 @@ a p99 is filled in only from quiet passes with 1,000 requests or more. Fault arm
 result directory of a running `fault-proxy` (its `--control` and `--result-dir`): a fault arm
 writes the file, waits until the proxy's counters say it is in the mode, and fails the arm if it
 does not get there. The cold store the cell reaches must be behind that proxy. Without the two
-flags a `run` measures the healthy arms.
+flags a `run` measures the healthy arms. Every line the switch writes is `MODE ttl=SECS`
+(`--fault-ttl-secs`, 300 unless set), so a run that dies with a fault in force leaves a proxy that
+falls back to `pass` by itself; the time must be longer than the longest stretch a cell holds one
+mode. The file is replaced atomically.
 
-`run` needs `--run-id` and `--git-sha`, and a passed `preflight` in the result directory: its
+`run` needs `--run-id`, `--git-sha`, `--campaign-ledger` (see above), and a passed `preflight` in the result directory: its
 `preflight.json` gives the binary digest, versions and hardware that every result carries.
 
 `report --result-dir DIR` prints one table per cell: per arm and window, requests, failures with

@@ -303,6 +303,22 @@ impl Charger {
             .unwrap_or_else(PoisonError::into_inner)
             .charge(bytes)
     }
+
+    /// Counts `planned` bytes as written before they are sent (see [`Ledger::reserve`]).
+    fn reserve(&self, planned: u64) -> Result<(), BenchError> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reserve(planned)
+    }
+
+    /// Replaces a reservation by what was written (see [`Ledger::settle`]).
+    fn settle(&self, planned: u64, actual: u64) -> Result<(), BenchError> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .settle(planned, actual)
+    }
 }
 
 /// What a run of cells holds: the configuration, the clients' shared parts, the ledger and the
@@ -324,10 +340,12 @@ pub struct Env {
 }
 
 impl Env {
-    /// Opens the result directory (made if it is not there), the samples file and the ledger.
+    /// Opens the result directory (made if it is not there), the samples file and the campaign
+    /// ledger, which must exist already (`Campaign::begin` makes it).
     ///
     /// # Errors
-    /// [`BenchError`] if the directory or a file in it cannot be made or read.
+    /// [`BenchError`] if the directory or a file in it cannot be made or read, or there is no
+    /// ledger.
     pub fn new(ctx: &CellContext, load: Arc<dyn LoadSource>) -> Result<Self, BenchError> {
         let dir = &ctx.config.result_dir;
         std::fs::create_dir_all(dir).map_err(|source| BenchError::Io {
@@ -343,7 +361,10 @@ impl Env {
             cold_cap: Arc::new(Throttle::new(ctx.config.rates.cold_rps)),
             hot_cap: Arc::new(Throttle::new(ctx.config.rates.hot_rps)),
             recorder: Recorder::open(dir)?,
-            ledger: Charger(Arc::new(Mutex::new(Ledger::open(dir, ctx.config.bytes)?))),
+            ledger: Charger(Arc::new(Mutex::new(Ledger::open(
+                &ctx.campaign.ledger,
+                ctx.config.bytes,
+            )?))),
         })
     }
 
@@ -699,6 +720,11 @@ async fn run_pass(
         acc.entry(arm.label.clone()).or_default().passes.push(empty);
         return Ok(Some(trip));
     }
+    // The pass's planned bytes are counted before anything is sent, so a run that dies in the
+    // middle of a pass, or a ledger read by another run meanwhile, never sees fewer bytes than
+    // may have landed. After the pass the count becomes what was written (a failed put counts).
+    let planned = arm.cold_bytes_per_pass;
+    env.ledger.reserve(planned)?;
     let mut notes = Vec::new();
     if let Some(before) = &arm.before {
         notes.extend(before(pass).await?);
@@ -708,7 +734,7 @@ async fn run_pass(
         notes.extend(after(pass).await?);
     }
     env.ledger
-        .charge(driven.steps.iter().map(|s| s.cold_write).sum())?;
+        .settle(planned, driven.steps.iter().map(|s| s.cold_write).sum())?;
     let window = if driven.trip.is_some() {
         Window::Busy
     } else {
@@ -1060,6 +1086,63 @@ mod tests {
         let again = Env::new(&testkit::ctx(dir.path(), &[], Window::Busy), Script::calm()).unwrap();
         assert_eq!(again.spent(), 60);
         assert_eq!(csv_rows(dir.path()).len(), 6);
+    }
+
+    /// Catches a pass counted only after it is sent (a run that dies in the middle, or a second
+    /// run reading the ledger meanwhile, would see too little): the first request of every pass
+    /// finds the pass's planned bytes already in the ledger file; a pass that wrote less is then
+    /// corrected down to what it wrote, and a pass that fails leaves its reservation counted.
+    #[tokio::test]
+    async fn a_pass_is_reserved_before_it_sends_and_settled_to_what_it_wrote() {
+        let dir = temp("tb-engine-reserve");
+        let env = env(dir.path(), Window::Busy, Script::calm());
+        let file = dir.path().join("ledger.json");
+        let on_disk = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut a = arm("a", 1, 1, &Arc::new(Mutex::new(vec![])));
+        a.cold_bytes_per_pass = 30;
+        let (seen, path) = (on_disk.clone(), file.clone());
+        a.work = work(move |_| {
+            let (seen, path) = (seen.clone(), path.clone());
+            async move {
+                seen.lock()
+                    .unwrap()
+                    .push(std::fs::read_to_string(&path).unwrap());
+                Ok(vec![step(1, 10)])
+            }
+        });
+        run_cell(&env, CellId::ColdPut, vec![a], 2, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            *on_disk.lock().unwrap(),
+            ["{\"cold_written_bytes\":30}", "{\"cold_written_bytes\":40}"],
+            "reserved 30 before the first pass; 10 written and 30 reserved again for the second"
+        );
+        assert_eq!(env.spent(), 20);
+
+        let mut failing = arm("f", 1, 1, &Arc::new(Mutex::new(vec![])));
+        failing.cold_bytes_per_pass = 30;
+        failing.work = work(|_| async { Err(BenchError::Request("work")) });
+        run_cell(&env, CellId::ColdPut, vec![failing], 2, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "{\"cold_written_bytes\":50}",
+            "a pass that died keeps its reservation"
+        );
+    }
+
+    /// Catches a campaign that starts without a ledger: with no ledger file, opening the cells'
+    /// environment is refused and nothing is made.
+    #[test]
+    fn a_run_without_a_ledger_does_not_start() {
+        let dir = temp("tb-engine-noledger");
+        let mut ctx = testkit::ctx(dir.path(), &[], Window::Busy);
+        ctx.campaign.ledger = dir.path().join("elsewhere.json");
+        let err = Env::new(&ctx, Script::calm()).err().unwrap();
+        assert!(matches!(err, BenchError::Budget(_)), "{err}");
+        assert!(!ctx.campaign.ledger.exists());
     }
 
     /// Catches an open loop that waits for answers (it must send on its own clock), loses a

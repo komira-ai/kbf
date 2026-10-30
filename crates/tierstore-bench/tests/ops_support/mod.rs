@@ -30,6 +30,9 @@ pub const PRIVATE: [&str; 5] = [
     "/private-mark",
 ];
 
+/// The test prefix of the fixtures: every test bucket and scoped account id starts with it.
+pub const TEST_PREFIX: &str = "tb-";
+
 /// What a fake machine answers a command with.
 pub type Respond = Box<dyn Fn(&Cmd) -> io::Result<CmdOutput> + Send + Sync>;
 
@@ -268,12 +271,12 @@ pub fn is_uploads(seen: &Seen) -> bool {
 /// The run configuration: the cold store (and the hot one, if asked) at these endpoints.
 pub fn run_config(result_dir: &Path, cold: &str, hot: Option<&str>) -> RunConfig {
     let mut stores = json!({
-        "cold": {"endpoint": cold, "bucket": "cold-test-bucket-mark",
-                 "access_key_id": "KEYID-MARK-cold", "secret_access_key": "SECRET-MARK-cold"}
+        "cold": {"endpoint": cold, "bucket": "tb-cold-test-bucket-mark",
+                 "access_key_id": "tb-KEYID-MARK-cold", "secret_access_key": "SECRET-MARK-cold"}
     });
     if let Some(hot) = hot {
-        stores["hot"] = json!({"endpoint": hot, "bucket": "hot-test-bucket-mark",
-                 "access_key_id": "KEYID-MARK-hot", "secret_access_key": "SECRET-MARK-hot"});
+        stores["hot"] = json!({"endpoint": hot, "bucket": "tb-hot-test-bucket-mark",
+                 "access_key_id": "tb-KEYID-MARK-hot", "secret_access_key": "SECRET-MARK-hot"});
     }
     config_from(result_dir, &json!({ "stores": stores }))
 }
@@ -282,8 +285,8 @@ pub fn run_config(result_dir: &Path, cold: &str, hot: Option<&str>) -> RunConfig
 pub fn hot_only(result_dir: &Path, hot: &str) -> RunConfig {
     config_from(
         result_dir,
-        &json!({"stores": {"hot": {"endpoint": hot, "bucket": "hot-test-bucket-mark",
-                 "access_key_id": "KEYID-MARK-hot", "secret_access_key": "SECRET-MARK-hot"}}}),
+        &json!({"stores": {"hot": {"endpoint": hot, "bucket": "tb-hot-test-bucket-mark",
+                 "access_key_id": "tb-KEYID-MARK-hot", "secret_access_key": "SECRET-MARK-hot"}}}),
     )
 }
 
@@ -300,7 +303,7 @@ struct Wrap {
 
 fn config_from(result_dir: &Path, file: &serde_json::Value) -> RunConfig {
     let dir = result_dir.to_str().unwrap();
-    let args = Wrap::try_parse_from(["t", "--result-dir", dir])
+    let args = Wrap::try_parse_from(["t", "--result-dir", dir, "--test-prefix", TEST_PREFIX])
         .unwrap()
         .args;
     let file: RunFile = serde_json::from_value(file.clone()).unwrap();

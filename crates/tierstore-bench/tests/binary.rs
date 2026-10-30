@@ -60,3 +60,55 @@ fn help_lists_the_six_verbs() {
         assert!(text.contains(verb), "{verb}");
     }
 }
+
+/// Catches a `plan` that prints something else than the contract's lines: standard output is
+/// `key=value` lines only (the prefix, then each store's bucket, then the account ids of `hot`
+/// and `cold`), the status is 0, and a bucket outside the prefix is exit status 2 with the value
+/// named and nothing on standard output.
+#[test]
+fn plan_prints_the_prefix_the_buckets_and_the_accounts() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-plan-bin");
+    let file = dir.path().join("run.json");
+    let write = |hot_bucket: &str| {
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"test_prefix": "bench-", "stores": {{
+                "hot": {{"endpoint": "http://h.example:1", "bucket": "{hot_bucket}",
+                         "access_key_id": "bench-hot-key", "secret_access_key": "SECRET-ONE"}},
+                "cold": {{"endpoint": "http://c.example:1", "bucket": "bench-cold",
+                          "access_key_id": "bench-cold-key", "secret_access_key": "SECRET-TWO"}},
+                "instance": {{"endpoint": "http://i.example:1", "bucket": "bench-front",
+                              "access_key_id": "front-key", "secret_access_key": "SECRET-THREE"}}}}}}"#
+            ),
+        )
+        .unwrap();
+    };
+    let plan = || {
+        Command::new(env!("CARGO_BIN_EXE_tierstore-bench"))
+            .args(["plan", "--result-dir"])
+            .arg(dir.path())
+            .arg("--run-file")
+            .arg(&file)
+            .output()
+            .unwrap()
+    };
+
+    write("bench-hot");
+    let out = plan();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "test_prefix=bench-\n\
+         bucket=bench-hot\naccount=bench-hot-key\n\
+         bucket=bench-cold\naccount=bench-cold-key\n\
+         bucket=bench-front\n"
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("SECRET"));
+
+    write("live-hot");
+    let out = plan();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("live-hot"));
+}

@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod atomic;
 pub mod cells;
 pub mod cli;
 pub mod config;

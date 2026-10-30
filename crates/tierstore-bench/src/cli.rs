@@ -1,4 +1,4 @@
-//! The command line: six verbs, each a thin call into its module.
+//! The command line: seven verbs, each a thin call into its module.
 //!
 //! Exit status: 0 on success, 2 when the verb stopped and for usage errors, as clap reports them.
 
@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::cells::budget::Campaign;
 use crate::cells::engine::FaultSwitch;
 use crate::cells::{self, CellContext, CellId, CellPlan};
 use crate::config::{ConfigArgs, RunConfig};
@@ -35,6 +36,9 @@ pub struct Cli {
 pub enum Command {
     /// Read-only checks before anything is written; writes the before-snapshot.
     Preflight(ConfigArgs),
+    /// Print the test prefix, test bucket names and scoped account ids the run file resolves to,
+    /// one `key=value` per line (`test_prefix`, `bucket`, `account`). Sends nothing to any store.
+    Plan(ConfigArgs),
     /// Create the test buckets, scoped accounts and quotas (a dry run unless `--apply`).
     Provision(ProvisionArgs),
     /// Run cells.
@@ -90,6 +94,33 @@ pub struct RunArgs {
     /// are.
     #[arg(long, value_name = "DIR", requires = "fault_control")]
     pub fault_result_dir: Option<PathBuf>,
+    /// Seconds a fault set through `--fault-control` lasts before the proxy falls back to `pass`
+    /// on its own, so a run that dies with a fault in force does not leave the store refused. It
+    /// must be longer than the longest stretch a cell holds one fault: a fault that ends early
+    /// turns the rest of that arm into a healthy one.
+    #[arg(long, value_name = "SECS", default_value = "300")]
+    pub fault_ttl_secs: NonZeroU64,
+    /// The campaign ledger: the file that counts the bytes written to the cold store across all
+    /// runs of a campaign, kept outside every result directory. It must exist, unless
+    /// `--new-campaign` says this run starts the campaign.
+    #[arg(long, value_name = "FILE")]
+    pub campaign_ledger: PathBuf,
+    /// Create the campaign ledger (refused if the file is already there, so a ledger is never
+    /// reset by a flag left in a command line).
+    #[arg(long)]
+    pub new_campaign: bool,
+}
+
+impl RunArgs {
+    /// The switch of the fault proxy `--fault-control` names, with `--fault-ttl-secs`.
+    #[must_use]
+    pub fn fault_switch(&self) -> Option<FileSwitch> {
+        let ttl = Duration::from_secs(self.fault_ttl_secs.get());
+        self.fault_control
+            .clone()
+            .zip(self.fault_result_dir.as_deref())
+            .map(|(control, dir)| FileSwitch::new(control, dir).with_ttl(ttl))
+    }
 }
 
 /// Flags of `fault-proxy`.
@@ -154,6 +185,12 @@ fn provenance(result_dir: &Path, run_id: &str, git_sha: &str) -> Result<Provenan
 pub async fn run(cli: Cli) -> Result<(), BenchError> {
     match cli.command {
         Command::Preflight(args) => preflight::run(&RunConfig::load(&args)?).await.map(|_| ()),
+        Command::Plan(args) => {
+            for line in RunConfig::load(&args)?.plan_lines() {
+                println!("{line}");
+            }
+            Ok(())
+        }
         Command::Provision(args) => {
             let mode = if args.apply {
                 Mode::Apply
@@ -172,22 +209,28 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
                     source,
                 })
                 .and_then(|()| RequestLog::create(&config.result_dir.join("requests.jsonl")))?;
+            let provenance = provenance(&config.result_dir, &args.run_id, &args.git_sha)?;
+            // Before a request is sent: the ledger is begun or found, or the run stops.
+            let campaign = Campaign::begin(
+                &args.campaign_ledger,
+                args.new_campaign,
+                &config.result_dir,
+                config.bytes,
+            )?;
+            let faults = args
+                .fault_switch()
+                .map(|switch| Arc::new(switch) as Arc<dyn FaultSwitch>);
             let plan = CellPlan {
                 passes: args.passes,
                 in_flight: args.in_flight,
                 object_bytes: args.object_bytes,
             };
             let ctx = CellContext {
-                provenance: provenance(&config.result_dir, &args.run_id, &args.git_sha)?,
+                provenance,
                 config,
                 log: Arc::new(log),
+                campaign,
             };
-            let faults = args
-                .fault_control
-                .zip(args.fault_result_dir)
-                .map(|(control, dir)| {
-                    Arc::new(FileSwitch::new(control, &dir)) as Arc<dyn FaultSwitch>
-                });
             for id in args.cells {
                 cells::run_with_faults(id, &ctx, &plan, faults.clone())
                     .await

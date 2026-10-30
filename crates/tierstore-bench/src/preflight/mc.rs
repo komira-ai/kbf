@@ -3,10 +3,13 @@
 //!
 //! `MC_HOST_<alias>` carries the endpoint with the key pair in it (`http://KEY:SECRET@host:port`,
 //! each part percent-encoded), which is how `mc` takes a one-off alias without a config file.
-//! The commands that make an account put the account's own secret on the command line, because
-//! `mc admin user add` takes it there: the verb that does it (`provision --apply`) is run by
-//! engineering on the node, and the secret is the scoped account's, which reaches only the test
-//! bucket.
+//!
+//! The scoped account's secret is not on a command line either. `mc admin user add ALIAS` with
+//! no key arguments reads the access key and then the secret key, one per line, from standard
+//! input when that is not a terminal (`fetchUserKeys` in mc's `cmd/admin-user-add.go`; the
+//! command's own help shows `echo -e "key\nsecret" | mc admin user add ALIAS`), so
+//! [`Mc::add_account`] feeds them through the child's input pipe and the secret never reaches an
+//! argument vector, which every user of the machine can read.
 
 use std::path::{Path, PathBuf};
 
@@ -104,11 +107,22 @@ impl<'a> Mc<'a> {
 
     /// Runs `mc` with `args` after the global flags.
     fn run(&self, what: &str, args: &[&str]) -> Result<String, BenchError> {
+        self.run_with(what, args, None)
+    }
+
+    /// [`Self::run`], giving the child `input` on its standard input.
+    fn run_with(
+        &self,
+        what: &str,
+        args: &[&str],
+        input: Option<String>,
+    ) -> Result<String, BenchError> {
         let config_dir = self.config_dir.display().to_string();
         let mut all = vec!["--config-dir", config_dir.as_str(), "--json"];
         all.extend_from_slice(args);
-        let cmd = Cmd::new(&self.program, &all)
+        let mut cmd = Cmd::new(&self.program, &all)
             .with_env(&format!("MC_HOST_{ALIAS}"), self.alias_url.clone());
+        cmd.stdin = input;
         run_ok(self.host, what, &cmd)
     }
 
@@ -127,14 +141,43 @@ impl<'a> Mc<'a> {
             .map_err(|e| BenchError::Ops(format!("mc admin info: not JSON: {e}")))
     }
 
-    /// Makes `bucket`; one that exists is left as it is.
+    /// Whether the store has a bucket called `bucket` (`mc ls` of the alias, read-only).
+    ///
+    /// # Errors
+    /// [`BenchError::Ops`] if the command fails or a line of its answer is not JSON: a store
+    /// that cannot be read is not a store without the bucket.
+    pub fn bucket_exists(&self, bucket: &str) -> Result<bool, BenchError> {
+        let out = self.run("mc ls", &["ls", ALIAS])?;
+        let wanted = format!("{bucket}/");
+        Ok(json_lines("mc ls", &out)?
+            .iter()
+            .any(|line| line.get("key").and_then(Value::as_str) == Some(wanted.as_str())))
+    }
+
+    /// Whether the store has an account whose access key id is `access_key_id` (`mc admin user
+    /// list`, read-only).
+    ///
+    /// The list is read, not `mc admin user info`: `info` fails the same way for an account that
+    /// is not there and for a store that cannot be reached, and a failure must not read as
+    /// "absent".
+    ///
+    /// # Errors
+    /// [`BenchError::Ops`] if the command fails or a line of its answer is not JSON.
+    pub fn account_exists(&self, access_key_id: &str) -> Result<bool, BenchError> {
+        let out = self.run("mc admin user list", &["admin", "user", "list", ALIAS])?;
+        Ok(json_lines("mc admin user list", &out)?
+            .iter()
+            .any(|line| line.get("accessKey").and_then(Value::as_str) == Some(access_key_id)))
+    }
+
+    /// Makes `bucket`. It does not take `--ignore-existing`: a bucket that is there (made by
+    /// someone else between the caller's check and this command) is an error, not a bucket kept.
     ///
     /// # Errors
     /// [`BenchError::Ops`] if the command fails.
     pub fn make_bucket(&self, bucket: &str) -> Result<(), BenchError> {
         let target = Self::target(bucket);
-        self.run("mc mb", &["mb", "--ignore-existing", &target])
-            .map(|_| ())
+        self.run("mc mb", &["mb", &target]).map(|_| ())
     }
 
     /// Sets the hard quota of `bucket` to [`QUOTA_SIZE`].
@@ -163,21 +206,28 @@ impl<'a> Mc<'a> {
         .map(|_| ())
     }
 
-    /// Adds the account `key` (or sets its secret, if it exists).
+    /// Adds the account `key`. `mc admin user add` sets the secret of an account that exists, so
+    /// the caller checks [`Self::account_exists`] first. The key pair goes to the child's standard
+    /// input, one value per line (see the module header), never into its arguments.
     ///
     /// # Errors
-    /// [`BenchError::Ops`] if the command fails.
+    /// [`BenchError::Ops`] if the id or the secret holds a line break (it would shift the lines
+    /// the command reads) or the command fails.
     pub fn add_account(&self, key: &KeyPair) -> Result<(), BenchError> {
-        self.run(
+        let secret = key.secret_access_key.expose();
+        if [key.access_key_id.as_str(), secret]
+            .iter()
+            .any(|v| v.contains(['\n', '\r']))
+        {
+            return Err(BenchError::Ops(
+                "an account's key pair may not hold a line break".to_owned(),
+            ));
+        }
+        let input = format!("{}\n{secret}\n", key.access_key_id);
+        self.run_with(
             "mc admin user add",
-            &[
-                "admin",
-                "user",
-                "add",
-                ALIAS,
-                &key.access_key_id,
-                key.secret_access_key.expose(),
-            ],
+            &["admin", "user", "add", ALIAS],
+            Some(input),
         )
         .map(|_| ())
     }
@@ -202,17 +252,30 @@ impl<'a> Mc<'a> {
         .map(|_| ())
     }
 
-    /// Removes the account `access_key_id`.
+    /// Removes the account `access_key_id`. Crate-private: the only caller is
+    /// [`crate::provision::state::State::remove_account`], which removes an account only if the
+    /// run made it.
     ///
     /// # Errors
     /// [`BenchError::Ops`] if the command fails.
-    pub fn remove_account(&self, access_key_id: &str) -> Result<(), BenchError> {
+    pub(crate) fn remove_account(&self, access_key_id: &str) -> Result<(), BenchError> {
         self.run(
             "mc admin user remove",
             &["admin", "user", "remove", ALIAS, access_key_id],
         )
         .map(|_| ())
     }
+}
+
+/// The lines of an `mc --json` answer, each parsed: `mc` prints one JSON object per line.
+fn json_lines(what: &str, out: &str) -> Result<Vec<Value>, BenchError> {
+    out.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line)
+                .map_err(|_| BenchError::Ops(format!("{what}: a line of the answer is not JSON")))
+        })
+        .collect()
 }
 
 /// The server version in an `mc admin info` answer: the first server's `version`.

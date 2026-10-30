@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::cells::CellContext;
+use crate::cells::budget::{Campaign, Ledger};
 use crate::cells::engine::LoadSource;
 use crate::config::{ByteCaps, RateCaps, RunConfig, Secret, StoreSpec};
 use crate::error::BenchError;
@@ -112,6 +113,7 @@ pub fn ctx_with_log(
 ) -> CellContext {
     let config = RunConfig {
         result_dir: dir.to_owned(),
+        test_prefix: "kbf-".to_owned(),
         stores: stores
             .iter()
             .map(|(role, endpoint)| (*role, spec(endpoint)))
@@ -131,9 +133,16 @@ pub fn ctx_with_log(
         },
         bytes: CAPS,
     };
+    // The campaign of a test lives beside the results (`ledger.json`, which the tests read), and
+    // is begun once: a second context over the same directory continues it.
+    let ledger = dir.join("ledger.json");
+    if !ledger.exists() {
+        Ledger::create(&ledger, CAPS).unwrap();
+    }
     CellContext {
         config,
         log,
+        campaign: Campaign { ledger },
         provenance: Provenance {
             run_id: "test-run".to_owned(),
             ..Provenance::unrecorded()

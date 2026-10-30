@@ -38,6 +38,7 @@ use std::sync::Arc;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
+use crate::cells::budget::Campaign;
 use crate::cells::engine::{FaultSwitch, ProcLoad};
 use crate::config::RunConfig;
 use crate::error::BenchError;
@@ -124,6 +125,8 @@ pub struct CellContext {
     pub log: Arc<RequestLog>,
     /// Where this run's numbers come from; copied into every result.
     pub provenance: Provenance,
+    /// The campaign the run belongs to: its ledger of bytes written to the cold store.
+    pub campaign: Campaign,
 }
 
 /// What the `run` verb asks of a cell; a cell reads the parts it has.
@@ -167,7 +170,17 @@ pub async fn run_with_faults(
         CellId::ColdRead => cold_read::run_with(ctx, plan, load(), faults, None).await,
         CellId::A1 => a1::run_with(ctx, plan, load(), faults, None).await,
         CellId::B => b::run_with(ctx, plan, load(), None).await,
-        CellId::C => c::run_with(ctx, plan, load(), faults, c::polling(), None).await,
+        CellId::C => {
+            c::run_with(
+                ctx,
+                plan,
+                load(),
+                faults,
+                c::polling(ctx.config.rates.list_poll_rps),
+                None,
+            )
+            .await
+        }
         CellId::G => g::run_with(ctx, plan, load(), None).await,
     }
 }

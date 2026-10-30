@@ -1,13 +1,19 @@
-//! `provision`: what a dry run promises, what an apply does and in what order, and the two probes
-//! that make isolation a fact: the scoped account reaches its test bucket and is refused a live
-//! one.
+//! `provision`: what a dry run promises, what an apply does and in what order, the two probes
+//! that make isolation a fact (the scoped account reaches its test bucket and is refused a live
+//! one), and the rule that it changes only what it made: names inside the test prefix, a bucket or
+//! account already on the store left alone, the secret kept off every command line.
 
 mod ops_support;
 
 use std::fs;
 
+use tierstore_bench::config::{ConfigError, Secret};
 use tierstore_bench::error::BenchError;
+use tierstore_bench::preflight::mc::Mc;
+use tierstore_bench::preflight::ops::KeyPair;
+use tierstore_bench::provision::state::{STATE_FILE, State};
 use tierstore_bench::provision::{Mode, STEPS_FILE, policy_document, run, run_with};
+use tierstore_bench::role::Role;
 
 use ops_support::*;
 
@@ -59,11 +65,12 @@ async fn a_dry_run_lists_the_steps_and_changes_nothing() {
         assert!(!text.contains(word), "{word}");
     }
     assert!(!dir.path().join("policy-hot.json").exists());
+    assert!(!dir.path().join(STATE_FILE).exists());
 }
 
 /// Catches an apply that misses a step, runs them out of order, or puts the admin secret where a
 /// process list shows it: the exact commands for both roles in order, the admin pair in the
-/// environment only, and the scoped account's pair only in `user add`.
+/// environment only, and the scoped account's pair only on the input of `user add`.
 #[tokio::test]
 async fn an_apply_makes_the_bucket_quota_policy_and_account_in_order() {
     let stub = Stub::start(farm()).await;
@@ -82,22 +89,28 @@ async fn an_apply_makes_the_bucket_quota_policy_and_account_in_order() {
     let expected = [
         (
             "hot",
-            "hot-test-bucket-mark",
-            "KEYID-MARK-hot",
+            "tb-hot-test-bucket-mark",
+            "tb-KEYID-MARK-hot",
             "SECRET-MARK-hot",
         ),
         (
             "cold",
-            "cold-test-bucket-mark",
-            "KEYID-MARK-cold",
+            "tb-cold-test-bucket-mark",
+            "tb-KEYID-MARK-cold",
             "SECRET-MARK-cold",
         ),
     ];
     let mut want: Vec<Vec<String>> = Vec::new();
-    for (role, bucket, key, secret) in expected {
+    // First everything is looked for, read-only, for both roles; then each role is made.
+    for _ in expected {
+        want.push(words(&["ls", "tbops"]));
+        want.push(words(&["admin", "user", "list", "tbops"]));
+    }
+    for (role, bucket, key, _) in expected {
         let name = format!("tierstore-bench-{role}");
         let target = format!("tbops/{bucket}");
-        want.push(words(&["mb", "--ignore-existing", &target]));
+        want.push(words(&["ls", "tbops"]));
+        want.push(words(&["mb", &target]));
         want.push(words(&["quota", "set", &target, "--size", "30GiB"]));
         want.push(words(&[
             "admin",
@@ -107,7 +120,8 @@ async fn an_apply_makes_the_bucket_quota_policy_and_account_in_order() {
             &name,
             &policy(role),
         ]));
-        want.push(words(&["admin", "user", "add", "tbops", key, secret]));
+        want.push(words(&["admin", "user", "list", "tbops"]));
+        want.push(words(&["admin", "user", "add", "tbops"]));
         want.push(words(&[
             "admin", "policy", "attach", "tbops", &name, "--user", key,
         ]));
@@ -130,7 +144,36 @@ async fn an_apply_makes_the_bucket_quota_policy_and_account_in_order() {
             cmd.args.iter().all(|a| !a.contains("ADMIN")),
             "the admin pair is on a command line: {cmd:?}"
         );
+        assert!(
+            cmd.args.iter().all(|a| !a.contains("SECRET-MARK")),
+            "a secret is on a command line: {cmd:?}"
+        );
     }
+    // The scoped account's pair reaches `mc` on its input, one value a line, and no other
+    // command is given any input.
+    let inputs: Vec<(String, String)> = host
+        .ran()
+        .into_iter()
+        .filter_map(|c| c.stdin.map(|input| (c.args[3..].join(" "), input)))
+        .collect();
+    let [(hot_cmd, hot_in), (cold_cmd, cold_in)] = inputs.as_slice() else {
+        panic!("{inputs:?}");
+    };
+    assert_eq!(hot_cmd, "admin user add tbops");
+    assert_eq!(cold_cmd, "admin user add tbops");
+    assert_eq!(hot_in, "tb-KEYID-MARK-hot\nSECRET-MARK-hot\n");
+    assert_eq!(cold_in, "tb-KEYID-MARK-cold\nSECRET-MARK-cold\n");
+    // What it made is written down, by name, for the next run to find.
+    let record: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join(STATE_FILE)).unwrap()).unwrap();
+    assert_eq!(
+        record["buckets"],
+        serde_json::json!(["tb-cold-test-bucket-mark", "tb-hot-test-bucket-mark"])
+    );
+    assert_eq!(
+        record["accounts"],
+        serde_json::json!(["tb-KEYID-MARK-cold", "tb-KEYID-MARK-hot"])
+    );
 
     // Each role's account listed its test bucket and read from the named live bucket.
     let seen = stub.requests();
@@ -201,7 +244,7 @@ async fn the_policy_names_the_test_bucket_and_nothing_else() {
     let written: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dir.path().join("policy-cold.json")).unwrap())
             .unwrap();
-    assert_eq!(written, policy_document("cold-test-bucket-mark"));
+    assert_eq!(written, policy_document("tb-cold-test-bucket-mark"));
 }
 
 /// Catches a scoped account that reaches a live bucket going unnoticed: the apply stops with an
@@ -233,7 +276,7 @@ async fn an_account_that_reaches_a_live_bucket_stops_the_apply_and_is_removed() 
     let last = mc_args(&host).pop().unwrap();
     assert_eq!(
         last,
-        words(&["admin", "user", "remove", "tbops", "KEYID-MARK-cold"])
+        words(&["admin", "user", "remove", "tbops", "tb-KEYID-MARK-cold"])
     );
     assert!(!dir.path().join(STEPS_FILE).exists());
 
@@ -296,8 +339,8 @@ async fn a_failing_command_stops_the_apply_at_once() {
     assert_eq!(err.to_string(), "mc quota set: exited Some(1)");
     assert_eq!(
         host.ran().len(),
-        2,
-        "make bucket, then the quota that failed"
+        5,
+        "the two look-ups, then look-up, make bucket and the quota that failed"
     );
     assert!(stub.requests().is_empty());
 }
@@ -330,7 +373,7 @@ async fn bad_inputs_stop_the_verb_before_any_command() {
     let mut same = ops.clone();
     same.live_buckets.insert(
         tierstore_bench::role::Role::Cold,
-        "cold-test-bucket-mark".to_owned(),
+        "tb-cold-test-bucket-mark".to_owned(),
     );
     let err = run_with(&host, &config, &same, Mode::Apply)
         .await
@@ -398,8 +441,8 @@ async fn a_policy_or_steps_file_that_cannot_be_written_is_an_error() {
     assert!(matches!(err, BenchError::Io { .. }), "{err:?}");
     assert_eq!(
         host.ran().len(),
-        2,
-        "bucket and quota, then the policy file failed"
+        5,
+        "the two look-ups, bucket and quota, then the policy file failed"
     );
 
     let (dir, host, _c, ops) = base("tb-prov-write-steps");
@@ -410,4 +453,305 @@ async fn a_policy_or_steps_file_that_cannot_be_written_is_an_error() {
         .unwrap_err();
     assert!(matches!(err, BenchError::Io { .. }), "{err:?}");
     assert!(host.ran().is_empty());
+}
+
+fn ran_args(host: &FakeHost) -> Vec<String> {
+    mc_args(host).into_iter().map(|a| a.join(" ")).collect()
+}
+
+/// A machine whose store already holds the named bucket and account ids, as `mc ls` and `mc admin
+/// user list` print them (one JSON object a line); every other command succeeds.
+fn store_holding(
+    buckets: &[&str],
+    accounts: &[&str],
+) -> impl Fn(&Cmd) -> std::io::Result<CmdOutput> + Send + Sync + 'static {
+    let listing: String = buckets
+        .iter()
+        .map(|b| format!("{{\"status\":\"success\",\"type\":\"folder\",\"key\":\"{b}/\"}}\n"))
+        .collect();
+    let users: String = accounts
+        .iter()
+        .map(|a| {
+            format!("{{\"status\":\"success\",\"accessKey\":\"{a}\",\"userStatus\":\"enabled\"}}\n")
+        })
+        .collect();
+    move |cmd| {
+        let has = |word: &str| cmd.args.iter().any(|a| a == word);
+        if has("ls") {
+            ok(&listing)
+        } else if has("list") {
+            ok(&users)
+        } else {
+            ok("")
+        }
+    }
+}
+
+use tierstore_bench::preflight::host::{Cmd, CmdOutput};
+
+/// Catches a name outside the test prefix reaching a store: a bucket of the farm, or an account
+/// id that is not the run's, stops the verb (dry run or apply) with the value named, before any
+/// command is run or request sent.
+#[tokio::test]
+async fn a_name_outside_the_test_prefix_stops_provision_before_any_store_call() {
+    let stub = Stub::start(farm()).await;
+    let (dir, host, _c, ops) = base("tb-prov-prefix");
+    for mode in [Mode::DryRun, Mode::Apply] {
+        let mut config = run_config(dir.path(), &stub.endpoint, Some(&stub.endpoint));
+        config.stores.get_mut(&Role::Cold).unwrap().bucket = "farm-cold-bucket".to_owned();
+        let err = run_with(&host, &config, &ops, mode).await.unwrap_err();
+        let BenchError::Config(ConfigError::OutsidePrefix {
+            role, what, value, ..
+        }) = &err
+        else {
+            panic!("{err:?}");
+        };
+        assert_eq!(
+            (*role, *what, value.as_str()),
+            (Role::Cold, "bucket", "farm-cold-bucket")
+        );
+        assert!(err.to_string().contains("farm-cold-bucket"), "{err}");
+
+        let mut config = run_config(dir.path(), &stub.endpoint, Some(&stub.endpoint));
+        config.stores.get_mut(&Role::Hot).unwrap().access_key_id = "farm-hot-key".to_owned();
+        let err = run_with(&host, &config, &ops, mode).await.unwrap_err();
+        assert!(err.to_string().contains("farm-hot-key"), "{err}");
+    }
+    assert!(host.ran().is_empty());
+    assert!(stub.requests().is_empty());
+    assert!(!dir.path().join(STATE_FILE).exists());
+}
+
+/// Catches `provision` changing a bucket it did not make (`mc mb --ignore-existing` kept it
+/// silently, then the quota and the policy were put on it): the bucket is on the store and the
+/// run has no record of making it, so the verb stops at the look-up; nothing was made, set or
+/// recorded.
+#[tokio::test]
+async fn a_bucket_already_on_the_store_that_the_run_did_not_make_is_refused() {
+    let stub = Stub::start(farm()).await;
+    let (dir, host, _c, ops) = base("tb-prov-foreign-bucket");
+    let config = run_config(dir.path(), &stub.endpoint, None);
+    host.answer(store_holding(&["tb-cold-test-bucket-mark"], &[]));
+    let err = run_with(&host, &config, &ops, Mode::Apply)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "role cold: the test bucket is already on the store and this run did not make it"
+    );
+    assert_eq!(
+        ran_args(&host),
+        ["ls tbops"],
+        "one read-only look-up and nothing else"
+    );
+    assert!(!dir.path().join(STATE_FILE).exists());
+    assert!(!dir.path().join("policy-cold.json").exists());
+}
+
+/// Catches `provision` resetting the secret of a live account (`mc admin user add` does that to an
+/// account that exists): the account is on the store and not the run's, so the verb stops after
+/// two read-only look-ups, before it makes the bucket, sets the quota or writes the policy.
+#[tokio::test]
+async fn an_account_already_on_the_store_that_the_run_did_not_make_is_refused_before_anything_changes()
+ {
+    let stub = Stub::start(farm()).await;
+    let (dir, host, _c, ops) = base("tb-prov-foreign-account");
+    let config = run_config(dir.path(), &stub.endpoint, None);
+    host.answer(store_holding(
+        &["other-bucket"],
+        &["tb-KEYID-MARK-cold", "someone-else"],
+    ));
+    let err = run_with(&host, &config, &ops, Mode::Apply)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "role cold: the scoped account is already on the store and this run did not make it"
+    );
+    assert_eq!(ran_args(&host), ["ls tbops", "admin user list tbops"]);
+    assert!(!dir.path().join(STATE_FILE).exists());
+    assert!(stub.requests().is_empty());
+}
+
+/// Catches a second apply of the same run failing on, or redoing, what the first made: the run's
+/// own bucket and account are on the store and in its record, so they are found and kept (no
+/// `mb`, no `user add`), and the quota, the policy and the attachment are put again.
+#[tokio::test]
+async fn a_second_apply_of_the_same_run_keeps_what_it_made() {
+    let stub = Stub::start(farm()).await;
+    let (dir, host, _c, ops) = base("tb-prov-again");
+    let config = run_config(dir.path(), &stub.endpoint, None);
+    run_with(&host, &config, &ops, Mode::Apply).await.unwrap();
+    assert!(ran_args(&host).iter().any(|c| c.starts_with("mb ")));
+
+    let again = healthy_host();
+    again.answer(store_holding(
+        &["tb-cold-test-bucket-mark"],
+        &["tb-KEYID-MARK-cold"],
+    ));
+    let steps = run_with(&again, &config, &ops, Mode::Apply).await.unwrap();
+    assert_eq!(steps.len(), 7);
+    let ran = ran_args(&again);
+    assert!(
+        ran.iter()
+            .all(|c| !c.starts_with("mb ") && c != "admin user add tbops"),
+        "{ran:?}"
+    );
+    for kept in ["quota set", "admin policy create", "admin policy attach"] {
+        assert!(ran.iter().any(|c| c.starts_with(kept)), "{kept}: {ran:?}");
+    }
+    assert!(
+        again.ran().iter().all(|c| c.stdin.is_none()),
+        "no secret is sent again"
+    );
+}
+
+/// Catches a record that cannot be read being taken for an empty one (the run would then call its
+/// own bucket someone else's, or the reverse): a file that is not a record, and one that cannot be
+/// read, each stop the verb before any command.
+#[tokio::test]
+async fn a_damaged_record_stops_the_verb_before_any_command() {
+    let stub = Stub::start(farm()).await;
+    let (dir, host, _c, ops) = base("tb-prov-record");
+    let config = run_config(dir.path(), &stub.endpoint, None);
+    fs::write(dir.path().join(STATE_FILE), "{\"buckets\": 3}").unwrap();
+    let err = run_with(&host, &config, &ops, Mode::Apply)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not a provision record"), "{err}");
+    fs::remove_file(dir.path().join(STATE_FILE)).unwrap();
+    fs::create_dir(dir.path().join(STATE_FILE)).unwrap();
+    let err = run_with(&host, &config, &ops, Mode::Apply)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BenchError::Io { .. }), "{err:?}");
+    assert!(host.ran().is_empty());
+}
+
+/// A client over `host` for the fixtures' store.
+fn mc_on<'a>(host: &'a FakeHost, dir: &std::path::Path) -> Mc<'a> {
+    let admin = KeyPair {
+        access_key_id: "ADMIN-KEYID-MARK".to_owned(),
+        secret_access_key: Secret::new("ADMIN-SECRET-MARK"),
+    };
+    Mc::new(
+        host,
+        std::path::Path::new("/private-mark/mc"),
+        dir,
+        "http://host-mark:9000",
+        &admin,
+    )
+    .unwrap()
+}
+
+/// Catches an account being removed that the run did not make, or one without the prefix: the
+/// removal runs no command for a name the record lacks, or one recorded without the prefix (a
+/// hand-edited record), and removes, and forgets, one the run made.
+#[test]
+fn only_an_account_the_run_made_and_that_carries_the_prefix_is_removed() {
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tb-prov-remove");
+    let host = FakeHost::new();
+    let mc = mc_on(&host, dir.path());
+    let mut state = State::load(dir.path(), "tb-").unwrap();
+
+    let err = state.remove_account(&mc, "tb-live-account").unwrap_err();
+    assert!(err.to_string().contains("not made by this run"), "{err}");
+    state.record_account("farm-account").unwrap();
+    assert!(
+        !state.made_account("farm-account"),
+        "no prefix, not the run's"
+    );
+    state.remove_account(&mc, "farm-account").unwrap_err();
+    assert!(host.ran().is_empty());
+
+    state.record_account("tb-mine").unwrap();
+    assert!(state.made_account("tb-mine"));
+    state.remove_account(&mc, "tb-mine").unwrap();
+    assert_eq!(ran_args(&host), ["admin user remove tbops tb-mine"]);
+    assert!(!state.made_account("tb-mine"));
+    let reloaded = State::load(dir.path(), "tb-").unwrap();
+    assert!(!reloaded.made_account("tb-mine"), "the record was saved");
+    state.remove_account(&mc, "tb-mine").unwrap_err();
+    assert_eq!(host.ran().len(), 1, "removed once");
+
+    let mut other_run = State::load(dir.path(), "other-").unwrap();
+    other_run.record_bucket("tb-bucket").unwrap();
+    assert!(
+        !other_run.made_bucket("tb-bucket"),
+        "another prefix, not the run's"
+    );
+}
+
+/// Catches the scoped secret being able to shift the lines `mc` reads (a line break in the id would
+/// make the secret the id's tail), a look-up that cannot be read being taken for "absent", and
+/// the parsing of the two look-ups: the matching line among others, and an answer that is not JSON.
+#[test]
+fn the_account_pair_is_one_line_each_and_a_look_up_that_fails_is_not_absence() {
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tb-prov-mc");
+    let host = FakeHost::new();
+    let mc = mc_on(&host, dir.path());
+    for (id, secret) in [
+        (
+            "a
+b", "s",
+        ),
+        (
+            "a", "s
+t",
+        ),
+        (
+            "a
+", "s",
+        ),
+    ] {
+        let key = KeyPair {
+            access_key_id: id.to_owned(),
+            secret_access_key: Secret::new(secret),
+        };
+        let err = mc.add_account(&key).unwrap_err();
+        assert!(err.to_string().contains("line break"), "{err}");
+    }
+    assert!(host.ran().is_empty());
+
+    host.answer(store_holding(&["one", "tb-two"], &["u1", "tb-user"]));
+    assert!(mc.bucket_exists("tb-two").unwrap());
+    assert!(
+        !mc.bucket_exists("tb").unwrap(),
+        "a prefix of a name is not the name"
+    );
+    assert!(mc.account_exists("tb-user").unwrap());
+    assert!(!mc.account_exists("tb").unwrap());
+
+    host.answer(|_| ok("not json at all\n"));
+    assert!(
+        mc.bucket_exists("x")
+            .unwrap_err()
+            .to_string()
+            .contains("not JSON")
+    );
+    assert!(mc.account_exists("x").is_err());
+    host.answer(|_| failed(1, "unreachable"));
+    assert!(mc.bucket_exists("x").is_err());
+    assert!(mc.account_exists("x").is_err());
+}
+
+/// Catches a record that cannot be saved going unreported (the run would carry on with nothing
+/// written down, and the next run would call its bucket someone else's): a result directory that
+/// turns into a file, and a record file that turns into a directory, each make the recording
+/// fail with the file named.
+#[test]
+fn a_record_that_cannot_be_saved_is_an_error() {
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tb-prov-save");
+    let results = dir.path().join("results");
+    let mut state = State::load(&results, "tb-").unwrap();
+    fs::write(&results, "a file where the directory should be").unwrap();
+    let err = state.record_bucket("tb-b").unwrap_err();
+    assert!(matches!(err, BenchError::Io { .. }), "{err:?}");
+
+    let other = dir.path().join("other");
+    let mut state = State::load(&other, "tb-").unwrap();
+    fs::create_dir_all(other.join(STATE_FILE)).unwrap();
+    let err = state.record_account("tb-a").unwrap_err();
+    assert!(matches!(err, BenchError::Io { .. }), "{err:?}");
+    assert!(err.to_string().contains(STATE_FILE), "{err}");
 }

@@ -8,7 +8,8 @@
 //! the requests in flight asked for. Then the cold test bucket is listed under the burst's prefix,
 //! once per poll, one prefix LIST (pages of up to 1,000 keys) and never a HEAD per key; an object
 //! is on the cold store at the first poll that lists it, so the lag has the resolution of the
-//! poll (one second). The load gate is read before the
+//! poll: one over `--list-poll-rps` seconds (the cap on LISTs per second of a poll, 2 unless
+//! set, so half a second). The load gate is read before the
 //! burst, not during it.
 //!
 //! Each object is a request of the arm (`<N>x<size>-c<in flight>-<mode>`): its latency is its lag
@@ -66,12 +67,13 @@ pub fn burst_for(size: u64) -> u64 {
     if size <= MIB { 1000 } else { 8 }
 }
 
-/// The poll of a run: one LIST a second (the request-rate cap of `list_poll_rps` is at least
-/// one a second), pages of 1,000 keys, ten minutes to drain.
+/// The poll of a run: one LIST every `1 / list_poll_rps` seconds (`--list-poll-rps`, the cap on
+/// prefix LISTs per second of a copy-lag poll, taken as at least 1), pages of 1,000 keys, ten
+/// minutes to drain.
 #[must_use]
-pub fn polling() -> Polling {
+pub fn polling(list_poll_rps: u32) -> Polling {
     Polling {
-        every: Duration::from_secs(1),
+        every: Duration::from_secs(1) / list_poll_rps.max(1),
         deadline: Duration::from_secs(600),
         page: 1000,
     }
@@ -330,7 +332,8 @@ fn arm(label: String, mode: &str, burst: &Arc<Burst>) -> Arm {
 /// [`BenchError`] if the instance or cold role is not configured, the ledger refuses the cell,
 /// the load gate trips or cannot be read, or a file or the request log fails.
 pub async fn run(ctx: &CellContext, plan: &CellPlan) -> Result<Vec<CellResult>, BenchError> {
-    run_with(ctx, plan, Arc::new(ProcLoad), None, polling(), None).await
+    let poll = polling(ctx.config.rates.list_poll_rps);
+    run_with(ctx, plan, Arc::new(ProcLoad), None, poll, None).await
 }
 
 /// [`run`] with the machine, the fault proxy, the poll and a cap on the objects of a burst given.
@@ -418,11 +421,57 @@ mod tests {
             [4096, MIB, 16 * MIB, 128 * MIB].map(burst_for),
             [1000, 1000, 8, 8]
         );
-        let poll = polling();
+        let poll = polling(2);
         assert_eq!(
             (poll.every, poll.deadline, poll.page),
-            (Duration::from_secs(1), Duration::from_secs(600), 1000)
+            (Duration::from_millis(500), Duration::from_secs(600), 1000)
         );
+    }
+
+    /// The number of polls a pass noted: the entries of its "backlog at each poll" list.
+    fn polls_noted(result: &CellResult) -> usize {
+        let note = result
+            .notes
+            .iter()
+            .find(|n| n.contains("backlog at each poll ["))
+            .unwrap();
+        let (_, list) = note.split_once("backlog at each poll [").unwrap();
+        list.split_once(']').unwrap().0.split(',').count()
+    }
+
+    /// Catches `--list-poll-rps` not reaching the poll (it was hard-wired to one LIST a second):
+    /// objects that never land are polled until a four second deadline on the paused clock, once
+    /// per second at 1 a second (5 polls, at 0, 1, 2, 3 and 4 s) and four times a second at 4
+    /// (17 polls), and the rate of the context's setting is the rate of `run`'s poll.
+    #[tokio::test(start_paused = true)]
+    async fn the_poll_rate_follows_the_setting() {
+        for (rps, polls) in [(1_u32, 5_usize), (4, 17)] {
+            let dir = temp(&format!("tb-c-rate-{rps}"));
+            let (instance, cold) = (FakeS3::start().await, FakeS3::start().await);
+            let stores = [
+                (Role::Instance, instance.endpoint()),
+                (Role::Cold, cold.endpoint()),
+            ];
+            let mut ctx = testkit::ctx(dir.path(), &stores, Window::Busy);
+            ctx.config.rates.list_poll_rps = rps;
+            let poll = Polling {
+                deadline: Duration::from_secs(4),
+                ..polling(ctx.config.rates.list_poll_rps)
+            };
+            assert_eq!(poll.every, Duration::from_secs(1) / rps);
+            let results = run_with(
+                &ctx,
+                &plan(&[1], &[4096]),
+                Script::calm(),
+                None,
+                poll,
+                Some(1),
+            )
+            .await
+            .unwrap();
+            assert_eq!(polls_noted(&results[0]), polls, "{rps} a second");
+        }
+        assert_eq!(polling(0).every, Duration::from_secs(1), "zero is one");
     }
 
     /// Catches a lag that is not measured from the acknowledgement to a LIST that shows the

@@ -115,12 +115,13 @@ impl ObjectSet {
         self.ready
             .get_or_try_init(|| async {
                 for key in &self.keys {
+                    // Counted before it is sent: a put that is cut off may have landed.
+                    self.charger.charge(self.size)?;
                     let outcome = if self.path.multipart {
                         self.writer.put_multipart(key, self.body.clone()).await?
                     } else {
                         self.writer.put(key, self.body.clone()).await?
                     };
-                    self.charger.charge(self.size)?;
                     if !outcome.is_ok() {
                         return Err(BenchError::Setup(format!(
                             "cold-read: the store of role {} would not take the objects to read",

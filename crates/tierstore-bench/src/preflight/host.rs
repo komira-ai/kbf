@@ -4,7 +4,7 @@
 //! [`Host`] they are the same code on the node and in a test, where a fake answers from a table
 //! and records the commands it was asked to run. [`SystemHost`] is the node itself.
 
-use std::io;
+use std::io::{self, Write as _};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -13,11 +13,13 @@ use std::time::Duration;
 use crate::error::BenchError;
 use crate::gate::LoadSample;
 
-/// A command to run: a program, its arguments and the environment variables added to it.
+/// A command to run: a program, its arguments, the environment variables added to it and the
+/// text it is given on standard input.
 ///
-/// The arguments and the variables may carry a secret (an account's key pair), so `Debug`
-/// prints the program and the counts only, and an error built from a command never repeats
-/// them.
+/// The arguments, the variables and the input may carry a secret (an account's key pair), so
+/// `Debug` prints the program and the counts only, and an error built from a command never
+/// repeats them. A secret goes in the input or a variable, never in the arguments: arguments are
+/// readable by every user of the machine.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Cmd {
     /// The program, a path or a name looked up on `PATH`.
@@ -26,6 +28,8 @@ pub struct Cmd {
     pub args: Vec<String>,
     /// Environment variables set for it, over the caller's own.
     pub env: Vec<(String, String)>,
+    /// What it reads from standard input, if anything; none is an empty, closed input.
+    pub stdin: Option<String>,
 }
 
 impl Cmd {
@@ -36,7 +40,15 @@ impl Cmd {
             program: program.into(),
             args: args.iter().map(|a| (*a).to_owned()).collect(),
             env: Vec::new(),
+            stdin: None,
         }
+    }
+
+    /// The same command reading `text` from standard input.
+    #[must_use]
+    pub fn with_stdin(mut self, text: String) -> Self {
+        self.stdin = Some(text);
+        self
     }
 
     /// The same command with one more variable.
@@ -51,10 +63,11 @@ impl std::fmt::Debug for Cmd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Cmd({}, {} args, {} variables; not printed)",
+            "Cmd({}, {} args, {} variables, {} input; not printed)",
             self.program.display(),
             self.args.len(),
-            self.env.len()
+            self.env.len(),
+            if self.stdin.is_some() { "with" } else { "no" }
         )
     }
 }
@@ -116,11 +129,25 @@ impl Host for SystemHost {
     }
 
     fn run(&self, cmd: &Cmd) -> io::Result<CmdOutput> {
-        let out = Command::new(&cmd.program)
+        let mut child = Command::new(&cmd.program)
             .args(&cmd.args)
             .envs(cmd.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .stdin(Stdio::null())
-            .output()?;
+            .stdin(if cmd.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(text) = &cmd.stdin {
+            // A write that fails (the child exited without reading) is not an error of its own:
+            // the exit status says what happened. Dropping the pipe closes the child's input.
+            child.stdin.take().into_iter().for_each(|mut pipe| {
+                pipe.write_all(text.as_bytes()).ok();
+            });
+        }
+        let out = child.wait_with_output()?;
         Ok(CmdOutput {
             success: out.status.success(),
             code: out.status.code(),

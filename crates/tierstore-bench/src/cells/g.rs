@@ -165,14 +165,15 @@ impl Stored {
                 for (index, file) in self.tree.files.iter().enumerate() {
                     let key = format!("{}/{}", self.prefix, file.path);
                     let body = Bytes::from(self.tree.content(index));
+                    // Counted before it is sent: a put that is cut off may have landed.
+                    if self.cold {
+                        self.charger.charge(file.size)?;
+                    }
                     let put = if self.multipart {
                         self.writer.put_multipart(&key, body).await?
                     } else {
                         self.writer.put(&key, body).await?
                     };
-                    if self.cold {
-                        self.charger.charge(file.size)?;
-                    }
                     if !put.is_ok() {
                         return Err(BenchError::Setup(format!(
                             "g: the store of role {} would not take the tree",

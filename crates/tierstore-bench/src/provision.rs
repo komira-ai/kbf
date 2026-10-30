@@ -7,24 +7,33 @@
 //! key file, the endpoint, the live bucket named for the probe) but runs no command and sends no
 //! request; `--apply` does it. For each store role of the run that is a shared store (`hot`,
 //! `cold`) it:
-//! 1. makes the test bucket (an existing one is kept);
+//! 1. makes the test bucket, after finding that the store has none of that name (one that is
+//!    there is kept only if this run made it, see [`state`]; any other stops the verb);
 //! 2. sets a hard quota of 30 GiB on it, which the harness cannot lift;
 //! 3. writes the policy that allows the bucket's own objects and listings and nothing else, to
 //!    `policy-<role>.json` of the result directory, and creates it;
-//! 4. adds the scoped account (the key pair the run file holds for the role) and attaches the
-//!    policy;
+//! 4. adds the scoped account (the key pair the run file holds for the role), after finding
+//!    that the store has no account of that id (one that is there is kept only if this run made
+//!    it; any other stops the verb, since `mc admin user add` would reset its secret), and
+//!    attaches the policy. The secret goes to `mc` on its standard input, not its arguments;
 //! 5. probes: the account lists its test bucket (must be served), and reads a key of the live
 //!    bucket the ops file names (must be refused with 403). A live bucket the account reaches
-//!    stops the verb after it removes the account.
+//!    stops the verb after it removes the account, if this run made it.
+//!
+//! Before the first command every bucket and account id is checked against the run's test prefix
+//! ([`RunConfig::check_names`]); a name outside it stops the verb with nothing sent. What the run
+//! makes is written to `provision-state.json` as it is made.
 //!
 //! The commands are `mc`'s, driven through [`crate::preflight::mc`]; the steps are written to
 //! `provision.json` and printed, by role and never by bucket name.
 
 pub mod probe;
+pub mod state;
 
 use serde::Serialize;
 
 use self::probe::Access;
+use self::state::State;
 use crate::config::{RunConfig, StoreSpec};
 use crate::error::BenchError;
 use crate::preflight::host::{Host, SystemHost};
@@ -137,11 +146,49 @@ fn unexpected(what: &str, access: &Access) -> BenchError {
     BenchError::Ops(format!("{what}: got {access:?}"))
 }
 
+/// Asks the store about the test bucket: `Ok(true)` if it is there and this run made it (kept),
+/// `Ok(false)` if the store has none, an error if it is there and is someone else's.
+fn bucket_kept(target: &Target<'_>, state: &State) -> Result<bool, BenchError> {
+    let name = &target.spec.bucket;
+    if !target.mc.bucket_exists(name)? {
+        return Ok(false);
+    }
+    if state.made_bucket(name) {
+        return Ok(true);
+    }
+    Err(BenchError::Ops(format!(
+        "role {}: the test bucket is already on the store and this run did not make it",
+        target.role
+    )))
+}
+
+/// [`bucket_kept`] for the scoped account: an account that is there and not this run's is never
+/// touched, since `mc admin user add` would reset its secret.
+fn account_kept(target: &Target<'_>, state: &State) -> Result<bool, BenchError> {
+    let id = &target.spec.access_key_id;
+    if !target.mc.account_exists(id)? {
+        return Ok(false);
+    }
+    if state.made_account(id) {
+        return Ok(true);
+    }
+    Err(BenchError::Ops(format!(
+        "role {}: the scoped account is already on the store and this run did not make it",
+        target.role
+    )))
+}
+
 /// Does one step.
-async fn execute(step: Step, target: &Target<'_>) -> Result<(), BenchError> {
+async fn execute(step: Step, target: &Target<'_>, state: &mut State) -> Result<(), BenchError> {
     let spec = target.spec;
     match step {
-        Step::MakeBucket => target.mc.make_bucket(&spec.bucket),
+        Step::MakeBucket => {
+            if bucket_kept(target, state)? {
+                return Ok(());
+            }
+            target.mc.make_bucket(&spec.bucket)?;
+            state.record_bucket(&spec.bucket)
+        }
         Step::SetQuota => target.mc.set_quota(&spec.bucket),
         Step::MakePolicy => {
             write_json(&target.policy_file, &policy_document(&spec.bucket))?;
@@ -149,10 +196,16 @@ async fn execute(step: Step, target: &Target<'_>) -> Result<(), BenchError> {
                 .mc
                 .create_policy(&target.policy_name, &target.policy_file)
         }
-        Step::AddAccount => target.mc.add_account(&KeyPair {
-            access_key_id: spec.access_key_id.clone(),
-            secret_access_key: spec.secret_access_key.clone(),
-        }),
+        Step::AddAccount => {
+            if account_kept(target, state)? {
+                return Ok(());
+            }
+            target.mc.add_account(&KeyPair {
+                access_key_id: spec.access_key_id.clone(),
+                secret_access_key: spec.secret_access_key.clone(),
+            })?;
+            state.record_account(&spec.access_key_id)
+        }
         Step::AttachPolicy => target
             .mc
             .attach_policy(&target.policy_name, &spec.access_key_id),
@@ -169,7 +222,7 @@ async fn execute(step: Step, target: &Target<'_>) -> Result<(), BenchError> {
         Step::ProbeLive => match probe::can_read(spec, target.live_bucket).await? {
             Access::Denied(_) => Ok(()),
             other => {
-                let removed = match target.mc.remove_account(&spec.access_key_id) {
+                let removed = match state.remove_account(&target.mc, &spec.access_key_id) {
                     Ok(()) => "the account was removed",
                     Err(_) => "REMOVE THE ACCOUNT BY HAND",
                 };
@@ -225,7 +278,8 @@ struct StepsFile<'a> {
 /// # Errors
 /// [`BenchError`] if the ops file or an admin key file cannot be read, a role has no live bucket
 /// named or its test bucket is the live one, a command fails, or a probe does not give the
-/// answer isolation needs.
+/// answer isolation needs; a bucket or account id outside the test prefix, a bucket or account
+/// already on the store that this run did not make.
 pub async fn run(config: &RunConfig, mode: Mode) -> Result<Steps, BenchError> {
     let host = SystemHost;
     let ops = OpsFile::load(&host, &config.result_dir)?;
@@ -242,6 +296,7 @@ pub async fn run_with(
     ops: &OpsFile,
     mode: Mode,
 ) -> Result<Steps, BenchError> {
+    config.check_names()?;
     let roles: Vec<(Role, &StoreSpec)> = SHARED_ROLES
         .into_iter()
         .filter_map(|role| config.stores.get(&role).map(|spec| (role, spec)))
@@ -255,12 +310,21 @@ pub async fn run_with(
         .into_iter()
         .map(|(role, spec)| prepare(host, config, ops, role, spec))
         .collect::<Result<Vec<_>, _>>()?;
+    let mut state = State::load(&config.result_dir, &config.test_prefix)?;
+    if mode == Mode::Apply {
+        // Everything that could be someone else's is looked for before anything is changed, so a
+        // refusal leaves the store as it was.
+        for target in &targets {
+            bucket_kept(target, &state)?;
+            account_kept(target, &state)?;
+        }
+    }
     let mut steps = Steps::new();
     for target in &targets {
         for step in STEPS {
             let line = describe(step, target.role);
             if mode == Mode::Apply {
-                execute(step, target).await?;
+                execute(step, target, &mut state).await?;
                 steps.push(format!("done: {line}"));
             } else {
                 steps.push(format!("plan: {line}"));

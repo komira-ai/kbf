@@ -60,6 +60,54 @@ pub enum ConfigError {
     /// The byte caps are not `pass <= cell <= campaign`.
     #[error("byte caps must satisfy pass <= cell <= campaign")]
     CapOrder,
+    /// No `test_prefix` was given, or it is not lowercase letters, digits and dashes with a stem
+    /// and a closing dash.
+    #[error("test_prefix: {0}")]
+    TestPrefix(&'static str),
+    /// A bucket or an account id the run would create, write or delete does not start with the
+    /// test prefix. Nothing was sent to any store.
+    #[error("role {role}: the {what} {value:?} does not start with the test prefix {prefix:?}")]
+    OutsidePrefix {
+        /// The role.
+        role: Role,
+        /// `bucket` or `account id`.
+        what: &'static str,
+        /// The offending name.
+        value: String,
+        /// The test prefix.
+        prefix: String,
+    },
+}
+
+/// Whether `provision` makes a scoped account for `role`: the shared stores, `hot` and `cold`.
+fn gets_account(role: Role) -> bool {
+    matches!(role, Role::Hot | Role::Cold)
+}
+
+/// The test prefix as the run file or `--test-prefix` gives it: lowercase letters, digits and
+/// dashes, a stem and then a closing dash (`bench7-`), so a name that starts with it can be told
+/// from a farm's own at a glance.
+///
+/// # Errors
+/// [`ConfigError::TestPrefix`] with what is wrong.
+pub fn check_test_prefix(prefix: &str) -> Result<(), ConfigError> {
+    if prefix.is_empty() {
+        return Err(ConfigError::TestPrefix("it is empty"));
+    }
+    if !prefix
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(ConfigError::TestPrefix(
+            "it may hold only lowercase letters, digits and dashes",
+        ));
+    }
+    if !prefix.ends_with('-') || prefix.len() < 2 {
+        return Err(ConfigError::TestPrefix(
+            "it must be a stem followed by a closing dash",
+        ));
+    }
+    Ok(())
 }
 
 /// A secret that never prints: its `Debug` is `<redacted>`.
@@ -122,6 +170,10 @@ pub struct StoreFile {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunFile {
+    /// What every bucket and every account id the tool creates, writes or deletes must start
+    /// with. Required, here or as `--test-prefix` (the flag wins).
+    #[serde(default)]
+    pub test_prefix: Option<String>,
     /// One entry per store role.
     #[serde(default)]
     pub stores: BTreeMap<Role, StoreFile>,
@@ -158,6 +210,11 @@ pub struct ConfigArgs {
     /// Directory the result JSON, the CSV of samples and the request log are written to.
     #[arg(long, value_name = "DIR")]
     pub result_dir: PathBuf,
+    /// What every test bucket name and every scoped account id must start with (lowercase
+    /// letters, digits and dashes, ending in `-`); a verb refuses, before any store call, a
+    /// name that does not. Required, here or as `test_prefix` of the run file.
+    #[arg(long, value_name = "PREFIX")]
+    pub test_prefix: Option<String>,
     /// Endpoint of a store role, `ROLE=http://host:port`; repeatable.
     #[arg(long = "endpoint", value_name = "ROLE=URL", value_parser = parse_pair)]
     pub endpoints: Vec<(Role, String)>,
@@ -219,6 +276,8 @@ fn parse_pair(s: &str) -> Result<(Role, String), ConfigError> {
 pub struct RunConfig {
     /// Where results, samples and the request log go.
     pub result_dir: PathBuf,
+    /// What every bucket and every account id this tool creates, writes or deletes starts with.
+    pub test_prefix: String,
     /// The store roles in use, each complete.
     pub stores: BTreeMap<Role, StoreSpec>,
     /// Declared by the operator.
@@ -259,6 +318,14 @@ impl RunConfig {
             return Err(ConfigError::CapOrder);
         }
         let file = file.unwrap_or_default();
+        let test_prefix = args
+            .test_prefix
+            .clone()
+            .or_else(|| file.test_prefix.clone())
+            .ok_or(ConfigError::TestPrefix(
+                "none given (--test-prefix, or test_prefix in the run file)",
+            ))?;
+        check_test_prefix(&test_prefix)?;
         let roles: BTreeSet<Role> = file
             .stores
             .keys()
@@ -299,8 +366,9 @@ impl RunConfig {
                 },
             );
         }
-        Ok(Self {
+        let config = Self {
             result_dir: args.result_dir.clone(),
+            test_prefix,
             stores,
             window: args.window,
             seed: args.seed,
@@ -316,7 +384,50 @@ impl RunConfig {
                 list_poll_rps: args.list_poll_rps,
             },
             bytes,
-        })
+        };
+        config.check_names()?;
+        Ok(config)
+    }
+
+    /// Refuses a bucket, or an account id of the roles `provision` makes accounts for (`hot`,
+    /// `cold`), that does not start with the test prefix. [`Self::resolve`] runs it, so every
+    /// verb that holds a configuration has passed it; `provision` runs it again before its first
+    /// command, for a configuration built by hand.
+    ///
+    /// # Errors
+    /// [`ConfigError::OutsidePrefix`] naming the role and the offending value.
+    pub fn check_names(&self) -> Result<(), ConfigError> {
+        let outside = |role, what, value: &str| ConfigError::OutsidePrefix {
+            role,
+            what,
+            value: value.to_owned(),
+            prefix: self.test_prefix.clone(),
+        };
+        for (&role, spec) in &self.stores {
+            if !spec.bucket.starts_with(&self.test_prefix) {
+                return Err(outside(role, "bucket", &spec.bucket));
+            }
+            if gets_account(role) && !spec.access_key_id.starts_with(&self.test_prefix) {
+                return Err(outside(role, "account id", &spec.access_key_id));
+            }
+        }
+        Ok(())
+    }
+
+    /// The names a verb would create, write or delete, one `key=value` per line: `test_prefix=`,
+    /// then for each configured store role, in the order of [`Role::ALL`], its `bucket=`, and for `hot` and
+    /// `cold` its `account=`. Reads nothing and sends nothing; the held scripts compare it with
+    /// their site file.
+    #[must_use]
+    pub fn plan_lines(&self) -> Vec<String> {
+        let mut lines = vec![format!("test_prefix={}", self.test_prefix)];
+        for (&role, spec) in &self.stores {
+            lines.push(format!("bucket={}", spec.bucket));
+            if gets_account(role) {
+                lines.push(format!("account={}", spec.access_key_id));
+            }
+        }
+        lines
     }
 
     /// The spec of a store role.
@@ -364,10 +475,18 @@ mod tests {
         args: ConfigArgs,
     }
 
-    fn args(extra: &[&str]) -> ConfigArgs {
+    /// The flags with no test prefix among them.
+    fn bare(extra: &[&str]) -> ConfigArgs {
         let mut argv = vec!["t", "--result-dir", "out"];
         argv.extend_from_slice(extra);
         Wrap::try_parse_from(argv).unwrap().args
+    }
+
+    /// The flags with the test prefix `t-`.
+    fn args(extra: &[&str]) -> ConfigArgs {
+        let mut argv = vec!["--test-prefix", "t-"];
+        argv.extend_from_slice(extra);
+        bare(&argv)
     }
 
     fn file(json: &str) -> RunFile {
@@ -375,9 +494,9 @@ mod tests {
     }
 
     const FILE: &str = r#"{"stores": {
-        "hot": {"endpoint": "http://hot.example:9000", "bucket": "hot-test",
-                "access_key_id": "hot-id", "secret_access_key": "hot-secret"},
-        "cold": {"access_key_id": "cold-id", "secret_access_key": "cold-secret",
+        "hot": {"endpoint": "http://hot.example:9000", "bucket": "t-hot-test",
+                "access_key_id": "t-hot-id", "secret_access_key": "hot-secret"},
+        "cold": {"access_key_id": "t-cold-id", "secret_access_key": "cold-secret",
                  "region": "eu-test-1"}}}"#;
 
     /// Catches a default that drifted from the approved caps and gate (200 GiB campaign, 8 GiB
@@ -403,19 +522,19 @@ mod tests {
             "--endpoint",
             "cold=http://cold.example:9000",
             "--bucket",
-            "cold=cold-test",
+            "cold=t-cold-test",
             "--endpoint",
             "hot=http://other.example:9000",
         ]);
         let cfg = RunConfig::resolve(&a, Some(file(FILE))).unwrap();
         let hot = cfg.store(Role::Hot).unwrap();
         assert_eq!(hot.endpoint, "http://other.example:9000");
-        assert_eq!(hot.bucket, "hot-test");
+        assert_eq!(hot.bucket, "t-hot-test");
         assert_eq!(hot.region, "us-east-1");
         let cold = cfg.store(Role::Cold).unwrap();
         assert_eq!(cold.endpoint, "http://cold.example:9000");
         assert_eq!(cold.region, "eu-test-1");
-        assert_eq!(cold.access_key_id, "cold-id");
+        assert_eq!(cold.access_key_id, "t-cold-id");
     }
 
     /// Catches a secret reaching a log through `Debug` of the configuration.
@@ -425,7 +544,7 @@ mod tests {
             "--endpoint",
             "cold=http://cold.example:9000",
             "--bucket",
-            "cold=cold-test",
+            "cold=t-cold-test",
         ]);
         let cfg = RunConfig::resolve(&a, Some(file(FILE))).unwrap();
         let shown = format!("{cfg:?}");
@@ -475,7 +594,7 @@ mod tests {
             "--endpoint",
             "instance=http://i.example:1",
             "--bucket",
-            "instance=b-test",
+            "instance=t-b-test",
         ]);
         let err = RunConfig::resolve(&a, None).unwrap_err();
         assert!(
@@ -494,7 +613,7 @@ mod tests {
     /// Catches a machine role being given a bucket.
     #[test]
     fn a_machine_role_is_not_a_store() {
-        let a = args(&["--bucket", "generator=x-test"]);
+        let a = args(&["--bucket", "generator=t-x-test"]);
         let err = RunConfig::resolve(&a, None).unwrap_err();
         assert!(matches!(err, ConfigError::NotAStore(Role::Generator)));
     }
@@ -544,5 +663,118 @@ mod tests {
         let bad = r#"{"stores": {"hot": {"access_key_id": "a", "secret_access_key": "s", "secret": "x"}}}"#;
         assert!(serde_json::from_str::<RunFile>(bad).is_err());
         assert!(serde_json::from_str::<RunFile>(r#"{"store": {}}"#).is_err());
+    }
+
+    /// Catches a run with no test prefix, or a prefix that would not tell a test name from a
+    /// farm's: none, an empty one, upper case, a dot, no closing dash and a bare dash are all
+    /// refused before any store is looked at; the flag and the run file each give one.
+    #[test]
+    fn the_test_prefix_is_required_and_has_a_shape() {
+        let err = RunConfig::resolve(&bare(&[]), None).unwrap_err();
+        assert!(matches!(err, ConfigError::TestPrefix(_)), "{err}");
+        for bad in ["", "Bench-", "bench.", "bench", "-", "ben ch-"] {
+            let err = RunConfig::resolve(&bare(&["--test-prefix", bad]), None).unwrap_err();
+            assert!(matches!(err, ConfigError::TestPrefix(_)), "{bad:?}: {err}");
+        }
+        let from_file = file(r#"{"test_prefix": "run7-"}"#);
+        let cfg = RunConfig::resolve(&bare(&[]), Some(from_file)).unwrap();
+        assert_eq!(cfg.test_prefix, "run7-");
+        let from_file = file(r#"{"test_prefix": "run7-"}"#);
+        let cfg = RunConfig::resolve(&args(&[]), Some(from_file)).unwrap();
+        assert_eq!(cfg.test_prefix, "t-", "the flag wins over the run file");
+    }
+
+    /// Catches a bucket or a scoped account id outside the prefix being accepted: the error names
+    /// the role and the value, for a bucket given by flag or file and for an id of `hot` or
+    /// `cold`; an `instance` key is not an account the tool makes, so only its bucket counts.
+    #[test]
+    fn a_name_outside_the_prefix_is_refused_naming_it() {
+        let a = args(&[
+            "--endpoint",
+            "cold=http://c.example:1",
+            "--bucket",
+            "cold=t-c",
+            "--bucket",
+            "hot=farm-hot",
+        ]);
+        let err = RunConfig::resolve(&a, Some(file(FILE))).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::OutsidePrefix { role: Role::Hot, what: "bucket", value, .. } if value == "farm-hot"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("farm-hot"));
+
+        let live = FILE.replace("t-cold-id", "live-cold-id");
+        let a = args(&[
+            "--endpoint",
+            "cold=http://c.example:1",
+            "--bucket",
+            "cold=t-c",
+        ]);
+        let err = RunConfig::resolve(&a, Some(file(&live))).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::OutsidePrefix { role: Role::Cold, what: "account id", value, .. } if value == "live-cold-id"),
+            "{err}"
+        );
+
+        let instance = r#"{"stores": {"instance": {"endpoint": "http://i.example:1",
+            "bucket": "t-i", "access_key_id": "tierstore-key", "secret_access_key": "s"}}}"#;
+        RunConfig::resolve(&args(&[]), Some(file(instance))).unwrap();
+        let outside = instance.replace("t-i", "i");
+        let err = RunConfig::resolve(&args(&[]), Some(file(&outside))).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::OutsidePrefix {
+                    role: Role::Instance,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    /// Catches a hand-built configuration skipping the check that `resolve` makes: `check_names`
+    /// on its own refuses a bucket that was changed after the fact.
+    #[test]
+    fn check_names_refuses_a_configuration_changed_after_resolving() {
+        let a = args(&[
+            "--endpoint",
+            "cold=http://c.example:1",
+            "--bucket",
+            "cold=t-c",
+        ]);
+        let mut cfg = RunConfig::resolve(&a, Some(file(FILE))).unwrap();
+        cfg.check_names().unwrap();
+        cfg.stores.get_mut(&Role::Cold).unwrap().bucket = "live".to_owned();
+        assert!(cfg.check_names().is_err());
+    }
+
+    /// Catches the plan listing something other than what a verb would touch, or a store call's
+    /// worth of detail: the prefix, then each configured store's bucket in role order, and the
+    /// account id of `hot` and `cold` only.
+    #[test]
+    fn the_plan_lists_the_prefix_the_buckets_and_the_accounts() {
+        let instance = r#", "instance": {"endpoint": "http://i.example:1",
+            "bucket": "t-inst", "access_key_id": "tierstore-key", "secret_access_key": "s"}}}"#;
+        let with_instance = FILE[..FILE.len() - 2].to_owned() + instance;
+        let a = args(&[
+            "--endpoint",
+            "cold=http://c.example:1",
+            "--bucket",
+            "cold=t-cold-test",
+        ]);
+        let cfg = RunConfig::resolve(&a, Some(file(&with_instance))).unwrap();
+        assert_eq!(
+            cfg.plan_lines(),
+            [
+                "test_prefix=t-",
+                "bucket=t-hot-test",
+                "account=t-hot-id",
+                "bucket=t-cold-test",
+                "account=t-cold-id",
+                "bucket=t-inst",
+            ]
+        );
     }
 }

@@ -101,6 +101,7 @@ pub fn read_unit(host: &dyn Host, unit: &str) -> Result<UnitView, BenchError> {
         program: "systemctl".into(),
         args,
         env: Vec::new(),
+        stdin: None,
     };
     let text = run_ok(host, "systemctl show", &cmd)?;
     let normal = normalize_show(&text);

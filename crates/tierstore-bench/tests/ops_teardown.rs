@@ -40,7 +40,7 @@ const CLEAN: World = World {
 /// the verifier (`READER-KEYID-MARK`) sees the bucket as `world` says.
 fn store(world: World) -> impl Fn(&Seen) -> (u16, String) + Send + Sync + 'static {
     move |seen| {
-        if seen.key_id().starts_with("KEYID-MARK") {
+        if seen.key_id().starts_with("tb-KEYID-MARK") {
             return if world.account_known {
                 empty_listing()
             } else {
@@ -105,8 +105,8 @@ fn prepare(host: &FakeHost, dir: &Path) -> PathBuf {
     write_log(
         dir,
         &[
-            record(Role::Cold, "cold-test-bucket-mark"),
-            record(Role::Hot, "hot-test-bucket-mark"),
+            record(Role::Cold, "tb-cold-test-bucket-mark"),
+            record(Role::Hot, "tb-hot-test-bucket-mark"),
         ],
     );
     before
@@ -362,7 +362,7 @@ async fn the_request_log_must_name_test_buckets_only_and_read_whole() {
     write_log(
         dir,
         &[
-            record(Role::Cold, "cold-test-bucket-mark"),
+            record(Role::Cold, "tb-cold-test-bucket-mark"),
             String::new(),
             record(Role::Cold, "live-cold-bucket-mark"),
         ],
@@ -373,7 +373,7 @@ async fn the_request_log_must_name_test_buckets_only_and_read_whole() {
         "2 requests: 1 to a bucket that is not the test bucket of its role, 0 unreadable lines"
     );
 
-    write_log(dir, &[record(Role::Proxy, "cold-test-bucket-mark")]);
+    write_log(dir, &[record(Role::Proxy, "tb-cold-test-bucket-mark")]);
     assert!(!find(&a.checks().await, name).passed);
 
     write_log(dir, &["{not a record".to_owned()]);
