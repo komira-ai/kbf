@@ -419,8 +419,10 @@ fn the_water_marks_are_judged_at_their_edges() {
             "local_cache.keep_wait",
         ),
         (
+            // A value that is not a duration is refused by the parser of the file, whose message
+            // gives the line and the column of the value and not the name of the key.
             cache_with("keep_wait  = \"45s\"", "keep_wait  = \"soon\""),
-            "keep_wait",
+            "not a duration",
         ),
         (
             cache_with("keep_deadline = \"5m\"", "keep_deadline = \"0s\""),
@@ -446,7 +448,12 @@ fn a_storage_node_refuses_a_list_of_endpoints_and_a_cache_policy() {
         "[hot_store]\nendpoints = [\"http://h:1\"]\n",
         1,
     );
-    let cold = format!("{GOLDEN}endpoints = [\"http://c:1\"]\n");
+    // Put in [cold_store] itself, not at the end of the file, which ends with another table.
+    let cold = GOLDEN.replacen(
+        "[cold_store]\n",
+        "[cold_store]\nendpoints = [\"http://c:1\"]\n",
+        1,
+    );
     for (text, key) in [(hot, "hot_store.endpoints"), (cold, "cold_store.endpoints")] {
         let why = refusal(&text);
         assert!(why.contains(key), "{why}");
