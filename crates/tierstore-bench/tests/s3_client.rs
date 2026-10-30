@@ -181,3 +181,37 @@ fn a_bad_endpoint_or_bucket_is_refused_when_the_client_is_made() {
         );
     }
 }
+
+/// A writer that refuses everything, as a full disk does.
+struct FullDisk;
+
+impl std::io::Write for FullDisk {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("disk full"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Catches a request whose record could not be written being reported as a success: a
+/// harness-side log with a gap proves nothing, so the call is an error.
+#[tokio::test]
+async fn a_call_whose_record_cannot_be_written_is_an_error() {
+    let log = Arc::new(RequestLog::to_writer(FullDisk));
+    let fake = FakeS3::start().await;
+    let s3 = BenchS3::new(
+        Role::Instance,
+        &spec(fake.endpoint()),
+        Timeouts::default(),
+        log.clone(),
+    )
+    .unwrap();
+    let err = s3
+        .put("bench/a", Bytes::from_static(b"x"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BenchError::Log(_)));
+    assert_eq!(log.count(), 0);
+}

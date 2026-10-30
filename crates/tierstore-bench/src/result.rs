@@ -385,7 +385,8 @@ mod tests {
         assert!(!text.contains("://"));
         let dotted_quad = text
             .split(|c: char| !(c.is_ascii_digit() || c == '.'))
-            .any(|w| w.split('.').count() == 4 && w.split('.').all(|p| p.parse::<u8>().is_ok()));
+            .filter(|w| w.split('.').count() == 4)
+            .any(|w| w.split('.').all(|p| p.parse::<u8>().is_ok()));
         assert!(!dotted_quad);
     }
 

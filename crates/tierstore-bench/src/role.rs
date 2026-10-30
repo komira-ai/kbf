@@ -103,7 +103,10 @@ mod tests {
     #[test]
     fn an_unknown_role_is_refused_by_name() {
         let err = "silo-1".parse::<Role>().unwrap_err();
-        assert!(matches!(err, ConfigError::UnknownRole(ref n) if n == "silo-1"));
+        assert_eq!(
+            err.to_string(),
+            ConfigError::UnknownRole("silo-1".to_owned()).to_string()
+        );
     }
 
     /// Catches a machine role being given a bucket, or a store role being refused one.

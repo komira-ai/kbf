@@ -112,18 +112,16 @@ pub struct ReportArgs {
 /// [`BenchError`]: what stopped the verb.
 pub async fn run(cli: Cli) -> Result<(), BenchError> {
     match cli.command {
-        Command::Preflight(args) => {
-            preflight::run(&RunConfig::load(&args)?).await?;
-            Ok(())
-        }
+        Command::Preflight(args) => preflight::run(&RunConfig::load(&args)?).await.map(|_| ()),
         Command::Provision(args) => {
             let mode = if args.apply {
                 Mode::Apply
             } else {
                 Mode::DryRun
             };
-            provision::run(&RunConfig::load(&args.config)?, mode).await?;
-            Ok(())
+            provision::run(&RunConfig::load(&args.config)?, mode)
+                .await
+                .map(|_| ())
         }
         Command::Run(args) => {
             let config = RunConfig::load(&args.config)?;
@@ -144,7 +142,7 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
                 provenance: Provenance::unrecorded(),
             };
             for id in args.cells {
-                cells::run(id, &ctx, &plan).await?;
+                cells::run(id, &ctx, &plan).await.map(|_| ())?;
             }
             Ok(())
         }
@@ -158,8 +156,7 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
         }
         Command::VerifyTeardown(args) => {
             let config = RunConfig::load(&args.config)?;
-            teardown::run(&config, &args.before).await?;
-            Ok(())
+            teardown::run(&config, &args.before).await.map(|_| ())
         }
         Command::Report(args) => report::render(&args.result_dir).map(|_| ()),
     }
