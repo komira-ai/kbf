@@ -51,7 +51,7 @@ use kbf_meta::{
 use kbf_sched::{DaemonInstance, Event as SchedEvent, Input, OpState, Request, Scheduler};
 use kbf_server::RaftMetaLog;
 use kbf_server::action_usage::Subject;
-use kbf_server::machine::{FarmMachine, Platform, Sent, Waiter};
+use kbf_server::machine::{Booked, FarmMachine, Platform, Sent, Waiter};
 use kbf_server::stamp::Stamp;
 use kbf_sim::{Event, NodeId, NodeInput, Output};
 use kbf_store::{Fault, FaultFs};
@@ -574,6 +574,10 @@ impl Up {
                 queued,
                 started: wall(now),
             },
+            booked: Some(Booked {
+                cpu_millis: start.resources.cpu_millis,
+                memory_bytes: start.resources.memory_bytes,
+            }),
         };
         self.machine.start(start.lease, sent);
     }
