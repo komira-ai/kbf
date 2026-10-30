@@ -220,6 +220,162 @@ Two uses, for the pieces of kbf that keep their objects in a tierstore bucket:
   server, and a sweeper that deletes would need `delete_prefixes: ["kbf-history/"]`). So the key is
   `read_prefixes: ["kbf-history/"]`, `write_prefixes: ["kbf-history/"]`, `delete_prefixes: []`.
 
+## The configuration file
+
+`tierstore --config <path>` reads one TOML file in place of the flags that describe the data path
+(the listen address, the tiers, the key files, the limits and the reconciler's settings). A server
+started from a file runs the code of one started from the same settings as flags: the file is read
+into the settings the flags make, and the defaults are the flags' defaults. The unit above keeps
+its flags; a file is for a setup that would rather keep its settings in one place.
+
+This release reads the storage-node shape: `[server]`, `[hot_store]` and `[cold_store]`, and an
+optional `[[policy]]`. A file for a storage node:
+
+```toml
+[server]
+listen              = "192.0.2.10:9000"
+proxy_id            = "tierstore-1"
+bucket              = "tierstore"
+region              = "us-east-1"
+max_request_bytes   = 268435456
+access_key_file     = "/etc/tierstore/access.key"
+read_only_key_files = ["/etc/tierstore/daemons.key"]
+presign_key_files   = ["/etc/tierstore/pack-presign.key"]
+gc_key_files        = ["/etc/tierstore/pack-gc.key"]
+
+[hot_store]
+kind              = "s3"
+bucket            = "tierstore-hot"
+endpoint          = "http://s3-hot.example:9000"
+region            = "us-east-1"
+credentials_file  = "/etc/tierstore/hot.credentials"
+budget            = "1TiB"
+high_water        = 80
+low_water         = 70
+critical          = 95
+copy_parallel     = 16
+lease_ttl         = "30s"
+reconcile_interval = "5s"
+usage_stale_after = "2m"
+journal_linger    = "20ms"
+journal_retention = "24h"
+
+[cold_store]
+kind             = "s3"
+bucket           = "tierstore-cold"
+endpoint         = "http://s3-cold.example:9000"
+credentials_file = "/etc/tierstore/cold.credentials"
+skip_checks      = []
+```
+
+A key that is left out has the default of its flag (`tierstore --help` lists them); `listen`,
+`proxy_id`, `bucket` and `access_key_file` of `[server]`, `kind` of each tier and `budget` of
+`[hot_store]` are needed. Durations are a whole number and `ms`, `s`, `m` or `h`, as in the flags.
+The water marks are percents, as in the flags (1 to 100).
+
+### Which key each flag has
+
+Every flag that describes the data path has the key or keys below, and no other has one. A flag
+that takes a list (`--read-only-key-file`, given once for each key) is a list in the file. A tier
+flag is a `kind` and the key its kind needs: `--hot dir:<path>` is `kind = "dir"` and `path`,
+`--hot s3:<bucket>` is `kind = "s3"` and `bucket`. The keys of the reconciler, the journal and the
+lease are in `[hot_store]`, since only a process with a hot tier has them. The crate's tests walk
+the flags of the binary against this table, so a flag added without a key fails them.
+
+| flag | key | what |
+|---|---|---|
+| `--listen` | `server.listen` | the address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on |
+| `--proxy-id` | `server.proxy_id` | names the journal and the lease of this process |
+| `--hot` | `hot_store.kind`, `hot_store.path`, `hot_store.bucket` | the hot tier: `kind` is `memory`, `dir` (with `path`) or `s3` (with `bucket`, `endpoint` and `credentials_file`); in a flag, `memory`, `dir:<path>` or `s3:<bucket>` |
+| `--cold` | `cold_store.kind`, `cold_store.path`, `cold_store.bucket` | the cold tier, in the same three kinds |
+| `--hot-endpoint` | `hot_store.endpoint` | `http://host[:port]` of an `s3` hot tier |
+| `--hot-region` | `hot_store.region` | the signing region of an `s3` hot tier |
+| `--hot-credentials-file` | `hot_store.credentials_file` | the key file of an `s3` hot tier |
+| `--cold-endpoint` | `cold_store.endpoint` | `http://host[:port]` of an `s3` cold tier |
+| `--cold-region` | `cold_store.region` | the signing region of an `s3` cold tier |
+| `--cold-credentials-file` | `cold_store.credentials_file` | the key file of an `s3` cold tier |
+| `--s3-request-timeout` | `server.s3_request_timeout` | the limit on a request to an `s3` tier (both tiers) |
+| `--hot-bytes` | `hot_store.budget` | the bytes the hot tier is meant to hold: a number, or a string such as `"500GiB"` |
+| `--high-water` | `hot_store.high_water` | percent of the budget above which eviction begins |
+| `--low-water` | `hot_store.low_water` | percent of the budget eviction goes down to |
+| `--critical` | `hot_store.critical` | percent of the budget above which a put waits and a cold read is not copied back |
+| `--bucket` | `server.bucket` | the name of the bucket served |
+| `--region` | `server.region` | the region of a request's signature |
+| `--access-key-file` | `server.access_key_file` | the full key file |
+| `--read-only-key-file` | `server.read_only_key_files` | a list of read-only key files |
+| `--presign-key-file` | `server.presign_key_files` | a list of presigning key files |
+| `--gc-key-file` | `server.gc_key_files` | a list of GC key files |
+| `--scoped-key-file` | `server.scoped_key_files` | a list of scoped key files |
+| `--presign-max-expires` | `server.presign_max_expires` | the longest expiry of any presigned URL |
+| `--journal-linger` | `hot_store.journal_linger` | how long a batch of journal entries waits for more |
+| `--journal-retention` | `hot_store.journal_retention` | how long an applied journal object is kept |
+| `--copy-parallel` | `hot_store.copy_parallel` | the most objects the reconciler copies at once |
+| `--lease-ttl` | `hot_store.lease_ttl` | how long the reconciler's lease lasts without a renewal |
+| `--reconcile-interval` | `hot_store.reconcile_interval` | how often the reconciler works |
+| `--usage-stale-after` | `hot_store.usage_stale_after` | how old the published usage may be before `/usagez` says 503 |
+| `--max-request-bytes` | `server.max_request_bytes` | the longest body of a request |
+| `--max-concurrent-puts` | `server.max_concurrent_puts` | the most put bodies and parts taken at once |
+| `--put-min-bytes-per-sec` | `server.put_min_bytes_per_sec` | the least average rate of a body (0 turns it off) |
+| `--put-rate-grace` | `server.put_rate_grace` | the time waiting for the client before that rate is held |
+| `--body-idle-timeout` | `server.body_idle_timeout` | how long a body or an answer may go without a byte |
+| `--skip-backend-check` | `cold_store.skip_checks` | a list of `CHECK=REASON` texts: the start-up check that is left out, with its reason (only `multipart-conditional`; it runs on the cold tier) |
+| `--backend-check-wait` | `server.backend_check_wait` | how long the start-up self-test asks again of a tier that does not answer |
+
+These stay flags, since they describe one run and not the data path: `--config`,
+`--print-config`, `--drain-lb-wait` and `--drain-deadline`. A start that gives `--config` and any
+other flag is refused with status 2 and a message that names the flags (`--drain-lb-wait` and
+`--drain-deadline` may go with it). A refusal that the checks of the start make (water marks out of
+order, a key file others can read) names the keys of the file where the flag-mode message names the
+flags.
+
+### What the loader refuses
+
+Each of these exits with status 2 and names the file and the key:
+
+- a key or a table the format does not have (the file is a closed set), and a value of the wrong
+  type;
+- a key that holds a secret: keys and credentials are paths of files, whose names end in `_file`
+  or `_files`; `secret_access_key`, `access_key_id`, `password`, a name with `token` in it and the
+  like are refused wherever they are;
+- `[local_cache]`, which is reserved for a later release and refused as not supported yet, and a
+  file without both `[hot_store]` and `[cold_store]`;
+- a key of a tier that its `kind` does not take (`path` for a `memory` tier, `endpoint` for a `dir`
+  tier), a `dir` tier without `path`, an `s3` tier without `bucket`, `endpoint` or
+  `credentials_file`, and a key only one tier has in the other (`budget` and the reconciler's keys
+  are `[hot_store]`'s; `skip_checks` is `[cold_store]`'s, since the check it skips runs there);
+- a water mark outside 1 to 100, and a budget, a count or a limit of zero;
+- a `[[policy]]` prefix that is listed twice, that lies inside another listed prefix (or holds
+  one), that does not end in `/`, or that is under `_journal/` or `_tiering/`, which tierstore
+  keeps for itself.
+
+`[[policy]]` has a `prefix` (empty for all the rest) and `cache`. In this release a policy is read
+and checked and has no effect, since nothing is cached yet; `cache = true` is refused as not
+supported yet. The empty prefix may be listed along with others (it is the rest); two non-empty
+prefixes may not nest.
+
+### Moving from flags to a file
+
+`tierstore --print-config` with the flags of a unit (without `--config`) prints the file that is
+equivalent to them on stdout and exits 0 without starting anything; it prints the key files by
+path, never what is in them, and the file it prints is loaded back before it is printed, so it
+loads. Take the flags out of `ExecStart=`:
+
+```sh
+/usr/libexec/kbf/tierstore --print-config --listen 192.0.2.10:9000 ... > /etc/tierstore/tierstore.toml
+```
+
+and switch the unit by changing `ExecStart=` to
+
+```
+ExecStart=/usr/libexec/kbf/tierstore --config /etc/tierstore/tierstore.toml --drain-lb-wait 10s --drain-deadline 15m
+```
+
+The flags and the file are both accepted in this release, so a unit may stay as it is and move
+when it is convenient; the flags are to go in the release after, and `--config` is then the way to
+configure the data path. The shipped `tierstore.service` keeps its flags, and
+`crates/tierstore/tests/packaging.rs` parses them as the binary parses them. `--print-config` does
+not convert anything else in a unit (a drop-in, the firewall rules).
+
 ## Filling in the flags
 
 The unit's `ExecStart=` is a complete command line. The flags to edit:
