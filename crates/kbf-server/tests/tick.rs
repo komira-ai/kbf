@@ -83,6 +83,7 @@ async fn a_silent_node_past_the_budget_answers_the_callers_on_a_tick() {
         resources: Resources::new(1_000, 1 << 30),
         needs: kbf_caps::Request::default(),
         hermetic: true,
+        whole_worker: false,
         do_not_cache: false,
     };
     let ticket = farm
@@ -168,6 +169,7 @@ async fn a_node_that_drops_every_start_answers_the_callers_that_it_never_started
         resources: Resources::new(1_000, 1 << 30),
         needs: kbf_caps::Request::default(),
         hermetic: true,
+        whole_worker: false,
         do_not_cache: false,
     };
     let ticket = farm
@@ -218,6 +220,7 @@ fn farm_with_a_lease() -> (Farm, StreamId, WorkerId, String) {
         resources: Resources::new(1_000, 1 << 30),
         needs: kbf_caps::Request::default(),
         hermetic: true,
+        whole_worker: false,
         do_not_cache: false,
     };
     let _ticket = farm

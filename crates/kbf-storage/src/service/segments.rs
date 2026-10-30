@@ -9,6 +9,7 @@ use kbf_proto::worker::{
 use tonic::{Request, Response, Status};
 
 use super::{Endpoint, StorageService, generation};
+use crate::legacy::Path;
 
 #[tonic::async_trait]
 impl Segments for StorageService {
@@ -57,6 +58,8 @@ impl Segments for StorageService {
     ) -> Result<Response<ReadRangeResponse>, Status> {
         self.guard(&request, Endpoint::Segments)?;
         self.check_map(generation::requested(&request)?).await?;
-        self.segments.read_range(request).await
+        let read = self.segments.read_range(request).await?;
+        self.legacy_reads.count(Path::CasSegments);
+        Ok(read)
     }
 }

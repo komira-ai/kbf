@@ -27,6 +27,9 @@
 //! keep-alive connections are pooled. The first failure stops new requests; requests already in
 //! flight finish, and that first error is returned.
 //!
+//! With [`HttpBlobSource::with_batch`], blobs under 64 KiB are asked for many to a request instead
+//! (see the `batch` module): the same bounded concurrency counts a batch as one request.
+//!
 //! # Copies
 //!
 //! A blob named by several paths is fetched once, streamed to the first path. The other paths are
@@ -140,11 +143,7 @@ pub trait BlobSource: Sync {
     /// # Errors
     /// The blob cannot be had ([`FetchError::Source`]), or `out` fails.
     fn fetch_to(&self, digest: &Digest, out: &mut dyn Write) -> Result<(), FetchError> {
-        let bytes = self.get(digest)?;
-        out.write_all(&bytes).map_err(|e| FetchError::Source {
-            digest: label(digest),
-            why: format!("the bytes could not be taken: {e}"),
-        })
+        write_whole(self.get(digest), digest, out)
     }
 
     /// Fetches every digest in `digests`, at most `concurrency` (at least 1) requests in flight,
@@ -174,10 +173,29 @@ pub trait BlobSource: Sync {
     /// # Errors
     /// The digest is malformed, the source fails, or the bytes are not the blob.
     fn verified(&self, digest: &Digest) -> Result<Vec<u8>, FetchError> {
-        stream_checked(digest, Path::new(""), Vec::new(), &mut |out| {
-            self.fetch_to(digest, out)
-        })
+        verified_bytes(digest, &mut |out| self.fetch_to(digest, out))
     }
+}
+
+/// The blob `digest` names, streamed through `fetch` into memory and checked: the default of
+/// [`BlobSource::verified`], outside the trait so that it is one function whatever the source.
+fn verified_bytes(digest: &Digest, fetch: Fetch<'_>) -> Result<Vec<u8>, FetchError> {
+    let mut bytes = Vec::new();
+    stream_checked(digest, Path::new(""), &mut bytes, fetch)?;
+    Ok(bytes)
+}
+
+/// Writes `bytes`, what a source held for `digest`, into `out`: the default of
+/// [`BlobSource::fetch_to`], outside the trait so that it is one function whatever the source.
+fn write_whole(
+    bytes: Result<Vec<u8>, FetchError>,
+    digest: &Digest,
+    out: &mut dyn Write,
+) -> Result<(), FetchError> {
+    out.write_all(&bytes?).map_err(|e| FetchError::Source {
+        digest: label(digest),
+        why: format!("the bytes could not be taken: {e}"),
+    })
 }
 
 /// Runs `work(index, item)` for every item on up to `concurrency` threads that take items from
@@ -230,8 +248,8 @@ impl Drop for StopOnExit<'_> {
 /// first write that would take the total past the digest's size, and hashes what it passes on.
 /// Why it refused (or why `inner` failed) is kept in `failure`, since the `io::Error` a source
 /// sees cannot carry it.
-struct Checked<'a, W> {
-    inner: W,
+struct Checked<'a> {
+    inner: &'a mut dyn Write,
     digest: &'a Digest,
     path: &'a Path,
     hasher: Sha256,
@@ -239,7 +257,7 @@ struct Checked<'a, W> {
     failure: Option<FetchError>,
 }
 
-impl<W: Write> Write for Checked<'_, W> {
+impl Write for Checked<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let (digest, path) = (self.digest, self.path);
         let size = digest.size_bytes.unsigned_abs();
@@ -270,14 +288,14 @@ impl<W: Write> Write for Checked<'_, W> {
 
 /// Streams the blob `digest` names into `inner` through `fetch`, checking it as it goes: the
 /// digest is well formed, the body is not longer than its size, and at the end it is exactly that
-/// long and its SHA-256 matches. Returns `inner` on success. `path` names `inner` in an error
-/// when writing to it fails.
-fn stream_checked<W: Write>(
+/// long and its SHA-256 matches. `path` names `inner` in an error when writing to it fails. Not
+/// generic over the writer, so its branches are one function.
+fn stream_checked(
     digest: &Digest,
     path: &Path,
-    inner: W,
+    inner: &mut dyn Write,
     fetch: Fetch<'_>,
-) -> Result<W, FetchError> {
+) -> Result<(), FetchError> {
     check_digest(digest)?;
     let mut checked = Checked {
         inner,
@@ -304,12 +322,12 @@ fn stream_checked<W: Write>(
     if hash != digest.hash {
         return Err(mismatch(format!("its SHA-256 is {hash}")));
     }
-    Ok(checked.inner)
+    Ok(())
 }
 
 /// Streams `digest` through `fetch` into memory (at most [`MAX_MESSAGE_BYTES`], checked before
-/// the request), verifies it, and decodes it as `M`.
-fn message_from<M: Message + Default>(digest: &Digest, fetch: Fetch<'_>) -> Result<M, FetchError> {
+/// the request) and verifies it. Not generic over the message, so its branches are one function.
+fn message_bytes(digest: &Digest, fetch: Fetch<'_>) -> Result<Vec<u8>, FetchError> {
     if digest.size_bytes > MAX_MESSAGE_BYTES {
         return Err(FetchError::Invalid(format!(
             "message blob {} is {} bytes, over the {MAX_MESSAGE_BYTES}-byte limit for a message",
@@ -317,9 +335,12 @@ fn message_from<M: Message + Default>(digest: &Digest, fetch: Fetch<'_>) -> Resu
             digest.size_bytes
         )));
     }
-    let bytes = stream_checked(digest, Path::new(""), Vec::new(), fetch)?;
-    M::decode(bytes.as_slice())
-        .map_err(|e| FetchError::Invalid(format!("blob {} does not decode: {e}", label(digest))))
+    verified_bytes(digest, fetch)
+}
+
+/// The refusal of a verified message blob that does not decode.
+fn undecodable(digest: &Digest, error: &prost::DecodeError) -> FetchError {
+    FetchError::Invalid(format!("blob {} does not decode: {error}", label(digest)))
 }
 
 /// Fetches a message blob and decodes it as `M`.
@@ -329,10 +350,16 @@ fn message_from<M: Message + Default>(digest: &Digest, fetch: Fetch<'_>) -> Resu
 /// read or checked ([`BlobSource::verified`]), or it does not decode as `M`
 /// ([`FetchError::Invalid`]).
 pub fn fetch_message<M: Message + Default>(
-    source: &impl BlobSource,
+    source: &dyn BlobSource,
     digest: &Digest,
 ) -> Result<M, FetchError> {
-    message_from(digest, &mut |out| source.fetch_to(digest, out))
+    let bytes = message_bytes(digest, &mut |out| source.fetch_to(digest, out))?;
+    decode_message(&bytes, digest)
+}
+
+/// `bytes`, a verified blob `digest` names, decoded as `M`.
+fn decode_message<M: Message + Default>(bytes: &[u8], digest: &Digest) -> Result<M, FetchError> {
+    M::decode(bytes).map_err(|e| undecodable(digest, &e))
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -357,6 +384,12 @@ pub struct HttpBlobSource {
     agent: ureq::Agent,
     base: String,
     authorization: String,
+    /// Whether small blobs are asked for in batches (see the `batch` module).
+    batch: bool,
+    /// Set once the grant has answered that it has no batch route.
+    batch_off: AtomicBool,
+    /// Makes the one stderr line about a missing batch route.
+    batch_notice: std::sync::Once,
 }
 
 impl std::fmt::Debug for HttpBlobSource {
@@ -385,12 +418,27 @@ impl HttpBlobSource {
     /// # Errors
     /// `roots` is empty: every connection would fail with an unhelpful message.
     pub fn new(base: &str, token: &str, roots: &[Vec<u8>]) -> Result<Self, FetchError> {
+        Self::new_with(base, token, roots, false)
+    }
+
+    /// [`new`](Self::new), and with `allow_plain_http` an `http://` grant is read too (the
+    /// `--allow-plain-http-grant` opt-in, for a farm on its own network). The bearer token is sent
+    /// either way.
+    ///
+    /// # Errors
+    /// `roots` is empty.
+    pub fn new_with(
+        base: &str,
+        token: &str,
+        roots: &[Vec<u8>],
+        allow_plain_http: bool,
+    ) -> Result<Self, FetchError> {
         if roots.is_empty() {
             return Err(FetchError::Invalid(
                 "no trusted root certificates for the read grant".to_owned(),
             ));
         }
-        Ok(Self::build(base, token, roots, true))
+        Ok(Self::build(base, token, roots, !allow_plain_http))
     }
 
     fn build(base: &str, token: &str, roots: &[Vec<u8>], https_only: bool) -> Self {
@@ -418,6 +466,9 @@ impl HttpBlobSource {
             agent,
             base: base.trim_end_matches('/').to_owned(),
             authorization: format!("Bearer {token}"),
+            batch: false,
+            batch_off: AtomicBool::new(false),
+            batch_notice: std::sync::Once::new(),
         }
     }
 }
@@ -454,6 +505,15 @@ impl BlobSource for HttpBlobSource {
         std::io::copy(&mut response.body_mut().as_reader().take(limit), out)
             .map(|_| ())
             .map_err(|e| source(e.to_string()))
+    }
+
+    fn fetch_many(
+        &self,
+        digests: &[Digest],
+        concurrency: usize,
+        each: &Each<'_>,
+    ) -> Result<(), FetchError> {
+        self.fetch_units(digests, concurrency, each)
     }
 }
 
@@ -527,7 +587,7 @@ struct Copies {
 /// # Errors
 /// A blob is missing or corrupt, the tree breaks a naming rule, or a write fails.
 pub fn materialize(
-    source: &impl BlobSource,
+    source: &dyn BlobSource,
     root: &Digest,
     dir: &Path,
     concurrency: usize,
@@ -535,9 +595,23 @@ pub fn materialize(
     std::fs::create_dir_all(dir).map_err(io(dir))?;
     let files = make_directories(source, root, dir, concurrency)?;
     let digests: Vec<Digest> = files.iter().map(|f| f.digest.clone()).collect();
+    let written = AtomicUsize::new(0);
     source.fetch_many(&digests, concurrency, &|index, fetch| {
-        write_copies(&files[index], fetch)
-    })
+        write_copies(&files[index], fetch)?;
+        written.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })?;
+    all_written(written.into_inner(), files.len())
+}
+
+/// Fails when a source called back for fewer blobs than it was asked for. It is not generic, so
+/// both outcomes are one branch however many sources `materialize` is used with.
+fn all_written(written: usize, wanted: usize) -> Result<(), FetchError> {
+    if written == wanted {
+        Ok(())
+    } else {
+        Err(FetchError::Invalid("a source skipped a blob".to_owned()))
+    }
 }
 
 /// Fetches and decodes one Directory message and checks its names.
@@ -545,7 +619,8 @@ fn fetch_directory(
     digest: &Digest,
     fetch: Fetch<'_>,
 ) -> Result<kbf_proto::reapi::Directory, FetchError> {
-    let directory: kbf_proto::reapi::Directory = message_from(digest, fetch)?;
+    let bytes = message_bytes(digest, fetch)?;
+    let directory: kbf_proto::reapi::Directory = decode_message(&bytes, digest)?;
     check_names(&directory)?;
     Ok(directory)
 }
@@ -554,7 +629,7 @@ fn fetch_directory(
 /// its directories and symlinks under `dir`; returns the file blobs to write, each distinct digest
 /// once.
 fn make_directories(
-    source: &impl BlobSource,
+    source: &dyn BlobSource,
     root: &Digest,
     dir: &Path,
     concurrency: usize,
@@ -624,8 +699,11 @@ fn make_directories(
 /// that fails its check is removed from the first path.
 fn write_copies(blob: &Copies, fetch: Fetch<'_>) -> Result<(), FetchError> {
     let (first, first_executable) = &blob.copies[0];
-    let file = create_file(first, *first_executable)?;
-    if let Err(error) = stream_checked(&blob.digest, first, file, fetch) {
+    let mut file = create_file(first, *first_executable)?;
+    let streamed = stream_checked(&blob.digest, first, &mut file, fetch);
+    // Closed before the copies are made from it, or the failed file removed.
+    drop(file);
+    if let Err(error) = streamed {
         // Best effort: the error is the one to report, and the file is not complete.
         let _ = std::fs::remove_file(first);
         return Err(error);
@@ -670,6 +748,9 @@ fn create_file(path: &Path, is_executable: bool) -> Result<std::fs::File, FetchE
         .map_err(io(path))?;
     Ok(file)
 }
+
+#[path = "batch.rs"]
+mod batch;
 
 #[cfg(test)]
 #[path = "fetch_tests.rs"]

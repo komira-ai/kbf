@@ -103,6 +103,82 @@ async fn a_run_keeps_its_cgroup_block_and_its_reapi_times() {
     assert_eq!(attempt.memory_kill(), Some(Kill::None));
 }
 
+/// Catches: the booking kept only for a memory-killed attempt (an accepted run's row
+/// without what its lease held), the request kept rather than the grant, and the two axes
+/// in other units than the `Start` carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accepted_run_keeps_the_booking_its_lease_was_granted() {
+    let cell = Cell::start().await;
+    let mut daemon = cell.daemon("node-a", 8, 16).await;
+    let job = Job::new(
+        "sized",
+        &[("kbf-book-cpus", "3"), ("kbf-book-mem-gib", "6")],
+    );
+    upload(&cell, BUILD, &job.blobs()).await;
+    let mut ops = execute(&cell, BUILD, &job.action).await;
+    let start = daemon.start().await;
+    let result = output(&cell, "sized", 0).await;
+    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
+    done(&mut ops).await;
+
+    let inv = record(&cell, BUILD).await;
+    let [row] = inv.rows() else {
+        panic!("one row: {:?}", inv.rows());
+    };
+    let [attempt] = row.attempts.as_slice() else {
+        panic!("one attempt: {:?}", row.attempts);
+    };
+    let run = attempt.run.as_deref().expect("the report's run");
+    assert_eq!(
+        (run.booked_millicpus, run.booked_memory_bytes),
+        (Some(3_000), Some(6 * GIB))
+    );
+    assert_eq!((start.millicpus, start.memory_bytes), (3_000, 6 * GIB));
+    assert_eq!(attempt.memory_kill(), Some(Kill::None));
+}
+
+/// Catches: the rerun after an own-limit kill recorded with the first rung's booking (the
+/// attempt row must show the raised memory its `Start` carried, and the CPU grant too).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rerun_after_a_kill_keeps_its_raised_booking() {
+    let cell = Cell::start().await;
+    let mut daemon = cell.daemon("node-a", 4, 16).await;
+    let job = Job::new("ladder", &[]);
+    upload(&cell, BUILD, &job.blobs()).await;
+    let mut ops = execute(&cell, BUILD, &job.action).await;
+    let first = daemon.start().await;
+    let killed = worker::Result {
+        memory_kill: MemoryKill::OwnLimit as i32,
+        ..failed(first.lease_id, Code::ResourceExhausted)
+    };
+    assert!(daemon.report(killed).await.accepted);
+    let second = daemon.start().await;
+    assert!(second.memory_bytes > first.memory_bytes);
+    let result = output(&cell, "ladder", 0).await;
+    assert!(daemon.report(ran(second.lease_id, &result)).await.accepted);
+    done(&mut ops).await;
+
+    let inv = record(&cell, BUILD).await;
+    let [row] = inv.rows() else {
+        panic!("one row");
+    };
+    let [one, two] = row.attempts.as_slice() else {
+        panic!("two attempts: {:?}", row.attempts);
+    };
+    let booked = |a: &kbf_invocation::Attempt| {
+        let run = a.run.as_deref().expect("a run");
+        (run.booked_millicpus, run.booked_memory_bytes)
+    };
+    assert_eq!(
+        booked(one),
+        (Some(first.millicpus), Some(first.memory_bytes))
+    );
+    assert_eq!(
+        booked(two),
+        (Some(second.millicpus), Some(second.memory_bytes))
+    );
+}
+
 /// Catches (ui-data 9, U1 red): the attempt that ends the operation, killed at the
 /// largest node, recorded without its booking and cap (only a requeue had them), a
 /// cap taken from another run, and a requeued kill's cap not kept. With the default
@@ -173,6 +249,50 @@ async fn kill_at_the_largest_node(cell: Cell) {
         [requeued.memory_kill(), last.memory_kill()],
         [Some(Kill::OwnLimit); 2]
     );
+}
+
+/// Catches `--no-memory-climb` leaving the attempt that its own-limit kill ended without
+/// its kill, booking or cap in the invocation record: with the climb off the first attempt
+/// is also the last, `Failed(OutOfMemory)` at the first booking, with `own_limit` as its kill
+/// and no requeue before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_the_climb_the_one_attempt_keeps_its_own_limit_kill() {
+    let cell = Cell::start_no_climb(
+        kbf_server::LearnedSizes::Off,
+        kbf_server::MemoryLadder::from_gib(&[1, 2, 4]).expect("a ladder"),
+        None,
+    )
+    .await;
+    let mut daemon = cell.daemon("node-n", 4, 8).await;
+    let job = Job::new("fixed", &[]);
+    upload(&cell, BUILD, &job.blobs()).await;
+    let mut ops = execute(&cell, BUILD, &job.action).await;
+    let start = daemon.start().await;
+    let killed = worker::Result {
+        memory_kill: MemoryKill::OwnLimit as i32,
+        ..failed(start.lease_id, Code::ResourceExhausted)
+    };
+    assert!(daemon.report(killed).await.accepted);
+    let status = crate::support::response(&done(&mut ops).await)
+        .status
+        .expect("a status");
+    assert_eq!(status.code, Code::FailedPrecondition as i32);
+
+    let inv = record(&cell, BUILD).await;
+    let [row] = inv.rows() else {
+        panic!("one row");
+    };
+    let [only] = row.attempts.as_slice() else {
+        panic!("one attempt: {:?}", row.attempts);
+    };
+    assert!(matches!(
+        only.end,
+        Some(AttemptEnd::Failed(Failure::OutOfMemory, _))
+    ));
+    let run = only.run.as_deref().expect("the run");
+    assert_eq!(run.booked_memory_bytes, Some(GIB));
+    assert_eq!(run.cap_bytes, Some(8 * GIB));
+    assert_eq!(only.memory_kill(), Some(Kill::OwnLimit));
 }
 
 /// Catches (review of ui-data 9): a run killed under node memory pressure recorded

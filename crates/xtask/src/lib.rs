@@ -624,6 +624,10 @@ enum Sums {
         /// Append the result to this file (on Actions, `GITHUB_STEP_SUMMARY`).
         #[arg(long)]
         summary: Option<PathBuf>,
+        /// Append `sha256=<hex>`, the digest of the result, to this file (on Actions,
+        /// `GITHUB_OUTPUT`).
+        #[arg(long)]
+        digest_output: Option<PathBuf>,
     },
 }
 
@@ -1159,6 +1163,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 binary.as_deref(),
                 verify_only,
             )?;
+            let base = service.base(platform)?;
             pkg_image_asset::asset(
                 &image,
                 &commit,
@@ -1170,6 +1175,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                     image: service,
                     platform,
                     reference,
+                    base: base.as_ref(),
                 },
             )
         }
@@ -1296,7 +1302,13 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             dir,
             expect,
             summary,
-        }) => sums::assemble(&dir, expect.as_deref(), summary.as_deref()),
+            digest_output,
+        }) => sums::assemble(
+            &dir,
+            expect.as_deref(),
+            summary.as_deref(),
+            digest_output.as_deref(),
+        ),
         Verb::VerifyAssets(VerifyAssets::Sums { dir }) => {
             Ok(vec![sums::verify_sums(&dir, fetch::Sha256::of)?])
         }

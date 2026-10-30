@@ -109,6 +109,8 @@ fn flags(dir: &Path, s3: &FakeS3, fake: &FakeLeaseServer, executor: &[&str]) -> 
         "--executor-hosts=1".to_owned(),
         "--executor-host-cpus=2".to_owned(),
         "--executor-host-memory-gib=16".to_owned(),
+        "--executor-base-image=registry.test/base@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        "--executor-kbf-image=registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_owned(),
     ]);
     more.extend(executor.iter().map(ToString::to_string));
     flags_of(&more)

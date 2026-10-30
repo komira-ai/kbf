@@ -108,16 +108,14 @@ fn connections_are_reused_across_requests_and_threads() {
     let connections = server.connections.load(Ordering::SeqCst);
     assert!(connections <= 4, "{connections} connections");
     // Dropping the source drops its agent's pool, which closes the idle sockets; every
-    // connection's loop then ends on end of input. The wait is only a liveness guard: if a
-    // socket is leaked, `GUARD` turns the hang into the named failure below. Nothing here asserts
-    // elapsed time.
+    // connection's loop then ends on end of input and reports it. A leaked socket hangs the
+    // wait; the nextest profile's `terminate-after` (.config/nextest.toml) ends the hang and
+    // fails the test. Nothing here asserts elapsed time.
     drop(source);
-    let guard_expired = AtomicBool::new(false);
     for _ in 0..connections {
-        guard_expired.fetch_or(server.ended.recv_timeout(GUARD).is_err(), Ordering::SeqCst);
+        server
+            .ended
+            .recv()
+            .expect("a connection was not closed when the source was dropped");
     }
-    assert!(
-        !guard_expired.load(Ordering::SeqCst),
-        "a connection was not closed when the source was dropped"
-    );
 }

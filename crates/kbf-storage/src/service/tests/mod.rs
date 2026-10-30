@@ -14,7 +14,9 @@ pub(crate) mod fake;
 mod generation;
 mod in_flight;
 mod in_process;
+mod legacy_reads;
 mod open_writes;
+mod put_streamed;
 pub(crate) mod roles;
 mod stale_map;
 
@@ -994,26 +996,6 @@ async fn find_missing_refuses_a_call_over_the_digest_limit() {
     );
 }
 
-/// Catches a client that claims a streamed put it cannot make: the service has no
-/// streamed write to the object store, so `put_streamed` is refused as invalid (the
-/// caller then stores the blob with `put`), and nothing is stored.
-#[tokio::test]
-async fn a_streamed_put_is_refused_over_the_wire() {
-    let (_mem, remote, _) = pair().await;
-    let digest = sha(b"abc");
-    let bytes = stream::iter([Ok(Bytes::from_static(b"abc"))]).boxed();
-    let claim = Box::pin(async move { Some(digest) });
-    let refused = remote
-        .put_streamed(3, bytes, claim)
-        .await
-        .expect_err("no streamed put");
-    assert!(matches!(refused, StorageError::Invalid(_)), "{refused:?}");
-    assert_eq!(
-        remote.find_missing(&[digest]).await.expect("find"),
-        [digest]
-    );
-}
-
 /// Catches a limit that drifted from the front's (a test in kbf-server pins the front's
 /// to these): a full 16 MiB batch has to fit, and a blob is streamed from the same size.
 #[test]
@@ -1181,23 +1163,4 @@ async fn a_streamed_write_with_an_oversized_message_stores_nothing() {
     assert_eq!(status.code(), Code::OutOfRange, "{status}");
     assert!(mem.blobs.lock().expect("lock").is_empty());
     assert_eq!(mem.streamed.load(Ordering::SeqCst), 0);
-}
-
-/// Catches a remote storage that gathers a streamed put or answers it as if stored: it
-/// takes none (it writes a blob through `put`), and says so as `Invalid`, consuming
-/// nothing.
-#[tokio::test]
-async fn a_remote_storage_takes_no_streamed_put() {
-    let (mem, remote, _) = pair().await;
-    let bytes = patterned(100);
-    let digest = sha(&bytes);
-    let body = stream::iter([Ok(Bytes::from(bytes))]).boxed();
-    let refused = remote
-        .put_streamed(100, body, Box::pin(async move { Some(digest) }))
-        .await;
-    assert!(
-        matches!(refused, Err(StorageError::Invalid(_))),
-        "{refused:?}"
-    );
-    assert!(mem.blobs.lock().expect("lock").is_empty());
 }

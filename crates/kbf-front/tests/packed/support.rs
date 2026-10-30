@@ -62,6 +62,9 @@ pub struct Spy {
     reads: AtomicU64,
     fail_read_at: AtomicU64,
     shave_len: AtomicU64,
+    reject_big_reads: AtomicU32,
+    reject_large_lens: AtomicU32,
+    overstated: Mutex<Vec<(String, u64)>>,
     puts: AtomicU32,
     ranges: Mutex<Vec<(String, u64, u64)>>,
 }
@@ -100,6 +103,9 @@ impl Spy {
             reads: AtomicU64::new(0),
             fail_read_at: AtomicU64::new(u64::MAX),
             shave_len: AtomicU64::new(0),
+            reject_big_reads: AtomicU32::new(0),
+            reject_large_lens: AtomicU32::new(0),
+            overstated: Mutex::new(Vec::new()),
             puts: AtomicU32::new(0),
             ranges: Mutex::new(Vec::new()),
         }
@@ -131,6 +137,27 @@ impl Spy {
     /// shorter than it is.
     pub fn understate_len(&self, by: u64) {
         self.shave_len.store(by, SeqCst);
+    }
+
+    /// The next `n` range reads of a MiB or more fail (after they are logged): a read of a large
+    /// object's window, not of a footer or a record.
+    pub fn reject_big_reads(&self, n: u32) {
+        self.reject_big_reads.store(n, SeqCst);
+    }
+
+    /// The next `n` length questions about a large object (a key of slot `L<i>`) fail.
+    pub fn reject_large_lens(&self, n: u32) {
+        self.reject_large_lens.store(n, SeqCst);
+    }
+
+    /// The length answer for `key` is `by` bytes more than the object's: the store says an
+    /// object is longer than it is.
+    pub fn overstate_len_of(&self, key: &str, by: u64) {
+        let mut overstated = self
+            .overstated
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        overstated.push((key.to_owned(), by));
     }
 
     /// How many writes were tried.
@@ -200,6 +227,9 @@ impl ObjectStore for Spy {
         if fires(&self.reject_reads) || number == self.fail_read_at.load(SeqCst) {
             return Err(injected());
         }
+        if range.size() >= 1 << 20 && fires(&self.reject_big_reads) {
+            return Err(injected());
+        }
         self.inner.get_range(key, range).await
     }
 
@@ -211,9 +241,24 @@ impl ObjectStore for Spy {
         if fires(&self.reject_lens) {
             return Err(injected());
         }
+        let large = key.as_str().rsplit('-').next();
+        if large.is_some_and(|slot| slot.starts_with('L')) && fires(&self.reject_large_lens) {
+            return Err(injected());
+        }
         let shave = self.shave_len.load(SeqCst);
         let len = self.inner.len(key).await?;
-        Ok(len.map(|len| len.saturating_sub(shave)))
+        let by: u64 = {
+            let overstated = self
+                .overstated
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            overstated
+                .iter()
+                .filter(|(named, _)| named == key.as_str())
+                .map(|(_, by)| by)
+                .sum()
+        };
+        Ok(len.map(|len| len.saturating_sub(shave) + by))
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {

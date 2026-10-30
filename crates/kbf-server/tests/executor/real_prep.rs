@@ -34,6 +34,8 @@ use tonic::Code;
 use crate::rig::{ClockHold, GIB, settle};
 
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
+const KBF_IMAGE: &str =
+    "registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 const IMAGE: &str = "docker://registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const BUCKET: &str = "packs";
 
@@ -159,7 +161,8 @@ impl World {
             "--executor-host-memory-gib=16".to_owned(),
             "--executor-host-slots=2".to_owned(),
             "--executor-insecure-argv-secrets".to_owned(),
-            "--executor-images-have-no-entrypoint".to_owned(),
+            format!("--executor-base-image={IMAGE}"),
+            format!("--executor-kbf-image={KBF_IMAGE}"),
             "--executor-allow-plain-http-put".to_owned(),
         ];
         let matches = frontend::command()
@@ -226,6 +229,7 @@ impl World {
                     hermetic: true,
                     do_not_cache: false,
                     needs: kbf_caps::Request::default(),
+                    whole_worker: false,
                 },
                 call: None,
                 described: Described {

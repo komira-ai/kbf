@@ -606,9 +606,11 @@ mod netns {
         let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
         request.ifr_name[0] = b'l' as libc::c_char;
         request.ifr_name[1] = b'o' as libc::c_char;
+        // The `SIOC*` constants are `c_ulong`, `ioctl`'s request is `c_ulong` on glibc but `c_int`
+        // on musl (the release builds), so each request is cast to `libc::Ioctl` (0x89xx fits both).
         // SAFETY: `request` is an `ifreq`, as both requests take.
         cvt(libc::c_long::from(unsafe {
-            libc::ioctl(fd, libc::SIOCGIFFLAGS, &raw mut request)
+            libc::ioctl(fd, libc::SIOCGIFFLAGS as libc::Ioctl, &raw mut request)
         }))?;
         // SAFETY: the kernel filled the flags member of the union.
         unsafe {
@@ -616,7 +618,7 @@ mod netns {
         }
         // SAFETY: as above.
         cvt(libc::c_long::from(unsafe {
-            libc::ioctl(fd, libc::SIOCSIFFLAGS, &raw mut request)
+            libc::ioctl(fd, libc::SIOCSIFFLAGS as libc::Ioctl, &raw mut request)
         }))
         .map(drop)
     }

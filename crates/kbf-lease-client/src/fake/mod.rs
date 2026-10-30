@@ -33,7 +33,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::{Config, Origin, Token};
 use crate::ids::{LeaseId, RunId};
-use crate::wire::{Mount, Outcome, RunState};
+use crate::wire::{HostLoad, Mount, Outcome, RunState};
 use crate::{Client, ConfigError};
 
 pub use state::Pool;
@@ -190,9 +190,21 @@ impl FakeLeaseServer {
         locked(&self.shared.state).set_lost(host, lost)
     }
 
+    /// The host's agent reports `load` (`None`: its newest heartbeat carried none), which
+    /// `GET /v1/hosts` lists unless the host is lost. False for a host the pool lacks.
+    pub fn set_host_load(&self, host: &str, load: Option<HostLoad>) -> bool {
+        locked(&self.shared.state).set_load(host, load)
+    }
+
     /// The host reports a taint: it takes no new run.
     pub fn taint_host(&self, host: &str, reason: &str) -> bool {
         locked(&self.shared.state).taint(host, reason)
+    }
+
+    /// The host refuses every new run with `409` and `code` (`None`: takes runs again). It
+    /// taints nothing, and the runs it has go on.
+    pub fn refuse_posts(&self, host: &str, code: Option<&'static str>) -> bool {
+        locked(&self.shared.state).refuse_posts(host, code)
     }
 
     /// The host starts a queued run. False if the run is not queued.
@@ -231,6 +243,12 @@ impl FakeLeaseServer {
     #[must_use]
     pub fn run_args(&self, run: &RunId) -> Option<Vec<String>> {
         locked(&self.shared.state).run_args(run)
+    }
+
+    /// The image the run was queued with, as the server received it.
+    #[must_use]
+    pub fn run_image(&self, run: &RunId) -> Option<String> {
+        locked(&self.shared.state).run_image(run)
     }
 
     /// The mounts the run was queued with, as the server received them.

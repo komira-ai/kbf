@@ -44,7 +44,12 @@ fn parsed(argv: Vec<String>) -> Result<FrontendFlags, String> {
 }
 
 /// The flags `--executor js-agent` needs, and nothing it can do without.
-const JS: [&str; 11] = [
+const BASE: &str =
+    "registry.test/base@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const KBF: &str =
+    "registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+const JS: [&str; 12] = [
     "--executor=js-agent",
     "--executor-lease-url=http://127.0.0.1:7",
     "--executor-lease-token-file=/etc/token",
@@ -53,8 +58,9 @@ const JS: [&str; 11] = [
     "--executor-hosts=2",
     "--executor-host-cpus=8",
     "--executor-host-memory-gib=32",
+    "--executor-base-image=registry.test/base@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "--executor-kbf-image=registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
     "--executor-insecure-argv-secrets",
-    "--executor-images-have-no-entrypoint",
     // The tier store of the task flags is `http://`, as it is until it serves TLS.
     "--executor-allow-plain-http-put",
 ];
@@ -107,7 +113,8 @@ fn the_daemon_executor_keeps_the_lease_servers_settings_unread() {
         }
         assert!(all.contains(&"--executor-insecure-argv-secrets"));
         // A tag, which the js-agent parse refuses: the daemon executor must never read it.
-        all.push("--executor-default-image=registry.test/base:22.04");
+        all.retain(|flag| !flag.starts_with("--executor-base-image"));
+        all.push("--executor-base-image=registry.test/base:22.04");
         let flags = parsed(argv(&all)).expect("flags");
         assert_eq!(flags.executor.kind, ExecutorKind::KbfDaemon);
         assert!(flags.executor.js.is_none());
@@ -127,10 +134,12 @@ fn js_agent_names_each_flag_it_needs() {
         "--executor-hosts",
         "--executor-host-cpus",
         "--executor-host-memory-gib",
+        "--executor-base-image",
+        "--executor-kbf-image",
     ] {
         assert!(why.contains(flag), "{flag} in {why}");
     }
-    for (at, flag) in JS.iter().enumerate().skip(1).take(7) {
+    for (at, flag) in JS.iter().enumerate().skip(1).take(9) {
         let name = name(flag);
         let mut all = JS.to_vec();
         all.remove(at);
@@ -158,15 +167,13 @@ fn js_agent_needs_the_secrets_opt_in_and_the_packs() {
     assert!(why.contains("--pack-store-endpoint"), "{why}");
 }
 
-/// Catches settings that do not become the executor's: the shape is in cores and GiB, the tool
-/// is a path in the container, and everything else is what was given.
+/// Catches settings that do not become the executor's: the shape is in cores and GiB, the two
+/// images are the ones given by digest, and everything else is what was given.
 #[test]
 fn js_agent_settings_become_the_executors_config() {
     let flags = js_with(&[
         "--executor-host-slots=4",
         "--executor-arch=arm64",
-        "--executor-task-tool=/mnt/tools/bin/task",
-        "--executor-root-der=farm-ca.der",
         "--executor-work-dir=/scratch",
         "--executor-allow-plain-http-put",
         "--executor-run-margin-secs=120",
@@ -182,7 +189,8 @@ fn js_agent_settings_become_the_executors_config() {
     assert_eq!(js.lease_url, "http://127.0.0.1:7");
     assert_eq!(js.token_file, Path::new("/etc/token"));
     assert!(js.ca_file.is_none());
-    assert!(js.images_have_no_entrypoint);
+    assert_eq!(js.base_image.to_string(), BASE);
+    assert_eq!(js.kbf_image.to_string(), KBF);
     assert_eq!(config.frontend, "front-1");
     assert_eq!(config.class, "farm-linux");
     assert_eq!(config.hosts, 2);
@@ -190,11 +198,6 @@ fn js_agent_settings_become_the_executors_config() {
     assert_eq!(config.memory_bytes, 32 << 30);
     assert_eq!(config.slots, 4);
     assert_eq!(config.arch, "arm64");
-    assert_eq!(config.tool_mount.root_name, "tools");
-    assert_eq!(config.tool_mount.rel, "bin/task");
-    assert!(config.tool_mount.ro);
-    assert_eq!(config.tool_path(), "/mnt/tools/bin/task");
-    assert_eq!(config.root_der.as_deref(), Some("farm-ca.der"));
     assert_eq!(config.work_dir.as_deref(), Some("/scratch"));
     assert!(config.allow_plain_http_put);
     assert!(config.insecure_argv_secrets);
@@ -220,8 +223,6 @@ fn the_defaults_are_the_executors_own() {
     let own = Config::new("front-1", 2, "farm-linux", 8_000, 32 << 30);
     assert_eq!(config.slots, own.slots);
     assert_eq!(config.arch, own.arch);
-    assert_eq!(config.tool_mount, own.tool_mount);
-    assert_eq!(config.root_der, own.root_der);
     assert_eq!(config.work_dir, own.work_dir);
     assert_eq!(config.allow_plain_http_put, own.allow_plain_http_put);
     assert_eq!(config.run_margin, own.run_margin);
@@ -232,44 +233,76 @@ fn the_defaults_are_the_executors_own() {
     assert_eq!(own.delivery, config.delivery);
 }
 
-/// Catches a default image that is taken when it is not pinned by digest, or dropped when it is:
-/// the scheme is optional, a tag is refused naming the flag, and no flag is no default (an
-/// action that names no image is then the caller's to fix).
+/// Catches an image that is taken when it is not pinned by digest, or dropped when it is: for
+/// each of the base and the kbf image the scheme is optional, a tag, a bare name and a short
+/// digest are refused naming the flag, and so is leaving the flag out (there is no default
+/// image: an executor with none could not tell what an action's image is served as).
 #[test]
-fn the_default_image_is_pinned_by_digest() {
+fn the_base_and_kbf_images_are_pinned_by_digest() {
     let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let own = format!("registry.test/base@sha256:{digest}");
-    for given in [own.clone(), format!("docker://{own}")] {
-        let flags = js_with(&[&format!("--executor-default-image={given}")]).expect("flags");
-        let image = flags.executor.js.expect("js-agent").default_image;
-        assert_eq!(image.map(|i| i.to_string()), Some(own.clone()), "{given}");
-    }
-    assert!(
-        js_with(&[])
-            .expect("flags")
-            .executor
-            .js
-            .expect("js")
-            .default_image
-            .is_none()
-    );
-    for tag in [
-        "registry.test/base:22.04",
-        &format!("registry.test/base:22.04@sha256:{digest}"),
-        "registry.test/base",
-        "registry.test/base@sha256:abc",
-        "",
-    ] {
-        let why = refused(&[&format!("--executor-default-image={tag}")]);
-        assert!(why.contains("--executor-default-image"), "{tag}: {why}");
+    // Neither image the other flag of `JS` names.
+    let fresh = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for flag in ["--executor-base-image", "--executor-kbf-image"] {
+        let own = format!("registry.test/image@sha256:{fresh}");
+        for given in [own.clone(), format!("docker://{own}")] {
+            let flags = js_with(&[&format!("{flag}={given}")]).expect("flags");
+            let js = flags.executor.js.expect("js-agent");
+            let image = if flag.contains("base") {
+                js.base_image
+            } else {
+                js.kbf_image
+            };
+            assert_eq!(image.to_string(), own, "{given}");
+        }
+        for tag in [
+            "registry.test/base:22.04",
+            &format!("registry.test/base:22.04@sha256:{digest}"),
+            "registry.test/base",
+            "registry.test/base@sha256:abc",
+            "",
+        ] {
+            let why = refused(&[&format!("{flag}={tag}")]);
+            assert!(why.contains(flag), "{tag}: {why}");
+        }
     }
 }
 
-/// Catches a lease server, a tool, a certificate or a directory that is not one being taken:
+/// Catches a kbf image that is the base itself being taken: it would have no task tool as its
+/// entrypoint, and every run would execute the action's first argument as the tool. The same
+/// digest under another repository name is the same image.
+#[test]
+fn the_kbf_image_must_be_another_image_than_the_base() {
+    let why = refused(&[&format!("--executor-kbf-image={BASE}")]);
+    assert!(
+        why.contains("--executor-kbf-image") && why.contains(BASE),
+        "{why}"
+    );
+    let digest = BASE.split_once('@').expect("a digest").1;
+    let why = refused(&[&format!("--executor-kbf-image=mirror.test/base@{digest}")]);
+    assert!(why.contains("--executor-kbf-image"), "{why}");
+}
+
+/// Catches the retired flags being accepted: the task tool is the kbf image's entrypoint, so
+/// there is no path to give, no certificate mounted beside it, no default image, and no
+/// entrypoint to declare absent.
+#[test]
+fn the_flags_of_the_host_preloaded_tool_are_gone() {
+    for retired in [
+        "--executor-task-tool=/mnt/kbf-tools/kbf-task",
+        "--executor-root-der=farm-ca.der",
+        "--executor-default-image=registry.test/base@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "--executor-images-have-no-entrypoint",
+    ] {
+        let why = refused(&[retired]);
+        assert!(why.contains("unexpected argument"), "{retired}: {why}");
+    }
+}
+
+/// Catches a lease server or a directory that is not one being taken:
 /// each is refused at the flags, naming the flag.
 #[test]
 fn settings_that_are_not_what_they_name_are_refused_naming_the_flag() {
-    let cases: [(&[&str], &str); 12] = [
+    let cases: [(&[&str], &str); 5] = [
         (&["--executor-lease-url=ftp://x"], "--executor-lease-url"),
         (
             &["--executor-lease-url=http://lease.example:80"],
@@ -283,22 +316,6 @@ fn settings_that_are_not_what_they_name_are_refused_naming_the_flag() {
             &["--executor-lease-ca-file=/etc/ca.pem"],
             "--executor-lease-ca-file",
         ),
-        (
-            &["--executor-task-tool=/usr/bin/task"],
-            "--executor-task-tool",
-        ),
-        (&["--executor-task-tool=/mnt/tools"], "--executor-task-tool"),
-        (
-            &["--executor-task-tool=/mnt/../task"],
-            "--executor-task-tool",
-        ),
-        (
-            &["--executor-task-tool=/mnt/tools/a//b"],
-            "--executor-task-tool",
-        ),
-        (&["--executor-root-der=dir/ca.der"], "--executor-root-der"),
-        (&["--executor-root-der="], "--executor-root-der"),
-        (&["--executor-root-der=.."], "--executor-root-der"),
         (&["--executor-work-dir=scratch"], "--executor-work-dir"),
     ];
     for (more, flag) in cases {
@@ -334,8 +351,8 @@ fn flags_of(url: &str, token: &Path, ca: Option<&Path>) -> JsAgentFlags {
         lease_url: url.to_owned(),
         token_file: token.to_path_buf(),
         ca_file: ca.map(Path::to_path_buf),
-        images_have_no_entrypoint: false,
-        default_image: None,
+        base_image: ImageRef::parse(&format!("docker://{BASE}")).expect("an image"),
+        kbf_image: ImageRef::parse(&format!("docker://{KBF}")).expect("an image"),
     }
 }
 
