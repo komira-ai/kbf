@@ -14,12 +14,13 @@
 //! The rules, over `.github/workflows/*.yml` and `docs/artifacts.md`:
 //! - no line names `kbf-task` and `darwin` together (`kbf-task-<commit>-darwin-arm64.tar.gz`, a
 //!   `--platform darwin-arm64` package line, a release asset list);
-//! - no line of a darwin job (its name has `darwin`, or it runs on `macos-*`, or builds for
-//!   `apple-darwin`) names `kbf-task`: the build of it, its SBOM, its package or its image;
-//! - no line of a darwin job runs `cargo build`, `test`, `nextest`, `check` or `clippy` with
-//!   `--workspace` or `--all` (in a job that runs on a Mac, or for an `apple-darwin` target) and without `--exclude kbf-task` (it would build `kbf-task` without
-//!   naming it), and no line naming `kbf-task` interpolates a matrix, env or input value (a name the
-//!   text cannot resolve);
+//! - no line of a job that runs on a Mac (its name has `darwin`, or `runs-on` or a matrix names
+//!   `macos-*`) names `kbf-task`: the build of it, its SBOM, its package or its image;
+//! - no line of such a job, or naming an `apple-darwin` target, runs `cargo build`, `test`,
+//!   `nextest`, `check` or `clippy` with `--workspace` or `--all` and without `--exclude kbf-task`
+//!   (it would build `kbf-task` without naming it);
+//! - no line naming `kbf-task` interpolates a matrix, env or input value (a name the text cannot
+//!   resolve);
 //! - no workflow names the feature `unconfined-for-tests`, which lets a Command run with the
 //!   network where no confine exists and is for developers' test runs only.
 
@@ -42,18 +43,6 @@ fn is_mac_runner_job(header: &str, body: &[&str]) -> bool {
         || body.iter().any(|l| {
             let l = l.trim();
             (l.starts_with("runs-on:") && l.contains("macos"))
-                || (l.contains("macos-")
-                    && (l.starts_with("os:") || l.starts_with("- ") || l.starts_with('[')))
-        })
-}
-
-/// Whether the job `header` (a two-space-indented key) with `body` is a darwin one.
-fn is_darwin_job(header: &str, body: &[&str]) -> bool {
-    header.contains("darwin")
-        || body.iter().any(|l| {
-            let l = l.trim();
-            (l.starts_with("runs-on:") && l.contains("macos"))
-                || l.contains("apple-darwin")
                 || (l.contains("macos-")
                     && (l.starts_with("os:") || l.starts_with("- ") || l.starts_with('[')))
         })
@@ -118,7 +107,7 @@ fn problems(files: &[(String, String)]) -> Vec<String> {
         for (n, &(start, header)) in jobs.iter().enumerate() {
             let end = jobs.get(n + 1).map_or(lines.len(), |j| j.0);
             let body = &lines[start + 1..end];
-            if !is_darwin_job(header, body) {
+            if !is_mac_runner_job(header, body) {
                 continue;
             }
             for (k, line) in body.iter().enumerate() {
