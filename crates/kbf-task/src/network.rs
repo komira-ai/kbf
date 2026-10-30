@@ -343,6 +343,23 @@ pub struct Launch {
     pub args: Vec<OsString>,
 }
 
+impl Launch {
+    /// How an error names what was started: `program` itself, or, where it is started through
+    /// another program (`sandbox-exec`), both.
+    #[must_use]
+    pub fn name(&self, program: &Path) -> PathBuf {
+        if self.program == program {
+            program.to_owned()
+        } else {
+            PathBuf::from(format!(
+                "{} for {}",
+                self.program.display(),
+                program.display()
+            ))
+        }
+    }
+}
+
 /// What to start for `program` with `args`. On macOS: `sandbox-exec -p <profile> <program> <args>`,
 /// where the profile denies the network to a [`Network::Denied`] Command and, for any Command,
 /// reading each of `unreadable` (the files holding a credential or a presigned URL; each is

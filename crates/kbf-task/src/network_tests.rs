@@ -845,3 +845,22 @@ fn on_macos_confine_refuses_a_denied_command_that_is_not_under_sandbox_exec() {
         Layers::Open
     );
 }
+
+/// Catches an error that names only the wrapper, or only the Command's program: a Command started
+/// as it is has one name, one started through another program has both.
+#[test]
+fn a_launch_names_the_program_it_runs_and_the_one_it_runs_through() {
+    let own = Launch {
+        program: PathBuf::from("/bin/echo"),
+        args: Vec::new(),
+    };
+    assert_eq!(own.name(Path::new("/bin/echo")), Path::new("/bin/echo"));
+    let wrapped = Launch {
+        program: PathBuf::from("/usr/bin/sandbox-exec"),
+        args: Vec::new(),
+    };
+    assert_eq!(
+        wrapped.name(Path::new("/bin/echo")),
+        Path::new("/usr/bin/sandbox-exec for /bin/echo")
+    );
+}
