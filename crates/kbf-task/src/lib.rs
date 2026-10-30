@@ -86,6 +86,12 @@
 //! a stopgap until the job scheduler delivers job secrets as files, and are removed then. A
 //! process of the Command that leaves its process group (for example with `setsid`) survives the
 //! group kill at the deadline; only such a sandbox ends it.
+//!
+//! # The confinement probe
+//!
+//! `kbf-task --probe-confinement` runs a Command under the same confinement as an action's and
+//! prints whether it holds, one `probe <name>: ok|FAIL|n/a` line per check ([`probe`]). It needs
+//! no grant, server or network.
 
 pub mod digest;
 pub mod fetch;
@@ -93,6 +99,7 @@ pub mod network;
 pub mod outputs;
 pub mod pack;
 pub mod plan;
+pub mod probe;
 pub mod put;
 pub mod put_urls;
 pub mod run;
