@@ -476,6 +476,8 @@ async fn a_backend_without_multipart_calls_answers_unsupported() {
     assert_unsupported(&blind.unwrap_err(), "upload_part");
     assert_unsupported(&completed.unwrap_err(), "complete_upload");
     assert_unsupported(&aborted.unwrap_err(), "abort_upload");
+    let listed = plain.list_uploads("", None, 10).await;
+    assert_unsupported(&listed.unwrap_err(), "list_uploads");
 
     let clock = Arc::new(TestClock::new());
     let hot = Arc::new(MemoryBackend::with_clock(clock.clone()));
@@ -485,4 +487,6 @@ async fn a_backend_without_multipart_calls_answers_unsupported() {
     let completed = complete(&proxy, "k", "u", &[]).await;
     assert_unsupported(&created.unwrap_err(), "create_upload");
     assert_unsupported(&completed.unwrap_err(), "complete_upload");
+    let listed = proxy.list_uploads("", None, 10).await;
+    assert_unsupported(&listed.unwrap_err(), "list_uploads");
 }

@@ -50,6 +50,23 @@ async fn fixture() -> Fixture {
 }
 
 /// A presigned `PUT` URL for `key`, good for `secs`, signed by the presigning key.
+/// Asserts that a presigned URL of the presigning key signed for the listing of the open
+/// uploads of the bucket (`GET /<bucket>?uploads`, with and without a prefix) is 403
+/// `AccessDenied` and tells nothing of the uploads: the key may only PUT. It catches a listing
+/// route that is reached by a key that has no read role.
+#[tokio::test(start_paused = true)]
+async fn a_presigning_key_cannot_list_the_open_uploads() {
+    let f = fixture().await;
+    let id = f.rig.cold_mem.create_upload("cas/b/open").await.unwrap();
+    let extras: [&[(&str, &str)]; 2] = [&[("uploads", "")], &[("uploads", ""), ("prefix", "cas/")]];
+    for extra in extras {
+        let url = presign_url("GET", &access("pack-presign"), &request("", 300), extra);
+        let reply = f.send("GET", &url.unwrap(), b"").await;
+        assert_eq!(refused(&reply), (403, "AccessDenied".to_owned()));
+        assert!(!reply.body.contains(&id) && !reply.body.contains("cas/b/open"));
+    }
+}
+
 fn put_url(key: &str, secs: u64) -> String {
     presign_url("PUT", &access("pack-presign"), &request(key, secs), &[]).unwrap()
 }

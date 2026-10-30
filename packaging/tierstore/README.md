@@ -53,8 +53,9 @@ refuses a key file that its group or others can read):
   list, delete, and the calls of a multipart upload;
 - `/etc/tierstore/daemons.key`: a read-only key (`--read-only-key-file`), for the daemons that
   read blobs and must not write or delete them. A request signed with it may get and head an
-  object, list the bucket and head the bucket; a put, a delete, CreateBucket or any call of a
-  multipart upload is answered 403 `AccessDenied`, before its body is read, and changes nothing.
+  object, list the bucket (objects, and the open multipart uploads) and head the bucket; a put, a
+  delete, CreateBucket or any call that starts, feeds, completes or aborts a multipart upload is
+  answered 403 `AccessDenied`, before its body is read, and changes nothing.
   Give the flag once for each read-only key, to give each reader a key of its own. The access key
   ids of all the keys of one server must differ: a request names its key by its id, so a start
   with two keys that have one id is refused with exit status 2;
@@ -128,7 +129,7 @@ and is longer than it:
 | call | allowed |
 |---|---|
 | ListObjectsV2 | with a `prefix` inside the key's; a list with no prefix or another is 403, not filtered |
-| ListMultipartUploads | authorized the same way, but served once ListMultipartUploads lands; the front answers 501 until then |
+| ListMultipartUploads | with a `prefix` inside the key's, the open uploads under it; no prefix or another is 403, not filtered |
 | HeadObject | yes |
 | DeleteObject | yes: from both tiers, journaled as for any delete |
 | AbortMultipartUpload | of an upload of such a key |
@@ -158,6 +159,7 @@ The unit's `ExecStart=` is a complete command line. The flags to edit:
 | `--hot-endpoint`, `--cold-endpoint` | where the tier's store is, `http://host[:port]` (TLS is not built yet); `--hot-region` and `--cold-region` set the signing region of a tier, `us-east-1` if not given |
 | `--hot-bytes` | the bytes the hot tier is meant to hold; the water marks are shares of it (`--high-water`, `--low-water`, `--critical`) |
 | `--drain-lb-wait`, `--drain-deadline` | the drain on SIGTERM: how long `/readyz` says 503 while the server goes on serving, and how long it then waits for requests in flight |
+| `--usage-stale-after` | how old the usage that the reconciler publishes may be (2m by default, longer than `--lease-ttl`) before `/usagez` says 503 with the reason (200 and the age while fresh). Puts ignore a usage older than 30 s, so a stopped reconciler means a hot tier that is never taken to be full; puts are not refused. A load balancer probes `/readyz`, which does not look at the usage (one stopped reconciler would otherwise take every node out); alerting probes `/usagez` |
 
 `tierstore --help` lists them all, with their defaults.
 

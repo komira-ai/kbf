@@ -267,14 +267,44 @@ async fn a_gc_key_aborts_uploads_under_its_prefix_only() {
     assert_eq!(again.status, StatusCode::NOT_FOUND);
 }
 
-/// Asserts that a list of multipart uploads (`GET ?uploads`) passes the role of the key with a
-/// prefix inside its own and is refused (403) with none or one outside: the front's own answer to
-/// the call, whatever it is, is not a refusal of the role.
+/// Asserts that a list of multipart uploads (`GET ?uploads`) by a GC key lists the open uploads
+/// under a prefix inside its own (and not those of another prefix), is 403 with no prefix or one
+/// outside, and that the uploads it finds are the ones the key may abort.
 #[tokio::test(start_paused = true)]
 async fn a_list_of_uploads_is_held_to_the_prefix_of_the_gc_key() {
     let rig = rig().await;
+    let begin = |key: &'static str| {
+        let rig = &rig;
+        async move {
+            let started = rig.call("POST", &format!("{key}?uploads"), b"").await;
+            texts(&started.body, "UploadId").concat()
+        }
+    };
+    let mine = begin("cas/b/up").await;
+    let _theirs = begin("cas/c/up").await;
     let inside = gc(&rig, "GET", &listing("uploads&prefix=cas%2Fb%2F"), &[], b"").await;
-    assert_ne!(inside.status, StatusCode::FORBIDDEN, "{}", inside.body);
+    assert_eq!(inside.status, StatusCode::OK, "{}", inside.body);
+    assert_eq!(texts(&inside.body, "Key"), ["cas/b/up"]);
+    assert_eq!(texts(&inside.body, "UploadId"), [mine.as_str()]);
+    let deeper = gc(
+        &rig,
+        "GET",
+        &listing("uploads&prefix=cas%2Fb%2Fu"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(texts(&deeper.body, "Key"), ["cas/b/up"]);
+    let none = gc(
+        &rig,
+        "GET",
+        &listing("uploads&prefix=cas%2Fb%2Fz"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(none.status, StatusCode::OK);
+    assert!(texts(&none.body, "Key").is_empty());
     for query in [
         "uploads",
         "uploads&prefix=",

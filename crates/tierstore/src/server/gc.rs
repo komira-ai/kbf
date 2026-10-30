@@ -16,8 +16,7 @@
 //!
 //! - ListObjectsV2 with a `prefix` parameter inside the prefix of the key (a list with no prefix,
 //!   or one outside, is refused and not filtered), and ListMultipartUploads (`GET ?uploads`) with
-//!   such a prefix (authorized here; the front serves it once ListMultipartUploads is built, and
-//!   answers 501 until then);
+//!   such a prefix, under the same rule (the open uploads under the prefix are listed);
 //! - HeadObject;
 //! - DeleteObject, and AbortMultipartUpload of an upload of such a key.
 //!

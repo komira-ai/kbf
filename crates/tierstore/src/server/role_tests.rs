@@ -216,3 +216,35 @@ async fn an_unknown_key_and_a_wrong_secret_are_refused() {
         assert_eq!(reply.code(), code);
     }
 }
+
+/// Asserts that a read-only key lists the open multipart uploads, by prefix and by page, as the
+/// full key does (the listing is a read, as the listing of objects is), and that what it learns
+/// from the listing lets it do nothing to an upload: the abort it then tries is 403 and the
+/// upload stays open and listed. It catches a role that refuses the listing, and one that lets
+/// a key that only reads end an upload.
+#[tokio::test(start_paused = true)]
+async fn a_read_only_key_lists_open_uploads_and_cannot_end_them() {
+    let rig = rig().await;
+    let id = start(&rig, "jobs/a").await;
+    let other = start(&rig, "other/b").await;
+    let all = format!("/{BUCKET}?uploads");
+    let by_reader = as_reader(&rig, "GET", &all, &[], b"").await;
+    assert_eq!(by_reader.status, StatusCode::OK);
+    assert_eq!(texts(&by_reader.body, "Key"), ["jobs/a", "other/b"]);
+    assert_eq!(texts(&by_reader.body, "UploadId"), [id.clone(), other]);
+    let by_full_key = rig.send("GET", &all, &[], b"").await;
+    assert_eq!(by_full_key.body, by_reader.body);
+
+    let under = format!("/{BUCKET}?uploads&prefix=jobs%2F&max-uploads=1");
+    let scoped = as_reader(&rig, "GET", &under, &[], b"").await;
+    assert_eq!(scoped.status, StatusCode::OK);
+    assert_eq!(texts(&scoped.body, "Key"), ["jobs/a"]);
+    assert_eq!(texts(&scoped.body, "IsTruncated"), ["false"]);
+
+    let abort = format!("{}?uploadId={id}", object("jobs/a"));
+    let refused = as_reader(&rig, "DELETE", &abort, &[], b"").await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    assert_eq!(refused.code(), "AccessDenied");
+    let still = as_reader(&rig, "GET", &all, &[], b"").await;
+    assert_eq!(texts(&still.body, "UploadId").len(), 2);
+}
