@@ -56,7 +56,7 @@ use std::collections::BTreeSet;
 
 use kbf_meta::Closure;
 use kbf_objstore::{ByteRange, ObjectKey};
-use kbf_pack::{ShapeError, TaskManifest, check_shape};
+use kbf_pack::{MANIFEST_VERSION, ShapeError, TaskManifest, check_shape};
 use kbf_pack_index::{BlobDigest, NewPack, PackBlob};
 use kbf_proto::reapi::{self, ActionResult};
 use kbf_segments::layout::{TRAILER_LEN, footer_len};
@@ -306,6 +306,11 @@ impl Ingest<'_> {
             .verify(&record)
             .map_err(|_| RejectReason::HashMismatch)?;
         let manifest = TaskManifest::parse(&record).map_err(|_| RejectReason::BadManifest)?;
+        // This ingest reads one pack and no large object: a manifest that says more would have its
+        // other objects silently dropped.
+        if manifest.version() != MANIFEST_VERSION {
+            return Err(RejectReason::BadManifest.into());
+        }
         if manifest.lease != self.lease || manifest.action != *self.action {
             return Err(RejectReason::WrongKey.into());
         }

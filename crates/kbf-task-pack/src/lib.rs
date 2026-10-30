@@ -15,13 +15,15 @@ mod task_manifest;
 mod task_pack;
 
 pub use task_key::{
-    MAC_LEN, MAX_BUILD_BYTES, TaskKeyError, TaskPackKey, check_build, mac_input, minute_of,
+    MAC_LEN, MAX_BUILD_BYTES, MAX_LARGE, MAX_PACKS, Slot, TaskKeyError, TaskPackKey, check_build,
+    mac_input, mac_input_v1, minute_of,
 };
 pub use task_manifest::{
-    EMPTY_DIGEST, MANIFEST_VERSION, MAX_MANIFEST_BYTES, MAX_PATH_BYTES, ManifestError,
-    OutputDirectory, OutputFile, OutputSymlink, PathError, TaskManifest, Timing, Usage,
+    EMPTY_DIGEST, LargeEntry, MANIFEST_VERSION, MANIFEST_VERSION_2, MAX_MANIFEST_BYTES,
+    MAX_PATH_BYTES, ManifestError, OutputDirectory, OutputFile, OutputSymlink, PathError,
+    TaskManifest, Timing, Usage,
 };
 pub use task_pack::{
     MAX_PACK_BYTES, MAX_PACK_RECORDS, MAX_RECORD_BYTES, ShapeError, TaskPackError, WritePackError,
-    check_shape, read_manifest, write_pack,
+    check_shape, read_manifest, read_manifest_with, write_pack, write_pack_with,
 };
