@@ -50,6 +50,9 @@ pub(in crate::server) struct Tamper {
     deletes: Mutex<Option<Arc<Semaphore>>>,
     /// The deletes that wait at `deletes`, counted when they arrive.
     deleting: AtomicU64,
+    /// The next delete is applied and then answers with an `Unavailable` error, as a store does
+    /// whose answer is lost after it committed.
+    pub(in crate::server) lose_delete_answer: AtomicBool,
     /// What `needs_length` says.
     pub(in crate::server) needs_len: AtomicBool,
 }
@@ -69,6 +72,7 @@ impl Tamper {
             parked: AtomicU64::new(0),
             deletes: Mutex::new(None),
             deleting: AtomicU64::new(0),
+            lose_delete_answer: AtomicBool::new(false),
             needs_len: AtomicBool::new(false),
         }
     }
@@ -184,7 +188,11 @@ impl Backend for Tamper {
             let _ = self.deleting.fetch_add(1, Ordering::SeqCst);
             gate.acquire().await.expect("the gate stays open").forget();
         }
-        self.memory.delete(key).await
+        self.memory.delete(key).await?;
+        if self.lose_delete_answer.swap(false, Ordering::SeqCst) {
+            return Err(Error::Unavailable("the answer was lost".to_owned()));
+        }
+        Ok(())
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<Listed>, Error> {

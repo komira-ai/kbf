@@ -17,8 +17,8 @@ use tokio::sync::oneshot;
 use super::Drained;
 use super::cache_cli::{run_cache, serve_cache, size_of_file_system, unjudged_warning};
 use super::cli::Error;
-use super::cli::exit_status;
-use super::config::{PerRun, settings_from_text};
+use super::cli::{checked, exit_status};
+use super::config::{PerRun, Settings, settings_from_text};
 use super::config_cache::CacheSettings;
 use super::local_cache::testing::{FakeDisk, Quirk, digest, pattern};
 use super::local_cache::{Disk, SystemDisk};
@@ -524,4 +524,66 @@ async fn a_write_through_node_takes_a_put_and_a_read_cache_refuses_it() {
         assert_eq!(stored.ok(), writes.then(|| Bytes::from_static(b"made")));
         assert!(flat.inner.list("_tiering/").await.unwrap().is_empty());
     }
+}
+
+/// Asserts what `--check-config` finds in the settings of a build node: a file that is whole
+/// passes, a request timeout of zero is refused with the message of a start, and a key file that
+/// is not there is refused (the branch for a cache), and that a budget far over the file system
+/// is not looked at (the start's check of the disk is not made).
+#[test]
+fn check_config_of_a_build_node_refuses_a_zero_timeout_and_a_missing_key_file() {
+    let node = Node::new("tscache-cli-check-cache");
+    let big = node.text("", "").replace("\"1MiB\"", "\"8TiB\"");
+    let whole = settings_from_text(&big, QUICK)
+        .unwrap()
+        .into_cache()
+        .unwrap();
+    assert!(checked(&Settings::Cache(Box::new(whole))).is_ok());
+
+    let zero = node.settings("s3_request_timeout = \"0s\"", "");
+    let why = checked(&Settings::Cache(Box::new(zero))).unwrap_err();
+    assert!(why.to_string().contains("--s3-request-timeout"), "{why}");
+
+    let text = node
+        .text("", "")
+        .replace(&node.key.display().to_string(), "/no/such/access.key");
+    let gone = settings_from_text(&text, QUICK)
+        .unwrap()
+        .into_cache()
+        .unwrap();
+    let why = checked(&Settings::Cache(Box::new(gone))).unwrap_err();
+    assert!(why.to_string().contains("/no/such/access.key"), "{why}");
+}
+
+/// Asserts what `--check-config` finds in the settings of a storage node: a file whose key file
+/// is there passes, one whose bucket is the name of a probe path is refused, and one whose key
+/// file is not there is refused (the branch for a storage node).
+#[test]
+fn check_config_of_a_storage_node_reads_its_key_files() {
+    let node = Node::new("tscache-cli-check-storage");
+    let text = format!(
+        r#"
+[server]
+listen          = "127.0.0.1:0"
+proxy_id        = "s1"
+bucket          = "tier-bucket"
+access_key_file = "{key}"
+
+[hot_store]
+kind   = "memory"
+budget = 1048576
+
+[cold_store]
+kind = "memory"
+"#,
+        key = node.key.display()
+    );
+    let storage = |text: &str| settings_from_text(text, QUICK).unwrap();
+    assert!(checked(&storage(&text)).is_ok());
+    let probe = text.replace("tier-bucket", "healthz");
+    let why = checked(&storage(&probe)).unwrap_err();
+    assert!(why.to_string().contains("probe path"), "{why}");
+    let gone = text.replace(&node.key.display().to_string(), "/no/such/access.key");
+    let why = checked(&storage(&gone)).unwrap_err();
+    assert!(why.to_string().contains("/no/such/access.key"), "{why}");
 }

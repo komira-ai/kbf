@@ -1,7 +1,16 @@
 //! The listings of a cache leave out the keys a storage node keeps for itself.
 
-use super::testing::Rig;
-use crate::{Backend, Listed};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use kbf_testkit::dir::TestDir;
+
+use super::listing::LISTING_CALLS;
+use super::testing::{FakeDisk, Rig};
+use super::{CacheConfig, LocalCache};
+use crate::{Backend, ByteRange, Error, Listed, MemoryBackend, Meta, Op, TestClock};
 
 /// The keys of a listing.
 fn keys(listed: &[Listed]) -> Vec<&str> {
@@ -118,4 +127,126 @@ async fn list_uploads_leaves_out_the_reserved_keys() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// Asserts that a listing whose prefix is inside a reserved prefix is empty and makes no call to
+/// the upstream, for the three listings. It catches a filter that asks the upstream for a range
+/// it then throws away.
+#[tokio::test]
+async fn a_listing_inside_a_reserved_prefix_asks_the_upstream_nothing() {
+    let rig = rig("tscache-list-inside").await;
+    rig.tamper.create_upload("_journal/p1/1").await.unwrap();
+    assert!(rig.cache.list("_journal/p1/").await.unwrap().is_empty());
+    assert!(
+        rig.cache
+            .list_page("_tiering/", None, 5)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let uploads = rig.cache.list_uploads("_journal/", None, 5).await;
+    assert!(uploads.unwrap().is_empty());
+    assert_eq!(rig.calls(Op::List), 0);
+    assert_eq!(rig.calls(Op::ListUploads), 0);
+}
+
+/// Asserts that a large reserved range costs about one call of the upstream and not one for each
+/// page of it: two thousand keys under `_journal/` and some under `_tiering/`, between data keys
+/// and the data keys `_journal0` and `_tiering0` that sort right after each range (which the jump
+/// must not pass), are listed three keys at a time in three calls; a listing that walked the range
+/// page by page would make hundreds.
+#[tokio::test]
+async fn a_large_reserved_range_costs_about_one_call() {
+    let rig = Rig::new("tscache-list-jump");
+    for key in [
+        "A/1",
+        "_journal0",
+        "_tiering/t1",
+        "_tiering/t2",
+        "_tiering0",
+        "b/1",
+        "b/2",
+    ] {
+        rig.put(key, b"x").await;
+    }
+    for n in 0..2000 {
+        rig.put(&format!("_journal/{n:04}"), b"x").await;
+    }
+    let page = rig.cache.list_page("", None, 3).await.unwrap();
+    assert_eq!(keys(&page), ["A/1", "_journal0", "_tiering0"]);
+    assert_eq!(rig.calls(Op::List), 3);
+    let after = page.last().unwrap().key.as_str();
+    let rest = rig.cache.list_page("", Some(after), 3).await.unwrap();
+    assert_eq!(keys(&rest), ["b/1", "b/2"]);
+}
+
+/// A store that ignores `start_after`: every page it gives is the first, and it counts the pages.
+struct Stuck {
+    inner: MemoryBackend,
+    pages: AtomicU64,
+}
+
+#[async_trait]
+impl Backend for Stuck {
+    async fn put(&self, key: &str, body: Bytes) -> Result<(), Error> {
+        self.inner.put(key, body).await
+    }
+
+    async fn put_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<String, Error> {
+        self.inner.put_if_match(key, body, etag).await
+    }
+
+    async fn get(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
+        self.inner.get(key, range).await
+    }
+
+    async fn head(&self, key: &str) -> Result<Meta, Error> {
+        self.inner.head(key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), Error> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<Listed>, Error> {
+        self.inner.list(prefix).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        _start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Result<Vec<Listed>, Error> {
+        let _ = self.pages.fetch_add(1, Ordering::SeqCst);
+        let mut page = self.inner.list(prefix).await?;
+        page.truncate(max_keys);
+        Ok(page)
+    }
+}
+
+/// Asserts the cap on the pages one listing reads: an upstream that answers every page with the
+/// same two reserved keys (it ignores where to continue) ends the listing after exactly the cap,
+/// with `Unavailable`, and not never. It catches a cap that is gone or off by one.
+#[tokio::test]
+async fn a_listing_that_never_gets_past_the_reserved_keys_stops_at_the_cap() {
+    let inner = MemoryBackend::new();
+    for key in ["_journal/a", "_journal/b", "_journal/c"] {
+        inner.put(key, Bytes::from_static(b"x")).await.unwrap();
+    }
+    let stuck = Arc::new(Stuck {
+        inner,
+        pages: AtomicU64::new(0),
+    });
+    let dir = TestDir::under(std::env::temp_dir(), "tscache-list-cap");
+    let config = CacheConfig::new(dir.path().join("cache"), 1 << 20, Vec::new());
+    let (upstream, disk, clock) = (
+        stuck.clone(),
+        Arc::new(FakeDisk::new()),
+        Arc::new(TestClock::new()),
+    );
+    let cache = LocalCache::open(config, upstream, disk, clock).unwrap();
+    let page = cache.list_page("", None, 2).await;
+    assert!(matches!(page, Err(Error::Unavailable(_))), "{page:?}");
+    assert_eq!(stuck.pages.load(Ordering::SeqCst), u64::from(LISTING_CALLS));
 }
