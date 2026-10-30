@@ -169,8 +169,8 @@ async fn a_listing_passes_through_and_keeps_nothing() {
 }
 
 /// Asserts that `GET /metricz` needs no signature and shows the counters of the cache, after
-/// the reads that made them; that HEAD answers it too; and that a storage node's `/metricz` has the series of its proxy and
-/// none of the cache's.
+/// the reads that made them; that HEAD answers it too; and that a storage node's `/metricz` has
+/// the series of its proxy and none of the cache's.
 #[tokio::test]
 async fn metricz_shows_the_cache_block_on_a_cache_node_and_the_proxy_block_on_a_storage_node() {
     let front = Front::new("tscache-front-metrics").await;
