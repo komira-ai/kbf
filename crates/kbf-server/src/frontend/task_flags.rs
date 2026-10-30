@@ -300,10 +300,14 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<Option<TaskFlags>, String> 
     let read_url = text(READ_URL);
     let plain = super::executor_flags::plain_http_grant(m);
     check_read_url_allowing(&read_url, plain).map_err(|error| {
-        let hint = if read_url.starts_with("http://") {
-            " (--executor-allow-plain-http-grant with --executor js-agent accepts it)"
-        } else {
+        let hint = if !read_url.starts_with("http://") {
             ""
+        } else if super::job_read::serves_tls(m) {
+            // The flag alone would pass this check and fail the next, on the listener's scheme.
+            " (--job-listen serves TLS: use an https:// url, or serve it with --job-plain-http \
+             and give --executor-allow-plain-http-grant)"
+        } else {
+            " (--executor-allow-plain-http-grant with --executor js-agent accepts it)"
         };
         format!("--task-read-url: {error}{hint}")
     })?;

@@ -1736,7 +1736,8 @@ any more.
 
 **Job-facing read.** On a frontend given `--job-listen` ([kbf-modes.md](deploy/kbf-modes.md)) the
 listener a task fetches its action's inputs from counts requests and bytes; without the flag these
-are absent. The same scrape has a `listener="job"` series in the `kbf_tls_reloads_total` family.
+are absent. The same scrape has a `listener="job"` series in the `kbf_tls_reloads_total` family, except
+under `--job-plain-http`, where the listener has no TLS files.
 
 | Family | Type | What it measures |
 |---|---|---|
