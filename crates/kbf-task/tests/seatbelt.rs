@@ -58,10 +58,26 @@ async fn a_denied_command_cannot_make_a_tcp_connection() {
     assert_eq!(ran.layers, Layers::Seatbelt);
 }
 
+/// The control of the test above: the same connect, run as a Command allowed the network, is not
+/// refused by the sandbox (the answer is a timeout, an unreachable network or a connection, never
+/// `EPERM`), so `EPERM` there is the denial and not the address.
+#[tokio::test]
+async fn an_allowed_command_is_not_refused_the_same_connect() {
+    let ran = probe_run("connect-allowed", Network::Allowed, &[], &["tcp-outside"]).await;
+    assert_ne!(ran.exit_code, EPERM, "{ran:?}");
+    assert_eq!(ran.layers, Layers::Open);
+}
+
 /// Catches a profile that denies more than the network: a denied Command still uses loopback and
 /// Unix sockets, which builds and their tools need.
 #[tokio::test]
 async fn a_denied_command_still_reaches_loopback_and_unix_sockets() {
+    // `::1` is loopback too; a runner without IPv6 answers `EADDRNOTAVAIL` or `EAFNOSUPPORT`.
+    let v6 = probe_run("loopback6", Network::Denied, &[], &["tcp-loopback6"]).await;
+    assert!(
+        [0, libc::EADDRNOTAVAIL, libc::EAFNOSUPPORT].contains(&v6.exit_code),
+        "{v6:?}"
+    );
     for mode in ["tcp-loopback", "unix"] {
         let ran = probe_run("loopback", Network::Denied, &[], &[mode]).await;
         assert_eq!(ran.exit_code, 0, "{mode}: {ran:?}");
@@ -109,6 +125,8 @@ async fn a_denied_file_is_refused_through_a_link_to_it() {
     let link = dir.join("link");
     std::os::unix::fs::symlink(&grant, &link).expect("link");
     let read = link.to_str().expect("utf-8");
+    let direct = probe_run("link-open", Network::Denied, &[], &["read", read]).await;
+    assert_eq!(direct.exit_code, 0, "{direct:?}");
     let ran = probe_run("link", Network::Denied, &[link.clone()], &["read", read]).await;
     assert_eq!(ran.exit_code, EPERM, "{ran:?}");
 }
@@ -199,4 +217,56 @@ async fn a_denied_file_cannot_be_renamed_and_read_by_the_command() {
         move_then_read("rn-denied", "rename-read", &secret, true).await,
         0
     );
+}
+
+/// Catches a credential read after the Command renames the directory that holds it: the file, now
+/// under another path, must stay unreadable. The same rename and read with nothing denied works.
+#[tokio::test]
+async fn a_denied_file_cannot_be_read_after_its_directory_is_renamed() {
+    let dir = TestDir::under(std::env::temp_dir(), "kbf-task-seatbelt-dirmove");
+    for (name, denied) in [("dm-control", false), ("dm-denied", true)] {
+        let held = dir.join(format!("{name}-dir"));
+        std::fs::create_dir(&held).expect("dir");
+        let secret = held.join("secret");
+        std::fs::write(&secret, "secret").expect("file");
+        let moved = dir.join(format!("{name}-moved"));
+        let unreadable = if denied {
+            vec![secret.clone()]
+        } else {
+            Vec::new()
+        };
+        let args = [
+            "rename-dir-read",
+            held.to_str().expect("utf-8"),
+            moved.to_str().expect("utf-8"),
+            "secret",
+        ];
+        let ran = probe_run(name, Network::Denied, &unreadable, &args).await;
+        if denied {
+            assert_ne!(ran.exit_code, 0, "{ran:?}");
+        } else {
+            assert_eq!(ran.exit_code, 0, "{ran:?}");
+        }
+    }
+}
+
+/// Catches a credential read under the same name in other letter case: the volume ignores case, and
+/// the sandbox must too. The control reads the same file by another case with nothing denied.
+#[tokio::test]
+async fn a_denied_file_is_refused_under_another_letter_case() {
+    let dir = TestDir::under(std::env::temp_dir(), "kbf-task-seatbelt-case");
+    let secret = dir.join("secret-file");
+    std::fs::write(&secret, "secret").expect("file");
+    let shouted = dir.join("SECRET-FILE");
+    let read = shouted.to_str().expect("utf-8");
+    let open = probe_run("case-open", Network::Denied, &[], &["read", read]).await;
+    assert_eq!(open.exit_code, 0, "the volume ignores case: {open:?}");
+    let ran = probe_run(
+        "case",
+        Network::Denied,
+        std::slice::from_ref(&secret),
+        &["read", read],
+    )
+    .await;
+    assert_eq!(ran.exit_code, EPERM, "{ran:?}");
 }

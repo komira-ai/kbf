@@ -801,6 +801,10 @@ fn start(runtime: std::io::Result<tokio::runtime::Runtime>, cli: &Cli) -> ExitCo
 mod tests;
 
 #[cfg(test)]
+#[path = "credential_files_tests.rs"]
+mod credential_files_tests;
+
+#[cfg(test)]
 #[path = "plain_grant_tests.rs"]
 mod plain_grant_tests;
 

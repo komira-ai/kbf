@@ -121,8 +121,10 @@ pub struct Profile {
 impl Profile {
     /// The profile text: allow everything but handing work to `launchd` (`job-creation`,
     /// `lsopen`) and writing a preference through `cfprefsd`, then the network denial if asked,
-    /// then [`NO_DEVICE_RULES`], then one `(deny file-read* (literal "<path>"))` per file. The
-    /// read denies are last: a later rule wins.
+    /// then [`NO_DEVICE_RULES`], then, per file, `(deny file-read* (literal "<path>"))` and the same for
+    /// `file-write*` (which covers a rename, an unlink and a hard link of the file, each of which
+    /// would otherwise give the same file a second name the read deny does not name). The denies
+    /// are last: a later rule wins.
     ///
     /// Writes are not limited by this profile (the driver's profiles limit them to a lease
     /// directory; this one does not), so a process may write wherever its user can.
@@ -144,9 +146,14 @@ impl Profile {
                     why: "not an absolute path",
                 });
             }
-            text.push_str("(deny file-read* (literal ");
-            text.push_str(&quoted(path)?);
-            text.push_str("))\n");
+            let literal = quoted(path)?;
+            for operation in ["file-read*", "file-write*"] {
+                text.push_str("(deny ");
+                text.push_str(operation);
+                text.push_str(" (literal ");
+                text.push_str(&literal);
+                text.push_str("))\n");
+            }
         }
         Ok(text)
     }

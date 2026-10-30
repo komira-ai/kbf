@@ -169,8 +169,18 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
 
     let cpu_before = children_usage().cpu_us;
     let started = Instant::now();
+    // Where the program is started through another (`sandbox-exec`), the error names both.
+    let started_as = if launch.program == program {
+        program.clone()
+    } else {
+        PathBuf::from(format!(
+            "{} for {}",
+            launch.program.display(),
+            program.display()
+        ))
+    };
     let spawn_error = |source| RunError::Spawn {
-        program: launch.program.clone(),
+        program: started_as.clone(),
         source,
     };
     let mut child = process.spawn().map_err(spawn_error)?;

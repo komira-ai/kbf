@@ -40,6 +40,10 @@ fn probe(args: &[&str]) -> u8 {
         ["link-read", from, to] => {
             std::fs::hard_link(from, to).map_or_else(|e| errno_of(&e), |()| probe(&["read", to]))
         }
+        ["rename-dir-read", from, to, name] => std::fs::rename(from, to).map_or_else(
+            |e| errno_of(&e),
+            |()| probe(&["read", &format!("{to}/{name}")]),
+        ),
         ["rename-read", from, to] => {
             std::fs::rename(from, to).map_or_else(|e| errno_of(&e), |()| probe(&["read", to]))
         }
@@ -47,6 +51,7 @@ fn probe(args: &[&str]) -> u8 {
         ["ifaces"] => ifaces(),
         ["tcp-loopback"] => tcp_loopback(),
         ["tcp-outside"] => tcp_outside(),
+        ["tcp-loopback6"] => tcp_loopback6(),
         ["ids"] => ids(),
         ["hidden", pid] => hidden(pid),
         #[cfg(target_arch = "x86_64")]
@@ -207,8 +212,26 @@ fn tcp_loopback() -> u8 {
 fn tcp_outside() -> u8 {
     // An address of the documentation range (RFC 5737): no route to it exists in an empty
     // namespace, so the connect fails at once with `ENETUNREACH`.
-    match std::net::TcpStream::connect("192.0.2.1:9") {
+    // A bounded wait: where the network is open the packets may get no answer at all, which is
+    // reported as `ETIMEDOUT`, not waited for.
+    let address = std::net::SocketAddr::from(([192, 0, 2, 1], 9));
+    match std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(3)) {
         Ok(_) => 0,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            u8::try_from(libc::ETIMEDOUT).unwrap_or(UNKNOWN_MODE)
+        }
         Err(e) => errno_of(&e),
     }
+}
+
+/// Listens on `[::1]` and connects to it: 0, or the errno of the step that failed.
+fn tcp_loopback6() -> u8 {
+    let run = || -> std::io::Result<()> {
+        let listener = std::net::TcpListener::bind("[::1]:0")?;
+        let client = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (_server, _) = listener.accept()?;
+        drop(client);
+        Ok(())
+    };
+    run().map_or_else(|e| errno_of(&e), |()| 0)
 }

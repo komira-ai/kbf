@@ -11,6 +11,12 @@
 //! (a script, an action) and says so by being a text match. A line is read as words split on
 //! whitespace: `cargo` and the word after it (a `+toolchain` between them is skipped) name the verb.
 //!
+//! What the text match does not see: a `run: |` script, where only the line a `cargo` is on is read,
+//! so a build split over continuation lines is missed; `cross build` and any other wrapper that is not
+//! `cargo`; a `--target` that is an unresolved `${{ matrix` or `$CARGO_BUILD_TARGET` (the release
+//! builds `kbf-task` for a Linux target named by a variable, so such a line cannot be refused); and a
+//! flag whose value is a separate word, which is read as the verb.
+//!
 //! The rules, over `.github/workflows/*.yml` and `docs/artifacts.md`:
 //! - no line names `kbf-task` and `darwin` together (`kbf-task-<commit>-darwin-arm64.tar.gz`, a
 //!   `--platform darwin-arm64` package line, a release asset list), except a line whose every `cargo`
@@ -61,13 +67,19 @@ fn interpolates_a_platform(line: &str) -> bool {
     })
 }
 
-/// The word after each `cargo` in `words`, skipping a `+toolchain` between them: the verb.
+/// The word after each `cargo` in `words`, skipping a `+toolchain` or a `-flag` between them: the
+/// verb. (A flag that takes its value as a separate word, `-Z x`, makes that value the verb.)
 fn cargo_verbs<'a>(words: &[&'a str]) -> Vec<&'a str> {
     words
         .iter()
         .enumerate()
         .filter(|(_, w)| **w == "cargo")
-        .filter_map(|(i, _)| words[i + 1..].iter().find(|w| !w.starts_with('+')).copied())
+        .filter_map(|(i, _)| {
+            words[i + 1..]
+                .iter()
+                .find(|w| !w.starts_with(['+', '-']))
+                .copied()
+        })
         .collect()
 }
 
@@ -305,7 +317,11 @@ fn the_guard_names_each_way_a_darwin_kbf_task_would_ship() {
     );
     let named = linux_build.replace("--workspace", "-p kbf-task");
     let got = problems(&with(".github/workflows/other.yml", &named));
-    assert!(!got.is_empty(), "{got:?}");
+    assert!(
+        got.iter()
+            .any(|p| p.contains("builds kbf-task for an apple-darwin target")),
+        "{got:?}"
+    );
 
     let cross = "jobs:\n  t:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: cargo check --locked --target aarch64-apple-darwin -p kbf-task\n      - run: cargo clippy --workspace --target aarch64-apple-darwin\n";
     assert_eq!(
@@ -419,16 +435,41 @@ fn the_guard_names_each_way_a_darwin_kbf_task_would_ship() {
             "{step}"
         );
     }
-    for step in [
-        "cargo build --locked --release -p kbf-task",
-        "cargo b -p kbf-task",
-        "cargo install --path crates/kbf-task",
-        "cargo xtask package --binary target/release/kbf-task",
-        "cargo test -p kbf-task --features unconfined-for-tests",
+    for (step, rule) in [
+        (
+            "cargo build --locked --release -p kbf-task",
+            "the darwin job `task-macos` names kbf-task",
+        ),
+        (
+            "cargo b -p kbf-task",
+            "the darwin job `task-macos` names kbf-task",
+        ),
+        (
+            "cargo install --path crates/kbf-task",
+            "the darwin job `task-macos` names kbf-task",
+        ),
+        (
+            "cargo xtask package --binary target/release/kbf-task",
+            "the darwin job `task-macos` names kbf-task",
+        ),
+        (
+            "cargo test -p kbf-task --features unconfined-for-tests",
+            "names the test-only feature `unconfined-for-tests`",
+        ),
     ] {
         let got = problems(&with(".github/workflows/other.yml", &mac_job(step)));
         assert_eq!(got.len(), 1, "{step}: {got:?}");
+        assert!(got[0].contains(rule), "{step}: {got:?}");
     }
+    // A flag before the verb does not hide it.
+    for line in [
+        "cargo --locked build -p kbf-task --target aarch64-apple-darwin",
+        "cargo --locked b --workspace --target aarch64-apple-darwin",
+    ] {
+        assert!(builds_task_for_darwin(line), "{line}");
+    }
+    assert!(is_cross_check("cargo --locked check -p kbf-task"));
+    assert!(!is_cross_check("cargo --locked build -p kbf-task"));
 
     let sha = "jobs:\n  t:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: cp dist/kbf-task-${{ github.sha }}-linux-x86_64.tar.gz out\n";
     assert_eq!(
