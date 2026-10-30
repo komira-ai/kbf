@@ -17,7 +17,7 @@
 //! - no line of a darwin job (its name has `darwin`, or it runs on `macos-*`, or builds for
 //!   `apple-darwin`) names `kbf-task`: the build of it, its SBOM, its package or its image;
 //! - no line of a darwin job runs `cargo build`, `test`, `nextest`, `check` or `clippy` with
-//!   `--workspace` or `--all` and without `--exclude kbf-task` (it would build `kbf-task` without
+//!   `--workspace` or `--all` (in a job that runs on a Mac, or for an `apple-darwin` target) and without `--exclude kbf-task` (it would build `kbf-task` without
 //!   naming it), and no line naming `kbf-task` interpolates a matrix, env or input value (a name the
 //!   text cannot resolve);
 //! - no workflow names the feature `unconfined-for-tests`, which lets a Command run with the
@@ -33,6 +33,18 @@ fn repo_root() -> PathBuf {
         .join("../..")
         .canonicalize()
         .expect("repository root")
+}
+
+/// Whether the job runs on a Mac (its name has `darwin`, a `runs-on` or matrix names `macos`).
+/// A Linux job that cross-checks for `apple-darwin` is not one.
+fn is_mac_runner_job(header: &str, body: &[&str]) -> bool {
+    header.contains("darwin")
+        || body.iter().any(|l| {
+            let l = l.trim();
+            (l.starts_with("runs-on:") && l.contains("macos"))
+                || (l.contains("macos-")
+                    && (l.starts_with("os:") || l.starts_with("- ") || l.starts_with('[')))
+        })
 }
 
 /// Whether the job `header` (a two-space-indented key) with `body` is a darwin one.
@@ -110,7 +122,8 @@ fn problems(files: &[(String, String)]) -> Vec<String> {
                 continue;
             }
             for (k, line) in body.iter().enumerate() {
-                if builds_workspace(line) {
+                let to_darwin = line.contains("apple-darwin");
+                if builds_workspace(line) && (to_darwin || is_mac_runner_job(header, body)) {
                     out.push(format!(
                         "{name}:{}: the darwin job `{}` builds the whole workspace, kbf-task included, without `--exclude kbf-task`: {}",
                         start + k + 2,
