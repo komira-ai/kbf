@@ -379,15 +379,16 @@ pub struct Args {
     /// it) or over (less than half of it) in `kbf_prediction_vs_run_total`; the operations
     /// given a prediction are counted in `kbf_prediction_made_total` and those given none,
     /// by why, in `kbf_prediction_unset_total`. Placement is exactly what `off` does. `on`
-    /// gives the scheduler the prediction as the cost of the operation's lease, at submit
-    /// (on the legacy core also again for an operation read back from the state store at a
-    /// start), which charges the learned memory as well as the cores: a lease is admitted to a node only while the
-    /// memory charged to the node's leases stays within the node's memory. An operation the
-    /// estimator has no usable row for, or is not asked about (not an action, one that asks
-    /// for a GPU, no OS pinned, no subject), gets none and is charged as it is with `off`.
-    /// `shadow` and `on` need `--learned-sizes shadow` or `on`; `on` needs `--placement-load
-    /// on`; a prediction only changes what the lease is charged: the memory limit and the cores it is booked and run with stay the request's and the ladder's. A server given a combination
-    /// that breaks one of these refuses to start
+    /// gives the scheduler the prediction as the cost of the operation's lease, at submit (on
+    /// the legacy core also again for an operation read back from the state store at a
+    /// start), which charges the learned memory as well as the cores: a lease is admitted to
+    /// a node only while the memory charged to the node's leases stays within the node's
+    /// memory. An operation the estimator has no usable row for, or is not asked about (not
+    /// an action, one that asks for a GPU, no OS pinned, no subject), gets none and is
+    /// charged as it is with `off`. `shadow` and `on` need `--learned-sizes shadow` or `on`;
+    /// `on` needs `--placement-load on`; a prediction only changes what the lease is charged:
+    /// the memory limit and the cores it is booked and run with stay the request's and the
+    /// ladder's. A server given a combination that breaks one of these refuses to start
     // The text above states the default; the help golden cannot hold the whitespace-only
     // line clap prints before a `[default: ...]` line.
     #[arg(

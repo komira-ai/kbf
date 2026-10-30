@@ -342,7 +342,8 @@ async fn a_joined_caller_neither_counts_nor_changes_the_cost_of_a_waiting_operat
     let rig = rig(PlacementLoad::On, PlacementPredictions::On);
     let mut node = register(&rig, "node-join", 0);
     warm(&rig, &mut node, "node-join").await;
-    // Two 4 GiB leases fill the node's 8 GiB: the next operation waits.
+    // With predictions on each lease is charged the row's cores (2000 m) and a 1 GiB peak, so
+    // two leases fill the node's 4 cores, not its memory: the next operation waits for CPU.
     let (first, _) = start_new(&rig, &mut node, 20).await;
     let (_second, _) = start_new(&rig, &mut node, 21).await;
     let before = counted(&rig);

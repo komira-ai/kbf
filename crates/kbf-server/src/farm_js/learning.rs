@@ -10,9 +10,13 @@
 //!
 //! `--placement-predictions` is a separate flag with the same two steps: the prediction of a
 //! new operation is asked for before its submit ([`KbfAdapter::forecast_submit`], counting
-//! nothing, so a caller that joins a twin counts nothing), given to the core with the submit
+//! nothing; asked of a request that has no twin when asked), given to the core with the submit
 //! (`on`; the scheduler charges it from the first placement round) and counted after it, by
-//! [`KbfAdapter::learn_submit`]. What reaches the scheduler is the cores and the memory
+//! [`KbfAdapter::learn_submit`]. The twin check and the submit are separate holds of the
+//! core's lock, so two identical requests racing can both be asked: the loser joins, is not
+//! counted, and its prediction is still handed to the waiting operation (the core lets a
+//! waiting twin take the newer one). The state store's queue, which other frontends fill,
+//! is read only by the core at the submit, with the same effect. What reaches the scheduler is the cores and the memory
 //! peak of the estimator's row (and its life in minutes, which only a lease charged by a
 //! curve reads): a charge. The lease's booked memory limit and cores are the request's and
 //! the ladder's, whatever is predicted.
@@ -20,7 +24,8 @@
 //! [`js_server_core::Adapter::predicted`] is not implemented: the core asks it for an operation
 //! read back from the state store (at a start, or from another frontend's queue) before it tells
 //! the adapter of the operation, and the subject that keys the estimator's row is in the parcel
-//! of that later call. Such an operation is charged as it is with `off`.
+//! of that later call (komira-ai/jobscheduler#446). Such an operation is charged as it is with
+//! `off`.
 
 // Only the farm of the js core (and the tests) write the summaries; a build without it keeps
 // the pieces for them compiled.
@@ -261,9 +266,12 @@ impl KbfAdapter {
     /// What the estimator predicts for a request about to be submitted (`--placement-
     /// predictions`), asked of the summaries in memory and counting nothing; the core's lock
     /// is held for the lookup only, not for the submit. `None`: predictions are off, or the
-    /// request would join an operation in flight, which keeps its own cost. The prediction
-    /// is counted, and remembered in `shadow`, by [`KbfAdapter::learn_submit`] once the
-    /// submit has said the operation is a new one.
+    /// request has a twin in this scheduler's view, which keeps its own cost. The twin is
+    /// looked for now and the submit follows in a later hold of the lock, so a request that
+    /// races an identical one can still join at the submit and hand its prediction to a
+    /// waiting operation without being counted. The prediction is counted, and remembered in
+    /// `shadow`, by [`KbfAdapter::learn_submit`] once the submit has said the operation is a
+    /// new one.
     pub(crate) fn forecast_submit(
         &self,
         view: &View<'_>,
