@@ -85,6 +85,8 @@ enum Fault {
     AskFails,
     /// A streamed put answers that the claim was withdrawn, whatever it was given.
     Withdrawn,
+    /// A streamed put answers that it stored another blob than the one claimed.
+    StoredAnother,
 }
 
 /// A [`Storage`] over another, that counts FindMissing calls and gets one thing wrong.
@@ -140,6 +142,10 @@ impl Storage for Spy {
     ) -> Answer<'_, Option<Digest>> {
         if matches!(self.fault, Fault::Withdrawn) {
             return Box::pin(async { Ok(None) });
+        }
+        if matches!(self.fault, Fault::StoredAnother) {
+            let other = blob("another blob").0;
+            return Box::pin(async move { Ok(Some(other)) });
         }
         self.inner.put_streamed(size, bytes, claim)
     }
@@ -327,6 +333,14 @@ async fn a_streamed_put_through_a_backend_lands_the_blob_and_refuses_other_bytes
         .put_streamed(&digest, &pieces_of(bytes))
         .await
         .expect_err("not stored");
+    assert!(matches!(error, StorageError::Internal(_)), "{error:?}");
+
+    let (backend, _) = spy(&cache, Fault::StoredAnother);
+    let (digest, bytes) = blob("a streamed blob");
+    let error = backend
+        .put_streamed(&digest, &pieces_of(bytes))
+        .await
+        .expect_err("another blob stored");
     assert!(matches!(error, StorageError::Internal(_)), "{error:?}");
 }
 
