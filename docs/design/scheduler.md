@@ -714,8 +714,11 @@ turns it into one of two outcomes, and the scheduler decides on the committed re
   operation again. The scheduler records the kill as a memory run, as it does a kill at
   the cap, and finishes the operation `Failed(OutOfMemory)` at the booking it ran with:
   the first rung, or the GiB its `kbf-book-mem-gib` names. Its callers are told
-  FAILED_PRECONDITION with reason `ACTION_OUT_OF_MEMORY`, the message naming that booking
-  (`Runs: 1 (4 GiB on node-a)`), and its attempt in the invocation record carries
+  FAILED_PRECONDITION with reason `ACTION_OUT_OF_MEMORY`, the message saying the ladder is
+  off, not that no node is large enough (it passed its memory limit with 4 GiB booked on
+  node-a; the memory ladder is off (--no-memory-climb), so it is not run again with more
+  memory. Runs: 1 (4 GiB on node-a)). The server tells the two apart by the last run: a
+  kill below its cap can only end an operation when the climb is off, and its attempt in the invocation record carries
   `memory_kill` `own_limit`. No booking, floor or key floor is raised, so every
   submission of the action starts where the first did. A kill the node made under memory
   pressure is not the action's: it runs again with the same booking and counts against

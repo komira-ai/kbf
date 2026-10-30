@@ -170,7 +170,8 @@ async fn an_own_limit_kill_climbs_the_ladder_then_tells_the_client() {
 /// Catches `--no-memory-climb` not reaching the scheduler (an own-limit kill still run
 /// again one rung up), a kill answered with another code or without the `ErrorInfo`, a
 /// booking raised or a floor left behind by the kill (the next Execute must book the first
-/// rung again), and a kill answered with the climb on's wording of a spent ladder. The kill is
+/// rung again), and a kill answered with the climb on's wording ("needs more memory than any node offers"),
+/// which is false on a node of 64 GiB. The kill is
 /// the one a node of 64 GiB could still have raised.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_the_climb_an_own_limit_kill_fails_at_the_first_booking() {
@@ -191,9 +192,9 @@ async fn without_the_climb_an_own_limit_kill_fails_at_the_first_booking() {
     assert_eq!(status.code, Code::FailedPrecondition as i32, "{status:?}");
     assert_eq!(
         status.message,
-        "kbf: the action needs more memory than any node offers: it passed its memory \
-         limit with 4 GiB booked on fixed-node, the largest node for its platform. Runs: 1 \
-         (4 GiB on fixed-node)."
+        "kbf: the action passed its memory limit with 4 GiB booked on fixed-node; the \
+         memory ladder is off (--no-memory-climb), so it is not run again with more \
+         memory. Runs: 1 (4 GiB on fixed-node)."
     );
     let [detail] = &status.details[..] else {
         panic!("{status:?}");
@@ -236,11 +237,12 @@ async fn without_the_climb_a_node_pressure_kill_still_reruns_at_the_same_booking
     daemon.no_work().await;
 }
 
-/// Catches `--no-memory-climb` read once at construction but lost when the scheduler takes
-/// a state store's rows over: a second server started over the store the first wrote to
-/// (a restart) must also fail an own-limit kill at the first booking.
+/// Shows that a server started over a state store another server wrote to also fails an
+/// own-limit kill at the first booking. It does not show the setting surviving a recovery of
+/// a lease started before the restart: the flag is applied when the farm is built, before
+/// any row is read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn without_the_climb_a_restarted_server_still_does_not_climb() {
+async fn without_the_climb_a_second_server_over_the_same_store_does_not_climb() {
     let store = std::sync::Arc::new(kbf_state::fake::Fake::with_flaw(
         std::sync::Arc::new(kbf_state::ManualClock::default()),
         kbf_state::fake::Flaw::None,
