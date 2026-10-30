@@ -5,7 +5,10 @@ use kbf_front::Finished;
 use kbf_server::executor::MintError;
 use tonic::Code;
 
-use crate::rig::{Posted, Rig};
+use kbf_server::executor::DISK_MARGIN;
+
+use crate::real_prep::Log;
+use crate::rig::{GIB, INPUT_BYTES, Posted, Rig};
 
 fn code(finished: &Finished) -> Code {
     match finished {
@@ -196,4 +199,99 @@ async fn only_hosts_of_the_reported_system_and_architecture_are_leased() {
     let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
     rig.pump().await;
     assert_eq!(rig.exec.hosts().len(), 1);
+}
+
+/// Catches a run that books the wrong scratch disk: the run posted carries the bytes of the
+/// input closure the grant reports, the operator's output allowance and the fixed margin, each
+/// once. The allowance is set to a number the default is not, so a run that ignores the config
+/// cannot match; the input bytes are not a whole GiB, so a sum that drops them cannot either.
+#[tokio::test(start_paused = true)]
+async fn a_run_books_its_inputs_plus_the_output_allowance_plus_the_margin() {
+    let mut rig = Rig::start(&["node1"], 1, |cfg| cfg.output_disk_bytes = 5 * GIB + 7).await;
+    let run = posted(&mut rig).await;
+    assert_eq!(
+        rig.fake.run_disk_bytes(&run.run),
+        Some(INPUT_BYTES + 5 * GIB + 7 + DISK_MARGIN)
+    );
+}
+
+/// Catches a grant that does not say how large its closure is booking nothing, or booking the
+/// wrong thing: the run books the allowance and the margin, and the executor says in its log
+/// that it did not know the inputs, so an operator who finds a full host can see why.
+#[tokio::test(start_paused = true)]
+async fn a_run_whose_inputs_are_not_measured_books_the_allowance_and_says_so() {
+    let log = Log::default();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish(),
+    );
+    let _logged = tracing::dispatcher::set_default(&dispatch);
+    let mut rig = Rig::start(&["node1"], 1, |cfg| cfg.output_disk_bytes = 5 * GIB + 7).await;
+    rig.pump().await;
+    rig.inputs
+        .grant
+        .lock()
+        .expect("grant")
+        .as_mut()
+        .expect("ok")
+        .input_bytes = None;
+    let _caller = rig.submit(3);
+    rig.pump().await;
+    let run = rig.runs_of(3).await.remove(0);
+    assert_eq!(
+        rig.fake.run_disk_bytes(&run.run),
+        Some(5 * GIB + 7 + DISK_MARGIN)
+    );
+    let said = log.text();
+    assert!(
+        said.contains("size of the inputs is not known") && said.contains("books the allowance"),
+        "{said}"
+    );
+}
+
+/// Catches a run whose disk the host cannot hold being posted, or being taken for a fault of
+/// the host: with the pool's shape under what the run books, the lease server answers
+/// `limits-exceed-shape`, nothing is queued, the host stays held (a refusal is not a reason to
+/// drop or drain it), and the action ends as the farm's to run again, as every other refusal
+/// does. With a shape that holds the run, the same executor posts it.
+#[tokio::test(start_paused = true)]
+async fn a_run_whose_disk_exceeds_the_hosts_shape_is_refused_cleanly() {
+    let booked = INPUT_BYTES + 8 * GIB + DISK_MARGIN;
+    let mut rig = Rig::pooled(
+        &["node1"],
+        1,
+        16,
+        |pool| pool.shape.disk_bytes = Some(booked - 1),
+        |_| {},
+    )
+    .await;
+    rig.pump().await;
+    let caller = rig.submit(3);
+    let finished = rig.until_done(&caller, 3).await;
+    assert_eq!(code(&finished), Code::Internal, "{finished:?}");
+    assert!(rig.runs().await.is_empty(), "a run the host cannot hold");
+    let asked = rig
+        .requests()
+        .iter()
+        .any(|r| r.ends_with("/runs") && r.starts_with("POST"));
+    assert!(
+        asked,
+        "the lease server was never asked: {:?}",
+        rig.requests()
+    );
+    assert_eq!(rig.exec.hosts().len(), 1, "the host was dropped");
+
+    let mut rig = Rig::pooled(
+        &["node1"],
+        1,
+        16,
+        |pool| pool.shape.disk_bytes = Some(booked),
+        |_| {},
+    )
+    .await;
+    let run = posted(&mut rig).await;
+    assert_eq!(rig.fake.run_disk_bytes(&run.run), Some(booked));
 }

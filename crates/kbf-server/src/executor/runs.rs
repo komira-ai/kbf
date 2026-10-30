@@ -384,6 +384,7 @@ impl HostWorker {
             memory_bytes: Config::hard_memory(w.memory_bytes),
             pids: None,
             wall_ms: Some(u64::try_from(wall.as_millis()).unwrap_or(u64::MAX)),
+            disk_bytes: None,
         };
         let mut spec = RunSpec::new(image, limits);
         spec.args = args.argv(ctx.cfg.delivery);

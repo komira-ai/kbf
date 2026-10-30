@@ -68,6 +68,7 @@ impl Inputs for Easy {
         Ok(ReadGrant {
             url: "https://grant.test:9400".to_owned(),
             token: Secret::new("token"),
+            input_bytes: Some(3 * GIB),
         })
     }
 }

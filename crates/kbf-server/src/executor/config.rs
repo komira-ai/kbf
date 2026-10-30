@@ -24,6 +24,15 @@ pub const PRESIGN_LIMIT: Duration = Duration::from_secs(4 * 3600);
 /// on either executor.
 const HARD_CAP_PAD: u64 = 512 << 20;
 
+/// What a run books for its outputs when the operator says nothing: 8 GiB. A host reports its
+/// scratch as one share for all its runs, so this times the host's slots (and the margin, and
+/// the inputs) is what a full host asks of it.
+pub const DEFAULT_OUTPUT_DISK: u64 = 8 * GIB;
+
+/// What a run books beyond its inputs and its output allowance: 1 GiB for what neither counts
+/// (the task tool's own files, the manifest and logs, the filesystem's rounding).
+pub const DISK_MARGIN: u64 = GIB;
+
 /// The executor's settings. Every duration is an upper or lower bound the executor holds
 /// itself to; [`Config::validate`] refuses a set that breaks the ones the scheduler's
 /// safety rests on.
@@ -113,6 +122,11 @@ pub struct Config {
     pub max_blob_bytes: u64,
     /// The longest a pack url may stay good: the store's presign ceiling.
     pub presign_ceiling: Duration,
+    /// The scratch disk a run books for what it writes, in bytes, on top of its inputs: the
+    /// outputs, the pack it builds and the private home, tmp and cache of the work directory
+    /// (`--executor-output-disk-bytes`). A run books this, the bytes of its input closure and
+    /// [`DISK_MARGIN`] ([`Config::disk_bytes`]).
+    pub output_disk_bytes: u64,
 }
 
 /// Why a [`Config`] is refused.
@@ -215,6 +229,7 @@ impl Config {
             max_pack_bytes: 128 << 20,
             max_blob_bytes: 64 << 20,
             presign_ceiling: PRESIGN_LIMIT,
+            output_disk_bytes: DEFAULT_OUTPUT_DISK,
         }
     }
 
@@ -338,6 +353,13 @@ impl Config {
     #[must_use]
     pub fn hard_memory(booking: u64) -> u64 {
         booking.saturating_mul(3) / 2 + HARD_CAP_PAD
+    }
+
+    /// The scratch disk a run books: its `input_bytes` (`None` when the size of its input
+    /// closure is not known), [`Config::output_disk_bytes`] and [`DISK_MARGIN`].
+    #[must_use]
+    pub fn disk_bytes(&self, _input_bytes: Option<u64>) -> u64 {
+        0
     }
 
     /// The wall time of a run of an action of `timeout`. Never the time a lease has left:

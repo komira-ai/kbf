@@ -52,6 +52,7 @@ impl Pool {
                 memory_bytes,
                 gpus: 0,
                 gpu_class: None,
+                disk_bytes: None,
             },
             capabilities: BTreeMap::from([("os".to_owned(), "linux".to_owned())]),
             hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
@@ -163,6 +164,7 @@ struct RunRow {
     cpu_millis: u64,
     memory_bytes: u64,
     wall_ms: u64,
+    disk_bytes: Option<u64>,
     args: Vec<String>,
     image: String,
     mounts: Vec<Mount>,
@@ -462,6 +464,7 @@ impl State {
             cpu_millis: limits.cpu_millis,
             memory_bytes: limits.memory_bytes,
             wall_ms: limits.wall_ms.map_or(cap, |asked| asked.min(cap)),
+            disk_bytes: limits.disk_bytes,
             args: spec.args.clone(),
             image: spec.image.clone(),
             mounts: spec.mounts.clone(),
@@ -629,6 +632,13 @@ impl State {
             row.lease
         });
         lease.map(|lease| self.settle(lease)).is_some()
+    }
+
+    pub(super) fn run_disk_bytes(&self, run: &RunId) -> Option<u64> {
+        self.runs
+            .iter()
+            .find(|row| row.id == *run)
+            .and_then(|row| row.disk_bytes)
     }
 
     pub(super) fn run_wall_ms(&self, run: &RunId) -> Option<u64> {

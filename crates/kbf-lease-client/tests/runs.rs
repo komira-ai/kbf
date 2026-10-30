@@ -5,8 +5,9 @@ mod support;
 
 use std::time::Duration;
 
+use kbf_lease_client::fake::FakeLeaseServer;
 use kbf_lease_client::{ErrorCode, Isolation, Outcome, RunId, RunState};
-use support::{IMAGE, fake, lease, raw_json, refused, run_of};
+use support::{GIB, IMAGE, fake, lease, raw_json, refused, run_of};
 
 /// Asserts a run's life as the client sees it: queued, then what the host does (started,
 /// result reported, listing dropped), with the outcome and exit code only once the host has
@@ -179,6 +180,34 @@ async fn a_job_that_breaks_the_contract_is_refused_with_its_code() {
         let error = client.queue_run(id, &spec).await.unwrap_err();
         assert_eq!(refused(error), (status, code), "{label}");
     }
+}
+
+/// Asserts the disk a run books is passed to the server as asked and checked against the
+/// host's shape: a run whose disk is within the shape is accepted and the server holds the
+/// number it was sent, one over it is `422 limits-exceed-shape`, and a pool that reports no
+/// disk refuses none. It catches a client that drops the disk, and a fake whose shape check
+/// ignores it (the executor's refusal arm would then never be reached).
+#[tokio::test]
+async fn a_runs_disk_is_checked_against_the_hosts_shape() {
+    let mut pool = support::pool();
+    pool.shape.disk_bytes = Some(100 * GIB);
+    let server = FakeLeaseServer::start(pool).await;
+    let client = server.client().unwrap();
+    let id = lease(&client).await;
+    let mut within = run_of(1000, 1);
+    within.limits.disk_bytes = Some(100 * GIB);
+    let run = client.queue_run(id, &within).await.unwrap().run_id;
+    assert_eq!(server.run_disk_bytes(&run), Some(100 * GIB));
+    let mut over = run_of(1000, 1);
+    over.limits.disk_bytes = Some(100 * GIB + 1);
+    let error = client.queue_run(id, &over).await.unwrap_err();
+    assert_eq!(refused(error), (422, ErrorCode::LimitsExceedShape));
+    let (unshaped, client) = fake().await;
+    let id = lease(&client).await;
+    let run = client.queue_run(id, &over).await.unwrap().run_id;
+    assert_eq!(unshaped.run_disk_bytes(&run), Some(100 * GIB + 1));
+    let none = client.queue_run(id, &run_of(1000, 1)).await.unwrap().run_id;
+    assert_eq!(unshaped.run_disk_bytes(&none), None);
 }
 
 /// Asserts that a run's wall limit is the one asked for, cut to what the lease has left, and
