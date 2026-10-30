@@ -238,6 +238,12 @@ fn a_look_that_fails_is_tried_again() {
     let e = wait(&mut s, &args(&WANTED, 20)).expect_err("too many in a row");
     assert_eq!(e.to_string(), "gh api: down");
 
+    // The artifacts call failing after the jobs call worked is a failed look as well.
+    let mut s = Script::new(vec![(running(), made(&WANTED))]);
+    s.flaky = vec![false, true];
+    wait(&mut s, &args(&WANTED, 20)).expect("the look after the failed one works");
+    assert_eq!(s.pauses, 1);
+
     // Failures, a look that works but finds an artifact missing, and failures again: no more
     // than the limit in a row at any time, though more in all.
     let mut flaky = vec![true; few];

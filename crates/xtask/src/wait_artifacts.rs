@@ -10,7 +10,9 @@
 //! fails at once when a job whose name contains `--job-prefix` has failed, was cancelled or
 //! timed out (its artifact will never come, and waiting for it would hold a runner until the
 //! limit), or when every such job has finished and a named artifact is still missing. It
-//! looks every `--poll-seconds`, at most `--polls` times, and fails when they are used up.
+//! looks every `--poll-seconds`, at most `--polls` times, and fails when they are used up. A look
+//! in which GitHub answers an error is tried again, and the wait fails with that error only when
+//! [`FAILED_LOOKS`] looks in a row have failed: one bad reply is not the end of an hour's wait.
 //!
 //! GitHub is spoken to with `gh api` ([`crate::advisories::Process`]); the job's token needs
 //! the `actions: read` permission.
@@ -125,22 +127,52 @@ fn missing(reply: &Value, wanted: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// A reply, or `None` for a call that failed in a look that may be tried again: the error when
+/// that is the `FAILED_LOOKS`th failed look in a row.
+fn tolerate(reply: Result<Value, Error>, failed_looks: &mut u32) -> Result<Option<Value>, Error> {
+    match reply {
+        Ok(value) => Ok(Some(value)),
+        Err(e) => {
+            *failed_looks += 1;
+            if *failed_looks >= FAILED_LOOKS {
+                Err(e)
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
 /// Waits as the module docs say; the line to print when the artifacts are there.
 pub fn wait(github: &mut dyn Github, args: &Args) -> Result<String, Error> {
     let run = format!("repos/{}/actions/runs/{}", args.repo, args.run_id);
     let mut absent = args.artifacts.clone();
+    let mut failed_looks = 0;
     for look in 0..args.polls {
         if look > 0 {
             github.pause();
         }
-        let jobs = github.get(&format!("{run}/jobs?per_page=100"))?;
+        let Some(jobs) = tolerate(
+            github.get(&format!("{run}/jobs?per_page=100")),
+            &mut failed_looks,
+        )?
+        else {
+            continue;
+        };
         let shards = shards(&jobs, &args.job_prefix);
         if let Some(job) = failed(&shards) {
             return Err(Error::Failed(format!(
                 "{job} did not succeed, so its artifact will not come"
             )));
         }
-        let reply = github.get(&format!("{run}/artifacts?per_page=100"))?;
+        let Some(reply) = tolerate(
+            github.get(&format!("{run}/artifacts?per_page=100")),
+            &mut failed_looks,
+        )?
+        else {
+            continue;
+        };
+        failed_looks = 0;
         absent = missing(&reply, &args.artifacts);
         if absent.is_empty() {
             return Ok(format!(
