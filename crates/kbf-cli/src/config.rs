@@ -252,6 +252,10 @@ const GROUPS: &[(&str, &[&str])] = &[
         &[
             "task-closure-max-bytes",
             "task-closure-max-digests",
+            "task-large-credentials-file",
+            "task-large-max-bytes",
+            "task-max-large",
+            "task-max-packs",
             "task-put-bucket",
             "task-put-credentials-file",
             "task-put-endpoint",
