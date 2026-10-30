@@ -36,14 +36,9 @@ nothing, not 0.
 
 ## Reading the series
 
-- Every series except the gauges named as such is a counter since the process started. It never
-  goes down while the process runs, and it restarts at 0 when the process does. Use `rate()` or
-  `increase()` over a window at least four scrape intervals long; the queries on this page use
-  `5m` for a 15 s scrape.
-- Labels have a few fixed values each. None is a key, a bucket or a client, so the number of
-  series stays small however busy the node is.
-- Sum a ratio's numerator and denominator separately (`sum(rate(a)) / sum(rate(b))`), never
-  average per-series ratios.
+- Every series except the gauges named as such is a counter since the process started. It never goes down while the process runs, and it restarts at 0 when the process does. Use `rate()` or `increase()` over a window at least four scrape intervals long; the queries on this page use `5m` for a 15 s scrape.
+- Labels have a few fixed values each. None is a key, a bucket or a client, so the number of series stays small however busy the node is.
+- Sum a ratio's numerator and denominator separately (`sum(rate(a)) / sum(rate(b))`), never average per-series ratios.
 
 ## On `/metricz` today
 
@@ -73,7 +68,7 @@ The cache's series start with `tierstore_cache_`. An S3 GET reaches the cache as
 size and the conditions) and then a GET, so some series count the HEAD and some the GET; the
 tables say which.
 
-#### Reads and bytes
+### v1: reads and bytes
 
 | name | type | labels | increments when |
 |---|---|---|---|
@@ -84,31 +79,16 @@ tables say which.
 
 What they do not count:
 
-- A key the cache is not set to keep (outside every keep policy, or under a reserved prefix) is
-  passed through to the upstream. It counts bytes under `bytes_served_upstream` and is neither a
-  hit nor a miss.
-- A miss counts once for each reader. Readers that share one fill each count a miss, and the
-  fill counts once.
-- A read of a kept key that the cache does not serve is one miss on every path: a ranged GET
-  whose size HEAD to the upstream then fails, a ranged GET of an object over the whole-object
-  limit (passed through, fills nothing, and counts bytes under `bytes_served_upstream`), and a
-  fill that then fails. The miss is counted before any of those calls, so a failure after it
-  does not remove it.
-- A range past the end of an object the cache holds is an error of the client: it is neither a
-  hit nor a miss.
-- A GET of a missing key never reaches the GET: the HEAD before it answers 404. It shows only in
-  the HEAD series below, so the hit and miss counters are rates of GETs that went on to read
-  data.
-- Bytes are counted when the cache hands them to the front, so a client that disconnects while
-  they are sent still has them counted.
-- `bytes_served_upstream` means "answered after going upstream", not "fetched". The read that
-  follows a fill is served from the file the fill just wrote, and counts here although it came
-  from disk. What the cache fetched from the upstream is `tierstore_cache_upstream_bytes_read_total`
-  below.
-- A ranged miss of an object at or under the whole-object limit fills the whole object, then
-  answers the range. Its bytes served are the range; its bytes fetched are the object.
+- A key the cache is not set to keep (outside every keep policy, or under a reserved prefix) is passed through to the upstream. It counts bytes under `bytes_served_upstream` and is neither a hit nor a miss.
+- A miss counts once for each reader. Readers that share one fill each count a miss, and the fill counts once.
+- A read of a kept key that the cache does not serve is one miss on every path: a ranged GET whose size HEAD to the upstream then fails, a ranged GET of an object over the whole-object limit (passed through, fills nothing, and counts bytes under `bytes_served_upstream`), and a fill that then fails. The miss is counted before any of those calls, so a failure after it does not remove it.
+- A range past the end of an object the cache holds is an error of the client: it is neither a hit nor a miss.
+- A GET of a missing key never reaches the GET: the HEAD before it answers 404. It shows only in the HEAD series below, so the hit and miss counters are rates of GETs that went on to read data.
+- Bytes are counted when the cache hands them to the front, so a client that disconnects while they are sent still has them counted.
+- `bytes_served_upstream` means "answered after going upstream", not "fetched". The read that follows a fill is served from the file the fill just wrote, and counts here although it came from disk. What the cache fetched from the upstream is `tierstore_cache_upstream_bytes_read_total` below.
+- A ranged miss of an object at or under the whole-object limit fills the whole object, then answers the range. Its bytes served are the range; its bytes fetched are the object.
 
-#### Fills, failures and eviction
+### v1: fills, failures and eviction
 
 | name | type | labels | increments when |
 |---|---|---|---|
@@ -122,17 +102,12 @@ What they do not count:
 
 The reasons of a failed fill:
 
-- `hash_mismatch`: a key named by its content hashed to another name. The readers get an error
-  and nothing is kept.
-- `upstream_error`: the upstream failed with anything but "not found". A fill whose object does
-  not exist counts nothing here.
-- `short_body`: the upstream gave fewer bytes than the size it had said. The readers are served
-  from the upstream.
+- `hash_mismatch`: a key named by its content hashed to another name. The readers get an error and nothing is kept.
+- `upstream_error`: the upstream failed with anything but "not found". A fill whose object does not exist counts nothing here.
+- `short_body`: the upstream gave fewer bytes than the size it had said. The readers are served from the upstream.
 - `local_io`: the cache directory could not be written.
-- `changed`: the object was written over while it was read. Only keys not named by their content
-  are checked for this.
-- `aborted`: the fill task panicked or was cancelled before it ended. The readers that waited
-  get a 503, and the failure counts once for the fill.
+- `changed`: the object was written over while it was read. Only keys not named by their content are checked for this.
+- `aborted`: the fill task panicked or was cancelled before it ended. The readers that waited get a 503, and the failure counts once for the fill.
 
 `fills_skipped_total` and `fill_failures_total` do not overlap: a short body, a local write error
 and a changed object are failures, not skips. `evictions_total` counts objects, not bytes, and
@@ -142,7 +117,7 @@ up once for each pinned object on every pass, so it keeps rising while an object
 `discarded_at_start_total` is a counter that is set once, when the cache is opened, and stays
 the same for the rest of the process.
 
-#### Gauges
+### v1: gauges
 
 These four are gauges, measured when `/metricz` is read.
 
@@ -153,7 +128,7 @@ These four are gauges, measured when `/metricz` is read.
 | `tierstore_cache_fs_free_bytes` | gauge | free bytes of the file system of the cache directory |
 | `tierstore_cache_staging_files` | gauge | files in the stage directory now: fills that are running |
 
-#### The cache's calls to the upstream
+### v1: the cache's calls to the upstream
 
 | name | type | labels | increments when |
 |---|---|---|---|
@@ -164,23 +139,13 @@ These four are gauges, measured when `/metricz` is read.
 
 What they do not count:
 
-- A fill reads the upstream in ranged chunks, so `op="get"` counts calls, not objects: an object
-  of 350 bytes filled in chunks of 100 is four GET calls. It also counts every pass-through read.
-- `op="head"` counts the cache's own HEADs as well as the clients': the size before a ranged
-  fill, the two HEADs of a fill, the HEAD before a put, and the HEAD after one is acknowledged.
-  `head_hits_total` and `head_misses_total` count only the HEADs the S3 front sends to the
-  cache, which includes the HEAD that the front sends before each GET. So
-  `head_hits_total + head_misses_total` is a lookup rate, not a rate of HEAD requests from
-  clients.
-- A listing counts as one `list` call, and each page of a paged listing counts as one more.
-  Each call of `list_uploads` counts one.
-- Not counted at all: deletes, creating and aborting uploads, sending a part, the start-up probe,
-  and retries made inside a backend wrapper.
-- `upstream_bytes_read_total` counts a GET that returned. The bytes of a GET that failed are not
-  counted, and the bytes of a GET that returned are counted even if the fill then fails (a short
-  body, a hash mismatch, a changed object) or is dropped.
+- A fill reads the upstream in ranged chunks, so `op="get"` counts calls, not objects: an object of 350 bytes filled in chunks of 100 is four GET calls. It also counts every pass-through read.
+- `op="head"` counts the cache's own HEADs as well as the clients': the size before a ranged fill, the two HEADs of a fill, the HEAD before a put, and the HEAD after one is acknowledged. `head_hits_total` and `head_misses_total` count only the HEADs the S3 front sends to the cache, which includes the HEAD that the front sends before each GET. So `head_hits_total + head_misses_total` is a lookup rate, not a rate of HEAD requests from clients.
+- A listing counts as one `list` call, and each page of a paged listing counts as one more. Each call of `list_uploads` counts one.
+- Not counted at all: deletes, creating and aborting uploads, sending a part, the start-up probe, and retries made inside a backend wrapper.
+- `upstream_bytes_read_total` counts a GET that returned. The bytes of a GET that failed are not counted, and the bytes of a GET that returned are counted even if the fill then fails (a short body, a hash mismatch, a changed object) or is dropped.
 
-#### Writes through the cache
+### v1: writes through the cache
 
 These series exist when the cache node is set to send writes to the upstream (write-through).
 Without it, the cache is read-only and they stay 0.
@@ -200,30 +165,22 @@ The reasons of a failed put:
 - `exists`: the upstream's create-only put or completion found the object (412).
 - `unavailable`: the upstream did not answer.
 - `full`: the upstream had no room (507).
-- `bad_digest`: the body did not hash to the name of the object. When the upstream had already
-  taken the put, it counts as a put and as a `bad_digest` failure.
+- `bad_digest`: the body did not hash to the name of the object. When the upstream had already taken the put, it counts as a put and as a `bad_digest` failure.
 - `other`: any other failure.
 
 What they do not count:
 
-- Before sending a put, the cache sends the upstream a HEAD. A key the HEAD finds is answered
-  "already exists" without a put reaching the upstream: it counts in `write_exists_total` only,
-  not as `put_failures` with reason `exists`. That reason counts the races the HEAD did not see.
-- A HEAD before a put that fails with anything but "not found" fails the put although no put
-  was sent. It counts under `put_failures` with the reason its error maps to (`unavailable`,
-  `full`, `other`), and in `upstream_reads_total{op="head"}`.
-- A part that fails, a delete, an abort and a part's retry are not failures here. A part that is
-  accepted counts its bytes even if the upload is never completed, and a client's retry of an
-  accepted part counts them twice.
+- Before sending a put, the cache sends the upstream a HEAD. A key the HEAD finds is answered "already exists" without a put reaching the upstream: it counts in `write_exists_total` only, not as `put_failures` with reason `exists`. That reason counts the races the HEAD did not see.
+- A HEAD before a put that fails with anything but "not found" fails the put although no put was sent. It counts under `put_failures` with the reason its error maps to (`unavailable`, `full`, `other`), and in `upstream_reads_total{op="head"}`.
+- A part that fails, a delete, an abort and a part's retry are not failures here. A part that is accepted counts its bytes even if the upload is never completed, and a client's retry of an accepted part counts them twice.
 - A completion counts one put and no bytes of its own: the bytes are those of its parts.
-- `writes_through_total` counts whole-body puts only, `upstream_puts_total` counts those and
-  completions, and `write_exists_total` counts the HEAD's answer and the upstream's together.
+- `writes_through_total` counts whole-body puts only, `upstream_puts_total` counts those and completions, and `write_exists_total` counts the HEAD's answer and the upstream's together.
 
 ### v2: the hot and cold tiers
 
 One labelled family per measure. `tier` is `hot` or `cold`, and `op` is `get` or `head`. The
 value `local` of `tier` is reserved for the build node's cache, whose series are the ones above;
-see "One dashboard for both" below.
+see "Query: one dashboard for both" below.
 
 | name | type | labels | increments when |
 |---|---|---|---|
@@ -239,42 +196,22 @@ see "One dashboard for both" below.
 
 What they do not count, and how to read them:
 
-- An S3 GET reaches the proxy as a HEAD and then a GET. A GET that is answered at the HEAD shows
-  only under `op="head"`: a key that exists in neither tier, a conditional request that is
-  answered 304 or 412, and a range that cannot be satisfied. So `op="head"` is a lookup rate: it
-  mixes the clients' HEADs with the HEAD that starts every GET. `op="get"` counts only the reads
-  that went on to fetch data.
-- An error is neither a hit nor a miss. A tier that is down does not lower its hit rate; it
-  shows in `read_errors_total`. A hot-tier error ends the read: the cold tier is not asked, so
-  a hot outage does not show as cold reads.
-- Bytes are counted when the proxy hands them to the front, so a client that disconnects while
-  they are sent still has them counted. A range that cannot be satisfied after a cold read has
-  counted the cold hit and the cold bytes read, and no bytes served.
-- A ranged GET that misses the hot tier, while the hot tier is at its critical mark, asks the
-  cold tier for the range alone and copies nothing: it counts a `critical` skip, and its
-  `bytes_read` and `bytes_served` are both the range.
-- Otherwise a ranged GET that misses the hot tier reads the whole object from the cold tier, promotes the
-  whole object, and serves the range. Its `bytes_read` and `promoted_bytes` are the object's
-  size, and its `bytes_served` is the range.
+- An S3 GET reaches the proxy as a HEAD and then a GET. A GET that is answered at the HEAD shows only under `op="head"`: a key that exists in neither tier, a conditional request that is answered 304 or 412, and a range that cannot be satisfied. So `op="head"` is a lookup rate: it mixes the clients' HEADs with the HEAD that starts every GET. `op="get"` counts only the reads that went on to fetch data.
+- An error is neither a hit nor a miss. A tier that is down does not lower its hit rate; it shows in `read_errors_total`. A hot-tier error ends the read: the cold tier is not asked, so a hot outage does not show as cold reads.
+- Bytes are counted when the proxy hands them to the front, so a client that disconnects while they are sent still has them counted. A range that cannot be satisfied after a cold read has counted the cold hit and the cold bytes read, and no bytes served.
+- A ranged GET that misses the hot tier, while the hot tier is at its critical mark, asks the cold tier for the range alone and copies nothing: it counts a `critical` skip, and its `bytes_read` and `bytes_served` are both the range.
+- Otherwise a ranged GET that misses the hot tier reads the whole object from the cold tier, promotes the whole object, and serves the range. Its `bytes_read` and `promoted_bytes` are the object's size, and its `bytes_served` is the range.
 - A HEAD promotes nothing.
-- `critical` is a skip because the hot tier is at or above its critical mark by the usage the
-  reconciler last published, and also while the proxy takes the hot tier to be full because it
-  answered an earlier copy with "full" a moment ago. `full` is the hot tier answering this copy
-  with "full". `raced` is another read having copied the object first: two concurrent cold GETs
-  of one object read it twice and promote it once, and the second counts `raced`. `failed` is
-  any other error of the copy.
-- `promotions_total` counts a copy when the hot tier has taken it, before the entry for it is
-  appended to the journal. That append can fail, and then the object can later leave the hot
-  tier with no trace in these counters.
-- A GET that is dropped while it copies has counted its cold hit and its bytes, and neither a
-  promotion nor a skip. So promotions plus skips can be fewer than cold hits.
+- `critical` is a skip because the hot tier is at or above its critical mark by the usage the reconciler last published, and also while the proxy takes the hot tier to be full because it answered an earlier copy with "full" a moment ago. `full` is the hot tier answering this copy with "full". `raced` is another read having copied the object first: two concurrent cold GETs of one object read it twice and promote it once, and the second counts `raced`. `failed` is any other error of the copy.
+- `promotions_total` counts a copy when the hot tier has taken it, before the entry for it is appended to the journal. That append can fail, and then the object can later leave the hot tier with no trace in these counters.
+- A GET that is dropped while it copies has counted its cold hit and its bytes, and neither a promotion nor a skip. So promotions plus skips can be fewer than cold hits.
 
 ### The queries
 
 All of these use a `5m` window. Every `sum` is outside the `rate`. Shorten the window to see a
 change sooner and lengthen it to smooth a quiet node; keep it at least four scrape intervals.
 
-#### Hit rate per tier
+### Query: hit rate per tier
 
 The v1 local cache, from the cache's own series. Errors are not in either term, so a failing
 upstream does not lower the rate:
@@ -315,7 +252,7 @@ sum(rate(tierstore_hits_total{tier="cold",op="get"}[5m]))
 
 To count errors as non-hits, divide by `tierstore_reads_total` for the tier instead.
 
-#### One dashboard for both: the v1 cache as tier="local"
+### Query: one dashboard for both, the v1 cache as tier="local"
 
 The shared series have `tier` and `op` labels and the cache's do not. `label_replace` adds the
 label, and `or` joins the two shapes, so one panel, `sum by (tier)`, reads either deployment.
@@ -378,7 +315,7 @@ the fills and the evictions have none either, and `tierstore_cache_head_hits_tot
 clients' HEADs, not `op="head"` of the shared family. The `local` values count a GET once per reader at the cache, and the `hot` and `cold`
 values once per GET at the proxy, so compare the rates, not the totals.
 
-#### Cold-read share of GETs (v2)
+### Query: cold-read share of GETs (v2)
 
 Every GET asks the hot tier first, so the share of GETs that had to read the cold tier is the
 cold reads over the hot reads:
@@ -398,7 +335,7 @@ sum(rate(tierstore_hits_total{tier="cold",op="get"}[5m]))
 sum(rate(tierstore_hits_total{op="get"}[5m]))
 ```
 
-#### Read amplification
+### Query: read amplification
 
 Bytes read from below divided by bytes served. For the v1 cache, over all answers, and over the
 answers that went upstream:
@@ -438,7 +375,7 @@ sum(rate(tierstore_bytes_served_total[5m]))
 On the hot tier the two byte counters are equal, so the second query is 1 plus the extra bytes
 that whole-object cold reads cost.
 
-#### Write-through put failure rate by reason (v1)
+### Query: write-through put failure rate by reason (v1)
 
 Failures per second, by reason:
 
@@ -459,7 +396,7 @@ ignoring (reason) group_left
 
 The denominator counts a bad-digest put that the upstream took twice, once as a put and once as
 a failure, and does not count puts refused because the HEAD before the send found the key (see
-"Writes through the cache"). For the share of puts refused because the key exists, add `write_exists_total`:
+"v1: writes through the cache"). For the share of puts refused because the key exists, add `write_exists_total`:
 
 ```promql
 sum(rate(tierstore_cache_write_exists_total[5m]))
@@ -469,7 +406,7 @@ sum(rate(tierstore_cache_write_exists_total[5m]))
   + sum(rate(tierstore_cache_upstream_put_failures_total{reason!="exists"}[5m])))
 ```
 
-#### Promotions per cold hit (v2)
+### Query: promotions per cold hit (v2)
 
 ```promql
 sum(rate(tierstore_promotions_total[5m]))
