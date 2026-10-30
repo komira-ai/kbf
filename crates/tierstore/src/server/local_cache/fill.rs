@@ -9,11 +9,12 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use futures::FutureExt as _;
-use futures::future::{BoxFuture, Shared};
+use futures::future::{BoxFuture, OptionFuture, Shared};
 use sha2::{Digest, Sha256};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt as _;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, oneshot};
+use tokio::task::JoinHandle;
 
 use crate::{ByteRange, Error};
 
@@ -32,6 +33,9 @@ pub(super) enum Filled {
 
 /// A fill that is running, which every reader of the key waits on.
 pub(super) type Pending = Shared<BoxFuture<'static, Result<Filled, Error>>>;
+
+/// The task of a fill.
+type Task = JoinHandle<Result<Filled, Error>>;
 
 /// Why a fill ended without an object.
 #[derive(Debug)]
@@ -211,34 +215,83 @@ impl Inner {
         key: &str,
         name: &Name,
     ) -> Result<Filled, Error> {
-        let pending = {
+        match self.join_or_start(key, name) {
+            Ok(pending) => pending.await,
+            Err(filled) => Ok(filled),
+        }
+    }
+
+    /// The fill of `key` to wait for (`Ok`), started if none is running; or (`Err`) the answer
+    /// that needs no wait. It does not wait, and it holds no lock when it returns.
+    ///
+    /// The fill is started after the table of the fills that run is unlocked. The task is
+    /// spawned with its [`Flight`], and a spawn that drops the task at once (the runtime is
+    /// shutting down) drops the flight on this thread, which locks the table: with the table
+    /// locked by this thread that is a deadlock. The entry is therefore put in the table first,
+    /// with a fill that waits for the task, and the task is handed to it after the unlock.
+    pub(super) fn join_or_start(
+        self: &Arc<Self>,
+        key: &str,
+        name: &Name,
+    ) -> Result<Pending, Filled> {
+        let (pending, launch) = {
             let mut flights = locked(&self.flights);
             // A fill that ended after the reader missed, and before it got here, left the object
             // in the index (it is put there before the flight is removed): that is not a miss
             // to fill again.
             if locked(&self.index).get(&name.hex).is_some() {
-                return Ok(Filled::Kept);
+                return Err(Filled::Kept);
             }
             match flights.entry(name.hex.clone()) {
-                Entry::Occupied(running) => running.get().clone(),
+                Entry::Occupied(running) => (running.get().clone(), None),
                 Entry::Vacant(slot) => {
                     let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
                         bump(&self.counters.fills_skipped);
                         bump(&self.counters.fills_skipped_busy);
-                        return Ok(Filled::Skipped);
+                        return Err(Filled::Skipped);
                     };
-                    slot.insert(self.start(key, name, permit)).clone()
+                    let (sender, receiver) = oneshot::channel();
+                    let pending = self.waiting(receiver);
+                    slot.insert(pending.clone());
+                    (pending, Some((permit, sender)))
                 }
             }
         };
-        pending.await
+        if let Some((permit, sender)) = launch {
+            self.start(key, name, permit, sender);
+        }
+        Ok(pending)
+    }
+
+    /// The fill that waits for the task that `receiver` is to be given, and for its end. A task
+    /// that did not end by itself is an error of the readers that waited for it, and is counted.
+    fn waiting(self: &Arc<Self>, receiver: oneshot::Receiver<Task>) -> Pending {
+        let inner = Arc::clone(self);
+        let waiting = async move {
+            let task = OptionFuture::from(receiver.await.ok()).await;
+            match task.and_then(Result::ok) {
+                Some(filled) => filled,
+                None => {
+                    inner.counters.failed(FailedFill::Aborted);
+                    let text = "the fill of the object did not finish";
+                    Err(Error::Unavailable(text.to_owned()))
+                }
+            }
+        };
+        waiting.boxed().shared()
     }
 
     /// Runs the fill on a task of its own, so that it ends even if every reader goes away, and
     /// takes it out of the table of the fills that run when it ends, panics or is cancelled. The
-    /// permit is held until then. A task that did not end by itself is an error of the readers
-    /// that waited for it, and is counted.
-    fn start(self: &Arc<Self>, key: &str, name: &Name, permit: OwnedSemaphorePermit) -> Pending {
+    /// permit is held until then. The task is sent to the fill that waits for it. The table must
+    /// not be locked by the caller (see [`join_or_start`](Self::join_or_start)).
+    fn start(
+        self: &Arc<Self>,
+        key: &str,
+        name: &Name,
+        permit: OwnedSemaphorePermit,
+        sender: oneshot::Sender<Task>,
+    ) {
         let (inner, key, name) = (Arc::clone(self), key.to_owned(), name.clone());
         // Built before the spawn, so a task dropped before its first poll still takes its key out.
         let flight = Flight {
@@ -250,18 +303,8 @@ impl Inner {
             let _flight = flight;
             inner.fill(&key, &name).await
         });
-        let inner = Arc::clone(self);
-        let waiting = async move {
-            match task.await {
-                Ok(filled) => filled,
-                Err(_) => {
-                    inner.counters.failed(FailedFill::Aborted);
-                    let text = "the fill of the object did not finish";
-                    Err(Error::Unavailable(text.to_owned()))
-                }
-            }
-        };
-        waiting.boxed().shared()
+        // The receiver is in the fill that is in the table, and in the caller: it is there.
+        let _ = sender.send(task);
     }
 
     /// Reads the object into the stage directory and, if it is whole and is what its name says,

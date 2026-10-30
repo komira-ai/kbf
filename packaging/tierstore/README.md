@@ -351,7 +351,10 @@ Memory. A fill holds one chunk (8 MiB) at a time, so the memory of the fills is 
 `max_concurrent_fills` chunks (4 by default: 32 MiB). A miss of a key with no fill running, when
 that many fills are running, does not wait for one: it is served from the upstream as a
 pass-through, keeps nothing, and is counted in `fills_skipped_total` and `fills_skipped_busy_total`.
-The misses of a key whose fill is running share it and need no slot. That bound is only for the
+The misses of a key whose fill is running share it and need no slot. A pass-through is not retried:
+the object is filled by the next miss of its key that finds a free slot, so with every slot busy
+for long, as under a sustained cold load, new keys are warmed more slowly (watch
+`fills_skipped_busy_total`; raise `max_concurrent_fills` if it climbs). That bound is only for the
 fills. The front holds a response whole, as it does for any backend, so a GET of a large object
 (a whole GET, or a range) holds the bytes asked in memory for the request, hit, miss or
 pass-through, whether or not the object is kept, and a whole GET of a miss holds the object once

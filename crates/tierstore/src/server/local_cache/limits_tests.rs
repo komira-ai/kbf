@@ -2,14 +2,16 @@
 //! most fills that run at once, and readers that share a fill that fails.
 
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use tokio::task::JoinHandle;
 
+use super::fill::{Filled, Pending};
 use super::layout::name_of;
-use super::locked;
 use super::metrics::{FailedFill, read};
 use super::testing::{Rig, digest, pattern};
+use super::{Inner, locked};
 use crate::{Backend, Error, Op};
 
 type Reader = JoinHandle<Result<Bytes, Error>>;
@@ -89,7 +91,8 @@ async fn a_fill_that_panics_frees_its_key_and_its_waiters_get_an_error() {
 /// other way round, the index is read before the commit and the reservation after it, and the
 /// object is counted in neither. The bytes held before the second reservation already refuse
 /// it, so this test is red for that order only; it does not tell the index read from the
-/// reserved bytes. A reservation that fits is kept.
+/// reserved bytes. A reservation that fits is kept. (The two terms of the sum are told apart
+/// by `a_reservation_counts_the_index_the_running_fills_and_both`.)
 #[tokio::test]
 async fn a_fill_that_commits_between_the_steps_of_a_reservation_is_counted() {
     let rig = Rig::with("tscache-reserve-race", |config| {
@@ -112,6 +115,110 @@ async fn a_fill_that_commits_between_the_steps_of_a_reservation_is_counted() {
     assert_eq!(inner.reserved.load(Ordering::SeqCst), 40);
     drop(fits);
     assert_eq!(inner.reserved.load(Ordering::SeqCst), 0);
+}
+
+/// A cache of 100 bytes with the critical mark at 95, called `name`.
+fn tight(name: &str) -> Rig {
+    Rig::with(name, |config| {
+        config.budget = 100;
+        config.high_water = 100;
+        config.low_water = 50;
+    })
+}
+
+/// Puts an object of `size` bytes in the index of the rig, as a fill that committed does.
+fn commit_object(rig: &Rig, key: &str, size: u64) {
+    let name = name_of(key);
+    locked(&rig.cache.inner.index).insert(&name.hex, size, "tag".to_owned(), 0);
+}
+
+/// Asserts that a reservation is refused for the objects in the index, for the fills that run, and
+/// for the two together, each with sizes where the other term alone would let it through, and
+/// that one that lands exactly on the critical mark (95) is kept. The sum is of the index
+/// (`held`), the reservations made before (`before`) and the new size: with 60 in the index, 40
+/// more is refused though nothing is reserved; with 60 reserved and an empty index, the same;
+/// with 30 in the index and 30 reserved, 40 more is refused though each term and the size make 70.
+/// A reservation that is refused leaves nothing reserved. A defect that left the index out of
+/// the sum passes the first case, one that left the reserved bytes out the second, and one that
+/// took the larger of the two terms the third.
+#[tokio::test]
+async fn a_reservation_counts_the_index_the_running_fills_and_both() {
+    let indexed = tight("tscache-reserve-index");
+    commit_object(&indexed, "cas/b/one", 60);
+    assert!(indexed.cache.inner.reserve(40).is_none());
+    assert_eq!(indexed.cache.inner.reserved.load(Ordering::SeqCst), 0);
+    assert!(indexed.cache.inner.reserve(35).is_some());
+
+    let running = tight("tscache-reserve-running");
+    let inner = &running.cache.inner;
+    let fill = inner.reserve(60).expect("room for the fill that runs");
+    assert!(inner.reserve(40).is_none());
+    assert_eq!(inner.reserved.load(Ordering::SeqCst), 60);
+    assert!(inner.reserve(35).is_some());
+    drop(fill);
+    assert_eq!(inner.reserved.load(Ordering::SeqCst), 0);
+
+    let both = tight("tscache-reserve-both");
+    commit_object(&both, "cas/b/one", 30);
+    let inner = &both.cache.inner;
+    let fill = inner.reserve(30).expect("room for the fill that runs");
+    assert!(inner.reserve(40).is_none());
+    assert_eq!(inner.reserved.load(Ordering::SeqCst), 30);
+    assert!(inner.reserve(35).is_some());
+    drop(fill);
+}
+
+/// Asserts that a fill started by a thread of a runtime that is shutting down (its task is
+/// dropped by the spawn, on the thread that spawned it) does not wait for the table of the fills
+/// that run, and leaves no key in it: the dropped task takes its key out, the table and the
+/// permit are free again, and the reader that joined gets the `Unavailable` error and the failure
+/// is counted as `aborted`. The start runs from the drop of a task during the shutdown, which
+/// is when a spawn drops its task at once. A start made with the table locked would wait on
+/// that lock for ever, so the defect is a test that does not end.
+#[test]
+fn a_fill_dropped_by_its_spawn_leaves_no_key_in_the_table() {
+    /// Starts a fill when it is dropped.
+    struct Starter {
+        inner: Arc<Inner>,
+        joined: Arc<Mutex<Option<Result<Pending, Filled>>>>,
+    }
+
+    impl Drop for Starter {
+        fn drop(&mut self) {
+            let joined = self.inner.join_or_start("cas/b/obj", &name_of("cas/b/obj"));
+            *locked(&self.joined) = Some(joined);
+        }
+    }
+
+    let rig = Rig::new("tscache-spawn-dropped");
+    let inner = Arc::clone(&rig.cache.inner);
+    let joined = Arc::new(Mutex::new(None));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let starter = Starter {
+        inner: Arc::clone(&inner),
+        joined: Arc::clone(&joined),
+    };
+    let task = runtime.spawn(async move {
+        let _starter = starter;
+        std::future::pending::<()>().await;
+    });
+    drop(task);
+    drop(runtime);
+
+    assert!(locked(&inner.flights).is_empty());
+    assert_eq!(
+        inner.permits.available_permits(),
+        rig.config.max_concurrent_fills
+    );
+    let pending = locked(&joined).take().unwrap().unwrap();
+    let waiter = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let error = waiter.block_on(pending).unwrap_err();
+    assert!(error.is_unavailable(), "{error}");
+    assert_eq!(rig.cache.counters().failures(FailedFill::Aborted), 1);
 }
 
 /// Asserts the most fills that run at once. With one permit and the fill of one key held, a

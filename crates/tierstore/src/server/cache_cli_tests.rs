@@ -14,7 +14,7 @@ use kbf_testkit::dir::TestDir;
 use tokio::sync::oneshot;
 
 use super::Drained;
-use super::cache_cli::{run_cache, serve_cache};
+use super::cache_cli::{run_cache, serve_cache, size_of_file_system};
 use super::cli::Error;
 use super::cli::exit_status;
 use super::config::{PerRun, settings_from_text};
@@ -354,6 +354,48 @@ async fn a_budget_larger_than_the_file_system_less_the_floor_is_refused_with_sta
     let enough = Arc::new(FakeDisk::new());
     enough.set_space(1_165_084, 1_165_084);
     let disk: Arc<dyn Disk> = enough;
+    let drained = serving(&settings, upstream, disk, nothing).await.unwrap();
+    assert_eq!(drained, Drained { abandoned: 0 });
+}
+
+/// Asserts what the start does with a file system whose size it cannot use: when the system
+/// refuses the question the answer is the reason (naming that the size could not be read), when it
+/// answers 0 bytes the answer is that reason, and in neither case is the budget refused; the node
+/// starts (and says so on stderr). A size that is read is returned as it is. A defect that read
+/// "unknown" as 0 would refuse every budget with exit status 2, and one that read it as a
+/// size would start a node on a budget it was never compared with.
+#[tokio::test]
+async fn a_file_system_whose_size_is_unknown_is_not_judged_and_the_node_starts() {
+    let path = std::env::temp_dir();
+    let failing = FakeDisk::new();
+    failing.set(Quirk::SpaceFails);
+    let why = size_of_file_system(&failing, &path).unwrap_err();
+    assert!(why.contains("could not be read"), "{why}");
+
+    let empty = FakeDisk::new();
+    empty.set_space(0, 0);
+    let why = size_of_file_system(&empty, &path).unwrap_err();
+    assert!(why.contains("reports a size of 0 bytes"), "{why}");
+
+    let sized = FakeDisk::new();
+    sized.set_space(5000, 100);
+    assert_eq!(size_of_file_system(&sized, &path), Ok(5000));
+
+    let node = Node::new("tscache-cli-room-unknown");
+    let settings = node.settings("", "");
+    let upstream: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let nothing = |_addr: SocketAddr| async {};
+    let refusing = Arc::new(FakeDisk::new());
+    refusing.set(Quirk::SpaceFails);
+    let disk: Arc<dyn Disk> = refusing;
+    let drained = serving(&settings, upstream.clone(), disk, nothing)
+        .await
+        .unwrap();
+    assert_eq!(drained, Drained { abandoned: 0 });
+
+    let zero = Arc::new(FakeDisk::new());
+    zero.set_space(0, 0);
+    let disk: Arc<dyn Disk> = zero;
     let drained = serving(&settings, upstream, disk, nothing).await.unwrap();
     assert_eq!(drained, Drained { abandoned: 0 });
 }

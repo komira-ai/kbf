@@ -8,7 +8,8 @@
 //! the upstream a HEAD of a key that is not there, which it answers with 404 when it is up and
 //! the key is accepted (an upstream that does not answer is exit status 1: a restart may mend
 //! it). A `budget` above the size of the file system less the `free_floor` is refused as
-//! flags that cannot go together (exit status 2). The build node's upstream is read with a
+//! flags that cannot go together (exit status 2); a file system whose size cannot be read, or
+//! that reports 0 bytes, is not judged: the start says so on stderr and goes on. The build node's upstream is read with a
 //! read-only key, so the write checks of the storage node's self-test are not run against it.
 //!
 //! On SIGTERM or SIGINT the process drains as a storage node does; the eviction pass is the only
@@ -17,6 +18,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,6 +46,19 @@ async fn reach(upstream: &dyn Backend, run: &str, spec: &str) -> Result<(), Erro
     }
 }
 
+/// The size of the file system under `path` in bytes, or why it is not known: the system did not
+/// answer, or it answered 0 (a file system that does not report its size, which a budget cannot
+/// be compared with).
+pub(super) fn size_of_file_system(disk: &dyn Disk, path: &Path) -> Result<u64, String> {
+    match disk.space(path) {
+        Ok(space) if space.total > 0 => Ok(space.total),
+        Ok(_) => Err("the file system reports a size of 0 bytes".to_owned()),
+        Err(why) => Err(format!(
+            "the size of the file system could not be read: {why}"
+        )),
+    }
+}
+
 /// Opens the cache in `config`, checks its file system and the upstream, and says on stderr what
 /// the start found.
 async fn open(
@@ -62,20 +77,24 @@ async fn open(
         )
     })?;
     check_local(&*disk, cache.path(), run)?;
-    // A file system whose size cannot be read is not judged: the check above has used it.
-    let total = disk
-        .space(cache.path())
-        .map_or(u64::MAX, |space| space.total);
-    if config.budget > config.room(total) {
-        let text = format!(
-            "local_cache.budget: {} bytes is more than the {} bytes of the file system at {} \
-             less its free_floor of {} percent",
-            config.budget,
-            total,
-            config.path.display(),
-            config.free_floor
-        );
-        return Err(Box::new(InvalidFlags(text)));
+    // A file system whose size cannot be read is not judged: the start says so and goes on.
+    match size_of_file_system(&*disk, cache.path()) {
+        Ok(total) if config.budget > config.room(total) => {
+            let text = format!(
+                "local_cache.budget: {} bytes is more than the {} bytes of the file system at {} \
+                 less its free_floor of {} percent",
+                config.budget,
+                total,
+                config.path.display(),
+                config.free_floor
+            );
+            return Err(Box::new(InvalidFlags(text)));
+        }
+        Ok(_) => {}
+        Err(why) => eprintln!(
+            "tierstore: warning: {why} (at {}); local_cache.budget is not checked against it",
+            config.path.display()
+        ),
     }
     let (bytes, objects) = cache.held();
     eprintln!(

@@ -153,6 +153,8 @@ pub(in crate::server) enum Quirk {
     OneLink,
     /// Every link fails with this kind of error.
     LinkFails(io::ErrorKind),
+    /// `space` fails, as a `statvfs` that the system refuses.
+    SpaceFails,
 }
 
 /// The file system of the machine, with the answers a test changes.
@@ -195,6 +197,9 @@ impl FakeDisk {
 
 impl Disk for FakeDisk {
     fn space(&self, path: &Path) -> io::Result<Space> {
+        if self.quirk() == Quirk::SpaceFails {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
         let set = *self.space.lock().unwrap_or_else(PoisonError::into_inner);
         match set {
             Some(space) => Ok(space),
