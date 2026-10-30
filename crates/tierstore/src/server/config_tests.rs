@@ -325,7 +325,11 @@ fn the_keys_of_a_tier_must_fit_its_kind() {
             "hot_store.path",
         ),
         ("kind = \"memory\"", "hot_store.budget"),
-        ("kind = \"tape\"\nbudget = 1", "tape"),
+        // The refused value is never shown; the key and the values it takes are.
+        (
+            "kind = \"tape\"\nbudget = 1",
+            "kind: not a value this key takes",
+        ),
     ];
     for (table, key) in cases {
         let why = refusal(&minimal_with(hot, table));

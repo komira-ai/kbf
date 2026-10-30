@@ -523,10 +523,17 @@ fn syntax(text: &str, error: &toml::de::Error) -> ConfigError {
             .map_or("another value", |(_, expected)| expected);
         let key = key.unwrap_or("a value");
         format!("{key}: not a value this key takes (it is not shown); expected {expected}")
-    } else if value.is_empty() {
-        message.to_owned()
     } else {
-        message.replace(value, "(value)")
+        let message = if value.is_empty() {
+            message.to_owned()
+        } else {
+            message.replace(value, "(value)")
+        };
+        // A value's own parse error (a size, a duration, an address) does not name its key.
+        match key {
+            Some(key) => format!("{key}: {message}"),
+            None => message,
+        }
     };
     ConfigError::Syntax { line, column, what }
 }
