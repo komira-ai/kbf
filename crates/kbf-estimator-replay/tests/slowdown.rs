@@ -361,7 +361,7 @@ fn the_verb_reads_an_export_and_prints_text_or_json() {
     for want in [
         "slowdown on busy hosts",
         "node CPU pressure at lease start <= 5.00%",
-        "10th percentile",
+        "baseline: percentile 10 (nearest rank)",
         "keys: 1 with a quiet baseline, 1 without",
         "overall (2 runs): median 1.00x, p90 3.00x, above 1.5x: 1/2",
     ] {
@@ -415,5 +415,31 @@ fn bad_arguments_and_a_missing_export_fail() {
     assert!(
         matches!(err, Failure::Run(ref t) if t.contains("none")),
         "{err:?}"
+    );
+}
+
+/// Catches a report with no quiet run anywhere that divides by nothing, prints a number for
+/// an absent one, or hides the keys it could not score.
+#[test]
+fn a_history_with_no_quiet_run_says_so() {
+    let rows = vec![
+        ok("b", "n1", 100, 100, Some(BUSY)),
+        ok("u", "n1", 1_000, 100, None),
+    ];
+    let report = analyze(&rows, &Params::default());
+    assert_eq!(report.overall, Summary::default());
+    let text = render_text(&report);
+    assert!(
+        text.contains("overall (0 runs): median -, p90 -, above 1.5x: 0/0 = -"),
+        "{text}"
+    );
+    assert!(text.contains("baseline none"), "{text}");
+    assert!(
+        text.contains("keys: 0 with a quiet baseline, 1 without"),
+        "{text}"
+    );
+    assert!(
+        text.contains("measured runs with no pressure reading: 1"),
+        "{text}"
     );
 }
