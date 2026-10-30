@@ -419,10 +419,14 @@ fn the_water_marks_are_judged_at_their_edges() {
             "local_cache.keep_wait",
         ),
         (
-            // A value that is not a duration is refused by the parser of the file, whose message
-            // gives the line and the column of the value and not the name of the key.
+            // A value that is not a duration is refused naming its key and the kind of value, and
+            // without the value (the loop below checks that "soon" is not shown).
             cache_with("keep_wait  = \"45s\"", "keep_wait  = \"soon\""),
-            "not a duration",
+            "keep_wait: not a value this key takes (it is not shown); expected a duration such as",
+        ),
+        (
+            cache_with("keep_deadline = \"5m\"", "keep_deadline = \"later\""),
+            "keep_deadline: not a value this key takes (it is not shown); expected a duration such as",
         ),
         (
             cache_with("keep_deadline = \"5m\"", "keep_deadline = \"0s\""),
@@ -436,6 +440,7 @@ fn the_water_marks_are_judged_at_their_edges() {
     for (text, key) in refused {
         let why = refusal(&text);
         assert!(why.contains(key), "{key}: {why}");
+        assert!(!why.contains("soon") && !why.contains("later"), "{why}");
     }
 }
 
