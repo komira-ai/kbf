@@ -373,7 +373,7 @@ fn check_config_checks_the_oci_table_of_a_build_node() {
                 "listen = \"127.0.0.1:0\"\ntls_cert_file = \"/no/such/cert.pem\"\ntls_key_file = \"{key}\""
             ),
             "/no/such/cert.pem",
-            2,
+            1,
         ),
         (
             format!("listen = \"127.0.0.1:0\"\ntls_cert_file = \"{key}\""),
@@ -381,13 +381,15 @@ fn check_config_checks_the_oci_table_of_a_build_node() {
             2,
         ),
     ];
-    for (n, (oci, want, status)) in cases.into_iter().enumerate() {
+    // The check exits 2 for every refusal; a start exits 1 for a file it cannot read, as the
+    // storage node's does, and 2 for a file that does not load.
+    for (n, (oci, want, started_status)) in cases.into_iter().enumerate() {
         let config = with(&format!("oci-bad-{n}.toml"), &oci);
         let (code, out, said) = run(&checking(&config));
-        assert_eq!((code, out.as_str()), (status, ""), "{oci}");
+        assert_eq!((code, out.as_str()), (2, ""), "{oci}");
         assert!(said.contains(want), "{want}: {said}");
         let (code, _, started) = run(&["--config".to_owned(), config]);
-        assert_eq!(code, status, "{oci}");
+        assert_eq!(code, started_status, "{oci}");
         assert_eq!(said, started, "{oci}");
     }
 }

@@ -658,7 +658,9 @@ fn check_config_of_a_build_node_checks_its_oci_table() {
     );
     let why = checked(&load(&no_cert).unwrap()).unwrap_err();
     assert!(why.to_string().contains("/no/such/cert.pem"), "{why}");
-    assert_eq!(exit_status(&why), 2);
+    // A start exits 1 for a file it cannot read (a restart may mend that); `--check-config` exits
+    // 2 for any refusal, which the binary test checks.
+    assert_eq!(exit_status(&why), 1);
 
     let lone = format!("listen = \"127.0.0.1:0\"\nprefix = \"cas/\"\ntls_cert_file = \"{key}\"");
     let why = load(&lone).unwrap_err();
