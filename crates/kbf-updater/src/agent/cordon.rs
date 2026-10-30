@@ -7,11 +7,25 @@
 //! between the drain and the undrain finds its own cordon on the next attempt.
 //!
 //! [`OwnCordon`] keeps that on disk. A drain of a node that is in placement first writes a
-//! mark file for the node (and syncs it and its directory), then drains. The mark is removed
-//! only after an undrain worked. A node with a mark reads as [`Placed::In`] whatever the
-//! frontend says; a node with none reads as the frontend says. The mark lives in the agent's
-//! cordon directory (`--cordon-dir`, else `--state-dir`, else the directory of
-//! `--client-key`), one file per node, so it survives a restart of the agent and of the host.
+//! mark file for the node and the unit being updated (`cordon-<node>.<unit>`, `kbf` for the
+//! agent's own update, the service's name for a service's; synced, with its directory), then
+//! drains. The mark is removed only after an undrain worked. A node with any mark reads as
+//! [`Placed::In`]; a node with none reads as the frontend says. The marks live in the agent's
+//! cordon directory (`--cordon-dir`, else `--state-dir`, else the directory of `--client-key`),
+//! so they survive a restart of the agent and of the host.
+//!
+//! - **A mark means something only while its cordon is there.** Whenever the agent reads a
+//!   marked node and finds it serving (in [`Drain::placed`], and in [`Drain::observe`], which
+//!   the agent calls for every unit at start and at each idle heartbeat), the cordon was given
+//!   back by hand and every mark of the node is removed. A frontend that cannot be asked
+//!   leaves the marks. The frontend's node read carries nothing that names one cordon (no
+//!   generation, no time), so a cordon given back and made again by an operator between two
+//!   looks is not told from the updater's.
+//! - **One mark per unit.** An undrain removes its own mark and uncordons only when no mark of
+//!   another unit remains, so one unit finishing does not give back a node another is still
+//!   rolling on.
+//! - **No node, no mark.** A host the frontend knows no node for (a storage host with no daemon)
+//!   is drained as nothing and marked as nothing.
 //!
 //! What this does not know: a cordon an operator adds to a node the updater has drained is
 //! still the updater's, and a node drained by an agent that predates the marks reads as an
@@ -33,29 +47,80 @@ const MARK: &[u8] = b"cordoned by kbf-updater\n";
 pub struct OwnCordon {
     inner: Arc<dyn Drain>,
     dir: PathBuf,
+    /// The unit this drain serves: `kbf`, or a service's name.
+    unit: String,
 }
 
 impl OwnCordon {
-    pub fn new(inner: Arc<dyn Drain>, dir: impl Into<PathBuf>, _unit: &str) -> Self {
+    pub fn new(inner: Arc<dyn Drain>, dir: impl Into<PathBuf>, unit: &str) -> Self {
         Self {
             inner,
             dir: dir.into(),
+            unit: unit.to_owned(),
         }
     }
 
-    /// Whether the directory takes marks.
+    /// Whether the directory takes marks: a probe file is created, synced and removed.
     ///
     /// # Errors
-    /// It does not.
+    /// It does not; the text names `--cordon-dir`.
     pub fn check_writable(&self) -> Result<(), String> {
-        Ok(())
+        let probe = self.dir.join(format!(
+            ".cordon-probe-{}-{}",
+            self.unit,
+            std::process::id()
+        ));
+        let tried = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&probe)
+            .and_then(|mut file| file.write_all(MARK).and_then(|()| file.sync_all()))
+            .and_then(|()| self.sync_dir())
+            .and_then(|()| std::fs::remove_file(&probe))
+            .and_then(|()| self.sync_dir());
+        tried.map_err(|e| {
+            format!(
+                "--cordon-dir {}: the agent cannot write there ({e}); it records the cordons it \
+                 makes in that directory and refuses to drain a node it cannot record. Give \
+                 --cordon-dir a directory the agent can write (under the packaged unit, one \
+                 inside its StateDirectory)",
+                self.dir.display()
+            )
+        })
     }
 
-    /// The mark of `host`'s node. A host with no usable node id has none: the inner drain
-    /// refuses it by itself.
+    /// The node of `host`. A host with no usable node id has none: the inner drain refuses it
+    /// by itself.
+    fn node(host: &Host) -> Option<&str> {
+        host.node_id.as_deref().filter(|id| valid_node_id(id))
+    }
+
+    /// This unit's mark of `host`'s node. A node id is a label, which holds no `.`, so the
+    /// marks of one node are exactly the files that start with `cordon-<node>.`.
     fn mark(&self, host: &Host) -> Option<PathBuf> {
-        let node = host.node_id.as_deref().filter(|id| valid_node_id(id))?;
-        Some(self.dir.join(format!("cordon-{node}")))
+        let node = Self::node(host)?;
+        Some(self.dir.join(format!("cordon-{node}.{}", self.unit)))
+    }
+
+    /// Every mark of `host`'s node, of any unit.
+    fn marks(&self, host: &Host) -> Result<Vec<PathBuf>, PortError> {
+        let Some(node) = Self::node(host) else {
+            return Ok(Vec::new());
+        };
+        let prefix = format!("cordon-{node}.");
+        let listed =
+            std::fs::read_dir(&self.dir).and_then(|entries| entries.collect::<Result<Vec<_>, _>>());
+        let entries = match listed {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(Self::fail("look for the cordon marks in", &self.dir, &e)),
+        };
+        Ok(entries
+            .into_iter()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .map(|entry| entry.path())
+            .collect())
     }
 
     fn fail(what: &str, path: &Path, e: &std::io::Error) -> PortError {
@@ -95,21 +160,33 @@ impl OwnCordon {
 }
 
 impl Drain for OwnCordon {
+    /// A marked node reads as in placement: the cordon on it is ours, unless the frontend says
+    /// it serves, which means the cordon was given back and every mark of it is removed. A
+    /// frontend that cannot be asked leaves the marks, and the node ours.
     fn placed(&self, host: &Host) -> Result<Placed, PortError> {
-        if let Some(mark) = self.mark(host)
-            && Self::is_set(&mark)?
-        {
-            return Ok(Placed::In);
+        let marks = self.marks(host)?;
+        let read = self.inner.placed(host);
+        if marks.is_empty() {
+            return read;
         }
-        self.inner.placed(host)
+        if read == Ok(Placed::In) {
+            marks.iter().try_for_each(|mark| self.clear(mark))?;
+        }
+        Ok(Placed::In)
+    }
+
+    fn placed_if_known(&self, host: &Host) -> Result<Option<Placed>, PortError> {
+        self.inner.placed_if_known(host)
     }
 
     /// The mark is written before the drain call, and kept if the call fails (the frontend
-    /// may have applied it). A node already out and unmarked is an operator's: no mark.
+    /// may have applied it). A node already out and unmarked is an operator's, and a node the
+    /// frontend does not know is nobody's: no mark.
     fn drain(&self, host: &Host, deadline: Option<Duration>) -> Result<(), PortError> {
         if let Some(mark) = self.mark(host)
             && !Self::is_set(&mark)?
-            && self.inner.placed(host)? == Placed::In
+            && (!self.marks(host)?.is_empty()
+                || self.inner.placed_if_known(host)? == Some(Placed::In))
         {
             self.set(&mark)?;
         }
@@ -120,12 +197,24 @@ impl Drain for OwnCordon {
         self.inner.leases(host)
     }
 
-    /// The mark is cleared only after the node was returned to placement.
+    /// This unit's mark is cleared after the node was returned to placement, and the node is
+    /// returned only if no other unit's mark remains.
     fn undrain(&self, host: &Host) -> Result<(), PortError> {
-        self.inner.undrain(host)?;
-        match self.mark(host) {
-            Some(mark) => self.clear(&mark),
-            None => Ok(()),
+        let Some(own) = self.mark(host) else {
+            return self.inner.undrain(host);
+        };
+        if self.marks(host)?.iter().all(|mark| *mark == own) {
+            self.inner.undrain(host)?;
         }
+        self.clear(&own)
+    }
+
+    /// A marked node is read, so that a cordon given back by hand is noticed; an unmarked one
+    /// is not asked about.
+    fn observe(&self, host: &Host) -> Result<(), PortError> {
+        if self.marks(host)?.is_empty() {
+            return Ok(());
+        }
+        self.placed(host).map(drop)
     }
 }

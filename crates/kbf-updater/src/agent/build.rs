@@ -115,12 +115,15 @@ pub(super) fn node_ports(
     local: &Arc<SocketLocal>,
 ) -> Result<NodePorts, String> {
     let installer = || Arc::new(LocalInstaller(local.clone()));
-    let own = |drain: Arc<dyn Drain>| -> Arc<dyn Drain> {
-        Arc::new(OwnCordon::new(drain, cordon_dir(cfg), unit))
+    // A drain that could not record its cordon would refuse every update: found out here.
+    let own = |drain: Arc<dyn Drain>| -> Result<Arc<dyn Drain>, String> {
+        let own = OwnCordon::new(drain, cordon_dir(cfg), unit);
+        own.check_writable()?;
+        Ok(Arc::new(own))
     };
     if let Some(api) = &cfg.node_api {
         let api = OperatorApi::new(api.addr, api.token_file.clone())?;
-        let drain = own(drain_for(role, &api));
+        let drain = own(drain_for(role, &api))?;
         let health = Arc::new(NodeHealth::with_api(api, installer()));
         return Ok((drain, health));
     }
@@ -131,7 +134,7 @@ pub(super) fn node_ports(
         ));
     };
     let api = OperatorApi::as_updater(frontend.clone(), cfg.files.clone(), identity.clone());
-    let drain = own(drain_for(role, &api));
+    let drain = own(drain_for(role, &api))?;
     let health = Arc::new(NodeHealth::for_updater(api, installer()));
     Ok((drain, health))
 }

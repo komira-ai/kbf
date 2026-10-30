@@ -32,10 +32,11 @@
 //! - `--daemon-node`: for the agent of a frontend host that also runs a daemon: the daemon's
 //!   node id. The frontend's update drains that node around it (the frontend itself is drained
 //!   by the helper, inside the A/B); without the flag a frontend host's node is not drained.
-//! - `--cordon-dir`: where the agent records, one file per node, that a cordon is its own, so
-//!   that a retry or a restart gives back a node it drained and leaves out one an operator
-//!   drained. Default: `--state-dir`, else the directory `--client-key` is in. It must be
-//!   writable by the agent: a drain that cannot record its mark is refused.
+//! - `--cordon-dir`: where the agent records, one file per node and unit, that a cordon is its
+//!   own, so that a retry or a restart gives back a node it drained and leaves out one an
+//!   operator drained; the agent drops the marks of a node it reads serving (a cordon given back
+//!   by hand). Default: `--state-dir`, else the directory `--client-key` is in. It must be
+//!   writable by the agent, which checks at start and does not start otherwise.
 //! - `--channel`: the release channel the helper's allowlist names; the version the
 //!   coordinator names is looked up in it by the helper, never by URL.
 //! - `--helper-socket`: the socket of `kbf-host-install --serve` (default

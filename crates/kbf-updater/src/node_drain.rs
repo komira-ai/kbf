@@ -100,17 +100,21 @@ impl NodeDrain {
 
 impl Drain for NodeDrain {
     fn placed(&self, host: &Host) -> Result<Placed, PortError> {
+        // No node here: nothing was in placement, and nothing is left out.
+        Ok(self.placed_if_known(host)?.unwrap_or(Placed::In))
+    }
+
+    fn placed_if_known(&self, host: &Host) -> Result<Option<Placed>, PortError> {
         let node = Self::node(host)?;
         let Some(reply) = self.judged(self.api.get(&format!("/v1/nodes/{node}"))?, node)? else {
-            // No node here: nothing was in placement, and nothing is left out.
-            return Ok(Placed::In);
+            return Ok(None);
         };
         let read: Node = Self::read(&reply, node)?;
-        Ok(if read.placement.state == "serving" {
+        Ok(Some(if read.placement.state == "serving" {
             Placed::In
         } else {
             Placed::Out
-        })
+        }))
     }
 
     fn drain(&self, host: &Host, deadline: Option<Duration>) -> Result<(), PortError> {

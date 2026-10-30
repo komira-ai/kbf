@@ -176,9 +176,51 @@ fn a_mark_that_cannot_be_read_or_cleared_is_an_error() {
     let dir = scratch("cordon-dirmark");
     std::fs::create_dir(dir.join("cordon-n1.kbf")).unwrap();
     let node = ServingNode::new();
+    node.operator_drains();
     let w = cordon(&node, &dir);
     assert_eq!(w.placed(&h).unwrap(), Placed::In);
     assert!(w.undrain(&h).is_err());
+    // A mark that cannot be removed cannot be dropped for a serving node either.
+    node.operator_uncordons();
+    assert!(w.placed(&h).is_err());
+}
+
+/// An agent whose refresh cannot look at its marks says so in its log and goes on.
+///
+/// Catches: a failed look hidden from the operator, or one that stops the refresh.
+#[test]
+fn a_refresh_that_cannot_look_at_the_marks_logs_it() {
+    let events = Events::default();
+    let health = FakeHealth::new(&events);
+    health.say(VA, vec![Ok(Health::Healthy)]);
+    let file = crate::testutil::file(&scratch("cordon-refresh-file"), "not-a-dir", "x", 0o600);
+    let logs: Arc<Mutex<Vec<String>>> = Arc::default();
+    let sink = Arc::clone(&logs);
+    let agent = Agent::new(
+        host(Role::Daemon),
+        "stable".to_owned(),
+        Timing::DEFAULT,
+        World {
+            coordinator: Arc::new(FakeCoordinator::default()),
+            local: Arc::new(FakeLocal::new(&events)),
+            drain: Arc::new(cordon(&ServingNode::new(), &file)),
+            health: Arc::new(health),
+            clock: Arc::new(ManualClock::default()),
+            unix_now: Arc::new(|| NOW),
+            renewer: None,
+            log: Arc::new(move |line| sink.lock().unwrap().push(line.to_owned())),
+        },
+        Status::unknown(ReleasePlatform::LinuxX86_64, version(VA)),
+    );
+    agent.refresh();
+    assert!(
+        logs.lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("could not be looked at")),
+        "{:?}",
+        logs.lock().unwrap()
+    );
 }
 
 struct Rig {
