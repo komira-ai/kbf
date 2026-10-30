@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
-use crate::support::cache_kit::{CountingCas, FakeClock, Gates, config, file, lease, stop};
+use crate::support::cache_kit::{CountingCas, FakeClock, Gates, config, file, key, lease, stop};
 use crate::support::scratch;
-use kbf_daemon::cache::Cache;
+use kbf_daemon::cache::{Cache, Point};
 
 /// Catches a fill, a hit or an eviction left out of the counts, a count taken per file
 /// name where the cache's unit is the entry, and bytes that are not the entry's size.
@@ -85,6 +85,55 @@ async fn an_entry_copied_from_its_sibling_is_not_a_fill() {
         .expect("lease");
     let counts = cache.input_counts();
     assert_eq!((counts.fills, counts.fill_bytes), (1, 64), "{counts:?}");
+    assert_eq!(cas.reads_of(&crate::support::cache_kit::digest(&bytes)), 1);
+    stop(cache, &gates);
+}
+
+/// Catches a second lease's use of an entry another lease is filling not counted as a hit, and
+/// the entry counted as filled twice: the first lease's fill is held open after the entry is
+/// written, the second lease asks for the same missing entry, and once the first is released
+/// the counts are one fill of the entry's bytes and one hit (the second lease found it, whether
+/// it waited on the slot or came after). The totals do not depend on which of the two happens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn two_leases_for_one_missing_entry_count_one_fill_and_one_hit() {
+    let dir = scratch("cache-input-counts-race");
+    let gates = Gates::new();
+    let cache = Cache::open(config(
+        &dir,
+        1 << 30,
+        Arc::clone(&gates),
+        &FakeClock::at(1000),
+    ))
+    .expect("open");
+    let cas = Arc::new(CountingCas::default());
+    let bytes = vec![b'r'; 80];
+    let tree = cas.tree(&[file("f", &bytes, false)]);
+    let k = key(&bytes, false);
+    let held = gates.hold(move |p| *p == Point::Filled(&k));
+    let spawn = |name: &'static str| {
+        let (cas, cache, dir, tree) = (
+            Arc::clone(&cas),
+            Arc::clone(&cache),
+            dir.clone(),
+            tree.clone(),
+        );
+        tokio::spawn(async move { lease(&cas, &cache, &tree, &dir, name).await })
+    };
+    let first = spawn("first");
+    let waiting = Arc::clone(&gates);
+    tokio::task::spawn_blocking(move || waiting.wait_reached(held))
+        .await
+        .expect("held");
+    let second = spawn("second");
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    gates.release(held);
+    first.await.expect("joined").expect("first");
+    second.await.expect("joined").expect("second");
+    let counts = cache.input_counts();
+    assert_eq!((counts.fills, counts.fill_bytes), (1, 80), "{counts:?}");
+    assert_eq!((counts.hits, counts.hit_bytes), (1, 80), "{counts:?}");
     assert_eq!(cas.reads_of(&crate::support::cache_kit::digest(&bytes)), 1);
     stop(cache, &gates);
 }

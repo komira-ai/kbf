@@ -199,6 +199,9 @@ async fn place(
                     &counts.misses
                 };
                 counted.fetch_add(files, Ordering::Relaxed);
+                if got.hit {
+                    cache.inner.note_hit(&names.key);
+                }
                 let (shared, private) = (names.shared.len() as u64, names.private.len() as u64);
                 if fell_back {
                     bump(&counts.link_fallbacks);

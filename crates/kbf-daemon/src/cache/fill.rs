@@ -237,7 +237,6 @@ impl Cache {
                     let uid = inner.uid;
                     let checked = blocking(move || stat_check(&path, &key, uid).ok()).await;
                     if let Some(nlink) = checked {
-                        inner.note_hit(&key);
                         let path = inner.path_of(&key);
                         let source = Source::Entry { path, nlink };
                         return Ok(Got { source, hit: true });
@@ -259,9 +258,6 @@ impl Cache {
                 Step::Own(mut slot) => {
                     let settled = self.settle(cas, key, counts).await;
                     slot.error = settled.as_ref().err().cloned();
-                    if settled.as_ref().is_ok_and(|got| got.hit) {
-                        inner.note_hit(&key);
-                    }
                     return settled;
                 }
             }
@@ -417,8 +413,10 @@ impl Inner {
         Step::Own(self.take(&mut state, key))
     }
 
-    /// Counts a lease's use of `key`'s entry, found in the cache.
-    fn note_hit(&self, key: &Key) {
+    /// Counts a lease's use of `key`'s entry, found in the cache: called once the lease has
+    /// placed its names, so a lease that finds the entry gone and settles the key again counts
+    /// the one use, not two.
+    pub(super) fn note_hit(&self, key: &Key) {
         bump(&self.counters.hits);
         (self.counters.hit_bytes).fetch_add(key.size, Ordering::Relaxed);
     }
