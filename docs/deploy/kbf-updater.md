@@ -73,6 +73,8 @@ deadline of S s; nothing was installed and the leases run on; ...; node dm-node 
 drained`"), the node stays drained (cordoned) and its leases run on. To try again, start another
 roll: it drains the node again (a drain of a drained node does nothing) and waits again. To give
 the node back without installing, uncordon it (`POST /v1/nodes/{id}:uncordon`, or `kbf cluster`).
+(A host run by the [agent](#the-agent-mode) keeps a mark of the cordons the agent makes; a cordon
+given back by hand is noticed by the agent, see `--cordon-dir`.)
 The node drain at the frontend is the frontend's cordon and is not changed by this.
 
 ## What a roll does with a frontend pool member
@@ -170,7 +172,8 @@ mode 755), come from the `updater_user` item of `kbf-mac-provision` (a release a
 kbf-updater agent --coordinator <dns name>:<port> --channel NAME
                   (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
                   [--frontend <dns name>:<port>] [--enroll-frontend <dns name>:<port>]
-                  [--operator-api http://IP:PORT --token-file FILE] [--helper-socket PATH]
+                  [--operator-api http://IP:PORT --token-file FILE] [--cordon-dir DIR]
+                  [--helper-socket PATH]
                   [--service NAME,helper-socket=PATH[,SETTING=VALUE...]]...
                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
                   [--health-poll-secs N] [--retry-secs N]
@@ -202,6 +205,27 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
   required with `--state-dir`.
 - `--channel`: the channel of the helper's allowlist. The version the coordinator names is looked
   up in it by the helper, never fetched by URL.
+- `--cordon-dir`: where the agent records that a cordon on the node is its own: one small file
+  per node and per unit it updates (`cordon-<node>.<unit>`, the unit being `kbf` or the
+  `--service` name), synced before the drain call and removed after the undrain worked. A retry
+  of an update that failed with the node left drained, and an agent restarted in the middle of an
+  update, give such a node back; a node an operator drained is left out. A host the frontend
+  knows no node for (a storage host with no daemon) gets no mark. A node counts as the agent's
+  while any unit's mark is on it, and an undrain by one unit gives the node back only when no
+  other unit's mark remains. Default: the `--state-dir`, else the directory of `--client-key`.
+  The agent checks at start that it can write there and does not start otherwise; with placed
+  files in a root-owned directory under the shipped unit's `ProtectSystem=strict`, name a writable
+  one (the unit's `StateDirectory`, `/var/lib/kbf-updater`, or a path in `ReadWritePaths=`).
+  **A cordon given back by hand** (`:uncordon`, `kbf cluster`) leaves the mark; the agent drops
+  the marks of a node whenever it reads that node serving: at start, at each heartbeat it spends
+  idle, and before an update's drain. The window in which a stale mark still means something is
+  therefore from the hand uncordon to the agent's next look: at most one heartbeat interval while
+  the agent is idle, up to the end of the update when it is in the middle of one, and for as long
+  as the agent is stopped, or the frontend cannot be reached. In that window an operator's new
+  drain of the node reads as the agent's own and is given back by the update that finds it. If
+  the agent is stopped, remove the file by hand: `<cordon dir>/cordon-<node>.<unit>`. The
+  frontend's node read names no cordon (no generation, no time), so nothing finer is possible
+  without changing it.
 - `--daemon-node`: for the agent of a **frontend host** that also runs a daemon: the daemon's node
   id. The agent drains that node around the frontend's update (with the operator token if the
   agent has one, else with its certificate, which names its own node only). Without it a frontend

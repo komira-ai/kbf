@@ -96,6 +96,8 @@ fn the_linux_units_agree_with_the_programs_and_with_each_other() {
         Path::new("/var/lib").join(unit_value(&agent, "StateDirectory"))
     );
     assert_eq!(unit_value(&agent, "StateDirectoryMode"), "0700");
+    // The marks of the agent's cordons go where the unit can write, under ProtectSystem=strict.
+    assert_eq!(config.cordon_dir.as_deref(), Some(state.as_path()));
     assert_eq!(config.files.cert, state.join("pki/updater.pem"));
     assert_eq!(config.files.key, state.join("pki/updater.key"));
 
