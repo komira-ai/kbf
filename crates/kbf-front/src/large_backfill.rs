@@ -20,8 +20,10 @@
 //! bytes ([`DEFAULT_BUFFER_BYTES`], two parts of the S3 store's multipart upload, so a put that
 //! is busy sending one part and setting up the next still has the blob's next bytes waiting,
 //! whatever the size of the chunks the reader gives); a put that falls further behind than that
-//! loses its tee (the put is abandoned, counted `skipped`), and the response is not slowed. At most [`DEFAULT_CONCURRENCY`] puts run at once and one blob has at
-//! most one in flight, so concurrent readers of a blob cause one put; the others are `skipped`.
+//! loses its tee (the put is abandoned, counted `skipped`), and the response is not slowed. At
+//! most [`DEFAULT_CONCURRENCY`] puts run at once and one blob has at most one in flight, so
+//! concurrent readers of a blob cause one put; the others are `skipped`. The buffers together
+//! hold at most the concurrency times the buffer size (64 MiB with the defaults).
 //! Before it takes a byte the put asks the store for the key's length (one HEAD): an object of
 //! the right length is `already_present` and nothing is sent; an object of another length is
 //! `failed` (logged, and not overwritten: with a store that does not refuse an existing key a
@@ -153,7 +155,8 @@ impl LargeBackfill {
         }
     }
 
-    /// Waits until `n` puts in all have ended, by any result.
+    /// Waits until `n` puts in all have ended, by any result. One waiter at a time: each end
+    /// wakes a single waiter, so a second concurrent caller may not be woken.
     pub async fn ended(&self, n: u64) {
         while self.counts.total() < n {
             self.counts.ended.notified().await;
@@ -297,7 +300,12 @@ impl Put {
                 self.counts.end(&self.counts.already_present);
             } else {
                 self.counts.end(&self.counts.failed);
-                tracing::warn!(%key, found = len, wanted = self.digest.size_bytes, "an object of another length is at the large key; not written over");
+                tracing::warn!(
+                    %key,
+                    found = len,
+                    wanted = self.digest.size_bytes,
+                    "an object of another length is at the large key; not written over"
+                );
             }
             return;
         }
