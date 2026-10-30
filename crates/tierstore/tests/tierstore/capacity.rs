@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use tierstore::{Backend, Error, Op};
+use tierstore::{Backend, ByteRange, Error, Op};
 use tokio::time::Instant;
 
 use crate::support::{
@@ -176,6 +176,29 @@ async fn a_get_does_not_copy_back_above_the_critical_mark() {
     set_usage(&rig, 100, 0).await;
     assert_eq!(proxy.get("k", None).await.unwrap(), body("value"));
     assert_eq!(read(&*rig.hot_mem, "k").await, body("value"));
+}
+
+/// Asserts that a ranged get of an object only the cold tier holds asks the cold tier for the
+/// range alone while the usage is above the critical mark (no copy is made, so a whole read
+/// would only be thrown away), and for the whole object once the usage is under it.
+#[tokio::test(start_paused = true)]
+async fn a_ranged_get_above_the_critical_mark_reads_only_the_range_from_the_cold_tier() {
+    let rig = Rig::new();
+    let mut config = rig.config("p1", 1000);
+    config.critical = 0.5;
+    let proxy = rig.open(config).await.unwrap();
+    rig.cold_mem.put("k", body("0123456789")).await.unwrap();
+
+    set_usage(&rig, 600, 0).await;
+    let part = ByteRange::new(2, 3);
+    assert_eq!(proxy.get("k", Some(part)).await.unwrap(), body("234"));
+    assert_eq!(rig.cold.get_ranges(), vec![Some((2, 3))]);
+    assert_absent(&*rig.hot_mem, "k").await;
+
+    set_usage(&rig, 100, 0).await;
+    assert_eq!(proxy.get("k", Some(part)).await.unwrap(), body("234"));
+    assert_eq!(rig.cold.get_ranges(), vec![Some((2, 3)), None]);
+    assert_eq!(read(&*rig.hot_mem, "k").await, body("0123456789"));
 }
 
 /// Asserts that a read whose copy back into the hot tier fails (the hot tier is full, or

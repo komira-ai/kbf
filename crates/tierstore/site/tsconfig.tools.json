@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "types": ["node"],
+    "noEmit": false,
+    "outDir": "build/tools",
+    "rootDir": "."
+  },
+  "include": ["tools", "test"]
+}

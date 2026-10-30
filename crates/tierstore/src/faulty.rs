@@ -74,6 +74,8 @@ struct Plan {
     /// The length every call that uploads a part was given, failed or not, in the order of the
     /// calls.
     lengths: Vec<Option<u64>>,
+    /// The range every get was given, failed or not, in the order of the calls.
+    ranges: Vec<Option<(u64, u64)>>,
 }
 
 /// Passes every call to the backend it wraps, unless it was told to fail or delay it.
@@ -151,6 +153,13 @@ impl FaultyBackend {
     #[must_use]
     pub fn part_lengths(&self) -> Vec<Option<u64>> {
         self.plan().lengths.clone()
+    }
+
+    /// The range (offset and length) each get was given, the failed ones included, in the order
+    /// of the calls: `None` where the caller gave none.
+    #[must_use]
+    pub fn get_ranges(&self) -> Vec<Option<(u64, u64)>> {
+        self.plan().ranges.clone()
     }
 
     fn plan(&self) -> MutexGuard<'_, Plan> {
@@ -232,6 +241,8 @@ impl Backend for FaultyBackend {
     }
 
     async fn get(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
+        let asked = range.map(|range| (range.offset(), range.size()));
+        self.plan().ranges.push(asked);
         self.enter(Op::Get, key).await?;
         self.inner.get(key, range).await
     }

@@ -159,6 +159,9 @@ pub struct ReadGrant {
     pub url: String,
     /// The bearer token.
     pub token: Secret,
+    /// The bytes of the input closure the grant reads (the blobs the task fetches into its
+    /// scratch); `None` when the preparation did not say.
+    pub input_bytes: Option<u64>,
 }
 
 /// Why the inputs of an action could not be had.

@@ -18,8 +18,8 @@ build.
 
 ## Pull request labels
 
-A pull request runs the three jobs of `ci.yml` (`lint`, `test` on the fast set, and `task-macos`, the task runner's tests on a hosted Mac) and nothing
-else; the full suite, the macOS jobs and the packages run on a push to `main`
+A pull request runs `ci.yml` (the checks `lint` and `test`, which gates the coverage of the fast set
+run in the `test-shard` matrix beside it, and `task-macos`, the task runner's tests on a hosted Mac) and nothing else; the full suite, the macOS jobs and the packages run on a push to `main`
 (`beta.yml`). One label opts a pull request in to more, to spare the small
 macOS runner pool. Adding it to an open pull request starts a run.
 

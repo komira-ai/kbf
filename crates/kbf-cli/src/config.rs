@@ -273,6 +273,7 @@ const GROUPS: &[(&str, &[&str])] = &[
         "executor",
         &[
             "executor",
+            "executor-allow-plain-http-grant",
             "executor-allow-plain-http-put",
             "executor-arch",
             "executor-base-image",
@@ -291,6 +292,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "executor-lease-ttl-secs",
             "executor-lease-url",
             "executor-max-run-secs",
+            "executor-output-disk-bytes",
             "executor-run-margin-secs",
             "executor-work-dir",
         ],

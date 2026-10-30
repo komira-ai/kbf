@@ -56,7 +56,7 @@ use tokio::time::Instant;
 use crate::Farm;
 use pool::{Adopted, Adoption, Slot};
 
-pub use config::{Config, ConfigError};
+pub use config::{Config, ConfigError, DEFAULT_OUTPUT_DISK, DISK_MARGIN};
 pub use driver::Running;
 pub use front::{Front, FrontParts, PrepareError, PreparedRun, RunPrepare, RunSource};
 pub use metrics::Metrics;
