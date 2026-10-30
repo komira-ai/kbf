@@ -83,7 +83,7 @@ fn rigs_and_floors(text: &str) -> (usize, usize) {
 /// Whether the file has more cold store rigs than floor mentions.
 fn lacks_floor(text: &str) -> bool {
     let (rigs, floors) = rigs_and_floors(text);
-    floors < rigs
+    rigs > 0 && floors == 0
 }
 
 /// What is wrong with the files, one line each.
@@ -147,6 +147,29 @@ fn the_scan_finds_a_rig_without_a_floor() {
         Vec::<String>::new()
     );
     assert_eq!(problems(&[], &[(path, "why")]).len(), 1, "a stale entry");
+    let floor = "\"--cold-store-floor-bytes=1\"";
+    let two = format!("{bare}; {bare}");
+    assert_eq!(
+        problems(&file(path, &format!("{floor}; {two}")), &[]).len(),
+        1,
+        "two rigs and one floor"
+    );
+    assert_eq!(
+        problems(&file(path, &format!("{floor}; {floor}; {two}")), &[]),
+        Vec::<String>::new(),
+        "two rigs and two floors"
+    );
+    let separate = "\"--cold-store\", format!(\"file://{}\", d.display())";
+    assert_eq!(
+        problems(&file(path, separate), &[]).len(),
+        1,
+        "a separate argument is one rig"
+    );
+    assert_eq!(
+        problems(&file(path, &format!("{floor}; {separate}")), &[]),
+        Vec::<String>::new(),
+        "a separate argument with one floor"
+    );
     for (p, text) in [
         (
             path,
