@@ -27,14 +27,24 @@ kbf-objstore.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+# Streams of a body for a multipart part (`BodyStream`), and `join_all` of the cells.
+futures.workspace = true
+# The signed streaming GET (`cells::streamget`): the time to the first byte of a read, which the
+# S3 client of kbf-objstore does not give (it returns a body whole).
+hex.workspace = true
+hmac.workspace = true
+reqwest.workspace = true
+# The digests of the synthetic tree (`cells::tree`) and of the signing key.
+sha2.workspace = true
 
 [dev-dependencies]
 # `FakeS3`, a loopback S3 service, for the tests of the client wrapper.
 kbf-objstore = { workspace = true, features = ["testkit"] }
 # Scratch directories of the tests.
 kbf-testkit.workspace = true
-# Raw sockets for the proxy tests: requests as text, upstreams that answer by hand.
+# Raw sockets for the proxy tests: requests as text, upstreams that answer by hand. A paused clock
+# for the throttle and the open-loop pacing tests.
 tokio = { workspace = true, features = ["io-util", "test-util"] }
 
 [lints]
