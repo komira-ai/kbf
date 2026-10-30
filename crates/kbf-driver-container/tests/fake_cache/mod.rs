@@ -175,6 +175,44 @@ fn a_cache_that_cannot_be_opened_runs_uncached() {
     assert!(!runtime.cached());
 }
 
+/// What `--no-input-cache` gives the driver: no cache in its config. Catches a driver
+/// without a cache that records input statistics, or writes inputs wrong: two actions
+/// with the same input each get its bytes straight from the CAS (the action copies the
+/// input into an output, whose bytes are compared), neither is counted as a cache hit,
+/// and the input is a private file of its own (one link), as a cache link would not be.
+/// The cached counterpart is `inputs_are_links_to_the_cache_and_only_directories_change_owner`.
+#[tokio::test]
+async fn without_a_cache_each_action_gets_its_inputs_from_the_cas() {
+    let fake = Fake::new("no-cache");
+    assert!(!fake.runtime.cached());
+    let mut spec = Spec::new(&image(), "unused");
+    spec.inputs = vec![("src/a.txt", b"input bytes", false)];
+    spec.outputs = vec!["seen".to_owned(), "stat".to_owned()];
+    for seq in [1, 2] {
+        let steps = [
+            "copy",
+            "$UPPER/seen",
+            "$ROOT/src/a.txt",
+            ";",
+            "inode-links",
+            "$UPPER/stat",
+            "$ROOT/src/a.txt",
+        ];
+        let result = fake.run(seq, &spec, &steps).await.expect("run");
+        assert_eq!(result.exit_code, 0, "{result:?}");
+        let seen = blob(&fake.cas, result.output_files[0].digest.as_ref());
+        assert_eq!(seen, b"input bytes");
+        let stat = String::from_utf8(blob(&fake.cas, result.output_files[1].digest.as_ref()))
+            .expect("utf-8");
+        assert!(
+            stat.trim_end().ends_with(" 1"),
+            "linked from somewhere: {stat}"
+        );
+        assert_eq!(fake.runtime.last_inputs(), None);
+        fake.assert_clean(seq);
+    }
+}
+
 /// A fake whose runtime has a cache and a tree store of its own.
 fn treed(name: &str) -> Fake {
     let dir = crate::support::scratch(&format!("fake-trees-{name}"));
