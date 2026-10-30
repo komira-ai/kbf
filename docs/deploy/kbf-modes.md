@@ -308,7 +308,11 @@ given together, and takes two more that have defaults:
   stays taken until the response has been sent (or the connection dropped), so that clients that
   are slow to read do not hold more than the budget; a batch also pays 64 KiB for each gap
   between its blobs, and takes at most half of `--job-reads-in-flight` while it reads. An Action
-  or Directory blob over 4 MiB gives its Action no scope (it is not read). The scope
+  or Directory blob over 4 MiB gives its Action no scope (it is not read).
+- `--job-read-idle-secs` (default 60): a response that holds budget and whose client takes no
+  chunk for this long is dropped, its budget given back and its response ended (the client sees a
+  broken response). A client that reads is not cut off however long its response takes in all; one
+  that opens a response and never reads it holds budget for this long and no longer. The scope
   of an Action is worked out once however many tasks ask for it at the same time.
 
 The answers are 200 with the blob and its `Content-Length`; 401 for a missing, malformed, forged,

@@ -103,6 +103,7 @@ fn flags(files: &Files, listen: &str) -> JobReadFlags {
         max_blob_bytes: Limits::default().max_blob_bytes,
         reads_in_flight: 32,
         read_budget_bytes: Limits::default().read_budget_bytes,
+        read_idle_secs: Limits::default().held_idle.as_secs(),
     }
 }
 
