@@ -221,7 +221,9 @@ pub struct Reply {
 /// The read places and budget a reply keeps until it is dropped, so that bytes held for a
 /// client that is slow to read them stay charged to the budget.
 #[derive(Debug)]
-struct Hold(Vec<Result<OwnedSemaphorePermit, AcquireError>>);
+struct Hold {
+    _permits: Vec<Result<OwnedSemaphorePermit, AcquireError>>,
+}
 
 impl Reply {
     /// The body as a stream of pieces of at most [`HELD_CHUNK_BYTES`], when the reply holds
@@ -522,7 +524,9 @@ impl JobRead {
                 // The place is given back with the read; the bytes stay charged to the budget
                 // until the reply is sent.
                 let mut reply = self.serve(bytes);
-                reply.hold = Some(Hold(vec![room]));
+                reply.hold = Some(Hold {
+                    _permits: vec![room],
+                });
                 reply
             }
             Err(error) => self.unreadable(&error),
@@ -563,7 +567,7 @@ impl JobRead {
             frames.extend_from_slice(&bytes);
         }
         let mut reply = self.tally(&self.batches, Outcome::Ok, Bytes::from(frames));
-        reply.hold = Some(Hold(held));
+        reply.hold = Some(Hold { _permits: held });
         reply
     }
 
