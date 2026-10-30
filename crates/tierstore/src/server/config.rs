@@ -54,7 +54,13 @@ use super::front::FrontSettings;
 use crate::journal::{JOURNAL_PREFIX, TIERING_PREFIX};
 
 /// The flags that stay flags: the file is for the data path, and these are per run.
-pub(super) const PER_RUN: &[&str] = &["config", "print-config", "drain-lb-wait", "drain-deadline"];
+pub(super) const PER_RUN: &[&str] = &[
+    "config",
+    "print-config",
+    "check-config",
+    "drain-lb-wait",
+    "drain-deadline",
+];
 
 /// The key of each flag that the file holds: the flag's name without `--`, then the keys that
 /// stand for it, the first of them the one an error message names in its place. A tier flag
@@ -172,6 +178,9 @@ pub enum ConfigError {
     /// `--print-config` writes the file for flags; it has no use with a file.
     #[error("--print-config writes the file for the flags given; do not give it with --config")]
     PrintWithConfig,
+    /// `--check-config` checks the file `--config` names; there is nothing to check without it.
+    #[error("--check-config checks the file that --config names; give --config")]
+    CheckWithoutConfig,
     /// The settings could not be written as TOML.
     #[error("--print-config: {0}")]
     Print(#[from] toml::ser::Error),
@@ -545,6 +554,7 @@ const LOCAL_CACHE_KEYS: &[&str] = &[
     "path",
     "layout",
     "max_concurrent_fills",
+    "write_through",
     "whole_fill_limit",
     "scrub_rate",
 ];
@@ -857,6 +867,7 @@ fn storage(
     Ok(Cli {
         config: None,
         print_config: false,
+        check_config: false,
         listen: front.listen,
         proxy_id: front.proxy_id,
         hot: hot_parts.spec,

@@ -17,6 +17,7 @@
 //! critical   = 95
 //! free_floor = 10
 //! max_concurrent_fills = 4
+//! write_through        = false  # true: take writes and send them to the upstream
 //!
 //! [cold_store]                  # the upstream: an S3 endpoint
 //! kind             = "s3"
@@ -31,6 +32,12 @@
 //! prefix = "cas/b/"
 //! cache  = true
 //! ```
+//!
+//! `write_through = true` makes the node take the writes its keys may do (create-only puts,
+//! multipart uploads, presigned puts, deletes) and send each to the upstream, which must then be
+//! written with a key that may write: the start tests the upstream's create-only and
+//! multipart-conditional answers (see [`cache_cli`](super::cache_cli)). Left out or `false`, the
+//! node refuses every write with 403 and its upstream key may be a read-only one.
 //!
 //! The file is read into a [`CacheSettings`]. It has no flag form. The `[oci]` table is the
 //! storage node's, with its rules (see [`config`](super::config)). What it refuses, besides what
@@ -119,6 +126,9 @@ pub(super) struct LocalCacheTable {
     /// The most fills that run at once (1 to 64, default 4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_fills: Option<u8>,
+    /// Whether the node takes writes and sends them to the upstream (default `false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_through: Option<bool>,
     /// The most an object may be for a ranged read of it to fill the whole of it (1 byte up to
     /// the budget, default 64 MiB). A larger object is passed through and kept nowhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -277,6 +287,7 @@ impl CacheSettings {
             let fills = within("local_cache", "max_concurrent_fills", fills, 1, 64)?;
             cache.max_concurrent_fills = usize::from(fills);
         }
+        cache.write_through = table.write_through.unwrap_or(false);
         if let Some(limit) = table.whole_fill_limit {
             cache.whole_limit = within("local_cache", "whole_fill_limit", limit.0, 1, budget)?;
         }

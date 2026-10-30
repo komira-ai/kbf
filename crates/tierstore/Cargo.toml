@@ -1,6 +1,8 @@
 [package]
 name = "tierstore"
-version.workspace = true
+# Its own version, not the workspace's: 0.2.0 is the first release whose cache node can write
+# through (`[local_cache] write_through`), which `tierstore --version` shows.
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

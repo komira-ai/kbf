@@ -35,6 +35,7 @@ low_water  = 60
 critical   = 97
 free_floor = 15
 max_concurrent_fills = 6
+write_through = true
 whole_fill_limit = "128MiB"
 cache      = true
 scrub_rate = "50MiB/s"
@@ -196,6 +197,7 @@ fn a_build_node_file_makes_a_cache() {
     );
     assert_eq!((FILL_CHUNK, WHOLE_FILL_LIMIT), (8 << 20, 64 << 20));
     assert_eq!(config.max_concurrent_fills, 6);
+    assert!(config.write_through);
     let upstream = &cache.upstream;
     assert_eq!(upstream.spec, "s3:tierstore");
     assert_eq!(upstream.endpoint.as_deref(), Some("http://192.0.2.20:9300"));
@@ -230,6 +232,10 @@ fn a_build_node_file_has_the_defaults_of_the_flags_and_of_the_cache() {
         (90, 75, 95, 10)
     );
     assert_eq!(config.max_concurrent_fills, 4);
+    assert!(
+        !config.write_through,
+        "a file that leaves it out is a read cache"
+    );
     assert_eq!(config.whole_limit, WHOLE_FILL_LIMIT);
     assert_eq!(config.budget, 1000);
     assert_eq!(cache.front.region, "us-east-1");
@@ -656,7 +662,7 @@ fn the_whole_fill_limit_is_a_size_between_one_byte_and_the_budget() {
 }
 
 /// The keys of `[local_cache]`, which the README of the packaging must document each in a row.
-const LOCAL_CACHE_KEYS: [&str; 11] = [
+const LOCAL_CACHE_KEYS: [&str; 12] = [
     "path",
     "layout",
     "budget",
@@ -665,6 +671,7 @@ const LOCAL_CACHE_KEYS: [&str; 11] = [
     "critical",
     "free_floor",
     "max_concurrent_fills",
+    "write_through",
     "whole_fill_limit",
     "cache",
     "scrub_rate",

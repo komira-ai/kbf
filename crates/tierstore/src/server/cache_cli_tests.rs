@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use kbf_objstore::s3::{Credentials, S3Config, S3Store};
 use kbf_objstore::{ByteRange, Capabilities, ObjectKey, ObjectStore};
@@ -16,12 +17,16 @@ use tokio::sync::oneshot;
 use super::Drained;
 use super::cache_cli::{run_cache, serve_cache, size_of_file_system, unjudged_warning};
 use super::cli::Error;
-use super::cli::exit_status;
-use super::config::{PerRun, settings_from_text};
+use super::cli::{checked, exit_status};
+use super::config::{PerRun, Settings, settings_from_text};
 use super::config_cache::CacheSettings;
 use super::local_cache::testing::{FakeDisk, Quirk, digest, pattern};
 use super::local_cache::{Disk, SystemDisk};
-use crate::{Backend, FaultyBackend, MemoryBackend};
+use crate::selftest_tests::{Flaw, Flawed};
+use crate::{
+    Backend, ByteRange as TierRange, Error as BackendError, FaultyBackend, Listed, MemoryBackend,
+    Meta,
+};
 
 const KEY_ID: &str = "AKIDCACHE";
 const SECRET: &str = "cache-secret";
@@ -406,6 +411,261 @@ async fn a_file_system_whose_size_is_unknown_is_not_judged_and_the_node_starts()
     let disk: Arc<dyn Disk> = zero;
     let drained = serving(&settings, upstream, disk, nothing).await.unwrap();
     assert_eq!(drained, Drained { abandoned: 0 });
+}
+
+/// What a read-only key sees of a store: the reads are answered and every write is refused as a
+/// 403 is, with an error that is no precondition's.
+struct ReadOnly(MemoryBackend);
+
+fn forbidden() -> BackendError {
+    BackendError::Other("403 AccessDenied".to_owned())
+}
+
+#[async_trait]
+impl Backend for ReadOnly {
+    async fn put(&self, _key: &str, _body: Bytes) -> Result<(), BackendError> {
+        Err(forbidden())
+    }
+
+    async fn put_if_match(
+        &self,
+        _key: &str,
+        _body: Bytes,
+        _etag: &str,
+    ) -> Result<String, BackendError> {
+        Err(forbidden())
+    }
+
+    async fn get(&self, key: &str, range: Option<TierRange>) -> Result<Bytes, BackendError> {
+        self.0.get(key, range).await
+    }
+
+    async fn head(&self, key: &str) -> Result<Meta, BackendError> {
+        self.0.head(key).await
+    }
+
+    async fn delete(&self, _key: &str) -> Result<(), BackendError> {
+        Err(forbidden())
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<Listed>, BackendError> {
+        self.0.list(prefix).await
+    }
+
+    async fn create_upload(&self, _key: &str) -> Result<String, BackendError> {
+        Err(forbidden())
+    }
+}
+
+/// Asserts that a start with `write_through` asks the upstream the write questions of the
+/// self-test and refuses an upstream that answers one wrongly with exit status 3, before the
+/// address is bound: a key that may not write (the create-only check), a store that overwrites on
+/// a create-only put (the same check), and one that overwrites on the completion of an upload (the
+/// multipart-conditional check, so the start asks the multipart question too). The same read-only
+/// upstream starts a node without `write_through`, which never asks.
+#[tokio::test]
+async fn a_write_through_start_tests_the_upstream_for_writes_and_refuses_a_wrong_answer_with_3() {
+    let node = Node::new("tscache-cli-wthru-refused");
+    let disk: Arc<dyn Disk> = Arc::new(SystemDisk);
+    let nothing = |_addr: SocketAddr| async {};
+    let writing = node.settings("", "write_through = true");
+    let reading = node.settings("", "");
+
+    let read_only: Arc<dyn Backend> = Arc::new(ReadOnly(MemoryBackend::new()));
+    let overwriting: Arc<dyn Backend> = Arc::new(Flawed::new(Flaw::OverwritesOnCreate));
+    let completing: Arc<dyn Backend> = Arc::new(Flawed::new(Flaw::CompletionOverwrites));
+    let flaws = [
+        (read_only.clone(), "create-only"),
+        (overwriting, "create-only"),
+        (completing, "multipart-conditional"),
+    ];
+    for (upstream, check) in flaws {
+        let why = serving(&writing, upstream, disk.clone(), nothing)
+            .await
+            .unwrap_err();
+        let said = format!("failed the {check} check");
+        assert!(why.to_string().contains(&said), "{check}: {why}");
+        assert_eq!(exit_status(&why), 3, "{check}");
+    }
+
+    let drained = serving(&reading, read_only, disk, nothing).await.unwrap();
+    assert_eq!(drained, Drained { abandoned: 0 });
+}
+
+/// Asserts that a node with `write_through` over an upstream that answers the self-test takes a
+/// create-only put through its front, which is made at the upstream, and a repeat of it is
+/// refused with a precondition error; that the probe keys of the self-test are gone from the
+/// upstream when the node has started; and that the same node without `write_through` refuses the
+/// put and the upstream gets none.
+#[tokio::test]
+async fn a_write_through_node_takes_a_put_and_a_read_cache_refuses_it() {
+    let node = Node::new("tscache-cli-wthru-serve");
+    let disk: Arc<dyn Disk> = Arc::new(SystemDisk);
+    for writes in [true, false] {
+        let flat = Arc::new(Flawed::new(Flaw::None));
+        let upstream: Arc<dyn Backend> = flat.clone();
+        let local = if writes { "write_through = true" } else { "" };
+        let settings = node.settings("", local);
+        let work = |addr: SocketAddr| async move {
+            let store = client(addr);
+            let key = ObjectKey::new("cas/made").unwrap();
+            let made = store.put_new(&key, Bytes::from_static(b"made"), None).await;
+            assert_eq!(made.is_ok(), writes, "{made:?}");
+            let again = store
+                .put_new(&key, Bytes::from_static(b"twice"), None)
+                .await;
+            assert!(again.is_err());
+        };
+        let drained = serving(&settings, upstream, disk.clone(), work)
+            .await
+            .unwrap();
+        assert_eq!(drained, Drained { abandoned: 0 });
+        let stored = flat.inner.get("cas/made", None).await;
+        assert_eq!(stored.ok(), writes.then(|| Bytes::from_static(b"made")));
+        assert!(flat.inner.list("_tiering/").await.unwrap().is_empty());
+    }
+}
+
+/// Asserts what `--check-config` finds in the settings of a build node: a file that is whole
+/// passes, a request timeout of zero is refused with the message of a start, and a key file that
+/// is not there is refused (the branch for a cache), and that a budget far over the file system
+/// is not looked at (the start's check of the disk is not made).
+#[test]
+fn check_config_of_a_build_node_refuses_a_zero_timeout_and_a_missing_key_file() {
+    let node = Node::new("tscache-cli-check-cache");
+    let big = node.text("", "").replace("\"1MiB\"", "\"8TiB\"");
+    let whole = settings_from_text(&big, QUICK)
+        .unwrap()
+        .into_cache()
+        .unwrap();
+    assert!(checked(&Settings::Cache(Box::new(whole))).is_ok());
+
+    let zero = node.settings("s3_request_timeout = \"0s\"", "");
+    let why = checked(&Settings::Cache(Box::new(zero))).unwrap_err();
+    assert!(why.to_string().contains("--s3-request-timeout"), "{why}");
+
+    let text = node
+        .text("", "")
+        .replace(&node.key.display().to_string(), "/no/such/access.key");
+    let gone = settings_from_text(&text, QUICK)
+        .unwrap()
+        .into_cache()
+        .unwrap();
+    let why = checked(&Settings::Cache(Box::new(gone))).unwrap_err();
+    assert!(why.to_string().contains("/no/such/access.key"), "{why}");
+}
+
+/// Asserts what `--check-config` finds in the settings of a storage node: a file whose key file
+/// is there passes, one whose bucket is the name of a probe path is refused, and one whose key
+/// file is not there is refused (the branch for a storage node).
+#[test]
+fn check_config_of_a_storage_node_reads_its_key_files() {
+    let node = Node::new("tscache-cli-check-storage");
+    let text = format!(
+        r#"
+[server]
+listen          = "127.0.0.1:0"
+proxy_id        = "s1"
+bucket          = "tier-bucket"
+access_key_file = "{key}"
+
+[hot_store]
+kind   = "memory"
+budget = 1048576
+
+[cold_store]
+kind = "memory"
+"#,
+        key = node.key.display()
+    );
+    let storage = |text: &str| settings_from_text(text, QUICK).unwrap();
+    assert!(checked(&storage(&text)).is_ok());
+    let probe = text.replace("tier-bucket", "healthz");
+    let why = checked(&storage(&probe)).unwrap_err();
+    assert!(why.to_string().contains("probe path"), "{why}");
+    let gone = text.replace(&node.key.display().to_string(), "/no/such/access.key");
+    let why = checked(&storage(&gone)).unwrap_err();
+    assert!(why.to_string().contains("/no/such/access.key"), "{why}");
+}
+
+/// Asserts what `--check-config` finds in the `[oci]` table of a storage node: a plain listener
+/// off loopback passes (the warning of a start is not printed, which the binary test checks on
+/// stderr); a prefix that overlaps `_journal/` and a certificate file that is not there are
+/// refused, each with the reason; and a certificate without its key does not load at all.
+#[test]
+fn check_config_of_a_storage_node_checks_its_oci_table() {
+    let node = Node::new("tscache-cli-check-oci");
+    let with = |oci: &str| {
+        format!(
+            r#"
+[server]
+listen          = "127.0.0.1:0"
+proxy_id        = "s1"
+bucket          = "tier-bucket"
+access_key_file = "{key}"
+
+[hot_store]
+kind   = "memory"
+budget = 1048576
+
+[cold_store]
+kind = "memory"
+
+[oci]
+{oci}
+"#,
+            key = node.key.display()
+        )
+    };
+    let load = |oci: &str| settings_from_text(&with(oci), QUICK);
+    let plain = load("listen = \"0.0.0.0:0\"").unwrap();
+    assert!(checked(&plain).is_ok());
+
+    let overlapping = load("listen = \"127.0.0.1:0\"\nprefix = \"_journal/x/\"").unwrap();
+    let why = checked(&overlapping).unwrap_err();
+    assert!(why.to_string().contains("overlaps"), "{why}");
+    assert_eq!(exit_status(&why), 2);
+
+    let key = node.key.display();
+    let no_cert = format!(
+        "listen = \"127.0.0.1:0\"\ntls_cert_file = \"/no/such/cert.pem\"\ntls_key_file = \"{key}\""
+    );
+    let why = checked(&load(&no_cert).unwrap()).unwrap_err();
+    assert!(why.to_string().contains("/no/such/cert.pem"), "{why}");
+
+    let lone = format!("listen = \"127.0.0.1:0\"\ntls_cert_file = \"{key}\"");
+    let why = load(&lone).unwrap_err();
+    assert!(why.to_string().contains("tls_key_file"), "{why}");
+}
+
+/// Asserts what `--check-config` finds in the `[oci]` table of a build node, as for a storage
+/// node: a plain listener off loopback passes without the warning of a start; a certificate file
+/// that is not there is refused with the reason and status 2; a certificate without its key does
+/// not load; and a prefix outside every keeping policy does not load, naming `oci.prefix`.
+#[test]
+fn check_config_of_a_build_node_checks_its_oci_table() {
+    let node = Node::new("tscache-cli-check-oci-cache");
+    let load = |oci: &str| {
+        let text = format!("{}\n[oci]\n{oci}\n", node.text("", ""));
+        settings_from_text(&text, QUICK)
+    };
+    let plain = load("listen = \"0.0.0.0:0\"\nprefix = \"cas/\"").unwrap();
+    assert!(checked(&plain).is_ok());
+
+    let key = node.key.display();
+    let no_cert = format!(
+        "listen = \"127.0.0.1:0\"\nprefix = \"cas/\"\ntls_cert_file = \"/no/such/cert.pem\"\ntls_key_file = \"{key}\""
+    );
+    let why = checked(&load(&no_cert).unwrap()).unwrap_err();
+    assert!(why.to_string().contains("/no/such/cert.pem"), "{why}");
+    assert_eq!(exit_status(&why), 2);
+
+    let lone = format!("listen = \"127.0.0.1:0\"\nprefix = \"cas/\"\ntls_cert_file = \"{key}\"");
+    let why = load(&lone).unwrap_err();
+    assert!(why.to_string().contains("tls_key_file"), "{why}");
+
+    let unkept = load("listen = \"127.0.0.1:0\"\nprefix = \"_journal/x/\"").unwrap_err();
+    assert!(unkept.to_string().contains("oci.prefix"), "{unkept}");
 }
 
 /// Asserts that a build node whose `[oci]` certificate is not a certificate is refused at start

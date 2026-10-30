@@ -24,6 +24,9 @@ pub(super) struct Launch {
     pub settings: Settings,
     /// Whether they were read from a file, so that a refusal speaks of its keys.
     pub from_file: bool,
+    /// Whether `--check-config` was given (with a file): the settings are checked and nothing
+    /// is started.
+    pub check_only: bool,
 }
 
 /// Why there are no settings.
@@ -55,12 +58,17 @@ pub(super) fn resolve(args: Vec<OsString>) -> Result<Launch, Refused> {
         return Ok(Launch {
             settings,
             from_file: true,
+            check_only: matches.get_flag("check_config"),
         });
     }
     let cli = Cli::try_parse_from(args).map_err(Refused::Usage)?;
+    if cli.check_config {
+        return Err(Refused::Config(ConfigError::CheckWithoutConfig));
+    }
     Ok(Launch {
         settings: Settings::Storage(Box::new(cli)),
         from_file: false,
+        check_only: false,
     })
 }
 

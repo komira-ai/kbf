@@ -145,6 +145,12 @@ pub struct Cli {
     /// path, never their contents), and exits with status 0 without starting anything.
     #[arg(long)]
     pub print_config: bool,
+    /// With `--config`: loads and checks the file as a start does (the file, and the key files it
+    /// names) and exits with status 0 and no output, or prints the refusal and exits with status
+    /// 2. Nothing is bound, opened or asked of the network. Without `--config` it is a usage
+    /// error.
+    #[arg(long)]
+    pub check_config: bool,
     /// The address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on.
     #[arg(long)]
     pub listen: SocketAddr,
@@ -608,7 +614,7 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     reconciler.parallel = cli.copy_parallel as usize;
     reconciler.lease_ttl = cli.lease_ttl;
     reconciler.retention = cli.journal_retention;
-    let oci = oci_setup(cli, &server)?;
+    let oci = oci_setup(cli, &server, true)?;
     server.oci_metrics = oci.as_ref().map(|setup| Arc::clone(&setup.metrics));
     Ok(Built {
         server,
@@ -634,8 +640,9 @@ const OCI_HANDSHAKE: Duration = Duration::from_secs(10);
 
 /// Checks the OCI front's flags and files, and makes its TLS, if `--oci-listen` is given. A prefix,
 /// certificate or key that cannot work is an `InvalidFlags` (exit 2, as a restart cannot mend it);
-/// a file that cannot be read is exit 1.
-fn oci_setup(cli: &Cli, server: &ServerConfig) -> Result<Option<OciSetup>, Error> {
+/// a file that cannot be read is exit 1. `warn` says whether the warning for a plain-text listener
+/// is printed; `--check-config` leaves it out, as it prints nothing when the file is fine.
+fn oci_setup(cli: &Cli, server: &ServerConfig, warn: bool) -> Result<Option<OciSetup>, Error> {
     let flags = OciFlags {
         listen: cli.oci_listen,
         tls_cert: cli.oci_tls_cert.clone(),
@@ -644,7 +651,7 @@ fn oci_setup(cli: &Cli, server: &ServerConfig) -> Result<Option<OciSetup>, Error
         max_connections: cli.oci_max_connections,
         connection_lifetime: cli.oci_connection_lifetime,
     };
-    oci_setup_of(&flags, server)
+    oci_setup_of(&flags, server, warn)
 }
 
 /// [`oci_setup`] for the values the flags or the `[oci]` table of a file make: the one place the
@@ -652,6 +659,7 @@ fn oci_setup(cli: &Cli, server: &ServerConfig) -> Result<Option<OciSetup>, Error
 pub(super) fn oci_setup_of(
     flags: &OciFlags,
     server: &ServerConfig,
+    warn: bool,
 ) -> Result<Option<OciSetup>, Error> {
     let Some(listen) = flags.listen else {
         return Ok(None);
@@ -674,7 +682,7 @@ pub(super) fn oci_setup_of(
     let acceptor = match (&flags.tls_cert, &flags.tls_key) {
         (Some(cert), Some(key)) => Some(oci::acceptor(cert, key, listen).map_err(refuse)?),
         (None, None) => {
-            if let Some(warning) = oci::plain_warning(listen) {
+            if let Some(warning) = oci::plain_warning(listen).filter(|_| warn) {
                 eprintln!("{warning}");
             }
             None
@@ -995,7 +1003,11 @@ pub fn main(args: Vec<OsString>) -> ExitCode {
     let Launch {
         settings,
         from_file,
+        check_only,
     } = launch;
+    if check_only {
+        return check_config(&settings);
+    }
     let started = match settings {
         Settings::Storage(cli) if cli.print_config => return print_config(&cli),
         Settings::Storage(cli) => blocking(serve_until_signalled(*cli)),
@@ -1013,6 +1025,43 @@ pub fn main(args: Vec<OsString>) -> ExitCode {
             };
             eprintln!("tierstore: {text}");
             ExitCode::from(exit_status(&why))
+        }
+    }
+}
+
+/// `--check-config`: what a start refuses before it opens anything, asked of the settings of a
+/// file: the front's settings, which reads the key files it names, and the limits a start
+/// checks first. Status 0 and no output if there is nothing to refuse; else the start's message
+/// on stderr and status 2. It binds nothing and asks nothing of a tier. It does not make the
+/// checks that a start makes of the disk and the stores: the budget of a cache against the size
+/// of its file system (`free_floor`), the cache directory, the credentials of a tier, the
+/// self-test.
+fn check_config(settings: &Settings) -> ExitCode {
+    match checked(settings) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(why) => {
+            eprintln!("tierstore: {}", keys_for_flags(&why.to_string()));
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// What `--check-config` finds wrong with the settings, if anything.
+pub(super) fn checked(settings: &Settings) -> Result<(), Error> {
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    match settings {
+        Settings::Storage(cli) => {
+            let server = server_config(&cli.front(), clock)?;
+            // The `oci_*` fields: the prefix, the lifetime and the TLS files, as a start checks them.
+            oci_setup(cli, &server, false).map(drop)
+        }
+        Settings::Cache(cache) if cache.s3_request_timeout.is_zero() => {
+            Err("--s3-request-timeout must be longer than zero".into())
+        }
+        Settings::Cache(cache) => {
+            let server = server_config(&cache.front, clock)?;
+            // The `[oci]` table, with the checks a start makes of it.
+            oci_setup_of(&cache.oci, &server, false).map(drop)
         }
     }
 }
