@@ -35,7 +35,7 @@ use crate::test_dir::scratch_dir;
 
 /// The flags of a frontend on loopback ports, with a Postgres state store that is only parsed
 /// (the index is handed to the start) and `--pack-index`, and `more`.
-fn flags_of(more: &[String]) -> FrontendFlags {
+pub(super) fn flags_of(more: &[String]) -> FrontendFlags {
     let mut argv: Vec<String> = [
         "frontend",
         "--storage=http://127.0.0.1:1",
@@ -54,7 +54,7 @@ fn flags_of(more: &[String]) -> FrontendFlags {
 }
 
 /// The pack flags for the S3 service at `endpoint`, with a credentials file in `dir`.
-fn pack_flags(endpoint: &str, dir: &Path) -> Vec<String> {
+pub(super) fn pack_flags(endpoint: &str, dir: &Path) -> Vec<String> {
     let file = dir.join("pack-credentials.json");
     std::fs::write(&file, r#"{"access_key_id": "k", "secret_access_key": "s"}"#).expect("written");
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("mode");
@@ -66,12 +66,12 @@ fn pack_flags(endpoint: &str, dir: &Path) -> Vec<String> {
     ]
 }
 
-fn index() -> Arc<dyn PackIndex> {
+pub(super) fn index() -> Arc<dyn PackIndex> {
     Arc::new(MemoryPackIndex::new(Arc::new(ManualClock::default())))
 }
 
 /// Starts the frontend `flags` describe over `index`, bound and not yet serving.
-fn started(
+pub(super) fn started(
     flags: &FrontendFlags,
     index: Option<Arc<dyn PackIndex>>,
 ) -> Result<FrontendHandle, Box<dyn Error>> {
@@ -89,7 +89,7 @@ fn proto(digest: &Digest) -> reapi::Digest {
 }
 
 /// The status code of each item of a BatchUpdateBlobs of `blobs`.
-async fn upload(addr: SocketAddr, blobs: &[(Digest, &[u8])]) -> Vec<i32> {
+pub(super) async fn upload(addr: SocketAddr, blobs: &[(Digest, &[u8])]) -> Vec<i32> {
     let requests = blobs
         .iter()
         .map(|(digest, bytes)| batch_update_blobs_request::Request {
@@ -114,7 +114,7 @@ async fn upload(addr: SocketAddr, blobs: &[(Digest, &[u8])]) -> Vec<i32> {
 }
 
 /// The text `GET /metrics` of the operator API at `addr` answers.
-async fn scrape(addr: SocketAddr) -> String {
+pub(super) async fn scrape(addr: SocketAddr) -> String {
     let mut stream = TcpStream::connect(addr).await.expect("connects");
     let request = b"GET /metrics HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n";
     stream.write_all(request).await.expect("sent");

@@ -80,8 +80,12 @@ async fn handle(
         .await
         .map(http_body_util::Collected::to_bytes);
     let line = format!("{} {}", head.method, head.uri.path());
-    locked(&shared.requests).push(line);
-    let fault = locked(&shared.faults).pop_front();
+    locked(&shared.requests).push(line.clone());
+    let fault = {
+        let mut faults = locked(&shared.faults);
+        let at = faults.iter().position(|(route, _)| line.starts_with(route));
+        at.and_then(|at| faults.remove(at)).map(|(_, fault)| fault)
+    };
     match fault {
         Some(Fault::Close) => return Err(Box::new(Injected)),
         Some(Fault::Hang) => match std::future::pending::<Infallible>().await {},

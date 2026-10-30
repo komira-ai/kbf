@@ -226,6 +226,47 @@ index knows, so a read of one still goes to the members. `kbf-pack-adopt`, an op
 a binary of its own, indexes those segments where they lie, with no byte copied and nothing
 written to the object store: [pack-adopt.md](pack-adopt.md) gives the order to run it in.
 
+**The job-facing read listener** (off by default; the `[job-read]` table of `kbf.toml`). A task
+that runs an action on a worker fetches the action's input files from the frontend, with a read
+grant (a token the frontend gives the run, valid until its expiry, for one Action: it reads that
+Action, its Command and its input tree, and no other blob). The task is untrusted code that holds
+no client certificate, so the REAPI listener is not open to it; `--job-listen <addr>` opens
+another, over HTTPS, that serves `GET /<hex>/<size>` with `Authorization: Bearer <read grant>` and
+nothing else (any other path is 404, any other method 405). It needs three more flags, all four
+given together:
+
+- `--job-tls-cert` and `--job-tls-key`: the certificate chain and key of the listener (PEM), issued
+  by the farm CA that the task is told to trust. The TLS is the server's alone: no client
+  certificate is asked for. The task dials the frontend by IP address, and a client that dials an
+  IP address accepts only a certificate that names it as an IP subjectAltName, so the certificate
+  must carry one for each address a job dials the frontend at (for a farm of frontends, one
+  certificate per frontend with its own address, or one naming them all). The start checks this
+  and exits 2 when the certificate has none, or when `--job-listen` is on one address and the
+  certificate does not name it; on `0.0.0.0` or `::` it needs some IP name. The files are read
+  again every `--tls-reload-interval-secs` like the other listeners' (the names are checked at
+  start only).
+- `--job-grant-secret-file`: the farm secret the grants are signed with (at least 32 bytes, mode
+  0600 or 0400, owned by the server's user; surrounding whitespace is dropped). Every frontend
+  of the farm, and whatever issues the grants, reads the same secret, so a grant is verified by
+  any frontend. It is never a flag.
+
+The answers are 200 with the blob and its `Content-Length`; 401 for a missing, malformed, forged,
+expired or revoked grant (with `WWW-Authenticate: Bearer`); 403 for a digest outside the grant's
+scope, or a grant whose Action has no readable inputs in the store; 404 for a blob that is not
+held, an unknown path, and 405 (with `Allow: GET`) for another method; 413 for a blob over 64 MiB,
+without reading it; and 503 when the store cannot answer. A body carries a reason code
+(`missing_token`, `invalid_token`, `expired`, `revoked`, `out_of_scope`, `no_scope`, `too_large`,
+`not_found`, `method_not_allowed`, `store_unavailable`) and nothing else. A blob is read as the
+REAPI listener's reads are (the pack index first, then the storage nodes, checked against its
+digest) and sent whole, so a response never holds more than 64 MiB; at most 32 reads are open at
+once, at most 256 connections are open, a client has 10 seconds to send a request's headers, and a
+connection lives at most 10 minutes. The listener's socket is closed the moment a drain begins; the
+connections open finish their request. `GET /metrics` of the operator API gains
+`kbf_job_read_requests_total` (by `outcome`) and `kbf_job_read_bytes_total`, and
+`kbf_tls_reloads_total` a `listener="job"` series. Where the jobs run must be allowed to reach
+this address and port (the egress allowlist of the worker's network), and the listener should be
+on an interface the jobs, and nothing outside the farm, can reach.
+
 **`storage`.** It serves the storage service over gRPC and nothing else: no REAPI, no
 scheduler, no operator API (only `GET /metrics`, on `--metrics-listen`, off unless given).
 It has no state store; it reaches one only through a frontend. Without `--frontend` it is a
@@ -285,6 +326,7 @@ host; a farm sets routable addresses.
 | worker listener | `--worker-listen` | `127.0.0.1:8981` | `frontend`, `all-in-one` |
 | operator API | `--api-listen` | off unless given | `frontend`, `all-in-one` |
 | enrollment | `--enroll-listen` | off unless given | `frontend` |
+| job-facing read | `--job-listen` | off unless given | `frontend` |
 | storage service | `--storage-listen` | `127.0.0.1:8982` | `storage`, `storage-and-daemon` |
 | storage metrics | `--metrics-listen` | off unless given | `storage`, `storage-and-daemon` |
 | the proxy's public port | `ListenStream=` of `kbf-proxy.socket` | `8980` | proxy hosts |

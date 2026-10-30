@@ -33,7 +33,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::{Config, Origin, Token};
 use crate::ids::{LeaseId, RunId};
-use crate::wire::{Outcome, RunState};
+use crate::wire::{Mount, Outcome, RunState};
 use crate::{Client, ConfigError};
 
 pub use state::Pool;
@@ -62,7 +62,8 @@ pub enum Fault {
 
 struct Shared {
     state: Mutex<State>,
-    faults: Mutex<VecDeque<Fault>>,
+    /// Each fault, with the prefix of the `METHOD /path` line of the request it breaks.
+    faults: Mutex<VecDeque<(String, Fault)>>,
     requests: Mutex<Vec<String>>,
 }
 
@@ -232,6 +233,12 @@ impl FakeLeaseServer {
         locked(&self.shared.state).run_args(run)
     }
 
+    /// The mounts the run was queued with, as the server received them.
+    #[must_use]
+    pub fn run_mounts(&self, run: &RunId) -> Option<Vec<Mount>> {
+        locked(&self.shared.state).run_mounts(run)
+    }
+
     /// The run's state, whoever is asking (a run of a forgotten boot is `None`).
     #[must_use]
     pub fn run_state(&self, run: &RunId) -> Option<RunState> {
@@ -240,7 +247,13 @@ impl FakeLeaseServer {
 
     /// Breaks the next request that arrives (after the ones already queued).
     pub fn inject(&self, fault: Fault) {
-        locked(&self.shared.faults).push_back(fault);
+        self.inject_on("", fault);
+    }
+
+    /// Breaks the next request whose `METHOD /path` line starts with `route`, such as
+    /// `DELETE /v1/leases/`; requests before it are served as usual.
+    pub fn inject_on(&self, route: &str, fault: Fault) {
+        locked(&self.shared.faults).push_back((route.to_owned(), fault));
     }
 
     /// Every request seen so far, as `METHOD /path`, in arrival order. Empty for a server
