@@ -20,7 +20,9 @@ async fn a_hit_serves_the_upstream_bytes_and_makes_no_upstream_call() {
     assert_eq!(rig.get("cas/b/obj").await.unwrap(), body);
     let (gets, heads) = (rig.calls(Op::Get), rig.calls(Op::Head));
     assert_eq!(gets, 1);
-    assert_eq!(heads, 1);
+    // A key that is not named by its content is looked at before the fill and again after it, to
+    // see that nobody wrote over the object while it was read.
+    assert_eq!(heads, 2);
 
     let meta = rig.cache.head("cas/b/obj").await.unwrap();
     let upstream_meta = rig.tamper.memory.head("cas/b/obj").await.unwrap();
