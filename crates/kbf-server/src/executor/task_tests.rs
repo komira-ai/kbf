@@ -16,6 +16,7 @@ fn args<'a>(action: &'a Digest, grant: &'a Secret, url: &'a Secret, plain: bool)
         deadline: Duration::from_secs(90),
         work_dir: None,
         allow_plain_http_put: plain,
+        allow_plain_http_grant: false,
     }
 }
 
@@ -112,6 +113,39 @@ fn the_argv_is_the_task_tools_command_line() {
     }
     .argv(Delivery::InsecureArgv);
     assert_eq!(&worked[plain.len()..], ["--work-dir", "/work"]);
+}
+
+/// Catches the plain-http grant flag leaking into runs that did not ask for it, or being passed
+/// twice or under another spelling: it is the task tool's own `--allow-plain-http-grant`, once,
+/// after the other optional flags, and only when the config allows it, whether or not the put
+/// is plain.
+#[test]
+fn the_plain_http_grant_flag_is_passed_once_and_only_when_allowed() {
+    let (action, grant, url) = (
+        digest(),
+        Secret::new("grant-token"),
+        Secret::new("https://p/key"),
+    );
+    let count = |argv: &[String]| {
+        argv.iter()
+            .filter(|a| a.contains("plain-http-grant"))
+            .count()
+    };
+    for put in [false, true] {
+        let off = args(&action, &grant, &url, put).argv(Delivery::InsecureArgv);
+        assert_eq!(count(&off), 0, "{off:?}");
+        let on = TaskArgs {
+            allow_plain_http_grant: true,
+            ..args(&action, &grant, &url, put)
+        }
+        .argv(Delivery::InsecureArgv);
+        assert_eq!(count(&on), 1, "{on:?}");
+        assert_eq!(
+            on.last().map(String::as_str),
+            Some("--allow-plain-http-grant")
+        );
+        assert_eq!(on.iter().any(|a| a == "--allow-plain-http-put"), put);
+    }
 }
 
 /// Catches a Debug of the task arguments that shows the pack url or the read token.
