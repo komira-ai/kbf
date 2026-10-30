@@ -447,12 +447,12 @@ async fn the_commands_platform_is_read_and_no_timeout_is_none() {
     assert_eq!(rig.front.action(&zero).await.expect("facts").timeout, None);
 }
 
-/// Catches actions the executor must not run being passed on: no image, an image named by a tag
-/// and a timeout below zero are the caller's to fix.
+/// Catches actions the executor must not run being passed on: an image named by a tag and a
+/// timeout below zero are the caller's to fix (an action that names no image is run: see
+/// `an_action_that_names_no_image_is_run_from_the_kbf_image`).
 #[tokio::test]
-async fn an_action_that_names_no_image_by_digest_or_a_negative_timeout_is_invalid() {
+async fn an_image_named_by_tag_or_a_negative_timeout_is_invalid() {
     let rig = Rig::new();
-    let bare = rig.action(|_| {}, |_| {}).await;
     let tagged = rig
         .action(
             |action| action.platform = Some(platform("docker://registry.test/app:latest")),
@@ -468,7 +468,7 @@ async fn an_action_that_names_no_image_by_digest_or_a_negative_timeout_is_invali
             |_| {},
         )
         .await;
-    for digest in [bare, tagged, negative] {
+    for digest in [tagged, negative] {
         let refused = rig.front.action(&digest).await;
         assert!(
             matches!(refused, Err(InputsError::Invalid(_))),
