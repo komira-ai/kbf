@@ -47,18 +47,21 @@ use super::config::{
     invalid, parse_size, refuse, refuse_hot_keys, require, tier, within,
 };
 use super::front::FrontSettings;
-use super::local_cache::CacheConfig;
+use super::local_cache::{CacheConfig, SCRUB_RATE};
 
 /// The only layout of the cache directory.
 const LAYOUT: &str = "digest-v1";
 
-/// A rate in the file: a size and `/s`, such as `50MiB/s`.
+/// A rate in the file: a size and `/s`, such as `50MiB/s`, or `off` (which is 0 bytes a second).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Rate(pub u64);
 
 impl Serialize for Rate {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&format!("{}B/s", self.0))
+        match self.0 {
+            0 => serializer.serialize_str("off"),
+            bytes => serializer.serialize_str(&format!("{bytes}B/s")),
+        }
     }
 }
 
@@ -74,10 +77,13 @@ impl Visitor<'_> for RateVisitor {
     type Value = Rate;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a rate such as \"50MiB/s\"")
+        f.write_str("a rate such as \"50MiB/s\", or \"off\"")
     }
 
     fn visit_str<E: de::Error>(self, text: &str) -> Result<Rate, E> {
+        if text == "off" {
+            return Ok(Rate(0));
+        }
         let size = text.strip_suffix("/s").map(parse_size);
         match size {
             Some(Ok(bytes)) => Ok(Rate(bytes)),
@@ -113,8 +119,8 @@ pub(super) struct LocalCacheTable {
     /// Whether the cache is on: `true`, the default. `false` is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<bool>,
-    /// The rate at which a scrubber would re-read the objects. Accepted; this release does not
-    /// scrub.
+    /// The rate at which the scrub re-reads the objects (`SCRUB_RATE`, 16 MiB/s, if not given);
+    /// `"off"` (or `"0B/s"`) turns the scrub off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrub_rate: Option<Rate>,
 }
@@ -130,7 +136,8 @@ pub(super) struct CacheSettings {
     pub upstream: TierParts,
     /// The cache.
     pub cache: CacheConfig,
-    /// The rate at which a scrubber would run, in bytes a second, if the file gave one.
+    /// The rate of the scrub in bytes a second: the default if the file gave none; none if the
+    /// file turned it off.
     pub scrub_rate: Option<u64>,
 }
 
@@ -232,7 +239,7 @@ impl CacheSettings {
             s3_request_timeout: shared.s3_request_timeout,
             upstream,
             cache,
-            scrub_rate: table.scrub_rate.map(|rate| rate.0),
+            scrub_rate: Some(table.scrub_rate.map_or(SCRUB_RATE, |rate| rate.0)).filter(|n| *n > 0),
         })
     }
 }

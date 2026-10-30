@@ -57,6 +57,11 @@ pub struct Counters {
     failures: [AtomicU64; FAILED.len()],
     evictions: [AtomicU64; EVICTED.len()],
     pub(super) pinned_skips: AtomicU64,
+    /// The objects the scrub hashed again, and the bytes it read for them.
+    pub(super) scrubbed_objects: AtomicU64,
+    pub(super) scrubbed_bytes: AtomicU64,
+    /// The objects the scrub dropped because their bytes did not match.
+    pub(super) scrub_mismatches: AtomicU64,
     pub(super) discarded_at_start: AtomicU64,
     /// The files in the stage directory now.
     pub(super) staging_files: AtomicU64,
@@ -127,6 +132,9 @@ impl Counters {
             ("fills_skipped_total", read(&self.fills_skipped)),
             ("fills_skipped_busy_total", read(&self.fills_skipped_busy)),
             ("pinned_skips_total", read(&self.pinned_skips)),
+            ("scrubbed_objects_total", read(&self.scrubbed_objects)),
+            ("scrubbed_bytes_total", read(&self.scrubbed_bytes)),
+            ("scrub_mismatches_total", read(&self.scrub_mismatches)),
             ("discarded_at_start_total", read(&self.discarded_at_start)),
             ("bytes", cache_bytes),
             ("objects", cache_objects),

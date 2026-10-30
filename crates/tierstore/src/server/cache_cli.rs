@@ -31,7 +31,9 @@ use crate::{Backend, Clock, Error as BackendError, SystemClock};
 use super::cli::{Error, S3Flags, open_tier, probe_run_id, signals};
 use super::config_cache::CacheSettings;
 use super::front::{InvalidFlags, server_config};
-use super::local_cache::{CacheConfig, Disk, LocalCache, SystemDisk, check_local};
+use super::local_cache::{
+    CacheConfig, Disk, Every, LocalCache, SCRUB_TICK, SystemDisk, check_local,
+};
 use super::{Drained, Server};
 
 /// How often the eviction pass runs beside the server.
@@ -129,9 +131,6 @@ pub(super) async fn serve_cache(
     let run = probe_run_id(&settings.front.proxy_id, clock.now(), std::process::id());
     let cache = open(&settings.cache, &upstream, &disk, &run).await?;
     reach(&*upstream, &run, &settings.upstream.spec).await?;
-    if let Some(rate) = settings.scrub_rate {
-        eprintln!("tierstore: scrub_rate {rate} B/s is accepted; this release does not scrub");
-    }
     config.cache = Some(cache.clone());
     let backend: Arc<dyn Backend> = Arc::new(cache.clone());
     let server = Server::new(backend, config);
@@ -144,15 +143,19 @@ pub(super) async fn serve_cache(
         stop.await;
         stopping.begin_drain();
     });
-    let halt = Arc::new(Notify::new());
-    let halting = Arc::clone(&halt);
+    // One Notify for each loop: `notify_one` wakes one waiter, and keeps the wake for a loop that
+    // is not waiting just now.
+    let (halt, halt_scrub) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let halting = (Arc::clone(&halt), Arc::clone(&halt_scrub));
     let serving = async move {
         let drained = server.serve(listener).await;
-        halting.notify_one();
+        halting.0.notify_one();
+        halting.1.notify_one();
         drained
     };
     let maintaining = cache.maintain(PASS_INTERVAL, halt);
-    let (drained, ()) = tokio::join!(serving, maintaining);
+    let scrubbing = cache.scrub(settings.scrub_rate, Every::new(SCRUB_TICK), halt_scrub);
+    let (drained, (), ()) = tokio::join!(serving, maintaining, scrubbing);
     watcher.abort();
     Ok(drained)
 }

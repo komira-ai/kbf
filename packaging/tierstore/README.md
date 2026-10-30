@@ -341,9 +341,9 @@ GET of an object that is not there fills the whole object if it is at most 64 Mi
 passes the range through and keeps nothing. A fill that fails (a short body, an object written over
 while it was read, an upstream error, a directory that cannot be written) never fails the reader for
 the cache's reasons: the reader is answered from the upstream. A kept object is never checked
-against the upstream again, and a hit is not hashed again: put `cache = true` only on prefixes whose
-objects are never rewritten (the content-addressed ones), and note that the start reads the sizes of
-the files, not their bytes. Anyone who may read through the front may read everything the upstream's
+against the upstream again, and a hit is not hashed again (the scrub below does that, later): put
+`cache = true` only on prefixes whose objects are never rewritten (the content-addressed ones), and
+note that the start reads the sizes of the files, not their bytes. Anyone who may read through the front may read everything the upstream's
 read key can read, so give build clients scoped keys. The directories the cache makes are mode 0755
 whatever the umask.
 
@@ -361,9 +361,19 @@ pass-through, whether or not the object is kept, and a whole GET of a miss holds
 the fill has kept it. A fill that panics or is cancelled frees its slot and its key, and the
 readers that waited for it get a 503 (`fill_failures_total{reason="aborted"}`).
 
-No scrub. A hit is not hashed again, and the sidecar's `sha256` is written but not checked after
-the fill: an object that rots on the disk is served as it is now until it is evicted. A restart
-checks sizes only.
+Scrub. A hit is not hashed again, so a background scrub reads the objects at `scrub_rate` (16 MiB a
+second by default) and hashes each against the digest it must have: the name for a key
+`cas/l/<sha256>`, and for any other key the `sha256` that the sidecar recorded at the fill (every
+sidecar has it, so every object is checked). An object whose bytes do not match, or whose sidecar
+can no longer be read, is removed from the index and the disk, counted in
+`scrub_mismatches_total` and named on stderr; the next read of its key fills it again from the
+upstream. The scrub walks the objects in name order, takes the names at the start of a round, and
+starts over when it is done; it reads an object whole, so one object larger than the rate is read
+in one go and the next reads wait until the rate has paid for it. It never drops an object whose
+fill is still ending, and never one whose file was replaced after it was read. A file that cannot
+be read (a failing disk, out of descriptors) is left alone and not counted. `scrub_rate = "off"`
+turns it off; a restart still checks sizes only. A hard link that a job holds to a dropped object
+keeps the old bytes for that job: the scrub removes the cache's name only.
 
 Eviction keeps the cache under `budget` bytes: above `high_water` percent of it, and when the free
 space of the file system (`statvfs`) is under `free_floor` percent, a pass removes the least
@@ -377,8 +387,7 @@ stop a fill, so on a disk that the jobs fill, the cache may fill the file system
 until the next pass (every 10 seconds) frees it. The start refuses (exit status 2) a `budget` larger
 than the size of the file system less `free_floor` percent of it; a file system whose size cannot be
 read, or that reports 0 bytes, is not judged: the start warns on stderr and goes on. The files of
-`.stage/` are never evicted and are removed at start. `scrub_rate` is accepted; this release does not
-scrub.
+`.stage/` are never evicted and are removed at start.
 
 | key | what |
 |---|---|
@@ -391,7 +400,7 @@ scrub.
 | `local_cache.free_floor` | percent of the file system that is kept free (0 to 99, default 10): below it a pass evicts, even under the budget; it does not stop a fill, and `budget` may not be above the file system's size less the floor (exit status 2), unless its size cannot be read or is 0, which the start warns of and does not judge |
 | `local_cache.max_concurrent_fills` | the most fills that run at once (1 to 64, default 4); a miss that finds them all running is served from the upstream and kept nowhere |
 | `local_cache.cache` | `true`, the default; `false` is refused (leave `[local_cache]` out to run without a cache) |
-| `local_cache.scrub_rate` | a size and `/s`, such as `"50MiB/s"`: accepted, and not used by this release |
+| `local_cache.scrub_rate` | the bytes a second the scrub reads, a size and `/s` such as `"50MiB/s"` (default `"16MiB/s"`); `"off"` turns the scrub off |
 | `cold_store.endpoints` | a list of exactly one endpoint, in place of `endpoint`: several are refused as not supported yet, since the cache reads from one upstream |
 
 `[cold_store]` is the upstream: any `kind` (an `s3` bucket, with `endpoint` and a `credentials_file`
@@ -417,7 +426,7 @@ text format, `tierstore_cache_<name>`, with: `hits_total`, `misses_total`, `byte
 fill included, so the byte hit ratio is the first over the sum of the two), `fills_total`,
 `fills_skipped_total`, `fills_skipped_busy_total` (those of the skipped fills that found every fill
 slot taken), `fill_failures_total{reason}` (`hash_mismatch`, `upstream_error`,
-`short_body`, `local_io`, `changed`, `aborted`), `evictions_total{reason}` (`budget`, `floor`), `pinned_skips_total`,
+`short_body`, `local_io`, `changed`, `aborted`), `evictions_total{reason}` (`budget`, `floor`), `pinned_skips_total`, `scrubbed_objects_total`, `scrubbed_bytes_total`, `scrub_mismatches_total`,
 `discarded_at_start_total`, and the gauges `bytes`, `objects`, `fs_free_bytes` and `staging_files`.
 On a storage node it says there is no cache.
 

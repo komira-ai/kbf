@@ -7,7 +7,7 @@ use std::time::Duration;
 use super::config::{File, from_text, settings_from_text};
 use super::config_cache::{CacheSettings, Rate};
 use super::config_testing::{DEFAULTS, GOLDEN};
-use super::local_cache::{FILL_CHUNK, WHOLE_FILL_LIMIT};
+use super::local_cache::{FILL_CHUNK, SCRUB_RATE, WHOLE_FILL_LIMIT};
 
 /// A build node's file with every key given a value that is not the default.
 const CACHE: &str = r#"
@@ -166,7 +166,7 @@ fn a_build_node_file_makes_a_cache() {
 }
 
 /// Asserts the defaults of a build node's file: marks at 90, 75 and 95 percent, a floor of 10
-/// percent, the region of the flags, no scrub, and the limits of the flags.
+/// percent, the region of the flags, the scrub at its default rate, and the limits of the flags.
 #[test]
 fn a_build_node_file_has_the_defaults_of_the_flags_and_of_the_cache() {
     let cache = cache_of(LEAST);
@@ -186,8 +186,22 @@ fn a_build_node_file_has_the_defaults_of_the_flags_and_of_the_cache() {
     assert_eq!(cache.front.max_request_bytes, 256 << 20);
     assert_eq!(cache.front.max_concurrent_puts, 32);
     assert_eq!(cache.s3_request_timeout, Duration::from_secs(60));
-    assert_eq!(cache.scrub_rate, None);
+    assert_eq!(cache.scrub_rate, Some(SCRUB_RATE));
+    assert_eq!(SCRUB_RATE, 16 << 20);
     assert_eq!(cache.upstream.spec, "memory");
+}
+
+/// Asserts that `scrub_rate` of `"off"` or of zero bytes turns the scrub off, and that a rate is
+/// written back by `--print-config`'s form: `off` for none, bytes a second otherwise.
+#[test]
+fn a_scrub_rate_of_off_or_zero_turns_the_scrub_off() {
+    for off in ["\"off\"", "\"0B/s\""] {
+        let text = cache_with("\"50MiB/s\"", off);
+        assert_eq!(cache_of(&text).scrub_rate, None, "{off}");
+    }
+    assert_eq!(serde_json::to_string(&Rate(0)).unwrap(), "\"off\"");
+    assert_eq!(serde_json::to_string(&Rate(7)).unwrap(), "\"7B/s\"");
+    assert_eq!(serde_json::from_str::<Rate>("\"off\"").unwrap(), Rate(0));
 }
 
 /// Asserts that a single `endpoints` entry is the upstream, as `endpoint` is.

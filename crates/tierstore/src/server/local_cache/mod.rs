@@ -4,8 +4,8 @@
 //! binary: a storage node's tierstore). The S3 front serves it like any other backend, and
 //! refuses every write before it gets here (see `ServerConfig::cache`), so a cache has no
 //! journal, no lease and no reconciler, and nothing to recover but a directory of files it can
-//! delete. The only things that run on their own are the fills a miss starts and the eviction
-//! pass ([`LocalCache::maintain`]).
+//! delete. The only things that run on their own are the fills a miss starts, the eviction
+//! pass ([`LocalCache::maintain`]) and the scrub ([`LocalCache::scrub`]).
 //!
 //! # What is kept
 //!
@@ -39,7 +39,7 @@
 //! the upstream. A key that is not named by its content is read twice by HEAD, before the first
 //! chunk and after the last: if the size or the tag changed, the object was written over during
 //! the fill and is not kept. A key named by its content whose bytes do not hash to the name is
-//! the reader's error, not passed through. A hit is not hashed again.
+//! the reader's error, not passed through. A hit is not hashed again: the scrub does that.
 //!
 //! At most `max_concurrent_fills` fills run at once, each holding one chunk (`fill_chunk`, 8 MiB)
 //! in memory at a time, so the fills hold at most that many chunks. A miss of a key that has no
@@ -59,6 +59,11 @@
 //! per pass however often it was used) so that a restart keeps it. An object with more than one
 //! link is in use by another tree: it is skipped, counted, and stays charged to the budget.
 //! Files in `.stage/` are never evicted and are removed at start.
+//!
+//! # Scrub
+//!
+//! A background walk hashes each object again at a bounded rate and drops the ones whose bytes
+//! changed on the disk; see [`scrub`].
 
 mod disk;
 mod evict;
@@ -66,6 +71,7 @@ mod fill;
 mod index;
 pub(super) mod layout;
 mod metrics;
+mod scrub;
 mod selfcheck;
 
 #[cfg(test)]
@@ -78,6 +84,8 @@ mod front_tests;
 mod hit_tests;
 #[cfg(test)]
 mod limits_tests;
+#[cfg(test)]
+mod scrub_tests;
 #[cfg(test)]
 mod selfcheck_tests;
 #[cfg(test)]
@@ -101,6 +109,7 @@ use crate::{Backend, ByteRange, Clock, Error, Listed, Meta, OpenUpload, UploadsA
 
 pub use disk::{Disk, Space, SystemDisk};
 pub use metrics::Counters;
+pub use scrub::{Every, SCRUB_RATE, SCRUB_TICK, ScrubPass, Scrubber, Ticker};
 pub use selfcheck::{LocalTierFailure, check_local};
 
 use fill::Pending;
