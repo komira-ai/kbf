@@ -208,14 +208,26 @@ impl Release {
         self.attest_from(skip, "refs/heads/main");
     }
 
-    /// The files with a bundle: the tarballs and the `.deb` packages.
+    /// The files with a bundle: the tarballs, the `.deb` packages and the image tarballs.
     fn bundled(&self) -> Vec<(String, String)> {
         self.sums()
             .into_iter()
             .filter(|(_, name)| {
-                name.ends_with(".tar.gz") || name.ends_with(".deb") || name.ends_with(".pkg")
+                name.ends_with(".tar.gz")
+                    || name.ends_with(".deb")
+                    || name.ends_with(".pkg")
+                    || name.ends_with(".oci.tar")
             })
             .collect()
+    }
+
+    /// Whether the sums list the SBOM of the image `name` (`<image stem>.cdx.json`): the one
+    /// image an SBOM attestation covers.
+    fn has_image_sbom(&self, name: &str) -> bool {
+        name.strip_suffix(".oci.tar").is_some_and(|stem| {
+            let sbom = format!("{stem}.cdx.json");
+            self.sums().iter().any(|(_, n)| *n == sbom)
+        })
     }
 
     /// Adds a deb of `platform` as `pkg-kbf-asset` leaves it: the file in
@@ -278,7 +290,7 @@ impl Release {
         let mut store = String::new();
         for (sha, name) in self.sums() {
             let mut kinds = vec![false];
-            if name.ends_with(".tar.gz") {
+            if name.ends_with(".tar.gz") || self.has_image_sbom(&name) {
                 kinds.push(true);
             }
             for sbom in kinds {
@@ -763,7 +775,9 @@ fn a_task_image_does_not_go_without_its_facts_or_the_facts_without_the_image() {
     let r = Release::build_with("image-facts", &[("linux-x86_64", names)]);
     let image = format!("kbf-task-image-{COMMIT}-linux-x86_64.oci.tar");
     let facts = format!("kbf-task-image-{COMMIT}-linux-x86_64.facts.json");
+    let sbom = format!("kbf-task-image-{COMMIT}-linux-x86_64.cdx.json");
     r.add_listed(&image, "the task image\n");
+    r.add_listed(&sbom, "the SBOM of the task image\n");
     let (code, out, err) = xtask(&["verify-assets", "sums", s(&r.dist)], &r.tmp, None);
     assert_eq!(code, Some(1), "{out}");
     assert_eq!(
@@ -785,6 +799,127 @@ fn a_task_image_does_not_go_without_its_facts_or_the_facts_without_the_image() {
             "xtask: {facts}: the image it states the facts of, {image}, is not listed in \
              SHA256SUMS\n"
         )
+    );
+}
+
+#[test]
+fn a_task_image_does_not_go_without_its_sbom_or_the_sbom_without_the_image() {
+    // Catches: a release set that lists the task image without the CycloneDX SBOM of the image (the
+    // base's packages would be attested nowhere), an image SBOM left in a set with no image it
+    // describes, the SBOM of the `kbf-task` binary (`kbf-task-<commit>-<platform>.cdx.json`)
+    // mistaken for the image's, and a pairing that is checked for one platform only. The control
+    // is the set with both listed.
+    let names: &[&str] = &["kbf-daemon"];
+    let r = Release::build_with("image-sbom", &[("linux-x86_64", names)]);
+    let image = format!("kbf-task-image-{COMMIT}-linux-x86_64.oci.tar");
+    let facts = format!("kbf-task-image-{COMMIT}-linux-x86_64.facts.json");
+    let sbom = format!("kbf-task-image-{COMMIT}-linux-x86_64.cdx.json");
+    r.add_listed(&image, "the task image\n");
+    r.add_listed(&facts, "the facts of the task image\n");
+    let (code, out, err) = xtask(&["verify-assets", "sums", s(&r.dist)], &r.tmp, None);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!("xtask: {image}: its image SBOM {sbom} is not listed in SHA256SUMS\n")
+    );
+    r.add_listed(&sbom, "the SBOM of the task image\n");
+    let (code, out, err) = xtask(&["verify-assets", "sums", s(&r.dist)], &r.tmp, None);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.starts_with("sums: "), "{out}");
+
+    let r = Release::build_with("image-sbom-orphan", &[("linux-x86_64", names)]);
+    r.add_listed(&sbom, "the SBOM of the task image\n");
+    let (code, out, err) = xtask(&["verify-assets", "sums", s(&r.dist)], &r.tmp, None);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!("xtask: {sbom}: the image it describes, {image}, is not listed in SHA256SUMS\n")
+    );
+
+    // The SBOM of the binary is the tarball's, and is no image's.
+    let r = Release::build_with("image-sbom-binary", &[("linux-arm64", &["kbf-task"][..])]);
+    let (code, out, err) = xtask(&["verify-assets", "sums", s(&r.dist)], &r.tmp, None);
+    assert_eq!(code, Some(0), "{err}: {out}");
+}
+
+#[test]
+fn the_task_image_is_verified_with_an_sbom_attestation_and_its_sbom_with_provenance() {
+    // Catches: an image whose SBOM attestation the verify job never asks for (the attest job could
+    // lose its step and nothing would notice); the SBOM asked for with provenance only, or the
+    // image's SBOM attestation required of an image that has no SBOM listed (the previous release);
+    // the image's bundle dropped because it now has an SBOM attestation too; and the SBOM file
+    // refused as neither a tarball, a package nor facts.
+    let names: &[&str] = &["kbf", "kbf-daemon"];
+    let r = Release::build_with("image-sbom-attested", &[("linux-x86_64", names)]);
+    let image = format!("kbf-task-image-{COMMIT}-linux-x86_64.oci.tar");
+    let facts = format!("kbf-task-image-{COMMIT}-linux-x86_64.facts.json");
+    let sbom = format!("kbf-task-image-{COMMIT}-linux-x86_64.cdx.json");
+    for (name, what) in [
+        (&image, "the task image\n"),
+        (&facts, "the facts of the task image\n"),
+        (&sbom, "the SBOM of the task image\n"),
+    ] {
+        r.add_listed(name, what);
+    }
+    r.attest(None);
+    let (code, out, err) = r.verify(&format!("{WORKFLOW}@refs/heads/main"), None);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(
+        out.lines()
+            .any(|l| l == format!("verified: {image} (provenance, SBOM, bundle)")),
+        "{out}"
+    );
+    assert!(
+        out.lines()
+            .any(|l| l == format!("verified: {sbom} (provenance)")),
+        "{out}"
+    );
+    let path = s(&r.dist.join(&image)).to_owned();
+    let calls = r.gh_calls();
+    let asked = format!(
+        "attestation verify {path} {} {SBOM_PREDICATE}",
+        flags(WORKFLOW)
+    );
+    assert_eq!(
+        calls.iter().filter(|c| **c == asked).count(),
+        1,
+        "{calls:#?}"
+    );
+    // The image's SBOM attestation lost: refused, naming the predicate.
+    r.attest(Some((image.as_str(), true)));
+    let (code, _, err) = r.verify(WORKFLOW, None);
+    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(
+        err,
+        format!(
+            "xtask: {path}: no https://cyclonedx.org/bom attestation signed by {WORKFLOW} verifies\n"
+        )
+    );
+    // The SBOM file's own provenance lost: refused as any file's.
+    r.attest(Some((sbom.as_str(), false)));
+    let (code, _, err) = r.verify(WORKFLOW, None);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains(&sbom), "{err}");
+}
+
+#[test]
+fn a_task_image_with_no_sbom_listed_is_verified_as_before() {
+    // Catches: the SBOM attestation required of a task image whose SBOM the set does not list (the
+    // previous release, made before the image had one, is read by `release fetch-previous`, which
+    // verifies its attestations): provenance and the bundle only.
+    let names: &[&str] = &["kbf", "kbf-daemon"];
+    let r = Release::build_with("image-no-sbom", &[("linux-x86_64", names)]);
+    let image = format!("kbf-task-image-{COMMIT}-linux-x86_64.oci.tar");
+    let facts = format!("kbf-task-image-{COMMIT}-linux-x86_64.facts.json");
+    r.add_listed(&image, "the task image\n");
+    r.add_listed(&facts, "the facts of the task image\n");
+    r.attest(None);
+    let (code, out, err) = r.verify(&format!("{WORKFLOW}@refs/heads/main"), None);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(
+        out.lines()
+            .any(|l| l == format!("verified: {image} (provenance, bundle)")),
+        "{out}"
     );
 }
 

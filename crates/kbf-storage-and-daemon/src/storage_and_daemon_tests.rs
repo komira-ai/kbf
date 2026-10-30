@@ -228,7 +228,12 @@ fn a_starter_starts_the_daemon_half_over_the_storage_half_in_either_mode() {
         let at = |name: &str| dir.join(frontend.map_or("one", |_| "farm")).join(name);
         let cold = format!("--cold-store=file://{}", at("cold").display());
         let meta = format!("--meta-dir={}", at("meta").display());
-        let mut extra = vec!["--storage-listen=127.0.0.1:0", &cold, &meta];
+        let mut extra = vec![
+            "--storage-listen=127.0.0.1:0",
+            &cold,
+            "--cold-store-floor-bytes=1",
+            &meta,
+        ];
         extra.extend(frontend);
         let flags = flags(&extra).expect("flags");
         let half = tokio
@@ -264,6 +269,7 @@ fn the_local_member_is_registered_under_the_advertised_address() {
         let mut extra = vec![
             "--storage-listen=127.0.0.1:0".to_owned(),
             cold,
+            "--cold-store-floor-bytes=1".to_owned(),
             meta,
             admitting.clone(),
         ];
