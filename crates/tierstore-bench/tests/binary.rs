@@ -40,9 +40,9 @@ fn report_prints_its_table_and_a_missing_directory_stops_it() {
 }
 
 /// Catches a binary that cannot print its help, which means a clap definition that does not
-/// build.
+/// build, and a verb left out of it.
 #[test]
-fn help_lists_the_six_verbs() {
+fn help_lists_every_verb() {
     let out = Command::new(env!("CARGO_BIN_EXE_tierstore-bench"))
         .arg("--help")
         .output()
@@ -51,6 +51,7 @@ fn help_lists_the_six_verbs() {
     let text = String::from_utf8_lossy(&out.stdout);
     for verb in [
         "preflight",
+        "plan",
         "provision",
         "run",
         "fault-proxy",
