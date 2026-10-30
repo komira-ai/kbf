@@ -263,6 +263,13 @@ async fn a_break_after_sending_may_have_applied() {
     assert!(error.may_have_applied());
     assert!(error.to_string().contains("after the request was sent"));
 
+    // A fault aimed at a route waits for it, and the requests before it are served.
+    server.inject_on("GET /v1/hosts", Fault::Close);
+    client.leases().await.unwrap();
+    let error = client.hosts().await.unwrap_err();
+    assert!(matches!(error, Error::Transport(_)), "{error:?}");
+    client.hosts().await.unwrap();
+
     server.inject(Fault::Hang);
     let error = client.queue_run(id, &spec).await.unwrap_err();
     assert!(matches!(error, Error::Transport(_)), "{error:?}");
