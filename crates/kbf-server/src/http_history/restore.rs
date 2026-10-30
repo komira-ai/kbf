@@ -258,6 +258,7 @@ fn run(r: &RunRecord) -> Option<Box<Run>> {
             times,
             usage,
             booked_memory_bytes: booked,
+            booked_millicpus: r.booked_millicpus,
             cap_bytes: cap,
         })
     })

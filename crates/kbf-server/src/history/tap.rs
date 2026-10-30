@@ -388,7 +388,11 @@ pub(crate) fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
                 wall_us: f.wall_micros.or((wall > 0).then_some(wall)),
             }),
         node_cpu_pressure_centi: usage.and_then(|u| u.node_cpu_pressure_centi),
-        booked_millicpus: usage.and_then(|u| u.booked_millicpus),
+        // What the lease was granted, as the build pages show it; the daemon's own report
+        // (the same figure) only for a lease the server never started.
+        booked_millicpus: run
+            .and_then(|r| r.booked_millicpus)
+            .or(usage.and_then(|u| u.booked_millicpus)),
         outputs: listing.map_or_else(Vec::new, |l| {
             l.outputs
                 .iter()

@@ -143,6 +143,11 @@ pub struct Cli {
     /// distinct file blob, each streamed to disk.
     #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u16).range(1..=256))]
     pub fetch_concurrency: u16,
+    /// Read the input blobs under 64 KiB in `POST <grant-url>/batch` requests (up to 256 digests
+    /// and 4 MiB each) instead of one GET each; larger blobs still go by GET. Off by default: a
+    /// grant without the route answers 404, after which every blob is read by GET.
+    #[arg(long)]
+    pub fetch_batch: bool,
     /// A file holding the read grant's bearer token (a trailing newline is dropped).
     #[arg(long)]
     pub grant_token_file: Option<PathBuf>,
@@ -666,7 +671,7 @@ fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
         );
     }
     let urls = put_urls(cli)?;
-    let source = HttpBlobSource::new(&cli.grant_url, &token, &roots)?;
+    let source = HttpBlobSource::new(&cli.grant_url, &token, &roots)?.with_batch(cli.fetch_batch);
     let sink = HttpSink {
         agent: if cli.allow_plain_http_put {
             agent_with_plain_http(tls_config(&roots))
