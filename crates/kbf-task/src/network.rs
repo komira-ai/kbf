@@ -272,18 +272,43 @@ fn confine_with(
 }
 
 /// Applies `network` to the process about to be started. Only the seccomp filter and the
-/// namespace exist on Linux: elsewhere the Command runs with the network and a line says so.
+/// namespace exist on Linux, and no confine is compiled in elsewhere: a Command that is to be
+/// denied the network is refused ([`RunError::NoConfine`], exit 15), never run with it. The test-only
+/// feature `unconfined-for-tests` turns the refusal into a warning line and a run with the
+/// network, so a developer's machine can run the suite.
 ///
 /// # Errors
-/// None on this system.
+/// [`RunError::NoConfine`] for [`Network::Denied`], unless the feature is on.
 #[cfg(not(target_os = "linux"))]
 pub fn confine(_process: &mut Process, network: Network) -> Result<Confinement, RunError> {
     let denied = network == Network::Denied;
-    if denied {
-        eprintln!("kbf-task: this system cannot deny the Command the network; it runs with it");
+    if let Some(warning) = without_confine(network, cfg!(feature = "unconfined-for-tests"))? {
+        eprintln!("{warning}");
     }
     Ok(Confinement { denied })
 }
+
+/// What a system with no confine does with `network`: nothing for [`Network::Allowed`]; for
+/// [`Network::Denied`] the refusal, or, when `unconfined_for_tests`, the line to print before the
+/// Command runs with the network. Not tied to the system, so Linux runs its tests.
+///
+/// # Errors
+/// [`RunError::NoConfine`] for a denied Command when `unconfined_for_tests` is false.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) fn without_confine(
+    network: Network,
+    unconfined_for_tests: bool,
+) -> Result<Option<&'static str>, RunError> {
+    match (network, unconfined_for_tests) {
+        (Network::Allowed, _) => Ok(None),
+        (Network::Denied, true) => Ok(Some(UNCONFINED_WARNING)),
+        (Network::Denied, false) => Err(RunError::NoConfine),
+    }
+}
+
+/// The line printed when the feature `unconfined-for-tests` lets a denied Command run with the network.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) const UNCONFINED_WARNING: &str = "kbf-task: this system cannot deny the Command the network; it runs with it (unconfined-for-tests)";
 
 /// The filter that lets `AF_INET` through is for a Command that is certainly in a namespace of
 /// its own: every step must have succeeded. Any other outcome, a skip for root included, gets

@@ -50,6 +50,12 @@ pub enum RunError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// The Command is to be denied the network and this system has no way to deny it (no
+    /// platform confine is compiled in): it is refused, not run with the network.
+    #[error(
+        "this system cannot deny the Command the network (no confine is built for it), so the Command is not run; only a Command allowed the network (kbf-network=allow) runs here"
+    )]
+    NoConfine,
     /// The program could not be started.
     #[error("cannot start {program}: {source}")]
     Spawn {
