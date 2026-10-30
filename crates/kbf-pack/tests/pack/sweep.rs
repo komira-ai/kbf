@@ -561,7 +561,7 @@ async fn a_403_on_a_delete_aborts_the_sweep_at_the_first_key() {
     for k in 0..4 {
         rig.store.seed(&key(OLD + k), b"orphan").await;
     }
-    rig.store.deny_deletes();
+    rig.store.deny_deletes(403);
     let error = sweeper(&rig, gates(true, None)).sweep(now()).await;
     assert!(matches!(error, Err(SweepError::Denied(_))), "{error:?}");
     assert_eq!(rig.store.deletes(), 1);
@@ -739,4 +739,61 @@ async fn the_claim_is_held_from_the_last_index_answer_through_the_delete() {
         format!("release {name}"),
     ];
     assert_eq!(*log.lock().unwrap(), want);
+}
+
+/// Asserts that a delete answered 401 (a bad credential) ends the sweep at that key as a 403
+/// does: one delete asked, `Denied`, nothing deleted.
+#[tokio::test]
+async fn a_401_on_a_delete_aborts_the_sweep_like_a_403() {
+    let rig = Rig::new();
+    for k in 0..4 {
+        rig.store.seed(&key(OLD + k), b"orphan").await;
+    }
+    rig.store.deny_deletes(401);
+    let error = sweeper(&rig, gates(true, None)).sweep(now()).await;
+    assert!(matches!(error, Err(SweepError::Denied(_))), "{error:?}");
+    assert_eq!(rig.store.deletes(), 1);
+    assert_eq!(rig.store.keys_under("cas/b/").await.len(), 4);
+}
+
+/// Asserts that leadership is asked last, after the index's answer for the key and immediately
+/// before the delete: a server that stops leading while the key is claimed and the index is being
+/// asked deletes nothing, lets the claim go, and is counted abandoned. The gate says no from the
+/// moment the index has answered the second time.
+#[tokio::test]
+async fn leadership_lost_after_the_last_index_answer_stops_before_the_delete() {
+    let log: Log = Log::default();
+    let rig = Rig::new();
+    rig.store.seed(&key(OLD), b"orphan").await;
+    let index: Arc<dyn PackIndex> = Arc::new(LoggedIndex {
+        inner: MemoryPackIndex::new(Arc::new(ManualClock::default())),
+        log: Arc::clone(&log),
+    });
+    let store = Arc::new(LoggedStore {
+        inner: Arc::clone(&rig.store),
+        log: Arc::clone(&log),
+    });
+    let mut gates = gates(true, None);
+    let asked = Arc::clone(&log);
+    gates.is_leader = Box::new(move || asked.lock().unwrap().len() < 3);
+    let claims = Arc::clone(&log);
+    gates.claim = Box::new(move |key| {
+        log_of(&claims, format!("claim {key}"));
+        Some(Box::new(LoggedClaim(Arc::clone(&claims), key.to_owned())))
+    });
+    let sweep = Sweeper::new(store, index, SweepConfig::default(), gates);
+
+    let report = sweep.sweep(now()).await.unwrap();
+
+    assert!(report.abandoned);
+    assert_eq!(report.deleted, 0);
+    let name = key(OLD);
+    let want = [
+        "ask 1".to_owned(),
+        format!("claim {name}"),
+        "ask 1".to_owned(),
+        format!("release {name}"),
+    ];
+    assert_eq!(*log.lock().unwrap(), want);
+    assert!(rig.store.holds(&name).await);
 }

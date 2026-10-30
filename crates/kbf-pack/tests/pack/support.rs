@@ -1,7 +1,7 @@
 //! Fixtures: an object store and a pack index that fail when told to, and record what they
 //! are asked.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -52,7 +52,7 @@ pub struct FaultyStore {
     lose_puts: AtomicU32,
     fail_gets: AtomicU32,
     fail_deletes: AtomicU32,
-    deny_deletes: AtomicBool,
+    deny_deletes: AtomicU32,
     delete_calls: AtomicU32,
     pass_gets: AtomicU32,
     pass_lists: AtomicU32,
@@ -82,7 +82,7 @@ impl FaultyStore {
             lose_puts: AtomicU32::new(0),
             fail_gets: AtomicU32::new(0),
             fail_deletes: AtomicU32::new(0),
-            deny_deletes: AtomicBool::new(false),
+            deny_deletes: AtomicU32::new(0),
             delete_calls: AtomicU32::new(0),
             pass_gets: AtomicU32::new(0),
             pass_lists: AtomicU32::new(0),
@@ -125,9 +125,9 @@ impl FaultyStore {
         self.fail_deletes.store(n, Ordering::SeqCst);
     }
 
-    /// From now on every delete is answered 403 AccessDenied.
-    pub fn deny_deletes(&self) {
-        self.deny_deletes.store(true, Ordering::SeqCst);
+    /// From now on every delete is answered `status` (401 or 403) AccessDenied.
+    pub fn deny_deletes(&self, status: u32) {
+        self.deny_deletes.store(status, Ordering::SeqCst);
     }
 
     /// The deletes asked of the store so far, refused ones included.
@@ -228,9 +228,10 @@ impl ObjectStore for FaultyStore {
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
         self.delete_calls.fetch_add(1, Ordering::SeqCst);
-        if self.deny_deletes.load(Ordering::SeqCst) {
+        let denied = self.deny_deletes.load(Ordering::SeqCst);
+        if denied != 0 {
             return Err(ObjectStoreError::Service {
-                status: 403,
+                status: u16::try_from(denied).unwrap(),
                 code: "AccessDenied".to_owned(),
                 message: "injected".to_owned(),
             });

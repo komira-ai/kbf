@@ -496,16 +496,19 @@ async fn a_dry_run_counts_and_deletes_nothing() {
 #[tokio::test(start_paused = true)]
 async fn the_loop_sweeps_on_every_interval() {
     let rig = Rig::new();
-    let metrics = rig.metrics.clone();
+    let mut finished = rig.metrics.finished();
     let store = Arc::clone(&rig.store);
     let looping = tokio::spawn(rig.janitor.run());
-    while metrics.sweeps() < 1 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+    // Each sweep that ends is told, so the test waits for sweeps and not for time.
+    finished
+        .wait_for(|sweeps| *sweeps >= 1)
+        .await
+        .expect("runs");
     store.seed(&key(OLD, Slot::Pack(0))).await;
-    while metrics.sweeps() < 3 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+    finished
+        .wait_for(|sweeps| *sweeps >= 3)
+        .await
+        .expect("runs");
     assert!(store.keys().await.is_empty());
     looping.abort();
 }
@@ -604,7 +607,7 @@ fn refused(more: &[&str]) -> ErrorKind {
 fn the_janitor_is_off_unless_the_key_file_is_given() {
     let companions = [
         "--task-janitor-interval-secs=5",
-        "--task-janitor-grace-secs=18000",
+        "--task-janitor-grace-secs=21600",
         "--task-janitor-page-size=10",
         "--task-janitor-page-pause-ms=0",
         "--task-janitor-dry-run",
@@ -638,7 +641,7 @@ fn the_flags_make_the_setting_and_the_defaults_are_the_constants() {
     let every = [
         KEY_FILE,
         "--task-janitor-interval-secs=30",
-        "--task-janitor-grace-secs=18000",
+        "--task-janitor-grace-secs=21600",
         "--task-janitor-page-size=7",
         "--task-janitor-page-pause-ms=0",
         "--task-janitor-dry-run",
@@ -646,18 +649,21 @@ fn the_flags_make_the_setting_and_the_defaults_are_the_constants() {
     let set = parsed(&with(&every)).expect("parses").janitor;
     let set = set.expect("janitor flags");
     assert_eq!(set.interval, Duration::from_secs(30));
-    assert_eq!(set.grace, Duration::from_secs(18_000));
+    assert_eq!(set.grace, Duration::from_secs(21_600));
     assert_eq!(set.page.get(), 7);
     assert_eq!(set.pause, Duration::ZERO);
     assert!(set.dry_run);
 }
 
-/// Asserts the bounds: a grace under the 4 hours a write is good for and an hour more is refused,
-/// as are an interval of 0, a page of 0 or over 1000, and a pause over a minute.
+/// Asserts the bounds: a grace under 6 hours (the age an ingest refuses a key at, and an hour of
+/// margin for a fenced old leader that is still ingesting) is refused, and the least is exactly
+/// that; as are an interval of 0, a page of 0 or over 1000, and a pause over a minute.
 #[test]
 fn the_flags_hold_to_their_bounds() {
+    let margin = Duration::from_secs(3_600);
+    assert_eq!(MIN_GRACE_SECS, (kbf_pack::MIN_GRACE + margin).as_secs());
     let bad = [
-        "--task-janitor-grace-secs=17999",
+        "--task-janitor-grace-secs=21599",
         "--task-janitor-grace-secs=604801",
         "--task-janitor-interval-secs=0",
         "--task-janitor-interval-secs=86401",
@@ -673,7 +679,7 @@ fn the_flags_hold_to_their_bounds() {
         );
     }
     let edges = [
-        "--task-janitor-grace-secs=18000",
+        "--task-janitor-grace-secs=21600",
         "--task-janitor-page-size=1000",
         "--task-janitor-page-size=1",
     ];
