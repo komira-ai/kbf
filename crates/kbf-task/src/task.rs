@@ -16,7 +16,7 @@
 //! | 0 | the action ran (whatever its exit code, a timeout included) and its pack was stored |
 //! | 2 | the flags are wrong (clap) |
 //! | 10 | fetch: the Action, the Command or an input could not be read or checked, or laid out |
-//! | 11 | run-start: the Command could not be started (bad paths, no program) |
+//! | 11 | run-start: the Command could not be started (bad paths, no program), or the run's `private/` home, tmp and cache directories could not be made |
 //! | 12 | pack: the outputs could not be collected, did not fit one pack (`output-too-large`), or made a manifest or pack the frontend would refuse (`invalid-manifest`, `invalid-pack`) |
 //! | 13 | put: the pack could not be stored (refused, key already taken, still no room after the retries of a 503, unreachable) |
 //! | 14 | setup: `--lease` is not a build id, a credential or root certificate is unusable, a credential given as a flag value without `--insecure-argv-secrets`, or the runtime did not start |
@@ -141,7 +141,11 @@ pub struct Cli {
     /// The Action to run, as `<64 lowercase hex digits>/<size>`.
     #[arg(long, value_parser = digest::parse)]
     pub action: Digest,
-    /// Where the inputs are laid out (`in/` under it) and the output streams are written.
+    /// Where the inputs are laid out (`in/` under it) and the output streams are written. The
+    /// Command's `HOME`, `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH` name directories
+    /// under `private/` here, made new for the run (an existing `private` is refused) with mode 0700, beside `in/` and so never collected as outputs: a job's
+    /// image root is read-only and its `/tmp` is small and `noexec`. A variable the Command sets
+    /// itself keeps its value.
     #[arg(long, default_value = "/scratch/work")]
     pub work_dir: PathBuf,
     /// The longest the Command may run, in milliseconds: the Action's timeout when it sets a
@@ -258,10 +262,12 @@ pub async fn execute(
 
     let stdout = cli.work_dir.join("stdout");
     let stderr = cli.work_dir.join("stderr");
+    let private = cli.work_dir.join("private");
     let ran = run(
         &command,
         &Run {
             root: &root,
+            private: &private,
             stdout: &stdout,
             stderr: &stderr,
             deadline: deadline(&action, Duration::from_millis(cli.deadline_ms)),
