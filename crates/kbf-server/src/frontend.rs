@@ -64,6 +64,12 @@
 //! give yet (kbf#1966): `--executor js-agent` is refused at start there. By default,
 //! `--executor kbf-daemon`, nothing is built and no lease server is contacted.
 //!
+//! **Task runs** are prepared only if `--task-secret-file` is given (`task_flags` has the flags
+//! and what they need): the started frontend then carries a [`kbf_front::prepare_run::RunPrep`]
+//! ([`FrontendHandle::run_prep`]) that gives a host executor, for each run, the key the task may
+//! write, one presigned write of it to the tier store and a read grant for its inputs; without
+//! the flag no secret file is read and the frontend serves exactly as it did.
+//!
 //! **Readiness** (`GET /readyz`, `grpc.health.v1`) fails when the storage node does not
 //! answer an action-cache lookup within `--readyz-store-timeout-ms`, when the state store (if
 //! configured) does not answer a read, and when the storage map is not loaded (always
@@ -110,6 +116,7 @@ use clap::{Arg, ArgMatches, Command, FromArgMatches as _};
 use futures::FutureExt as _;
 use futures::future::{AbortHandle, Abortable, BoxFuture};
 use kbf_auth::AuthenticateLayer;
+use kbf_front::prepare_run::RunPrep;
 use kbf_front::{
     Backend, MAX_MESSAGE_BYTES, Owner, Owners, Packs, Proxy, RECORDER_CHANNEL, Recorder,
     RequestMetadataLayer, Routed,
@@ -125,8 +132,10 @@ use kbf_tls::TlsSource;
 use tonic::service::Routes;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server};
 
+pub use self::job_read::{JobReadError, JobReadFlags};
 pub use self::executor_flags::{ExecutorFlags, JsAgentFlags};
 pub use self::pack_flags::{PackFlagError, PackFlags};
+pub use self::task_flags::{TaskFlagError, TaskFlags};
 use crate::drain::Drain;
 use crate::enroll::flags::EnrollFlags;
 use crate::enroll::start as enroll_start;
@@ -259,6 +268,13 @@ pub struct FrontendFlags {
     pub packs: Option<PackFlags>,
     /// `--executor` and its companions: where placed actions run.
     pub executor: ExecutorFlags,
+    /// `--job-listen` and its companions: the listener a task on a worker reads its action's
+    /// inputs from with a read grant. `None` without `--job-listen`, where there is none.
+    pub job_read: Option<JobReadFlags>,
+    /// `--task-secret-file` and its companions: the frontend prepares the runs of a host
+    /// executor (the key, the presigned write and the read grant of each). `None` without the
+    /// switch, where no run is prepared.
+    pub task: Option<TaskFlags>,
 }
 
 /// The long names of the flags of [`Args`] that `kbf frontend` hides and refuses by name
@@ -313,6 +329,8 @@ pub fn command() -> Command {
     .args(drain_flags::args())
     .args(state_wait::args())
     .args(pack_flags::args())
+    .args(job_read::args())
+    .args(task_flags::args())
     .args(executor_flags::args())
     .arg(
         Arg::new(SECRETS_DIR)
@@ -381,6 +399,7 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
     // clap makes the three come together.
     let tls = <[PathBuf; 3]>::try_from(paths).ok();
     transport(&storage, tls.is_some()).map_err(refuse)?;
+    let task = task_flags::from_matches(m).map_err(refuse)?;
     Ok(FrontendFlags {
         server,
         storage,
@@ -393,6 +412,8 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         retired: RetiredHandoverFlags::from_arg_matches(m)?,
         packs,
         executor,
+        job_read: job_read::from_matches(m),
+        task,
     })
 }
 
@@ -519,6 +540,8 @@ pub struct FrontendHandle {
     pub api: Option<SocketAddr>,
     /// Where the enroll listener is, if there is one.
     pub enroll: Option<SocketAddr>,
+    /// Where the job-facing read listener is (`--job-listen`), if there is one.
+    pub job_read: Option<SocketAddr>,
     enroll_tls: Option<kbf_tls::TlsSource>,
     drain: Arc<Drain>,
     /// Completes on the second stop signal; [`FrontendHandle::serve`] then closes the
@@ -535,6 +558,8 @@ pub struct FrontendHandle {
     pack_index: Option<Arc<dyn PackIndex>>,
     /// The packs `--pack-store-endpoint` describes, if the flag was given.
     packs: Option<Packs>,
+    /// The preparer of runs `--task-secret-file` describes, if the flag was given.
+    run_prep: Option<Arc<RunPrep>>,
     /// The count of intake polls the farm has run to the end ([`Farm::intake_polls`]).
     intake_polls: tokio::sync::watch::Receiver<u64>,
     /// The executor `--executor js-agent` builds, stepped while the frontend serves.
@@ -556,6 +581,14 @@ impl FrontendHandle {
     #[must_use]
     pub fn pack_index(&self) -> Option<Arc<dyn PackIndex>> {
         self.pack_index.clone()
+    }
+
+    /// The preparer of the runs of a host executor `--task-secret-file` describes, or `None`
+    /// without the flag: the executor asks it for the key, the presigned write and the read grant
+    /// of each run ([`RunPrep::prepare_run`]).
+    #[must_use]
+    pub fn run_prep(&self) -> Option<Arc<RunPrep>> {
+        self.run_prep.clone()
     }
 
     /// The frontend's drain ([`Drain`]): `POST /v1/frontend/drain` begins it, and the
@@ -744,6 +777,9 @@ struct Prepared<'a> {
     sockets: Bound,
     /// The enroll listener bound and its CA open, if `--enroll-listen` is given.
     enroll: Option<enroll_start::Prepared>,
+    /// The job-facing read listener bound, its certificate and grant secret read, if
+    /// `--job-listen` is given.
+    job_read: Option<job_read::Prepared>,
 }
 
 /// The three listening sockets.
@@ -789,6 +825,12 @@ impl<'a> Prepared<'a> {
             .as_ref()
             .map(|enroll| enroll_start::prepare_with(enroll, &binder))
             .transpose()?;
+        let reload = Duration::from_secs(args.tls_reload_interval_secs);
+        let job_read = flags
+            .job_read
+            .as_ref()
+            .map(|job| job_read::Prepared::new(job, reload, &binder))
+            .transpose()?;
         let sockets = Bound::bind(
             listeners.reapi,
             listeners.worker,
@@ -804,6 +846,7 @@ impl<'a> Prepared<'a> {
             channel,
             sockets,
             enroll,
+            job_read,
         })
     }
 
@@ -825,6 +868,7 @@ impl<'a> Prepared<'a> {
             channel,
             sockets,
             enroll,
+            job_read,
         } = self;
         let args = &flags.server;
         let state = crate::start::with_members(state, args.members());
@@ -849,6 +893,7 @@ impl<'a> Prepared<'a> {
             Some(routed) => Backend::routed_over(Arc::clone(routed), storage, packs.clone()),
             None => Backend::remote_over(storage, packs.clone()),
         };
+        let run_prep = task_flags::open(flags.task.as_ref(), &backend)?;
         // A failed run's logs are read from the storage node, under a budget of this
         // frontend's own: it serves no blob route to share one with.
         let history = history.map(|history| {
@@ -882,7 +927,7 @@ impl<'a> Prepared<'a> {
         );
         // The rows a revocation writes, beside the file: a revoked daemon is refused here.
         let peers = peers.with_denied_rows(members.clone());
-        let tls_sources: Vec<TlsSource> = listeners
+        let mut tls_sources: Vec<TlsSource> = listeners
             .reapi_tls
             .iter()
             .chain(&worker_tls)
@@ -935,6 +980,28 @@ impl<'a> Prepared<'a> {
             }
             None => (None, futures::future::pending().boxed(), None, None),
         };
+        // The job-facing read listener, which reads the blobs the REAPI listener's reads do
+        // (through the same backend) and is closed, like the others, the moment the drain
+        // begins. Off without `--job-listen`.
+        let job_addr = job_read.as_ref().map(job_read::Prepared::local);
+        let job_read = job_read
+            .map(|prepared| {
+                prepared.start(Arc::new(backend.clone()), job_read::Timeouts::default())
+            })
+            .transpose()?;
+        let (job_stats, job_task) = match job_read {
+            Some(job_read::Serving {
+                latch,
+                task,
+                tls,
+                read,
+            }) => {
+                drain.begins().closes(latch);
+                tls_sources.push(tls);
+                (Some(read), Some(task))
+            }
+            None => (None, None),
+        };
         let object_stores = flags
             .object_store_secrets_dir
             .as_deref()
@@ -964,6 +1031,7 @@ impl<'a> Prepared<'a> {
             members.clone(),
             tls_sources,
             packs.clone(),
+            job_stats,
             Arc::clone(&farm),
             executor.as_ref().map(|built| Arc::clone(&built.metrics)),
         ));
@@ -1056,6 +1124,7 @@ impl<'a> Prepared<'a> {
             let _ = retire.set(Retire::new(stand, sequence));
         }
         background.extend(enroll_renewal);
+        background.extend(job_task);
 
         let intake_polls = farm.intake_polls();
         let shutdown = shutdown()?;
@@ -1151,6 +1220,7 @@ impl<'a> Prepared<'a> {
             worker: worker_addr,
             api: api_addr,
             enroll: enroll_addr,
+            job_read: job_addr,
             enroll_tls,
             drain,
             escalation: None,
@@ -1170,6 +1240,7 @@ impl<'a> Prepared<'a> {
             },
             pack_index,
             packs,
+            run_prep,
             intake_polls,
             executor: executor.map(|built| built.executor),
         })
@@ -1256,14 +1327,16 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
 
 /// `GET /metrics`: what the service counts, in the Prometheus text format, history's
 /// counters when it keeps history, the storage health of `members` when there are any, the
-/// reloads of the listeners' `tls` files, the counters of the `packs` when there are any, and
-/// the pack reads the daemons of `farm` report and its failed actions by class.
+/// reloads of the listeners' `tls` files, the counters of the `packs` when there are any, those
+/// of the job-facing read when there is one, and the pack reads the daemons of `farm` report
+/// and its failed actions by class.
 fn metrics_route(
     backend: Backend,
     history: Option<Arc<crate::history::Stats>>,
     members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
     packs: Option<Packs>,
+    job_read: Option<Arc<kbf_front::job_read::JobRead>>,
     farm: Arc<Farm>,
     executor: Option<Arc<ExecutorMetrics>>,
 ) -> axum::Router {
@@ -1272,12 +1345,14 @@ fn metrics_route(
         let (backend, members, tls) = (backend.clone(), members.clone(), Arc::clone(&tls));
         let (history, packs, farm) = (history.clone(), packs.clone(), Arc::clone(&farm));
         let executor = executor.clone();
+        let job_read = job_read.clone();
         async move {
             let mut text = backend.render_metrics();
             if let Some(history) = history {
                 history.render(&mut text);
             }
             Packs::render_metrics_of(packs.as_ref(), &mut text);
+            kbf_front::job_read::JobRead::render_metrics_of(job_read.as_deref(), &mut text);
             crate::metrics::render_farm(&mut text, &farm);
             if let Some(executor) = executor {
                 executor.render(&mut text);
@@ -1355,8 +1430,10 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
 mod drain_flags;
 mod executor_flags;
 mod handoff;
+mod job_read;
 mod pack_flags;
 mod state_wait;
+mod task_flags;
 
 #[cfg(test)]
 mod executor_tests;

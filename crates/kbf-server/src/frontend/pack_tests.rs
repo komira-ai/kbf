@@ -71,7 +71,7 @@ pub(super) fn index() -> Arc<dyn PackIndex> {
 }
 
 /// Starts the frontend `flags` describe over `index`, bound and not yet serving.
-fn started(
+pub(super) fn started(
     flags: &FrontendFlags,
     index: Option<Arc<dyn PackIndex>>,
 ) -> Result<FrontendHandle, Box<dyn Error>> {
@@ -89,7 +89,7 @@ fn proto(digest: &Digest) -> reapi::Digest {
 }
 
 /// The status code of each item of a BatchUpdateBlobs of `blobs`.
-async fn upload(addr: SocketAddr, blobs: &[(Digest, &[u8])]) -> Vec<i32> {
+pub(super) async fn upload(addr: SocketAddr, blobs: &[(Digest, &[u8])]) -> Vec<i32> {
     let requests = blobs
         .iter()
         .map(|(digest, bytes)| batch_update_blobs_request::Request {

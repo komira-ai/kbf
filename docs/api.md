@@ -1683,6 +1683,15 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_executor_late_starts_total` | counter | `Start`s dropped because their window ended before the run was posted; the farm runs the action again |
 | `kbf_executor_stray_leases_released_total` | counter | leases released because none of the executor's slots held them (a lost acquire answer, an undelivered release, a lease beyond the pool's size at a restart) |
 
+**Job-facing read.** On a frontend given `--job-listen` ([kbf-modes.md](deploy/kbf-modes.md)) the
+listener a task fetches its action's inputs from counts requests and bytes; without the flag these
+are absent. The same scrape has a `listener="job"` series in the `kbf_tls_reloads_total` family.
+
+| Family | Type | What it measures |
+|---|---|---|
+| `kbf_job_read_requests_total` | counter | requests answered, labelled `outcome`: `ok` (200), `unauthorized` (401: no grant, a malformed, forged, expired or revoked one), `forbidden` (403: a digest outside the grant's scope, or an Action with no readable inputs), `not_found` (404: a blob that is not held, or a path that is not `/<hex>/<size>`), `too_large` (413: a blob over 64 MiB, not read), `method_not_allowed` (405) and `unavailable` (503: the store could not answer) |
+| `kbf_job_read_bytes_total` | counter | blob bytes served to jobs |
+
 **Pack reads by daemons.** A daemon started with `--pack-read` ([kbf-modes.md](deploy/kbf-modes.md))
 puts the counts of its pack reads in every heartbeat, and the frontend its worker stream is on
 keeps the newest of each node and exports them, one sample per node, labelled `node`. They

@@ -185,6 +185,34 @@ the whole farm, with no frontend to ask and no pack index, and refuse the flag. 
 what was read from packs, elsewhere, lost and damaged are logged when the daemon stops
 (`pack reads: ...`), and a lost or damaged blob is logged when it is found.
 
+**Task runs** (off by default; the `[task-runs]` table of `kbf.toml`). With `--task-secret-file`
+the frontend prepares the runs of a host executor: for each lease and Action it makes the three
+values a task needs and the executor delivers, `RunInputs` of `kbf_front::prepare_run`. They are
+the pack key the task may write (`cas/b/<lease>/<nonce>-0`, which the executor passes to `ingest`
+when the run ends); a presigned `PUT` of exactly that key to the tier store, signed with a
+presign-only key (the URL takes a `PUT` until it expires, and the store is create-only, so the
+first write is the only one that lands); and a read grant, a bearer token with the base URL of the job-facing read
+listener, for the Action, its Command and every blob of its input tree (the job-facing read listener, kbf#1943, works
+the scope out again from the Action each time the token is used, so a blob removed after the run was prepared
+fails that read). The write and the grant
+are good for the run's wall limit plus a slack, `--task-run-wall-secs` (default 7200) and
+`--task-url-slack-secs` (default 600), and never for more than 4 hours (14400 seconds), the
+ceiling of a presigned write: the tier store's presigning key must allow at least that
+(`max_expires_secs` of its `--presign-key-file`, and `--presign-max-expires`), and a wall and
+slack that add up to more are refused at start. Before it signs anything the frontend reads the
+Action, its Command and the whole input tree and checks that every blob is held: a blob that is
+missing is an error, never a smaller grant, and a tree over `--task-closure-max-digests`
+(default 500000) or `--task-closure-max-bytes` (default 32 GiB) is refused. The switch needs
+`--task-put-endpoint` (the tier store's proxy, `http://` or `https://host:port`),
+`--task-put-bucket`, `--task-put-region` (default `us-east-1`),
+`--task-put-credentials-file` (JSON `{"access_key_id": "...", "secret_access_key": "..."}` of
+the presign-only key, owned by the server's user, mode 0600 or 0400) and `--task-read-url`
+(`https://host:port`, no path: an `http://` URL is refused at start, as the token is a bearer
+secret). The secret file holds one secret of at least 32 bytes, owned by the server's user
+and readable by it alone; the pack-key mint and the grant key are made from it, and the
+job-facing listener must verify grants with the same secret. No secret is a flag. Left out, no
+secret file is read and the frontend serves exactly as before.
+
 A daemon writes its outputs into packs with `--pack-write` (off by default; the `[packs]`
 table of `kbf.toml`), which needs `--pack-read` and `--pack-store-write-credentials-file`, a
 key pair file of the same form as `--pack-store-credentials-file` but of a key that may
@@ -230,6 +258,47 @@ The blobs the storage members flushed before the frontends wrote packs are in no
 index knows, so a read of one still goes to the members. `kbf-pack-adopt`, an operator tool and
 a binary of its own, indexes those segments where they lie, with no byte copied and nothing
 written to the object store: [pack-adopt.md](pack-adopt.md) gives the order to run it in.
+
+**The job-facing read listener** (off by default; the `[job-read]` table of `kbf.toml`). A task
+that runs an action on a worker fetches the action's input files from the frontend, with a read
+grant (a token the frontend gives the run, valid until its expiry, for one Action: it reads that
+Action, its Command and its input tree, and no other blob). The task is untrusted code that holds
+no client certificate, so the REAPI listener is not open to it; `--job-listen <addr>` opens
+another, over HTTPS, that serves `GET /<hex>/<size>` with `Authorization: Bearer <read grant>` and
+nothing else (any other path is 404, any other method 405). It needs three more flags, all four
+given together:
+
+- `--job-tls-cert` and `--job-tls-key`: the certificate chain and key of the listener (PEM), issued
+  by the farm CA that the task is told to trust. The TLS is the server's alone: no client
+  certificate is asked for. The task dials the frontend by IP address, and a client that dials an
+  IP address accepts only a certificate that names it as an IP subjectAltName, so the certificate
+  must carry one for each address a job dials the frontend at (for a farm of frontends, one
+  certificate per frontend with its own address, or one naming them all). The start checks this
+  and exits 2 when the certificate has none, or when `--job-listen` is on one address and the
+  certificate does not name it; on `0.0.0.0` or `::` it needs some IP name. The files are read
+  again every `--tls-reload-interval-secs` like the other listeners' (the names are checked at
+  start only).
+- `--job-grant-secret-file`: the farm secret the grants are signed with (at least 32 bytes, mode
+  0600 or 0400, owned by the server's user; surrounding whitespace is dropped). Every frontend
+  of the farm, and whatever issues the grants, reads the same secret, so a grant is verified by
+  any frontend. It is never a flag.
+
+The answers are 200 with the blob and its `Content-Length`; 401 for a missing, malformed, forged,
+expired or revoked grant (with `WWW-Authenticate: Bearer`); 403 for a digest outside the grant's
+scope, or a grant whose Action has no readable inputs in the store; 404 for a blob that is not
+held, an unknown path, and 405 (with `Allow: GET`) for another method; 413 for a blob over 64 MiB,
+without reading it; and 503 when the store cannot answer. A body carries a reason code
+(`missing_token`, `invalid_token`, `expired`, `revoked`, `out_of_scope`, `no_scope`, `too_large`,
+`not_found`, `method_not_allowed`, `store_unavailable`) and nothing else. A blob is read as the
+REAPI listener's reads are (the pack index first, then the storage nodes, checked against its
+digest) and sent whole, so a response never holds more than 64 MiB; at most 32 reads are open at
+once, at most 256 connections are open, a client has 10 seconds to send a request's headers, and a
+connection lives at most 10 minutes. The listener's socket is closed the moment a drain begins; the
+connections open finish their request. `GET /metrics` of the operator API gains
+`kbf_job_read_requests_total` (by `outcome`) and `kbf_job_read_bytes_total`, and
+`kbf_tls_reloads_total` a `listener="job"` series. Where the jobs run must be allowed to reach
+this address and port (the egress allowlist of the worker's network), and the listener should be
+on an interface the jobs, and nothing outside the farm, can reach.
 
 **`storage`.** It serves the storage service over gRPC and nothing else: no REAPI, no
 scheduler, no operator API (only `GET /metrics`, on `--metrics-listen`, off unless given).
@@ -290,6 +359,7 @@ host; a farm sets routable addresses.
 | worker listener | `--worker-listen` | `127.0.0.1:8981` | `frontend`, `all-in-one` |
 | operator API | `--api-listen` | off unless given | `frontend`, `all-in-one` |
 | enrollment | `--enroll-listen` | off unless given | `frontend` |
+| job-facing read | `--job-listen` | off unless given | `frontend` |
 | storage service | `--storage-listen` | `127.0.0.1:8982` | `storage`, `storage-and-daemon` |
 | storage metrics | `--metrics-listen` | off unless given | `storage`, `storage-and-daemon` |
 | the proxy's public port | `ListenStream=` of `kbf-proxy.socket` | `8980` | proxy hosts |

@@ -171,6 +171,9 @@ pub fn validate_prefix(prefix: &str) -> Result<(), PresignError> {
     if prefix.is_empty() {
         return Err(PresignError::Name("empty"));
     }
+    if prefix.starts_with('/') {
+        return Err(PresignError::Name("starts with /"));
+    }
     check_name(prefix)?;
     let reserved = [JOURNAL_PREFIX, TIERING_PREFIX];
     if is_reserved(prefix) || reserved.iter().any(|name| name.starts_with(prefix)) {
