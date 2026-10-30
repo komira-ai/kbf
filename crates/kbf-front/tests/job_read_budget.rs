@@ -617,9 +617,9 @@ async fn a_directory_or_action_blob_over_the_cap_gives_no_scope_and_is_not_read(
     assert_eq!(rig.source.reads_of(&huge), 0);
 }
 
-/// Catches: a batch that does not take the budget for its read (a mutant that drops the take
-/// leaves every other test green): with a budget of 4000, two batches of one 3000-byte blob each
-/// never have their reads open together.
+/// Catches: a batch that does not take the budget for its read, which no other test notices:
+/// with a budget of 4000, two batches of one 3000-byte blob each never have their reads open
+/// together.
 #[tokio::test]
 async fn a_batch_takes_its_budget_for_the_whole_read() {
     let mut blobs = HashMap::new();
