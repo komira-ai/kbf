@@ -31,6 +31,10 @@
 //!  ,"packs":2,"large":[{"slot":0,"digest":"<hex>/<size>"}]
 //! ```
 //!
+//! and may add an advisory `"inputs":{..}` ([`InputStats`]) after them, which only version 2
+//! may carry: a manifest with `inputs` is written as version 2, since a version 1 reader
+//! refuses a field it does not know.
+//!
 //! `packs` is how many of packs `0..` were written (1 to [`MAX_PACKS`]); `large` names the
 //! large objects by slot (unique, below [`MAX_LARGE`]), each of a size above
 //! [`MAX_RECORD_BYTES`] and at most the large cap the reader is given. Every digest an output
@@ -250,6 +254,90 @@ impl LargeEntry {
     }
 }
 
+/// Where the bytes of a task's inputs came from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SourceBytes {
+    /// From the read listener, one blob per request.
+    pub listener_get: u64,
+    /// From the read listener's batch request.
+    pub listener_batch: u64,
+    /// From a node-local read cache.
+    pub cache_hit: u64,
+    /// Directly from the tier store.
+    pub tierstore_direct: u64,
+}
+
+/// What a task measured while fetching its inputs. A field the writer leaves out is 0.
+///
+/// ADVISORY, NEVER TRUSTED: the task writes it and ingest only carries it into metrics. It
+/// decides nothing: not what is stored, not the action result, not whether the run is accepted
+/// (beyond each number fitting an `i64`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct InputStats {
+    /// Blobs fetched.
+    pub blobs: u64,
+    /// Files in the input tree.
+    pub files: u64,
+    /// Directories in the input tree.
+    pub directories: u64,
+    /// Requests made.
+    pub requests: u64,
+    /// Requests that were retried.
+    pub retries: u64,
+    /// The most requests in flight at once.
+    pub max_in_flight: u64,
+    /// Bytes written to the scratch directory.
+    pub bytes_written_scratch: u64,
+    /// Time walking the input tree, in milliseconds.
+    pub walk_ms: u64,
+    /// Time fetching, in milliseconds.
+    pub fetch_ms: u64,
+    /// Time hashing, in milliseconds.
+    pub hash_ms: u64,
+    /// Time writing to scratch, in milliseconds.
+    pub write_ms: u64,
+    /// The median request time, in milliseconds.
+    pub request_p50_ms: u64,
+    /// The 99th percentile request time, in milliseconds.
+    pub request_p99_ms: u64,
+    /// Bytes by where they came from.
+    pub bytes_by_source: SourceBytes,
+}
+
+impl InputStats {
+    /// Every number with its field name, for the `i64` check.
+    fn numbers(&self) -> [(&'static str, u64); 17] {
+        let source = &self.bytes_by_source;
+        [
+            ("inputs.blobs", self.blobs),
+            ("inputs.files", self.files),
+            ("inputs.directories", self.directories),
+            ("inputs.requests", self.requests),
+            ("inputs.retries", self.retries),
+            ("inputs.max_in_flight", self.max_in_flight),
+            ("inputs.bytes_written_scratch", self.bytes_written_scratch),
+            ("inputs.walk_ms", self.walk_ms),
+            ("inputs.fetch_ms", self.fetch_ms),
+            ("inputs.hash_ms", self.hash_ms),
+            ("inputs.write_ms", self.write_ms),
+            ("inputs.request_p50_ms", self.request_p50_ms),
+            ("inputs.request_p99_ms", self.request_p99_ms),
+            ("inputs.bytes_by_source.listener_get", source.listener_get),
+            (
+                "inputs.bytes_by_source.listener_batch",
+                source.listener_batch,
+            ),
+            ("inputs.bytes_by_source.cache_hit", source.cache_hit),
+            (
+                "inputs.bytes_by_source.tierstore_direct",
+                source.tierstore_direct,
+            ),
+        ]
+    }
+}
+
 /// How long the task's steps took, in milliseconds. Advisory.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Timing {
@@ -300,6 +388,8 @@ pub struct TaskManifest {
     pub packs: u8,
     /// The large objects, by slot. Empty for a version 1 manifest.
     pub large: Vec<LargeEntry>,
+    /// What the task measured fetching its inputs, if it says. Advisory: see [`InputStats`].
+    pub inputs: Option<InputStats>,
 }
 
 impl TaskManifest {
@@ -329,6 +419,9 @@ impl TaskManifest {
                 }
                 if wire.large.is_some() {
                     return Err(ManifestError::UnexpectedField("large"));
+                }
+                if wire.inputs.is_some() {
+                    return Err(ManifestError::UnexpectedField("inputs"));
                 }
             }
             MANIFEST_VERSION_2 => {
@@ -420,7 +513,10 @@ impl TaskManifest {
             ("timing.pack_ms", self.timing.pack_ms),
             ("usage.cpu_usage_us", self.usage.cpu_usage_us),
             ("usage.memory_peak_bytes", self.usage.memory_peak_bytes),
-        ] {
+        ]
+        .into_iter()
+        .chain(self.inputs.iter().flat_map(|i| i.numbers()))
+        {
             if i64::try_from(value).is_err() {
                 return Err(ManifestError::Advisory { field, value });
             }
@@ -463,7 +559,7 @@ impl TaskManifest {
     /// The manifest version this manifest is written as.
     #[must_use]
     pub fn version(&self) -> u32 {
-        if self.packs == 1 && self.large.is_empty() {
+        if self.packs == 1 && self.large.is_empty() && self.inputs.is_none() {
             MANIFEST_VERSION
         } else {
             MANIFEST_VERSION_2
@@ -561,6 +657,8 @@ struct Wire {
     packs: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     large: Option<Vec<WireLarge>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inputs: Option<InputStats>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -660,6 +758,7 @@ impl Wire {
                     })
                     .collect()
             }),
+            inputs: m.inputs,
         }
     }
 
@@ -716,6 +815,7 @@ impl Wire {
             },
             packs: self.packs.unwrap_or(1),
             large,
+            inputs: self.inputs,
         })
     }
 }
