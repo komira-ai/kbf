@@ -308,7 +308,6 @@ pub struct InputStats {
 
 impl InputStats {
     /// Every number with its field name, for the `i64` check.
-    #[allow(dead_code)] // STUB: not checked yet.
     fn numbers(&self) -> [(&'static str, u64); 17] {
         let source = &self.bytes_by_source;
         [
@@ -421,6 +420,9 @@ impl TaskManifest {
                 if wire.large.is_some() {
                     return Err(ManifestError::UnexpectedField("large"));
                 }
+                if wire.inputs.is_some() {
+                    return Err(ManifestError::UnexpectedField("inputs"));
+                }
             }
             MANIFEST_VERSION_2 => {
                 if wire.packs.is_none() {
@@ -513,6 +515,7 @@ impl TaskManifest {
             ("usage.memory_peak_bytes", self.usage.memory_peak_bytes),
         ]
         .into_iter()
+        .chain(self.inputs.iter().flat_map(|i| i.numbers()))
         {
             if i64::try_from(value).is_err() {
                 return Err(ManifestError::Advisory { field, value });
@@ -556,7 +559,7 @@ impl TaskManifest {
     /// The manifest version this manifest is written as.
     #[must_use]
     pub fn version(&self) -> u32 {
-        if self.packs == 1 && self.large.is_empty() {
+        if self.packs == 1 && self.large.is_empty() && self.inputs.is_none() {
             MANIFEST_VERSION
         } else {
             MANIFEST_VERSION_2
