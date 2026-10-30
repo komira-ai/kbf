@@ -52,6 +52,7 @@ impl Pool {
                 memory_bytes,
                 gpus: 0,
                 gpu_class: None,
+                disk_bytes: None,
             },
             capabilities: BTreeMap::from([("os".to_owned(), "linux".to_owned())]),
             hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
@@ -165,6 +166,7 @@ struct RunRow {
     cpu_millis: u64,
     memory_bytes: u64,
     wall_ms: u64,
+    disk_bytes: Option<u64>,
     args: Vec<String>,
     image: String,
     mounts: Vec<Mount>,
@@ -429,8 +431,13 @@ impl State {
             .gpu_indices
             .iter()
             .any(|index| u64::from(*index) >= shape.gpus);
+        let disk_beyond = limits
+            .disk_bytes
+            .zip(shape.disk_bytes)
+            .is_some_and(|(asked, held)| asked > held);
         if limits.cpu_millis > shape.cpu_millis
             || limits.memory_bytes > shape.memory_bytes
+            || disk_beyond
             || gpu_beyond
         {
             return Err(Refusal::new(422, "limits-exceed-shape"));
@@ -467,6 +474,7 @@ impl State {
             cpu_millis: limits.cpu_millis,
             memory_bytes: limits.memory_bytes,
             wall_ms: limits.wall_ms.map_or(cap, |asked| asked.min(cap)),
+            disk_bytes: limits.disk_bytes,
             args: spec.args.clone(),
             image: spec.image.clone(),
             mounts: spec.mounts.clone(),
@@ -641,6 +649,13 @@ impl State {
             row.lease
         });
         lease.map(|lease| self.settle(lease)).is_some()
+    }
+
+    pub(super) fn run_disk_bytes(&self, run: &RunId) -> Option<u64> {
+        self.runs
+            .iter()
+            .find(|row| row.id == *run)
+            .and_then(|row| row.disk_bytes)
     }
 
     pub(super) fn run_wall_ms(&self, run: &RunId) -> Option<u64> {
