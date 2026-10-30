@@ -106,8 +106,13 @@ pub struct Run {
     pub times: ReapiTimes,
     /// The `ResourceUsage` the report carried, if any.
     pub usage: Option<RunUsage>,
-    /// For a run killed for memory: its memory booking, in bytes.
+    /// The memory the lease was granted, in bytes: the booking its `Start` carried
+    /// (after the ladder and the floors), for every run whose grant the server knows.
+    /// `None` for a lease taken up from the state store, which was never started here.
     pub booked_memory_bytes: Option<u64>,
+    /// The CPU the lease was granted, in thousandths of a CPU, known as
+    /// `booked_memory_bytes` is.
+    pub booked_millicpus: Option<u64>,
     /// For a run killed at its own limit: the memory of the largest node that could
     /// run it when the kill was committed, in bytes.
     pub cap_bytes: Option<u64>,
