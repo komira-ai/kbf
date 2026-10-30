@@ -220,6 +220,9 @@ pub enum ServeError {
     /// The pack store does not refuse to replace an object, or cannot be written to.
     #[error("--pack-store-endpoint: {0}")]
     Packs(String),
+    /// The executor stopped by itself.
+    #[error("--executor js-agent: {0}")]
+    Executor(String),
 }
 
 /// A server that is listening: the addresses it bound, and the future that serves
