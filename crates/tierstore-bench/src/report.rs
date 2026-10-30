@@ -472,6 +472,33 @@ mod tests {
         let busy = text.lines().find(|l| l.contains("| big | busy |")).unwrap();
         assert!(busy.contains("not claimed: busy window"), "{busy}");
 
+        let pooled = result(
+            "pooled",
+            vec![
+                pass(1, Window::Quiet, 600, None),
+                pass(2, Window::Quiet, 600, None),
+            ],
+            &[],
+        );
+        let both = merged(vec![
+            rows("pooled", 1, &(1..=600).collect::<Vec<u64>>(), "200"),
+            rows("pooled", 2, &(1..=600).collect::<Vec<u64>>(), "200"),
+        ]);
+        let line = format_report(&[pooled], &both)
+            .lines()
+            .find(|l| l.contains("| pooled |"))
+            .unwrap()
+            .to_owned();
+        assert!(line.contains("| 2 | 1200 |"), "{line}");
+        assert!(
+            line.contains("594 us ["),
+            "the p99 of 1200 pooled quiet samples: {line}"
+        );
+        assert!(
+            !line.contains("per-pass") && !line.contains("not claimed"),
+            "{line}"
+        );
+
         let thin = result("thin", vec![pass(1, Window::Quiet, 5, None)], &[]);
         let text = format_report(&[thin], &rows("thin", 1, &[100, 200, 300], "200"));
         let line = text.lines().find(|l| l.contains("| thin |")).unwrap();

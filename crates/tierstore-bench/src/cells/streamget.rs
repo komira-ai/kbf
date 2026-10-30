@@ -82,7 +82,7 @@ impl StreamGet {
     ) -> Result<Self, BenchError> {
         let url = reqwest::Url::parse(&spec.endpoint)
             .ok()
-            .filter(|u| u.scheme() == "http" && u.host_str().is_some())
+            .filter(|u| u.scheme() == "http")
             .ok_or(BenchError::Request("endpoint must be http://host[:port]"))?;
         let host = match url.port() {
             Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
@@ -195,7 +195,7 @@ impl StreamGet {
                     match response.chunk().await {
                         Ok(Some(chunk)) => {
                             streamed.bytes += chunk.len() as u64;
-                            if streamed.ttfb.is_none() && !chunk.is_empty() {
+                            if streamed.ttfb.is_none() {
                                 streamed.ttfb = Some(clock.elapsed());
                             }
                         }
