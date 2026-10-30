@@ -844,17 +844,25 @@ What an operator sees with `js`:
     its remaining maximum memory. This core gives the scheduler no profile, so the setting
     is idle today.
   - *Flat-memory guard* (`FLAT_MEMORY_SLACK_PERMILLE` = 0). The flat memory charged to the
-    leases of a node, the new lease's own included, stays within the node's memory.
+    leases of a node, the new lease's own included, stays within the node's memory. With no
+    prediction a lease is charged no memory, so the guard counts only the leases that carry
+    one (a retry up the memory ladder, a VM) until predictions give leases a memory; in
+    `--placement-load on` alone it admits nearly everything.
   - *Expected-life delta* (`EXPECTED_LIFE_DELTA_MINUTES` = 2). A new lease is charged until
-    the P90 of its key's wall time plus two minutes, not for the whole horizon.
+    the P90 of its key's wall time plus two minutes, not for the whole horizon. The delta
+    needs a prediction for the operation and a curve source that knows the key's wall time.
+    This core gives the scheduler neither (`--placement-predictions` is refused with it, and
+    the farm never gives the scheduler a curve source), so the setting is idle today.
   - *Balance scoring.* Nodes are ranked with the scheduler's own balance term, which
     `placement_load.rs` leaves at the scheduler library's value.
 
   A node with no usable reading is admitted on the sum of its leases' predicted costs, never
   by the booked rule. A node that has never sent an accepted reading (a daemon or runtime
-  that takes none, or an agent that reports none) is charged at least 1000 m for each lease,
-  whatever the prediction; a node that has measured and gone stale is not floored. On a farm of
-  such nodes `--placement-load on` therefore charges close to the booked rule, and a change
+  that takes none, or an agent that reports none) is charged at least 1000 m for each lease
+  (the node's whole CPU capacity, if that is less), whatever the prediction, so a prediction
+  under one core changes nothing there, and `--placement-predictions on` would do nothing for
+  small actions on such nodes; a node that has measured and gone stale is not floored. On a
+  farm of such nodes `--placement-load on` therefore charges close to the booked rule, and a change
   in placement is not to be expected from it. `--placement-predictions` is refused with
   `--scheduler-core js` (see the flag's help).
 - **Node of another frontend.** The detail of a node that another frontend holds is not
