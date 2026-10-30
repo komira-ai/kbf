@@ -12,9 +12,10 @@ use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
 
 use super::*;
-use crate::PlacementLoad;
 use crate::farm::EpochPolicy;
+use crate::learned::LearnedSizes;
 use crate::state_store::StateStore;
+use crate::{PlacementLoad, PlacementPredictions};
 
 mod hot;
 mod learned;
@@ -131,6 +132,28 @@ fn the_builders_rebuild_the_core_and_keep_the_settings() {
     assert_eq!(js.settings.held_cap, 17);
     assert_eq!(js.settings.orphan_wait, Duration::from_secs(2));
     assert!(js.settings.whole_node.is_some());
+}
+
+/// Catches `--placement-predictions` not reaching the adapter of a js farm, in either order of
+/// the builders (the estimator is rebuilt by `with_learned_sizes`, which must not drop the mode)
+/// and a mode other than `on` handed to the scheduler.
+#[test]
+fn the_predictions_mode_reaches_the_adapter_in_either_order_of_the_builders() {
+    let hands = |farm: &Farm| js(farm).core.with(|_, adapter| adapter.hands_predictions());
+    for (mode, expected) in [
+        (PlacementPredictions::On, true),
+        (PlacementPredictions::Shadow, false),
+        (PlacementPredictions::Off, false),
+    ] {
+        let first = farm()
+            .with_learned_sizes(LearnedSizes::Shadow, 4 << 30)
+            .with_placement_predictions(mode);
+        let second = farm()
+            .with_placement_predictions(mode)
+            .with_learned_sizes(LearnedSizes::Shadow, 4 << 30);
+        assert_eq!(hands(&first), expected, "{mode:?}, learned first");
+        assert_eq!(hands(&second), expected, "{mode:?}, predictions first");
+    }
 }
 
 /// Catches a farm on the js driver that names the legacy core (the gauge

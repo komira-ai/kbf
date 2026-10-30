@@ -7,6 +7,15 @@
 //! would have booked, in a log line and a tally. The `on` mode (size keys on submit, key
 //! floors on requeue) is not supported here; a farm asked for it learns as `shadow` does.
 //! Every method returns at once while the estimator is off.
+//!
+//! `--placement-predictions` is a separate flag with the same two steps: the prediction of a
+//! new operation is asked for before its submit ([`KbfAdapter::forecast_submit`], counting
+//! nothing, so a caller that joins a twin counts nothing), given to the core with the submit
+//! (`on`; the scheduler charges it from the first placement round) and counted after it, by
+//! [`KbfAdapter::learn_submit`]. What reaches the scheduler is the cores and the memory
+//! peak of the estimator's row (and its life in minutes, which only a lease charged by a
+//! curve reads): a charge. The lease's booked memory limit and cores are the request's and
+//! the ladder's, whatever is predicted.
 
 // Only the farm of the js core (and the tests) write the summaries; a build without it keeps
 // the pieces for them compiled.
@@ -29,12 +38,15 @@ use kbf_types::{
 
 use super::adapter::KbfAdapter;
 use super::ext::KbfExt;
+use crate::PlacementPredictions;
 use crate::action_usage::Measured;
+use crate::action_usage::Subject;
 use crate::farm::durable::{ESTIMATE, estimate};
 use crate::learned::{
-    Attempt, BATCH, Learned, LearnedSizes, Row, Skip, basis_of_os, hint_of, key_of, kill_run,
-    run_of,
+    Attempt, BATCH, Forecast, Learned, LearnedSizes, Row, Skip, Unset, basis_of_os, hint_of,
+    key_of, kill_run, run_of,
 };
+use crate::machine::Platform;
 use crate::run_record;
 
 /// Transactions of at most [`SWEEP_ROWS`] rows a tick's sweep commits.
@@ -84,6 +96,25 @@ pub(crate) struct Sized {
     pub(crate) cpu_millis: u64,
     /// What the client named of the size.
     pub(crate) evidence: Evidence,
+}
+
+/// Whose estimate a submit asks for: the request and what keys the estimator's row.
+pub(crate) struct Ask<'a> {
+    /// The request about to be submitted.
+    pub(crate) request: &'a kbf_sched::Request,
+    /// The instance of its action.
+    pub(crate) instance: &'a str,
+    /// The platform it asks for.
+    pub(crate) platform: &'a Platform,
+    /// What its action is.
+    pub(crate) subject: &'a Subject,
+}
+
+/// The estimator's key for an action to run on `platform`, measured by the basis of its OS.
+fn estimator_key(instance: &str, platform: &Platform, subject: &Subject) -> Result<Key, Skip> {
+    basis_of_os(platform.os_family)
+        .ok_or(Skip::NoOs)
+        .and_then(|basis| key_of(instance, platform, basis, subject))
 }
 
 impl KbfAdapter {
@@ -191,7 +222,10 @@ impl KbfAdapter {
             return;
         };
         match key_of(&instance, &platform, basis, &subject) {
-            Ok(key) => learned.stage(lease, Some(Attempt { key, run })),
+            Ok(key) => {
+                learned.stage(lease, Some(Attempt { key, run }));
+                learned.stage_prediction(lease, operation);
+            }
             Err(why) => learned.skip(why),
         }
     }
@@ -219,19 +253,65 @@ impl KbfAdapter {
             .extend(rows.into_iter().map(|(key, _)| key));
     }
 
+    /// What the estimator predicts for a request about to be submitted (`--placement-
+    /// predictions`), asked of the summaries in memory and counting nothing; the core's lock
+    /// is held for the lookup only, not for the submit. `None`: predictions are off, or the
+    /// request would join an operation in flight, which keeps its own cost. The prediction
+    /// is counted, and remembered in `shadow`, by [`KbfAdapter::learn_submit`] once the
+    /// submit has said the operation is a new one.
+    pub(crate) fn forecast_submit(
+        &self,
+        view: &View<'_>,
+        sized: &Sized,
+        ask: Ask<'_>,
+    ) -> Option<Forecast> {
+        let learned = &self.learning.learned;
+        if learned.off() || !learned.predictions().predicts() {
+            return None;
+        }
+        if view.sched().twin(ask.request).is_some() {
+            return None;
+        }
+        if sized.kind != LeaseKind::Action || sized.gpus != 0 {
+            return Some(Err(Unset::Kind));
+        }
+        let key = match estimator_key(ask.instance, ask.platform, ask.subject) {
+            Ok(key) => key,
+            Err(why) => return Some(Err(Unset::of_key_error(why))),
+        };
+        let bounds = self.bounds_for_os(view.sched(), ask.platform.os_family);
+        let hint = hint_of(&sized.evidence, sized.memory_bytes, sized.cpu_millis);
+        Some(learned.forecast(&key, &hint, &bounds))
+    }
+
+    /// Whether the scheduler is given the predictions (`--placement-predictions on`); in
+    /// `shadow` they are counted and compared with the run, and the scheduler is given none.
+    pub(crate) fn hands_predictions(&self) -> bool {
+        self.learning.learned.predictions() == PlacementPredictions::On
+    }
+
     /// Logs what the estimator would book for the new operation `admitted`, that `sized`
-    /// describes. A caller that joined a twin is not a new operation.
+    /// describes, and counts `forecast`, the prediction [`KbfAdapter::forecast_submit`] made
+    /// before the submit (remembered in `shadow` to compare with the run). A caller that
+    /// joined a twin is not a new operation.
     pub(crate) fn learn_submit(
         &mut self,
         view: &View<'_>,
         admitted: &js_server_core::Admitted,
         sized: &Sized,
+        forecast: Option<Forecast>,
     ) {
         if self.learning.learned.off() || admitted.joined {
             return;
         }
+        let note = |learned: &mut Learned| {
+            if let Some(forecast) = forecast {
+                learned.note_forecast(admitted.operation, forecast);
+            }
+        };
         if sized.kind != LeaseKind::Action || sized.gpus != 0 {
             self.learning.learned.skip(Skip::Kind);
+            note(&mut self.learning.learned);
             return;
         }
         let Some(waiter) = self.machine.waiter(admitted.waiter) else {
@@ -242,13 +322,11 @@ impl KbfAdapter {
             waiter.platform.clone(),
             waiter.usage.clone(),
         );
-        let key = basis_of_os(platform.os_family)
-            .ok_or(Skip::NoOs)
-            .and_then(|basis| key_of(&instance, &platform, basis, &subject));
-        let key = match key {
+        let key = match estimator_key(&instance, &platform, &subject) {
             Ok(key) => key,
             Err(why) => {
                 self.learning.learned.skip(why);
+                note(&mut self.learning.learned);
                 return;
             }
         };
@@ -257,6 +335,7 @@ impl KbfAdapter {
         let text = self.learning.learned.estimate_text(&key, &hint, &bounds);
         let name = crate::machine::stored_name(admitted.operation);
         tracing::info!(operation = %name, "size estimate: {text}");
+        note(&mut self.learning.learned);
     }
 
     /// Takes up the size summaries the state store holds, when the core starts.
@@ -272,10 +351,13 @@ impl KbfAdapter {
         }
     }
 
-    /// Copies the estimator's tally into the scrape.
+    /// Copies the estimator's tally and the predictions' into the scrape.
     pub(crate) fn publish_learned(&self) {
         let metrics = self.cache.metrics();
         self.learning.learned.publish(&metrics.estimator_shadow);
+        self.learning
+            .learned
+            .publish_predictions(&metrics.prediction);
     }
 
     /// Whether summaries a kill changed wait to be written ([`write_learned`]).

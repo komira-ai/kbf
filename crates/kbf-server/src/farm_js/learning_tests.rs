@@ -861,7 +861,7 @@ async fn an_operation_whose_caller_is_unknown_is_not_asked_about() {
         evidence: Default::default(),
     };
     rig.core
-        .with(|view, adapter| adapter.learn_submit(view, &admitted, &sized));
+        .with(|view, adapter| adapter.learn_submit(view, &admitted, &sized, None));
     assert!(estimates(&log.text()).is_empty());
 }
 

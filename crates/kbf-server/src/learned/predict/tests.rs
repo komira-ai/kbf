@@ -516,3 +516,54 @@ fn each_reason_has_its_label_and_each_error_its_reason() {
     assert_eq!(Unset::of_key_error(Skip::NoSubject), Unset::NoSubject);
     assert_eq!(Unset::of_key_error(Skip::NoOs), Unset::NoOs);
 }
+
+/// Catches a forecast that counts, remembers or changes anything (the farm asks before it
+/// knows the operation is new), and one that is not what `predict` answers for the key.
+#[test]
+fn a_forecast_counts_nothing_and_is_what_predict_answers() {
+    let mut learned = warm(PlacementPredictions::Shadow);
+    let calls = learned.calls();
+    let hint = Hint::default();
+    let forecast = learned.forecast(&key(), &hint, &bounds());
+    assert_eq!(learned.calls(), calls);
+    assert_eq!(learned.predictions_made(), 0);
+    assert_eq!(learned.predictions_pending(), 0);
+    assert_eq!(unset_counts(&learned), [0; 8]);
+    assert_eq!(
+        forecast.ok(),
+        learned.predict(&key(), &hint, &bounds()),
+        "the same figures"
+    );
+    let cold = Learned::new(LearnedSizes::Shadow, 4 * GIB, EPOCH);
+    assert_eq!(
+        cold.forecast(&key(), &hint, &bounds()),
+        Err(Unset::Missing),
+        "an unknown key says why"
+    );
+}
+
+/// Catches a noted forecast not counted as made or by its reason, a mode that does with it
+/// other than `predict` and `to_set` do (`on` hands it, `shadow` keeps it, `off` neither
+/// counts nor keeps it).
+#[test]
+fn a_noted_forecast_is_counted_and_handled_as_the_mode_says() {
+    let hint = Hint::default();
+    for (mode, handed, pending, made) in [
+        (PlacementPredictions::On, true, 0, 1),
+        (PlacementPredictions::Shadow, false, 1, 1),
+        (PlacementPredictions::Off, false, 0, 0),
+    ] {
+        let mut learned = warm(mode);
+        let forecast = learned.forecast(&key(), &hint, &bounds());
+        let set = learned.note_forecast(OperationId(1), forecast);
+        assert_eq!(set.is_some(), handed, "{mode:?}");
+        assert_eq!(learned.predictions_pending(), pending, "{mode:?}");
+        assert_eq!(learned.predictions_made(), made, "{mode:?}");
+    }
+    let mut learned = learned(PlacementPredictions::On);
+    assert_eq!(
+        learned.note_forecast(OperationId(1), Err(Unset::Kind)),
+        None
+    );
+    assert_eq!(learned.predictions_unset(Unset::Kind), 1);
+}
