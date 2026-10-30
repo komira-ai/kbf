@@ -67,6 +67,8 @@ async fn each_cell_flag_runs_its_own_cell_and_the_run_makes_its_request_log() {
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-cells");
     let out = dir.path().join("out");
     for (cell, name) in [
+        ("cold-put", "cell cold-put"),
+        ("cold-read", "cell cold-read"),
         ("a1", "cell a1"),
         ("b", "cell b"),
         ("c", "cell c"),

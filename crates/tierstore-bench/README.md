@@ -21,7 +21,7 @@ with the private run directory.
 ```
 tierstore-bench preflight        read-only checks and the before-snapshot
 tierstore-bench provision        test buckets and scoped accounts (dry run unless --apply)
-tierstore-bench run              cells A1, B, C, G
+tierstore-bench run              cells cold-put, cold-read, g (first stage); a1, b, c (with a hot tier)
 tierstore-bench fault-proxy      the loopback proxy that slows, refuses or blackholes the cold side
 tierstore-bench verify-teardown  PASS/FAIL per check against the before-snapshot
 tierstore-bench report           one table from the result JSON and CSV files

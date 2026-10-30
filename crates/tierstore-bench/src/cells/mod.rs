@@ -34,13 +34,30 @@ use crate::result::{CellResult, Provenance};
 pub mod a1;
 pub mod b;
 pub mod c;
+pub mod cold_put;
+pub mod cold_read;
 pub mod g;
 
-/// The cells of the first stage.
+/// The cells. `ColdPut`, `ColdRead` and `G` are the first stage (the instance with the cold
+/// tier on the measured path); `A1`, `B` and `C` need a hot tier and are the second.
+///
+/// Whether the instance can run with a cold tier only: at the pinned tag (v0.0.37) it cannot.
+/// `--hot` is a required flag (`memory`, `dir:<path>` or `s3:<bucket>`), and there is no
+/// cold-only mode. So the cold cells measure two paths and say which in the arm label:
+/// - `direct`: this tool against the test cold bucket, with no instance, the floor;
+/// - `instance`: the instance in front of the same bucket, with a `dir:` hot tier of its own on
+///   the same host. A multipart upload goes to the cold tier part by part and does not touch
+///   the hot tier, so `cold-put` through the instance measures the cold path only when it
+///   uploads in parts; a plain put is acknowledged from the hot tier and belongs to `a1`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum CellId {
-    /// Put-to-ack, cold healthy, slow and stopped (through the fault proxy).
+    /// Put-to-ack straight to the cold store, healthy, slow and stopped (through the fault
+    /// proxy).
+    ColdPut,
+    /// Reads of objects that are on the cold store only, healthy, slow and stopped.
+    ColdRead,
+    /// Put-to-ack with a hot tier, cold healthy, slow and stopped.
     A1,
     /// Read of a hot miss, with copy-back.
     B,
@@ -52,12 +69,21 @@ pub enum CellId {
 
 impl CellId {
     /// Every cell, in order.
-    pub const ALL: [CellId; 4] = [CellId::A1, CellId::B, CellId::C, CellId::G];
+    pub const ALL: [CellId; 6] = [
+        CellId::ColdPut,
+        CellId::ColdRead,
+        CellId::G,
+        CellId::A1,
+        CellId::B,
+        CellId::C,
+    ];
 
     /// The name a result file and a flag use.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            CellId::ColdPut => "cold-put",
+            CellId::ColdRead => "cold-read",
             CellId::A1 => "a1",
             CellId::B => "b",
             CellId::C => "c",
@@ -97,9 +123,31 @@ pub async fn run(
     plan: &CellPlan,
 ) -> Result<Vec<CellResult>, BenchError> {
     match id {
+        CellId::ColdPut => cold_put::run(ctx, plan).await,
+        CellId::ColdRead => cold_read::run(ctx, plan).await,
         CellId::A1 => a1::run(ctx, plan).await,
         CellId::B => b::run(ctx, plan).await,
         CellId::C => c::run(ctx, plan).await,
         CellId::G => g::run(ctx, plan).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches a cell whose result-file name, flag name and JSON name differ, or two cells with
+    /// one name.
+    #[test]
+    fn a_cell_has_one_name_in_flag_json_and_file() {
+        let mut seen = std::collections::BTreeSet::new();
+        for id in CellId::ALL {
+            let name = id.as_str();
+            assert!(seen.insert(name), "{name} twice");
+            assert_eq!(serde_json::to_string(&id).unwrap(), format!("\"{name}\""));
+            let flag = id.to_possible_value().unwrap();
+            assert_eq!(flag.get_name(), name);
+        }
+        assert_eq!(seen.len(), 6);
     }
 }
