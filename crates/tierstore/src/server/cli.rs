@@ -55,6 +55,11 @@
 //! need a write are skipped, with a line that says so. `--skip-backend-check` leaves the
 //! multipart-completion check out, for a reason that is logged at the start; no other check can
 //! be left out.
+//!
+//! A file of the build-node shape (`[local_cache]` and `[cold_store]` and no `[hot_store]`) is a
+//! different start: a read cache in front of one upstream, with none of the above (no proxy, no
+//! tiers to test, no reconciler). `cache_cli.rs` has its start and its checks; the exit statuses
+//! are the same, and a file system under the cache that fails its check is status 3.
 
 use std::ffi::OsString;
 use std::future::Future;
@@ -76,23 +81,19 @@ use crate::{
     ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SystemClock, self_test,
 };
 
-use super::config::keys_for_flags;
+use super::cache_cli::serve_cache_until_signalled;
+use super::config::{Settings, keys_for_flags};
 use super::config_print::render;
-use super::gc::{ensure_distinct as gc_distinct, gc_keys, ids as gc_ids};
-use super::keys::{ensure_distinct, read_credentials, read_only_keys};
+#[cfg(test)]
+use super::front::read_key;
+use super::front::{InvalidFlags, server_config};
+use super::keys::read_credentials;
 use super::launch::{Launch, Refused, resolve};
-use super::presign::{ensure_distinct as presign_distinct, presign_keys};
-use super::scoped::{ensure_distinct as scoped_distinct, ids as scoped_ids, scoped_keys};
+use super::local_cache::LocalTierFailure;
 use super::{Drained, Server, ServerConfig};
 
 /// A start-up error, for the operator.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
-
-/// Flags that cannot go together, which only the files they name show: the process exits with
-/// status 2, as for flags the parser refused, since a restart cannot mend them.
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct InvalidFlags(String);
 
 pub(super) const DEFAULT_MAX_REQUEST_BYTES: u64 = 256 << 20;
 
@@ -409,10 +410,10 @@ struct Built {
 }
 
 /// The flags that say how to reach a tier that is an S3 bucket.
-struct S3Flags<'a> {
-    endpoint: Option<&'a str>,
-    region: Option<&'a str>,
-    credentials: Option<&'a Path>,
+pub(super) struct S3Flags<'a> {
+    pub(super) endpoint: Option<&'a str>,
+    pub(super) region: Option<&'a str>,
+    pub(super) credentials: Option<&'a Path>,
 }
 
 impl S3Flags<'_> {
@@ -449,7 +450,7 @@ impl Cli {
 
 /// The tier a flag names, with the flags that go with it: a bucket of an S3-compatible store,
 /// or one of the kinds that `tier` opens, which have no use for those flags.
-fn open_tier(
+pub(super) fn open_tier(
     flag: &str,
     spec: &str,
     s3: &S3Flags<'_>,
@@ -513,11 +514,6 @@ fn tier(flag: &str, spec: &str) -> Result<Arc<dyn Backend>, String> {
     }
 }
 
-/// The access key id and the secret access key in the file of `--access-key-file`.
-fn read_key(path: &Path) -> Result<(String, String), String> {
-    read_credentials("--access-key-file", path)
-}
-
 /// Checks the flags that depend on each other, and makes the settings they stand for.
 fn build(cli: &Cli) -> Result<Built, Error> {
     if cli.low_water >= cli.high_water {
@@ -532,49 +528,15 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     if cli.usage_stale_after <= cli.lease_ttl {
         return Err("--usage-stale-after must be longer than --lease-ttl".into());
     }
-    if matches!(cli.bucket.as_str(), "healthz" | "readyz" | "usagez") {
-        let name = &cli.bucket;
-        return Err(format!("--bucket {name:?} is the name of a probe path").into());
-    }
-    if cli.body_idle_timeout.is_zero() {
-        return Err("--body-idle-timeout must be longer than zero".into());
-    }
     if cli.s3_request_timeout.is_zero() {
         return Err("--s3-request-timeout must be longer than zero".into());
     }
-    let (key_id, secret) = read_key(&cli.access_key_file)?;
-    let read_only = read_only_keys(&cli.read_only_key_file)?;
-    ensure_distinct(&key_id, &read_only).map_err(InvalidFlags)?;
-    let presign = presign_keys(&cli.presign_key_file)?;
-    let gc = gc_keys(&cli.gc_key_file)?;
-    let scoped = scoped_keys(&cli.scoped_key_file)?;
-    let mut others: Vec<&str> = std::iter::once(key_id.as_str())
-        .chain(read_only.iter().map(|key| key.id.as_str()))
-        .collect();
-    gc_distinct(&others, &gc).map_err(InvalidFlags)?;
-    others.extend(gc_ids(&gc));
-    scoped_distinct(&others, &scoped).map_err(InvalidFlags)?;
-    others.extend(scoped_ids(&scoped));
-    presign_distinct(&others, &presign).map_err(InvalidFlags)?;
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let mut server = server_config(&cli.front(), Arc::clone(&clock))?;
+    server.usage_stale_after = cli.usage_stale_after;
     let timeout = cli.s3_request_timeout;
     let hot = open_tier("--hot", &cli.hot, &cli.hot_s3(), timeout)?;
     let cold = open_tier("--cold", &cli.cold, &cli.cold_s3(), timeout)?;
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let mut server = ServerConfig::new(&cli.bucket, &key_id, &secret, Arc::clone(&clock));
-    server.read_only_keys = read_only;
-    server.presign_keys = presign;
-    server.gc_keys = gc;
-    server.scoped_keys = scoped;
-    server.presign_max_expires = cli.presign_max_expires;
-    server.region = cli.region.clone();
-    server.max_request_bytes = usize::try_from(cli.max_request_bytes).unwrap_or(usize::MAX);
-    server.body_idle_timeout = cli.body_idle_timeout;
-    server.max_concurrent_puts = cli.max_concurrent_puts as usize;
-    server.put_min_bytes_per_sec = cli.put_min_bytes_per_sec;
-    server.put_rate_grace = cli.put_rate_grace;
-    server.drain_lb_wait = cli.drain_lb_wait;
-    server.drain_deadline = cli.drain_deadline;
-    server.usage_stale_after = cli.usage_stale_after;
     let mut proxy = ProxyConfig::new(&cli.proxy_id, cli.hot_bytes, Arc::clone(&clock));
     proxy.critical = share(cli.critical);
     proxy.linger = cli.journal_linger;
@@ -625,7 +587,7 @@ pub(crate) async fn reconcile(mut reconciler: Reconciler, interval: Duration, ha
 /// The id of a start for the probe keys of its self-test: the proxy id (with any character a
 /// key cannot carry replaced by `_`), the time of the start and the process id, so that two
 /// starts never share a probe key.
-fn probe_run_id(proxy_id: &str, now: u64, process: u32) -> String {
+pub(super) fn probe_run_id(proxy_id: &str, now: u64, process: u32) -> String {
     let safe = |c: char| {
         if c.is_ascii_alphanumeric() || c == '-' {
             c
@@ -742,7 +704,7 @@ pub async fn run(
 
 /// What [`run`] reports on stderr of a drain: a line when the drain deadline cut requests, and
 /// nothing when it cut none.
-fn cut_note(drained: Drained) -> String {
+pub(super) fn cut_note(drained: Drained) -> String {
     match drained.abandoned {
         0 => String::new(),
         cut => format!("tierstore: {cut} requests were cut at the drain deadline\n"),
@@ -750,7 +712,7 @@ fn cut_note(drained: Drained) -> String {
 }
 
 /// Resolves on SIGTERM or SIGINT. The handlers are in place when this returns.
-fn signals() -> std::io::Result<impl Future<Output = ()> + Send + 'static> {
+pub(super) fn signals() -> std::io::Result<impl Future<Output = ()> + Send + 'static> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
@@ -770,11 +732,11 @@ async fn serve_until_signalled(cli: Cli) -> Result<(), Error> {
     Ok(())
 }
 
-fn blocking(cli: Cli) -> Result<(), Error> {
+fn blocking(start: impl Future<Output = Result<(), Error>>) -> Result<(), Error> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(serve_until_signalled(cli))
+    runtime.block_on(start)
 }
 
 /// The binary: flags in, exit status out.
@@ -791,11 +753,16 @@ pub fn main(args: Vec<OsString>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let Launch { cli, from_file } = launch;
-    if cli.print_config {
-        return print_config(&cli);
-    }
-    match blocking(cli) {
+    let Launch {
+        settings,
+        from_file,
+    } = launch;
+    let started = match settings {
+        Settings::Storage(cli) if cli.print_config => return print_config(&cli),
+        Settings::Storage(cli) => blocking(serve_until_signalled(*cli)),
+        Settings::Cache(cache) => blocking(serve_cache_until_signalled(*cache)),
+    };
+    match started {
         Ok(()) => ExitCode::SUCCESS,
         Err(why) => {
             // The messages of the flags' checks name flags; in a start from a file they name keys.
@@ -833,11 +800,14 @@ fn print_config(cli: &Cli) -> ExitCode {
 }
 
 /// The exit status of a start that failed: 2 for flags that cannot go together, 3 for a tier
-/// that answered the self-test wrongly, 1 for anything else (a tier that could not be reached
+/// or a cache directory that answered the self-test wrongly, 1 for anything else (a tier that could not be reached
 /// among it: a restart may mend that).
-fn exit_status(why: &Error) -> u8 {
+pub(super) fn exit_status(why: &Error) -> u8 {
     if why.downcast_ref::<InvalidFlags>().is_some() {
         return 2;
+    }
+    if why.downcast_ref::<LocalTierFailure>().is_some() {
+        return 3;
     }
     match why.downcast_ref::<SelfTestError>() {
         Some(SelfTestError::Violation(_)) => 3,

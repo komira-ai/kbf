@@ -1,0 +1,311 @@
+//! Fixtures of the tests of the local cache: an upstream whose answers a test can cut short or
+//! hold, a file system whose answers a test can change, and a cache over them in a scratch
+//! directory.
+
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use kbf_testkit::dir::TestDir;
+use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
+
+use crate::{
+    Backend, ByteRange, Error, FaultyBackend, Listed, MemoryBackend, Meta, Op, OpenUpload,
+    TestClock, UploadsAfter,
+};
+
+use super::layout::{data_path, name_of};
+use super::{CacheConfig, Disk, LocalCache, Space, SystemDisk};
+
+/// `len` bytes that differ from one place to the next, so that a wrong range shows.
+pub(in crate::server) fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| ((i * 7 + 3) % 251) as u8).collect()
+}
+
+/// The hex of the SHA-256 of `bytes`: the name of a blob under `cas/l/`.
+pub(in crate::server) fn digest(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// An upstream that holds objects in memory and can be told to give short bodies or to hold a
+/// read until the test lets it go.
+pub(in crate::server) struct Tamper {
+    pub(in crate::server) memory: MemoryBackend,
+    pub(in crate::server) short: AtomicBool,
+    gate: Mutex<Option<Arc<Semaphore>>>,
+}
+
+impl Tamper {
+    fn new() -> Self {
+        Self {
+            memory: MemoryBackend::new(),
+            short: AtomicBool::new(false),
+            gate: Mutex::new(None),
+        }
+    }
+
+    /// Holds every read from now on until a permit is added to the gate that is returned.
+    pub(in crate::server) fn hold(&self) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        let mut held = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
+        *held = Some(Arc::clone(&gate));
+        gate
+    }
+}
+
+#[async_trait]
+impl Backend for Tamper {
+    async fn put(&self, key: &str, body: Bytes) -> Result<(), Error> {
+        self.memory.put(key, body).await
+    }
+
+    async fn put_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<String, Error> {
+        self.memory.put_if_match(key, body, etag).await
+    }
+
+    async fn get(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
+        let gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(gate) = gate {
+            gate.acquire().await.expect("the gate stays open").forget();
+        }
+        let body = self.memory.get(key, range).await?;
+        if self.short.load(Ordering::SeqCst) && !body.is_empty() {
+            return Ok(body.slice(..body.len() - 1));
+        }
+        Ok(body)
+    }
+
+    async fn head(&self, key: &str) -> Result<Meta, Error> {
+        self.memory.head(key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), Error> {
+        self.memory.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<Listed>, Error> {
+        self.memory.list(prefix).await
+    }
+
+    async fn create_upload(&self, key: &str) -> Result<String, Error> {
+        self.memory.create_upload(key).await
+    }
+
+    async fn list_uploads(
+        &self,
+        prefix: &str,
+        after: Option<UploadsAfter<'_>>,
+        max_uploads: usize,
+    ) -> Result<Vec<OpenUpload>, Error> {
+        self.memory.list_uploads(prefix, after, max_uploads).await
+    }
+}
+
+/// What a [`FakeDisk`] does wrongly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::server) enum Quirk {
+    /// Nothing: it is the file system of the machine.
+    None,
+    /// A second link to a name that exists succeeds and changes nothing.
+    LinkOverwrites,
+    /// The name made by a link holds other bytes than the file it was linked to.
+    SecondDiffers,
+    /// The file that was linked holds other bytes after the link.
+    FirstDiffers,
+    /// Every file reports one link.
+    OneLink,
+    /// Every link fails with this kind of error.
+    LinkFails(io::ErrorKind),
+}
+
+/// The file system of the machine, with the answers a test changes.
+pub(in crate::server) struct FakeDisk {
+    pub(in crate::server) quirk: Mutex<Quirk>,
+    /// The space `space` reports, if a test sets one.
+    pub(in crate::server) space: Mutex<Option<Space>>,
+    /// Every call of `touch`, in order.
+    pub(in crate::server) touched: Mutex<Vec<(PathBuf, u64)>>,
+    /// The number of calls of `link`.
+    links_made: Mutex<u32>,
+}
+
+impl FakeDisk {
+    pub(in crate::server) fn new() -> Self {
+        Self {
+            quirk: Mutex::new(Quirk::None),
+            space: Mutex::new(None),
+            touched: Mutex::new(Vec::new()),
+            links_made: Mutex::new(0),
+        }
+    }
+
+    pub(in crate::server) fn set(&self, quirk: Quirk) {
+        *self.quirk.lock().unwrap_or_else(PoisonError::into_inner) = quirk;
+    }
+
+    pub(in crate::server) fn set_space(&self, total: u64, free: u64) {
+        let space = Space { total, free };
+        *self.space.lock().unwrap_or_else(PoisonError::into_inner) = Some(space);
+    }
+
+    fn quirk(&self) -> Quirk {
+        *self.quirk.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Disk for FakeDisk {
+    fn space(&self, path: &Path) -> io::Result<Space> {
+        let set = *self.space.lock().unwrap_or_else(PoisonError::into_inner);
+        match set {
+            Some(space) => Ok(space),
+            None => SystemDisk.space(path),
+        }
+    }
+
+    fn link(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let call = {
+            let mut made = self
+                .links_made
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *made += 1;
+            *made
+        };
+        let quirk = self.quirk();
+        if let Quirk::LinkFails(kind) = quirk {
+            return Err(io::Error::from(kind));
+        }
+        if quirk == Quirk::LinkOverwrites && call == 2 {
+            return Ok(());
+        }
+        SystemDisk.link(from, to)?;
+        match quirk {
+            Quirk::SecondDiffers => {
+                std::fs::remove_file(to)?;
+                std::fs::write(to, b"other bytes")?;
+            }
+            Quirk::FirstDiffers => {
+                std::fs::remove_file(from)?;
+                std::fs::write(from, b"other bytes")?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn links(&self, path: &Path) -> io::Result<u64> {
+        match self.quirk() {
+            Quirk::OneLink => Ok(1),
+            _ => SystemDisk.links(path),
+        }
+    }
+
+    fn touch(&self, path: &Path, millis: u64) -> io::Result<()> {
+        self.touched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((path.to_path_buf(), millis));
+        SystemDisk.touch(path, millis)
+    }
+}
+
+/// A cache over a [`Tamper`] upstream in a scratch directory.
+pub(in crate::server) struct Rig {
+    pub(in crate::server) dir: TestDir,
+    pub(in crate::server) tamper: Arc<Tamper>,
+    pub(in crate::server) upstream: Arc<FaultyBackend>,
+    pub(in crate::server) clock: Arc<TestClock>,
+    pub(in crate::server) disk: Arc<FakeDisk>,
+    pub(in crate::server) config: CacheConfig,
+    pub(in crate::server) cache: LocalCache,
+}
+
+impl Rig {
+    /// A cache of a mebibyte that keeps what is under `cas/`, in a scratch directory called
+    /// `name`.
+    pub(in crate::server) fn new(name: &str) -> Self {
+        Self::with(name, |_| {})
+    }
+
+    /// The same, with the settings changed by `change`.
+    pub(in crate::server) fn with(name: &str, change: impl FnOnce(&mut CacheConfig)) -> Self {
+        let dir = TestDir::under(std::env::temp_dir(), name);
+        let path = dir.path().join("cache");
+        let mut config = CacheConfig::new(path, 1 << 20, vec![("cas/".to_owned(), true)]);
+        change(&mut config);
+        let tamper = Arc::new(Tamper::new());
+        let upstream = Arc::new(FaultyBackend::new(tamper.clone()));
+        let clock = Arc::new(TestClock::new());
+        let disk = Arc::new(FakeDisk::new());
+        let cache = Self::open(&config, &upstream, &disk, &clock);
+        Self {
+            dir,
+            tamper,
+            upstream,
+            clock,
+            disk,
+            config,
+            cache,
+        }
+    }
+
+    fn open(
+        config: &CacheConfig,
+        upstream: &Arc<FaultyBackend>,
+        disk: &Arc<FakeDisk>,
+        clock: &Arc<TestClock>,
+    ) -> LocalCache {
+        let upstream: Arc<dyn Backend> = upstream.clone();
+        let (disk, clock) = (disk.clone(), clock.clone());
+        LocalCache::open(config.clone(), upstream, disk, clock).expect("a cache")
+    }
+
+    /// The cache again over the same directory, as after a restart.
+    pub(in crate::server) fn reopen(&self) -> LocalCache {
+        self.reopen_with(|_| {})
+    }
+
+    /// The same, with the settings changed by `change`.
+    pub(in crate::server) fn reopen_with(
+        &self,
+        change: impl FnOnce(&mut CacheConfig),
+    ) -> LocalCache {
+        let mut config = self.config.clone();
+        change(&mut config);
+        Self::open(&config, &self.upstream, &self.disk, &self.clock)
+    }
+
+    /// Puts an object in the upstream.
+    pub(in crate::server) async fn put(&self, key: &str, body: &[u8]) {
+        let body = Bytes::copy_from_slice(body);
+        self.tamper.memory.put(key, body).await.expect("a put");
+    }
+
+    /// A whole read through the cache.
+    pub(in crate::server) async fn get(&self, key: &str) -> Result<Bytes, Error> {
+        self.cache.get(key, None).await
+    }
+
+    /// The calls of a kind the upstream has had.
+    pub(in crate::server) fn calls(&self, op: Op) -> u64 {
+        self.upstream.calls(op)
+    }
+
+    /// The data file of `key` in the cache directory.
+    pub(in crate::server) fn file(&self, key: &str) -> PathBuf {
+        data_path(&self.config.path, &name_of(key).hex)
+    }
+
+    /// Whether the cache directory has a data file for `key`.
+    pub(in crate::server) fn has_file(&self, key: &str) -> bool {
+        self.file(key).is_file()
+    }
+}

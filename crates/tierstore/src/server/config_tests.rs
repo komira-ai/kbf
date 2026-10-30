@@ -87,8 +87,8 @@ fn a_file_is_read_from_its_path_and_its_refusals_name_it() {
     let good = dir.path().join("tierstore.toml");
     std::fs::write(&good, GOLDEN).unwrap();
     assert_eq!(
-        load(&good, DEFAULTS).unwrap(),
-        from_text(GOLDEN, DEFAULTS).unwrap()
+        load(&good, DEFAULTS).unwrap().into_storage(),
+        Some(from_text(GOLDEN, DEFAULTS).unwrap())
     );
     let missing = load(&dir.path().join("none.toml"), DEFAULTS).unwrap_err();
     assert!(matches!(missing, ConfigError::Read { .. }), "{missing}");
@@ -257,21 +257,22 @@ fn a_fault_in_the_file_is_reported_without_the_value() {
     }
 }
 
-/// Asserts that `[local_cache]` is refused as not supported yet, with or without the other
-/// tables, and that a file missing `[hot_store]` or `[cold_store]` is refused for the shape.
+/// Asserts that `[local_cache]` along with `[hot_store]` is refused, with the reason, and that a
+/// file with neither shape's tables (`[local_cache]` alone, or a storage node's file missing
+/// `[hot_store]` or `[cold_store]`) is refused for the shape.
 #[test]
-fn a_local_cache_and_any_shape_but_the_storage_node_are_refused() {
+fn a_local_cache_with_a_hot_store_and_any_shape_but_the_two_are_refused() {
     let cache = format!("{GOLDEN}\n[local_cache]\npath = \"/var/cache\"\n");
     let why = refusal(&cache);
     assert!(
-        why.contains("local_cache") && why.contains("not supported yet"),
+        why.contains("local_cache") && why.contains("is refused with [hot_store]"),
         "{why}"
     );
     let only_cache = minimal_with(
         "[hot_store]\nkind   = \"memory\"\nbudget = 1000\n\n[cold_store]\nkind = \"memory\"\n",
         "[local_cache]\npath = \"/c\"\n",
     );
-    assert!(refusal(&only_cache).contains("not supported yet"));
+    assert!(refusal(&only_cache).contains("[local_cache] and [cold_store]"));
     let no_cold = minimal_with("[cold_store]\nkind = \"memory\"\n", "");
     let no_hot = minimal_with("[hot_store]\nkind   = \"memory\"\nbudget = 1000\n", "");
     for text in [no_cold, no_hot] {
@@ -436,11 +437,12 @@ fn a_value_out_of_range_is_refused_with_its_key() {
     }
 }
 
-/// Asserts that a policy is read and checked and has no effect: the settings with policies are
-/// the settings without; a prefix twice, a prefix inside another, a prefix that does not end in
-/// `/`, one under `_journal/` or `_tiering/`, and one that asks for a cache are refused.
+/// Asserts that on a storage node a policy is read and checked and has no effect: the settings
+/// with policies are the settings without; a prefix twice, a prefix inside another, a prefix that
+/// does not end in `/`, one under `_journal/` or `_tiering/`, and one that asks for a cache are
+/// refused.
 #[test]
-fn a_policy_is_checked_and_has_no_effect_yet() {
+fn a_policy_is_checked_and_has_no_effect_on_a_storage_node() {
     let policies = "\n[[policy]]\nprefix = \"cas/b/\"\n\n[[policy]]\nprefix = \"cas/d/\"\ncache = false\n\n[[policy]]\nprefix = \"\"\n";
     let with = from_text(&format!("{GOLDEN}{policies}"), DEFAULTS).unwrap();
     assert_eq!(with, from_text(GOLDEN, DEFAULTS).unwrap());

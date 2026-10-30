@@ -233,8 +233,10 @@ and the key. A number above 9223372036854775807 (the largest TOML integer) canno
 is accepted, and `--print-config` refuses it. A `--print-config` that cannot write its output
 (a closed pipe, a full disk) exits 1; a refusal of the file or the flags exits 2.
 
-This release reads the storage-node shape: `[server]`, `[hot_store]` and `[cold_store]`, and an
-optional `[[policy]]`. A file for a storage node:
+A file has one of two shapes, told apart by its tables: a storage node (`[server]`, `[hot_store]`
+and `[cold_store]`, as the flags are, and an optional `[[policy]]`) and a build node (`[server]`,
+`[local_cache]` and `[cold_store]` with no `[hot_store]`, and `[[policy]]`), which is a read cache
+and has no flag form (see "A build node" below). A file for a storage node:
 
 ```toml
 [server]
@@ -277,6 +279,117 @@ A key that is left out has the default of its flag (`tierstore --help` lists the
 `proxy_id`, `bucket` and `access_key_file` of `[server]`, `kind` of each tier and `budget` of
 `[hot_store]` are needed. Durations are a whole number and `ms`, `s`, `m` or `h`, as in the flags.
 The water marks are percents, as in the flags (1 to 100).
+
+### A build node
+
+A file with `[local_cache]` and `[cold_store]` and no `[hot_store]` runs a read cache in front of
+one upstream: typically an S3 endpoint that is the tierstore of a storage node, read with a
+read-only key. It has no journal, no lease and no reconciler; the only things that run beside the
+front are the fills that a miss starts and the eviction pass. It is not a tier that is written to:
+every call but GET and HEAD (a put, a part, the start or completion of an upload, a delete, a copy,
+CreateBucket) is refused 403 `AccessDenied` with a message that says this is a read cache, before
+the body is read. The key files of `[server]` are those of the front, as for a storage node.
+
+```toml
+[server]
+listen          = "127.0.0.1:9400"
+proxy_id        = "tierstore-cache-1"
+bucket          = "tierstore"
+access_key_file = "/etc/tierstore-cache/access.key"
+
+[local_cache]
+path       = "/var/lib/tierstore-cache"
+layout     = "digest-v1"
+budget     = "40GiB"
+high_water = 90
+low_water  = 75
+critical   = 95
+free_floor = 10
+scrub_rate = "50MiB/s"
+
+[cold_store]
+kind             = "s3"
+bucket           = "tierstore"
+endpoint         = "http://s3-upstream.example:9300"
+credentials_file = "/etc/tierstore-cache/upstream-read.key"
+
+[[policy]]
+prefix = "cas/b/"
+cache  = true
+
+[[policy]]
+prefix = "cas/d/"
+cache  = true
+
+[[policy]]
+prefix = ""
+cache  = false
+```
+
+What it keeps: a key is kept if the longest `[[policy]]` prefix that holds it says `cache = true`
+(and it is not under `_journal/` or `_tiering/`). Every other key, and every listing, goes to the
+upstream as it is and is never kept. A HEAD, GET or ranged GET of a kept object is answered from the
+disk and makes no call to the upstream. A GET of an object that is not there reads it from the
+upstream in chunks of 8 MiB into `<path>/.stage/`, hashing the bytes as they pass, and links it into
+`<path>/obj/<aa>/<bb>/<hex>` (raw bytes, mode 0444; `<hex>` is the SHA-256 of the key, or, for a
+key `cas/l/<sha256>`, the SHA-256 in the key, which the bytes must hash to or the fill is
+discarded and counted) only when the object is whole; a sidecar `<hex>.meta` holds the key, the
+size, the hash of the bytes and the upstream's tag. The misses of one key share one fill. A ranged
+GET of an object that is not there fills the whole object if it is at most 64 MiB, and otherwise
+passes the range through and keeps nothing. A fill that fails (a short body, a hash that is not
+the name, an upstream error, a directory that cannot be written) never fails the reader for the
+cache's reasons: the reader is answered from the upstream. The front holds a response whole, as
+it does for any backend, so a read of a very large object holds it in memory whether or not it is
+kept; the bound on a fill is one chunk.
+
+Eviction keeps the cache under `budget` bytes: above `high_water` percent of it, and when the free
+space of the file system (`statvfs`) is under `free_floor` percent, a pass removes the least
+recently used objects until the cache is at `low_water` percent and the free space is back at the
+floor. The order of use is in memory, seeded at start from the times of the files and written back
+to them (once for each object each pass); an object with a link count over one is in use by another
+tree, so it is skipped, counted and stays charged to the budget. A fill is skipped, and counted,
+when the object is larger than the budget or would take the cache above `critical`. The files of
+`.stage/` are never evicted and are removed at start. `scrub_rate` is accepted; this release does not
+scrub.
+
+| key | what |
+|---|---|
+| `local_cache.path` | the directory of the cache, made if it is not there; put it on the file system that jobs' scratch is on, outside every job's mount |
+| `local_cache.layout` | `"digest-v1"`, the only layout: raw bytes, hard-linkable |
+| `local_cache.budget` | the bytes the cache is meant to hold: a number, or a string such as `"40GiB"`; needed |
+| `local_cache.high_water` | percent of the budget above which a pass evicts (default 90) |
+| `local_cache.low_water` | percent of the budget a pass evicts down to (default 75, below `high_water`) |
+| `local_cache.critical` | percent of the budget above which a fill is skipped (default 95, not below `high_water`) |
+| `local_cache.free_floor` | percent of the file system that is kept free (0 to 99, default 10): below it a pass evicts, even under the budget |
+| `local_cache.cache` | `true`, the default; `false` is refused (leave `[local_cache]` out to run without a cache) |
+| `local_cache.scrub_rate` | a size and `/s`, such as `"50MiB/s"`: accepted, and not used by this release |
+| `cold_store.endpoints` | a list of exactly one endpoint, in place of `endpoint`: several are refused as not supported yet, since the cache reads from one upstream |
+
+`[cold_store]` is the upstream: any `kind` (an `s3` bucket, with `endpoint` and a `credentials_file`
+of a read-only key, in practice), and without `skip_checks` and the keys of the reconciler. `[server]`
+is as for a storage node, without `backend_check_wait`. A `[[policy]]` with `cache = true` is needed.
+The three tables `[hot_store]`, `[local_cache]` and `[cold_store]` together are refused: the hot
+store is already local disk.
+
+At start the process makes the directory, removes what a fill that was running left in `.stage/`,
+reads `obj/` back (an object whose sidecar does not say what the file holds is deleted), and asks
+the file system under the cache four questions with a probe object: a second link to a name that
+exists is refused (`create-only`), a name made by a link shows the whole file (`atomic-visibility`),
+the bytes read back are the bytes written (`raw-bytes`), and the link count reports the second
+name (`st_nlink`). A file system that answers one wrongly is not served over: the process says which
+check and exits with status 3, as for a tier that fails its self-test. It then asks the upstream a
+HEAD of a key that is not there: 404 or any object is an answer, and anything else (it is down, it
+refuses the key) exits with status 1. The write checks of the storage-node self-test are not run
+against the upstream, whose key is read-only. On SIGTERM the process drains as a storage node does.
+
+`GET /metricz` is not signed, and a bucket cannot be called `metricz`. It answers in the Prometheus
+text format, `tierstore_cache_<name>`, with: `hits_total`, `misses_total`, `bytes_served_local_total`,
+`bytes_served_upstream_total` (the bytes of every read that was not a hit, the read that follows a
+fill included, so the byte hit ratio is the first over the sum of the two), `fills_total`,
+`fills_skipped_total`, `fill_failures_total{reason}` (`hash_mismatch`, `upstream_error`,
+`short_body`, `local_io`), `evictions_total{reason}` (`budget`, `floor`), `pinned_skips_total`,
+`discarded_at_start_total`, and the gauges `bytes`, `objects`, `fs_free_bytes` and `staging_files`.
+On a storage node it says there is no cache.
 
 ### Which key each flag has
 
@@ -342,8 +455,9 @@ Each of these exits with status 2 and names the file and the key:
 - a key that holds a secret: keys and credentials are paths of files, whose names end in `_file`
   or `_files`; `secret_access_key`, `access_key_id`, `password`, a name with `token` in it and the
   like are refused wherever they are;
-- `[local_cache]`, which is reserved for a later release and refused as not supported yet, and a
-  file without both `[hot_store]` and `[cold_store]`;
+- `[local_cache]` along with `[hot_store]`, and a file with neither shape's tables (it needs both
+  `[hot_store]` and `[cold_store]`, or `[local_cache]` and `[cold_store]`); the refusals of a build
+  node are with its table above;
 - a key of a tier that its `kind` does not take (`path` for a `memory` tier, `endpoint` for a `dir`
   tier), a `dir` tier without `path`, an `s3` tier without `bucket`, `endpoint` or
   `credentials_file`, and a key only one tier has in the other (`budget` and the reconciler's keys
@@ -353,10 +467,10 @@ Each of these exits with status 2 and names the file and the key:
   one), that does not end in `/`, or that is under `_journal/` or `_tiering/`, which tierstore
   keeps for itself.
 
-`[[policy]]` has a `prefix` (empty for all the rest) and `cache`. In this release a policy is read
-and checked and has no effect, since nothing is cached yet; `cache = true` is refused as not
-supported yet. The empty prefix may be listed along with others (it is the rest); two non-empty
-prefixes may not nest.
+`[[policy]]` has a `prefix` (empty for all the rest) and `cache`. On a build node `cache = true`
+keeps the keys under the prefix; on a storage node a policy is read and checked and has no effect,
+and `cache = true` is refused, since a storage node keeps no cache. The empty prefix may be listed
+along with others (it is the rest); two non-empty prefixes may not nest.
 
 ### Moving from flags to a file
 
