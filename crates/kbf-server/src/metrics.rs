@@ -69,6 +69,9 @@ pub(crate) fn render_farm(out: &mut String, farm: &Farm) {
     crate::scheduler_core::render(out, farm.scheduler_core());
     crate::pack_daemon_metrics::render_farm(out, farm);
     crate::load_metrics::render_farm(out, farm);
+    if let Some((ablation, counters)) = farm.ablation() {
+        ablation.render(out, &counters);
+    }
     farm.failed_actions().render(out);
 }
 
