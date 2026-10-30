@@ -628,3 +628,23 @@ fn the_binary_makes_itself_non_dumpable_before_reading_anything() {
     // The empty token is a setup failure.
     assert_eq!(status.code(), Some(14));
 }
+
+/// Catches: a tool that could not make itself non-dumpable going on to run the Command, which
+/// could then take its sockets. It stops with the setup exit code before anything is read.
+#[test]
+fn a_tool_that_cannot_protect_itself_stops_with_the_setup_exit_code() {
+    let dir = scratch("unprotected");
+    let digest = Digest {
+        hash: "0".repeat(64),
+        size_bytes: 0,
+    };
+    let cli = cli(&dir, &digest);
+    let refused = kbf_task::task::run_cli_with(Err(std::io::Error::other("no")), &cli);
+    assert_eq!(
+        format!("{refused:?}"),
+        format!(
+            "{:?}",
+            std::process::ExitCode::from(kbf_task::task::EXIT_SETUP)
+        )
+    );
+}

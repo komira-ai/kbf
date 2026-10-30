@@ -466,6 +466,19 @@ async fn finish(
     }
 }
 
+/// [`run_cli`] once `protection` (what [`network::protect_this_process`] returned, called before
+/// anything else) is known to have worked: if it did not, the tool stops with the setup exit code
+/// rather than run with the Command able to take its sockets.
+pub fn run_cli_with(protection: std::io::Result<()>, cli: &Cli) -> ExitCode {
+    match protection {
+        Ok(()) => run_cli(cli),
+        Err(e) => {
+            eprintln!("kbf-task: cannot make this process non-dumpable: {e}");
+            ExitCode::from(EXIT_SETUP)
+        }
+    }
+}
+
 /// Runs the task the flags describe on a fresh single-threaded runtime and returns the exit code;
 /// a runtime that cannot start is a setup failure.
 pub fn run_cli(cli: &Cli) -> ExitCode {
