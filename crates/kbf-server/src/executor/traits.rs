@@ -1,16 +1,11 @@
 //! What the executor needs from the rest of the server, as the smallest seams it can say.
 //!
-//! Each trait has a real implementation elsewhere (the frontend's ingest of an untrusted
-//! pack, the tier store's presigned `PUT`, the CAS read for an action and the read grant) and
-//! a fake in the tests. None of them is implemented here.
-//!
-//! The real [`Ingest`] is a thin adapter over the frontend's ingest of an untrusted pack and
-//! belongs to the change that wires the executor in, which builds it from what the server
-//! owns: the pack index, a CAS backend over the same index, and the key mint with its secret.
-//! It maps this module's types to the frontend's one for one: the build id of a farm lease
-//! ([`build_id`](crate::executor::build_id)) for the lease, a key the mint issued for
-//! [`PackKey`], [`UntrustedLimits`] filled out with the frontend's own bounds for the fields it
-//! does not have, and the frontend's reasons for [`RejectReason`].
+//! Each trait has a real implementation, [`Front`](crate::executor::Front), which is built from
+//! what the frontend owns: the packs, a CAS backend over the same packs, the key mint and the
+//! preparation of a run. It maps this module's types to the frontend's one for one: the build id
+//! of a farm lease ([`build_id`](crate::executor::build_id)) for the lease, a key the mint
+//! issued for [`PackKey`], [`UntrustedLimits`] filled out with the frontend's own bounds for the
+//! fields it does not have, and the frontend's reasons for [`RejectReason`]. The tests have fakes.
 
 use std::fmt;
 use std::time::Duration;
@@ -80,22 +75,36 @@ pub enum Ingested {
     Unavailable(String),
 }
 
-/// Why a pack key was not issued.
+/// Why a pack key was not issued, and whose to fix: the same run asked again gives the same
+/// answer when it is refused, and may give another when the store was unavailable.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{0}")]
-pub struct MintError(pub String);
+pub enum MintError {
+    /// The run cannot be prepared as asked (an input missing or over budget, a digest that is
+    /// not one, a configuration that does not sign): the caller's to fix, and settled as such.
+    #[error("{0}")]
+    Refused(String),
+    /// The store could not answer: the farm runs the action again.
+    #[error("{0}")]
+    Unavailable(String),
+}
 
 /// Issues, reads, verifies and commits the pack a task wrote. Called after a run ended with
 /// the task tool's exit 0, and never with a lock of the farm held.
 #[tonic::async_trait]
 pub trait Ingest: Send + Sync {
-    /// The key `lease` may write the pack of `action` under. Issued by the same secret that
-    /// [`ingest`](Self::ingest) verifies it with: a key the ingest did not issue for this
-    /// lease and this action is refused there. Called once for a farm lease.
+    /// The key `lease` may write the pack of `action` under, good for a run of `wall`. Issued
+    /// by the same secret that [`ingest`](Self::ingest) verifies it with: a key the ingest did
+    /// not issue for this lease and this action is refused there. Called once for a farm
+    /// lease, before the url and the grant of the same run are asked for.
     ///
     /// # Errors
     /// [`MintError`].
-    fn mint(&self, lease: LeaseId, action: &Digest) -> Result<PackKey, MintError>;
+    async fn mint(
+        &self,
+        lease: LeaseId,
+        action: &Digest,
+        wall: Duration,
+    ) -> Result<PackKey, MintError>;
 
     /// What `key` holds, for `action`, run under `lease`. Never trusts the pack.
     async fn ingest(

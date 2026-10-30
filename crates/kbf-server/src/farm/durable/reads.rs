@@ -76,6 +76,7 @@ impl Engine {
             free: none,
             leases,
             load: None,
+            input_cache: None,
         })
     }
 }
