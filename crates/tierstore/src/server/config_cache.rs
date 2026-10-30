@@ -16,6 +16,7 @@
 //! low_water  = 75
 //! critical   = 95
 //! free_floor = 10
+//! max_concurrent_fills = 4
 //!
 //! [cold_store]                  # the upstream: an S3 endpoint
 //! kind             = "s3"
@@ -106,6 +107,9 @@ pub(super) struct LocalCacheTable {
     /// The percent of the file system that is kept free.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub free_floor: Option<u8>,
+    /// The most fills that run at once (1 to 64, default 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_fills: Option<u8>,
     /// Whether the cache is on: `true`, the default. `false` is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<bool>,
@@ -219,6 +223,10 @@ impl CacheSettings {
         cache.low_water = low;
         cache.critical = critical;
         cache.free_floor = floor;
+        if let Some(fills) = table.max_concurrent_fills {
+            let fills = within("local_cache", "max_concurrent_fills", fills, 1, 64)?;
+            cache.max_concurrent_fills = usize::from(fills);
+        }
         Ok(Self {
             front: shared.front,
             s3_request_timeout: shared.s3_request_timeout,

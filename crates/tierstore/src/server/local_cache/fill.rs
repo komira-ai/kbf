@@ -1,6 +1,7 @@
 //! A fill: the object read from the upstream into the stage directory, checked, and linked
 //! into `obj/`; and the single flight that lets the readers of one key share it.
 
+use std::collections::hash_map::Entry;
 use std::io;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,7 @@ use futures::future::{BoxFuture, Shared};
 use sha2::{Digest, Sha256};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt as _;
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::{ByteRange, Error};
 
@@ -146,7 +148,7 @@ fn publish(
 
 /// The bytes of a fill that is running, counted against the critical mark from the moment the
 /// fill starts until its object is in the index (or it ends without one).
-struct Reserved {
+pub(super) struct Reserved {
     inner: Arc<Inner>,
     size: u64,
 }
@@ -157,23 +159,51 @@ impl Drop for Reserved {
     }
 }
 
+/// A fill's place in the table of the fills that run: taken out when it is dropped, whether the
+/// fill ended, panicked or was cancelled, so that no key stays marked as being filled.
+struct Flight {
+    inner: Arc<Inner>,
+    hex: String,
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        drop(locked(&self.inner.flights).remove(&self.hex));
+    }
+}
+
 impl Inner {
     /// Reserves room for an object of `size` bytes if it fits in the budget and the cache, with
     /// the fills that are running, would not pass its critical mark.
-    fn reserve(self: &Arc<Self>, size: u64) -> Option<Reserved> {
-        let held = locked(&self.index).bytes();
-        let critical = percent_of(self.config.budget, self.config.critical);
+    pub(super) fn reserve(self: &Arc<Self>, size: u64) -> Option<Reserved> {
+        self.reserve_between(size, || {})
+    }
+
+    /// [`reserve`](Self::reserve), running `between` after the bytes are reserved and before the
+    /// index is read. The order matters: a fill that commits puts its object in the index before
+    /// it drops its reservation, so an object is in the reserved bytes or in the index (possibly
+    /// both, which only makes the count high), never in neither.
+    pub(super) fn reserve_between(
+        self: &Arc<Self>,
+        size: u64,
+        between: impl FnOnce(),
+    ) -> Option<Reserved> {
         let before = self.reserved.fetch_add(size, Ordering::SeqCst);
+        // A refused reservation is dropped, which gives the bytes back.
         let reservation = Reserved {
             inner: Arc::clone(self),
             size,
         };
+        between();
+        let held = locked(&self.index).bytes();
+        let critical = percent_of(self.config.budget, self.config.critical);
         let total = held.saturating_add(before).saturating_add(size);
-        // A refused reservation is dropped, which gives the bytes back.
         (size <= self.config.budget && total <= critical).then_some(reservation)
     }
 
-    /// The fill of `key`, started if none is running, and waited for.
+    /// The fill of `key`, started if none is running, and waited for. A key with no fill running
+    /// when all the fills the cache may run are running is not filled: the answer is
+    /// [`Filled::Skipped`] at once, and the reader goes to the upstream.
     pub(super) async fn fill_once(
         self: &Arc<Self>,
         key: &str,
@@ -187,24 +217,46 @@ impl Inner {
             if locked(&self.index).get(&name.hex).is_some() {
                 return Ok(Filled::Kept);
             }
-            flights
-                .entry(name.hex.clone())
-                .or_insert_with(|| self.start(key, name))
-                .clone()
+            match flights.entry(name.hex.clone()) {
+                Entry::Occupied(running) => running.get().clone(),
+                Entry::Vacant(slot) => {
+                    let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
+                        bump(&self.counters.fills_skipped);
+                        bump(&self.counters.fills_skipped_busy);
+                        return Ok(Filled::Skipped);
+                    };
+                    slot.insert(self.start(key, name, permit)).clone()
+                }
+            }
         };
         pending.await
     }
 
     /// Runs the fill on a task of its own, so that it ends even if every reader goes away, and
-    /// takes it out of the table of the fills that run when it ends.
-    fn start(self: &Arc<Self>, key: &str, name: &Name) -> Pending {
+    /// takes it out of the table of the fills that run when it ends, panics or is cancelled. The
+    /// permit is held until then. A task that did not end by itself is an error of the readers
+    /// that waited for it, and is counted.
+    fn start(self: &Arc<Self>, key: &str, name: &Name, permit: OwnedSemaphorePermit) -> Pending {
         let (inner, key, name) = (Arc::clone(self), key.to_owned(), name.clone());
         let task = tokio::spawn(async move {
-            let filled = inner.fill(&key, &name).await;
-            drop(locked(&inner.flights).remove(&name.hex));
-            filled
+            let _permit = permit;
+            let _flight = Flight {
+                inner: Arc::clone(&inner),
+                hex: name.hex.clone(),
+            };
+            inner.fill(&key, &name).await
         });
-        let waiting = async move { task.await.expect("a fill does not panic") };
+        let inner = Arc::clone(self);
+        let waiting = async move {
+            match task.await {
+                Ok(filled) => filled,
+                Err(_) => {
+                    inner.counters.failed(FailedFill::Aborted);
+                    let text = "the fill of the object did not finish";
+                    Err(Error::Unavailable(text.to_owned()))
+                }
+            }
+        };
         waiting.boxed().shared()
     }
 

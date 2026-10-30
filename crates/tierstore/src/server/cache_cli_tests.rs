@@ -326,3 +326,34 @@ async fn a_build_node_that_cannot_start_exits_with_the_status_of_the_reason() {
     );
     assert_eq!(exit_status(&why), 3);
 }
+
+/// Asserts that a budget above the size of the file system less its free-space floor is refused
+/// at start with exit status 2 and a message that names the key, and that a budget exactly that
+/// size starts. The sizes come from an injected file system (a budget of 1 MiB, a floor of 10
+/// percent: 1165084 bytes leave exactly the budget, 1165083 one byte less).
+#[tokio::test]
+async fn a_budget_larger_than_the_file_system_less_the_floor_is_refused_with_status_2() {
+    let node = Node::new("tscache-cli-room");
+    let settings = node.settings("", "");
+    let upstream: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let nothing = |_addr: SocketAddr| async {};
+
+    let small = Arc::new(FakeDisk::new());
+    small.set_space(1_165_083, 1_165_083);
+    let disk: Arc<dyn Disk> = small;
+    let why = serving(&settings, upstream.clone(), disk, nothing)
+        .await
+        .unwrap_err();
+    assert!(why.to_string().contains("local_cache.budget"), "{why}");
+    assert!(
+        why.to_string().contains("free_floor of 10 percent"),
+        "{why}"
+    );
+    assert_eq!(exit_status(&why), 2);
+
+    let enough = Arc::new(FakeDisk::new());
+    enough.set_space(1_165_084, 1_165_084);
+    let disk: Arc<dyn Disk> = enough;
+    let drained = serving(&settings, upstream, disk, nothing).await.unwrap();
+    assert_eq!(drained, Drained { abandoned: 0 });
+}

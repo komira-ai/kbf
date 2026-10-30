@@ -16,15 +16,18 @@ pub(super) enum FailedFill {
     LocalIo,
     /// An object that was written over while it was read.
     Changed,
+    /// The task of the fill panicked or was cancelled before it ended.
+    Aborted,
 }
 
 /// The label of each [`FailedFill`], in the order of the enum.
-const FAILED: [&str; 5] = [
+const FAILED: [&str; 6] = [
     "hash_mismatch",
     "upstream_error",
     "short_body",
     "local_io",
     "changed",
+    "aborted",
 ];
 
 /// Why an object was evicted.
@@ -47,7 +50,10 @@ pub struct Counters {
     pub(super) bytes_served_local: AtomicU64,
     pub(super) bytes_served_upstream: AtomicU64,
     pub(super) fills: AtomicU64,
+    /// The fills not started or not kept for a reason that is not an error (no room, or busy).
     pub(super) fills_skipped: AtomicU64,
+    /// Of `fills_skipped`, those skipped because every fill the cache may run was running.
+    pub(super) fills_skipped_busy: AtomicU64,
     failures: [AtomicU64; FAILED.len()],
     evictions: [AtomicU64; EVICTED.len()],
     pub(super) pinned_skips: AtomicU64,
@@ -119,6 +125,7 @@ impl Counters {
             ),
             ("fills_total", read(&self.fills)),
             ("fills_skipped_total", read(&self.fills_skipped)),
+            ("fills_skipped_busy_total", read(&self.fills_skipped_busy)),
             ("pinned_skips_total", read(&self.pinned_skips)),
             ("discarded_at_start_total", read(&self.discarded_at_start)),
             ("bytes", cache_bytes),

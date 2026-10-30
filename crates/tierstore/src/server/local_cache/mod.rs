@@ -41,6 +41,14 @@
 //! the fill and is not kept. A key named by its content whose bytes do not hash to the name is
 //! the reader's error, not passed through. A hit is not hashed again.
 //!
+//! At most `max_concurrent_fills` fills run at once, each holding one chunk (`fill_chunk`, 8 MiB)
+//! in memory at a time, so the fills hold at most that many chunks. A miss of a key that has no
+//! fill running, when every permit is taken, does not wait for one: it is served from the upstream
+//! as a pass-through, keeps nothing and is counted in `fills_skipped` and `fills_skipped_busy`.
+//! The readers of a key that has a fill running share it and need no permit. A fill that panics
+//! or is cancelled frees its key and its permit, and the readers that waited for it get an error
+//! (`Unavailable`, counted as a failed fill with the reason `aborted`).
+//!
 //! # Eviction
 //!
 //! The cache keeps its objects under `budget` bytes. Above `high_water` percent of it, and
@@ -69,6 +77,8 @@ mod front_tests;
 #[cfg(test)]
 mod hit_tests;
 #[cfg(test)]
+mod limits_tests;
+#[cfg(test)]
 mod selfcheck_tests;
 #[cfg(test)]
 mod start_tests;
@@ -84,6 +94,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use tokio::sync::Semaphore;
 
 use crate::journal::is_reserved;
 use crate::{Backend, ByteRange, Clock, Error, Listed, Meta, OpenUpload, UploadsAfter};
@@ -102,6 +113,9 @@ pub const WHOLE_FILL_LIMIT: u64 = 64 << 20;
 
 /// The bytes a fill reads from the upstream at a time.
 pub const FILL_CHUNK: u64 = 8 << 20;
+
+/// The fills that may run at once, unless the settings say otherwise.
+pub const MAX_CONCURRENT_FILLS: usize = 4;
 
 /// The text of the refusal of a write at the Backend level (the front refuses it earlier).
 const READ_ONLY: &str = "this tierstore is a read cache";
@@ -128,6 +142,9 @@ pub struct CacheConfig {
     pub fill_chunk: u64,
     /// The most an object may be for a ranged read of it to fill it.
     pub whole_limit: u64,
+    /// The most fills that run at once. A miss that finds all of them running is served from
+    /// the upstream and keeps nothing.
+    pub max_concurrent_fills: usize,
 }
 
 impl CacheConfig {
@@ -145,7 +162,15 @@ impl CacheConfig {
             policies,
             fill_chunk: FILL_CHUNK,
             whole_limit: WHOLE_FILL_LIMIT,
+            max_concurrent_fills: MAX_CONCURRENT_FILLS,
         }
+    }
+
+    /// The most the budget may be on a file system of `total` bytes: its size less the
+    /// `free_floor` percent that is kept free.
+    #[must_use]
+    pub fn room(&self, total: u64) -> u64 {
+        total.saturating_sub(percent_of(total, self.free_floor))
     }
 }
 
@@ -208,6 +233,8 @@ pub(super) struct Inner {
     staged: AtomicU64,
     /// The bytes of the fills that are running and have no object in the index yet.
     reserved: AtomicU64,
+    /// One permit for each fill that may run; a fill holds one until it ends.
+    permits: Arc<Semaphore>,
     /// Whether a pass of the eviction is running.
     evicting: AtomicBool,
 }
@@ -244,6 +271,7 @@ impl LocalCache {
         }
         let counters = Counters::default();
         add(&counters.discarded_at_start, scanned.discarded + removed);
+        let permits = Arc::new(Semaphore::new(config.max_concurrent_fills));
         let inner = Inner {
             upstream,
             disk,
@@ -254,6 +282,7 @@ impl LocalCache {
             flights: Mutex::new(HashMap::new()),
             staged: AtomicU64::new(0),
             reserved: AtomicU64::new(0),
+            permits,
             evicting: AtomicBool::new(false),
         };
         Ok(Self {

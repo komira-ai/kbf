@@ -7,7 +7,8 @@
 //! that answers one wrongly is exit status 3, as for a tier that fails its self-test), and asks
 //! the upstream a HEAD of a key that is not there, which it answers with 404 when it is up and
 //! the key is accepted (an upstream that does not answer is exit status 1: a restart may mend
-//! it). The build node's upstream is read with a read-only key, so the write checks of the
+//! it). A `budget` above the size of the file system less the `free_floor` is refused as flags that
+//! cannot go together (exit status 2). The build node's upstream is read with a read-only key, so the write checks of the
 //! storage node's self-test are not run against it.
 //!
 //! On SIGTERM or SIGINT the process drains as a storage node does; the eviction pass is the only
@@ -26,7 +27,7 @@ use crate::{Backend, Clock, Error as BackendError, SystemClock};
 
 use super::cli::{Error, S3Flags, open_tier, probe_run_id, signals};
 use super::config_cache::CacheSettings;
-use super::front::server_config;
+use super::front::{InvalidFlags, server_config};
 use super::local_cache::{CacheConfig, Disk, LocalCache, SystemDisk, check_local};
 use super::{Drained, Server};
 
@@ -61,6 +62,21 @@ async fn open(
         )
     })?;
     check_local(&*disk, cache.path(), run)?;
+    // A file system whose size cannot be read is not judged: the check above has used it.
+    let total = disk
+        .space(cache.path())
+        .map_or(u64::MAX, |space| space.total);
+    if config.budget > config.room(total) {
+        let text = format!(
+            "local_cache.budget: {} bytes is more than the {} bytes of the file system at {} \
+             less its free_floor of {} percent",
+            config.budget,
+            total,
+            config.path.display(),
+            config.free_floor
+        );
+        return Err(Box::new(InvalidFlags(text)));
+    }
     let (bytes, objects) = cache.held();
     eprintln!(
         "tierstore: local cache at {}: {objects} objects, {bytes} bytes, {} files removed at start",

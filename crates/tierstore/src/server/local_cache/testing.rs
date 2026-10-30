@@ -31,28 +31,48 @@ pub(in crate::server) fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-/// An upstream that holds objects in memory and can be told to give short bodies or to hold a
-/// read until the test lets it go.
+/// An upstream that holds objects in memory and can be told to give short bodies, to hold a
+/// read until the test lets it go, and to fail or panic in the next read it lets go.
 pub(in crate::server) struct Tamper {
     pub(in crate::server) memory: MemoryBackend,
     pub(in crate::server) short: AtomicBool,
-    gate: Mutex<Option<Arc<Semaphore>>>,
+    /// The next read, once the gate lets it go, is an `Unavailable` error.
+    pub(in crate::server) fail_once: AtomicBool,
+    /// The next read, once the gate lets it go, panics.
+    pub(in crate::server) panic_once: AtomicBool,
+    /// The gate and the one key it holds (every key if none).
+    gate: Mutex<Option<Gate>>,
 }
+
+/// A semaphore that reads wait on, and the key whose reads wait (every key if none).
+type Gate = (Option<String>, Arc<Semaphore>);
 
 impl Tamper {
     fn new() -> Self {
         Self {
             memory: MemoryBackend::new(),
             short: AtomicBool::new(false),
+            fail_once: AtomicBool::new(false),
+            panic_once: AtomicBool::new(false),
             gate: Mutex::new(None),
         }
     }
 
     /// Holds every read from now on until a permit is added to the gate that is returned.
     pub(in crate::server) fn hold(&self) -> Arc<Semaphore> {
+        self.gated(None)
+    }
+
+    /// Holds the reads of `key` only, from now on, until a permit is added to the gate that is
+    /// returned.
+    pub(in crate::server) fn hold_key(&self, key: &str) -> Arc<Semaphore> {
+        self.gated(Some(key.to_owned()))
+    }
+
+    fn gated(&self, key: Option<String>) -> Arc<Semaphore> {
         let gate = Arc::new(Semaphore::new(0));
         let mut held = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
-        *held = Some(Arc::clone(&gate));
+        *held = Some((key, Arc::clone(&gate)));
         gate
     }
 }
@@ -73,8 +93,17 @@ impl Backend for Tamper {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        if let Some(gate) = gate {
+        if let Some((_, gate)) = gate.filter(|(only, _)| only.as_deref().is_none_or(|k| k == key)) {
             gate.acquire().await.expect("the gate stays open").forget();
+        }
+        assert!(
+            !self.panic_once.swap(false, Ordering::SeqCst),
+            "the upstream was told to panic"
+        );
+        if self.fail_once.swap(false, Ordering::SeqCst) {
+            return Err(Error::Unavailable(
+                "the upstream was told to fail".to_owned(),
+            ));
         }
         let body = self.memory.get(key, range).await?;
         if self.short.load(Ordering::SeqCst) {

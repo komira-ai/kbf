@@ -345,9 +345,22 @@ against the upstream again, and a hit is not hashed again: put `cache = true` on
 objects are never rewritten (the content-addressed ones), and note that the start reads the sizes of
 the files, not their bytes. Anyone who may read through the front may read everything the upstream's
 read key can read, so give build clients scoped keys. The directories the cache makes are mode 0755
-whatever the umask. The front holds a response whole, as
-it does for any backend, so a read of a very large object holds it in memory whether or not it is
-kept; the bound on a fill is one chunk.
+whatever the umask.
+
+Memory. A fill holds one chunk (8 MiB) at a time, so the memory of the fills is at most
+`max_concurrent_fills` chunks (4 by default: 32 MiB). A miss of a key with no fill running, when
+that many fills are running, does not wait for one: it is served from the upstream as a
+pass-through, keeps nothing, and is counted in `fills_skipped_total` and `fills_skipped_busy_total`.
+The misses of a key whose fill is running share it and need no slot. That bound is only for the
+fills. The front holds a response whole, as it does for any backend, so a GET of a large object
+(a whole GET, or a range) holds the bytes asked in memory for the request, hit, miss or
+pass-through, whether or not the object is kept, and a whole GET of a miss holds the object once
+the fill has kept it. A fill that panics or is cancelled frees its slot and its key, and the
+readers that waited for it get a 503 (`fill_failures_total{reason="aborted"}`).
+
+No scrub. A hit is not hashed again, and the sidecar's `sha256` is written but not checked after
+the fill: an object that rots on the disk is served as it is now until it is evicted. A restart
+checks sizes only.
 
 Eviction keeps the cache under `budget` bytes: above `high_water` percent of it, and when the free
 space of the file system (`statvfs`) is under `free_floor` percent, a pass removes the least
@@ -356,7 +369,10 @@ floor. The order of use is in memory, seeded at start from the times of the file
 to them (once for each object each pass); an object with a link count over one is in use by another
 tree, so it is skipped, counted and stays charged to the budget. A fill is skipped, and counted,
 when the object is larger than the budget or would take the cache, with the fills that are running,
-above `critical`. The files of
+above `critical`. The free-space floor is a trigger of the eviction and nothing else: it does not
+stop a fill, so on a disk that the jobs fill, the cache may fill the file system below the floor
+until the next pass (every 10 seconds) frees it. The start refuses (exit status 2) a `budget` larger
+than the size of the file system less `free_floor` percent of it. The files of
 `.stage/` are never evicted and are removed at start. `scrub_rate` is accepted; this release does not
 scrub.
 
@@ -368,7 +384,8 @@ scrub.
 | `local_cache.high_water` | percent of the budget above which a pass evicts (default 90) |
 | `local_cache.low_water` | percent of the budget a pass evicts down to (default 75, below `high_water`) |
 | `local_cache.critical` | percent of the budget above which a fill is skipped (default 95, not below `high_water`) |
-| `local_cache.free_floor` | percent of the file system that is kept free (0 to 99, default 10): below it a pass evicts, even under the budget |
+| `local_cache.free_floor` | percent of the file system that is kept free (0 to 99, default 10): below it a pass evicts, even under the budget; it does not stop a fill, and `budget` may not be above the file system's size less the floor (exit status 2) |
+| `local_cache.max_concurrent_fills` | the most fills that run at once (1 to 64, default 4); a miss that finds them all running is served from the upstream and kept nowhere |
 | `local_cache.cache` | `true`, the default; `false` is refused (leave `[local_cache]` out to run without a cache) |
 | `local_cache.scrub_rate` | a size and `/s`, such as `"50MiB/s"`: accepted, and not used by this release |
 | `cold_store.endpoints` | a list of exactly one endpoint, in place of `endpoint`: several are refused as not supported yet, since the cache reads from one upstream |
@@ -394,8 +411,9 @@ against the upstream, whose key is read-only. On SIGTERM the process drains as a
 text format, `tierstore_cache_<name>`, with: `hits_total`, `misses_total`, `bytes_served_local_total`,
 `bytes_served_upstream_total` (the bytes of every read that was not a hit, the read that follows a
 fill included, so the byte hit ratio is the first over the sum of the two), `fills_total`,
-`fills_skipped_total`, `fill_failures_total{reason}` (`hash_mismatch`, `upstream_error`,
-`short_body`, `local_io`), `evictions_total{reason}` (`budget`, `floor`), `pinned_skips_total`,
+`fills_skipped_total`, `fills_skipped_busy_total` (those of the skipped fills that found every fill
+slot taken), `fill_failures_total{reason}` (`hash_mismatch`, `upstream_error`,
+`short_body`, `local_io`, `changed`, `aborted`), `evictions_total{reason}` (`budget`, `floor`), `pinned_skips_total`,
 `discarded_at_start_total`, and the gauges `bytes`, `objects`, `fs_free_bytes` and `staging_files`.
 On a storage node it says there is no cache.
 
