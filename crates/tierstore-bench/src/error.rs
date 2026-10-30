@@ -36,6 +36,16 @@ pub enum BenchError {
     /// proves nothing.
     #[error("request log: {0}")]
     Log(#[source] std::io::Error),
+    /// A cell is over a byte cap of the run (see `cells::budget`); nothing was sent for it.
+    #[error("budget: {0}")]
+    Budget(String),
+    /// The load gate tripped; the results of the passes up to it are written.
+    #[error(transparent)]
+    Gate(#[from] crate::gate::Trip),
+    /// A cell cannot start or go on: what it needs first (objects to read, a client, a tree on
+    /// disk) could not be made. The text names the step, with roles and counts only.
+    #[error("{0}")]
+    Setup(String),
     /// A result file is not JSON of the schema this build writes.
     #[error("result file: {0}")]
     Result(String),

@@ -33,10 +33,19 @@ use crate::result::{CellResult, Provenance};
 
 pub mod a1;
 pub mod b;
+pub mod budget;
 pub mod c;
 pub mod cold_put;
 pub mod cold_read;
+pub mod content;
+pub mod engine;
 pub mod g;
+pub mod modes;
+pub mod putcell;
+pub mod stats;
+pub mod streamget;
+#[cfg(test)]
+pub(crate) mod testkit;
 
 /// The cells. `ColdPut`, `ColdRead` and `G` are the first stage (the instance with the cold
 /// tier on the measured path); `A1`, `B` and `C` need a hot tier and are the second.
