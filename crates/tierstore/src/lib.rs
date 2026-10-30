@@ -69,6 +69,10 @@
 //! `tierstore` binary, which runs a proxy, that front and a [`Reconciler`] in one process
 //! (`cargo build -p tierstore --features server`), over memory, directory or S3 tiers; the
 //! feature turns `s3` on.
+//!
+//! The same feature adds a read-only OCI distribution front, over HTTPS or over plain HTTP on
+//! loopback (`--oci-listen`, `server::oci`), which serves the objects under a key prefix by
+//! their SHA-256 digest, so that a container engine pulls an image from the tiers.
 
 #![forbid(unsafe_code)]
 
