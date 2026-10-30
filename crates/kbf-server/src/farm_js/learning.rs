@@ -16,6 +16,11 @@
 //! peak of the estimator's row (and its life in minutes, which only a lease charged by a
 //! curve reads): a charge. The lease's booked memory limit and cores are the request's and
 //! the ladder's, whatever is predicted.
+//!
+//! [`js_server_core::Adapter::predicted`] is not implemented: the core asks it for an operation
+//! read back from the state store (at a start, or from another frontend's queue) before it tells
+//! the adapter of the operation, and the subject that keys the estimator's row is in the parcel
+//! of that later call. Such an operation is charged as it is with `off`.
 
 // Only the farm of the js core (and the tests) write the summaries; a build without it keeps
 // the pieces for them compiled.
