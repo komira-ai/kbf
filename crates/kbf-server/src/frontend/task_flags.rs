@@ -1,15 +1,18 @@
 //! The flags that let the frontend prepare the runs of a host executor: `--task-secret-file`
 //! and its companions, and the [`RunPrep`] they open over the frontend's [`Backend`].
 //!
-//! A [`RunPrep`] (`kbf_front::prepare_run`) hands the executor, for each run, the key a task
-//! may write, one presigned write of it to the tier store, and a read grant for the task's
+//! A [`RunPrep`] (`kbf_front::prepare_run`) hands the executor, for each run, the keys a task
+//! may write (`--task-max-packs` pack keys, and `--task-max-large` large-object keys when
+//! `--task-large-credentials-file` is given), a presigned write of each to the tier store, and
+//! a read grant for the task's
 //! inputs. These flags give it the secrets and the places it needs. All are off unless
 //! `--task-secret-file` is given, and then a frontend serves exactly as it did: nothing is
 //! read from the files until the frontend starts, and nothing is sent anywhere. The switch
 //! needs `--task-put-endpoint`, `--task-put-bucket`, `--task-put-credentials-file` and
 //! `--task-read-url`, which clap enforces (so does the file of `kbf.toml`, which becomes
 //! flags). The companions that have a default (`--task-put-region`, `--task-run-wall-secs`,
-//! `--task-url-slack-secs`, `--task-closure-max-digests`, `--task-closure-max-bytes`) need
+//! `--task-url-slack-secs`, `--task-closure-max-digests`, `--task-closure-max-bytes`,
+//! `--task-max-packs`, `--task-max-large`, `--task-large-max-bytes`) need
 //! nothing, since the config template writes every flag with a default as a live line.
 //!
 //! The secrets are files and never flags, as a command line is world-readable. The secret file
@@ -29,7 +32,8 @@ use std::time::Duration;
 use clap::{Arg, ArgMatches};
 use kbf_front::grants::{GrantKey, KeyError};
 use kbf_front::prepare_run::{
-    AccessKey, ClosureLimits, ConfigError, PutTarget, RunPrep, RunPrepConfig, check_read_url,
+    AccessKey, ClosureLimits, ConfigError, LargeTarget, PutTarget, RunPrep, RunPrepConfig,
+    check_read_url,
 };
 use kbf_front::{Backend, MintError, PackKeyMint};
 use zeroize::Zeroizing;
@@ -46,6 +50,12 @@ const RUN_WALL: &str = "task_run_wall_secs";
 const URL_SLACK: &str = "task_url_slack_secs";
 const MAX_DIGESTS: &str = "task_closure_max_digests";
 const MAX_BYTES: &str = "task_closure_max_bytes";
+const MAX_PACKS: &str = "task_max_packs";
+const MAX_LARGE: &str = "task_max_large";
+const LARGE_CREDENTIALS: &str = "task_large_credentials_file";
+const LARGE_MAX_BYTES: &str = "task_large_max_bytes";
+const PUT_FLAG: &str = "--task-put-credentials-file";
+const LARGE_FLAG: &str = "--task-large-credentials-file";
 
 /// The signing region when `--task-put-region` is left out: the one S3-compatible stores accept
 /// unless they are configured to another.
@@ -61,7 +71,11 @@ const DEFAULT_RUN_WALL_SECS: u64 = 7_200;
 const DEFAULT_URL_SLACK_SECS: u64 = 600;
 
 /// The cap of a large object when `--task-large-max-bytes` is left out: 512 MiB.
+#[cfg(test)]
 const DEFAULT_LARGE_MAX_BYTES: u64 = 536_870_912;
+
+/// The most bytes a pack record holds, which a large object must exceed.
+const RECORD_BYTES: u64 = kbf_pack::MAX_RECORD_BYTES;
 
 /// The longest wall or slack a flag takes, in seconds: the 4 hour ceiling of a presigned write
 /// ([`kbf_front::prepare_run::MAX_EXPIRY`]).
@@ -70,8 +84,8 @@ const MAX_SECS: u64 = kbf_front::prepare_run::MAX_EXPIRY.as_secs();
 /// The most bytes a secret file or a credentials file may hold.
 const MAX_FILE_BYTES: usize = 4096;
 
-/// The ten flags.
-pub(super) fn args() -> [Arg; 10] {
+/// The fourteen flags.
+pub(super) fn args() -> [Arg; 14] {
     [
         Arg::new(SECRET)
             .long("task-secret-file")
@@ -80,7 +94,7 @@ pub(super) fn args() -> [Arg; 10] {
             .requires_all([PUT_ENDPOINT, PUT_BUCKET, PUT_CREDENTIALS, READ_URL])
             .help(
                 "Turns on the preparation of the runs of a host executor: for each run the \
-                 frontend makes the key the task may write, one presigned write of it to the \
+                 frontend makes the keys the task may write, a presigned write of each to the \
                  tier store, and a read grant for the task's inputs. The file holds one \
                  secret of at least 32 bytes (surrounding white space is dropped), owned by \
                  this user and readable by it alone (mode 0600 or 0400): the pack-key mint and \
@@ -185,6 +199,54 @@ pub(super) fn args() -> [Arg; 10] {
                  have (each distinct blob once): a run whose tree has more is refused. Used only \
                  with `--task-secret-file`",
             ),
+        Arg::new(MAX_PACKS)
+            .long("task-max-packs")
+            .value_name("PACKS")
+            .value_parser(clap::value_parser!(u8).range(1..=i64::from(kbf_pack::MAX_PACKS)))
+            // kbf_pack::MAX_PACKS, as above.
+            .default_value("8")
+            .help(
+                "The pack keys each run gets, 1 to 8 (`cas/b/<lease>/<nonce>-<k>`): a ceiling, \
+                 not a prediction, since the sizes of a run's outputs are not known before it \
+                 runs; a key a task does not write is never used. Used only with \
+                 `--task-secret-file`",
+            ),
+        Arg::new(MAX_LARGE)
+            .long("task-max-large")
+            .value_name("OBJECTS")
+            .value_parser(clap::value_parser!(u8).range(0..=i64::from(kbf_pack::MAX_LARGE)))
+            // kbf_pack::MAX_LARGE, as above.
+            .default_value("8")
+            .help(
+                "The large-object keys each run gets, 0 to 8 (`cas/b/<lease>/<nonce>-L<i>`): an \
+                 output blob over 64 MiB is written whole to one of them. A ceiling, as for \
+                 `--task-max-packs`. Without `--task-large-credentials-file` no run gets one, \
+                 whatever this says. Used only with `--task-secret-file`",
+            ),
+        Arg::new(LARGE_CREDENTIALS)
+            .long("task-large-credentials-file")
+            .value_name("PATH")
+            .value_parser(clap::value_parser!(PathBuf))
+            .requires(SECRET)
+            .help(
+                "A file with the presign-only key that signs a task's writes of large objects, \
+                 of the same form and with the same owner and mode rules as \
+                 `--task-put-credentials-file`: a key of the tier store whose prefix allows \
+                 objects up to `--task-large-max-bytes`, with a ceiling of at least 14400 \
+                 seconds. Left out, no run gets a large-object key and an output over 64 MiB \
+                 fails its task",
+            ),
+        Arg::new(LARGE_MAX_BYTES)
+            .long("task-large-max-bytes")
+            .value_name("BYTES")
+            .value_parser(clap::value_parser!(u64).range((RECORD_BYTES + 1)..))
+            // DEFAULT_LARGE_MAX_BYTES, as above.
+            .default_value("536870912")
+            .help(
+                "The most bytes of one large object, above 67108864 (64 MiB, the most a pack \
+                 record holds): the cap a task and the ingest of its run hold an object to. \
+                 Used only with `--task-large-credentials-file`",
+            ),
     ]
 }
 
@@ -249,10 +311,13 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<Option<TaskFlags>, String> 
         url_slack: secs(URL_SLACK),
         max_digests: usize::try_from(digests).unwrap_or(usize::MAX),
         max_bytes: m.get_one::<u64>(MAX_BYTES).copied().unwrap_or_default(),
-        max_packs: 1,
-        max_large: 0,
-        large_credentials_file: None,
-        large_max_bytes: DEFAULT_LARGE_MAX_BYTES,
+        max_packs: m.get_one::<u8>(MAX_PACKS).copied().unwrap_or_default(),
+        max_large: m.get_one::<u8>(MAX_LARGE).copied().unwrap_or_default(),
+        large_credentials_file: m.get_one::<PathBuf>(LARGE_CREDENTIALS).cloned(),
+        large_max_bytes: m
+            .get_one::<u64>(LARGE_MAX_BYTES)
+            .copied()
+            .unwrap_or_default(),
     }))
 }
 
@@ -269,8 +334,10 @@ pub enum TaskFlagError {
     #[error("--task-secret-file: {0}")]
     Mint(#[from] MintError),
     /// The credentials file cannot be used.
-    #[error("--task-put-credentials-file {path}: {why}")]
+    #[error("{flag} {path}: {why}")]
     Credentials {
+        /// The flag that names the file.
+        flag: &'static str,
         /// The file.
         path: String,
         /// What is wrong with it.
@@ -294,7 +361,16 @@ impl TaskFlags {
         let secret = secret.trim_ascii();
         let grant_key = GrantKey::from_secret(secret)?;
         let mint = PackKeyMint::new(secret)?;
-        let key = read_credentials(&self.put_credentials_file)?;
+        let key = read_credentials(PUT_FLAG, &self.put_credentials_file)?;
+        // No large credentials, no large keys, whatever `--task-max-large` says.
+        let large = match &self.large_credentials_file {
+            Some(path) => Some(LargeTarget {
+                key: read_credentials(LARGE_FLAG, path)?,
+                max_objects: self.max_large,
+                max_bytes: self.large_max_bytes,
+            }),
+            None => None,
+        };
         let config = RunPrepConfig {
             mint,
             grant_key,
@@ -304,8 +380,8 @@ impl TaskFlags {
                 bucket: self.put_bucket.clone(),
                 key,
             },
-            max_packs: 1,
-            large: None,
+            max_packs: self.max_packs,
+            large,
             read_url: self.read_url.clone(),
             run_wall: self.run_wall,
             slack: self.url_slack,
@@ -341,9 +417,10 @@ struct Keys {
     secret_access_key: String,
 }
 
-/// The key in the file at `path`, which only its owner may be able to read.
-fn read_credentials(path: &Path) -> Result<AccessKey, TaskFlagError> {
+/// The key in the file at `path`, named by `flag`, which only its owner may be able to read.
+fn read_credentials(flag: &'static str, path: &Path) -> Result<AccessKey, TaskFlagError> {
     let bad = |why: String| TaskFlagError::Credentials {
+        flag,
         path: path.display().to_string(),
         why,
     };

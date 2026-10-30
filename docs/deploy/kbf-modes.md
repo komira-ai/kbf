@@ -145,10 +145,13 @@ what was read from packs, elsewhere, lost and damaged are logged when the daemon
 **Task runs** (off by default; the `[task-runs]` table of `kbf.toml`). With `--task-secret-file`
 the frontend prepares the runs of a host executor: for each lease and Action it makes the three
 values a task needs and the executor delivers, `RunInputs` of `kbf_front::prepare_run`. They are
-the pack key the task may write (`cas/b/<lease>/<nonce>-0`, which the executor passes to `ingest`
-when the run ends); a presigned `PUT` of exactly that key to the tier store, signed with a
-presign-only key (the URL takes a `PUT` until it expires, and the store is create-only, so the
-first write is the only one that lands); and a read grant, a bearer token with the base URL of the job-facing read
+the keys the task may write, N pack keys (`cas/b/<lease>/<nonce>-<k>`, `k` from 0; pack 0 holds the
+manifest and its key is the one a one-pack caller reads) and M large-object keys
+(`cas/b/<lease>/<nonce>-L<i>`), which the executor passes to `ingest` when the run ends; a presigned
+`PUT` of exactly each key to the tier store, signed with a presign-only key (the URL takes a `PUT`
+until it expires, and the store is create-only, so the first write is the only one that lands): a pack
+URL with the key of `--task-put-credentials-file`, a large-object URL with the key of
+`--task-large-credentials-file`; and a read grant, a bearer token with the base URL of the job-facing read
 listener, for the Action, its Command and every blob of its input tree (the job-facing read listener, kbf#1943, works
 the scope out again from the Action each time the token is used, so a blob removed after the run was prepared
 fails that read). The write and the grant
@@ -159,7 +162,14 @@ ceiling of a presigned write: the tier store's presigning key must allow at leas
 slack that add up to more are refused at start. Before it signs anything the frontend reads the
 Action, its Command and the whole input tree and checks that every blob is held: a blob that is
 missing is an error, never a smaller grant, and a tree over `--task-closure-max-digests`
-(default 500000) or `--task-closure-max-bytes` (default 32 GiB) is refused. The switch needs
+(default 500000) or `--task-closure-max-bytes` (default 32 GiB) is refused. N and M are ceilings, not predictions (the sizes of a run's outputs are not known before it runs, and
+a key a task does not write is never used): `--task-max-packs` (default 8, 1 to 8) and
+`--task-max-large` (default 8, 0 to 8). An output blob over 64 MiB is a large object, written whole
+to one large key; without `--task-large-credentials-file` (same form and mode rules as
+`--task-put-credentials-file`, a key whose prefix allows objects up to `--task-large-max-bytes`) M is
+0 whatever `--task-max-large` says, and such an output fails its task. `--task-large-max-bytes`
+(default 536870912, 512 MiB) is the cap of one large object and must be above 67108864; a value at or
+under it is refused at parse time. Every URL of a run has the same expiry. The switch needs
 `--task-put-endpoint` (the tier store's proxy, `http://` or `https://host:port`),
 `--task-put-bucket`, `--task-put-region` (default `us-east-1`),
 `--task-put-credentials-file` (JSON `{"access_key_id": "...", "secret_access_key": "..."}` of

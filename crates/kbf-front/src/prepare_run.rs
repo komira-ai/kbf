@@ -1,20 +1,28 @@
 //! Preparing one run: what the frontend hands the executor for a task before it starts.
 //!
-//! [`RunPrep::prepare_run`] turns a lease and the Action it runs into [`RunInputs`], three
-//! values the executor delivers to `kbf-task` as it chooses (this module writes no file and
-//! reads no environment):
+//! [`RunPrep::prepare_run`] turns a lease and the Action it runs into [`RunInputs`], values
+//! the executor delivers to `kbf-task` as it chooses (this module writes no file and reads no
+//! environment):
 //!
-//! - **The key** ([`IssuedPackKey`], `cas/b/<lease>/<nonce>-0`), minted by [`PackKeyMint`]
-//!   for this lease and this Action, which the executor passes to [`crate::ingest`] when
-//!   the run ends. The lease string is the one [`kbf_pack::check_build`] accepts, and the
-//!   one the executor passes to `kbf-task --lease`.
-//! - **The write** (`put_url`): one presigned `PUT` of exactly that key to the tier store's
-//!   proxy, signed with the presign-only credential (`tierstore::server::presign_put`).
+//! - **The key set** ([`RunInputs::packs`] and [`RunInputs::large`], each a [`PutGrant`]):
+//!   `N` pack keys (`cas/b/<lease>/<nonce>-<k>`, slots `0..N`) and `M` large-object keys
+//!   (`...-L<i>`, slots `L0..L<M>`), all minted by [`PackKeyMint::mint_set`] for this lease
+//!   and this Action at one time. `N` and `M` are ceilings the preparer is configured with
+//!   ([`RunPrepConfig::max_packs`], [`LargeTarget::max_objects`]), not predictions: the
+//!   executor cannot know the sizes of the outputs before the run, and an unused key is never
+//!   written. The executor passes [`RunInputs::keys`] to [`crate::ingest`] when the run ends.
+//!   The lease string is the one [`kbf_pack::check_build`] accepts, and the one the executor
+//!   passes to `kbf-task --lease`. [`RunInputs::key`] is the key of pack 0, for a caller that
+//!   writes one pack.
+//! - **The writes** (`put_url` of each grant): one presigned `PUT` of exactly its key to the
+//!   tier store's proxy. A pack is signed with the presign-only pack credential and a large
+//!   object with the large credential (`tierstore::server::presign_put`); without a large
+//!   credential `M` is 0.
 //! - **The read grant** ([`ReadGrant`]): the base URL of the job-facing read listener, a
 //!   bearer token ([`crate::grants`]) and the second it stops working at, for reading the
 //!   Action, its Command and the input tree.
 //!
-//! **One lifetime.** The write and the grant are good for the run's wall limit plus a slack
+//! **One lifetime.** Every write and the grant are good for the run's wall limit plus a slack
 //! (the time a task takes to start and to put its pack), and never for more than
 //! [`MAX_EXPIRY`], the longest a presigning key may sign a URL for. A wall that would make
 //! them longer is refused ([`ExpiryError`]), at start for the configured wall and per run
@@ -504,7 +512,8 @@ impl RunPrep {
             .map_err(|_| PrepareError::Clock)?;
         let closure = self.closure(action).await?;
         // One key per object the task may write: packs `0..N`, then large objects `L0..L<M>`.
-        let (n_packs, n_large) = (1, 0);
+        let n_packs = self.max_packs;
+        let n_large = self.large.as_ref().map_or(0, |large| large.max_objects);
         let keys = self.mint.mint_set(lease, action, now, n_packs, n_large)?;
         let now_ms = u64::try_from(since.as_millis()).unwrap_or(u64::MAX);
         let mut grants = Vec::with_capacity(keys.len());
