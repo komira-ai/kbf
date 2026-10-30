@@ -171,7 +171,9 @@ pub fn check_shape(footer: &Footer, pack_len: u64) -> Result<&IndexEntry, ShapeE
 /// # Errors
 /// [`TaskPackError::Segment`], [`TaskPackError::Shape`] or [`TaskPackError::Manifest`].
 pub fn read_manifest(pack: &[u8]) -> Result<TaskManifest, TaskPackError> {
-    read_manifest_with(pack, 0)
+    let manifest = read_manifest_with(pack, 0)?;
+    manifest.check_single_pack()?;
+    Ok(manifest)
 }
 
 /// [`read_manifest`] for a reader that accepts large objects of up to `large_max` bytes.
@@ -200,6 +202,7 @@ pub fn read_manifest_with(pack: &[u8], large_max: u64) -> Result<TaskManifest, T
 /// [`WritePackError::RecordTooLarge`] for a blob over [`MAX_RECORD_BYTES`];
 /// [`WritePackError::Segment`] when the records pass [`MAX_PACK_BYTES`].
 pub fn write_pack(manifest: &TaskManifest, blobs: &[&[u8]]) -> Result<Vec<u8>, WritePackError> {
+    manifest.validate()?;
     write_pack_with(manifest, blobs, 0)
 }
 

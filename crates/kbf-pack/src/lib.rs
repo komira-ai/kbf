@@ -55,12 +55,12 @@ pub use cache::ReadCache;
 pub use digest::blob_digest;
 pub use error::{CacheError, PackError, ReadError};
 pub use kbf_task_pack::{
-    EMPTY_DIGEST, LargeEntry, MAC_LEN, MANIFEST_VERSION, MANIFEST_VERSION_2, MAX_BUILD_BYTES,
-    MAX_LARGE, MAX_MANIFEST_BYTES, MAX_PACK_BYTES, MAX_PACK_RECORDS, MAX_PACKS, MAX_PATH_BYTES,
-    MAX_RECORD_BYTES, ManifestError, OutputDirectory, OutputFile, OutputSymlink, PathError,
-    ShapeError, Slot, TaskKeyError, TaskManifest, TaskPackError, TaskPackKey, Timing, Usage,
-    WritePackError, check_build, check_shape, mac_input, mac_input_v1, minute_of, read_manifest,
-    read_manifest_with, write_pack, write_pack_with,
+    EMPTY_DIGEST, InputStats, LargeEntry, MAC_LEN, MANIFEST_VERSION, MANIFEST_VERSION_2,
+    MAX_BUILD_BYTES, MAX_LARGE, MAX_MANIFEST_BYTES, MAX_PACK_BYTES, MAX_PACK_RECORDS, MAX_PACKS,
+    MAX_PATH_BYTES, MAX_RECORD_BYTES, ManifestError, OutputDirectory, OutputFile, OutputSymlink,
+    PathError, ShapeError, Slot, SourceBytes, TaskKeyError, TaskManifest, TaskPackError,
+    TaskPackKey, Timing, Usage, WritePackError, check_build, check_shape, mac_input, mac_input_v1,
+    minute_of, read_manifest, read_manifest_with, write_pack, write_pack_with,
 };
 pub use keys::{PackKeys, WriterKind};
 pub use packer::{

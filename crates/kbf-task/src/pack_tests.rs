@@ -45,6 +45,7 @@ fn manifest() -> TaskManifest {
         },
         packs: 1,
         large: Vec::new(),
+        inputs: None,
     }
 }
 

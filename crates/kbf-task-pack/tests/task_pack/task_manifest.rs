@@ -5,9 +5,9 @@ use std::path::Path;
 
 use kbf_segments::sha256;
 use kbf_task_pack::{
-    EMPTY_DIGEST, LargeEntry, MANIFEST_VERSION, MANIFEST_VERSION_2, MAX_LARGE, MAX_MANIFEST_BYTES,
-    MAX_PACKS, MAX_RECORD_BYTES, ManifestError, OutputDirectory, OutputFile, OutputSymlink,
-    PathError, TaskKeyError, TaskManifest, Timing, Usage,
+    EMPTY_DIGEST, InputStats, LargeEntry, MANIFEST_VERSION, MANIFEST_VERSION_2, MAX_LARGE,
+    MAX_MANIFEST_BYTES, MAX_PACKS, MAX_RECORD_BYTES, ManifestError, OutputDirectory, OutputFile,
+    OutputSymlink, PathError, SourceBytes, TaskKeyError, TaskManifest, Timing, Usage,
 };
 use kbf_types::{Digest, DigestFunction, ParseDigestError};
 
@@ -63,6 +63,7 @@ fn base() -> TaskManifest {
         },
         packs: 1,
         large: Vec::new(),
+        inputs: None,
     }
 }
 
@@ -576,7 +577,6 @@ fn parse_without_a_cap_refuses_a_large_object() {
             cap: 0
         })
     ));
-    assert!(TaskManifest::parse(&fixture("valid_v2/two_packs.json")).is_ok());
 }
 
 /// Asserts that `packs` is 1 to 8: 0 and 9 are refused, 1 and 8 are not.
@@ -592,7 +592,7 @@ fn packs_is_one_to_eight() {
     ));
     for packs in [1, MAX_PACKS] {
         let manifest = TaskManifest { packs, ..base() };
-        assert!(manifest.validate().is_ok(), "{packs}");
+        assert!(manifest.validate_with(LARGE_MAX).is_ok(), "{packs}");
     }
     for packs in [0, MAX_PACKS + 1] {
         let manifest = TaskManifest { packs, ..base() };
@@ -731,4 +731,181 @@ fn a_bad_large_digest_names_its_position() {
         TaskManifest::parse_with(broken.as_bytes(), LARGE_MAX),
         Err(ManifestError::Digest { field, .. }) if field == "large[0].digest"
     ));
+}
+
+// The advisory `inputs` object.
+
+fn all_inputs() -> InputStats {
+    InputStats {
+        blobs: 19_312,
+        files: 19_000,
+        directories: 300,
+        requests: 4_100,
+        retries: 7,
+        max_in_flight: 32,
+        bytes_written_scratch: 344_000_000,
+        walk_ms: 120,
+        fetch_ms: 8_800,
+        hash_ms: 900,
+        write_ms: 1_500,
+        request_p50_ms: 5,
+        request_p99_ms: 240,
+        bytes_by_source: SourceBytes {
+            listener_get: 1,
+            listener_batch: 2,
+            cache_hit: 3,
+            tierstore_direct: 4,
+        },
+    }
+}
+
+/// Asserts that a manifest with every `inputs` field parses to the value written out here, is
+/// written back byte for byte, and is version 2 though it names one pack and no large object.
+#[test]
+fn a_manifest_with_inputs_is_v2_and_writes_back_byte_for_byte() {
+    let name = "valid_v2/inputs_all_fields.json";
+    let expected = TaskManifest {
+        inputs: Some(all_inputs()),
+        ..base()
+    };
+    let parsed = parse_v2(name).expect(name);
+    assert_eq!(parsed, expected);
+    assert_eq!(parsed.version(), MANIFEST_VERSION_2);
+    assert_eq!(expected.to_json().expect(name), fixture(name));
+}
+
+/// Asserts that a partial `inputs` object reads with 0 for each missing field, in `inputs` and in
+/// `bytes_by_source`, and is written back in full.
+#[test]
+fn a_partial_inputs_object_reads_missing_fields_as_zero() {
+    let parsed = parse_v2("valid_v2/inputs_partial.json").expect("valid");
+    let expected = InputStats {
+        blobs: 5,
+        bytes_by_source: SourceBytes {
+            cache_hit: 9,
+            ..SourceBytes::default()
+        },
+        ..InputStats::default()
+    };
+    assert_eq!(parsed.inputs, Some(expected));
+    let json = String::from_utf8(parsed.to_json().expect("json")).expect("utf8");
+    assert!(json.contains("\"walk_ms\":0"), "{json}");
+    assert!(json.contains("\"tierstore_direct\":0"), "{json}");
+}
+
+/// Asserts that a manifest without `inputs` is unchanged: one pack and no large object is still
+/// written as version 1 and has no `inputs` key; with `inputs` it is version 2.
+#[test]
+fn a_manifest_without_inputs_stays_v1() {
+    let plain = base();
+    assert_eq!(plain.version(), MANIFEST_VERSION);
+    let json = String::from_utf8(plain.to_json().expect("json")).expect("utf8");
+    assert!(!json.contains("inputs"), "{json}");
+    let with = TaskManifest {
+        inputs: Some(InputStats::default()),
+        ..base()
+    };
+    assert_eq!(with.version(), MANIFEST_VERSION_2);
+}
+
+/// Asserts that an unknown field is refused inside `inputs` and inside `bytes_by_source`.
+#[test]
+fn an_unknown_field_inside_inputs_is_refused() {
+    for name in [
+        "invalid_v2/inputs_unknown_field.json",
+        "invalid_v2/inputs_unknown_source_field.json",
+    ] {
+        let ManifestError::Json(e) = refusal_v2(name) else {
+            panic!("{name}: not a Json refusal");
+        };
+        assert!(e.to_string().contains("unknown field"), "{name}: {e}");
+    }
+}
+
+/// Asserts that an `inputs` number over `i64::MAX` is refused with its field name, in `inputs`
+/// and in `bytes_by_source`, and that `i64::MAX` itself is allowed.
+#[test]
+fn an_inputs_number_beyond_i64_is_refused() {
+    let over = i64::MAX as u64 + 1;
+    assert!(matches!(
+        refusal_v2("invalid_v2/inputs_over_i64.json"),
+        ManifestError::Advisory { field: "inputs.retries", value } if value == over
+    ));
+    assert!(matches!(
+        refusal_v2("invalid_v2/inputs_source_over_i64.json"),
+        ManifestError::Advisory { field: "inputs.bytes_by_source.cache_hit", value } if value == over
+    ));
+    let mut at_max = all_inputs();
+    at_max.requests = i64::MAX as u64;
+    at_max.bytes_by_source.tierstore_direct = i64::MAX as u64;
+    let manifest = TaskManifest {
+        inputs: Some(at_max),
+        ..base()
+    };
+    assert!(manifest.validate().is_ok());
+    let mut past = at_max;
+    past.walk_ms = over;
+    let manifest = TaskManifest {
+        inputs: Some(past),
+        ..base()
+    };
+    assert!(matches!(
+        manifest.validate(),
+        Err(ManifestError::Advisory {
+            field: "inputs.walk_ms",
+            ..
+        })
+    ));
+}
+
+/// Asserts that a version 1 body carrying `inputs` is refused: only version 2 has the field.
+#[test]
+fn a_v1_manifest_with_inputs_is_refused() {
+    assert!(matches!(
+        refusal_v2("invalid_v2/v1_with_inputs.json"),
+        ManifestError::UnexpectedField("inputs")
+    ));
+}
+
+/// Asserts that a version 2 body that needs nothing of version 2 (one pack, no large object, no
+/// inputs) is refused, so every manifest has one spelling; and that each thing that does need
+/// version 2 is accepted in a version 2 body.
+#[test]
+fn a_v2_manifest_that_needs_nothing_of_v2_is_refused() {
+    assert!(matches!(
+        refusal_v2("invalid_v2/v2_needing_nothing.json"),
+        ManifestError::NotV2
+    ));
+    for name in [
+        "valid_v2/two_packs.json",
+        "valid_v2/one_large.json",
+        "valid_v2/inputs_partial.json",
+    ] {
+        assert!(parse_v2(name).is_ok(), "{name}");
+    }
+}
+
+/// Asserts that the plain forms are the single-pack path: `parse`, `validate` and `to_json`
+/// refuse a manifest of 2 to 8 packs (`MultiPack`), as they refuse a large entry, so a consumer
+/// of them cannot take pack 0 of a multi-pack run as the whole run; the `_with` forms accept
+/// the same file and manifest; and `inputs`, being advisory, is accepted by both.
+#[test]
+fn the_plain_forms_refuse_a_multi_pack_manifest_and_the_with_forms_take_it() {
+    let two = fixture("valid_v2/two_packs.json");
+    assert!(matches!(
+        TaskManifest::parse(&two),
+        Err(ManifestError::MultiPack(2))
+    ));
+    assert!(TaskManifest::parse_with(&two, 0).is_ok());
+    assert!(TaskManifest::parse_with(&two, LARGE_MAX).is_ok());
+    for packs in 2..=MAX_PACKS {
+        let manifest = TaskManifest { packs, ..base() };
+        assert!(matches!(manifest.validate(), Err(ManifestError::MultiPack(p)) if p == packs));
+        assert!(matches!(manifest.to_json(), Err(ManifestError::MultiPack(p)) if p == packs));
+        assert!(manifest.validate_with(0).is_ok());
+        assert!(manifest.to_json_with(0).is_ok());
+    }
+    let with_inputs = fixture("valid_v2/inputs_partial.json");
+    assert!(TaskManifest::parse(&with_inputs).is_ok());
+    assert!(TaskManifest::parse_with(&with_inputs, 0).is_ok());
 }
