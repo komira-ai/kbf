@@ -4,7 +4,7 @@ tierstore is an S3-compatible object store server that puts a small, fast tier i
 
 This guide is for the person who installs and runs it. It describes what is on the main branch of the source today. A piece that is planned and not in the code is described only under a heading titled "Not in a release yet", so you can tell the two apart.
 
-> The configuration file (`--config`, `--print-config`) and the OCI read front (`--oci-listen`) are on main and are not in the latest release (v0.0.38). The command-line flags of every other setting work in every release. The pages say where a setting needs a build of main.
+> The configuration file (`--config`, `--print-config`) and the OCI read front (`--oci-listen`) are on main and are not in the latest release (v0.0.38). The command-line flags of every other setting work in every release. The node-local read cache (a build node, `[local_cache]`) is on main too and has no flag form. The pages say where a setting needs a build of main.
 
 ## The shape of a deployment
 
@@ -45,7 +45,6 @@ A write goes to the hot tier and is acknowledged once a journal entry for it is 
 
 These are planned for the v1 shape and are not in the code on main. Nothing here can be configured today.
 
-- **A node-local read-through cache.** A cache on the SSD of the node a client runs on, in front of an upstream tierstore: reads are served from the local disk and filled from the upstream on a miss. Today the hot tier of a storage node is the only disk cache.
-- **Write-through.** A cache node sending writes to the upstream before it answers, so that a write is never only on the node.
+- **Write-through.** A cache node sending writes to the upstream before it answers, so that a write is never only on the node. Today a cache node is read-only.
 - **Client retries on 503.** Clients retrying a 503 with jittered waits, and the server waiting briefly for a free put slot before it answers 503.
 - **Hot and cold counters.** Hit, miss, byte and cold-read counters for the two tiers.

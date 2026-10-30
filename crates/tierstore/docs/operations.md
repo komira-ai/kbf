@@ -70,9 +70,21 @@ Before it serves, the process asks each tier, under a probe key in `_tiering/sel
 
 `--skip-backend-check multipart-conditional=<reason>` leaves out the last check, for a store you have shown to be safe another way; the reason is written to stderr at every start. No other check can be skipped.
 
+## A build node
+
+A build node (the file has `[local_cache]`, see [configuration](configuration.md#a-file-for-a-build-node)) serves the S3 front as a read cache. What it keeps: a key is kept if the longest `[[policy]]` prefix that holds it says `cache = true` (and it is not under `_journal/` or `_tiering/`). A GET or HEAD of a kept object is answered from the disk with no call to the upstream. A GET of one that is not there is read from the upstream in chunks of 8 MiB into a staging directory, hashed as it passes, and linked into place only when it is whole; the misses of one key share one fill. A ranged GET of a miss fills the whole object if it is at most 64 MiB, and otherwise passes the range through and keeps nothing. A fill that fails never fails the reader for the cache's reasons: the reader is answered from the upstream. Every call but GET and HEAD is refused 403 `AccessDenied`.
+
+Put `cache = true` only on prefixes whose objects are never rewritten, the content-addressed ones: a kept object is never checked against the upstream again. Anyone who may read through the front may read what the upstream's key can read, so give clients scoped keys.
+
+Memory is bounded for the fills: at most `local_cache.max_concurrent_fills` chunks of 8 MiB are held. A miss that finds every slot taken is served from the upstream and kept nowhere; if the count of such skips climbs, raise the key. A response is held whole in memory, as for any backend.
+
+Eviction keeps the cache under `local_cache.budget`: above `high_water` percent of it, or when the free space of the file system is under `free_floor` percent, a pass (every 10 seconds) removes the least recently used objects down to `low_water` percent and until the free space is back at the floor. The free-space floor only triggers a pass; it does not stop a fill. An object that another tree has linked is skipped, counted and stays charged to the budget. A fill is skipped when the object is larger than the budget or would take the cache above `critical`.
+
+At start the process makes the directory, removes what a fill left half done, reads the kept objects back (sizes only; an object whose sidecar does not say what the file holds is deleted), and asks the file system four questions with a probe object. A file system that answers one wrongly exits the process with status 3, naming the check. It then asks the upstream for a key that is not there: 404 or any object is an answer, and anything else exits 1. On SIGTERM it drains as a storage node does.
+
 ## Metrics
 
-`GET /metricz` on the S3 listener (unsigned) answers 200 in the Prometheus text format. On main it has the counters of the OCI read front, such as `tierstore_oci_requests_total`, and without `--oci-listen` it says the front is not enabled. The full list of metric names, their labels and queries to alert on is in [metrics](metrics.md).
+`GET /metricz` on the S3 listener (unsigned) answers 200 in the Prometheus text format. On main it has the counters of the OCI read front, such as `tierstore_oci_requests_total`, and without `--oci-listen` it says the front is not enabled. The counters of the cache of a build node follow them, each named `tierstore_cache_` and one of `hits_total`, `misses_total`, `bytes_served_local_total`, `bytes_served_upstream_total`, `fills_total`, `fills_skipped_total`, `fills_skipped_busy_total`, `fill_failures_total` (label `reason`), `evictions_total` (label `reason`: `budget` or `floor`), `pinned_skips_total` and `discarded_at_start_total`, and the gauges `bytes`, `objects`, `fs_free_bytes` and `staging_files`; a node with no cache says so on a line of its own. The full list of metric names, their labels and queries to alert on is in [metrics](metrics.md).
 
 ## Not in a release yet
 

@@ -2,7 +2,7 @@
 
 tierstore is configured by flags, or by one TOML file given with `--config <path>`. The two make the same settings and run the same code: the file is read into the settings the flags make, and a key that is left out has the default of its flag. A file holds no secret, only the paths of key files.
 
-> `--config` and `--print-config` are on main and not in the latest release (v0.0.38). Every flag below works in every release. This release means the storage-node shape described here: a hot tier and a cold tier.
+> `--config` and `--print-config` are on main and not in the latest release (v0.0.38). Every flag below works in every release. A file has one of two shapes, told apart by its tables: a storage node (a hot tier and a cold tier, as the flags have) and a build node (a read cache on local disk in front of one upstream, `[local_cache]`). The build node is on main and has no flag form.
 
 ## A file for a storage node
 
@@ -71,6 +71,40 @@ Start it with the file and nothing else but the per-run flags:
 /usr/libexec/kbf/tierstore --config /etc/tierstore/tierstore.toml --drain-lb-wait 10s --drain-deadline 15m
 ```
 
+## A file for a build node
+
+A read cache in front of one upstream, with no hot tier. The file has `[local_cache]` and `[cold_store]` and no `[hot_store]`; the cold store is the upstream, read with a read-only key:
+
+```toml
+[server]
+listen          = "127.0.0.1:9400"
+proxy_id        = "tierstore-cache-1"
+bucket          = "tierstore"
+access_key_file = "/etc/tierstore-cache/access.key"
+
+[local_cache]
+path       = "/var/lib/tierstore-cache"
+layout     = "digest-v1"
+budget     = "40GiB"
+high_water = 90
+low_water  = 75
+critical   = 95
+free_floor = 10
+max_concurrent_fills = 4
+
+[cold_store]
+kind             = "s3"
+bucket           = "tierstore"
+endpoint         = "http://192.0.2.20:9300"
+credentials_file = "/etc/tierstore-cache/upstream-read.key"
+
+[[policy]]
+prefix = "cas/b/"
+cache  = true
+```
+
+How the cache behaves is in [operations](operations.md#a-build-node). The file is started as a storage node's is, with `--config` and the per-run flags.
+
 ## Types
 
 - A duration is a string of a whole number and `ms`, `s`, `m` or `h`: `250ms`, `15m`.
@@ -133,6 +167,25 @@ Only `[hot_store]` has these, since only a process with a hot tier has them:
 
 The water marks are percents from 1 to 100. The start refuses `low_water` at or above `high_water`, `high_water` above `critical`, a `reconcile_interval` at or above `lease_ttl`, and a `usage_stale_after` at or below `lease_ttl`.
 
+## `[local_cache]`
+
+The read cache of a build node. A GET or HEAD of a key that a `[[policy]]` with `cache = true` holds is answered from the directory and filled from the upstream on a miss; every other call to the front but GET and HEAD is refused 403. The table has no flag.
+
+| Key | Type, default | What |
+|---|---|---|
+| `local_cache.path` | path, required | the directory of the cache, made if it is not there; put it on the file system that the jobs' scratch is on |
+| `local_cache.layout` | string, `"digest-v1"` | the only layout: raw bytes, one file for each object |
+| `local_cache.budget` | size, required | the bytes the cache is meant to hold. The marks are shares of it |
+| `local_cache.high_water` | percent, 90 | above this share of the budget, a pass evicts |
+| `local_cache.low_water` | percent, 75 | a pass evicts down to this share; below `high_water` |
+| `local_cache.critical` | percent, 95 | above this share a fill is skipped; not below `high_water` |
+| `local_cache.free_floor` | percent, 10 (0 to 99) | the share of the file system that is kept free: below it a pass evicts, even under the budget. The budget may not be above the size of the file system less this share |
+| `local_cache.max_concurrent_fills` | count, 4 (1 to 64) | the most fills that run at once; a miss that finds them all running is served from the upstream and kept nowhere |
+| `local_cache.cache` | boolean, `true` | `false` is refused: leave `[local_cache]` out to run without a cache |
+| `local_cache.scrub_rate` | rate, none | a size and `/s`, such as `"50MiB/s"`: accepted, and not used by this release |
+
+The upstream is `[cold_store]`, with any `kind`. In place of `endpoint` it may have a list `endpoints` of exactly one entry. A build node leaves out `skip_checks` and the reconciler's keys, `server.backend_check_wait`, and the `[oci]` table.
+
 ## `[oci]`
 
 The read-only OCI registry front. The table is the front: leave it out for a server with none. `listen` is needed in it and the other keys are refused without it.
@@ -160,7 +213,7 @@ The front reads objects at `<prefix>blobs/sha256/<hex>` and serves GET and HEAD 
 
 ## `[[policy]]`
 
-`[[policy]]` has a `prefix` (empty for all the rest, or ending in `/`) and `cache`. A policy is read and checked and has no effect: `policy.cache = true` is refused, because there is no cache to ask for yet. Two non-empty prefixes may not nest, a prefix may not be listed twice, and none may lie under `_journal/` or `_tiering/`.
+`[[policy]]` has a `prefix` (empty for all the rest, or ending in `/`) and `cache`. On a storage node a policy is read and checked and has no effect, and `policy.cache = true` is refused, since it has no cache. On a build node a key is kept if the longest prefix that holds it says `cache = true`, and at least one policy must say so. Two non-empty prefixes may not nest, a prefix may not be listed twice, and none may lie under `_journal/` or `_tiering/`.
 
 ## The flags that stay flags
 
@@ -181,7 +234,8 @@ Each of these exits with status 2 and names the file and the key (a syntax error
 
 - a key or a table the format does not have, and a value of the wrong type;
 - a key that holds a secret: keys and credentials are paths of files whose names end in `_file` or `_files`; `secret_access_key`, `access_key_id`, `password`, a name with `token` in it and the like are refused anywhere;
-- a file without both `[hot_store]` and `[cold_store]`, and the table `[local_cache]`;
+- a file that is neither a storage node's (`[hot_store]` and `[cold_store]`) nor a build node's (`[local_cache]` and `[cold_store]`, no `[hot_store]`), and all three tables together;
+- in a build node's file, an `[oci]` table, a `layout` other than `digest-v1`, `cache = false`, marks out of order, no `[[policy]]` with `cache = true`, and more than one entry in `endpoints`;
 - a key a tier's `kind` does not take, a `dir` tier without `path`, an `s3` tier without `bucket`, `endpoint` or `credentials_file`, and a key only one tier has in the other (`budget` and the reconciler's keys belong to `[hot_store]`, `skip_checks` to `[cold_store]`);
 - a water mark outside 1 to 100, and a budget, count or limit of zero;
 - an `[oci]` table without `listen`, with only one of the certificate and the key, or with `max_connections = 0`;
@@ -199,5 +253,5 @@ Then change `ExecStart=` to the `--config` line above, keeping `--drain-lb-wait`
 
 ## Not in a release yet
 
-- **The node-local cache table.** The file will have a table for a read-through cache on local disk in front of an upstream, and a write-through setting for it. On main the table name `[local_cache]` is reserved and refused as not supported yet, and the file must have a hot tier and a cold tier.
+- **Write-through for the cache.** A setting that sends a write to the upstream before the cache node answers. A build node refuses every write today.
 - **Several upstream endpoints.** A cache node listing more than one upstream, with failover between them.

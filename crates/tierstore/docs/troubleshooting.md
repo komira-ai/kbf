@@ -43,11 +43,13 @@ The configuration file:
 ```message
 <key>: a secret is never in the file; give the path of the file that holds it (a key whose name ends in _file)
 --config cannot be given with <flags>: the file holds what they hold (only --drain-lb-wait and --drain-deadline go with it)
-<key>: a cache is not supported yet: it needs [local_cache]
-<key>: not supported yet: this release reads the storage-node shape, [hot_store] with [cold_store]
+<key>: a storage node keeps no cache: it needs [local_cache] and no [hot_store]
+<key>: the file needs both [hot_store] and [cold_store] (the storage-node shape), or [local_cache] and [cold_store] without [hot_store] (the build-node shape)
+<key>: is refused with [hot_store]: the hot store is already local disk, and a disk cache in front of it would cache a disk with a disk
+<key>: is refused in the file of a build node: the OCI front is a storage node's, and this node serves only the S3 front
 ```
 
-Move the setting into the file as a path, or take the flag out of the command line; leave `[local_cache]` out. A message of a syntax error reads `line <N>, column <M>: <key>: ...` and never repeats the value.
+Move the setting into the file as a path, or take the flag out of the command line; give the file one of the two shapes, a storage node's or a build node's, and leave `[local_cache]` out of a storage node's. A message of a syntax error reads `line <N>, column <M>: <key>: ...` and never repeats the value.
 
 The tiers:
 

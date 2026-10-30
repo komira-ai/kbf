@@ -21,7 +21,8 @@ use std::path::{Path, PathBuf};
 use clap::CommandFactory;
 
 use super::cli::Cli;
-use super::config::{KEYS, from_text};
+use super::config::{KEYS, settings_from_text};
+use super::config_cache::LocalCacheTable;
 use super::config_testing::DEFAULTS;
 
 /// The title of the sections that the exists-in-code checks leave out.
@@ -49,6 +50,21 @@ const SECTIONS: &[&str] = &[
     "local_cache",
 ];
 const POLICY_KEYS: &[&str] = &["policy.prefix", "policy.cache"];
+
+/// The keys of `[local_cache]`, which have no flag and so are not in the key table (the test
+/// `the_cache_table_has_the_keys_listed` holds this list to the table).
+const LOCAL_CACHE_KEYS: &[&str] = &[
+    "local_cache.path",
+    "local_cache.layout",
+    "local_cache.budget",
+    "local_cache.high_water",
+    "local_cache.low_water",
+    "local_cache.critical",
+    "local_cache.free_floor",
+    "local_cache.max_concurrent_fills",
+    "local_cache.cache",
+    "local_cache.scrub_rate",
+];
 
 /// One page.
 struct Doc {
@@ -206,7 +222,9 @@ fn check(docs: &[Doc], code: &Code) -> Vec<String> {
     let parsed: Vec<(&Doc, Parsed)> = docs.iter().map(|doc| (doc, parse(&doc.text))).collect();
     let mut named_flags = BTreeSet::new();
     let mut named_keys = BTreeSet::new();
-    let known_key = |key: &str| code.keys.contains(key) || POLICY_KEYS.contains(&key);
+    let known_key = |key: &str| {
+        code.keys.contains(key) || POLICY_KEYS.contains(&key) || LOCAL_CACHE_KEYS.contains(&key)
+    };
     for (doc, page) in &parsed {
         let name = &doc.name;
         let mut seen = BTreeSet::new();
@@ -264,7 +282,7 @@ fn check(docs: &[Doc], code: &Code) -> Vec<String> {
                     }
                 }
                 if block.info == "toml"
-                    && let Err(why) = from_text(&block.body, DEFAULTS)
+                    && let Err(why) = settings_from_text(&block.body, DEFAULTS)
                 {
                     problems.push(format!("{at}: the loader refuses the file: {why}"));
                 }
@@ -296,8 +314,13 @@ fn check(docs: &[Doc], code: &Code) -> Vec<String> {
     for flag in missing_flags.filter(|f| !UNDOCUMENTED_FLAGS.contains(&f.as_str())) {
         problems.push(format!("no page names the flag {flag}"));
     }
-    let missing_keys = code.keys.iter().filter(|k| !named_keys.contains(*k));
-    for key in missing_keys.filter(|k| !UNDOCUMENTED_KEYS.contains(&k.as_str())) {
+    let missing_keys = code
+        .keys
+        .iter()
+        .map(String::as_str)
+        .chain(LOCAL_CACHE_KEYS.iter().copied())
+        .filter(|k| !named_keys.contains(*k));
+    for key in missing_keys.filter(|k| !UNDOCUMENTED_KEYS.contains(k)) {
         problems.push(format!("no page names the key {key}"));
     }
     problems
@@ -524,6 +547,23 @@ fn a_flag_that_is_not_the_binarys_is_found() {
         &check(&block, &code()),
         "--no-such-flag is not a flag"
     ));
+}
+
+/// Asserts that the list of the keys of `[local_cache]` above is the table's: a file that gives
+/// each of them loads as a build node, and the table written back has just those keys.
+#[test]
+fn the_cache_table_has_the_keys_listed() {
+    let text = "[local_cache]\npath = \"/var/cache\"\nlayout = \"digest-v1\"\nbudget = \"1GiB\"\nhigh_water = 90\nlow_water = 75\ncritical = 95\nfree_floor = 10\nmax_concurrent_fills = 4\ncache = true\nscrub_rate = \"1MiB/s\"\n";
+    let table: LocalCacheTable = toml::from_str::<toml::Table>(text)
+        .expect("the TOML parses")
+        .remove("local_cache")
+        .expect("the table is there")
+        .try_into()
+        .expect("every listed key is a key of the table");
+    let written = toml::Table::try_from(table).expect("the table serializes");
+    let keys: BTreeSet<String> = written.keys().map(|k| format!("local_cache.{k}")).collect();
+    let listed: BTreeSet<String> = LOCAL_CACHE_KEYS.iter().map(|k| (*k).to_owned()).collect();
+    assert_eq!(keys, listed);
 }
 
 /// Asserts that a key that the table does not have is found, in a span and in a TOML block, and

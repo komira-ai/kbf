@@ -1,8 +1,8 @@
 // The statements of the pages about what tierstore does not do, and the strings of the demo, held to the code.
 //
 // Catches: a page that says "not built" about something the code now does, and a demo line that is no longer what the
-// program prints. The site says the per-node cache is not built, that `[local_cache]` and `cache = true` are refused,
-// that the only counters `/metricz` has are the OCI front's, and that the binary does not use `CachedStore`; the demo quotes the bodies of the
+// program prints. The site says the per-node cache is a build node (`[local_cache]` with `[cold_store]`),
+// that the only counters `/metricz` has are the OCI front's and the cache's, and that the binary does not use `CachedStore`; the demo quotes the bodies of the
 // probes. Each of those is read from the crate's source here, so when the code changes the test fails and says which
 // page to update. The crate's source is the directory above the site's (crates/tierstore/src, and src/ once the
 // crate is a repository of its own).
@@ -34,11 +34,11 @@ export function staleClaims(src: ReadonlyMap<string, string>): string[] {
   const out: string[] = [];
   const all = [...src.entries()];
   const config = src.get('server/config.rs') ?? '';
-  if (!/a cache is not supported yet/.test(config) || !/\[local_cache\]/.test(config)) {
-    out.push('config.rs no longer refuses [local_cache] and `cache = true` as not supported: update docs/configuration.md ("Not in a release yet"), content/why.html and content/index.html (the status table)');
+  if (!/build-node shape/.test(config) || !/\[local_cache\]/.test(config)) {
+    out.push('config.rs no longer reads a build node ([local_cache] with [cold_store]): update docs/configuration.md, docs/operations.md ("A build node"), content/why.html and content/index.html (the status table)');
   }
   for (const [name, text] of all) {
-    if (name !== 'server/oci/metrics.rs' && /# TYPE /.test(text)) out.push(`${name} exports metrics: the OCI front's counters were the only ones; update docs/operations.md ("Metrics"), docs/metrics.md and content/why.html ("Where it stops")`);
+    if (name !== 'server/oci/metrics.rs' && name !== 'server/local_cache/metrics.rs' && /# TYPE |tierstore_cache_\{/.test(text)) out.push(`${name} exports metrics: the OCI front's and the cache's counters were the only ones; update docs/operations.md ("Metrics"), docs/metrics.md and content/why.html ("Where it stops")`);
     if (/\bCachedStore\b/.test(text)) out.push(`${name} uses CachedStore: the binary has a cache now; update content/why.html ("The per-node read-through cache is not in the binary") and content/index.html`);
   }
   const routes = new Set([...(src.get('server/mod.rs') ?? '').matchAll(/\(true, "(\/[a-z]+)"/g)].map((m) => m[1]));
@@ -53,22 +53,22 @@ const page = (name: string): string => read(SITE, 'content', `${name}.html`);
 
 test('the pages say what they say about the cache and metrics, so the code check below is not vacuous', () => {
   assert.match(read(DOCS, 'operations.md'), /the counters of the OCI read front/);
-  assert.match(page('why'), /serves the counters of the OCI read front and no others/);
+  assert.match(page('why'), /serves the counters of the OCI read front and those of the local cache, and no others/);
   assert.match(page('why'), /The <code>tierstore<\/code> binary does not use it/);
-  assert.match(page('why'), /refuses <code>cache = true<\/code>/);
-  assert.match(page('index'), /not built: the file refuses it/);
+  assert.match(page('why'), /<code>\[local_cache\]<\/code> and <code>\[cold_store\]<\/code> and no <code>\[hot_store\]<\/code>/);
+  assert.match(page('index'), /a build node, file only/);
 });
 
 test('the code still matches those statements', () => {
   assert.deepEqual(staleClaims(binarySource()), []);
 });
 
-test('the check can fail: a second metrics exporter, a CachedStore use and a lifted refusal are each reported with the page to change', () => {
+test('the check can fail: a second metrics exporter, a CachedStore use and a dropped build-node shape are each reported with the page to change', () => {
   const real = binarySource();
   const with_ = (name: string, f: (s: string) => string): Map<string, string> => new Map([...real].map(([k, v]) => [k, k === name ? f(v) : v]));
   assert.match(staleClaims(with_('server/mod.rs', (s) => s + '\n# TYPE x counter')).join('\n'), /exports metrics.*docs\/operations\.md/);
   assert.match(staleClaims(with_('main.rs', (s) => s + '\nuse tierstore::CachedStore;')).join('\n'), /uses CachedStore.*content\/why\.html/);
-  assert.match(staleClaims(with_('server/config.rs', (s) => s.replace('a cache is not supported yet', 'ok'))).join('\n'), /no longer refuses \[local_cache\].*docs\/configuration\.md/);
+  assert.match(staleClaims(with_('server/config.rs', (s) => s.replace('build-node shape', 'ok'))).join('\n'), /no longer reads a build node.*docs\/configuration\.md/);
   assert.match(staleClaims(with_('server/mod.rs', (s) => s.replace('"/usagez"', '"/usagez2"'))).join('\n'), /probe routes/);
 });
 
