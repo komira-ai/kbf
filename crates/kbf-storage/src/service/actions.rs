@@ -10,6 +10,7 @@ use tonic::{Request, Response, Status};
 
 use super::{Endpoint, StorageService, catch_up, wire};
 use crate::StorageError;
+use crate::legacy::Path;
 
 /// The record a `Commit` carries, as the store takes it.
 fn record_of(record: Option<&Record>) -> Result<ActionRecord, Status> {
@@ -35,6 +36,9 @@ impl ActionStore for StorageService {
         let entry = self.storage.action_entry(&action).await?;
         if let Some(status) = catch_up::entry_miss(catching_up, entry.is_some(), &action) {
             return Err(status);
+        }
+        if entry.is_some() {
+            self.legacy_reads.count(Path::AcActionStore);
         }
         Ok(Response::new(GetResponse {
             entry: entry.map(|entry| Entry {

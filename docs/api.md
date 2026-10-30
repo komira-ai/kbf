@@ -1711,6 +1711,19 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_executor_late_starts_total` | counter | `Start`s dropped because their window ended before the run was posted; the farm runs the action again |
 | `kbf_executor_stray_leases_released_total` | counter | leases released because none of the executor's slots held them (a lost acquire answer, an undelivered release, a lease beyond the pool's size at a restart) |
 
+**Legacy reads, on a storage node's `--metrics-listen`.** `kbf_storage_legacy_read_total{kind,source}`
+(counter) counts the reads a storage node (`kbf storage`, `kbf storage-and-daemon`) serves from its
+own copy of the data. Its five rows are always printed, 0 included: `kind="cas",source="bytestream"`
+(a ByteStream `Read` that found its blob, one per call), `kind="cas",source="segments"` (a `Segments`
+`ReadRange` that returned bytes, one per call), `kind="ac",source="action_store"` (an `ActionStore`
+`Get` that found an entry), and `kind="cas",source="in_process"` and `kind="ac",source="in_process"`
+(the same blob and entry reads made by the daemon half of a `storage-and-daemon` process, which reaches
+its own node without a connection). A read that finds nothing, a read of the empty blob,
+`FindMissingBlobs`, `QueryWriteStatus`, `Segments` `Locate`, every write, and the node's own reads for
+flushing and repair are not counted; a read a frontend or a daemon serves from a pack never reaches a
+node. The sum over all rows staying at 0 is how an operator sees that nothing reads the storage nodes
+any more.
+
 **Job-facing read.** On a frontend given `--job-listen` ([kbf-modes.md](deploy/kbf-modes.md)) the
 listener a task fetches its action's inputs from counts requests and bytes; without the flag these
 are absent. The same scrape has a `listener="job"` series in the `kbf_tls_reloads_total` family.
