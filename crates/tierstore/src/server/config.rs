@@ -517,10 +517,20 @@ fn looks_secret(key: &str) -> bool {
         || key.ends_with("_key")
 }
 
-/// Whether `key` is a name some table of the file holds: the last part of a key in [`KEYS`], or a
-/// `[[policy]]` key.
+/// The keys of `[local_cache]` that are in no flag, and so not in [`KEYS`].
+const LOCAL_CACHE_KEYS: &[&str] = &[
+    "path",
+    "layout",
+    "max_concurrent_fills",
+    "write_through",
+    "scrub_rate",
+];
+
+/// Whether `key` is a name some table of the file holds: the last part of a key in [`KEYS`], a
+/// `[local_cache]` key or a `[[policy]]` key.
 fn known_key(key: &str) -> bool {
     matches!(key, "prefix" | "cache")
+        || LOCAL_CACHE_KEYS.contains(&key)
         || KEYS
             .iter()
             .flat_map(|(_, keys)| keys.iter())
