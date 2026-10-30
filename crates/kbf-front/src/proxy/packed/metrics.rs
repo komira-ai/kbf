@@ -88,6 +88,36 @@ pub struct PackMetrics {
     pub(super) ingest_packs: Counter,
     /// The bytes of large objects `ingest` stored in the CAS for the runs it turned into a result.
     pub(super) ingest_large_bytes: Counter,
+    /// Large objects `ingest` also put to `cas/l/<sha256>`, by [`LargeWriteThrough`] in the order of its
+    /// variants.
+    pub(super) ingest_large_writethrough: [Counter; LargeWriteThrough::ALL.len()],
+}
+
+/// How the write-through of one large object to its content-bound key ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LargeWriteThrough {
+    /// The object was written.
+    Ok,
+    /// The store already held the key (a create-only refusal): the key is bound to the bytes, so
+    /// whoever wrote it wrote these.
+    Exists,
+    /// The write failed or was abandoned, and nothing was kept under the key.
+    Failed,
+}
+
+impl LargeWriteThrough {
+    /// Every ending, in the order of the variants.
+    pub const ALL: [Self; 3] = [Self::Ok, Self::Exists, Self::Failed];
+
+    /// The `result` label of the ending.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Exists => "exists",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// Why a commit of an untrusted pack was refused: the key is not the one issued, the manifest
@@ -144,6 +174,12 @@ impl PackMetrics {
     #[must_use]
     pub fn ingest_large_bytes(&self) -> u64 {
         self.ingest_large_bytes.get()
+    }
+
+    /// The large objects of ingested runs whose write-through to `cas/l/<sha256>` ended as `how`.
+    #[must_use]
+    pub fn ingest_large_writethrough(&self, how: LargeWriteThrough) -> u64 {
+        self.ingest_large_writethrough[how as usize].get()
     }
 
     /// The bytes reserved for the uploads in flight now.
@@ -321,6 +357,23 @@ impl PackMetrics {
              it ingested into an action result",
             self.ingest_large_bytes.get(),
         );
+        families.head(
+            "kbf_pack_ingest_large_writethrough_total",
+            "counter",
+            "Large objects a task wrote that ingest also put to cas/l/<sha256> in the object \
+             store, by how the put ended (ok, exists, failed); best effort, never fails an ingest",
+        );
+        for (how, counter) in LargeWriteThrough::ALL
+            .iter()
+            .zip(&self.ingest_large_writethrough)
+        {
+            let line = format!(
+                "kbf_pack_ingest_large_writethrough_total{{result=\"{}\"}} {}\n",
+                how.label(),
+                counter.get()
+            );
+            families.0.push_str(&line);
+        }
         *out = families.0;
     }
 }

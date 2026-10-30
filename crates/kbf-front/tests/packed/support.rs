@@ -9,12 +9,13 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt as _;
 use kbf_auth::Authorizers;
 use kbf_front::{Cache, CacheStorage, Owner, Owners, PackSettings, Packs, Proxy, SegmentsConfig};
 use kbf_objstore::{
-    ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
-    ObjectStoreError, PageSize,
+    BodyStream, ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey,
+    ObjectStore, ObjectStoreError, PageSize,
 };
 use kbf_pack::{PackKeys, WriterKind};
 use kbf_pack_index::memory::MemoryPackIndex;
@@ -63,6 +64,7 @@ pub struct Spy {
     reject_large_lens: AtomicU32,
     overstated: Mutex<Vec<(String, u64)>>,
     puts: AtomicU32,
+    largest_piece: AtomicU64,
     ranges: Mutex<Vec<(String, u64, u64)>>,
 }
 
@@ -102,6 +104,7 @@ impl Spy {
             reject_large_lens: AtomicU32::new(0),
             overstated: Mutex::new(Vec::new()),
             puts: AtomicU32::new(0),
+            largest_piece: AtomicU64::new(0),
             ranges: Mutex::new(Vec::new()),
         }
     }
@@ -153,6 +156,20 @@ impl Spy {
         self.puts.load(SeqCst)
     }
 
+    /// The most bytes any one piece of a streamed write's body has had so far: what a writer
+    /// held at once to hand the store a piece.
+    pub fn largest_piece(&self) -> u64 {
+        self.largest_piece.load(SeqCst)
+    }
+
+    /// The bytes of the object under `key`, if the store holds one.
+    pub async fn held(&self, key: &str) -> Option<Bytes> {
+        let key = ObjectKey::new(key).expect("a key");
+        let len = self.inner.len(&key).await.expect("asked")?;
+        let range = ByteRange::new(0, len).expect("bytes");
+        Some(self.inner.get_range(&key, range).await.expect("read"))
+    }
+
     /// Every range read so far: the key, the offset and the length.
     pub fn ranges(&self) -> Vec<(String, u64, u64)> {
         self.ranges
@@ -199,6 +216,31 @@ impl ObjectStore for Spy {
             return Err(injected());
         }
         self.inner.put_new(key, body, retain_until).await
+    }
+
+    async fn put_stream(
+        &self,
+        key: &ObjectKey,
+        len: u64,
+        mut body: BodyStream,
+    ) -> Result<(), ObjectStoreError> {
+        self.puts.fetch_add(1, SeqCst);
+        if fires(&self.reject_puts) {
+            return Err(injected());
+        }
+        let mut out = BytesMut::new();
+        while let Some(piece) = body.next().await {
+            let piece = piece?;
+            self.largest_piece.fetch_max(piece.len() as u64, SeqCst);
+            if out.len() as u64 + piece.len() as u64 > len {
+                return Err(ObjectStoreError::Body("more than its length".to_owned()));
+            }
+            out.extend_from_slice(&piece);
+        }
+        if (out.len() as u64) < len {
+            return Err(ObjectStoreError::Body("shorter than its length".to_owned()));
+        }
+        self.inner.put_new(key, out.freeze(), None).await
     }
 
     async fn get_range(
