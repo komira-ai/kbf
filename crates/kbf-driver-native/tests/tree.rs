@@ -432,7 +432,7 @@ async fn processes_that_end_on_sigterm_are_not_reported() {
 /// report no usage.
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn the_cpu_of_children_that_exited_between_polls_is_counted() {
+async fn the_usage_cpu_of_children_that_exited_between_polls_is_counted() {
     let dir = scratch("usage-short-children");
     let cas = Arc::new(MemoryCas::default());
     let mut config = config(&dir);
