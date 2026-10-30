@@ -364,6 +364,8 @@ pub struct HttpBlobSource {
     batch: bool,
     /// Set once the grant has answered that it has no batch route.
     batch_off: AtomicBool,
+    /// Makes the one stderr line about a missing batch route.
+    batch_notice: std::sync::Once,
 }
 
 impl std::fmt::Debug for HttpBlobSource {
@@ -427,6 +429,7 @@ impl HttpBlobSource {
             authorization: format!("Bearer {token}"),
             batch: false,
             batch_off: AtomicBool::new(false),
+            batch_notice: std::sync::Once::new(),
         }
     }
 }

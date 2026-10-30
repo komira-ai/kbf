@@ -138,12 +138,13 @@ impl HttpBlobSource {
                     why: format!("the grant answered {status} to a batch request"),
                 });
             }
-            if !self.batch_off.swap(true, Ordering::SeqCst) {
+            self.batch_off.store(true, Ordering::SeqCst);
+            self.batch_notice.call_once(|| {
                 eprintln!(
                     "kbf-task: the grant answered {status} to a batch request; \
                      fetching every blob by GET"
                 );
-            }
+            });
         }
         indexes
             .iter()

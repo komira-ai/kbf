@@ -732,3 +732,14 @@ fn an_unreachable_grant_fails_a_batch_as_a_source_error() {
     assert!(matches!(&error, FetchError::Source { .. }), "{error:?}");
     assert!(error.to_string().contains("batch of 1"), "{error}");
 }
+
+/// Catches `HttpBlobSource::get` not returning the blob's bytes over HTTP: the whole body comes
+/// back from a GET of the digest.
+#[test]
+fn get_returns_the_blob_over_http() {
+    let (blobs, _, bytes, _) = one_file();
+    let server = Server::start(Grant::new(&blobs));
+    let got = server.source().get(&digest_of(&bytes)).expect("get");
+    assert_eq!(got, bytes);
+    assert_eq!(server.gets().len(), 1);
+}
