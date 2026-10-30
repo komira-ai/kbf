@@ -32,9 +32,11 @@
 //! as it is read, in chunks of 4 MiB, and its last chunk is held back until the hash is right:
 //! if it is not, the connection is cut before the response is complete (its `Content-Length`
 //! has been sent), so a client never gets a whole body that is wrong, and a blob of one chunk
-//! delivers no body byte. Both are counted. A `HEAD` or a ranged read reports what the store
-//! holds without reading it all, and so verifies nothing: the client checks the digest of what
-//! it assembles.
+//! delivers no body byte. Both are counted. A manifest `HEAD` reads and verifies the object; a blob
+//! `HEAD` or a read of part of a blob reports what the store holds without reading it all, and so
+//! verifies nothing (a range that covers the whole blob is read and checked like a whole read): the
+//! client checks the digest of what it assembles. `If-Range`, `If-None-Match` and `Accept` are
+//! ignored, as the specification allows.
 //!
 //! # Access
 //!
@@ -65,6 +67,8 @@ mod body_tests;
 #[cfg(test)]
 mod front_tests;
 #[cfg(test)]
+mod listener_tests;
+#[cfg(test)]
 mod parse_tests;
 #[cfg(test)]
 pub(crate) mod test_pki;
@@ -82,6 +86,7 @@ use hyper::{HeaderMap, Method, Response, StatusCode};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
+use crate::journal::{JOURNAL_PREFIX, TIERING_PREFIX};
 use crate::{Backend, ByteRange, Error};
 
 pub use body::{BodyError, OciBody};
@@ -98,7 +103,10 @@ use range::Range;
 pub const MAX_MANIFEST_BYTES: u64 = 4 << 20;
 
 /// The prefixes the proxy keeps for itself, which the front's must not overlap.
-const RESERVED: [&str; 2] = ["_journal/", "_tiering/"];
+const RESERVED: [&str; 2] = [JOURNAL_PREFIX, TIERING_PREFIX];
+
+/// The longest piece of request text an error echoes back.
+const ECHO_BYTES: usize = 256;
 
 const DISTRIBUTION_VERSION: HeaderName = HeaderName::from_static("docker-distribution-api-version");
 const CONTENT_DIGEST: HeaderName = HeaderName::from_static("docker-content-digest");
@@ -211,7 +219,7 @@ impl OciFront {
             Some(digest) => digest,
             None if names::is_tag(reference) => {
                 let message = "tags are not served: pull by digest (name@sha256:<hex>)";
-                let detail = json!({ "tag": reference });
+                let detail = json!({ "tag": echoed(reference) });
                 return (
                     Outcome::NotFound,
                     error(StatusCode::NOT_FOUND, UNKNOWN, message, detail),
@@ -220,13 +228,13 @@ impl OciFront {
             None => return invalid_digest(reference),
         };
         let key = self.prefix.key(&digest);
-        // One byte more than the limit: a longer object is found out without reading it all.
-        let range = ByteRange::new(0, MAX_MANIFEST_BYTES + 1);
-        let body = match self.backend.get(&key, Some(range)).await {
-            Ok(body) => body,
+        // The size is asked first: the digest of any object under the prefix can be named here,
+        // and a layer of gigabytes must not be read whole to find out it is not a manifest.
+        let size = match self.backend.head(&key).await {
+            Ok(meta) => meta.size,
             Err(failure) => return store_failed(&failure, &key, UNKNOWN, &digest),
         };
-        if body.len() as u64 > MAX_MANIFEST_BYTES {
+        if size > MAX_MANIFEST_BYTES {
             let message =
                 format!("the object is over the {MAX_MANIFEST_BYTES}-byte limit of a manifest");
             let detail = json!({ "digest": digest.text() });
@@ -235,6 +243,12 @@ impl OciFront {
                 error(StatusCode::NOT_FOUND, UNKNOWN, &message, detail),
             );
         }
+        // Bounded by the limit even if the object has grown since it was measured.
+        let range = ByteRange::new(0, MAX_MANIFEST_BYTES);
+        let body = match self.backend.get(&key, Some(range)).await {
+            Ok(body) => body,
+            Err(failure) => return store_failed(&failure, &key, UNKNOWN, &digest),
+        };
         let found = Digest::of_hex(hex::encode(Sha256::digest(&body)));
         if found != digest {
             return mismatch(&self.metrics, &digest, &found);
@@ -310,7 +324,8 @@ impl OciFront {
             headers.insert(CONTENT_RANGE, header_value(&value));
         }
         if !head {
-            let whole = status == StatusCode::OK;
+            // A range that covers the object is as good as a whole read, and is checked.
+            let whole = start == 0 && end == size;
             let read = BlobRead {
                 backend: Arc::clone(&self.backend),
                 key,
@@ -384,9 +399,18 @@ fn unsupported_route() -> Response<OciBody> {
     error(StatusCode::NOT_FOUND, "UNSUPPORTED", message, Value::Null)
 }
 
+/// `text` cut to [`ECHO_BYTES`] bytes (at a character boundary), for an error to repeat.
+fn echoed(text: &str) -> &str {
+    let mut end = text.len().min(ECHO_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 fn invalid_name(name: &str) -> (Outcome, Response<OciBody>) {
     let message = "the repository name is not valid";
-    let detail = json!({ "name": name });
+    let detail = json!({ "name": echoed(name) });
     (
         Outcome::Invalid,
         error(StatusCode::BAD_REQUEST, "NAME_INVALID", message, detail),
@@ -395,7 +419,7 @@ fn invalid_name(name: &str) -> (Outcome, Response<OciBody>) {
 
 fn invalid_digest(text: &str) -> (Outcome, Response<OciBody>) {
     let message = "the digest must be sha256: and 64 lowercase hex digits";
-    let detail = json!({ "digest": text });
+    let detail = json!({ "digest": echoed(text) });
     (
         Outcome::Invalid,
         error(StatusCode::BAD_REQUEST, "DIGEST_INVALID", message, detail),

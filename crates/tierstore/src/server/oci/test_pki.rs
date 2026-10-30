@@ -1,6 +1,7 @@
 //! A test CA and leaves with chosen subjectAltNames, written as the files the front reads.
 
 use std::net::IpAddr;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use rcgen::{
@@ -45,9 +46,22 @@ pub(crate) struct Leaf {
 /// A leaf of `ca` with exactly the names `sans`, written to `<name>.pem` and `<name>.key` in
 /// `dir`.
 pub(crate) fn leaf(dir: &Path, name: &str, ca: &Ca, sans: Vec<SanType>) -> Leaf {
+    leaf_with(dir, name, ca, sans, |_| {})
+}
+
+/// The same, with `change` applied to the parameters of the certificate (its validity, say). The
+/// key file is mode 0600.
+pub(crate) fn leaf_with(
+    dir: &Path,
+    name: &str,
+    ca: &Ca,
+    sans: Vec<SanType>,
+    change: impl FnOnce(&mut CertificateParams),
+) -> Leaf {
     let mut params = CertificateParams::new(Vec::<String>::new()).expect("leaf params");
     params.subject_alt_names = sans;
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    change(&mut params);
     let key = KeyPair::generate().expect("leaf key");
     let cert = params.signed_by(&key, &ca.issuer).expect("sign leaf");
     std::fs::create_dir_all(dir).expect("the directory");
@@ -57,5 +71,6 @@ pub(crate) fn leaf(dir: &Path, name: &str, ca: &Ca, sans: Vec<SanType>) -> Leaf 
     };
     std::fs::write(&files.cert, cert.pem()).expect("certificate");
     std::fs::write(&files.key, key.serialize_pem()).expect("key");
+    std::fs::set_permissions(&files.key, std::fs::Permissions::from_mode(0o600)).expect("mode");
     files
 }

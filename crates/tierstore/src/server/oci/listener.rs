@@ -2,12 +2,13 @@
 //! a request, in how long a client may leave an answer unread, and in lifetime.
 
 use std::convert::Infallible;
+use std::future::poll_fn;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use hyper::Request;
-use hyper::body::Incoming;
+use hyper::body::Incoming as RequestBody;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -18,24 +19,27 @@ use tokio_rustls::TlsAcceptor;
 
 use super::{OciError, OciFront};
 use crate::server::idle::Watched;
-
-/// How long [`OciListener::serve`] waits after a failed accept before the next.
-const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
+use crate::server::{ACCEPT_PAUSE, Incoming};
 
 /// The bounds on the connections of a listener.
 #[derive(Clone, Copy, Debug)]
 pub struct OciLimits {
     /// The most connections open at once; the others wait in the kernel's backlog.
     pub max_connections: usize,
-    /// How long a client has to finish the TLS handshake and to send the head of a request,
-    /// and so how long a connection may wait, idle, for its next request.
+    /// How long a client has to finish the TLS handshake. Short, since a connection that never
+    /// speaks holds a slot until it is closed.
+    pub handshake_timeout: Duration,
+    /// How long a client has to send the head of a request, and so how long a connection may
+    /// wait, idle, for its next request.
     pub header_timeout: Duration,
     /// How long a client may go without taking a byte of an answer before the connection is
     /// closed.
     pub write_idle: Duration,
-    /// The longest a connection lives. A request being answered when it ends is finished first.
+    /// The longest a connection lives. A request being answered when it ends is finished first,
+    /// for at most [`drain_deadline`](Self::drain_deadline) more.
     pub lifetime: Duration,
-    /// How long, after a stop, the connections still open are waited for before they are cut.
+    /// How long, after a stop or at the end of a connection's lifetime, the answer being sent is
+    /// waited for before the connection is cut.
     pub drain_deadline: Duration,
 }
 
@@ -79,54 +83,69 @@ impl OciListener {
     /// Serves connections until `stop` turns true: then it takes no more, lets the connections
     /// that are open finish the request they are answering and close, waits for them for
     /// [`OciLimits::drain_deadline`], and cuts those that are left. Returns how many were cut.
-    pub async fn serve(self, mut stop: watch::Receiver<bool>) -> usize {
+    pub async fn serve(self, stop: watch::Receiver<bool>) -> usize {
         let Self {
             listener,
             acceptor,
             front,
             limits,
         } = self;
-        let slots = Arc::new(Semaphore::new(limits.max_connections));
-        let mut connections = JoinSet::new();
-        loop {
-            // A slot is taken before the next accept, so a flood waits in the backlog and not
-            // in tasks.
-            let slot = tokio::select! {
-                slot = Arc::clone(&slots).acquire_owned() => slot,
-                () = stopped(&mut stop) => break,
-            };
-            tokio::select! {
-                accepted = listener.accept() => match accepted {
-                    Ok((tcp, peer)) => {
-                        let serving = Serving {
-                            acceptor: acceptor.clone(),
-                            front: Arc::clone(&front),
-                            limits,
-                            stop: stop.clone(),
-                        };
-                        connections.spawn(serving.connection(tcp, peer, slot));
-                    }
-                    Err(error) => {
-                        eprintln!("tierstore: oci: accept: {error}");
-                        tokio::time::sleep(ACCEPT_PAUSE).await;
-                    }
-                },
-                Some(_) = connections.join_next() => {}
-                () = stopped(&mut stop) => break,
-            }
-        }
-        drop(listener);
-        let finished = async { while connections.join_next().await.is_some() {} };
-        if tokio::time::timeout(limits.drain_deadline, finished)
-            .await
-            .is_ok()
-        {
-            return 0;
-        }
-        let cut = connections.len();
-        connections.abort_all();
-        cut
+        accept_loop(listener, acceptor, front, limits, stop).await
     }
+}
+
+/// [`OciListener::serve`] over any source of connections: the listener of a socket, and in the
+/// tests one that fails.
+pub(super) async fn accept_loop<I>(
+    mut incoming: I,
+    acceptor: TlsAcceptor,
+    front: Arc<OciFront>,
+    limits: OciLimits,
+    mut stop: watch::Receiver<bool>,
+) -> usize
+where
+    I: Incoming<Stream = TcpStream> + Send,
+{
+    let slots = Arc::new(Semaphore::new(limits.max_connections));
+    let mut connections = JoinSet::new();
+    loop {
+        // A slot is taken before the next accept, so a flood waits in the backlog and not
+        // in tasks.
+        let slot = tokio::select! {
+            slot = Arc::clone(&slots).acquire_owned() => slot,
+            () = stopped(&mut stop) => break,
+        };
+        tokio::select! {
+            accepted = poll_fn(|cx| incoming.poll_incoming(cx)) => match accepted {
+                Ok((tcp, peer)) => {
+                    let serving = Serving {
+                        acceptor: acceptor.clone(),
+                        front: Arc::clone(&front),
+                        limits,
+                        stop: stop.clone(),
+                    };
+                    connections.spawn(serving.connection(tcp, peer, slot));
+                }
+                Err(error) => {
+                    eprintln!("tierstore: oci: accept: {error}");
+                    tokio::time::sleep(ACCEPT_PAUSE).await;
+                }
+            },
+            Some(_) = connections.join_next() => {}
+            () = stopped(&mut stop) => break,
+        }
+    }
+    drop(incoming);
+    let finished = async { while connections.join_next().await.is_some() {} };
+    if tokio::time::timeout(limits.drain_deadline, finished)
+        .await
+        .is_ok()
+    {
+        return 0;
+    }
+    let cut = connections.len();
+    connections.abort_all();
+    cut
 }
 
 /// Resolves once `stop` is true, or its sender is gone.
@@ -152,14 +171,14 @@ impl Serving {
         _slot: Result<OwnedSemaphorePermit, AcquireError>,
     ) {
         let limits = self.limits;
-        let handshake = tokio::time::timeout(limits.header_timeout, self.acceptor.accept(tcp));
+        let handshake = tokio::time::timeout(limits.handshake_timeout, self.acceptor.accept(tcp));
         let tls = match handshake.await {
             Ok(Ok(tls)) => tls,
             Ok(Err(error)) => return eprintln!("tierstore: oci: {peer}: TLS handshake: {error}"),
             Err(_) => return eprintln!("tierstore: oci: {peer}: TLS handshake took too long"),
         };
         let front = Arc::clone(&self.front);
-        let service = service_fn(move |request: Request<Incoming>| {
+        let service = service_fn(move |request: Request<RequestBody>| {
             let front = Arc::clone(&front);
             async move {
                 let (method, uri, headers) = (request.method(), request.uri(), request.headers());
@@ -175,14 +194,20 @@ impl Serving {
         tokio::pin!(serving);
         let lifetime = tokio::time::sleep(limits.lifetime);
         tokio::pin!(lifetime);
-        tokio::select! {
+        let lifetime_ended = tokio::select! {
             // A connection that ends badly has nothing to tell the other side.
             _ = serving.as_mut() => return,
-            () = &mut lifetime => {}
-            () = stopped(&mut self.stop) => {}
-        }
+            () = &mut lifetime => true,
+            () = stopped(&mut self.stop) => false,
+        };
         // The request being answered is finished, and then the connection closes.
         serving.as_mut().graceful_shutdown();
-        let _ = serving.await;
+        if lifetime_ended {
+            // A client that takes the answer a few bytes at a time must not keep the slot past
+            // the lifetime for ever. (After a stop, the listener cuts what is left.)
+            let _ = tokio::time::timeout(limits.drain_deadline, serving).await;
+        } else {
+            let _ = serving.await;
+        }
     }
 }

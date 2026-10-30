@@ -61,6 +61,7 @@ impl Rig {
         let front = Arc::new(OciFront::new(proxy.clone(), prefix, metrics.clone()));
         let mut limits = OciLimits {
             max_connections: 16,
+            handshake_timeout: Duration::from_secs(30),
             header_timeout: Duration::from_secs(30),
             write_idle: Duration::from_secs(30),
             lifetime: Duration::from_secs(3600),

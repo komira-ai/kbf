@@ -266,14 +266,18 @@ proxy in the process: no S3 credential and no hop through the S3 listener. It is
 | flag | what |
 |---|---|
 | `--oci-listen ADDR` | where the registry front listens. Needs `--oci-tls-cert` and `--oci-tls-key`: there is no plain-HTTP mode |
-| `--oci-tls-cert PATH`, `--oci-tls-key PATH` | the certificate chain (leaf first) and the private key, PEM. Clients dial an IP address, so the leaf must carry an IP subjectAltName for `--oci-listen` (any IP subjectAltName, if the address is `0.0.0.0` or `::`); a certificate without one, or an unreadable file, is refused at start. The files are read once: a new certificate takes a restart |
+| `--oci-tls-cert PATH`, `--oci-tls-key PATH` | the certificate chain (leaf first) and the private key, PEM. Clients dial an IP address, so the leaf must carry an IP subjectAltName for `--oci-listen` (any IP subjectAltName, if the address is `0.0.0.0` or `::`); a certificate without one, one that is expired or not yet valid, a key file any user can read (the "other" mode bits; a group may), or an unreadable file, is refused at start. The files are read once: a new certificate takes a restart, so renew it before it expires |
 | `--oci-prefix PREFIX` | the key prefix, ending in `/`, `oci/` if not given. A prefix inside `_journal/` or `_tiering/`, or one that is not plain path segments, is refused at start (exit 2) |
 | `--oci-max-connections N` | connections open at once, 256 if not given; the others wait in the kernel's backlog |
 | `--oci-connection-lifetime D` | the longest a connection lives, 1h if not given; a request being answered is finished first |
 
-The time a client has to finish the TLS handshake and to send the head of a request is the S3
-front's header timeout (a minute), and a client that takes no byte of an answer for `--body-idle-timeout`
-is cut. On the drain the front goes on serving through `--drain-lb-wait`, takes no new connection,
+A client has 10 seconds to finish the TLS handshake and then the S3 front's header timeout (a
+minute) to send the head of a request, which is also how long an idle connection may wait for its
+next request. A connection holds one of the `--oci-max-connections` slots from accept to close and
+there is no limit per client address, so a host that opens that many connections and says nothing
+can keep the others waiting: the host's firewall rules are the control for that. A client that takes no byte of an answer for `--body-idle-timeout`
+is cut. A connection that reaches its lifetime finishes the answer it is sending for at most
+`--drain-deadline`, and is cut then. On the drain the front goes on serving through `--drain-lb-wait`, takes no new connection,
 lets the requests being answered finish, and closes what is left at `--drain-deadline`. The start
 line on stdout gets ` oci-listen=<address>` after `listen=<address>`.
 
@@ -310,8 +314,13 @@ A manifest is read whole and its SHA-256 is checked against its digest before a 
 that does not match is 500 `DIGEST_INVALID`, is never served and is counted. A blob is hashed as it is
 read, in chunks of 4 MiB, and its last chunk is held back until the hash is right: a blob that does
 not match its digest ends the connection before the response is complete, so no client receives a
-whole wrong body, and the mismatch is counted. `HEAD` and ranged reads (which podman uses to resume)
-report what the store holds and verify nothing; the client verifies the digest of what it assembles.
+whole wrong body, and the mismatch is counted. That holds for a read of the whole blob, and for a
+`Range` that covers all of it (which is still 206). A blob `HEAD` and a `Range` of part of a blob
+report what the store holds and verify nothing; the client verifies the digest of what it
+assembles. (A manifest `HEAD` reads and verifies the manifest.) A client that sends several ranges
+(as a partial pull of a `zstd:chunked` or `estargz` layer does) is sent the whole blob with 200,
+which the specification allows, and falls back to splitting it. `If-Range`, `If-None-Match` and
+`Accept` are ignored.
 
 ### Anonymous reads
 
@@ -351,9 +360,9 @@ The reference is by digest: a tag is refused. The repository name (`library/app`
 fits the grammar and means nothing to the store. A registry on another port than 443 is written
 `192.0.2.10:8443/library/app@sha256:...` and its directory is `certs.d/192.0.2.10:8443`.
 
-js-oci pulls the same references with the rules of its own `Allow`: the URL must be `https`, the port
-443 or the registry's own port in the reference, and a registry at a private address needs the client's
-explicit allow of it.
+A client that allows only `https` registries on port 443 (or the port in the reference), and
+registries at a private address only when told to, pulls the same references; allow the address in
+that client's own settings.
 
 ### Counters
 

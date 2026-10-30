@@ -1,13 +1,16 @@
 //! The start-up checks of the front's certificate and key.
 
+use std::fs::Permissions;
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use kbf_testkit::dir::TestDir;
 
 use super::OciError;
-use super::test_pki::{ca, dns, ip, leaf};
+use super::test_pki::{ca, dns, ip, leaf, leaf_with};
 use super::tls::{acceptor, ip_of, unnamed};
+use rcgen::date_time_ymd;
 
 fn addr(text: &str) -> SocketAddr {
     text.parse().expect("an address")
@@ -75,6 +78,7 @@ fn files_that_are_not_a_certificate_and_a_key_are_refused() {
     let missing: PathBuf = dir.path().join("missing");
     let text = dir.path().join("text");
     std::fs::write(&text, "not a PEM file\n").expect("write");
+    std::fs::set_permissions(&text, Permissions::from_mode(0o600)).expect("mode");
     let junk = dir.path().join("junk.pem");
     let block = "-----BEGIN CERTIFICATE-----\nanVuaw==\n-----END CERTIFICATE-----\n";
     std::fs::write(&junk, block).expect("write");
@@ -100,6 +104,42 @@ fn files_that_are_not_a_certificate_and_a_key_are_refused() {
         why.starts_with("--oci-tls-cert and --oci-tls-key: "),
         "{why}"
     );
+}
+
+/// Asserts a certificate that is expired or not yet valid is refused with its period, and that a
+/// key file any user can read is refused while one a group can read is not.
+#[test]
+fn an_expired_certificate_and_an_open_key_are_refused() {
+    let dir = TestDir::under(std::env::temp_dir(), "oci-tls-lifetime");
+    let ca = ca();
+    let names = || vec![ip("127.0.0.1")];
+    let past = leaf_with(dir.path(), "past", &ca, names(), |params| {
+        params.not_before = date_time_ymd(2020, 1, 1);
+        params.not_after = date_time_ymd(2021, 1, 1);
+    });
+    let future = leaf_with(dir.path(), "future", &ca, names(), |params| {
+        params.not_before = date_time_ymd(3000, 1, 1);
+        params.not_after = date_time_ymd(3001, 1, 1);
+    });
+    for files in [&past, &future] {
+        let why = refusal(&files.cert, &files.key, "127.0.0.1:443");
+        assert!(why.starts_with("--oci-tls-cert "), "{why}");
+        assert!(why.contains("not valid now"), "{why}");
+        assert!(why.contains("notBefore"), "{why}");
+        assert!(why.contains("notAfter"), "{why}");
+    }
+    assert!(refusal(&past.cert, &past.key, "127.0.0.1:443").contains("2021"));
+
+    let good = leaf(dir.path(), "good", &ca, names());
+    let mode = |bits| std::fs::set_permissions(&good.key, Permissions::from_mode(bits));
+    mode(0o640).expect("mode");
+    acceptor(&good.cert, &good.key, addr("127.0.0.1:443")).expect("a group may read the key");
+    for open in [0o644, 0o604, 0o666] {
+        mode(open).expect("mode");
+        let why = refusal(&good.cert, &good.key, "127.0.0.1:443");
+        assert!(why.starts_with("--oci-tls-key "), "{why}");
+        assert!(why.contains("any user can read the key"), "{why}");
+    }
 }
 
 /// Asserts which errors a restart can mend: an unreadable file and an address that cannot be

@@ -35,7 +35,8 @@
 //! `--oci-listen` adds a fourth thing: a read-only OCI distribution front over HTTPS (see
 //! [`oci`](super::oci)), served from the same proxy, so that podman pulls an image by digest from
 //! the tiers. It needs `--oci-tls-cert` and `--oci-tls-key` (the certificate must carry an IP
-//! subjectAltName for the address, which the start checks); a certificate, key or prefix that
+//! subjectAltName for the address and be valid now, and the key file must not be readable by
+//! every user; the start checks); a certificate, key or prefix that
 //! cannot work exits with status 2, and one that cannot be read with status 1. The start line
 //! gets ` oci-listen=<address>`.
 //!
@@ -330,7 +331,8 @@ pub struct Cli {
     /// trust. Read once at start: a new certificate takes a restart.
     #[arg(long, value_name = "PATH", requires = "oci_listen")]
     pub oci_tls_cert: Option<PathBuf>,
-    /// The private key (PEM) of `--oci-tls-cert`.
+    /// The private key (PEM) of `--oci-tls-cert`. A file any user can read (a mode with the
+    /// "other" bits set) is refused at start; a group may read it.
     #[arg(long, value_name = "PATH", requires = "oci_listen")]
     pub oci_tls_key: Option<PathBuf>,
     /// The prefix of the keys the OCI front reads, ending in `/` (`oci/` if not given): an
@@ -625,6 +627,9 @@ const DEFAULT_OCI_CONNECTIONS: u32 = 256;
 /// The default of `--oci-connection-lifetime`.
 const DEFAULT_OCI_LIFETIME: Duration = Duration::from_secs(3600);
 
+/// How long a client has to finish the TLS handshake with the OCI front.
+const OCI_HANDSHAKE: Duration = Duration::from_secs(10);
+
 /// Checks the OCI front's flags and files, and makes its TLS, if `--oci-listen` is given. A prefix,
 /// certificate or key that cannot work is an `InvalidFlags` (exit 2, as a restart cannot mend it);
 /// a file that cannot be read is exit 1.
@@ -655,6 +660,7 @@ fn oci_setup(cli: &Cli, server: &ServerConfig) -> Result<Option<OciSetup>, Error
     let connections = cli.oci_max_connections.unwrap_or(DEFAULT_OCI_CONNECTIONS);
     let limits = OciLimits {
         max_connections: connections as usize,
+        handshake_timeout: OCI_HANDSHAKE,
         header_timeout: server.header_timeout,
         write_idle: server.body_idle_timeout,
         lifetime,

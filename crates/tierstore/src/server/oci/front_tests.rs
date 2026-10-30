@@ -233,18 +233,16 @@ async fn the_content_type_comes_from_the_manifest() {
 #[tokio::test]
 async fn an_object_that_is_not_a_manifest_is_refused() {
     let rig = Rig::new();
-    for content in [
-        &b"not json at all"[..],
-        br#"{"schemaVersion":2,"mediaType":"x"}"#,
-    ] {
+    let cases: [(&[u8], &str); 2] = [
+        (b"not json at all", "not JSON"),
+        (br#"{"schemaVersion":2,"mediaType":"x"}"#, "not a manifest"),
+    ];
+    for (content, expected) in cases {
         let digest = rig.seed(content).await;
         let answer = rig.get(&format!("/v2/a/manifests/{digest}")).await;
         let (message, detail) =
             answer.assert_error(StatusCode::INTERNAL_SERVER_ERROR, "MANIFEST_INVALID");
-        assert!(
-            message.contains("not JSON") || message.contains("not a manifest"),
-            "{message}"
-        );
+        assert!(message.contains(expected), "{message}");
         assert_eq!(detail["digest"], digest);
         assert!(!String::from_utf8_lossy(&answer.body).contains("not json at all"));
     }
@@ -369,12 +367,50 @@ async fn a_manifest_over_the_limit_is_not_served() {
     assert_eq!(served.body.len() as u64, MAX_MANIFEST_BYTES);
     let over = fill(1);
     let digest = rig.seed(over.as_bytes()).await;
+    let reads = rig.faulty.calls(Op::Get);
     let refused = rig.get(&format!("/v2/a/manifests/{digest}")).await;
     let (message, _) = refused.assert_error(StatusCode::NOT_FOUND, "MANIFEST_UNKNOWN");
     assert!(
         message.contains(&MAX_MANIFEST_BYTES.to_string()),
         "{message}"
     );
+    // Found out from the size alone: the object is not read.
+    assert_eq!(rig.faulty.calls(Op::Get), reads);
+}
+
+/// Asserts a range that covers the whole of a blob is 206 and is checked against the digest like
+/// a whole read: a blob that is not its digest is cut short for each way of asking for all of it,
+/// and a range of part of it is not checked.
+#[tokio::test]
+async fn a_range_over_the_whole_blob_is_verified() {
+    let rig = Rig::new();
+    let hex = hex_of(b"the digest names these bytes");
+    rig.put_under(&hex, b"0123456789").await;
+    let path = format!("/v2/a/blobs/sha256:{hex}");
+    for range in ["bytes=0-", "bytes=0-9", "bytes=-10", "bytes=0-99"] {
+        let answer = rig.ask(Method::GET, &path, &[("range", range)]).await;
+        assert_eq!(answer.status, StatusCode::PARTIAL_CONTENT, "{range}");
+        assert!(answer.cut, "{range}");
+        assert!(answer.body.is_empty(), "{range}");
+    }
+    let part = rig.ask(Method::GET, &path, &[("range", "bytes=2-5")]).await;
+    assert_eq!(part.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!((part.cut, part.body.as_slice()), (false, &b"2345"[..]));
+    assert_eq!(rig.metrics.mismatches(), 4);
+}
+
+/// Asserts an error repeats at most 256 bytes of what the client sent, cut at a character.
+#[tokio::test]
+async fn an_error_repeats_only_a_short_piece_of_the_request() {
+    let rig = Rig::new();
+    for long in ["a".repeat(1000), "\u{20ac}".repeat(300)] {
+        let answer = rig.get(&format!("/v2/a/blobs/{long}")).await;
+        let (_, detail) = answer.assert_error(StatusCode::BAD_REQUEST, "DIGEST_INVALID");
+        let echoed = detail["digest"].as_str().expect("text");
+        assert!(long.starts_with(echoed));
+        assert!(echoed.len() <= 256, "{}", echoed.len());
+        assert!(echoed.len() > 250, "{}", echoed.len());
+    }
 }
 
 /// Asserts a blob is served with its length, its digest, `Accept-Ranges` and the octet-stream

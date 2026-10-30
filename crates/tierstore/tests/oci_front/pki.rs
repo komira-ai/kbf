@@ -1,6 +1,7 @@
 //! A test CA and leaves with chosen subjectAltNames.
 
 use std::net::IpAddr;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use rcgen::{
@@ -54,5 +55,6 @@ pub fn leaf(dir: &Path, name: &str, ca: &Ca, sans: Vec<SanType>) -> Leaf {
     };
     std::fs::write(&files.cert, cert.pem()).expect("certificate");
     std::fs::write(&files.key, key.serialize_pem()).expect("key");
+    std::fs::set_permissions(&files.key, std::fs::Permissions::from_mode(0o600)).expect("mode");
     files
 }

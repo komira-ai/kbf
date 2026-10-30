@@ -9,7 +9,7 @@ use std::time::Duration;
 use clap::Parser;
 use kbf_testkit::dir::TestDir;
 
-use super::{Cli, Error, build, exit_status, oci_cut_note};
+use super::{Cli, Error, build, exit_status, oci_cut_note, run_serving};
 use crate::server::oci::test_pki::{Leaf, ca, dns, ip, leaf};
 
 /// A directory with a key file and a certificate and key that name 127.0.0.1.
@@ -103,6 +103,7 @@ fn the_flags_make_the_front() {
     assert_eq!(setup.listen.to_string(), "127.0.0.1:0");
     assert_eq!(setup.limits.max_connections, 256);
     assert_eq!(setup.limits.lifetime, Duration::from_secs(3600));
+    assert_eq!(setup.limits.handshake_timeout, Duration::from_secs(10));
     assert_eq!(setup.limits.header_timeout, built.server.header_timeout);
     assert_eq!(setup.limits.write_idle, built.server.body_idle_timeout);
     assert_eq!(setup.limits.drain_deadline, built.server.drain_deadline);
@@ -157,6 +158,14 @@ fn a_front_that_cannot_serve_is_refused_at_start() {
         assert_eq!(status, 2, "{prefix:?}: {why}");
         assert!(why.contains("--oci-prefix"), "{why}");
     }
+    let open = rig.dir.join("open.key");
+    std::fs::copy(&rig.leaf.key, &open).expect("copy");
+    std::fs::set_permissions(&open, Permissions::from_mode(0o644)).expect("mode");
+    let mut cli = rig.cli(&[]);
+    cli.oci_tls_key = Some(open);
+    let (status, why) = refused(&cli);
+    assert_eq!(status, 2, "{why}");
+    assert!(why.contains("any user can read the key"), "{why}");
     let (status, why) = refused(&rig.cli(&["--oci-connection-lifetime", "0s"]));
     assert_eq!(status, 2, "{why}");
     assert!(why.contains("--oci-connection-lifetime"), "{why}");
@@ -192,6 +201,29 @@ fn a_front_that_cannot_serve_is_refused_at_start() {
         assert_eq!(status, 2, "{why}");
         assert!(why.contains("https only"), "{why}");
     }
+}
+
+/// Asserts that an OCI address that is in use fails the start with status 1 (a restart may mend
+/// it), and the message names the address.
+#[tokio::test]
+async fn an_oci_address_in_use_is_status_1() {
+    let rig = Rig::new("oci-flags-in-use");
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("a socket");
+    let addr = held.local_addr().expect("an address").to_string();
+    let mut args = rig.args(&[]);
+    let at = args
+        .iter()
+        .position(|arg| arg == "--oci-listen")
+        .expect("flag");
+    args[at + 1] = addr.clone();
+    let cli = Cli::try_parse_from(args).expect("flags");
+    let stop = std::future::pending::<()>();
+    let error = run_serving(&cli, stop, |_| ()).await.expect_err("refused");
+    assert_eq!(exit_status(&error), 1);
+    assert!(
+        error.to_string().starts_with(&format!("binding {addr}: ")),
+        "{error}"
+    );
 }
 
 /// Asserts that a bucket called `metricz` is refused like the other probe paths.

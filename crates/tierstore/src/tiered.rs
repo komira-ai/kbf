@@ -641,6 +641,13 @@ impl Inner {
             Err(Error::NotFound(_)) => {}
             found => return found,
         }
+        // A read of a part, with the hot tier too full to take a copy, asks the cold tier for
+        // that part alone: a whole read per chunk of a long blob would be quadratic.
+        if let Some(part) = range
+            && self.level().await >= Level::Critical
+        {
+            return self.cold.get(key, Some(part)).await;
+        }
         let body = self.cold.get(key, None).await?;
         self.copy_back(key, &body).await;
         match range {

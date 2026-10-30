@@ -2,6 +2,7 @@
 //! certificate names the address clients dial.
 
 use std::net::{IpAddr, SocketAddr};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -75,13 +76,16 @@ const KEY_FLAG: &str = "--oci-tls-key";
 /// The acceptor for the certificate chain in `cert` and the key in `key` (both PEM), which serves
 /// HTTP/1.1 only and asks no client for a certificate. The leaf must carry an IP subjectAltName
 /// for `listen` (any IP subjectAltName, when `listen` is the unspecified address), since the
-/// clients of the front dial an IP address and accept only a certificate that names it.
+/// clients of the front dial an IP address and accept only a certificate that names it. A leaf
+/// that is expired or not yet valid is refused, and so is a key file that others can read (a
+/// group may, as the key of a service often is).
 ///
-/// The files are read once: a new certificate takes a restart.
+/// The files are read once: a new certificate takes a restart, so renew it before it expires.
 ///
 /// # Errors
 /// A file that cannot be read, PEM that is not a certificate chain and a key, a certificate that
-/// does not name the address, or a key that is not the leaf's.
+/// does not name the address or is not valid now, a key file any user can read, or a key that is
+/// not the leaf's.
 pub fn acceptor(cert: &Path, key: &Path, listen: SocketAddr) -> Result<TlsAcceptor, OciError> {
     let read = |flag, path: &Path| {
         std::fs::read(path).map_err(|source| OciError::Read {
@@ -103,9 +107,18 @@ pub fn acceptor(cert: &Path, key: &Path, listen: SocketAddr) -> Result<TlsAccept
     let Some(leaf) = chain.first() else {
         return Err(pem_error(CERT_FLAG, cert, "no certificate".to_owned()));
     };
-    let named = ip_names(leaf).map_err(|why| pem_error(CERT_FLAG, cert, why))?;
-    if let Some(why) = unnamed(&named, listen) {
+    let facts = Facts::of(leaf).map_err(|why| pem_error(CERT_FLAG, cert, why))?;
+    if let Some(why) = unnamed(&facts.ips, listen) {
         return Err(pem_error(CERT_FLAG, cert, why));
+    }
+    if let Some(why) = facts.not_valid_now() {
+        return Err(pem_error(CERT_FLAG, cert, why));
+    }
+    // A mode that cannot be read counts as open to all.
+    let mode = std::fs::metadata(key).map_or(0o777, |meta| meta.permissions().mode());
+    if mode & 0o007 != 0 {
+        let why = "any user can read the key; make it mode 0640 or 0600".to_owned();
+        return Err(pem_error(KEY_FLAG, key, why));
     }
     let private = PrivateKeyDer::from_pem_slice(&key_pem)
         .map_err(|why| pem_error(KEY_FLAG, key, format!("not a PEM private key: {why}")))?;
@@ -122,10 +135,40 @@ pub fn acceptor(cert: &Path, key: &Path, listen: SocketAddr) -> Result<TlsAccept
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
-/// The IP addresses the certificate `leaf` names in its subjectAltName.
-fn ip_names(leaf: &CertificateDer<'_>) -> Result<Vec<IpAddr>, String> {
-    let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref())
-        .map_err(|why| format!("the first certificate is not X.509: {why}"))?;
+/// What the front needs to know of a leaf certificate.
+struct Facts {
+    /// The IP addresses it names in its subjectAltName.
+    ips: Vec<IpAddr>,
+    /// Whether the time now is within its validity.
+    valid: bool,
+    /// Its validity, as text, for the message of a refusal.
+    period: String,
+}
+
+impl Facts {
+    fn of(leaf: &CertificateDer<'_>) -> Result<Self, String> {
+        let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref())
+            .map_err(|why| format!("the first certificate is not X.509: {why}"))?;
+        let validity = parsed.validity();
+        Ok(Self {
+            ips: ip_names(&parsed),
+            valid: validity.is_valid(),
+            period: format!(
+                "notBefore {}, notAfter {}",
+                validity.not_before, validity.not_after
+            ),
+        })
+    }
+
+    /// Why the certificate cannot be served now, or `None` if it can.
+    fn not_valid_now(&self) -> Option<String> {
+        let period = &self.period;
+        (!self.valid).then(|| format!("the certificate is not valid now ({period})"))
+    }
+}
+
+/// The IP addresses the certificate `parsed` names in its subjectAltName.
+fn ip_names(parsed: &x509_parser::certificate::X509Certificate<'_>) -> Vec<IpAddr> {
     // A subjectAltName that cannot be read names nothing.
     let alt = parsed.subject_alternative_name().ok().flatten();
     let names = alt
@@ -135,7 +178,7 @@ fn ip_names(leaf: &CertificateDer<'_>) -> Result<Vec<IpAddr>, String> {
         GeneralName::IPAddress(bytes) => ip_of(bytes),
         _ => None,
     });
-    Ok(ips.collect())
+    ips.collect()
 }
 
 /// The address of 4 bytes (IPv4) or 16 (IPv6).
