@@ -9,9 +9,9 @@ use serde::Serialize;
 
 use crate::ids::{LeaseId, RunId};
 use crate::wire::{
-    AcquireRequest, Granted, Host, HostList, HostSource, HostState, Lease, LeaseList, LeaseState,
-    Mount, Outcome, PendingLease, ReleaseState, Released, RenewRequest, Renewed, Run, RunAccepted,
-    RunList, RunSpec, RunState, Shape, Taint,
+    AcquireRequest, Granted, Host, HostList, HostLoad, HostSource, HostState, Lease, LeaseList,
+    LeaseState, Mount, Outcome, PendingLease, ReleaseState, Released, RenewRequest, Renewed, Run,
+    RunAccepted, RunList, RunSpec, RunState, Shape, Taint,
 };
 
 /// The ttl of a lease that asks for none (the server's `--default-ttl`).
@@ -152,6 +152,7 @@ struct HostRow {
     taint: Option<Taint>,
     /// A code the host refuses every new run with, short of a taint.
     refusing: Option<&'static str>,
+    load: Option<HostLoad>,
 }
 
 struct RunRow {
@@ -390,6 +391,8 @@ impl State {
                 mark: None,
                 reserved_for: None,
                 drain_deadline_ms: None,
+                // A lost host lists none, as the server does.
+                load: row.load.clone().filter(|_| !row.lost),
             })
             .collect();
         json(200, &HostList { hosts })
@@ -575,6 +578,13 @@ impl State {
         self.hosts
             .get_mut(host)
             .map(|row| row.refusing = code)
+            .is_some()
+    }
+
+    pub(super) fn set_load(&mut self, host: &str, load: Option<HostLoad>) -> bool {
+        self.hosts
+            .get_mut(host)
+            .map(|row| row.load = load)
             .is_some()
     }
 

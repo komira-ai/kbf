@@ -13,7 +13,10 @@
 //! - `note_pack_reads` and `note_pack_writes`: the task's reads and its one pack are
 //!   counted by the frontend's own ingest.
 //! - `Welcome.pack_commit` and `placement_load`: nothing here commits a pack through
-//!   `CommitPack`, and the host reports no load, so the farm places it by booking alone.
+//!   `CommitPack`. The host's load is not the worker's to measure: it is the agent's, listed
+//!   by the lease server with the host and handed to the farm with a heartbeat ([`super::load`]);
+//!   a host with none listed, or one gone stale, sends none, and the farm places it by
+//!   booking alone.
 //! - `Start.kind`, `device_id`, `job` and `fence`: the node report names `container` as its
 //!   only driver, so the farm places only actions on it, with no device; the worker fences
 //!   every run it starts, as a daemon does that is told nothing else.
@@ -57,6 +60,7 @@ use kbf_types::WorkerId;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::executor::load::Seen;
 use crate::executor::runs::Task;
 use crate::executor::{Ctx, HostInfo, View, lease_gone, release_lease};
 use crate::farm::{Outbound, Reported, StreamId};
@@ -121,6 +125,8 @@ pub(super) struct HostWorker {
     pub(super) ends_at: Instant,
     pub(super) draining: Option<Drain>,
     pub(super) tasks: BTreeMap<kbf_types::LeaseId, Task>,
+    /// The newest load the lease server listed for the host, until the farm has it.
+    load: Option<Seen>,
 }
 
 impl Drop for HostWorker {
@@ -159,6 +165,7 @@ impl HostWorker {
             ends_at,
             draining: None,
             tasks: BTreeMap::new(),
+            load: None,
         }
     }
 
@@ -202,7 +209,7 @@ impl HostWorker {
             self.reconnect(ctx, now).await;
         }
         self.renew(ctx, now, false).await?;
-        self.watch(ctx, view)?;
+        self.watch(ctx, view, now)?;
         self.launch(ctx, now).await?;
         self.poll(ctx, now).await?;
         self.settle(ctx, now);
@@ -309,8 +316,11 @@ impl HostWorker {
     }
 
     /// What the lease server's host list says of this host: lost is fenced, tainted drains.
-    fn watch(&mut self, ctx: &Ctx<'_>, view: &View) -> ControlFlow<Retire> {
+    fn watch(&mut self, ctx: &Ctx<'_>, view: &View, now: Instant) -> ControlFlow<Retire> {
         let host = view.host(&self.host);
+        if let Some(host) = host {
+            self.load = Seen::after_poll(self.load.take(), host.load.as_ref(), now);
+        }
         let lost = host.is_some_and(kbf_lease_client::Host::is_lost);
         let tainted = host.is_some_and(kbf_lease_client::Host::is_tainted);
         if tainted {
@@ -372,10 +382,20 @@ impl HostWorker {
         self.beats.retain(|(_, sent)| now < *sent + START_VALIDITY);
         self.next_beat = now + ctx.cfg.heartbeat;
         let running = self.listed();
+        let load = self
+            .load
+            .as_mut()
+            .and_then(|seen| seen.take(now, ctx.cfg.host_check));
+        // Taken by the accept rule like a daemon's reading: the scheduler is handed what it
+        // accepts, with the heartbeat.
+        let fed = ctx
+            .deps
+            .farm
+            .note_node_load(&self.id, self.stream, load.as_ref());
         let acked = ctx
             .deps
             .farm
-            .heartbeat_with_load(&self.id, self.stream, self.seq, running, None)
+            .heartbeat_with_load(&self.id, self.stream, self.seq, running, fed)
             .await;
         if acked {
             self.last_ack = now;

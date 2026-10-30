@@ -33,7 +33,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::{Config, Origin, Token};
 use crate::ids::{LeaseId, RunId};
-use crate::wire::{Mount, Outcome, RunState};
+use crate::wire::{HostLoad, Mount, Outcome, RunState};
 use crate::{Client, ConfigError};
 
 pub use state::Pool;
@@ -188,6 +188,12 @@ impl FakeLeaseServer {
     /// last state.
     pub fn set_lost(&self, host: &str, lost: bool) -> bool {
         locked(&self.shared.state).set_lost(host, lost)
+    }
+
+    /// The host's agent reports `load` (`None`: its newest heartbeat carried none), which
+    /// `GET /v1/hosts` lists unless the host is lost. False for a host the pool lacks.
+    pub fn set_host_load(&self, host: &str, load: Option<HostLoad>) -> bool {
+        locked(&self.shared.state).set_load(host, load)
     }
 
     /// The host reports a taint: it takes no new run.

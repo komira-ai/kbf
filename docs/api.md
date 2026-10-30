@@ -1823,6 +1823,18 @@ count since the frontend started (a restart starts them again from 0):
 | `kbf_sched_load_chose_slack_total`, `kbf_sched_load_chose_distrusted_total`, `kbf_sched_load_chose_concentrated_total`, `kbf_sched_load_chose_by_tie_break_total` | counter | of the scored placements: on a node predicted above its capacity; on a distrusted node; on a node concentrated on the lease's key; decided by the last tie-break |
 | `kbf_sched_load_fallback_cpu_limited_nodes` | gauge | live nodes charged by prediction because their newest reading says the actions cgroup has a CPU limit, while `--placement-load` is on: not a running total, and above 0 means a node whose cgroup limit and pool do not match |
 
+The js core also writes the `kbf_ablation_*` families, which split the counts above and a few
+more into the cases a run of the placement ablation is compared on (js alone, `--placement-load
+on`, `--placement-predictions` shadow or on). All are written from the start of a frontend on the
+js core and absent on the farm's own scheduler core:
+
+| Family | Type | Labels | What it measures |
+|---|---|---|---|
+| `kbf_ablation_placements_total` | counter | `decision` | `by_load`: leases admitted by the load rule on a node with a usable reading; `fallback_charge`: leases admitted on a node charged by prediction alone; `refused_over_capacity`: queued requests, once per request per round, that had a node with room apart from the rule and found none it admitted. All 0 while placement does not read the load. The nodes charged by prediction because of a CPU quota are `kbf_placement_cpu_limited_nodes` |
+| `kbf_ablation_charges_total` | counter | `source` | of the leases admitted by load: `profile_cpu` and `profile_memory` charged by their key's learned curve, `curve_flat` whose key has a curve that was not used |
+| `kbf_ablation_bookings_total` | counter | `source` | leases started, by what admission charged them: `prediction` (a learned estimate), `cold` (the cold costs of a key with no estimate), `retry` (a rerun up the memory ladder, charged at its rung), `default` (the request's cores and no memory) |
+| `kbf_ablation_oom_retries_total` | counter | `rung_gib` | leases given up after passing their own memory limit, by the whole GiB they run again at; a series for a rung only once something was retried at it |
+
 Each node that has a load in its view ([Node load](#node-load); `GET /v1/nodes/{id}`) has one
 sample of each of these, labelled `node` (the node id) as the pack families are: at most one series
 per node the frontend has accepted a reading of. A node with no accepted reading has none. A node
