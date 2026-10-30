@@ -3,13 +3,15 @@
 //! `:drain`, `:uncordon`"). The calls are the ones of `kbf cluster drain` and `kbf cluster
 //! undrain`.
 //!
+//! - **placed**: `GET /v1/nodes/<node>`, before the drain: a node that is not `serving` was
+//!   taken out of placement by somebody else, and the caller does not undrain it.
 //! - **drain**: `POST /v1/nodes/<node>:drain` with `{"deadline_secs": N}`, or with no body
 //!   when there is no deadline. The frontend cordons the node (no new lease; its leases run
 //!   on) and waits for the leases for `N` seconds, or however long they run. The call returns
 //!   at once with the node as it is then.
 //! - **leases**: `GET /v1/nodes/<node>`, the length of `leases`. A node that is `serving`
 //!   is not drained (somebody returned it), and that is an error, not zero leases.
-//! - **undrain**: `POST /v1/nodes/<node>:uncordon`.
+//! - **undrain**: `POST /v1/nodes/<node>:uncordon`, for a node that was in placement.
 //!
 //! A storage host runs a daemon only sometimes (`storage-and-daemon` does; `storage` does not),
 //! and the host's role does not say which: [`NodeDrain::if_present`] drains the daemon if the
@@ -71,6 +73,14 @@ impl NodeDrain {
             .ok_or_else(|| PortError::other(format!("{} has no usable node id", host.alias)))
     }
 
+    fn read(reply: &Reply, node: &str) -> Result<Node, PortError> {
+        serde_json::from_slice(&reply.body).map_err(|_| {
+            PortError::other(format!(
+                "{WHAT}'s answer for node {node} is not what it should be"
+            ))
+        })
+    }
+
     /// A 200 is the reply; a 404 says the frontend does not know the node, which is `None` for
     /// a host that may run no daemon and a failure for any other; anything else is the
     /// failure of the status.
@@ -87,8 +97,18 @@ impl NodeDrain {
 }
 
 impl Drain for NodeDrain {
-    fn placed(&self, _host: &Host) -> Result<Placed, PortError> {
-        Ok(Placed::In)
+    fn placed(&self, host: &Host) -> Result<Placed, PortError> {
+        let node = Self::node(host)?;
+        let Some(reply) = self.judged(self.api.get(&format!("/v1/nodes/{node}"))?, node)? else {
+            // No node here: nothing was in placement, and nothing is left out.
+            return Ok(Placed::In);
+        };
+        let read: Node = Self::read(&reply, node)?;
+        Ok(if read.placement.state == "serving" {
+            Placed::In
+        } else {
+            Placed::Out
+        })
     }
 
     fn drain(&self, host: &Host, deadline: Option<Duration>) -> Result<(), PortError> {
@@ -105,11 +125,7 @@ impl Drain for NodeDrain {
         let Some(reply) = self.judged(self.api.get(&format!("/v1/nodes/{node}"))?, node)? else {
             return Ok(0);
         };
-        let read: Node = serde_json::from_slice(&reply.body).map_err(|_| {
-            PortError::other(format!(
-                "{WHAT}'s answer for node {node} is not what it should be"
-            ))
-        })?;
+        let read = Self::read(&reply, node)?;
         if read.placement.state == "serving" {
             return Err(PortError::other(format!(
                 "node {node} is serving again; it is no longer drained"
