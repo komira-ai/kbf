@@ -165,9 +165,10 @@ pub struct Limits {
     pub locate_heads_per_request: usize,
     /// The most digests one `GET /locate` asks the pack index about; the others are `absent`.
     pub locate_packed_per_request: usize,
-    /// How long the presence checks of one `GET /locate` may take together, the wait for a
-    /// place among all requests' checks included: a blob not answered by then is `absent` (and
-    /// the answer not remembered).
+    /// How long the store phase of one `GET /locate` may take: the index ask and the presence
+    /// checks together, the wait for a place among all requests' checks included. An index not
+    /// answering by then is a 503; a blob whose check is not answered is `absent` (and the
+    /// answer not remembered).
     pub locate_head_timeout: Duration,
 }
 

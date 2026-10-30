@@ -35,6 +35,8 @@ struct Source {
     asked: Mutex<Vec<Vec<Digest>>>,
     heads: Mutex<Vec<Digest>>,
     index_down: AtomicBool,
+    /// The index never answers.
+    index_hang: AtomicBool,
     blobs_down: AtomicBool,
     /// Presence checks wait here when it is set, and are counted while they wait.
     head_gate: Option<tokio::sync::Semaphore>,
@@ -103,6 +105,9 @@ impl BlobSource for Source {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(digests.to_vec());
+            if self.index_hang.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             if self.index_down.load(Ordering::SeqCst) {
                 return Err(down());
             }
@@ -902,7 +907,8 @@ async fn the_table_is_charged_to_the_budget_before_it_is_built() {
 /// checks, so that a store that never answers keeps a request (and its reads place) for as long
 /// as the queue takes: with one reads place, 40 large blobs and a store that never answers, the
 /// request ends at its deadline on a paused clock with every large blob `absent`, only the
-/// places' worth of checks ever started, a GET is then served (the place was given back), and
+/// places' worth of checks ever started, a GET issued while it waits is served when the deadline
+/// gives the place back, and
 /// the next locate, with the store answering, finds the blobs (the stuck checks gave their
 /// places back).
 #[tokio::test(start_paused = true)]
@@ -922,7 +928,22 @@ async fn the_deadline_covers_the_wait_for_a_place_and_a_get_is_served_after() {
     };
     let rig = rig(source, limits);
     let token = rig.token(a.action);
-    let reply = rig.locate(&token).await;
+    let header = format!("Bearer {token}");
+    let mut locate = Box::pin(rig.locate(&token));
+    // Run the locate until its checks are stuck: it holds the one reads place.
+    while rig.source.heads.lock().unwrap().len() < HEADS_IN_FLIGHT {
+        assert!(futures::poll!(locate.as_mut()).is_pending());
+        tokio::task::yield_now().await;
+    }
+    let path = format!("/{}", a.files[40]);
+    let mut get = Box::pin(rig.read.respond(&Method::GET, &path, Some(&header)));
+    assert!(
+        futures::poll!(get.as_mut()).is_pending(),
+        "the GET waits for the place the locate holds"
+    );
+    // The deadline frees the place: the locate ends with every large blob absent, only the
+    // places' worth of checks ever started, and the GET is served.
+    let reply = locate.await;
     let first = table(&reply);
     assert!(
         a.files[..40]
@@ -931,12 +952,7 @@ async fn the_deadline_covers_the_wait_for_a_place_and_a_get_is_served_after() {
     );
     assert_eq!(rig.source.heads.lock().unwrap().len(), HEADS_IN_FLIGHT);
     drop(reply);
-
-    let header = format!("Bearer {token}");
-    let got = rig
-        .read
-        .respond(&Method::GET, &format!("/{}", a.files[40]), Some(&header))
-        .await;
+    let got = get.await;
     assert_eq!(got.status, StatusCode::OK);
     assert_eq!(&got.body[..], b"small");
 
@@ -968,8 +984,42 @@ async fn a_request_asks_the_index_about_at_most_the_cap() {
     let rig = rig(source, limits);
     let table = table(&rig.locate(&rig.token(a.action)).await);
     let packed = table.values().filter(|l| l["pack"].is_object()).count();
-    assert_eq!(packed, 3);
+    let absent = table.values().filter(|l| l["absent"] == true).count();
+    // The Action, Command, root, subdirectory and deep file, and five files.
+    assert_eq!((table.len(), packed, absent), (10, 3, 7));
     let asked = rig.source.asked();
     assert_eq!(asked.len(), 1);
     assert_eq!(asked[0].len(), 3);
+}
+
+/// Catches: an index that never answers holding a reads place for ever: on a paused clock the
+/// locate is a 503 `store_unavailable` at its deadline, a GET issued meanwhile is served once
+/// the deadline frees the place, and a locate after the index is back is answered.
+#[tokio::test(start_paused = true)]
+async fn an_index_that_never_answers_is_unavailable_at_the_deadline_and_frees_the_place() {
+    let source = Source::default();
+    let a = build(&source, "a", &[b"alpha".to_vec()]);
+    source.index_hang.store(true, Ordering::SeqCst);
+    let limits = Limits {
+        reads_in_flight: 1,
+        locate_head_timeout: Duration::from_secs(5),
+        ..small()
+    };
+    let rig = rig(source, limits);
+    let token = rig.token(a.action);
+    let header = format!("Bearer {token}");
+    let mut locate = Box::pin(rig.locate(&token));
+    while rig.source.asked().is_empty() {
+        assert!(futures::poll!(locate.as_mut()).is_pending());
+        tokio::task::yield_now().await;
+    }
+    let path = format!("/{}", a.files[0]);
+    let mut get = Box::pin(rig.read.respond(&Method::GET, &path, Some(&header)));
+    assert!(futures::poll!(get.as_mut()).is_pending());
+    let refused = locate.await;
+    assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(&refused.body[..], b"store_unavailable\n");
+    assert_eq!(get.await.status, StatusCode::OK);
+    rig.source.index_hang.store(false, Ordering::SeqCst);
+    assert_eq!(rig.locate(&token).await.status, StatusCode::OK);
 }

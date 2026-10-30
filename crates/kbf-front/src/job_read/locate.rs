@@ -24,14 +24,17 @@
 //! bounded without trusting them: at most [`super::Limits::locate_packed_per_request`] digests
 //! are asked of the index and [`super::Limits::locate_heads_per_request`] large digests checked
 //! in tierstore (the rest are `absent`, which is always safe), the checks of all requests
-//! together run at most [`HEADS_IN_FLIGHT`] at a time, and the whole check phase of a request,
-//! the wait for a place included, has one deadline, [`super::Limits::locate_head_timeout`]: what
-//! is not answered by then is `absent` for that request and not remembered, so a request holds
-//! its reads place for that long at most. The table is charged to the read budget before any of it is built, at
-//! [`MAX_LOCATE_LINE_BYTES`] for each digest (the longest line there can be), and a request takes
-//! one of the reads in flight while it asks the stores. Each digest is charged
-//! [`MAX_LOCATE_LINE_BYTES`] and the 256 bytes it costs while the table is made. A span whose length is not the digest's
-//! size, or whose pack key is longer than an object key can be, is `absent`.
+//! together run at most [`HEADS_IN_FLIGHT`] at a time, and the whole store phase of a request,
+//! the index ask and the presence checks (the wait for a place included), has one deadline,
+//! [`super::Limits::locate_head_timeout`], so a request holds its reads place for that long at
+//! most. An index that does not answer by then is a 503 (`store_unavailable`, as when it fails:
+//! answering `absent` for every digest would hide an outage from the task and its operator).
+//! Presence checks not answered by then are `absent` for that request and not remembered.
+//! The table is charged to the read budget before any of it is built, at
+//! [`MAX_LOCATE_LINE_BYTES`] and the 256 bytes it costs while the table is made for each
+//! digest, and a request takes one of the reads in flight while it asks the stores. A span
+//! whose length is not the digest's size, or whose pack key is longer than an object key can be,
+//! is `absent`.
 //!
 //! [`super::Limits::stream_over`] must equal the pack store's `max_blob_bytes`: a blob between
 //! them is asked of the index, which does not hold it, and is `absent`.
@@ -280,14 +283,17 @@ impl JobRead {
             .take(self.limits.locate_packed_per_request)
             .copied()
             .collect();
-        let spans = self.source.locate_packed(&packed).await.map_err(|_| ())?;
+        // One deadline for the stores: the index ask and then the presence checks.
+        let deadline = Instant::now() + self.limits.locate_head_timeout;
+        let asked = tokio::time::timeout_at(deadline, self.source.locate_packed(&packed)).await;
+        let spans = asked.map_err(|_| ())?.map_err(|_| ())?;
         let large: Vec<Digest> = digests
             .iter()
             .filter(|d| d.size_bytes > over)
             .take(self.limits.locate_heads_per_request)
             .copied()
             .collect();
-        let held = self.large_objects(&large).await?;
+        let held = self.large_objects(&large, deadline).await?;
         // What the source did not answer for is absent: the task asks the listener for it.
         let mut entries: HashMap<Digest, Entry> = HashMap::new();
         for (digest, at) in packed.iter().zip(spans) {
@@ -316,11 +322,15 @@ impl JobRead {
 
     /// The length of the object of each of `large` that tierstore holds, for those that were
     /// answered: what was found out lately is taken from the memory first (before any check can
-    /// change it), and the rest are checked together under one deadline,
-    /// [`Limits::locate_head_timeout`], that covers the wait for a place among the checks of all
+    /// change it), and the rest are checked together under `deadline` (that of the request's
+    /// store phase, [`Limits::locate_head_timeout`] from its start), which covers the wait for a place among the checks of all
     /// requests as well as the checks. A digest not answered by then is left out (it is
     /// `absent` for this request) and nothing is remembered for it. `Err` when a check failed.
-    async fn large_objects(&self, large: &[Digest]) -> Result<Vec<(Digest, Option<u64>)>, ()> {
+    async fn large_objects(
+        &self,
+        large: &[Digest],
+        deadline: Instant,
+    ) -> Result<Vec<(Digest, Option<u64>)>, ()> {
         let mut held = Vec::with_capacity(large.len());
         let mut unknown = Vec::new();
         for digest in large {
@@ -329,7 +339,6 @@ impl JobRead {
                 None => unknown.push(digest),
             }
         }
-        let deadline = Instant::now() + self.limits.locate_head_timeout;
         let mut checks: FuturesUnordered<_> = unknown
             .into_iter()
             .map(|digest| async move { (*digest, self.large_object(digest).await) })
