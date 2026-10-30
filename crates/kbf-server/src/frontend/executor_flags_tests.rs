@@ -18,8 +18,19 @@ fn argv(more: &[&str]) -> Vec<String> {
         "--pack-store-endpoint=http://127.0.0.1:9",
         "--pack-store-bucket=packs",
         "--pack-store-credentials-file=/nowhere",
+        // What `--executor js-agent` prepares its runs with, which the parse requires.
+        "--task-secret-file=/nowhere/secret",
+        "--task-put-endpoint=http://127.0.0.1:9",
+        "--task-put-bucket=packs",
+        "--task-put-credentials-file=/nowhere/presign.json",
+        "--task-read-url=https://127.0.0.1:9400",
+        "--job-listen=127.0.0.1:9400",
+        "--job-tls-cert=/nowhere/job.pem",
+        "--job-tls-key=/nowhere/job.key",
+        "--job-grant-secret-file=/nowhere/secret",
     ]
     .iter()
+    .filter(|flag| !more.iter().any(|m| name(m) == name(flag)))
     .chain(more)
     .map(ToString::to_string)
     .collect()
@@ -33,7 +44,7 @@ fn parsed(argv: Vec<String>) -> Result<FrontendFlags, String> {
 }
 
 /// The flags `--executor js-agent` needs, and nothing it can do without.
-const JS: [&str; 10] = [
+const JS: [&str; 11] = [
     "--executor=js-agent",
     "--executor-lease-url=http://127.0.0.1:7",
     "--executor-lease-token-file=/etc/token",
@@ -44,6 +55,8 @@ const JS: [&str; 10] = [
     "--executor-host-memory-gib=32",
     "--executor-insecure-argv-secrets",
     "--executor-images-have-no-entrypoint",
+    // The tier store of the task flags is `http://`, as it is until it serves TLS.
+    "--executor-allow-plain-http-put",
 ];
 
 /// The name of a flag given as `--name=value`.
@@ -194,7 +207,13 @@ fn js_agent_settings_become_the_executors_config() {
 /// as text in the flags and are the config's.
 #[test]
 fn the_defaults_are_the_executors_own() {
-    let flags = js_with(&[]).expect("flags");
+    let mut all: Vec<&str> = JS
+        .iter()
+        .copied()
+        .filter(|flag| *flag != "--executor-allow-plain-http-put")
+        .collect();
+    all.push("--task-put-endpoint=https://127.0.0.1:9");
+    let flags = parsed(argv(&all)).expect("flags");
     let config = flags.executor.js.expect("js-agent").config;
     let own = Config::new("front-1", 2, "farm-linux", 8_000, 32 << 30);
     assert_eq!(config.slots, own.slots);
@@ -209,6 +228,39 @@ fn the_defaults_are_the_executors_own() {
     assert_eq!(config.default_timeout, own.default_timeout);
     assert_eq!(config.call_timeout, own.call_timeout);
     assert_eq!(own.delivery, config.delivery);
+}
+
+/// Catches a default image that is taken when it is not pinned by digest, or dropped when it is:
+/// the scheme is optional, a tag is refused naming the flag, and no flag is no default (an
+/// action that names no image is then the caller's to fix).
+#[test]
+fn the_default_image_is_pinned_by_digest() {
+    let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let own = format!("registry.test/base@sha256:{digest}");
+    for given in [own.clone(), format!("docker://{own}")] {
+        let flags = js_with(&[&format!("--executor-default-image={given}")]).expect("flags");
+        let image = flags.executor.js.expect("js-agent").default_image;
+        assert_eq!(image.map(|i| i.to_string()), Some(own.clone()), "{given}");
+    }
+    assert!(
+        js_with(&[])
+            .expect("flags")
+            .executor
+            .js
+            .expect("js")
+            .default_image
+            .is_none()
+    );
+    for tag in [
+        "registry.test/base:22.04",
+        &format!("registry.test/base:22.04@sha256:{digest}"),
+        "registry.test/base",
+        "registry.test/base@sha256:abc",
+        "",
+    ] {
+        let why = refused(&[&format!("--executor-default-image={tag}")]);
+        assert!(why.contains("--executor-default-image"), "{tag}: {why}");
+    }
 }
 
 /// Catches a lease server, a tool, a certificate or a directory that is not one being taken:
@@ -281,6 +333,7 @@ fn flags_of(url: &str, token: &Path, ca: Option<&Path>) -> JsAgentFlags {
         token_file: token.to_path_buf(),
         ca_file: ca.map(Path::to_path_buf),
         images_have_no_entrypoint: false,
+        default_image: None,
     }
 }
 

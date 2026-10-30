@@ -49,6 +49,8 @@ executor-arch = "x86_64"
 executor-call-timeout-secs = 5
 # The lease server's class every lease asks for (the pool of hosts the executor draws from). Used only with `--executor js-agent`
 # executor-class = "CLASS"
+# The image, pinned by digest as `<repository>@sha256:<64 hex digits>` (a leading `docker://` is optional), that an action runs in when it names no `container-image` platform property. An action that names one runs in its own. A tag is refused, and an action with neither is refused as invalid. Like every image of the farm, it must not set an `ENTRYPOINT` (see `--executor-images-have-no-entrypoint`). Used only with `--executor js-agent`
+# executor-default-image = "IMAGE"
 # The timeout, in seconds, of an action that names none: at most `--executor-max-run-secs`. Used only with `--executor js-agent`
 executor-default-timeout-secs = 3000
 # The name of this frontend on the lease server: the value of the `kbf-frontend` label on its leases, by which a restarted frontend finds them and releases the ones it no longer needs. 1 to 63 of letters, digits, `-`, `_` and `.`. It must be different for each frontend (not copied with the config). Used only with `--executor js-agent`

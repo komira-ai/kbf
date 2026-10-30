@@ -11,9 +11,12 @@
 //!   read grant. The executor asks for them in three steps ([`Ingest::mint`], then
 //!   [`Presign::put_url`], then [`Inputs::read_grant`]), so what the one call returned is parked
 //!   under the lease and handed out once. The write host and the size cap are the
-//!   preparation's: it signs for one store endpoint and the signer limits the object.
+//!   preparation's: it signs for one store endpoint and the signer limits the object. A run
+//!   that cannot be prepared is the caller's ([`MintError::Refused`]) unless the store could
+//!   not be read ([`MintError::Unavailable`]): see [`RunPrep`]'s [`PrepareFault`].
 //! - **The action's facts** are read from the Action and the Command in the CAS: the image from
-//!   the `container-image` platform property, which must name the image by digest, and the
+//!   the `container-image` platform property, which must name the image by digest (an action
+//!   that names none is run in the operator's default image, if there is one), and the
 //!   timeout. Whether the image sets an `ENTRYPOINT` is in the image's config, which the
 //!   frontend never reads, so it is not known: every action is refused as such unless the
 //!   operator said no image of the farm sets one.
@@ -22,6 +25,7 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use kbf_front::prepare_run::{PrepareError as RunPrepError, PrepareFault, RunPrep};
 use kbf_front::{Backend, IssuedPackKey, PackKeyMint, Packs};
 use kbf_proto::reapi::{self, Action, Command, Digest};
 use kbf_types::{DigestFunction, ImageRef, LeaseId};
@@ -77,14 +81,72 @@ pub trait RunPrepare: Send + Sync {
     ) -> Result<PreparedRun, PrepareError>;
 }
 
+impl From<PrepareError> for MintError {
+    fn from(error: PrepareError) -> Self {
+        match error {
+            PrepareError::Refused(why) => Self::Refused(why),
+            PrepareError::Unavailable(why) => Self::Unavailable(why),
+        }
+    }
+}
+
+/// The frontend's real preparation, [`RunPrep`], as the executor asks for it: its own wall per
+/// run (`prepare_run_for`), the values of its [`RunInputs`](kbf_front::prepare_run::RunInputs)
+/// with the two secrets wrapped, and its refusal by whose it is to fix.
+///
+/// No error text carries the presigned url or the token: they exist only in a success.
+#[tonic::async_trait]
+impl RunPrepare for RunPrep {
+    async fn prepare_run(
+        &self,
+        lease: &str,
+        action: &kbf_types::Digest,
+        now: SystemTime,
+        wall: Duration,
+    ) -> Result<PreparedRun, PrepareError> {
+        let run = self
+            .prepare_run_for(lease, action, now, wall)
+            .await
+            .map_err(prepare_error)?;
+        Ok(PreparedRun {
+            key: run.key.key().to_owned(),
+            put_url: Secret::new(run.put_url),
+            grant_url: run.read_grant.url,
+            grant_token: Secret::new(run.read_grant.token.expose()),
+            not_after: run.read_grant.not_after,
+        })
+    }
+}
+
+fn prepare_error(error: RunPrepError) -> PrepareError {
+    let why = error.to_string();
+    match error.fault() {
+        PrepareFault::Unavailable => PrepareError::Unavailable(why),
+        PrepareFault::Refused => PrepareError::Refused(why),
+    }
+}
+
 /// What the preparation of task runs is made of: the mint and the preparation, both built from
-/// the same secrets as the frontend's task flags. A frontend that runs `--executor js-agent`
-/// is started with one ([`crate::frontend::start_frontend_with`]).
+/// the same secrets as the frontend's task flags. The frontend makes one from its
+/// [`RunPrep`] ([`RunSource::of`]); a test may start one with another preparation
+/// ([`crate::frontend::start_frontend_with`]).
 pub struct RunSource {
     /// The mint that issues the keys and verifies them in the ingest.
     pub mint: PackKeyMint,
     /// The preparation of a run's write and read grant.
     pub prepare: Arc<dyn RunPrepare>,
+}
+
+impl RunSource {
+    /// The source over `prep`: its own mint, which signs the keys it prepares, so the ingest
+    /// verifies the keys that were issued.
+    #[must_use]
+    pub fn of(prep: &Arc<RunPrep>) -> Self {
+        Self {
+            mint: prep.mint().clone(),
+            prepare: prep.clone(),
+        }
+    }
 }
 
 /// What a frontend builds the executor's seams from.
@@ -99,6 +161,8 @@ pub struct FrontParts {
     pub prepare: Arc<dyn RunPrepare>,
     /// Whether the operator says no image of the farm sets an `ENTRYPOINT`.
     pub images_have_no_entrypoint: bool,
+    /// The image, pinned by digest, of an action that names none.
+    pub default_image: Option<ImageRef>,
 }
 
 /// What [`Front`] holds of one run between the three steps.
@@ -174,17 +238,17 @@ impl Ingest for Front {
         action: &Digest,
         wall: Duration,
     ) -> Result<PackKey, MintError> {
-        let action = cas_digest(action).map_err(MintError)?;
+        let action = cas_digest(action).map_err(MintError::Refused)?;
         let now = (self.now)();
         let prepared = self
             .parts
             .prepare
             .prepare_run(&build_id(lease), &action, now, wall)
             .await
-            .map_err(|e| MintError(e.to_string()))?;
+            .map_err(MintError::from)?;
         let needed = seconds(now).saturating_add(wall.as_secs());
         if prepared.not_after < needed {
-            return Err(MintError(
+            return Err(MintError::Refused(
                 "the write and the grant end before the run's wall time does".to_owned(),
             ));
         }
@@ -296,7 +360,7 @@ impl Inputs for Front {
             .ok_or_else(|| InputsError::Invalid("the action names no command".to_owned()))?;
         let command = cas_digest(command).map_err(InputsError::Invalid)?;
         let command: Command = self.read("command", &command).await?;
-        let image = image_of(&action, &command)?;
+        let image = image_of(&action, &command, self.parts.default_image.as_ref())?;
         if !self.parts.images_have_no_entrypoint {
             return Err(InputsError::Invalid(
                 "whether the action's image sets an ENTRYPOINT is in the image's config, which \
@@ -325,16 +389,26 @@ impl Inputs for Front {
     }
 }
 
-/// The action's image, by digest, from the platform of the Action or else the Command's.
+/// The action's image, by digest, from the platform of the Action or else the Command's; the
+/// operator's `default` if the action names none.
 #[allow(deprecated)]
-fn image_of(action: &Action, command: &Command) -> Result<String, InputsError> {
+fn image_of(
+    action: &Action,
+    command: &Command,
+    default: Option<&ImageRef>,
+) -> Result<String, InputsError> {
     let platform: Option<&reapi::Platform> = action.platform.as_ref().or(command.platform.as_ref());
-    let value = platform
+    let named = platform
         .and_then(|p| p.properties.iter().find(|p| p.name == IMAGE_PROPERTY))
-        .map(|p| p.value.as_str())
-        .ok_or_else(|| {
-            InputsError::Invalid(format!("the action names no {IMAGE_PROPERTY} property"))
-        })?;
+        .map(|p| p.value.as_str());
+    let Some(value) = named else {
+        return default.map(ImageRef::to_string).ok_or_else(|| {
+            InputsError::Invalid(format!(
+                "the action names no {IMAGE_PROPERTY} property, and the executor has no \
+                 --executor-default-image"
+            ))
+        });
+    };
     ImageRef::parse(value)
         .map(|image| image.to_string())
         .map_err(|e| InputsError::Invalid(e.to_string()))

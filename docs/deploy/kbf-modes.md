@@ -144,10 +144,26 @@ also carries the process that made it: a frontend that starts and finds leases o
 process under its own id watches them for a renewal (the longest a live executor goes without
 one, 30 s, plus the fence time) before it takes them over, and stops if one is renewed; it takes
 them if none is, as after a crash. Nothing asks for a host meanwhile. A restart of the frontend fails the builds in flight, and
-stopping it stops the runs and releases the leases. The binary does not yet give the executor
-the preparation of a run's write url and read grant (kbf#1966), so `--executor js-agent` is
-refused at start ("started without the preparation of task runs") until it does. `GET /metrics` gains the
-`kbf_executor_*` families. The remaining settings are `--executor-host-slots` (default 8),
+stopping it stops the runs and releases the leases. The executor prepares each run with the
+frontend's **task runs** (below) and its job-facing read listener (`--job-listen`), so
+`--executor js-agent` is refused when the flags are read unless `--task-secret-file` (with the
+four flags it needs), `--job-listen` (with its three) and `--pack-store-endpoint` are given, and
+unless they agree with it: the tier store and the read url must be IP addresses (the job network
+has no DNS); `--task-put-bucket` must be `--pack-store-bucket`, the bucket the pack is read
+from; an `http://` `--task-put-endpoint` needs `--executor-allow-plain-http-put` (with an
+`https://` one the flag is only warned about); and the longest run (`--executor-max-run-secs`
+plus `--executor-run-margin-secs`) must fit 14400 s less `--task-url-slack-secs`, the longest a
+presigned write may be good for once the slack is added. A lease ttl over 3600 s is warned
+about: the lease server grants at most its `--max-ttl` (3600 s unless started with another) and
+clamps the ask. The run's wall time is the action's timeout plus the margin, and
+`--task-run-wall-secs` is not used by the executor. A run that cannot be prepared because an
+input blob is missing, malformed or over the closure budget ends as an invalid argument to its
+caller and is not rerun; one that cannot be prepared because the store cannot be read is rerun.
+`--executor-default-image` (`<repository>@sha256:<digest>`, the `docker://` scheme optional)
+is the image of an action that names no `container-image` property; an action that names one
+runs in its own, a tag is refused, and an action with neither is refused as invalid. The
+presigned write and the read token are never part of an error, a log line or a metric.
+`GET /metrics` gains the `kbf_executor_*` families. The remaining settings are `--executor-host-slots` (default 8),
 `--executor-run-margin-secs` (300; what a run's wall time adds to the action's timeout),
 `--executor-lease-ttl-secs` (3600), `--executor-max-run-secs` and
 `--executor-default-timeout-secs` (3000), `--executor-call-timeout-secs` (5),

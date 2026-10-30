@@ -180,6 +180,7 @@ impl Rig {
                 mint: PackKeyMint::new(SECRET).expect("a mint"),
                 prepare: prepared.clone(),
                 images_have_no_entrypoint,
+                default_image: None,
             },
             clock,
         );
@@ -331,7 +332,11 @@ async fn a_run_that_cannot_be_prepared_is_not_a_key_and_says_why() {
             .front
             .mint(lease(), &action_digest(), Duration::from_secs(60))
             .await;
-        assert_eq!(refused.err(), Some(MintError(why.to_string())));
+        let expected = match &why {
+            PrepareError::Refused(why) => MintError::Refused(why.clone()),
+            PrepareError::Unavailable(why) => MintError::Unavailable(why.clone()),
+        };
+        assert_eq!(refused.err(), Some(expected));
     }
     let not_a_digest = reapi::Digest {
         hash: "xyz".to_owned(),
@@ -483,6 +488,83 @@ async fn an_image_is_refused_unless_the_operator_says_none_sets_an_entrypoint() 
         panic!("not refused: {refused:?}");
     };
     assert!(why.contains("ENTRYPOINT"), "{why}");
+}
+
+/// Catches a refusal of the real preparation being sorted by its text or its kind and not by whose
+/// it is to fix: only a store that could not be read is the farm's to retry; a blob that is
+/// missing, a tree over budget and a lease no key can carry are the caller's, and neither says
+/// more than the preparation did.
+#[test]
+fn the_real_preparations_refusals_are_sorted_by_whose_they_are() {
+    use kbf_front::prepare_run::ClosureError;
+    let digest = kbf_types::Digest::new(DigestFunction::Sha256, [9; 32], 5);
+    let unavailable = RunPrepError::Closure(ClosureError::Unavailable {
+        digest,
+        why: "the store is down".to_owned(),
+    });
+    let text = unavailable.to_string();
+    assert_eq!(
+        prepare_error(unavailable),
+        PrepareError::Unavailable(text.clone())
+    );
+    assert!(text.contains("the store is down"), "{text}");
+    for refused in [
+        RunPrepError::Closure(ClosureError::Missing {
+            what: "a file",
+            digest,
+        }),
+        RunPrepError::Closure(ClosureError::TooManyDigests { limit: 3 }),
+        RunPrepError::Clock,
+    ] {
+        let text = refused.to_string();
+        assert_eq!(prepare_error(refused), PrepareError::Refused(text));
+    }
+}
+
+/// Catches the operator's default image missing where an action names none, or replacing one
+/// that does: an action with no `container-image` runs in `--executor-default-image`, one that
+/// names an image runs in its own, and one with neither is the caller's to fix, told which flag
+/// would have run it.
+#[tokio::test]
+async fn an_action_that_names_no_image_runs_in_the_default_one() {
+    let mut rig = Rig::new(true);
+    rig.front.parts.default_image = Some(ImageRef::parse(OTHER_IMAGE).expect("an image"));
+    let bare = rig.action(|_| {}, |_| {}).await;
+    let facts = rig.front.action(&bare).await.expect("runs in the default");
+    assert_eq!(facts.image, OTHER_IMAGE.trim_start_matches("docker://"));
+    let named = rig
+        .action(|action| action.platform = Some(platform(IMAGE)), |_| {})
+        .await;
+    let facts = rig.front.action(&named).await.expect("runs in its own");
+    assert_eq!(facts.image, IMAGE.trim_start_matches("docker://"));
+
+    rig.front.parts.default_image = None;
+    let refused = rig.front.action(&bare).await;
+    let Err(InputsError::Invalid(why)) = refused else {
+        panic!("not refused: {refused:?}");
+    };
+    assert!(
+        why.contains("container-image") && why.contains("--executor-default-image"),
+        "{why}"
+    );
+}
+
+/// Catches an image the action names being excused by the default: an action that names a tag
+/// is refused, whether or not there is a default image.
+#[tokio::test]
+async fn a_default_image_does_not_excuse_an_image_that_is_named_by_tag() {
+    let mut rig = Rig::new(true);
+    rig.front.parts.default_image = Some(ImageRef::parse(OTHER_IMAGE).expect("an image"));
+    let tagged = rig
+        .action(
+            |action| action.platform = Some(platform("docker://registry.test/app:latest")),
+            |_| {},
+        )
+        .await;
+    assert!(matches!(
+        rig.front.action(&tagged).await,
+        Err(InputsError::Invalid(_))
+    ));
 }
 
 /// Catches blobs that cannot be had being taken for a bad action: a CAS that does not hold the

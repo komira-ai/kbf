@@ -53,6 +53,46 @@ async fn lease_server(hosts: &[&str]) -> FakeLeaseServer {
     FakeLeaseServer::start(pool).await
 }
 
+/// The flags the host executor prepares its runs with, over files in `dir`: the task flags and
+/// the job-facing read listener (on loopback, with a certificate that names it), which share
+/// one secret, as they do in a deployment.
+fn beside_flags(dir: &Path) -> Vec<String> {
+    let private = |name: &str, bytes: &[u8]| {
+        let file = dir.join(name);
+        std::fs::write(&file, bytes).expect("written");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        file.display().to_string()
+    };
+    let secret = private(
+        "task.secret",
+        b"0123456789abcdef0123456789abcdef-the-farm\n",
+    );
+    let presign = private(
+        "presign.json",
+        br#"{"access_key_id": "k", "secret_access_key": "s"}"#,
+    );
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+    params.subject_alt_names = vec![rcgen::SanType::IpAddress(
+        std::net::Ipv4Addr::LOCALHOST.into(),
+    )];
+    let key = rcgen::KeyPair::generate().expect("key");
+    let cert = params.self_signed(&key).expect("certificate");
+    let cert = private("job.pem", cert.pem().as_bytes());
+    let key = private("job.key", key.serialize_pem().as_bytes());
+    vec![
+        format!("--task-secret-file={secret}"),
+        "--task-put-endpoint=http://127.0.0.1:9".to_owned(),
+        "--task-put-bucket=kbf-fake".to_owned(),
+        format!("--task-put-credentials-file={presign}"),
+        "--task-read-url=https://127.0.0.1:9400".to_owned(),
+        "--job-listen=127.0.0.1:0".to_owned(),
+        format!("--job-tls-cert={cert}"),
+        format!("--job-tls-key={key}"),
+        format!("--job-grant-secret-file={secret}"),
+        "--executor-allow-plain-http-put".to_owned(),
+    ]
+}
+
 /// The flags of a frontend with packs on the S3 service at `endpoint`, and the executor flags
 /// `executor`, which name the lease server `fake`.
 fn flags(dir: &Path, s3: &FakeS3, fake: &FakeLeaseServer, executor: &[&str]) -> FrontendFlags {
@@ -60,6 +100,7 @@ fn flags(dir: &Path, s3: &FakeS3, fake: &FakeLeaseServer, executor: &[&str]) -> 
     std::fs::write(&token, TOKEN).expect("written");
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).expect("mode");
     let mut more = pack_flags(s3.endpoint(), dir);
+    more.extend(beside_flags(dir));
     more.extend([
         format!("--executor-lease-url={}", fake.origin()),
         format!("--executor-lease-token-file={}", token.display()),
@@ -241,8 +282,14 @@ async fn a_frontend_that_cannot_build_its_executor_does_not_start() {
     let js = ["--executor=js-agent", "--executor-insecure-argv-secrets"];
 
     let good = flags(dir.path(), &s3, &fake, &js);
-    let why = started(&good, None).err().expect("refused").to_string();
+    let mut no_task = good.clone();
+    no_task.task = None;
+    let why = started(&no_task, None).err().expect("refused").to_string();
     assert!(why.contains("preparation of task runs"), "{why}");
+    assert!(why.contains("--task-secret-file"), "{why}");
+    // The frontend makes its own source from the task flags: no test source is needed.
+    let (own, _stop) = started(&good, None).expect("starts over its own preparation");
+    drop(own);
 
     let mut no_packs = good.clone();
     no_packs.packs = None;

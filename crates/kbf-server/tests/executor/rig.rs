@@ -160,7 +160,7 @@ pub struct FakeIngest {
     pub panics: std::sync::atomic::AtomicUsize,
     pub script: Mutex<VecDeque<Ingested>>,
     /// The reason the next mint fails for, if any.
-    pub mint_fails: Mutex<Option<String>>,
+    pub mint_fails: Mutex<Option<MintError>>,
     pub calls: Mutex<Vec<(kbf_types::LeaseId, String, UntrustedLimits)>>,
 }
 
@@ -196,7 +196,7 @@ impl Ingest for FakeIngest {
         _wall: Duration,
     ) -> Result<PackKey, MintError> {
         match locked(&self.mint_fails).take() {
-            Some(why) => Err(MintError(why)),
+            Some(why) => Err(why),
             None => Ok(PackKey::new(format!(
                 "cas/b/{}/{}-0",
                 build_id(lease),

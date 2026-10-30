@@ -3,6 +3,7 @@
 
 use kbf_front::Finished;
 use kbf_lease_client::Mount;
+use kbf_server::executor::MintError;
 use tonic::Code;
 
 use crate::rig::{Posted, Rig};
@@ -165,6 +166,25 @@ async fn an_image_with_an_entrypoint_is_refused_to_its_caller() {
     assert!(rig.runs().await.is_empty());
 }
 
+/// Catches a run the preparation refuses (an input not held, a tree over budget) being rerun as
+/// if the farm were at fault: asking again gives the same answer, so it is the caller's to fix
+/// and ends as an invalid argument, not as a retry, and nothing is posted.
+#[tokio::test(start_paused = true)]
+async fn a_run_the_preparation_refuses_is_the_callers_not_rerun() {
+    let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
+    rig.pump().await;
+    *rig.ingest.mint_fails.lock().expect("mint") =
+        Some(MintError::Refused("an input is not held".to_owned()));
+    let caller = rig.submit(3);
+    let finished = rig.until_done(&caller, 3).await;
+    assert_eq!(code(&finished), Code::InvalidArgument, "{finished:?}");
+    assert!(
+        format!("{finished:?}").contains("an input is not held"),
+        "{finished:?}"
+    );
+    assert!(rig.runs().await.is_empty(), "posted without a key");
+}
+
 /// Catches a key the mint would not issue being posted anyway: the run needs a key to write,
 /// and without one it is infrastructure, so nothing is posted and the farm runs the action
 /// again, which the mint then answers.
@@ -172,7 +192,8 @@ async fn an_image_with_an_entrypoint_is_refused_to_its_caller() {
 async fn a_pack_key_that_cannot_be_issued_is_rerun_not_posted() {
     let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
     rig.pump().await;
-    *rig.ingest.mint_fails.lock().expect("mint") = Some("no secret".to_owned());
+    *rig.ingest.mint_fails.lock().expect("mint") =
+        Some(MintError::Unavailable("no secret".to_owned()));
     let caller = rig.submit(3);
     rig.farm.tick().await;
     crate::rig::settle().await;

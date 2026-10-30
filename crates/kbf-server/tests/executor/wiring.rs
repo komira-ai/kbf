@@ -131,6 +131,17 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         "--pack-store-endpoint=http://127.0.0.1:9".to_owned(),
         "--pack-store-bucket=packs".to_owned(),
         "--pack-store-credentials-file=/nowhere".to_owned(),
+        // What the flags need beside the executor: only parsed here, the test prepares its own
+        // runs (`real_prep.rs` opens the real ones).
+        "--task-secret-file=/nowhere/secret".to_owned(),
+        "--task-put-endpoint=http://127.0.0.1:9300".to_owned(),
+        "--task-put-bucket=packs".to_owned(),
+        "--task-put-credentials-file=/nowhere/presign.json".to_owned(),
+        "--task-read-url=https://127.0.0.1:9400".to_owned(),
+        "--job-listen=127.0.0.1:9400".to_owned(),
+        "--job-tls-cert=/nowhere/job.pem".to_owned(),
+        "--job-tls-key=/nowhere/job.key".to_owned(),
+        "--job-grant-secret-file=/nowhere/secret".to_owned(),
         "--executor=js-agent".to_owned(),
         format!("--executor-lease-url={}", fake.origin()),
         format!("--executor-lease-token-file={}", token.display()),

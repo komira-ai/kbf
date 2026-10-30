@@ -23,7 +23,7 @@ use crate::executor::host::{Drain, HostWorker, Retire};
 use crate::executor::metrics::{IngestEnd, Metrics, RunEnd};
 use crate::executor::outcome::{Settled, Verdict, judge, ran, result_of};
 use crate::executor::task::{Nonce, PackKey, TaskArgs};
-use crate::executor::traits::{Ingested, InputsError, PresignError, UntrustedLimits};
+use crate::executor::traits::{Ingested, InputsError, MintError, PresignError, UntrustedLimits};
 use crate::executor::{Ctx, note};
 
 /// The label that names a run by the nonce drawn for its `POST`, so a run whose `202` was
@@ -352,7 +352,12 @@ impl HostWorker {
             .ingest
             .mint(lease, action, wall)
             .await
-            .map_err(|e| Settled::Infra(format!("no key for the pack: {e}")))?;
+            .map_err(|e| match e {
+                MintError::Refused(why) => Settled::Invalid(format!("no key for the pack: {why}")),
+                MintError::Unavailable(why) => {
+                    Settled::Infra(format!("no key for the pack: {why}"))
+                }
+            })?;
         let pack = ctx
             .deps
             .presign

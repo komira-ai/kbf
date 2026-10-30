@@ -270,6 +270,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "executor-arch",
             "executor-call-timeout-secs",
             "executor-class",
+            "executor-default-image",
             "executor-default-timeout-secs",
             "executor-frontend-id",
             "executor-host-cpus",

@@ -75,10 +75,18 @@ pub enum Ingested {
     Unavailable(String),
 }
 
-/// Why a pack key was not issued.
+/// Why a pack key was not issued, and whose to fix: the same run asked again gives the same
+/// answer when it is refused, and may give another when the store was unavailable.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{0}")]
-pub struct MintError(pub String);
+pub enum MintError {
+    /// The run cannot be prepared as asked (an input missing or over budget, a digest that is
+    /// not one, a configuration that does not sign): the caller's to fix, and settled as such.
+    #[error("{0}")]
+    Refused(String),
+    /// The store could not answer: the farm runs the action again.
+    #[error("{0}")]
+    Unavailable(String),
+}
 
 /// Issues, reads, verifies and commits the pack a task wrote. Called after a run ended with
 /// the task tool's exit 0, and never with a lock of the farm held.

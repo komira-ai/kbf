@@ -26,6 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::{Arg, ArgAction, ArgMatches};
 use kbf_front::{Backend, Packs};
 use kbf_lease_client::{Client, Origin, Token};
+use kbf_types::ImageRef;
 
 use crate::Farm;
 use crate::executor::{
@@ -48,6 +49,7 @@ const ROOT_DER: &str = "executor_root_der";
 const WORK_DIR: &str = "executor_work_dir";
 const PLAIN_PUT: &str = "executor_allow_plain_http_put";
 const INSECURE: &str = "executor_insecure_argv_secrets";
+const DEFAULT_IMAGE: &str = "executor_default_image";
 const NO_ENTRYPOINT: &str = "executor_images_have_no_entrypoint";
 const MARGIN: &str = "executor_run_margin_secs";
 const TTL: &str = "executor_lease_ttl_secs";
@@ -253,6 +255,17 @@ pub(super) fn args() -> Vec<Arg> {
              one, and the frontend does not read an image's config: without this every action \
              is refused as such. Used only with `--executor js-agent`",
         ),
+        text(
+            DEFAULT_IMAGE,
+            "executor-default-image",
+            "IMAGE",
+            "The image, pinned by digest as `<repository>@sha256:<64 hex digits>` (a leading \
+             `docker://` is optional), that an action runs in when it names no `container-image` \
+             platform property. An action that names one runs in its own. A tag is refused, and \
+             an action with neither is refused as invalid. Like every image of the farm, it \
+             must not set an `ENTRYPOINT` (see `--executor-images-have-no-entrypoint`). Used \
+             only with `--executor js-agent`",
+        ),
         number(
             MARGIN,
             "executor-run-margin-secs",
@@ -307,6 +320,8 @@ pub struct JsAgentFlags {
     pub ca_file: Option<PathBuf>,
     /// `--executor-images-have-no-entrypoint`.
     pub images_have_no_entrypoint: bool,
+    /// `--executor-default-image`, by digest.
+    pub default_image: Option<ImageRef>,
 }
 
 /// What `--executor` says: the daemons, or hosts of a lease server.
@@ -432,7 +447,21 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
             .unwrap_or_default(),
         ca_file,
         images_have_no_entrypoint: m.get_flag(NO_ENTRYPOINT),
+        default_image: m
+            .get_one::<String>(DEFAULT_IMAGE)
+            .map(|value| default_image(value))
+            .transpose()?,
     })
+}
+
+/// The image `--executor-default-image` names: by digest, with or without the `docker://`
+/// scheme of the `container-image` property.
+fn default_image(value: &str) -> Result<ImageRef, String> {
+    let named = match value.starts_with("docker://") {
+        true => value.to_owned(),
+        false => format!("docker://{value}"),
+    };
+    ImageRef::parse(&named).map_err(|e| format!("--executor-default-image: {e}"))
 }
 
 /// The mount that puts the tool at `path` (`/mnt/<root>/<file>`), read-only.
@@ -469,6 +498,7 @@ impl JsAgentFlags {
             mint: source.mint,
             prepare: source.prepare,
             images_have_no_entrypoint: self.images_have_no_entrypoint,
+            default_image: self.default_image.clone(),
         })
     }
 
