@@ -98,6 +98,9 @@ pub struct Listeners {
     pub vm_host_floor: HostFloor,
     /// Whether the farm shows `kbf-estimator` what finished (`--learned-sizes`).
     pub learned_sizes: crate::LearnedSizes,
+    /// Whether every `action` lease books the whole worker it lands on, so that one action
+    /// runs per worker (`--exclusive-actions`).
+    pub exclusive_actions: bool,
     /// Which core drives the farm's scheduling (`--scheduler-core`).
     pub scheduler_core: crate::SchedulerCore,
     /// Whether placement reads the load the nodes report (`--placement-load`).
@@ -570,6 +573,16 @@ pub(crate) fn log_core(farm: &Farm) {
     );
 }
 
+/// The line a start logs when `--exclusive-actions` is on, and none when it is off.
+pub(crate) const EXCLUSIVE_LINE: &str = "exclusive-actions: on";
+
+/// Logs [`EXCLUSIVE_LINE`] at a start with `--exclusive-actions` on.
+pub(crate) fn log_exclusive(on: bool) {
+    if on {
+        tracing::info!("{EXCLUSIVE_LINE}");
+    }
+}
+
 /// Logs where the scheduler's state is, at every start. Not generic, unlike the binding
 /// that calls it, so every test binary's runs count toward the same function's coverage.
 pub(crate) fn log_state(durable: bool, term: u64, epoch: u64) {
@@ -816,9 +829,11 @@ where
         memory: listeners.memory_ladder.first(),
         platform: listeners.default_platform,
         qos: listeners.qos_allowed,
+        exclusive_actions: listeners.exclusive_actions,
     };
     let farm = Farm::from_listeners(Arc::clone(&cache), &listeners).recording(recorder.clone());
     log_core(&farm);
+    log_exclusive(listeners.exclusive_actions);
     let durable = state.is_some();
     // Storage nodes register with a frontend that has a state store to keep them in.
     let members = members_of(state.as_ref(), None);

@@ -103,6 +103,7 @@ const GROUPS: &[(&str, &[&str])] = &[
         "scheduler",
         &[
             "default-platform",
+            "exclusive-actions",
             "finished-retention-secs",
             "heartbeat-interval-ms",
             "input-tree-cache-bytes",
