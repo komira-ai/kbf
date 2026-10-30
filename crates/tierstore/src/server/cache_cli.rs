@@ -133,23 +133,23 @@ pub(super) async fn serve_cache(
     stop: impl Future<Output = ()> + Send + 'static,
     ready: impl FnOnce(SocketAddr),
 ) -> Result<Drained, Error> {
-    serve_cache_over(settings, (upstream, None), disk, stop, ready).await
+    serve_cache_over(settings, upstream, None, disk, stop, ready).await
 }
 
 /// [`serve_cache`] over an upstream that may be a list of endpoints: `upstream` is read through
-/// and, if `endpoints` is given, it is the same list, whose `/readyz` poll runs beside the
+/// and `endpoints`, if given, is the same list as `upstream`, whose `/readyz` poll runs beside the
 /// server and which the front shows on `/readyz` and `/metricz`.
 ///
 /// # Errors
 /// As [`serve_cache`].
 pub(super) async fn serve_cache_over(
     settings: &CacheSettings,
-    upstream: (Arc<dyn Backend>, Option<Arc<Endpoints>>),
+    upstream: Arc<dyn Backend>,
+    endpoints: Option<Arc<Endpoints>>,
     disk: Arc<dyn Disk>,
     stop: impl Future<Output = ()> + Send + 'static,
     ready: impl FnOnce(SocketAddr),
 ) -> Result<Drained, Error> {
-    let (upstream, endpoints) = upstream;
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut config = server_config(&settings.front, Arc::clone(&clock))?;
     let run = probe_run_id(&settings.front.proxy_id, clock.now(), std::process::id());
@@ -228,7 +228,7 @@ pub(super) async fn run_cache(
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let endpoints = Arc::new(Endpoints::new(members, settings.failover, clock, probe));
     let upstream: Arc<dyn Backend> = endpoints.clone();
-    serve_cache_over(settings, (upstream, Some(endpoints)), disk, stop, ready).await
+    serve_cache_over(settings, upstream, Some(endpoints), disk, stop, ready).await
 }
 
 /// Runs the cache until SIGTERM or SIGINT.

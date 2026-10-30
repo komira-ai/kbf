@@ -32,8 +32,6 @@ kind             = "s3"
 bucket           = "kbf-fake"
 endpoint         = "{endpoint}"
 credentials_file = "{upstream_key}"
-# The fake S3 service has no /readyz, so it is not polled during the test.
-readyz_interval  = "1h"
 
 [[policy]]
 prefix = "cas/"

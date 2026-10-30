@@ -16,23 +16,20 @@ pub(in crate::server) trait Probe: Send + Sync {
     async fn ready(&self, endpoint: &str) -> bool;
 }
 
-/// The `host:port` that the URL `http://host[:port]` (or `https://`) names, with the port of the
-/// scheme (80, 443) where the URL gives none. `None` for a URL that has another scheme, a path
+/// The `host:port` that the URL `http://host[:port]` names, with port 80 where the URL gives
+/// none. `None` for a URL that has another scheme (`https://` too: the S3 client has no TLS), a path
 /// (a trailing `/` too), a query, user information, an empty host, a port that is not
 /// 1 to 65535, or a character that is not in a host name or an address (so the text is also safe
 /// to show as a label of a metric).
 pub(in crate::server) fn authority(url: &str) -> Option<String> {
-    let (rest, default) = match url.strip_prefix("http://") {
-        Some(rest) => (rest, 80),
-        None => (url.strip_prefix("https://")?, 443),
-    };
+    let rest = url.strip_prefix("http://")?;
     let allowed = |c: char| c.is_ascii_alphanumeric() || ".-_:[]".contains(c);
     if rest.is_empty() || !rest.chars().all(allowed) {
         return None;
     }
     let (host, port) = match rest.rsplit_once(':') {
         Some((host, port)) if !port.contains(']') => (host, port.parse::<u16>().ok()?),
-        _ => (rest, default),
+        _ => (rest, 80),
     };
     let bracketed = host.starts_with('[') && host.ends_with(']');
     if host.is_empty() || port == 0 || (host.contains(':') && !bracketed) {

@@ -216,7 +216,8 @@ async fn a_build_node_over_endpoints_follows_their_readiness() {
     let (told, addr) = oneshot::channel::<SocketAddr>();
     let running = serve_cache_over(
         &settings,
-        (upstream, Some(fleet.endpoints.clone())),
+        upstream,
+        Some(fleet.endpoints.clone()),
         disk,
         async move {
             let _ = stopped.await;
@@ -269,6 +270,32 @@ async fn a_cold_directory_that_cannot_be_opened_is_refused() {
         .await
         .unwrap_err();
     assert!(why.to_string().contains("--cold"), "{why}");
+    assert_eq!(exit_status(&why), 1);
+}
+
+/// Asserts that a list of endpoints one of which cannot be opened (the key file of the upstream
+/// is not there) is refused by `run_cache`, naming the key file, with exit status 1, and that
+/// nothing is served: the address is never told.
+#[tokio::test]
+async fn a_list_of_endpoints_that_cannot_be_opened_is_refused() {
+    let node = Node::new("tscache-cli-listrefused");
+    let missing = node.dir.path().join("no-such-credentials");
+    let s3 = format!(
+        "kind = \"s3\"\nbucket = \"b\"\nendpoints = [\"http://127.0.0.1:1\", \"http://127.0.0.1:2\"]\ncredentials_file = \"{}\"",
+        missing.display()
+    );
+    let text = node.text("", "").replace("kind = \"memory\"", &s3);
+    let settings = settings_from_text(&text, QUICK)
+        .unwrap()
+        .into_cache()
+        .unwrap();
+    assert_eq!(settings.endpoints.len(), 2);
+    let why = run_cache(&settings, std::future::ready(()), |_| {
+        panic!("a start that is refused tells no address")
+    })
+    .await
+    .unwrap_err();
+    assert!(why.to_string().contains("credentials"), "{why}");
     assert_eq!(exit_status(&why), 1);
 }
 

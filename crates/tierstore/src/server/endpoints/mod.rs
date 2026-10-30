@@ -29,8 +29,10 @@
 //! Both times come from injected parts (the [`Clock`] and the probe), so the tests move them by
 //! hand.
 //!
-//! Every endpoint starts ready. A call that finds every endpoint failed, not ready or backed off
-//! is [`Error::Unavailable`]; the cache then still serves the objects it holds, and its
+//! Every endpoint starts ready. A call that finds every endpoint skipped asks the ones that are
+//! only backed off, in order, as a last resort, so a sole endpoint that failed one request does
+//! not fail every key for the whole backoff. A call that finds every endpoint failed or not
+//! ready is [`Error::Unavailable`]; the cache then still serves the objects it holds, and its
 //! `/readyz` says 503 until an endpoint is usable again ([`Endpoints::is_ready`]).
 //!
 //! # Writes
@@ -207,7 +209,8 @@ impl Endpoints {
         futures::future::join_all(asking).await;
     }
 
-    /// Polls every [`EndpointsConfig::readyz_interval`] until `halt` is notified.
+    /// Polls every [`EndpointsConfig::readyz_interval`] until `halt` is notified, which also
+    /// ends a poll in flight.
     pub(super) async fn watch(&self, halt: Arc<Notify>) {
         loop {
             tokio::select! {
@@ -215,7 +218,11 @@ impl Endpoints {
                 () = halt.notified() => break,
                 () = tokio::time::sleep(self.config.readyz_interval) => {}
             }
-            self.poll().await;
+            tokio::select! {
+                biased;
+                () = halt.notified() => break,
+                () = self.poll() => {}
+            }
         }
     }
 
@@ -243,11 +250,33 @@ impl Endpoints {
         text
     }
 
+    /// Runs `call` on `member`, and backs the member off when the call is [`Error::Unavailable`].
+    async fn attempt<T, Fut>(
+        &self,
+        member: &Member,
+        call: &impl Fn(Arc<dyn Backend>) -> Fut,
+    ) -> Result<T, Error>
+    where
+        Fut: Future<Output = Result<T, Error>>,
+    {
+        let answer = call(Arc::clone(&member.backend)).await;
+        if matches!(&answer, Err(error) if error.is_unavailable()) {
+            let backoff = u64::try_from(self.config.unready_backoff.as_millis());
+            let until = self.clock.now().saturating_add(backoff.unwrap_or(u64::MAX));
+            member.skip_until.store(until, Ordering::SeqCst);
+        }
+        answer
+    }
+
     /// Runs `call` on the endpoints in the order of `key`, going past the ones that are skipped
     /// and the ones whose call is [`Error::Unavailable`], and gives the first other result.
-    /// A call that passed endpoints and was then answered counts one failover for each; one that
-    /// found none to answer counts one unavailable and gives the last failure, or
-    /// [`Error::Unavailable`] when every endpoint was skipped.
+    /// A call that passed endpoints and was then answered counts one failover for each.
+    ///
+    /// A call that found every endpoint skipped asks the ones that are only backed off, in the
+    /// same order, as a last resort (one that answers ends its backoff): a sole endpoint that
+    /// failed one request is not out for every key for the whole backoff. The ones that are
+    /// not ready are not asked. A call that found none to answer counts one unavailable and
+    /// gives the last failure, or [`Error::Unavailable`] when no endpoint was asked.
     async fn across<T, Fut>(
         &self,
         key: &str,
@@ -258,18 +287,19 @@ impl Endpoints {
     {
         let now = self.clock.now();
         let mut passed = Vec::new();
+        let mut backed_off = Vec::new();
         let mut failure = None;
         for place in rank(&self.names, key) {
             let member = &self.members[place];
             if let Some(why) = member.skipped(now) {
+                if why == Passed::Backoff {
+                    backed_off.push(member);
+                }
                 passed.push(why);
                 continue;
             }
-            match call(Arc::clone(&member.backend)).await {
+            match self.attempt(member, &call).await {
                 Err(error) if error.is_unavailable() => {
-                    let backoff = self.config.unready_backoff.as_millis();
-                    let until = self.clock.now().saturating_add(backoff as u64);
-                    member.skip_until.store(until, Ordering::SeqCst);
                     passed.push(Passed::RequestFailed);
                     failure = Some(error);
                 }
@@ -278,6 +308,17 @@ impl Endpoints {
                         let _ = self.failovers[why as usize].fetch_add(1, Ordering::Relaxed);
                     }
                     return answer;
+                }
+            }
+        }
+        if failure.is_none() {
+            for member in backed_off {
+                match self.attempt(member, &call).await {
+                    Err(error) if error.is_unavailable() => failure = Some(error),
+                    answer => {
+                        member.skip_until.store(0, Ordering::SeqCst);
+                        return answer;
+                    }
                 }
             }
         }

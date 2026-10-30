@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 
-use crate::{Backend, ByteRange, Error, Op};
+use crate::{Backend, ByteRange, Error, MemoryBackend, Op, TestClock};
 
-use super::Passed;
 use super::testing::{BACKOFF_MS, Fleet};
+use super::{Endpoints, EndpointsConfig, Passed, Probe};
 
 const BODY: &[u8] = b"0123456789abcdefghij";
 
@@ -187,8 +187,9 @@ async fn a_second_failure_backs_off_from_its_own_time() {
 
 /// Asserts that with every endpoint down an uncached call fails with the error of the last
 /// endpoint, each endpoint is asked once, the call counts as unavailable and no failover; that
-/// the next call asks none (all are backed off) and says why; that the fleet is not ready; and
-/// that it is ready again when the backoff has passed.
+/// the fleet is not ready; that the next call, which finds all backed off, asks each again as a
+/// last resort and fails the same way; and that the fleet is ready again when the backoff has
+/// passed.
 #[tokio::test]
 async fn with_every_endpoint_down_the_call_is_unavailable() {
     let key = "cas/b/pack";
@@ -204,12 +205,11 @@ async fn with_every_endpoint_down_the_call_is_unavailable() {
     assert!(!fleet.endpoints.is_ready());
 
     let error = fleet.endpoints.get(key, None).await.unwrap_err();
-    assert_eq!(
-        error,
-        Error::Unavailable("no upstream endpoint is ready".to_owned())
-    );
-    assert_eq!(fleet.all_gets(), [1, 1, 1]);
+    assert!(error.is_unavailable(), "{error}");
+    assert_eq!(fleet.all_gets(), [2, 2, 2]);
     assert_eq!(fleet.endpoints.unavailable(), 2);
+    assert_eq!(counted(&fleet), [0, 0, 0]);
+    assert!(!fleet.endpoints.is_ready());
 
     fleet.clock.advance(BACKOFF_MS);
     assert!(fleet.endpoints.is_ready());
@@ -267,11 +267,68 @@ async fn a_ready_poll_does_not_end_a_backoff() {
     fleet.faulty[0].set_down(false);
     fleet.endpoints.poll().await;
     assert!(!fleet.endpoints.is_ready());
-    assert!(fleet.endpoints.get(key, None).await.is_err());
     assert_eq!(fleet.gets(0), 1);
-    fleet.clock.advance(BACKOFF_MS);
-    assert!(fleet.endpoints.is_ready());
+    // The call finds the only endpoint backed off, asks it as a last resort and it answers,
+    // which ends the backoff.
     assert_eq!(&fleet.endpoints.get(key, None).await.unwrap()[..], BODY);
+    assert_eq!(fleet.gets(0), 2);
+    assert!(fleet.endpoints.is_ready());
+}
+
+/// Asserts that a sole endpoint that failed one request is asked again by the next call for
+/// another key, not failed for the whole backoff: the first call is unavailable and counted,
+/// the second is answered by the endpoint, nothing is counted as a failover, and the endpoint
+/// is ready again at once.
+#[tokio::test]
+async fn a_sole_endpoint_that_failed_one_request_answers_the_next() {
+    let fleet = Fleet::new(1);
+    fleet.put("cas/b/one", BODY).await;
+    fleet.put("cas/b/two", BODY).await;
+    let error = Error::Unavailable("the store answered 503".to_owned());
+    fleet.faulty[0].fail_next_with(Op::Get, error.clone());
+    assert_eq!(
+        fleet.endpoints.get("cas/b/one", None).await.unwrap_err(),
+        error
+    );
+    assert!(!fleet.endpoints.is_ready());
+    assert_eq!(fleet.endpoints.unavailable(), 1);
+
+    let body = fleet.endpoints.get("cas/b/two", None).await.unwrap();
+    assert_eq!(&body[..], BODY);
+    assert_eq!(fleet.gets(0), 2);
+    assert!(fleet.endpoints.is_ready());
+    assert_eq!(fleet.endpoints.unavailable(), 1);
+    assert_eq!(counted(&fleet), [0, 0, 0]);
+}
+
+/// Asserts that the last resort asks the endpoints that are only backed off and not the ones
+/// that are not ready: with the first of the order not ready and the second backed off, the
+/// call asks the second alone and it answers; with the second not ready too, it asks none.
+#[tokio::test]
+async fn the_last_resort_does_not_ask_an_endpoint_that_is_not_ready() {
+    let key = "cas/b/pack";
+    let fleet = holding(2, key).await;
+    let order = fleet.order(key);
+    let error = Error::Unavailable("the store answered 503".to_owned());
+    fleet.faulty[order[1]].fail_next_with(Op::Get, error);
+    fleet.probe.set(&fleet.names[order[0]], false);
+    fleet.endpoints.poll().await;
+    assert!(fleet.endpoints.get(key, None).await.is_err());
+    assert_eq!(fleet.all_gets()[order[1]], 1);
+
+    let body = fleet.endpoints.get(key, None).await.unwrap();
+    assert_eq!(&body[..], BODY);
+    assert_eq!(fleet.gets(order[0]), 0, "not ready: not asked");
+    assert_eq!(fleet.gets(order[1]), 2);
+
+    fleet.faulty[order[1]].set_down(true);
+    fleet.endpoints.get(key, None).await.unwrap_err();
+    assert_eq!(fleet.gets(order[1]), 3);
+    fleet.probe.set(&fleet.names[order[1]], false);
+    fleet.endpoints.poll().await;
+    let error = fleet.endpoints.get(key, None).await.unwrap_err();
+    assert!(error.is_unavailable(), "{error}");
+    assert_eq!(fleet.all_gets().iter().sum::<u64>(), 3, "none was asked");
 }
 
 /// Asserts that every read call fails over and gives the answer of the endpoint that serves it:
@@ -401,4 +458,35 @@ async fn a_halt_before_the_first_round_ends_the_poll() {
     halt.notify_one();
     fleet.endpoints.watch(halt).await;
     assert_eq!(fleet.probe.asked.available_permits(), 0);
+}
+
+/// Asserts that a halt ends a poll that is in flight: a probe that never answers would hold the
+/// loop, and the drain with it, if the halt were looked for only between rounds. The paused
+/// clock moves to the first round, which starts and does not end, and the halt then ends it.
+#[tokio::test(start_paused = true)]
+async fn a_halt_ends_a_poll_in_flight() {
+    struct Silent(tokio::sync::Semaphore);
+
+    #[async_trait::async_trait]
+    impl Probe for Silent {
+        async fn ready(&self, _endpoint: &str) -> bool {
+            self.0.add_permits(1);
+            std::future::pending().await
+        }
+    }
+
+    let silent = Arc::new(Silent(tokio::sync::Semaphore::new(0)));
+    let members: Vec<(String, Arc<dyn Backend>)> = vec![(
+        "http://192.0.2.1:9300".to_owned(),
+        Arc::new(MemoryBackend::new()),
+    )];
+    let config = EndpointsConfig::default();
+    let clock = Arc::new(TestClock::new());
+    let endpoints = Arc::new(Endpoints::new(members, config, clock, silent.clone()));
+    let halt = Arc::new(Notify::new());
+    let (watched, stop) = (Arc::clone(&endpoints), Arc::clone(&halt));
+    let watching = tokio::spawn(async move { watched.watch(stop).await });
+    silent.0.acquire().await.unwrap().forget();
+    halt.notify_one();
+    watching.await.unwrap();
 }

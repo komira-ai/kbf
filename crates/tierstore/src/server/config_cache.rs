@@ -37,8 +37,10 @@
 //! `skip_checks`, the reconciler's keys and `backend_check_wait`.
 //!
 //! `[cold_store]` names the upstream by `endpoint` or by `endpoints`, a list of 1 to 16 storage
-//! proxies over the same store; the cache tries them in an order that depends on the key (see
-//! [`endpoints`](super::endpoints)). Two keys of an S3 upstream set the failover:
+//! proxies over the same store; the cache tries them in an order that depends on the key and
+//! polls their `/readyz` (see [`endpoints`](super::endpoints)). A single `endpoint` is read
+//! directly: it is not polled, so an S3 server that has no `/readyz` can be the upstream. Two
+//! keys of an S3 upstream set the failover of a list (a single `endpoint` ignores them):
 //! `unready_backoff` (how long an endpoint that failed is skipped, default `5s`) and
 //! `readyz_interval` (the time between two polls of every endpoint's `/readyz`, default `2s`),
 //! each longer than zero and at most `1h`.
@@ -139,10 +141,10 @@ pub(super) struct CacheSettings {
     /// The upstream: the spec and the flags of an S3 bucket. Its `endpoint` is the first of
     /// `endpoints`.
     pub upstream: TierParts,
-    /// The endpoints of an S3 upstream, in the order of the file: one for `endpoint`, none for
-    /// an upstream that is not S3.
+    /// The list the file gave as `endpoints`, in its order: none for a single `endpoint` (which
+    /// is read directly, not polled) and for an upstream that is not S3.
     pub endpoints: Vec<String>,
-    /// How the endpoints fail over.
+    /// How the endpoints of a list fail over.
     pub failover: EndpointsConfig,
     /// The cache.
     pub cache: CacheConfig,
@@ -179,6 +181,11 @@ fn check_endpoints(endpoints: &[String], listed: bool) -> Result<(), ConfigError
         } else {
             "cold_store.endpoint".to_owned()
         };
+        if url.starts_with("https://") {
+            let why =
+                "https is not supported: the S3 client has no TLS yet; use http://host[:port]";
+            return Err(invalid(&key, why));
+        }
         if authority(url).is_none() {
             let why = "not an endpoint; use http://host[:port] with no path, user or query";
             return Err(invalid(&key, why));
@@ -230,6 +237,7 @@ impl CacheSettings {
         let upstream = tier("cold_store", &cold)?;
         let (endpoints, failover) = if upstream.spec.starts_with("s3:") {
             check_endpoints(&listed, as_list)?;
+            let listed = if as_list { listed } else { Vec::new() };
             let failover = EndpointsConfig {
                 unready_backoff: span("unready_backoff", timing.0, DEFAULT_UNREADY_BACKOFF)?,
                 readyz_interval: span("readyz_interval", timing.1, DEFAULT_READYZ_INTERVAL)?,

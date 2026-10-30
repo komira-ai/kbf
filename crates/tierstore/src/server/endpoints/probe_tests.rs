@@ -10,8 +10,8 @@ use tokio::sync::mpsc;
 use super::probe::{HttpProbe, Probe, authority};
 
 /// Asserts what `authority` makes of the URLs the file may give: the host and the port, the
-/// port of the scheme where there is none, an address in brackets; and what it refuses: another
-/// scheme, a path or a trailing slash, a query, user information, an empty host, a port that is
+/// port 80 where there is none, an address in brackets; and what it refuses: another
+/// scheme (https too), a path or a trailing slash, a query, user information, an empty host, a port that is
 /// empty, zero, too large or not a number, an address with colons and no brackets, and a
 /// character a host name does not have.
 #[test]
@@ -19,7 +19,7 @@ fn an_endpoint_names_a_host_and_a_port() {
     let accepted = [
         ("http://192.0.2.1:9300", "192.0.2.1:9300"),
         ("http://proxy-a.example", "proxy-a.example:80"),
-        ("https://proxy_a.example", "proxy_a.example:443"),
+        ("http://proxy_a.example", "proxy_a.example:80"),
         ("http://proxy-a.example:65535", "proxy-a.example:65535"),
         ("http://[2001:db8::1]:9300", "[2001:db8::1]:9300"),
         ("http://[2001:db8::1]", "[2001:db8::1]:80"),
@@ -29,6 +29,7 @@ fn an_endpoint_names_a_host_and_a_port() {
     }
     let refused = [
         "ftp://192.0.2.1:9300",
+        "https://192.0.2.1:9300",
         "192.0.2.1:9300",
         "http://",
         "http://:9300",

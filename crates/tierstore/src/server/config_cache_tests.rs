@@ -159,7 +159,10 @@ fn a_build_node_file_makes_a_cache() {
         Some(Path::new("/etc/tierstore-cache/upstream-read.key"))
     );
     assert_eq!(cache.scrub_rate, Some(50 << 20));
-    assert_eq!(cache.endpoints, ["http://192.0.2.20:9300"]);
+    assert!(
+        cache.endpoints.is_empty(),
+        "a single endpoint is not polled"
+    );
     let failover = cache.failover;
     assert_eq!(failover.unready_backoff, Duration::from_millis(750));
     assert_eq!(failover.readyz_interval, Duration::from_millis(1500));
@@ -200,7 +203,7 @@ fn a_build_node_file_has_the_defaults_of_the_flags_and_of_the_cache() {
 }
 
 /// Asserts that an S3 upstream without the timing keys fails over with 5 seconds of backoff and
-/// a poll every 2 seconds, and keeps the one `endpoint` as the one endpoint.
+/// a poll every 2 seconds, and does not make the one `endpoint` a list of endpoints.
 #[test]
 fn an_s3_upstream_has_the_default_failover() {
     let text = CACHE
@@ -209,10 +212,11 @@ fn an_s3_upstream_has_the_default_failover() {
     let cache = cache_of(&text);
     assert_eq!(cache.failover.unready_backoff, Duration::from_secs(5));
     assert_eq!(cache.failover.readyz_interval, Duration::from_secs(2));
-    assert_eq!(cache.endpoints, ["http://192.0.2.20:9300"]);
+    assert!(cache.endpoints.is_empty());
 }
 
-/// Asserts that a single `endpoints` entry is the upstream, as `endpoint` is.
+/// Asserts that a single `endpoints` entry is the upstream, as `endpoint` is, and is a list
+/// of one (polled), which `endpoint` is not.
 #[test]
 fn a_list_of_one_endpoint_is_the_upstream() {
     let one = cache_with(
@@ -384,6 +388,20 @@ fn a_build_node_file_is_refused_when_it_cannot_be_run() {
                 "endpoint         = \"http://user@192.0.2.20:9300\"",
             ),
             "cold_store.endpoint: not an endpoint",
+        ),
+        (
+            cache_with(
+                "endpoint         = \"http://192.0.2.20:9300\"",
+                "endpoint         = \"https://192.0.2.20:9300\"",
+            ),
+            "cold_store.endpoint: https is not supported",
+        ),
+        (
+            cache_with(
+                "endpoint         = \"http://192.0.2.20:9300\"",
+                "endpoints = [\"http://a:1\", \"https://b:2\"]",
+            ),
+            "cold_store.endpoints[1]: https is not supported",
         ),
         (
             cache_with("\"750ms\"", "\"0s\""),

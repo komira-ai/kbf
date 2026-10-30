@@ -392,9 +392,9 @@ scrub.
 | `local_cache.max_concurrent_fills` | the most fills that run at once (1 to 64, default 4); a miss that finds them all running is served from the upstream and kept nowhere |
 | `local_cache.cache` | `true`, the default; `false` is refused (leave `[local_cache]` out to run without a cache) |
 | `local_cache.scrub_rate` | a size and `/s`, such as `"50MiB/s"`: accepted, and not used by this release |
-| `cold_store.endpoints` | a list of 1 to 16 `http://host[:port]` endpoints of an `s3` upstream, in place of `endpoint` (not both; each once; no path, user or query): see below |
-| `cold_store.unready_backoff` | how long an endpoint that failed a request is skipped (default `"5s"`; longer than zero, at most `"1h"`); an `s3` upstream only |
-| `cold_store.readyz_interval` | the time between two polls of every endpoint's `/readyz` (default `"2s"`; longer than zero, at most `"1h"`); an `s3` upstream only |
+| `cold_store.endpoints` | a list of 1 to 16 `http://host[:port]` endpoints of an `s3` upstream, in place of `endpoint` (not both; each once; no path, user or query; `https://` is refused, the S3 client has no TLS yet): see below |
+| `cold_store.unready_backoff` | how long an endpoint that failed a request is skipped (default `"5s"`; longer than zero, at most `"1h"`); an `s3` upstream only; a single `endpoint` ignores it |
+| `cold_store.readyz_interval` | the time between two polls of every endpoint's `/readyz` (default `"2s"`; longer than zero, at most `"1h"`); an `s3` upstream only; a single `endpoint` ignores it |
 
 `[cold_store]` is the upstream: any `kind` (an `s3` bucket, with `endpoint` and a `credentials_file`
 of a read-only key, in practice), and without `skip_checks` and the keys of the reconciler. `[server]`
@@ -402,7 +402,7 @@ is as for a storage node, without `backend_check_wait`. A `[[policy]]` with `cac
 The three tables `[hot_store]`, `[local_cache]` and `[cold_store]` together are refused: the hot
 store is already local disk.
 
-**Several endpoints.** `endpoints` lists storage proxies over the same store, so any one of them
+**Several endpoints.** A single `endpoint` is read directly: it is not polled and has no failover, so an S3 server with no `/readyz` can be the upstream. `endpoints` lists storage proxies over the same store, so any one of them
 serves any key. For each call the cache ranks the endpoints by rendezvous (highest-random-weight)
 hashing of the key and tries them in that order. The weight of an endpoint for a key is the first
 eight bytes, as a big-endian number, of the SHA-256 of the endpoint's URL as the file writes it, a
@@ -416,11 +416,11 @@ that timed out, a 408 or 429, or a 5xx other than 501 and 507. Any other answer 
 is final (the endpoints share the store), and so are 403, 412 and 413. An endpoint that failed is
 skipped for `unready_backoff`, and the next call that ranks it after that tries it again. An
 endpoint is also skipped while its `GET /readyz` did not answer 200 at the last poll (a draining
-proxy answers 503 there while it still serves). The poll runs every `readyz_interval`, the first
+proxy answers 503 there while it still serves). A call that finds every endpoint skipped asks the ones that are only backed off, in the same order, as a last resort (one that answers ends its backoff), so one failed request does not fail every key for the whole backoff; it does not ask an endpoint that is not ready. The poll runs every `readyz_interval`, the first
 one an interval after the start; every endpoint is taken to be ready until then. A call that finds
 no endpoint to try is answered 503 `ServiceUnavailable`; the objects the cache holds are still
 served, and the cache's own `GET /readyz` is 503 (`no upstream endpoint is ready`) until an
-endpoint is usable again. The cache is read-only in this release, so there is no failover of a
+endpoint is usable again. The first request to an endpoint that does not answer takes up to `--s3-request-timeout` (60 s by default) to fail; after that the poll, which gives up on an endpoint in 2 s, keeps it out of the way. The cache is read-only in this release, so there is no failover of a
 write.
 
 At start the process makes the directory, removes what a fill that was running left in `.stage/`,
@@ -442,8 +442,8 @@ fill included, so the byte hit ratio is the first over the sum of the two), `fil
 slot taken), `fill_failures_total{reason}` (`hash_mismatch`, `upstream_error`,
 `short_body`, `local_io`, `changed`, `aborted`), `evictions_total{reason}` (`budget`, `floor`), `pinned_skips_total`,
 `discarded_at_start_total`, and the gauges `bytes`, `objects`, `fs_free_bytes` and `staging_files`.
-With an `s3` upstream it adds `upstream_failovers_total{reason}` (the endpoints a call went past
-before one answered: `request_failed`, `not_ready`, `backoff`), `upstream_unavailable_total` (the
+With a list of `endpoints` it adds `upstream_failovers_total{reason}` (the endpoints a call went past
+before one answered, counted only when one did: `request_failed`, `not_ready`, `backoff`), `upstream_unavailable_total` (the
 calls that found no endpoint to answer) and the gauge `upstream_endpoint_ready{endpoint}` (1 for an
 endpoint a call would try now). On a storage node it says there is no cache.
 
