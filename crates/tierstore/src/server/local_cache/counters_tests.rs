@@ -349,6 +349,89 @@ fn the_page_is_the_families_of_the_constants_in_order() {
     assert_eq!(names.len(), FAMILIES.len() + LABELLED.len());
 }
 
+/// Asserts the page of a cache that has done nothing (and a cache of 4 bytes in 5 objects on a
+/// disk with 6 free), against a page written out here in full, from no constant of the source: a
+/// family renamed, a kind changed, a label renamed or added, or a family moved or left out, fails.
+/// The names are the ones the docs and the dashboards use, so a change of one is a change of the
+/// interface and is made here on purpose.
+#[test]
+fn the_page_is_this_text() {
+    let expected = "\
+# TYPE tierstore_cache_hits_total counter
+tierstore_cache_hits_total 0
+# TYPE tierstore_cache_misses_total counter
+tierstore_cache_misses_total 0
+# TYPE tierstore_cache_bytes_served_local_total counter
+tierstore_cache_bytes_served_local_total 0
+# TYPE tierstore_cache_bytes_served_upstream_total counter
+tierstore_cache_bytes_served_upstream_total 0
+# TYPE tierstore_cache_fills_total counter
+tierstore_cache_fills_total 0
+# TYPE tierstore_cache_fills_skipped_total counter
+tierstore_cache_fills_skipped_total 0
+# TYPE tierstore_cache_fills_skipped_busy_total counter
+tierstore_cache_fills_skipped_busy_total 0
+# TYPE tierstore_cache_upstream_bytes_read_total counter
+tierstore_cache_upstream_bytes_read_total 0
+# TYPE tierstore_cache_head_hits_total counter
+tierstore_cache_head_hits_total 0
+# TYPE tierstore_cache_head_misses_total counter
+tierstore_cache_head_misses_total 0
+# TYPE tierstore_cache_upstream_puts_total counter
+tierstore_cache_upstream_puts_total 0
+# TYPE tierstore_cache_upstream_put_bytes_total counter
+tierstore_cache_upstream_put_bytes_total 0
+# TYPE tierstore_cache_writes_through_total counter
+tierstore_cache_writes_through_total 0
+# TYPE tierstore_cache_write_exists_total counter
+tierstore_cache_write_exists_total 0
+# TYPE tierstore_cache_keeps_expired_total counter
+tierstore_cache_keeps_expired_total 0
+# TYPE tierstore_cache_pinned_skips_total counter
+tierstore_cache_pinned_skips_total 0
+# TYPE tierstore_cache_discarded_at_start_total counter
+tierstore_cache_discarded_at_start_total 0
+# TYPE tierstore_cache_bytes gauge
+tierstore_cache_bytes 4
+# TYPE tierstore_cache_objects gauge
+tierstore_cache_objects 5
+# TYPE tierstore_cache_fs_free_bytes gauge
+tierstore_cache_fs_free_bytes 6
+# TYPE tierstore_cache_staging_files gauge
+tierstore_cache_staging_files 0
+# TYPE tierstore_cache_fill_failures_total counter
+tierstore_cache_fill_failures_total{reason=\"hash_mismatch\"} 0
+tierstore_cache_fill_failures_total{reason=\"upstream_error\"} 0
+tierstore_cache_fill_failures_total{reason=\"short_body\"} 0
+tierstore_cache_fill_failures_total{reason=\"local_io\"} 0
+tierstore_cache_fill_failures_total{reason=\"changed\"} 0
+tierstore_cache_fill_failures_total{reason=\"aborted\"} 0
+# TYPE tierstore_cache_upstream_reads_total counter
+tierstore_cache_upstream_reads_total{op=\"get\"} 0
+tierstore_cache_upstream_reads_total{op=\"head\"} 0
+tierstore_cache_upstream_reads_total{op=\"list\"} 0
+tierstore_cache_upstream_reads_total{op=\"list_uploads\"} 0
+# TYPE tierstore_cache_upstream_put_failures_total counter
+tierstore_cache_upstream_put_failures_total{reason=\"exists\"} 0
+tierstore_cache_upstream_put_failures_total{reason=\"unavailable\"} 0
+tierstore_cache_upstream_put_failures_total{reason=\"full\"} 0
+tierstore_cache_upstream_put_failures_total{reason=\"bad_digest\"} 0
+tierstore_cache_upstream_put_failures_total{reason=\"other\"} 0
+# TYPE tierstore_cache_write_keep_skipped_total counter
+tierstore_cache_write_keep_skipped_total{reason=\"budget\"} 0
+tierstore_cache_write_keep_skipped_total{reason=\"io\"} 0
+tierstore_cache_write_keep_skipped_total{reason=\"busy\"} 0
+tierstore_cache_write_keep_skipped_total{reason=\"head\"} 0
+tierstore_cache_write_keep_skipped_total{reason=\"deleted\"} 0
+tierstore_cache_write_keep_skipped_total{reason=\"slow\"} 0
+tierstore_cache_write_keep_skipped_total{reason=\"deadline\"} 0
+# TYPE tierstore_cache_evictions_total counter
+tierstore_cache_evictions_total{reason=\"budget\"} 0
+tierstore_cache_evictions_total{reason=\"floor\"} 0
+";
+    assert_eq!(Counters::default().render(4, 5, 6), expected);
+}
+
 /// Asserts the form of the page: every family has exactly one `# TYPE` line, before its first
 /// sample, and no sample is of a family without one; the four measured now (`bytes`, `objects`,
 /// `fs_free_bytes`, `staging_files`) are gauges and every other family is a counter; and every

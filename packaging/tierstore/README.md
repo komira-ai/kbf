@@ -538,7 +538,9 @@ and `bytes_served_local_total` (and `bytes_served_upstream_total`, the bytes of 
 were not hits), are the series of `tier="local"`. The `upstream_reads_total`,
 `upstream_bytes_read_total` and `upstream_put*` counters are the traffic of the cache toward its
 upstream, the cold side: they are not `tier="local"` series, and a query that sums the local tier
-over them would count the cache's own reads twice. They have no `tier` label.
+over them would count the cache's own reads twice. The cache's own series carry no `tier` label,
+but the `upstream_*` ones map to the `tier="cold"` series of the shared scheme, as the rows below
+say.
 
 The rows for these counters in the mapping of "Local cache" (shared series to `tierstore_cache_*`
 series):
@@ -547,9 +549,11 @@ series):
 |---|---|
 | `tierstore_hits_total{tier="local",op="head"}` | `tierstore_cache_head_hits_total` (the HEADs the cache is asked, the front's own pre-GET HEADs included) |
 | `tierstore_misses_total{tier="local",op="head"}` | `tierstore_cache_head_misses_total` |
+| `tierstore_reads_total{tier="cold",op="get"}` | `tierstore_cache_upstream_reads_total{op="get"}` |
+| `tierstore_reads_total{tier="cold",op="head"}` | `tierstore_cache_upstream_reads_total{op="head"}` |
 | `tierstore_bytes_read_total{tier="cold"}` | `tierstore_cache_upstream_bytes_read_total` |
-| cold side, calls (no shared series): `op="head"` is the cache's HEADs of the upstream | `tierstore_cache_upstream_reads_total{op="get\|head\|list\|list_uploads"}` |
-| cold side, writes (no shared series) | `tierstore_cache_upstream_puts_total`, `tierstore_cache_upstream_put_bytes_total`, `tierstore_cache_upstream_put_failures_total{reason}` |
+| (no shared counterpart: the shared scheme has no `list` or `list_uploads` op) | `tierstore_cache_upstream_reads_total{op="list"}` and `{op="list_uploads"}` |
+| (no shared counterpart: the cache's writes to its upstream) | `tierstore_cache_upstream_puts_total`, `tierstore_cache_upstream_put_bytes_total`, `tierstore_cache_upstream_put_failures_total{reason}` |
 
 ### Which key each flag has
 
