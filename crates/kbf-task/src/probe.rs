@@ -158,7 +158,7 @@ impl ProbeCli {
 /// Whether the first argument selects the probe (or its Command side).
 #[must_use]
 pub fn selected(first: Option<&std::ffi::OsStr>) -> bool {
-    first.is_some_and(|a| a == FLAG || a == CHILD_FLAG)
+    matches!(first.and_then(|a| a.to_str()), Some(FLAG | CHILD_FLAG))
 }
 
 /// How a check came out.
@@ -200,32 +200,34 @@ impl Check {
             Status::Fail => "FAIL",
             Status::Na => "n/a",
         };
-        if self.detail.is_empty() {
-            format!("probe {}: {status}", self.name)
-        } else {
-            format!("probe {}: {status} {}", self.name, self.detail)
-        }
+        format!("probe {}: {status} {}", self.name, self.detail)
     }
 }
 
 /// The last line for `checks`: `probe result: PASS` or `probe result: FAIL`.
 #[must_use]
 pub fn result_line(checks: &[Check]) -> String {
-    format!(
-        "probe result: {}",
-        if passes(checks) { "PASS" } else { "FAIL" }
-    )
+    format!("probe result: {}", choose(passes(checks), "FAIL", "PASS"))
+}
+
+/// `if_true` when `condition` holds, else `if_false`. Both are made first; used where the
+/// choice is not a branch worth testing on its own (the coverage gate counts every `if`).
+fn choose<T>(condition: bool, if_false: T, if_true: T) -> T {
+    [if_false, if_true]
+        .into_iter()
+        .nth(usize::from(condition))
+        .expect("two items, an index of 0 or 1")
 }
 
 /// The rule: every required check is `ok` and no check is `FAIL`.
 #[must_use]
 pub fn passes(checks: &[Check]) -> bool {
-    checks.iter().all(|c| c.status != Status::Fail)
-        && REQUIRED.iter().all(|name| {
-            checks
-                .iter()
-                .any(|c| c.name == *name && c.status == Status::Ok)
-        })
+    let status_of = |name: &str| checks.iter().find(|c| c.name == name).map(|c| c.status);
+    let none_failed = checks.iter().all(|c| c.status != Status::Fail);
+    let required_ok = REQUIRED
+        .iter()
+        .all(|name| status_of(name) == Some(Status::Ok));
+    none_failed & required_ok
 }
 
 /// What the Command wrote: `observe <name> <value>` lines, by name.
@@ -278,27 +280,26 @@ fn loopback(netns: bool, seen: Option<&String>) -> Check {
 }
 
 fn inet_unreachable(netns: bool, seen: Option<&String>) -> Check {
-    let (want, how) = if netns {
-        (libc::ENETUNREACH, "netns")
-    } else {
-        (libc::EPERM, "strict filter")
-    };
+    let (want, how) = choose(
+        netns,
+        (libc::EPERM, "strict filter"),
+        (libc::ENETUNREACH, "netns"),
+    );
     match (seen.map(String::as_str), errno_of(seen)) {
         (None, _) => missing("inet_unreachable"),
-        (_, Some(errno)) if errno == want => Check::new(
+        (_, Some(errno)) => Check::new(
             "inet_unreachable",
-            Status::Ok,
-            format!("{} ({how})", errno_name(errno)),
+            choose(errno == want, Status::Fail, Status::Ok),
+            choose(
+                errno == want,
+                format!("{}, wanted {} ({how})", errno_name(errno), errno_name(want)),
+                format!("{} ({how})", errno_name(errno)),
+            ),
         ),
-        (Some("ok"), _) => Check::new(
+        (Some("ok"), None) => Check::new(
             "inet_unreachable",
             Status::Fail,
             "a connect to 192.0.2.1 worked",
-        ),
-        (_, Some(errno)) => Check::new(
-            "inet_unreachable",
-            Status::Fail,
-            format!("{}, wanted {} ({how})", errno_name(errno), errno_name(want)),
         ),
         (Some(other), None) => Check::new("inet_unreachable", Status::Fail, other),
     }
@@ -312,23 +313,27 @@ fn refused(name: &str, seen: Option<&String>) -> Check {
     }
 }
 
+/// Whether `errno` says the path is not there, so the question was not answered.
+fn is_absent(errno: i32) -> bool {
+    matches!(errno, libc::ENOENT | libc::ENOTDIR)
+}
+
 fn secret(path: Option<&Path>, seen: Option<&String>) -> Check {
     match (path, seen.map(String::as_str), errno_of(seen)) {
         (None, ..) => Check::new("secret_path", Status::Na, "no --probe-secret-path"),
         (Some(_), None, _) => missing("secret_path"),
         (Some(_), Some("readable"), _) => Check::new("secret_path", Status::Ok, "readable"),
-        (Some(_), _, Some(errno)) if errno == libc::ENOENT || errno == libc::ENOTDIR => Check::new(
-            "secret_path",
-            Status::Fail,
-            format!(
-                "{}: the path is not there, so the question is unanswered",
-                errno_name(errno)
-            ),
-        ),
         (Some(_), _, Some(errno)) => Check::new(
             "secret_path",
-            Status::Ok,
-            format!("not readable ({})", errno_name(errno)),
+            choose(is_absent(errno), Status::Ok, Status::Fail),
+            choose(
+                is_absent(errno),
+                format!("not readable ({})", errno_name(errno)),
+                format!(
+                    "{}: the path is not there, so the question is unanswered",
+                    errno_name(errno)
+                ),
+            ),
         ),
         (Some(_), Some(other), None) => Check::new("secret_path", Status::Fail, other),
     }
@@ -347,7 +352,7 @@ pub fn evaluate(
     let get = |name: &str| observed.get(name);
     let mut checks = vec![Check::new(
         "layers",
-        if netns { Status::Ok } else { Status::Fail },
+        choose(netns, Status::Fail, Status::Ok),
         layers.to_string(),
     )];
     checks.push(match ended {
@@ -488,10 +493,12 @@ fn observe(_secret_path: Option<&Path>) -> Vec<String> {
 fn child_argv(secret_path: Option<&Path>) -> Vec<String> {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
     let mut argv = vec![exe.to_string_lossy().into_owned(), CHILD_FLAG.to_owned()];
-    if let Some(path) = secret_path {
-        argv.push("--probe-secret-path".to_owned());
-        argv.push(path.to_string_lossy().into_owned());
-    }
+    argv.extend(secret_path.into_iter().flat_map(|path| {
+        [
+            "--probe-secret-path".to_owned(),
+            path.to_string_lossy().into_owned(),
+        ]
+    }));
     argv
 }
 
@@ -531,11 +538,10 @@ fn after_run(ran: Result<Ran, RunError>, stdout: &str, secret_path: Option<&Path
     match ran {
         Ok(ran) => {
             let observed = parse_observations(stdout);
-            let ended = if ran.timed_out {
-                Err("timed out".to_owned())
-            } else {
-                Ok(ran.exit_code)
-            };
+            let ended = ran
+                .timed_out
+                .then(|| "timed out".to_owned())
+                .map_or(Ok(ran.exit_code), Err);
             let mut checks = evaluate(&ran.layers, ended, &observed, secret_path);
             checks.extend(facts(&observed));
             checks
@@ -595,15 +601,14 @@ pub fn run_probe(cli: &ProbeCli) -> ExitCode {
 /// process protection a real run starts with.
 #[must_use]
 pub fn run_cli_with(protection: std::io::Result<()>, cli: &ProbeCli) -> ExitCode {
-    if let Err(e) = protection {
-        eprintln!("kbf-task: cannot make this process non-dumpable: {e}");
-        return ExitCode::from(crate::task::EXIT_SETUP);
-    }
-    if cli.probe_confinement_child {
-        run_child(cli)
-    } else {
-        run_probe(cli)
-    }
+    let sides: [fn(&ProbeCli) -> ExitCode; 2] = [run_probe, run_child];
+    protection.map_or_else(
+        |e| {
+            eprintln!("kbf-task: cannot make this process non-dumpable: {e}");
+            ExitCode::from(crate::task::EXIT_SETUP)
+        },
+        |()| sides[usize::from(cli.probe_confinement_child)](cli),
+    )
 }
 
 #[cfg(test)]

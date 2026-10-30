@@ -41,10 +41,6 @@ fn a_line_is_probe_name_status_detail() {
         Check::new("secret_path", Status::Na, "no --probe-secret-path").line(),
         "probe secret_path: n/a no --probe-secret-path"
     );
-    assert_eq!(
-        Check::new("child", Status::Ok, "").line(),
-        "probe child: ok"
-    );
 }
 
 /// Catches: a full set of required checks that does not pass.

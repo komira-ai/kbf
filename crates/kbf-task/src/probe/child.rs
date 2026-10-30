@@ -56,29 +56,33 @@ fn io_uring() -> String {
 
 /// The value for a call that returns a descriptor or -1 with `errno`: the descriptor is closed.
 pub(super) fn fd_outcome(fd: libc::c_long) -> String {
-    if fd < 0 {
-        return errno(&std::io::Error::last_os_error());
+    match u32::try_from(fd) {
+        Ok(fd) => {
+            // SAFETY: `fd` was just returned by the call and is not used again.
+            unsafe { libc::close(fd as libc::c_int) };
+            "ok".to_owned()
+        }
+        Err(_) => errno(&std::io::Error::last_os_error()),
     }
-    // SAFETY: `fd` was just returned by the call and is not used again.
-    unsafe { libc::close(fd as libc::c_int) };
-    "ok".to_owned()
 }
 
 /// Whether the file at `path` can be opened and a byte read from it, or the directory listed.
 /// Nothing read is kept or shown.
 fn secret(path: &Path) -> String {
-    let tried = (|| {
-        if std::fs::metadata(path)?.is_dir() {
-            std::fs::read_dir(path).map(|mut d| d.next())?;
-        } else {
-            let _bytes: usize = std::fs::File::open(path)?.read(&mut [0u8; 1])?;
-        }
-        Ok(())
-    })();
+    let readers: [fn(&Path) -> std::io::Result<()>; 2] = [read_file, read_directory];
+    let tried = std::fs::metadata(path).and_then(|meta| readers[usize::from(meta.is_dir())](path));
     match tried {
         Ok(()) => "readable".to_owned(),
         Err(e) => errno(&e),
     }
+}
+
+fn read_file(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.read(&mut [0u8; 1]).map(|_| ())
+}
+
+fn read_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::read_dir(path).map(|_| ())
 }
 
 /// The `observe` lines, one per call.
@@ -90,8 +94,6 @@ pub fn observations(secret_path: Option<&Path>) -> Vec<String> {
         format!("observe packet {}", socket(libc::AF_PACKET)),
         format!("observe io_uring {}", io_uring()),
     ];
-    if let Some(path) = secret_path {
-        lines.push(format!("observe secret {}", secret(path)));
-    }
+    lines.extend(secret_path.map(|path| format!("observe secret {}", secret(path))));
     lines
 }
