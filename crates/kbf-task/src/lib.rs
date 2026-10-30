@@ -99,8 +99,14 @@ pub mod run;
 pub mod task;
 
 // The feature that lets a denied Command run with the network where no confine exists is for tests:
-// a build of the tool without debug assertions (a release build) that turns it on does not compile.
-#[cfg(all(feature = "unconfined-for-tests", not(debug_assertions), not(test)))]
+// a non-Linux build without debug assertions (a release build) that turns it on does not compile; on
+// Linux the feature does nothing, so it is allowed there (a workspace-wide `--all-features` build).
+#[cfg(all(
+    feature = "unconfined-for-tests",
+    not(target_os = "linux"),
+    not(debug_assertions),
+    not(test)
+))]
 compile_error!(
     "the `unconfined-for-tests` feature of kbf-task is for test builds only; a release build must not enable it"
 );

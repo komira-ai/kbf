@@ -6,11 +6,20 @@
 //! the Mac confine lands (the Mac confine change, M7), which lifts this lint together with the
 //! refusal for the platform that has the confine.
 //!
+//! This is a text tripwire, not the backstop. The backstop is the pin of `release_artifacts`: the
+//! asset table and the workflow must agree, so a darwin `kbf-task` asset needs an edit of
+//! docs/artifacts.md, which these rules catch. The lint cannot read a build that names nothing
+//! (a script, an action) and says so by being a text match.
+//!
 //! The rules, over `.github/workflows/*.yml` and `docs/artifacts.md`:
 //! - no line names `kbf-task` and `darwin` together (`kbf-task-<commit>-darwin-arm64.tar.gz`, a
 //!   `--platform darwin-arm64` package line, a release asset list);
 //! - no line of a darwin job (its name has `darwin`, or it runs on `macos-*`, or builds for
 //!   `apple-darwin`) names `kbf-task`: the build of it, its SBOM, its package or its image;
+//! - no line of a darwin job runs `cargo build`, `test`, `nextest`, `check` or `clippy` with
+//!   `--workspace` or `--all` and without `--exclude kbf-task` (it would build `kbf-task` without
+//!   naming it), and no line naming `kbf-task` has a `${{` interpolation (a matrix name the text
+//!   cannot resolve);
 //! - no workflow names the feature `unconfined-for-tests`, which lets a Command run with the
 //!   network where no confine exists and is for developers' test runs only.
 
@@ -31,8 +40,21 @@ fn is_darwin_job(header: &str, body: &[&str]) -> bool {
     header.contains("darwin")
         || body.iter().any(|l| {
             let l = l.trim();
-            (l.starts_with("runs-on:") && l.contains("macos")) || l.contains("apple-darwin")
+            (l.starts_with("runs-on:") && l.contains("macos"))
+                || l.contains("apple-darwin")
+                || (l.contains("macos-")
+                    && (l.starts_with("os:") || l.starts_with("- ") || l.starts_with('[')))
         })
+}
+
+/// Whether `line` runs a cargo verb over the whole workspace and does not exclude `kbf-task`.
+fn builds_workspace(line: &str) -> bool {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let verb = ["build", "test", "nextest", "check", "clippy", "llvm-cov"];
+    words.contains(&"cargo")
+        && words.iter().any(|w| verb.contains(w))
+        && words.iter().any(|w| *w == "--workspace" || *w == "--all")
+        && !line.contains("--exclude kbf-task")
 }
 
 /// Every way `files` (name and text) ship a darwin `kbf-task` or turn on the test feature.
@@ -46,6 +68,12 @@ fn problems(files: &[(String, String)]) -> Vec<String> {
             if line.contains("kbf-task") && line.contains("darwin") {
                 out.push(format!(
                     "{at}: names a darwin kbf-task, which cannot ship until {LIFTED_BY}: {}",
+                    line.trim()
+                ));
+            }
+            if workflow && line.contains("kbf-task") && line.contains("${{") {
+                out.push(format!(
+                    "{at}: a line naming kbf-task has an interpolation the lint cannot resolve: {}",
                     line.trim()
                 ));
             }
@@ -73,6 +101,14 @@ fn problems(files: &[(String, String)]) -> Vec<String> {
                 continue;
             }
             for (k, line) in body.iter().enumerate() {
+                if builds_workspace(line) {
+                    out.push(format!(
+                        "{name}:{}: the darwin job `{}` builds the whole workspace, kbf-task included, without `--exclude kbf-task`: {}",
+                        start + k + 2,
+                        header.trim_end_matches(':'),
+                        line.trim()
+                    ));
+                }
                 if line.contains("kbf-task") && !line.contains("darwin") {
                     out.push(format!(
                         "{name}:{}: the darwin job `{}` names kbf-task, which cannot ship until {LIFTED_BY}: {}",
@@ -165,4 +201,19 @@ fn the_guard_names_each_way_a_darwin_kbf_task_would_ship() {
         problems(&with(".github/workflows/other.yml", linux)),
         Vec::<String>::new()
     );
+
+    let matrix = "jobs:\n  t:\n    strategy:\n      matrix:\n        os: [ubuntu-24.04, macos-15]\n    runs-on: ${{ matrix.os }}\n    steps:\n      - run: cargo build --release --workspace\n";
+    let got = problems(&with(".github/workflows/other.yml", matrix));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].contains("builds the whole workspace"), "{got:?}");
+    let excluded = matrix.replace("--workspace", "--workspace --exclude kbf-task");
+    assert_eq!(
+        problems(&with(".github/workflows/other.yml", &excluded)),
+        Vec::<String>::new()
+    );
+
+    let interpolated = "jobs:\n  t:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: cp dist/kbf-task-${{ matrix.os }}.tar.gz out\n";
+    let got = problems(&with(".github/workflows/other.yml", interpolated));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].contains("interpolation"), "{got:?}");
 }

@@ -95,7 +95,7 @@ interpreter and no needed library. The task image
 carries the same file. It writes its pack with `kbf-task-pack` (`crates/kbf-task-pack`), the task pack types
 the frontend ingests with, a crate of pure Rust that does not link the pack index or the object store client.
 
-There is no `kbf-task` asset or image for a Mac. Where no confine is built (anywhere but Linux) `kbf-task` refuses a Command that is to be denied the network (exit 15), so no workflow may package one until the Mac confine exists; a repository lint fails on such an asset, package line or image, and on a workflow that names the test-only feature `unconfined-for-tests`.
+There is no `kbf-task` asset or image for a Mac. Where no confine is built (anywhere but Linux) `kbf-task` refuses a Command that is to be denied the network (exit 15), so no workflow may package one until the Mac confine exists; a repository lint fails on such an asset, package line or image, and on a workflow that names the test-only feature `unconfined-for-tests`. The backstop is the pin of the release set (the asset table here and the workflow must agree, so a `kbf-task` asset for a Mac needs an edit of this file, which the lint catches); the lint's text match of workflow jobs is a tripwire.
 
 `tierstore` is the hot and cold S3 object store proxy (`crates/tierstore`): an S3 server over two
 tiers that copies new objects to the cold tier and frees the hot one when it fills. It is built with
