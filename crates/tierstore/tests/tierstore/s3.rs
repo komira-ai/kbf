@@ -1,4 +1,4 @@
-//! The S3 backend over the loopback S3 service of `kbf-objstore`: the checks every backend
+//! The S3 backend over the loopback S3 service of `objstore-s3`: the checks every backend
 //! passes, and the cases only S3 has (ranges that S3 answers 416 to, listings of more than one
 //! page, names the client cannot sign, a store that cannot be reached, the proxy and the
 //! reconciler working over S3 backends).
@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{StreamExt, stream};
-use kbf_objstore::s3::fake::{Failure, FakeS3, part_etag};
+use objstore_s3::s3::fake::{Failure, FakeS3, part_etag};
 use tierstore::s3::{Capabilities, Credentials, S3Config};
 use tierstore::{
     Backend, ByteRange, Check, Clock, Error, PartBody, Proxy, ProxyConfig, Reconciler,

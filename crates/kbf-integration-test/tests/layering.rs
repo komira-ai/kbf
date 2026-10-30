@@ -70,10 +70,11 @@
 //! - the hot/cold object store library (`tierstore`) depending, directly or through another
 //!   crate, on any other crate of this workspace, which would stop it from moving to a
 //!   repository of its own (its `s3` feature, off by default, adds the S3 client of
-//!   `kbf-objstore`, and so does its `server` feature, which the `tierstore` binary needs;
+//!   `objstore-s3`, and so does its `server` feature, which the `tierstore` binary needs;
 //!   the check reads the tree of the crate built alone, so the features that its own tests
 //!   turn on do not count); and a walk that cannot see its dependencies, which would make
-//!   that check pass vacuously;
+//!   that check pass vacuously; and, with every feature and its dev-dependencies, `tierstore`
+//!   reaching a `kbf-*` crate other than `kbf-testkit`, or a walk that does not reach `objstore-s3`;
 //! - the S3 client and object store trait (`objstore-s3`, which `kbf-objstore` re-exports)
 //!   depending, directly or through another crate, on any other crate of this workspace, which
 //!   would stop it from leaving with `tierstore`; a walk that cannot see its dependencies; and
@@ -727,7 +728,7 @@ fn pack_adopt_reaches_neither_the_frontend_nor_the_daemon() {
 /// and through other crates, include no other crate of this workspace, and that the walk
 /// sees its dependencies (it reaches `tokio`), so the check does not pass on an empty walk.
 /// The tree is that of `cargo build -p tierstore`, with the features the crate has by default:
-/// its `s3` feature, which adds `kbf-objstore`, is off in it, and so is `server`, which turns
+/// its `s3` feature, which adds `objstore-s3`, is off in it, and so is `server`, which turns
 /// `s3` on for the `tierstore` binary. It is not the graph of `cargo metadata`, which has the
 /// features of the whole workspace, where the tests of `tierstore` turn `server` on.
 #[test]
@@ -756,19 +757,16 @@ fn tierstore_reaches_no_other_workspace_crate() {
     );
 }
 
-/// Asserts that the tree of `cargo build -p tierstore --features s3` holds `kbf-objstore` (the
+/// Asserts that the tree of `cargo build -p tierstore --features s3` holds `objstore-s3` (the
 /// S3 client that `S3Backend` adapts) and that of `--features server` holds it too, so that the
 /// check above sees the edge it guards, and that `server` turns `s3` on.
 #[test]
 fn tierstore_links_the_s3_client_only_with_its_s3_or_server_feature() {
     let bare = linked_by("tierstore");
-    assert!(
-        !bare.contains("kbf-objstore"),
-        "without a feature: {bare:?}"
-    );
+    assert!(!bare.contains("objstore-s3"), "without a feature: {bare:?}");
     for features in ["s3", "server"] {
         let linked = linked_with("tierstore", features);
-        assert!(linked.contains("kbf-objstore"), "{features}: {linked:?}");
+        assert!(linked.contains("objstore-s3"), "{features}: {linked:?}");
     }
 }
 

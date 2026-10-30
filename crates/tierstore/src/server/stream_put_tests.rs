@@ -18,8 +18,8 @@ use futures::StreamExt;
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame};
 use hyper::{Request, StatusCode};
-use kbf_objstore::s3::fake::FakeS3;
 use kbf_testkit::dir::TestDir;
+use objstore_s3::s3::fake::FakeS3;
 use sha2::{Digest, Sha256};
 
 use crate::journal::is_reserved;

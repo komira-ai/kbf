@@ -5,8 +5,8 @@
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream;
-use kbf_objstore::s3::MULTIPART_THRESHOLD;
-use kbf_objstore::{BodyStream, KeyPrefix, ObjectStore, ObjectStoreError, PageSize};
+use objstore_s3::s3::MULTIPART_THRESHOLD;
+use objstore_s3::{BodyStream, KeyPrefix, ObjectStore, ObjectStoreError, PageSize};
 use reqwest::Response;
 use tierstore::server::AccessKey;
 use tierstore::{Backend, Listed, Op};

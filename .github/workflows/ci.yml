@@ -81,7 +81,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
         if: ${{ !cancelled() }}
       # The object store library with its `s3` feature alone (the adapter over the S3 client of
-      # kbf-objstore). The workspace run above has the feature on as well, since the crate's own
+      # objstore-s3). The workspace run above has the feature on as well, since the crate's own
       # tests turn `server` on and `server` enables `s3`; the library alone is built here, since
       # its tests would turn `server` on in this build too, so the code that is compiled only
       # without `server` is linted.
