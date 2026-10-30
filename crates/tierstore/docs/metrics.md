@@ -346,9 +346,28 @@ The mapping, series by series:
 | `tierstore_misses_total{tier="local",op="get"}` | `tierstore_cache_misses_total` |
 | `tierstore_bytes_served_total{tier="local"}` | `tierstore_cache_bytes_served_local_total` |
 
-Only these three map. `tierstore_cache_bytes_served_upstream_total`, the fills, the evictions and
-the upstream calls have no counterpart, and `tierstore_cache_head_hits_total` counts clients'
-HEADs, not `op="head"` of the shared family. The `local` values count a GET once per reader at the cache, and the `hot` and `cold`
+Only these three map to `tier="local"`. The cache's `upstream` series are not local: they
+measure the cache's calls to the cold store, so on a build node they are the cold-side numbers
+and map to `tier="cold"`:
+
+| shared series | the cache's series | how they differ |
+|---|---|---|
+| `tierstore_bytes_read_total{tier="cold"}` | `tierstore_cache_upstream_bytes_read_total` | the cache's counts the chunks of fills and pass-through reads that returned, whole objects or not |
+| `tierstore_reads_total{tier="cold",op="get"}` | `tierstore_cache_upstream_reads_total{op="get"}` | the cache's counts calls, and a fill makes one per chunk, so it is not a count of objects |
+| `tierstore_reads_total{tier="cold",op="head"}` | `tierstore_cache_upstream_reads_total{op="head"}` | the cache's includes its own HEADs (fills, puts) |
+
+Cold-side bytes read, one query for both deployments:
+
+```promql
+sum(rate(tierstore_bytes_read_total{tier="cold"}[5m]))
+or
+label_replace(sum(rate(tierstore_cache_upstream_bytes_read_total[5m])), "tier", "cold", "", "")
+```
+
+The write-through counters (`upstream_puts`, `upstream_put_bytes`, `upstream_put_failures`) are
+also toward the cold store and have no shared counterpart. `tierstore_cache_bytes_served_upstream_total`,
+the fills and the evictions have none either, and `tierstore_cache_head_hits_total` counts
+clients' HEADs, not `op="head"` of the shared family. The `local` values count a GET once per reader at the cache, and the `hot` and `cold`
 values once per GET at the proxy, so compare the rates, not the totals.
 
 #### Cold-read share of GETs (v2)
