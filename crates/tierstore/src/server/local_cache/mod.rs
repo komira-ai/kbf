@@ -84,6 +84,8 @@ mod selfcheck;
 mod write;
 
 #[cfg(test)]
+mod counters_tests;
+#[cfg(test)]
 mod evict_tests;
 #[cfg(test)]
 mod fill_tests;
@@ -460,9 +462,24 @@ impl Inner {
 
     /// The read of `range` of `key` from the upstream, which keeps nothing.
     async fn passthrough(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
-        let bytes = self.upstream.get(key, range).await?;
+        let bytes = self.upstream_get(key, range).await?;
         add(&self.counters.bytes_served_upstream, bytes.len() as u64);
         Ok(bytes)
+    }
+
+    /// A GET of the upstream, counted: the call, and the bytes it gave. Every GET the cache makes
+    /// goes through here.
+    async fn upstream_get(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
+        bump(&self.counters.upstream_gets);
+        let bytes = self.upstream.get(key, range).await?;
+        add(&self.counters.upstream_bytes_read, bytes.len() as u64);
+        Ok(bytes)
+    }
+
+    /// A HEAD of the upstream, counted. Every HEAD the cache makes goes through here.
+    async fn upstream_head(&self, key: &str) -> Result<Meta, Error> {
+        bump(&self.counters.upstream_heads);
+        self.upstream.head(key).await
     }
 }
 
@@ -545,7 +562,7 @@ impl Backend for LocalCache {
             return Ok(bytes);
         }
         if let Some(wanted) = range {
-            let meta = inner.upstream.head(key).await?;
+            let meta = inner.upstream_head(key).await?;
             if meta.size > inner.config.whole_limit {
                 bump(&inner.counters.misses);
                 return inner.passthrough(key, Some(wanted)).await;
@@ -564,8 +581,14 @@ impl Backend for LocalCache {
         let inner = &self.inner;
         let kept = inner.cacheable(key).and_then(|name| inner.kept(&name));
         match kept {
-            Some(meta) => Ok(meta),
-            None => inner.upstream.head(key).await,
+            Some(meta) => {
+                bump(&inner.counters.head_hits);
+                Ok(meta)
+            }
+            None => {
+                bump(&inner.counters.head_misses);
+                inner.upstream_head(key).await
+            }
         }
     }
 

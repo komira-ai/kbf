@@ -69,9 +69,56 @@ pub(super) enum Evicted {
 /// The label of each [`Evicted`], in the order of the enum.
 const EVICTED: [&str; 2] = ["budget", "floor"];
 
+/// Why a put or a completion that reached the upstream was refused or failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PutFailed {
+    /// The upstream's create-only put found the object (412).
+    Exists,
+    /// The upstream did not answer.
+    Unavailable,
+    /// The upstream had no room (507).
+    Full,
+    /// The body did not hash to the name of the object; the upstream stored nothing.
+    BadDigest,
+    /// Any other failure.
+    Other,
+}
+
+impl PutFailed {
+    /// The reason an error of a put counts under.
+    pub(super) fn of(error: &crate::Error) -> Self {
+        match error {
+            crate::Error::AlreadyExists(_) => Self::Exists,
+            crate::Error::Unavailable(_) => Self::Unavailable,
+            crate::Error::Full(_) => Self::Full,
+            crate::Error::BadDigest(_) => Self::BadDigest,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// The label of each [`PutFailed`], in the order of the enum.
+const PUT_FAILED: [&str; 5] = ["exists", "unavailable", "full", "bad_digest", "other"];
+
 /// What the cache has done since it started.
 #[derive(Debug, Default)]
 pub struct Counters {
+    /// The GET calls the cache made to the upstream (a fill reads in ranged chunks: these are
+    /// calls, not objects).
+    pub(super) upstream_gets: AtomicU64,
+    /// The HEAD calls the cache made to the upstream.
+    pub(super) upstream_heads: AtomicU64,
+    /// The bytes the upstream gave to fills and pass-through reads.
+    pub(super) upstream_bytes_read: AtomicU64,
+    /// The HEADs of clients answered from the index.
+    pub(super) head_hits: AtomicU64,
+    /// The HEADs of clients sent to the upstream.
+    pub(super) head_misses: AtomicU64,
+    /// The create-only puts and the completions of uploads the upstream accepted.
+    pub(super) upstream_puts: AtomicU64,
+    /// The bytes of those puts, and of the parts of uploads the upstream accepted.
+    pub(super) upstream_put_bytes: AtomicU64,
+    put_failures: [AtomicU64; PUT_FAILED.len()],
     pub(super) hits: AtomicU64,
     pub(super) misses: AtomicU64,
     pub(super) bytes_served_local: AtomicU64,
@@ -135,6 +182,17 @@ impl Counters {
         read(&self.keep_skips[why as usize])
     }
 
+    /// Counts a put or a completion the upstream refused, for the reason `error` gives.
+    pub(super) fn put_failed(&self, error: &crate::Error) {
+        bump(&self.put_failures[PutFailed::of(error) as usize]);
+    }
+
+    /// The puts and completions that failed for `why`.
+    #[cfg(test)]
+    pub(super) fn put_failures(&self, why: PutFailed) -> u64 {
+        read(&self.put_failures[why as usize])
+    }
+
     /// Counts an eviction for `why`.
     pub(super) fn evicted(&self, why: Evicted) {
         bump(&self.evictions[why as usize]);
@@ -171,6 +229,11 @@ impl Counters {
             ("fills_total", read(&self.fills)),
             ("fills_skipped_total", read(&self.fills_skipped)),
             ("fills_skipped_busy_total", read(&self.fills_skipped_busy)),
+            ("upstream_bytes_read_total", read(&self.upstream_bytes_read)),
+            ("head_hits_total", read(&self.head_hits)),
+            ("head_misses_total", read(&self.head_misses)),
+            ("upstream_puts_total", read(&self.upstream_puts)),
+            ("upstream_put_bytes_total", read(&self.upstream_put_bytes)),
             ("writes_through_total", read(&self.writes_through)),
             ("write_exists_total", read(&self.write_exists)),
             ("keeps_expired_total", read(&self.keeps_expired)),
@@ -189,6 +252,20 @@ impl Counters {
             let _ = writeln!(
                 text,
                 "tierstore_cache_fill_failures_total{{reason=\"{label}\"}} {value}"
+            );
+        }
+        for (op, counter) in [("get", &self.upstream_gets), ("head", &self.upstream_heads)] {
+            let value = read(counter);
+            let _ = writeln!(
+                text,
+                "tierstore_cache_upstream_reads_total{{op=\"{op}\"}} {value}"
+            );
+        }
+        for (label, counter) in PUT_FAILED.iter().zip(&self.put_failures) {
+            let value = read(counter);
+            let _ = writeln!(
+                text,
+                "tierstore_cache_upstream_put_failures_total{{reason=\"{label}\"}} {value}"
             );
         }
         for (label, counter) in SKIPPED_KEEP.iter().zip(&self.keep_skips) {
