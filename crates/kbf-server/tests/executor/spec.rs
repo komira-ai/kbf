@@ -323,7 +323,7 @@ async fn a_refusal_that_is_not_about_the_shape_is_still_infrastructure() {
     let finished = rig.until_done(&caller, 3).await;
     assert_eq!(code(&finished), Code::Internal, "{finished:?}");
     assert!(
-        message(&finished).contains("run-exists"),
+        message(&finished).contains("infra failure"),
         "{}",
         message(&finished)
     );
