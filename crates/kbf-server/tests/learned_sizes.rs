@@ -544,6 +544,32 @@ async fn a_kill_that_ends_the_operation_is_written_at_once() {
     assert!(!rows(&store).is_empty(), "the kill is in the store");
 }
 
+/// Catches `--learned-sizes on` with `--no-memory-climb` leaving a floor for a kill that
+/// raised nothing: the combination is allowed, and an own-limit kill that ends the operation
+/// at the first rung writes no floor, so the next submission of the key books the first rung
+/// again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn learned_sizes_on_with_no_climb_leaves_no_floor() {
+    log();
+    let (_store, state) = state();
+    let cell = Cell::start_no_climb(LearnedSizes::On, ladder(), Some(state)).await;
+    let mut daemon = cell.daemon("node-fixed", 8, 64).await;
+    let blob = job("compile fixed kill", "a", LINUX);
+    cell.upload(&blob.blobs()).await;
+    let mut ops = cell.execute(&blob.action).await;
+    let start = daemon.start().await;
+    assert_eq!(start.memory_bytes, 4 * GIB);
+    assert!(
+        daemon
+            .report(killed(start.lease_id, 5 * GIB))
+            .await
+            .accepted
+    );
+    done(&mut ops).await;
+    let _again = cell.execute(&blob.action).await;
+    assert_eq!(daemon.start().await.memory_bytes, 4 * GIB);
+}
+
 /// Catches: a kill by the node (not by the action's own limit) teaching the estimator a
 /// floor. The run's later success is written behind after the write-behind interval, and
 /// no row the store holds then has a floor.

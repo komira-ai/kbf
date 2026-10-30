@@ -383,6 +383,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "memory-limit-percent",
             "memory-poll-ms",
             "memory-pressure-pause-percent",
+            "no-memory-climb",
         ],
     ),
     (

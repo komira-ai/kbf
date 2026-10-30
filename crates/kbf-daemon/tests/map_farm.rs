@@ -65,6 +65,7 @@ async fn farm(name: &str, source: Arc<dyn MapSource>) -> Arc<MapHolder> {
         default_platform: kbf_front::DefaultPlatform::NONE,
         qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        memory_climb: true,
         vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         scheduler_core: kbf_server::SchedulerCore::under_test(),
