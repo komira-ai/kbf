@@ -470,13 +470,22 @@ refuses the key) exits with status 1. The write checks of the storage-node self-
 against the upstream, whose key is read-only. On SIGTERM the process drains as a storage node does.
 
 `GET /metricz` is not signed, and a bucket cannot be called `metricz`. It answers in the Prometheus
-text format, `tierstore_cache_<name>`, with: `hits_total`, `misses_total`, `bytes_served_local_total`,
+text format, `tierstore_cache_<name>`, each family after a `# TYPE` line of its kind, as the OCI
+counters have (no `# HELP`). The counters (`counter`) are all the families but four, and the four
+gauges (`gauge`) are `bytes`, `objects`, `fs_free_bytes` and `staging_files`, which are measured
+when the page is read. `discarded_at_start_total` is a counter that is set once, when the cache is
+opened (the files it removed then), and does not change for the rest of the process. The
+families are: `hits_total`, `misses_total` (a read of a kept key that the index did not serve,
+counted once, before any call to the upstream: a ranged read whose HEAD then fails is one, and so
+is a read of an object whose file could not be read from the disk; a read of a key under a prefix
+that is not kept is neither a hit nor a miss), `bytes_served_local_total`,
 `bytes_served_upstream_total` (the bytes of every read that was not a hit, the read that follows a
 fill included, so the byte hit ratio is the first over the sum of the two), `fills_total`,
 `fills_skipped_total`, `fills_skipped_busy_total` (those of the skipped fills that found every fill
 slot taken), `fill_failures_total{reason}` (`hash_mismatch`, `upstream_error`,
 `short_body`, `local_io`, `changed`, `aborted`), `evictions_total{reason}` (`budget`, `floor`), `pinned_skips_total`,
-`discarded_at_start_total`, and the gauges `bytes`, `objects`, `fs_free_bytes` and `staging_files`.
+`discarded_at_start_total`, the gauges `bytes`, `objects`, `fs_free_bytes` and `staging_files`,
+and the families of the table below.
 On a storage node it says there is no cache. The same path on a storage node with the OCI front
 has the OCI counters (see Counters); a node with neither has a line for each that says it is not
 there.
@@ -517,11 +526,11 @@ cache's calls, not of the requests on the wire.
 | `tierstore_cache_upstream_reads_total{op="list"}` | the listing calls: `list`, and each page that `list_page` asks of the upstream (a page short of keys that were left out is made up with more pages, each counted) |
 | `tierstore_cache_upstream_reads_total{op="list_uploads"}` | the calls of `list_uploads` to the upstream |
 | `tierstore_cache_upstream_bytes_read_total` | the bytes the upstream gave to fills and pass-through reads. Over `bytes_served_upstream_total` it shows the fill amplification of ranged misses: a 20-byte range of a 350-byte object reads 350 |
-| `tierstore_cache_head_hits_total` | the HEADs of clients answered from the index, with no call to the upstream |
-| `tierstore_cache_head_misses_total` | the HEADs of clients sent to the upstream (a key that is not kept yet, one under a prefix that is not kept, one that is not there) |
+| `tierstore_cache_head_hits_total` | the HEADs the cache is asked, answered from the index, with no call to the upstream. These are the HEADs of clients and also the S3 front's own HEAD before a GET it serves, so a client GET can add one; they are not the client HEADs alone |
+| `tierstore_cache_head_misses_total` | the same HEADs sent to the upstream (a key that is not kept yet, one under a prefix that is not kept, one that is not there), the front's own pre-GET HEADs included |
 | `tierstore_cache_upstream_puts_total` | the create-only puts and the completions of uploads that the upstream took. A multipart upload is one, counted at its completion. A create-only put makes a HEAD before the body and, under a kept prefix, one after the upstream's acknowledgement; both are in `upstream_reads_total{op="head"}`; a key that the first one finds is answered 412 without a put and is in `write_exists_total` only |
 | `tierstore_cache_upstream_put_bytes_total` | the bytes of the puts the upstream took, and of the parts of uploads that it took: a part counts when it is accepted, so the bytes of an upload that is never completed are in this and its put is not in `upstream_puts_total`, and a client that retries a part the upstream already accepted has the bytes counted twice (the cache keeps no state of an upload to know it is a retry) |
-| `tierstore_cache_upstream_put_failures_total{reason}` | the puts and completions that reached the upstream and failed: `exists` (its create-only put answered 412), `unavailable`, `full` (507), `bad_digest` (a key named by its content whose body hashes to another name: the upstream stores nothing, except when it took the put without reading the body to its end, in which case the put is counted in `upstream_puts_total` and its bytes as well, and the client is still told 400, so it is a failure too) and `other`. Puts plus failures are the attempts, except for that one case, which is in both |
+| `tierstore_cache_upstream_put_failures_total{reason}` | the puts and completions that reached the upstream and failed: `exists` (its create-only put answered 412), `unavailable`, `full` (507), `bad_digest` (a key named by its content whose body hashes to another name: the upstream stores nothing, except when it took the put without reading the body to its end, in which case the put is counted in `upstream_puts_total` and its bytes as well, and the client is still told 400, so it is a failure too) and `other`. A create-only put whose HEAD before the body fails with anything but "not found" is refused before any put is sent, and is counted here too, under the reason the error maps to (`unavailable`, `other`...); one whose HEAD finds the object is counted in `write_exists_total` only, as no put reached the upstream. So puts plus failures are the attempts, except for that bad-digest case, which is in both, and except that failures also hold those puts that failed before they were sent |
 
 Mapping to the shared scheme of the tier metrics (`tierstore_hits_total{tier,op}` and the others
 of that family): only the counters of what the cache itself serves, `hits_total`, `misses_total`

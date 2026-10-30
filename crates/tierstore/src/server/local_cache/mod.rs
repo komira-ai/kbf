@@ -561,14 +561,17 @@ impl Backend for LocalCache {
         if let Some(bytes) = inner.lookup(&name, range, true).await? {
             return Ok(bytes);
         }
+        // A read of a kept key that the index did not serve is one miss, counted here once,
+        // before any call to the upstream: a file that could not be read from the disk (the
+        // entry is dropped then) is one too, and a range past the end of a held object is an
+        // error of the client and is neither.
+        bump(&inner.counters.misses);
         if let Some(wanted) = range {
             let meta = inner.upstream_head(key).await?;
             if meta.size > inner.config.whole_limit {
-                bump(&inner.counters.misses);
                 return inner.passthrough(key, Some(wanted)).await;
             }
         }
-        bump(&inner.counters.misses);
         if inner.fill_once(key, &name).await? == fill::Filled::Kept
             && let Some(bytes) = inner.lookup(&name, range, false).await?
         {

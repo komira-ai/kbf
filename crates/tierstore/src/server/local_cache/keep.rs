@@ -321,7 +321,12 @@ impl Inner {
                 return Err(Error::AlreadyExists(key.to_owned()));
             }
             Err(Error::NotFound(_)) => {}
-            Err(other) => return Err(other),
+            Err(other) => {
+                // The HEAD before the body failed: no put was sent, and the client has an
+                // error, so it is counted as a failed put, under the reason the error maps to.
+                self.counters.put_failed(&other);
+                return Err(other);
+            }
         }
         let name = self.cacheable(key);
         let mut keeping = match &name {

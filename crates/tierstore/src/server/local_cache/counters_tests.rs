@@ -3,6 +3,8 @@
 //! or refuses. Each is checked against the calls the upstream fixture itself counted, so that a
 //! call counted twice or not at all shows.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream;
@@ -311,4 +313,122 @@ async fn a_multipart_counts_one_put_with_the_bytes_of_its_parts() {
     // The completions the upstream saw are the ones taken and the ones that failed.
     let failed = failures(&rig).iter().sum::<u64>();
     assert_eq!(rig.calls(Op::CompleteUpload), puts(&rig).0 + failed);
+}
+
+/// Asserts the form of the page: every family has exactly one `# TYPE` line, before its first
+/// sample, and no sample is of a family without one; the four measured now (`bytes`, `objects`,
+/// `fs_free_bytes`, `staging_files`) are gauges and every other family is a counter; and every
+/// family with a `# TYPE` line has a sample. It fails on a family that lost its line or has two,
+/// and on a gauge typed as a counter.
+#[tokio::test]
+async fn every_family_has_one_type_line_of_the_right_kind() {
+    let rig = Rig::writing("tscache-counters-types");
+    let made = rig.cache.put_stream("cas/b/t", Some(3), whole(b"abc"));
+    assert_eq!(made.await, Ok(()));
+    rig.put("cas/b/u", b"def").await;
+    assert_eq!(rig.get("cas/b/u").await.unwrap(), "def");
+    let text = rig.cache.metrics();
+
+    let mut kinds: BTreeMap<String, String> = BTreeMap::new();
+    let mut sampled: BTreeSet<String> = BTreeSet::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("# TYPE ") {
+            let (name, kind) = rest.split_once(' ').expect("a name and a kind");
+            assert!(!sampled.contains(name), "{name}: TYPE after a sample");
+            let before = kinds.insert(name.to_owned(), kind.to_owned());
+            assert!(before.is_none(), "{name}: two TYPE lines");
+        } else {
+            let name = line.split([' ', '{']).next().expect("a name");
+            assert!(kinds.contains_key(name), "{name}: a sample with no TYPE");
+            let _ = sampled.insert(name.to_owned());
+        }
+    }
+    let typed: BTreeSet<String> = kinds.keys().cloned().collect();
+    assert_eq!(typed, sampled);
+    let gauges: BTreeSet<&str> = kinds
+        .iter()
+        .filter(|(_, kind)| kind.as_str() == "gauge")
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let expected: BTreeSet<&str> = [
+        "tierstore_cache_bytes",
+        "tierstore_cache_objects",
+        "tierstore_cache_fs_free_bytes",
+        "tierstore_cache_staging_files",
+    ]
+    .into();
+    assert_eq!(gauges, expected);
+    for (name, kind) in &kinds {
+        assert!(
+            matches!(kind.as_str(), "counter" | "gauge"),
+            "{name}: {kind}"
+        );
+    }
+    assert!(kinds.len() > 20, "{}", kinds.len());
+}
+
+/// Asserts the accounting of misses: a read of a kept key that the index did not serve is one
+/// miss, counted before any call to the upstream: a ranged read whose HEAD fails (it makes
+/// no GET), a ranged read of an object over the whole-fill limit, a whole read that fills, and a
+/// read of an object whose file was removed behind the cache's back; a hit and a read of a
+/// key under a prefix that is not kept are not misses.
+#[tokio::test]
+async fn a_read_the_index_did_not_serve_is_one_miss_counted_before_the_upstream() {
+    let rig = Rig::with("tscache-counters-misses", |config| config.whole_limit = 10);
+    rig.put("cas/b/k", &pattern(50)).await;
+    rig.put("other/x", &pattern(5)).await;
+    let counters = rig.cache.counters();
+    let tally = || (read(&counters.hits), read(&counters.misses));
+
+    rig.upstream.fail_next(Op::Head, 1);
+    let failed = rig.cache.get("cas/b/k", Some(ByteRange::new(0, 5))).await;
+    assert!(matches!(failed, Err(Error::Unavailable(_))), "{failed:?}");
+    assert_eq!(tally(), (0, 1));
+    assert_eq!(rig.calls(Op::Get), 0);
+
+    let over = rig.cache.get("cas/b/k", Some(ByteRange::new(0, 5))).await;
+    assert_eq!(over.unwrap().len(), 5);
+    assert_eq!(tally(), (0, 2));
+
+    assert_eq!(rig.get("cas/b/k").await.unwrap().len(), 50);
+    assert_eq!(tally(), (0, 3));
+    assert_eq!(rig.get("cas/b/k").await.unwrap().len(), 50);
+    assert_eq!(tally(), (1, 3));
+
+    std::fs::remove_file(rig.file("cas/b/k")).unwrap();
+    assert_eq!(rig.get("cas/b/k").await.unwrap().len(), 50);
+    assert_eq!(tally(), (1, 4));
+
+    assert_eq!(rig.get("other/x").await.unwrap().len(), 5);
+    assert_eq!(tally(), (1, 4));
+}
+
+/// Asserts that a create-only put whose HEAD before the body fails with anything but "not found"
+/// is refused with that error and counted as a failed put under the reason the error maps to
+/// (`unavailable`, `other`), though no put was sent (the upstream saw none); and that one whose
+/// HEAD finds the object is counted as a repeat only, not as a failed put.
+#[tokio::test]
+async fn a_put_whose_precheck_head_fails_is_a_counted_failure() {
+    let rig = Rig::writing("tscache-counters-precheck");
+    let down = Error::Unavailable("head".to_owned());
+    rig.upstream.fail_next_with(Op::Head, down.clone());
+    let refused = rig.cache.put_stream("cas/b/p", Some(1), whole(b"x"));
+    assert_eq!(refused.await, Err(down));
+    assert_eq!(failures(&rig), [0, 1, 0, 0, 0]);
+
+    let odd = Error::Other("head".to_owned());
+    rig.upstream.fail_next_with(Op::Head, odd.clone());
+    let refused = rig.cache.put_stream("cas/b/p", Some(1), whole(b"x"));
+    assert_eq!(refused.await, Err(odd));
+    assert_eq!(failures(&rig), [0, 1, 0, 0, 1]);
+    assert_eq!(puts(&rig), (0, 0));
+    assert_eq!(rig.calls(Op::Put), 0);
+    assert_eq!(read(&rig.cache.counters().write_exists), 0);
+
+    rig.put("cas/b/there", b"here").await;
+    let found = rig.cache.put_stream("cas/b/there", Some(1), whole(b"x"));
+    assert!(matches!(found.await, Err(Error::AlreadyExists(_))));
+    assert_eq!(failures(&rig), [0, 1, 0, 0, 1]);
+    assert_eq!(read(&rig.cache.counters().write_exists), 1);
+    assert_eq!(rig.calls(Op::Put), 0);
 }

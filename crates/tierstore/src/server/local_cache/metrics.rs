@@ -69,6 +69,12 @@ pub(super) enum Evicted {
 /// The label of each [`Evicted`], in the order of the enum.
 const EVICTED: [&str; 2] = ["budget", "floor"];
 
+/// The kind of a family that only goes up (or is fixed once the process has started).
+const COUNTER: &str = "counter";
+
+/// The kind of a family that is measured now and goes up and down.
+const GAUGE: &str = "gauge";
+
 /// Why a put or a completion that reached the upstream was refused or failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PutFailed {
@@ -114,9 +120,10 @@ pub struct Counters {
     pub(super) upstream_list_uploads: AtomicU64,
     /// The bytes the upstream gave to fills and pass-through reads.
     pub(super) upstream_bytes_read: AtomicU64,
-    /// The HEADs of clients answered from the index.
+    /// The HEADs the cache is asked that the index answered: the HEADs of clients, and the S3
+    /// front's own HEAD before a GET it serves.
     pub(super) head_hits: AtomicU64,
-    /// The HEADs of clients sent to the upstream.
+    /// The same HEADs sent to the upstream.
     pub(super) head_misses: AtomicU64,
     /// The create-only puts and the completions of uploads the upstream accepted.
     pub(super) upstream_puts: AtomicU64,
@@ -222,35 +229,60 @@ impl Counters {
         fs_free_bytes: u64,
     ) -> String {
         let mut text = String::new();
+        // Each family has one `# TYPE` line, before its first sample, as the OCI series have.
         let plain = [
-            ("hits_total", read(&self.hits)),
-            ("misses_total", read(&self.misses)),
-            ("bytes_served_local_total", read(&self.bytes_served_local)),
+            ("hits_total", COUNTER, read(&self.hits)),
+            ("misses_total", COUNTER, read(&self.misses)),
+            (
+                "bytes_served_local_total",
+                COUNTER,
+                read(&self.bytes_served_local),
+            ),
             (
                 "bytes_served_upstream_total",
+                COUNTER,
                 read(&self.bytes_served_upstream),
             ),
-            ("fills_total", read(&self.fills)),
-            ("fills_skipped_total", read(&self.fills_skipped)),
-            ("fills_skipped_busy_total", read(&self.fills_skipped_busy)),
-            ("upstream_bytes_read_total", read(&self.upstream_bytes_read)),
-            ("head_hits_total", read(&self.head_hits)),
-            ("head_misses_total", read(&self.head_misses)),
-            ("upstream_puts_total", read(&self.upstream_puts)),
-            ("upstream_put_bytes_total", read(&self.upstream_put_bytes)),
-            ("writes_through_total", read(&self.writes_through)),
-            ("write_exists_total", read(&self.write_exists)),
-            ("keeps_expired_total", read(&self.keeps_expired)),
-            ("pinned_skips_total", read(&self.pinned_skips)),
-            ("discarded_at_start_total", read(&self.discarded_at_start)),
-            ("bytes", cache_bytes),
-            ("objects", cache_objects),
-            ("fs_free_bytes", fs_free_bytes),
-            ("staging_files", read(&self.staging_files)),
+            ("fills_total", COUNTER, read(&self.fills)),
+            ("fills_skipped_total", COUNTER, read(&self.fills_skipped)),
+            (
+                "fills_skipped_busy_total",
+                COUNTER,
+                read(&self.fills_skipped_busy),
+            ),
+            (
+                "upstream_bytes_read_total",
+                COUNTER,
+                read(&self.upstream_bytes_read),
+            ),
+            ("head_hits_total", COUNTER, read(&self.head_hits)),
+            ("head_misses_total", COUNTER, read(&self.head_misses)),
+            ("upstream_puts_total", COUNTER, read(&self.upstream_puts)),
+            (
+                "upstream_put_bytes_total",
+                COUNTER,
+                read(&self.upstream_put_bytes),
+            ),
+            ("writes_through_total", COUNTER, read(&self.writes_through)),
+            ("write_exists_total", COUNTER, read(&self.write_exists)),
+            ("keeps_expired_total", COUNTER, read(&self.keeps_expired)),
+            ("pinned_skips_total", COUNTER, read(&self.pinned_skips)),
+            // Set once, when the cache is opened, and the same for the rest of the process.
+            (
+                "discarded_at_start_total",
+                COUNTER,
+                read(&self.discarded_at_start),
+            ),
+            ("bytes", GAUGE, cache_bytes),
+            ("objects", GAUGE, cache_objects),
+            ("fs_free_bytes", GAUGE, fs_free_bytes),
+            ("staging_files", GAUGE, read(&self.staging_files)),
         ];
-        for (name, value) in plain {
+        for (name, kind, value) in plain {
+            let _ = writeln!(text, "# TYPE tierstore_cache_{name} {kind}");
             let _ = writeln!(text, "tierstore_cache_{name} {value}");
         }
+        let _ = writeln!(text, "# TYPE tierstore_cache_fill_failures_total {COUNTER}");
         for (label, counter) in FAILED.iter().zip(&self.failures) {
             let value = read(counter);
             let _ = writeln!(
@@ -264,6 +296,10 @@ impl Counters {
             ("list", &self.upstream_lists),
             ("list_uploads", &self.upstream_list_uploads),
         ];
+        let _ = writeln!(
+            text,
+            "# TYPE tierstore_cache_upstream_reads_total {COUNTER}"
+        );
         for (op, counter) in reads {
             let value = read(counter);
             let _ = writeln!(
@@ -271,6 +307,8 @@ impl Counters {
                 "tierstore_cache_upstream_reads_total{{op=\"{op}\"}} {value}"
             );
         }
+        let family = "tierstore_cache_upstream_put_failures_total";
+        let _ = writeln!(text, "# TYPE {family} {COUNTER}");
         for (label, counter) in PUT_FAILED.iter().zip(&self.put_failures) {
             let value = read(counter);
             let _ = writeln!(
@@ -278,6 +316,8 @@ impl Counters {
                 "tierstore_cache_upstream_put_failures_total{{reason=\"{label}\"}} {value}"
             );
         }
+        let family = "tierstore_cache_write_keep_skipped_total";
+        let _ = writeln!(text, "# TYPE {family} {COUNTER}");
         for (label, counter) in SKIPPED_KEEP.iter().zip(&self.keep_skips) {
             let value = read(counter);
             let _ = writeln!(
@@ -285,6 +325,7 @@ impl Counters {
                 "tierstore_cache_write_keep_skipped_total{{reason=\"{label}\"}} {value}"
             );
         }
+        let _ = writeln!(text, "# TYPE tierstore_cache_evictions_total {COUNTER}");
         for (label, counter) in EVICTED.iter().zip(&self.evictions) {
             let value = read(counter);
             let _ = writeln!(
