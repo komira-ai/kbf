@@ -328,8 +328,8 @@ impl Proxy {
     }
 
     /// What this proxy has counted of its reads since it started, in the Prometheus text
-    /// format: hits and misses of each tier, the bytes each served, the reads that went on to
-    /// the cold tier and the copies they made into the hot tier. Every sample is a counter
+    /// format: hits, misses and errors of each tier, the bytes each served and read, and the
+    /// copies into the hot tier that cold reads made. Every sample is a counter
     /// whose labels have a few fixed values; the names and their meaning are in the README of
     /// the crate.
     #[must_use]
@@ -634,6 +634,8 @@ impl Inner {
         }
         match self.hot.put(key, body.clone()).await {
             Ok(()) => {
+                // Counted when the hot tier has the object, before the journal entry below,
+                // which can fail.
                 self.counters.promoted(body.len());
                 let inner = Arc::clone(self);
                 let key = key.to_owned();
@@ -659,23 +661,29 @@ impl Inner {
         match self.hot.get(key, range).await {
             Ok(body) => {
                 self.counters.hit(Tier::Hot, Read::Get);
+                self.counters.bytes_read(Tier::Hot, body.len());
                 self.counters.served(Tier::Hot, body.len());
                 return Ok(body);
             }
             Err(Error::NotFound(_)) => self.counters.miss(Tier::Hot, Read::Get),
-            Err(error) => return Err(error),
+            Err(error) => {
+                self.counters.error(Tier::Hot, Read::Get);
+                return Err(error);
+            }
         }
-        self.counters.cold_read(Read::Get);
         let body = match self.cold.get(key, None).await {
             Ok(body) => body,
             Err(error @ Error::NotFound(_)) => {
                 self.counters.miss(Tier::Cold, Read::Get);
                 return Err(error);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                self.counters.error(Tier::Cold, Read::Get);
+                return Err(error);
+            }
         };
         self.counters.hit(Tier::Cold, Read::Get);
-        self.counters.cold_bytes_read(body.len());
+        self.counters.bytes_read(Tier::Cold, body.len());
         self.copy_back(key, &body).await;
         let served = match range {
             Some(range) => range.slice(&body)?,
@@ -692,9 +700,11 @@ impl Inner {
                 return Ok(meta);
             }
             Err(Error::NotFound(_)) => self.counters.miss(Tier::Hot, Read::Head),
-            Err(error) => return Err(error),
+            Err(error) => {
+                self.counters.error(Tier::Hot, Read::Head);
+                return Err(error);
+            }
         }
-        self.counters.cold_read(Read::Head);
         match self.cold.head(key).await {
             Ok(meta) => {
                 self.counters.hit(Tier::Cold, Read::Head);
@@ -704,7 +714,10 @@ impl Inner {
                 self.counters.miss(Tier::Cold, Read::Head);
                 Err(error)
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                self.counters.error(Tier::Cold, Read::Head);
+                Err(error)
+            }
         }
     }
 

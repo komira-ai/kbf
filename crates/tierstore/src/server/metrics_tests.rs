@@ -9,23 +9,30 @@ use crate::{Backend, ByteRange, Error, Op};
 
 use super::testing::{Reply, Rig};
 
-const BUDGET: u64 = 1 << 20;
+pub(super) const BUDGET: u64 = 1 << 20;
 
 /// Every series of `/metricz` with its labels, as the text names it.
-const SERIES: [&str; 19] = [
-    "tierstore_hot_hits_total{op=\"get\"}",
-    "tierstore_hot_hits_total{op=\"head\"}",
-    "tierstore_cold_hits_total{op=\"get\"}",
-    "tierstore_cold_hits_total{op=\"head\"}",
-    "tierstore_hot_misses_total{op=\"get\"}",
-    "tierstore_hot_misses_total{op=\"head\"}",
-    "tierstore_cold_misses_total{op=\"get\"}",
-    "tierstore_cold_misses_total{op=\"head\"}",
-    "tierstore_hot_bytes_served_total",
-    "tierstore_cold_bytes_served_total",
-    "tierstore_cold_reads_total{op=\"get\"}",
-    "tierstore_cold_reads_total{op=\"head\"}",
-    "tierstore_cold_bytes_read_total",
+const SERIES: [&str; 26] = [
+    "tierstore_hits_total{tier=\"hot\",op=\"get\"}",
+    "tierstore_hits_total{tier=\"hot\",op=\"head\"}",
+    "tierstore_hits_total{tier=\"cold\",op=\"get\"}",
+    "tierstore_hits_total{tier=\"cold\",op=\"head\"}",
+    "tierstore_misses_total{tier=\"hot\",op=\"get\"}",
+    "tierstore_misses_total{tier=\"hot\",op=\"head\"}",
+    "tierstore_misses_total{tier=\"cold\",op=\"get\"}",
+    "tierstore_misses_total{tier=\"cold\",op=\"head\"}",
+    "tierstore_read_errors_total{tier=\"hot\",op=\"get\"}",
+    "tierstore_read_errors_total{tier=\"hot\",op=\"head\"}",
+    "tierstore_read_errors_total{tier=\"cold\",op=\"get\"}",
+    "tierstore_read_errors_total{tier=\"cold\",op=\"head\"}",
+    "tierstore_reads_total{tier=\"hot\",op=\"get\"}",
+    "tierstore_reads_total{tier=\"hot\",op=\"head\"}",
+    "tierstore_reads_total{tier=\"cold\",op=\"get\"}",
+    "tierstore_reads_total{tier=\"cold\",op=\"head\"}",
+    "tierstore_bytes_served_total{tier=\"hot\"}",
+    "tierstore_bytes_served_total{tier=\"cold\"}",
+    "tierstore_bytes_read_total{tier=\"hot\"}",
+    "tierstore_bytes_read_total{tier=\"cold\"}",
     "tierstore_promotions_total",
     "tierstore_promoted_bytes_total",
     "tierstore_promotions_skipped_total{reason=\"critical\"}",
@@ -43,35 +50,44 @@ async fn metricz(rig: &Rig) -> Reply {
     rig.send_raw(request).await
 }
 
-/// The value of the series `name` in the text of `/metricz`.
-async fn value(rig: &Rig, name: &str) -> u64 {
-    let reply = metricz(rig).await;
+/// The value of the series `name` in the text of a `/metricz`.
+pub(super) fn sample(text: &str, name: &str) -> u64 {
     let prefix = format!("{name} ");
-    let line = reply
-        .body
+    let line = text
         .lines()
         .find(|line| line.starts_with(&prefix))
-        .unwrap_or_else(|| panic!("no series {name} in:\n{}", reply.body));
+        .unwrap_or_else(|| panic!("no series {name} in:\n{text}"));
     line[prefix.len()..].parse().expect("a number")
 }
 
-const HOT_HIT_GET: &str = "tierstore_hot_hits_total{op=\"get\"}";
-const HOT_HIT_HEAD: &str = "tierstore_hot_hits_total{op=\"head\"}";
-const COLD_HIT_GET: &str = "tierstore_cold_hits_total{op=\"get\"}";
-const COLD_HIT_HEAD: &str = "tierstore_cold_hits_total{op=\"head\"}";
-const HOT_MISS_GET: &str = "tierstore_hot_misses_total{op=\"get\"}";
-const HOT_MISS_HEAD: &str = "tierstore_hot_misses_total{op=\"head\"}";
-const COLD_MISS_GET: &str = "tierstore_cold_misses_total{op=\"get\"}";
-const COLD_MISS_HEAD: &str = "tierstore_cold_misses_total{op=\"head\"}";
-const HOT_SERVED: &str = "tierstore_hot_bytes_served_total";
-const COLD_SERVED: &str = "tierstore_cold_bytes_served_total";
-const COLD_READS_GET: &str = "tierstore_cold_reads_total{op=\"get\"}";
-const COLD_READS_HEAD: &str = "tierstore_cold_reads_total{op=\"head\"}";
-const COLD_BYTES: &str = "tierstore_cold_bytes_read_total";
-const PROMOTIONS: &str = "tierstore_promotions_total";
-const PROMOTED_BYTES: &str = "tierstore_promoted_bytes_total";
+/// The value of the series `name` on the `/metricz` of the rig.
+async fn value(rig: &Rig, name: &str) -> u64 {
+    sample(&metricz(rig).await.body, name)
+}
 
-fn skipped(reason: &str) -> String {
+pub(super) const HOT_HIT_GET: &str = "tierstore_hits_total{tier=\"hot\",op=\"get\"}";
+pub(super) const HOT_MISS_GET: &str = "tierstore_misses_total{tier=\"hot\",op=\"get\"}";
+pub(super) const HOT_ERR_GET: &str = "tierstore_read_errors_total{tier=\"hot\",op=\"get\"}";
+pub(super) const HOT_READS_GET: &str = "tierstore_reads_total{tier=\"hot\",op=\"get\"}";
+pub(super) const HOT_HIT_HEAD: &str = "tierstore_hits_total{tier=\"hot\",op=\"head\"}";
+pub(super) const HOT_MISS_HEAD: &str = "tierstore_misses_total{tier=\"hot\",op=\"head\"}";
+pub(super) const HOT_ERR_HEAD: &str = "tierstore_read_errors_total{tier=\"hot\",op=\"head\"}";
+pub(super) const HOT_READS_HEAD: &str = "tierstore_reads_total{tier=\"hot\",op=\"head\"}";
+pub(super) const COLD_HIT_GET: &str = "tierstore_hits_total{tier=\"cold\",op=\"get\"}";
+pub(super) const COLD_MISS_GET: &str = "tierstore_misses_total{tier=\"cold\",op=\"get\"}";
+pub(super) const COLD_ERR_GET: &str = "tierstore_read_errors_total{tier=\"cold\",op=\"get\"}";
+pub(super) const COLD_READS_GET: &str = "tierstore_reads_total{tier=\"cold\",op=\"get\"}";
+pub(super) const COLD_HIT_HEAD: &str = "tierstore_hits_total{tier=\"cold\",op=\"head\"}";
+pub(super) const COLD_MISS_HEAD: &str = "tierstore_misses_total{tier=\"cold\",op=\"head\"}";
+pub(super) const COLD_ERR_HEAD: &str = "tierstore_read_errors_total{tier=\"cold\",op=\"head\"}";
+pub(super) const COLD_READS_HEAD: &str = "tierstore_reads_total{tier=\"cold\",op=\"head\"}";
+pub(super) const HOT_SERVED: &str = "tierstore_bytes_served_total{tier=\"hot\"}";
+pub(super) const COLD_SERVED: &str = "tierstore_bytes_served_total{tier=\"cold\"}";
+pub(super) const COLD_BYTES: &str = "tierstore_bytes_read_total{tier=\"cold\"}";
+pub(super) const PROMOTIONS: &str = "tierstore_promotions_total";
+pub(super) const PROMOTED_BYTES: &str = "tierstore_promoted_bytes_total";
+
+pub(super) fn skipped(reason: &str) -> String {
     format!("tierstore_promotions_skipped_total{{reason=\"{reason}\"}}")
 }
 
@@ -99,14 +115,18 @@ async fn metricz_lists_every_series_with_its_labels() {
     }
 }
 
-/// Asserts that a server with no proxy answers `/metricz` 200 and says so. It would catch a
+/// Asserts that a server with nothing to count answers `/metricz` 200 and says so. It would catch a
 /// probe that fails or an empty body when there is nothing to count.
 #[tokio::test]
 async fn metricz_without_a_proxy_says_there_is_none() {
     let rig = Rig::with(BUDGET, |config| config.proxy = None).await;
     let reply = metricz(&rig).await;
     assert_eq!(reply.status, StatusCode::OK);
-    assert!(reply.body.contains("no proxy"), "{}", reply.body);
+    assert!(
+        reply.body.contains("no proxy and no local cache"),
+        "{}",
+        reply.body
+    );
 }
 
 /// Asserts that a GET of an object only in the cold tier counts a hot miss, a cold read, a cold
@@ -154,6 +174,7 @@ async fn a_get_of_a_hot_object_counts_only_a_hot_hit() {
     assert_eq!(rig.put("hot", b"hello").await.status, StatusCode::OK);
     assert_eq!(rig.get("hot", None).await.body, "hello");
     assert_eq!(value(&rig, HOT_HIT_GET).await, 1);
+    assert_eq!(value(&rig, HOT_READS_GET).await, 1);
     assert_eq!(value(&rig, HOT_SERVED).await, 5);
     assert_eq!(value(&rig, HOT_MISS_GET).await, 0);
     assert_eq!(value(&rig, COLD_READS_GET).await, 0);
@@ -220,8 +241,10 @@ async fn a_head_of_a_cold_object_counts_the_read_and_copies_nothing() {
 #[tokio::test]
 async fn a_cold_read_that_is_not_copied_back_counts_why() {
     let rig = cold_only("a", b"aaaa").await;
+    // 96 percent of the budget: above the critical mark (95), below the budget, which is `Full`.
+    let hot_bytes = BUDGET / 100 * 96;
     let json = format!(
-        r#"{{"hot_bytes":{BUDGET},"copy_lag":0,"time":{}}}"#,
+        r#"{{"hot_bytes":{hot_bytes},"copy_lag":0,"time":{}}}"#,
         super::testing::NOW
     );
     rig.hot_mem
@@ -271,6 +294,12 @@ async fn a_failed_read_is_not_counted_as_a_hit_or_a_miss() {
         proxy.head("obj").await,
         Err(Error::Unavailable(_))
     ));
+    assert_eq!(value(&rig, HOT_ERR_GET).await, 1);
+    assert_eq!(value(&rig, HOT_ERR_HEAD).await, 1);
+    assert_eq!(
+        value(&rig, HOT_HIT_GET).await + value(&rig, HOT_HIT_HEAD).await,
+        0
+    );
     assert_eq!(value(&rig, HOT_MISS_GET).await, 0);
     assert_eq!(value(&rig, HOT_MISS_HEAD).await, 0);
     assert_eq!(value(&rig, COLD_READS_GET).await, 0);
@@ -285,6 +314,8 @@ async fn a_failed_read_is_not_counted_as_a_hit_or_a_miss() {
         proxy.head("obj").await,
         Err(Error::Unavailable(_))
     ));
+    assert_eq!(value(&rig, COLD_ERR_GET).await, 1);
+    assert_eq!(value(&rig, COLD_ERR_HEAD).await, 1);
     assert_eq!(value(&rig, COLD_READS_GET).await, 1);
     assert_eq!(value(&rig, COLD_READS_HEAD).await, 1);
     assert_eq!(value(&rig, COLD_HIT_GET).await, 0);
@@ -292,9 +323,13 @@ async fn a_failed_read_is_not_counted_as_a_hit_or_a_miss() {
     assert_eq!(value(&rig, COLD_HIT_HEAD).await, 0);
     assert_eq!(value(&rig, COLD_MISS_HEAD).await, 0);
 
+    // A range past the end of the object: the cold tier gave the whole object (3 bytes) and the
+    // proxy copied it into the hot tier before it cut the range, which it cannot.
     let past = proxy.get("obj", Some(ByteRange::new(9, 1))).await;
     assert!(past.is_err());
     assert_eq!(value(&rig, COLD_SERVED).await, 0);
+    assert_eq!(value(&rig, COLD_BYTES).await, 3);
+    assert_eq!(value(&rig, PROMOTIONS).await, 1);
 }
 
 /// Asserts that an object deleted between the head and the get (the get finds neither tier)
@@ -310,4 +345,62 @@ async fn a_get_that_finds_neither_tier_counts_a_get_miss() {
     assert_eq!(value(&rig, HOT_MISS_GET).await, 1);
     assert_eq!(value(&rig, COLD_MISS_GET).await, 1);
     assert_eq!(value(&rig, COLD_READS_GET).await, 1);
+}
+
+/// Asserts that a hot tier that is down, met by a GET through the S3 front, moves
+/// `read_errors_total` of the hot tier and leaves every hit and miss where it was, and that the
+/// reads of the cold tier, which was never asked, stay at zero. It would catch an outage that
+/// counts as a miss (the hit rate of a tier that is down would fall) or as nothing.
+#[tokio::test]
+async fn a_hot_outage_moves_the_error_counter_and_not_the_hit_rate() {
+    let rig = cold_only("obj", b"abc").await;
+    rig.hot.set_down(true);
+    let reply = rig.get("obj", None).await;
+    assert_ne!(reply.status, StatusCode::OK);
+    assert_eq!(value(&rig, HOT_ERR_HEAD).await, 1);
+    assert_eq!(value(&rig, HOT_READS_HEAD).await, 1);
+    for series in [
+        HOT_HIT_GET,
+        HOT_HIT_HEAD,
+        HOT_MISS_GET,
+        HOT_MISS_HEAD,
+        COLD_READS_HEAD,
+    ] {
+        assert_eq!(value(&rig, series).await, 0, "{series}");
+    }
+}
+
+/// Asserts that a GET whose object vanishes from the cold tier between the head and the get (the
+/// head found it, the get does not) counts a cold miss at `op="get"` and answers 404. It would
+/// catch a miss at the get that the front's own head hides.
+#[tokio::test]
+async fn a_get_whose_object_vanishes_after_the_head_counts_a_cold_get_miss() {
+    let rig = cold_only("obj", b"abc").await;
+    rig.cold
+        .fail_next_with(Op::Get, Error::NotFound("obj".to_owned()));
+    // The cold tier's head is the first call the front makes; the injected failure is for the get.
+    let reply = rig.get("obj", None).await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert_eq!(value(&rig, COLD_HIT_HEAD).await, 1);
+    assert_eq!(value(&rig, COLD_MISS_GET).await, 1);
+    assert_eq!(value(&rig, COLD_HIT_GET).await, 0);
+    assert_eq!(value(&rig, HOT_MISS_GET).await, 1);
+    assert_eq!(value(&rig, COLD_SERVED).await, 0);
+}
+
+/// Asserts that no series of `/metricz` is named twice, whatever its value, and that every line
+/// is a comment or `name value` or `name{labels} value`. It would catch two code paths that
+/// emit the same series, which a scraper takes as a duplicate and drops.
+#[tokio::test]
+async fn no_series_is_emitted_twice() {
+    let rig = cold_only("obj", b"abc").await;
+    assert_eq!(rig.get("obj", None).await.status, StatusCode::OK);
+    let text = metricz(&rig).await.body;
+    let mut seen = std::collections::BTreeSet::new();
+    for line in text.lines().filter(|line| !line.starts_with('#')) {
+        let (name, number) = line.rsplit_once(' ').expect("name and value");
+        assert!(number.parse::<u64>().is_ok(), "{line}");
+        assert!(seen.insert(name.to_owned()), "{name} twice in:\n{text}");
+    }
+    assert_eq!(seen.len(), SERIES.len());
 }

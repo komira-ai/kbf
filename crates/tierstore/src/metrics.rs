@@ -30,7 +30,8 @@ const READS: [&str; 2] = ["get", "head"];
 /// Why a get that found an object in the cold tier did not copy it into the hot tier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Skipped {
-    /// The hot tier is at or above its critical mark, or was just told it is full.
+    /// The hot tier is at or above its critical mark by the usage the reconciler published, or
+    /// is taken to be full because it answered an earlier copy with "full" a moment ago.
     Critical,
     /// The hot tier answered the copy with "full".
     Full,
@@ -50,12 +51,13 @@ pub(crate) struct Counters {
     hits: [[AtomicU64; READS.len()]; TIERS.len()],
     /// Reads a tier did not find the object for, by tier and kind of read.
     misses: [[AtomicU64; READS.len()]; TIERS.len()],
+    /// Reads a tier failed with something other than "not found", by tier and kind of read.
+    errors: [[AtomicU64; READS.len()]; TIERS.len()],
     /// Bytes of object data in the answers of gets, by the tier that gave them.
     served: [AtomicU64; TIERS.len()],
-    /// Reads that went on to the cold tier because the hot tier did not have the object.
-    cold_reads: [AtomicU64; READS.len()],
-    /// Bytes gets read from the cold tier, whole objects, whatever range was asked.
-    cold_bytes_read: AtomicU64,
+    /// Bytes of object data gets read from a tier: the whole object of a cold read, whatever
+    /// range was asked.
+    read: [AtomicU64; TIERS.len()],
     /// Objects copied from the cold tier into the hot tier by a get.
     promotions: AtomicU64,
     /// Bytes of those objects.
@@ -92,14 +94,14 @@ impl Counters {
         add(&self.served[tier as usize], bytes);
     }
 
-    /// A read went on to the cold tier.
-    pub(crate) fn cold_read(&self, kind: Read) {
-        bump(&self.cold_reads[kind as usize]);
+    /// A read of `tier` failed with something other than "not found".
+    pub(crate) fn error(&self, tier: Tier, kind: Read) {
+        bump(&self.errors[tier as usize][kind as usize]);
     }
 
-    /// A get read `bytes` bytes from the cold tier.
-    pub(crate) fn cold_bytes_read(&self, bytes: usize) {
-        add(&self.cold_bytes_read, bytes);
+    /// A get read `bytes` bytes of object data from `tier`.
+    pub(crate) fn bytes_read(&self, tier: Tier, bytes: usize) {
+        add(&self.read[tier as usize], bytes);
     }
 
     /// An object of `bytes` bytes was copied into the hot tier.
@@ -113,54 +115,74 @@ impl Counters {
         bump(&self.skipped[why as usize]);
     }
 
-    /// The text of the counters. The names follow those of the local cache: the tier is in the
-    /// name (`tierstore_hot_hits_total`), as `cache` is in `tierstore_cache_hits_total`, and a
-    /// label has the few values of a kind of read or a reason.
+    /// The text of the counters, one family for both tiers, the tier a label (`tier` is `hot`
+    /// or `cold` here; the local cache of a build node uses `local`). A read that reached a tier
+    /// is a hit, a miss or an error there, so `reads` is the sum of the three.
     pub(crate) fn render(&self) -> String {
         let mut text = String::new();
-        for (tier, (hits, misses)) in TIERS.into_iter().zip(self.hits.iter().zip(&self.misses)) {
-            for (kind, (hit, miss)) in READS.into_iter().zip(hits.iter().zip(misses)) {
-                sample(&mut text, &format!("{tier}_hits_total"), ("op", kind), hit);
+        let tiers = TIERS.into_iter().enumerate();
+        for (tier, label) in tiers.clone() {
+            for (kind, op) in READS.into_iter().enumerate() {
+                let labels = [("tier", label), ("op", op)];
                 sample(
                     &mut text,
-                    &format!("{tier}_misses_total"),
-                    ("op", kind),
-                    miss,
+                    "hits_total",
+                    &labels,
+                    read(&self.hits[tier][kind]),
                 );
+                sample(
+                    &mut text,
+                    "misses_total",
+                    &labels,
+                    read(&self.misses[tier][kind]),
+                );
+                let failed = read(&self.errors[tier][kind]);
+                sample(&mut text, "read_errors_total", &labels, failed);
+                let reads = read(&self.hits[tier][kind]) + read(&self.misses[tier][kind]) + failed;
+                sample(&mut text, "reads_total", &labels, reads);
             }
         }
-        for (tier, counter) in TIERS.into_iter().zip(&self.served) {
-            plain(&mut text, &format!("{tier}_bytes_served_total"), counter);
+        for (tier, label) in tiers {
+            let labels = [("tier", label)];
+            sample(
+                &mut text,
+                "bytes_served_total",
+                &labels,
+                read(&self.served[tier]),
+            );
+            sample(
+                &mut text,
+                "bytes_read_total",
+                &labels,
+                read(&self.read[tier]),
+            );
         }
-        for (kind, counter) in READS.into_iter().zip(&self.cold_reads) {
-            sample(&mut text, "cold_reads_total", ("op", kind), counter);
-        }
-        plain(&mut text, "cold_bytes_read_total", &self.cold_bytes_read);
-        plain(&mut text, "promotions_total", &self.promotions);
-        plain(&mut text, "promoted_bytes_total", &self.promoted_bytes);
+        sample(&mut text, "promotions_total", &[], read(&self.promotions));
+        sample(
+            &mut text,
+            "promoted_bytes_total",
+            &[],
+            read(&self.promoted_bytes),
+        );
         for (why, counter) in SKIPPED.into_iter().zip(&self.skipped) {
+            let labels = [("reason", why)];
             sample(
                 &mut text,
                 "promotions_skipped_total",
-                ("reason", why),
-                counter,
+                &labels,
+                read(counter),
             );
         }
         text
     }
 }
 
-/// The line of `tierstore_<name>`.
-fn plain(text: &mut String, name: &str, counter: &AtomicU64) {
-    let _ = writeln!(text, "tierstore_{name} {}", read(counter));
-}
-
-/// The line of `tierstore_<name>` with the label `(key, value)`.
-fn sample(text: &mut String, name: &str, label: (&str, &str), counter: &AtomicU64) {
-    let (key, value) = label;
-    let _ = writeln!(
-        text,
-        "tierstore_{name}{{{key}=\"{value}\"}} {}",
-        read(counter)
-    );
+/// The line of `tierstore_<name>` with `labels`.
+fn sample(text: &mut String, name: &str, labels: &[(&str, &str)], value: u64) {
+    let pairs: Vec<String> = labels.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect();
+    if pairs.is_empty() {
+        let _ = writeln!(text, "tierstore_{name} {value}");
+    } else {
+        let _ = writeln!(text, "tierstore_{name}{{{}}} {value}", pairs.join(","));
+    }
 }

@@ -150,8 +150,9 @@
 //! `GET /metricz` is 200 with the counters of the proxy's reads ([`Proxy::metrics`]: hits,
 //! misses and bytes of each tier, the reads that went on to the cold tier, the copies they made
 //! into the hot tier) in the Prometheus text format; it is not signed either, and a bucket
-//! cannot be called `metricz`. Without [`ServerConfig::proxy`] it is 200 and says there is no
-//! proxy. The README of the crate lists every name and label.
+//! cannot be called `metricz`. Without [`ServerConfig::proxy`] it is 200 and says there is
+//! no proxy and no local cache. Every source of counters the server has shows, one block after the other.
+//! The README of the crate lists every name and label.
 //!
 //! # Drain
 //!
@@ -199,6 +200,8 @@ mod gc_server_tests;
 mod gc_tests;
 #[cfg(test)]
 mod idle_tests;
+#[cfg(test)]
+mod metrics_race_tests;
 #[cfg(test)]
 mod metrics_tests;
 #[cfg(test)]
@@ -765,11 +768,17 @@ impl Server {
         Some(answer(status, &headers, Bytes::from(text)))
     }
 
-    /// The text of `/metricz`: the counters of the proxy, or a line that says there is none.
+    /// The text of `/metricz`: the block of every source of counters the server has, one after
+    /// the other, or a line that says there is none. Every block that exists renders, never
+    /// one of them: a server with a proxy and a local cache shows both. A new source adds one
+    /// entry to `blocks`.
     fn metrics_probe(&self) -> String {
-        match &self.config.proxy {
-            Some(proxy) => proxy.metrics(),
-            None => "# this server has no proxy to count\n".to_owned(),
+        let blocks = [self.config.proxy.as_ref().map(|proxy| proxy.metrics())];
+        let text: String = blocks.into_iter().flatten().collect();
+        if text.is_empty() {
+            "# this server has no proxy and no local cache\n".to_owned()
+        } else {
+            text
         }
     }
 
