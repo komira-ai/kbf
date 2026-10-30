@@ -257,7 +257,10 @@ fn a_build_node_file_is_refused_when_it_cannot_be_run() {
             cache_with("high_water = 85", "high_water = 101"),
             "local_cache.high_water",
         ),
-        (cache_with("\"50MiB/s\"", "\"fast\""), "not a rate"),
+        (
+            cache_with("\"50MiB/s\"", "\"fast\""),
+            "expected a rate such as",
+        ),
         (cache_with("\"50MiB/s\"", "50"), "scrub_rate"),
         (no_cache_policy, "no policy has cache = true"),
         (
@@ -329,6 +332,10 @@ fn a_build_node_file_is_refused_when_it_cannot_be_run() {
         let why = refusal(&text);
         assert!(why.contains(want), "{want}: {why}");
     }
+    // A rate that does not parse is refused naming its key, and the value is not shown.
+    let why = refusal(&cache_with("\"50MiB/s\"", "\"fast\""));
+    assert!(why.contains("scrub_rate"), "{why}");
+    assert!(!why.contains("fast"), "{why}");
 }
 
 /// Asserts the edges of the water marks: a low water mark one under the high one, a high one
