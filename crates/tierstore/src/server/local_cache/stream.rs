@@ -243,7 +243,12 @@ impl Follower {
         let limit = self
             .end
             .or_else(|| self.range.map(|r| r.offset().saturating_add(r.size())));
-        let left = limit.map(|limit| limit.saturating_sub(self.sent));
+        // A read of the whole object has no length of its own: the size is read again from the
+        // upstream, so that a body shorter than the object is known for what it is.
+        let left = self
+            .range
+            .and(limit)
+            .map(|limit| limit.saturating_sub(self.sent));
         // A reader that was given bytes goes on only if the upstream still has the version they
         // came from (it may have been deleted or written over, which is what ended the fill).
         let had = self.meta.clone().filter(|_| self.sent > self.first);

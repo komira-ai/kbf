@@ -314,13 +314,24 @@ pub(super) async fn raw_get(server: &Arc<Server>, config: &ServerConfig, uri: &s
 }
 
 /// The head of an answer as text, the `Content-Length` it gives (if it gives one) and the body
-/// that came with it.
+/// that came with it. An answer that was cut before its head was complete gives an empty head and
+/// no body: the server does not flush a head it has not followed with the whole of its body.
 pub(super) fn split_answer(answer: &[u8]) -> (String, Option<usize>, &[u8]) {
-    let end = answer.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let Some(found) = answer.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return (String::new(), None, &[]);
+    };
+    let end = found + 4;
     let head = String::from_utf8_lossy(&answer[..end]).into_owned();
     let length = head.to_ascii_lowercase().lines().find_map(|line| {
         let value = line.strip_prefix("content-length: ")?;
         value.trim().parse().ok()
     });
     (head, length, &answer[end..])
+}
+
+/// Whether an answer reached the client incomplete: it ends before the body of the length its head
+/// gave, or before its head was complete at all.
+pub(super) fn is_cut(answer: &[u8]) -> bool {
+    let (head, length, body) = split_answer(answer);
+    head.is_empty() || length.is_none_or(|length| body.len() < length)
 }

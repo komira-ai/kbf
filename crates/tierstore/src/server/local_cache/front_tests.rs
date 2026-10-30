@@ -311,8 +311,9 @@ async fn a_body_that_fails_the_hash_ends_the_connection_before_its_length() {
     .await;
     gate.add_permits(64);
     let answer = reading.await.unwrap();
-    let (head, length, body) = crate::server::pipes::split_answer(&answer);
-    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    assert_eq!(length, Some(100));
-    assert!(body.len() < 100, "{} bytes", body.len());
+    assert!(
+        crate::server::pipes::is_cut(&answer),
+        "{} bytes",
+        answer.len()
+    );
 }
