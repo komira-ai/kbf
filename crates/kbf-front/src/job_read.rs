@@ -545,6 +545,9 @@ impl JobRead {
     /// a read are read together, each once, with [`BlobSource::read_many`], under a take of at
     /// most half the reads in flight (as many places as blobs) while they are read, and of the
     /// budget: their sizes together and [`BATCH_GAP_BYTES`] for each gap between them.
+    /// The places bound the batches that read at once, not the reads of one: a source reads the
+    /// blobs it does not read together concurrently, up to the batch's size (at most
+    /// [`BATCH_MAX_DIGESTS`]), and what bounds their bytes is the budget.
     async fn batch_blobs(
         &self,
         claims: &Claims,
@@ -634,7 +637,9 @@ impl JobRead {
         let cell = {
             let mut cells = self.scopes.lock().unwrap_or_else(PoisonError::into_inner);
             if cells.len() >= self.limits.scopes {
-                cells.retain(|_, cell| !cell.initialized());
+                // A walk that is done, and one that no one is waiting on (it failed, or was
+                // cancelled), go; one in progress stays, so that a second ask joins it.
+                cells.retain(|_, cell| !cell.initialized() && Arc::strong_count(cell) > 1);
             }
             Arc::clone(cells.entry(action).or_default())
         };

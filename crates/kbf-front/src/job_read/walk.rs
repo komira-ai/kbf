@@ -2,10 +2,10 @@
 //! walk and the reads of blobs share.
 //!
 //! The walk reads the Action and then the Directories under its input root a level at a time,
-//! and keeps only the digests they name: a Directory is dropped as soon as it is read, so what a
-//! level holds is the digests it names and not the Directories (each of at most
-//! [`MAX_SCOPE_BLOB_BYTES`]); the bound [`super::Limits::scope_digests`] is checked after each level.
-//! Each read takes its blob's size from the budget first, and a blob
+//! and keeps only the digests they name: a Directory is dropped as soon as it is read, and the
+//! bound [`super::Limits::scope_digests`] is checked as each Directory is folded in, so the
+//! walk holds the bound, the sixteen Directories being read (each of at most
+//! [`MAX_SCOPE_BLOB_BYTES`]) and the digests of one more. Each read takes its blob's size from the budget first, and a blob
 //! over [`MAX_SCOPE_BLOB_BYTES`] is refused before it is charged or read.
 
 use std::collections::HashSet;
@@ -107,23 +107,24 @@ pub(super) async fn walk(
     let mut seen = HashSet::from([root]);
     let mut level = vec![root];
     while !level.is_empty() {
-        let entries: Vec<Entries> = stream::iter(level)
+        let mut next = Vec::new();
+        let mut entries = stream::iter(level)
             .map(|digest| directory(source, budget, digest))
-            .buffer_unordered(DIRECTORIES_IN_FLIGHT)
-            .try_collect()
-            .await?;
-        level = Vec::new();
-        for (files, directories) in entries {
+            .buffer_unordered(DIRECTORIES_IN_FLIGHT);
+        // Each Directory is folded in as it arrives and the bound checked at once, so that what
+        // the walk holds is the bound, the Directories being read and one more.
+        while let Some((files, directories)) = entries.try_next().await? {
             seen.extend(files);
             for digest in directories {
                 if seen.insert(digest) {
-                    level.push(digest);
+                    next.push(digest);
                 }
             }
+            if seen.len() > most {
+                return Err(ScopeError::Unusable);
+            }
         }
-        if seen.len() > most {
-            return Err(ScopeError::Unusable);
-        }
+        level = next;
     }
     Ok(Scope::new(action, command, seen))
 }
