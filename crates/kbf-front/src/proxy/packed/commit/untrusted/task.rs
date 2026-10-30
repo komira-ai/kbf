@@ -115,11 +115,15 @@ pub enum RejectReason {
     /// A pack beyond the first, or a large object, is not in the store, or a digest the manifest
     /// or a tree names is in no pack and no large object.
     Incomplete,
+    /// A key is older than the longest it can be in use ([`kbf_pack::MIN_GRACE`]), or the
+    /// janitor of `cas/b/` has claimed it for its delete. Either way the run is not
+    /// ingested, and the action is run again under a new key set.
+    Expired,
 }
 
 impl RejectReason {
     /// Every reason, in the order of the variants (the order of the counters).
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Missing,
         Self::WrongKey,
         Self::TooLarge,
@@ -127,6 +131,7 @@ impl RejectReason {
         Self::HashMismatch,
         Self::BadManifest,
         Self::Incomplete,
+        Self::Expired,
     ];
 
     /// The label of the reason in the metrics.
@@ -140,6 +145,7 @@ impl RejectReason {
             Self::HashMismatch => "hash_mismatch",
             Self::BadManifest => "bad_manifest",
             Self::Incomplete => "incomplete",
+            Self::Expired => "expired",
         }
     }
 }
@@ -245,13 +251,16 @@ pub async fn ingest_set(
 ) -> Ingested {
     // Every key of the set is held from here to the end of the call, or its being dropped, so the
     // janitor of `cas/b/` never deletes what this ingest is reading or copying.
-    let _verifying = packs.verifying.hold(
-        keys.packs()
-            .iter()
-            .chain(keys.large())
-            .map(|key| key.key().to_owned())
-            .collect(),
-    );
+    let _verifying = packs
+        .verifying
+        .hold(
+            keys.packs()
+                .iter()
+                .chain(keys.large())
+                .map(|key| key.key().to_owned())
+                .collect(),
+        )
+        .ok();
     let done = Ingest {
         packs,
         backend,

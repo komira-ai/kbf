@@ -6,7 +6,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -155,6 +155,9 @@ impl<S: ObjectStore> PackStore for Over<S> {
     }
 }
 
+/// The clock that dates a task key's age.
+pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
+
 /// The frontend's packs. Cheap to clone; every clone is the same packs.
 #[derive(Clone)]
 pub struct Packs {
@@ -165,6 +168,7 @@ pub struct Packs {
     budget: Budget,
     pub(super) metrics: Arc<PackMetrics>,
     pub(super) verifying: Arc<VerifyingKeys>,
+    clock: Clock,
 }
 
 impl fmt::Debug for Packs {
@@ -213,7 +217,21 @@ impl Packs {
             budget: Budget::new(settings.inflight_bytes, Arc::clone(&metrics)),
             metrics,
             verifying: Arc::default(),
+            clock: Arc::new(SystemTime::now),
         })
+    }
+
+    /// These packs judging the age of a task key by `clock` (the wall clock unless told).
+    #[must_use]
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The time these packs judge the age of a task key by.
+    #[must_use]
+    pub fn now(&self) -> SystemTime {
+        (self.clock)()
     }
 
     /// The task pack keys an ingest through these packs is verifying now: the janitor of

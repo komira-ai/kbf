@@ -5,7 +5,7 @@
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use bytes::Bytes;
 use clap::error::ErrorKind;
@@ -46,6 +46,10 @@ struct Flaky {
     inner: MemoryStore,
     refused: Mutex<Vec<String>>,
     no_listing: AtomicBool,
+    deny_deletes: AtomicBool,
+    refuse_every_delete: AtomicBool,
+    deletes: AtomicU32,
+    stops_leading: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl Flaky {
@@ -54,6 +58,10 @@ impl Flaky {
             inner: MemoryStore::new(Capabilities::default()),
             refused: Mutex::new(Vec::new()),
             no_listing: AtomicBool::new(false),
+            deny_deletes: AtomicBool::new(false),
+            refuse_every_delete: AtomicBool::new(false),
+            deletes: AtomicU32::new(0),
+            stops_leading: Mutex::new(None),
         })
     }
 
@@ -108,6 +116,23 @@ impl ObjectStore for Flaky {
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
+        self.deletes.fetch_add(1, Ordering::SeqCst);
+        let service = |status: u16, code: &str| ObjectStoreError::Service {
+            status,
+            code: code.to_owned(),
+            message: "refused".to_owned(),
+        };
+        if self.deny_deletes.load(Ordering::SeqCst) {
+            return Err(service(403, "AccessDenied"));
+        }
+        if self.refuse_every_delete.load(Ordering::SeqCst) {
+            return Err(service(503, "SlowDown"));
+        }
+        let leading = self.stops_leading.lock().expect("lock").clone();
+        if let Some(leading) = leading {
+            // The server stops leading as this delete is made.
+            leading.store(false, Ordering::SeqCst);
+        }
         let refused = self
             .refused
             .lock()
@@ -371,7 +396,10 @@ async fn a_key_under_verification_is_kept_until_the_ingest_ends() {
     let (pack, large) = (key(OLD, Slot::Pack(0)), key(OLD, Slot::Large(0)));
     rig.store.seed(&pack).await;
     rig.store.seed(&large).await;
-    let hold = rig.verifying.hold(vec![pack.clone(), large.clone()]);
+    let hold = rig
+        .verifying
+        .hold(vec![pack.clone(), large.clone()])
+        .expect("free");
 
     rig.janitor.sweep_once().await;
 
@@ -504,6 +532,7 @@ async fn the_metrics_render_every_family() {
         ("kept_referenced", 0),
         ("kept_unparsed", 1),
         ("kept_outside", 0),
+        ("abandoned", 0),
         ("reaped", 1),
         ("would_reap", 0),
         ("reap_errors", 0),
@@ -878,11 +907,13 @@ async fn a_frontend_with_the_janitor_flags_sweeps_the_store_as_it_serves() {
     assert!(flags.janitor.is_some());
     let handle = started(&flags, Some(index())).expect("starts");
     let api = handle.api.expect("the operator API");
+    let mut sweeps = handle.janitor_sweeps().expect("a janitor");
     let served = tokio::spawn(handle.serve());
 
+    // Each sweep that ends is told, so the scrape is repeated per sweep and not per time.
     let mut text = scrape(api).await;
     while !text.contains("kbf_cas_b_janitor_reaped_total 2\n") {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        sweeps.changed().await.expect("the janitor runs");
         text = scrape(api).await;
     }
 
@@ -908,4 +939,62 @@ async fn a_frontend_without_the_janitor_flags_has_no_janitor() {
 
     assert!(!text.contains("kbf_cas_b_janitor_"), "{text}");
     served.abort();
+}
+
+/// Asserts that leadership lost as a delete is made stops the next delete of the same page: one
+/// key is reaped, the rest stay, and the sweep is counted abandoned and not as an error.
+#[tokio::test]
+async fn leadership_lost_mid_sweep_stops_the_deletes() {
+    let rig = Rig::new();
+    for n in 0..4 {
+        rig.store.seed(&key(OLD + n, Slot::Pack(0))).await;
+    }
+    *rig.store.stops_leading.lock().expect("lock") = Some(Arc::clone(&rig.leader));
+
+    rig.janitor.sweep_once().await;
+
+    assert_eq!(rig.store.keys().await.len(), 3);
+    assert_eq!(rig.count("reaped"), 1);
+    assert_eq!(rig.count("abandoned"), 1);
+    assert_eq!(rig.count("sweep_errors"), 0);
+}
+
+/// Asserts that a delete the store answers 403 ends the sweep at once: one delete is asked and
+/// not one per key, the sweep is counted as an error once, and the next sweep does the same.
+#[tokio::test]
+async fn a_403_on_delete_aborts_the_sweep() {
+    let rig = Rig::new();
+    for n in 0..4 {
+        rig.store.seed(&key(OLD + n, Slot::Pack(0))).await;
+    }
+    rig.store.deny_deletes.store(true, Ordering::SeqCst);
+
+    rig.janitor.sweep_once().await;
+
+    assert_eq!(rig.store.deletes.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.count("sweep_errors"), 1);
+    assert_eq!(rig.store.keys().await.len(), 4);
+    rig.janitor.sweep_once().await;
+    assert_eq!(rig.store.deletes.load(Ordering::SeqCst), 2);
+    assert_eq!(rig.count("sweep_errors"), 2);
+}
+
+/// Asserts that a store that answers every delete 503 is asked only as many times as the sweep
+/// tolerates in a row (3 here), and the sweep is counted as an error.
+#[tokio::test]
+async fn deletes_that_keep_failing_stop_the_sweep() {
+    let rig = Rig::with(SweepConfig {
+        max_consecutive_failures: 3,
+        ..SweepConfig::default()
+    });
+    for n in 0..6 {
+        rig.store.seed(&key(OLD + n, Slot::Pack(0))).await;
+    }
+    rig.store.refuse_every_delete.store(true, Ordering::SeqCst);
+
+    rig.janitor.sweep_once().await;
+
+    assert_eq!(rig.store.deletes.load(Ordering::SeqCst), 3);
+    assert_eq!(rig.count("sweep_errors"), 1);
+    assert_eq!(rig.store.keys().await.len(), 6);
 }

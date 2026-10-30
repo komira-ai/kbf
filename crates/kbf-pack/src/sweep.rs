@@ -26,6 +26,20 @@ pub const SWEPT_PREFIX: &str = "cas/b/";
 /// grant and the wait of the answer that reads it.
 pub const DEFAULT_GRACE: Duration = Duration::from_secs(6 * 60 * 60);
 
+/// The longest a presigned write of a task's key is good for: 4 hours. A key is never written
+/// after it is this old.
+pub const MAX_KEY_LIFE: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// The time the ingest of a run is given after the last write its key allows.
+pub const INGEST_ALLOWANCE: Duration = Duration::from_secs(60 * 60);
+
+/// The least a key's age may be for the janitor to delete it, and the age from which an ingest
+/// refuses it: the longest a key can be written ([`MAX_KEY_LIFE`]) and the ingest after it
+/// ([`INGEST_ALLOWANCE`]). One constant for both sides, so a key an ingest accepts is never one
+/// the janitor may delete.
+pub const MIN_GRACE: Duration =
+    Duration::from_secs(MAX_KEY_LIFE.as_secs() + INGEST_ALLOWANCE.as_secs());
+
 /// How a sweep runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SweepConfig {
@@ -38,6 +52,9 @@ pub struct SweepConfig {
     /// How long the sweep waits after each page before it lists the next: with `page`, the
     /// bound on how fast a sweep lists and deletes. Zero does not wait.
     pub pause: Duration,
+    /// The sweep stops, with [`SweepError::Failing`], after this many deletes in a row that the
+    /// store refused or could not answer.
+    pub max_consecutive_failures: usize,
 }
 
 impl Default for SweepConfig {
@@ -47,6 +64,7 @@ impl Default for SweepConfig {
             page: PageSize::MAX,
             dry_run: false,
             pause: Duration::ZERO,
+            max_consecutive_failures: 5,
         }
     }
 }
@@ -60,6 +78,12 @@ pub fn task_key_age(key: &str) -> Option<SystemTime> {
     Some(SystemTime::UNIX_EPOCH + Duration::from_secs(key.minted_unix_secs()))
 }
 
+/// What a claim on a key holds until it is dropped.
+pub type Claim = Box<dyn Send>;
+
+/// Claims a key for its delete, or says it cannot.
+pub type ClaimOf = Box<dyn Fn(&str) -> Option<Claim> + Send + Sync>;
+
 /// When a key was minted, read from the key itself; `None` when the key does not say.
 pub type AgeOf = Box<dyn Fn(&str) -> Option<SystemTime> + Send + Sync>;
 
@@ -71,6 +95,10 @@ pub struct SweepGates {
     pub is_leader: Box<dyn Fn() -> bool + Send + Sync>,
     /// Whether the key is being verified right now.
     pub verifying: Box<dyn Fn(&str) -> bool + Send + Sync>,
+    /// Claims the key for its delete, atomically with the check that nothing is verifying it:
+    /// `None` when something is. The claim is held through the index's last answer and the
+    /// delete, and while it is held nothing may begin to verify the key.
+    pub claim: ClaimOf,
 }
 
 /// What one sweep did.
@@ -97,6 +125,8 @@ pub struct SweepReport {
     pub would_delete: usize,
     /// Deletes the store refused; the next sweep tries again.
     pub delete_failed: usize,
+    /// This process stopped leading part way through, and the sweep stopped there.
+    pub abandoned: bool,
 }
 
 /// Why a sweep stopped before it reached the end of the listing.
@@ -108,6 +138,19 @@ pub enum SweepError {
     /// The index could not say which keys it records.
     #[error("sweep: the pack index failed: {0}")]
     Index(#[source] PackIndexError),
+    /// The store answered a delete with 401 or 403: the key may not delete under the prefix, and
+    /// no other delete of the sweep would be allowed either.
+    #[error("sweep: the store refused to let this key delete under {SWEPT_PREFIX}: {0}")]
+    Denied(#[source] ObjectStoreError),
+    /// The store refused or could not answer this many deletes in a row.
+    #[error("sweep: {failures} deletes in a row failed; the last: {last}")]
+    Failing {
+        /// The deletes in a row.
+        failures: usize,
+        /// The last error.
+        #[source]
+        last: ObjectStoreError,
+    },
 }
 
 /// The sweep of orphans over one object store and one pack index.

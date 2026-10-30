@@ -50,7 +50,6 @@ use std::time::{Duration, SystemTime};
 
 use clap::{Arg, ArgMatches};
 use futures::future::BoxFuture;
-use kbf_front::prepare_run::MAX_EXPIRY;
 use kbf_front::{Packs, VerifyingKeys};
 use kbf_objstore::s3::{Credentials, S3Config, S3Store};
 use kbf_objstore::{Capabilities, ObjectStore, PageSize};
@@ -72,13 +71,10 @@ const PAGE_PAUSE: &str = "task_janitor_page_pause_ms";
 const DRY_RUN: &str = "task_janitor_dry_run";
 const SECRET: &str = "task_secret_file";
 
-/// The time an ingest is given on top of the life of a write: the least `--task-janitor-grace-secs`
-/// is [`MAX_EXPIRY`] and this.
-const INGEST_ALLOWANCE_SECS: u64 = 3_600;
-
 /// The least `--task-janitor-grace-secs`: the longest a presigned write is good for and the
-/// allowance of the ingest.
-const MIN_GRACE_SECS: u64 = MAX_EXPIRY.as_secs() + INGEST_ALLOWANCE_SECS;
+/// allowance of the ingest, the one constant ([`kbf_pack::MIN_GRACE`]) the ingest refuses a key
+/// by too.
+const MIN_GRACE_SECS: u64 = kbf_pack::MIN_GRACE.as_secs();
 
 /// The most `--task-janitor-grace-secs`: a week.
 const MAX_GRACE_SECS: u64 = 7 * 24 * 3_600;
@@ -299,6 +295,19 @@ pub struct JanitorMetrics {
     reaped: AtomicU64,
     would_reap: AtomicU64,
     reap_errors: AtomicU64,
+    abandoned: AtomicU64,
+    done: Done,
+}
+
+/// The count of sweeps the janitor has finished, led or not, whole or stopped by an error,
+/// that a caller can wait on.
+#[derive(Debug)]
+struct Done(tokio::sync::watch::Sender<u64>);
+
+impl Default for Done {
+    fn default() -> Self {
+        Self(tokio::sync::watch::channel(0).0)
+    }
 }
 
 impl JanitorMetrics {
@@ -317,6 +326,19 @@ impl JanitorMetrics {
         add(&self.reaped, report.deleted);
         add(&self.would_reap, report.would_delete);
         add(&self.reap_errors, report.delete_failed);
+        add(&self.abandoned, usize::from(report.abandoned));
+    }
+
+    /// Tells the waiters a sweep is finished.
+    fn finished_one(&self) {
+        self.done.0.send_modify(|finished| *finished += 1);
+    }
+
+    /// The count of sweeps finished so far, told as each one ends: a caller waits for a sweep by
+    /// this event and not by time.
+    #[must_use]
+    pub fn finished(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.done.0.subscribe()
     }
 
     /// The sweeps that led and ran to the end of the listing.
@@ -338,6 +360,7 @@ impl JanitorMetrics {
             "kept_referenced" => &self.kept_referenced,
             "kept_unparsed" => &self.kept_unparsed,
             "kept_outside" => &self.kept_outside,
+            "abandoned" => &self.abandoned,
             "reaped" => &self.reaped,
             "would_reap" => &self.would_reap,
             _ => &self.reap_errors,
@@ -387,6 +410,11 @@ impl JanitorMetrics {
                 "kept_outside",
                 "Keys a listing returned that are not under cas/b/, kept",
                 &self.kept_outside,
+            ),
+            (
+                "abandoned",
+                "Sweeps stopped part way because this frontend stopped leading",
+                &self.abandoned,
             ),
             ("reaped", "Orphan keys deleted", &self.reaped),
             (
@@ -441,7 +469,11 @@ impl Janitor {
         let gates = SweepGates {
             age_of: Box::new(task_key_age),
             is_leader,
-            verifying: Box::new(move |key| verifying.is_held(key)),
+            verifying: Box::new({
+                let verifying = Arc::clone(&verifying);
+                move |key| verifying.is_held(key)
+            }),
+            claim: Box::new(|_| Some(Box::new(()))),
         };
         let sweeper = Arc::new(Sweeper::new(store, index, config, gates));
         let pass: Pass = Box::new(move |now| {
@@ -471,6 +503,7 @@ impl Janitor {
                 self.metrics.sweep_errors.fetch_add(1, Ordering::Relaxed);
             }
         }
+        self.metrics.finished_one();
     }
 
     /// Sweeps now and then every interval, for ever. A sweep that runs past an interval delays
@@ -516,6 +549,7 @@ impl JanitorFlags {
             page: self.page,
             dry_run: self.dry_run,
             pause: self.pause,
+            ..SweepConfig::default()
         };
         Ok(Janitor::new(
             Arc::new(store),

@@ -62,6 +62,9 @@ fn injected_with(status: u32) -> ObjectStoreError {
     }
 }
 
+/// What a test runs inside a store call, given the key the call is for.
+pub type Hook = Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
 /// A memory object store that claims what it is told to, whose writes and range reads fail when
 /// armed to, and whose range reads are logged.
 pub struct Spy {
@@ -83,6 +86,8 @@ pub struct Spy {
     largest_piece: AtomicU64,
     ranges: Mutex<Vec<(String, u64, u64)>>,
     watching: Mutex<Option<(Arc<VerifyingKeys>, Vec<String>)>>,
+    on_len: Mutex<Option<Hook>>,
+    on_delete: Mutex<Option<Hook>>,
     held_when_asked: Mutex<Vec<bool>>,
 }
 
@@ -130,6 +135,8 @@ impl Spy {
             largest_piece: AtomicU64::new(0),
             ranges: Mutex::new(Vec::new()),
             watching: Mutex::new(None),
+            on_len: Mutex::new(None),
+            on_delete: Mutex::new(None),
             held_when_asked: Mutex::new(Vec::new()),
         }
     }
@@ -138,6 +145,19 @@ impl Spy {
     /// `registry` at that moment.
     pub fn watch_verifying(&self, registry: Arc<VerifyingKeys>, keys: Vec<String>) {
         *self.watching.lock().unwrap_or_else(PoisonError::into_inner) = Some((registry, keys));
+    }
+
+    /// Runs `hook` inside every length asked of the store, before it answers.
+    pub fn on_len(&self, hook: Hook) {
+        *self.on_len.lock().unwrap_or_else(PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Runs `hook` inside every delete asked of the store, before it is made.
+    pub fn on_delete(&self, hook: Hook) {
+        *self
+            .on_delete
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(hook);
     }
 
     /// What each length asked since `watch_verifying` found: whether all the keys were held.
@@ -343,6 +363,14 @@ impl ObjectStore for Spy {
     }
 
     async fn len(&self, key: &ObjectKey) -> Result<Option<u64>, ObjectStoreError> {
+        let hook = self
+            .on_len
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(key.to_string()).await;
+        }
         let watching = self
             .watching
             .lock()
@@ -396,6 +424,14 @@ impl ObjectStore for Spy {
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
+        let hook = self
+            .on_delete
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(key.to_string()).await;
+        }
         self.inner.delete(key).await
     }
 
@@ -612,6 +648,8 @@ impl Rig {
         let shared: Arc<dyn PackIndex> = index.clone();
         let keys = PackKeys::new(WriterKind::Frontend, "fe1", "boot1").expect("keys");
         let packs = Packs::new(Arc::clone(&store), shared, keys, settings).expect("packs");
+        // The keys of these tests are minted at one fixed time, which the packs take as now.
+        let packs = packs.with_clock(Arc::new(crate::untrusted_task::now));
         let authorizers = Arc::new(Authorizers::allow_all());
         let proxy = Proxy::new(owners, authorizers).with_packs(Some(packs.clone()));
         let front = harness::serve(proxy.routes()).await;

@@ -582,6 +582,9 @@ pub struct FrontendHandle {
     run_prep: Option<Arc<RunPrep>>,
     /// The count of intake polls the farm has run to the end ([`Farm::intake_polls`]).
     intake_polls: tokio::sync::watch::Receiver<u64>,
+    /// The count of sweeps the janitor of `cas/b/` has finished, if `--task-janitor-key-file`
+    /// was given.
+    janitor_sweeps: Option<tokio::sync::watch::Receiver<u64>>,
     /// The executor `--executor js-agent` builds, stepped while the frontend serves.
     executor: Option<Executor>,
 }
@@ -593,6 +596,14 @@ impl FrontendHandle {
     #[must_use]
     pub fn intake_polls(&self) -> tokio::sync::watch::Receiver<u64> {
         self.intake_polls.clone()
+    }
+
+    /// The count of sweeps the janitor of `cas/b/` has finished (whole, stopped part way or by an
+    /// error), told as each ends, or `None` without `--task-janitor-key-file`: a caller waits
+    /// for sweeps by this event and not by time.
+    #[must_use]
+    pub fn janitor_sweeps(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.janitor_sweeps.clone()
     }
 
     /// The pack index `--pack-index` opened on the Postgres state store, or `None` without the
@@ -911,6 +922,7 @@ impl<'a> Prepared<'a> {
             &readiness,
         )?;
         let janitor_metrics = janitor.as_ref().map(Janitor::metrics);
+        let janitor_sweeps = janitor_metrics.as_ref().map(|metrics| metrics.finished());
         let checks = Arc::new(checks(
             Arc::clone(&readiness),
             storage.clone(),
@@ -1278,6 +1290,7 @@ impl<'a> Prepared<'a> {
             packs,
             run_prep,
             intake_polls,
+            janitor_sweeps,
             executor: executor.map(|built| built.executor),
         })
     }

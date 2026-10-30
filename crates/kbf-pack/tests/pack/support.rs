@@ -1,7 +1,7 @@
 //! Fixtures: an object store and a pack index that fail when told to, and record what they
 //! are asked.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -52,6 +52,8 @@ pub struct FaultyStore {
     lose_puts: AtomicU32,
     fail_gets: AtomicU32,
     fail_deletes: AtomicU32,
+    deny_deletes: AtomicBool,
+    delete_calls: AtomicU32,
     pass_gets: AtomicU32,
     pass_lists: AtomicU32,
     fail_lists: AtomicU32,
@@ -80,6 +82,8 @@ impl FaultyStore {
             lose_puts: AtomicU32::new(0),
             fail_gets: AtomicU32::new(0),
             fail_deletes: AtomicU32::new(0),
+            deny_deletes: AtomicBool::new(false),
+            delete_calls: AtomicU32::new(0),
             pass_gets: AtomicU32::new(0),
             pass_lists: AtomicU32::new(0),
             fail_lists: AtomicU32::new(0),
@@ -119,6 +123,16 @@ impl FaultyStore {
     /// The next `n` deletes fail.
     pub fn fail_deletes(&self, n: u32) {
         self.fail_deletes.store(n, Ordering::SeqCst);
+    }
+
+    /// From now on every delete is answered 403 AccessDenied.
+    pub fn deny_deletes(&self) {
+        self.deny_deletes.store(true, Ordering::SeqCst);
+    }
+
+    /// The deletes asked of the store so far, refused ones included.
+    pub fn deletes(&self) -> u32 {
+        self.delete_calls.load(Ordering::SeqCst)
     }
 
     /// After the next `ok` listing calls go through, the one after them fails.
@@ -213,6 +227,14 @@ impl ObjectStore for FaultyStore {
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
+        self.delete_calls.fetch_add(1, Ordering::SeqCst);
+        if self.deny_deletes.load(Ordering::SeqCst) {
+            return Err(ObjectStoreError::Service {
+                status: 403,
+                code: "AccessDenied".to_owned(),
+                message: "injected".to_owned(),
+            });
+        }
         if fires(&self.fail_deletes) {
             return Err(injected());
         }

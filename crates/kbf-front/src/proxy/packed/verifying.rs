@@ -18,16 +18,27 @@ pub struct VerifyingKeys {
 
 impl VerifyingKeys {
     /// Holds `keys` until the returned [`Held`] is dropped.
-    #[must_use]
-    pub fn hold(self: &Arc<Self>, keys: Vec<String>) -> Held {
+    ///
+    /// # Errors
+    /// [`Claimed`] when the janitor has claimed one of the keys for its delete.
+    pub fn hold(self: &Arc<Self>, keys: Vec<String>) -> Result<Held, Claimed> {
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         for key in &keys {
             *held.entry(key.clone()).or_default() += 1;
         }
-        Held {
+        Ok(Held {
             registry: Arc::clone(self),
             keys,
-        }
+        })
+    }
+
+    /// Claims `key` for its delete, or `None` when something holds or has claimed it.
+    #[must_use]
+    pub fn claim(self: &Arc<Self>, key: &str) -> Option<Claim> {
+        Some(Claim {
+            registry: Arc::clone(self),
+            key: key.to_owned(),
+        })
     }
 
     /// Whether some [`Held`] holds `key` now.
@@ -57,4 +68,17 @@ impl Drop for Held {
         }
         held.retain(|_, holds| *holds > 0);
     }
+}
+
+/// A key the janitor has claimed for its delete.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Claimed(pub String);
+
+/// A claim on a key, released when it is dropped.
+#[derive(Debug)]
+pub struct Claim {
+    #[expect(dead_code, reason = "the claim is not recorded yet")]
+    registry: Arc<VerifyingKeys>,
+    #[expect(dead_code, reason = "the claim is not recorded yet")]
+    key: String,
 }
