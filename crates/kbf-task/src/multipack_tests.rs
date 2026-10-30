@@ -3,6 +3,7 @@
 use super::*;
 use crate::pack::MAX_LARGE_BYTES;
 use crate::task::recording_sink::Put;
+use kbf_segments::layout::footer_len;
 use kbf_task_pack::{LargeEntry, MAX_RECORD_BYTES, read_manifest_with, write_pack};
 
 /// Declares two outputs of the input tree, a file and a directory: three to five distinct
@@ -294,4 +295,180 @@ async fn a_failed_pack_put_stops_before_pack_0() {
         .expect_err("refused");
     assert_eq!(failure.exit_code(), EXIT_PUT);
     assert_eq!(sink.tried(), [(false, 1)]);
+}
+
+/// Declares the file `big` and the two small outputs of the input tree (`BIG` writes the file).
+const BIG_AND_TREE: &[&str] = &["big", "data", "src"];
+
+/// The most records a pack may hold so that `blobs` one-byte blobs need exactly three packs
+/// (pack 0 keeps one record for the manifest): found by asking the plan.
+fn records_for_three_packs(blobs: usize) -> usize {
+    let sizes: Vec<_> = (0..blobs as u32)
+        .map(|n| {
+            let mut hash = [0u8; 32];
+            hash[..4].copy_from_slice(&n.to_be_bytes());
+            (
+                kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, hash, 1),
+                1,
+            )
+        })
+        .collect();
+    (2..=blobs)
+        .find(|&per_pack| {
+            let limits = Limits {
+                pack_records: per_pack,
+                packs: 8,
+                large: 0,
+                ..Limits::real()
+            };
+            plan(&sizes, 0, &limits).map(|p| p.packs.len()) == Ok(3)
+        })
+        .expect("a record limit that gives three packs")
+}
+
+/// Catches the packs being PUT in ascending order, or the large object not first, or pack 0 not
+/// last, when there are three packs (an ascending loop is invisible with two): a large object and
+/// outputs that need packs 2, 1 and 0 are PUT as large 0, pack 2, pack 1, pack 0, and pack 0's
+/// manifest says `packs = 3` and lists the large object.
+#[tokio::test]
+async fn three_packs_and_a_large_object_are_put_in_commit_order() {
+    let mut mem = Mem::default();
+    let small = action(&mut mem, TWO_OUTPUTS, TWO_PATHS);
+    let blobs = blob_count(&mem, &small, "multi-three-count").await;
+    let digest = action(&mut mem, BIG, BIG_AND_TREE);
+    let dir = scratch("multi-three");
+    let sink = Fake::with_slots(3, 1);
+    let limits = Limits {
+        pack_records: records_for_three_packs(blobs),
+        packs: 3,
+        large: 1,
+        ..Limits::real()
+    };
+    let manifest = execute_with(&cli(&dir, digest), &mem, &sink, &limits)
+        .await
+        .expect("task");
+    assert_eq!(manifest.packs, 3);
+    assert_eq!(manifest.large.len(), 1);
+    assert_eq!(
+        sink.tried(),
+        [(true, 0), (false, 2), (false, 1), (false, 0)]
+    );
+    let bodies = bodies(&sink);
+    assert_eq!(
+        read_manifest_with(&bodies[2], MAX_LARGE_BYTES).expect("pack 0"),
+        manifest
+    );
+}
+
+/// Catches the bytes of a small run changing: the manifest's JSON begins with the frozen text
+/// of the v1 wire form (key order, no `packs` or `large`, empty lists written), the one record
+/// after it is the output's bytes, and the pack is the manifest, that record and a footer of two
+/// entries, ending with the segment magic. These are written out here and do not move when
+/// `write_pack` does.
+#[tokio::test]
+async fn a_small_run_is_frozen_to_the_v1_wire_form() {
+    let mut mem = Mem::default();
+    let digest = action(&mut mem, &["true"], &["data"]);
+    let dir = scratch("multi-frozen");
+    let sink = Fake::new(false);
+    let flags = cli(&dir, digest);
+    let manifest = execute(&flags, &mem, &sink).await.expect("task");
+    let body = bodies(&sink).remove(0);
+    let json_len = manifest.to_json().expect("json").len();
+    let json = String::from_utf8(body[..json_len].to_vec()).expect("utf-8");
+    let frozen = format!(
+        concat!(
+            r#"{{"version":1,"lease":"lease-1","action":"{}","exit_code":0,"#,
+            r#""output_files":[{{"path":"data","digest":"{}","is_executable":false}}],"#,
+            r#""output_directories":[],"output_symlinks":[],"timing":{{"fetch_ms":"#
+        ),
+        flags.action,
+        sha256(b"hi\n"),
+    );
+    assert!(json.starts_with(&frozen), "{json}");
+    assert!(json.ends_with("}}"), "{json}");
+    assert_eq!(&body[json_len..json_len + 3], b"hi\n");
+    // Two entries of 52 bytes, the fan-out of 1,024 and the 32-byte trailer.
+    assert_eq!(body.len(), json_len + 3 + 1024 + 2 * 52 + 32);
+    assert_eq!(&body[body.len() - 8..], b"KBFSEG\r\n");
+}
+
+/// Catches an extra pack that cannot be built being found only after other packs were PUT: with
+/// the plan allowed records of 200 MiB, the 65 MiB output is planned into pack 1 and the small
+/// output into pack 2; the pack of the big record is refused (a record is at most 64 MiB), and the
+/// task fails as `output-too-large` (exit 12) with no PUT tried, though pack 2, which builds, would
+/// have been PUT first.
+#[tokio::test]
+async fn an_extra_pack_that_cannot_be_built_fails_before_any_put() {
+    let mut mem = Mem::default();
+    let digest = action(&mut mem, BIG, &["big", "data"]);
+    let dir = scratch("multi-unbuildable");
+    let sink = Fake::with_slots(3, 0);
+    let limits = Limits {
+        pack_records: 1,
+        record_bytes: 200 << 20,
+        packs: 3,
+        large: 0,
+        ..Limits::real()
+    };
+    let failure = execute_with(&cli(&dir, digest), &mem, &sink, &limits)
+        .await
+        .expect_err("unbuildable");
+    assert_eq!(failure.exit_code(), EXIT_PACK);
+    assert!(
+        failure.to_string().contains("output-too-large"),
+        "{failure}"
+    );
+    assert!(sink.tried().is_empty());
+}
+
+/// Catches a v1 run that fills its pack to the byte being refused because the manifest's room was
+/// over-reserved: a run of one pack and no large object reserves exactly its manifest, so a pack
+/// limit of exactly the records, the manifest and the footer places everything in pack 0 and one
+/// byte less is `output-too-large`; with more packs or a large object, the slack is added.
+#[tokio::test]
+async fn a_v1_run_that_exactly_fills_the_pack_is_accepted() {
+    let mut mem = Mem::default();
+    let digest = action(&mut mem, &["true"], &["data"]);
+    let dir = scratch("multi-exact");
+    let manifest = execute(&cli(&dir, digest), &mem, &Fake::new(false))
+        .await
+        .expect("task");
+    let one_pack = Limits {
+        packs: 1,
+        large: 0,
+        ..Limits::real()
+    };
+    let json = manifest.to_json().expect("json").len() as u64;
+    assert_eq!(
+        manifest_reserve(&manifest, &one_pack).expect("reserve"),
+        json
+    );
+    let more = |packs, large| Limits {
+        packs,
+        large,
+        ..Limits::real()
+    };
+    for limits in [more(2, 0), more(1, 1)] {
+        assert_eq!(
+            manifest_reserve(&manifest, &limits).expect("reserve"),
+            json + MANIFEST_SLACK
+        );
+    }
+    // One 3-byte record and the manifest: two entries.
+    let blob = [(sha256(b"hi\n"), 3)];
+    let exact = json + 3 + footer_len(2);
+    let fits = |pack_bytes| {
+        plan(
+            &blob,
+            manifest_reserve(&manifest, &one_pack).expect("reserve"),
+            &Limits {
+                pack_bytes,
+                ..one_pack
+            },
+        )
+    };
+    assert_eq!(fits(exact).expect("exactly full").packs, [vec![blob[0].0]]);
+    let text = fits(exact - 1).unwrap_err().to_string();
+    assert!(text.contains("output-too-large"), "{text}");
 }

@@ -123,7 +123,9 @@ pub struct Cli {
     /// `--pack-url-file`: read, never deleted, and a credential like the pack URL. The pack URLs
     /// are, in order, the slots of packs 0..; the large URLs, the slots of large objects 0.. . A
     /// run that needs more packs or large objects than the set has fails with `output-too-large`
-    /// before anything is stored. At most 8 of each are used.
+    /// before anything is stored. At most 8 of each are used. The file's protection is the
+    /// executor's per-run directory, not its mode: the executor delivers it read-only for the
+    /// run, so the tool does not check its permissions.
     #[arg(long)]
     pub put_urls_file: Option<PathBuf>,
     /// The v2 key set itself. Stopgap (komira-ai/kbf#1934): it is in argv, so it needs
@@ -292,11 +294,31 @@ impl PackSink for HttpSink {
 /// the `packs` field and up to [`MAX_LARGE`] entries of about 110 bytes each.
 const MANIFEST_SLACK: u64 = 2048;
 
+/// The bytes pack 0 keeps for the manifest. A run of one pack and no large object writes the
+/// manifest it already has, so the reserve is exactly its JSON length and a v1 run that fills
+/// the pack to the byte still fits. With more packs or a large object the manifest gains the
+/// `packs` field and entries, so [`MANIFEST_SLACK`] is added.
+fn manifest_reserve(manifest: &TaskManifest, limits: &Limits) -> Result<u64, PackError> {
+    let json = manifest.to_json_with(MAX_LARGE_BYTES)?.len() as u64;
+    Ok(if limits.packs == 1 && limits.large == 0 {
+        json
+    } else {
+        json + MANIFEST_SLACK
+    })
+}
+
 /// The bytes of outputs the recorder may hold: what the run's packs and large objects can.
 fn output_cap(limits: &Limits) -> u64 {
     let packs = (limits.packs as u64).saturating_mul(limits.pack_bytes);
     let large = (limits.large as u64).saturating_mul(limits.large_bytes);
     packs.saturating_add(large)
+}
+
+/// One of packs 1.., built from the recorded blobs `digests`.
+fn extra_pack(blobs: &Blobs, digests: &[Digest]) -> Result<Vec<u8>, Failure> {
+    let held = held(blobs, digests)?;
+    let views: Vec<&[u8]> = held.iter().map(|bytes| bytes.as_ref()).collect();
+    Ok(build_extra(&views)?)
 }
 
 /// The recorded blobs `digests` in memory, for one pack.
@@ -326,8 +348,8 @@ pub async fn execute(
     sink: &impl PackSink,
 ) -> Result<TaskManifest, Failure> {
     let limits = Limits {
-        packs: sink.pack_slots().min(usize::from(MAX_PACKS)),
-        large: sink.large_slots().min(usize::from(MAX_LARGE)),
+        packs: sink.pack_slots(),
+        large: sink.large_slots(),
         ..Limits::real()
     };
     execute_with(cli, source, sink, &limits).await
@@ -340,6 +362,12 @@ pub(crate) async fn execute_with(
     sink: &impl PackSink,
     limits: &Limits,
 ) -> Result<TaskManifest, Failure> {
+    // A manifest names at most MAX_PACKS packs and MAX_LARGE large objects.
+    let limits = &Limits {
+        packs: limits.packs.min(usize::from(MAX_PACKS)),
+        large: limits.large.min(usize::from(MAX_LARGE)),
+        ..*limits
+    };
     let fetching = Instant::now();
     let action_digest = digest::to_reapi(&cli.action);
     let action: Action = fetch_message(source, &action_digest)?;
@@ -420,18 +448,15 @@ pub(crate) async fn execute_with(
     }
     // Plan before anything is built or stored: pack 0 keeps room for the manifest as it will be
     // written, with its `packs` and `large` fields.
-    let reserve = manifest
-        .to_json_with(MAX_LARGE_BYTES)
-        .map_err(PackError::from)?
-        .len() as u64
-        + MANIFEST_SLACK;
+    let reserve = manifest_reserve(&manifest, limits)?;
     let sizes = outputs
         .blobs
         .digests()
         .map(|d| digest_of(Some(&d)).map(|d| (d, d.size_bytes)))
         .collect::<Result<Vec<_>, _>>()?;
     let planned = plan(&sizes, reserve, limits).map_err(PackError::from)?;
-    manifest.packs = u8::try_from(planned.packs.len()).unwrap_or(u8::MAX);
+    // At most `limits.packs`, which is at most MAX_PACKS.
+    manifest.packs = planned.packs.len() as u8;
     manifest.large = planned
         .large
         .iter()
@@ -450,18 +475,19 @@ pub(crate) async fn execute_with(
         let blobs: Vec<&[u8]> = held.iter().map(|bytes| bytes.as_ref()).collect();
         build(&manifest, &blobs)?
     };
+    // Every other pack is built once now and dropped, one at a time, so a pack that cannot be
+    // built fails the task (exit 12) before anything is stored; each is built again, only when
+    // its turn to be PUT comes, so at most one extra pack is in memory besides pack 0.
+    for slot in 1..planned.packs.len() {
+        extra_pack(&outputs.blobs, &planned.packs[slot])?;
+    }
     // The order is the commit order: large objects, packs N-1 down to 1, then pack 0, so a run
     // whose pack 0 is absent is lost whatever else was written.
     for (slot, digest) in planned.large.iter().enumerate() {
         sink.store_large(slot, &outputs.blobs, digest)?;
     }
     for slot in (1..planned.packs.len()).rev() {
-        let pack = {
-            let held = held(&outputs.blobs, &planned.packs[slot])?;
-            let blobs: Vec<&[u8]> = held.iter().map(|bytes| bytes.as_ref()).collect();
-            build_extra(&blobs)?
-        };
-        sink.store_pack(slot, &pack)?;
+        sink.store_pack(slot, &extra_pack(&outputs.blobs, &planned.packs[slot])?)?;
     }
     sink.store_pack(0, &pack_0)?;
     Ok(manifest)
@@ -525,7 +551,9 @@ fn check_lease(cli: &Cli) -> Result<(), Failure> {
 }
 
 /// A credential from the file or the flag value the command line named, a trailing newline
-/// dropped, and the file (when it was one) left in place. `what` names the credential.
+/// dropped, and the file (when it was one) left in place. `what` names the credential. The
+/// file's protection is the executor's per-run directory, not its mode (the executor delivers it
+/// read-only), so its permissions are not checked.
 fn credential(what: &str, file: Option<&Path>, flag: Option<&str>) -> Result<String, Failure> {
     let (raw, from) = match (file, flag) {
         (Some(path), _) => (

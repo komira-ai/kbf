@@ -38,7 +38,7 @@
 //! streamed from the file it was read from, never held whole), the others fill packs 1.. and then
 //! pack 0, which keeps room for the manifest. More large blobs or packs than the key set has, or
 //! a blob over the large cap, fails the task as `output-too-large` (exit 12) before anything is
-//! stored. Pack 0 is built, validated and read back first; then the PUTs go in the order large
+//! stored. Pack 0 is built, validated and read back first and every other pack is built once to check it can be, one at a time; then the PUTs go in the order large
 //! objects, packs `N-1` down to 1, and pack 0 last, so pack 0, which holds the manifest at offset
 //! 0, is the commit point. Any refused PUT fails the task (exit 13) and later PUTs are not made.
 //! A run that needs one pack and no large object writes the manifest as version 1 and the same
