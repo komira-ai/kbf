@@ -120,7 +120,10 @@ fn problems(files: &[(String, String)]) -> Vec<String> {
                         line.trim()
                     ));
                 }
-                if line.contains("kbf-task") && !line.contains("darwin") {
+                if line.contains("kbf-task")
+                    && !line.contains("darwin")
+                    && !line.contains("--exclude kbf-task")
+                {
                     out.push(format!(
                         "{name}:{}: the darwin job `{}` names kbf-task, which cannot ship until {LIFTED_BY}: {}",
                         start + k + 2,
