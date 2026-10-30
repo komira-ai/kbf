@@ -7,7 +7,11 @@
 //!    directory. The tree is read breadth-first with at most `--fetch-concurrency` requests in
 //!    flight (32 by default) over pooled connections, and each file streams from the response to
 //!    disk through its digest check instead of being held in memory. With `--fetch-batch`, blobs
-//!    under 64 KiB are read in `/batch` requests of up to 256 digests;
+//!    under 64 KiB are read in `/batch` requests of up to 256 digests. The grant is `https`
+//!    unless `--allow-plain-http-grant` is given: a farm on its own network may serve it over
+//!    plain HTTP, since the token is scoped to one action's inputs and expires. Without the flag
+//!    an `http` grant URL is refused at startup (exit 14), before any request; either way the
+//!    token is sent as a bearer header and is never logged;
 //! 2. runs the Command there ([`run`]): its argv, environment and working directory, stdout and
 //!    stderr to files, under a deadline. The environment is the Command's own, preceded by `HOME`,
 //!    `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`, which name fresh directories

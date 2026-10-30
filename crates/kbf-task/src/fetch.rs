@@ -394,12 +394,27 @@ impl HttpBlobSource {
     /// # Errors
     /// `roots` is empty: every connection would fail with an unhelpful message.
     pub fn new(base: &str, token: &str, roots: &[Vec<u8>]) -> Result<Self, FetchError> {
+        Self::new_with(base, token, roots, false)
+    }
+
+    /// [`new`](Self::new), and with `allow_plain_http` an `http://` grant is read too (the
+    /// `--allow-plain-http-grant` opt-in, for a farm on its own network). The bearer token is sent
+    /// either way.
+    ///
+    /// # Errors
+    /// `roots` is empty.
+    pub fn new_with(
+        base: &str,
+        token: &str,
+        roots: &[Vec<u8>],
+        allow_plain_http: bool,
+    ) -> Result<Self, FetchError> {
         if roots.is_empty() {
             return Err(FetchError::Invalid(
                 "no trusted root certificates for the read grant".to_owned(),
             ));
         }
-        Ok(Self::build(base, token, roots, true))
+        Ok(Self::build(base, token, roots, !allow_plain_http))
     }
 
     fn build(base: &str, token: &str, roots: &[Vec<u8>], https_only: bool) -> Self {

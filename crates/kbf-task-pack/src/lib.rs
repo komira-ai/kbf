@@ -25,5 +25,5 @@ pub use task_manifest::{
 };
 pub use task_pack::{
     MAX_PACK_BYTES, MAX_PACK_RECORDS, MAX_RECORD_BYTES, ShapeError, TaskPackError, WritePackError,
-    check_shape, read_manifest, read_manifest_with, write_pack, write_pack_with,
+    check_records, check_shape, read_manifest, read_manifest_with, write_pack, write_pack_with,
 };

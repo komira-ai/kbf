@@ -294,6 +294,14 @@ member-ttl-secs = 15
 task-closure-max-bytes = 34359738368
 # The most distinct digests (directories and files) the input tree of a run may have: a run whose tree has more is refused, never run on a part of its inputs. Used only with `--task-secret-file`
 task-closure-max-digests = 500000
+# A file with the presign-only key that signs a task's writes of large objects, of the same form and with the same owner and mode rules as `--task-put-credentials-file`: a key of the tier store whose prefix allows objects up to `--task-large-max-bytes`, with a ceiling of at least 14400 seconds. Left out, no run gets a large-object key and an output over 64 MiB fails its task
+# task-large-credentials-file = "PATH"
+# The most bytes of one large object, above 67108864 (64 MiB, the most a pack record holds): the cap a task and the ingest of its run hold an object to. Used only with `--task-large-credentials-file`
+task-large-max-bytes = 536870912
+# The large-object keys each run gets, 0 to 8 (`cas/b/<lease>/<nonce>-L<i>`): an output blob over 64 MiB is written whole to one of them. A ceiling, as for `--task-max-packs`. Without `--task-large-credentials-file` no run gets one, whatever this says. Used only with `--task-secret-file`
+task-max-large = 8
+# The pack keys each run gets, 1 to 8 (`cas/b/<lease>/<nonce>-<k>`): a ceiling, not a prediction, since the sizes of a run's outputs are not known before it runs; a key a task does not write is never used. Used only with `--task-secret-file`
+task-max-packs = 8
 # The bucket of `--task-put-endpoint` a task's pack is written to, under the key `cas/b/<lease>/<nonce>-0`
 # task-put-bucket = "BUCKET"
 # A file with the presign-only key of the tier store, as JSON `{"access_key_id": "...", "secret_access_key": "..."}`, owned by this user and readable by it alone (mode 0600 or 0400). The key signs a `PUT` of one object under its prefix and does nothing else; its ceiling (`max_expires_secs` of the store's `--presign-key-file`) must be at least 14400, and the store's `--presign-max-expires` too
@@ -306,7 +314,7 @@ task-put-region = "us-east-1"
 # task-read-url = "URL"
 # The run wall limit a run is prepared for, in seconds, at least 1 and at most 14400: a task's presigned write and read grant are good for this plus `--task-url-slack-secs`. Used only with `--task-secret-file`
 task-run-wall-secs = 7200
-# Turns on the preparation of the runs of a host executor: for each run the frontend makes the key the task may write, one presigned write of it to the tier store, and a read grant for the task's inputs. The file holds one secret of at least 32 bytes (surrounding white space is dropped), owned by this user and readable by it alone (mode 0600 or 0400): the pack-key mint and the read-grant key are made from it, and it is the secret the job-facing listener verifies grants with. The secret is never a flag: a command line is world-readable. Needs `--task-put-endpoint`, `--task-put-bucket`, `--task-put-credentials-file` and `--task-read-url`. Left out, no run is prepared
+# Turns on the preparation of the runs of a host executor: for each run the frontend makes the keys the task may write, a presigned write of each to the tier store, and a read grant for the task's inputs. The file holds one secret of at least 32 bytes (surrounding white space is dropped), owned by this user and readable by it alone (mode 0600 or 0400): the pack-key mint and the read-grant key are made from it, and it is the secret the job-facing listener verifies grants with. The secret is never a flag: a command line is world-readable. Needs `--task-put-endpoint`, `--task-put-bucket`, `--task-put-credentials-file` and `--task-read-url`. Left out, no run is prepared
 # task-secret-file = "PATH"
 # The time past the run wall, in seconds, that a task's presigned write and read grant stay good: the time a task takes to start and to put its pack. The wall and the slack together must not pass 14400, the ceiling of a presigned write, or the frontend does not start. Used only with `--task-secret-file`
 task-url-slack-secs = 600
