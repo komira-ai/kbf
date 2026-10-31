@@ -43,6 +43,7 @@ use std::time::Duration;
 use kbf_types::NodeId;
 use kbf_updater::version::Version;
 use kbf_updater::wire::{Outcome, Reply};
+use serde::Serialize;
 
 use crate::desired::{Desired, KBF};
 use crate::fleet::{Fleet, Host};
@@ -74,8 +75,10 @@ pub fn decide_in(
 }
 
 /// Which rule held an order back: the first that failed, in the order the module lists them
-/// (the lookups before them come first: the definition, the desired state, the host).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// (the lookups before them come first: the definition, the desired state, the host). The
+/// status says it in snake case (`no_slot`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Hold {
     /// The service has no definition.
     NoDefinition,

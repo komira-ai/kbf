@@ -20,7 +20,7 @@ use crate::faultfile::FileSwitch;
 use crate::preflight::host::SystemHost;
 use crate::preflight::ops::OpsFile;
 use crate::preflight::{self, PreflightReport};
-use crate::provision::{self, Mode};
+use crate::provision::{self, Mode, Supply};
 use crate::proxy::{self, FaultMode, ProxyConfig};
 use crate::requestlog::RequestLog;
 use crate::result::Provenance;
@@ -65,6 +65,11 @@ pub struct ProvisionArgs {
     /// read from standard input either way.
     #[arg(long)]
     pub apply: bool,
+    /// The buckets, quotas, policies and accounts were made by a held script: make none of them,
+    /// check that each bucket is there with a quota of at most 30 GiB, and prove the account (it
+    /// reaches its own bucket, it is refused a live one).
+    #[arg(long)]
+    pub premade: bool,
 }
 
 /// A flag that is on or off, spelled out.
@@ -252,7 +257,12 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
             } else {
                 Mode::DryRun
             };
-            provision::run(&RunConfig::load(&args.config)?, mode)
+            let supply = if args.premade {
+                Supply::Premade
+            } else {
+                Supply::Create
+            };
+            provision::run(&RunConfig::load(&args.config)?, mode, supply)
                 .await
                 .map(|_| ())
         }
