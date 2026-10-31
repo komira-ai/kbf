@@ -416,6 +416,7 @@ struct Shared {
     control: Option<PathBuf>,
     result_dir: Option<PathBuf>,
     requests: AtomicU64,
+    by_method: std::sync::Mutex<BTreeMap<String, u64>>,
     request_bytes: AtomicU64,
     response_bytes: AtomicU64,
     refused: AtomicU64,
@@ -434,6 +435,7 @@ impl Shared {
             control: config.control.clone(),
             result_dir: config.result_dir.clone(),
             requests: AtomicU64::new(0),
+            by_method: std::sync::Mutex::new(BTreeMap::new()),
             request_bytes: AtomicU64::new(0),
             response_bytes: AtomicU64::new(0),
             refused: AtomicU64::new(0),
@@ -488,7 +490,11 @@ impl Shared {
             schema_version: COUNTERS_SCHEMA_VERSION,
             role: Role::Proxy.as_str().to_owned(),
             requests: load(&self.requests),
-            requests_by_method: BTreeMap::new(),
+            requests_by_method: self
+                .by_method
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             request_bytes: load(&self.request_bytes),
             response_bytes: load(&self.response_bytes),
             refused: load(&self.refused),
@@ -590,6 +596,12 @@ async fn forward(
         FaultMode::Pass | FaultMode::Bandwidth { .. } | FaultMode::DateSkew { .. } => {}
     }
     shared.bump(&shared.requests, 1);
+    *shared
+        .by_method
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(request.method().as_str().to_owned())
+        .or_insert(0) += 1;
     let upstream = TcpStream::connect(&shared.upstream).await?;
     upstream.set_nodelay(true).ok();
     let (mut sender, connection) =

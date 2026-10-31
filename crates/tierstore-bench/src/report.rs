@@ -309,6 +309,155 @@ fn arm_name(result: &CellResult, of_cell: &[&CellResult]) -> String {
     }
 }
 
+/// `+2.00 ms` or `-850 us`: `value` against `base`.
+fn fmt_diff(value: u64, base: u64) -> String {
+    let sign = if value >= base { '+' } else { '-' };
+    format!("{sign}{}", fmt_us(value.abs_diff(base)))
+}
+
+/// `+2.00 ms (2.00x)`: the difference of `value` from `base` and the ratio.
+fn fmt_against(value: u64, base: u64) -> String {
+    if base == 0 {
+        return format!("{} (n/a)", fmt_diff(value, base));
+    }
+    format!(
+        "{} ({:.2}x)",
+        fmt_diff(value, base),
+        value as f64 / base as f64
+    )
+}
+
+/// The table that sets each `instance` put arm beside the `direct-mp` arm of the same size,
+/// width and mode: both are multipart uploads, so only these two are alike but for the
+/// instance. The single PUT (`direct`) is not a partner. `None` if no arm has a partner.
+fn put_comparison(of_cell: &[&CellResult], rows: &Rows) -> Option<String> {
+    let mut table = String::new();
+    for instance in of_cell {
+        let Some(rest) = instance.arm.strip_prefix("instance-") else {
+            continue;
+        };
+        let floor_arm = format!("direct-mp-{rest}");
+        let Some(floor) = of_cell
+            .iter()
+            .find(|r| r.arm == floor_arm && r.provenance.attempt == instance.provenance.attempt)
+        else {
+            continue;
+        };
+        let name = if instance.provenance.attempt == 1 {
+            rest.to_owned()
+        } else {
+            format!("{rest} (attempt {})", instance.provenance.attempt)
+        };
+        for window in [Window::Quiet, Window::Busy] {
+            let (Some(mut via), Some(mut base)) =
+                (gather(instance, rows, window), gather(floor, rows, window))
+            else {
+                continue;
+            };
+            let (Some(via), Some(base)) = (
+                stats::summarise(&mut via.ok),
+                stats::summarise(&mut base.ok),
+            ) else {
+                continue;
+            };
+            writeln!(
+                table,
+                "| {name} | {} | {} | {} | {} | {} | {} | {} |",
+                window.as_str(),
+                fmt_us(base.p50),
+                fmt_us(via.p50),
+                fmt_against(via.p50, base.p50),
+                fmt_us(base.p95),
+                fmt_us(via.p95),
+                fmt_against(via.p95, base.p95),
+            )
+            .expect("a string takes text");
+        }
+    }
+    (!table.is_empty()).then(|| {
+        format!(
+            "### cold-put: instance against direct-mp\n\n| arm | window | direct-mp p50 | instance p50 | instance against direct-mp | direct-mp p95 | instance p95 | instance against direct-mp |\n|---|---|---|---|---|---|---|---|\n{table}\n"
+        )
+    })
+}
+
+/// The caps line of a cell: the request-rate caps the run held its clients to.
+fn caps_line(of_cell: &[&CellResult]) -> String {
+    match of_cell.iter().find_map(|r| r.rate_caps) {
+        Some(caps) => format!(
+            "- request caps of the run: cold {}/s, hot {}/s, LIST poll {}/s",
+            caps.cold_rps, caps.hot_rps, caps.list_poll_rps
+        ),
+        None => "- request caps of the run: not recorded".to_owned(),
+    }
+}
+
+/// `HEAD 2.00, PUT 1.00` or `none`: `counts` per request.
+fn per_request(counts: &BTreeMap<String, u64>, requests: u64) -> String {
+    if counts.is_empty() {
+        return "none".to_owned();
+    }
+    counts
+        .iter()
+        .map(|(method, n)| format!("{method} {:.2}", *n as f64 / requests as f64))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The lines about what an arm's measured passes recorded beside the latencies: the proxy's
+/// requests by method per request, the busy time of the disks, and the width reached.
+fn recorded_lines(name: &str, result: &CellResult) -> Vec<String> {
+    let measured: Vec<_> = result.passes.iter().filter(|p| !p.discarded).collect();
+    let mut lines = Vec::new();
+    let counted: Vec<_> = measured
+        .iter()
+        .filter_map(|p| p.proxy_requests.as_ref().map(|c| (p.requests, c)))
+        .collect();
+    let requests: u64 = counted.iter().map(|(n, _)| n).sum();
+    if requests > 0 {
+        let (mut during, mut after) = (BTreeMap::new(), BTreeMap::new());
+        for (_, counts) in &counted {
+            for (total, part) in [(&mut during, &counts.during), (&mut after, &counts.after)] {
+                for (method, n) in part {
+                    *total.entry(method.clone()).or_insert(0) += n;
+                }
+            }
+        }
+        lines.push(format!(
+            "- arm {name}: proxy requests per request, measured passes: during {}; after {}",
+            per_request(&during, requests),
+            per_request(&after, requests)
+        ));
+    }
+    let mut disks: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+    for pass in &measured {
+        for (disk, busy) in &pass.disk_busy {
+            disks.entry(disk).or_default().push(busy.util_pct);
+        }
+    }
+    if !disks.is_empty() {
+        let each: Vec<String> = disks
+            .iter()
+            .map(|(disk, utils)| {
+                let mean = utils.iter().sum::<f64>() / utils.len() as f64;
+                let max = utils.iter().copied().fold(0.0, f64::max);
+                format!("{disk} mean {mean:.1}%, max {max:.1}%")
+            })
+            .collect();
+        lines.push(format!(
+            "- arm {name}: disk busy, measured passes: {}",
+            each.join("; ")
+        ));
+    }
+    let peak = measured.iter().map(|p| p.peak_in_flight).max().unwrap_or(0);
+    if peak > 0 {
+        lines.push(format!(
+            "- arm {name}: most requests in flight in a measured pass: {peak}"
+        ));
+    }
+    lines
+}
+
 /// The report for `results` with their `rows`.
 fn format_report(results: &[CellResult], rows: &Rows) -> String {
     let mut out = String::new();
@@ -353,6 +502,12 @@ fn format_report(results: &[CellResult], rows: &Rows) -> String {
             }
         }
         out.push('\n');
+        if cell == CellId::ColdPut
+            && let Some(table) = put_comparison(&of_cell, rows)
+        {
+            out.push_str(&table);
+        }
+        writeln!(out, "{}", caps_line(&of_cell)).expect("a string takes text");
         let mut said = BTreeSet::new();
         for result in &of_cell {
             for note in &result.notes {
@@ -374,6 +529,9 @@ fn format_report(results: &[CellResult], rows: &Rows) -> String {
                 Some(why) => format!("not labelled v1: {why}"),
             };
             writeln!(out, "- arm {name}: {label}").expect("a string takes text");
+            for line in recorded_lines(&name, result) {
+                writeln!(out, "{line}").expect("a string takes text");
+            }
             for pass in result.passes.iter().filter(|p| p.gate_tripped.is_some()) {
                 writeln!(
                     out,
@@ -1021,5 +1179,18 @@ mod tests {
             text.contains("- request caps of the run: not recorded"),
             "{text}"
         );
+    }
+
+    /// Pins how the paper's 10,000 requests are reached: the warm-up pass is left out, so eleven
+    /// passes of 1,000 give a row of ten passes and 10,000 requests, and six give 5,000.
+    #[test]
+    fn eleven_passes_of_a_thousand_give_ten_thousand_measured_requests() {
+        let passes = |n: u32| (0..n).map(|i| pass(i, Window::Quiet, 1000, None)).collect();
+        let row = |n: u32, needle: &str| {
+            let text = format_report(&[result("big", passes(n), &[])], &Rows::new());
+            text.lines().any(|l| l.contains(needle))
+        };
+        assert!(row(11, "| big | quiet | 10 | 10000 |"));
+        assert!(row(6, "| big | quiet | 5 | 5000 |"));
     }
 }

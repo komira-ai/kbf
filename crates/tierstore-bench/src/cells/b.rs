@@ -2,8 +2,11 @@
 //!
 //! Quantity: the time of a read through the instance of an object that is on the cold store only
 //! (the first read, which the instance copies back to its hot tier), the second read of the same
-//! object, and a read of the cold store directly. Per object, in this order: the direct read of
-//! the cold bucket (if the run configures the cold role), the first read, the second.
+//! object, and a read of the cold store directly. Per object, in this order: the first read, the
+//! second, and last the direct read of the cold bucket (if the run configures the cold role). The
+//! direct read is last because a read of the cold bucket before the first read would leave the
+//! object in the page cache of the store's disks, and the miss would be timed against a warm
+//! store; the direct read after them is the warm one, which the label says.
 //!
 //! Arms (`<size>-c<in flight>`): the first read's time to the last byte; the arm with the suffix
 //! `.ttfb` its time to the first byte (the first byte of a miss of a 128 MiB object is the
@@ -105,17 +108,11 @@ impl Misses {
         ))
     }
 
-    /// The reads of one object: direct from the cold bucket, then the first and the second
-    /// through the instance.
+    /// The reads of one object: the first and the second through the instance, then, last,
+    /// direct from the cold bucket (see the header for why last).
     async fn read(&self, pass: u32, index: u64) -> Result<Vec<Step>, BenchError> {
         let key = self.key(pass, index);
         let mut steps = Vec::new();
-        if let Some(cold) = &self.read_cold {
-            let direct = cold.get(&key, None).await?;
-            steps.push(
-                Step::streamed(Role::Cold, Op::Get, self.size, &direct).labelled(".cold-direct"),
-            );
-        }
         let first = self.read_instance.get(&key, None).await?;
         let full = Step::streamed(Role::Instance, Op::Get, self.size, &first);
         steps.extend(first.ttfb.map(|t| {
@@ -128,6 +125,12 @@ impl Misses {
         steps.push(full);
         let second = self.read_instance.get(&key, None).await?;
         steps.push(Step::streamed(Role::Instance, Op::Get, self.size, &second).labelled(".second"));
+        if let Some(cold) = &self.read_cold {
+            let direct = cold.get(&key, None).await?;
+            steps.push(
+                Step::streamed(Role::Cold, Op::Get, self.size, &direct).labelled(".cold-direct"),
+            );
+        }
         Ok(steps)
     }
 }
@@ -184,6 +187,7 @@ fn arm(label: String, in_flight: u32, misses: &Arc<Misses>) -> Arm {
             size_label(misses.size)
         ),
         "recently written, likely cache-warm on the store; a lower bound on a real miss".to_owned(),
+        "per object the instance's reads come first and the direct read of the cold bucket last, so the first read is not timed against a store the harness has just read from".to_owned(),
         "test instance and test buckets; two-tier instance (no cold-only mode at the pinned tag)"
             .to_owned(),
     ];
@@ -291,7 +295,7 @@ mod tests {
     /// written as parts through the instance, charged to the ledger, and gone from both stores
     /// after each pass, the cold bucket's copy included.
     #[tokio::test]
-    async fn each_object_is_read_directly_then_twice_through_the_instance_and_removed() {
+    async fn each_object_is_read_twice_through_the_instance_then_directly_and_removed() {
         let dir = temp("tb-b");
         let (instance, cold) = (FakeS3::start().await, FakeS3::start().await);
         let stores = [

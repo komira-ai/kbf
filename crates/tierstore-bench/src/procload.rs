@@ -70,8 +70,12 @@ pub fn disk_busy_snapshot(
     proc_root: &Path,
     sys_block: &Path,
 ) -> Result<BTreeMap<String, u64>, BenchError> {
-    let _ = (proc_root, sys_block);
-    Ok(BTreeMap::new())
+    let path = proc_root.join("diskstats");
+    let text = std::fs::read_to_string(&path).map_err(|source| BenchError::Io { path, source })?;
+    Ok(parse_diskstats(&text)
+        .into_iter()
+        .filter(|(name, _)| counted(sys_block, name))
+        .collect())
 }
 
 /// What each disk of `after` that is also in `before` did over a pass of `elapsed_us`: its busy
@@ -82,8 +86,17 @@ pub fn disk_busy_over(
     after: &BTreeMap<String, u64>,
     elapsed_us: u64,
 ) -> BTreeMap<String, DiskBusy> {
-    let _ = (before, after, elapsed_us);
-    BTreeMap::new()
+    // A pass shorter than a millisecond is read as one, so the share is never a division by 0.
+    let wall_ms = (elapsed_us / 1000).max(1);
+    after
+        .iter()
+        .filter_map(|(name, ticks)| {
+            let busy_ms = ticks.saturating_sub(*before.get(name)?);
+            // At most a few days of milliseconds: exactly representable.
+            let util_pct = (busy_ms as f64 * 100.0 / wall_ms as f64).min(100.0);
+            Some((name.clone(), DiskBusy { busy_ms, util_pct }))
+        })
+        .collect()
 }
 
 /// Whether the busy time of `name` is counted: not a loop, ram or zram device, and a whole disk,

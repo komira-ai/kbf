@@ -11,6 +11,7 @@
 //! ever. The control file is replaced atomically ([`crate::atomic`]): the proxy reads it every
 //! tick and must never see half a line.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -107,5 +108,11 @@ impl FaultSwitch for FileSwitch {
     /// The requests the proxy has sent on; 0 while its counters cannot be read.
     fn request_count(&self) -> u64 {
         self.counters().map_or(0, |c| c.requests)
+    }
+
+    /// The same requests by method; empty while the counters cannot be read.
+    fn method_counts(&self) -> BTreeMap<String, u64> {
+        self.counters()
+            .map_or_else(BTreeMap::new, |c| c.requests_by_method)
     }
 }

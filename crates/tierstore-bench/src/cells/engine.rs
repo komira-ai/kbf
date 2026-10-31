@@ -46,11 +46,12 @@ use crate::coldstate::ColdStateSource;
 use crate::config::RunConfig;
 use crate::error::BenchError;
 use crate::gate::{LoadSample, Trip};
+use crate::procload::{disk_busy_over, disk_busy_snapshot};
 use crate::proxy::FaultMode;
 use crate::requestlog::RequestLog;
 use crate::result::{
-    CellResult, ColdTrip, Op, PassColdState, PassResult, Percentiles, Provenance, SCHEMA_VERSION,
-    Sample, Window,
+    CellResult, ColdTrip, Op, PassColdState, PassResult, Percentiles, Provenance, ProxyRequests,
+    SCHEMA_VERSION, Sample, Window,
 };
 use crate::role::Role;
 use crate::s3::{BenchS3, Outcome, Timeouts, unix_ms};
@@ -121,6 +122,24 @@ impl LoadSource for ProcLoad {
     fn sample(&self) -> Result<LoadSample, BenchError> {
         LoadSample::read()
     }
+
+    fn disk_busy_ms(&self) -> Result<BTreeMap<String, u64>, BenchError> {
+        disk_busy_snapshot(Path::new("/proc"), Path::new("/sys/block"))
+    }
+}
+
+/// What `now` has over `before`, by method: the requests made between two readings of the
+/// proxy's counts. A method with none is left out; a count that went back counts as none.
+fn count_delta(
+    before: &BTreeMap<String, u64>,
+    now: &BTreeMap<String, u64>,
+) -> BTreeMap<String, u64> {
+    now.iter()
+        .filter_map(|(method, n)| {
+            let made = n.saturating_sub(before.get(method).copied().unwrap_or(0));
+            (made > 0).then(|| (method.clone(), made))
+        })
+        .collect()
 }
 
 /// The fault proxy as a cell sees it: it sets the fault between passes and counts what went
@@ -725,7 +744,7 @@ fn pass_result(
         cold_guard: cold_trip.cloned(),
         proxy_requests: None,
         disk_busy: BTreeMap::new(),
-        peak_in_flight: 0,
+        peak_in_flight: steps.iter().map(|s| s.in_flight).max().unwrap_or(0),
     }
 }
 
@@ -817,7 +836,7 @@ pub async fn run_cell(
             passes: got.passes,
             notes,
             cold_state: got.cold_state,
-            rate_caps: None,
+            rate_caps: Some(env.config.rates),
         };
         write_new(&env.result_path(cell, &result.arm), &result.to_json())?;
         results.push(result);
@@ -910,10 +929,23 @@ async fn run_pass(
     if let Some(before) = &arm.before {
         notes.extend(before(pass).await?);
     }
+    // Read after the `before` hook (its setup is not the pass) and right around the requests.
+    let disks_before = env.load.disk_busy_ms()?;
+    let proxy_before = arm.proxy.as_ref().map(|p| p.method_counts());
     let driven = drive(env, arm, pass).await?;
+    let disks_after = env.load.disk_busy_ms()?;
+    let proxy_driven = arm.proxy.as_ref().map(|p| p.method_counts());
     if let Some(after) = &arm.after {
         notes.extend(after(pass).await?);
     }
+    let proxy_requests = match (proxy_before, proxy_driven, &arm.proxy) {
+        (Some(before), Some(sent), Some(proxy)) => Some(ProxyRequests {
+            during: count_delta(&before, &sent),
+            after: count_delta(&sent, &proxy.method_counts()),
+        }),
+        _ => None,
+    };
+    let disk_busy = disk_busy_over(&disks_before, &disks_after, micros(driven.elapsed));
     env.ledger
         .settle(planned, driven.steps.iter().map(|s| s.cold_write).sum())?;
     let window = if driven.trip.is_some() || driven.cold_trip.is_some() {
@@ -954,6 +986,11 @@ async fn run_pass(
             driven.cold_trip.as_ref(),
             &steps,
         );
+        let result = PassResult {
+            proxy_requests: proxy_requests.clone(),
+            disk_busy: disk_busy.clone(),
+            ..result
+        };
         let slot = acc.entry(label).or_default();
         slot.passes.push(result);
         slot.cold_state
