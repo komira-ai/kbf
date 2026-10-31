@@ -118,6 +118,8 @@ const CODES: &[(&str, ErrorCode)] = &[
     ("limits-exceed-shape", ErrorCode::LimitsExceedShape),
     ("host-jobs-not-allowed", ErrorCode::HostJobsNotAllowed),
     ("image-digest-required", ErrorCode::ImageDigestRequired),
+    ("files-unsupported", ErrorCode::FilesUnsupported),
+    ("invalid-file", ErrorCode::InvalidFile),
 ];
 
 impl ErrorCode {
