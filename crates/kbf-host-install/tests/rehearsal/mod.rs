@@ -13,7 +13,7 @@
 //!
 //! Every command's output and the units' journal go to `target/update-rehearsal` (the
 //! workflow uploads it). The workflow leaves its read-only token in
-//! `/var/tmp/kbf-update-rehearsal.token`.
+//! `/var/tmp/kbf-update-rehearsal.token`; the channel's `token_file` is a root-owned copy.
 
 #![allow(dead_code)]
 
@@ -40,6 +40,8 @@ pub const RELEASES: &str = "/var/lib/kbf-installer/releases";
 pub const HELPER: &str = "/usr/libexec/kbf/kbf-host-install";
 pub const TRUST: &str = "/usr/share/kbf/trust";
 pub const CHANNELS: &str = "/etc/kbf/host-install-releases.toml";
+/// The channel's token file, root's alone.
+pub const CHANNEL_TOKEN: &str = "/etc/kbf/host-install-github.token";
 pub const UNIT_DIR: &str = "/etc/systemd/system";
 pub const HELPER_UNIT: &str = "kbf-host-local.service";
 /// The `kbf` unit the helper restarts.
@@ -180,6 +182,7 @@ impl Journal {
 
 impl Drop for Journal {
     fn drop(&mut self) {
+        let _ = fs::remove_file(CHANNEL_TOKEN);
         let mut cmd = Command::new("journalctl");
         cmd.arg("--no-pager");
         for unit in &self.units {
@@ -436,10 +439,25 @@ pub fn lay_out(r: &Rehearsal, kbf_unit: &str) -> PathBuf {
             .arg(HELPER),
     );
     fs::create_dir_all("/etc/kbf").unwrap();
-    // The channel as the farm's nodes name theirs: no token. (The helper takes a token of
-    // letters, digits, `_` and `-`, at most 255 bytes; the run's token is longer.)
+    // The channel as the farm's nodes name theirs, with a token file: a hosted runner's address
+    // shares GitHub's anonymous quota with other jobs, so the helper lists the releases under
+    // the run's own read-only token. The helper reads a token file that is root's alone, so the
+    // workflow's file (the runner user's) is copied to one root owns.
+    let token = fs::read_to_string(TOKEN_FILE).unwrap_or_else(|e| panic!("{TOKEN_FILE}: {e}"));
+    let _ = fs::remove_file(CHANNEL_TOKEN);
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(CHANNEL_TOKEN)
+            .unwrap_or_else(|e| panic!("{CHANNEL_TOKEN}: {e}"));
+        file.write_all(token.trim().as_bytes()).unwrap();
+    }
     install_file(
-        &format!("[channels.{CHANNEL}]\nsource = \"github\"\n"),
+        &format!("[channels.{CHANNEL}]\nsource = \"github\"\ntoken_file = \"{CHANNEL_TOKEN}\"\n"),
         CHANNELS,
         0o644,
     );

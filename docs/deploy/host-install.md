@@ -525,7 +525,7 @@ launchd, and no stage left behind.
   no secret is on the Mac.
 - Optionally, a token for a higher rate limit. A channel may name a `token_file`: a file that is
   root's alone to write (checked like the allowlist) holding a GitHub token, one line of letters,
-  digits, `_` and `-`. It needs no scope: the repository is public. The root process reads it and
+  digits, `_`, `-` and `.`, at most 1024 bytes (a workflow token of GitHub Actions is about 520). It needs no scope: the repository is public. The root process reads it and
   sends it to `curl` as an `Authorization` header in a configuration on `curl`'s standard input
   (never in its arguments, which every user can read), and gives it to `gh release download` as
   `GH_TOKEN`; the attestation check never gets it.
