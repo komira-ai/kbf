@@ -110,6 +110,9 @@ pub(super) fn render(cli: &Cli) -> Result<String, ConfigError> {
         body_idle_timeout: Some(Dur(cli.body_idle_timeout)),
         s3_request_timeout: Some(Dur(cli.s3_request_timeout)),
         backend_check_wait: Some(Dur(cli.backend_check_wait)),
+        bridge_listen: None,
+        listen_unix: None,
+        listen_unix_group: None,
     };
     // The flags that need `--oci-listen` cannot be given without it, so the table is the front.
     let oci = cli.oci_listen.map(|listen| OciTable {

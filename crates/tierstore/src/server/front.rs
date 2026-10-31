@@ -12,6 +12,7 @@ use super::ServerConfig;
 use super::cli::{Cli, Error};
 use super::gc::{ensure_distinct as gc_distinct, gc_keys, ids as gc_ids};
 use super::keys::{ensure_distinct, read_credentials, read_only_keys};
+use super::listeners::JobListeners;
 use super::presign::{ensure_distinct as presign_distinct, presign_keys};
 use super::scoped::{ensure_distinct as scoped_distinct, ids as scoped_ids, scoped_keys};
 
@@ -31,6 +32,8 @@ pub(super) fn read_key(path: &Path) -> Result<(String, String), String> {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct FrontSettings {
     pub listen: SocketAddr,
+    /// The listeners for jobs, besides `listen`: none for a storage node.
+    pub jobs: JobListeners,
     pub proxy_id: String,
     pub bucket: String,
     pub region: String,
@@ -54,6 +57,7 @@ impl Cli {
     pub(super) fn front(&self) -> FrontSettings {
         FrontSettings {
             listen: self.listen,
+            jobs: JobListeners::default(),
             proxy_id: self.proxy_id.clone(),
             bucket: self.bucket.clone(),
             region: self.region.clone(),

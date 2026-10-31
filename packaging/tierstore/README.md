@@ -417,6 +417,9 @@ scrub.
 | `local_cache.cache` | `true`, the default; `false` is refused (leave `[local_cache]` out to run without a cache) |
 | `local_cache.scrub_rate` | a size and `/s`, such as `"50MiB/s"`: accepted, and not used by this release |
 | `cold_store.endpoints` | a list of exactly one endpoint, in place of `endpoint`: several are refused as not supported yet, since the cache reads from one upstream |
+| `server.bridge_listen` | build node only: a second TCP listener on this one address (the host's address on the job network's bridge), plain HTTP, served as `listen` is; `0.0.0.0` and `::` are refused, and so is the address of `listen` |
+| `server.listen_unix` | build node only: the absolute path of a Unix-domain socket that is listened on as well, served as `listen` is |
+| `server.listen_unix_group` | build node only, and only with `listen_unix`: the group (a name in `/etc/group`) that owns the socket file; without it the file belongs to the effective group of the process, or to the group of the directory if that is setgid |
 
 `[cold_store]` is the upstream: any `kind` (an `s3` bucket, with `endpoint` and a `credentials_file`
 of a read-only key, in practice, or of a key that writes with `write_through`), and without `skip_checks` and the keys of the reconciler. `[server]`
@@ -468,6 +471,50 @@ The table has the rules of the `--oci-*` flags: `listen` is needed in it, and th
 refused without it; `tls_cert_file` and `tls_key_file` go together; `max_connections` is at least
 one; `connection_lifetime` is a duration as elsewhere. The certificate and the key are named by
 path, as every key file is, so the names end in `_file`.
+
+### Listeners for jobs
+
+A build node may listen for jobs on two more places than `listen`, both optional, both for the
+build-node shape only (a storage-node file with any of the three keys is refused, exit status 2):
+
+```toml
+[server]
+listen            = "127.0.0.1:9400"
+bridge_listen     = "192.0.2.1:9400"
+listen_unix       = "/run/tierstore-cache/jobs.sock"
+listen_unix_group = "jobs"
+```
+
+Every listener is served by the one front, with the same keys, checks and cache: a request over
+any of them is answered as it would be over `listen` (a test reads a cached object over each and
+compares the answers), and `GET /healthz`, `/readyz` and `/metricz` are on each. The drain, the
+header timeout, the idle timeouts and the limits on bodies are the server's, so they hold for every
+listener as for the main one: on SIGTERM `/readyz` is 503 on all of them, all stop accepting
+together, and the connections of all are closed when their requests are done.
+
+`bridge_listen` is plain HTTP on one address, as `listen` is; presigned URLs and signatures cross the
+bridge in clear text, which is for a bridge that does not leave the host. It names one address
+because a wildcard would be open on every network the host is on. Close the port to every other
+network with the host's firewall.
+
+`listen_unix` is made with mode 0660 before it listens, so no client can connect to it with another
+mode, and with the group `listen_unix_group` if one is given (the group is looked up in
+`/etc/group`; a name it does not have fails the start, exit status 1, and so does a group the
+process may not give a file to). Who may connect is decided by the file: its owner, its group, and
+the directory it is in; that directory must not be writable by others, since the mode and group are set by path after the socket is made. A file at the path that is a socket is replaced (the socket of a process
+that did not clean up, or of one that is still running, which is then unreachable); a file of any
+other type, a symbolic link included, is never replaced and the start fails. The socket is removed
+when the server stops accepting at the start of the drain, unless the file there is no longer the
+one it made.
+
+Signing over the socket is unchanged. A request carries a `Host` header, which is part of what the
+signature covers; the server checks the signature over the `Host` the client sent and holds that
+header to no value, so a client sends any name and signs it: `localhost` is the convention. Use
+path-style addressing (`http://localhost/<bucket>/<key>`, the bucket of `[server]`), no TLS, and
+the keys that `listen` takes; the endpoint URL of an S3 client does not name the socket, so use a
+client or a transport that connects to the socket path and sends the URL's `Host`. The log line of a
+connection over the socket names its peer as `127.0.0.1:0`, since it has no address. The start line
+on stdout ends with `bridge=ADDR` and `unix=PATH` for the listeners that are set.
 
 ### Which key each flag has
 

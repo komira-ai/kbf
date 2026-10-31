@@ -7,6 +7,8 @@
 //! proxy_id        = "tierstore-cache-1"
 //! bucket          = "tierstore"
 //! access_key_file = "/etc/tierstore-cache/access.key"
+//! bridge_listen   = "192.0.2.1:9400"                     # optional: see `listeners`
+//! listen_unix     = "/run/tierstore-cache/jobs.sock"     # optional
 //!
 //! [local_cache]
 //! path       = "/var/lib/tierstore-cache"

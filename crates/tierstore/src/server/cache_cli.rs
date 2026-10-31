@@ -29,7 +29,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
 use crate::{Backend, Clock, Error as BackendError, SelfTestOptions, SystemClock, self_test};
@@ -37,6 +36,7 @@ use crate::{Backend, Clock, Error as BackendError, SelfTestOptions, SystemClock,
 use super::cli::{Error, S3Flags, open_tier, probe_run_id, signals};
 use super::config_cache::CacheSettings;
 use super::front::{InvalidFlags, server_config};
+use super::listeners::{Bound, Listeners};
 use super::local_cache::{CacheConfig, Disk, LocalCache, SystemDisk, check_local};
 use super::{Drained, Server};
 
@@ -152,6 +152,22 @@ pub(super) async fn serve_cache(
     stop: impl Future<Output = ()> + Send + 'static,
     ready: impl FnOnce(SocketAddr),
 ) -> Result<Drained, Error> {
+    let told = |bound: &Bound| ready(bound.main);
+    serve_cache_bound(settings, upstream, disk, stop, told).await
+}
+
+/// [`serve_cache`] that tells `ready` every address and path it listens on, the listeners for
+/// jobs (see [`listeners`](super::listeners)) included.
+///
+/// # Errors
+/// As [`serve_cache`], and a listener for jobs that cannot be made.
+pub(super) async fn serve_cache_bound(
+    settings: &CacheSettings,
+    upstream: Arc<dyn Backend>,
+    disk: Arc<dyn Disk>,
+    stop: impl Future<Output = ()> + Send + 'static,
+    ready: impl FnOnce(&Bound),
+) -> Result<Drained, Error> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut config = server_config(&settings.front, Arc::clone(&clock))?;
     let run = probe_run_id(&settings.front.proxy_id, clock.now(), std::process::id());
@@ -167,10 +183,8 @@ pub(super) async fn serve_cache(
     config.cache = Some(cache.clone());
     let backend: Arc<dyn Backend> = Arc::new(cache.clone());
     let server = Server::new(backend, config);
-    let address = settings.front.listen;
-    let bound = TcpListener::bind(address).await;
-    let listener = bound.map_err(|why| format!("binding {address}: {why}"))?;
-    ready(listener.local_addr()?);
+    let listeners = Listeners::bind(settings.front.listen, &settings.front.jobs).await?;
+    ready(listeners.bound());
     let stopping = Arc::clone(&server);
     let watcher = tokio::spawn(async move {
         stop.await;
@@ -179,7 +193,7 @@ pub(super) async fn serve_cache(
     let halt = Arc::new(Notify::new());
     let halting = Arc::clone(&halt);
     let serving = async move {
-        let drained = server.serve(listener).await;
+        let drained = server.serve_listeners(listeners).await;
         halting.notify_one();
         drained
     };
@@ -222,7 +236,9 @@ pub(super) async fn serve_cache_until_signalled(settings: CacheSettings) -> Resu
     } else {
         "read-cache"
     };
-    let announce = |addr: SocketAddr| println!("tierstore {version} listen={addr} mode={mode}");
+    let jobs = settings.front.jobs.announce();
+    let announce =
+        |addr: SocketAddr| println!("tierstore {version} listen={addr} mode={mode}{jobs}");
     let drained = run_cache(&settings, stop, announce).await?;
     eprint!("{}", super::cli::cut_note(drained));
     Ok(())
