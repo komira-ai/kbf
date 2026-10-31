@@ -567,10 +567,11 @@ fn an_artifact_altered_while_the_updater_was_down_never_runs_on_resume() {
     rig.fake
         .lose_run
         .store(2, std::sync::atomic::Ordering::SeqCst);
-    assert!(rig.runner().run(&rig.order()).is_err());
+    let order = rig.order();
+    assert!(rig.runner().run(&order).is_err());
     fs::write(rig.new_dir.join("lib/data"), "tampered").unwrap();
     rig.fake.clear();
-    let got = rig.runner().run(&rig.order()).unwrap();
+    let got = rig.runner().run(&order).unwrap();
     assert_eq!(got.verdict, Verdict::Halt);
     assert_eq!(rig.fake.stops(), ["updater-svc-cutover-1"]);
     assert!(rig.fake.steps().is_empty());
