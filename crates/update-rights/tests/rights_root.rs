@@ -668,7 +668,7 @@ fn probe_2_mask_runtime_then_stop_an_active_instance_through_polkit() {
     );
     let log = said(
         "/usr/bin/journalctl",
-        &["-u", "polkit.service", "-n", "40", "--no-pager"],
+        &["--no-pager", "-n", "400", "-g", "polkit|probe-polkit|urp2"],
     );
     record("probe-2-facts", &format!("{facts}\n{log}"));
     assert_eq!(refused_stop.outcome, Outcome::Failure, "{facts}");
