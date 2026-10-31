@@ -214,3 +214,48 @@ fn the_flag_names_the_file() {
     let args = Args::try_parse_from(["kbf-server", "--cold-store=file:///c"]).expect("flags");
     assert_eq!(args.cold_store_credentials_file, None);
 }
+
+/// Catches: a reason that repeats the path (the message would name it twice) or says nothing
+/// of what is wrong, for each way a secret file is refused.
+#[test]
+fn every_secret_file_refusal_has_a_reason_without_the_path() {
+    use crate::token::TokenFileError;
+    let path = PathBuf::from("/p/secret-name");
+    let cases = [
+        (
+            TokenFileError::NotAFile { path: path.clone() },
+            "not a regular file",
+        ),
+        (
+            TokenFileError::Owner {
+                path: path.clone(),
+                owner: 1,
+                server: 2,
+            },
+            "owned by uid 1, not by this server's uid 2",
+        ),
+        (
+            TokenFileError::Mode {
+                path: path.clone(),
+                mode: 0o644,
+            },
+            "mode 0644",
+        ),
+        (
+            TokenFileError::Content { path: path.clone() },
+            "content is not usable",
+        ),
+        (
+            TokenFileError::Read {
+                path: path.clone(),
+                source: std::io::ErrorKind::NotFound.into(),
+            },
+            "entity not found",
+        ),
+    ];
+    for (error, says) in cases {
+        let reason = error.reason();
+        assert!(reason.contains(says), "{reason}");
+        assert!(!reason.contains("secret-name"), "{reason}");
+    }
+}

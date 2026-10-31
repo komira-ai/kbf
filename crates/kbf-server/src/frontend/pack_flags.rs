@@ -14,15 +14,14 @@
 //! reads back and checks ([`commits`]).
 //!
 //! The credentials are a file and never a flag, as a command line is world-readable: JSON with
-//! `access_key_id` and `secret_access_key`, readable by its owner alone.
+//! `access_key_id` and `secret_access_key`, readable by its owner alone (the reader is
+//! [`crate::key_file`], which `--cold-store-credentials-file` uses too).
 //!
 //! Opening the packs sends nothing to the store. [`super::FrontendHandle::serve`] first checks
 //! that the store refuses to replace an object, and does not serve if it does not.
 
 use std::error::Error;
-use std::io::Read as _;
 use std::num::NonZeroU64;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -33,8 +32,8 @@ use kbf_objstore::Capabilities;
 use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
 use kbf_pack::{CacheError, PackError, PackKeys, ReadCache, WriterKind};
 use kbf_pack_index::PackIndex;
-use zeroize::Zeroizing;
 
+use crate::key_file::read_key_pair;
 use crate::pack_locate::PackCommits;
 
 const ENDPOINT: &str = "pack_store_endpoint";
@@ -357,39 +356,14 @@ pub(super) fn open(
     }
 }
 
-/// What a credentials file that is not JSON of the key pair is told.
-const NOT_KEYS: &str = "not JSON with access_key_id and secret_access_key";
-
-/// What the credentials file holds.
-#[derive(serde::Deserialize)]
-struct Keys {
-    access_key_id: String,
-    secret_access_key: String,
-}
-
-/// The key pair in the file at `path`, which only its owner may be able to read.
+/// The key pair in the file at `path`, read as every key file of the server is
+/// ([`crate::key_file::read_key_pair`]): a regular file, not a link, owned by the server's
+/// user, mode 0600 or 0400.
 fn read_credentials(path: &Path) -> Result<Credentials, PackFlagError> {
-    let bad = |why: String| PackFlagError::Credentials {
+    read_key_pair(path).map_err(|error| PackFlagError::Credentials {
         path: path.display().to_string(),
-        why,
-    };
-    let read = std::fs::File::open(path).and_then(|mut file| {
-        file.metadata().and_then(|meta| {
-            let mut text = String::new();
-            let read = file.read_to_string(&mut text);
-            read.map(|_| (meta.permissions().mode(), text))
-        })
-    });
-    let (mode, text) = read.map_err(|error| bad(error.to_string()))?;
-    let text = Zeroizing::new(text);
-    if mode & 0o077 != 0 {
-        let shown = mode & 0o777;
-        let why = format!("mode {shown:04o} lets others read a secret: use 0600");
-        return Err(bad(why));
-    }
-    let parsed = serde_json::from_str::<Keys>(&text);
-    let keys = parsed.map_err(|_| bad(NOT_KEYS.to_owned()))?;
-    Ok(Credentials::new(keys.access_key_id, keys.secret_access_key))
+        why: error.to_string(),
+    })
 }
 
 /// A name for this start of the process, so that no two starts of a frontend name the same

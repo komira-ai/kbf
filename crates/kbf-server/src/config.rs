@@ -1,6 +1,7 @@
 //! Command-line flags. Every setting is a flag; the only environment variables read are
 //! the standard S3 key pair, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (a secret
-//! never goes on the command line). Where the server keeps its bytes is two store URIs
+//! never goes on the command line), and only when `--cold-store-credentials-file` names no
+//! file: they are deprecated. Where the server keeps its bytes is two store URIs
 //! and, sometimes, one directory ([`crate::stores`]): `--cold-store`, `--hot-store`,
 //! `--meta-dir`.
 

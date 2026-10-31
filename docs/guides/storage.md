@@ -218,8 +218,9 @@ the store of record: nothing sits behind it, so an object it evicts is gone.
 signs requests with SigV4 and uses path-style addressing. Put the endpoint in the URI query
 (`endpoint=` is required). Other query keys are `region` (default `us-east-1`),
 `conditional-put=true` for a store that refuses to overwrite a key, and
-`min-put-rate=BYTES_PER_SEC`. The key pair comes from `AWS_ACCESS_KEY_ID` and
-`AWS_SECRET_ACCESS_KEY`, never from the URI. An object over 16 MiB is uploaded as a
+`min-put-rate=BYTES_PER_SEC`. The key pair comes from the JSON file of
+`--cold-store-credentials-file` (mode 0600 or 0400), never from the URI; `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` still work when no file is named, deprecated. An object over 16 MiB is uploaded as a
 multipart upload and aborted on any failure. The store must be reached over `http`;
 `https://` endpoints are refused in this build.
 
