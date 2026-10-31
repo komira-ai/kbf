@@ -91,4 +91,4 @@ At start the process makes the directory, removes what a fill left half done, re
 
 ## Not in a release yet
 
-- **Waiting for a put slot.** Today a put over `--max-concurrent-puts` is answered 503 `SlowDown` at once; the server will instead wait briefly for a slot first, and clients will retry a 503 with jittered waits.
+- **Waiting for a put slot** (on main, not in v0.0.41). A put over `--max-concurrent-puts` waits up to `--put-permit-wait` (15 s) for a slot before it is answered 503 `SlowDown`, and the kbf task client retries a 503 with jittered waits. In v0.0.41 it is answered 503 at once.

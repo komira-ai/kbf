@@ -76,7 +76,7 @@ A tier that answers a self-test question wrongly exits 3 and names the tier, the
 | 412 `PreconditionFailed` | the key already exists in either tier: puts are create-only |
 | 413 `EntityTooLarge` | a body longer than `--max-request-bytes` (or the presigning key's ceiling) |
 | 400 `RequestTimeout` | a body that stalled for `--body-idle-timeout` or came slower than `--put-min-bytes-per-sec`; nothing is stored |
-| 503 `SlowDown` | more than `--max-concurrent-puts` bodies at once, or a put that met a full tier; retry |
+| 503 `SlowDown` | more than `--max-concurrent-puts` bodies at once for longer than `--put-permit-wait`, or a put that met a full tier; retry |
 | 503 `ServiceUnavailable` | the server is draining, or a tier could not be reached |
 | 501 `NotImplemented` | an `aws-chunked` or trailing-checksum body, CRC-64/NVMe, or `encoding-type=url` on a listing; set the SDK's checksum calculation to "when required" |
 

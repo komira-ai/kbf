@@ -30,6 +30,32 @@ a key or a table it does not know. The format, the table of the key of each flag
 in "The configuration file" in `packaging/tierstore/README.md`; the flags stay accepted for one
 release along with the file.
 
+## When the puts are at their limit
+
+At most `--max-concurrent-puts` put bodies and upload parts are taken at once. A request that
+arrives when all are taken waits up to `--put-permit-wait` (`server.put_permit_wait`, 15s by
+default) for one to end, without reading its body, and is taken if one ends in that time. If none
+does, it is answered 503 `SlowDown` with `Retry-After: 1` and its body is never read. With a tier
+that is slow to take a body, clients queue here for up to that long instead of retrying at once.
+`0s` answers 503 at once. The requests that are refused for their head (411, 413) do not wait.
+
+What waiting costs, as the code does it:
+
+- A waiting request holds a connection and its task, and no permit and no body memory. It has
+  been authenticated (a valid signature) before it waits. The number of waiters is bounded only by
+  the number of connections the server accepts.
+- A waiter counts as a request in flight. During a drain the server waits for it, so a drain can
+  take up to `--put-permit-wait` longer than without waiting, and never longer than
+  `--drain-deadline`.
+- A waiter does not notice that its client went away: the connection is looked at again when the
+  body is first read, after a permit is given.
+- The client of kbf (`kbf-task`) retries the 503, and a connection that broke while it was still
+  sending the body of a refused PUT, with jittered waits (see its crate docs). It does not retry
+  429, 500, 502 or 504, deliberately.
+- The 503 is sent before the body is read, so the front may close the connection under a client
+  that is still sending a large body. A client that sees the reset instead of the 503 has to treat
+  it as one; `kbf-task` does.
+
 ## A build node: a read cache
 
 A file with `[local_cache]` and `[cold_store]` and no `[hot_store]` runs the same binary as a read

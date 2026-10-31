@@ -21,6 +21,7 @@ access_key_file       = "/etc/tierstore-cache/access.key"
 read_only_key_files   = ["/etc/tierstore-cache/clients.key"]
 presign_max_expires   = "10m"
 max_concurrent_puts   = 8
+put_permit_wait       = "25s"
 put_min_bytes_per_sec = 2048
 put_rate_grace        = "45s"
 body_idle_timeout     = "20s"
@@ -165,6 +166,7 @@ fn a_build_node_file_makes_a_cache() {
     );
     assert_eq!(front.presign_max_expires, Duration::from_secs(600));
     assert_eq!(front.max_concurrent_puts, 8);
+    assert_eq!(front.put_permit_wait, Duration::from_secs(25));
     assert_eq!(front.put_min_bytes_per_sec, 2048);
     assert_eq!(front.put_rate_grace, Duration::from_secs(45));
     assert_eq!(front.body_idle_timeout, Duration::from_secs(20));
@@ -250,6 +252,7 @@ fn a_build_node_file_has_the_defaults_of_the_flags_and_of_the_cache() {
     assert_eq!(cache.front.region, "us-east-1");
     assert_eq!(cache.front.max_request_bytes, 256 << 20);
     assert_eq!(cache.front.max_concurrent_puts, 32);
+    assert_eq!(cache.front.put_permit_wait, Duration::from_secs(15));
     assert_eq!(cache.s3_request_timeout, Duration::from_secs(60));
     assert_eq!(cache.scrub_rate, None);
     assert_eq!(cache.upstream.spec, "memory");

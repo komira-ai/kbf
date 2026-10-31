@@ -105,6 +105,7 @@ pub(super) fn render(cli: &Cli) -> Result<String, ConfigError> {
         presign_max_expires: Some(Dur(cli.presign_max_expires)),
         max_request_bytes: Some(cli.max_request_bytes),
         max_concurrent_puts: Some(cli.max_concurrent_puts),
+        put_permit_wait: Some(Dur(cli.put_permit_wait)),
         put_min_bytes_per_sec: Some(cli.put_min_bytes_per_sec),
         put_rate_grace: Some(Dur(cli.put_rate_grace)),
         body_idle_timeout: Some(Dur(cli.body_idle_timeout)),

@@ -30,6 +30,7 @@ gc_key_files          = ["/etc/tierstore/pack-gc.key"]
 scoped_key_files      = ["/etc/tierstore/scoped.key"]
 presign_max_expires   = "10m"
 max_concurrent_puts   = 8
+put_permit_wait       = "25s"
 put_min_bytes_per_sec = 2048
 put_rate_grace        = "45s"
 body_idle_timeout     = "20s"
@@ -87,6 +88,7 @@ pub(crate) fn golden_flags() -> Vec<&'static str> {
         "--scoped-key-file=/etc/tierstore/scoped.key",
         "--presign-max-expires=10m",
         "--max-concurrent-puts=8",
+        "--put-permit-wait=25s",
         "--put-min-bytes-per-sec=2048",
         "--put-rate-grace=45s",
         "--body-idle-timeout=20s",

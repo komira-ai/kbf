@@ -43,11 +43,22 @@
 //!    stored, and pack 0 is read back through the shape check ingest applies to its footer: a
 //!    manifest or a pack ingest would refuse fails the task (exit 12) instead of being stored;
 //! 5. PUTs each object to its presigned URL ([`put`]): one create-only PUT per object, repeated only after a
-//!    503 (the store's hot tier is full and nothing was stored), at most three more times, each
-//!    after the wait the store's `Retry-After` names (whole seconds, at most 30; 2 s when it names
-//!    none). Every other answer, 412 included, is final. The retries do not look at the URL's
-//!    expiry: they wait at most 90 s in all, and a retry the store gets after the URL expired is
-//!    refused (403), which is final, so the task fails (exit 13) and nothing is stored.
+//!    503 (the store's hot tier is full or it is taking as many puts as it may, and nothing was
+//!    stored), at most seven more times, each after a wait of between half and one and a half
+//!    times the store's `Retry-After` (whole seconds, taken as at most 30; 2 s when it names
+//!    none), chosen at random for each wait. A connection that broke after it was made (a store
+//!    that answers 503 and closes while the body is still being sent) is retried the same way.
+//!    Every other answer, 412 included, is final (exit 13; a 412 that follows an interrupted
+//!    attempt of the same PUT writes the line `put: 412 after an interrupted attempt of this
+//!    put; the earlier attempt may have stored it: ...`, so that it can be counted, and a
+//!    first-attempt 412 the line `put: the object already exists at ...`); 429, 500, 502 and 504
+//!    are deliberately not retried. The retries do not look at the URL's expiry: the task's own waits add up to at
+//!    most 60 s, after which the 503 is the failure, but each refused attempt can also wait at
+//!    the store for a put permit before it is answered (15 s by default), so the last attempt
+//!    begins at most about 165 s after the first by default; the URL is good for the run's wall
+//!    limit plus the frontend's slack (`--task-url-slack-secs`), which must cover that. A retry
+//!    the store gets after the URL expired is refused (403), which is final, so the task fails
+//!    (exit 13) and nothing is stored.
 //!
 //! `js-agent` returns nothing but an exit code, so the manifest travels inside the pack, and the exit
 //! code says only whether the farm did its part: 0 when the action ran and its pack was stored

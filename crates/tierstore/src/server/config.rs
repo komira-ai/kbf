@@ -47,7 +47,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::cli::{
     Cli, DEFAULT_MAX_CONCURRENT_PUTS, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_PUT_MIN_BYTES_PER_SEC,
-    DEFAULT_REGION, SkippedCheck, parse_duration, parse_skip,
+    DEFAULT_PUT_PERMIT_WAIT, DEFAULT_REGION, SkippedCheck, parse_duration, parse_skip,
 };
 use super::config_cache::{CacheSettings, LocalCacheTable};
 use super::front::FrontSettings;
@@ -103,6 +103,7 @@ pub(super) const KEYS: &[(&str, &[&str])] = &[
     ("usage-stale-after", &["hot_store.usage_stale_after"]),
     ("max-request-bytes", &["server.max_request_bytes"]),
     ("max-concurrent-puts", &["server.max_concurrent_puts"]),
+    ("put-permit-wait", &["server.put_permit_wait"]),
     ("put-min-bytes-per-sec", &["server.put_min_bytes_per_sec"]),
     ("put-rate-grace", &["server.put_rate_grace"]),
     ("body-idle-timeout", &["server.body_idle_timeout"]),
@@ -362,6 +363,7 @@ pub(super) struct ServerTable {
     pub presign_max_expires: Option<Dur>,
     pub max_request_bytes: Option<u64>,
     pub max_concurrent_puts: Option<u32>,
+    pub put_permit_wait: Option<Dur>,
     pub put_min_bytes_per_sec: Option<u64>,
     pub put_rate_grace: Option<Dur>,
     pub body_idle_timeout: Option<Dur>,
@@ -917,6 +919,7 @@ fn storage(
         usage_stale_after: duration(hot.usage_stale_after, Duration::from_secs(120)),
         max_request_bytes: front.max_request_bytes,
         max_concurrent_puts: front.max_concurrent_puts,
+        put_permit_wait: front.put_permit_wait,
         put_min_bytes_per_sec: front.put_min_bytes_per_sec,
         put_rate_grace: front.put_rate_grace,
         body_idle_timeout: front.body_idle_timeout,
@@ -974,6 +977,7 @@ pub(super) fn front_of(server: ServerTable, per_run: PerRun) -> Result<Shared, C
         presign_max_expires: duration(server.presign_max_expires, Duration::from_secs(15 * 60)),
         max_request_bytes,
         max_concurrent_puts,
+        put_permit_wait: duration(server.put_permit_wait, DEFAULT_PUT_PERMIT_WAIT),
         put_min_bytes_per_sec: server
             .put_min_bytes_per_sec
             .unwrap_or(DEFAULT_PUT_MIN_BYTES_PER_SEC),

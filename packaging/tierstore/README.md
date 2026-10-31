@@ -433,7 +433,9 @@ until the next pass (every 10 seconds) frees it. The start refuses (exit status 
 than the size of the file system less `free_floor` percent of it; a file system whose size cannot be
 read, or that reports 0 bytes, is not judged: the start warns on stderr and goes on. The files of
 `.stage/` are never evicted and are removed at start. `scrub_rate` is accepted; this release does not
-scrub.
+scrub. `put_permit_wait`, like `max_concurrent_puts` and `put_min_bytes_per_sec`, is accepted in
+`[server]` of a build node and does nothing there without write-through, since the node answers every
+put 403.
 
 | key | what |
 |---|---|
@@ -569,6 +571,7 @@ the flags of the binary against this table, so a flag added without a key fails 
 | `--usage-stale-after` | `hot_store.usage_stale_after` | how old the published usage may be before `/usagez` says 503 |
 | `--max-request-bytes` | `server.max_request_bytes` | the longest body of a request |
 | `--max-concurrent-puts` | `server.max_concurrent_puts` | the most put bodies and parts taken at once |
+| `--put-permit-wait` | `server.put_permit_wait` | how long a put that arrives with all of those taken waits for one to end (15s by default; 0 answers 503 at once). No byte of its body is read while it waits. If none ends in that time it is answered 503 `SlowDown` with `Retry-After: 1`. A waiter holds a connection and no permit or body memory, is not bounded except by the connections, counts as in flight in a drain (so a drain may take up to this much longer, never past `--drain-deadline`), and does not notice its client leaving until its body is first read |
 | `--put-min-bytes-per-sec` | `server.put_min_bytes_per_sec` | the least average rate of a body (0 turns it off) |
 | `--put-rate-grace` | `server.put_rate_grace` | the time waiting for the client before that rate is held |
 | `--body-idle-timeout` | `server.body_idle_timeout` | how long a body or an answer may go without a byte |

@@ -139,7 +139,11 @@ fn a_503_then_a_201_resends_the_whole_file() {
         }
     }
     let agent = agent(None);
-    let outcome = put_retrying(|| put_file(&agent, &url, &path), &Record(&waits));
+    let outcome = put_retrying(
+        || put_file(&agent, &url, &path),
+        &Record(&waits),
+        &FixedJitter(0.5),
+    );
     assert_eq!(outcome, Ok(()));
     let seen = server.join().expect("server");
     assert_eq!(seen.len(), 2);
@@ -159,7 +163,8 @@ fn a_412_is_final() {
     let (base, server) = serve_each(vec![(412, "")]);
     let url = format!("{base}/k?X-Sig=secret");
     let agent = agent(None);
-    let err = put_retrying(|| put_file(&agent, &url, &path), &NoWait).unwrap_err();
+    let err =
+        put_retrying(|| put_file(&agent, &url, &path), &NoWait, &FixedJitter(0.5)).unwrap_err();
     assert_eq!(server.join().expect("server").len(), 1);
     assert_eq!(
         err,

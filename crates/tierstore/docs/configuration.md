@@ -127,7 +127,8 @@ How the cache behaves is in [operations](operations.md#a-build-node). The file i
 | `server.scoped_key_files` | `--scoped-key-file` | paths, none | scoped key files |
 | `server.presign_max_expires` | `--presign-max-expires` | duration, `15m` | the longest expiry of any presigned URL |
 | `server.max_request_bytes` | `--max-request-bytes` | bytes, 268435456 (256 MiB) | the longest body of a request: the longest object and the longest part. A body over it is refused with 413 and nothing is stored |
-| `server.max_concurrent_puts` | `--max-concurrent-puts` | count, 32 | the most put bodies and parts taken at once; one more is 503 `SlowDown` with `Retry-After: 1` |
+| `server.max_concurrent_puts` | `--max-concurrent-puts` | count, 32 | the most put bodies and parts taken at once; one more waits for one to end, up to `server.put_permit_wait` |
+| `server.put_permit_wait` | `--put-permit-wait` | duration, `15s` | on main, not in v0.0.41. How long a put that finds every put slot taken waits for one to end before it is answered 503 `SlowDown` with `Retry-After: 1`; `0s` answers at once. No byte of its body is read while it waits, and a waiter counts as in flight in a drain (never past `--drain-deadline`) |
 | `server.put_min_bytes_per_sec` | `--put-min-bytes-per-sec` | bytes a second, 1024 | the least average rate of a body, counted over the time spent waiting for the client; 0 turns it off |
 | `server.put_rate_grace` | `--put-rate-grace` | duration, `30s` | the time spent waiting for the client before that rate is held |
 | `server.body_idle_timeout` | `--body-idle-timeout` | duration, `30s` | how long a body or an answer may go without a byte; more than zero |

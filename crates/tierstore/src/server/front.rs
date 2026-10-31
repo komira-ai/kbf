@@ -42,6 +42,7 @@ pub(super) struct FrontSettings {
     pub presign_max_expires: Duration,
     pub max_request_bytes: u64,
     pub max_concurrent_puts: u32,
+    pub put_permit_wait: Duration,
     pub put_min_bytes_per_sec: u64,
     pub put_rate_grace: Duration,
     pub body_idle_timeout: Duration,
@@ -65,6 +66,7 @@ impl Cli {
             presign_max_expires: self.presign_max_expires,
             max_request_bytes: self.max_request_bytes,
             max_concurrent_puts: self.max_concurrent_puts,
+            put_permit_wait: self.put_permit_wait,
             put_min_bytes_per_sec: self.put_min_bytes_per_sec,
             put_rate_grace: self.put_rate_grace,
             body_idle_timeout: self.body_idle_timeout,
@@ -114,6 +116,7 @@ pub(super) fn server_config(
     server.max_request_bytes = usize::try_from(front.max_request_bytes).unwrap_or(usize::MAX);
     server.body_idle_timeout = front.body_idle_timeout;
     server.max_concurrent_puts = front.max_concurrent_puts as usize;
+    server.put_permit_wait = front.put_permit_wait;
     server.put_min_bytes_per_sec = front.put_min_bytes_per_sec;
     server.put_rate_grace = front.put_rate_grace;
     server.drain_lb_wait = front.drain_lb_wait;
