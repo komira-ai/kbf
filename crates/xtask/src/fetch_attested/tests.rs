@@ -95,7 +95,8 @@ fn a_verified_archive_gives_its_member_and_gh_is_asked_about_the_file_the_member
 #[test]
 fn a_download_that_is_not_the_pinned_digest_is_refused_before_anything_is_written() {
     // Asserts: the mismatch error names both digests, gh is not asked, and neither the archive nor the
-    // program exists afterwards.
+    // program exists afterwards, nor the directory the archive would go in (it is made only after
+    // the digest is checked).
     let dir = scratch("sha");
     let bytes = archive("tool-1/tool");
     let mut req = request(&dir, &bytes, "tool-1/tool");
@@ -105,6 +106,7 @@ fn a_download_that_is_not_the_pinned_digest_is_refused_before_anything_is_writte
     assert!(err.to_string().contains("not the pinned"), "{err}");
     assert!(gh.seen.borrow().is_empty());
     assert!(!req.archive.exists() && !req.out.exists());
+    assert!(!req.archive.parent().expect("the archive has a directory").exists());
 }
 
 #[test]
