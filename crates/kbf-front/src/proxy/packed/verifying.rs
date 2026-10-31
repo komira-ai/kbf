@@ -10,7 +10,7 @@
 //!   and held through its delete) fails if the key is held, or already claimed.
 //!
 //! So an ingest that has begun makes the janitor keep the key, and an ingest that begins after the
-//! janitor has claimed it is refused (`RejectReason::Expired`) and reads nothing. The index is
+//! janitor has claimed it is refused (`RejectReason::Claimed`) and reads nothing. The index is
 //! never told of a pack whose object the janitor is deleting: a pack recorded before the claim is
 //! seen by the index's last answer, and none can be recorded between the claim and the delete.
 //!

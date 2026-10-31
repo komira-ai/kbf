@@ -22,13 +22,21 @@
 //! registry the ingests hold keys in, after the index's last answer for the page and held through
 //! the index's answer for that key and the delete. A claim and a hold on one key exclude each
 //! other under one lock: an ingest that has begun makes the janitor keep the key, and an ingest
-//! that begins after the claim is refused (`Expired`) before it reads anything. So the index is
+//! that begins after the claim is refused (`Claimed`) before it reads anything. So the index is
 //! never told of a pack whose object is being deleted. An ingest also refuses a key as old as
 //! `kbf_pack::MIN_GRACE`, the least grace the flag takes, so an over-age key (a run seen as ended
 //! only after a long outage) is never committed. The leadership is asked before each page and each
 //! delete, and a sweep that finds it lost stops (`abandoned`). A 403 on a delete ends the
 //! sweep at the first key (a key that may not delete may not delete any), and so do a number of
-//! deletes failing in a row; both are counted in `sweep_errors` and logged once.
+//! deletes failing in a row; both are counted in `sweep_errors` and logged once, and what the sweep
+//! did before it stopped is counted too. A 401 (a bad credential) ends it as a 403 does.
+//!
+//! **Across processes.** Holds and claims are per process (a lock in the packs). A fenced old
+//! leader that is still ingesting while the janitor runs on the new leader, or two frontends whose
+//! clocks differ, are protected by the age rule alone: the ingest refuses a key at
+//! `kbf_pack::MIN_GRACE` and the janitor deletes at the grace, so the margin is
+//! `grace - MIN_GRACE`, an hour at least (`--task-janitor-grace-secs` takes nothing under
+//! `MIN_GRACE` plus that hour, 6 hours).
 //!
 //! A key whose name the parser does not understand is kept and counted (`kept_unparsed`).
 //!
@@ -83,10 +91,27 @@ const PAGE_PAUSE: &str = "task_janitor_page_pause_ms";
 const DRY_RUN: &str = "task_janitor_dry_run";
 const SECRET: &str = "task_secret_file";
 
-/// The least `--task-janitor-grace-secs`: the longest a presigned write is good for and the
-/// allowance of the ingest, the one constant ([`kbf_pack::MIN_GRACE`]) the ingest refuses a key
-/// by too.
-const MIN_GRACE_SECS: u64 = kbf_pack::MIN_GRACE.as_secs();
+/// The margin above the age an ingest refuses a key at that the grace must have: holds and
+/// claims are per process, so across frontends (two hosts with clocks that differ, or a fenced
+/// old leader still ingesting while the new one sweeps) a key is safe only by the age rule, and
+/// this is its margin: an hour.
+const FENCE_MARGIN_SECS: u64 = 3_600;
+
+/// The least `--task-janitor-grace-secs`: the age an ingest refuses a key at
+/// ([`kbf_pack::MIN_GRACE`], the one constant both sides are built from) and the margin above it.
+const MIN_GRACE_SECS: u64 = kbf_pack::MIN_GRACE.as_secs() + FENCE_MARGIN_SECS;
+
+/// The help of `--task-janitor-grace-secs`, its bounds from the constants.
+fn grace_help() -> String {
+    format!(
+        "How old a key must be, in seconds, before the janitor may delete it, by the minute its \
+         name says it was minted in. At least {MIN_GRACE_SECS} (the {ingest} seconds at which an \
+         ingest refuses a key, and an hour more as a margin for hosts with different clocks and \
+         for an old leader still ingesting) and at most {MAX_GRACE_SECS}. Used only with \
+         `--task-janitor-key-file`",
+        ingest = kbf_pack::MIN_GRACE.as_secs(),
+    )
+}
 
 /// The most `--task-janitor-grace-secs`: a week.
 const MAX_GRACE_SECS: u64 = 7 * 24 * 3_600;
@@ -154,12 +179,7 @@ pub(super) fn args() -> [Arg; 6] {
             .value_parser(clap::value_parser!(u64).range(MIN_GRACE_SECS..=MAX_GRACE_SECS))
             // The default grace of `kbf_pack`, 6 hours, as above.
             .default_value("21600")
-            .help(
-                "How old a key must be, in seconds, before the janitor may delete it, by the \
-                 minute its name says it was minted in. At least 18000 (the 4 hours a presigned \
-                 write is good for and an hour for the ingest) and at most 604800. Used only \
-                 with `--task-janitor-key-file`",
-            ),
+            .help(grace_help()),
         Arg::new(PAGE_SIZE)
             .long("task-janitor-page-size")
             .value_name("KEYS")
@@ -324,11 +344,11 @@ impl Default for Done {
 
 impl JanitorMetrics {
     /// Counts what one sweep did.
-    fn record(&self, report: &SweepReport) {
+    fn record(&self, report: &SweepReport, ended: bool) {
         let add = |counter: &AtomicU64, n: usize| {
             counter.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
         };
-        add(&self.sweeps, usize::from(report.led));
+        add(&self.sweeps, usize::from(report.led && ended));
         add(&self.listed, report.listed);
         add(&self.kept_young, report.young);
         add(&self.kept_verifying, report.verifying);
@@ -385,12 +405,14 @@ impl JanitorMetrics {
         let counters = [
             (
                 "sweeps",
-                "Sweeps of cas/b/ that this frontend led and ran to the end of the listing",
+                "Sweeps of cas/b/ that this frontend led and that ended without an error, those \
+                 stopped part way by losing leadership included",
                 &self.sweeps,
             ),
             (
                 "sweep_errors",
-                "Sweeps stopped early because the listing or the pack index failed",
+                "Sweeps stopped by an error: the listing or the pack index failed, a delete was \
+                 refused with 401 or 403, or deletes failed several times in a row",
                 &self.sweep_errors,
             ),
             (
@@ -455,8 +477,10 @@ impl JanitorMetrics {
 pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
 /// One sweep, over whatever store the janitor was built on.
-type Pass =
-    Box<dyn Fn(SystemTime) -> BoxFuture<'static, Result<SweepReport, SweepError>> + Send + Sync>;
+type Pass = Box<dyn Fn(SystemTime) -> BoxFuture<'static, Swept> + Send + Sync>;
+
+/// What a sweep did, and the error that stopped it, if one did: the report is whole either way.
+type Swept = (SweepReport, Result<(), SweepError>);
 
 /// Sweeps `cas/b/` on an interval: see the module docs.
 pub struct Janitor {
@@ -495,7 +519,11 @@ impl Janitor {
         let sweeper = Arc::new(Sweeper::new(store, index, config, gates));
         let pass: Pass = Box::new(move |now| {
             let sweeper = Arc::clone(&sweeper);
-            Box::pin(async move { sweeper.sweep(now).await })
+            Box::pin(async move {
+                let mut report = SweepReport::default();
+                let ended = sweeper.sweep_into(now, &mut report).await;
+                (report, ended)
+            })
         });
         Self {
             pass,
@@ -513,12 +541,12 @@ impl Janitor {
 
     /// One sweep, judged at the time the clock says now.
     pub async fn sweep_once(&self) {
-        match (self.pass)((self.clock)()).await {
-            Ok(report) => self.metrics.record(&report),
-            Err(error) => {
-                tracing::warn!(%error, "the sweep of cas/b/ stopped early");
-                self.metrics.sweep_errors.fetch_add(1, Ordering::Relaxed);
-            }
+        // What the sweep did before an error stopped it is counted too.
+        let (report, ended) = (self.pass)((self.clock)()).await;
+        self.metrics.record(&report, ended.is_ok());
+        if let Err(error) = ended {
+            tracing::warn!(%error, "the sweep of cas/b/ stopped early");
+            self.metrics.sweep_errors.fetch_add(1, Ordering::Relaxed);
         }
         self.metrics.finished_one();
     }

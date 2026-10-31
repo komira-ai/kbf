@@ -243,7 +243,7 @@ pub async fn ingest(
 /// Every key of `keys` is held in [`Packs::verifying_keys`] from the start of the call until it
 /// returns or is dropped, so the janitor of `cas/b/` never deletes a pack or a large object this
 /// ingest is reading or copying, however old its key says it is. A key the janitor has claimed
-/// for its delete, or one as old as [`kbf_pack::MIN_GRACE`], is refused as `Expired`.
+/// for its delete is refused as `Claimed`, and one as old as [`kbf_pack::MIN_GRACE`] as `Expired`.
 ///
 /// Every ending is counted: an ingest (`kbf_pack_ingests_total`, with the packs of the run in
 /// `kbf_pack_ingest_packs_total` and the bytes of its large objects in
@@ -336,7 +336,7 @@ impl Ingest<'_> {
             .packs
             .verifying
             .hold(names)
-            .map_err(|_| Stop::from(RejectReason::Expired))?;
+            .map_err(|_| Stop::from(RejectReason::Claimed))?;
         let first = self.verified()?;
         let size = self.length(&first.object).await?;
         let (footer, entry) = self.footer(&first.object, size, true).await?;

@@ -138,7 +138,7 @@ pub enum SweepError {
     /// The index could not say which keys it records.
     #[error("sweep: the pack index failed: {0}")]
     Index(#[source] PackIndexError),
-    /// The store answered a delete with 403: the key may not delete under the prefix, and
+    /// The store answered a delete with 401 (a bad credential) or 403: the key may not delete under the prefix, and
     /// no other delete of the sweep would be allowed either.
     #[error("sweep: the store refused to let this key delete under {SWEPT_PREFIX}: {0}")]
     Denied(#[source] ObjectStoreError),
@@ -180,10 +180,25 @@ impl<S: ObjectStore> Sweeper<S> {
     /// One sweep, judging every age against `now`.
     ///
     /// # Errors
-    /// [`SweepError::List`] or [`SweepError::Index`]: the sweep stops, and what it deleted
-    /// before stays deleted.
+    /// [`SweepError`]: the sweep stops, and what it deleted before stays deleted. A caller that
+    /// wants what the sweep did before it stopped uses [`Sweeper::sweep_into`].
     pub async fn sweep(&self, now: SystemTime) -> Result<SweepReport, SweepError> {
         let mut report = SweepReport::default();
+        self.sweep_into(now, &mut report).await?;
+        Ok(report)
+    }
+
+    /// One sweep, judging every age against `now`, counting into `report` as it goes, so that
+    /// when the sweep stops with an error `report` says what it did before.
+    ///
+    /// # Errors
+    /// [`SweepError::List`], [`SweepError::Index`], [`SweepError::Denied`] or
+    /// [`SweepError::Failing`]: the sweep stops, and what it deleted before stays deleted.
+    pub async fn sweep_into(
+        &self,
+        now: SystemTime,
+        report: &mut SweepReport,
+    ) -> Result<(), SweepError> {
         let prefix = KeyPrefix::new(SWEPT_PREFIX).expect("the swept prefix is a valid prefix");
         let mut after: Option<ListToken> = None;
         let mut failures = 0;
@@ -192,7 +207,7 @@ impl<S: ObjectStore> Sweeper<S> {
             // deleting at once, and says so if it had begun.
             if !(self.gates.is_leader)() {
                 report.abandoned = report.led;
-                return Ok(report);
+                return Ok(());
             }
             report.led = true;
             let page = self
@@ -226,13 +241,13 @@ impl<S: ObjectStore> Sweeper<S> {
                     candidates.push(object.key.clone());
                 }
             }
-            self.judge(candidates, &mut report, &mut failures).await?;
+            self.judge(candidates, report, &mut failures).await?;
             if report.abandoned {
-                return Ok(report);
+                return Ok(());
             }
             match page.next {
                 Some(token) => after = Some(token),
-                None => return Ok(report),
+                None => return Ok(()),
             }
             tokio::time::sleep(self.config.pause).await;
         }
@@ -256,10 +271,6 @@ impl<S: ObjectStore> Sweeper<S> {
             if !orphans.contains(&key.to_string()) {
                 continue;
             }
-            if !(self.gates.is_leader)() {
-                report.abandoned = true;
-                return Ok(());
-            }
             // From here to the end of the delete nothing may begin to verify the key (and
             // if something already does, the key is kept): the claim is taken after the last
             // answer of the page and held through the index's answer for this key and the delete.
@@ -277,13 +288,24 @@ impl<S: ObjectStore> Sweeper<S> {
                 report.would_delete += 1;
                 continue;
             }
+            // Asked last, after the claim and the index's last answer and with nothing between
+            // it and the delete: a server that stopped leading while it was waiting on either
+            // deletes nothing (the claim is let go as this returns).
+            if !(self.gates.is_leader)() {
+                report.abandoned = true;
+                return Ok(());
+            }
             match self.store.delete(&key).await {
                 Ok(()) => {
                     tracing::info!(%key, "deleted an orphan pack");
                     report.deleted += 1;
                     *failures = 0;
                 }
-                Err(error @ ObjectStoreError::Service { status: 403, .. }) => {
+                Err(
+                    error @ ObjectStoreError::Service {
+                        status: 401 | 403, ..
+                    },
+                ) => {
                     return Err(SweepError::Denied(error));
                 }
                 Err(error) => {
