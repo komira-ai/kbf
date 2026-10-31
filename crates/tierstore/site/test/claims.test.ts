@@ -60,6 +60,13 @@ test('the pages say what they say about the cache and metrics, so the code check
   assert.match(page('why'), /The <code>tierstore<\/code> binary does not use it/);
   assert.match(page('why'), /<code>\[local_cache\]<\/code> and <code>\[cold_store\]<\/code> and no <code>\[hot_store\]<\/code>/);
   assert.match(page('index'), /a build node, file only/);
+  // The metric names the page gives exist in the source, and the demo says what the drain does.
+  const metricsSrc = binarySource();
+  for (const name of ['tierstore_build_info', 'tierstore_drain_late_requests_total']) {
+    assert.match(page('why'), new RegExp(`<code>${name}</code>`));
+    assert.ok([...metricsSrc.values()].some((s) => s.includes(name)), `${name} is not in the source: update content/why.html ("Where it stops")`);
+  }
+  assert.match(page('demo'), /<code>Connection: close<\/code>.*lingering close.*not answered 503/);
 });
 
 test('the code still matches those statements', () => {
