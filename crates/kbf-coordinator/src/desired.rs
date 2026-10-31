@@ -73,7 +73,7 @@ impl MaxUpdating {
     pub const fn of(&self, role: HostRole) -> u32 {
         match role {
             HostRole::Frontend => self.frontend,
-            HostRole::Storage => self.storage,
+            HostRole::Storage => self.frontend,
             HostRole::Daemon => self.daemon,
             HostRole::MacDaemon => self.mac_daemon,
         }
@@ -95,7 +95,7 @@ impl MinUp {
     #[must_use]
     pub const fn of(&self, role: HostRole) -> u32 {
         match role {
-            HostRole::Storage => self.storage,
+            HostRole::Storage => self.frontend,
             HostRole::Frontend => self.frontend,
             HostRole::Daemon | HostRole::MacDaemon => 0,
         }
