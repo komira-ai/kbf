@@ -18,6 +18,8 @@
 //! name = "agent"
 //! after = ["server"]             # services defined earlier in the file, or kbf
 //! priority = 0                   # default 0; a host is offered the higher number first
+//! bake_beats = 0                 # default 0, at most 100: healthy beats before a slot frees
+//! canary = { count = 1 }         # optional: only this many hosts go until they have baked
 //!
 //! [service.roles.daemon]
 //! max_updating = 2               # optional; absent: the desired state's number
@@ -34,6 +36,7 @@ use kbf_updater::secret::read_secret;
 use kbf_updater::wire::{MAX_SERVICE_NAME, MAX_SERVICES, is_service_name};
 use serde::Deserialize;
 
+use crate::bake::MAX_BAKE_BEATS;
 use crate::canary::Canary;
 use crate::desired::{Desired, KBF, KBF_MIN_UP, LEGACY_ROLES, MAX_COUNT, kbf_roles};
 
@@ -195,6 +198,17 @@ struct RawService {
     roles: BTreeMap<String, RawRole>,
     #[serde(default)]
     priority: i32,
+    #[serde(default)]
+    bake_beats: u32,
+    canary: Option<RawCanary>,
+}
+
+/// The count form of the canary. The roles and labels form is refused as an unknown field
+/// until it is implemented.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCanary {
+    count: u32,
 }
 
 #[derive(Deserialize)]
@@ -267,6 +281,8 @@ fn service_def(
         after,
         roles,
         priority,
+        bake_beats,
+        canary,
     } = raw;
     if !is_service_name(&name) {
         return invalid(format!(
@@ -287,6 +303,15 @@ fn service_def(
             "{name}: after names {unknown}, which is not kbf or defined earlier in the file"
         ));
     }
+    if bake_beats > MAX_BAKE_BEATS {
+        return invalid(format!("{name}: bake_beats is over {MAX_BAKE_BEATS}"));
+    }
+    if canary
+        .as_ref()
+        .is_some_and(|c| c.count == 0 || c.count > MAX_COUNT)
+    {
+        return invalid(format!("{name}: canary count is not 1 to {MAX_COUNT}"));
+    }
     let names = roles
         .keys()
         .map(|r| role_of(r))
@@ -301,8 +326,8 @@ fn service_def(
         after,
         require_min_up: Vec::new(),
         priority,
-        bake_beats: 0,
-        canary: None,
+        bake_beats,
+        canary: canary.map(|c| Canary { count: c.count }),
     })
 }
 

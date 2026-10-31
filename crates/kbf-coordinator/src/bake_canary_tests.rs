@@ -235,6 +235,23 @@ fn started_others(f: &mut Fleet, at: u64) {
     }
 }
 
+/// A canary at the desired version whose promotion is pending has not baked: the gate stays
+/// closed, whatever the bake count says.
+#[test]
+fn a_canary_with_a_pending_promotion_keeps_the_gate_closed() {
+    let s = services("canary = { count = 1 }", 3, 0);
+    let mut f = Fleet::new(Duration::ZERO);
+    started(&mut f, 100);
+    let mut pending = beat("2.0");
+    pending.promotion_pending = true;
+    beats(&mut f, "a", &pending, 115);
+    started_others(&mut f, 115);
+    assert_eq!(why(&s, &f, "b", 115), held(Hold::CanaryWait));
+    beats(&mut f, "a", &beat("2.0"), 130);
+    started_others(&mut f, 130);
+    assert_eq!(why(&s, &f, "b", 130), go());
+}
+
 /// A canary of two lets two hosts go; the third waits until both have baked.
 #[test]
 fn a_canary_of_two_orders_two_hosts() {
