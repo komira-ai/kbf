@@ -6,7 +6,7 @@
 //! [`crate::fleet::DOWN_AFTER`]); a silent host is `down`, and is not at the desired
 //! version whatever it last said.
 //!
-//! The state is one of three:
+//! The state is one of four:
 //!
 //! - `blocked`: some live host failed an update to the desired version and is still behind
 //!   it. It stays so until the host is fixed or another version is set (the coordinator
@@ -15,6 +15,9 @@
 //!   desired version and none updating or failed, and at least `min_up` hosts of the
 //!   storage and of the frontend role up. The last two keep a coordinator that has just
 //!   restarted, and has heard from few hosts, from reporting a farm converged.
+//! - `halted`: a host reported a failure no version can repair and an operator has not
+//!   cleared it. It wins over every other state, and the convergence names the halt
+//!   (`halt`: the host, the check and the version); see [`crate::halt`].
 //! - `in_progress`: everything else.
 //!
 //! How long a farm has gone without progress is the caller's to judge: it needs the time of
@@ -28,6 +31,7 @@ use serde::Serialize;
 
 use crate::desired::Desired;
 use crate::fleet::{Fleet, Host};
+use crate::ops::Halt;
 use crate::services::ServiceDef;
 
 /// Where the farm stands.
@@ -39,6 +43,9 @@ pub enum State {
     Converged,
     /// A live host failed its update to the desired version.
     Blocked,
+    /// A host reported a failure no version can repair and an operator has not cleared it
+    /// ([`crate::halt`]): nothing is ordered, whatever the other hosts say.
+    Halted,
     /// Neither.
     InProgress,
 }
@@ -69,9 +76,24 @@ pub struct Convergence {
     pub state: State,
     /// The counts of every role that has a host, in role order.
     pub roles: Vec<RoleCounts>,
+    /// The halt that stands, when the state is `halted`: the host, the check and the version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub halt: Option<Halt>,
     /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]): what a client
     /// compares with a release before it orders one.
     pub commit: &'static str,
+}
+
+impl Convergence {
+    /// This convergence of a service that `halt` stops: `halted`, naming the halt.
+    #[must_use]
+    pub fn halted(self, halt: Halt) -> Self {
+        Self {
+            state: State::Halted,
+            halt: Some(halt),
+            ..self
+        }
+    }
 }
 
 fn failed_to_reach(host: &Host, desired: &Desired) -> bool {
@@ -183,6 +205,7 @@ fn converge_with(
             quiet,
             state: State::InProgress,
             roles: Vec::new(),
+            halt: None,
             commit: crate::BUILD_COMMIT,
         };
     };
@@ -220,6 +243,7 @@ fn converge_with(
         quiet,
         state,
         roles,
+        halt: None,
         commit: crate::BUILD_COMMIT,
     }
 }

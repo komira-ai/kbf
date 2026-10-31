@@ -26,6 +26,7 @@ pub mod converge;
 pub mod decide;
 pub mod desired;
 pub mod fleet;
+pub mod halt;
 pub mod http;
 pub mod identity;
 pub mod listen;

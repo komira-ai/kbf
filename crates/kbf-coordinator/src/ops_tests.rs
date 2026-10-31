@@ -59,6 +59,7 @@ const FULL: &str = r#"{
           "target": "1.5"
         }
       ],
+      "halt_generation": 3,
       "last_good": "1.0",
       "bad": [
         "1.9"
@@ -107,6 +108,7 @@ fn the_file_reads_and_writes_every_field_of_the_schema() {
                 node_id: "n4".to_owned(),
                 target: version("1.5"),
             }],
+            halt_generation: 3,
             last_good: Some(version("1.0")),
             bad: vec![version("1.9")],
         },

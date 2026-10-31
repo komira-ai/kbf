@@ -8,14 +8,15 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kbf_oidc::{Refusal, Verified, Verifier};
-use kbf_updater::wire::{Answer, Heartbeat, Reply, ServiceReply};
+use kbf_updater::wire::{Answer, Heartbeat, ServiceReply};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
 use crate::converge::{Convergence, RoleCounts, converge_kbf, converge_service, role_counts};
-use crate::decide::{Decision, Hold, decide_in, decide_why};
+use crate::decide::{Decision, Hold};
 use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
 use crate::fleet::{Fleet, Host};
+use crate::halt;
 use crate::identity::Identity;
 use crate::ops::{self, AuditEntry, OPERATOR, OperateError, OpsState, OpsStore};
 use crate::services::{ServiceDef, Services};
@@ -172,9 +173,10 @@ pub struct Status {
 
 /// The features this coordinator advertises to an agent that announces `agent_features`.
 ///
-/// Empty: each name is added in the change that implements what it names (`heartbeat-v2`,
+/// Each name is added in the change that implements what it names (`heartbeat-v2`,
 /// `deferred-v1`, `halt-v1`), so a name is never advertised for behaviour that is not there.
-pub const FEATURES: &[&str] = &[];
+/// Now: `halt-v1`, the clear generations of [`crate::halt`].
+pub const FEATURES: &[&str] = &[halt::FEATURE];
 
 /// The coordinator.
 pub struct Coordinator {
@@ -269,32 +271,35 @@ impl Coordinator {
         let reply = self.reply_to(who, beat);
         // Only an agent that announced features gets `features`: an older agent reads the
         // reply strictly and refuses a field it does not know.
-        let features = (!asked.is_empty()).then(|| {
+        let features: Option<Vec<String>> = (!asked.is_empty()).then(|| {
             self.features
                 .iter()
                 .filter(|name| asked.contains(name))
                 .cloned()
                 .collect()
         });
+        // The generations only to an agent that announced `halt-v1` and a coordinator that
+        // advertises it: an older agent's strict reader refuses the field.
+        let halts = features
+            .as_ref()
+            .filter(|names| names.iter().any(|name| name == halt::FEATURE))
+            .map_or_else(BTreeMap::new, |_| halt::generations(&self.ops));
         Answer {
             reply,
             features,
-            halts: BTreeMap::new(),
+            halts,
         }
     }
 
     fn reply_to(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
         let now = (self.clock)();
+        halt::note(&self.ops, &self.services, &who, &beat);
         let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         let announced = beat.services.clone().unwrap_or_default();
         let platform = beat.platform;
         fleet.record(who.node_id.clone(), who.role.clone(), beat, now);
         for one in &announced {
-            let runs_here = self
-                .services
-                .get(&one.name)
-                .is_some_and(|def| def.roles.contains_key(who.role.name()));
-            if runs_here {
+            if halt::is_member(&self.services, &one.name, who.role.name()) {
                 fleet.record_in(
                     &one.name,
                     who.node_id.clone(),
@@ -311,8 +316,16 @@ impl Coordinator {
         // Stable: services of one priority keep the order above.
         names.sort_by_key(|name| Reverse(self.services.get(name).map_or(0, |def| def.priority)));
         for name in names {
-            let reply = decide_in(&self.services, &desired, name, &fleet, &who.node_id, now);
-            if let Reply::Update { version } = reply {
+            let decision = halt::decide(
+                &self.ops,
+                &self.services,
+                &desired,
+                name,
+                &fleet,
+                &who.node_id,
+                now,
+            );
+            if let Decision::Update { version } = decision {
                 fleet.order(name, who.node_id.clone(), version.clone(), now);
                 return ServiceReply::Update {
                     service: (name != KBF).then(|| name.to_owned()),
@@ -431,7 +444,15 @@ impl Coordinator {
                     .hosts_of(&def.name)
                     .map(|(id, host)| ServiceHostStatus {
                         host: host_status(&fleet, &def.name, id, host, now),
-                        hold: match decide_why(&self.services, &all, &def.name, &fleet, id, now) {
+                        hold: match halt::decide(
+                            &self.ops,
+                            &self.services,
+                            &all,
+                            &def.name,
+                            &fleet,
+                            id,
+                            now,
+                        ) {
                             Decision::Update { .. } => None,
                             Decision::Hold(why) => Some(why),
                         },
@@ -439,7 +460,7 @@ impl Coordinator {
                     .collect();
                 let up = hosts.iter().filter(|h| h.host.up).count();
                 let slots_held = hosts.iter().filter(|h| h.host.holds_slot).count();
-                let convergence = convergence_of(def, desired.as_ref(), &fleet, now);
+                let convergence = convergence_of(&self.ops, def, desired.as_ref(), &fleet, now);
                 let status = ServiceStatus {
                     desired,
                     roles,
@@ -483,7 +504,13 @@ impl Coordinator {
         let now = (self.clock)();
         let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         let desired = self.desired.get(service);
-        Ok(convergence_of(def, desired.as_ref(), &fleet, now))
+        Ok(convergence_of(
+            &self.ops,
+            def,
+            desired.as_ref(),
+            &fleet,
+            now,
+        ))
     }
 }
 
@@ -509,16 +536,22 @@ fn host_status(
 
 /// Where the hosts of `def` stand: the one answer both `GET /v1/convergence` and the status
 /// give. `kbf` is counted with the minimums of its desired state, as it always has been; any
-/// other service with what its definition requires of each role.
+/// other service with what its definition requires of each role. A halted service is
+/// `halted` whatever its hosts say.
 fn convergence_of(
+    ops: &OpsStore,
     def: &ServiceDef,
     desired: Option<&Desired>,
     fleet: &Fleet,
     now: Duration,
 ) -> Convergence {
-    if def.name == KBF {
+    let convergence = if def.name == KBF {
         converge_kbf(def, desired, fleet, now)
     } else {
         converge_service(def, desired, fleet, now)
+    };
+    match halt::standing(ops, &def.name) {
+        Some(halt) => convergence.halted(halt),
+        None => convergence,
     }
 }

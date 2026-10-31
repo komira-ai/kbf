@@ -22,8 +22,9 @@
 //! Every change carries an [`AuditEntry`]: the store numbers it, keeps the last
 //! [`AUDIT_RING`] in the file and logs it on the target `kbf_coordinator::audit`.
 //!
-//! The operator actions ([`operate`]) are the only writers in this PR; nothing reads the
-//! store when it decides what a host is told.
+//! The operator actions ([`operate`]) write exclusions, labels and the clear of a halt; the
+//! coordinator itself writes the raising of a halt ([`crate::halt`]). Nothing but a halt reads
+//! the store when it decides what a host is told.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -78,7 +79,7 @@ pub struct Exclusion {
     pub reason: String,
 }
 
-/// A halt of a service: set by a later change, cleared by the operator.
+/// A halt of a service: raised by a host's report ([`crate::halt`]), cleared by the operator.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Halt {
@@ -100,6 +101,10 @@ pub struct HaltAck {
     pub target: Version,
 }
 
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 /// The marks of one service.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -107,9 +112,14 @@ pub struct ServiceOps {
     /// The standing halt, if any.
     #[serde(default)]
     pub halt: Option<Halt>,
-    /// The halt reports an operator cleared.
+    /// The halt reports an operator cleared: one per host, the latest.
     #[serde(default)]
     pub halt_acked: Vec<HaltAck>,
+    /// How many halts an operator has cleared. Agents that announced `halt-v1` are told it
+    /// and lift their hold when it is newer than the one they halted under. Written only
+    /// once it is not zero, so a file of a service never cleared reads as it always did.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub halt_generation: u64,
     /// The newest version that converged and baked.
     #[serde(default)]
     pub last_good: Option<Version>,
@@ -126,7 +136,7 @@ pub struct AuditEntry {
     pub seq: u64,
     /// Who made it.
     pub by: String,
-    /// What it was (`exclude`, `include`, `set_labels`).
+    /// What it was (`exclude`, `include`, `set_labels`, `clear_halt`, `halt`).
     pub action: String,
     /// The service it concerned, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -325,6 +335,12 @@ impl OpsStore {
         self.lock().clone()
     }
 
+    /// What `read` makes of the state now, without copying it: for a decision that looks at
+    /// a little of it on every heartbeat.
+    pub fn read<T>(&self, read: impl FnOnce(&OpsState) -> T) -> T {
+        read(&self.lock())
+    }
+
     fn lock(&self) -> MutexGuard<'_, OpsState> {
         self.current.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -394,6 +410,9 @@ enum Action {
         node_id: String,
         labels: BTreeMap<String, String>,
     },
+    /// Lifts the halt of a service: orders resume, and the report that raised it is not
+    /// raised again.
+    ClearHalt { service: String, reason: String },
 }
 
 /// Why an operator action was not done.
@@ -508,6 +527,38 @@ pub fn operate(
                 } else {
                     state.hosts.insert(id, HostOps { labels });
                 }
+            })?
+        }
+        Action::ClearHalt {
+            service: name,
+            reason: why,
+        } => {
+            let name = service(services, &name)?.to_owned();
+            let why = reason(&why)?;
+            let halt = store
+                .read(|state| {
+                    state
+                        .services
+                        .get(&name)
+                        .and_then(|marks| marks.halt.clone())
+                })
+                .ok_or(OperateError::Invalid("the service is not halted"))?;
+            let mut entry = AuditEntry::new(by, "clear_halt");
+            entry.service = Some(name.clone());
+            entry.node_id = Some(halt.node_id.clone());
+            entry.reason = Some(why);
+            // Written first: a clear that cannot be written leaves the halt standing. The
+            // report is acknowledged (one per host, the latest) so that the host, which keeps
+            // reporting it until it updates again, does not raise the halt again.
+            store.change(Write::BeforeMemory, entry, |state| {
+                let marks = state.services.entry(name).or_default();
+                marks.halt = None;
+                marks.halt_acked.retain(|ack| ack.node_id != halt.node_id);
+                marks.halt_acked.push(HaltAck {
+                    node_id: halt.node_id,
+                    target: halt.target,
+                });
+                marks.halt_generation = marks.halt_generation.saturating_add(1);
             })?
         }
     })

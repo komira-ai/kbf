@@ -79,11 +79,22 @@ fn an_answer_without_halts_reads_with_none() {
 
 /// Catches: a generation that is not a service's or not a number being taken into the
 /// agent's state: a bad name, a negative or fractional or textual generation, a list in place
-/// of the map and more entries than a host has services are each refused.
+/// of the map and more entries than a coordinator has services (`kbf` and a full services
+/// file) are each refused, and that many are read.
 #[test]
 fn a_bad_halts_map_is_refused() {
-    let many: BTreeMap<String, u64> = (0..=MAX_SERVICES).map(|n| (format!("s{n}"), 1)).collect();
-    let too_many = serde_json::json!({"reply": "nothing", "halts": many}).to_string();
+    let map = |n: usize| -> String {
+        let halts: BTreeMap<String, u64> = (0..n).map(|n| (format!("s{n}"), 1)).collect();
+        serde_json::json!({"reply": "nothing", "halts": halts}).to_string()
+    };
+    assert_eq!(
+        answer(&map(MAX_SERVICES + 1))
+            .expect("at the cap")
+            .halts
+            .len(),
+        MAX_SERVICES + 1
+    );
+    let too_many = map(MAX_SERVICES + 2);
     for text in [
         r#"{"reply":"nothing","halts":{"Kbf":1}}"#,
         r#"{"reply":"nothing","halts":{"":1}}"#,
