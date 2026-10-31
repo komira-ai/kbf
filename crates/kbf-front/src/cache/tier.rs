@@ -303,6 +303,19 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         self
     }
 
+    /// The same cache, rendering `metrics` as the cold store's families
+    /// (`kbf_cold_store_*`). Wrap the store the cache is opened on in
+    /// [`Counted`](crate::store_metrics::Counted) with the same handle; a cache whose store is
+    /// not counted renders the families with zeros.
+    #[must_use]
+    pub fn with_cold_store_metrics(
+        mut self,
+        metrics: Arc<crate::store_metrics::StoreMetrics>,
+    ) -> Self {
+        self.cold_store = metrics;
+        self
+    }
+
     /// Every metric family: [`CacheMetrics::render`](crate::metrics::CacheMetrics::render),
     /// then the legacy reads of a storage node's cache, then, with a tier attached, the
     /// tier's (its counters, its budget and usage, and
