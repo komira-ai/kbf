@@ -18,6 +18,11 @@
 //! name = "agent"
 //! after = ["server"]             # services defined earlier in the file, or kbf
 //! priority = 0                   # default 0; a host is offered the higher number first
+//! install_when_absent = false    # default false; order a host whose copy never registered
+//!
+//! [service.selector]             # optional; absent: a host belongs if it announces the service
+//! roles = ["daemon"]             # default: every role of the service
+//! labels = { zone = "a" }        # operator-set labels the host must carry
 //!
 //! [service.roles.daemon]
 //! max_updating = 2               # optional; absent: the desired state's number
@@ -35,6 +40,7 @@ use kbf_updater::wire::{MAX_SERVICE_NAME, MAX_SERVICES, is_service_name};
 use serde::Deserialize;
 
 use crate::desired::{Desired, KBF, KBF_MIN_UP, LEGACY_ROLES, MAX_COUNT, kbf_roles};
+use crate::membership::{RawSelector, Selector};
 
 /// The most bytes of a services file.
 const MAX_FILE_BYTES: u64 = 1 << 20;
@@ -107,6 +113,10 @@ pub struct ServiceDef {
     /// [`crate::service::Coordinator::heartbeat`]. It orders offers only: a service that
     /// must wait (`after`, its slots) yields to the next one whatever its priority.
     pub priority: i32,
+    /// Which hosts should run the service (`None`: the hosts that announce it).
+    pub selector: Option<Selector>,
+    /// Whether a host on which the service is declared and has never registered is ordered.
+    pub install_when_absent: bool,
 }
 
 impl ServiceDef {
@@ -122,6 +132,8 @@ impl ServiceDef {
             after: Vec::new(),
             require_min_up: Vec::new(),
             priority: 0,
+            selector: None,
+            install_when_absent: false,
         }
     }
 
@@ -187,6 +199,9 @@ struct RawService {
     roles: BTreeMap<String, RawRole>,
     #[serde(default)]
     priority: i32,
+    selector: Option<RawSelector>,
+    #[serde(default)]
+    install_when_absent: bool,
 }
 
 #[derive(Deserialize)]
@@ -259,6 +274,8 @@ fn service_def(
         after,
         roles,
         priority,
+        selector,
+        install_when_absent,
     } = raw;
     if !is_service_name(&name) {
         return invalid(format!(
@@ -283,6 +300,10 @@ fn service_def(
         .keys()
         .map(|r| role_of(r))
         .collect::<Result<BTreeSet<_>, _>>()?;
+    let selector = selector
+        .map(|raw| Selector::new(raw, &names))
+        .transpose()
+        .or_else(|why| invalid(format!("{name}: selector {why}")))?;
     let roles = roles
         .into_iter()
         .map(|(r, raw)| Ok((role_of(&r)?, role_def(&name, raw, &names)?)))
@@ -293,6 +314,8 @@ fn service_def(
         after,
         require_min_up: Vec::new(),
         priority,
+        selector,
+        install_when_absent,
     })
 }
 

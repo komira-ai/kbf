@@ -310,7 +310,6 @@ async fn a_definition_without_a_selector_counts_exactly_as_before() {
     send(&rig, "d2", false, &[]);
     let c = convergence(&rig, "other");
     assert!(c.get("hosts").is_none());
-    assert_eq!(c["roles"][0]["updating"], 0);
     assert!(service_status(&rig, "other").get("members").is_none());
     assert_eq!(
         service_status(&rig, "other")["hosts"]

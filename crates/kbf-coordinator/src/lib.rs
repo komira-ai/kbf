@@ -29,6 +29,7 @@ pub mod fleet;
 pub mod http;
 pub mod identity;
 pub mod listen;
+pub mod membership;
 pub mod ops;
 pub mod service;
 pub mod services;
