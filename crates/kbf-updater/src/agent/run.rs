@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use super::coordinator::{Coordinator, CoordinatorError};
 use super::flags::Timing;
-use super::hold::{ANNOUNCED, Deferral, Features, Fit, Hold, Marks, fit};
+use super::hold::{ANNOUNCED, Deferral, Features, Fit, Hold, MAX_RETRY_SECS, Marks, fit};
 use super::local::{HostState, Local};
 use super::renew::Renewer;
 use super::status::{Shared, Status, version_of_commit};
@@ -216,7 +216,10 @@ impl Agent {
         let marks = Marks::new(dir);
         for slot in &self.slots {
             match marks.load(slot.unit()) {
-                Ok(deferral) => *held(&slot.deferral) = deferral,
+                Ok(deferral) => {
+                    let now = (self.world.unix_now)();
+                    *held(&slot.deferral) = deferral.map(|d| d.read_at(now));
+                }
                 Err(e) => self.log(&slot.say(&format!("a deferral on disk is ignored: {e}"))),
             }
         }
@@ -581,15 +584,16 @@ impl Agent {
 
     /// The host declined `target`: remember until when, in memory and on disk.
     fn defer(&self, slot: &Slot, target: &Version, reason: &Token) {
+        let retry = self.timing.retry.as_secs().min(MAX_RETRY_SECS);
         let deferral = Deferral {
             target: target.clone(),
             reason: reason.clone(),
-            retry_after_unix: (self.world.unix_now)().saturating_add(self.timing.retry.as_secs()),
+            retry_after_unix: (self.world.unix_now)().saturating_add(retry),
         };
         self.log(&slot.say(&format!(
             "update to {target}: deferred ({}), not ordered again for {} s",
             reason.as_str(),
-            self.timing.retry.as_secs()
+            retry
         )));
         if let Err(e) = self
             .marks

@@ -101,6 +101,17 @@ pub struct Deferral {
 }
 
 impl Deferral {
+    /// This deferral as read at `now`: its retry time no further out than [`MAX_RETRY_SECS`]
+    /// from `now`, so a file an older agent wrote with a longer one cannot hold the host longer
+    /// than that.
+    #[must_use]
+    pub fn read_at(mut self, now: u64) -> Self {
+        self.retry_after_unix = self
+            .retry_after_unix
+            .min(now.saturating_add(MAX_RETRY_SECS));
+        self
+    }
+
     /// The report for the heartbeat at `now`: none once the retry time has come.
     #[must_use]
     pub fn report(&self, now: u64) -> Option<DeferredReport> {
