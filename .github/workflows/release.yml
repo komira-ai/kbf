@@ -449,9 +449,6 @@ jobs:
           TAG: ${{ needs.plan.outputs.tag }}
         run: printf '%s\n' "$TAG" > /var/tmp/kbf-update-rehearsal.to
       - run: cargo xtask sudo-test -p kbf-host-install --test update_rehearsal -- --exact the_helper_updates_a_hand_laid_host_from_the_last_release_to_the_next --nocapture
-      - name: Remove the token file
-        if: ${{ always() }}
-        run: rm -f /var/tmp/kbf-update-rehearsal.token
 
   # The rehearsal of the control loop, which the gamma stage needs too: the host of the rehearsal
   # above is updated by the real agent that the real coordinator of this commit orders, after
