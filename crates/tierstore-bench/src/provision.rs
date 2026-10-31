@@ -24,6 +24,15 @@
 //! ([`RunConfig::check_names`]); a name outside it stops the verb with nothing sent. What the run
 //! makes is written to `provision-state.json` as it is made.
 //!
+//! With `--premade` ([`Supply::Premade`]) the run makes none of this: a held script that holds
+//! the rights to make buckets, quotas, policies and accounts did, and the key this verb holds
+//! can only read. For each role it checks that the test bucket is there (`mc ls` of that bucket)
+//! and that its quota is set and at most 30 GiB (`mc quota info`), for every role before any
+//! probe; then it runs the two probes of step 5; then it writes the bucket and the account to
+//! `provision-state.json` with `premade` true. A live bucket the account reaches stops the verb
+//! with the instruction to run the held script with `--remove`: the verb never removes an
+//! account, since it has no right to.
+//!
 //! The commands are `mc`'s, driven through [`crate::preflight::mc`]; the steps are written to
 //! `provision.json` and printed, by role and never by bucket name.
 
@@ -37,7 +46,7 @@ use self::state::State;
 use crate::config::{RunConfig, StoreSpec};
 use crate::error::BenchError;
 use crate::preflight::host::{Host, SystemHost};
-use crate::preflight::mc::{Mc, QUOTA_SIZE};
+use crate::preflight::mc::{Mc, QUOTA_BYTES, QUOTA_SIZE};
 use crate::preflight::ops::{KeyPair, OpsFile};
 use crate::preflight::write_json;
 use crate::role::Role;
@@ -57,6 +66,16 @@ pub enum Mode {
     Apply,
 }
 
+/// Where a run's buckets and accounts come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Supply {
+    /// The run makes them (`mb`, `quota set`, `admin policy create`, `admin user add`, `admin
+    /// policy attach`).
+    Create,
+    /// A held script made them; the run only checks and probes them.
+    Premade,
+}
+
 /// One line per step taken or planned.
 pub type Steps = Vec<String>;
 
@@ -70,9 +89,12 @@ enum Step {
     AttachPolicy,
     ProbeOwn,
     ProbeLive,
+    UseBucket,
+    CheckQuota,
+    Record,
 }
 
-const STEPS: [Step; 7] = [
+static STEPS: [Step; 7] = [
     Step::MakeBucket,
     Step::SetQuota,
     Step::MakePolicy,
@@ -82,21 +104,41 @@ const STEPS: [Step; 7] = [
     Step::ProbeLive,
 ];
 
-/// The step in words, by role.
-fn describe(step: Step, role: Role) -> String {
+/// What a premade run checks of each role before it probes anything.
+static PREMADE_CHECKS: [Step; 2] = [Step::UseBucket, Step::CheckQuota];
+
+/// What a premade run does to each role after every role's checks have passed.
+static PREMADE_PROBES: [Step; 3] = [Step::ProbeOwn, Step::ProbeLive, Step::Record];
+
+/// The held script that makes, and removes, what a premade run uses.
+const HELD_SCRIPT: &str = "admin_mint.sh --campaign ...";
+
+/// The step in words.
+fn describe(step: Step) -> String {
     match step {
-        Step::MakeBucket => format!("role {role}: make the test bucket"),
-        Step::SetQuota => format!("role {role}: set the test bucket's hard quota to {QUOTA_SIZE}"),
-        Step::MakePolicy => {
-            format!("role {role}: create the policy that reaches the test bucket only")
+        Step::MakeBucket => "make the test bucket".to_owned(),
+        Step::SetQuota => format!("set the test bucket's hard quota to {QUOTA_SIZE}"),
+        Step::MakePolicy => "create the policy that reaches the test bucket only".to_owned(),
+        Step::AddAccount => "add the scoped account".to_owned(),
+        Step::AttachPolicy => "attach the policy to the account".to_owned(),
+        Step::ProbeOwn => "the account must list its test bucket".to_owned(),
+        Step::ProbeLive => "the account must be refused a read of the named live bucket".to_owned(),
+        Step::UseBucket => "the test bucket must be on the store".to_owned(),
+        Step::CheckQuota => {
+            format!("the test bucket's hard quota must be set, at most {QUOTA_SIZE}")
         }
-        Step::AddAccount => format!("role {role}: add the scoped account"),
-        Step::AttachPolicy => format!("role {role}: attach the policy to the account"),
-        Step::ProbeOwn => format!("role {role}: the account must list its test bucket"),
-        Step::ProbeLive => {
-            format!("role {role}: the account must be refused a read of the named live bucket")
-        }
+        Step::Record => "record the bucket and the account in provision-state.json".to_owned(),
     }
+}
+
+/// The line of a step: `premade` after the role says the held script made what the step uses.
+fn line_of(step: Step, role: Role, supply: Supply) -> String {
+    let premade = if supply == Supply::Premade {
+        "premade: "
+    } else {
+        ""
+    };
+    format!("role {role}: {premade}{}", describe(step))
 }
 
 /// The policy document of a scoped account: listing and multipart bookkeeping on `bucket`, and
@@ -139,6 +181,7 @@ struct Target<'a> {
     mc: Mc<'a>,
     policy_name: String,
     policy_file: std::path::PathBuf,
+    supply: Supply,
 }
 
 /// The text of a probe that did not give the answer the step needs.
@@ -219,8 +262,36 @@ async fn execute(step: Step, target: &Target<'_>, state: &mut State) -> Result<(
                 &other,
             )),
         },
+        Step::UseBucket => {
+            if target.mc.bucket_present(&spec.bucket)? {
+                return Ok(());
+            }
+            Err(BenchError::Ops(format!(
+                "role {}: the test bucket is not on the store (or may not be listed): run {HELD_SCRIPT} first",
+                target.role
+            )))
+        }
+        Step::CheckQuota => match target.mc.quota_info(&spec.bucket)? {
+            None => Err(BenchError::Ops(format!(
+                "role {}: the test bucket has no quota: run {HELD_SCRIPT} first",
+                target.role
+            ))),
+            Some(bytes) if bytes > QUOTA_BYTES => Err(BenchError::Ops(format!(
+                "role {}: the test bucket's quota is {bytes} bytes, over the run's {QUOTA_SIZE}: run {HELD_SCRIPT} first",
+                target.role
+            ))),
+            Some(_) => Ok(()),
+        },
+        Step::Record => state.record_premade(&spec.bucket, &spec.access_key_id),
         Step::ProbeLive => match probe::can_read(spec, target.live_bucket).await? {
             Access::Denied(_) => Ok(()),
+            other if target.supply == Supply::Premade => Err(unexpected(
+                &format!(
+                    "role {}: the scoped account can read a live bucket: run {HELD_SCRIPT} --remove now",
+                    target.role
+                ),
+                &other,
+            )),
             other => {
                 let removed = match state.remove_account(&target.mc, &spec.access_key_id) {
                     Ok(()) => "the account was removed",
@@ -245,6 +316,7 @@ fn prepare<'a>(
     ops: &'a OpsFile,
     role: Role,
     spec: &'a StoreSpec,
+    supply: Supply,
 ) -> Result<Target<'a>, BenchError> {
     let live_bucket = ops
         .live_buckets
@@ -262,7 +334,24 @@ fn prepare<'a>(
         mc: Mc::for_role(host, ops, role, spec, &config.result_dir)?,
         policy_name: crate::config::policy_name(&config.test_prefix, role),
         policy_file: config.result_dir.join(format!("policy-{role}.json")),
+        supply,
     })
+}
+
+/// The steps of a run in order. A created run does all of a role's steps, role by role. A premade
+/// run first checks every role's bucket and quota, then probes and records, so a bucket that is
+/// missing is found before any account has sent a request.
+fn order<'a>(targets: &'a [Target<'a>], supply: Supply) -> Vec<(&'a Target<'a>, Step)> {
+    let each = |steps: &'static [Step]| {
+        targets
+            .iter()
+            .flat_map(|target| steps.iter().map(move |step| (target, *step)))
+            .collect::<Vec<_>>()
+    };
+    match supply {
+        Supply::Create => each(&STEPS),
+        Supply::Premade => [each(&PREMADE_CHECKS), each(&PREMADE_PROBES)].concat(),
+    }
 }
 
 /// What `provision.json` holds.
@@ -280,10 +369,10 @@ struct StepsFile<'a> {
 /// named or its test bucket is the live one, a command fails, or a probe does not give the
 /// answer isolation needs; a bucket or account id outside the test prefix, a bucket or account
 /// already on the store that this run did not make.
-pub async fn run(config: &RunConfig, mode: Mode) -> Result<Steps, BenchError> {
+pub async fn run(config: &RunConfig, mode: Mode, supply: Supply) -> Result<Steps, BenchError> {
     let host = SystemHost;
     let ops = OpsFile::load(&host, &config.result_dir)?;
-    run_with(&host, config, &ops, mode).await
+    run_with_supply(&host, config, &ops, mode, supply).await
 }
 
 /// [`run`] on a given host and ops file.
@@ -295,6 +384,20 @@ pub async fn run_with(
     config: &RunConfig,
     ops: &OpsFile,
     mode: Mode,
+) -> Result<Steps, BenchError> {
+    run_with_supply(host, config, ops, mode, Supply::Create).await
+}
+
+/// [`run_with`], with the buckets and accounts coming from `supply`.
+///
+/// # Errors
+/// As [`run_with`].
+pub async fn run_with_supply(
+    host: &dyn Host,
+    config: &RunConfig,
+    ops: &OpsFile,
+    mode: Mode,
+    supply: Supply,
 ) -> Result<Steps, BenchError> {
     config.check_names()?;
     let roles: Vec<(Role, &StoreSpec)> = SHARED_ROLES
@@ -308,10 +411,29 @@ pub async fn run_with(
     }
     let targets = roles
         .into_iter()
-        .map(|(role, spec)| prepare(host, config, ops, role, spec))
+        .map(|(role, spec)| prepare(host, config, ops, role, spec, supply))
         .collect::<Result<Vec<_>, _>>()?;
     let mut state = State::load(&config.result_dir, &config.test_prefix)?;
-    if mode == Mode::Apply {
+    // One record says one thing: what a created run made, or what a held script made. A record
+    // of the other kind would be relabelled whole by this run, and the teardown, which trusts
+    // the label, would take a made account for the script's or the reverse. Dry runs refuse too.
+    let dir = config.result_dir.display();
+    match supply {
+        Supply::Premade if state.has_entries() && !state.is_premade() => {
+            return Err(BenchError::Ops(format!(
+                "{dir} holds a record of buckets or accounts this tool made; `--premade` would \
+                 relabel it. Use a fresh result directory, or tear the old one down first"
+            )));
+        }
+        Supply::Create if state.is_premade() => {
+            return Err(BenchError::Ops(format!(
+                "{dir} holds a record of pre-made buckets and accounts; a run that makes its own \
+                 would mix them in. Use a fresh result directory, or tear the old one down first"
+            )));
+        }
+        _ => {}
+    }
+    if mode == Mode::Apply && supply == Supply::Create {
         // Everything that could be someone else's is looked for before anything is changed, so a
         // refusal leaves the store as it was.
         for target in &targets {
@@ -320,21 +442,20 @@ pub async fn run_with(
         }
     }
     let mut steps = Steps::new();
-    for target in &targets {
-        for step in STEPS {
-            let line = describe(step, target.role);
-            if mode == Mode::Apply {
-                execute(step, target, &mut state).await?;
-                steps.push(format!("done: {line}"));
-            } else {
-                steps.push(format!("plan: {line}"));
-            }
+    for (target, step) in order(&targets, supply) {
+        let line = line_of(step, target.role, supply);
+        if mode == Mode::Apply {
+            execute(step, target, &mut state).await?;
+            steps.push(format!("done: {line}"));
+        } else {
+            steps.push(format!("plan: {line}"));
         }
     }
-    let label = if mode == Mode::Apply {
-        "apply"
-    } else {
-        "dry-run"
+    let label = match (mode, supply) {
+        (Mode::Apply, Supply::Create) => "apply",
+        (Mode::Apply, Supply::Premade) => "apply-premade",
+        (Mode::DryRun, Supply::Create) => "dry-run",
+        (Mode::DryRun, Supply::Premade) => "dry-run-premade",
     };
     write_json(
         &config.result_dir.join(STEPS_FILE),

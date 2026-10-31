@@ -11,7 +11,7 @@
 //!   [`ASSETS`] (binary and platform): `kbf`, `kbf-host-install` and `kbf-updater` for the
 //!   three platforms (a Mac runs the host agent), `kbf-installer` and `kbf-mac-provision` for macOS only (its Linux
 //!   package is the `kbf` package's now; a Mac is provisioned by `kbf-mac-provision`), `kbf-daemon`, `kbf-server`, `kbf-deploy`,
-//!   `kbf-signer`, `tierstore` and `kbf-task` (a static musl build) for Linux, `kbf-deploy` for macOS (a Mac runs
+//!   `kbf-signer` and `kbf-task` (a static musl build) for Linux, `kbf-deploy` for macOS (a Mac runs
 //!   `kbf daemon`; there is no darwin `kbf-daemon`). Each one's SBOM attestation is
 //!   [`crate::attested_assets`]' business, and its provenance bundle
 //!   [`crate::attested_bundles`]'.
@@ -95,7 +95,6 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-host-install", "linux-x86_64"),
     ("kbf-updater", "linux-x86_64"),
     ("kbf-signer", "linux-x86_64"),
-    ("tierstore", "linux-x86_64"),
     ("kbf-task", "linux-x86_64"),
     ("kbf", "linux-arm64"),
     ("kbf-daemon", "linux-arm64"),
@@ -104,7 +103,6 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-host-install", "linux-arm64"),
     ("kbf-updater", "linux-arm64"),
     ("kbf-signer", "linux-arm64"),
-    ("tierstore", "linux-arm64"),
     ("kbf-task", "linux-arm64"),
 ];
 

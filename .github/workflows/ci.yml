@@ -80,13 +80,6 @@ jobs:
         if: ${{ !cancelled() }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
         if: ${{ !cancelled() }}
-      # The object store library with its `s3` feature alone (the adapter over the S3 client of
-      # objstore-s3). The workspace run above has the feature on as well, since the crate's own
-      # tests turn `server` on and `server` enables `s3`; the library alone is built here, since
-      # its tests would turn `server` on in this build too, so the code that is compiled only
-      # without `server` is linted.
-      - run: cargo clippy -p tierstore --features s3 --lib --locked -- -D warnings
-        if: ${{ !cancelled() }}
       # The setup library without its `proxy` feature, as the `kbf` binary links it. The workspace
       # run above has the feature on (the installer is in the workspace), so the code that is
       # compiled only without it is built and linted here, with the library and the binary alone.
@@ -242,8 +235,7 @@ jobs:
   # run did in turn before: `legacy` (the workspace, the scheduler's default core) and `js` (the
   # four packages that link kbf-server code, on the js core: its test-only `farm-core-js`
   # feature makes `SchedulerCore::under_test()` return it; kbf-front has no kbf-server
-  # dependency and kbf-farm-test links none, so neither is selected, and `tierstore/s3` is
-  # left out, no selected package depending on tierstore). The matrix lists every shard: a core's
+  # dependency and kbf-farm-test links none, so neither is selected). The matrix lists every shard: a core's
   # entries are parts 1 to `parts` of its tests, each once (tests/coverage_wiring reads it).
   # A shard builds only its own core's instrumented tests: the two builds
   # share the dependencies, and the js build (the feature rebuilds kbf-server and what depends
@@ -276,17 +268,17 @@ jobs:
             part: 1
             parts: 3
             min_free_gb: 75
-            args: --workspace --features tierstore/s3
+            args: --workspace
           - core: legacy
             part: 2
             parts: 3
             min_free_gb: 75
-            args: --workspace --features tierstore/s3
+            args: --workspace
           - core: legacy
             part: 3
             parts: 3
             min_free_gb: 75
-            args: --workspace --features tierstore/s3
+            args: --workspace
           - core: js
             part: 1
             parts: 1
@@ -385,10 +377,7 @@ jobs:
       # `--partition` is a flag of `cargo nextest run`, which cargo-llvm-cov passes on as it does
       # any flag it does not know. `count` deals the tests out in turn, so the parts are the same
       # size whatever the tests are named. `$ARGS` is the core's package selection: it must be
-      # split into words here, so it is not quoted. `--features tierstore/s3` (legacy) puts the
-      # object store library's S3 backend (off by default; the crate's own tests turn it on
-      # through `server`) into the run whichever way they are built, so its tests count toward
-      # the 99% of tierstore.
+      # split into words here, so it is not quoted.
       - name: Run this part of the core's fast tests under coverage
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest $ARGS --locked --branch --no-report --no-fail-fast --profile pr "--partition=count:$PART/$PARTS"
       # What the test run left on the disk, so a run that ran the runner out of room says
@@ -485,7 +474,7 @@ jobs:
       # build adds the rebuilt kbf-server and its dependents beside it in the same target
       # directory, as the two runs of one job did.
       - name: Build the instrumented tests of the legacy core (none run)
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --features tierstore/s3 --locked --branch --no-report --profile pr -E 'none()' --no-tests=pass
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --profile pr -E 'none()' --no-tests=pass
       - name: Build the instrumented tests of the js core (none run)
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest -p kbf-server -p kbf-integration-test -p kbf-daemon -p kbf-node --features kbf-server/farm-core-js --locked --branch --no-report --profile pr -E 'none()' --no-tests=pass
       # nextest listed the tests by running each instrumented binary, which wrote a profile; the
