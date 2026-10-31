@@ -30,7 +30,7 @@ A write goes to the hot tier and is acknowledged once a journal entry for it is 
 - A put is create-only: a key that exists in either tier is refused with 412 `PreconditionFailed`. Objects are immutable.
 - A put is acknowledged only after its journal entry is durable in the hot tier. Losing the hot tier loses objects that were not yet copied to the cold tier.
 - It asks each tier the questions these guarantees rest on before it starts (see "The start-up self-test" in [operations](operations.md)) and refuses to start on a store that answers one wrongly.
-- It does not scrub: nothing re-reads stored bytes to find rot. See [limits](limits.md).
+- It does not scrub a storage node's objects: nothing re-reads stored bytes to find rot. See [limits](limits.md).
 
 ## Where to go next
 

@@ -73,6 +73,10 @@ What they do not count:
 | `fill_failures_total` | counter | `reason`: `hash_mismatch`, `upstream_error`, `short_body`, `local_io`, `changed`, `aborted` | a fill ended without leaving an object in the cache |
 | `evictions_total` | counter | `reason`: `budget`, `floor` | an object was evicted |
 | `pinned_skips_total` | counter | none | an eviction pass passed over an object because it has more than one hard link |
+| `scrubbed_objects_total` | counter | none | the scrub hashed an object again (not in a release yet) |
+| `scrubbed_bytes_total` | counter | none | the bytes the scrub read for those objects |
+| `scrub_mismatches_total` | counter | none | the scrub dropped an object whose bytes no longer matched its digest |
+| `scrub_errors_total` | counter | none | the scrub could not judge an object because a read failed, or its check panicked |
 | `discarded_at_start_total` | counter | none | a file was removed at start: a file the scan did not find whole, or what a fill left in the stage directory at the last stop |
 
 The reasons of a failed fill:
