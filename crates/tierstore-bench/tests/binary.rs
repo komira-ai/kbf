@@ -10,7 +10,7 @@ use kbf_testkit::dir::TestDir;
 fn a_stopped_verb_exits_2_and_says_what_stopped_it() {
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-bin");
     let out = Command::new(env!("CARGO_BIN_EXE_tierstore-bench"))
-        .args(["preflight", "--result-dir"])
+        .args(["preflight", "--test-prefix", "tb-", "--result-dir"])
         .arg(dir.path())
         .output()
         .unwrap();

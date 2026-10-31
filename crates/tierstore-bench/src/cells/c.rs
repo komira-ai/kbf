@@ -79,6 +79,51 @@ pub fn polling(list_poll_rps: u32) -> Polling {
     }
 }
 
+/// What a watch of a burst found: the lag of each put that was seen, the backlog at each poll,
+/// and when the last put was seen if all were.
+type Watched = (Vec<Option<Duration>>, Vec<usize>, Option<Instant>);
+
+/// Polls `listed` (the keys of the burst's prefix on the cold store) once every `polling.every`
+/// until every acknowledged put in `acked` is in it or `polling.deadline` has passed since the last
+/// acknowledgement. The lag of a put is the time from its acknowledgement to the first poll that
+/// lists it, so it has the resolution of the poll.
+async fn watch_with<F, Fut>(
+    polling: Polling,
+    acked: &[(String, Instant, bool)],
+    mut listed: F,
+) -> Result<Watched, BenchError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<HashSet<String>, BenchError>>,
+{
+    let last = acked.iter().map(|(_, at, _)| *at).max();
+    let mut lag: Vec<Option<Duration>> = vec![None; acked.len()];
+    let mut backlog = Vec::new();
+    let drained = loop {
+        let seen = listed().await?;
+        let now = Instant::now();
+        for (slot, (key, at, ok)) in lag.iter_mut().zip(acked) {
+            if slot.is_none() && *ok && seen.contains(key) {
+                *slot = Some(now.saturating_duration_since(*at));
+            }
+        }
+        let waiting = lag
+            .iter()
+            .zip(acked)
+            .filter(|(l, (_, _, ok))| l.is_none() && *ok)
+            .count();
+        backlog.push(waiting);
+        if waiting == 0 {
+            break Some(now);
+        }
+        if last.is_some_and(|l| now.saturating_duration_since(l) >= polling.deadline) {
+            break None;
+        }
+        tokio::time::sleep(polling.every).await;
+    };
+    Ok((lag, backlog, drained))
+}
+
 /// What one arm sends and watches.
 struct Burst {
     instance: Arc<BenchS3>,
@@ -140,39 +185,14 @@ impl Burst {
         &self,
         pass: u32,
         acked: &[(String, Instant, bool)],
-    ) -> Result<(Vec<Option<Duration>>, Vec<usize>, Option<Instant>), BenchError> {
-        let last = acked.iter().map(|(_, at, _)| *at).max();
+    ) -> Result<Watched, BenchError> {
         let prefix = format!("{}/p{pass}/", self.prefix);
-        let mut lag: Vec<Option<Duration>> = vec![None; acked.len()];
-        let mut backlog = Vec::new();
-        let drained = loop {
-            let seen: HashSet<String> = self
-                .listed(&prefix)
-                .await?
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            let now = Instant::now();
-            for (slot, (key, at, ok)) in lag.iter_mut().zip(acked) {
-                if slot.is_none() && *ok && seen.contains(key) {
-                    *slot = Some(now.saturating_duration_since(*at));
-                }
-            }
-            let waiting = lag
-                .iter()
-                .zip(acked)
-                .filter(|(l, (_, _, ok))| l.is_none() && *ok)
-                .count();
-            backlog.push(waiting);
-            if waiting == 0 {
-                break Some(now);
-            }
-            if last.is_some_and(|l| now.saturating_duration_since(l) >= self.polling.deadline) {
-                break None;
-            }
-            tokio::time::sleep(self.polling.every).await;
-        };
-        Ok((lag, backlog, drained))
+        let (this, prefix) = (self, prefix.as_str());
+        watch_with(self.polling, acked, || async move {
+            let keys = this.listed(prefix).await?.unwrap_or_default();
+            Ok(keys.into_iter().collect())
+        })
+        .await
     }
 
     /// Sends the burst of `pass` and watches it drain; one step per object.
@@ -428,50 +448,68 @@ mod tests {
         );
     }
 
-    /// The number of polls a pass noted: the entries of its "backlog at each poll" list.
-    fn polls_noted(result: &CellResult) -> usize {
-        let note = result
-            .notes
-            .iter()
-            .find(|n| n.contains("backlog at each poll ["))
-            .unwrap();
-        let (_, list) = note.split_once("backlog at each poll [").unwrap();
-        list.split_once(']').unwrap().0.split(',').count()
-    }
-
     /// Catches `--list-poll-rps` not reaching the poll (it was hard-wired to one LIST a second):
-    /// objects that never land are polled until a four second deadline on the paused clock, once
-    /// per second at 1 a second (5 polls, at 0, 1, 2, 3 and 4 s) and four times a second at 4
-    /// (17 polls), and the rate of the context's setting is the rate of `run`'s poll.
+    /// on the paused clock, objects that never land are listed until a four second deadline, once
+    /// a second at 1 a second (5 polls, at 0, 1, 2, 3 and 4 s) and four times a second at 4 (17
+    /// polls); zero is taken as one a second.
     #[tokio::test(start_paused = true)]
     async fn the_poll_rate_follows_the_setting() {
         for (rps, polls) in [(1_u32, 5_usize), (4, 17)] {
-            let dir = temp(&format!("tb-c-rate-{rps}"));
-            let (instance, cold) = (FakeS3::start().await, FakeS3::start().await);
-            let stores = [
-                (Role::Instance, instance.endpoint()),
-                (Role::Cold, cold.endpoint()),
-            ];
-            let mut ctx = testkit::ctx(dir.path(), &stores, Window::Busy);
-            ctx.config.rates.list_poll_rps = rps;
             let poll = Polling {
                 deadline: Duration::from_secs(4),
-                ..polling(ctx.config.rates.list_poll_rps)
+                ..polling(rps)
             };
             assert_eq!(poll.every, Duration::from_secs(1) / rps);
-            let results = run_with(
-                &ctx,
-                &plan(&[1], &[4096]),
-                Script::calm(),
-                None,
-                poll,
-                Some(1),
-            )
+            let acked = vec![("k".to_owned(), Instant::now(), true)];
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = calls.clone();
+            let (lag, backlog, drained) = watch_with(poll, &acked, move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Ok(HashSet::new()))
+            })
             .await
             .unwrap();
-            assert_eq!(polls_noted(&results[0]), polls, "{rps} a second");
+            let listed = calls.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!((listed, backlog.len()), (polls, polls), "{rps} a second");
+            assert_eq!((lag, drained), (vec![None], None));
         }
         assert_eq!(polling(0).every, Duration::from_secs(1), "zero is one");
+    }
+
+    /// Catches a lag that does not have the resolution of the poll: an object that shows in the
+    /// third listing was acknowledged two poll intervals before it, whatever the rate (1 s at 2 a
+    /// second, 0.5 s at 4), and a put that failed is never waited for.
+    #[tokio::test(start_paused = true)]
+    async fn the_lag_of_an_object_is_the_time_to_the_poll_that_lists_it() {
+        for rps in [2_u32, 4] {
+            let acked = vec![
+                ("seen".to_owned(), Instant::now(), true),
+                ("failed".to_owned(), Instant::now(), false),
+            ];
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = calls.clone();
+            let (lag, backlog, drained) = watch_with(polling(rps), &acked, move || {
+                let n = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let keys = if n >= 2 {
+                    vec!["seen".to_owned()]
+                } else {
+                    vec![]
+                };
+                std::future::ready(Ok(keys.into_iter().collect()))
+            })
+            .await
+            .unwrap();
+            let two_polls = Duration::from_secs(1) / rps * 2;
+            // The timer wheel rounds a sleep up to the millisecond, so allow that and no more.
+            let seen = lag[0].unwrap();
+            assert!(
+                seen >= two_polls && seen < two_polls + Duration::from_millis(5),
+                "{rps} a second: {seen:?}"
+            );
+            assert_eq!(lag[1], None);
+            assert_eq!(backlog, [1, 1, 0]);
+            assert!(drained.is_some());
+        }
     }
 
     /// Catches a lag that is not measured from the acknowledgement to a LIST that shows the
