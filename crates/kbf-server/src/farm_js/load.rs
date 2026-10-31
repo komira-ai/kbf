@@ -35,15 +35,7 @@ pub struct Loaded {
 /// What [`Rows::load`] returns, and [`StateError::Corrupt`] for a floor row the farm server's
 /// reader refuses.
 pub fn load(rows: &Rows) -> Result<Loaded, StateError> {
-    let mut stored = rows.load().unwrap_or(js_store::Stored {
-        next_operation: 0,
-        next_seq: 0,
-        operations: Vec::new(),
-        floors: Vec::new(),
-        key_floors: Vec::new(),
-        key_names: Vec::new(),
-        cordons: Vec::new(),
-    });
+    let mut stored = rows.load()?;
     for floor in &stored.floors {
         if Digest::parse(DigestFunction::Sha256, &floor.key.dedup).is_err() {
             return Err(StateError::Corrupt {

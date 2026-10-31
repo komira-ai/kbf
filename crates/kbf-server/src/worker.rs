@@ -321,6 +321,9 @@ impl Session {
                         hello.node_id
                     )));
                 }
+                self.peers
+                    .admit(self.peer.as_ref(), worker.as_str())
+                    .await?;
                 match reported(&hello, self.host_floor) {
                     Ok(reported) => farm.resize(worker, stream, reported),
                     Err(e) => tracing::warn!(%worker, error = %e, "a resent Hello ignored"),
@@ -352,6 +355,9 @@ impl Session {
             Some(daemon_message::Message::Result(result)) => {
                 // A revoked daemon must not write its result into the action cache,
                 // even before its next heartbeat.
+                self.peers
+                    .admit(self.peer.as_ref(), worker.as_str())
+                    .await?;
                 // Settling it writes to the object store and the metadata log, which
                 // can take many seconds; it runs beside this loop, so the heartbeats
                 // behind it are still acknowledged before the daemon fences.
@@ -366,15 +372,24 @@ impl Session {
             }
             Some(daemon_message::Message::NodeStatus(status)) => {
                 // A revoked daemon's status must not reach the operator API either.
+                self.peers
+                    .admit(self.peer.as_ref(), worker.as_str())
+                    .await?;
                 // Logged there; the lines are for tests.
                 let _ = farm.node_status(worker, stream, status);
                 None
             }
             Some(daemon_message::Message::MapRequest(_)) => {
+                self.peers
+                    .admit(self.peer.as_ref(), worker.as_str())
+                    .await?;
                 self.map.answer()
             }
             Some(daemon_message::Message::UpdateStatus(status)) => {
                 // A revoked daemon's status must not reach the update session either.
+                self.peers
+                    .admit(self.peer.as_ref(), worker.as_str())
+                    .await?;
                 // Kept as the node's newest, unless a newer stream of the node has
                 // registered since.
                 let _ = farm.update_status(worker, stream, status);
