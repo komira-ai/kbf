@@ -78,7 +78,7 @@ async fn the_convergence_default_service_is_still_kbf() {
 
 /// Behaviour: `GET /v1/status` lists, under each service, the hosts that heartbeated it. The
 /// daemon was ordered to update `other`, so under `other` it holds a slot, is not up and has
-/// no hold reason; under kbf it is up to date. The top-level `hosts` list, kbf's, has no
+/// no hold reason; under kbf it is busy elsewhere (a host does one update at a time). The top-level `hosts` list, kbf's, has no
 /// `hold` key. Catches the hosts of a service missing from the HTTP answer.
 #[tokio::test]
 async fn the_status_over_http_lists_the_hosts_of_every_service() {
@@ -94,7 +94,7 @@ async fn the_status_over_http_lists_the_hosts_of_every_service() {
     let kbf = under("kbf");
     assert_eq!(
         (&kbf["up"], &kbf["holds_slot"], &kbf["hold"]),
-        (&json!(true), &json!(false), &json!("up_to_date"))
+        (&json!(true), &json!(false), &json!("busy_elsewhere"))
     );
     assert_eq!(status["hosts"][0].get("hold"), None);
     assert_eq!(status["per_service"]["other"]["up"], 0);

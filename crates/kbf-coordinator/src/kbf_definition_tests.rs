@@ -76,10 +76,18 @@ fn a_services_file_may_replace_kbf_as_its_first_entry() {
     assert_eq!(kbf.require_min_up, ["storage", "frontend"]);
     assert_eq!(services.names().collect::<Vec<_>>(), ["agent", "kbf"]);
 
-    let body = br#"{"version":"2.0"}"#;
+    let parse = |body: &[u8]| Desired::parse_request_for(body, &services).map(|_| ());
+    assert!(matches!(
+        parse(br#"{"version":"2.0"}"#),
+        Err(DesiredError::Malformed(_))
+    ));
     assert_eq!(
-        Desired::parse_request_for(body, &services).map(|_| ()),
-        Err(DesiredError::Malformed("min_up lacks storage".to_owned()))
+        parse(br#"{"version":"2.0","min_up":{"storage":0}}"#),
+        Err(DesiredError::Malformed("min_up lacks frontend".to_owned()))
+    );
+    assert_eq!(
+        parse(br#"{"version":"2.0","min_up":{"storage":0,"frontend":0}}"#),
+        Ok(())
     );
 }
 

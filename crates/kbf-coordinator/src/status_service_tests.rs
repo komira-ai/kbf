@@ -44,7 +44,8 @@ fn announcing(mut top: Heartbeat, services: &[(&str, &str)]) -> Heartbeat {
 /// - `s1` storage at 2.0; `s2` storage at 1.0 and updating to 2.0; `s3` storage at 1.0,
 ///   behind with the one storage slot taken by `s2`;
 /// - `d1` daemon at 2.0, running `other` at 3.0 and `third` at 1.0;
-/// - `d2` daemon at 2.0, running `other` at 1.0: it is ordered to update `other`.
+/// - `d2` daemon at 2.0, running `other` at 1.0: it is ordered to update `other`, so under
+///   kbf it is busy elsewhere.
 async fn farm(name: &str) -> Rig {
     let mut rig = Rig::new(name);
     let list = config_text(STATIC_ISSUER) + "services = [\"kbf\", \"other\", \"third\"]\n";
@@ -123,7 +124,7 @@ async fn status_lists_every_service_with_its_hosts_up_count_slots_and_hold() {
         rows(&status, "kbf"),
         [
             row("d1", true, false, json!("up_to_date")),
-            row("d2", true, false, json!("up_to_date")),
+            row("d2", true, false, json!("busy_elsewhere")),
             row("s1", true, false, json!("up_to_date")),
             row("s2", false, true, json!("updating")),
             row("s3", true, false, json!("no_slot")),
