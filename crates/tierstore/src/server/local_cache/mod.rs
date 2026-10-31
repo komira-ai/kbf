@@ -120,6 +120,7 @@ use bytes::Bytes;
 use tokio::sync::Semaphore;
 
 use crate::journal::is_reserved;
+use crate::server::lock;
 use crate::{Backend, ByteRange, Clock, Error, Listed, Meta, OpenUpload, PartBody, UploadsAfter};
 
 pub use disk::{Disk, Space, SystemDisk};
@@ -128,6 +129,7 @@ pub use metrics::Counters;
 pub use selfcheck::{LocalTierFailure, check_local};
 
 use fill::Pending;
+use hold::{Hold, Standing};
 use index::Index;
 use layout::{Name, data_path, name_of};
 use metrics::{add, bump};
@@ -270,6 +272,19 @@ pub(super) struct Inner {
     permits: Arc<Semaphore>,
     /// Whether a pass of the eviction is running.
     evicting: AtomicBool,
+    /// Whether this cache may write to its directory, and the lock that says so.
+    hold: Hold,
+}
+
+/// The index of the objects a scan found, the least recently used first.
+fn index_of(mut found: Vec<layout::Found>) -> Index {
+    found.sort_by(|a, b| (a.used, &a.hex).cmp(&(b.used, &b.hex)));
+    let mut index = Index::default();
+    for found in found {
+        let sidecar = found.sidecar;
+        index.insert(&found.hex, sidecar.size, sidecar.tag, sidecar.modified);
+    }
+    index
 }
 
 /// A read-through cache of an upstream, on a directory of the local file system.
@@ -284,6 +299,10 @@ impl LocalCache {
     /// say what the file holds is deleted), the least recently used first by the time of the
     /// file.
     ///
+    /// This cache takes no lock: it is read-write whatever else has the directory open. The
+    /// binary uses [`open_locked`](Self::open_locked); a second cache over a directory that has
+    /// one must not use this.
+    ///
     /// # Errors
     /// What the system said about the directory.
     pub fn open(
@@ -292,40 +311,14 @@ impl LocalCache {
         disk: Arc<dyn Disk>,
         clock: Arc<dyn Clock>,
     ) -> io::Result<Self> {
-        let removed = layout::clear_stage(&config.path)?;
-        let mut scanned = layout::scan(&config.path)?;
-        scanned
-            .found
-            .sort_by(|a, b| (a.used, &a.hex).cmp(&(b.used, &b.hex)));
-        let mut index = Index::default();
-        for found in scanned.found {
-            let sidecar = found.sidecar;
-            index.insert(&found.hex, sidecar.size, sidecar.tag, sidecar.modified);
-        }
-        let counters = Counters::default();
-        add(&counters.discarded_at_start, scanned.discarded + removed);
-        let permits = Arc::new(Semaphore::new(config.max_concurrent_fills.max(1)));
-        let inner = Inner {
-            upstream,
-            disk,
-            clock,
-            config,
-            index: Mutex::new(index),
-            counters,
-            flights: Mutex::new(HashMap::new()),
-            invalidated: Mutex::new(HashSet::new()),
-            staged: AtomicU64::new(0),
-            reserved: AtomicU64::new(0),
-            permits,
-            evicting: AtomicBool::new(false),
-        };
-        Ok(Self {
-            inner: Arc::new(inner),
-        })
+        Self::start(config, upstream, disk, clock, Standing::Lockless)
     }
 
-    /// Opens the cache as [`open`](Self::open) does, if the lock of the directory is free; a
-    /// cache that does not get the lock is read-only (see [`Mode`]).
+    /// Opens the cache as [`open`](Self::open) does, if the lock of the directory (`.lock`) is
+    /// free: this cache holds it and is read-write. If another process holds it, this one is
+    /// read-only: it reads the directory as it finds it and changes nothing in it (see
+    /// [`Mode`]), and [`tick`](Self::tick), which [`hold`](Self::hold) calls, takes the lock
+    /// when it is free and makes the cache read-write.
     ///
     /// # Errors
     /// What the system said about the directory or the lock file.
@@ -335,7 +328,50 @@ impl LocalCache {
         disk: Arc<dyn Disk>,
         clock: Arc<dyn Clock>,
     ) -> io::Result<Self> {
-        Self::open(config, upstream, disk, clock)
+        std::fs::create_dir_all(&config.path)?;
+        let standing = match lock::try_take(&config.path.join(hold::LOCK))? {
+            Some(file) => Standing::Holding(file),
+            None => Standing::Waiting,
+        };
+        Self::start(config, upstream, disk, clock, standing)
+    }
+
+    /// The cache over `config.path` as `standing` says it may treat it.
+    fn start(
+        config: CacheConfig,
+        upstream: Arc<dyn Backend>,
+        disk: Arc<dyn Disk>,
+        clock: Arc<dyn Clock>,
+        standing: Standing,
+    ) -> io::Result<Self> {
+        let counters = Counters::default();
+        let scanned = if matches!(standing, Standing::Waiting) {
+            layout::read_only_scan(&config.path)
+        } else {
+            let removed = layout::clear_stage(&config.path)?;
+            let scanned = layout::scan(&config.path)?;
+            add(&counters.discarded_at_start, scanned.discarded + removed);
+            scanned
+        };
+        let permits = Arc::new(Semaphore::new(config.max_concurrent_fills.max(1)));
+        let inner = Inner {
+            upstream,
+            disk,
+            clock,
+            config,
+            index: Mutex::new(index_of(scanned.found)),
+            counters,
+            flights: Mutex::new(HashMap::new()),
+            invalidated: Mutex::new(HashSet::new()),
+            staged: AtomicU64::new(0),
+            reserved: AtomicU64::new(0),
+            permits,
+            evicting: AtomicBool::new(false),
+            hold: Hold::new(standing),
+        };
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
     }
 
     /// The directory of the cache.
@@ -367,7 +403,10 @@ impl LocalCache {
             .disk
             .space(&inner.config.path)
             .map_or(0, |space| space.free);
-        inner.counters.render(bytes, objects as u64, free)
+        let read_write = inner.read_write();
+        inner
+            .counters
+            .render(bytes, objects as u64, free, read_write)
     }
 }
 
@@ -390,9 +429,13 @@ impl Inner {
         locked(&self.index).get(&name.hex).map(index::Entry::meta)
     }
 
-    /// Removes the object from the index and the disk.
+    /// Removes the object from the index and, if this cache may write to its directory, from the
+    /// disk. A read-only cache forgets the object and leaves its files: they are the holder's.
     fn drop_entry(&self, hex: &str) {
         drop(locked(&self.index).remove(hex));
+        if !self.read_write() {
+            return;
+        }
         let root = &self.config.path;
         let _ = std::fs::remove_file(data_path(root, hex));
         let _ = std::fs::remove_file(layout::meta_path(root, hex));
@@ -424,7 +467,9 @@ impl Inner {
                 }
                 Ok(Some(bytes))
             }
-            Err(error) if gone(&error) => {
+            // A read-only cache has no say over the files: the holder may have evicted this one,
+            // or be publishing it, so the read is a miss and nothing is dropped.
+            Err(error) if gone(&error) && self.read_write() => {
                 // The file is gone or short: the entry is a lie, so it is dropped.
                 self.drop_entry(&name.hex);
                 Ok(None)
@@ -519,6 +564,11 @@ impl Backend for LocalCache {
         };
         if let Some(bytes) = inner.lookup(&name, range, true).await? {
             return Ok(bytes);
+        }
+        if !inner.read_write() {
+            // A read-only cache fills nothing: the miss goes straight to the upstream.
+            bump(&inner.counters.misses);
+            return inner.passthrough(key, range).await;
         }
         if let Some(wanted) = range {
             let meta = inner.upstream.head(key).await?;

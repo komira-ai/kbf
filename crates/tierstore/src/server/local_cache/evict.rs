@@ -36,6 +36,10 @@ impl Inner {
     /// that the order of use outlives the process. One call to the system for each object, however
     /// often it was used.
     pub(super) fn flush_touches(&self) {
+        // A read-only cache does not stamp the files of the one that holds the directory.
+        if !self.read_write() {
+            return;
+        }
         let touched = locked(&self.index).take_touched();
         for (hex, at) in touched {
             // An object that was evicted since it was used has no file to stamp.
@@ -45,8 +49,11 @@ impl Inner {
 
     /// One pass: removes the least recently used objects until the cache is down to its low water
     /// mark, if it is above its high water mark, and until the free space is back at the floor, if
-    /// it is below it. Does nothing if a pass is running.
+    /// it is below it. Does nothing if a pass is running, or if the cache is read-only.
     pub(super) fn evict_pass(&self) -> Pass {
+        if !self.read_write() {
+            return Pass::default();
+        }
         if self.evicting.swap(true, Ordering::SeqCst) {
             return Pass::default();
         }
