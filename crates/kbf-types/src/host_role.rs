@@ -47,6 +47,20 @@ impl HostRole {
         &self.0
     }
 
+    /// [`FromStr`], then only the four named roles: how every verifier and issuer reads a
+    /// role until they take any well-formed name.
+    ///
+    /// # Errors
+    /// [`HostRoleError`] for a malformed name and for a well-formed one that is not
+    /// `frontend`, `storage`, `daemon` or `mac-daemon`.
+    pub fn parse_named(name: &str) -> Result<Self, HostRoleError> {
+        let role: Self = name.parse()?;
+        match role.0 {
+            Cow::Borrowed(_) => Ok(role),
+            Cow::Owned(_) => Err(HostRoleError),
+        }
+    }
+
     /// The role a certificate's URI names: [`HostRole::URI_PREFIX`] exactly, then a name.
     /// `None` for any other URI, and for a prefix followed by a malformed name.
     #[must_use]
@@ -188,6 +202,17 @@ mod tests {
             too_long.as_str(),
         ] {
             assert_eq!(bad.parse::<HostRole>(), Err(HostRoleError), "{bad:?}");
+        }
+    }
+
+    /// Catches: a verifier or issuer reading a role outside the four before it is meant to.
+    #[test]
+    fn parse_named_takes_the_four_and_nothing_else() {
+        for name in ["frontend", "storage", "daemon", "mac-daemon"] {
+            assert_eq!(HostRole::parse_named(name), name.parse());
+        }
+        for bad in ["cache", "Frontend", "", "daemon "] {
+            assert_eq!(HostRole::parse_named(bad), Err(HostRoleError), "{bad:?}");
         }
     }
 }

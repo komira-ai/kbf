@@ -110,7 +110,7 @@ pub(crate) fn host_role_of(
     name: Option<&str>,
     family: &'static str,
 ) -> Result<Option<HostRole>, Corrupt> {
-    name.map(|name| name.parse().map_err(|_| Corrupt(family)))
+    name.map(|name| HostRole::parse_named(name).map_err(|_| Corrupt(family)))
         .transpose()
 }
 

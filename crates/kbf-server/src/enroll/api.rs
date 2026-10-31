@@ -389,7 +389,7 @@ fn make_token(api: &EnrollApi, request: TokenCreate) -> Result<TokenCreated, Fai
     let host_role = request
         .host_role
         .as_deref()
-        .map(str::parse::<HostRole>)
+        .map(HostRole::parse_named)
         .transpose()
         .map_err(|e| bad(format!("host_role: {e}")))?;
     let node_id = request

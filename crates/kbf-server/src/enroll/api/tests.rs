@@ -724,7 +724,7 @@ async fn a_bad_create_is_refused_and_stores_nothing() {
         // role goes with no other role.
         r#"{"roles":["updater"],"node_id":"n7"}"#.to_owned(),
         r#"{"roles":["updater"],"host_role":"daemon"}"#.to_owned(),
-        r#"{"roles":["updater"],"host_role":"Nope","node_id":"n7"}"#.to_owned(),
+        r#"{"roles":["updater"],"host_role":"nope","node_id":"n7"}"#.to_owned(),
         r#"{"roles":["updater"],"host_role":"daemon","node_id":"n7","max_uses":2}"#.to_owned(),
         r#"{"roles":["updater","daemon"],"host_role":"daemon","node_id":"n7"}"#.to_owned(),
         r#"{"roles":["daemon"],"host_role":"daemon"}"#.to_owned(),
