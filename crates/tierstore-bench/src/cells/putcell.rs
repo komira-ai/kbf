@@ -9,7 +9,9 @@
 //! the last one is answered (the sum of the requests' times, for a multipart put).
 //!
 //! The counts and sizes are the plan's; an operator narrows them with `--object-bytes` and
-//! `--in-flight`, and the ledger refuses what does not fit the caps.
+//! `--in-flight`, and leaves out the open-loop arms with `--open-loop off`. The ledger refuses
+//! what does not fit the caps, and is asked about the arms built, so a plan without the open-loop
+//! arms costs without them.
 
 use std::sync::Arc;
 
@@ -212,7 +214,9 @@ pub fn arms(
                     ));
                 }
                 let open = OPEN_LOOP.iter().filter(|(s, ..)| *s == size);
-                for &(_, per_sec, secs) in open.filter(|_| mode.fault.is_none()) {
+                // `&`, not `&&`: both are plain flags, and a short circuit would be a branch.
+                let wanted = plan.open_loop & mode.fault.is_none();
+                for &(_, per_sec, secs) in open.filter(|_| wanted) {
                     let requests = (u64::from(per_sec) * secs).min(limit.unwrap_or(u64::MAX));
                     let label = slug(&format!(
                         "{}-{}-open{per_sec}-{}",

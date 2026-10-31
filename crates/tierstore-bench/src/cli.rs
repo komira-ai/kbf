@@ -140,7 +140,7 @@ impl RunArgs {
     /// Whether the open-loop arms are in the plan (`--open-loop`).
     #[must_use]
     pub fn open_loop(&self) -> bool {
-        true
+        self.open_loop == Switch::On
     }
 
     /// The switch of the fault proxy `--fault-control` names, with `--fault-ttl-secs`.
@@ -205,7 +205,7 @@ fn provenance(
     run_id: &str,
     git_sha: &str,
     attempt: u32,
-    _open_loop: bool,
+    open_loop: bool,
 ) -> Result<Provenance, BenchError> {
     let path = result_dir.join(preflight::REPORT_FILE);
     let text = std::fs::read(&path).map_err(|source| BenchError::Io { path, source })?;
@@ -214,6 +214,7 @@ fn provenance(
     preflight::all_passed("run", &report.checks)?;
     Ok(Provenance {
         attempt,
+        open_loop,
         ..report.provenance(run_id, git_sha)
     })
 }

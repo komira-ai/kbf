@@ -322,8 +322,11 @@ fn format_report(results: &[CellResult], rows: &Rows) -> String {
         let p = &first.provenance;
         writeln!(
             out,
-            "run `{}`, tool commit `{}`, binary `{}`\n",
-            p.run_id, p.git_sha, p.binary_digest
+            "run `{}`, tool commit `{}`, binary `{}`, open loop `{}`\n",
+            p.run_id,
+            p.git_sha,
+            p.binary_digest,
+            if p.open_loop { "on" } else { "off" }
         )
         .expect("a string takes text");
     }
