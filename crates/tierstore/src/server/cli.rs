@@ -3,7 +3,10 @@
 //! One process runs three things over the same pair of tiers: a [`Proxy`] with the given id,
 //! the S3 front of that proxy ([`Server`]), and a [`Reconciler`], which works only while it
 //! holds the lease in the hot tier, so that any number of these processes may run over the same
-//! tiers. The settings are flags, or one TOML file given with `--config` (see
+//! tiers. With `--lock-file` it works only while the process also holds an exclusive lock on
+//! that file (see [`Gate`]): a second process over the same node, started beside the first,
+//! serves at once and reconciles when the first has exited. The settings are flags, or one TOML
+//! file given with `--config` (see
 //! [`config`](super::config) for the format, and `--print-config`, which prints the file for
 //! the flags given); the process reads no environment variable, and the secret access key is
 //! read from a file, not from the command line or the config file. The file is read into the
@@ -44,10 +47,18 @@
 //! flags without the other, and a certificate, key or prefix that cannot work, exit with status
 //! 2; a file that cannot be read
 //! with status 1. The start line gets ` oci-listen=<address> (http)` or ` (https)`.
+//! The start line ends with ` commit=<the commit the binary was built from>`.
+//!
+//! `--listen` and `--oci-listen` may each be given more than once (the file's `listen` keys take a
+//! string or a list): a socket is bound for each address, an IPv6 one for IPv6 only (see
+//! [`listen`](super::listen)), and one server, one drain and one limit on connections serve them
+//! all. An address given twice is refused with status 2, and a start that cannot bind every address
+//! is refused with status 1. The start line names every address, separated by commas.
 //!
 //! On SIGTERM or SIGINT the process drains (see the [`server`](super) docs): `/readyz` says 503,
-//! it serves for `--drain-lb-wait`, refuses new requests, waits for those in flight and for the
-//! answers it is sending for at most `--drain-deadline`, gives the reconciler's lease up and
+//! it serves for `--drain-lb-wait`, stops accepting and closes idle connections, waits for the
+//! requests in flight, the answers it is sending and the connections it closes for at most
+//! `--drain-deadline`, gives the reconciler's lease up and
 //! exits with status 0. A start that fails exits with status 1. Flags that are not valid exit
 //! with status 2: those the parser refuses, two keys that have one id, and a config file that is
 //! refused or given with flags that describe the data path.
@@ -92,6 +103,7 @@ use crate::{
     SystemClock, self_test, sweep_probes,
 };
 
+use super::build_info::{CAPABILITIES, COMMIT, RELEASE_VERSION, VERSION, capabilities_text};
 use super::cache_cli::serve_cache_until_signalled;
 use super::config::{OciFlags, Settings, keys_for_flags};
 use super::config_print::render;
@@ -100,7 +112,9 @@ use super::front::read_key;
 use super::front::{InvalidFlags, server_config};
 use super::keys::read_credentials;
 use super::launch::{Launch, Refused, resolve};
+use super::listen::{bind_all, has_duplicate, joined, local_addrs};
 use super::local_cache::LocalTierFailure;
+use super::lock::{self, LockFile, check_lock_path};
 use super::oci::{
     self, OciError, OciFront, OciLimits, OciListener, OciMetrics, OciMode, OciPrefix,
 };
@@ -113,6 +127,10 @@ pub(super) const DEFAULT_MAX_REQUEST_BYTES: u64 = 256 << 20;
 
 /// The streamed bodies taken at once: 32 of them hold at most 32 x (16 MiB + a few pieces).
 pub(super) const DEFAULT_MAX_CONCURRENT_PUTS: u32 = 32;
+
+/// How long a put that finds all the slots taken waits for one before it is answered 503
+/// (`--put-permit-wait`'s default, `15s`).
+pub(super) const DEFAULT_PUT_PERMIT_WAIT: Duration = Duration::from_secs(15);
 
 /// The least average rate of a body, in bytes a second.
 pub(super) const DEFAULT_PUT_MIN_BYTES_PER_SEC: u64 = 1024;
@@ -133,7 +151,7 @@ const S3_MIN_BODY_RATE: Option<NonZeroU64> = NonZeroU64::new(1 << 20);
 /// read-only keys, writes new objects to the hot tier, copies them to the cold tier in the
 /// background, and frees the hot tier when it fills.
 #[derive(Clone, Debug, PartialEq, Parser)]
-#[command(name = "tierstore", version)]
+#[command(name = "tierstore", version = RELEASE_VERSION)]
 pub struct Cli {
     /// The configuration file: a TOML file with the tables `[server]`, `[hot_store]` and
     /// `[cold_store]` that holds what the flags below hold, except `--drain-lb-wait` and
@@ -152,9 +170,20 @@ pub struct Cli {
     /// error.
     #[arg(long)]
     pub check_config: bool,
-    /// The address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on.
+    /// Prints the capabilities of this build, one to a line, and exits with status 0 without
+    /// starting anything. It needs no other flag and is refused with any (status 2). A host
+    /// updater asks it of a release before it hands over to it.
+    // Never read: `main` finds the flag in the raw arguments before they are parsed, since a
+    // parse would demand `--listen`. The field is here so that `--help` and the docs checks
+    // know the flag.
     #[arg(long)]
-    pub listen: SocketAddr,
+    pub capabilities: bool,
+    /// An address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on. Give the flag
+    /// again for each further address (for instance `0.0.0.0:P` and `[::]:P`, which a firewall
+    /// redirect to the port needs): one server, one drain and one limit on connections serve
+    /// them all. An address that is given twice is refused.
+    #[arg(long, value_name = "ADDR", required = true)]
+    pub listen: Vec<SocketAddr>,
     /// The id of this proxy, which names its journal in the hot tier and its lease. Keep it
     /// across restarts, and give each process over the same tiers one of its own.
     #[arg(long)]
@@ -269,8 +298,8 @@ pub struct Cli {
     /// 503 of `/readyz` is seen: a number and `ms`, `s`, `m` or `h`.
     #[arg(long, default_value = "10s", value_parser = parse_duration)]
     pub drain_lb_wait: Duration,
-    /// How long the drain waits for requests in flight, and for the answers being sent, once it
-    /// refuses new requests.
+    /// How long the drain waits for requests in flight, for the answers being sent, and for the
+    /// connections it closes, once the settle is over.
     #[arg(long, default_value = "15m", value_parser = parse_duration)]
     pub drain_deadline: Duration,
     /// How long a batch of journal entries waits for more before it is written.
@@ -288,6 +317,13 @@ pub struct Cli {
     /// How often the reconciler works: shorter than `--lease-ttl`.
     #[arg(long, default_value = "5s", value_parser = parse_duration)]
     pub reconcile_interval: Duration,
+    /// The lock file of this node: an absolute path on a local file system, in a directory that
+    /// nothing removes (not under `/run`), the same for every process of one node. The reconciler
+    /// works only while this process holds an exclusive lock on the file; a process that finds
+    /// it held serves reads and writes through its own proxy and tries the lock again every
+    /// second. Without it the reconciler works as soon as the process starts.
+    #[arg(long, value_name = "PATH")]
+    pub lock_file: Option<PathBuf>,
     /// How old the usage the reconciler publishes may be before `/usagez` says 503 with the
     /// reason (`/readyz` does not look at it): a number and `ms`, `s`, `m` or `h`, longer than
     /// `--lease-ttl`, so that a reconciler that takes over the lease does not show. A usage that
@@ -309,8 +345,9 @@ pub struct Cli {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub max_request_bytes: u64,
-    /// The most put bodies and upload parts taken at once. One more is answered 503 `SlowDown`
-    /// with `Retry-After: 1` and its body is not read. A body in flight holds a few pieces of
+    /// The most put bodies and upload parts taken at once. One more waits for a slot, at most
+    /// `--put-permit-wait`, and is then answered 503 `SlowDown` with `Retry-After: 1`; its body
+    /// is not read, while it waits or after. A body in flight holds a few pieces of
     /// at most the size the connection delivers (tens of KiB), and an S3 tier up to 16 MiB
     /// more, so 32 bodies hold about half a GiB at most, with S3 tiers, and a few MiB with
     /// directory tiers.
@@ -320,6 +357,13 @@ pub struct Cli {
         value_parser = clap::value_parser!(u32).range(1..)
     )]
     pub max_concurrent_puts: u32,
+    /// How long a put body or upload part that arrives when `--max-concurrent-puts` bodies are
+    /// already being taken waits for one of them to end: a number and `ms`, `s`, `m` or `h`. If a
+    /// slot is free in that time the body is taken; if not, it is answered 503 `SlowDown` with
+    /// `Retry-After: 1`. The request's body is not read while it waits, so a slow tier makes
+    /// clients queue here, up to this long, instead of retrying at once. 0 answers 503 at once.
+    #[arg(long, default_value = "15s", value_parser = parse_duration)]
+    pub put_permit_wait: Duration,
     /// The least average rate, in bytes a second, at which a request body may come in, counted
     /// over the time the server spends waiting for the client to send the next piece, once that
     /// time has passed `--put-rate-grace`. Time the server spends not waiting for the client (a
@@ -368,9 +412,11 @@ pub struct Cli {
     /// is plain HTTP, served at any address: on loopback (127/8 or `::1`) a node's own engine
     /// pulls from its own store and the traffic never leaves the host; off loopback the start
     /// prints one warning line, since a plain connection can be read and changed on its path,
-    /// and the certificate and key are advised. Left out, no such listener is opened.
+    /// and the certificate and key are advised. Give the flag again for each further address, as
+    /// for `--listen`; the certificate must name each of them. Left out, no such listener is
+    /// opened.
     #[arg(long, value_name = "ADDR")]
-    pub oci_listen: Option<SocketAddr>,
+    pub oci_listen: Vec<SocketAddr>,
     /// The certificate chain (PEM) of `--oci-listen`, leaf first, issued by the CA the clients
     /// trust. Read once at start: a new certificate takes a restart. Given with
     /// `--oci-tls-key` or not at all.
@@ -470,7 +516,8 @@ struct Built {
 
 /// The OCI front, as far as the flags and files go: the proxy it reads is not open yet.
 pub(super) struct OciSetup {
-    listen: SocketAddr,
+    /// The addresses, which are at least one.
+    listen: Vec<SocketAddr>,
     /// `None` serves plain HTTP.
     acceptor: Option<tokio_rustls::TlsAcceptor>,
     prefix: OciPrefix,
@@ -600,6 +647,9 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     if cli.s3_request_timeout.is_zero() {
         return Err("--s3-request-timeout must be longer than zero".into());
     }
+    if let Some(path) = &cli.lock_file {
+        check_lock_path(path).map_err(|why| format!("--lock-file {path:?} {why}"))?;
+    }
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut server = server_config(&cli.front(), Arc::clone(&clock))?;
     server.usage_stale_after = cli.usage_stale_after;
@@ -645,7 +695,7 @@ const OCI_HANDSHAKE: Duration = Duration::from_secs(10);
 /// is printed; `--check-config` leaves it out, as it prints nothing when the file is fine.
 fn oci_setup(cli: &Cli, server: &ServerConfig, warn: bool) -> Result<Option<OciSetup>, Error> {
     let flags = OciFlags {
-        listen: cli.oci_listen,
+        listen: cli.oci_listen.clone(),
         tls_cert: cli.oci_tls_cert.clone(),
         tls_key: cli.oci_tls_key.clone(),
         prefix: cli.oci_prefix.clone(),
@@ -662,9 +712,13 @@ pub(super) fn oci_setup_of(
     server: &ServerConfig,
     warn: bool,
 ) -> Result<Option<OciSetup>, Error> {
-    let Some(listen) = flags.listen else {
+    if flags.listen.is_empty() {
         return Ok(None);
-    };
+    }
+    let listen = flags.listen.clone();
+    if has_duplicate(&listen) {
+        return Err(InvalidFlags("--oci-listen is given the same address twice".into()).into());
+    }
     let refuse = |why: OciError| -> Error {
         if why.is_invalid_flags() {
             InvalidFlags(why.to_string()).into()
@@ -681,9 +735,10 @@ pub(super) fn oci_setup_of(
     let prefix = flags.prefix.as_deref().unwrap_or(DEFAULT_OCI_PREFIX);
     let prefix = OciPrefix::new(prefix).map_err(refuse)?;
     let acceptor = match (&flags.tls_cert, &flags.tls_key) {
-        (Some(cert), Some(key)) => Some(oci::acceptor(cert, key, listen).map_err(refuse)?),
+        (Some(cert), Some(key)) => Some(oci::acceptor_for(cert, key, &listen).map_err(refuse)?),
         (None, None) => {
-            if let Some(warning) = oci::plain_warning(listen).filter(|_| warn) {
+            let warnings = listen.iter().filter_map(|addr| oci::plain_warning(*addr));
+            for warning in warnings.filter(|_| warn) {
                 eprintln!("{warning}");
             }
             None
@@ -719,6 +774,9 @@ pub(super) fn oci_setup_of(
 /// How long [`reconcile`] waits for the lease to be given up once it is halted.
 const STOP_WAIT: Duration = Duration::from_secs(5);
 
+/// How long a process that does not hold the `--lock-file` waits between two tries of it.
+const LOCK_RETRY: Duration = Duration::from_secs(1);
+
 /// Runs a pass of `reconciler` now and then every `interval`, until `halt` is notified. Then
 /// it gives the lease up. The calls that failed in a pass are reported on stderr.
 ///
@@ -727,10 +785,34 @@ const STOP_WAIT: Duration = Duration::from_secs(5);
 /// create-only and the checkpoints conditional, so the next reconciler does again what the pass
 /// had not finished.
 pub(crate) async fn reconcile(mut reconciler: Reconciler, interval: Duration, halt: Arc<Notify>) {
+    let _ = run_passes(&mut reconciler, interval, &halt, None).await;
+    let _ = tokio::time::timeout(STOP_WAIT, reconciler.stop()).await;
+}
+
+/// What ended a run of passes.
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    /// The halt.
+    Halted,
+    /// The lock file at the path is not the file that is held.
+    Lost,
+}
+
+/// Runs passes as [`reconcile`] does, until the halt or, if there is a `lock`, until the lock
+/// file is not the one at its path any more (looked at before each pass).
+async fn run_passes(
+    reconciler: &mut Reconciler,
+    interval: Duration,
+    halt: &Notify,
+    lock: Option<&LockFile>,
+) -> Ended {
     loop {
+        if lock.is_some_and(|file| !file.is_current()) {
+            return Ended::Lost;
+        }
         tokio::select! {
             biased;
-            () = halt.notified() => break,
+            () = halt.notified() => return Ended::Halted,
             report = reconciler.pass() => {
                 for error in &report.failed {
                     eprintln!("tierstore: reconciler: {error}");
@@ -738,9 +820,85 @@ pub(crate) async fn reconcile(mut reconciler: Reconciler, interval: Duration, ha
             }
         }
         tokio::select! {
-            () = halt.notified() => break,
+            () = halt.notified() => return Ended::Halted,
             () = tokio::time::sleep(interval) => {}
         }
+    }
+}
+
+/// The lock file a storage node's reconciler works under (`--lock-file`).
+#[derive(Debug)]
+pub(crate) struct Gate {
+    path: PathBuf,
+    /// How long to wait between two tries of a lock that is held by another process.
+    retry: Duration,
+    /// The lock, if the try at the start took it; the reconciler's first run uses it.
+    taken: Option<LockFile>,
+}
+
+impl Gate {
+    /// Opens the lock file at `path` and tries the lock once, now.
+    ///
+    /// # Errors
+    /// What the system said about the file: it cannot be made or opened, it is a link, or it is
+    /// on a network file system.
+    pub(crate) fn open(path: &Path, retry: Duration) -> std::io::Result<Self> {
+        Ok(Self {
+            path: path.to_owned(),
+            retry,
+            taken: lock::try_take(path)?,
+        })
+    }
+}
+
+/// Tries the lock every `retry` until it is taken (`Some`) or `halt` is notified (`None`). A try
+/// that fails is said on stderr and tried again. It runs on a thread that may block, so nothing
+/// waits on the lock on the runtime.
+async fn wait_for_lock(path: &Path, retry: Duration, halt: &Notify) -> Option<LockFile> {
+    loop {
+        tokio::select! {
+            biased;
+            () = halt.notified() => return None,
+            () = tokio::time::sleep(retry) => {}
+        }
+        let owned = path.to_owned();
+        let trying = tokio::task::spawn_blocking(move || lock::try_take(&owned));
+        match trying.await.expect("a try of the lock does not panic") {
+            Ok(Some(file)) => return Some(file),
+            Ok(None) => {}
+            Err(why) => eprintln!("tierstore: lock file {}: {why}", path.display()),
+        }
+    }
+}
+
+/// [`reconcile`], but only while this process holds the lock file of `gate`: it does not touch
+/// the tiers (no lease, no pass) until it holds the lock, takes it by trying every
+/// `gate.retry` while another process holds it, and stops (giving the lease up) and waits for the
+/// lock again if the lock file is replaced. The process that held the lock gives its lease up
+/// when it exits (see [`reconcile`]), so the first pass after the lock is taken finds it free.
+pub(crate) async fn reconcile_gated(
+    mut reconciler: Reconciler,
+    interval: Duration,
+    halt: Arc<Notify>,
+    mut gate: Gate,
+) {
+    loop {
+        let file = match gate.taken.take() {
+            Some(file) => file,
+            None => match wait_for_lock(&gate.path, gate.retry, &halt).await {
+                Some(file) => file,
+                None => break,
+            },
+        };
+        if run_passes(&mut reconciler, interval, &halt, Some(&file)).await == Ended::Halted {
+            break;
+        }
+        eprintln!(
+            "tierstore: lock file {}: the file was replaced; the reconciler stops until the lock \
+             is taken again",
+            gate.path.display()
+        );
+        let _ = tokio::time::timeout(STOP_WAIT, reconciler.stop()).await;
     }
     let _ = tokio::time::timeout(STOP_WAIT, reconciler.stop()).await;
 }
@@ -821,14 +979,48 @@ async fn probe_tiers(
 }
 
 /// The addresses [`run_serving`] is bound to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Addresses {
-    /// The S3 front, `/healthz`, `/readyz`, `/usagez` and `/metricz`.
+    /// The S3 front, `/healthz`, `/readyz`, `/usagez` and `/metricz`: the first address of
+    /// [`s3_all`](Self::s3_all).
     pub s3: SocketAddr,
-    /// The OCI read front, if `--oci-listen` was given.
+    /// Every address the S3 front is bound to, in the order of the `--listen` flags.
+    pub s3_all: Vec<SocketAddr>,
+    /// The OCI read front, if `--oci-listen` was given: the first address of
+    /// [`oci_all`](Self::oci_all).
     pub oci: Option<SocketAddr>,
+    /// Every address the OCI front is bound to; empty when there is none.
+    pub oci_all: Vec<SocketAddr>,
     /// How the OCI front carries its connections: `Some` exactly when [`oci`](Self::oci) is.
     pub oci_mode: Option<OciMode>,
+}
+
+impl Addresses {
+    /// The addresses of the sockets bound: the S3 front's, which are at least one, and the OCI
+    /// front's, if it is served.
+    ///
+    /// # Errors
+    /// A socket's address cannot be read, or the S3 front has none.
+    pub(super) fn of(s3_all: Vec<SocketAddr>, oci: Option<&OciListener>) -> std::io::Result<Self> {
+        let oci_all = oci.map(OciListener::local_addrs).transpose()?;
+        let oci_all = oci_all.unwrap_or_default();
+        let none = || std::io::Error::other("--listen is needed");
+        Ok(Self {
+            s3: s3_all.first().copied().ok_or_else(none)?,
+            s3_all,
+            oci: oci_all.first().copied(),
+            oci_all,
+            oci_mode: oci.map(OciListener::mode),
+        })
+    }
+}
+
+/// Binds the S3 front's sockets, one for each of `addrs`.
+///
+/// # Errors
+/// An address cannot be bound; the message names it.
+pub(super) fn bind_s3(addrs: &[SocketAddr]) -> Result<Vec<TcpListener>, Error> {
+    bind_all(addrs).map_err(|(addr, why)| format!("binding {addr}: {why}").into())
 }
 
 /// Opens the proxy and serves it until `stop` resolves, and then drains.
@@ -863,6 +1055,15 @@ pub async fn run_serving(
     ready: impl FnOnce(Addresses),
 ) -> Result<Drained, Error> {
     let mut built = build(cli)?;
+    // One try now, so that a lock file that cannot be used stops the start; the reconciler's
+    // loop takes it later if another process holds it now.
+    let gate = match &cli.lock_file {
+        Some(path) => {
+            let opened = Gate::open(path, LOCK_RETRY);
+            Some(opened.map_err(|why| format!("--lock-file {}: {why}", path.display()))?)
+        }
+        None => None,
+    };
     let (hot, cold) = (built.hot.as_ref(), built.cold.as_ref());
     probe_tiers(cli, hot, cold, cli.backend_check_wait).await?;
     let (hot, cold) = (Arc::clone(&built.hot), Arc::clone(&built.cold));
@@ -871,17 +1072,9 @@ pub async fn run_serving(
     built.server.proxy = Some(Arc::clone(&proxy));
     let oci_backend: Arc<dyn Backend> = proxy.clone();
     let server = Server::new(proxy, built.server);
-    let address = cli.listen;
-    let bound = TcpListener::bind(address).await;
-    let listener = bound.map_err(|why| format!("binding {address}: {why}"))?;
+    let listeners = bind_s3(&cli.listen)?;
     let oci = bind_oci(built.oci, oci_backend).await?;
-    let oci_addr = oci.as_ref().map(OciListener::local_addr).transpose()?;
-    let oci_mode = oci.as_ref().map(OciListener::mode);
-    ready(Addresses {
-        s3: listener.local_addr()?,
-        oci: oci_addr,
-        oci_mode,
-    });
+    ready(Addresses::of(local_addrs(&listeners)?, oci.as_ref())?);
     let stopping = Arc::clone(&server);
     let (oci_stop, oci_stopped) = watch::channel(false);
     let lb_wait = cli.drain_lb_wait;
@@ -894,13 +1087,19 @@ pub async fn run_serving(
     let halt = Arc::new(Notify::new());
     let halting = Arc::clone(&halt);
     let serving = async move {
-        let drained = server.serve(listener).await;
+        let drained = server.serve_all(listeners).await;
         halting.notify_one();
         drained
     };
     let oci_serving = serve_oci(oci, oci_stopped);
     let reconciler = Reconciler::new(built.hot, built.cold, built.reconciler);
-    let reconciling = reconcile(reconciler, cli.reconcile_interval, halt);
+    let interval = cli.reconcile_interval;
+    let reconciling = async move {
+        match gate {
+            Some(gate) => reconcile_gated(reconciler, interval, halt, gate).await,
+            None => reconcile(reconciler, interval, halt).await,
+        }
+    };
     let (drained, (), oci_cut) = tokio::join!(serving, reconciling, oci_serving);
     watcher.abort();
     eprint!("{}", cut_note(drained));
@@ -930,10 +1129,7 @@ pub(super) async fn bind_oci(
         return Ok(None);
     };
     let front = Arc::new(OciFront::new(backend, setup.prefix, setup.metrics));
-    let bound = match setup.acceptor {
-        Some(tls) => OciListener::bind(setup.listen, tls, front, setup.limits).await,
-        None => OciListener::bind_plain(setup.listen, front, setup.limits).await,
-    };
+    let bound = OciListener::bind_all(&setup.listen, setup.acceptor, front, setup.limits).await;
     Ok(Some(bound?))
 }
 
@@ -971,14 +1167,13 @@ pub(super) fn signals() -> std::io::Result<impl Future<Output = ()> + Send + 'st
 
 async fn serve_until_signalled(cli: Cli) -> Result<(), Error> {
     let stop = signals()?;
-    let version = env!("CARGO_PKG_VERSION");
     let announce = |bound: Addresses| {
-        let mut line = format!("tierstore {version} listen={}", bound.s3);
-        if let Some(oci) = bound.oci {
+        let mut line = format!("tierstore {VERSION} listen={}", joined(&bound.s3_all));
+        if bound.oci.is_some() {
             let mode = bound.oci_mode.unwrap_or_default().as_str();
-            line.push_str(&format!(" oci-listen={oci} ({mode})"));
+            line.push_str(&format!(" oci-listen={} ({mode})", joined(&bound.oci_all)));
         }
-        println!("{line}");
+        println!("{line} commit={COMMIT}");
     };
     run_serving(&cli, stop, announce).await?;
     Ok(())
@@ -991,9 +1186,30 @@ fn blocking(start: impl Future<Output = Result<(), Error>>) -> Result<(), Error>
     runtime.block_on(start)
 }
 
+/// `--capabilities`: the capabilities of this build, one to a line, on stdout and status 0 (see
+/// [`CAPABILITIES`]); or, when `args` (the program name first) hold anything else, the first of
+/// it named on stderr and status 2, with nothing on stdout.
+fn capabilities(args: &[OsString]) -> ExitCode {
+    match args.iter().skip(1).find(|arg| *arg != "--capabilities") {
+        Some(other) => {
+            let other = other.to_string_lossy();
+            eprintln!("tierstore: --capabilities takes no other flag, got {other}");
+            ExitCode::from(2)
+        }
+        None => {
+            print!("{}", capabilities_text(CAPABILITIES));
+            ExitCode::SUCCESS
+        }
+    }
+}
+
 /// The binary: flags in, exit status out.
 #[must_use]
 pub fn main(args: Vec<OsString>) -> ExitCode {
+    // Before the flags are parsed: it needs none of the flags a start requires.
+    if args.iter().skip(1).any(|arg| arg == "--capabilities") {
+        return capabilities(&args);
+    }
     let launch = match resolve(args) {
         Ok(launch) => launch,
         Err(Refused::Usage(usage)) => {

@@ -34,6 +34,8 @@ pub mod services;
 #[cfg(test)]
 mod converge_tests;
 #[cfg(test)]
+mod decide_golden_tests;
+#[cfg(test)]
 mod decide_tests;
 #[cfg(test)]
 mod desired_tests;

@@ -9,7 +9,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use clap::Parser;
 use serde_json::json;
@@ -65,7 +67,16 @@ pub struct FakeHost {
     pub load: Mutex<Option<LoadSample>>,
     pub respond: Mutex<Respond>,
     pub commands: Mutex<Vec<Cmd>>,
+    /// While set, a command does not end by itself: it waits until it is told to stop (when run
+    /// with `run_until`) or, as a bound for a test whose code does not stop it, for `HANG_POLLS`
+    /// milliseconds of this thread, and then answers as `respond` says.
+    pub hang: AtomicBool,
+    /// Set when a hanging command was told to stop.
+    pub stopped: AtomicBool,
 }
+
+/// How many one-millisecond waits a hanging command is held for at most.
+const HANG_POLLS: u32 = 5_000;
 
 impl FakeHost {
     /// A machine with nothing on it, whose commands all succeed with no output.
@@ -77,6 +88,8 @@ impl FakeHost {
             load: Mutex::new(Some(calm())),
             respond: Mutex::new(Box::new(|_| ok(""))),
             commands: Mutex::default(),
+            hang: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
         }
     }
 
@@ -100,6 +113,21 @@ impl FakeHost {
     pub fn ran(&self) -> Vec<Cmd> {
         self.commands.lock().unwrap().clone()
     }
+
+    /// Holds a hanging command; true if `stop` was set meanwhile.
+    fn hold(&self, stop: Option<&AtomicBool>) -> bool {
+        for _ in 0..HANG_POLLS {
+            if !self.hang.load(Ordering::SeqCst) {
+                return false;
+            }
+            if stop.is_some_and(|s| s.load(Ordering::SeqCst)) {
+                self.stopped.store(true, Ordering::SeqCst);
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
 }
 
 impl Host for FakeHost {
@@ -118,7 +146,16 @@ impl Host for FakeHost {
 
     fn run(&self, cmd: &Cmd) -> io::Result<CmdOutput> {
         self.commands.lock().unwrap().push(cmd.clone());
+        self.hold(None);
         (self.respond.lock().unwrap())(cmd)
+    }
+
+    fn run_until(&self, cmd: &Cmd, stop: &AtomicBool) -> io::Result<Option<CmdOutput>> {
+        self.commands.lock().unwrap().push(cmd.clone());
+        if self.hold(Some(stop)) {
+            return Ok(None);
+        }
+        (self.respond.lock().unwrap())(cmd).map(Some)
     }
 
     fn port_open(&self, port: u16) -> bool {

@@ -79,6 +79,18 @@ fn refused(cli: &Cli) -> (u8, String) {
     (exit_status(&error), error.to_string())
 }
 
+/// Asserts that a start with no address for the S3 front is refused before it serves: the parser
+/// requires one, and settings made another way do not slip through.
+#[tokio::test]
+async fn a_start_with_no_listen_address_is_refused() {
+    let rig = Rig::new("oci-flags-no-listen");
+    let mut cli = rig.cli(&["--drain-lb-wait", "50ms"]);
+    cli.listen.clear();
+    let refused = run_serving(&cli, async {}, |_| {}).await.err();
+    let why = refused.expect("a refused start").to_string();
+    assert!(why.contains("--listen is needed"), "{why}");
+}
+
 /// Asserts that the front is off without `--oci-listen`: nothing is made, and `/metricz` has no
 /// counters to show.
 #[test]
@@ -101,7 +113,7 @@ fn the_flags_make_the_front() {
     let built = build(&rig.cli(&[])).expect("built");
     let setup = built.oci.expect("a front");
     assert_eq!(setup.prefix.as_str(), "oci/");
-    assert_eq!(setup.listen.to_string(), "127.0.0.1:0");
+    assert_eq!(setup.listen, vec!["127.0.0.1:0".parse().unwrap()]);
     assert_eq!(setup.limits.max_connections, 64);
     assert_eq!(setup.limits.lifetime, Duration::from_secs(3600));
     assert_eq!(setup.limits.handshake_timeout, Duration::from_secs(10));
@@ -307,7 +319,7 @@ fn a_loopback_front_without_a_certificate_is_plain() {
         let built = build(&plain_cli(&rig, listen)).expect("built");
         let setup = built.oci.expect("a front");
         assert!(setup.acceptor.is_none(), "{listen}");
-        assert_eq!(setup.listen.to_string(), listen);
+        assert_eq!(setup.listen, vec![listen.parse().unwrap()]);
         let shown = built.server.oci_metrics.expect("counters").render();
         assert!(
             shown.contains("tierstore_oci_front_info{mode=\"http\"} 1\n"),
@@ -331,8 +343,8 @@ fn a_plain_front_off_loopback_starts_with_a_warning() {
         let built = build(&plain_cli(&rig, listen)).expect("built");
         let setup = built.oci.expect("a front");
         assert!(setup.acceptor.is_none(), "{listen}");
-        assert_eq!(setup.listen.to_string(), listen);
-        let warning = plain_warning(setup.listen).expect("a warning");
+        assert_eq!(setup.listen, vec![listen.parse().unwrap()]);
+        let warning = plain_warning(setup.listen[0]).expect("a warning");
         assert!(warning.contains(listen), "{warning}");
         let shown = built.server.oci_metrics.expect("counters").render();
         assert!(
@@ -349,14 +361,14 @@ fn a_certificate_and_key_allow_an_address_off_loopback() {
     let rig = Rig::new("oci-flags-tls-wide");
     let wide = leaf(&rig.dir, "wide", &ca(), vec![ip("192.0.2.1")]);
     let mut cli = rig.cli(&[]);
-    cli.oci_listen = Some("192.0.2.1:9500".parse().expect("an address"));
+    cli.oci_listen = vec!["192.0.2.1:9500".parse().expect("an address")];
     cli.oci_tls_cert = Some(wide.cert);
     cli.oci_tls_key = Some(wide.key);
     let setup = build(&cli).expect("built").oci.expect("a front");
     assert!(setup.acceptor.is_some());
     // A certificate for another address is refused as before.
     let mut cli = rig.cli(&[]);
-    cli.oci_listen = Some("192.0.2.1:9500".parse().expect("an address"));
+    cli.oci_listen = vec!["192.0.2.1:9500".parse().expect("an address")];
     let (status, why) = refused(&cli);
     assert_eq!(status, 2, "{why}");
     assert!(why.contains("no IP subjectAltName for 192.0.2.1"), "{why}");
