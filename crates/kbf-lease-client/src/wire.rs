@@ -444,6 +444,11 @@ pub struct RunLimits {
 ///
 /// The contents are secret: `Debug` prints the name and the length of the contents and
 /// nothing else, so no log line that prints a spec can leak them.
+///
+/// Who owns the secret's lifetime: the contents are a plain `String`, copied into the encoded
+/// body, and none of it is zeroized. This crate writes them nowhere (no file, no log) and
+/// keeps them only as long as the caller keeps the spec. The caller decides when they are
+/// dropped.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunFile {
     /// The file name.

@@ -43,7 +43,8 @@ pub struct Pool {
 
 impl Pool {
     /// The same pool with its hosts reporting `run-files=true`, as an agent with a usable
-    /// files root does. Without it a start with files is `409 files-unsupported`. Pools are
+    /// files root does. The fake models it per pool; the real server takes the capability
+    /// from each host's own hello. Without it a start with files is `409 files-unsupported`. Pools are
     /// built without it so that a host list has the capabilities it always had.
     #[must_use]
     pub fn with_run_files(mut self) -> Self {
@@ -459,6 +460,12 @@ impl State {
         {
             return Err(Refusal::new(422, "limits-exceed-shape"));
         }
+        // After the vetting, as the registry has it, and before the host's state: a host that
+        // cannot deliver the files is refused for that, lost or tainted or not.
+        let delivers = self.pool.capabilities.get("run-files").map(String::as_str) == Some("true");
+        if !spec.files.is_empty() && !delivers {
+            return Err(Refusal::new(409, "files-unsupported"));
+        }
         if host.lost {
             return Err(Refusal::new(409, "host-lost"));
         }
@@ -467,10 +474,6 @@ impl State {
         }
         if let Some(code) = host.refusing {
             return Err(Refusal::new(409, code));
-        }
-        let delivers = self.pool.capabilities.get("run-files").map(String::as_str) == Some("true");
-        if !spec.files.is_empty() && !delivers {
-            return Err(Refusal::new(409, "files-unsupported"));
         }
         let live = self.runs.iter().filter(|run| run.lease == id && run.live());
         let (count, cpu, memory) = live.fold((0, 0, 0), |(count, cpu, memory), run| {
@@ -793,8 +796,6 @@ impl State {
     }
 }
 
-/// Whether an image reference is pinned by digest, `name@sha256:<64 hex>` (a tag before the
-/// `@` is fine).
 /// The lease server's rules for the files of a start: at most 8; a name of `[A-Za-z0-9._-]`,
 /// leading alphanumeric, 1 to 64 bytes, none twice ignoring case; 16 KiB of contents a file
 /// and 64 KiB in all; no NUL.
@@ -824,6 +825,8 @@ fn files_valid(files: &[RunFile]) -> bool {
     files.len() <= MAX_FILES && each && total <= MAX_TOTAL
 }
 
+/// Whether an image reference is pinned by digest, `name@sha256:<64 hex>` (a tag before the
+/// `@` is fine).
 fn pinned(image: &str) -> bool {
     image.rsplit_once("@sha256:").is_some_and(|(name, hex)| {
         !name.is_empty() && hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
