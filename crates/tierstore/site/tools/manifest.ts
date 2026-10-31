@@ -1,5 +1,5 @@
-// The manifest of a built tree: every file's path and sha256, one per line, sorted. test/golden.manifest is its
-// committed copy; `npm run golden` rewrites that copy from a fresh build after a change meant to alter the output.
+// The manifest of a built tree: every file's path and sha256, one per line, sorted, except the pages under docs/ (rendered from the guide;
+// docs.test.ts holds them). test/golden.manifest is its committed copy; `npm run golden` rewrites it from a fresh build after a change meant to alter the output.
 
 import { createHash } from 'crypto';
 import { readFileSync, writeFileSync } from 'fs';
@@ -7,8 +7,13 @@ import { join, resolve } from 'path';
 import { buildSite } from './build';
 import { listFiles } from './check-dist';
 
+/** The pages rendered from the guide are not in the manifest: docs.test.ts holds them, so a guide edit changes no golden. */
+export function isGuidePage(file: string): boolean {
+  return file.startsWith('docs/');
+}
+
 export function manifestOf(dir: string): string {
-  return listFiles(dir).map((f) => `${createHash('sha256').update(readFileSync(join(dir, f))).digest('hex')}  ${f}\n`).join('');
+  return listFiles(dir).filter((f) => !isGuidePage(f)).map((f) => `${createHash('sha256').update(readFileSync(join(dir, f))).digest('hex')}  ${f}\n`).join('');
 }
 
 if (require.main === module) {

@@ -1,4 +1,4 @@
-// Golden output: the built tree is exactly the committed manifest (every file's path and sha256).
+// Golden output: the built tree, without the docs pages, is exactly the committed manifest (every file's path and sha256).
 //
 // Catches: any change to the output nobody meant. A template byte, a content word, a stylesheet, a compiler upgrade
 // that changes the emitted JavaScript, a file that appears or disappears, an asset id that moves. The manifest is

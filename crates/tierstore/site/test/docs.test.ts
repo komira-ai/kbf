@@ -38,6 +38,9 @@ test('every file of docs/ is a page of the site, under /docs/<name>/, and /docs/
     assert.ok(existsSync(join(dist, 'docs', stem, 'index.html')), `docs/${stem}.md has no page`);
     assert.ok(index.includes(`href="/docs/${stem}/"`), `/docs/ does not list ${stem}`);
   }
+  assert.ok(existsSync(join(dist, 'docs', 'index.html')), 'there is no /docs/ index');
+  const pages = readdirSync(join(dist, 'docs'), { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name).sort();
+  assert.deepEqual(pages, stems, 'the built docs/ has a page for every guide file and no other');
 });
 
 test('the guide is read in its order, and a page the site has not heard of follows by name', () => {

@@ -10,7 +10,7 @@ npm ci --ignore-scripts --no-audit --no-fund
 npm run typecheck
 npm test            # compiles, then runs test/*.test.ts
 npm run build       # writes dist/
-npm run golden      # after a change meant to alter the output: rewrites test/golden.manifest
+npm run golden      # after a change meant to alter a hand-made page or asset: rewrites test/golden.manifest
 ```
 
 ## Why it is here
@@ -31,7 +31,7 @@ repository needs that file too, or the policy copied beside the site.
 | `static/site.css` | this site's own rules, loaded after the theme |
 | `src/copy.ts` | copy buttons on command blocks |
 | `tools/` | `pages.ts` (routes, titles, the white-paper URL), `layout.ts` (the page shell, with the `> tierstore` mark), `build.ts`, `check-dist.ts`, `links.ts`, `csp.ts` |
-| `test/` | golden output, the docs pages (`docs.test.ts`), links, Content-Security-Policy, theme digest, the white-paper slot, the "not built" statements and demo strings held to the crate source (`claims.test.ts`), public-repo scan, supply-chain policy |
+| `test/` | golden output (`golden.manifest` guards the hand-made pages and assets; the docs pages are left out of it and held by `docs.test.ts` and the crate's `docs_tests.rs`, so a guide edit needs no new manifest), the docs pages (`docs.test.ts`), links, Content-Security-Policy, theme digest, the white-paper slot, the "not built" statements and demo strings held to the crate source (`claims.test.ts`), public-repo scan, supply-chain policy |
 
 ## The demo
 
