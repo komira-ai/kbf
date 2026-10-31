@@ -23,5 +23,9 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# The client of the registration socket, run against the server of `register` (tests/register_client.rs).
+update-register = { path = "../update-register" }
+
 [lints]
 workspace = true
