@@ -27,11 +27,15 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
 /// The longest registration line the updater reads, newline included.
 pub const MAX_LINE: usize = 4096;
+
+/// How long `register` waits for the answer.
+pub const ANSWER_DEADLINE_SECS: u64 = 10;
 
 /// The most of an answer that is read; an answer is one short line.
 const MAX_ANSWER: u64 = 512;
@@ -144,7 +148,13 @@ pub fn register(
         path: socket.to_path_buf(),
         source,
     })?;
-    register_on(stream, name, version, health)
+    register_on(
+        stream,
+        name,
+        version,
+        health,
+        Duration::from_secs(ANSWER_DEADLINE_SECS),
+    )
 }
 
 fn register_on(
@@ -152,6 +162,7 @@ fn register_on(
     name: &str,
     version: &str,
     health: Option<&Health>,
+    _deadline: Duration,
 ) -> Result<Registration, Error> {
     let line = encode(name, version, health);
     if line.len() > MAX_LINE {

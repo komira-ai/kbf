@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use kbf_step_runner::register::{
-    Declared, Grant, HealthAddr, MAX_LINE, Refused, Registry, Reported, Server, Why,
+    Declared, Grant, HealthAddr, LINE_DEADLINE_SECS, MAX_LINE, Refused, Registry, Reported, Server,
+    Why,
 };
 use support::{FakeClock, Scratch};
 use update_register::{Error, Health, Refusal, register};
@@ -304,4 +305,10 @@ fn a_socket_nobody_listens_on_is_a_connect_error() {
         Err(Error::Connect { path, .. }) => assert_eq!(path, sock),
         other => panic!("{other:?}"),
     }
+}
+
+/// The client waits for the answer as long as the server takes to read a line.
+#[test]
+fn the_client_waits_as_long_as_the_server_reads_a_line() {
+    assert_eq!(update_register::ANSWER_DEADLINE_SECS, LINE_DEADLINE_SECS);
 }

@@ -4,6 +4,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -29,9 +30,25 @@ fn sent_line(peer: &UnixStream) -> String {
     line
 }
 
+/// `register_on` with the deadline of `register`, which no test waits for.
+fn on(
+    client: UnixStream,
+    name: &str,
+    version: &str,
+    health: Option<&Health>,
+) -> Result<Registration, Error> {
+    register_on(
+        client,
+        name,
+        version,
+        health,
+        Duration::from_secs(ANSWER_DEADLINE_SECS),
+    )
+}
+
 fn refused(said: &str) -> Refusal {
     let (client, _peer) = peer_that_said(said.as_bytes());
-    match register_on(client, "svc", "1.0.0", None) {
+    match on(client, "svc", "1.0.0", None) {
         Err(Error::Refused(refusal)) => refusal,
         other => panic!("{said:?}: {other:?}"),
     }
@@ -42,7 +59,7 @@ fn refused(said: &str) -> Refusal {
 #[test]
 fn the_registration_is_one_json_line() {
     let (client, peer) = peer_that_said(OK.as_bytes());
-    let _held = register_on(client, "svc", "1.2.3", None).unwrap();
+    let _held = on(client, "svc", "1.2.3", None).unwrap();
     let line = sent_line(&peer);
     assert!(line.ends_with('\n'));
     let sent: Value = serde_json::from_str(&line).unwrap();
@@ -58,7 +75,7 @@ fn the_health_address_is_sent_with_its_path() {
     for addr in ["127.0.0.1:9301", "[::1]:9302"] {
         let (client, peer) = peer_that_said(OK.as_bytes());
         let health = Health::new(addr.parse().unwrap(), "/readyz");
-        let _held = register_on(client, "svc", "1.0.0", Some(&health)).unwrap();
+        let _held = on(client, "svc", "1.0.0", Some(&health)).unwrap();
         let sent: Value = serde_json::from_str(&sent_line(&peer)).unwrap();
         assert_eq!(sent["health"], json!({"addr": addr, "path": "/readyz"}));
     }
@@ -69,7 +86,7 @@ fn the_health_address_is_sent_with_its_path() {
 #[test]
 fn a_name_with_a_newline_stays_one_line() {
     let (client, peer) = peer_that_said(OK.as_bytes());
-    let _held = register_on(client, "a\"b\nc\u{e9}", "v\n2", None).unwrap();
+    let _held = on(client, "a\"b\nc\u{e9}", "v\n2", None).unwrap();
     let line = sent_line(&peer);
     assert_eq!(line.matches('\n').count(), 1, "{line:?}");
     let sent: Value = serde_json::from_str(&line).unwrap();
@@ -82,7 +99,7 @@ fn a_name_with_a_newline_stays_one_line() {
 #[test]
 fn dropping_the_registration_closes_the_connection() {
     let (client, mut peer) = peer_that_said(OK.as_bytes());
-    let held = register_on(client, "svc", "1.0.0", None).unwrap();
+    let held = on(client, "svc", "1.0.0", None).unwrap();
     let _ = sent_line(&peer);
     peer.set_nonblocking(true).unwrap();
     let mut byte = [0u8; 1];
@@ -148,7 +165,7 @@ fn an_answer_that_is_not_understood_is_not_success() {
     ];
     for answer in answers {
         let (client, _peer) = peer_that_said(answer.as_bytes());
-        let got = register_on(client, "svc", "1.0.0", None);
+        let got = on(client, "svc", "1.0.0", None);
         match got {
             Err(Error::BadAnswer(text)) => assert_eq!(text, answer),
             other => panic!("{answer:?}: {other:?}"),
@@ -160,18 +177,76 @@ fn an_answer_that_is_not_understood_is_not_success() {
 #[test]
 fn an_endless_answer_is_cut_off() {
     let (client, _peer) = peer_that_said(&vec![b'x'; 2 * MAX_ANSWER as usize]);
-    match register_on(client, "svc", "1.0.0", None) {
+    match on(client, "svc", "1.0.0", None) {
         Err(Error::BadAnswer(text)) => assert_eq!(text.len(), MAX_ANSWER as usize),
         other => panic!("{other:?}"),
     }
 }
 
-/// An answer that is not text is an I/O error, not a panic.
+/// An answer that is not text is not understood, and is not a panic.
 #[test]
-fn an_answer_that_is_not_text_is_an_error() {
+fn an_answer_that_is_not_text_is_not_understood() {
     let (client, _peer) = peer_that_said(&[0xff, 0xfe, b'\n']);
     assert!(matches!(
-        register_on(client, "svc", "1.0.0", None),
+        on(client, "svc", "1.0.0", None),
+        Err(Error::BadAnswer(_))
+    ));
+}
+
+/// An answer that ends before its newline is cut short, and a cut-short success is never
+/// believed: it is `BadAnswer` with what was read, and a peer that sent nothing is `NoAnswer`.
+#[test]
+fn an_answer_cut_short_is_not_success() {
+    let (client, peer) = peer_that_said(b"{\"ok\":true,\"error\":null}");
+    drop(peer);
+    match on(client, "svc", "1.0.0", None) {
+        Err(Error::BadAnswer(text)) => assert_eq!(text, "{\"ok\":true,\"error\":null}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// An updater that never answers is given up on when the deadline passes, whatever the
+/// deadline: a zero deadline is the smallest the socket takes (a zero timeout would mean
+/// waiting for ever), and the peer here stays open and says nothing, so the outcome does not
+/// depend on how long anything takes.
+#[test]
+fn an_updater_that_never_answers_is_given_up_on() {
+    let (client, _peer) = UnixStream::pair().unwrap();
+    let got = register_on(client, "svc", "1.0.0", None, Duration::ZERO);
+    assert!(matches!(got, Err(Error::NoAnswer)), "{got:?}");
+}
+
+/// The deadline of `register` is ten seconds, the updater's own limit on a line.
+#[test]
+fn the_answer_deadline_is_ten_seconds() {
+    assert_eq!(ANSWER_DEADLINE_SECS, 10);
+}
+
+/// A read that fails for another reason than the deadline is an I/O error: here the peer
+/// closes with the line unread, which the kernel reports as a reset.
+#[test]
+fn a_connection_reset_is_an_io_error() {
+    let (client, peer) = UnixStream::pair().unwrap();
+    let reset = std::thread::spawn(move || {
+        let mut byte = [0u8; 1];
+        (&peer).read_exact(&mut byte).unwrap();
+    });
+    let got = on(client, "svc", "1.0.0", None);
+    reset.join().unwrap();
+    match got {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A success is not reported when the line did not go: the updater answered `ok` and closed
+/// before the write.
+#[test]
+fn an_ok_with_a_failed_write_is_an_error() {
+    let (client, peer) = peer_that_said(OK.as_bytes());
+    drop(peer);
+    assert!(matches!(
+        on(client, "svc", "1.0.0", None),
         Err(Error::Io(_))
     ));
 }
@@ -183,14 +258,14 @@ fn a_peer_that_hangs_up_is_told_apart_by_what_was_sent() {
     // The peer reads the line and closes without a word.
     let (client, peer) = UnixStream::pair().unwrap();
     let hang_up = std::thread::spawn(move || sent_line(&peer));
-    let got = register_on(client, "svc", "1.0.0", None);
+    let got = on(client, "svc", "1.0.0", None);
     hang_up.join().unwrap();
     assert!(matches!(got, Err(Error::NoAnswer)), "{got:?}");
 
     // The peer is gone before the line is written.
     let (client, peer) = UnixStream::pair().unwrap();
     drop(peer);
-    let got = register_on(client, "svc", "1.0.0", None);
+    let got = on(client, "svc", "1.0.0", None);
     assert!(matches!(got, Err(Error::Io(_))), "{got:?}");
 }
 
@@ -201,7 +276,7 @@ fn the_answer_of_a_peer_that_closed_is_still_read() {
     let (client, peer) = peer_that_said(refusal_line("busy").as_bytes());
     drop(peer);
     assert!(matches!(
-        register_on(client, "svc", "1.0.0", None),
+        on(client, "svc", "1.0.0", None),
         Err(Error::Refused(Refusal::Busy))
     ));
 }
@@ -214,12 +289,12 @@ fn a_registration_over_the_limit_is_not_sent() {
     let overhead = r#"{"health":null,"name":"svc","version":""}"#.len() + 1;
     let (client, peer) = peer_that_said(OK.as_bytes());
     let version = "9".repeat(MAX_LINE - overhead);
-    let _held = register_on(client, "svc", &version, None).unwrap();
+    let _held = on(client, "svc", &version, None).unwrap();
     assert_eq!(sent_line(&peer).len(), MAX_LINE);
 
     let (client, peer) = UnixStream::pair().unwrap();
     let version = "9".repeat(MAX_LINE - overhead + 1);
-    match register_on(client, "svc", &version, None) {
+    match on(client, "svc", &version, None) {
         Err(Error::TooLong { len }) => assert_eq!(len, MAX_LINE + 1),
         other => panic!("{other:?}"),
     }
