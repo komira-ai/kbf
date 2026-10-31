@@ -14,6 +14,6 @@ export function manifestOf(dir: string): string {
 if (require.main === module) {
   const site = resolve(__dirname, '..', '..', '..');
   const out = join(site, 'build', 'golden-dist');
-  buildSite({ browserDir: join(site, 'build', 'browser'), staticDir: join(site, 'static'), contentDir: join(site, 'content'), outDir: out });
+  buildSite({ browserDir: join(site, 'build', 'browser'), staticDir: join(site, 'static'), contentDir: join(site, 'content'), docsDir: join(site, '..', 'docs'), outDir: out });
   writeFileSync(join(site, 'test', 'golden.manifest'), manifestOf(out));
 }
