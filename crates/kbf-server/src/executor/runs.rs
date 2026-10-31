@@ -252,9 +252,10 @@ impl HostWorker {
 
     /// Stamps `mark` of `lease`'s run at `at`: the first stamp of each is kept.
     fn stamp(&mut self, lease: kbf_types::LeaseId, mark: Mark, at: Instant, ctx: &Ctx<'_>) {
-        if let Some(task) = self.tasks.get_mut(&lease) {
-            task.timeline.stamp(mark, at, &ctx.deps.metrics);
-        }
+        let metrics = &ctx.deps.metrics;
+        self.tasks
+            .entry(lease)
+            .and_modify(|task| task.timeline.stamp(mark, at, metrics));
     }
 
     fn set_stage(&mut self, lease: kbf_types::LeaseId, stage: Stage) {
