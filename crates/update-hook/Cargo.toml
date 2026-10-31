@@ -1,0 +1,35 @@
+[package]
+name = "update-hook"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The contract between a host updater and the update hook a service ships (docs/design/host-updates.md,
+# sections 3.2 and 9): the five steps and their arguments, the exit codes, the JSON last line, the
+# `--params` table, what the updater runs next after each outcome, and the conformance harness a
+# service uses in its own tests to prove its hook keeps the contract. The crate depends on no
+# crate of this workspace and its name does not say `kbf`: services depend on the contract, not
+# on kbf, and tierstore will leave this repository
+# (crates/kbf-integration-test/tests/layering.rs keeps both true).
+
+[dependencies]
+# `kill(-pgid)` for the step the harness stops at a kill point.
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# The `--params` file is TOML, like the declaration table it is written from.
+toml.workspace = true
+
+# The example hook the harness is proven against (tests/conformance.rs), with its planted
+# defects. A program of the tests, not shipped.
+[[bin]]
+name = "update-hook-example"
+path = "tests/bin/example_hook.rs"
+test = false
+
+[lints]
+workspace = true
