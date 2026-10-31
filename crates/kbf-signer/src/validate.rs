@@ -3,6 +3,7 @@
 
 use kbf_ca::{Policy, PublicKey};
 use kbf_types::HostRole;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use x509_parser::oid_registry::{
     OID_SIG_ECDSA_WITH_SHA256, OID_X509_EXT_AUTHORITY_KEY_IDENTIFIER,
     OID_X509_EXT_BASIC_CONSTRAINTS, OID_X509_EXT_EXTENDED_KEY_USAGE, OID_X509_EXT_KEY_USAGE,
@@ -22,7 +23,8 @@ pub enum Route {
     /// A certificate for an enrolled node: role `storage` or `daemon`, or a host's `updater`
     /// (with its host-role URI).
     Node,
-    /// The frontend's own certificate: role `frontend`.
+    /// The frontend's own certificates: role `frontend`, and the job scheduler's server
+    /// certificate, role `scheduler`.
     Frontend,
 }
 
@@ -123,7 +125,7 @@ pub fn check_tbs(
         return Err(Refusal::KeyUsage);
     }
 
-    // Names: any number of DNS names and addresses, and the role URI (an updater's two).
+    // Names: DNS names and addresses, and the role URI (an updater's two).
     let san = t
         .subject_alternative_name()
         .ok()
@@ -131,11 +133,16 @@ pub fn check_tbs(
         .ok_or(Refusal::Name)?;
     let mut uris = Vec::new();
     let mut names = 0usize;
+    let mut undialable_address = false;
     for name in &san.value.general_names {
         match name {
             GeneralName::URI(uri) => uris.push(*uri),
             GeneralName::DNSName(dns) if dns.contains('*') => return Err(Refusal::Name),
-            GeneralName::DNSName(_) | GeneralName::IPAddress(_) => names += 1,
+            GeneralName::DNSName(_) => names += 1,
+            GeneralName::IPAddress(bytes) => {
+                names += 1;
+                undialable_address |= undialable(bytes);
+            }
             _ => return Err(Refusal::Name),
         }
     }
@@ -149,15 +156,14 @@ pub fn check_tbs(
         [a, b] if route == Route::Node => updater_role(a, b)?,
         _ => return Err(Refusal::RoleUri),
     };
-    // Whether the role serves (serverAuth), and whether it names only its node.
-    let (server, single) = match (route, role) {
-        (Route::Node, "storage") | (Route::Frontend, "frontend") => (true, false),
-        (Route::Node, "daemon" | "updater") => (false, true),
+    let shape = match (route, role) {
+        (Route::Node, "storage") | (Route::Frontend, "frontend") => Shape::BOTH,
+        (Route::Node, "daemon" | "updater") => Shape::CLIENT_OF_ONE,
+        (Route::Frontend, "scheduler") => Shape::SCHEDULER,
         (Route::Node, "frontend") => return Err(Refusal::FrontendRole),
         _ => return Err(Refusal::RoleUri),
     };
-    let allowed = if single { 1..=1 } else { 1..=usize::MAX };
-    if !allowed.contains(&names) {
+    if !shape.names.contains(&names) || (shape.refuse_undialable && undialable_address) {
         return Err(Refusal::Name);
     }
 
@@ -173,10 +179,68 @@ pub fn check_tbs(
         + usize::from(eku.time_stamping)
         + usize::from(eku.ocsp_signing)
         + eku.other.len();
-    if (eku.server_auth, eku.client_auth, others) != (server, true, 0) {
+    if (eku.server_auth, eku.client_auth, others) != (shape.server, shape.client, 0) {
         return Err(Refusal::ExtendedKeyUsage);
     }
     Ok(())
+}
+
+/// What a role's certificate may be: the usages it carries, how many names it has, and
+/// whether an address that no peer can dial (unspecified or multicast) is refused.
+struct Shape {
+    /// serverAuth is present (and absent when false).
+    server: bool,
+    /// clientAuth is present (and absent when false).
+    client: bool,
+    /// How many DNS names and addresses it names.
+    names: std::ops::RangeInclusive<usize>,
+    /// Refuse an unspecified or multicast address.
+    refuse_undialable: bool,
+}
+
+impl Shape {
+    /// A node that serves and calls peers (`storage`), or the frontend: any names.
+    const BOTH: Shape = Shape {
+        server: true,
+        client: true,
+        names: 1..=usize::MAX,
+        refuse_undialable: false,
+    };
+    /// A client of one node (`daemon`, `updater`): its own name alone.
+    const CLIENT_OF_ONE: Shape = Shape {
+        server: false,
+        client: true,
+        names: 1..=1,
+        refuse_undialable: false,
+    };
+    /// The job scheduler's server certificate: it serves and calls nobody by certificate.
+    const SCHEDULER: Shape = Shape {
+        server: true,
+        client: false,
+        names: 1..=MAX_SCHEDULER_NAMES,
+        refuse_undialable: true,
+    };
+}
+
+/// The most names a scheduler certificate carries.
+const MAX_SCHEDULER_NAMES: usize = 8;
+
+/// Whether the bytes of an `iPAddress` name are an address no peer dials: unspecified or
+/// multicast, in either family; or not an address at all (neither 4 nor 16 bytes).
+fn undialable(bytes: &[u8]) -> bool {
+    match <[u8; 4]>::try_from(bytes) {
+        Ok(v4) => {
+            let a = Ipv4Addr::from(v4);
+            a.is_unspecified() || a.is_multicast()
+        }
+        Err(_) => match <[u8; 16]>::try_from(bytes) {
+            Ok(v6) => {
+                let a = Ipv6Addr::from(v6);
+                a.is_unspecified() || a.is_multicast()
+            }
+            Err(_) => true,
+        },
+    }
 }
 
 /// The role of a certificate with two URIs: `updater`, with exactly one `host-role` URI

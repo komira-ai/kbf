@@ -22,9 +22,12 @@
 //!   lifetime over the policy, only the key usage, extended key usage and extensions of
 //!   the table. A host's `updater` certificate is a node-route shape: exactly two URIs, the
 //!   role and one `urn:kbf:host-role:<name>` that names a host role (and that no other role
-//!   may carry), one DNS name, clientAuth only. The coordinator's certificate is not
-//!   signed here on either route. A frontend that is fully compromised can therefore mint only well-formed
-//!   node certificates.
+//!   may carry), one DNS name, clientAuth only. The frontend route also signs the job
+//!   scheduler's server certificate: role `scheduler` (no other role URI), serverAuth only,
+//!   one to eight DNS names or addresses, none a wildcard, unspecified or multicast. The
+//!   coordinator's certificate is not signed here on either route. A frontend that is fully
+//!   compromised can therefore mint only well-formed node certificates (and a scheduler
+//!   server certificate, which no node accepts as a peer).
 //! - [`SocketSigner`] is the frontend's side: a [`kbf_ca::Signer`] whose custody is
 //!   [`kbf_ca::Custody::External`], so `Authority::require_external` accepts it.
 //!

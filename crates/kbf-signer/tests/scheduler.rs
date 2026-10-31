@@ -5,11 +5,12 @@
 
 mod support;
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, OnceLock};
 
 use kbf_ca::{Authority, CaError, Policy};
 use kbf_signer::{Refusal, Route, SocketSigner, check_tbs};
-use rcgen::{ExtendedKeyUsagePurpose, SanType};
+use rcgen::{CustomExtension, ExtendedKeyUsagePurpose, SanType};
 use support::{Ca, Evil, NOW, dns, euid, fresh_key, ip, make_ca, role_uri, serve};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
@@ -116,9 +117,19 @@ fn a_scheduler_names_one_to_eight_dns_names_and_addresses() {
         name,
         "wildcard"
     );
-    for addr in ["0.0.0.0", "::", "224.0.0.1", "239.255.255.255", "ff02::1"] {
+    let undialable: [IpAddr; 5] = [
+        Ipv4Addr::UNSPECIFIED.into(),
+        Ipv6Addr::UNSPECIFIED.into(),
+        Ipv4Addr::new(224, 0, 0, 1).into(),
+        Ipv4Addr::new(239, 255, 255, 255).into(),
+        Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1).into(),
+    ];
+    for addr in undialable {
         assert_eq!(
-            scheduler(with_names(vec![ip("192.0.2.7"), ip(addr)]), |_| {}),
+            scheduler(
+                with_names(vec![ip("192.0.2.7"), SanType::IpAddress(addr)]),
+                |_| {}
+            ),
             name,
             "{addr}"
         );
@@ -131,6 +142,24 @@ fn a_scheduler_names_one_to_eight_dns_names_and_addresses() {
         Err(Refusal::RoleUri),
         "a second URI"
     );
+}
+
+// Catches: an iPAddress name that is no address (five bytes) read as a usable name: a
+// structure the farm's builder never makes, written by hand as a subjectAltName.
+#[test]
+fn a_scheduler_name_that_is_no_address_is_refused() {
+    let uri = b"urn:kbf:role:scheduler";
+    let mut inner = vec![0x86, u8::try_from(uri.len()).expect("short")];
+    inner.extend_from_slice(uri);
+    inner.extend_from_slice(&[0x87, 5, 1, 2, 3, 4, 5]);
+    let mut san = vec![0x30, u8::try_from(inner.len()).expect("short")];
+    san.extend(inner);
+    let result = scheduler(vec![], |e| {
+        e.params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(&[2, 5, 29, 17], san));
+    });
+    assert_eq!(result, Err(Refusal::Name));
 }
 
 // Catches: a certificate with two roles, or the scheduler's role beside the frontend's:

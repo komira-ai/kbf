@@ -531,8 +531,8 @@ impl Authority {
         now: i64,
         entropy: &mut dyn Entropy,
     ) -> Result<Issued, CaError> {
-        let _ = (names, key, now, entropy);
-        Err(CaError::NoNames)
+        let ekus = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        self.issue_named("scheduler", names, ekus, key, now, entropy)
     }
 
     /// A host's updater certificate (role `updater`, clientAuth only: it dials the

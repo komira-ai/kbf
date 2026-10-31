@@ -388,9 +388,11 @@ The frontend then builds the certificate (via `kbf-ca`, section 6.2):
 | `notAfter` | `notBefore` + lifetime; default **7 days** [owner], 1 hour to 30 days by flag |
 | basicConstraints | `CA:FALSE`, critical |
 | keyUsage | `digitalSignature` (critical) |
-| extendedKeyUsage | `daemon`, `updater`: clientAuth. `storage`: serverAuth and clientAuth |
+| extendedKeyUsage | `daemon`, `updater`: clientAuth. `storage`: serverAuth and clientAuth. `scheduler` (the job scheduler's own certificate, frontend route of the signer only, never from a token): serverAuth alone |
 | subjectAltName | URI `urn:kbf:role:<role>` (exactly one); `daemon`: DNS = node id (exactly one); `storage`: DNS = node id, and DNS or IP = the advertise host if different; `updater`: DNS = node id (exactly one), and a second URI `urn:kbf:host-role:<frontend|storage|daemon|mac-daemon>` (exactly one, on no other role) |
 | authorityKeyIdentifier, subjectKeyIdentifier | set |
+
+The `scheduler` role is the one exception to the names above: one to eight DNS names or addresses, none a wildcard, unspecified or multicast (either address family), and exactly the one role URI `urn:kbf:role:scheduler`. It is a different role from `frontend` so the scheduler's key can never pass as the frontend (or the reverse); the signer's lifetime policy applies to it unchanged.
 
 These are the rows `kbf-deploy linux verify-cert` checks today **[F]**; the CA's tests run `verify-cert`'s checks over every issued certificate so the two cannot drift.
 
