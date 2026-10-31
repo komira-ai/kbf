@@ -209,6 +209,9 @@ fn only_failures_of_the_desired_version_count() {
     ran_it.version = version("2.0");
     fleet.record(id("d3"), HostRole::DAEMON, ran_it.clone(), secs(2_000));
     fleet.record(id("d4"), HostRole::DAEMON, ran_it, secs(2_000));
+    let mut done = beat("1.0");
+    done.last_update = Some(UpdateResult::new(version("2.0"), Outcome::Succeeded));
+    fleet.record(id("d5"), HostRole::DAEMON, done, secs(2_000));
     assert_eq!(plan_for(&def(AUTO), &good(), &fleet), vec![]);
 }
 
@@ -384,6 +387,16 @@ fn a_plan_over_a_marked_desired_version_only_sets_the_desired_state() {
     assert_eq!(
         plan_for(&def(AUTO), &marked, &farm(6, 2, phase, class)),
         vec![Change::RollBackTo(version("1.0"))]
+    );
+    // The mark was the decision: the hosts need not still say so.
+    assert_eq!(
+        plan_for(&def(AUTO), &marked, &farm(6, 0, phase, class)),
+        vec![Change::RollBackTo(version("1.0"))]
+    );
+    // A manual service, whose version somebody marked, is left to its operator.
+    assert_eq!(
+        plan_for(&def(""), &marked, &farm(6, 2, phase, class)),
+        vec![]
     );
 }
 
@@ -864,4 +877,59 @@ async fn min_version_clears_last_good_on_the_coordinator() {
     round(&rig, 2_030, &two_failed());
     assert_eq!(wanted(&rig), version("2.0"));
     assert!(marks(&rig).bad.is_empty());
+}
+
+/// An ops store whose file cannot be written, holding `state`.
+fn unwritable(state: OpsState) -> OpsStore {
+    OpsStore::with_writer(
+        state,
+        Box::new(|_| {
+            Err(OpsError::Io(StoreError::Io {
+                path: "ops".into(),
+                source: std::io::Error::other("disk full"),
+            }))
+        }),
+    )
+}
+
+/// A rig over `ops` instead of the files of its directory.
+async fn rig_over(test: &str, extra: &str, body: &str, ops: OpsStore) -> Rig {
+    let mut rig = Rig::new(test);
+    rig.coordinator = Rig::start(&rig.dir, &rig.clock)
+        .with_services(services_of(extra))
+        .with_ops(ops);
+    rig.set(body).await;
+    rig.at(2_000);
+    rig
+}
+
+/// A last good version that cannot be written is not recorded, and the heartbeats are
+/// answered all the same.
+#[tokio::test]
+async fn a_last_good_that_cannot_be_written_is_not_recorded() {
+    let rig = rig_over("rb-lg-fails", AUTO, ONE, unwritable(OpsState::default())).await;
+    let replies = round(&rig, 2_000, &[]);
+    assert!(replies.iter().all(|r| *r == ServiceReply::Nothing));
+    assert_eq!(marks(&rig).last_good, None);
+}
+
+/// A mark that cannot be written stays raised in memory, so the version is not ordered, and
+/// the desired state is left for the next beat: the rollback is not made on the beat whose
+/// write failed.
+#[tokio::test]
+async fn a_mark_that_cannot_be_written_stays_raised_and_the_rollback_waits() {
+    let mut state = OpsState::default();
+    state.services.insert(KBF.to_owned(), good());
+    let rig = rig_over("rb-mark-fails", AUTO, ONE, unwritable(state)).await;
+    rig.set(TWO).await;
+    round(&rig, 2_000, &[]);
+    let (phase, class) = release();
+    let heartbeat = |host: &str, b: Heartbeat| rig.coordinator.heartbeat(who(host), b).reply;
+    rig.at(2_015);
+    heartbeat("d1", failure(phase, class, "2.0"));
+    heartbeat("d2", failure(phase, class, "2.0"));
+    assert_eq!(marks(&rig).bad, vec![version("2.0")], "raised in memory");
+    assert_eq!(wanted(&rig), version("2.0"), "not rolled back on that beat");
+    assert_eq!(heartbeat("d3", beat("1.0")), ServiceReply::Nothing);
+    assert_eq!(wanted(&rig), version("1.0"), "the next beat finishes it");
 }
