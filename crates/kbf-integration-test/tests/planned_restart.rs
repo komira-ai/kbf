@@ -142,8 +142,10 @@ fn node_with_a_lease(farm: &Farm) -> Option<usize> {
 /// The twelve actions are uploaded, and the uploads joined, before the victim is chosen and
 /// its member marked `planned_down`: the restart moves the storage map's generation (the
 /// node re-enters it catching up, then active), and an upload that spans those moves can be
-/// refused `STALE_MAP`, which is a property of uploads under a moving map and not of a
-/// planned restart. Only the Execute streams are in flight during the restart.
+/// refused `STALE_MAP`: the frontend's ByteStream `Write` passes that answer through
+/// without a map refetch (#2157). A real planned restart can cause it, so uploads during a
+/// restart are deliberately not exercised here until #2157 lands; its own tests cover the
+/// retry. Only the Execute streams are in flight during the restart.
 ///
 /// What it proves is the contract of a planned restart as an operator lives it: every
 /// `Execute` still completes with exit code 0 (none cached, each output the action wrote),
