@@ -18,6 +18,7 @@ use crate::testutil::{OPERATOR, Rig, ci_token};
 
 /// How long a body has in the tests that are not about patience.
 mod services;
+mod status;
 
 const PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
