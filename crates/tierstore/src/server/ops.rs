@@ -11,12 +11,12 @@ use hyper::http::request::Parts;
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::journal::is_reserved;
-use crate::{ByteRange, Error, Meta};
+use crate::{ByteRange, Error, Meta, ReadBody};
 
 use super::Server;
 use super::handover::hand_over;
 use super::presign::Grant;
-use super::reply::{Answer, S3Error, answer, xml_answer};
+use super::reply::{Answer, S3Error, answer, streamed_answer, xml_answer};
 use super::request::{BoxError, Check, Query, Reader, Refused, Target, header, pieces};
 use super::time::http_date;
 use super::xml::{self, Listing, UploadListing};
@@ -103,6 +103,21 @@ fn object_headers(meta: &Meta) -> Vec<(&'static str, String)> {
         ("accept-ranges", "bytes".to_owned()),
         ("content-type", "application/octet-stream".to_owned()),
     ]
+}
+
+/// The answer to a read of `len` bytes: the chunks of `body` as they come, which end the
+/// connection without a clean end unless they are exactly `len` bytes. (A body of no bytes is
+/// held whole: there is nothing to stream.)
+fn read_answer(
+    status: StatusCode,
+    headers: &[(&'static str, String)],
+    len: u64,
+    body: ReadBody,
+) -> Answer {
+    if len == 0 {
+        return answer(status, headers, Bytes::new());
+    }
+    streamed_answer(status, headers, len, body)
 }
 
 /// A client may not name the keys the proxy keeps for itself.
@@ -293,15 +308,20 @@ impl Server {
         let mut headers = object_headers(&meta);
         match window(header(&parts.headers, "range"), meta.size) {
             Window::Whole => {
-                let body = self.backend.get(key, None).await?;
-                Ok(answer(StatusCode::OK, &headers, body))
+                let body = self.backend.get_stream(key, None).await?;
+                Ok(read_answer(StatusCode::OK, &headers, meta.size, body))
             }
             Window::Part { start, len } => {
                 let range = ByteRange::new(start, len);
-                let body = self.backend.get(key, Some(range)).await?;
+                let body = self.backend.get_stream(key, Some(range)).await?;
                 let (last, size) = (start + len - 1, meta.size);
                 headers.push(("content-range", format!("bytes {start}-{last}/{size}")));
-                Ok(answer(StatusCode::PARTIAL_CONTENT, &headers, body))
+                Ok(read_answer(
+                    StatusCode::PARTIAL_CONTENT,
+                    &headers,
+                    len,
+                    body,
+                ))
             }
             Window::Unsatisfiable => Err(S3Error::invalid_range(meta.size)),
         }
