@@ -319,6 +319,8 @@ fn seen_tells_a_plain_cordon_from_a_drain() {
         ("draining", Seen::Draining),
         ("drained", Seen::Draining),
         ("drain_paused", Seen::Draining),
+        // A state this build does not know is not the updater's drain.
+        ("quarantined", Seen::Cordoned),
     ] {
         let server = answering(200, &node(state, &[]));
         let got = adapter(&server, "nd-seen").seen_if_known(&dm(Some("dm-node")));

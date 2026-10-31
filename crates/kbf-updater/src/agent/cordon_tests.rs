@@ -443,6 +443,35 @@ fn observing_a_node_an_operator_cordoned_drops_the_mark() {
     assert_eq!(marks(&dir), 0);
 }
 
+/// A marked node whose placement cannot be read is not given back unseen: the read fails, the
+/// roll fails with the node left drained, and nothing is uncordoned.
+///
+/// Catches: a failed read taken for "ours", which let an undrain that worked lift a cordon the
+/// agent could not tell was its own.
+#[test]
+fn a_marked_node_that_cannot_be_read_is_not_given_back() {
+    let dir = scratch("cordon-unreadable");
+    let h = host(Role::Daemon);
+    let node = ServingNode::new();
+    let w = cordon(&node, &dir);
+    w.drain(&h, None).unwrap();
+    *node.read_error.lock().unwrap() = Some(PortError::other("503"));
+    assert!(w.placed(&h).is_err());
+    assert_eq!(marks(&dir), 1, "the mark stays");
+
+    let rig = Rig::new("cordon-unreadable-roll");
+    *rig.node.leases.lock().unwrap() = 1;
+    assert_eq!(
+        rig.run(VB, Some(Duration::from_secs(10))),
+        result(VB, Outcome::Failed)
+    );
+    *rig.node.read_error.lock().unwrap() = Some(PortError::other("503"));
+    *rig.node.leases.lock().unwrap() = 0;
+    assert_eq!(rig.run(VB, None), result(VB, Outcome::Failed));
+    assert!(!rig.node.is_serving(), "left drained");
+    assert_eq!(marks(&rig.dir), 1);
+}
+
 /// `observe` (what the agent calls when it looks at its node outside an update) drops the mark
 /// of a node read serving, keeps that of one still cordoned, and does nothing with no mark.
 ///

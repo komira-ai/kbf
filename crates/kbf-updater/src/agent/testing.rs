@@ -327,6 +327,8 @@ pub struct ServingNode {
     /// Out of placement as a plain cordon (no drain), which only an operator makes: the
     /// updater's own cordon is always a drain.
     pub cordoned: Arc<Mutex<bool>>,
+    /// Reads of the node fail with this.
+    pub read_error: Arc<Mutex<Option<PortError>>>,
 }
 
 impl ServingNode {
@@ -341,6 +343,7 @@ impl ServingNode {
             seen_at_drain: Arc::default(),
             absent: Arc::default(),
             cordoned: Arc::default(),
+            read_error: Arc::default(),
         }
     }
 
@@ -374,6 +377,9 @@ impl ServingNode {
 
 impl Drain for ServingNode {
     fn placed(&self, _host: &Host) -> Result<Placed, PortError> {
+        if let Some(e) = lock(&self.read_error).clone() {
+            return Err(e);
+        }
         Ok(if self.is_serving() {
             Placed::In
         } else {
