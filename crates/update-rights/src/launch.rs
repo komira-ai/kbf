@@ -33,6 +33,7 @@ use std::process::{Command, Stdio};
 use update_hook::{Invocation, Outcome, Report, Step};
 
 use crate::declaration::{Declaration, Refusal};
+use crate::load::recheck_targets;
 
 /// Where `systemd-run` is.
 pub const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
@@ -160,6 +161,7 @@ pub fn command(launch: &Launch<'_>) -> Result<SystemdRun, LaunchError> {
             .into_iter()
             .map(|property| OsString::from(format!("--property={property}"))),
     );
+    args.push("--setenv=HARNESS_SECRET".into());
     args.push("--".into());
     args.push(launch.release.join(&declaration.binary).into());
     args.extend(declaration.hook_args.iter().map(OsString::from));
@@ -204,6 +206,7 @@ impl Spawner for Systemd {
     fn run(&self, command: &SystemdRun) -> io::Result<Finished> {
         let output = Command::new(&self.program)
             .args(&command.args)
+            .env_clear()
             .stdin(Stdio::null())
             .output()?;
         Ok(Finished {
@@ -240,6 +243,7 @@ pub enum RunError {
 /// contract, a signal and a timeout are failures) and the last line of standard output as a
 /// [`Report`] (a missing or malformed line is `{}`).
 pub fn run_step(spawner: &dyn Spawner, launch: &Launch<'_>) -> Result<StepRun, RunError> {
+    recheck_targets(launch.declaration, launch.root_hook).map_err(RunError::Recheck)?;
     let command = command(launch)?;
     let finished = spawner.run(&command)?;
     Ok(StepRun {
