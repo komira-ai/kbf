@@ -46,8 +46,8 @@ use crate::outputs::{Blobs, OutputLimits, collect_outputs};
 use crate::pack::{MAX_LARGE_BYTES, PackError, build, build_extra};
 use crate::plan::{Limits, plan};
 use crate::put::{
-    PutError, Sleeper, ThreadSleeper, agent, agent_with_plain_http, put, put_reader, put_retrying,
-    tls_config,
+    Jitter, PutError, RandomJitter, Sleeper, ThreadSleeper, agent, agent_with_plain_http, put,
+    put_reader, put_retrying, tls_config,
 };
 use crate::put_urls::PutUrls;
 use crate::run::{Run, RunError, output_paths, run};
@@ -102,9 +102,15 @@ pub const EXIT_NO_CONFINE: u8 = 15;
 ///
 /// # Storing the pack
 ///
-/// The pack is PUT once, create-only. A 503 (no room in the store) is retried up to three times
-/// after the wait its `Retry-After` names, at most 30 s; every other answer is final, and a 412
-/// means the key exists (a re-attempt of the task gets a new key).
+/// The pack is PUT once, create-only. A 503 (no room in the store, or the store is taking as
+/// many puts as it may) is retried up to seven times, each after a wait of between half and one
+/// and a half times the `Retry-After` it names (taken as at most 30 s; 2 s when it names none),
+/// the task's own waits adding up to at most 60 s (the store may also hold each refused attempt
+/// for its put-permit wait before answering, so the last attempt can begin about 165 s after the
+/// first; the URL's lifetime, the run's wall limit plus the frontend's slack, bounds it). A
+/// connection that broke after it was made is retried the same way. Every other answer is final
+/// (429, 500, 502 and 504 deliberately not retried), and a 412 means the key exists (a
+/// re-attempt of the task gets a new key).
 #[derive(Parser)]
 #[command(
     name = "kbf-task",
@@ -295,11 +301,13 @@ pub trait PackSink {
 }
 
 /// The real sink: the create-only PUT ([`put`], [`put_reader`]) to the presigned URL of each
-/// slot, repeated after a 503 only ([`put_retrying`]), with `sleeper` between the attempts.
+/// slot, repeated after a 503 only ([`put_retrying`]), with `sleeper` between the attempts and
+/// `jitter` moving each wait.
 pub struct HttpSink {
     agent: ureq::Agent,
     urls: PutUrls,
     sleeper: Arc<dyn Sleeper>,
+    jitter: Arc<dyn Jitter>,
 }
 
 impl PackSink for HttpSink {
@@ -315,6 +323,7 @@ impl PackSink for HttpSink {
         put_retrying(
             || put(&self.agent, &self.urls.packs[slot], body),
             self.sleeper.as_ref(),
+            self.jitter.as_ref(),
         )
     }
 
@@ -344,6 +353,7 @@ impl PackSink for HttpSink {
                 })
             },
             self.sleeper.as_ref(),
+            self.jitter.as_ref(),
         )
     }
 }
@@ -751,6 +761,7 @@ fn connect_with_roots(cli: &Cli) -> Result<(HttpBlobSource, HttpSink, Vec<Vec<u8
         },
         urls,
         sleeper: Arc::new(ThreadSleeper),
+        jitter: Arc::new(RandomJitter),
     };
     Ok((source, sink, roots))
 }

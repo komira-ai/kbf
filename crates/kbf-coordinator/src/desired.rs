@@ -21,7 +21,10 @@ use std::sync::{Mutex, PoisonError};
 
 use kbf_types::HostRole;
 use kbf_updater::version::Version;
+
 use serde::{Deserialize, Serialize};
+
+use crate::services::Services;
 
 /// The service every host runs today, and the only one a desired state may name unless a
 /// services file defines more.
@@ -30,76 +33,141 @@ pub const KBF: &str = "kbf";
 /// The most any count may be: a typo's order of magnitude, not a plan.
 pub const MAX_COUNT: u32 = 10_000;
 
-/// How many hosts of each kind may be updating at once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MaxUpdating {
-    /// Frontends (default 1).
-    #[serde(default = "one")]
-    pub frontend: u32,
-    /// Storage hosts (default 1).
-    #[serde(default = "one")]
-    pub storage: u32,
-    /// Daemon-only Linux hosts (default 2).
-    #[serde(default = "two")]
-    pub daemon: u32,
-    /// Macs that run a daemon (default 2).
-    #[serde(default = "two", rename = "mac-daemon")]
-    pub mac_daemon: u32,
+/// The host roles of the farm, in the order every output lists them (frontend, storage, daemon,
+/// Mac). A role of a service that is not one of these is listed after them, by name.
+pub const LEGACY_ROLES: [&str; 4] = ["frontend", "storage", "daemon", "mac-daemon"];
+
+/// The minimums an earlier build named, in the order it wrote them. `kbf` requires both.
+pub const KBF_MIN_UP: [&str; 2] = ["storage", "frontend"];
+
+/// The four host roles `kbf` names, in the order the status lists them. The services loader
+/// accepts no others.
+#[must_use]
+pub fn kbf_roles() -> [HostRole; 4] {
+    [
+        HostRole::FRONTEND,
+        HostRole::STORAGE,
+        HostRole::DAEMON,
+        HostRole::MAC_DAEMON,
+    ]
 }
 
-const fn one() -> u32 {
-    1
+/// Whether `name` can name a role: the grammar of a host role ([`HostRole`]'s parse), which
+/// is the one place that says.
+#[must_use]
+pub fn is_role_name(name: &str) -> bool {
+    name.parse::<HostRole>().is_ok()
 }
 
-const fn two() -> u32 {
-    2
-}
+/// A number per role name: the limit on hosts updating at once, or the minimum that stays up.
+///
+/// A role the map does not name has the default of the question asked ([`Self::max_updating_of`],
+/// [`Self::min_up_of`]). The defaults are for a role a service definition names: whether a role
+/// is run at all is the definition's to say, never this map's.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct RoleLimits(BTreeMap<String, u32>);
 
-impl Default for MaxUpdating {
-    fn default() -> Self {
-        Self {
-            frontend: one(),
-            storage: one(),
-            daemon: two(),
-            mac_daemon: two(),
-        }
+impl<const N: usize> From<[(&str, u32); N]> for RoleLimits {
+    fn from(pairs: [(&str, u32); N]) -> Self {
+        Self(pairs.map(|(role, n)| (role.to_owned(), n)).into())
     }
 }
 
-impl MaxUpdating {
-    /// The limit for hosts of `role`.
+impl RoleLimits {
+    /// The limits of a state that says none: one frontend and one storage host, two daemons
+    /// and two Macs at a time.
     #[must_use]
-    pub const fn of(&self, role: HostRole) -> u32 {
-        match role {
-            HostRole::Frontend => self.frontend,
-            HostRole::Storage => self.storage,
-            HostRole::Daemon => self.daemon,
-            HostRole::MacDaemon => self.mac_daemon,
-        }
+    pub fn max_updating_default() -> Self {
+        Self(
+            LEGACY_ROLES
+                .into_iter()
+                .map(|role| (role.to_owned(), default_max_updating(role)))
+                .collect(),
+        )
     }
-}
 
-/// How many hosts must be up (live, healthy, not updating) while another updates.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MinUp {
-    /// Storage hosts. The operator picks it so that every blob stays readable.
-    pub storage: u32,
-    /// Frontends. At least one is always required, whatever this says.
-    pub frontend: u32,
-}
-
-impl MinUp {
-    /// The minimum for hosts of `role`: the other roles have none.
+    /// What the map says of `role`, if it names it.
     #[must_use]
-    pub const fn of(&self, role: HostRole) -> u32 {
-        match role {
-            HostRole::Storage => self.storage,
-            HostRole::Frontend => self.frontend,
-            HostRole::Daemon | HostRole::MacDaemon => 0,
-        }
+    pub fn get(&self, role: &str) -> Option<u32> {
+        self.0.get(role).copied()
     }
+
+    /// Sets the number of `role`.
+    pub fn set(&mut self, role: &str, n: u32) {
+        self.0.insert(role.to_owned(), n);
+    }
+
+    /// How many hosts of `role` may update at once: the map's number, else the default (2 for
+    /// the daemon roles, 1 for any other).
+    #[must_use]
+    pub fn max_updating_of(&self, role: &str) -> u32 {
+        self.get(role).unwrap_or_else(|| default_max_updating(role))
+    }
+
+    /// How many hosts of `role` must stay up: the map's number, else none.
+    #[must_use]
+    pub fn min_up_of(&self, role: &str) -> u32 {
+        self.get(role).unwrap_or(0)
+    }
+
+    /// The entries: the names in `legacy` first, in that order, then the others by name.
+    fn ordered<'a>(&'a self, legacy: &[&'a str]) -> Vec<(&'a str, u32)> {
+        let first = legacy
+            .iter()
+            .filter_map(|role| self.get(role).map(|n| (*role, n)));
+        let rest = self
+            .0
+            .iter()
+            .filter(|(role, _)| !legacy.contains(&role.as_str()))
+            .map(|(role, n)| (role.as_str(), *n));
+        first.chain(rest).collect()
+    }
+
+    /// Drops the limits for roles that are neither in `legacy` nor accepted by `keep`, and
+    /// returns their names.
+    fn retain(&mut self, legacy: &[&str], keep: impl Fn(&str) -> bool) -> Vec<String> {
+        let mut dropped = Vec::new();
+        self.0.retain(|role, _| {
+            let kept = legacy.contains(&role.as_str()) || keep(role);
+            if !kept {
+                dropped.push(role.clone());
+            }
+            kept
+        });
+        dropped
+    }
+}
+
+const fn default_max_updating(role: &str) -> u32 {
+    match role.as_bytes() {
+        b"daemon" | b"mac-daemon" => 2,
+        _ => 1,
+    }
+}
+
+/// The limits in the order the old struct wrote them.
+fn write_max_updating<S: serde::Serializer>(limits: &RoleLimits, s: S) -> Result<S::Ok, S::Error> {
+    s.collect_map(limits.ordered(&LEGACY_ROLES))
+}
+
+/// The minimums in the order the old struct wrote them. The old struct requires `storage` and
+/// `frontend`, so a state that names neither writes them as 0, which is what none means.
+fn write_min_up<S: serde::Serializer>(limits: &RoleLimits, s: S) -> Result<S::Ok, S::Error> {
+    let mut written = limits.clone();
+    for role in KBF_MIN_UP {
+        written.0.entry(role.to_owned()).or_insert(0);
+    }
+    s.collect_map(written.ordered(&KBF_MIN_UP))
+}
+
+/// The limits as written, with the four legacy roles filled in with their defaults.
+fn read_max_updating<'de, D: serde::Deserializer<'de>>(d: D) -> Result<RoleLimits, D::Error> {
+    let mut limits = RoleLimits::deserialize(d)?;
+    for (role, n) in RoleLimits::max_updating_default().0 {
+        limits.0.entry(role).or_insert(n);
+    }
+    Ok(limits)
 }
 
 /// The desired state.
@@ -109,10 +177,15 @@ pub struct Desired {
     /// The version every host should run. An older one than the hosts run is a rollback.
     pub version: Version,
     /// The per-role limit on hosts updating at once.
-    #[serde(default)]
-    pub max_updating: MaxUpdating,
+    #[serde(
+        default = "RoleLimits::max_updating_default",
+        deserialize_with = "read_max_updating",
+        serialize_with = "write_max_updating"
+    )]
+    pub max_updating: RoleLimits,
     /// The minimum number of hosts that stay up.
-    pub min_up: MinUp,
+    #[serde(serialize_with = "write_min_up")]
+    pub min_up: RoleLimits,
 }
 
 /// Why a desired state is refused.
@@ -129,35 +202,58 @@ pub enum DesiredError {
     UnknownService,
 }
 
+/// The minimums `kbf` requires a state to name.
+fn kbf_required() -> Vec<String> {
+    KBF_MIN_UP.map(str::to_owned).into()
+}
+
 impl Desired {
-    /// The desired state in `bytes`.
+    /// The desired state of `kbf` in `bytes`: the single state of the state file.
     ///
     /// # Errors
     /// [`DesiredError`].
     pub fn parse(bytes: &[u8]) -> Result<Self, DesiredError> {
         let desired: Self =
             serde_json::from_slice(bytes).map_err(|e| DesiredError::Malformed(e.to_string()))?;
-        desired.checked()?;
+        desired.checked(&kbf_required())?;
         Ok(desired)
     }
 
     /// The service and desired state of a `POST /v1/desired` body: the state's fields and an
-    /// optional `service` (absent means [`KBF`]).
+    /// optional `service` (absent means [`KBF`]), for a coordinator that manages `kbf` alone.
     ///
     /// # Errors
     /// [`DesiredError`]; [`DesiredError::UnknownService`] for any service but [`KBF`].
     pub fn parse_request(bytes: &[u8]) -> Result<(String, Self), DesiredError> {
-        Self::parse_request_for(bytes, |name| name == KBF)
+        Self::parse_request_for(bytes, &Services::default())
     }
 
-    /// Like [`Self::parse_request`], for the services `known` accepts.
+    /// Like [`Self::parse_request`], for the services of `services`.
+    ///
+    /// The body is the one every service gets: a service takes the `min_up` keys its definition
+    /// requires (`kbf`: `storage` and `frontend`) and may omit the map when it requires none. A
+    /// limit for a role the service does not have is dropped, so that one body does for all
+    /// services; the four legacy roles' keys stay as sent, the form earlier builds read.
     ///
     /// # Errors
-    /// [`DesiredError`]; [`DesiredError::UnknownService`] for a service `known` refuses.
+    /// [`DesiredError`]; [`DesiredError::UnknownService`] for a service `services` lacks.
     pub fn parse_request_for(
         bytes: &[u8],
-        known: impl Fn(&str) -> bool,
+        services: &Services,
     ) -> Result<(String, Self), DesiredError> {
+        Self::parse_request_noting(bytes, services).map(|(service, desired, _)| (service, desired))
+    }
+
+    /// [`Self::parse_request_for`], also returning the names of the roles whose limits were
+    /// dropped because the service does not have them (sorted, each once), which it logs as a
+    /// warning.
+    ///
+    /// # Errors
+    /// [`DesiredError`], as [`Self::parse_request_for`].
+    pub fn parse_request_noting(
+        bytes: &[u8],
+        services: &Services,
+    ) -> Result<(String, Self, Vec<String>), DesiredError> {
         let malformed = |e: serde_json::Error| DesiredError::Malformed(e.to_string());
         let mut fields: serde_json::Map<String, serde_json::Value> =
             serde_json::from_slice(bytes).map_err(malformed)?;
@@ -166,25 +262,64 @@ impl Desired {
             Some(serde_json::Value::String(name)) => name,
             Some(_) => return Err(DesiredError::Malformed("service is not text".to_owned())),
         };
-        if !known(&service) {
-            return Err(DesiredError::UnknownService);
+        let def = services.get(&service).ok_or(DesiredError::UnknownService)?;
+        if def.require_min_up.is_empty() && !fields.contains_key("min_up") {
+            fields.insert("min_up".to_owned(), serde_json::json!({}));
         }
-        let desired: Self = serde_json::from_value(fields.into()).map_err(malformed)?;
-        desired.checked()?;
-        Ok((service, desired))
+        let mut desired: Self = serde_json::from_value(fields.into()).map_err(malformed)?;
+        desired.checked(&def.require_min_up)?;
+        desired.refuse_unnamed(services)?;
+        let has = |role: &str| def.roles.contains_key(role);
+        let mut dropped = desired.max_updating.retain(&LEGACY_ROLES, has);
+        dropped.extend(desired.min_up.retain(&KBF_MIN_UP, has));
+        dropped.sort();
+        dropped.dedup();
+        if !dropped.is_empty() {
+            tracing::warn!(%service, roles = ?dropped, "dropped limits for roles the service does not have");
+        }
+        Ok((service, desired, dropped))
     }
 
-    fn checked(&self) -> Result<(), DesiredError> {
-        let desired = self;
-        let counts = [
-            desired.max_updating.frontend,
-            desired.max_updating.storage,
-            desired.max_updating.daemon,
-            desired.max_updating.mac_daemon,
-            desired.min_up.storage,
-            desired.min_up.frontend,
+    /// Refuses a limits key that is neither a legacy name nor a role of any service, so that a
+    /// typo is an error and not a limit silently lost; one body still serves every service.
+    fn refuse_unnamed(&self, services: &Services) -> Result<(), DesiredError> {
+        let maps = [
+            ("max_updating", &self.max_updating, &LEGACY_ROLES[..]),
+            ("min_up", &self.min_up, &KBF_MIN_UP[..]),
         ];
-        if counts.iter().any(|&n| n > MAX_COUNT) {
+        for (map, limits, legacy) in maps {
+            let unnamed = limits.0.keys().find(|role| {
+                !legacy.contains(&role.as_str())
+                    && !services.defs().any(|def| def.roles.contains_key(*role))
+            });
+            if let Some(role) = unnamed {
+                return Err(DesiredError::Malformed(format!(
+                    "{map}: {role} is no role of any service"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the state is acceptable: every limit key a role name, every count within
+    /// [`MAX_COUNT`], and every minimum in `require` named.
+    fn checked(&self, require: &[String]) -> Result<(), DesiredError> {
+        let limits = [&self.max_updating, &self.min_up];
+        for role in limits.iter().flat_map(|l| l.0.keys()) {
+            if !is_role_name(role) {
+                return Err(DesiredError::Malformed(format!(
+                    "{role:?} is not a role name"
+                )));
+            }
+        }
+        if let Some(role) = require.iter().find(|r| !self.min_up.0.contains_key(*r)) {
+            return Err(DesiredError::Malformed(format!("min_up lacks {role}")));
+        }
+        if limits
+            .iter()
+            .flat_map(|l| l.0.values())
+            .any(|&n| n > MAX_COUNT)
+        {
             return Err(DesiredError::Count);
         }
         Ok(())
@@ -194,7 +329,7 @@ impl Desired {
 /// The state file in its map form.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Services {
+struct MapFile {
     services: BTreeMap<String, Desired>,
 }
 
@@ -205,10 +340,15 @@ fn parse_file(bytes: &[u8]) -> Result<BTreeMap<String, Desired>, DesiredError> {
     if !is_map {
         return Ok(BTreeMap::from([(KBF.to_owned(), Desired::parse(bytes)?)]));
     }
-    let file: Services =
+    let file: MapFile =
         serde_json::from_slice(bytes).map_err(|e| DesiredError::Malformed(e.to_string()))?;
-    for desired in file.services.values() {
-        desired.checked()?;
+    for (name, desired) in &file.services {
+        let require = if name == KBF {
+            kbf_required()
+        } else {
+            Vec::new()
+        };
+        desired.checked(&require)?;
     }
     Ok(file.services)
 }
@@ -317,7 +457,7 @@ impl DesiredStore {
         // Only `kbf` is the single state of earlier builds, which refuse the map form.
         let encoded = match services.iter().collect::<Vec<_>>().as_slice() {
             [(name, only)] if name.as_str() == KBF => serde_json::to_vec_pretty(only),
-            _ => serde_json::to_vec_pretty(&Services {
+            _ => serde_json::to_vec_pretty(&MapFile {
                 services: services.clone(),
             }),
         };

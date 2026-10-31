@@ -32,6 +32,41 @@ before it makes either: one that is on the store and not in `provision-state.jso
 directory is someone else's, and the verb stops before changing anything. The account's secret is
 given to `mc` on its standard input, never in its arguments.
 
+## Pre-made buckets: `provision --premade`
+
+MinIO cannot confine admin user, policy or quota actions to a name prefix: its policy engine
+ignores `Resource` for admin actions, so a key allowed to create a policy and attach it to a user
+can grant itself anything. So the admin work is split between two keys.
+
+| who | holds | does |
+|---|---|---|
+| the held script `admin_mint.sh --campaign ...`, run by a person with the store's root key | everything | per campaign: the bucket, its 30 GiB quota, the bucket-only policy `<test prefix>tierstore-bench-<role>`, the scoped account and the attachment; and, with `--remove`, the reverse |
+| the key this tool holds (the `admin` file of `ops.json`) | `admin:ServerInfo`, `admin:GetBucketQuota`; `s3:GetBucketLocation`, `s3:ListBucket`, `s3:ListBucketVersions`, `s3:DeleteBucket`, `s3:ForceDeleteBucket` on the campaign's buckets (`<prefix>*`); `s3:DeleteObject` and `s3:DeleteObjectVersion` on their objects (`<prefix>*/*`) | `preflight` (`mc admin info`), `provision --premade`, and the removal of a bucket's objects and the bucket itself |
+
+That key has no `admin:ListUsers`, `admin:CreatePolicy`, `admin:AttachUserOrGroupPolicy`,
+`admin:CreateUser`, `admin:SetBucketQuota` or `s3:CreateBucket`; every command `provision` runs
+without `--premade` needs at least one of them.
+
+`provision --premade` (with or without `--apply`) runs none of `mb`, `quota set`, `admin policy
+create`, `admin user add` and `admin policy attach`, and does not list accounts. For each role of
+the run (`hot`, `cold`) it:
+
+1. checks that the test bucket is there (`mc ls` of that bucket); if it is not, or may not be
+   listed, the verb stops and names the held script;
+2. checks the quota with `mc quota info`: no quota, or one over 30 GiB, stops the verb (a smaller
+   one passes);
+3. with every role's checks passed, runs the two probes: the scoped account (the key pair the run
+   file holds for the role) must list its own bucket, and must be refused a read of the live
+   bucket the ops file names;
+4. writes the bucket and the account to `provision-state.json` with `"premade": true`, so the
+   teardown's guard finds them. The record is written only after the probes pass; the key of a
+   run that made its own has no `premade` field, and a record without it reads as before.
+
+If the scoped account can read a live bucket the verb stops and does not remove it (it holds no
+right to): it says to run `admin_mint.sh --campaign ... --remove` now. The plan and the dry run
+say `premade` on every line, and `provision.json` has mode `apply-premade` or `dry-run-premade`.
+Without `--premade` nothing changes.
+
 ## Commands
 
 ```
@@ -59,14 +94,64 @@ so run each proxied arm once with `pass` as the control.
 
 ## Results
 
-One JSON per cell (`schema_version`, see `result.rs`) and a CSV of raw samples with the git SHA,
-the binary digest, the pass index and a quiet or busy flag on every row.
+One JSON per cell, arm and attempt (`schema_version`, see `result.rs`) and a CSV of raw samples
+with the git SHA, the binary digest, the pass index, a quiet or busy flag and the attempt on every
+row. The newer fields (`cold_state`, `cold_guard`, `provenance.attempt`) are optional on reading:
+a result written without them reads as a first attempt with no cold readings.
+
+## The ops file
+
+The verbs that look at the node (`preflight`, `provision`, `verify-teardown`) and `run` read
+`ops.json` in the result directory. It is private (paths, units, ports, credential files), so it
+is never committed and nothing of it is copied into a result. Shape:
+
+```json
+{
+  "tierstore": {"binary": "...", "sha256": "...", "version": "0.0.37", "plan_flags": ["--hot"]},
+  "live": {"unit": "...", "binary": "...", "port": 9300, "dirs": ["..."]},
+  "test_instance": {"unit": "...", "port": 9301, "dirs": ["..."]},
+  "live_buckets": {"cold": "..."},
+  "admin": {"cold": "/path/to/admin-key.json"},
+  "verifier": {"cold": "/path/to/reader-key.json"},
+  "mc": "/path/to/mc",
+  "node": {"roles": ["instance", "generator"], "link_interface": "..."},
+  "cold_heal_status_file": "/path/to/heal.json",
+  "paper": {"page": "...", "map": "..."}
+}
+```
+
+A credentials file (`admin`, `verifier`) is JSON of `access_key_id` and `secret_access_key`.
+`cold_heal_status_file` is JSON of `percent_done`, kept by the operator. `live_buckets`, `admin`,
+`verifier`, `mc`, `node`, `cold_heal_status_file` and `paper` are optional; `tierstore`, `live`
+(with `dirs`) and `test_instance` are not.
+
+### The live directories
+
+`live.dirs` lists the live tierstore's state and data directories on this node. It is required
+and must not be empty. `run` resolves the result directory, the campaign ledger and the ledger's
+lock file (`FILE.lock`) and each live directory (relative paths made absolute, `..` applied, links
+followed, also a link to something that is not there yet) and refuses, before it creates anything,
+a result directory, ledger or lock that is, contains or lies inside a live directory. `preflight`
+does not check this: it writes `preflight.json` and `before.json` to the result directory, so keep
+that directory clear of the live ones all the same.
+
+## Attempts
+
+`run --attempt N` (N from 1, 1 unless set) names the try of the run. The results of attempt N are
+`<cell>-<arm>-a<N>.json` (an arm with a step suffix is `<cell>-<arm>.ttfb-a<N>.json`), and every
+row of `samples.csv` ends in the attempt (column `attempt`). A run never writes over a result
+file: if a result of one of its arms for its attempt is in the result directory it stops with
+`ResultExists` before it sends one request, and a file that appears while it runs is not replaced
+either (the file is made exclusively). To retry a cell and arm, run it again with the next
+attempt number; every attempt is kept. `report` reads all of them: an arm that has more than one
+attempt, or an attempt other than the first, is shown as `arm (attempt N)`, and its samples are
+joined to its own attempt.
 
 ## Cells
 
 `run --cell NAME [--cell NAME ...] --passes N --in-flight 1,16 --object-bytes 4096,1048576`
 runs the cells in order. Every cell writes under `tierstore-bench/<run id>/` of its test bucket,
-deletes what it wrote, and leaves in the result directory `<cell>-<arm>.json` per arm,
+deletes what it wrote, and leaves in the result directory `<cell>-<arm>-a<N>.json` per arm and attempt,
 `samples.csv` (one row per counted request), `requests.jsonl` (every request the tool sent) and
 the campaign ledger.
 
@@ -80,6 +165,16 @@ file `FILE.lock` (made exclusively, holding the process id) from its start to it
 run on the same ledger is refused with the lock file named. A lock a dead run left is never broken
 by the tool: check that the process is gone and delete the file. The ledger's directory must exist,
 and the ledger must resolve (through links and `..`) to a place outside the result directory.
+
+`run --open-loop on|off` (default `on`) says whether the put cells (`cold-put`, `a1`) add their
+open-loop arms: 19 KiB at 20 puts a second for 600 s, and 1 MiB at 10 a second for 300 s, for every
+path and in healthy runs only. They are about 60% of the bytes of a 1 MiB run (per path, 3,000 puts
+of 1 MiB against the 1,000 of the closed-loop arm, per pass), so a closed-loop-only measurement at
+1 MiB with six passes is `--open-loop off`: the plan is built without them, the ledger is asked to
+admit the plan as built (worst pass, cell total and what is left of the campaign), and that run fits
+the default caps where the same run with the arms does not. The other cells have no open-loop arms
+and ignore the flag. The setting is recorded as `open_loop` in the provenance of every result (a
+result that predates the field was run with the arms on) and the report names it in its header.
 
 Tierstore at v0.0.37 has no cold-only mode (`--hot` is a required flag). So the cold cells label
 their paths in the arm names and the result notes say which they are:
@@ -108,9 +203,69 @@ flags a `run` measures the healthy arms. Every line the switch writes is `MODE t
 falls back to `pass` by itself; the time must be longer than the longest stretch a cell holds one
 mode. The file is replaced atomically.
 
-`run` needs `--run-id`, `--git-sha`, `--campaign-ledger` (see above), and a passed `preflight` in the result directory: its
-`preflight.json` gives the binary digest, versions and hardware that every result carries.
+`run` needs `--run-id`, `--git-sha`, `--campaign-ledger` (see above), the ops file (`ops.json`, see
+above) and a passed `preflight` in the result directory: its `preflight.json` gives the binary
+digest, versions and hardware that every result carries. `--attempt N` is optional (see Attempts).
 
-`report --result-dir DIR` prints one table per cell: per arm and window, requests, failures with
-their time to failure, p50 and p95 with a bootstrap interval, p99 where it may be claimed, the
-slowest, and the rate; labelled as measurements of a test instance on test buckets.
+## The cold store: state before every pass, and the guard
+
+The load gate sees this machine only. Two things look at the cold store itself.
+
+**State.** Preflight reads whether the cold store is healing once; a campaign of hours cannot
+carry that reading. Before every pass of every arm `run` reads it again, through what preflight
+uses and read-only: `mc admin info` of the cold role (its drives and whether any reports healing)
+and the status file of the ops file (`cold_heal_status_file`, `percent_done`). It is healing if a
+drive says so or the status file is under 100. A reading that cannot be made (neither source
+answers, or the status file is not one) stops the run, and so does a reading that takes longer
+than `--cold-state-timeout-secs` (30): the `mc admin info` that has not answered by then is
+killed (that command only) and the run stops with `cold state: unreadable`, the status file
+notwithstanding. A run with no `cold` role reads nothing.
+Each reading is stamped into the `cold_state` array of the result of the arm, one entry per pass:
+
+```json
+"cold_state": [{"pass": 0, "healing": false, "percent_done": 100.0,
+                "drives": [{"id": "d-1a2b3c4d", "state": "ok", "healing": false}],
+                "read_unix_ms": 1790000000000}]
+```
+
+`drives` is the set the admin info listed, each drive named by the first eight hex digits of the
+SHA-256 of its endpoint, so a change of the set shows without a host or path in the result.
+`report` labels an arm `v1` only if the cold store was read before every one of its passes (the
+warm-up included) and was healing in none; otherwise it prints `not labelled v1` with the passes
+that saw it healing, or the passes that have no reading. `v1` here means only that: the figures
+are still those of a test instance on test buckets.
+
+**Guard.** The tool keeps the harness's own requests to the cold role over a sliding window and
+stops the run, as the load gate does (the pass is cut and marked busy, the run ends, the results
+so far are written), when either holds:
+
+| flag | default | trips when |
+|---|---|---|
+| `--cold-abort-p99-ms` | 2000 | the p99 latency of the window is above it, milliseconds |
+| `--cold-abort-error-share` | 0.05 | the share of the window's requests that failed or timed out is above it (0 to 1) |
+| `--cold-abort-window-secs` | 60 | the length of the window, seconds |
+
+Equal to a limit is within it. The window counts one entry per request to the cold role: every
+step of the `cold` role is one, whatever its label (cell B's `.cold-direct` reads of the cold
+bucket are counted), except the `.ttfb` step of a streamed read, which is the time to the first
+byte of a request already counted and is not a second one. A window of fewer than 20 requests is not judged; with 20 to
+99 requests in it the p99 is the slowest request, so one slow request can stop the run. That is
+deliberate: it protects the farm. A failed request counts in the share and, with the time it took
+to fail, in the p99. Only requests the harness sent to the cold role are counted (steps of the
+`cold` role), and not the arms that put the cold store in a fault on purpose (the arms through the
+fault proxy other than `proxy-pass`), whose requests are meant to be slow or to fail.
+
+The guard does not watch the instance arms: requests to the instance are not counted, and the
+instance's own copy traffic to the cold store is throttled only by the held `COPY_PARALLEL` site
+key.
+
+The trip is in the
+result, in the pass it cut (`cold_guard`: `metric` `p99_ms` or `error_share`, `value`, `limit`,
+`requests` in the window, `window_secs`), and `report` lists it under the table. The flags are
+accepted by every verb that takes the shared flags, like the load gate's.
+
+`report --result-dir DIR` prints one table per cell: per arm, attempt and window, requests, failures
+with their time to failure, p50 and p95 with a bootstrap interval, p99 where it may be claimed, the
+slowest, and the rate; labelled as measurements of a test instance on test buckets. Under each
+table: the cell's notes, the `v1` label or the reason it is refused for each arm, the passes cut
+by the load gate or the cold store guard, and the notes of the passes.

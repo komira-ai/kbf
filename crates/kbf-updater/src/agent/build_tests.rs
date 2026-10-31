@@ -69,11 +69,11 @@ impl Rig {
 /// is a flag; a file that is not a certificate, holds none, or is no updater's says what is wrong.
 #[test]
 fn the_identity_comes_from_the_certificate() {
-    let rig = Rig::new("bd-identity", HostRole::MacDaemon);
+    let rig = Rig::new("bd-identity", HostRole::MAC_DAEMON);
     let who = identity_of_files(&rig.config.files).unwrap();
     assert_eq!(
         (who.node_id.to_string(), who.role),
-        ("n1".to_owned(), HostRole::MacDaemon)
+        ("n1".to_owned(), HostRole::MAC_DAEMON)
     );
 
     let missing = TlsFiles {
@@ -128,19 +128,19 @@ fn an_agent_is_built_for_every_kind_of_host() {
         "tests run where kbf has releases"
     );
     for role in [
-        HostRole::Storage,
-        HostRole::Daemon,
-        HostRole::MacDaemon,
-        HostRole::Frontend,
+        HostRole::STORAGE,
+        HostRole::DAEMON,
+        HostRole::MAC_DAEMON,
+        HostRole::FRONTEND,
     ] {
-        let rig = Rig::new("bd-built", role);
+        let rig = Rig::new("bd-built", role.clone());
         let agent = build(&rig.config).unwrap_or_else(|e| panic!("{role}: {e}"));
         let status = agent.status();
         assert_eq!(status.version, Version::parse("0").unwrap());
         assert_eq!(status.health, crate::wire::Health::Unhealthy);
     }
 
-    let mut rig = Rig::new("bd-nofiles", HostRole::Daemon);
+    let mut rig = Rig::new("bd-nofiles", HostRole::DAEMON);
     std::fs::write(&rig.config.files.ca, "").unwrap();
     assert!(
         build(&rig.config)
@@ -149,7 +149,7 @@ fn an_agent_is_built_for_every_kind_of_host() {
             .contains("holds no certificate")
     );
 
-    let mut rig2 = Rig::new("bd-notoken", HostRole::Daemon);
+    let mut rig2 = Rig::new("bd-notoken", HostRole::DAEMON);
     rig2.config.node_api.as_mut().unwrap().token_file = rig2.dir.join("absent");
     assert!(build(&rig2.config).err().unwrap().contains("--token-file"));
     rig.config.files.cert = rig.dir.join("absent.pem");
@@ -161,7 +161,7 @@ fn an_agent_is_built_for_every_kind_of_host() {
 /// does and is not taken for done.
 #[test]
 fn every_host_is_drained_through_the_frontend() {
-    let rig = Rig::new("bd-drain", HostRole::Daemon);
+    let rig = Rig::new("bd-drain", HostRole::DAEMON);
     let node = rig.config.node_api.clone().unwrap();
     let api = OperatorApi::new(node.addr, node.token_file)
         .unwrap()
@@ -182,7 +182,7 @@ fn every_host_is_drained_through_the_frontend() {
 /// exit 1 with the reason.
 #[test]
 fn the_process_runs_until_stopped_and_says_why_it_cannot_start() {
-    let rig = Rig::new("bd-run", HostRole::Daemon);
+    let rig = Rig::new("bd-run", HostRole::DAEMON);
     let (code, text) = run_config(&rig.config, |stop| {
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
@@ -191,7 +191,7 @@ fn the_process_runs_until_stopped_and_says_why_it_cannot_start() {
     });
     assert_eq!((code, text.as_str()), (0, ""));
 
-    let mut broken = Rig::new("bd-run-broken", HostRole::Frontend);
+    let mut broken = Rig::new("bd-run-broken", HostRole::FRONTEND);
     broken.config.files.cert = broken.dir.join("absent.pem");
     let (code, text) = run_config(&broken.config, |_| unreachable!("not started"));
     assert_eq!(code, 1);
@@ -204,7 +204,7 @@ fn the_process_runs_until_stopped_and_says_why_it_cannot_start() {
 /// `run_agent` hands the caller the handle before it runs.
 #[test]
 fn the_caller_gets_the_stop_handle_before_the_agent_runs() {
-    let rig = Rig::new("bd-ready", HostRole::Storage);
+    let rig = Rig::new("bd-ready", HostRole::STORAGE);
     let agent = build(&rig.config).unwrap();
     let stop_seen = Arc::new(std::sync::Mutex::new(None::<Stop>));
     let slot = Arc::clone(&stop_seen);
@@ -226,7 +226,7 @@ fn the_clock_is_unix_seconds() {
 /// anything is fetched, and drains nothing.
 #[test]
 fn an_agent_without_the_operator_credential_refuses_every_update() {
-    let mut rig = Rig::new("bd-nocred", HostRole::Daemon);
+    let mut rig = Rig::new("bd-nocred", HostRole::DAEMON);
     rig.config.node_api = None;
     assert!(build(&rig.config).is_ok());
     let h = host(Role::Daemon);
@@ -290,7 +290,7 @@ fn enrolled_in(dir: &TestDir, pki: &Pki, role: HostRole) -> std::path::PathBuf {
 fn an_agent_with_a_state_directory_renews_what_it_was_enrolled_with() {
     let dir = TestDir::under(std::env::temp_dir(), "bd-state");
     let pki = Pki::new();
-    let state = enrolled_in(&dir, &pki, HostRole::Daemon);
+    let state = enrolled_in(&dir, &pki, HostRole::DAEMON);
     let store = kbf_enroll::store::Store::unopened(&state);
     let config = Config {
         coordinator: Endpoint::parse("localhost:1").unwrap(),
@@ -334,7 +334,7 @@ fn an_agent_with_a_state_directory_renews_what_it_was_enrolled_with() {
 /// the daemon's.
 #[test]
 fn a_frontend_hosts_agent_drains_a_node_only_when_the_host_runs_a_daemon() {
-    let rig = Rig::new("bd-fe-ports", HostRole::Frontend);
+    let rig = Rig::new("bd-fe-ports", HostRole::FRONTEND);
     let local = Arc::new(SocketLocal::new(
         &rig.config.helper_socket,
         Limits::default(),
@@ -361,8 +361,8 @@ fn a_frontend_hosts_agent_drains_a_node_only_when_the_host_runs_a_daemon() {
     let (drain, _) = frontend_ports(&bare, &identity, &local).unwrap();
     assert!(drain.drain(&h, Some(Duration::from_secs(1))).is_err());
 
-    for role in [HostRole::Storage, HostRole::Daemon, HostRole::MacDaemon] {
-        let mut other = Rig::new("bd-fe-flag", role);
+    for role in [HostRole::STORAGE, HostRole::DAEMON, HostRole::MAC_DAEMON] {
+        let mut other = Rig::new("bd-fe-flag", role.clone());
         other.config.daemon_node = Some("d1".to_owned());
         let err = build(&other.config).err().unwrap();
         assert!(err.contains("--daemon-node"), "{role}: {err}");
@@ -375,7 +375,7 @@ fn a_frontend_hosts_agent_drains_a_node_only_when_the_host_runs_a_daemon() {
 /// URL's.
 #[test]
 fn a_services_ports_follow_its_settings() {
-    let rig = Rig::new("bd-service-ports", HostRole::Daemon);
+    let rig = Rig::new("bd-service-ports", HostRole::DAEMON);
     let identity = identity_of_files(&rig.config.files).unwrap();
     let h = host(Role::Daemon);
     let target = Version::parse("0.1.7+gbbbbbbbbbbbb-3").unwrap();
@@ -446,7 +446,7 @@ fn a_services_ports_follow_its_settings() {
 /// the directory the placed key is in.
 #[test]
 fn the_cordon_marks_go_where_the_flags_say() {
-    let mut rig = Rig::new("bd-cordon", HostRole::Daemon);
+    let mut rig = Rig::new("bd-cordon", HostRole::DAEMON);
     assert_eq!(
         cordon_dir(&rig.config),
         rig.config.files.key.parent().unwrap()
@@ -463,7 +463,7 @@ fn the_cordon_marks_go_where_the_flags_say() {
 /// Catches: every drain refused at the first update, with nothing at start to say why.
 #[test]
 fn a_cordon_directory_the_agent_cannot_write_stops_the_build_naming_the_flag() {
-    let mut rig = Rig::new("bd-cordon-ro", HostRole::Daemon);
+    let mut rig = Rig::new("bd-cordon-ro", HostRole::DAEMON);
     rig.config.cordon_dir = Some(rig.dir.join("missing"));
     let local = Arc::new(SocketLocal::new(
         &rig.config.helper_socket,
@@ -474,4 +474,18 @@ fn a_cordon_directory_the_agent_cannot_write_stops_the_build_naming_the_flag() {
         .err()
         .expect("refused");
     assert!(why.contains("--cordon-dir"), "{why}");
+}
+
+/// Catches: a role the agent has no duties for being built into an agent.
+#[test]
+fn a_role_the_agent_has_no_duties_for_is_refused() {
+    let cache: HostRole = "cache".parse().unwrap();
+    assert_eq!(
+        super::build::kind_of(&cache).unwrap_err(),
+        "cache is a host role this agent has no duties for"
+    );
+    assert_eq!(
+        super::build::kind_of(&HostRole::MAC_DAEMON),
+        Ok(Role::MacDaemon)
+    );
 }

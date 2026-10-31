@@ -21,7 +21,7 @@ use crate::frontend::{StoreGrantFlags, command, parse};
 use crate::test_dir::scratch_dir;
 
 const ID: &str = "locate-grant";
-const SECRET: &str = "locate-grant-secret-0123456789";
+const SECRET: &str = "locate-grant-secret-0123456789abcdef";
 const URL: &str = "https://store.farm.test:9000";
 const BUCKET: &str = "tiers";
 
@@ -123,9 +123,9 @@ async fn the_start_reads_the_grant_key_as_the_other_secret_files_are_read() {
         "{why}"
     );
     for bad in [
-        r#"{"access_key_id": "locate-grant", "secret_access_key": "locate-grant-secret-0123456789", "x": "y"}"#.to_owned(),
+        r#"{"access_key_id": "locate-grant", "secret_access_key": "locate-grant-secret-0123456789abcdef", "x": "y"}"#.to_owned(),
         r#"{"access_key_id": "locate-grant", "secret_access_key": ""}"#.to_owned(),
-        r#"{"access_key_id": "", "secret_access_key": "locate-grant-secret-0123456789"}"#
+        r#"{"access_key_id": "", "secret_access_key": "locate-grant-secret-0123456789abcdef"}"#
             .to_owned(),
         r#"{"access_key_id": "locate-grant"}"#.to_owned(),
         ID.to_owned(),

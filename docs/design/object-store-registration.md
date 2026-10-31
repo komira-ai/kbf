@@ -75,7 +75,7 @@ Related: [operator-verbs.md](operator-verbs.md) (every operator verb and its rou
   `crates/kbf-cli/src/node.rs`]**. Section 8 says what becomes of them.
 - **The store flag today.** A storage node is given `--cold-store`; `S3Store` refuses an
   `https` endpoint (`TLS is not built yet; use http`) **[F:
-  `crates/kbf-objstore/src/s3/mod.rs`]**.
+  `komira-ai/tierstore:crates/objstore-s3/src/s3/mod.rs`]**.
 - **Registration precedes the cache open.** With `--frontend`, the node binds its listener and
   registers before the cache opens, so the cache writes as the registration's member and boot
   **[F: `crates/kbf-server/src/storage_node.rs`, `start_storage`]**. The cold store is opened

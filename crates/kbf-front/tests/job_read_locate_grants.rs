@@ -29,7 +29,7 @@ use locate_common::*;
 const BUCKET: &str = "tiers";
 const STORE: &str = "http://store.farm.test:9000";
 const KEY_ID: &str = "locate-grant";
-const SECRET: &str = "locate-grant-secret-0123456789";
+const SECRET: &str = "locate-grant-secret-0123456789abcdef";
 /// The time the rig's grants are checked at, in unix seconds (see `locate_common::rig`).
 const NOW: u64 = 100;
 const OBJECT: &[u8] = b"an object of the store";

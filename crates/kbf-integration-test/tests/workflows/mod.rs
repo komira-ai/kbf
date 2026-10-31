@@ -671,7 +671,7 @@ impl Lint<'_> {
     /// A job may narrow its token to `read` or `none` scopes; it may not widen it, but
     /// for [`SIGNING_SCOPES`] set to `write` in a job whose `if:` (`condition`) is
     /// exactly [`SIGNING_PUSH_ONLY`], [`RELEASE_SCOPES`] set to `write` in one whose
-    /// `if:` is exactly [`RELEASE_PUSH_ONLY`], and [`ISSUE_SCOPES`] in one whose `if:`
+    /// `if:` is exactly [`RELEASE_PUSH_ONLY`], [`ISSUE_SCOPES`] in one whose `if:`
     /// is exactly [`ISSUES_MAIN_ONLY`]. Scope names and levels are compared
     /// exactly, so another spelling is refused (the safe side).
     fn job_permissions(&mut self, p: &Node, condition: Option<&str>) {

@@ -171,7 +171,7 @@ impl Reader {
             latency_us: read.ttfb.map_or(0, crate::cells::engine::micros),
             ..full.clone()
         }
-        .labelled(".ttfb");
+        .second_quantity_of_request(".ttfb");
         Ok(if read.ttfb.is_some() && full.ok {
             vec![full, first]
         } else {
@@ -323,6 +323,9 @@ fn arm(
 ) -> Arm {
     let seen = Arc::new(AtomicU64::new(0));
     let before_set = reader.set.clone();
+    let faulted = fault
+        .as_ref()
+        .is_some_and(|(mode, _)| *mode != FaultMode::Pass);
     let (before_fault, after_fault) = (fault.clone(), fault.map(|(_, switch)| switch));
     let (before_seen, after_seen) = (seen.clone(), seen);
     Arm {
@@ -371,6 +374,7 @@ fn arm(
                 )
             }
         })),
+        faulted,
         notes,
     }
 }
@@ -437,6 +441,7 @@ mod tests {
             passes: 2,
             in_flight: in_flight.to_vec(),
             object_bytes: sizes.to_vec(),
+            open_loop: true,
         }
     }
 
