@@ -21,7 +21,7 @@ const RESULT: &str = r#"{"schema_version":1,"cell":"cold-put","arm":"direct","st
 fn setup(name: &str) -> TestDir {
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), name);
     std::fs::create_dir(dir.path().join("results")).unwrap();
-    std::fs::write(dir.path().join("results/cold-put-direct.json"), RESULT).unwrap();
+    std::fs::write(dir.path().join("results/cold-put-direct-a1.json"), RESULT).unwrap();
     std::fs::write(dir.path().join("paper.html"), PAPER).unwrap();
     std::fs::write(dir.path().join("cells.json"), MAPPING).unwrap();
     dir
@@ -59,7 +59,7 @@ fn fill_writes_out_and_leaves_the_paper_alone() {
     );
     let filled = std::fs::read_to_string(&out).unwrap();
     assert!(filled.contains(
-        "<b data-cell=\"put\" data-source=\"cold-put-direct.json#p50\" data-label=\"farm\">2.50 ms</b>"
+        "<b data-cell=\"put\" data-source=\"cold-put-direct-a1.json#p50\" data-label=\"farm\">2.50 ms</b>"
     ), "{filled}");
     assert!(filled.contains("<i data-cell=\"gone\">TBD</i>"), "{filled}");
 }
@@ -109,7 +109,7 @@ fn contradictory_flags_are_refused_and_write_nothing() {
 fn check_exits_2_and_lists_when_a_source_is_gone() {
     let dir = setup("fill-paper-check");
     assert!(fill_paper(dir.path(), &["--in-place"]).status.success());
-    std::fs::remove_file(dir.path().join("results/cold-put-direct.json")).unwrap();
+    std::fs::remove_file(dir.path().join("results/cold-put-direct-a1.json")).unwrap();
     let run = fill_paper(dir.path(), &["--check"]);
     assert_eq!(run.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&run.stderr);
@@ -159,6 +159,12 @@ fn results_load_from_a_directory() {
     std::fs::write(results_dir.join("cold-put-wrong.json"), RESULT).unwrap();
     let err = Results::load(&results_dir).unwrap_err();
     assert!(err.to_string().contains("named for another"), "{err}");
+    std::fs::remove_file(results_dir.join("cold-put-wrong.json")).unwrap();
+    // The name of a file written before attempts existed does not say its attempt: refused.
+    std::fs::write(results_dir.join("cold-put-direct.json"), RESULT).unwrap();
+    let err = Results::load(&results_dir).unwrap_err();
+    assert!(err.to_string().contains("named for another"), "{err}");
+    std::fs::remove_file(results_dir.join("cold-put-direct.json")).unwrap();
     let missing = Results::load(&dir.path().join("none")).unwrap_err();
     assert!(matches!(missing, FillError::Io { .. }));
 }

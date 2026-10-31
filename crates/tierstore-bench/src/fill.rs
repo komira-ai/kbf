@@ -22,8 +22,11 @@
 //! - `label` overrides the data label; without it an arm naming `instance` is `test instance`
 //!   and any other arm is `farm`.
 //!
-//! The figures: the passes that count are those that are not the warm-up and were not aborted by
-//! the load gate. `p50`, `p95` and `max` take the median of the per-pass value (`max`: the
+//! The figures: the passes that count are those that are not the warm-up, were not aborted by
+//! the load gate or the cold store guard, and were not taken while the cold store was healing
+//! (the reading before the pass says so). A result file is one attempt
+//! (`<cell>-<arm>-a<N>.json`): when an arm has several, the latest attempt that gives a figure
+//! is used, and `data-source` names its file. `p50`, `p95` and `max` take the median of the per-pass value (`max`: the
 //! largest). `p99` takes the median of the quiet passes, and only when those passes made 1,000
 //! requests between them; otherwise the metric is unavailable, the next alternative is tried,
 //! and with none left the element keeps its text and gets a `data-note` saying why.
@@ -36,6 +39,7 @@ use clap::Args;
 use serde::Deserialize;
 
 use crate::cells::CellId;
+use crate::cells::engine::result_name;
 use crate::result::{CellResult, PassResult, Window};
 
 /// Requests the quiet passes must have made together before a p99 is quoted.
@@ -84,7 +88,7 @@ pub struct FillArgs {
     /// The mapping from placeholder ids to cells and metrics (JSON).
     #[arg(long, value_name = "FILE")]
     pub cells: PathBuf,
-    /// The directory of `<cell>-<arm>.json` results.
+    /// The directory of `<cell>-<arm>-a<N>.json` results.
     #[arg(long, value_name = "DIR")]
     pub result_dir: PathBuf,
     /// Where to write the filled paper.
@@ -460,7 +464,7 @@ pub struct Results {
 }
 
 impl Results {
-    /// Reads every `<cell>-<arm>.json` of `dir`; other files are not results and are skipped.
+    /// Reads every `<cell>-<arm>-a<N>.json` of `dir`; other files are not results and are skipped.
     ///
     /// # Errors
     /// [`FillError::Io`] if the directory or a result cannot be read; [`FillError::Result`] if
@@ -489,10 +493,10 @@ impl Results {
                     file: name.clone(),
                     reason: e.to_string(),
                 })?;
-            if name != format!("{}-{}.json", result.cell.as_str(), result.arm) {
+            if name != result_name(result.cell, &result.arm, result.provenance.attempt) {
                 return Err(FillError::Result {
                     file: name,
-                    reason: "named for another cell or arm than it holds".to_owned(),
+                    reason: "named for another cell, arm or attempt than it holds".to_owned(),
                 });
             }
             files.insert(name, result);
@@ -500,34 +504,52 @@ impl Results {
         Ok(Results { files })
     }
 
-    /// Builds a set from parsed results, named `<cell>-<arm>.json`.
+    /// Builds a set from parsed results, named `<cell>-<arm>-a<N>.json`.
     #[must_use]
     pub fn from_results(results: impl IntoIterator<Item = CellResult>) -> Results {
         Results {
             files: results
                 .into_iter()
-                .map(|r| (format!("{}-{}.json", r.cell.as_str(), r.arm), r))
+                .map(|r| (result_name(r.cell, &r.arm, r.provenance.attempt), r))
                 .collect(),
         }
     }
 
-    fn find(&self, cell: CellId, arm: &str) -> Option<(&str, &CellResult)> {
-        let name = format!("{}-{arm}.json", cell.as_str());
-        self.files
-            .get_key_value(&name)
+    /// The attempts of `arm` of `cell`, the latest first.
+    fn attempts(&self, cell: CellId, arm: &str) -> Vec<(&str, &CellResult)> {
+        let mut found: Vec<(&str, &CellResult)> = self
+            .files
+            .iter()
+            .filter(|(_, r)| r.cell == cell && r.arm == arm)
             .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        found.sort_by_key(|(_, r)| std::cmp::Reverse(r.provenance.attempt));
+        found
     }
 }
 
 /// The value of `metric` in `result`, in base units; `Err` says why there is none.
 fn measure(result: &CellResult, metric: Metric) -> Result<f64, String> {
+    let healing: BTreeSet<u32> = result
+        .cold_state
+        .iter()
+        .filter(|r| r.state.healing)
+        .map(|r| r.pass)
+        .collect();
     let counted: Vec<&PassResult> = result
         .passes
         .iter()
-        .filter(|p| !p.discarded && p.gate_tripped.is_none())
+        .filter(|p| {
+            !p.discarded
+                && p.gate_tripped.is_none()
+                && p.cold_guard.is_none()
+                && !healing.contains(&p.pass)
+        })
         .collect();
     if counted.is_empty() {
-        return Err("no pass counts (warm-up or gate-aborted only)".to_owned());
+        return Err(
+            "no pass counts (warm-up, gate-aborted, cold-guard-aborted or healing only)".to_owned(),
+        );
     }
     let latency = |pick: fn(&PassResult) -> Option<u64>, passes: &[&PassResult]| {
         let mut values: Vec<u64> = passes.iter().filter_map(|p| pick(p)).collect();
@@ -611,24 +633,32 @@ struct Found {
 /// The figure a mapping asks for, or why there is none.
 fn evaluate(mapping: &Mapping, results: &Results) -> Result<Found, String> {
     let arms = mapping.arms();
-    let Some((file, result)) = arms.iter().find_map(|a| results.find(mapping.cell, a)) else {
+    let Some(tries) = arms
+        .iter()
+        .map(|a| results.attempts(mapping.cell, a))
+        .find(|t| !t.is_empty())
+    else {
         return Err(format!(
             "no result for cell {} arm {}",
             mapping.cell.as_str(),
             arms.join(" or ")
         ));
     };
+    let several = tries.len() > 1;
     let mut why = Vec::new();
-    for (metric, unit) in &mapping.metrics {
-        match measure(result, *metric) {
-            Ok(v) => {
-                return Ok(Found {
-                    text: format_value(v / unit.divisor, *unit),
-                    source: format!("{file}#{}", metric.name()),
-                    label: mapping.label(&result.arm),
-                });
+    for (file, result) in tries {
+        for (metric, unit) in &mapping.metrics {
+            match measure(result, *metric) {
+                Ok(v) => {
+                    return Ok(Found {
+                        text: format_value(v / unit.divisor, *unit),
+                        source: format!("{file}#{}", metric.name()),
+                        label: mapping.label(&result.arm),
+                    });
+                }
+                Err(e) if several => why.push(format!("{file}: {e}")),
+                Err(e) => why.push(e),
             }
-            Err(e) => why.push(e),
         }
     }
     Err(why.join("; "))
@@ -1081,6 +1111,7 @@ mod tests {
                 max_us: 90_000 + u64::from(index),
             }),
             gate_tripped: None,
+            cold_guard: None,
         }
     }
 
@@ -1097,6 +1128,7 @@ mod tests {
                 .map(|i| pass(i, Window::Quiet, requests, p99))
                 .collect(),
             notes: Vec::new(),
+            cold_state: Vec::new(),
         }
     }
 
@@ -1130,7 +1162,7 @@ mod tests {
 <p  class='a'>Naïve put <span  data-cell='x'   id=\"k\" >TBD</span>, then <b>bold</b>.</p>\n<p>tail</p>";
         let (out, report) = fill(html, &one("x", "p50", "ms", "instance"), &results()).unwrap();
         let expected = "<!DOCTYPE html>\r\n<!-- <b data-cell=\"x\">keep</b> -->\n<script>var s = '<i data-cell=\"x\">';</script>\n\
-<p  class='a'>Naïve put <span  data-cell='x'   id=\"k\" data-source=\"cold-put-instance.json#p50\" data-label=\"test instance\" >2.00 ms</span>, then <b>bold</b>.</p>\n<p>tail</p>";
+<p  class='a'>Naïve put <span  data-cell='x'   id=\"k\" data-source=\"cold-put-instance-a1.json#p50\" data-label=\"test instance\" >2.00 ms</span>, then <b>bold</b>.</p>\n<p>tail</p>";
         assert_eq!(out, expected);
         assert_eq!(
             report,
@@ -1158,7 +1190,7 @@ mod tests {
         assert_eq!(once, twice);
         assert_eq!(report.filled, 2);
         assert_eq!(report.noted, 1);
-        assert!(once.contains("data-source=\"cold-put-direct.json#p95\""));
+        assert!(once.contains("data-source=\"cold-put-direct-a1.json#p95\""));
         assert!(!once.contains("old.json"));
     }
 
@@ -1200,7 +1232,7 @@ mod tests {
         let (out, report) = fill(html, &one("a", "p99|p95", "ms", "direct"), &few).unwrap();
         assert_eq!(report.filled, 1);
         assert!(
-            out.contains("data-source=\"cold-put-direct.json#p95\""),
+            out.contains("data-source=\"cold-put-direct-a1.json#p95\""),
             "{out}"
         );
         assert!(out.ends_with(">20.0 ms</b>"), "{out}");
@@ -1292,11 +1324,14 @@ mod tests {
         ]);
         let json = r#"[{"id":"a","cell":"cold-put","metric":"requests","unit":"count","condition":"direct","size":4096}]"#;
         let (out, _) = fill("<b data-cell=\"a\"></b>", &mappings(json), &r).unwrap();
-        assert!(out.contains("cold-put-direct-4096.json#requests"), "{out}");
+        assert!(
+            out.contains("cold-put-direct-4096-a1.json#requests"),
+            "{out}"
+        );
         assert!(out.contains("data-label=\"farm\""), "{out}");
         let json = json.replace("\"size\":4096", "\"label\":\"custom\"");
         let (out, _) = fill("<b data-cell=\"a\"></b>", &mappings(&json), &r).unwrap();
-        assert!(out.contains("cold-put-direct.json#requests"), "{out}");
+        assert!(out.contains("cold-put-direct-a1.json#requests"), "{out}");
         assert!(out.contains("data-label=\"custom\""), "{out}");
     }
 
@@ -1311,12 +1346,12 @@ mod tests {
             row("nores", "p50", "ms", "missing-arm"),
             row("few", "p99", "ms", "direct"),
         ));
-        let html = "<i data-cell=\"ok\" data-source=\"cold-put-instance.json#p50\">1</i>\
+        let html = "<i data-cell=\"ok\" data-source=\"cold-put-instance-a1.json#p50\">1</i>\
 <i data-cell=\"nomap\">?</i><i data-cell=\"blk\" data-blocked>?</i>\
 <i data-cell=\"nores\">?</i><i data-cell=\"few\">?</i>\
 <u data-source=\"cold-put-gone.json#p50\">2</u>\
-<u data-cell=\"g2\" data-source=\"cold-put-direct.json#p99\">3</u>\
-<u data-cell=\"g3\" data-source=\"cold-put-direct.json#bogus\">3</u><u data-source=\"nohash\">4</u>";
+<u data-cell=\"g2\" data-source=\"cold-put-direct-a1.json#p99\">3</u>\
+<u data-cell=\"g3\" data-source=\"cold-put-direct-a1.json#bogus\">3</u><u data-source=\"nohash\">4</u>";
         let findings = check(html, &m, &results()).unwrap();
         let text = findings.join("\n");
         assert!(
@@ -1333,7 +1368,7 @@ mod tests {
         assert!(text.contains("<u> at byte"), "{text}");
         assert!(text.contains("no file cold-put-gone.json"), "{text}");
         assert!(
-            text.contains("\"g2\" cites \"cold-put-direct.json#p99\""),
+            text.contains("\"g2\" cites \"cold-put-direct-a1.json#p99\""),
             "{text}"
         );
         assert!(text.contains("unknown metric \"bogus\""), "{text}");
@@ -1386,7 +1421,7 @@ mod tests {
 <?php x ?><![CDATA[ <b data-cell=\"a\"> ]]><textarea><b data-cell=\"a\"></textarea>";
         let (out, report) = fill(html, &one("a", "max", "ms", "instance"), &results()).unwrap();
         assert_eq!(report.filled, 1);
-        assert!(out.contains("<SPAN DATA-CELL=a hidden data-source=\"cold-put-instance.json#max\" data-label=\"test instance\">90.0 ms</SPAN>"), "{out}");
+        assert!(out.contains("<SPAN DATA-CELL=a hidden data-source=\"cold-put-instance-a1.json#max\" data-label=\"test instance\">90.0 ms</SPAN>"), "{out}");
         assert!(out.ends_with(
             "<P>two</DIV><?php x ?><![CDATA[ <b data-cell=\"a\"> ]]><textarea><b data-cell=\"a\"></textarea>"
         ));
@@ -1469,5 +1504,96 @@ mod tests {
         );
         assert!(measure(&r, Metric::Throughput).is_err());
         assert!(measure(&r, Metric::Max).is_err());
+    }
+
+    fn attempt(n: u32, mut r: CellResult) -> CellResult {
+        r.provenance.attempt = n;
+        r
+    }
+
+    /// Catches a retry read as a second arm, an older attempt winning over a later one, and a
+    /// later attempt with nothing countable hiding a good earlier one.
+    #[test]
+    fn the_latest_attempt_that_gives_a_figure_is_used() {
+        let first = result(CellId::ColdPut, "direct", 100, None);
+        let mut second = result(CellId::ColdPut, "direct", 100, None);
+        for p in &mut second.passes {
+            p.requests = 7;
+        }
+        let both = Results::from_results([first.clone(), attempt(2, second.clone())]);
+        let m = one("a", "requests", "count", "direct");
+        let found = evaluate(&m[0], &both).unwrap();
+        assert_eq!(found.source, "cold-put-direct-a2.json#requests");
+        assert_eq!(found.text, "21");
+
+        // The retry was aborted on every counted pass: the first try's figure stands.
+        for p in &mut second.passes {
+            p.gate_tripped = Some("loadavg_1m".to_owned());
+        }
+        let both = Results::from_results([first, attempt(2, second)]);
+        let found = evaluate(&m[0], &both).unwrap();
+        assert_eq!(found.source, "cold-put-direct-a1.json#requests");
+
+        // With no attempt giving a figure the reason names each file.
+        let mut only = result(CellId::ColdPut, "direct", 100, None);
+        only.passes.truncate(1);
+        let mut only2 = only.clone();
+        only2.provenance.attempt = 2;
+        let none = Results::from_results([only, only2]);
+        let why = evaluate(&m[0], &none).err().unwrap();
+        assert!(
+            why.contains("cold-put-direct-a2.json: no pass counts"),
+            "{why}"
+        );
+        assert!(
+            why.contains("cold-put-direct-a1.json: no pass counts"),
+            "{why}"
+        );
+    }
+
+    /// Catches a pass aborted by the cold store guard, or taken while the cold store was
+    /// healing, counting toward a figure.
+    #[test]
+    fn cold_guard_and_healing_passes_do_not_count() {
+        use crate::result::{ColdState, ColdTrip, PassColdState};
+        let mut r = result(CellId::ColdPut, "direct", 100, None);
+        r.passes[1].cold_guard = Some(ColdTrip {
+            metric: "p99_ms".to_owned(),
+            value: 9.0,
+            limit: 1.0,
+            requests: 50,
+            window_secs: 10,
+        });
+        r.cold_state.push(PassColdState {
+            pass: 2,
+            state: ColdState {
+                healing: true,
+                percent_done: None,
+                drives: Vec::new(),
+                read_unix_ms: 0,
+                source: None,
+            },
+        });
+        // Only pass 3 (p50 3 ms, 100 requests) is left.
+        assert_eq!(measure(&r, Metric::Requests).unwrap(), 100.0);
+        assert_eq!(measure(&r, Metric::P50).unwrap(), 3_000.0);
+        r.passes[3].gate_tripped = Some("loadavg_1m".to_owned());
+        assert!(
+            measure(&r, Metric::P50)
+                .unwrap_err()
+                .contains("no pass counts")
+        );
+    }
+
+    /// Catches a result file read under a name that is not its cell, arm and attempt.
+    #[test]
+    fn a_result_name_carries_the_attempt() {
+        assert_eq!(
+            Results::from_results([attempt(3, result(CellId::ColdPut, "x", 1, None))])
+                .files
+                .keys()
+                .collect::<Vec<_>>(),
+            ["cold-put-x-a3.json"]
+        );
     }
 }
