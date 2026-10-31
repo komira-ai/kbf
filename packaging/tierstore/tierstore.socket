@@ -1,0 +1,27 @@
+# The listening socket of tierstore.service (crates/tierstore, README.md): systemd binds it and
+# keeps it open across restarts of the service, and passes it to the process as descriptor 3. A
+# connection made while the service is stopped, or starting, waits in this socket's queue until
+# the next process accepts it; it is not refused. The process takes the socket by the name below
+# (--listen-from-systemd) and refuses a start in which the socket is not what it was told.
+#
+# An example, not a package: nothing installs or enables it, and like the service it has no
+# [Install] section. Edit the address before use: 192.0.2.10 is a documentation address, and it
+# must be the address of --listen in tierstore.service.
+#
+# The queue holds the connections of a restart. Its length is the kernel's limit for a listening
+# socket (Backlog= is left at systemd's default, net.core.somaxconn); connections beyond it wait
+# in the clients' retransmissions of their SYN, which a restart of seconds does not exhaust.
+#
+# A second socket, for the OCI front (--oci-listen), is a second socket unit, because a unit has
+# one FileDescriptorName=: see README.md.
+[Unit]
+Description=tierstore listening socket (S3 API)
+Documentation=https://github.com/komira-ai/kbf/blob/main/packaging/tierstore/README.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/tierstore/access.key
+
+[Socket]
+ListenStream=192.0.2.10:9000
+# The name the process asks for: tierstore takes the S3 API from the socket named s3.
+FileDescriptorName=s3

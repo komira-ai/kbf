@@ -201,3 +201,48 @@ fn the_unit_is_hardened() {
         assert_eq!(value(&unit, key), want, "{key}");
     }
 }
+
+/// The words of a unit's space-separated list in `key=` lines (`After=a b`, `Requires=c`).
+fn words(unit: &str, key: &str) -> Vec<String> {
+    values(unit, key)
+        .iter()
+        .flat_map(|line| line.split_whitespace().map(str::to_owned))
+        .collect()
+}
+
+/// Asserts that the socket unit and the service agree on every name they share: the service asks
+/// for its sockets from systemd (`--listen-from-systemd`), serves the address that `ListenStream=`
+/// binds, and takes the socket by the name `FileDescriptorName=` gives it (`s3`, the name the
+/// binary looks for); the service requires and follows `tierstore.socket`; the socket is bound
+/// after the network is up and is skipped, like the service, until the access key file exists;
+/// and neither unit installs itself.
+#[test]
+fn the_socket_unit_and_the_service_agree_on_names() {
+    let service = read("tierstore.service");
+    let socket = read("tierstore.socket");
+    let cli = parse(&service);
+    assert!(exec_start(&service).contains(&"--listen-from-systemd".to_owned()));
+    assert_eq!(value(&socket, "ListenStream").parse(), Ok(cli.listen));
+    assert_eq!(value(&socket, "FileDescriptorName"), "s3");
+    assert!(words(&service, "Requires").contains(&"tierstore.socket".to_owned()));
+    assert!(words(&service, "After").contains(&"tierstore.socket".to_owned()));
+    assert!(words(&socket, "After").contains(&"network-online.target".to_owned()));
+    assert_eq!(
+        value(&socket, "ConditionPathExists"),
+        value(&service, "ConditionPathExists")
+    );
+    // Without `Service=` a socket unit starts the service of its own name.
+    assert_eq!(values(&socket, "Service"), Vec::<String>::new());
+    for unit in [&service, &socket] {
+        assert_eq!(unit.lines().filter(|l| l.trim() == "[Install]").count(), 0);
+        for key in ["WantedBy", "RequiredBy", "Alias"] {
+            assert_eq!(values(unit, key), Vec::<String>::new(), "{key}");
+        }
+    }
+    // One socket, one name: the unit passes exactly the sockets the command line asks for (no
+    // `--oci-listen`), so the process is not refused for a socket it has no use for.
+    assert_eq!(values(&socket, "ListenStream").len(), 1);
+    // No load balancer to tell: the old process stops accepting and closes at once.
+    assert_eq!(cli.drain_lb_wait, Duration::ZERO);
+    assert!(cli.oci_listen.is_none());
+}

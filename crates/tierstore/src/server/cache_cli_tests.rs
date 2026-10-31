@@ -15,6 +15,7 @@ use kbf_testkit::dir::TestDir;
 use tokio::sync::oneshot;
 
 use super::Drained;
+use super::activation::Sockets;
 use super::cache_cli::{run_cache, serve_cache, size_of_file_system, unjudged_warning};
 use super::cli::Error;
 use super::cli::{checked, exit_status};
@@ -140,6 +141,7 @@ where
         move |bound| {
             let _ = told.send(bound.s3);
         },
+        Sockets::default(),
     );
     let driving = async {
         // A start that fails never tells its address.
@@ -218,6 +220,7 @@ async fn run_cache_opens_the_upstream_the_file_names() {
         move |bound| {
             let _ = told.send(bound.s3);
         },
+        Sockets::default(),
     );
     let driving = async {
         let store = client(addr.await.unwrap());
@@ -243,7 +246,7 @@ async fn a_build_node_that_cannot_start_exits_with_the_status_of_the_reason() {
     let nothing = |_addr: SocketAddr| async {};
 
     let zero = node.settings("s3_request_timeout = \"0s\"", "");
-    let why = run_cache(&zero, std::future::ready(()), |_| {})
+    let why = run_cache(&zero, std::future::ready(()), |_| {}, Sockets::default())
         .await
         .unwrap_err();
     assert!(why.to_string().contains("--s3-request-timeout"), "{why}");
@@ -313,7 +316,7 @@ async fn a_build_node_that_cannot_start_exits_with_the_status_of_the_reason() {
         .unwrap()
         .into_cache()
         .unwrap();
-    let why = run_cache(&remote, std::future::ready(()), |_| {})
+    let why = run_cache(&remote, std::future::ready(()), |_| {}, Sockets::default())
         .await
         .unwrap_err();
     assert!(why.to_string().contains("credentials"), "{why}");

@@ -171,7 +171,18 @@
 //! sending, and waits until they are closed. Both waits together take
 //! [`ServerConfig::drain_deadline`] at most. `serve` returns, with the number of requests that
 //! the deadline cut: those still running, or still being sent.
+//!
+//! With [`ServerConfig::activated`] (the listening socket is the service manager's, see
+//! [`activation`]) there is no load balancer to tell and no queue of new requests to refuse: a
+//! connection that waits for the next process waits in the socket, not here. The sequence is
+//! then: once the drain begins every answer carries `Connection: close`, so a connection ends
+//! with its next answer; when the server stops accepting it tells every connection to close at
+//! once, not after the requests in flight are done, so an idle connection ends at that moment and
+//! a connection that is answering finishes the answer and ends; and a request that was already on
+//! the wire at that moment is served, with `Connection: close`, not answered 503. The deadline
+//! counts the connections that have not closed by then.
 
+mod activation;
 mod auth;
 mod cache_cli;
 pub mod cli;
@@ -194,6 +205,8 @@ pub mod scoped;
 mod time;
 mod xml;
 
+#[cfg(test)]
+mod activated_drain_tests;
 #[cfg(test)]
 mod auth_tests;
 #[cfg(test)]
@@ -262,7 +275,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::Full;
-use hyper::header::{HeaderName, HeaderValue};
+use hyper::header::{CONNECTION, HeaderName, HeaderValue};
 use hyper::http::request::Parts;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -370,6 +383,10 @@ pub struct ServerConfig {
     /// The counters of the OCI read front, which `GET /metricz` shows; none by default, and then
     /// `/metricz` has no block of it. The binary sets them when it runs the front.
     pub oci_metrics: Option<Arc<oci::OciMetrics>>,
+    /// Whether the listening socket belongs to the service manager (`--listen-from-systemd`):
+    /// the drain then closes connections as described in the module docs and never answers a
+    /// request 503 for the drain. False by default.
+    pub activated: bool,
     /// The time, for the age of a signature and of the usage object.
     pub clock: Arc<dyn Clock>,
     /// The time, for the rate of a request body (`put_min_bytes_per_sec`). It is a clock that
@@ -414,6 +431,7 @@ impl ServerConfig {
             cache_writes: false,
             usage_stale_after: Duration::from_secs(120),
             oci_metrics: None,
+            activated: false,
             clock,
             rate_clock: Arc::new(MonotonicClock::new()),
         }
@@ -613,6 +631,10 @@ impl Server {
         }
         self.phase.store(REFUSING, Ordering::SeqCst);
         drop(incoming);
+        if self.config.activated {
+            // Nothing is accepted from here on, so every connection that exists has subscribed.
+            let _ = self.closing.send_replace(true);
+        }
         self.finish_by_deadline().await
     }
 
@@ -727,6 +749,11 @@ impl Server {
         response
             .headers_mut()
             .insert(name, HeaderValue::from_str(&id).expect("hex digits"));
+        if self.config.activated && self.phase() != SERVING {
+            response
+                .headers_mut()
+                .insert(CONNECTION, HeaderValue::from_static("close"));
+        }
         response
     }
 
@@ -745,7 +772,7 @@ impl Server {
         if let Some(answer) = self.probe(parts).await {
             return Ok(answer);
         }
-        if self.phase() == REFUSING {
+        if self.phase() == REFUSING && !self.config.activated {
             return Err(S3Error::draining());
         }
         let signed = auth::verify(&self.config, parts)?;

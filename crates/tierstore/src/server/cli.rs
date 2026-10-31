@@ -5,8 +5,9 @@
 //! holds the lease in the hot tier, so that any number of these processes may run over the same
 //! tiers. The settings are flags, or one TOML file given with `--config` (see
 //! [`config`](super::config) for the format, and `--print-config`, which prints the file for
-//! the flags given); the process reads no environment variable, and the secret access key is
-//! read from a file, not from the command line or the config file. The file is read into the
+//! the flags given); the process reads no environment variable but, with `--listen-from-systemd`,
+//! the three that a service manager sets to pass it sockets (see [`activation`](super::activation)),
+//! and the secret access key is read from a file, not from the command line or the config file. The file is read into the
 //! same [`Cli`] the flags make.
 //!
 //! The tiers are `memory`, `dir:<path>` and `s3:<bucket>`. A memory tier keeps nothing when the
@@ -82,7 +83,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
 
 use crate::s3::{Capabilities, Credentials, S3Config};
@@ -91,12 +91,13 @@ use crate::{
     ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SystemClock, self_test,
 };
 
+use super::activation::Sockets;
 use super::cache_cli::serve_cache_until_signalled;
 use super::config::{OciFlags, Settings, keys_for_flags};
 use super::config_print::render;
 #[cfg(test)]
 use super::front::read_key;
-use super::front::{InvalidFlags, server_config};
+use super::front::{FrontSettings, InvalidFlags, server_config};
 use super::keys::read_credentials;
 use super::launch::{Launch, Refused, resolve};
 use super::local_cache::LocalTierFailure;
@@ -154,6 +155,18 @@ pub struct Cli {
     /// The address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on.
     #[arg(long)]
     pub listen: SocketAddr,
+    /// Takes the listening sockets from the service manager (systemd socket activation) instead of
+    /// binding `--listen` and `--oci-listen`: the S3 API from the socket named `s3`
+    /// (`FileDescriptorName=s3`) and the OCI front, if there is one, from the one named `oci`. The
+    /// manager keeps the sockets while the process is stopped and started again, so the
+    /// connections made in between wait in the kernel's queue and are accepted by the next process.
+    /// The addresses of the two flags must be those the sockets are bound to. The start is refused
+    /// with status 2 if `LISTEN_PID`, `LISTEN_FDS` and `LISTEN_FDNAMES` (which the manager sets,
+    /// and the only environment variables the process reads) do not pass exactly those sockets
+    /// to this process, or a socket is not a listening TCP socket. Without the flag the three
+    /// variables are ignored.
+    #[arg(long)]
+    pub listen_from_systemd: bool,
     /// The id of this proxy, which names its journal in the hot tier and its lease. Keep it
     /// across restarts, and give each process over the same tiers one of its own.
     #[arg(long)]
@@ -857,6 +870,17 @@ pub async fn run_serving(
     stop: impl Future<Output = ()> + Send + 'static,
     ready: impl FnOnce(Addresses),
 ) -> Result<Drained, Error> {
+    serve_on(cli, stop, ready, Sockets::default()).await
+}
+
+/// [`run_serving`] over the sockets `sockets` holds, which the service manager passed (an
+/// address that is not among them is bound).
+async fn serve_on(
+    cli: &Cli,
+    stop: impl Future<Output = ()> + Send + 'static,
+    ready: impl FnOnce(Addresses),
+    mut sockets: Sockets,
+) -> Result<Drained, Error> {
     let mut built = build(cli)?;
     let (hot, cold) = (built.hot.as_ref(), built.cold.as_ref());
     probe_tiers(cli, hot, cold, cli.backend_check_wait).await?;
@@ -866,10 +890,8 @@ pub async fn run_serving(
     built.server.proxy = Some(Arc::clone(&proxy));
     let oci_backend: Arc<dyn Backend> = proxy.clone();
     let server = Server::new(proxy, built.server);
-    let address = cli.listen;
-    let bound = TcpListener::bind(address).await;
-    let listener = bound.map_err(|why| format!("binding {address}: {why}"))?;
-    let oci = bind_oci(built.oci, oci_backend).await?;
+    let listener = sockets.s3_or_bind(cli.listen).await?;
+    let oci = bind_oci(built.oci, oci_backend, sockets.oci()).await?;
     let oci_addr = oci.as_ref().map(OciListener::local_addr).transpose()?;
     let oci_mode = oci.as_ref().map(OciListener::mode);
     ready(Addresses {
@@ -920,14 +942,17 @@ pub(super) fn cut_note(drained: Drained) -> String {
 pub(super) async fn bind_oci(
     setup: Option<OciSetup>,
     backend: Arc<dyn Backend>,
+    inherited: Option<std::net::TcpListener>,
 ) -> Result<Option<OciListener>, Error> {
     let Some(setup) = setup else {
         return Ok(None);
     };
     let front = Arc::new(OciFront::new(backend, setup.prefix, setup.metrics));
-    let bound = match setup.acceptor {
-        Some(tls) => OciListener::bind(setup.listen, tls, front, setup.limits).await,
-        None => OciListener::bind_plain(setup.listen, front, setup.limits).await,
+    let (listen, limits) = (setup.listen, setup.limits);
+    let bound = match (inherited, setup.acceptor) {
+        (Some(socket), acceptor) => OciListener::adopt(listen, socket, acceptor, front, limits),
+        (None, Some(tls)) => OciListener::bind(listen, tls, front, limits).await,
+        (None, None) => OciListener::bind_plain(listen, front, limits).await,
     };
     Ok(Some(bound?))
 }
@@ -964,7 +989,7 @@ pub(super) fn signals() -> std::io::Result<impl Future<Output = ()> + Send + 'st
     })
 }
 
-async fn serve_until_signalled(cli: Cli) -> Result<(), Error> {
+async fn serve_until_signalled(cli: Cli, sockets: Sockets) -> Result<(), Error> {
     let stop = signals()?;
     let version = env!("CARGO_PKG_VERSION");
     let announce = |bound: Addresses| {
@@ -975,7 +1000,7 @@ async fn serve_until_signalled(cli: Cli) -> Result<(), Error> {
         }
         println!("{line}");
     };
-    run_serving(&cli, stop, announce).await?;
+    serve_on(&cli, stop, announce, sockets).await?;
     Ok(())
 }
 
@@ -1010,8 +1035,10 @@ pub fn main(args: Vec<OsString>) -> ExitCode {
     }
     let started = match settings {
         Settings::Storage(cli) if cli.print_config => return print_config(&cli),
-        Settings::Storage(cli) => blocking(serve_until_signalled(*cli)),
-        Settings::Cache(cache) => blocking(serve_cache_until_signalled(*cache)),
+        Settings::Storage(cli) => sockets_of(&cli.front(), cli.oci_listen)
+            .and_then(|sockets| blocking(serve_until_signalled(*cli, sockets))),
+        Settings::Cache(cache) => sockets_of(&cache.front, cache.oci.listen)
+            .and_then(|sockets| blocking(serve_cache_until_signalled(*cache, sockets))),
     };
     match started {
         Ok(()) => ExitCode::SUCCESS,
@@ -1026,6 +1053,16 @@ pub fn main(args: Vec<OsString>) -> ExitCode {
             eprintln!("tierstore: {text}");
             ExitCode::from(exit_status(&why))
         }
+    }
+}
+
+/// The sockets the service manager passed, if the settings say they are to be taken from it:
+/// none otherwise, and the three variables of the hand-over are left alone. Called once, by `main`.
+fn sockets_of(front: &FrontSettings, oci: Option<SocketAddr>) -> Result<Sockets, Error> {
+    if front.listen_from_systemd {
+        Sockets::from_process(front.listen, oci)
+    } else {
+        Ok(Sockets::default())
     }
 }
 

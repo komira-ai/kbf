@@ -31,6 +31,9 @@ pub(super) fn read_key(path: &Path) -> Result<(String, String), String> {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct FrontSettings {
     pub listen: SocketAddr,
+    /// Whether the listening sockets come from the service manager (see
+    /// [`activation`](super::activation)).
+    pub listen_from_systemd: bool,
     pub proxy_id: String,
     pub bucket: String,
     pub region: String,
@@ -54,6 +57,7 @@ impl Cli {
     pub(super) fn front(&self) -> FrontSettings {
         FrontSettings {
             listen: self.listen,
+            listen_from_systemd: self.listen_from_systemd,
             proxy_id: self.proxy_id.clone(),
             bucket: self.bucket.clone(),
             region: self.region.clone(),
@@ -116,6 +120,7 @@ pub(super) fn server_config(
     server.max_concurrent_puts = front.max_concurrent_puts as usize;
     server.put_min_bytes_per_sec = front.put_min_bytes_per_sec;
     server.put_rate_grace = front.put_rate_grace;
+    server.activated = front.listen_from_systemd;
     server.drain_lb_wait = front.drain_lb_wait;
     server.drain_deadline = front.drain_deadline;
     Ok(server)
