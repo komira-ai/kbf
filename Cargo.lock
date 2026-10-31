@@ -3436,7 +3436,7 @@ dependencies = [
 [[package]]
 name = "objstore-s3"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/tierstore?rev=19083d0c8bd2fb1ce549ac00d2aa692cef0fb793#19083d0c8bd2fb1ce549ac00d2aa692cef0fb793"
+source = "git+https://github.com/komira-ai/tierstore?rev=eb6cfae075b720f2203cd957cffd1ba3b586c999#eb6cfae075b720f2203cd957cffd1ba3b586c999"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -4691,8 +4691,8 @@ dependencies = [
 
 [[package]]
 name = "tierstore"
-version = "0.2.0"
-source = "git+https://github.com/komira-ai/tierstore?rev=19083d0c8bd2fb1ce549ac00d2aa692cef0fb793#19083d0c8bd2fb1ce549ac00d2aa692cef0fb793"
+version = "0.3.0"
+source = "git+https://github.com/komira-ai/tierstore?rev=eb6cfae075b720f2203cd957cffd1ba3b586c999#eb6cfae075b720f2203cd957cffd1ba3b586c999"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
