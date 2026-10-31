@@ -344,6 +344,11 @@ pub fn stderr_sink() -> AuditSink {
     Arc::new(|line| eprintln!("{line}"))
 }
 
+/// A log that writes each line to stderr, where the journal takes it.
+pub fn stderr_log() -> AuditSink {
+    Arc::new(|line| eprintln!("kbf-updater: {line}"))
+}
+
 /// The ports of this build: the real safe-to-stop, health check, clock and ssh installer.
 pub fn build_ports(cfg: &Config) -> Result<Ports, String> {
     build_ports_with_exec(cfg, Arc::new(SystemExec))
@@ -439,6 +444,7 @@ pub fn start_with(
     let store = RollStore::open(&cfg.state_dir)
         .map_err(|e| format!("state dir {}: {e}", cfg.state_dir.display()))?;
     let updater = Updater::open(inventory, store, ports, timing)
+        .map(|u| u.with_log(stderr_log()))
         .map_err(|e| format!("roll record in {}: {e}", cfg.state_dir.display()))?;
     let updater = Arc::new(updater);
     let opened = open(&cfg.listen)?;

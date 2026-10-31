@@ -232,7 +232,12 @@ impl Updater {
 
     /// Say that the roll leaves `host`'s node out, because its cordon is not the roll's.
     fn warn_left_out(&self, host: &Host) {
-        let _ = (&self.log, host);
+        let node = host.node_id.as_deref().unwrap_or(&host.alias);
+        (self.log)(&format!(
+            "warn: {node}: left out after the roll: its cordon is not marked as this roll's (an \
+             operator's, or placement was unknown at the drain); uncordon it by hand if it \
+             should serve"
+        ));
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, State> {
