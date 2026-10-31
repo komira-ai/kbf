@@ -28,7 +28,7 @@ use kbf_types::HostRole;
 use kbf_updater::wire::{MAX_SERVICE_NAME, MAX_SERVICES, is_service_name};
 use serde::Deserialize;
 
-use crate::desired::{Desired, KBF, MAX_COUNT, kbf_roles};
+use crate::desired::{Desired, KBF, KBF_MIN_UP, LEGACY_ROLES, MAX_COUNT, kbf_roles};
 
 /// What one role of a service is allowed and required to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,7 +42,7 @@ pub struct RoleDef {
     pub never_last: bool,
     /// The roles of the same service whose live hosts must all run the desired version, and
     /// not be updating, before a host of this role is ordered.
-    pub after: Vec<HostRole>,
+    pub after: Vec<String>,
 }
 
 impl RoleDef {
@@ -57,18 +57,24 @@ impl RoleDef {
         }
     }
 
-    /// The limit on hosts of the role updating at once under `desired`.
+    /// The limit on hosts of the role `role` updating at once under `desired`: the
+    /// definition's number, else the desired state's, else the default (2 for the daemon
+    /// roles, 1 for any other). A role the service does not name is never ordered, whatever
+    /// these say ([`crate::decide`]).
     #[must_use]
-    pub fn max_updating(&self, role: &HostRole, desired: &Desired) -> usize {
+    pub fn max_updating(&self, role: &str, desired: &Desired) -> usize {
         self.max_updating
-            .unwrap_or_else(|| desired.max_updating.of(role)) as usize
+            .unwrap_or_else(|| desired.max_updating.max_updating_of(role)) as usize
     }
 
     /// How many other hosts of the role must be up while one updates under `desired`.
     #[must_use]
-    pub fn required_up(&self, role: &HostRole, desired: &Desired) -> usize {
+    pub fn required_up(&self, role: &str, desired: &Desired) -> usize {
         let floor = usize::from(self.never_last);
-        (self.min_up.unwrap_or_else(|| desired.min_up.of(role)) as usize).max(floor)
+        (self
+            .min_up
+            .unwrap_or_else(|| desired.min_up.min_up_of(role)) as usize)
+            .max(floor)
     }
 }
 
@@ -78,25 +84,59 @@ pub struct ServiceDef {
     /// Its name.
     pub name: String,
     /// The roles it runs on. A host of any other role is never ordered for it.
-    pub roles: BTreeMap<HostRole, RoleDef>,
+    pub roles: BTreeMap<String, RoleDef>,
     /// The services that must have converged before any host of this one is ordered.
     pub after: Vec<String>,
+    /// The `min_up` keys a desired state of the service must name (`kbf`: storage and
+    /// frontend); a body without one is refused. Any other service may omit `min_up`.
+    pub require_min_up: Vec<String>,
 }
 
 impl ServiceDef {
+    /// A service named `name` with the roles `roles`, each by name.
+    #[cfg(test)]
+    pub(crate) fn new(name: &str, roles: &[(&str, RoleDef)]) -> Self {
+        Self {
+            name: name.to_owned(),
+            roles: roles
+                .iter()
+                .map(|(role, def)| ((*role).to_owned(), def.clone()))
+                .collect(),
+            after: Vec::new(),
+            require_min_up: Vec::new(),
+        }
+    }
+
+    /// The names of its roles: the four legacy roles first, in their order (frontend, storage,
+    /// daemon, mac-daemon), then any other by name. Every list of roles is in this order.
+    #[must_use]
+    pub fn role_names(&self) -> Vec<&str> {
+        let legacy = LEGACY_ROLES
+            .into_iter()
+            .filter(|role| self.roles.contains_key(*role));
+        let rest = self
+            .roles
+            .keys()
+            .map(String::as_str)
+            .filter(|role| !LEGACY_ROLES.contains(role));
+        legacy.chain(rest).collect()
+    }
+
     /// `kbf`: all four roles, limits from the desired state, and frontends that wait for
     /// every other role and are never the last one up.
     #[must_use]
     pub fn kbf() -> Self {
-        let mut roles: BTreeMap<HostRole, RoleDef> = kbf_roles()
+        let mut roles: BTreeMap<String, RoleDef> = LEGACY_ROLES
             .into_iter()
-            .map(|role| (role, RoleDef::plain()))
+            .map(|role| (role.to_owned(), RoleDef::plain()))
             .collect();
         roles.insert(
-            HostRole::FRONTEND,
+            "frontend".to_owned(),
             RoleDef {
                 never_last: true,
-                after: vec![HostRole::STORAGE, HostRole::DAEMON, HostRole::MAC_DAEMON],
+                after: ["storage", "daemon", "mac-daemon"]
+                    .map(str::to_owned)
+                    .into(),
                 ..RoleDef::plain()
             },
         );
@@ -104,6 +144,7 @@ impl ServiceDef {
             name: KBF.to_owned(),
             roles,
             after: Vec::new(),
+            require_min_up: KBF_MIN_UP.map(str::to_owned).into(),
         }
     }
 }
@@ -154,18 +195,22 @@ fn invalid<T>(why: String) -> Result<T, ServicesError> {
     Err(ServicesError::Invalid(why))
 }
 
-fn role_of(name: &str) -> Result<HostRole, ServicesError> {
+/// The one place that says which role names a services file may use.
+fn role_of(name: &str) -> Result<String, ServicesError> {
     // The loader names the four roles `kbf` knows and no others, however well formed.
-    name.parse()
+    name.parse::<HostRole>()
         .ok()
         .filter(|role| kbf_roles().contains(role))
-        .map_or_else(|| invalid(format!("{name} is not a host role")), Ok)
+        .map_or_else(
+            || invalid(format!("{name} is not a host role")),
+            |role| Ok(role.name().to_owned()),
+        )
 }
 
 fn role_def(
     service: &str,
     raw: RawRole,
-    roles: &BTreeSet<HostRole>,
+    roles: &BTreeSet<String>,
 ) -> Result<RoleDef, ServicesError> {
     if [raw.max_updating, raw.min_up]
         .into_iter()
@@ -228,7 +273,12 @@ fn service_def(
         .into_iter()
         .map(|(r, raw)| Ok((role_of(&r)?, role_def(&name, raw, &names)?)))
         .collect::<Result<_, ServicesError>>()?;
-    Ok(ServiceDef { name, roles, after })
+    Ok(ServiceDef {
+        name,
+        roles,
+        after,
+        require_min_up: Vec::new(),
+    })
 }
 
 /// Every service the coordinator manages, and the ones CI's token may set.
@@ -283,6 +333,22 @@ impl Services {
         let text = std::fs::read_to_string(path)
             .map_err(|e| ServicesError::Read(format!("{}: {e}", path.display())))?;
         Self::parse(&text)
+    }
+
+    /// The services `defs` and nothing else (not even `kbf`).
+    #[cfg(test)]
+    pub(crate) fn from_defs(defs: Vec<ServiceDef>) -> Self {
+        Self {
+            defs: defs
+                .into_iter()
+                .map(|def| (def.name.clone(), def))
+                .collect(),
+        }
+    }
+
+    /// Every service the coordinator manages, by name.
+    pub fn defs(&self) -> impl Iterator<Item = &ServiceDef> {
+        self.defs.values()
     }
 
     /// The names of every service the coordinator manages, in order.

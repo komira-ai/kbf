@@ -278,5 +278,5 @@ fn a_service_converges_on_its_own_hosts_and_its_own_minimums() {
     );
     let none = converge_service(def, None, &two, secs(NOW));
     assert_eq!((none.desired, none.state), (None, State::InProgress));
-    assert!(role_counts("agent", None, &two, secs(NOW)).is_empty());
+    assert!(role_counts(def, None, &two, secs(NOW)).is_empty());
 }
