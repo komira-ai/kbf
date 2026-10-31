@@ -446,3 +446,32 @@ fn compare_never_writes_outside_stdout() {
     snapshot(&dir, &mut after);
     assert_eq!(before, after);
 }
+
+/// Catches a kill rate taken over the attempts that started instead of all attempts: a
+/// cancelled attempt that never started is in the denominator. Nine attempts, eight
+/// started, one own-limit kill: 1000/9 per 1,000, where a denominator of 8 gives 125.
+#[test]
+fn the_kill_rate_counts_attempts_that_never_started() {
+    let mut rows: Vec<Row> = (0..7).map(|i| ok(&format!("s{i}"), 0, 1)).collect();
+    rows.push(row(
+        "own",
+        0,
+        Some(0),
+        Some(1),
+        "memory_killed",
+        "own_limit",
+    ));
+    rows.push(row("c", 0, None, None, "cancelled", "none"));
+    let stats = analyze(&rows);
+    assert_eq!(stats.attempts, 9);
+    assert_eq!(stats.started, 8);
+    assert_eq!(
+        stats.per_thousand(stats.kills.own_limit),
+        Some(1000.0 / 9.0)
+    );
+    let text = render_text(&stats, &stats);
+    assert_eq!(
+        cells(&text, "kills/1000 own_limit"),
+        ["111.11", "111.11", "0.00"]
+    );
+}
