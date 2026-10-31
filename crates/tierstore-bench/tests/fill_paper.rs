@@ -59,7 +59,7 @@ fn fill_writes_out_and_leaves_the_paper_alone() {
     );
     let filled = std::fs::read_to_string(&out).unwrap();
     assert!(filled.contains(
-        "<b data-cell=\"put\" data-source=\"cold-put-direct-a1.json#p50\" data-label=\"farm\">2.50 ms</b>"
+        "<b data-cell=\"put\" data-source=\"cold-put-direct-a1.json#p50\" data-label=\"farm\" data-result=\"cold-put-direct-a1.json\">2.50 ms</b>"
     ), "{filled}");
     assert!(filled.contains("<i data-cell=\"gone\">TBD</i>"), "{filled}");
 }

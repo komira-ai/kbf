@@ -1162,7 +1162,7 @@ mod tests {
 <p  class='a'>Naïve put <span  data-cell='x'   id=\"k\" >TBD</span>, then <b>bold</b>.</p>\n<p>tail</p>";
         let (out, report) = fill(html, &one("x", "p50", "ms", "instance"), &results()).unwrap();
         let expected = "<!DOCTYPE html>\r\n<!-- <b data-cell=\"x\">keep</b> -->\n<script>var s = '<i data-cell=\"x\">';</script>\n\
-<p  class='a'>Naïve put <span  data-cell='x'   id=\"k\" data-source=\"cold-put-instance-a1.json#p50\" data-label=\"test instance\" >2.00 ms</span>, then <b>bold</b>.</p>\n<p>tail</p>";
+<p  class='a'>Naïve put <span  data-cell='x'   id=\"k\" data-source=\"cold-put-instance-a1.json#p50\" data-label=\"test instance\" data-result=\"cold-put-instance-a1.json\" >2.00 ms</span>, then <b>bold</b>.</p>\n<p>tail</p>";
         assert_eq!(out, expected);
         assert_eq!(
             report,
@@ -1191,6 +1191,8 @@ mod tests {
         assert_eq!(report.filled, 2);
         assert_eq!(report.noted, 1);
         assert!(once.contains("data-source=\"cold-put-direct-a1.json#p95\""));
+        assert!(once.contains("data-result=\"cold-put-direct-a1.json\""));
+        assert_eq!(once.matches("data-result").count(), 2, "{once}");
         assert!(!once.contains("old.json"));
     }
 
@@ -1421,7 +1423,7 @@ mod tests {
 <?php x ?><![CDATA[ <b data-cell=\"a\"> ]]><textarea><b data-cell=\"a\"></textarea>";
         let (out, report) = fill(html, &one("a", "max", "ms", "instance"), &results()).unwrap();
         assert_eq!(report.filled, 1);
-        assert!(out.contains("<SPAN DATA-CELL=a hidden data-source=\"cold-put-instance-a1.json#max\" data-label=\"test instance\">90.0 ms</SPAN>"), "{out}");
+        assert!(out.contains("<SPAN DATA-CELL=a hidden data-source=\"cold-put-instance-a1.json#max\" data-label=\"test instance\" data-result=\"cold-put-instance-a1.json\">90.0 ms</SPAN>"), "{out}");
         assert!(out.ends_with(
             "<P>two</DIV><?php x ?><![CDATA[ <b data-cell=\"a\"> ]]><textarea><b data-cell=\"a\"></textarea>"
         ));
@@ -1594,6 +1596,84 @@ mod tests {
                 .keys()
                 .collect::<Vec<_>>(),
             ["cold-put-x-a3.json"]
+        );
+    }
+
+    /// Catches a filled cell that does not say which result file it came from, a cell that stays
+    /// a `tbd` placeholder after it is filled, a `tbd` span with no `data-cell` being written,
+    /// and a class list that loses its other classes.
+    #[test]
+    fn a_filled_cell_names_its_result_and_stops_being_a_placeholder() {
+        let html = "<p><span class=\"tbd\" data-cell=\"a\">[to measure]</span> \
+<span class=\"x tbd y\" data-cell=\"b\">[to measure]</span> \
+<span class=\"tbd\">[no cell]</span> <span class=\"tbd\" data-cell=\"z\">[no map]</span></p>";
+        let m = mappings(&format!(
+            "[{},{}]",
+            row("a", "p50", "ms", "instance"),
+            row("b", "p95", "ms", "direct")
+        ));
+        let (out, report) = fill(html, &m, &results()).unwrap();
+        let expected = "<p><span data-cell=\"a\" data-source=\"cold-put-instance-a1.json#p50\" data-label=\"test instance\" data-result=\"cold-put-instance-a1.json\">2.00 ms</span> \
+<span class=\"x y\" data-cell=\"b\" data-source=\"cold-put-direct-a1.json#p95\" data-label=\"farm\" data-result=\"cold-put-direct-a1.json\">20.0 ms</span> \
+<span class=\"tbd\">[no cell]</span> <span class=\"tbd\" data-cell=\"z\">[no map]</span></p>";
+        assert_eq!(out, expected);
+        assert_eq!((report.filled, report.unmapped), (2, 1));
+        // A cell left with a note keeps its class and gets no result file.
+        let few = Results::from_results([result(CellId::ColdPut, "direct", 100, None)]);
+        let (noted, _) = fill(
+            "<i class=\"tbd\" data-cell=\"a\">?</i>",
+            &one("a", "p99", "ms", "direct"),
+            &few,
+        )
+        .unwrap();
+        assert!(noted.contains("class=\"tbd\""), "{noted}");
+        assert!(!noted.contains("data-result"), "{noted}");
+    }
+
+    /// Catches a cell the paper marks as design or code reading (`data-basis`) being given a
+    /// measured number, a blocked cell that already names a result being rewritten, and the two
+    /// being counted as unmapped or listed by the check.
+    #[test]
+    fn a_cell_with_a_basis_or_a_block_is_never_written() {
+        let html = "<i data-cell=\"a\" data-basis=\"code-reading\">text</i>\
+<i class=\"tbd\" data-cell=\"b\" data-blocked=\"not run\" data-result=\"cold-put-direct-a1.json\">old</i>";
+        let m = mappings(&format!(
+            "[{},{}]",
+            row("a", "p50", "ms", "instance"),
+            row("b", "p50", "ms", "instance")
+        ));
+        let (out, report) = fill(html, &m, &results()).unwrap();
+        assert_eq!(out, html);
+        assert_eq!(
+            report,
+            FillReport {
+                blocked: 2,
+                ..FillReport::default()
+            }
+        );
+        let findings = check(html, &[], &results()).unwrap();
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    /// Catches a check that ignores `data-result`: a result file that is gone is a finding; a
+    /// result named by someone else's file type (the paper's hand-filled cells name a table) is
+    /// not ours to look up.
+    #[test]
+    fn check_follows_data_result_to_the_result_file() {
+        let html = "<i data-cell=\"a\" data-result=\"cold-put-instance-a1.json\">1</i>\
+<i data-cell=\"b\" data-result=\"cold-put-gone-a1.json\">2</i>\
+<i data-cell=\"c\" data-result=\"phase-b.tsv\">3</i>";
+        let m = mappings(&format!(
+            "[{},{},{}]",
+            row("a", "p50", "ms", "instance"),
+            row("b", "p50", "ms", "instance"),
+            row("c", "p50", "ms", "instance")
+        ));
+        let findings = check(html, &m, &results()).unwrap();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0].contains("\"b\" names the result file \"cold-put-gone-a1.json\""),
+            "{findings:?}"
         );
     }
 }
