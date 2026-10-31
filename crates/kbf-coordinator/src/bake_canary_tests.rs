@@ -327,10 +327,10 @@ fn a_canary_is_chosen_among_roles_that_wait_for_nobody_first() {
     assert_eq!(why(&s, &f, "a1", 100), held(Hold::CanaryWait));
 }
 
-/// With one canary and a service that has fewer first-wave hosts than the canary count,
-/// the hosts after them are still reached in order.
+/// With a canary of two and two hosts of a role that waits for nobody, both go before any
+/// host of a role that waits for them.
 #[test]
-fn a_canary_larger_than_the_first_wave_reaches_the_waiting_roles() {
+fn a_canary_of_two_takes_both_hosts_of_the_free_role_before_a_waiting_one() {
     let text = "[[service]]\nname = \"kbf\"\ncanary = { count = 2 }\n\
         [service.roles.frontend]\nafter = [\"storage\"]\nmax_updating = 2\nmin_up = 0\n\
         [service.roles.storage]\nmax_updating = 2\nmin_up = 0\n";
