@@ -1,7 +1,7 @@
 // Publishes a built dist/ to the tierstore.dev bucket: the one program the deploy workflow
 // (.github/workflows/tierstore-site-publish.yml) runs once the site has been built and tested.
 //
-//   node build/tools/tools/publish.js --dist <dir> --bucket <name> --distribution-id <id> --role-arn <arn> \
+//   node tools/publish.ts --dist <dir> --bucket <name> --distribution-id <id> --role-arn <arn> \
 //        --region <region> --commit <40-hex sha>
 //
 // What it does, in order:
@@ -18,15 +18,19 @@
 // The repository is public and so are its Actions logs, and the bucket name and the role carry the account id, so
 // every such value is masked (`::add-mask::`) before the first command runs.
 //
+// This file is run from source: the deploy job checks out this file alone, installs nothing, and Node strips the types.
+// So it imports `node:` built-ins only (a test holds that), and its syntax is what stripping erases (tsconfig:
+// erasableSyntaxOnly). Code that ran in the build job is never what holds the credentials.
+//
 // Configuration is flags. The two variables the runner sets for a job that may ask for a token
 // (ACTIONS_ID_TOKEN_REQUEST_URL and ACTIONS_ID_TOKEN_REQUEST_TOKEN) and RUNNER_TEMP are the platform's own; nothing else
 // is read from the environment, and the child `aws` processes get a fresh one that holds the credentials and nothing
 // the job had.
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative, sep } from 'node:path';
 
 export interface Options {
   dist: string;
@@ -105,6 +109,8 @@ export interface Deps {
   token(): Promise<string>;
   /** Writes text to a new file that only this user can read, and returns its path. */
   writeSecret(text: string): string;
+  /** Removes a file written by writeSecret. */
+  removeSecret(path: string): void;
   /** Writes the commit to a file for version.txt and returns its path. */
   writeVersion(commit: string): string;
   /** Runs `aws` with exactly this environment and returns its standard output. Throws when it fails. */
@@ -112,7 +118,26 @@ export interface Deps {
   log(line: string): void;
 }
 
-/** A built site: the pages the router and the error responses name, and the assets. */
+/** The least a built site has: its seven pages and ten files today. A dist/ below either is not a site, and the sweep deletes. */
+export const MIN_HTML_PAGES = 5;
+export const MIN_FILES = 8;
+/** The only file types a built site holds (check-dist.ts enforces it); the syncs above give exactly these a content type and a cache rule. */
+const TYPES = ['.html', '.js', '.css'];
+
+function filesUnder(dir: string): string[] {
+  const out: string[] = [];
+  const walk = (d: string): void => {
+    for (const f of readdirSync(d)) {
+      const p = join(d, f);
+      if (statSync(p).isDirectory()) walk(p);
+      else out.push(relative(dir, p).split(sep).join('/'));
+    }
+  };
+  walk(dir);
+  return out.sort();
+}
+
+/** A built site: the pages the router and the error responses name, the assets, at least the floor of pages and files, and no other file type. */
 export function checkDist(dist: string): void {
   for (const f of ['index.html', '404.html']) {
     if (!existsSync(join(dist, f))) throw new Error(`${dist} is not a built site: ${f} is missing`);
@@ -120,6 +145,12 @@ export function checkDist(dist: string): void {
   if (!existsSync(join(dist, 'assets')) || !statSync(join(dist, 'assets')).isDirectory()) {
     throw new Error(`${dist} is not a built site: assets/ is missing`);
   }
+  const files = filesUnder(dist);
+  const html = files.filter((f) => f.endsWith('.html')).length;
+  if (html < MIN_HTML_PAGES) throw new Error(`${dist} is not a built site: only ${html} html pages (at least ${MIN_HTML_PAGES}); the sweep would empty the bucket`);
+  if (files.length < MIN_FILES) throw new Error(`${dist} is not a built site: only ${files.length} files (at least ${MIN_FILES}); the sweep would empty the bucket`);
+  const odd = files.find((f) => !TYPES.some((t) => f.endsWith(t)));
+  if (odd !== undefined) throw new Error(`${dist} is not a built site: ${odd} is a file type the sync would upload without a content type or cache rule`);
 }
 
 interface Credentials {
@@ -154,17 +185,24 @@ export async function publish(o: Options, d: Deps): Promise<void> {
   d.log(`::add-mask::${jwt}`);
 
   const base = { AWS_DEFAULT_REGION: o.region };
-  const answer = d.run(
-    [
-      'sts', 'assume-role-with-web-identity',
-      '--role-arn', o.roleArn,
-      '--role-session-name', `tierstore-site-${o.commit.slice(0, 12)}`,
-      '--web-identity-token', `file://${d.writeSecret(jwt)}`,
-      '--duration-seconds', '3600',
-      '--query', 'Credentials', '--output', 'json',
-    ],
-    base,
-  );
+  // The token file lives only for the exchange.
+  const tokenFile = d.writeSecret(jwt);
+  let answer: string;
+  try {
+    answer = d.run(
+      [
+        'sts', 'assume-role-with-web-identity',
+        '--role-arn', o.roleArn,
+        '--role-session-name', `tierstore-site-${o.commit.slice(0, 12)}`,
+        '--web-identity-token', `file://${tokenFile}`,
+        '--duration-seconds', '3600',
+        '--query', 'Credentials', '--output', 'json',
+      ],
+      base,
+    );
+  } finally {
+    d.removeSecret(tokenFile);
+  }
   const c = credentialsOf(answer);
   for (const v of [c.AccessKeyId, c.SecretAccessKey, c.SessionToken]) d.log(`::add-mask::${v}`);
   const env = { ...base, AWS_ACCESS_KEY_ID: c.AccessKeyId, AWS_SECRET_ACCESS_KEY: c.SecretAccessKey, AWS_SESSION_TOKEN: c.SessionToken };
@@ -198,6 +236,7 @@ function realDeps(): Deps {
   return {
     token: requestToken,
     writeSecret: (text) => write(text, 0o600),
+    removeSecret: (path) => rmSync(path, { force: true }),
     writeVersion: (commit) => write(`${commit}\n`, 0o600),
     run: (argv, env) =>
       execFileSync('aws', [...argv], {
@@ -211,8 +250,8 @@ function realDeps(): Deps {
   };
 }
 
-if (require.main === module) {
-  // Compiled to site/build/tools/tools/publish.js.
+// Run as `node .../publish.ts` (or the compiled publish.js), not when a test imports it.
+if (/(^|[\\/])publish\.(ts|js)$/.test(process.argv[1] ?? '')) {
   (async () => publish(parseArgs(process.argv.slice(2)), realDeps()))().catch((e: unknown) => {
     process.stderr.write(`publish: ${e instanceof Error ? e.message : String(e)}\n`);
     process.exitCode = 1;

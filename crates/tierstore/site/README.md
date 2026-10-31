@@ -54,13 +54,24 @@ distribution does the upload. A pull request never reaches it.
 
 | Job | Holds | Does |
 |---|---|---|
-| `build` | `contents: read`; no environment, no token | the steps of `tierstore-site.yml` (install with scripts off, type-check, the tests, the build), then hands `dist/` and the compiled `tools/publish.ts` on as an artifact |
-| `deploy` | `id-token: write`; environment `prod-site-tierstore`; runs only for a push or a manual run on `main` and `needs` the build | downloads the artifact (no checkout, no install) and runs the publish program |
+| `build` | `contents: read`; no environment, no token | the steps of `tierstore-site.yml` (install with scripts off, type-check, the tests, the build), then hands `dist/` alone on as an artifact |
+| `deploy` | `contents: read` and `id-token: write`; environment `prod-site-tierstore`; runs only for a push or a manual run on `main` and `needs` the build | checks out the commit's `tools/publish.ts` and `.node-version` (sparse, no credentials kept), downloads the pages, and runs the program from source with Node's type stripping: no install, no build |
+
+`tools/publish.ts` is what holds the credentials, so it never comes from the build job, which runs dependency code. It imports
+`node:` built-ins only and uses only syntax Node can strip (`erasableSyntaxOnly` in `tsconfig.json`); the lint in
+`crates/kbf-integration-test/tests/site_deploy_workflow` holds both.
 
 The publish program asks the runner for the job's token, exchanges it with `aws sts assume-role-with-web-identity` for credentials
 that last an hour, uploads the assets (immutable) then the pages (short cache) then `version.txt`, sweeps what the build no
-longer has, and invalidates the distribution. `releases/` is never touched. Because the repository and its Actions logs are
+longer has, and invalidates the distribution. It refuses a `dist/` with fewer than 5 pages or 8 files (the site has 7 and 10), so
+an empty build can never make the sweep empty the bucket, and a file type other than `.html`, `.js` and `.css` (the sync
+gives only those a content type and a cache rule; `check-dist` already refuses others). `releases/` is never touched. Because the repository and its Actions logs are
 public, the role, the bucket (its name ends in the account id) and the distribution are masked before the first command.
+
+A run that is skipped, replaced or red does not publish later by itself: GitHub keeps only the newest pending run of the
+workflow's group, so a pending run can be replaced by a later push or dispatch, and a run that failed stays failed. After any
+skipped, replaced or failed run, run the workflow again by hand from `main` (Actions, tierstore-site-publish, Run workflow). A
+merge that changes nothing under the site's paths does not start it at all.
 
 The settings are three variables of the environment `prod-site-tierstore`, set once by whoever sets the site up
 (`TIERSTORE_SITE_BUCKET`, `TIERSTORE_SITE_DISTRIBUTION_ID`, `TIERSTORE_SITE_PUBLISH_ROLE_ARN`); there is no secret. An unset

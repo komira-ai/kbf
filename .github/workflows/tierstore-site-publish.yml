@@ -6,9 +6,11 @@
 #
 # Two jobs, so that nothing built from the repository's code ever runs beside the cloud token:
 #  - build  (no token, no environment): the same steps as tierstore-site.yml (typecheck, the tests, the build), then the
-#           built dist/ and the compiled publish program are handed on as an artifact;
-#  - deploy (the token, the environment): downloads that artifact and runs the publish program (tools/publish.ts). It
-#           checks out nothing and installs nothing.
+#           built dist/ alone is handed on as an artifact (the pages are data; no program travels);
+#  - deploy (the token, the environment): checks out the commit's publish program (tools/publish.ts) and the Node version
+#           file, nothing else, downloads the pages, and runs the program from source with Node's type stripping. It
+#           installs and builds nothing, and the program imports `node:` built-ins only, so no code that ran in the build
+#           job (dependencies, tsc, the tests) is ever what holds the credentials.
 # The job that holds `id-token: write` is the only one with `environment:`, runs only for a push to main or a manual run
 # of main, and needs the build. The lint in crates/kbf-integration-test/tests/site_deploy_workflow holds all of this.
 #
@@ -56,11 +58,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tierstore-site
-          path: |
-            crates/tierstore/site/dist
-            crates/tierstore/site/build/tools/tools/publish.js
-            crates/tierstore/site/.node-version
-          include-hidden-files: true
+          path: crates/tierstore/site/dist
           if-no-files-found: error
           retention-days: 1
 
@@ -71,18 +69,27 @@ jobs:
     timeout-minutes: 15
     environment: prod-site-tierstore
     permissions:
+      contents: read
       id-token: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            crates/tierstore/site/.node-version
+            crates/tierstore/site/tools/publish.ts
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: crates/tierstore/site/.node-version
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: tierstore-site
-          path: publish
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: publish/.node-version
+          path: dist
       - name: Upload the site and invalidate the distribution
         env:
           BUCKET: ${{ vars.TIERSTORE_SITE_BUCKET }}
           DISTRIBUTION_ID: ${{ vars.TIERSTORE_SITE_DISTRIBUTION_ID }}
           ROLE_ARN: ${{ vars.TIERSTORE_SITE_PUBLISH_ROLE_ARN }}
-        run: node publish/build/tools/tools/publish.js --dist publish/dist --bucket "$BUCKET" --distribution-id "$DISTRIBUTION_ID" --role-arn "$ROLE_ARN" --region us-east-1 --commit "${{ github.sha }}"
+        run: node crates/tierstore/site/tools/publish.ts --dist dist --bucket "$BUCKET" --distribution-id "$DISTRIBUTION_ID" --role-arn "$ROLE_ARN" --region us-east-1 --commit "${{ github.sha }}"
