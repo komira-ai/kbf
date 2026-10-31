@@ -18,6 +18,7 @@
 //! name = "agent"
 //! after = ["server"]             # services defined earlier in the file, or kbf
 //! priority = 0                   # default 0; a host is offered the higher number first
+//! defer_backoff = { initial_secs = 300, factor = 2, max_secs = 3600 }   # the defaults
 //!
 //! [service.roles.daemon]
 //! max_updating = 2               # optional; absent: the desired state's number
@@ -191,6 +192,8 @@ struct RawService {
     roles: BTreeMap<String, RawRole>,
     #[serde(default)]
     priority: i32,
+    #[serde(default)]
+    defer_backoff: DeferBackoff,
 }
 
 #[derive(Deserialize)]
@@ -263,6 +266,7 @@ fn service_def(
         after,
         roles,
         priority,
+        defer_backoff,
     } = raw;
     if !is_service_name(&name) {
         return invalid(format!(
@@ -272,6 +276,9 @@ fn service_def(
     if defined.contains_key(&name) {
         return invalid(format!("{name} is defined twice"));
     }
+    defer_backoff
+        .check()
+        .or_else(|why| invalid(format!("{name}: defer_backoff: {why}")))?;
     if roles.is_empty() {
         return invalid(format!("{name} has no roles"));
     }
@@ -297,7 +304,7 @@ fn service_def(
         after,
         require_min_up: Vec::new(),
         priority,
-        defer_backoff: DeferBackoff::default(),
+        defer_backoff,
     })
 }
 
