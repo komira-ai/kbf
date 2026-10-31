@@ -61,22 +61,25 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use super::cli::DEFAULT_OCI_PREFIX;
 use super::config::{
     ConfigError, Dur, OciFlags, OciTable, PerRun, Policy, ServerTable, Size, TierParts, TierTable,
-    check_policies, front_of, invalid, oci as oci_of, parse_size, refuse, refuse_hot_keys, require,
-    tier, within,
+    check_policies, duration, front_of, invalid, oci as oci_of, parse_size, refuse,
+    refuse_hot_keys, require, tier, within,
 };
 use super::front::FrontSettings;
-use super::local_cache::CacheConfig;
+use super::local_cache::{CacheConfig, SCRUB_MIN_ROUND, SCRUB_RATE};
 
 /// The only layout of the cache directory.
 const LAYOUT: &str = "digest-v1";
 
-/// A rate in the file: a size and `/s`, such as `50MiB/s`.
+/// A rate in the file: a size and `/s`, such as `50MiB/s`, or `off` (which is 0 bytes a second).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Rate(pub u64);
 
 impl Serialize for Rate {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&format!("{}B/s", self.0))
+        match self.0 {
+            0 => serializer.serialize_str("off"),
+            bytes => serializer.serialize_str(&format!("{bytes}B/s")),
+        }
     }
 }
 
@@ -92,10 +95,13 @@ impl Visitor<'_> for RateVisitor {
     type Value = Rate;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a rate such as \"50MiB/s\"")
+        f.write_str("a rate such as \"50MiB/s\", or \"off\"")
     }
 
     fn visit_str<E: de::Error>(self, text: &str) -> Result<Rate, E> {
+        if text == "off" {
+            return Ok(Rate(0));
+        }
         let size = text.strip_suffix("/s").map(parse_size);
         match size {
             Some(Ok(bytes)) => Ok(Rate(bytes)),
@@ -152,10 +158,14 @@ pub(super) struct LocalCacheTable {
     /// Whether the cache is on: `true`, the default. `false` is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<bool>,
-    /// The rate at which a scrubber would re-read the objects. Accepted; this release does not
-    /// scrub.
+    /// The rate at which the scrub re-reads the objects (`SCRUB_RATE`, 16 MiB/s, if not given);
+    /// `"off"` (or `"0B/s"`) turns the scrub off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrub_rate: Option<Rate>,
+    /// The least time between the starts of two rounds of the scrub (`SCRUB_MIN_ROUND`, one hour,
+    /// if not given); `"0s"` lets a round start as soon as the last is done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_min_round: Option<Dur>,
 }
 
 /// What a build-node file stands for.
@@ -171,8 +181,11 @@ pub(super) struct CacheSettings {
     pub cache: CacheConfig,
     /// The OCI front, as `[oci]` and the `--oci-*` flags make it: `listen` is empty for none.
     pub oci: OciFlags,
-    /// The rate at which a scrubber would run, in bytes a second, if the file gave one.
+    /// The rate of the scrub in bytes a second: the default if the file gave none; none if the
+    /// file turned it off.
     pub scrub_rate: Option<u64>,
+    /// The least time between the starts of two rounds of the scrub.
+    pub scrub_min_round: Duration,
 }
 
 /// The `endpoint` of the upstream: `endpoint`, or the one entry of `endpoints`.
@@ -326,6 +339,11 @@ impl CacheSettings {
             return Err(invalid("local_cache.keep_deadline", why));
         }
         cache.write_through = table.write_through.unwrap_or(false);
+        let scrub_min_round = duration(table.scrub_min_round, SCRUB_MIN_ROUND);
+        if !scrub_min_round.is_zero() && scrub_min_round < Duration::from_secs(1) {
+            let why = "must be at least 1s (the scrub ticks once a second), or 0s for no minimum";
+            return Err(invalid("local_cache.scrub_min_round", why));
+        }
         if let Some(limit) = table.whole_fill_limit {
             cache.whole_limit = within("local_cache", "whole_fill_limit", limit.0, 1, budget)?;
         }
@@ -335,8 +353,9 @@ impl CacheSettings {
             s3_request_timeout: shared.s3_request_timeout,
             upstream,
             cache,
+            scrub_min_round,
             oci,
-            scrub_rate: table.scrub_rate.map(|rate| rate.0),
+            scrub_rate: Some(table.scrub_rate.map_or(SCRUB_RATE, |rate| rate.0)).filter(|n| *n > 0),
         })
     }
 }
