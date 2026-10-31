@@ -99,17 +99,11 @@ impl Rig {
 }
 
 fn succeeded(target: &str) -> UpdateResult {
-    UpdateResult {
-        target: version(target),
-        outcome: Outcome::Succeeded,
-    }
+    UpdateResult::new(version(target), Outcome::Succeeded)
 }
 
 fn failed(target: &str) -> UpdateResult {
-    UpdateResult {
-        target: version(target),
-        outcome: Outcome::Failed,
-    }
+    UpdateResult::new(version(target), Outcome::Failed)
 }
 
 /// "Update to X" runs fetch and verify, drain, switch, health, confirm and undrain, in that
