@@ -8,7 +8,7 @@
 //!     Path::new("/run/updater/register.sock"),
 //!     "tierstore",
 //!     "1.4.0",
-//!     Some(update_register::Health::new("127.0.0.1:9301".parse().unwrap(), "/readyz")),
+//!     Some(&update_register::Health::new("127.0.0.1:9301".parse().unwrap(), "/readyz")),
 //! )?;
 //! // ... run the service; dropping `_registration` tells the updater it stopped.
 //! # Ok::<(), update_register::Error>(())
@@ -23,16 +23,17 @@
 //! [`register`] blocks until the updater has answered. The updater answers as soon as it has
 //! read the line, which this client sends at once.
 
-use std::io;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+
+use serde_json::{Value, json};
 
 /// The longest registration line the updater reads, newline included.
 pub const MAX_LINE: usize = 4096;
 
 /// The most of an answer that is read; an answer is one short line.
-#[allow(dead_code)]
 const MAX_ANSWER: u64 = 512;
 
 /// Where a service's health answers: the updater issues a `GET` of `path` on `addr` and reads
@@ -90,9 +91,17 @@ impl Refusal {
         }
     }
 
-    #[allow(dead_code)]
     fn from_token(token: &str) -> Refusal {
-        Refusal::Other(token.to_owned())
+        match token {
+            "malformed" => Refusal::Malformed,
+            "unknown_service" => Refusal::UnknownService,
+            "wrong_user" => Refusal::WrongUser,
+            "health_address" => Refusal::HealthAddress,
+            "health_port" => Refusal::HealthPort,
+            "busy" => Refusal::Busy,
+            "internal" => Refusal::Internal,
+            other => Refusal::Other(other.to_owned()),
+        }
     }
 }
 
@@ -139,12 +148,48 @@ pub fn register(
 }
 
 fn register_on(
-    _stream: UnixStream,
-    _name: &str,
-    _version: &str,
-    _health: Option<&Health>,
+    stream: UnixStream,
+    name: &str,
+    version: &str,
+    health: Option<&Health>,
 ) -> Result<Registration, Error> {
-    Err(Error::NoAnswer)
+    let line = encode(name, version, health);
+    if line.len() > MAX_LINE {
+        return Err(Error::TooLong { len: line.len() });
+    }
+    // An updater that is full answers and closes without reading the line, so the write can
+    // fail while the answer is waiting: the answer is read first and says why.
+    let sent = (&stream).write_all(&line);
+    match (answer(&stream), sent) {
+        (Ok(()), _) => Ok(Registration {
+            _connection: stream,
+        }),
+        (Err(Error::NoAnswer), Err(e)) => Err(Error::Io(e)),
+        (Err(e), _) => Err(e),
+    }
+}
+
+/// The registration line: one JSON object and a newline.
+fn encode(name: &str, version: &str, health: Option<&Health>) -> Vec<u8> {
+    let health = health.map(|h| json!({ "addr": h.addr.to_string(), "path": h.path }));
+    let mut line = json!({ "name": name, "version": version, "health": health }).to_string();
+    line.push('\n');
+    line.into_bytes()
+}
+
+/// Reads the updater's answer: `{"ok":true,"error":null}` or `{"ok":false,"error":"<token>"}`.
+fn answer(stream: &UnixStream) -> Result<(), Error> {
+    let mut text = String::new();
+    BufReader::new(stream.take(MAX_ANSWER)).read_line(&mut text)?;
+    if text.is_empty() {
+        return Err(Error::NoAnswer);
+    }
+    let reply: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    match (reply["ok"].as_bool(), reply["error"].as_str()) {
+        (Some(true), None) => Ok(()),
+        (Some(false), Some(token)) => Err(Refusal::from_token(token).into()),
+        _ => Err(Error::BadAnswer(text)),
+    }
 }
 
 #[cfg(test)]
