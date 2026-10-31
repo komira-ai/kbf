@@ -3,7 +3,10 @@
 //! One process runs three things over the same pair of tiers: a [`Proxy`] with the given id,
 //! the S3 front of that proxy ([`Server`]), and a [`Reconciler`], which works only while it
 //! holds the lease in the hot tier, so that any number of these processes may run over the same
-//! tiers. The settings are flags, or one TOML file given with `--config` (see
+//! tiers. With `--lock-file` it works only while the process also holds an exclusive lock on
+//! that file (see [`Gate`]): a second process over the same node, started beside the first,
+//! serves at once and reconciles when the first has exited. The settings are flags, or one TOML
+//! file given with `--config` (see
 //! [`config`](super::config) for the format, and `--print-config`, which prints the file for
 //! the flags given); the process reads no environment variable, and the secret access key is
 //! read from a file, not from the command line or the config file. The file is read into the
@@ -784,7 +787,11 @@ async fn run_passes(
 /// The lock file a storage node's reconciler works under (`--lock-file`).
 #[derive(Debug)]
 pub(crate) struct Gate {
-    _taken: Option<LockFile>,
+    path: PathBuf,
+    /// How long to wait between two tries of a lock that is held by another process.
+    retry: Duration,
+    /// The lock, if the try at the start took it; the reconciler's first run uses it.
+    taken: Option<LockFile>,
 }
 
 impl Gate {
@@ -793,21 +800,65 @@ impl Gate {
     /// # Errors
     /// What the system said about the file: it cannot be made or opened, it is a link, or it is
     /// on a network file system.
-    pub(crate) fn open(path: &Path, _retry: Duration) -> std::io::Result<Self> {
+    pub(crate) fn open(path: &Path, retry: Duration) -> std::io::Result<Self> {
         Ok(Self {
-            _taken: lock::try_take(path)?,
+            path: path.to_owned(),
+            retry,
+            taken: lock::try_take(path)?,
         })
     }
 }
 
-/// [`reconcile`], but only while this process holds the lock file of `gate`.
+/// Tries the lock every `retry` until it is taken (`Some`) or `halt` is notified (`None`). A try
+/// that fails is said on stderr and tried again. It runs on a thread that may block, so nothing
+/// waits on the lock on the runtime.
+async fn wait_for_lock(path: &Path, retry: Duration, halt: &Notify) -> Option<LockFile> {
+    loop {
+        tokio::select! {
+            biased;
+            () = halt.notified() => return None,
+            () = tokio::time::sleep(retry) => {}
+        }
+        let owned = path.to_owned();
+        let trying = tokio::task::spawn_blocking(move || lock::try_take(&owned));
+        match trying.await.expect("a try of the lock does not panic") {
+            Ok(Some(file)) => return Some(file),
+            Ok(None) => {}
+            Err(why) => eprintln!("tierstore: lock file {}: {why}", path.display()),
+        }
+    }
+}
+
+/// [`reconcile`], but only while this process holds the lock file of `gate`: it does not touch
+/// the tiers (no lease, no pass) until it holds the lock, takes it by trying every
+/// `gate.retry` while another process holds it, and stops (giving the lease up) and waits for the
+/// lock again if the lock file is replaced. The process that held the lock gives its lease up
+/// when it exits (see [`reconcile`]), so the first pass after the lock is taken finds it free.
 pub(crate) async fn reconcile_gated(
-    reconciler: Reconciler,
+    mut reconciler: Reconciler,
     interval: Duration,
     halt: Arc<Notify>,
-    _gate: Gate,
+    mut gate: Gate,
 ) {
-    reconcile(reconciler, interval, halt).await;
+    loop {
+        let file = match gate.taken.take() {
+            Some(file) => file,
+            None => match wait_for_lock(&gate.path, gate.retry, &halt).await {
+                Some(file) => file,
+                None => break,
+            },
+        };
+        if run_passes(&mut reconciler, interval, &halt, Some(&file)).await == Ended::Halted {
+            break;
+        }
+        eprintln!(
+            "tierstore: lock file {}: the file was replaced; the reconciler stops until the lock \
+             is taken again",
+            gate.path.display()
+        );
+        let _ = tokio::time::timeout(STOP_WAIT, reconciler.stop()).await;
+    }
+    let _ = tokio::time::timeout(STOP_WAIT, reconciler.stop()).await;
 }
 
 /// The id of a start for the probe keys of its self-test: the proxy id (with any character a
