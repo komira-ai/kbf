@@ -24,11 +24,15 @@ async fn tag(hot: &MemoryBackend) -> Option<String> {
 }
 
 /// Asserts that a holder whose lease expired and was taken over by a restart with the same name
-/// cannot renew the new holder's lease. Defect it catches: both write `p\n1` first, so the old
-/// holder's tag is the new holder's tag and its renewal replaces the new holder's object.
+/// cannot renew the new holder's lease. A takes the lease (its first `acquire` and a renewal
+/// write generations 1 and 2) and holds the tag of `p\n2`. B's take over also writes generation
+/// 2, because its `acquire` counts a body for the create-only put that fails and the renewal
+/// that replaces the object counts the next. Defect it catches: A's body and B's are the same
+/// bytes, so the tag is the same, and A's renewal replaces the new holder's object.
 #[tokio::test]
 async fn a_stale_holder_of_the_same_name_cannot_renew_the_new_holders_lease() {
     let (hot, clock, mut a, mut b) = two_holders();
+    assert!(a.ensure().await);
     assert!(a.ensure().await);
     let stale = tag(&hot).await.unwrap();
 
@@ -43,10 +47,13 @@ async fn a_stale_holder_of_the_same_name_cannot_renew_the_new_holders_lease() {
 }
 
 /// Asserts that the old holder's release leaves the new holder's lease in place. Defect it
-/// catches: the old holder sees a tag equal to its own and deletes the new holder's object.
+/// catches: the old holder sees a tag equal to its own and deletes the new holder's object. A
+/// is at generation 2 when it is taken over, as B is when its take over writes, so the bodies
+/// and the tags are equal (see the test above).
 #[tokio::test]
 async fn a_stale_holder_of_the_same_name_cannot_release_the_new_holders_lease() {
     let (hot, clock, mut a, mut b) = two_holders();
+    assert!(a.ensure().await);
     assert!(a.ensure().await);
 
     clock.set(30_000);
