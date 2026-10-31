@@ -119,6 +119,31 @@ fn each_rows_certificate_passes_as_its_row_and_no_other() {
     );
 }
 
+/// Catches the scheduler's certificate (role `scheduler`, serverAuth only) passing as any
+/// row: as the frontend's worker listener (it is a server, but not the frontend's role),
+/// as a storage node's, or as a daemon's.
+#[test]
+fn a_scheduler_certificate_is_no_peer_of_any_table_row() {
+    let ca = ca();
+    let cert = leaf(
+        &ca,
+        &[
+            "DNS:sched.example.com",
+            "IP:192.0.2.7",
+            "URI:urn:kbf:role:scheduler",
+        ],
+        vec![Eku::ServerAuth],
+        |_| {},
+    );
+    for row in Row::ALL {
+        assert_ne!(
+            check(&ca, &cert, row),
+            Vec::<String>::new(),
+            "scheduler passed as {row:?}"
+        );
+    }
+}
+
 /// Catches a certificate with no role, two roles (even two of the row's), another
 /// role, or the role under another prefix passed, and a name of another kind (an
 /// email address) read as a role.

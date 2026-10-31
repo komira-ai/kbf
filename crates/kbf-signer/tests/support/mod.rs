@@ -216,6 +216,15 @@ pub fn frontend_tbs(ca: &Ca) -> Vec<u8> {
     spy.last()
 }
 
+/// The to-be-signed structure `Authority::issue_scheduler` builds for `names`.
+pub fn scheduler_tbs(ca: &Ca, names: &[&str]) -> Vec<u8> {
+    let spy = Spy::new(&ca.spki);
+    authority_over(ca, &spy)
+        .issue_scheduler(names, &fresh_key(), NOW, &mut Stream(9))
+        .expect("issue");
+    spy.last()
+}
+
 /// The to-be-signed structure of the root itself (`CA:TRUE`).
 pub fn root_tbs(ca: &Ca) -> Vec<u8> {
     let (_, cert) = X509Certificate::from_der(&ca.root).expect("root");
@@ -269,6 +278,10 @@ pub fn role_uri(role: &str) -> SanType {
 
 pub fn host_role_uri(name: &str) -> SanType {
     SanType::URI(Ia5String::try_from(format!("urn:kbf:host-role:{name}")).expect("ia5"))
+}
+
+pub fn ip(addr: &str) -> SanType {
+    SanType::IpAddress(addr.parse().expect("an address"))
 }
 
 pub fn dns(name: &str) -> SanType {

@@ -605,6 +605,74 @@ fn the_coordinator_certificate_needs_good_names() {
     assert_eq!(go(&["ok.example", "Bad Name"]).unwrap_err(), CaError::Name);
 }
 
+// ---- the job scheduler's certificate -------------------------------------------------
+
+// Catches: a scheduler certificate with the wrong role, an EKU that lets it act as a client
+// (the signer's table forced clientAuth on every role before this one), names that are not
+// the ones given, and a chain that does not verify for the one use it has: a TLS server
+// under each of its names, an address and a DNS name.
+#[test]
+fn a_signed_scheduler_certificate_verifies_against_the_pin_with_ip_and_dns() {
+    let ca = authority();
+    let key = key();
+    let issued = ca
+        .issue_scheduler(
+            &["192.0.2.7", "sched.example.com"],
+            &key,
+            NOW,
+            &mut Stream(5),
+        )
+        .expect("issued");
+    let v = view(&issued.der);
+    assert_eq!(v.uris, ["urn:kbf:role:scheduler"]);
+    assert_eq!(v.dns, ["sched.example.com"]);
+    assert_eq!(
+        v.ips.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        ["192.0.2.7"]
+    );
+    assert_eq!(v.cn, ["192.0.2.7"]);
+    assert!(v.server_auth && !v.client_auth);
+    assert_eq!(v.other_ekus, 0);
+    assert_eq!(v.ca, Some((true, false, None)));
+    assert_eq!(v.key_usage, Some((true, KU_DIGITAL_SIGNATURE)));
+    assert_eq!(v.extension_oids, table_extension_oids());
+    assert_eq!(v.spki, key.spki());
+    as_server(&[ca.root_der()], &[&issued.der], "192.0.2.7").expect("serves its address");
+    as_server(&[ca.root_der()], &[&issued.der], "sched.example.com").expect("serves its name");
+    as_client(&[ca.root_der()], &[&issued.der]).expect_err("it dials nobody");
+}
+
+// Catches: a scheduler certificate a node would admit as a role it serves (the storage
+// service reads the role from the certificate), or that passes as the frontend's.
+#[test]
+fn a_scheduler_certificate_is_no_peer_role() {
+    let ca = authority();
+    let issued = ca
+        .issue_scheduler(&["192.0.2.7"], &key(), NOW, &mut Stream(6))
+        .expect("issued");
+    assert_eq!(
+        kbf_peer::role_of(&issued.der),
+        Err(kbf_peer::RoleError::Unknown("scheduler".to_owned()))
+    );
+    let frontend = ca
+        .issue_frontend(&["192.0.2.7"], &key(), NOW, &mut Stream(7))
+        .expect("issued");
+    assert_ne!(view(&issued.der).uris, view(&frontend.der).uris);
+    assert!(view(&frontend.der).client_auth);
+}
+
+// Catches: a scheduler certificate for no name, for a wildcard, or for a name that is not
+// one (the same names rule as the frontend's).
+#[test]
+fn the_scheduler_certificate_needs_good_names() {
+    let ca = authority();
+    let key = key();
+    let go = |names: &[&str]| ca.issue_scheduler(names, &key, NOW, &mut Stream(3));
+    assert_eq!(go(&[]).unwrap_err(), CaError::NoNames);
+    assert_eq!(go(&["*.example.com"]).unwrap_err(), CaError::Name);
+    assert_eq!(go(&["ok.example", "Bad Name"]).unwrap_err(), CaError::Name);
+}
+
 // ---- serials -------------------------------------------------------------------------
 
 // Catches: a counter or a reused serial, a negative or zero one, one over 127 bits, and a
