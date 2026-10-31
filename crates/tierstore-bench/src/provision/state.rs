@@ -61,6 +61,12 @@ impl State {
         })
     }
 
+    /// Whether the record was written by a `--premade` run.
+    #[must_use]
+    pub fn is_premade(&self) -> bool {
+        false
+    }
+
     /// Whether this run made the bucket `name`.
     #[must_use]
     pub fn made_bucket(&self, name: &str) -> bool {

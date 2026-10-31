@@ -57,6 +57,16 @@ pub enum Mode {
     Apply,
 }
 
+/// Where a run's buckets and accounts come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Supply {
+    /// The run makes them (`mb`, `quota set`, `admin policy create`, `admin user add`, `admin
+    /// policy attach`).
+    Create,
+    /// A held script made them; the run only checks and probes them.
+    Premade,
+}
+
 /// One line per step taken or planned.
 pub type Steps = Vec<String>;
 
@@ -280,10 +290,10 @@ struct StepsFile<'a> {
 /// named or its test bucket is the live one, a command fails, or a probe does not give the
 /// answer isolation needs; a bucket or account id outside the test prefix, a bucket or account
 /// already on the store that this run did not make.
-pub async fn run(config: &RunConfig, mode: Mode) -> Result<Steps, BenchError> {
+pub async fn run(config: &RunConfig, mode: Mode, supply: Supply) -> Result<Steps, BenchError> {
     let host = SystemHost;
     let ops = OpsFile::load(&host, &config.result_dir)?;
-    run_with(&host, config, &ops, mode).await
+    run_with_supply(&host, config, &ops, mode, supply).await
 }
 
 /// [`run`] on a given host and ops file.
@@ -296,6 +306,21 @@ pub async fn run_with(
     ops: &OpsFile,
     mode: Mode,
 ) -> Result<Steps, BenchError> {
+    run_with_supply(host, config, ops, mode, Supply::Create).await
+}
+
+/// [`run_with`], with the buckets and accounts coming from `supply`.
+///
+/// # Errors
+/// As [`run_with`].
+pub async fn run_with_supply(
+    host: &dyn Host,
+    config: &RunConfig,
+    ops: &OpsFile,
+    mode: Mode,
+    supply: Supply,
+) -> Result<Steps, BenchError> {
+    let _ = supply;
     config.check_names()?;
     let roles: Vec<(Role, &StoreSpec)> = SHARED_ROLES
         .into_iter()
