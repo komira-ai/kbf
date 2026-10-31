@@ -431,6 +431,19 @@ impl Inner {
         #[cfg(test)]
         self.trace_after_publish();
         if !self.owns(generation) {
+            if fresh {
+                // The one delete a cache makes in a directory it does not own. It is safe: this
+                // fill linked these names itself just now (`fresh`), and no other writer makes
+                // them, the staging name being unique; an object left here would be one the new
+                // owner does not index, so never evicts, and a later scan would index it, stale
+                // if the key was deleted at the upstream in between. It covers the whole span
+                // from the check before the rename, through the rename, the link and the return
+                // of the publish. What is left is a whole object that is on the disk for the
+                // moments until this removes it.
+                let root = &self.config.path;
+                let _ = std::fs::remove_file(data_path(root, &name.hex));
+                let _ = std::fs::remove_file(meta_path(root, &name.hex));
+            }
             return Err(Stop::Lost);
         }
         locked(&self.index).insert(&name.hex, meta.size, meta.tag, meta.modified);

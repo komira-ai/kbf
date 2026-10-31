@@ -32,8 +32,11 @@
 //! file, before each chunk, inside the publish before the first change to the directory and
 //! before the rename, and before the index. The names of the staging files start with a prefix of
 //! the cache, so a cache never removes the staging file of another. The loss is noticed by a
-//! tick, once a second at most: until then the cache still believes it holds the lock, and the
-//! step of a fill that is running when the lock file is replaced can finish.
+//! tick, once a second at most: until then the cache still believes it holds the lock. A fill
+//! that linked its object into the directory and then finds the lock lost removes the data file
+//! and the sidecar it linked (the one delete a cache makes in a directory it does not own: the
+//! names are its own). What is left of the window is a whole, valid object that is on the disk
+//! for the moments until that removal, and the staging file of a fill, which is its own.
 
 use std::collections::HashSet;
 use std::io;
@@ -48,6 +51,9 @@ use crate::server::lock::{self, LockFile};
 
 use super::{Inner, LocalCache, layout, locked};
 use super::{add, index_of};
+
+/// The rounds a take makes at most to remove the files of the names noted while it ran.
+const MAX_ROUNDS: u32 = 8;
 
 /// The name of the lock file in the cache directory.
 pub(super) const LOCK: &str = ".lock";
@@ -276,7 +282,9 @@ impl Inner {
         let scanned = layout::scan(&self.config.path)?;
         let mut found = scanned.found;
         let mut pending = std::mem::take(&mut *locked(&self.hold.forgotten));
+        let mut rounds = 0;
         loop {
+            rounds += 1;
             let distrust = |f: &layout::Found| pending.overflowed || pending.names.contains(&f.hex);
             let (gone, kept): (Vec<_>, Vec<_>) = found.into_iter().partition(distrust);
             found = kept;
@@ -286,16 +294,25 @@ impl Inner {
                 return Err(why);
             }
             let mut forgotten = locked(&self.hold.forgotten);
-            if forgotten.is_empty() {
+            // Nothing noted, or nothing left that a note could be about: flip.
+            if forgotten.is_empty() || found.is_empty() {
                 add(
                     &self.counters.discarded_at_start,
                     scanned.discarded + removed,
                 );
                 *locked(&self.index) = index_of(found);
+                *forgotten = Forgotten::default();
                 let _ = self.hold.read_write.swap(true, Ordering::SeqCst);
                 return Ok(());
             }
             pending = std::mem::take(&mut *forgotten);
+            // Deletes that keep arriving do not keep the take waiting: after the last round
+            // the rest is treated as an overflow, which removes every object that is left,
+            // and the round after it has no object left and flips. That is the safe side of
+            // the same rule as a full list: a cache that is emptied is cold, not wrong.
+            if rounds >= MAX_ROUNDS {
+                pending.overflowed = true;
+            }
         }
     }
 
