@@ -19,17 +19,41 @@ fn dir(name: &str) -> TestDir {
 #[test]
 fn a_desired_state_reads_every_limit_and_defaults_the_rest() {
     let d = Desired::parse(FULL.as_bytes()).expect("parsed");
-    let got = HostRole::ALL.map(|r| d.max_updating.of(r));
+    let got = [
+        HostRole::FRONTEND,
+        HostRole::STORAGE,
+        HostRole::DAEMON,
+        HostRole::MAC_DAEMON,
+    ]
+    .map(|r| d.max_updating.of(&r));
     assert_eq!(got, [1, 2, 3, 4]);
     assert_eq!((d.min_up.storage, d.min_up.frontend), (3, 2));
     assert_eq!(d.version.as_str(), "0.1.9+gabcdefabcdef-2");
     let short = r#"{"version":"1.0","min_up":{"storage":1,"frontend":1}}"#;
     let d = Desired::parse(short.as_bytes()).expect("parsed");
-    assert_eq!(HostRole::ALL.map(|r| d.max_updating.of(r)), [1, 1, 2, 2]);
+    assert_eq!(
+        [
+            HostRole::FRONTEND,
+            HostRole::STORAGE,
+            HostRole::DAEMON,
+            HostRole::MAC_DAEMON
+        ]
+        .map(|r| d.max_updating.of(&r)),
+        [1, 1, 2, 2]
+    );
     let partial =
         r#"{"version":"1.0","max_updating":{"daemon":7},"min_up":{"storage":1,"frontend":1}}"#;
     let d = Desired::parse(partial.as_bytes()).expect("parsed");
-    assert_eq!(HostRole::ALL.map(|r| d.max_updating.of(r)), [1, 1, 7, 2]);
+    assert_eq!(
+        [
+            HostRole::FRONTEND,
+            HostRole::STORAGE,
+            HostRole::DAEMON,
+            HostRole::MAC_DAEMON
+        ]
+        .map(|r| d.max_updating.of(&r)),
+        [1, 1, 7, 2]
+    );
 }
 
 /// Catches: a desired state accepted that the host-side rule or the schema refuses: a
@@ -341,4 +365,23 @@ fn a_map_file_that_is_not_a_map_of_states_refuses_to_start() {
         let why = DesiredStore::open(&file).expect_err("refused");
         assert!(matches!(why, StoreError::Invalid { .. }), "{bad}");
     }
+}
+
+/// Catches: a role the code does not name earning a slot or a free minimum: it gets no
+/// update slot and a minimum of hosts up that no farm has, while the four named roles keep
+/// their values.
+#[test]
+fn a_role_the_code_does_not_name_gets_no_slot() {
+    let d = Desired::parse(FULL.as_bytes()).expect("parsed");
+    let cache: HostRole = "cache".parse().expect("well formed");
+    assert_eq!(d.max_updating.of(&cache), 0);
+    assert_eq!(d.min_up.of(&cache), u32::MAX);
+    let named = [
+        HostRole::FRONTEND,
+        HostRole::STORAGE,
+        HostRole::DAEMON,
+        HostRole::MAC_DAEMON,
+    ];
+    assert_eq!(named.clone().map(|r| d.min_up.of(&r)), [2, 3, 0, 0]);
+    assert_eq!(crate::desired::kbf_roles(), named);
 }

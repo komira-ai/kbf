@@ -105,7 +105,7 @@ fn order(
         && !fleet.is_busy_besides(service, id, now)
         && host.beat.version != desired.version
         && !failed_here
-        && slots < role.max_updating(host.role, desired)
+        && slots < role.max_updating(&host.role, desired)
         && others().all(|(_, h)| !role.after.contains(&h.role) || !is_pending(h, desired, now))
         && def.after.iter().all(|earlier| {
             all.get(earlier).is_none_or(|want| {
@@ -117,7 +117,7 @@ fn order(
         && others()
             .filter(|(o, h)| h.role == host.role && fleet.is_up(service, o, h, now))
             .count()
-            >= role.required_up(host.role, desired)
+            >= role.required_up(&host.role, desired)
 }
 
 /// Whether `h` is live and not yet at `desired`, or still updating: what a later role or
