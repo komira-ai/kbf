@@ -276,7 +276,7 @@ const MAX_TOKEN_BYTES: usize = 1024;
 /// rehearsal, which runs the helper of the release before this one, reads the mark to know
 /// whether to give that helper the run's token.
 #[used]
-static LONG_TOKEN_MARKER: &[u8] = b"kbf-host-install:token-file-takes-actions-tokens";
+static LONG_TOKEN_MARKER: &[u8] = crate::LONG_TOKEN_MARKER;
 
 /// The token for the API in `file`, which is root's alone to write: one line of letters,
 /// digits, `_`, `-` and `.`, at most [`MAX_TOKEN_BYTES`] bytes.

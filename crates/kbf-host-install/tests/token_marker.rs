@@ -6,7 +6,7 @@
 //! Catches: the mark being dropped from the binary (dead-code removal, a changed profile), and
 //! the mark the rehearsal looks for drifting from the one the helper carries.
 
-const MARKER: &[u8] = b"kbf-host-install:token-file-takes-actions-tokens-WRONG";
+use kbf_host_install::LONG_TOKEN_MARKER as MARKER;
 
 #[test]
 fn the_helper_binary_carries_the_mark_the_rehearsal_looks_for() {

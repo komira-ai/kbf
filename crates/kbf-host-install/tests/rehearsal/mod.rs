@@ -24,6 +24,7 @@ use std::process::{Command, Output};
 use std::thread::sleep;
 use std::time::Duration;
 
+use kbf_host_install::LONG_TOKEN_MARKER;
 use serde_json::Value;
 
 pub mod farm;
@@ -476,10 +477,6 @@ pub fn lay_out(r: &Rehearsal, kbf_unit: &str) -> PathBuf {
     systemctl("daemon_reload", &["daemon-reload"]);
     host_agent
 }
-
-/// What release N's helper carries when its channel token file takes GitHub's Actions token
-/// (about 520 bytes, with dots), as `LONG_TOKEN_MARKER` of the helper says.
-const LONG_TOKEN_MARKER: &[u8] = b"kbf-host-install:token-file-takes-actions-tokens";
 
 /// Whether the helper binary at `path` carries [`LONG_TOKEN_MARKER`].
 fn takes_actions_token(path: &Path) -> bool {

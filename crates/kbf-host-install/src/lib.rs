@@ -82,6 +82,12 @@ mod trust;
 
 use std::process::ExitCode;
 
+/// The mark the binary carries when its channel token file takes GitHub's Actions token (about
+/// 520 bytes, with dots). The update rehearsal, which runs the helper of the release before
+/// this one, looks for these bytes in that binary to know whether to give it the run's token;
+/// `tests/token_marker.rs` checks the built binary carries them.
+pub const LONG_TOKEN_MARKER: &[u8] = b"kbf-host-install:token-file-takes-actions-tokens";
+
 /// What a client of the forced command may rely on: the answers it prints and the requests
 /// it accepts. The client (`kbf-updater`) dev-depends on this to test its reading of the
 /// answers against the real types; nothing here is for production code.
