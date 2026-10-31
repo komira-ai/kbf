@@ -80,7 +80,7 @@ cannot be rescinded, v-current stops accepting at the end of its settle wait and
 | 2 | swap the rule to v-next (`nft -f`, one transaction) | a request through 9300 is answered by v-next (build gauge); health gate held for a bound, v-current untouched | swap back, **then** stop v-next |
 | 3 | **commit**: the executor's `retire-slot` job for v-current's slot (link to none, runtime mask, stop: the SIGTERM), `--drain-lb-wait` as the settle wait | v-current's `/readyz` is 503; in flight reaches 0 or the deadline passes | none: no swap back after this point |
 | 4 | v-current exits; the kernel frees the lock | exit status 0 (a hung one is killed at `TimeoutStopSec=960`, `packaging/tierstore/tierstore.service`) | none: v-next serves; the coordinator's rollback is a new hand-over |
-| 5 | finish: observe v-next | `/readyz` says `read-write` (and, on a storage node, the reconciler runs), waited for at most `promotion_bound` | none: past the bound the update is reported, never failed; see failure cases |
+| 5 | finish: observe v-next | `/readyz` says `read-write` (and, on a storage node, the reconciler runs), waited for at most `promotion_bound` | none: past the bound the update is `Succeeded` with the heartbeat state `promotion_pending`, and the coordinator holds the host's slot until it clears; past `promotion_ceiling` it is `Failed` (`after_commit`) on a storage node and an alert on a build node (`host-updates.md`, 4.1.6) |
 | 6 | report healthy | as step 5 | the coordinator's rollback is this strategy with the old version |
 
 Rollback is a new hand-over with the old version as v-next. It works only if the old version has this mode; before the
