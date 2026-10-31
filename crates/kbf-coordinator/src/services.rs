@@ -13,6 +13,7 @@
 //! [[service]]
 //! name = "agent"
 //! after = ["server"]             # services defined earlier in the file, or kbf
+//! priority = 0                   # default 0; a host is offered the higher number first
 //!
 //! [service.roles.daemon]
 //! max_updating = 2               # optional; absent: the desired state's number
@@ -90,7 +91,10 @@ pub struct ServiceDef {
     /// The `min_up` keys a desired state of the service must name (`kbf`: storage and
     /// frontend); a body without one is refused. Any other service may omit `min_up`.
     pub require_min_up: Vec<String>,
-    /// Which service a host is offered first when two are behind: higher first.
+    /// Which service a host is offered first when more than one is behind: the higher
+    /// number first, and services with the same number in the tie order of
+    /// [`crate::service::Coordinator::heartbeat`]. It orders offers only: a service that
+    /// must wait (`after`, its slots) yields to the next one whatever its priority.
     pub priority: i32,
 }
 
@@ -182,6 +186,8 @@ struct RawService {
     after: Vec<String>,
     #[serde(default)]
     roles: BTreeMap<String, RawRole>,
+    #[serde(default)]
+    priority: i32,
 }
 
 #[derive(Deserialize)]
@@ -244,7 +250,12 @@ fn service_def(
     raw: RawService,
     defined: &BTreeMap<String, ServiceDef>,
 ) -> Result<ServiceDef, ServicesError> {
-    let RawService { name, after, roles } = raw;
+    let RawService {
+        name,
+        after,
+        roles,
+        priority,
+    } = raw;
     if !is_service_name(&name) {
         return invalid(format!(
             "service name {name:?} is not 1 to {MAX_SERVICE_NAME} bytes of lowercase letters, digits and -"
@@ -277,7 +288,7 @@ fn service_def(
         roles,
         after,
         require_min_up: Vec::new(),
-        priority: 0,
+        priority,
     })
 }
 

@@ -1,6 +1,7 @@
 //! The coordinator: the fleet the heartbeats build, the desired state, and who may change
 //! or read either. No sockets here; [`crate::http`] maps requests onto these calls.
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -190,9 +191,10 @@ impl Coordinator {
     ///
     /// The top-level fields are `kbf`. Each entry of `services` is noted as that service's
     /// heartbeat of the host, if the coordinator manages the service and runs it on the
-    /// host's role (any other entry is ignored). `kbf` is decided first, then the host's
-    /// services in the order it listed them, and the first order is the reply: one update
-    /// per reply. A host that sent no `services` is answered about `kbf` alone, in the
+    /// host's role (any other entry is ignored). The services are decided by priority, the
+    /// highest first ([`crate::services::ServiceDef::priority`], 0 unless a definition sets
+    /// it); services of one priority go `kbf` first, then in the order the host listed them.
+    /// The first order is the reply: one update per reply. A host that sent no `services` is answered about `kbf` alone, in the
     /// shape it has always read.
     pub fn heartbeat(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
         let now = (self.clock)();
@@ -216,7 +218,11 @@ impl Coordinator {
             }
         }
         let desired = self.desired.all();
-        let names = std::iter::once(KBF).chain(announced.iter().map(|one| one.name.as_str()));
+        let mut names: Vec<&str> = std::iter::once(KBF)
+            .chain(announced.iter().map(|one| one.name.as_str()))
+            .collect();
+        // Stable: services of one priority keep the order above.
+        names.sort_by_key(|name| Reverse(self.services.get(name).map_or(0, |def| def.priority)));
         for name in names {
             let reply = decide_in(&self.services, &desired, name, &fleet, &who.node_id, now);
             if let Reply::Update { version } = reply {
