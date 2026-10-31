@@ -575,6 +575,8 @@ fn probe_2_mask_runtime_then_stop_an_active_instance_through_polkit() {
              \x20 if (action.id == \"org.freedesktop.systemd1.manage-unit-files\") return polkit.Result.YES;\n\
              \x20 if (action.id == \"org.freedesktop.systemd1.manage-units\" &&\n\
              \x20     action.lookup(\"unit\") == \"probe-polkit@a.service\") return polkit.Result.YES;\n\
+             \x20 if (action.id == \"org.freedesktop.systemd1.manage-units\" &&\n\
+             \x20     action.lookup(\"unit\") == \"probe-polkit@b.service\") return polkit.Result.NO;\n\
              \x20 return polkit.Result.NOT_HANDLED;\n}});\n",
             user = account.name
         ),
@@ -668,7 +670,7 @@ fn probe_2_mask_runtime_then_stop_an_active_instance_through_polkit() {
     );
     let log = said(
         "/usr/bin/journalctl",
-        &["--no-pager", "-n", "400", "-g", "polkit|probe-polkit|urp2"],
+        &["--no-pager", "-u", "polkit.service", "--since", "-10min"],
     );
     record("probe-2-facts", &format!("{facts}\n{log}"));
     assert_eq!(refused_stop.outcome, Outcome::Failure, "{facts}");
