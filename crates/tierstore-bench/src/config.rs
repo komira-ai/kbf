@@ -261,9 +261,10 @@ pub struct ConfigArgs {
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     pub cold_state_timeout_secs: u64,
     /// File mode only (the ops file has no cold admin key and names a heal status file): the
-    /// oldest a status file's own `read_unix_ms` may be, seconds, when a reading is taken. A
-    /// older file stops the run and fails the preflight.
-    #[arg(long, default_value_t = 0)]
+    /// oldest a status file's own `read_unix_ms` may be, seconds, when a reading is taken. An
+    /// older file stops the run and fails the preflight; so does one stamped more than 5 s in
+    /// the future.
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     pub cold_state_max_age_secs: u64,
     /// Cap on requests per second to the cold store.
     #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..))]

@@ -93,7 +93,9 @@ fn an_admin_entry_whose_key_file_is_missing_is_an_error() {
         .lock()
         .unwrap()
         .remove(std::path::Path::new("/private-mark/admin-cold.json"));
-    assert!(matches!(source.read(), Err(BenchError::Io { .. })));
+    let err = source.read().unwrap_err();
+    assert!(matches!(err, BenchError::Ops(_)), "{err}");
+    assert!(err.to_string().starts_with("cold state:"), "{err}");
     assert!(host.ran().is_empty());
 }
 
