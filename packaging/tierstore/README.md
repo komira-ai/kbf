@@ -244,7 +244,7 @@ object is refused the same whether or not it exists:
 | GET or HEAD of an object that is not listed | 403 |
 | PUT, POST or DELETE of anything (parts too), a listing, a call on the bucket or the root | 403 |
 | GET of a listed object with `partNumber`, `uploadId`, `uploads` or any other parameter | 403 |
-| a grant that is expired, ends beyond `--grant-max-lifetime`, is malformed, over 64 KiB, for another bucket, signed with another secret, or by a key id the server does not have, or edited after it was signed | 403 |
+| a grant that is expired, ends beyond the lifetime cap, is malformed, over 64 KiB, for another bucket, signed with another secret, or by a key id the server does not have, or edited after it was signed | 403 |
 | a grant and an `Authorization` header, or two grant headers | 403 |
 
 ### The token

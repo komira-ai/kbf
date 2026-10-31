@@ -251,7 +251,7 @@ fn a_fault_in_the_file_is_reported_without_the_value() {
             "grant_max_lifetime",
         ),
         (
-            golden_with("kind              = \"s3\"", "kind = \"SENTINEL\""),
+            golden_with("kind               = \"s3\"", "kind = \"SENTINEL\""),
             "kind",
         ),
         (
