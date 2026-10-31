@@ -377,10 +377,13 @@ pub(super) async fn begin_get(rig: &Rig, client: &mut DuplexStream, key: &str) -
     piece
 }
 
-/// A signed GET of `uri` for the server with `config`, on a connection of its own that closes
-/// after the answer: everything the server sends on it, the head and as much of the body as
-/// arrives before the connection ends.
-pub(super) async fn raw_get(server: &Arc<Server>, config: &ServerConfig, uri: &str) -> Vec<u8> {
+/// A signed GET of `uri` for the server with `config`, sent on a connection of its own that closes
+/// after the answer: the client end of the connection, with nothing read from it yet.
+pub(super) async fn send_get(
+    server: &Arc<Server>,
+    config: &ServerConfig,
+    uri: &str,
+) -> DuplexStream {
     let (parts, _) = sign(config, "GET", uri, &[], b"").into_parts();
     let mut text = format!("GET {uri} HTTP/1.1\r\n");
     for (name, value) in &parts.headers {
@@ -390,6 +393,14 @@ pub(super) async fn raw_get(server: &Arc<Server>, config: &ServerConfig, uri: &s
     text.push_str("\r\n");
     let mut client = attach(server);
     client.write_all(text.as_bytes()).await.unwrap();
+    client
+}
+
+/// A signed GET of `uri` for the server with `config`, on a connection of its own that closes
+/// after the answer: everything the server sends on it, the head and as much of the body as
+/// arrives before the connection ends.
+pub(super) async fn raw_get(server: &Arc<Server>, config: &ServerConfig, uri: &str) -> Vec<u8> {
+    let mut client = send_get(server, config, uri).await;
     let mut answer = Vec::new();
     read_rest(&mut client, &mut answer).await;
     answer
