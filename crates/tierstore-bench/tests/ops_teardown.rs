@@ -234,8 +234,8 @@ async fn a_clean_teardown_passes_every_check() {
     );
     assert!(failing(&checks).is_empty(), "{checks:?}");
     assert_eq!(
+        find(&checks, "test-bucket-removed:cold").detail,
         "the store's bucket list does not name it (the bucket itself answers NoSuchBucket)"
-        "the store has no such bucket"
     );
     assert_eq!(
         find(&checks, "request-log-test-buckets-only").detail,
