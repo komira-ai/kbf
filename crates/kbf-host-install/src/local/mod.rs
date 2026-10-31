@@ -66,4 +66,6 @@ mod request_tests;
 #[cfg(test)]
 mod serve_tests;
 #[cfg(test)]
+mod timing_golden_tests;
+#[cfg(test)]
 mod units_tests;

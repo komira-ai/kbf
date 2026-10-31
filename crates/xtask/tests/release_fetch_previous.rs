@@ -102,11 +102,12 @@ impl Fx {
     }
 
     /// The release `tag` of `commit` as the pipeline publishes it: a tarball for each of
-    /// [`ASSETS`] with its SBOM and bundle, and the `SHA256SUMS`; and the artifacts
+    /// [`ASSETS`] with its SBOM and bundle, the version facts of each `kbf`, and the `SHA256SUMS`; and the artifacts
     /// workflow's attestations of them. The tarball of `kbf-server` holds the entry
     /// `server_entry`.
     fn release_with(&self, tag: &str, commit: &str, server_entry: &str) {
         let mut assets = Vec::new();
+        let mut facts = Vec::new();
         for (binary, platform) in ASSETS {
             let entry = if binary == "kbf-server" {
                 server_entry
@@ -114,9 +115,16 @@ impl Fx {
                 binary
             };
             let tgz = tarball(entry, &asset_bytes(binary, platform, commit)).expect("tarball");
-            assets.push((format!("{binary}-{commit}-{platform}"), tgz));
+            let stem = format!("{binary}-{commit}-{platform}");
+            if binary == "kbf" {
+                facts.push((
+                    stem.clone(),
+                    format!("{{\"stem\":\"{stem}\"}}\n").into_bytes(),
+                ));
+            }
+            assets.push((stem, tgz));
         }
-        self.publish(tag, commit, &assets);
+        self.publish_with_facts(tag, commit, &assets, &facts);
     }
 
     /// The release `tag` of `commit`, whole.
@@ -524,6 +532,33 @@ fn damage_no_sbom(f: &Fx) {
     let text = std::fs::read_to_string(&store).expect("attested");
     let kept: Vec<&str> = text.lines().filter(|l| !l.ends_with(SBOM)).collect();
     std::fs::write(&store, format!("{}\n", kept.join("\n"))).expect("write");
+}
+
+/// The release lists the `kbf` tarball and no longer its version facts: a release made before
+/// the build jobs recorded them.
+fn damage_no_version_facts(f: &Fx) {
+    let facts = format!("kbf-{PREV}-linux-x86_64.version.json");
+    std::fs::remove_file(f.asset(&facts)).expect("remove");
+    let sums = f.asset("SHA256SUMS");
+    let text = std::fs::read_to_string(&sums).expect("sums");
+    let kept: String = text
+        .lines()
+        .filter(|l| !l.ends_with(&facts))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_ne!(kept, text, "the facts were listed");
+    std::fs::write(&sums, kept).expect("write");
+}
+
+#[test]
+fn a_previous_release_without_the_version_facts_of_its_kbf_is_refused() {
+    // Catches: the previous release read with the facts waived (as it was for the release made
+    // before the build jobs recorded them), so a release without them is unpacked and run.
+    let why = format!(
+        "kbf-{PREV}-linux-x86_64.tar.gz: its version facts kbf-{PREV}-linux-x86_64.version.json \
+         are not listed in SHA256SUMS"
+    );
+    refuses_damaged("no-version-facts", damage_no_version_facts, &why);
 }
 
 #[test]

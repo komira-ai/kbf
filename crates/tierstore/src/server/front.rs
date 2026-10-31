@@ -12,6 +12,7 @@ use super::ServerConfig;
 use super::cli::{Cli, Error};
 use super::gc::{ensure_distinct as gc_distinct, gc_keys, ids as gc_ids};
 use super::keys::{ensure_distinct, read_credentials, read_only_keys};
+use super::listen::has_duplicate;
 use super::presign::{ensure_distinct as presign_distinct, presign_keys};
 use super::scoped::{ensure_distinct as scoped_distinct, ids as scoped_ids, scoped_keys};
 
@@ -30,7 +31,8 @@ pub(super) fn read_key(path: &Path) -> Result<(String, String), String> {
 /// the names, the key files and the limits.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct FrontSettings {
-    pub listen: SocketAddr,
+    /// The addresses of the S3 front, which are at least one.
+    pub listen: Vec<SocketAddr>,
     pub proxy_id: String,
     pub bucket: String,
     pub region: String,
@@ -42,6 +44,7 @@ pub(super) struct FrontSettings {
     pub presign_max_expires: Duration,
     pub max_request_bytes: u64,
     pub max_concurrent_puts: u32,
+    pub put_permit_wait: Duration,
     pub put_min_bytes_per_sec: u64,
     pub put_rate_grace: Duration,
     pub body_idle_timeout: Duration,
@@ -53,7 +56,7 @@ impl Cli {
     /// The settings of the S3 front.
     pub(super) fn front(&self) -> FrontSettings {
         FrontSettings {
-            listen: self.listen,
+            listen: self.listen.clone(),
             proxy_id: self.proxy_id.clone(),
             bucket: self.bucket.clone(),
             region: self.region.clone(),
@@ -65,6 +68,7 @@ impl Cli {
             presign_max_expires: self.presign_max_expires,
             max_request_bytes: self.max_request_bytes,
             max_concurrent_puts: self.max_concurrent_puts,
+            put_permit_wait: self.put_permit_wait,
             put_min_bytes_per_sec: self.put_min_bytes_per_sec,
             put_rate_grace: self.put_rate_grace,
             body_idle_timeout: self.body_idle_timeout,
@@ -90,6 +94,9 @@ pub(super) fn server_config(
     if front.body_idle_timeout.is_zero() {
         return Err("--body-idle-timeout must be longer than zero".into());
     }
+    if has_duplicate(&front.listen) {
+        return Err(InvalidFlags("--listen is given the same address twice".into()).into());
+    }
     let (key_id, secret) = read_key(&front.access_key_file)?;
     let read_only = read_only_keys(&front.read_only_key_file)?;
     ensure_distinct(&key_id, &read_only).map_err(InvalidFlags)?;
@@ -114,6 +121,7 @@ pub(super) fn server_config(
     server.max_request_bytes = usize::try_from(front.max_request_bytes).unwrap_or(usize::MAX);
     server.body_idle_timeout = front.body_idle_timeout;
     server.max_concurrent_puts = front.max_concurrent_puts as usize;
+    server.put_permit_wait = front.put_permit_wait;
     server.put_min_bytes_per_sec = front.put_min_bytes_per_sec;
     server.put_rate_grace = front.put_rate_grace;
     server.drain_lb_wait = front.drain_lb_wait;

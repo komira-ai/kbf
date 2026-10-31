@@ -9,7 +9,7 @@ use kbf_testkit::dir::TestDir;
 
 use super::OciError;
 use super::test_pki::{ca, dns, ip, leaf, leaf_with};
-use super::tls::{acceptor, ip_of, unnamed};
+use super::tls::{acceptor, acceptor_for, ip_of, unnamed};
 use rcgen::date_time_ymd;
 
 fn addr(text: &str) -> SocketAddr {
@@ -36,6 +36,24 @@ fn a_certificate_that_names_the_address_is_accepted() {
     for listen in ["192.0.2.7:443", "[::1]:443", "[::]:443"] {
         acceptor(&many.cert, &many.key, addr(listen)).expect(listen);
     }
+}
+
+/// Asserts that for a front at several addresses the certificate must name each of them, that
+/// the refusal says which one it does not name, and that any IP covers the wildcards.
+#[test]
+fn a_certificate_must_name_every_address_of_the_front() {
+    let dir = TestDir::under(std::env::temp_dir(), "oci-tls-several");
+    let ca = ca();
+    let both = leaf(dir.path(), "both", &ca, vec![ip("127.0.0.1"), ip("::1")]);
+    let v4 = leaf(dir.path(), "v4", &ca, vec![ip("127.0.0.1")]);
+    let listen = [addr("127.0.0.1:443"), addr("[::1]:443")];
+    acceptor_for(&both.cert, &both.key, &listen).expect("both are named");
+    let refused = acceptor_for(&v4.cert, &v4.key, &listen).err();
+    let why = refused.expect("::1 is not named").to_string();
+    assert!(why.starts_with("--oci-tls-cert "), "{why}");
+    assert!(why.contains("no IP subjectAltName for ::1"), "{why}");
+    let wildcards = [addr("0.0.0.0:443"), addr("[::]:443")];
+    acceptor_for(&v4.cert, &v4.key, &wildcards).expect("any IP will do for a wildcard");
 }
 
 /// Asserts a certificate without an IP subjectAltName for the address is refused with the

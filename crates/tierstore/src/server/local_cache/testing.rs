@@ -2,7 +2,9 @@
 //! hold, a file system whose answers a test can change, and a cache over them in a scratch
 //! directory.
 
+use std::collections::BTreeMap;
 use std::io;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -24,12 +26,88 @@ use crate::{
 use super::layout::{data_path, name_of};
 use super::{CacheConfig, Disk, LocalCache, Space, SystemDisk};
 
+/// What a listing of a directory tree says of one entry.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::server) struct Seen {
+    pub(in crate::server) dir: bool,
+    pub(in crate::server) len: u64,
+    pub(in crate::server) mode: u32,
+    pub(in crate::server) inode: u64,
+    /// The time of last change of the contents, in seconds and nanoseconds.
+    pub(in crate::server) mtime: (i64, i64),
+}
+
+/// Every entry under `root` (and `root` itself, as the empty path) with its kind, size, mode,
+/// inode and time of last change. Two listings are equal if nothing under `root` was made,
+/// removed, rewritten, renamed, chmodded or stamped between them.
+pub(in crate::server) fn tree(root: &Path) -> BTreeMap<PathBuf, Seen> {
+    let seen_of = |path: &Path| {
+        let meta = std::fs::symlink_metadata(path).expect("an entry of the tree");
+        Seen {
+            dir: meta.is_dir(),
+            len: meta.len(),
+            mode: meta.permissions().mode(),
+            inode: meta.ino(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+        }
+    };
+    let mut listing = BTreeMap::new();
+    listing.insert(PathBuf::new(), seen_of(root));
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("a directory of the tree") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                pending.push(path.clone());
+            }
+            let below = path.strip_prefix(root).expect("under the root");
+            listing.insert(below.to_path_buf(), seen_of(&path));
+        }
+    }
+    listing
+}
+
 /// The wait and the deadline of a keep in tests that do not test them: an hour, so that no test
 /// that runs on the real clock can reach either, whatever the load on the disk. The tests of the
 /// two settings run on a paused clock and set small values themselves.
 pub(in crate::server) fn never_expires(config: &mut CacheConfig) {
     config.keep_wait = std::time::Duration::from_secs(3600);
     config.keep_deadline = std::time::Duration::from_secs(3600);
+}
+
+/// The turns of the scheduler a test gives an event that another task or a thread brings about
+/// before it fails: some seconds of real time, which a disk under load needs for a file sync, and
+/// no virtual time, which only the test moves.
+pub(in crate::server) const TURNS: u32 = 10_000_000;
+
+/// Waits, by giving up the thread, until `done` is true; fails the test, saying what `what` was
+/// to have happened, if it has not after [`TURNS`] turns. A wait that is not bounded turns a
+/// regression into a test that runs until it is killed.
+pub(in crate::server) async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..TURNS {
+        if done() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("after {TURNS} turns of the scheduler, this never happened: {what}");
+}
+
+/// [`wait_until`] on a paused clock, which it moves by `step` at each turn: for an event that
+/// waits for a timer (a retry, a deadline) as well as for another task.
+pub(in crate::server) async fn wait_advancing(
+    what: &str,
+    step: std::time::Duration,
+    mut done: impl FnMut() -> bool,
+) {
+    for _ in 0..TURNS {
+        if done() {
+            return;
+        }
+        tokio::time::advance(step).await;
+        tokio::task::yield_now().await;
+    }
+    panic!("after {TURNS} turns of the scheduler, this never happened: {what}");
 }
 
 /// `len` bytes that differ from one place to the next, so that a wrong range shows.
@@ -344,6 +422,8 @@ pub(in crate::server) struct FakeDisk {
     space_waiting: AtomicU64,
     /// The names of every call of `link`, in order: from and to.
     pub(in crate::server) linked: Mutex<Vec<(PathBuf, PathBuf)>>,
+    /// What a test has every call of `touch` do, after it is noted.
+    pub(in crate::server) touch_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl FakeDisk {
@@ -358,6 +438,7 @@ impl FakeDisk {
             space_gate: Mutex::new(None),
             space_waiting: AtomicU64::new(0),
             linked: Mutex::new(Vec::new()),
+            touch_hook: Mutex::new(None),
         }
     }
 
@@ -542,6 +623,14 @@ impl Disk for FakeDisk {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((path.to_path_buf(), millis));
+        let hook = self
+            .touch_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
         SystemDisk.touch(path, millis)
     }
 }
@@ -613,6 +702,39 @@ impl Rig {
     /// The cache again over the same directory, as after a restart.
     pub(in crate::server) fn reopen(&self) -> LocalCache {
         self.reopen_with(|_| {})
+    }
+
+    /// A cache over the same directory that takes its lock, as the binary's does: read-write if
+    /// nobody holds the lock, else read-only. [`Rig::cache`] takes none.
+    pub(in crate::server) fn locked(&self) -> LocalCache {
+        self.try_locked().expect("a cache")
+    }
+
+    /// The same, with the settings changed by `change`.
+    pub(in crate::server) fn locked_with(
+        &self,
+        change: impl FnOnce(&mut CacheConfig),
+    ) -> LocalCache {
+        let mut config = self.config.clone();
+        change(&mut config);
+        Self::open_locked(&config, &self.upstream, &self.disk, &self.clock).expect("a cache")
+    }
+
+    /// The same, with the answer of the open.
+    pub(in crate::server) fn try_locked(&self) -> io::Result<LocalCache> {
+        let (config, upstream) = (&self.config, &self.upstream);
+        Self::open_locked(config, upstream, &self.disk, &self.clock)
+    }
+
+    fn open_locked(
+        config: &CacheConfig,
+        upstream: &Arc<FaultyBackend>,
+        disk: &Arc<FakeDisk>,
+        clock: &Arc<TestClock>,
+    ) -> io::Result<LocalCache> {
+        let upstream: Arc<dyn Backend> = upstream.clone();
+        let (disk, clock) = (disk.clone(), clock.clone());
+        LocalCache::open_locked(config.clone(), upstream, disk, clock)
     }
 
     /// The same, with the settings changed by `change`.

@@ -30,7 +30,7 @@ function binarySource(): Map<string, string> {
 }
 
 /** The files that export metrics: the OCI front's, the cache's and the tiers'. */
-const EXPORTERS = new Set(['server/oci/metrics.rs', 'server/local_cache/metrics.rs', 'metrics.rs']);
+const EXPORTERS = new Set(['server/oci/metrics.rs', 'server/local_cache/metrics.rs', 'metrics.rs', 'server/build_info.rs', 'server/mod.rs']);
 
 /** What in the source no longer matches the pages. Each problem names the pages to change. */
 export function staleClaims(src: ReadonlyMap<string, string>): string[] {

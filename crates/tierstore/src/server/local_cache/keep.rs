@@ -82,7 +82,7 @@ use tokio::time::Instant;
 
 use crate::{Error, PartBody};
 
-use super::fill::{Filled, Flight, Pending, Reserved, Staged};
+use super::fill::{Filled, Flight, Pending, Published, Reserved, Staged};
 use super::layout::{Name, Sidecar};
 use super::metrics::{SkippedKeep, bump};
 use super::{Inner, locked};
@@ -117,6 +117,7 @@ impl Writer {
             staged,
             queue,
             Arc::clone(&queued),
+            inner.generation(),
         ));
         Self {
             chunks: Some(chunks),
@@ -167,14 +168,20 @@ impl Drop for Writer {
 }
 
 /// Writes the chunks of `queue` to `staged` until the queue is closed. A write that fails ends
-/// the task with its error, and the stage file with it.
+/// the task with its error, and the stage file with it. So does a cache that does not own its
+/// directory any more (`generation` is the one the writer started under, see `Inner::owns`): it
+/// writes no chunk more.
 async fn write_chunks(
     inner: Arc<Inner>,
     mut staged: Staged,
     mut queue: mpsc::Receiver<Bytes>,
     queued: Arc<AtomicU64>,
+    generation: u64,
 ) -> io::Result<Staged> {
     while let Some(chunk) = queue.recv().await {
+        if !inner.owns(generation) {
+            return Err(io::Error::other("the cache lost the lock of its directory"));
+        }
         let written = inner.disk.write_stage(&mut staged.file, &chunk).await;
         let _ = queued.fetch_sub(chunk.len() as u64, Ordering::SeqCst);
         written?;
@@ -188,6 +195,9 @@ pub(super) struct Stage {
     writer: Writer,
     _reservation: Reserved,
     _permit: OwnedSemaphorePermit,
+    /// The number of times the cache had lost the lock when the copy began: the keep gives up
+    /// when it is not the number now (see `Inner::owns`).
+    generation: u64,
 }
 
 /// What a put knows of its body while the body passes.
@@ -373,6 +383,14 @@ impl Inner {
     /// The copy for a body of `len` bytes: a keep permit, room for the bytes and a stage file
     /// with its writer.
     async fn open_stage(self: &Arc<Self>, len: Option<u64>) -> Result<Stage, SkippedKeep> {
+        // A read-only cache keeps nothing: the stage directory is the holder's too. The keep
+        // asks again, with the number, before each chunk the writer writes, after the writer
+        // ends, inside the publish and after it. Nothing in between waits, so a look between
+        // the permit and the stage file would see what this one saw.
+        let generation = self.generation();
+        if !self.owns(generation) {
+            return Err(SkippedKeep::ReadOnly);
+        }
         let Ok(permit) = Arc::clone(&self.keeps).try_acquire_owned() else {
             return Err(SkippedKeep::Busy);
         };
@@ -383,6 +401,7 @@ impl Inner {
             writer: Writer::start(self, staged),
             _reservation: reservation,
             _permit: permit,
+            generation,
         })
     }
 
@@ -463,12 +482,23 @@ impl Inner {
             Ok(meta) if meta.size == size => meta,
             _ => return Err(SkippedKeep::Head),
         };
+        let generation = stage.generation;
         let ended = Self::before(deadline, stage.writer.finish()).await?;
+        // Before the error of the writer is looked at: a writer that stopped because the cache
+        // lost the lock is not an I/O error.
+        if !self.owns(generation) {
+            return Err(SkippedKeep::ReadOnly);
+        }
         let mut staged = ended.map_err(|_| SkippedKeep::Io)?;
         let synced = Self::before(deadline, staged.finish()).await?;
         synced.map_err(|_| SkippedKeep::Io)?;
         // An entry for the key is of an object that is gone: it must not keep the new file's
-        // place.
+        // place. It is not gated by a look at the lock (the publish looks first thing, and a
+        // keep that lost the lock ends below, with nothing linked, `Lost` included: a lost
+        // lock stays lost for this keep, the generation having changed): if the lock is lost
+        // and taken again before this runs, it removes an entry and files of the new
+        // ownership, which costs a refill of a whole object and never gives wrong bytes: what
+        // is removed is a valid object or nothing, and a read that misses goes to the upstream.
         self.drop_entry(&name.hex);
         let sidecar = Sidecar {
             key: key.to_owned(),
@@ -477,19 +507,29 @@ impl Inner {
             tag: meta.tag.clone(),
             modified: meta.modified,
         };
-        let mut publishing = self.begin_commit(&staged, name, &sidecar);
-        match tokio::time::timeout_at(deadline, &mut publishing).await {
+        let mut publishing = self.begin_commit(&staged, name, &sidecar, generation);
+        let published = match tokio::time::timeout_at(deadline, &mut publishing).await {
             Ok(joined) => joined
                 .expect("a publish does not panic")
                 .map_err(|_| SkippedKeep::Io)?,
             Err(_) => {
                 // The link cannot be called back: it is left to end on its own, and then undone,
-                // so that it leaves no file that nothing indexes.
+                // so that it leaves no file that nothing indexes. A cache that does not own the
+                // directory then removes only what it linked (see `remove_linked`).
                 let inner = Arc::clone(self);
                 let hex = name.hex.clone();
                 drop(tokio::spawn(async move {
-                    let _ = publishing.await;
-                    inner.drop_entry(&hex);
+                    let ended = publishing.await;
+                    let linked = matches!(ended, Ok(Ok(Published::New)));
+                    // Under the ownership the keep began in, the link is undone as it was. Past
+                    // it (the cache lost the lock, and may have taken it again, which is a
+                    // read-write cache with another generation) the name may be the new
+                    // ownership's: nothing is touched unless this keep linked it.
+                    if inner.owns(generation) {
+                        inner.drop_entry(&hex);
+                    } else if linked {
+                        inner.remove_linked(&hex);
+                    }
                     drop(staged);
                 }));
                 return Err(SkippedKeep::Deadline);
@@ -497,6 +537,12 @@ impl Inner {
         };
         #[cfg(test)]
         self.run_before_insert();
+        if !self.owns(generation) {
+            if published == Published::New {
+                self.remove_linked(&name.hex);
+            }
+            return Err(SkippedKeep::ReadOnly);
+        }
         locked(&self.index).insert(&name.hex, size, meta.tag, meta.modified);
         // A delete that finished after the HEAD marked this keep (see `forget`), and may have
         // dropped nothing because the entry was not in yet: the object is gone from the
