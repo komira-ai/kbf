@@ -32,6 +32,12 @@ fn beat() -> Heartbeat {
         last_update: None,
         updating: None,
         services: None,
+        agent_features: Vec::new(),
+        step: None,
+        commit: None,
+        step_secs: Default::default(),
+        promotion_pending: false,
+        deferred: None,
     }
 }
 
@@ -708,6 +714,11 @@ fn a_heartbeat_with_services_reads_a_reply_that_names_one() {
         health: Health::Healthy,
         last_update: None,
         updating: None,
+        step: None,
+        commit: None,
+        step_secs: Default::default(),
+        promotion_pending: false,
+        deferred: None,
     }]);
     let named = r#"{"reply":"update","service":"db","version":"0.1.7+gbbbbbbbbbbbb-3"}"#;
     let (addr, server) = rig.coordinator(vec![

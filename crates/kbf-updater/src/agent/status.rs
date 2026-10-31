@@ -56,6 +56,12 @@ impl Status {
             last_update: self.last_update.clone(),
             updating: self.updating.clone(),
             services: None,
+            agent_features: Vec::new(),
+            step: None,
+            commit: None,
+            step_secs: Default::default(),
+            promotion_pending: false,
+            deferred: None,
         }
     }
 
@@ -67,6 +73,11 @@ impl Status {
             health: self.health,
             last_update: self.last_update.clone(),
             updating: self.updating.clone(),
+            step: None,
+            commit: None,
+            step_secs: Default::default(),
+            promotion_pending: false,
+            deferred: None,
         }
     }
 }

@@ -29,6 +29,11 @@ fn announcing_other(mut top: Heartbeat, service: &str, running: &str) -> Heartbe
         health: Health::Healthy,
         last_update: None,
         updating: None,
+        step: None,
+        commit: None,
+        step_secs: Default::default(),
+        promotion_pending: false,
+        deferred: None,
     }]);
     top
 }
