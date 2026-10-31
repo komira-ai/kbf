@@ -18,8 +18,9 @@
 //!   passes, so a form the hosts never report fails here;
 //! - release N's `kbf-updater agent` (its own binary, from release N's tarball) as the packaged
 //!   unit `packaging/host-agent/linux/kbf-updater-agent.service` runs it, as `kbf-updater`, with
-//!   its certificate placed (`--client-cert`, `--client-key`, `--ca`), the simplest of the
-//!   supported ways: enrolling needs a token and the frontend's enroll listener for a result that
+//!   its certificate placed (`--client-cert`, `--client-key`, `--ca`; `--cordon-dir` is the unit's
+//!   state directory, as the packaged unit's comment says for placed certificates), the
+//!   simplest of the supported ways: enrolling needs a token and the frontend's enroll listener for a result that
 //!   is the same files;
 //! - release N's helper and `kbf` on the host, as in the first rehearsal;
 //! - a real frontend of release N (`kbf --mode=frontend`, a SQLite state store, the farm CA, the
@@ -102,14 +103,18 @@ fn agent_unit(host_agent: &Path, exec: &str) -> String {
     out.join("\n") + "\n"
 }
 
+/// The agent's `StateDirectory` in the packaged unit: the one place it may write under
+/// `ProtectSystem=strict`, where it keeps the marks of its cordons.
+const AGENT_STATE_DIR: &str = "/var/lib/kbf-updater";
+
 /// The command line of the agent the rehearsal runs, with its certificate placed in
-/// `updater_files`.
+/// `updater_files` (read-only for the unit) and its cordon marks in the unit's state directory.
 fn agent_exec(updater_files: &Path) -> String {
     let path = |p: &Path| p.display().to_string();
     format!(
         "{AGENT_BINARY} agent --coordinator localhost:{} --frontend localhost:{} \
-         --client-cert {} --client-key {} --ca {} --channel {CHANNEL} \
-         --heartbeat-secs 5 --health-poll-secs 2",
+         --client-cert {} --client-key {} --ca {} --cordon-dir {AGENT_STATE_DIR} \
+         --channel {CHANNEL} --heartbeat-secs 5 --health-poll-secs 2",
         farm::HEARTBEAT.rsplit(':').next().unwrap(),
         farm::FRONTEND_WORKER.rsplit(':').next().unwrap(),
         path(&updater_files.join("updater.pem")),
