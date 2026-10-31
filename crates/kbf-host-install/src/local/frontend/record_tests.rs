@@ -173,3 +173,23 @@ fn a_record_with_groups_keeps_them() {
     );
     assert_eq!(Record::load(&trust, &path).unwrap(), record);
 }
+
+/// A trial's configuration with every hardening key, as the helper writes it.
+const HARDENED_RECORD: &str = r#"{"images":{"n":"sha256:n"},"current":{"commit":"o","image":"sha256:o"},"pending":{"commit":"n","image":"sha256:n","from":"o","from_image":"sha256:o","deadline_unix":7,"config":{"run":{"name":"f","restart":"unless-stopped","network":null,"user":null,"read_only":true,"tmpfs":["/tmp:rw,size=256m"],"cap_drop":["ALL"],"security_opt":["no-new-privileges"],"ulimits":["nofile=1048576:1048576"],"ports":[],"mounts":[],"command":[]},"api":"127.0.0.1:1","drain_token_file":"/t","peers":[],"drain_secs":180,"ready_secs":90}}}"#;
+
+/// A record with the hardening keys loads, and saving what was loaded writes the same keys.
+#[test]
+fn a_record_with_hardening_keeps_it() {
+    let (dir, trust) = rig("hi-fe-record-hardening");
+    let path = dir.join("frontend.json");
+    fs::write(&path, HARDENED_RECORD).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let record = Record::load(&trust, &path).unwrap();
+    let run = &record.pending.as_ref().unwrap().config.run;
+    assert!(run.run_args("i").contains(&"--read-only".to_owned()));
+    record.save(&path).unwrap();
+    let written: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let expected: serde_json::Value = serde_json::from_str(HARDENED_RECORD).unwrap();
+    assert_eq!(written, expected);
+}

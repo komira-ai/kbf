@@ -8,6 +8,11 @@
 //! network = "bridge"                         # optional
 //! user = "65532:65532"                       # optional
 //! group_add = ["990"]                        # optional: supplementary gids, as quoted numbers
+//! read_only = true                           # optional: --read-only
+//! tmpfs = ["/tmp:rw,size=256m"]              # optional: --tmpfs
+//! cap_drop = ["ALL"]                         # optional: --cap-drop
+//! security_opt = ["no-new-privileges"]       # optional: --security-opt
+//! ulimits = ["nofile=1048576:1048576"]       # optional: --ulimit
 //! ports = ["127.0.0.1:8982:8982"]            # docker's --publish forms
 //! mounts = ["/etc/kbf:/etc/kbf:ro"]          # docker's --volume forms
 //! command = ["--config", "/etc/kbf/kbf.toml"]  # the flags after the image
@@ -60,6 +65,24 @@ pub struct RunSpec {
     /// before the helper is rolled back to a version without it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub group_add: Vec<u32>,
+    /// `--read-only`. Hardening options (this and the four below) are not written when unset,
+    /// for the reason `group_add` is not: a host that sets none writes the record it always
+    /// did. A host that sets any of them must settle or revert any release on trial before the
+    /// helper is rolled back to a version without them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+    /// `--tmpfs`, one `PATH[:OPTIONS]` per entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tmpfs: Vec<String>,
+    /// `--cap-drop`, one capability name (or `ALL`) per entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_drop: Vec<String>,
+    /// `--security-opt`; only `no-new-privileges` is accepted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub security_opt: Vec<String>,
+    /// `--ulimit`, one `NAME=SOFT[:HARD]` per entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ulimits: Vec<String>,
     #[serde(default)]
     pub ports: Vec<String>,
     #[serde(default)]
@@ -85,7 +108,17 @@ impl RunSpec {
             args.push("--group-add".to_owned());
             args.push(gid.to_string());
         }
-        for (flag, values) in [("--publish", &self.ports), ("--volume", &self.mounts)] {
+        if self.read_only {
+            args.push("--read-only".to_owned());
+        }
+        for (flag, values) in [
+            ("--tmpfs", &self.tmpfs),
+            ("--cap-drop", &self.cap_drop),
+            ("--security-opt", &self.security_opt),
+            ("--ulimit", &self.ulimits),
+            ("--publish", &self.ports),
+            ("--volume", &self.mounts),
+        ] {
             for value in values {
                 args.push(flag.to_owned());
                 args.push(value.clone());
@@ -129,6 +162,16 @@ struct Entry {
     user: Option<String>,
     #[serde(default)]
     group_add: Vec<String>,
+    #[serde(default)]
+    read_only: bool,
+    #[serde(default)]
+    tmpfs: Vec<String>,
+    #[serde(default)]
+    cap_drop: Vec<String>,
+    #[serde(default)]
+    security_opt: Vec<String>,
+    #[serde(default)]
+    ulimits: Vec<String>,
     #[serde(default)]
     ports: Vec<String>,
     #[serde(default)]
@@ -175,6 +218,89 @@ fn gid(text: &str) -> Option<u32> {
     text.parse().ok().filter(|gid| *gid != 0)
 }
 
+/// A `--tmpfs` entry: an absolute path of `A-Z a-z 0-9 _ . -` and `/` without a `..` part,
+/// then optionally `:` and comma-separated options from a short list. `exec`, `suid` and `dev`
+/// are not on it: they would loosen what docker's default for a tmpfs (`noexec,nosuid,nodev`)
+/// holds shut.
+fn tmpfs_ok(text: &str) -> bool {
+    let (path, options) = match text.split_once(':') {
+        Some((path, options)) => (path, Some(options)),
+        None => (text, None),
+    };
+    let path_ok = path.starts_with('/')
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/_.-".contains(&b))
+        && !path.split('/').any(|part| part == "..");
+    let size = |v: &str| {
+        let digits = v.strip_suffix(['k', 'm', 'g']).unwrap_or(v);
+        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+    };
+    let option_ok = |option: &str| match option.split_once('=') {
+        None => matches!(option, "ro" | "rw" | "noexec" | "nosuid" | "nodev"),
+        Some(("size", v)) => size(v),
+        Some(("mode", v)) => {
+            !v.is_empty() && v.len() <= 4 && v.bytes().all(|b| (b'0'..=b'7').contains(&b))
+        }
+        Some(("uid" | "gid" | "nr_inodes", v)) => {
+            !v.is_empty() && v.len() <= 10 && v.bytes().all(|b| b.is_ascii_digit())
+        }
+        Some(_) => false,
+    };
+    path_ok && options.is_none_or(|o| o.split(',').all(option_ok))
+}
+
+/// A capability name for `--cap-drop`: `ALL` or upper-case letters, digits and `_` (`NET_RAW`,
+/// `CAP_NET_RAW`).
+fn cap_ok(text: &str) -> bool {
+    text.starts_with(|c: char| c.is_ascii_uppercase())
+        && text.len() <= 32
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// A `--ulimit` entry: `NAME=SOFT` or `NAME=SOFT:HARD`, NAME one of the resources docker
+/// knows, the limits decimal digits with the soft limit not above the hard one.
+fn ulimit_ok(text: &str) -> bool {
+    let Some((name, limits)) = text.split_once('=') else {
+        return false;
+    };
+    let known = matches!(
+        name,
+        "core"
+            | "cpu"
+            | "data"
+            | "fsize"
+            | "locks"
+            | "memlock"
+            | "msgqueue"
+            | "nice"
+            | "nofile"
+            | "nproc"
+            | "rss"
+            | "rtprio"
+            | "rttime"
+            | "sigpending"
+            | "stack"
+    );
+    let number = |v: &str| -> Option<u64> {
+        if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        v.parse().ok()
+    };
+    let (soft, hard) = match limits.split_once(':') {
+        Some((soft, hard)) => (number(soft), number(hard).map(Some)),
+        None => (number(limits), Some(None)),
+    };
+    let ordered = match (soft, hard) {
+        (Some(soft), Some(hard)) => hard.is_none_or(|hard| soft <= hard),
+        _ => false,
+    };
+    known && ordered
+}
+
 fn plain(text: &str) -> bool {
     !text.is_empty() && !text.chars().any(char::is_control)
 }
@@ -195,6 +321,31 @@ fn check(entry: &RunSpec) -> Result<(), String> {
     }
     if !entry.user.as_deref().is_none_or(user_ok) {
         return Err("user is not NAME or ID, with an optional :GROUP".to_owned());
+    }
+    if !entry.tmpfs.iter().all(|t| tmpfs_ok(t)) {
+        return Err(
+            "tmpfs is not /PATH or /PATH:OPTIONS, with options from ro, rw, noexec, nosuid, nodev, size=, mode=, uid=, gid=, nr_inodes="
+                .to_owned(),
+        );
+    }
+    if !entry.cap_drop.iter().all(|c| cap_ok(c)) {
+        return Err("cap_drop is not ALL or a capability name in capitals".to_owned());
+    }
+    // Only the option that tightens: seccomp, apparmor and label values (`unconfined`,
+    // `disable`) and `no-new-privileges=false` would loosen what docker holds by default.
+    if !entry.security_opt.iter().all(|o| {
+        matches!(
+            o.as_str(),
+            "no-new-privileges" | "no-new-privileges=true" | "no-new-privileges:true"
+        )
+    }) {
+        return Err("security_opt is not no-new-privileges (an option that loosens the container is refused)".to_owned());
+    }
+    if !entry.ulimits.iter().all(|u| ulimit_ok(u)) {
+        return Err(
+            "ulimits is not NAME=SOFT or NAME=SOFT:HARD, in digits, for a resource docker knows"
+                .to_owned(),
+        );
     }
     if !entry.ports.iter().all(|p| plain(p)) {
         return Err("a port is empty or holds a control character".to_owned());
@@ -261,6 +412,11 @@ impl FrontendConfig {
             network: entry.network,
             user: entry.user,
             group_add,
+            read_only: entry.read_only,
+            tmpfs: entry.tmpfs,
+            cap_drop: entry.cap_drop,
+            security_opt: entry.security_opt,
+            ulimits: entry.ulimits,
             ports: entry.ports,
             mounts: entry.mounts,
             command: entry.command,
