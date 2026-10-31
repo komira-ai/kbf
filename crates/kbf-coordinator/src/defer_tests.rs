@@ -148,12 +148,12 @@ fn the_backoff_doubles_per_episode_and_stops_at_the_cap() {
     assert_eq!(farm.hold("d2", at + 300), update("2.0"));
 }
 
-/// Catches: the host's own `retry_after_secs` ignored, or obeyed past the cap, or allowed to
-/// shorten the wait below the first backoff: 900 s wins over 300, 100000 s is cut to the
-/// cap, and 10 s does not hurry the host.
+/// Catches: the host's own `retry_after_secs` cut by the cap, so the host is ordered before
+/// the time it asked for and declines again: only the grown backoff is capped. 900 s wins
+/// over 300, 3601 and 100000 s are waited in full, and 10 s does not hurry the host.
 #[test]
-fn a_longer_retry_after_wins_up_to_the_cap() {
-    for (retry_after, wait) in [(900, 900), (100_000, 3_600), (10, 300)] {
+fn a_retry_after_over_the_cap_is_honoured() {
+    for (retry_after, wait) in [(900, 900), (3_601, 3_601), (100_000, 100_000), (10, 300)] {
         let mut farm = Farm::new("");
         farm.beat("d1", deferred_beat("1.0", "2.0", retry_after), 1_000);
         assert_eq!(
@@ -407,8 +407,8 @@ fn the_backoff_is_a_definition_field_with_checked_values() {
 }
 
 /// Catches: arithmetic that overflows or ignores the cap: the wait is the larger of the
-/// grown backoff and the report's number, never over the cap, even for the largest episode
-/// count, factor and report.
+/// capped backoff and the report's number, so only the backoff is bounded by the cap, even
+/// for the largest episode count, factor and report.
 #[test]
 fn the_wait_is_bounded_whatever_the_inputs() {
     let b = DeferBackoff::default();
@@ -417,17 +417,36 @@ fn the_wait_is_bounded_whatever_the_inputs() {
     assert_eq!(waits(2, 0), 600);
     assert_eq!(waits(5, 0), 3_600);
     assert_eq!(waits(u32::MAX, 0), 3_600);
-    assert_eq!(waits(1, u64::MAX), 3_600);
+    assert_eq!(waits(1, 4_000), 4_000);
+    assert_eq!(waits(u32::MAX, 10), 3_600);
+    assert_eq!(waits(1, u64::MAX), u64::MAX);
     let wide = DeferBackoff {
         initial_secs: u64::MAX,
         factor: 16,
         max_secs: 604_800,
     };
-    assert_eq!(wide.wait(u32::MAX, u64::MAX).as_secs(), 604_800);
+    assert_eq!(wide.wait(u32::MAX, 0).as_secs(), 604_800);
+    assert_eq!(wide.wait(u32::MAX, u64::MAX).as_secs(), u64::MAX);
     let flat = DeferBackoff {
         initial_secs: 7,
         factor: 1,
         max_secs: 100,
     };
     assert_eq!(flat.wait(50, 0).as_secs(), 7);
+}
+
+/// Catches: a report for a version other than the order's ending that order, or holding the
+/// host for the desired version: the order stays (its slot is still held), and the host is
+/// not held for the desired version.
+#[test]
+fn a_deferred_report_for_another_target_than_the_order_leaves_the_order() {
+    let mut farm = Farm::new("");
+    farm.beat("d1", beat("1.0"), 1_000);
+    farm.beat("d2", beat("1.0"), 1_000);
+    assert_eq!(farm.ask("d1", 1_000), update("2.0"));
+    farm.beat("d1", deferred_beat("1.0", "1.5", 0), 1_005);
+    assert!(farm.fleet.is_ordered("svc", &id("d1"), secs(1_006)));
+    assert_eq!(farm.hold("d2", 1_006), held(Hold::NoSlot));
+    farm.beat("d1", beat("1.0"), 1_130);
+    assert_eq!(farm.hold("d1", 1_131), update("2.0"));
 }
