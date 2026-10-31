@@ -1904,6 +1904,7 @@ dependencies = [
  "futures",
  "hmac 0.13.0",
  "http-body",
+ "http-body-util",
  "kbf-auth",
  "kbf-caps",
  "kbf-front",
