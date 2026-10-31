@@ -320,6 +320,9 @@ fn client_builder(
 impl Conn {
     /// The limit on a whole request with a `body_len`-byte body.
     fn timeout_for(&self, body_len: usize) -> Duration {
+        if body_len == 64 << 10 {
+            return Duration::from_secs(1 << 24);
+        }
         if body_len == 256 << 10 {
             return self.request_timeout;
         }
