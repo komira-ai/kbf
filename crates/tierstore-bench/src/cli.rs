@@ -228,12 +228,15 @@ fn provenance(
 /// nothing if the run has no cold store.
 fn cold_source(config: &RunConfig, ops: &OpsFile) -> Arc<dyn ColdStateSource> {
     match config.stores.get(&Role::Cold) {
-        Some(spec) => Arc::new(OpsColdState::new(
-            Arc::new(SystemHost),
-            ops.clone(),
-            spec.clone(),
-            config.result_dir.clone(),
-        )),
+        Some(spec) => Arc::new(
+            OpsColdState::new(
+                Arc::new(SystemHost),
+                ops.clone(),
+                spec.clone(),
+                config.result_dir.clone(),
+            )
+            .with_max_age(config.cold_state_max_age),
+        ),
         None => Arc::new(NoColdState),
     }
 }
@@ -407,7 +410,7 @@ mod tests {
 
     /// Catches the source of the cold state being chosen by the wrong test: a run with no cold
     /// role reads nothing, and a run with one reads through the preflight's source, which here,
-    /// with no `mc` to run and no status file, says it cannot tell (so the run would stop).
+    /// with no admin key to read, says it cannot tell (so the run would stop).
     #[test]
     fn a_cold_role_is_read_through_the_ops_file_and_no_cold_role_is_not_read() {
         let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "tb-cli-cold-source");
@@ -427,10 +430,43 @@ mod tests {
             Window::Busy,
         );
         let err = cold_source(&cold.config, &ops).read().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("neither the admin info nor a status file"),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "cold state: a file cannot be read: NotFound"
         );
+    }
+
+    /// Catches `--cold-state-max-age-secs` not reaching the source: a status file 20 s old is
+    /// unreadable under a limit of 10 s and read under a limit of 60 s, through `cold_source`.
+    #[test]
+    fn the_cold_state_max_age_reaches_the_source() {
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "tb-cli-cold-age");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let file = dir.path().join("heal.json");
+        let stamp = crate::s3::unix_ms().saturating_sub(20_000);
+        std::fs::write(
+            &file,
+            format!(r#"{{"read_unix_ms": {stamp}, "healing": false, "drives": []}}"#),
+        )
+        .unwrap();
+        let ops: OpsFile = serde_json::from_value(serde_json::json!({
+            "tierstore": {"binary": "/x/t", "sha256": "00", "version": "0.0.37", "plan_flags": []},
+            "live": {"unit": "l.service", "binary": "/x/l", "port": 9300, "dirs": ["/x/live"]},
+            "test_instance": {"unit": "t.service", "port": 9411, "dirs": ["/x/state"]},
+            "cold_heal_status_file": file,
+            "mc": "/x/absent-mc"
+        }))
+        .unwrap();
+        let mut cold = testkit::ctx(
+            dir.path(),
+            &[(Role::Cold, "http://127.0.0.1:9")],
+            Window::Busy,
+        )
+        .config;
+        cold.cold_state_max_age = Duration::from_secs(10);
+        let err = cold_source(&cold, &ops).read().unwrap_err().to_string();
+        assert!(err.contains("over the limit of 10 s"), "{err}");
+        cold.cold_state_max_age = Duration::from_secs(60);
+        assert!(cold_source(&cold, &ops).read().unwrap().is_some());
     }
 }

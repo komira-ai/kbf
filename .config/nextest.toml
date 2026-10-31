@@ -12,27 +12,7 @@ install-sh-fixture = { max-threads = 1 }
 # name share a directory (crates/kbf-mac-provision/tests/support/mod.rs).
 mac-provision-scratch = { max-threads = 1 }
 
-# Hang guards for the tests of the tierstore local cache that wait for a task: no test asserts how
-# long it takes, and a test that waits for something that never comes is stopped after a minute
-# and fails. Named overrides go before any override that matches more.
-[[profile.default.overrides]]
-filter = 'package(tierstore) & (test(~local_cache::) | test(~cache_cli_tests::) | test(~cache_node::))'
-slow-timeout = { period = "60s", terminate-after = 2 }
-
-# The tierstore drain tests over a real socket (tests/s3_front/drain.rs) wait for the client to
-# read the end of the stream and for the drain to end, with no timeout of their own: one that
-# waits for ever is stopped after a minute and fails.
-[[profile.default.overrides]]
-filter = 'package(tierstore) & binary(s3_front) & test(~drain::)'
-slow-timeout = { period = "30s", terminate-after = 2 }
-
-# The same for the tierstore tests that bind sockets and serve over them (the unit tests of
-# `server::listen`, and `tests/s3_front/listeners.rs`, which starts the binary too): a drain that
-# never ends or a listener that is never served fails the test after two minutes at most.
-[[profile.default.overrides]]
-filter = 'package(tierstore) & (test(~listen::tests::) | (binary(s3_front) & test(~listeners::)))'
-slow-timeout = { period = "60s", terminate-after = 2 }
-
+# Named overrides go before any override that matches more.
 [[profile.default.overrides]]
 filter = 'package(xtask) & binary(install_sh)'
 test-group = 'install-sh-fixture'

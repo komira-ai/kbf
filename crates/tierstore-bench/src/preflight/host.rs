@@ -95,6 +95,17 @@ pub trait Host: Send + Sync {
     /// The operating system's error.
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>>;
 
+    /// The bytes of a status file that a writer outside this tool keeps and the run believes
+    /// (the cold store's heal status file). The machine itself refuses it unless it passes
+    /// [`crate::preflight::trusted::rule`] and is opened without following a link; the default
+    /// reads like [`Host::read_file`], for a host that is not a real file system.
+    ///
+    /// # Errors
+    /// The operating system's error, or a refusal.
+    fn read_status_file(&self, path: &Path) -> io::Result<Vec<u8>> {
+        self.read_file(path)
+    }
+
     /// Whether a file or directory is at `path`.
     fn exists(&self, path: &Path) -> bool;
 
@@ -174,6 +185,10 @@ impl Host for SystemHost {
         std::fs::read(path)
     }
 
+    fn read_status_file(&self, path: &Path) -> io::Result<Vec<u8>> {
+        super::trusted::read_trusted(path)
+    }
+
     fn exists(&self, path: &Path) -> bool {
         path.exists()
     }
@@ -229,6 +244,19 @@ impl Host for SystemHost {
 /// [`BenchError::Io`] if it cannot be read. Bytes that are not UTF-8 are replaced.
 pub fn read_text(host: &dyn Host, path: &Path) -> Result<String, BenchError> {
     host.read_file(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .map_err(|source| BenchError::Io {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+/// The text of a status file (see [`Host::read_status_file`]).
+///
+/// # Errors
+/// [`BenchError::Io`] if it cannot be read or is refused. Bytes that are not UTF-8 are replaced.
+pub fn read_status_text(host: &dyn Host, path: &Path) -> Result<String, BenchError> {
+    host.read_status_file(path)
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .map_err(|source| BenchError::Io {
             path: path.to_owned(),
