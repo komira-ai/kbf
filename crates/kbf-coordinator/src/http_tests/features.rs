@@ -179,11 +179,14 @@ async fn a_heartbeat_with_every_new_fact_is_accepted_and_ordered_as_without_them
     );
 }
 
-/// Catches: the unit test of the advertised set going vacuous: every name the coordinator
-/// advertises must be handled, and a name is added in the change that handles it. No name is
-/// handled yet.
-#[test]
-fn advertised_features_equal_the_handled_set() {
-    let handled: &[&str] = &[];
+/// Catches: the advertised set going vacuous: every name the coordinator advertises must have
+/// a proof that it acts on it, and a name is added in the change that handles it.
+#[tokio::test]
+async fn advertised_features_equal_the_handled_set() {
+    let proofs = [(
+        "heartbeat-v2",
+        crate::membership_tests::heartbeat_v2_is_acted_on().await,
+    )];
+    let handled: Vec<&str> = proofs.iter().map(|(name, ())| *name).collect();
     assert_eq!(FEATURES, handled);
 }

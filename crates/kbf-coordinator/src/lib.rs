@@ -58,6 +58,8 @@ mod kbf_definition_tests;
 #[cfg(test)]
 mod kbf_review_tests;
 #[cfg(test)]
+mod membership_tests;
+#[cfg(test)]
 mod ops_tests;
 #[cfg(test)]
 mod priority_tests;
