@@ -34,7 +34,7 @@ the package tests) runs in `beta.yml` on every push and never on a pull request;
 
 ## What is built
 
-25 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
+23 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), two Debian packages of `kbf`
 ([below](#the-kbf-package-deb)), one frontend, one update coordinator and one task runner container image per
 Linux architecture ([below](#the-frontend-and-coordinator-images-oci)) and one macOS package of `kbf-installer`
@@ -43,8 +43,8 @@ Linux architecture ([below](#the-frontend-and-coordinator-images-oci)) and one m
 | Asset | Runner | Target |
 |---|---|---|
 | `kbf-<commit>-darwin-arm64.tar.gz`, `kbf-deploy-<commit>-darwin-arm64.tar.gz`, `kbf-installer-<commit>-darwin-arm64.tar.gz`, `kbf-host-install-<commit>-darwin-arm64.tar.gz`, `kbf-updater-<commit>-darwin-arm64.tar.gz`, `kbf-mac-provision-<commit>-darwin-arm64.tar.gz`, `kbf-task-bundle-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
-| `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz`, `kbf-host-install-<commit>-linux-x86_64.tar.gz`, `kbf-updater-<commit>-linux-x86_64.tar.gz`, `kbf-signer-<commit>-linux-x86_64.tar.gz`, `tierstore-<commit>-linux-x86_64.tar.gz`, `kbf-task-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu`; `kbf-task` is built for `x86_64-unknown-linux-musl` |
-| `kbf-<commit>-linux-arm64.tar.gz`, `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz`, `kbf-host-install-<commit>-linux-arm64.tar.gz`, `kbf-updater-<commit>-linux-arm64.tar.gz`, `kbf-signer-<commit>-linux-arm64.tar.gz`, `tierstore-<commit>-linux-arm64.tar.gz`, `kbf-task-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu`; `kbf-task` is built for `aarch64-unknown-linux-musl` |
+| `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz`, `kbf-host-install-<commit>-linux-x86_64.tar.gz`, `kbf-updater-<commit>-linux-x86_64.tar.gz`, `kbf-signer-<commit>-linux-x86_64.tar.gz`, `kbf-task-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu`; `kbf-task` is built for `x86_64-unknown-linux-musl` |
+| `kbf-<commit>-linux-arm64.tar.gz`, `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz`, `kbf-host-install-<commit>-linux-arm64.tar.gz`, `kbf-updater-<commit>-linux-arm64.tar.gz`, `kbf-signer-<commit>-linux-arm64.tar.gz`, `kbf-task-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu`; `kbf-task` is built for `aarch64-unknown-linux-musl` |
 
 `kbf` is the one binary with all five modes (`kbf --mode=daemon`, `kbf --mode=all-in-one`,
 `kbf --mode=storage`, and the two modes not built yet; [cluster.md](design/cluster.md) sections 1
@@ -94,13 +94,10 @@ the frontend ingests with, a crate of pure Rust that does not link the pack inde
 
 A Mac gets `kbf-task` only as [the bundle below](#the-macos-kbf-task-bundle); there is no bare `kbf-task` tarball, binary asset or image for a Mac. `kbf-task` has a macOS confine: it runs the Command alone under `/usr/bin/sandbox-exec`, with a profile (`crates/kbf-seatbelt`, also used by the Mac daemon's driver) that denies every network operation but to loopback and Unix sockets for a Command denied the network, and denies reading, writing, renaming and linking each file holding a credential or presigned URL it was given (the grant token file, the pack URL file, the PUT URLs file), and renaming the directories above it, for any Command. It does not limit other writes, nor `mach-lookup` of helper daemons, does not stop DNS (any Unix socket is allowed, and the system resolver is reached through one), and a connect to the node's own non-loopback address was allowed under the denial on the macOS runner. A system that is neither Linux nor macOS has no confine, and `kbf-task` refuses a Command denied the network there (exit 15). The `task-macos` job of `ci.yml` runs `cargo test -p kbf-task` on a hosted Mac, without the test-only feature. A repository lint (`crates/kbf-integration-test/tests/no_darwin_task.rs`) allows exactly the bundle and refuses: a bare `kbf-task` asset, package line or image for a Mac (any name but `kbf-task-bundle-<commit>-darwin-arm64`), a `cargo build`, `b` or `install` for a Mac target that would produce `kbf-task`, a Mac runner job that names it other than in a `cargo test`, `check` or `clippy` line, or builds the whole workspace without `--exclude kbf-task`, in any job but the bundle job (`darwin-arm64` of `artifacts.yml`), the bundle made (`cargo xtask package-task-bundle`) by any other job, and any workflow that names the test-only feature `unconfined-for-tests`; a `cargo check`, `clippy` or `test` of it for a Mac target, which ships nothing, is allowed. The backstop is the pin of the release set (the asset table here and the workflow must agree: `crates/kbf-integration-test/tests/release_artifacts`); the lint's text match of workflow jobs is a tripwire.
 
-`tierstore` is the hot and cold S3 object store proxy (`crates/tierstore`): an S3 server over two
-tiers that copies new objects to the cold tier and frees the hot one when it fills. It is built with
-the crate's `server` feature, in a `cargo build` of its own. It has Linux tarballs only, no package
-and no container image; it is taken by digest, verified, and placed like `kbf-signer` and the host
-tools above, and its tarball holds one member, the binary under its own name. The host updater does
-not update it: the farm places it, and the example unit and the flags to fill in are in
-[`packaging/tierstore`](../packaging/tierstore/README.md).
+`tierstore` (the hot and cold S3 object store proxy) is no longer built or released by this repository: its source, its
+Linux tarballs and its packaging (the example unit and the flags to fill in) are in
+[komira-ai/tierstore](https://github.com/komira-ai/tierstore). The host updater does not update it: the farm places it,
+taking the tarball from that repository's release and checking it against that repository's release signer.
 
 The packages are the two Linux jobs' debs (one each) and container images (three each, and the facts and the SBOM of the task image), and the macOS job's `.pkg`:
 
@@ -740,7 +737,7 @@ toolchain bundle. The `darwin-arm64` job makes that bundle, and no other job doe
 
 Both are in the macOS `SHA256SUMS`, the tarball is attested like every tarball (build provenance, an SBOM
 attestation and its own `.sigstore.json` bundle; [above](#provenance-bundles-verifying-a-tarball-offline)),
-and the tarball is one of the 25. It is not a binary tarball: it holds no member named `kbf-task`, the layout
+and the tarball is one of the 23. It is not a binary tarball: it holds no member named `kbf-task`, the layout
 holds it in a layer.
 
 The steps, in order, each unconditional (`crates/kbf-integration-test/tests/release_artifacts` pins them):
