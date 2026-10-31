@@ -1,4 +1,4 @@
-//! What the two update rehearsals share: a Linux host laid out by hand from release N, as a
+//! What the update rehearsals share: a Linux host laid out by hand from release N, as a
 //! farm node is, with release N+1 named and checked, the helper's unit and the `kbf` unit
 //! written, and the helpers that run commands and keep their output.
 //!
@@ -27,7 +27,9 @@ use std::time::Duration;
 use serde_json::Value;
 
 pub mod farm;
+pub mod frontend;
 pub mod issuer;
+pub mod talk;
 
 pub const REPO: &str = "komira-ai/kbf";
 pub const TOKEN_FILE: &str = "/var/tmp/kbf-update-rehearsal.token";
@@ -42,6 +44,10 @@ pub const TRUST: &str = "/usr/share/kbf/trust";
 pub const CHANNELS: &str = "/etc/kbf/host-install-releases.toml";
 pub const UNIT_DIR: &str = "/etc/systemd/system";
 pub const HELPER_UNIT: &str = "kbf-host-local.service";
+/// The packaged unit of the helper for a host whose frontend is a container.
+pub const FRONTEND_HELPER_UNIT: &str = "kbf-host-local-frontend.service";
+/// The frontend container's description, root's alone to write.
+pub const FRONTEND_CONFIG: &str = "/etc/kbf/host-install-frontend.toml";
 /// The `kbf` unit the helper restarts.
 pub const KBF_UNIT: &str = "kbf-rehearsal.service";
 /// The `--restart-unit` of the packaged helper unit, replaced by [`KBF_UNIT`].
@@ -149,6 +155,23 @@ pub fn download(token: &str, tag: &str, dir: &Path, names: &[String]) {
             "{tag}: {name} is not checked OK: {checked}"
         );
     }
+}
+
+/// What the helper logs when GitHub refuses its listing for the address's quota.
+pub const RATE_LIMITED: &str = "rate limited by GitHub";
+
+/// Requires an install's answer to be `staged`; when it is not and the helper's journal says
+/// GitHub refused its anonymous listing, says so, because that is the runner's address and says
+/// nothing of the release.
+pub fn require_staged(staged: &Value, units: &[&str]) {
+    if staged["result"] != "staged" && journal(units).contains(RATE_LIMITED) {
+        panic!(
+            "GitHub refused the helper's anonymous release listing: this hosted runner's address \
+             is over GitHub's quota for it, which says nothing of the release. Re-run the job. \
+             {staged}"
+        );
+    }
+    assert_eq!(staged["result"], "staged", "{staged}");
 }
 
 /// The units' journal so far.
@@ -380,10 +403,10 @@ pub fn fetch_old_release(r: &Rehearsal) {
 }
 
 /// Lays the host out from release N: the trust files and accounts of N's package, the
-/// updater's account, N's `kbf` through its own `kbf-deploy`, N's helper, the channel, and the
-/// units (`kbf_unit` for the `kbf` unit, the packaged helper unit pointed at it). Nothing is
-/// started. Returns the checkout's `packaging/host-agent/linux`.
-pub fn lay_out(r: &Rehearsal, kbf_unit: &str) -> PathBuf {
+/// updater's account, N's `kbf` through its own `kbf-deploy`, N's helper, and the channel.
+/// No unit is written and nothing is started. Returns the checkout's
+/// `packaging/host-agent/linux`.
+pub fn lay_out_host(r: &Rehearsal) -> PathBuf {
     let (old, dir) = (&r.from.commit, &r.from.dir);
     let unpacked = dir.join("deb");
     // The hosted runner's image leaves `/usr/share` writable by everyone (0777), which the
@@ -443,9 +466,20 @@ pub fn lay_out(r: &Rehearsal, kbf_unit: &str) -> PathBuf {
         CHANNELS,
         0o644,
     );
+    host_agent
+}
 
-    // The units: the kbf unit, and the helper's unit of this checkout restarting it.
+/// Writes the `kbf` unit, as a systemd unit file; the daemon is not yet told.
+pub fn install_kbf_unit(kbf_unit: &str) {
     install_file(kbf_unit, &format!("{UNIT_DIR}/{KBF_UNIT}"), 0o644);
+}
+
+/// Lays the host out from release N ([`lay_out_host`]) and writes the units (`kbf_unit` for
+/// the `kbf` unit, the packaged helper unit pointed at it). Nothing is started. Returns the
+/// checkout's `packaging/host-agent/linux`.
+pub fn lay_out(r: &Rehearsal, kbf_unit: &str) -> PathBuf {
+    let host_agent = lay_out_host(r);
+    install_kbf_unit(kbf_unit);
     let packaged = fs::read_to_string(host_agent.join(HELPER_UNIT)).unwrap();
     assert_eq!(packaged.matches(PACKAGED_RESTART).count(), 1, "{packaged}");
     let helper_unit = packaged.replace(PACKAGED_RESTART, &format!("--restart-unit {KBF_UNIT}"));
@@ -456,6 +490,11 @@ pub fn lay_out(r: &Rehearsal, kbf_unit: &str) -> PathBuf {
 
 /// Starts the helper and waits for its socket.
 pub fn start_helper() {
-    systemctl("start_helper", &["start", HELPER_UNIT]);
-    until(HELPER_UNIT, || Path::new(SOCKET).exists());
+    start_helper_unit(HELPER_UNIT);
+}
+
+/// Starts the helper's `unit` and waits for its socket.
+pub fn start_helper_unit(unit: &str) {
+    systemctl("start_helper", &["start", unit]);
+    until(unit, || Path::new(SOCKET).exists());
 }

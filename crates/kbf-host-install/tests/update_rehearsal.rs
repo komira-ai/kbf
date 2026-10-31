@@ -32,70 +32,16 @@
 mod rehearsal;
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
 
-use rehearsal::{
-    CHANNEL, HELPER_UNIT, KBF_UNIT, RELEASES, SOCKET, UPDATER, answers, ids_of, journal, run,
-    systemctl, until,
-};
+use rehearsal::talk::ask;
+use rehearsal::{CHANNEL, HELPER_UNIT, KBF_UNIT, RELEASES, answers, run, systemctl, until};
 use serde_json::Value;
 
 /// Where the kbf unit's storage node listens.
 const STORAGE: &str = "127.0.0.1:8983";
-/// The environment variable that carries a request to [`speak_to_the_helper`].
-const REQUEST_ENV: &str = "KBF_REHEARSAL_REQUEST";
-/// How long one request may take: an install downloads and verifies a release.
-const REQUEST_LIMIT: Duration = Duration::from_secs(900);
-/// What the helper logs when GitHub refuses its listing for the address's quota.
-const RATE_LIMITED: &str = "rate limited by GitHub";
-
-/// The helper's answer line, which [`speak_to_the_helper`] prints, parsed.
-fn answer(text: &str) -> Value {
-    let line = text
-        .lines()
-        .find_map(|l| l.strip_prefix("answer: "))
-        .unwrap_or_else(|| panic!("no answer line: {text}"));
-    serde_json::from_str(line).unwrap_or_else(|e| panic!("not JSON ({e}): {line}"))
-}
-
-/// Not a test of its own: the process that speaks to the helper as the updater's account. It
-/// sends the request in [`REQUEST_ENV`] and prints the one line the helper answers.
-#[test]
-#[ignore = "run by the_helper_updates_a_hand_laid_host_from_the_last_release_to_the_next, as the updater's account"]
-fn speak_to_the_helper() {
-    let request = std::env::var(REQUEST_ENV).expect("a request to send");
-    let mut stream = UnixStream::connect(SOCKET).expect("the helper's socket");
-    stream.set_read_timeout(Some(REQUEST_LIMIT)).unwrap();
-    stream.write_all(format!("{request}\n").as_bytes()).unwrap();
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).unwrap();
-    println!("answer: {}", line.trim_end());
-}
-
-/// Sends `request` to the helper as the updater's account (through `probe`, a copy of this
-/// binary) and returns the answer, kept as `name`.
-fn ask(probe: &Path, name: &str, request: &str) -> Value {
-    let (uid, gid) = ids_of(UPDATER);
-    let text = run(
-        name,
-        Command::new(probe)
-            .args(["--ignored", "--exact", "speak_to_the_helper", "--nocapture"])
-            .env_clear()
-            .env(REQUEST_ENV, request)
-            .current_dir("/")
-            .uid(uid)
-            .gid(gid),
-    );
-    let value = answer(&text);
-    println!("{request} -> {value}");
-    value
-}
 
 #[test]
 #[ignore = "needs Linux, systemd, root and the network: cargo xtask sudo-test"]
@@ -128,14 +74,7 @@ fn the_helper_updates_a_hand_laid_host_from_the_last_release_to_the_next() {
         "install",
         &format!("install kbf={version} from {CHANNEL}"),
     );
-    if staged["result"] != "staged" && journal(&[HELPER_UNIT, KBF_UNIT]).contains(RATE_LIMITED) {
-        panic!(
-            "GitHub refused the helper's anonymous release listing: this hosted runner's address \
-             is over GitHub's quota for it, which says nothing of the release. Re-run the job. \
-             {staged}"
-        );
-    }
-    assert_eq!(staged["result"], "staged", "{staged}");
+    rehearsal::require_staged(&staged, &[HELPER_UNIT, KBF_UNIT]);
     assert_eq!(staged["commit"], new.as_str(), "{staged}");
 
     let switched = ask(&probe, "switch", &format!("switch kbf={version}"));
