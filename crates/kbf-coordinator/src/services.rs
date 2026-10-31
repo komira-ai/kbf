@@ -5,9 +5,13 @@
 //! waits for) and `after`, the services whose live hosts must have converged before any host
 //! of this one is ordered. The decision reads these and branches on no service name.
 //!
-//! `kbf`'s definition is built in ([`ServiceDef::kbf`]) and cannot be redefined. A file named
-//! by `--services-file` defines further services. Which of them a CI token may set is not
-//! here: the allow-list entry that admits the token says (`services = [...]`, default `kbf`).
+//! `kbf`'s definition is shipped data in this same format (`kbf.services.toml`, read by
+//! [`ServiceDef::kbf`]). A file named by `--services-file` defines further services, and may
+//! begin with an entry named `kbf` to replace the shipped definition: that entry must be the
+//! first, wait for no service and have a role, and a desired state of `kbf` still has to name
+//! `min_up` for storage and frontend, whatever roles the replacement has. Which services a CI
+//! token may set is not here: the allow-list entry that admits the token says
+//! (`services = [...]`, default `kbf`).
 //!
 //! ```toml
 //! [[service]]
@@ -30,6 +34,9 @@ use kbf_updater::wire::{MAX_SERVICE_NAME, MAX_SERVICES, is_service_name};
 use serde::Deserialize;
 
 use crate::desired::{Desired, KBF, KBF_MIN_UP, LEGACY_ROLES, MAX_COUNT};
+
+/// kbf's shipped definition, in the format of a services file.
+const KBF_SERVICES: &str = include_str!("kbf.services.toml");
 
 /// What one role of a service is allowed and required to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,31 +136,19 @@ impl ServiceDef {
         legacy.chain(rest).collect()
     }
 
-    /// `kbf`: all four roles, limits from the desired state, and frontends that wait for
-    /// every other role and are never the last one up.
+    /// `kbf`'s shipped definition (`kbf.services.toml`): all four roles, limits from the
+    /// desired state, and frontends that wait for every other role and are never the last
+    /// one up.
     #[must_use]
     pub fn kbf() -> Self {
-        let mut roles: BTreeMap<String, RoleDef> = LEGACY_ROLES
+        let file: RawFile = toml::from_str(KBF_SERVICES)
+            .expect("kbf.services.toml is TOML of the services file shape (a test reads it)");
+        let raw = file
+            .service
             .into_iter()
-            .map(|role| (role.to_owned(), RoleDef::plain()))
-            .collect();
-        roles.insert(
-            "frontend".to_owned(),
-            RoleDef {
-                never_last: true,
-                after: ["storage", "daemon", "mac-daemon"]
-                    .map(str::to_owned)
-                    .into(),
-                ..RoleDef::plain()
-            },
-        );
-        Self {
-            name: KBF.to_owned(),
-            roles,
-            after: Vec::new(),
-            require_min_up: KBF_MIN_UP.map(str::to_owned).into(),
-            priority: 0,
-        }
+            .next()
+            .expect("kbf.services.toml defines kbf (a test reads it)");
+        kbf_def(raw).expect("kbf.services.toml is a valid definition (a test reads it)")
     }
 }
 
@@ -261,8 +256,11 @@ fn service_def(
             "service name {name:?} is not 1 to {MAX_SERVICE_NAME} bytes of lowercase letters, digits and -"
         ));
     }
-    if name == KBF || defined.contains_key(&name) {
-        return invalid(format!("{name} is defined twice (kbf is built in)"));
+    if defined.contains_key(&name) {
+        return invalid(format!(
+            "{name} is defined twice (kbf is defined first, by the shipped data or by the \
+             first entry of the file)"
+        ));
     }
     if roles.is_empty() {
         return invalid(format!("{name} has no roles"));
@@ -292,6 +290,18 @@ fn service_def(
     })
 }
 
+/// The definition of `kbf` in `raw`: a service that waits for no service, and whose desired
+/// state must name `min_up` for [`KBF_MIN_UP`] (kbf's contract with CI and deploy-farm; not
+/// a thing a file sets).
+fn kbf_def(raw: RawService) -> Result<ServiceDef, ServicesError> {
+    if !raw.after.is_empty() {
+        return invalid(format!("{KBF} waits for no service"));
+    }
+    let mut def = service_def(raw, &BTreeMap::new())?;
+    def.require_min_up = KBF_MIN_UP.map(str::to_owned).into();
+    Ok(def)
+}
+
 /// Every service the coordinator manages, and the ones CI's token may set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Services {
@@ -299,7 +309,7 @@ pub struct Services {
 }
 
 impl Default for Services {
-    /// `kbf` only, and CI may set only `kbf`.
+    /// `kbf`, as shipped, and nothing else.
     fn default() -> Self {
         Self {
             defs: BTreeMap::from([(KBF.to_owned(), ServiceDef::kbf())]),
@@ -308,11 +318,12 @@ impl Default for Services {
 }
 
 impl Services {
-    /// The services of the file text `text`, with `kbf` built in.
+    /// The services of the file text `text`, with `kbf` as shipped unless the first entry of
+    /// the text defines it.
     ///
     /// # Errors
-    /// [`ServicesError`]: the text is not TOML of the shape, a name is bad or repeated, a
-    /// service has no roles, there are more than [`MAX_SERVICES`] services, a role name or
+    /// [`ServicesError`]: the text is not TOML of the shape, a name is bad or repeated (`kbf`
+    /// only as the first entry), a service has no roles, `kbf` has an `after`, there are more than [`MAX_SERVICES`] services, a role name or
     /// count is unusable, or an `after` names what does not exist (or is defined later, which
     /// also forbids a cycle).
     pub fn parse(text: &str) -> Result<Self, ServicesError> {
@@ -321,8 +332,15 @@ impl Services {
         if file.service.len() > MAX_SERVICES {
             return invalid(format!("more than {MAX_SERVICES} services"));
         }
-        let mut services = Self::default();
-        for raw in file.service {
+        let mut entries = file.service.into_iter().peekable();
+        let kbf = match entries.next_if(|raw| raw.name == KBF) {
+            Some(raw) => kbf_def(raw)?,
+            None => ServiceDef::kbf(),
+        };
+        let mut services = Self {
+            defs: BTreeMap::from([(KBF.to_owned(), kbf)]),
+        };
+        for raw in entries {
             let def = service_def(raw, &services.defs)?;
             services.defs.insert(def.name.clone(), def);
         }

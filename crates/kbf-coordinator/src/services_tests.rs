@@ -104,7 +104,7 @@ fn a_service_name_may_hold_digits_and_hyphens() {
 }
 
 /// Catches: a services file that is accepted although it cannot work: each refusal names
-/// what is wrong (not TOML or an unknown key, a bad or repeated name, kbf redefined, no roles,
+/// what is wrong (not TOML or an unknown key, a bad or repeated name, kbf defined after another service, no roles,
 /// a role that is not a host role, a count over the limit, a role waiting for a role the
 /// service lacks, an `after` that names an unknown or later service, and a CI service that
 /// does not exist).
@@ -128,7 +128,8 @@ fn a_services_file_that_cannot_work_is_refused() {
             "{bad:?}"
         );
     }
-    assert!(refusal(&svc("kbf", "", role)).contains("twice"));
+    let kbf_later = format!("{}{}", svc("a", "", role), svc("kbf", "", role));
+    assert!(refusal(&kbf_later).contains("twice"));
     let twice = format!("{}{}", svc("a", "", role), svc("a", "", role));
     assert!(refusal(&twice).contains("twice"));
     assert!(refusal(&svc("a", "", "")).contains("no roles"));

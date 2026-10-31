@@ -492,7 +492,7 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    workflow that may call. An entry's `services = [...]` (default `["kbf"]`) lists the services a
    token it admits may set, and a token never gets another entry's services: setting a service the
    admitting entry does not list is a 403 `forbidden` that changes nothing. The single table above
-   is one entry that lets CI set `kbf` only. The services must be defined (`kbf` is built in; others
+   is one entry that lets CI set `kbf` only. The services must be defined (`kbf` is shipped with the coordinator; others
    come from `--services-file`, which no longer takes `ci_services`: such a file is refused).
    Entries must name the same issuer, and two entries may not share a `repository_id` and a
    `job_workflow_ref`; such a file is refused at load.
@@ -602,7 +602,16 @@ declares is a 404 `not_found`; a query that is not exactly `service=NAME` is a 4
 allow-list accepts may read any service's convergence; the read changes nothing. `GET /v1/status` adds, after its
 existing keys, `per_service`: for every managed service (`kbf` included) by name,
 `{"desired": <its desired state or null>, "roles": [{"role", "at_desired", "updating",
-"failed", "down"}]}`, the counts being those of `GET /v1/convergence` for the service.
+"failed", "down"}], "hosts": [...], "up": N, "slots_held": N, "convergence": {...}}`, the counts
+being those of `GET /v1/convergence` for the service. `hosts` is every host that heartbeated the
+service, by node id: the fields of the top-level `hosts` entries, with `up` and `holds_slot`
+counted for this service (a host ordered to update `other` holds `other`'s slot and is not up for
+it, while it holds nothing under `kbf`), and `hold`: the rule that keeps the coordinator from
+ordering the host now (`quiet`, `updating`, `busy_elsewhere`, `up_to_date`, `failed_here`,
+`no_slot`, `waiting_for_role`, `waiting_for_service`, `min_up`, `not_a_member`, `no_desired`), or
+`null` when it would be ordered at its next heartbeat. `up` and `slots_held` count those hosts,
+and `convergence` is the answer of `GET /v1/convergence?service=NAME`. The top-level keys, and the
+top-level `hosts`, which are `kbf`'s, are unchanged.
 
 `cargo xtask deploy-farm --service NAME` (default `kbf`) deploys another service the same way.
 For `kbf` the requests are the ones listed above. For another service the POST body also has
