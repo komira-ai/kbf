@@ -358,6 +358,14 @@ impl Declaration {
             }
         }
         // The table is opaque, but it is scalars, and the `updater.` keys are the updater's.
+        // The design allows a string only for a key a schema lists, and none exists: a hook that
+        // runs as root takes numbers and booleans.
+        if self.hook.user == "root" && self.hook.params.values().any(toml::Value::is_str) {
+            return Err(value(
+                "hook.params",
+                "a hook that runs as root takes numbers and booleans, not strings",
+            ));
+        }
         Params::parse_declared(&self.hook.params.to_string())
             .map_err(|e| value("hook.params", e.to_string()))?;
         Ok(())

@@ -11,7 +11,7 @@ The crate names no product and depends on no crate of this workspace but the hoo
 | `load` | `load_dir`: the directory and each file are owned by the trusted account (root) and not writable by the group or others; the accounts exist; `hook.user` is not the service's account unless root; paths are checked again on what they point to; the record directory is not writable by the service; no two declarations share an account, a unit, a health port or a record directory. A declaration that fails refuses that one service. |
 | `names`, `reserved` | The grammars (no `-`, `+`, `!` prefix, no `..`, no white space) and the reserved-path deny list. |
 | `widening` | `widening(old, new)`: the fields that ask for more. Any change other than removing a set element or lowering a number. |
-| `approval`, `cli` | The record of approved declaration digests (`/etc/updater.d/approved`) and `approve <service> <sha256>`, which `kbf-host-install approve` runs. |
+| `approval`, `cli` | The record of approved declaration digests (`/etc/updater.d/approved`) and `approve <service> <sha256>`, which the root part of the updater runs as `approve`. |
 | `gate` | `gate(active, incoming, digest, approvals)`: install, or `Deferred` with the reason `rights_change`. |
 | `launch` | The `systemd-run` command of one step as a pure function (`command`, `properties`), `run_step` over a `Spawner`, and `Systemd`, the real one. |
 
@@ -31,6 +31,28 @@ The crate names no product and depends on no crate of this workspace but the hoo
 - **A reserved directory may hold a read-only entry**, but a write path or a record directory
   inside one is refused, except under `/var/lib/updater/hooks`, where the records live.
 - Account names come from `/etc/passwd` and `/etc/group` only, not from NSS.
+
+- **String parameters.** `[hook.params]` takes numbers, booleans and strings, except for a hook
+  that runs as root: the design allows a string only for a key a schema lists, and none exists,
+  so a root hook is refused a string. A float parameter that is `nan` is never a lowered number.
+- **The targets are checked again.** `recheck_targets` repeats the reserved-path rules on what each
+  entry points to now; the step runner calls it before every launch, because a link can be
+  re-pointed after the load. `check_state_dir` is the same for the record directory.
+- **The deny list** also holds `/run/systemd/{transient,generator*,system.control}` and
+  `/var/lib/polkit-1`; `/proc`, `/sys` and `/dev` may be read and never written.
+- **Hook accounts.** A hook may not run as another declared service's account, and two
+  declarations may not share a hook account; root is exempt from both, as it is from the shared
+  service account rule.
+- **Approving takes a lock** (`approved.lock` beside the record, flock) so two approvals at once
+  do not lose one, and the directory of the record must be the trusted account's and closed.
+
+## What polkit can and cannot scope
+
+A rule for the `manage-units` action limits an account to the units it lists. But `systemctl mask`
+needs `manage-unit-files`, whose policy implies `manage-units` for every unit, so an account that
+holds it can manage any unit. Hooks therefore never mask, and the launcher never grants
+`manage-unit-files` (a test holds that); if anything generates polkit rules from a declaration, it
+must not grant it either. The root tests assert both halves through `pkcheck`.
 
 ## Tests
 

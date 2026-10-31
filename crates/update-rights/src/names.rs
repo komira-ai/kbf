@@ -110,7 +110,7 @@ pub enum UnitError {
 }
 
 /// Checks that `unit` is `<service>.service`, `<service>@<instance>.service` or either with
-/// `-<more>` after the service name (`kbf-daemon.service` for the service `kbf`). A unit that
+/// `-<more>` after the service name (`web-cache.service` for the service `web`). A unit that
 /// does not begin with the service's own name could be a system unit, which a declaration may
 /// never claim.
 pub fn check_unit(service: &str, unit: &str) -> Result<(), UnitError> {

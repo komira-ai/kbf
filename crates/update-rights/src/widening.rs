@@ -65,18 +65,14 @@ fn keys_widened<'a, V: 'a>(
 fn param_widened(old: &toml::Value, new: &toml::Value) -> bool {
     match (old, new) {
         (toml::Value::Integer(old), toml::Value::Integer(new)) => new > old,
-        (toml::Value::Float(old), toml::Value::Float(new)) => new > old,
+        // `nan` is a valid TOML float and compares as neither above nor below: not lower is wider.
+        (toml::Value::Float(old), toml::Value::Float(new)) => matches!(
+            new.partial_cmp(old),
+            Some(std::cmp::Ordering::Greater) | None
+        ),
         (old, new) => old != new,
     }
 }
-
-const STEP_FIELDS: [(Step, &str); 5] = [
-    (Step::Prepare, "hook.step_capabilities.prepare"),
-    (Step::Cutover, "hook.step_capabilities.cutover"),
-    (Step::Verify, "hook.step_capabilities.verify"),
-    (Step::Rollback, "hook.step_capabilities.rollback"),
-    (Step::Cleanup, "hook.step_capabilities.cleanup"),
-];
 
 /// The fields of `new` that ask for more than `old` allowed, named as they are in the file
 /// (`hook.write_paths`, `hook.timeout_secs.verify`, `hook.environment.NAME`). Empty when `new`
@@ -213,9 +209,9 @@ fn hook_level(old: &Hook, new: &Hook) -> Vec<(String, bool)> {
         ),
     ];
     // Per step, on what the step ends up holding.
-    named.extend(STEP_FIELDS.iter().map(|(step, field)| {
+    named.extend(Step::ALL.iter().map(|step| {
         (
-            (*field).to_owned(),
+            format!("hook.step_capabilities.{step}"),
             grew(old.capabilities_for(*step), new.capabilities_for(*step)),
         )
     }));

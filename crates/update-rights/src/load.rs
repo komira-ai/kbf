@@ -10,7 +10,8 @@
 //! - the accounts exist, and `hook.user` is not the service's account unless it is root;
 //! - no path, once links are resolved, breaks the reserved-path rules;
 //! - `state_dir` is not on a path the service's account can write;
-//! - no two declarations share a service account (root is exempt: several services run as root), a unit, a health port or a record directory.
+//! - no two declarations share a service account (root is exempt: several services run as root),
+//!   or a non-root hook account, and no hook runs as another service's account; a unit, a health port or a record directory.
 //!
 //! **A declaration that fails a rule refuses that one service**, which becomes `unmanaged`
 //! and raises an alert; the others load. A conflict has two parties and neither has the better
@@ -45,6 +46,8 @@ pub struct Declared {
     pub digest: Digest,
     pub file: PathBuf,
     pub service: UserIds,
+    /// The ids of the hook's account.
+    pub hook: UserIds,
     /// The service account's primary group and the groups that list it.
     pub service_gids: Vec<u32>,
 }
@@ -129,8 +132,8 @@ fn check_targets(declaration: &Declaration) -> Result<(), Refusal> {
 
 /// The reserved-path rules on what each entry points to now, for the step runner to call before
 /// every launch: a link can be re-pointed after the load.
-pub fn recheck_targets(_declaration: &Declaration) -> Result<(), Refusal> {
-    Ok(())
+pub fn recheck_targets(declaration: &Declaration) -> Result<(), Refusal> {
+    check_targets(declaration)
 }
 
 fn account_error(what: &str, name: &str) -> Refusal {
@@ -172,6 +175,7 @@ fn load_file(path: &Path, stem: &str, policy: &Policy<'_>) -> Result<Declared, R
         file: path.to_owned(),
         declaration,
         service,
+        hook: hook_user,
         service_gids,
     })
 }
@@ -183,6 +187,11 @@ fn nested(a: &str, b: &str) -> bool {
 /// Whether `a` can write into the record directory of `b`, or a directory around it.
 fn writes_into(a: &Declaration, b: &Declaration) -> bool {
     a.hook.write_paths.iter().any(|w| nested(w, &b.state_dir))
+}
+
+/// Whether the hook of `a` runs as the service account of `b`, root excepted.
+fn owns(a: &Declared, b: &Declared) -> bool {
+    (a.hook.uid == b.service.uid) & (a.hook.uid != 0)
 }
 
 /// What the two declarations fight over, if anything. Symmetric.
@@ -202,6 +211,14 @@ fn conflict(a: &Declared, b: &Declared) -> Option<&'static str> {
         (
             "a write path into the record directory",
             writes_into(x, y) | writes_into(y, x),
+        ),
+        (
+            "a hook account that is another service's account",
+            owns(a, b) | owns(b, a),
+        ),
+        (
+            "a hook account",
+            (a.hook.uid == b.hook.uid) & (a.hook.uid != 0),
         ),
     ]
     .into_iter()

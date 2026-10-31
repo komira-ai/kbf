@@ -16,9 +16,11 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use rustix::fs::{FlockOperation, flock};
+
 use crate::digest::{BadDigest, Digest};
 use crate::names::is_service_name;
-use crate::trust::{TrustError, read_trusted};
+use crate::trust::{TrustError, check_dir, read_trusted};
 
 /// Where approvals are recorded.
 pub const APPROVALS_FILE: &str = "/etc/updater.d/approved";
@@ -119,6 +121,19 @@ pub fn approve(
             wanted: trusted_uid,
         });
     }
+    let directory = path.parent().unwrap_or(Path::new("/"));
+    check_dir(directory, trusted_uid)?;
+    // One approval at a time: each reads the record and replaces it, and two at once would lose one.
+    let mut lock_name = path.as_os_str().to_owned();
+    lock_name.push(".lock");
+    let lock = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(PathBuf::from(lock_name))?;
+    flock(&lock, FlockOperation::LockExclusive).map_err(io::Error::from)?;
     let bytes = read_bytes(path, trusted_uid)?;
     let mut text = String::from_utf8_lossy(&bytes).into_owned();
     if Approvals::parse(&text)?.contains(digest) {

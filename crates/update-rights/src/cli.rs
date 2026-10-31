@@ -5,7 +5,7 @@
 //! root act and says what it did on standard output: that line is the audit record, kept by
 //! whatever runs the command (journald, an ssh log).
 //!
-//! The root part of the updater (`kbf-host-install`) hands its `approve` arguments to [`main`].
+//! The root part of the updater hands its `approve` arguments to [`main`].
 
 use std::io::Write;
 use std::path::PathBuf;

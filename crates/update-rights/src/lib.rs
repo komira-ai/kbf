@@ -4,7 +4,7 @@
 //! in docs/design/host-updates.md, sections 2.4, 3.3 and 3.4, and this crate's README.
 //!
 //! The crate names no product and depends on no crate of this workspace but the hook contract
-//! (`update-hook`); a test in kbf-integration-test keeps both true.
+//! (`update-hook`); a layering test of the workspace keeps both true.
 
 pub mod accounts;
 pub mod approval;

@@ -12,7 +12,7 @@
 //! - a `write_paths` or `state_dir` entry is not **inside** a reserved directory either, except
 //!   under [`HOOKS_ROOT`], where the updater keeps the record directories of the hooks;
 //! - a `read_paths` entry may be inside a reserved directory: a single file such as the one
-//!   declaration under `/etc/updater.d`, or a directory such as `/etc/tierstore`, is read-only
+//!   declaration under `/etc/updater.d`, or a directory such as `/etc/service`, is read-only
 //!   and harmless.
 
 /// The directories no entry may name or contain.
@@ -26,11 +26,17 @@ pub const RESERVED: &[&str] = &[
     "/etc/updater.d",
     "/lib/systemd/system",
     "/root",
+    "/run/systemd/generator",
+    "/run/systemd/generator.early",
+    "/run/systemd/generator.late",
     "/run/systemd/system",
+    "/run/systemd/system.control",
+    "/run/systemd/transient",
     "/run/updater",
     "/usr",
     "/usr/lib/systemd/system",
     "/usr/share/polkit-1",
+    "/var/lib/polkit-1",
     "/var/lib/updater",
 ];
 
@@ -82,8 +88,10 @@ pub fn check(kind: Kind, path: &str) -> Result<(), Violation> {
     let in_hooks_root = path != HOOKS_ROOT && is_within(path, HOOKS_ROOT);
     // `/` is every path's ancestor, which the rule on the inside is not about.
     let inside = RESERVED.iter().skip(1).find(|r| is_within(path, r));
-    match inside {
-        Some(reserved) if writes && !in_hooks_root => Err(Violation::Inside(reserved)),
+    let forbidden = WRITE_FORBIDDEN.iter().find(|dir| is_within(path, dir));
+    match (inside, forbidden) {
+        (Some(reserved), _) if writes && !in_hooks_root => Err(Violation::Inside(reserved)),
+        (_, Some(dir)) if writes => Err(Violation::Inside(dir)),
         _ => Ok(()),
     }
 }
