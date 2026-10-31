@@ -67,6 +67,9 @@ http-body = "1.1.0"
 # The registry client of kbf-image reads response bodies frame by frame. Already in the tree
 # through axum and tonic.
 http-body-util = "0.1.5"
+# HTTP-date text of `Date` and `Last-Modified` (tierstore-bench's fault proxy). Already in the
+# tree through hyper.
+httpdate = "1.0.3"
 # `wait4` and `kill` for a measured child process (kbf-daemon's `usage` module); the
 # standard library reaps children without returning their resource usage.
 libc = "0.2.190"
