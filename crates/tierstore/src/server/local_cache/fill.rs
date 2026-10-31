@@ -164,8 +164,12 @@ fn publish(
         Ok(()) => Ok(Published::New),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(Published::Existed),
         Err(error) => {
-            // Nothing owns the sidecar: leave no file that says an object is there.
-            let _ = std::fs::remove_file(meta_path(root, hex));
+            // Nothing owns the sidecar: leave no file that says an object is there. A cache that
+            // has lost the directory since the rename leaves it: the name may be the new
+            // owner's by now, and a sidecar with no data file is what that owner's scan deletes.
+            if owns() {
+                let _ = std::fs::remove_file(meta_path(root, hex));
+            }
             Err(error)
         }
     }
@@ -467,11 +471,14 @@ impl Inner {
     /// Removes the data file and the sidecar that a fill or a keep of this cache linked just
     /// now, when it finds that the cache no longer owns the directory.
     ///
-    /// This is the one delete a cache makes in a directory it does not own. It is safe: the
-    /// caller linked these names itself (the publish said `New`), and no other writer makes
-    /// them, the staging name being unique; an object left here would be one the new owner does
-    /// not index, so never evicts, and a later scan would index it, stale if the key was deleted
-    /// at the upstream in between. It covers the whole span from the check before the rename,
+    /// This is the one delete a cache makes in a directory it does not own. The caller linked
+    /// these names itself (the publish said `New`), but the new owner may publish or index the
+    /// same name in that very instant, so the removal can take away an object that is the new
+    /// owner's. That costs one refill and nothing else: whoever made it, the object is a whole
+    /// object of the key, so neither a read before the removal nor one after it gets wrong
+    /// bytes. Leaving the object is the worse choice: the new owner may not index it, and then
+    /// nothing evicts it, and a later scan indexes it, stale if the key was deleted at the
+    /// upstream in between. The call covers the whole span from the check before the rename,
     /// through the rename, the link and the return of the publish. What is left is a whole
     /// object that is on the disk for the moments until this removes it.
     pub(super) fn remove_linked(&self, hex: &str) {
