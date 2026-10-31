@@ -881,24 +881,18 @@ fn probe_2_scope_diagnosis() {
         .unwrap();
     let pid = child.id().to_string();
     let mut text = String::new();
+    let log = "polkit.log(\"x \" + action.id + \" \" + action.lookup(\"unit\"));";
+    let files = "if (action.id == \"org.freedesktop.systemd1.manage-unit-files\") return polkit.Result.YES;";
+    let units = "if (action.id == \"org.freedesktop.systemd1.manage-units\" && action.lookup(\"unit\") == \"probe-polkit@a.service\") return polkit.Result.YES;";
     let scenarios = [
-        (
-            "loose ==",
-            "action.lookup(\"unit\") == \"probe-polkit@a.service\"",
-        ),
-        (
-            "strict ===",
-            "String(action.lookup(\"unit\")) === \"probe-polkit@a.service\"",
-        ),
-        (
-            "indexOf",
-            "String(action.lookup(\"unit\")).indexOf(\"@a.\") >= 0",
-        ),
-        ("always false", "false"),
+        ("log+files+units", format!("{log} {files} {units}")),
+        ("files+units", format!("{files} {units}")),
+        ("log+units", format!("{log} {units}")),
+        ("units+files", format!("{units} {files}")),
     ];
     for (name, condition) in scenarios {
         let body = format!(
-            "polkit.addRule(function(action, subject) {{\n  if (subject.user != \"{user}\") return polkit.Result.NOT_HANDLED;\n  if (action.id == \"org.freedesktop.systemd1.manage-units\" && {condition}) return polkit.Result.YES;\n  return polkit.Result.NOT_HANDLED;\n}});\n",
+            "polkit.addRule(function(action, subject) {{\n  if (subject.user != \"{user}\") return polkit.Result.NOT_HANDLED;\n  {condition}\n  return polkit.Result.NOT_HANDLED;\n}});\n",
             user = account.name
         );
         fs::write(&rule, body).unwrap();
