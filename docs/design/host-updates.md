@@ -361,7 +361,7 @@ What v-next offers, and what is new in tierstore:
   reconciler, under a `--lock-file`).
 - **No promote verb.** v-next takes over by itself, so the updater observes it: `/readyz` still answers 200 and its
   body and a gauge say `read-only` or `read-write`. A lock never protects against a v-current that predates it, so the
-  first release with the lock goes in by a plain restart (plan checks v-current reports a mode).
+  first release with the lock goes in by a plain restart (plan probes `tierstore --capabilities` for `handover-v1` on both releases).
 - **The drain** (changed): `Connection: close` on every answer from drain start. v-current keeps accepting through
   the settle wait (`--drain-lb-wait`, never 0 here). At its end an idle connection gets a lingering close
   (`shutdown(SHUT_WR)`, read to end of stream, then close), and a request on the wire is served, not answered 503.

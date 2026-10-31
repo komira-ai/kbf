@@ -75,12 +75,12 @@ cannot be rescinded, v-current stops accepting at the end of its settle wait and
 
 | # | step | check | abort |
 |---|---|---|---|
-| 0 | plan: v-current must report a mode (it holds the lock); a v-current that does not is older than the lock | `tierstore_cache_mode` is present on v-current | none: a plain restart with a gap, by rule |
+| 0 | plan: both releases must have the lock mode | `tierstore --capabilities` (new) prints `handover-v1` for the staged release and for v-current's (`host-updates.md`, the capability probe) | none: a plain restart with a gap, by rule |
 | 1 | start v-next on the free slot | start line seen; `/readyz` 200 with `read-only` on its private port | stop v-next |
 | 2 | swap the rule to v-next (`nft -f`, one transaction) | a request through 9300 is answered by v-next (build gauge); health gate held for a bound, v-current untouched | swap back, **then** stop v-next |
-| 3 | **commit**: SIGTERM to v-current, `--drain-lb-wait` as the settle wait | v-current's `/readyz` is 503; in flight reaches 0 or the deadline passes | none: no swap back after this point |
+| 3 | **commit**: the executor's `retire-slot` job for v-current's slot (link to none, runtime mask, stop: the SIGTERM), `--drain-lb-wait` as the settle wait | v-current's `/readyz` is 503; in flight reaches 0 or the deadline passes | none: no swap back after this point |
 | 4 | v-current exits; the kernel frees the lock | exit status 0 (a hung one is killed at `TimeoutStopSec=960`, `packaging/tierstore/tierstore.service`) | none: v-next serves; the coordinator's rollback is a new hand-over |
-| 5 | finish: observe v-next | `/readyz` says `read-write` (and, on a storage node, the reconciler runs) | none: see failure cases |
+| 5 | finish: observe v-next | `/readyz` says `read-write` (and, on a storage node, the reconciler runs), waited for at most `promotion_bound` | none: past the bound the update is reported, never failed; see failure cases |
 | 6 | report healthy | as step 5 | the coordinator's rollback is this strategy with the old version |
 
 Rollback is a new hand-over with the old version as v-next. It works only if the old version has this mode; before the
@@ -150,7 +150,7 @@ hot tier: create-only, renewed or taken over by `put_if_match` after `lease_ttl`
   (`dir.rs`, the doc of `DirBackend`). An S3 hot tier does not have this problem.
 
 **The same lock decides the reconciler.** A storage node has no cache directory, so it takes a host-local lock file
-(`--lock-file`, new; a path both slots share, the unit's runtime directory) with the same try-loop as section 4. v-next
+(`--lock-file`, new; a path both slots share in the units' `StateDirectory`, not a `RuntimeDirectory`, which systemd removes when a unit stops; the holder re-checks `fstat` of its descriptor against `stat` of the path while it holds the lock, so a replaced file is noticed) with the same try-loop as section 4. v-next
 serves reads and writes through its own proxy at once and does not run the reconcile loop until it holds the lock.
 Reasons: v-current already holds the lease and runs the loop through the whole drain (`reconcile` ends only when `serve`
 returns, `run_serving`); a second runner takes the lease only by expiry or makes v-current lose it silently, which
@@ -188,8 +188,8 @@ visible, and the test below asserts it is zero for clients that are never idle.
 
 `--drain-lb-wait` is the **settle wait** in a hand-over and is never `0s`: v-current keeps accepting and serving through
 it, so a connection whose SYN was mapped to v-current just before the swap (in its accept queue, or a retransmitted SYN)
-is served, not reset (`host-updates.md`, 4.1.3). The updater passes the strategy's `settle` (default **130 s**, the
-whole default SYN retransmit schedule, 4.1.3) as `--drain-lb-wait`; tierstore's own default stays 10 s for a plain
+is served, not reset (`host-updates.md`, 4.1.3). The updater passes the strategy's `settle` (default about **70 s** from the stop of v-current,
+which covers the last SYN retransmit of a default client, about 63 s after its first SYN, 4.1.3) as `--drain-lb-wait`; tierstore's own default stays 10 s for a plain
 restart. The longer settle costs only update time: v-current serves everything throughout it. A keep-alive connection that outlives `drain_deadline` is closed by
 v-current (`finish_by_deadline`, `finish`) and the cut requests are counted in `Drained.abandoned` and printed by
 `cut_note`: an idle one costs the client a reconnect; a request still running fails, as in a plain restart.
