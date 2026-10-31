@@ -1006,3 +1006,30 @@ fn a_service_name_may_hold_dashes_and_underscores() {
     };
     assert_eq!(unit, "updater-my-svc_1-prepare-1");
 }
+
+/// Catches a params file that does not name the artifact the updater verified: every step of an
+/// update, `rollback` included, is given `updater.artifact_digest` as `sha256:` and the digest
+/// of the staged tree the order names.
+#[test]
+fn every_steps_params_file_names_the_verified_artifact() {
+    let rig = Rig::new("run-params-digest");
+    rig.fake.say(Step::Verify, &[FAIL]);
+    let order = rig.order();
+    rig.runner().run(&order).unwrap();
+    let runs = rig.fake.runs();
+    assert_eq!(runs.len(), 4);
+    assert!(rig.fake.steps().contains(&Step::Rollback));
+    for e in runs {
+        let support::Event::Run { params, .. } = e else {
+            unreachable!()
+        };
+        let params = Params::parse(&params).unwrap();
+        assert_eq!(
+            params.get("updater.artifact_digest"),
+            Some(&update_hook::Scalar::Text(format!(
+                "sha256:{}",
+                order.staged.digest
+            )))
+        );
+    }
+}
