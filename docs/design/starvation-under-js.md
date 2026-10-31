@@ -1,6 +1,6 @@
 # Starvation of a large booking by small actions: who owns the rule
 
-Status: DESIGN, for review. Nothing here is built. Issue: komira-ai/kbf#169.
+Status: DESIGN, for review. Nothing here is built. Issue: komira-ai/kbf#169. Revised to the whole-node ruling: reserve the host with the least tail.
 
 Each claim is marked **[code]** (read from the named file and function, at the kbf
 `main` and the jobscheduler `main` that this note was written against) or **[proposed]**.
@@ -71,13 +71,13 @@ operation it calls `Servable::fit` (`crates/js-sched/src/servable.rs`).
     candidates), so a VM waits behind actions; `Worker::has_room` says "nothing reserves a
     node for a queued VM". `macos-vms.md` (reservation for VM leases) describes it as
     planned.
-  - **No bound and no give-up.** The hold lasts while the request is queued and the worker
-    could run it. Work *before* the head in queue order (a higher QoS, `queue` order) is
-    still placed on the held worker, so a steady stream of higher-QoS work refills it and
-    a lower-QoS head can wait for as long as that stream lasts. Nothing gives the hold up
-    at any bound: whole-node has `drain_after_ms`, `drain_deadline_ms` and
-    `max_reserve_attempts`; the head hold has none. On a one-worker pool, small work
-    behind a head waits up to the longest lease on that worker.
+  - **The hold picks by load ratio, not by remaining time, and admits no backfill.**
+    `hold_for_head` takes the worker with the smallest binding ratio (sticky within a
+    tenth), not the one that empties first, and every worker in `reserved` is closed to
+    all later operations, short ones included. Work *before* the head in queue order (a
+    higher QoS) is still placed there, so a steady higher-QoS stream refills the worker
+    and a lower-QoS head waits as long as the stream lasts. The hold has no timer; the
+    whole-node path has `drain_after_ms`, `drain_deadline_ms` and `max_reserve_attempts`.
   - The comment on `Scheduler::place` (`scheduler.rs`, "No other operation holds a
     worker") is stale: the code holds a worker for a blocked head and for an
     `owns_worker` action as well as for whole-machine requests.
@@ -85,114 +85,162 @@ operation it calls `Servable::fit` (`crates/js-sched/src/servable.rs`).
     asserts a wait bound (`CI_BOUND`) for whole-machine leases only. I found no kbf test of
     the #169 shape.
 
-### 2.3 Is the whole-node reservation the anti-starvation rule?
+### 2.3 What the whole-node path already does (it is most of the rule)
 
-- **[code]** `mark: reserved`, `reserved_for`, `drain_deadline_ms` are the fields of a
-  host in the lease server's hosts list (`crates/js-lease-server/src/hosts.rs`,
-  `crates/js-lease-server/src/api/whole_view_tests.rs`). They report `Scheduler`'s whole-node marks
-  (`crates/js-sched/src/scheduler/whole.rs: WholeMark`, `Drain`), made in `place` only for
-  `request.kind == LeaseKind::WholeMachine`; the `else` arm reserves via
-  `Servable::reserve` for `owns_worker()` actions. kbf exposes it as `--whole-node-max`
-  and the `--whole-node-*` flags; it is off unless `--whole-node-max` is given.
-- **[code]** It does have the shape asked for in #169: a wait bound
-  (`WholeNodeConfig.drain_after_ms`, default 0 so at once), a deadline
-  (`drain_deadline_ms`, default the pool's max wall time), a give-up with back-off
-  (`reserve_backoff_ms`, `max_reserve_attempts`), caps (`max_draining`, `max_whole_node`,
-  `keep_for_ordinary`), and a seed-swept bound test (`sim_whole_machine.rs`).
-- **[code]** But it is a different request class. It is for a request that wants the
-  whole machine, and it is keyed on `LeaseKind::WholeMachine`. The #169 request books
-  24 of 32 cores and is an ordinary `Action`. Sending it through whole-node would give it
-  a whole node it does not need and cap it with `max_whole_node`. It is the pattern to
-  copy, not the rule that applies.
+- **[code]** A `LeaseKind::WholeMachine` request that fits nowhere holds a worker
+  (`crates/js-sched/src/scheduler/whole.rs`: `Scheduler::hold_whole`, `WholeMark`,
+  `Drain`; called from `place`). With whole-node settings on, the worker is the first of
+  `Scheduler::drain_order` that could run it. `drain_order` builds one `HostLoad` per
+  worker whose `end_bounds` are each held lease's `started_at` (else `granted_at`) plus
+  the lease's `max_wall`, and `js_whole::cost::drain_cost` sorts hosts by
+  `wait_ms = max(end_bounds) - now`, then fewest leases, then name. A lease with no
+  `max_wall` counts as ending at `u64::MAX` (`set_max_wall` says so). That is already
+  "the host with the least remaining time", with the declared bound as the estimate.
+  Without whole-node settings, `Servable::reserve` takes fewest leases, then least booked.
+- **[code]** Today's drain mark is a reservation of the whole worker: its name is added to
+  `reserved`, so nothing after it in queue order is placed there. It is the right
+  object, but it has a clock: `drain_after_ms` before it is made, a `deadline`
+  (`reserve_deadline`) after which it is given up and the worker barred for
+  `reserve_backoff_ms`, up to `max_reserve_attempts`. It is in memory only.
+- **[code]** The #169 request (an `Action` booking 24 of 32 cores) never reaches this
+  path: `place` calls `hold_whole` only for `WholeMachine`, `Servable::reserve` only for
+  `owns_worker()` actions, and `hold_for_head` (load ratio) for a `Blocked::Load` head.
+  Three holds, three pick rules.
 
+## 3. The rule [proposed]
 
-## 3. Proposal
+### 3.1 Statement
 
-### 3.1 Owner [proposed]
+A request is **large** when it is queued, fits no worker now, and some worker could hold
+it once its leases end. The `WholeMachine` case and the #169 case are alike.
 
-**js owns the rule, once, in `Scheduler::place`.** Both kbf cores call that function. kbf
-owns only the flag default and a test, run on both cores, that holds the pinned js to the
-behaviour. No kbf scheduling code.
+1. Among the workers that could hold a large request, reserve the one with the least
+   **tail**: the estimated time until its current leases have all ended (the latest
+   estimated end among its leases, minus now).
+2. Work that would land on the reserved worker is placed there only if its estimated end
+   is no later than the reserved worker's tail end. Work that would extend the tail goes
+   elsewhere or waits.
+3. The large request starts when the tail ends (the worker has room), not when a timer
+   fires.
+4. No head-hold timer and no fixed hold: `head_hold_after` and `blocked_since` are not
+   built, and the large-booking hold has no give-up. The reservation is recomputed each
+   round (ties go to the worker already reserved, then name), so it follows the
+   estimates when they change.
 
-### 3.2 Steps, in order [proposed]
+### 3.2 Owner
 
-1. **kbf: make load placement the only mode, observe first.** In one kbf change:
-   - flip `--placement-load` to `on` (`crates/kbf-server/src/config.rs`, default
-     `PlacementLoad::Off`);
+**js owns the rule, once, in `Scheduler::place`.** kbf owns only the flag default and the
+both-core test. No kbf scheduling code.
+
+### 3.3 Mapping onto the code that exists
+
+- **Which worker.** One pick rule for `WholeMachine`, `owns_worker` and `Blocked::Load`
+  heads: `drain_cost`'s order (`wait_ms`, leases, name) over the workers that could run
+  the request. Today only the first is chosen that way, and only with whole-node settings
+  on; `drain_order` must stop requiring them. `hold_for_head`'s binding-ratio pick and
+  `Servable::reserve`'s fewest-leases pick go away (decision 4.2).
+- **Is the drain mark the reservation?** Yes: `reserved` plus the per-request record
+  (`WholeMark`'s worker and `made`). What goes for this rule: `deadline`, the give-up
+  count, `reserve_backoff_ms`, and `drain_after_ms` as a wait before holding (a hold is
+  taken the round the request is blocked). What stays and is not this rule: the caps
+  (`max_whole_node`, `max_draining`, `keep_for_ordinary`) on whole-machine requests.
+- **Backfill inside the tail.** The reserved worker is no longer closed outright. In
+  `place`, a later operation that `fit` would put on a reserved worker is allowed if
+  `now + estimate(op) <= tail_end(worker)`, else that worker is skipped for it as now.
+  This needs `drain_order`'s per-worker maximum end (it exists) carried into
+  `Servable::fit` as a per-worker limit beside `reserved`, and one thing that does not
+  exist: a lease's **estimated end**, `started_at` (else `granted_at`) plus an estimated
+  duration, for the candidate as well as for the leases held. Today only the declared
+  `max_wall` is known.
+- **Cold start.** `drain_order` treats a lease with no bound as ending at `u64::MAX`, so
+  every tail is infinite, the pick falls to fewest leases then name, and any candidate
+  would "fit inside" an infinite tail. That is wrong for backfill; 3.4 gives every lease
+  a finite estimate.
+
+### 3.4 Estimates, and the cold start
+
+Estimates come from historical tracking: a duration per key learned from recorded runs.
+That is the work of jobscheduler#245 and jobscheduler#446 (profiles that survive the
+store round trip, and a `predicted` that sees the parcel) and kbf#1950
+(`--usage-profiles`, a profile source for the embedded js core). Whether a profile
+already exposes a total duration was not verified; if not, a duration per key is part of
+that work. Until a key has history:
+
+- **Fallback [proposed, and it is a fallback]: the job's own declared bound.** The
+  estimated duration of a lease is its `max_wall` (what `set_max_wall` already carries
+  and `drain_order` already uses); with none declared, the pool's longest allowed wall
+  time. Learned history replaces the fallback per key once the key has enough clean runs
+  (the threshold jobscheduler#245 is about).
+- One function `estimate(op)` serves tail and backfill, so the rule is correct with the
+  fallback and sharper with history. With the fallback the tail is an upper bound: the
+  reserved worker waits at most its longest bound, and backfill is conservative.
+- An estimate too small lets a backfilled job run past the tail. That delays the large
+  job; it never fails or kills a lease. It is measured (section 5).
+
+### 3.5 Steps, in order
+
+1. **kbf: make load placement the only mode, then observe.** One change:
+   - flip `--placement-load` to `on` (`crates/kbf-server/src/config.rs`);
    - add the both-core #169 test through `Farm` (`SchedulerCore::Legacy` and `Js`, default
      flags): 60 small actions, then two booking 24 CPUs / 24 GiB, then 200 small and six
      booking 4 CPUs / 40 GiB on 32- and 28-core workers; assert every large action starts
-     before the small queue is empty. It is red today because the default is `off`, and
-     goes green with the flip if the existing hold is enough.
-   - then remove `off`. Places that name it: `crates/kbf-server/src/farm.rs:272` (built
-     `Off`, overridden by `with_placement_load` at `farm.rs:358` and
-     `farm/driver.rs:192`), `farm/driver.rs:94` (`Settings` default),
-     `crates/kbf-estimator-replay/src/replay/sim.rs:186`,
-     `crates/kbf-server/src/farm/js/tests.rs:95,128`, and the other test and daemon
-     fixtures that pass `PlacementLoad::Off` (`kbf-daemon/tests`, `kbf-integration-test`,
-     `kbf-node/src/startup_tests.rs`, `farm/js/tests/ablation.rs`, `placement.rs`,
-     `farm/placement_tests.rs`, `farm/node_load/tests.rs`). `Off` is documented in js as a
-     rollback switch only; it can go in js later.
-2. **Only if the test of step 1 is still red under `on`: change js.** Then the gap is a
-   refusal that takes no hold. Fold `Blocked::ColdCap` and VM refusals into the head hold
-   (give `fit` a reason for a VM refused for room, and hold on any `Some` reason). Nothing
-   else changes: same hold, same one-per-pool, same queue order.
-3. **Only if a run under `on` shows hold churn** (a worker held, then the request fitting a
-   heartbeat later; visible as `kbf_sched_load_reservations_total` rising faster than
-   starts): add a wait before the hold (`head_hold_after`, with a per-request
-   `blocked_since`, in memory). Not proposed now: it adds state and a time knob over
-   today's hold-at-once, and I recommend against it until a run shows the churn.
+     before the small queue is empty. Red today under the `off` default;
+   - then remove `off`: `crates/kbf-server/src/farm.rs:272`, `farm.rs:358`,
+     `farm/driver.rs:192` and `:94`, `crates/kbf-estimator-replay/src/replay/sim.rs:186`,
+     `crates/kbf-server/src/farm/js/tests.rs:95,128`, and the daemon, integration and
+     placement fixtures that pass `PlacementLoad::Off`.
+2. **js (the jobscheduler issue linked from this PR): the tail rule** of 3.1 to 3.4, tests
+   first (3.6).
+3. **kbf: bump the js revision.** The both-core test stays green with the bump.
 
-### 3.3 What the hold does and does not guarantee [code for current, proposed for tests]
+### 3.6 Tests, written first [proposed]
 
-The hold makes a head start once the leases on its worker end, provided nothing *ahead of
-it in queue order* keeps refilling that worker. It is a mechanism for starvation inside
-one QoS class, not a bound: it has no give-up at any time (2.2), and a steady stream of
-higher-QoS work starves a lower-QoS large booking. Decision 4.3 accepts that.
-So no wait bound is claimed. Instead of a bound assertion, a test documents the limit:
-
-- in `crates/js-sched/tests/admission_place.rs`, a `batch` head blocked while `ci`
-  actions keep arriving ahead of it is not started while the stream lasts, and starts when
-  it stops. The test is named for the limit ("a lower-QoS head waits out a higher-QoS
-  stream") so a later aging or give-up rule must change it on purpose.
-- on a one-worker pool, small work behind a head waits for the longest lease on the worker
-  (a unit test with one worker).
-
-### 3.4 Tests, written first [proposed]
-
-- kbf, step 1: the both-core #169 test above. Red now, green after the default flips (or
-  red under `on` too, which selects step 2).
-- js, step 2 only: a VM lease and a cold-cap refusal behind actions take the hold; each
-  fails today.
-- js, 3.3: the two limit-documenting tests; they pass today and pin the behaviour.
-- A seed sweep of the #169 shape beside `sim_whole_machine.rs` is useful to measure the
-  start times, but asserts no bound.
-
-### 3.5 What kbf#169 becomes [proposed]
-
-Keep kbf#169 as the tracking issue for step 1: it closes when the default flip and the
-both-core test land and the test is green. If step 1's test stays red, open a jobscheduler
-issue for step 2 and keep #169 open for the revision bump. It is not "superseded":
-`--scheduler-core js` does not change the behaviour (2.1).
+- kbf, step 1: the both-core #169 test. Red now.
+- js: (a) two workers, one with a short tail and one long: the large request reserves the
+  short tail and starts when it ends (the #169 shape; red today, the pick is by load
+  ratio); (b) tail backfill: a job estimated to end inside the tail is placed on the
+  reserved worker, one that would end after it is not, and the large job starts at the
+  original tail end; (c) cold start: with no history the declared bound is the estimate,
+  with none the pool maximum, and backfill never sees an infinite tail; (d) a lower-QoS
+  large request waits out a higher-QoS stream and starts when it stops (pins decision
+  4.3); (e) the tests of the deadline and give-up are removed with the code.
 
 ## 4. Decisions
 
-1. **Load placement is the only mode (decided).** With the CPU slack a setting (default
-   1.1x), kbf's `--placement-load` defaults to `on` and the `off` path is removed, not
-   supported. The first kbf step is the flip plus the both-core test (3.2 step 1); the
-   widening of `Fit.blocked` for `Off` is dropped with the path. Whether the existing hold
-   already cures #169 is observed, not assumed.
-2. **The held worker: by load ratio, as today (recommended).** The worker that empties
-   soonest needs remaining-life data that js has only with learned profiles. Revisit when
-   profiles give remaining life.
-3. **No aging across QoS (recommended, accepted limit).** A lower-QoS large booking can
+1. **Load placement is the only mode (decided).** kbf's `--placement-load` defaults to
+   `on` and the `off` path is removed; the CPU slack stays a setting (default 1.1x).
+2. **One pick rule: the least tail (decided).** It replaces the binding-ratio pick of
+   `hold_for_head` and the fewest-leases pick of `Servable::reserve`. The earlier
+   recommendation to hold by load ratio is withdrawn.
+3. **No aging across QoS (recommended, accepted limit).** A lower-QoS large request can
    wait as long as a higher-QoS stream lasts; aging would turn QoS from a priority into a
-   weight. Documented by the test of 3.3, not hidden.
-4. **One hold per pool, first (recommended).** Several large requests pay their drains in
-   turn: slower, never stuck by each other. Add more holds per pool only if the #169 run
-   shows the serial drains are unacceptable on a few nodes.
-5. **VM leases (recommended).** Fold into the hold only if step 2 happens (one mechanism
-   for every refusal); then the separate VM reservation in `macos-vms.md` is not built and
-   that document points here. Otherwise leave as is.
-6. **A wait before the hold (recommended: do not build).** `head_hold_after` and
-   `blocked_since` only if a run under `on` shows hold churn (3.2 step 3).
+   weight. Tested by 3.6(d), not hidden.
+4. **No hold timer (decided).** `head_hold_after`, `blocked_since` and the wait before a
+   hold are out. Recommendation: delete `drain_deadline_ms`, `reserve_backoff_ms` and
+   `max_reserve_attempts` for `WholeMachine` leases in the same js change rather than
+   keep a second hold with a timer; keep the caps. The give-up was the only protection
+   against a wrong estimate; the loss is bounded by the fallback (a hold waits at most
+   the longest declared bound).
+5. **One hold per pool, first (recommended).** Several large requests take their tails in
+   turn: slower, never stuck by each other. Allow more only if the #169 run shows the
+   serial waits are unacceptable on a few nodes.
+6. **Cold start: the declared bound (recommended).** A fallback, replaced per key by
+   history (3.4).
+7. **VM leases (recommended).** A VM refused for room is a large request: give it the same
+   hold, so the VM reservation planned in `macos-vms.md` is not built. If that is not a
+   small widening of the same call, leave it for its own issue.
+8. **Estimate source (recommended): not built here.** The js step uses `estimate(op)`
+   with the fallback; learned estimates arrive through jobscheduler#245,
+   jobscheduler#446 and kbf#1950 without changing the rule.
+
+## 5. What it measures (for the paper)
+
+- **Whole-node wait versus the tail estimate:** per large request, time from blocked to
+  start against the tail estimated when it reserved. Report p50 and p99.
+- **Backfill share:** the fraction of the reserved worker's core-seconds used by
+  backfilled work during the wait (utilization of the reserved host while it drains).
+- **Estimate miss:** actual tail end minus estimated tail end at reservation, and actual
+  over estimated duration per backfilled job; cold-start fallback versus learned.
+- The scheduler records per reservation: reserved-at, estimated tail end, actual start,
+  backfilled core-seconds. They are exported as counters and a per-request record; no
+  test asserts a time bound.
