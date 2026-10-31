@@ -333,6 +333,7 @@ impl Farm {
             epoch_unix_ms,
             shapes: Shapes::default(),
             reports: AtomicUsize::new(0),
+            refusals: crate::worker_refusals::Refusals::default(),
             ambient,
             settings,
             driver: Driver::Js(Box::new(js)),

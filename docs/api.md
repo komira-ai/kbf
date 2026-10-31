@@ -1810,6 +1810,14 @@ last heartbeat until the frontend restarts. The unit is the cache entry, not the
 | `kbf_node_input_cache_evictions_total{node}`, `kbf_node_input_cache_evicted_bytes_total{node}` | counter | entries evicted for the byte budget or the free-space floor, and their bytes |
 | `kbf_node_input_cache_tree_builds_total{node}`, `kbf_node_input_cache_tree_hits_total{node}`, `kbf_node_input_cache_tree_evictions_total{node}` | counter | the shared tree store's builds, acquires that found the tree built, and evictions; samples only for nodes that have a tree store |
 
+**Worker admission refusals.** `kbf_worker_admission_refused_total{message}` counts the messages a
+frontend's worker listener refused on an open stream because the node is no longer admitted (its
+certificate or node id was revoked or denied, or the deny list could not be read), by the kind of
+message: `hello` (a resent one), `heartbeat`, `result`, `node_status`, `map_request`,
+`update_status`. The check runs before the farm sees the message, so a refused message changes
+nothing else. All six samples are always written; a zero is a frontend that refused none. The
+count starts from 0 when the frontend starts.
+
 **Measured load.** A frontend with a farm hands the scheduler each node load reading it accepts
 ([Node load](#node-load)), in every `--placement-load` mode, and exports what the scheduler has
 counted of them and of placement by load, and each node's load as its view shows it, so that

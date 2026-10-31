@@ -71,6 +71,7 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::farm::{Farm, Outbound, Reported, StreamId};
 use crate::identity::{PeerCert, Peers, presented};
 use crate::map_push::MapFeed;
+use crate::worker_refusals::Message;
 
 /// The `kbf.worker.v1` version this server speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -305,6 +306,18 @@ impl Session {
         tracing::info!(%worker, "worker stream ended");
     }
 
+    /// [`Peers::admit`] for this stream's node, counting a refusal under `message`.
+    async fn admit(&self, message: Message) -> Result<(), Status> {
+        let admitted = self
+            .peers
+            .admit(self.peer.as_ref(), self.worker.as_str())
+            .await;
+        if admitted.is_err() {
+            self.farm.note_refused(message);
+        }
+        admitted
+    }
+
     /// The reply to one message, if any; an error ends the stream with it. A `Result`
     /// is answered later, on `outbound`.
     async fn handle(
@@ -321,9 +334,7 @@ impl Session {
                         hello.node_id
                     )));
                 }
-                self.peers
-                    .admit(self.peer.as_ref(), worker.as_str())
-                    .await?;
+                self.admit(Message::Hello).await?;
                 match reported(&hello, self.host_floor) {
                     Ok(reported) => farm.resize(worker, stream, reported),
                     Err(e) => tracing::warn!(%worker, error = %e, "a resent Hello ignored"),
@@ -331,9 +342,7 @@ impl Session {
                 None
             }
             Some(daemon_message::Message::Heartbeat(beat)) => {
-                self.peers
-                    .admit(self.peer.as_ref(), worker.as_str())
-                    .await?;
+                self.admit(Message::Heartbeat).await?;
                 // Before the acknowledgement below, so a daemon that has been acknowledged
                 // has its counts on `/metrics`.
                 farm.note_pack_reads(worker, stream, beat.pack_reads);
@@ -355,9 +364,7 @@ impl Session {
             Some(daemon_message::Message::Result(result)) => {
                 // A revoked daemon must not write its result into the action cache,
                 // even before its next heartbeat.
-                self.peers
-                    .admit(self.peer.as_ref(), worker.as_str())
-                    .await?;
+                self.admit(Message::Result).await?;
                 // Settling it writes to the object store and the metadata log, which
                 // can take many seconds; it runs beside this loop, so the heartbeats
                 // behind it are still acknowledged before the daemon fences.
@@ -372,24 +379,18 @@ impl Session {
             }
             Some(daemon_message::Message::NodeStatus(status)) => {
                 // A revoked daemon's status must not reach the operator API either.
-                self.peers
-                    .admit(self.peer.as_ref(), worker.as_str())
-                    .await?;
+                self.admit(Message::NodeStatus).await?;
                 // Logged there; the lines are for tests.
                 let _ = farm.node_status(worker, stream, status);
                 None
             }
             Some(daemon_message::Message::MapRequest(_)) => {
-                self.peers
-                    .admit(self.peer.as_ref(), worker.as_str())
-                    .await?;
+                self.admit(Message::MapRequest).await?;
                 self.map.answer()
             }
             Some(daemon_message::Message::UpdateStatus(status)) => {
                 // A revoked daemon's status must not reach the update session either.
-                self.peers
-                    .admit(self.peer.as_ref(), worker.as_str())
-                    .await?;
+                self.admit(Message::UpdateStatus).await?;
                 // Kept as the node's newest, unless a newer stream of the node has
                 // registered since.
                 let _ = farm.update_status(worker, stream, status);
