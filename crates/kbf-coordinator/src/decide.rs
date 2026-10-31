@@ -113,6 +113,8 @@ pub enum Hold {
     Baking,
     /// The service's canary gate is closed and the host is not one of the canaries.
     CanaryWait,
+    /// The desired version is marked bad ([`crate::reconcile`]).
+    Bad,
 }
 
 /// What [`decide_why`] found for one host and service.
@@ -138,6 +140,21 @@ pub fn decide_why(
     id: &NodeId,
     now: Duration,
 ) -> Decision {
+    decide_marked(services, desired, &[], service, fleet, id, now)
+}
+
+/// [`decide_why`] for a service whose versions `bad` are marked bad.
+#[must_use]
+pub fn decide_marked(
+    services: &Services,
+    desired: &BTreeMap<String, Desired>,
+    bad: &[Version],
+    service: &str,
+    fleet: &Fleet,
+    id: &NodeId,
+    now: Duration,
+) -> Decision {
+    let _ = bad;
     let Some(def) = services.get(service) else {
         return Decision::Hold(Hold::NoDefinition);
     };

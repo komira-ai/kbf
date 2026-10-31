@@ -9,6 +9,7 @@
 //! - [`converge`]: whether the farm has reached the desired version, for CI to wait on;
 //! - [`decide`]: the decision as a pure function of the desired state, the fleet, the host
 //!   and the time;
+//! - [`reconcile`]: the last good version, the bad ones, and the automatic rollback;
 //! - [`ops`]: what operators decide (exclusions, labels, the audit ring), in a file of its own;
 //! - [`services`]: services as data: roles, limits and the order between services;
 //! - [`service`]: the coordinator itself: heartbeats in, the desired state set by CI's OIDC
@@ -34,6 +35,7 @@ pub mod http;
 pub mod identity;
 pub mod listen;
 pub mod ops;
+pub mod reconcile;
 pub mod service;
 pub mod services;
 
@@ -67,6 +69,10 @@ mod kbf_review_tests;
 mod ops_tests;
 #[cfg(test)]
 mod priority_tests;
+#[cfg(test)]
+mod rollback_definition_tests;
+#[cfg(test)]
+mod rollback_tests;
 #[cfg(test)]
 mod service_tests;
 #[cfg(test)]

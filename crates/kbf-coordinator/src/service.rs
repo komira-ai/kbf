@@ -17,7 +17,7 @@ use crate::decide::{Decision, Hold, decide_in, decide_why};
 use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
 use crate::fleet::{Fleet, Host};
 use crate::identity::Identity;
-use crate::ops::{self, AuditEntry, OPERATOR, OperateError, OpsState, OpsStore};
+use crate::ops::{self, AuditEntry, OPERATOR, OperateError, OpsError, OpsState, OpsStore};
 use crate::services::{ServiceDef, Services};
 
 /// The time since the coordinator started.
@@ -42,6 +42,9 @@ pub enum SetError {
     /// The state file could not be written.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// The ops file could not be written (the bad mark of the version could not be cleared).
+    #[error(transparent)]
+    Ops(#[from] OpsError),
     /// The allow-list entry that admitted the token does not name this service.
     #[error("the token may not set this service")]
     Forbidden,

@@ -33,12 +33,14 @@ use std::path::Path;
 
 use kbf_types::HostRole;
 use kbf_updater::secret::read_secret;
+use kbf_updater::version::Version;
 use kbf_updater::wire::{MAX_SERVICE_NAME, MAX_SERVICES, is_service_name};
 use serde::Deserialize;
 
 use crate::bake::MAX_BAKE_BEATS;
 use crate::canary::Canary;
 use crate::desired::{Desired, KBF, KBF_MIN_UP, LEGACY_ROLES, MAX_COUNT, kbf_roles};
+use crate::reconcile::{FailThreshold, Rollback};
 
 /// The most bytes of a services file.
 const MAX_FILE_BYTES: u64 = 1 << 20;
@@ -116,6 +118,12 @@ pub struct ServiceDef {
     pub bake_beats: u32,
     /// The hosts that go alone first, if the service has a canary.
     pub canary: Option<Canary>,
+    /// Whether the coordinator rolls the service back by itself.
+    pub rollback: Rollback,
+    /// How many hosts must fail before it does.
+    pub rollback_after_failed: FailThreshold,
+    /// The first version that has update hooks: no rollback goes below it.
+    pub min_version: Option<Version>,
 }
 
 impl ServiceDef {
@@ -133,6 +141,9 @@ impl ServiceDef {
             priority: 0,
             bake_beats: 0,
             canary: None,
+            rollback: Rollback::Manual,
+            rollback_after_failed: FailThreshold::default(),
+            min_version: None,
         }
     }
 
@@ -328,6 +339,9 @@ fn service_def(
         priority,
         bake_beats,
         canary: canary.map(|c| Canary { count: c.count }),
+        rollback: Rollback::Manual,
+        rollback_after_failed: FailThreshold::default(),
+        min_version: None,
     })
 }
 

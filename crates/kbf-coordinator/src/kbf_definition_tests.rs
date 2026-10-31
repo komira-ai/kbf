@@ -2,6 +2,7 @@
 //! replace it as its first entry.
 
 use crate::desired::{Desired, DesiredError, KBF};
+use crate::reconcile::{FailThreshold, Rollback};
 use crate::services::{RoleDef, ServiceDef, Services};
 
 fn refusal(text: &str) -> String {
@@ -48,6 +49,9 @@ fn the_shipped_kbf_definition_equals_the_frozen_built_in() {
         priority: 0,
         bake_beats: 0,
         canary: None,
+        rollback: Rollback::Manual,
+        rollback_after_failed: FailThreshold::default(),
+        min_version: None,
     };
     assert_eq!(ServiceDef::kbf(), frozen);
     assert_eq!(Services::default().get(KBF), Some(&frozen));
