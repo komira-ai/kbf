@@ -116,10 +116,9 @@ fn attempt(args: &[String], setup: &Setup<'_>, err: &mut dyn Write) -> Done {
         Some(Err(e)) => return bad("bad_params", format!("updater.target_version: {e}")),
         None => return bad("bad_params", "no updater.target_version"),
     };
-    let digest = match params.artifact_digest() {
-        Ok(Some(digest)) => digest.to_owned(),
-        Ok(None) => return bad("bad_params", "no updater.artifact_digest"),
-        Err(e) => return bad("bad_params", e),
+    // `Params::read` has refused a digest of the wrong shape; one that is not there is refused here.
+    let Some(digest) = params.artifact_digest().ok().flatten().map(str::to_owned) else {
+        return bad("bad_params", "no updater.artifact_digest");
     };
     // The record directory is locked before anything else is touched: a second copy of a step
     // refuses, and changes nothing.
