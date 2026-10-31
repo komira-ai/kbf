@@ -346,3 +346,50 @@ fn check_config_refuses_a_bad_oci_table_with_the_message_of_a_start() {
         assert_eq!(said, started, "{oci}");
     }
 }
+
+/// Asserts that `--check-config` of a build-node file with an `[oci]` table passes with no output
+/// and status 0 on an address that is not loopback (no warning, no bind), and refuses a bad
+/// certificate and a certificate without its key with the start's message and status 2.
+#[test]
+fn check_config_checks_the_oci_table_of_a_build_node() {
+    let files = Files::new("bin-check-oci-cache");
+    let cache_dir = files.key.with_file_name("cache");
+    let base = check_file(&files, "", "http://192.0.2.1:9300", &cache_dir);
+    let base = std::fs::read_to_string(&base).unwrap();
+    let with = |name: &str, oci: &str| {
+        let text = format!("{base}\n[oci]\nprefix = \"cas/\"\n{oci}\n");
+        files.secret(name, &text).display().to_string()
+    };
+    let held = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = held.local_addr().unwrap().port();
+    let good = with("oci-good.toml", &format!("listen = \"0.0.0.0:{port}\""));
+    assert_eq!(run(&checking(&good)), (0, String::new(), String::new()));
+    drop(held);
+
+    let key = files.secret("oci.key", "not a key\n").display().to_string();
+    let cases = [
+        (
+            format!(
+                "listen = \"127.0.0.1:0\"\ntls_cert_file = \"/no/such/cert.pem\"\ntls_key_file = \"{key}\""
+            ),
+            "/no/such/cert.pem",
+            1,
+        ),
+        (
+            format!("listen = \"127.0.0.1:0\"\ntls_cert_file = \"{key}\""),
+            "tls_key_file",
+            2,
+        ),
+    ];
+    // The check exits 2 for every refusal; a start exits 1 for a file it cannot read, as the
+    // storage node's does, and 2 for a file that does not load.
+    for (n, (oci, want, started_status)) in cases.into_iter().enumerate() {
+        let config = with(&format!("oci-bad-{n}.toml"), &oci);
+        let (code, out, said) = run(&checking(&config));
+        assert_eq!((code, out.as_str()), (2, ""), "{oci}");
+        assert!(said.contains(want), "{want}: {said}");
+        let (code, _, started) = run(&["--config".to_owned(), config]);
+        assert_eq!(code, started_status, "{oci}");
+        assert_eq!(said, started, "{oci}");
+    }
+}
