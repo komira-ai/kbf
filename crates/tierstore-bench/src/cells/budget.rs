@@ -48,7 +48,7 @@ impl Throttle {
     pub fn capped(cap: RateCap) -> Self {
         match cap {
             RateCap::PerSec(n) => Self::new(n.get()),
-            RateCap::Unlimited => Self::new(1),
+            RateCap::Unlimited => Self::with_gap(None),
         }
     }
 

@@ -422,8 +422,16 @@ pub fn render(result_dir: &Path) -> Result<String, BenchError> {
 
 /// The request caps of a run, as the header of the report shows them: a figure of files or
 /// requests per second is read next to these.
-fn caps_text(_caps: Option<RateCaps>) -> String {
-    "`not recorded`".to_owned()
+fn caps_text(caps: Option<RateCaps>) -> String {
+    caps.map_or_else(
+        || "`not recorded`".to_owned(),
+        |c| {
+            format!(
+                "cold `{}`/s, hot `{}`/s, list poll `{}`/s",
+                c.cold_rps, c.hot_rps, c.list_poll_rps
+            )
+        },
+    )
 }
 
 #[cfg(test)]

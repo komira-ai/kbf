@@ -165,7 +165,11 @@ impl RunArgs {
     /// `--copy-lag-delete`).
     #[must_use]
     pub fn copy_lag(&self) -> CopyLag {
-        CopyLag::default()
+        CopyLag {
+            burst_objects: self.burst_objects,
+            drain_deadline: Duration::from_secs(self.drain_deadline_secs.get()),
+            delete: self.copy_lag_delete == Switch::On,
+        }
     }
 
     /// The switch of the fault proxy `--fault-control` names, with `--fault-ttl-secs`.

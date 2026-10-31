@@ -227,6 +227,9 @@ impl FromStr for RateCap {
     type Err = ConfigError;
 
     fn from_str(s: &str) -> Result<Self, ConfigError> {
+        if s == Self::UNLIMITED {
+            return Ok(Self::Unlimited);
+        }
         s.parse::<u32>()
             .ok()
             .and_then(Self::per_sec)

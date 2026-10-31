@@ -390,7 +390,10 @@ impl Env {
             config: ctx.config.clone(),
             // The caps the throttles below hold, stamped where they are made, so a result cannot
             // name a cap other than the one that was in force.
-            provenance: ctx.provenance.clone(),
+            provenance: Provenance {
+                rate_caps: Some(ctx.config.rates),
+                ..ctx.provenance.clone()
+            },
             log: ctx.log.clone(),
             timeouts: Timeouts::default(),
             load,
@@ -904,7 +907,7 @@ async fn run_pass(
     if let Some(after) = &arm.after {
         notes.extend(after(pass).await?);
     }
-    let drain: Option<Drain> = None;
+    let drain = arm.drain.as_ref().and_then(|of| of(pass));
     env.ledger
         .settle(planned, driven.steps.iter().map(|s| s.cold_write).sum())?;
     let window = if driven.trip.is_some() || driven.cold_trip.is_some() {

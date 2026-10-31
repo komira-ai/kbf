@@ -97,8 +97,11 @@ pub fn polling(list_poll_rps: u32) -> Polling {
 
 /// The poll of a run: [`polling`] with the deadline the plan asks for (`--drain-deadline-secs`).
 #[must_use]
-pub fn polling_for(ctx: &CellContext, _plan: &CellPlan) -> Polling {
-    polling(ctx.config.rates.list_poll_rps)
+pub fn polling_for(ctx: &CellContext, plan: &CellPlan) -> Polling {
+    Polling {
+        deadline: plan.copy_lag.drain_deadline,
+        ..polling(ctx.config.rates.list_poll_rps)
+    }
 }
 
 /// What a watch of a burst found: the lag of each put that was seen, the backlog at each poll,
@@ -149,15 +152,24 @@ where
 /// The [`Drain`] of a watch: `acked` are the operations as they were acknowledged, `watched` what
 /// the polls found. Only the operations that succeeded count; the clock is their acknowledgement.
 fn drain_of(acked: &[(String, Instant, bool)], watched: &Watched) -> Drain {
-    let _ = (acked, watched);
+    let (lag, backlog, drained) = watched;
+    let good = || acked.iter().filter(|(_, _, ok)| *ok).map(|(_, at, _)| *at);
+    let (first, last) = (good().min(), good().max());
+    let since = |from: Option<Instant>| {
+        drained
+            .zip(from)
+            .map(|(end, start)| micros(end.saturating_duration_since(start)))
+    };
     Drain {
-        acked: 0,
-        observed: 0,
-        ack_span_us: 0,
-        from_first_ack_us: None,
-        from_last_ack_us: None,
-        peak_backlog: 0,
-        polls: 0,
+        acked: good().count() as u64,
+        observed: lag.iter().filter(|l| l.is_some()).count() as u64,
+        ack_span_us: first
+            .zip(last)
+            .map_or(0, |(a, b)| micros(b.saturating_duration_since(a))),
+        from_first_ack_us: since(first),
+        from_last_ack_us: since(last),
+        peak_backlog: backlog.iter().copied().max().unwrap_or(0) as u64,
+        polls: backlog.len() as u64,
     }
 }
 
@@ -370,8 +382,30 @@ impl Burst {
             self.watch_gone(&self.instance, pass, &deletes),
         )
         .await?;
-        let _ = (cold, instance, started_unix_ms);
-        Ok(vec![])
+        self.keep(pass, drain_of(&deletes, &cold));
+        let (end, size) = (Instant::now(), self.size);
+        let steps_of = |(lag, _, _): &Watched, role, cold_write, label: &'static str| {
+            deletes
+                .iter()
+                .zip(lag)
+                .map(|((_, at, ok), lag)| Step {
+                    label,
+                    second_quantity: !label.is_empty(),
+                    role,
+                    op: Op::Delete,
+                    bytes: size,
+                    started_unix_ms,
+                    latency_us: micros(lag.unwrap_or_else(|| end.saturating_duration_since(*at))),
+                    status: lag.map(|_| 200),
+                    ok: *ok && lag.is_some(),
+                    cold_write,
+                    in_flight: 0,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut steps = steps_of(&cold, Role::Cold, size, "");
+        steps.extend(steps_of(&instance, Role::Instance, 0, ".instance-list"));
+        Ok(steps)
     }
 
     /// Deletes the burst's keys through the instance and whatever the cold bucket holds under
@@ -419,8 +453,11 @@ pub fn arms(
     for (mode, fault) in modes {
         for &size in &sizes {
             for &in_flight in plan.in_flight.iter().filter(|&&n| width_ok(n, size)) {
-                let _asked: Option<NonZeroU64> = plan.copy_lag.burst_objects;
-                let count = burst_for(size).min(limit.unwrap_or(u64::MAX));
+                let count = plan
+                    .copy_lag
+                    .burst_objects
+                    .map_or_else(|| burst_for(size), NonZeroU64::get)
+                    .min(limit.unwrap_or(u64::MAX));
                 let label = slug(&format!("{count}x{}-c{in_flight}-{mode}", size_label(size)));
                 let burst = Arc::new(Burst {
                     instance: instance.clone(),
@@ -1183,7 +1220,7 @@ mod tests {
             &delete_plan(&[2]),
             Script::calm(),
             None,
-            quick(Duration::from_millis(50)),
+            quick(Duration::from_secs(3)),
             Some(4),
         )
         .await
@@ -1347,6 +1384,44 @@ mod tests {
             )
             .await
             {
+                Ok(_) => {
+                    finished = true;
+                    break;
+                }
+                Err(e) => assert!(matches!(e, BenchError::Log(_)), "{taken}: {e}"),
+            }
+        }
+        assert!(finished);
+    }
+
+    /// Catches a request of the delete arm whose record cannot be written being taken for a good
+    /// one (a put, a listing of either store, a delete): the log refuses from its n-th write,
+    /// for every n, until a run is short enough not to meet it, with a stand-in copying and
+    /// deleting on the cold store meanwhile.
+    #[tokio::test]
+    async fn a_log_that_fails_at_any_request_of_the_delete_arm_stops_the_run() {
+        let mut finished = false;
+        for taken in 0..600 {
+            let dir = temp("tb-c-delete-log");
+            let (instance, cold) = (FakeS3::start().await, FakeS3::start().await);
+            let stores = [
+                (Role::Instance, instance.endpoint()),
+                (Role::Cold, cold.endpoint()),
+            ];
+            let log = Arc::new(RequestLog::to_writer(testkit::FailAfter(taken)));
+            let ctx = testkit::ctx_with_log(dir.path(), &stores, Window::Busy, log);
+            let syncing = syncer(instance.clone(), &cold);
+            let outcome = run_with(
+                &ctx,
+                &delete_plan(&[1]),
+                Script::calm(),
+                None,
+                quick(Duration::from_secs(60)),
+                Some(1),
+            )
+            .await;
+            syncing.abort();
+            match outcome {
                 Ok(_) => {
                     finished = true;
                     break;

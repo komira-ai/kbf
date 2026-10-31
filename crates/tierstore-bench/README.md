@@ -176,6 +176,17 @@ the default caps where the same run with the arms does not. The other cells have
 and ignore the flag. The setting is recorded as `open_loop` in the provenance of every result (a
 result that predates the field was run with the arms on) and the report names it in its header.
 
+Request caps. `--cold-rps` (default 100) and `--hot-rps` (default 2000, held on the hot store and
+the instance) are a number of requests a second or `unlimited`; zero is refused. One cap is shared
+by every request of its role in the run, so a cell whose figure is a rate (`g`'s files a second,
+the knee between 16 and 64 in flight, a burst of `c`) measures the cap when the cap is below that
+figure. Run those cells with the cap above the figure or `unlimited`, and read the figure next to
+the caps: they are recorded as `rate_caps` in the provenance of every result (stamped where the
+throttles are made, so they are the caps that were held; a result that predates the field has
+none and the report says `not recorded`) and the report names them in its header. `unlimited` on
+the cold store lifts the one harness cap there; the cold store guard and the byte ledger still stop
+the run.
+
 Tierstore at v0.0.37 has no cold-only mode (`--hot` is a required flag). So the cold cells label
 their paths in the arm names and the result notes say which they are:
 
@@ -186,7 +197,7 @@ their paths in the arm names and the result notes say which they are:
 | `g` | `instance`, `direct-cold`, `direct-hot`, `loopback-http`, `local-disk` | a read of the 18,105-file, 344,233,431-byte synthetic tree at each width, with the baselines |
 | `a1` | `instance`, `hot` | put-to-ack of a plain put, acknowledged from the hot tier |
 | `b` | `<size>-c<n>` and `.ttfb`, `.second`, `.cold-direct` | a read of a hot miss with copy-back, the second read, and the direct read |
-| `c` | `<N>x<size>-c<n>-<mode>` | copy lag of a burst, found by one prefix LIST of the cold bucket every `1 / --list-poll-rps` seconds (2 a second unless set) |
+| `c` | `<N>x<size>-c<n>-<mode>`; modes `healthy`, `stopped-restored`, and with `--copy-lag-delete on` `delete` (with `.instance-list`) | copy lag of a burst, found by one prefix LIST of the cold bucket every `1 / --list-poll-rps` seconds (2 a second unless set); each pass's `drain` figures: acknowledged and seen, the span the acknowledgements arrived over, the time from the first and from the last acknowledgement until every object was listed (missing, not zero, if `--drain-deadline-secs` passed first) and the peak backlog; `--burst-objects N` sets the burst; the `delete` arm times a delete's keys leaving the cold bucket's listing and the instance's |
 
 The rules (also in `cells/mod.rs`): pass 0 of every arm is a discarded warm-up, arms are
 interleaved across passes, the load gate is read before a pass and every few completions in it
