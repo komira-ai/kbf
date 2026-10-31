@@ -38,13 +38,13 @@ const QUICK: PerRun = PerRun {
 };
 
 /// A scratch directory with a key file in it.
-struct Node {
+pub(super) struct Node {
     dir: TestDir,
     key: PathBuf,
 }
 
 impl Node {
-    fn new(name: &str) -> Self {
+    pub(super) fn new(name: &str) -> Self {
         let dir = TestDir::under(std::env::temp_dir(), name);
         let key = dir.path().join("key");
         std::fs::write(&key, format!("{KEY_ID}\n{SECRET}\n")).unwrap();
@@ -52,7 +52,7 @@ impl Node {
         Self { dir, key }
     }
 
-    fn cache_dir(&self) -> PathBuf {
+    pub(super) fn cache_dir(&self) -> PathBuf {
         self.dir.path().join("cache")
     }
 
@@ -84,7 +84,7 @@ cache  = true
         )
     }
 
-    fn settings(&self, server: &str, local: &str) -> CacheSettings {
+    pub(super) fn settings(&self, server: &str, local: &str) -> CacheSettings {
         let text = self.text(server, local);
         settings_from_text(&text, QUICK)
             .unwrap()
@@ -94,7 +94,7 @@ cache  = true
 }
 
 /// A client of kbf for the server at `addr`.
-fn client(addr: SocketAddr) -> S3Store {
+pub(super) fn client(addr: SocketAddr) -> S3Store {
     let config = S3Config {
         endpoint: format!("http://{addr}"),
         region: "us-east-1".to_owned(),
@@ -112,13 +112,13 @@ fn client(addr: SocketAddr) -> S3Store {
 }
 
 /// The text an unsigned GET of `path` is answered with, and its status.
-async fn probe(addr: SocketAddr, path: &str) -> (u16, String) {
+pub(super) async fn probe(addr: SocketAddr, path: &str) -> (u16, String) {
     let reply = reqwest::get(format!("http://{addr}{path}")).await.unwrap();
     (reply.status().as_u16(), reply.text().await.unwrap())
 }
 
 /// Runs `serve_cache` over this upstream and disk, calls `work` with the address, then stops it.
-async fn serving<F, Fut>(
+pub(super) async fn serving<F, Fut>(
     settings: &CacheSettings,
     upstream: Arc<dyn Backend>,
     disk: Arc<dyn Disk>,
@@ -184,9 +184,13 @@ async fn a_build_node_serves_the_upstream_through_its_cache() {
         );
         assert_eq!(seen.calls(crate::Op::Put), 0);
         let (status, text) = probe(addr, "/readyz").await;
-        assert_eq!((status, text.as_str()), (200, "ready"));
+        assert_eq!((status, text.as_str()), (200, "ready read-write"));
         let (status, text) = probe(addr, "/metricz").await;
         assert_eq!(status, 200);
+        let gauge = "tierstore_cache_mode{mode=\"read_write\"} 1\n";
+        assert!(text.contains(gauge), "{text}");
+        let other = "tierstore_cache_mode{mode=\"read_only\"} 0\n";
+        assert!(text.contains(other), "{text}");
         assert!(text.contains("tierstore_cache_hits_total 1\n"), "{text}");
         assert!(text.contains("tierstore_cache_fills_total 1\n"), "{text}");
     };

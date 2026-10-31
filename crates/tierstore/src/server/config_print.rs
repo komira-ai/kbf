@@ -77,6 +77,7 @@ pub(super) fn render(cli: &Cli) -> Result<String, ConfigError> {
     hot.copy_parallel = Some(cli.copy_parallel);
     hot.lease_ttl = Some(Dur(cli.lease_ttl));
     hot.reconcile_interval = Some(Dur(cli.reconcile_interval));
+    hot.lock_file.clone_from(&cli.lock_file);
     hot.usage_stale_after = Some(Dur(cli.usage_stale_after));
     hot.journal_linger = Some(Dur(cli.journal_linger));
     hot.journal_retention = Some(Dur(cli.journal_retention));

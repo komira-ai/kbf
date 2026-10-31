@@ -100,6 +100,7 @@ use super::front::{InvalidFlags, server_config};
 use super::keys::read_credentials;
 use super::launch::{Launch, Refused, resolve};
 use super::local_cache::LocalTierFailure;
+use super::lock::{self, LockFile, check_lock_path};
 use super::oci::{
     self, OciError, OciFront, OciLimits, OciListener, OciMetrics, OciMode, OciPrefix,
 };
@@ -287,6 +288,13 @@ pub struct Cli {
     /// How often the reconciler works: shorter than `--lease-ttl`.
     #[arg(long, default_value = "5s", value_parser = parse_duration)]
     pub reconcile_interval: Duration,
+    /// The lock file of this node: an absolute path on a local file system, in a directory that
+    /// nothing removes (not under `/run`), the same for every process of one node. The reconciler
+    /// works only while this process holds an exclusive lock on the file; a process that finds
+    /// it held serves reads and writes through its own proxy and tries the lock again every
+    /// second. Without it the reconciler works as soon as the process starts.
+    #[arg(long, value_name = "PATH")]
+    pub lock_file: Option<PathBuf>,
     /// How old the usage the reconciler publishes may be before `/usagez` says 503 with the
     /// reason (`/readyz` does not look at it): a number and `ms`, `s`, `m` or `h`, longer than
     /// `--lease-ttl`, so that a reconciler that takes over the lease does not show. A usage that
@@ -599,6 +607,9 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     if cli.s3_request_timeout.is_zero() {
         return Err("--s3-request-timeout must be longer than zero".into());
     }
+    if let Some(path) = &cli.lock_file {
+        check_lock_path(path).map_err(|why| format!("--lock-file {path:?} {why}"))?;
+    }
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut server = server_config(&cli.front(), Arc::clone(&clock))?;
     server.usage_stale_after = cli.usage_stale_after;
@@ -718,6 +729,9 @@ pub(super) fn oci_setup_of(
 /// How long [`reconcile`] waits for the lease to be given up once it is halted.
 const STOP_WAIT: Duration = Duration::from_secs(5);
 
+/// How long a process that does not hold the `--lock-file` waits between two tries of it.
+const LOCK_RETRY: Duration = Duration::from_secs(1);
+
 /// Runs a pass of `reconciler` now and then every `interval`, until `halt` is notified. Then
 /// it gives the lease up. The calls that failed in a pass are reported on stderr.
 ///
@@ -726,10 +740,34 @@ const STOP_WAIT: Duration = Duration::from_secs(5);
 /// create-only and the checkpoints conditional, so the next reconciler does again what the pass
 /// had not finished.
 pub(crate) async fn reconcile(mut reconciler: Reconciler, interval: Duration, halt: Arc<Notify>) {
+    let _ = run_passes(&mut reconciler, interval, &halt, None).await;
+    let _ = tokio::time::timeout(STOP_WAIT, reconciler.stop()).await;
+}
+
+/// What ended a run of passes.
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    /// The halt.
+    Halted,
+    /// The lock file at the path is not the file that is held.
+    Lost,
+}
+
+/// Runs passes as [`reconcile`] does, until the halt or, if there is a `lock`, until the lock
+/// file is not the one at its path any more (looked at before each pass).
+async fn run_passes(
+    reconciler: &mut Reconciler,
+    interval: Duration,
+    halt: &Notify,
+    lock: Option<&LockFile>,
+) -> Ended {
     loop {
+        if lock.is_some_and(|file| !file.is_current()) {
+            return Ended::Lost;
+        }
         tokio::select! {
             biased;
-            () = halt.notified() => break,
+            () = halt.notified() => return Ended::Halted,
             report = reconciler.pass() => {
                 for error in &report.failed {
                     eprintln!("tierstore: reconciler: {error}");
@@ -737,11 +775,39 @@ pub(crate) async fn reconcile(mut reconciler: Reconciler, interval: Duration, ha
             }
         }
         tokio::select! {
-            () = halt.notified() => break,
+            () = halt.notified() => return Ended::Halted,
             () = tokio::time::sleep(interval) => {}
         }
     }
-    let _ = tokio::time::timeout(STOP_WAIT, reconciler.stop()).await;
+}
+
+/// The lock file a storage node's reconciler works under (`--lock-file`).
+#[derive(Debug)]
+pub(crate) struct Gate {
+    _taken: Option<LockFile>,
+}
+
+impl Gate {
+    /// Opens the lock file at `path` and tries the lock once, now.
+    ///
+    /// # Errors
+    /// What the system said about the file: it cannot be made or opened, it is a link, or it is
+    /// on a network file system.
+    pub(crate) fn open(path: &Path, _retry: Duration) -> std::io::Result<Self> {
+        Ok(Self {
+            _taken: lock::try_take(path)?,
+        })
+    }
+}
+
+/// [`reconcile`], but only while this process holds the lock file of `gate`.
+pub(crate) async fn reconcile_gated(
+    reconciler: Reconciler,
+    interval: Duration,
+    halt: Arc<Notify>,
+    _gate: Gate,
+) {
+    reconcile(reconciler, interval, halt).await;
 }
 
 /// The id of a start for the probe keys of its self-test: the proxy id (with any character a
@@ -858,6 +924,15 @@ pub async fn run_serving(
     ready: impl FnOnce(Addresses),
 ) -> Result<Drained, Error> {
     let mut built = build(cli)?;
+    // One try now, so that a lock file that cannot be used stops the start; the reconciler's
+    // loop takes it later if another process holds it now.
+    let gate = match &cli.lock_file {
+        Some(path) => {
+            let opened = Gate::open(path, LOCK_RETRY);
+            Some(opened.map_err(|why| format!("--lock-file {}: {why}", path.display()))?)
+        }
+        None => None,
+    };
     let (hot, cold) = (built.hot.as_ref(), built.cold.as_ref());
     probe_tiers(cli, hot, cold, cli.backend_check_wait).await?;
     let (hot, cold) = (Arc::clone(&built.hot), Arc::clone(&built.cold));
@@ -895,7 +970,13 @@ pub async fn run_serving(
     };
     let oci_serving = serve_oci(oci, oci_stopped);
     let reconciler = Reconciler::new(built.hot, built.cold, built.reconciler);
-    let reconciling = reconcile(reconciler, cli.reconcile_interval, halt);
+    let interval = cli.reconcile_interval;
+    let reconciling = async move {
+        match gate {
+            Some(gate) => reconcile_gated(reconciler, interval, halt, gate).await,
+            None => reconcile(reconciler, interval, halt).await,
+        }
+    };
     let (drained, (), oci_cut) = tokio::join!(serving, reconciling, oci_serving);
     watcher.abort();
     eprint!("{}", cut_note(drained));

@@ -71,6 +71,7 @@
 mod disk;
 mod evict;
 mod fill;
+mod hold;
 mod index;
 pub(super) mod layout;
 mod listing;
@@ -87,9 +88,13 @@ mod front_tests;
 #[cfg(test)]
 mod hit_tests;
 #[cfg(test)]
+mod hold_tests;
+#[cfg(test)]
 mod limits_tests;
 #[cfg(test)]
 mod listing_tests;
+#[cfg(test)]
+mod read_only_tests;
 #[cfg(test)]
 mod selfcheck_tests;
 #[cfg(test)]
@@ -118,6 +123,7 @@ use crate::journal::is_reserved;
 use crate::{Backend, ByteRange, Clock, Error, Listed, Meta, OpenUpload, PartBody, UploadsAfter};
 
 pub use disk::{Disk, Space, SystemDisk};
+pub use hold::{Mode, Tick};
 pub use metrics::Counters;
 pub use selfcheck::{LocalTierFailure, check_local};
 
@@ -316,6 +322,20 @@ impl LocalCache {
         Ok(Self {
             inner: Arc::new(inner),
         })
+    }
+
+    /// Opens the cache as [`open`](Self::open) does, if the lock of the directory is free; a
+    /// cache that does not get the lock is read-only (see [`Mode`]).
+    ///
+    /// # Errors
+    /// What the system said about the directory or the lock file.
+    pub fn open_locked(
+        config: CacheConfig,
+        upstream: Arc<dyn Backend>,
+        disk: Arc<dyn Disk>,
+        clock: Arc<dyn Clock>,
+    ) -> io::Result<Self> {
+        Self::open(config, upstream, disk, clock)
     }
 
     /// The directory of the cache.

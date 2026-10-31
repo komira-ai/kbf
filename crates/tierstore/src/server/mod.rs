@@ -185,6 +185,7 @@ mod idle;
 mod keys;
 mod launch;
 pub mod local_cache;
+mod lock;
 pub mod oci;
 mod ops;
 pub mod presign;
@@ -200,6 +201,8 @@ mod auth_tests;
 mod body_stall_tests;
 #[cfg(test)]
 mod cache_cli_tests;
+#[cfg(test)]
+mod cache_lock_tests;
 #[cfg(test)]
 mod completion_tests;
 #[cfg(test)]
@@ -217,6 +220,8 @@ mod gc_tests;
 #[cfg(test)]
 mod idle_tests;
 #[cfg(test)]
+mod lock_tests;
+#[cfg(test)]
 mod metrics_race_tests;
 #[cfg(test)]
 mod metrics_tests;
@@ -228,6 +233,8 @@ mod pipes;
 mod presign_server_tests;
 #[cfg(test)]
 mod ready_tests;
+#[cfg(test)]
+mod reconcile_lock_tests;
 #[cfg(test)]
 mod reply_tests;
 #[cfg(test)]

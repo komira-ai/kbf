@@ -2,7 +2,9 @@
 //! hold, a file system whose answers a test can change, and a cache over them in a scratch
 //! directory.
 
+use std::collections::BTreeMap;
 use std::io;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -20,6 +22,47 @@ use crate::{
 
 use super::layout::{data_path, name_of};
 use super::{CacheConfig, Disk, LocalCache, Space, SystemDisk};
+
+/// What a listing of a directory tree says of one entry.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::server) struct Seen {
+    pub(in crate::server) dir: bool,
+    pub(in crate::server) len: u64,
+    pub(in crate::server) mode: u32,
+    pub(in crate::server) inode: u64,
+    /// The time of last change of the contents, in seconds and nanoseconds.
+    pub(in crate::server) mtime: (i64, i64),
+}
+
+/// Every entry under `root` (and `root` itself, as the empty path) with its kind, size, mode,
+/// inode and time of last change. Two listings are equal if nothing under `root` was made,
+/// removed, rewritten, renamed, chmodded or stamped between them.
+pub(in crate::server) fn tree(root: &Path) -> BTreeMap<PathBuf, Seen> {
+    let seen_of = |path: &Path| {
+        let meta = std::fs::symlink_metadata(path).expect("an entry of the tree");
+        Seen {
+            dir: meta.is_dir(),
+            len: meta.len(),
+            mode: meta.permissions().mode(),
+            inode: meta.ino(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+        }
+    };
+    let mut listing = BTreeMap::new();
+    listing.insert(PathBuf::new(), seen_of(root));
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("a directory of the tree") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                pending.push(path.clone());
+            }
+            let below = path.strip_prefix(root).expect("under the root");
+            listing.insert(below.to_path_buf(), seen_of(&path));
+        }
+    }
+    listing
+}
 
 /// `len` bytes that differ from one place to the next, so that a wrong range shows.
 pub(in crate::server) fn pattern(len: usize) -> Vec<u8> {
@@ -422,6 +465,39 @@ impl Rig {
     /// The cache again over the same directory, as after a restart.
     pub(in crate::server) fn reopen(&self) -> LocalCache {
         self.reopen_with(|_| {})
+    }
+
+    /// A cache over the same directory that takes its lock, as the binary's does: read-write if
+    /// nobody holds the lock, else read-only. [`Rig::cache`] takes none.
+    pub(in crate::server) fn locked(&self) -> LocalCache {
+        self.try_locked().expect("a cache")
+    }
+
+    /// The same, with the settings changed by `change`.
+    pub(in crate::server) fn locked_with(
+        &self,
+        change: impl FnOnce(&mut CacheConfig),
+    ) -> LocalCache {
+        let mut config = self.config.clone();
+        change(&mut config);
+        Self::open_locked(&config, &self.upstream, &self.disk, &self.clock).expect("a cache")
+    }
+
+    /// The same, with the answer of the open.
+    pub(in crate::server) fn try_locked(&self) -> io::Result<LocalCache> {
+        let (config, upstream) = (&self.config, &self.upstream);
+        Self::open_locked(config, upstream, &self.disk, &self.clock)
+    }
+
+    fn open_locked(
+        config: &CacheConfig,
+        upstream: &Arc<FaultyBackend>,
+        disk: &Arc<FakeDisk>,
+        clock: &Arc<TestClock>,
+    ) -> io::Result<LocalCache> {
+        let upstream: Arc<dyn Backend> = upstream.clone();
+        let (disk, clock) = (disk.clone(), clock.clone());
+        LocalCache::open_locked(config.clone(), upstream, disk, clock)
     }
 
     /// The same, with the settings changed by `change`.

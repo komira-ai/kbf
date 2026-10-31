@@ -49,6 +49,7 @@ critical           = 97
 copy_parallel      = 8
 lease_ttl          = "40s"
 reconcile_interval = "4s"
+lock_file          = "/var/lib/tierstore/instance.lock"
 usage_stale_after  = "3m"
 journal_linger     = "50ms"
 journal_retention  = "12h"
@@ -103,6 +104,7 @@ pub(crate) fn golden_flags() -> Vec<&'static str> {
         "--copy-parallel=8",
         "--lease-ttl=40s",
         "--reconcile-interval=4s",
+        "--lock-file=/var/lib/tierstore/instance.lock",
         "--usage-stale-after=3m",
         "--journal-linger=50ms",
         "--journal-retention=12h",
