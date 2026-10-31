@@ -2458,6 +2458,7 @@ dependencies = [
  "thiserror",
  "time",
  "toml",
+ "update-rights",
 ]
 
 [[package]]
@@ -5695,6 +5696,20 @@ dependencies = [
  "serde_json",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "update-rights"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "libc",
+ "rustix",
+ "serde",
+ "sha2 0.11.0",
+ "thiserror",
+ "toml",
+ "update-hook",
 ]
 
 [[package]]

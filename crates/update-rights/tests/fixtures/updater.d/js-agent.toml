@@ -1,0 +1,30 @@
+# A declaration shaped like the design's example for the js-agent: a hook that runs as root with
+# no capabilities, which a host approves once, and a service with no listener.
+name = "js-agent"
+binary = "js-agent"
+signer = { repository = "komira-ai/jobscheduler", workflow = "release.yml" }
+uid = "js-agent"
+registration_ttl_secs = 300
+verify_deadline_secs = 9000
+state_dir = "/var/lib/js-agent-update"
+
+[hook]
+user = "root"
+group = "root"
+capabilities = []
+read_paths = ["/opt/js-agent/releases", "/var/lib/js-agent", "/etc/js-agent/credential"]
+write_paths = ["/opt/js-agent", "/var/lib/js-agent-update"]
+units = ["js-agent-crun.service"]
+address_families = ["AF_UNIX", "AF_INET", "AF_INET6"]
+environment = { }
+
+[hook.params]
+cordon_lease_secs = 300
+cordon_max_secs = 17355
+
+[hook.timeout_secs]
+prepare = 3900
+cutover = 4320
+verify = 615
+rollback = 8220
+cleanup = 120
