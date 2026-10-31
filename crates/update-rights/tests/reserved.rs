@@ -273,9 +273,9 @@ fn a_write_path_must_be_below_one_of_the_write_roots() {
     ] {
         assert_eq!(check(Kind::Write, path), Ok(()), "{path}");
     }
-    // (`/var/lib` and `/var/cache` hold reserved directories and are refused as containing them.)
+    // (`/var/lib`, `/var/cache` and `/run` hold reserved directories and are refused as containing
+    // them.)
     for path in [
-        "/run",
         "/opt",
         "/srv/x",
         "/mnt/x",
