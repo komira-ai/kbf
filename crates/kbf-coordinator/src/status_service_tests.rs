@@ -62,15 +62,15 @@ async fn farm(name: &str) -> Rig {
     }
     rig.at(2_000);
     let c = &rig.coordinator;
-    c.heartbeat(who("s1", HostRole::Storage), beat("2.0"));
-    c.heartbeat(who("s2", HostRole::Storage), updating(beat("1.0"), "2.0"));
-    c.heartbeat(who("s3", HostRole::Storage), beat("1.0"));
+    c.heartbeat(who("s1", HostRole::STORAGE), beat("2.0"));
+    c.heartbeat(who("s2", HostRole::STORAGE), updating(beat("1.0"), "2.0"));
+    c.heartbeat(who("s3", HostRole::STORAGE), beat("1.0"));
     c.heartbeat(
-        who("d1", HostRole::Daemon),
+        who("d1", HostRole::DAEMON),
         announcing(beat("2.0"), &[("other", "3.0"), ("third", "1.0")]),
     );
     c.heartbeat(
-        who("d2", HostRole::Daemon),
+        who("d2", HostRole::DAEMON),
         announcing(beat("2.0"), &[("other", "1.0")]),
     );
     rig
@@ -227,7 +227,7 @@ async fn the_kbf_status_keeps_its_bytes_and_only_gains_keys() {
         .await;
     rig.at(2_000);
     rig.coordinator
-        .heartbeat(who("st1", HostRole::Storage), beat("2.0"));
+        .heartbeat(who("st1", HostRole::STORAGE), beat("2.0"));
     let status = rig.coordinator.status(Some(OPERATOR)).expect("status");
     let text = serde_json::to_string(&status).expect("JSON");
     let commit = crate::BUILD_COMMIT;

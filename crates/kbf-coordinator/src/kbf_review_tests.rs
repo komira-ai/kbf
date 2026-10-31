@@ -60,9 +60,9 @@ async fn a_replaced_kbf_converges_over_its_own_roles() {
         .await;
     rig.at(2_000);
     let c = &rig.coordinator;
-    c.heartbeat(who("s1", HostRole::Storage), beat("2.0"));
-    c.heartbeat(who("d1", HostRole::Daemon), beat("2.0"));
-    c.heartbeat(who("f1", HostRole::Frontend), beat("1.0"));
+    c.heartbeat(who("s1", HostRole::STORAGE), beat("2.0"));
+    c.heartbeat(who("d1", HostRole::DAEMON), beat("2.0"));
+    c.heartbeat(who("f1", HostRole::FRONTEND), beat("1.0"));
     let read = c
         .convergence(Some(&ci_token()), "kbf")
         .await
@@ -103,7 +103,7 @@ async fn the_priority_of_a_replaced_kbf_orders_the_offers() {
         }
         rig.at(2_000);
         let reply = rig.coordinator.heartbeat(
-            who("d1", HostRole::Daemon),
+            who("d1", HostRole::DAEMON),
             announcing_other(beat("1.0"), "other", "1.0"),
         );
         assert_eq!(
