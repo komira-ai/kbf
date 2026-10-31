@@ -45,7 +45,7 @@ use futures::StreamExt;
 use futures::stream;
 use tokio::time::Instant;
 
-use crate::{Backend, ByteRange, Error, Listed};
+use crate::{Backend, ByteRange, Clock, Error, Listed};
 
 /// The prefix of the probe keys.
 const PROBE_PREFIX: &str = "_tiering/selftest/";
@@ -226,6 +226,55 @@ pub struct SelfTestOptions<'a> {
 /// Where the notes of the test go: a skipped check, an attempt that is repeated, a key that was
 /// not deleted.
 pub type Note<'a> = &'a (dyn Fn(String) + Sync);
+
+/// How much one sweep of old probe keys may do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SweepBudget {
+    /// The most deletes sent.
+    pub keys: usize,
+    /// The longest the sweep runs, on the clock it is given.
+    pub time: Duration,
+}
+
+impl Default for SweepBudget {
+    fn default() -> Self {
+        Self {
+            keys: 100,
+            time: Duration::from_secs(10),
+        }
+    }
+}
+
+/// What a sweep did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Swept {
+    /// The old probe keys deleted.
+    pub deleted: usize,
+    /// Whether a budget stopped the sweep with old keys left.
+    pub more_left: bool,
+}
+
+/// Deletes the probe keys that earlier starts left (see the module).
+pub async fn sweep_probes(
+    backend: &dyn Backend,
+    options: &SelfTestOptions<'_>,
+    _budget: SweepBudget,
+    _clock: &dyn Clock,
+    note: Note<'_>,
+) -> Swept {
+    let probe = Probe {
+        backend,
+        prefix: format!("{PROBE_PREFIX}{}/", options.run_id),
+        options,
+        note,
+        started: Instant::now(),
+    };
+    let deleted = probe.sweep().await;
+    Swept {
+        deleted,
+        more_left: false,
+    }
+}
 
 /// Runs the checks on `backend`. The first check that fails ends the test.
 ///
@@ -422,12 +471,12 @@ impl Probe<'_> {
     /// Deletes the probe keys that an earlier start left, more than an hour old by the clock of
     /// the store. Only keys under the probe prefix and not this run's are deleted, whatever the
     /// listing returns (a store that ignores the prefix lists the data too).
-    async fn sweep(&self) {
+    async fn sweep(&self) -> usize {
         let now = match self.store_time().await {
             Ok(now) => now,
             Err(error) => {
                 self.note(format!("could not read the time of the store: {error}"));
-                return;
+                return 0;
             }
         };
         let listed = self.backend.list_page(PROBE_PREFIX, None, SWEEP_LIMIT);
@@ -436,16 +485,19 @@ impl Probe<'_> {
             Err(error) => {
                 let why = format!("could not list the probe keys of earlier starts: {error}");
                 self.note(why);
-                return;
+                return 0;
             }
         };
+        let mut deleted = 0;
         for object in found {
             let ours = object.key.starts_with(&self.prefix);
             let probe = object.key.starts_with(PROBE_PREFIX);
             if probe && !ours && object.modified.saturating_add(SWEEP_AGE_MS) < now {
                 self.delete(&object.key).await;
+                deleted += 1;
             }
         }
+        deleted
     }
 
     async fn create_only(&self) -> Verdict {

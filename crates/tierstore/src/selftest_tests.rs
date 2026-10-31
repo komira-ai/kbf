@@ -11,8 +11,9 @@ use bytes::Bytes;
 use kbf_testkit::dir::TestDir;
 
 use crate::{
-    Backend, ByteRange, Check, DirBackend, Error, Listed, MemoryBackend, Meta, PartBody,
-    SelfTestError, SelfTestFailure, SelfTestOptions, TestClock, self_test,
+    Backend, ByteRange, Check, Clock, DirBackend, Error, Listed, MemoryBackend, Meta, PartBody,
+    SelfTestError, SelfTestFailure, SelfTestOptions, SweepBudget, Swept, TestClock, self_test,
+    sweep_probes,
 };
 
 /// The prefix the probe keys are under.
@@ -550,6 +551,229 @@ async fn keys_of(backend: &dyn Backend) -> Vec<String> {
     all.into_iter().map(|object| object.key).collect()
 }
 
+/// A memory backend that tells a hook of each delete, before it is done: a test makes the hook
+/// move a clock, or log what happened first.
+pub(crate) struct Watched {
+    pub(crate) inner: MemoryBackend,
+    on_delete: Box<dyn Fn(&str) + Send + Sync>,
+}
+
+impl Watched {
+    pub(crate) fn new(
+        inner: MemoryBackend,
+        on_delete: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Self {
+        let on_delete = Box::new(on_delete);
+        Self { inner, on_delete }
+    }
+}
+
+#[async_trait]
+impl Backend for Watched {
+    async fn put(&self, key: &str, body: Bytes) -> Result<(), Error> {
+        self.inner.put(key, body).await
+    }
+
+    async fn put_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<String, Error> {
+        self.inner.put_if_match(key, body, etag).await
+    }
+
+    async fn get(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
+        self.inner.get(key, range).await
+    }
+
+    async fn head(&self, key: &str) -> Result<Meta, Error> {
+        self.inner.head(key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), Error> {
+        (self.on_delete)(key);
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<Listed>, Error> {
+        self.inner.list(prefix).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Result<Vec<Listed>, Error> {
+        self.inner.list_page(prefix, start_after, max_keys).await
+    }
+
+    async fn create_upload(&self, key: &str) -> Result<String, Error> {
+        self.inner.create_upload(key).await
+    }
+
+    async fn upload_part(
+        &self,
+        key: &str,
+        id: &str,
+        number: u32,
+        body: PartBody<'_>,
+    ) -> Result<String, Error> {
+        self.inner.upload_part(key, id, number, body).await
+    }
+
+    async fn complete_upload(
+        &self,
+        key: &str,
+        id: &str,
+        parts: &[(u32, String)],
+    ) -> Result<String, Error> {
+        self.inner.complete_upload(key, id, parts).await
+    }
+
+    async fn abort_upload(&self, key: &str, id: &str) -> Result<(), Error> {
+        self.inner.abort_upload(key, id).await
+    }
+}
+
+/// Runs one sweep of `run-1`, timed by `clock`, and gives what it did and the notes it made.
+async fn sweeping(
+    backend: &dyn Backend,
+    budget: SweepBudget,
+    clock: &dyn Clock,
+) -> (Swept, Vec<String>) {
+    let notes = Mutex::new(Vec::new());
+    let note = |line: String| notes.lock().unwrap().push(line);
+    let options = options("run-1", true, &[]);
+    let swept = sweep_probes(backend, &options, budget, clock, &note).await;
+    (swept, notes.into_inner().unwrap())
+}
+
+/// A store whose clock reads two hours after it holds `stale` probe keys of earlier starts, named
+/// `old-<n>`, written at time zero.
+pub(crate) async fn two_hours_on(stale: usize) -> (std::sync::Arc<TestClock>, MemoryBackend) {
+    let clock = std::sync::Arc::new(TestClock::new());
+    let memory = MemoryBackend::with_clock(clock.clone());
+    for n in 0..stale {
+        let key = format!("{PROBE}old-{n:03}/create");
+        memory.put(&key, Bytes::from_static(b"x")).await.unwrap();
+    }
+    clock.set(2 * 60 * 60 * 1000);
+    (clock, memory)
+}
+
+/// Asserts that one sweep deletes at most the count budget of stale keys and says there are more
+/// left, that the next sweep goes on from there and the one after it finishes, and that each sweep
+/// says how many it deleted and how long it took by the clock it was given, with `(more left)`
+/// only while a budget stopped it. A sweep with no budget (the one this replaces) deletes all 300
+/// at once.
+#[tokio::test]
+async fn a_sweep_deletes_at_most_the_count_budget_and_the_next_one_goes_on() {
+    let (_, memory) = two_hours_on(300).await;
+    let budget = SweepBudget {
+        keys: 100,
+        time: Duration::from_secs(10),
+    };
+    let timer = TestClock::new();
+    // For each sweep: what it did, how many keys are left, and the line it wrote.
+    let rounds = [
+        (
+            100,
+            true,
+            200,
+            "swept 100 stale probe keys in 0 ms (more left)",
+        ),
+        (
+            100,
+            true,
+            100,
+            "swept 100 stale probe keys in 0 ms (more left)",
+        ),
+        (100, false, 0, "swept 100 stale probe keys in 0 ms"),
+        (0, false, 0, "swept 0 stale probe keys in 0 ms"),
+    ];
+    for (round, (deleted, more_left, left, line)) in rounds.into_iter().enumerate() {
+        let (swept, notes) = sweeping(&memory, budget, &timer).await;
+        assert_eq!(swept, Swept { deleted, more_left }, "sweep {round}");
+        assert_eq!(keys_of(&memory).await.len(), left, "sweep {round}");
+        assert_eq!(notes, [format!("the backend: {line}")], "sweep {round}");
+    }
+}
+
+/// Asserts that a sweep stops at the time budget, measured on the clock it is given and not by
+/// the machine: with a store whose delete takes one second by that clock and a budget of ten
+/// seconds, ten keys are deleted of fifty, the line says 10000 ms and that more are left. A sweep
+/// that does not look at the clock deletes all fifty.
+#[tokio::test]
+async fn a_sweep_stops_at_the_time_budget_on_the_clock_it_is_given() {
+    let (_, memory) = two_hours_on(50).await;
+    let timer = std::sync::Arc::new(TestClock::new());
+    let ticking = timer.clone();
+    let slow = Watched::new(memory, move |key| {
+        if key.contains("/old-") {
+            ticking.advance(1000);
+        }
+    });
+    let budget = SweepBudget {
+        keys: 1000,
+        time: Duration::from_secs(10),
+    };
+    let (swept, notes) = sweeping(&slow, budget, &*timer).await;
+    assert_eq!(
+        swept,
+        Swept {
+            deleted: 10,
+            more_left: true
+        }
+    );
+    assert_eq!(keys_of(&slow.inner).await.len(), 40);
+    assert_eq!(
+        notes,
+        ["the backend: swept 10 stale probe keys in 10000 ms (more left)"]
+    );
+}
+
+/// Asserts that a key that is younger than an hour by the clock of the store and a key under the
+/// run's own id are never deleted, and that they do not use up the count budget: they sort before
+/// the stale keys here, and a budget of one still deletes one stale key and leaves the other.
+#[tokio::test]
+async fn a_sweep_leaves_young_keys_and_its_own_and_they_cost_no_budget() {
+    let clock = std::sync::Arc::new(TestClock::new());
+    let memory = MemoryBackend::with_clock(clock.clone());
+    let put = |key: &'static str| memory.put(key, Bytes::from_static(b"x"));
+    put("_tiering/selftest/run-1/leftover").await.unwrap();
+    put("_tiering/selftest/z-old/create").await.unwrap();
+    put("_tiering/selftest/zz-old/create").await.unwrap();
+    put("client/object").await.unwrap();
+    clock.set(90 * 60 * 1000);
+    put("_tiering/selftest/a-young/create").await.unwrap();
+    clock.set(2 * 60 * 60 * 1000);
+    let budget = SweepBudget {
+        keys: 1,
+        time: Duration::from_secs(10),
+    };
+    let (swept, _) = sweeping(&memory, budget, &TestClock::new()).await;
+    assert_eq!(
+        swept,
+        Swept {
+            deleted: 1,
+            more_left: true
+        }
+    );
+    let (swept, _) = sweeping(&memory, budget, &TestClock::new()).await;
+    assert_eq!(
+        swept,
+        Swept {
+            deleted: 1,
+            more_left: false
+        }
+    );
+    assert_eq!(
+        keys_of(&memory).await,
+        [
+            "_tiering/selftest/a-young/create",
+            "_tiering/selftest/run-1/leftover",
+            "client/object"
+        ]
+    );
+}
+
 /// Asserts that probe keys of an earlier start are deleted when the test starts if they are more
 /// than an hour old by the store's own clock, whatever the clock of the machine says: at 59
 /// minutes on the store's clock a key written at 0 stays, at 61 it goes; a key that is newer and a
@@ -567,15 +791,13 @@ async fn probe_keys_older_than_an_hour_by_the_store_clock_are_swept() {
     put("_tiering/selftest/running-start/create").await.unwrap();
 
     clock.set(59 * 60 * 1000);
-    let (outcome, notes) = go(&memory, &options("run-1", true, &[])).await;
-    assert_eq!(outcome, Ok(()));
-    assert!(notes.is_empty(), "{notes:?}");
+    let (swept, _) = sweeping(&memory, SweepBudget::default(), &TestClock::new()).await;
+    assert_eq!(swept.deleted, 0);
     assert_eq!(keys_of(&memory).await.len(), 4);
 
     clock.set(61 * 60 * 1000);
-    let (outcome, notes) = go(&memory, &options("run-1", true, &[])).await;
-    assert_eq!(outcome, Ok(()));
-    assert!(notes.is_empty(), "{notes:?}");
+    let (swept, _) = sweeping(&memory, SweepBudget::default(), &TestClock::new()).await;
+    assert_eq!(swept.deleted, 1);
     assert_eq!(
         keys_of(&memory).await,
         [
@@ -601,26 +823,20 @@ async fn the_sweep_deletes_nothing_outside_the_probe_prefix() {
     put("_tiering/lease").await.unwrap();
     put("_tiering/selftest/killed-start/create").await.unwrap();
     clock.set(3 * 60 * 60 * 1000);
-    let skip = [Check::Paging];
-    let (outcome, notes) = go(&backend, &options("run-1", true, &skip)).await;
-    assert_eq!(outcome, Ok(()));
-    assert!(notes.is_empty(), "{notes:?}");
+    let (swept, _) = sweeping(&backend, SweepBudget::default(), &TestClock::new()).await;
+    assert_eq!(swept.deleted, 1);
     assert_eq!(
         keys_of(&backend.inner).await,
         ["_journal/p1/1", "_tiering/lease", "client/object"]
     );
 }
 
-/// Asserts that a store whose time cannot be read (its HEAD fails) is not swept, with a note, and
-/// the checks go on: the head check then refuses the store.
+/// Asserts that a store whose time cannot be read (its HEAD fails) is not swept, with a note.
 #[tokio::test]
 async fn a_store_whose_time_cannot_be_read_is_not_swept_and_a_note_says_so() {
     let backend = Flawed::new(Flaw::NoLastModified);
-    let (outcome, notes) = go(&backend, &options("run-1", true, &[])).await;
-    assert!(
-        matches!(outcome, Err(SelfTestError::Violation(_))),
-        "{outcome:?}"
-    );
+    let (swept, notes) = sweeping(&backend, SweepBudget::default(), &TestClock::new()).await;
+    assert_eq!(swept.deleted, 0);
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(
         notes[0].contains("could not read the time of the store"),
@@ -651,9 +867,7 @@ async fn a_wrong_answer_is_not_retried() {
 #[tokio::test]
 async fn a_listing_or_a_delete_that_fails_is_noted_and_goes_on() {
     let listing = Flawed::new(Flaw::ListFails);
-    let skip = [Check::Paging];
-    let (outcome, notes) = go(&listing, &options("run-1", true, &skip)).await;
-    assert_eq!(outcome, Ok(()));
+    let (_, notes) = sweeping(&listing, SweepBudget::default(), &TestClock::new()).await;
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(
         notes[0].contains("could not list the probe keys of earlier starts"),
