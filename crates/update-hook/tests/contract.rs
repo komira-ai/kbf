@@ -373,6 +373,93 @@ fn the_reserved_key_carries_the_promotion_ceiling() {
     assert_eq!(Params::default().to_toml(), "");
 }
 
+/// Catches a reserved key lost on the way to the hook, or one that reads as present when the
+/// updater left it out (a first install has no previous release or version).
+#[test]
+fn the_updater_tells_the_hook_which_releases_and_versions() {
+    assert_eq!(update_hook::STAGED_RELEASE_KEY, "updater.staged_release");
+    assert_eq!(
+        update_hook::PREVIOUS_RELEASE_KEY,
+        "updater.previous_release"
+    );
+    assert_eq!(update_hook::TARGET_VERSION_KEY, "updater.target_version");
+    assert_eq!(
+        update_hook::PREVIOUS_VERSION_KEY,
+        "updater.previous_version"
+    );
+    let update = Params::parse(concat!(
+        "\"updater.staged_release\" = \"/var/lib/updater/releases/s/abc\"\n",
+        "\"updater.previous_release\" = \"/var/lib/updater/releases/s/def\"\n",
+        "\"updater.target_version\" = \"1.4.0\"\n",
+        "\"updater.previous_version\" = \"1.3.0\"\n",
+    ))
+    .unwrap();
+    assert_eq!(
+        update.staged_release(),
+        Some(PathBuf::from("/var/lib/updater/releases/s/abc"))
+    );
+    assert_eq!(
+        update.previous_release(),
+        Some(PathBuf::from("/var/lib/updater/releases/s/def"))
+    );
+    assert_eq!(update.target_version(), Some("1.4.0"));
+    assert_eq!(update.previous_version(), Some("1.3.0"));
+    assert_eq!(Params::parse(&update.to_toml()).unwrap(), update);
+
+    let first = Params::parse(
+        "\"updater.staged_release\" = \"/r/abc\"\n\"updater.target_version\" = \"1.0.0\"\n",
+    )
+    .unwrap();
+    assert_eq!(first.staged_release(), Some(PathBuf::from("/r/abc")));
+    assert_eq!(
+        (first.previous_release(), first.previous_version()),
+        (None, None)
+    );
+    let none = Params::default();
+    assert_eq!((none.staged_release(), none.target_version()), (None, None));
+    // A reserved key that is not text is refused, not read as absent.
+    assert!(matches!(
+        Params::parse("\"updater.target_version\" = 3\n"),
+        Err(ParamsError::BadReserved(k)) if k == "updater.target_version"
+    ));
+}
+
+/// Catches a declaration that sets a key only the updater may write: its own `[hook.params]`
+/// may carry anything but the `updater.` namespace.
+#[test]
+fn a_declaration_may_not_set_an_updater_key() {
+    assert_eq!(
+        Params::parse_declared("promotion_bound_secs = 900\n")
+            .unwrap()
+            .get_u64("promotion_bound_secs"),
+        Some(900)
+    );
+    for text in [
+        "\"updater.staged_release\" = \"/etc\"\n",
+        "\"updater.promotion_ceiling_secs\" = 1\n",
+        "\"updater.anything_new\" = true\n",
+    ] {
+        assert!(
+            matches!(
+                Params::parse_declared(text),
+                Err(ParamsError::ReservedKey(_))
+            ),
+            "{text}"
+        );
+    }
+    // Other errors still come through.
+    assert!(matches!(
+        Params::parse_declared("list = [1]\n"),
+        Err(ParamsError::NotScalar(_))
+    ));
+    for error in [
+        ParamsError::BadReserved("k".to_owned()),
+        ParamsError::ReservedKey("k".to_owned()),
+    ] {
+        assert!(!error.to_string().is_empty());
+    }
+}
+
 /// Catches a table the updater would refuse being accepted by a hook, or the reverse.
 #[test]
 fn a_params_file_that_is_not_a_table_of_scalars_is_refused() {

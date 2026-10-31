@@ -7,6 +7,10 @@
 //! Rust of a hook; a Rust hook uses [`Invocation`], [`Outcome`] and [`Report`] to speak the
 //! contract, and every hook is tested by [`conformance`].
 //!
+//! The params file also carries the updater's reserved `updater.*` keys (the staged and previous
+//! release, the target and previous version); a hook validates what it reads from it against its
+//! own record directory and declaration.
+//!
 //! The crate depends on no other crate of this workspace, so a service outside it can depend on
 //! the contract; a test in kbf-integration-test keeps it so.
 
@@ -20,5 +24,8 @@ mod step;
 pub use exit::{EXIT_DEFERRED, EXIT_FAILURE, EXIT_HALT, EXIT_OK, Outcome};
 pub use line::{Class, LineError, MAX_REASON_LEN, Report, is_reason_token};
 pub use next::{Context, Next, Phase, Verdict, next};
-pub use params::{PROMOTION_CEILING_KEY, Params, ParamsError, Scalar};
+pub use params::{
+    PREVIOUS_RELEASE_KEY, PREVIOUS_VERSION_KEY, PROMOTION_CEILING_KEY, Params, ParamsError,
+    STAGED_RELEASE_KEY, Scalar, TARGET_VERSION_KEY,
+};
 pub use step::{ArgsError, Invocation, Step};
