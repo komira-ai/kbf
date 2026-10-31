@@ -9,8 +9,7 @@ publish.workspace = true
 
 # A measurement tool for tierstore, an S3 client of its front and of the two stores behind it.
 # It depends on no tierstore code (it talks to the binary over HTTP, as any client does) and on
-# `objstore-s3` only for the SigV4 client; crates/kbf-integration-test/tests/layering.rs does not
-# constrain it.
+# `objstore-s3` only for the SigV4 client.
 
 [dependencies]
 bytes.workspace = true
