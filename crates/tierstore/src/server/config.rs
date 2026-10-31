@@ -210,13 +210,26 @@ pub(super) struct Dur(pub Duration);
 
 impl<'de> Deserialize<'de> for Dur {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        match parse_duration(&text) {
+        deserializer.deserialize_str(DurVisitor)
+    }
+}
+
+struct DurVisitor;
+
+impl Visitor<'_> for DurVisitor {
+    type Value = Dur;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a duration such as \"15m\" (a number and ms, s, m or h)")
+    }
+
+    fn visit_str<E: de::Error>(self, text: &str) -> Result<Dur, E> {
+        match parse_duration(text) {
             Ok(duration) => Ok(Dur(duration)),
-            // Not the reason of the flag: it holds the text, which the file's messages never repeat.
-            Err(_) => Err(de::Error::custom(
-                "not a duration; use a number and ms, s, m or h, as in 15m",
-            )),
+            // An invalid value, not a custom message and not the reason of the flag (which holds
+            // the text): the refusal of a file names the key and the kind of value it takes and
+            // never shows what was written (see `syntax`).
+            Err(_) => Err(E::invalid_value(de::Unexpected::Str(text), &self)),
         }
     }
 }
@@ -555,6 +568,9 @@ const LOCAL_CACHE_KEYS: &[&str] = &[
     "path",
     "layout",
     "max_concurrent_fills",
+    "max_concurrent_keeps",
+    "keep_wait",
+    "keep_deadline",
     "write_through",
     "whole_fill_limit",
     "scrub_rate",

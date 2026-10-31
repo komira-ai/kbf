@@ -4,11 +4,14 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::FutureExt as _;
+use futures::StreamExt as _;
+use futures::future::BoxFuture;
 use kbf_testkit::dir::TestDir;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
@@ -20,6 +23,14 @@ use crate::{
 
 use super::layout::{data_path, name_of};
 use super::{CacheConfig, Disk, LocalCache, Space, SystemDisk};
+
+/// The wait and the deadline of a keep in tests that do not test them: an hour, so that no test
+/// that runs on the real clock can reach either, whatever the load on the disk. The tests of the
+/// two settings run on a paused clock and set small values themselves.
+pub(in crate::server) fn never_expires(config: &mut CacheConfig) {
+    config.keep_wait = std::time::Duration::from_secs(3600);
+    config.keep_deadline = std::time::Duration::from_secs(3600);
+}
 
 /// `len` bytes that differ from one place to the next, so that a wrong range shows.
 pub(in crate::server) fn pattern(len: usize) -> Vec<u8> {
@@ -55,6 +66,15 @@ pub(in crate::server) struct Tamper {
     pub(in crate::server) lose_delete_answer: AtomicBool,
     /// What `needs_length` says.
     pub(in crate::server) needs_len: AtomicBool,
+    /// If not 0, a streamed put stops reading its body after this many chunks and stores what
+    /// it has read, as a backend that does not read to the end of the body does.
+    pub(in crate::server) stop_after: AtomicUsize,
+    /// Every HEAD that finds its object says it is one byte larger than it is.
+    pub(in crate::server) lie_size: AtomicBool,
+    /// The gate that holds a HEAD that found its object, after it has read it.
+    heads: Mutex<Option<Arc<Semaphore>>>,
+    /// The HEADs that wait at `heads`, counted when they arrive.
+    heading: AtomicU64,
 }
 
 /// A semaphore that reads wait on, and the key whose reads wait (every key if none).
@@ -74,7 +94,26 @@ impl Tamper {
             deleting: AtomicU64::new(0),
             lose_delete_answer: AtomicBool::new(false),
             needs_len: AtomicBool::new(false),
+            stop_after: AtomicUsize::new(0),
+            lie_size: AtomicBool::new(false),
+            heads: Mutex::new(None),
+            heading: AtomicU64::new(0),
         }
+    }
+
+    /// Holds every HEAD that finds its object from now on, after it has the answer, until a
+    /// permit is added to the gate that is returned (a HEAD of a key that is not there is not
+    /// held).
+    pub(in crate::server) fn hold_heads(&self) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        let mut held = self.heads.lock().unwrap_or_else(PoisonError::into_inner);
+        *held = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// How many HEADs wait at the gate of [`hold_heads`](Self::hold_heads).
+    pub(in crate::server) fn heading(&self) -> u64 {
+        self.heading.load(Ordering::SeqCst)
     }
 
     /// Holds every delete from now on, before it deletes, until a permit is added to the gate
@@ -135,6 +174,24 @@ impl Backend for Tamper {
         self.memory.put(key, body).await
     }
 
+    async fn put_stream(
+        &self,
+        key: &str,
+        _len: Option<u64>,
+        mut body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        let stop = self.stop_after.load(Ordering::SeqCst);
+        let (mut whole, mut chunks) = (BytesMut::new(), 0);
+        while let Some(chunk) = body.next().await {
+            whole.extend_from_slice(&chunk?);
+            chunks += 1;
+            if stop != 0 && chunks >= stop {
+                break;
+            }
+        }
+        self.memory.put(key, whole.freeze()).await
+    }
+
     async fn put_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<String, Error> {
         self.memory.put_if_match(key, body, etag).await
     }
@@ -175,7 +232,20 @@ impl Backend for Tamper {
     }
 
     async fn head(&self, key: &str) -> Result<Meta, Error> {
-        self.memory.head(key).await
+        let mut meta = self.memory.head(key).await?;
+        if self.lie_size.load(Ordering::SeqCst) {
+            meta.size += 1;
+        }
+        let gate = self
+            .heads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(gate) = gate {
+            let _ = self.heading.fetch_add(1, Ordering::SeqCst);
+            gate.acquire().await.expect("the gate stays open").forget();
+        }
+        Ok(meta)
     }
 
     async fn delete(&self, key: &str) -> Result<(), Error> {
@@ -264,6 +334,14 @@ pub(in crate::server) struct FakeDisk {
     pub(in crate::server) touched: Mutex<Vec<(PathBuf, u64)>>,
     /// The number of calls of `link`.
     links_made: Mutex<u32>,
+    /// The gate that holds every write to a stage file, once set.
+    write_gate: Mutex<Option<Arc<Semaphore>>>,
+    /// The gate that holds every `link`, once set (the thread that calls it waits).
+    link_gate: Mutex<Option<Arc<BlockingGate>>>,
+    /// The gate that holds every `space`, once set (the thread that calls it waits).
+    space_gate: Mutex<Option<Arc<BlockingGate>>>,
+    /// The calls of `space` that wait at `space_gate`, counted when they arrive.
+    space_waiting: AtomicU64,
     /// The names of every call of `link`, in order: from and to.
     pub(in crate::server) linked: Mutex<Vec<(PathBuf, PathBuf)>>,
 }
@@ -275,8 +353,52 @@ impl FakeDisk {
             space: Mutex::new(None),
             touched: Mutex::new(Vec::new()),
             links_made: Mutex::new(0),
+            write_gate: Mutex::new(None),
+            link_gate: Mutex::new(None),
+            space_gate: Mutex::new(None),
+            space_waiting: AtomicU64::new(0),
             linked: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Holds every write to a stage file from now on until a permit is added to the gate that is
+    /// returned: a disk that hangs.
+    pub(in crate::server) fn hold_writes(&self) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        let mut held = self
+            .write_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *held = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Holds every `link` from now on, on its thread, until the gate that is returned is opened.
+    pub(in crate::server) fn hold_links(&self) -> Arc<BlockingGate> {
+        let gate = Arc::new(BlockingGate::new());
+        let mut held = self
+            .link_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *held = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Holds every `space` from now on, on its thread (the eviction pass asks for it), until the
+    /// gate that is returned is opened.
+    pub(in crate::server) fn hold_space(&self) -> Arc<BlockingGate> {
+        let gate = Arc::new(BlockingGate::new());
+        let mut held = self
+            .space_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *held = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// How many calls of `space` wait at the gate of [`hold_space`](Self::hold_space).
+    pub(in crate::server) fn space_waiting(&self) -> u64 {
+        self.space_waiting.load(Ordering::SeqCst)
     }
 
     pub(in crate::server) fn set(&self, quirk: Quirk) {
@@ -293,8 +415,49 @@ impl FakeDisk {
     }
 }
 
+/// A gate that a thread (not a task) waits at until a test opens it: the calls of `Disk` that
+/// are made on threads that may block.
+pub(in crate::server) struct BlockingGate {
+    open: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl BlockingGate {
+    fn new() -> Self {
+        Self {
+            open: Mutex::new(false),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) {
+        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        while !*open {
+            open = self
+                .changed
+                .wait(open)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Lets every thread at the gate go, and every one that comes.
+    pub(in crate::server) fn open(&self) {
+        *self.open.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.changed.notify_all();
+    }
+}
+
 impl Disk for FakeDisk {
     fn space(&self, path: &Path) -> io::Result<Space> {
+        let gate = self
+            .space_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(gate) = gate {
+            let _ = self.space_waiting.fetch_add(1, Ordering::SeqCst);
+            gate.wait();
+        }
         if self.quirk() == Quirk::SpaceFails {
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
         }
@@ -318,6 +481,14 @@ impl Disk for FakeDisk {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((from.to_path_buf(), to.to_path_buf()));
+        let gate = self
+            .link_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(gate) = gate {
+            gate.wait();
+        }
         let quirk = self.quirk();
         if let Quirk::LinkFails(kind) = quirk {
             return Err(io::Error::from(kind));
@@ -338,6 +509,25 @@ impl Disk for FakeDisk {
             _ => {}
         }
         Ok(())
+    }
+
+    fn write_stage<'a>(
+        &'a self,
+        file: &'a mut tokio::fs::File,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, io::Result<()>> {
+        async move {
+            let gate = self
+                .write_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(gate) = gate {
+                gate.acquire().await.expect("the gate stays open").forget();
+            }
+            tokio::io::AsyncWriteExt::write_all(file, bytes).await
+        }
+        .boxed()
     }
 
     fn links(&self, path: &Path) -> io::Result<u64> {
@@ -391,6 +581,7 @@ impl Rig {
         let dir = TestDir::under(std::env::temp_dir(), name);
         let path = dir.path().join("cache");
         let mut config = CacheConfig::new(path, 1 << 20, vec![("cas/".to_owned(), true)]);
+        never_expires(&mut config);
         change(&mut config);
         let tamper = Arc::new(Tamper::new());
         let upstream = Arc::new(FaultyBackend::new(tamper.clone()));
