@@ -300,7 +300,7 @@ fn a_bad_services_list_and_a_bad_new_field_are_both_dropped() {
 fn a_heartbeat_that_is_wrong_beyond_its_new_fields_is_still_refused() {
     let mut wire = full_beat();
     wire["agent_features"] = json!(["Upper"]);
-    wire["health"] = json!("absent");
+    wire["health"] = json!("sick");
     assert!(read_heartbeat(&serde_json::to_vec(&wire).expect("json")).is_err());
 }
 

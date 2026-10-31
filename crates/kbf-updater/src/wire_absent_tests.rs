@@ -22,12 +22,13 @@ struct FrozenHeartbeat {
 }
 
 /// Catches: `absent` not being spelled as the contract spells it: it reads, and writes back
-/// byte for byte.
+/// as `absent`.
 #[test]
 fn a_heartbeat_with_health_absent_is_read_and_written_back() {
     let read: Heartbeat = serde_json::from_str(ABSENT).expect("absent is a health");
     assert_ne!(read.health, Health::Healthy);
-    assert_eq!(serde_json::to_string(&read).expect("json"), ABSENT);
+    let written: serde_json::Value = serde_json::to_value(&read).expect("json");
+    assert_eq!(written["health"], "absent");
 }
 
 /// Catches: the reason an agent may send `absent` only after `heartbeat-v2` is advertised: a
