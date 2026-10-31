@@ -328,8 +328,10 @@ by the load gate or the cold store guard, and the notes of the passes.
 
 `tierstore-bench fill-paper --paper P.html --cells cells.json --result-dir DIR --out OUT.html`
 writes the measured numbers into the paper: each element carrying `data-cell="<id>"` gets the
-formatted value of the mapped result and `data-source="<file>#<metric>"` and `data-label`
-(`test instance` or `farm`); `data-blocked` cells are left alone, and the rest of the HTML is
-copied byte for byte. `--in-place` replaces `--out`; `--check` writes nothing and exits 2 listing
-placeholders without a mapping, mappings without a result and filled values whose source is gone.
+formatted value of the mapped result, `data-source="<file>#<metric>"`, `data-label`
+(`test instance` or `farm`) and `data-result="<file>"`, and loses `tbd` from its class list; a cell
+with `data-blocked` or `data-basis` is never written, and the rest of the HTML is copied byte for
+byte. A result file is `<cell>-<arm>-a<N>.json`; of several attempts of an arm the latest that
+gives a figure is used. `--in-place` replaces `--out`; `--check` writes nothing and exits 2 listing
+placeholders without a mapping, mappings without a result and filled values whose source or result file is gone.
 The mapping schema and the rules for each figure are in the header of `src/fill.rs`.

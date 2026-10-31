@@ -626,6 +626,8 @@ fn format_value(value: f64, unit: Unit) -> String {
 /// What a mapping gives for the results: the text, where from and the label.
 struct Found {
     text: String,
+    /// The result file the figure was taken from.
+    file: String,
     source: String,
     label: String,
 }
@@ -652,6 +654,7 @@ fn evaluate(mapping: &Mapping, results: &Results) -> Result<Found, String> {
                 Ok(v) => {
                     return Ok(Found {
                         text: format_value(v / unit.divisor, *unit),
+                        file: file.to_owned(),
                         source: format!("{file}#{}", metric.name()),
                         label: mapping.label(&result.arm),
                     });
@@ -973,6 +976,12 @@ fn apply(html: &str, mut edits: Vec<Edit>) -> Result<String, FillError> {
     Ok(out)
 }
 
+/// Whether the paper says a cell is not to be given a measured number: it is blocked (a reason
+/// it cannot be measured yet), or it has a basis (design or code reading, not a measurement).
+fn is_held(tag: &StartTag) -> bool {
+    tag.attr("data-blocked").is_some() || tag.attr("data-basis").is_some()
+}
+
 fn by_id(mappings: &[Mapping]) -> BTreeMap<&str, &Mapping> {
     mappings.iter().map(|m| (m.id.as_str(), m)).collect()
 }
@@ -992,7 +1001,7 @@ pub fn fill(
     let mut report = FillReport::default();
     let mut edits = Vec::new();
     for ph in placeholders(&tokens) {
-        if ph.tag.attr("data-blocked").is_some() {
+        if is_held(ph.tag) {
             report.blocked += 1;
             continue;
         }
@@ -1013,15 +1022,30 @@ pub fn fill(
         match evaluate(mapping, results) {
             Ok(Found {
                 text,
+                file,
                 source,
                 label,
             }) => {
-                edits.extend(attribute_edits(
-                    html,
-                    ph.tag,
-                    &[("data-source", &source), ("data-label", &label)],
-                    &["data-note"],
-                ));
+                let mut set = vec![
+                    ("data-source", source),
+                    ("data-label", label),
+                    ("data-result", file),
+                ];
+                let mut remove = vec!["data-note"];
+                // A filled cell is no longer a placeholder: `tbd` leaves its class list.
+                if let Some(class) = ph.tag.attr("class").and_then(|a| a.value.as_deref()) {
+                    let kept: Vec<&str> =
+                        class.split_whitespace().filter(|c| *c != "tbd").collect();
+                    if kept.len() != class.split_whitespace().count() {
+                        if kept.is_empty() {
+                            remove.push("class");
+                        } else {
+                            set.push(("class", kept.join(" ")));
+                        }
+                    }
+                }
+                let set: Vec<(&str, &str)> = set.iter().map(|(n, v)| (*n, v.as_str())).collect();
+                edits.extend(attribute_edits(html, ph.tag, &set, &remove));
                 edits.push(Edit {
                     start: inner_start,
                     end: inner_end,
@@ -1051,7 +1075,7 @@ pub fn check(
     let known = by_id(mappings);
     let mut findings = Vec::new();
     for ph in placeholders(&tokens) {
-        if ph.tag.attr("data-blocked").is_none() && !known.contains_key(ph.id.as_str()) {
+        if !is_held(ph.tag) && !known.contains_key(ph.id.as_str()) {
             findings.push(format!("placeholder {:?} has no mapping", ph.id));
         }
     }
@@ -1062,15 +1086,23 @@ pub fn check(
     }
     for token in &tokens {
         let Token::Open(tag) = token else { continue };
-        let Some(source) = tag.attr("data-source") else {
-            continue;
-        };
-        let source = source.value.clone().unwrap_or_default();
         let who = tag.attr("data-cell").and_then(|a| a.value.clone());
         let who = who.unwrap_or_else(|| format!("<{}> at byte {}", tag.name, tag.start));
-        if let Err(why) = source_exists(&source, results) {
+        if let Some(source) = tag.attr("data-source") {
+            let source = source.value.clone().unwrap_or_default();
+            if let Err(why) = source_exists(&source, results) {
+                findings.push(format!(
+                    "filled value {who:?} cites {source:?}, which no longer exists: {why}"
+                ));
+            }
+        }
+        // Only a result file is looked up: the paper's hand-filled cells name a table of their own.
+        if let Some(file) = tag.attr("data-result").and_then(|a| a.value.as_deref())
+            && file.ends_with(".json")
+            && !results.files.contains_key(file)
+        {
             findings.push(format!(
-                "filled value {who:?} cites {source:?}, which no longer exists: {why}"
+                "{who:?} names the result file {file:?}, which is not in the result directory"
             ));
         }
     }
@@ -1674,6 +1706,18 @@ mod tests {
         assert!(
             findings[0].contains("\"b\" names the result file \"cold-put-gone-a1.json\""),
             "{findings:?}"
+        );
+    }
+
+    /// Catches a class list rewritten when it holds no `tbd`: a filled cell keeps the classes it
+    /// had, byte for byte.
+    #[test]
+    fn a_class_without_tbd_is_left_as_written() {
+        let html = "<b class='how  now' data-cell=\"a\">?</b>";
+        let (out, _) = fill(html, &one("a", "p50", "ms", "instance"), &results()).unwrap();
+        assert!(
+            out.starts_with("<b class='how  now' data-cell=\"a\" "),
+            "{out}"
         );
     }
 }
