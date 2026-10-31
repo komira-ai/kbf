@@ -15,8 +15,6 @@
 //! rights of a declaration, and the loader of declarations, are migration step 3 and plug in
 //! through [`StepLauncher`] and [`register::Declared`].
 
-#![allow(unused)]
-
 pub mod artifact;
 pub mod clock;
 pub mod deadman;

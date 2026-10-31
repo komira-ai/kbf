@@ -777,3 +777,60 @@ fn the_runner_hands_out_one_watch() {
     let runner = rig.runner();
     assert!(Arc::ptr_eq(&runner.watch(), &runner.watch()));
 }
+
+/// Catches an update that is taken for the one under way when it is not: an order that differs
+/// in the service, the target, the digest of the staged release or of the previous one is not the
+/// unfinished update (it is `Busy`), and only the same order resumes it.
+#[test]
+fn only_the_same_order_resumes_an_unfinished_update() {
+    let rig = Rig::new("run-same-order");
+    rig.fake
+        .lose_run
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    assert!(rig.runner().run(&rig.order()).is_err());
+    let mut others = Vec::new();
+    let mut o = rig.order();
+    o.service = "other".to_owned();
+    others.push(o);
+    let mut o = rig.order();
+    o.target_version = "2.0.1".to_owned();
+    others.push(o);
+    let mut o = rig.order();
+    o.staged.digest = "0".repeat(64);
+    others.push(o);
+    let mut o = rig.order();
+    o.previous = None;
+    others.push(o);
+    let mut o = rig.order();
+    o.previous.as_mut().unwrap().digest = "0".repeat(64);
+    others.push(o);
+    for other in others {
+        let err = rig.runner().run(&other).unwrap_err();
+        assert!(matches!(err, RunError::Busy { .. }), "{err:?}");
+    }
+    assert_eq!(rig.runner().run(&rig.order()).unwrap(), ok());
+}
+
+/// Catches a finished update that is run over: the next order for the host starts the next
+/// generation (its units are numbered 2), and the verdict of the finished one is read with
+/// `last_result`.
+#[test]
+fn a_finished_update_is_followed_by_the_next_generation() {
+    let rig = Rig::new("run-generation");
+    assert_eq!(run(&rig), ok());
+    assert_eq!(rig.runner().last_result().unwrap(), Some(ok()));
+    rig.fake.clear();
+    rig.fake.say(Step::Verify, &[FAIL]);
+    assert_eq!(run(&rig), failed(Phase::GateRelease, Class::Release));
+    let units: Vec<String> = rig
+        .fake
+        .runs()
+        .iter()
+        .filter_map(|e| match e {
+            support::Event::Run { unit, .. } => Some(unit.clone()),
+            support::Event::Stop(_) => None,
+        })
+        .collect();
+    assert_eq!(units[0], "updater-svc-prepare-2");
+    assert!(rig.fake.stops().is_empty());
+}

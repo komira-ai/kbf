@@ -6,7 +6,7 @@
 use std::io;
 use std::path::Path;
 
-use update_hook::{Invocation, Outcome};
+use update_hook::Invocation;
 
 /// One run of one step.
 #[derive(Clone, Debug)]
@@ -34,13 +34,6 @@ pub struct StepExit {
     pub code: Option<i32>,
     /// The last line the hook wrote to standard output, `None` when it wrote none.
     pub last_line: Option<String>,
-}
-
-impl StepExit {
-    /// The outcome the contract reads from the code.
-    pub fn outcome(&self) -> Outcome {
-        Outcome::from_exit(self.code)
-    }
 }
 
 /// Why a step could not be run to an end.

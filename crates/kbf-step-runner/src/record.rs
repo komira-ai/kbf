@@ -162,19 +162,35 @@ impl RecordStore {
 
     /// Reads the record.
     pub fn load(&self) -> Result<Loaded, RecordError> {
-        Ok(Loaded::Absent)
+        let bytes = match fs::read(self.dir.join(RECORD_FILE)) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Loaded::Absent),
+            Err(e) => return Err(e.into()),
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| RecordError::Corrupt(e.to_string()))?;
+        let schema = value.get("schema").and_then(serde_json::Value::as_u64);
+        if let Some(schema) = schema.filter(|schema| *schema > u64::from(SCHEMA)) {
+            return Ok(Loaded::Newer { schema });
+        }
+        let record =
+            serde_json::from_value(value).map_err(|e| RecordError::Corrupt(e.to_string()))?;
+        Ok(Loaded::Current(Box::new(record)))
     }
 
     /// Writes the record, durably.
     pub fn save(&self, record: &Record) -> Result<(), RecordError> {
-        let _ = record;
-        Ok(())
+        let n = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
+        self.cross(CrashPoint::BeforeWrite(n))?;
+        let bytes =
+            serde_json::to_vec_pretty(record).map_err(|e| RecordError::Corrupt(e.to_string()))?;
+        write_atomic(&self.dir, RECORD_FILE, &bytes)?;
+        self.cross(CrashPoint::AfterWrite(n))
     }
 
     /// Writes the params file, durably.
     pub fn save_params(&self, text: &str) -> Result<(), RecordError> {
-        let _ = text;
-        Ok(())
+        Ok(write_atomic(&self.dir, PARAMS_FILE, text.as_bytes())?)
     }
 
     fn cross(&self, point: CrashPoint) -> Result<(), RecordError> {

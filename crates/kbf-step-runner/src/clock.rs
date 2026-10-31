@@ -34,8 +34,11 @@ impl Stamp {
     /// Seconds from this stamp to now, `0` when the host booted since: the time that passed
     /// before a reboot is unknown, and a window that restarts is bounded by one more window.
     pub fn elapsed_secs(&self, clock: &dyn Clock) -> u64 {
-        let _ = clock;
-        0
+        if self.boot_id == clock.boot_id() {
+            clock.mono_secs().saturating_sub(self.mono_secs)
+        } else {
+            0
+        }
     }
 }
 

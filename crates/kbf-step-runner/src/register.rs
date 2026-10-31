@@ -222,26 +222,79 @@ impl Registry {
         registration: &Registration,
         grant: &Grant,
     ) -> Result<u64, RegistryError> {
-        let _ = (peer_uid, registration, grant);
-        Ok(0)
+        if peer_uid != grant.uid {
+            return Err(Refused::WrongUser.into());
+        }
+        if let Some(health) = &registration.health {
+            check_health(health, grant)?;
+        }
+        let mut inner = self.inner();
+        inner.next_conn += 1;
+        let conn = inner.next_conn;
+        inner.entries.insert(
+            registration.name.clone(),
+            Entry {
+                uid: grant.uid,
+                version: registration.version.clone(),
+                health: registration.health.clone(),
+                ttl_secs: grant.registration_ttl_secs,
+                presence: Presence::Live,
+                conn,
+            },
+        );
+        let saved: Vec<Saved> = inner
+            .entries
+            .iter()
+            .map(|(name, e)| Saved {
+                name: name.clone(),
+                uid: e.uid,
+                version: e.version.clone(),
+                health: e.health.clone(),
+                ttl_secs: e.ttl_secs,
+            })
+            .collect();
+        let bytes =
+            serde_json::to_vec(&saved).map_err(|e| RegistryError::Corrupt(e.to_string()))?;
+        write_atomic(&self.dir, REGISTRATIONS_FILE, &bytes)?;
+        Ok(conn)
     }
 
     /// The connection `conn` closed: its service is stopped, unless a later registration of
     /// the same name has replaced it.
     pub fn closed(&self, name: &str, conn: u64) {
-        let _ = (name, conn);
+        let mut inner = self.inner();
+        if let Some(entry) = inner.entries.get_mut(name).filter(|e| e.conn == conn) {
+            entry.presence = Presence::Stopped;
+        }
     }
 
     /// What to report for `name`, whose staged version is `expected`.
     pub fn report(&self, name: &str, expected: Option<&str>) -> Reported {
-        let _ = (name, expected);
-        Reported::Absent
+        let inner = self.inner();
+        let Some(entry) = inner.entries.get(name) else {
+            return Reported::Absent;
+        };
+        let stopped = match entry.presence {
+            Presence::Live => false,
+            Presence::Stopped => true,
+            Presence::Unconfirmed { since } => {
+                self.clock.mono_secs().saturating_sub(since) >= entry.ttl_secs
+            }
+        };
+        if stopped {
+            Reported::Unhealthy(Why::Stopped)
+        } else if expected.is_some_and(|version| version != entry.version) {
+            Reported::Unhealthy(Why::VersionMismatch {
+                running: entry.version.clone(),
+            })
+        } else {
+            Reported::Healthy
+        }
     }
 
     /// The health address a service registered, for the updater's `GET`.
     pub fn health_addr(&self, name: &str) -> Option<HealthAddr> {
-        let _ = name;
-        None
+        self.inner().entries.get(name)?.health.clone()
     }
 }
 
@@ -288,21 +341,76 @@ impl Server {
         registry: Arc<Registry>,
         declared: Arc<dyn Declared>,
     ) -> Result<Server, RegistryError> {
-        let _ = (dir_owner, group, registry, declared);
-        Err(RegistryError::SocketDir(path.to_path_buf()))
+        let dir = path.parent().unwrap_or(Path::new("/"));
+        let meta = fs::symlink_metadata(dir)?;
+        if !meta.is_dir() || meta.uid() != dir_owner || meta.mode() & 0o007 != 0 {
+            return Err(RegistryError::SocketDir(dir.to_path_buf()));
+        }
+        match UnixStream::connect(path) {
+            Ok(_) => return Err(RegistryError::AlreadyServing(path.to_path_buf())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => fs::remove_file(path)?,
+            Err(e) => return Err(e.into()),
+        }
+        let listener = UnixListener::bind(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o660))?;
+        if let Some(gid) = group {
+            rustix::fs::chown(path, None, Some(rustix::fs::Gid::from_raw(gid)))
+                .map_err(io::Error::from)?;
+        }
+        Ok(Server {
+            listener,
+            registry,
+            declared,
+        })
     }
 
     /// Accepts connections, one thread each, until `stop` is set. The caller sets it and then
     /// makes one connection, which wakes the accept.
     pub fn serve(self: &Arc<Server>, stop: &AtomicBool) -> io::Result<()> {
-        let _ = stop;
-        Ok(())
+        loop {
+            let (stream, _) = self.listener.accept()?;
+            if stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let server = Arc::clone(self);
+            std::thread::spawn(move || {
+                let _ = server.serve_connection(stream);
+            });
+        }
     }
 
     /// Serves one connection: reads the registration, answers it, and holds the registration
     /// until the peer closes.
     pub fn serve_connection(&self, stream: UnixStream) -> Result<(), RegistryError> {
-        let _ = stream;
+        let peer = peer_uid(&stream)?;
+        let mut reader = BufReader::new((&stream).take(MAX_LINE as u64 + 1));
+        let mut line = String::new();
+        let read = reader.read_line(&mut line);
+        let registration = match read {
+            Ok(n) if n <= MAX_LINE => serde_json::from_str::<Registration>(&line).ok(),
+            _ => None,
+        };
+        let outcome = match registration {
+            None => Err(Refused::Malformed.into()),
+            Some(registration) => self.accept(peer, registration),
+        };
+        let (name, conn) = match outcome {
+            Ok(held) => held,
+            Err(RegistryError::Refused(refused)) => {
+                return reply(&stream, Some(refused.token()));
+            }
+            Err(e) => {
+                reply(&stream, Some("internal"))?;
+                return Err(e);
+            }
+        };
+        reply(&stream, None)?;
+        // The connection is the liveness: wait for the peer to close it.
+        let mut sink = [0u8; 256];
+        let mut rest = &stream;
+        while matches!(rest.read(&mut sink), Ok(n) if n > 0) {}
+        self.registry.closed(&name, conn);
         Ok(())
     }
 

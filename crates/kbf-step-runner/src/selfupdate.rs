@@ -75,31 +75,53 @@ impl Layout {
 
     /// The version `current` points at, `None` before the first switch.
     pub fn current(&self) -> io::Result<Option<String>> {
-        Ok(None)
+        link_version(&self.current_path())
     }
 
     /// The version `previous` points at.
     pub fn previous(&self) -> io::Result<Option<String>> {
-        Ok(None)
+        link_version(&self.previous_path())
     }
 
     /// Puts `binary` beside the others as version `version`, mode 0755, durably. Changes no link.
     pub fn stage(&self, version: &str, binary: &Path) -> io::Result<()> {
-        let _ = (version, binary);
-        Ok(())
+        check_version(version)?;
+        let versions = self.dir.join("versions");
+        fs::create_dir_all(&versions)?;
+        let tmp = versions.join(format!("{version}.tmp"));
+        fs::copy(binary, &tmp)?;
+        fs::set_permissions(&tmp, Permissions::from_mode(0o755))?;
+        File::open(&tmp)?.sync_all()?;
+        fs::rename(&tmp, self.version_path(version))?;
+        File::open(&versions)?.sync_all()
     }
 
     /// Points `current` at the staged `version` and `previous` at what `current` was. Running it
     /// again changes nothing.
     pub fn switch(&self, version: &str) -> io::Result<()> {
-        let _ = version;
-        Ok(())
+        check_version(version)?;
+        fs::symlink_metadata(self.version_path(version))?;
+        let before = self.current()?;
+        if before.as_deref() == Some(version) {
+            return Ok(());
+        }
+        if let Some(before) = before {
+            self.set_link("previous", &before)?;
+        }
+        self.set_link("current", version)
     }
 
     /// Points `current` at `previous` again. `false` when there is no `previous` or `current`
     /// already points at it.
     pub fn flip_back(&self) -> io::Result<bool> {
-        Ok(false)
+        let Some(previous) = self.previous()? else {
+            return Ok(false);
+        };
+        if self.current()?.as_deref() == Some(previous.as_str()) {
+            return Ok(false);
+        }
+        self.set_link("current", &previous)?;
+        Ok(true)
     }
 
     fn set_link(&self, name: &str, version: &str) -> io::Result<()> {
@@ -152,19 +174,26 @@ pub fn follow_on(
     version: &str,
     new_binary: &Path,
 ) -> io::Result<FollowOn> {
-    let _ = (finished, layout, running, version, new_binary);
-    Ok(FollowOn::NotNeeded)
+    if !matches!(finished.verdict, Verdict::Succeeded { .. }) || running == version {
+        return Ok(FollowOn::NotNeeded);
+    }
+    layout.stage(version, new_binary)?;
+    layout.switch(version)?;
+    Ok(FollowOn::Restart)
 }
 
 /// The drop-in for the updater's own unit: restart when it exits, and run the fallback unit
 /// once it has failed `burst` starts.
 pub fn main_dropin(fallback_unit: &str, burst: u32) -> String {
-    let _ = (fallback_unit, burst);
-    String::new()
+    format!(
+        "[Unit]\nOnFailure={fallback_unit}\nStartLimitIntervalSec=300\nStartLimitBurst={burst}\n\n[Service]\nRestart=always\nRestartSec=1\n"
+    )
 }
 
 /// The fallback unit: the previous binary flips `current` back and the main unit is started.
 pub fn fallback_unit(layout: &Layout, main_unit: &str) -> String {
-    let _ = (layout, main_unit);
-    String::new()
+    let dir = layout.dir().display();
+    format!(
+        "[Unit]\nDescription=Put the previous updater binary back after the new one failed to start\n\n[Service]\nType=oneshot\nExecStart={dir}/previous self-update-fallback --dir {dir}\nExecStartPost=/usr/bin/systemctl reset-failed {main_unit}\nExecStartPost=/usr/bin/systemctl start --no-block {main_unit}\n"
+    )
 }

@@ -53,7 +53,21 @@ impl Staged {
     /// `hook` is the declaration's `binary`: relative, plain names only, a regular file of the
     /// tree (not a link, so it cannot lead out of it).
     pub fn check(&self, hook: &Path) -> Result<PathBuf, ArtifactError> {
-        Ok(self.dir.join(hook))
+        let found = tree_digest(&self.dir)?;
+        if found != self.digest {
+            return Err(ArtifactError::Changed {
+                expected: self.digest.clone(),
+                found,
+            });
+        }
+        if hook.as_os_str().is_empty() || !hook.components().all(is_plain) {
+            return Err(ArtifactError::BadHookPath(hook.to_path_buf()));
+        }
+        let path = self.dir.join(hook);
+        if !fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+            return Err(ArtifactError::HookMissing(hook.to_path_buf()));
+        }
+        Ok(path)
     }
 }
 
@@ -64,8 +78,9 @@ fn is_plain(component: Component<'_>) -> bool {
 /// The sha256 of a tree: every name, kind, mode and content below `dir`, in name order, links
 /// by their target and never followed. Lower-case hex.
 pub fn tree_digest(dir: &Path) -> Result<String, ArtifactError> {
-    let _ = dir;
-    Ok(String::new())
+    let mut hasher = Sha256::new();
+    hash_dir(&mut hasher, dir, Path::new(""))?;
+    Ok(hex(&hasher.finalize()))
 }
 
 fn hash_dir(hasher: &mut Sha256, dir: &Path, rel: &Path) -> Result<(), ArtifactError> {

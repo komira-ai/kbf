@@ -86,13 +86,33 @@ impl DeadMan {
     /// Looks at the watch once: stops the armed step if its second has passed. `true` when it
     /// stopped one. A step is stopped once; a stop that failed is tried again at the next tick.
     pub fn tick(&self) -> Result<bool, LaunchError> {
-        Ok(false)
+        let due = {
+            let state = self.watch.state();
+            state
+                .active
+                .as_ref()
+                .filter(|a| !a.stopped && self.clock.mono_secs() >= a.deadline_secs)
+                .map(|a| a.unit.clone())
+        };
+        let Some(unit) = due else {
+            return Ok(false);
+        };
+        self.launcher.stop(&unit)?;
+        // Only the step that was stopped: another may have been armed meanwhile.
+        let mut state = self.watch.state();
+        let armed = state.active.iter_mut().filter(|a| a.unit == unit);
+        armed.for_each(|a| a.stopped = true);
+        Ok(true)
     }
 
     /// Ticks every `poll_secs` until `stop` is set. An error of stopping a unit is kept in the
     /// watch ([`Watch::last_error`]) and the next tick tries again.
     pub fn run(&self, stop: &AtomicBool, poll_secs: u64) {
-        let _ = (stop, poll_secs);
+        while !stop.load(Ordering::Acquire) {
+            let error = self.tick().err().map(|e| e.to_string());
+            self.watch.state().last_error = error;
+            self.clock.sleep_secs(poll_secs);
+        }
     }
 
     /// Runs [`DeadMan::run`] on a thread of its own.

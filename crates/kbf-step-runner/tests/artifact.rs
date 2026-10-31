@@ -100,7 +100,7 @@ fn a_tree_altered_after_sealing_is_refused() {
 fn only_a_plain_relative_regular_file_is_a_hook() {
     let s = tree("art-hook");
     let staged = Staged::seal(s.path()).unwrap();
-    for bad in ["/bin/sh", "../x", "", "bin/../bin/hook"] {
+    for bad in ["/usr/bin/hook", "../x", "", "bin/../bin/hook"] {
         let err = staged.check(Path::new(bad)).unwrap_err();
         assert!(
             matches!(err, ArtifactError::BadHookPath(_)),

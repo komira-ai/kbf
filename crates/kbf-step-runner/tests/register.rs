@@ -123,6 +123,10 @@ fn liveness_and_version_are_what_the_updater_reports() {
     assert_eq!(rig.registry.report("svc", Some("2.0.0")), Reported::Absent);
     let (client, served) = rig.connect();
     assert_eq!(say(&client, &registration("2.0.0", None))["ok"], true);
+    // Whatever else the peer sends while it is connected changes nothing.
+    (&client)
+        .write_all(b"{\"name\":\"svc\",\"version\":\"9\"}\n")
+        .unwrap();
     assert_eq!(rig.registry.report("svc", Some("2.0.0")), Reported::Healthy);
     assert_eq!(rig.registry.report("svc", None), Reported::Healthy);
     assert_eq!(
@@ -220,7 +224,7 @@ fn what_is_not_a_registration_is_malformed() {
 fn the_health_address_must_be_loopback_and_granted() {
     let rig = Rig::new("reg-health", me());
     for (addr, path, error) in [
-        ("10.0.0.1:9301", "/ready", "health_address"),
+        ("[::]:9301", "/ready", "health_address"),
         ("localhost:9301", "/ready", "health_address"),
         ("0.0.0.0:9301", "/ready", "health_address"),
         ("127.0.0.1:9301", "ready", "health_address"),

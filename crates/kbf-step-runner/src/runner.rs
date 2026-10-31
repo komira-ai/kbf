@@ -144,7 +144,14 @@ impl StepRunner {
 
     /// How the last update of this service ended, `None` when none has or one is under way.
     pub fn last_result(&self) -> Result<Option<Finished>, RunError> {
-        Ok(None)
+        Ok(match self.store.load()? {
+            Loaded::Current(rec) => match rec.state {
+                State::Finished { verdict, reason } => Some(Finished { verdict, reason }),
+                _ => None,
+            },
+            Loaded::Absent => None,
+            Loaded::Newer { schema } => return Err(RunError::RecordNewer(schema)),
+        })
     }
 
     /// Runs the update to its verdict, or resumes the unfinished one the record holds.
@@ -154,11 +161,54 @@ impl StepRunner {
     /// starts the next generation: the verdict of a finished update is read with
     /// [`StepRunner::last_result`].
     pub fn run(&self, order: &UpdateOrder) -> Result<Finished, RunError> {
-        let _ = order;
-        Ok(Finished {
-            verdict: Verdict::Halt,
-            reason: None,
-        })
+        let staged = path_str(&order.staged.dir)?;
+        let previous = order
+            .previous
+            .as_ref()
+            .map(|p| path_str(&p.dir))
+            .transpose()?;
+        if order.service.is_empty()
+            || !order
+                .service
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(RunError::BadOrder("the service name"));
+        }
+        if order
+            .min_updater_protocol
+            .is_some_and(|needed| needed > UPDATER_PROTOCOL)
+        {
+            return Ok(Finished {
+                verdict: Verdict::Deferred {
+                    retry_after_secs: None,
+                },
+                reason: Some(REASON_UPDATER_OLD.to_owned()),
+            });
+        }
+        let generation = match self.store.load()? {
+            Loaded::Newer { schema } => return Err(RunError::RecordNewer(schema)),
+            Loaded::Absent => 1,
+            Loaded::Current(rec) => {
+                let unfinished = !matches!(rec.state, State::Finished { .. });
+                if unfinished && same_update(&rec, order) {
+                    return self.advance(order, *rec);
+                }
+                if unfinished && rec.progress.watching.is_none() {
+                    return Err(RunError::Busy {
+                        service: rec.service,
+                        target: rec.target_version,
+                    });
+                }
+                // A watcher that is stopped by a new order may have a `verify` still alive.
+                if matches!(rec.state, State::Running { .. }) {
+                    self.launcher.stop(&rec.unit(rec.step))?;
+                }
+                rec.generation + 1
+            }
+        };
+        let rec = self.begin(order, generation, staged, previous)?;
+        self.advance(order, rec)
     }
 
     /// Writes the params file and the first record of an update.
