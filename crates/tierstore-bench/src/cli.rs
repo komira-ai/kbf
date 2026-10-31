@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::cells::budget::{Campaign, lock_path};
 use crate::cells::engine::FaultSwitch;
@@ -67,6 +67,15 @@ pub struct ProvisionArgs {
     pub apply: bool,
 }
 
+/// A flag that is on or off, spelled out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Switch {
+    /// Do it.
+    On,
+    /// Do not.
+    Off,
+}
+
 /// Flags of `run`.
 #[derive(Debug, Args)]
 pub struct RunArgs {
@@ -84,6 +93,12 @@ pub struct RunArgs {
     /// Object sizes in bytes, one arm each (comma separated).
     #[arg(long, value_delimiter = ',')]
     pub object_bytes: Vec<u64>,
+    /// Whether the put cells (`cold-put`, `a1`) add their open-loop arms: 19 KiB at 20 a second
+    /// for 600 s and 1 MiB at 10 a second for 300 s, about 60% of the bytes of a 1 MiB run.
+    /// `off` leaves them out of the plan, the ledger is asked to admit the plan without them,
+    /// and the report and the provenance of every result say so.
+    #[arg(long, value_enum, default_value_t = Switch::On, value_name = "on|off")]
+    pub open_loop: Switch,
     /// Names the run in every result and in the keys it writes (role names and digits; no host).
     #[arg(long)]
     pub run_id: String,
@@ -122,6 +137,12 @@ pub struct RunArgs {
 }
 
 impl RunArgs {
+    /// Whether the open-loop arms are in the plan (`--open-loop`).
+    #[must_use]
+    pub fn open_loop(&self) -> bool {
+        true
+    }
+
     /// The switch of the fault proxy `--fault-control` names, with `--fault-ttl-secs`.
     #[must_use]
     pub fn fault_switch(&self) -> Option<FileSwitch> {
@@ -184,6 +205,7 @@ fn provenance(
     run_id: &str,
     git_sha: &str,
     attempt: u32,
+    _open_loop: bool,
 ) -> Result<Provenance, BenchError> {
     let path = result_dir.join(preflight::REPORT_FILE);
     let text = std::fs::read(&path).map_err(|source| BenchError::Io { path, source })?;
@@ -256,6 +278,7 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
                 &args.run_id,
                 &args.git_sha,
                 args.attempt,
+                args.open_loop(),
             )?;
             // Before a request is sent: the ledger is begun or found, or the run stops.
             // The lock is held until the arm ends, the run with it.
@@ -268,10 +291,12 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
             let faults = args
                 .fault_switch()
                 .map(|switch| Arc::new(switch) as Arc<dyn FaultSwitch>);
+            let open_loop = args.open_loop();
             let plan = CellPlan {
                 passes: args.passes,
                 in_flight: args.in_flight,
                 object_bytes: args.object_bytes,
+                open_loop,
             };
             let ctx = CellContext {
                 provenance,
@@ -315,6 +340,59 @@ mod tests {
     use super::*;
     use crate::cells::testkit;
     use crate::result::Window;
+
+    fn run_args(extra: &[&str]) -> Result<RunArgs, clap::Error> {
+        let mut argv = vec![
+            "tierstore-bench",
+            "run",
+            "--result-dir",
+            "r",
+            "--cell",
+            "cold-put",
+            "--run-id",
+            "run-1",
+            "--git-sha",
+            "abc",
+            "--campaign-ledger",
+            "ledger.json",
+        ];
+        argv.extend_from_slice(extra);
+        match Cli::try_parse_from(argv)?.command {
+            Command::Run(args) => Ok(args),
+            other => panic!("not the run verb: {other:?}"),
+        }
+    }
+
+    /// Catches `--open-loop` that is off by default (a changed behaviour for every run in use),
+    /// that cannot be turned off, or that takes a word other than `on` and `off` for an answer.
+    #[test]
+    fn open_loop_is_on_unless_set_off_and_takes_on_or_off_only() {
+        assert!(run_args(&[]).unwrap().open_loop());
+        assert!(run_args(&["--open-loop", "on"]).unwrap().open_loop());
+        assert!(!run_args(&["--open-loop", "off"]).unwrap().open_loop());
+        assert!(!run_args(&["--open-loop=off"]).unwrap().open_loop());
+        for bad in ["true", "false", "yes", "0", "", "ON"] {
+            assert!(run_args(&["--open-loop", bad]).is_err(), "{bad:?}");
+        }
+        assert!(run_args(&["--open-loop"]).is_err());
+    }
+
+    /// Catches the provenance of a run not carrying the setting the run was given: it is what the
+    /// report and every result file say about the arms.
+    #[test]
+    fn the_provenance_of_a_run_records_the_open_loop_setting() {
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "tb-cli-provenance");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let report = serde_json::to_vec(&PreflightReport::default()).unwrap();
+        std::fs::write(dir.path().join(preflight::REPORT_FILE), report).unwrap();
+        let of = |open_loop| provenance(dir.path(), "run-1", "abc", 3, open_loop).unwrap();
+        let (on, off) = (of(true), of(false));
+        assert_eq!((on.open_loop, off.open_loop), (true, false));
+        assert_eq!(
+            (off.run_id.as_str(), off.git_sha.as_str(), off.attempt),
+            ("run-1", "abc", 3)
+        );
+    }
 
     /// Catches the source of the cold state being chosen by the wrong test: a run with no cold
     /// role reads nothing, and a run with one reads through the preflight's source, which here,

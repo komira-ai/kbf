@@ -652,6 +652,18 @@ mod tests {
         assert!(text.contains("two-tier"));
     }
 
+    /// Catches a report that does not say whether the run had its open-loop arms: a reader of a
+    /// closed-loop-only table would take the missing arms for a failure.
+    #[test]
+    fn the_report_header_says_whether_the_open_loop_arms_were_run() {
+        let mut a = result("a", vec![pass(1, Window::Quiet, 1, None)], &[]);
+        let on = format_report(&[a.clone()], &Rows::new());
+        assert!(on.contains(", open loop `on`"), "{on}");
+        a.provenance.open_loop = false;
+        let off = format_report(&[a], &Rows::new());
+        assert!(off.contains(", open loop `off`"), "{off}");
+    }
+
     /// A result of `arm` at `attempt`, with one quiet pass of 1,000 requests, and the cold store
     /// read before each of `passes` passes with `healing[pass]`.
     fn with_cold(arm: &str, attempt: u32, healing: &[bool]) -> CellResult {

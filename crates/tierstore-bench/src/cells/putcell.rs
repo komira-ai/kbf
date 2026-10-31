@@ -327,6 +327,7 @@ mod tests {
             passes: 2,
             in_flight: in_flight.to_vec(),
             object_bytes: sizes.to_vec(),
+            open_loop: true,
         }
     }
 
@@ -446,6 +447,112 @@ mod tests {
         )
         .unwrap();
         assert!(capped.iter().all(|a| a.requests == 5));
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    fn open(arms: &[Arm]) -> Vec<&str> {
+        arms.iter()
+            .filter(|a| matches!(a.pace, Pace::Open { .. }))
+            .map(|a| a.label.as_str())
+            .collect()
+    }
+
+    fn with_open_loop(mut plan: CellPlan, open_loop: bool) -> CellPlan {
+        plan.open_loop = open_loop;
+        plan
+    }
+
+    /// Catches an open-loop arm that cannot be left out, or a ledger that is asked about arms
+    /// other than the ones built. Cold-put at 1 MiB, one in flight, six passes, the three paths:
+    /// each path puts 1,000 objects of 1 MiB closed (1,048,576,000 bytes a pass) and, with the
+    /// open loop, 3,000 more (3,145,728,000). On, the cell is 75,497,472,000 bytes against a cap
+    /// of 20 GiB (21,474,836,480) and is refused; off, it is 18,874,368,000 and fits.
+    #[test]
+    fn cold_put_without_the_open_loop_has_none_and_a_one_mib_run_fits_the_cell_cap() {
+        use crate::cells::engine::admission_cost;
+        let (_dir, env) = env(&[
+            (Role::Cold, "http://127.0.0.1:9"),
+            (Role::Instance, "http://127.0.0.1:9"),
+        ]);
+        let build = |open_loop| {
+            let plan = with_open_loop(plan(&[1], &[MIB]), open_loop);
+            arms(&env, CellId::ColdPut, &PATHS, &plan, None, None).unwrap()
+        };
+        let (on, off) = (build(true), build(false));
+        assert_eq!(
+            open(&on),
+            [
+                "direct-1mib-open10-healthy",
+                "direct-mp-1mib-open10-healthy",
+                "instance-1mib-open10-healthy"
+            ]
+        );
+        assert!(open(&off).is_empty(), "{:?}", open(&off));
+        assert_eq!((on.len(), off.len()), (6, 3));
+        let per_pass = |arms: &[Arm]| {
+            arms.iter()
+                .map(|a| a.cold_bytes_per_pass)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(per_pass(&off), [1_048_576_000; 3]);
+        assert_eq!(per_pass(&on).iter().sum::<u64>(), 12_582_912_000);
+        assert_eq!(admission_cost(&on, 6), (3_145_728_000, 75_497_472_000));
+        assert_eq!(admission_cost(&off, 6), (1_048_576_000, 18_874_368_000));
+        assert!(admission_cost(&on, 6).1 > 20 * GIB);
+        assert!(admission_cost(&off, 6).1 < 20 * GIB);
+    }
+
+    /// Catches the same for a1 (the hot baseline is not charged to the cold ledger, the instance
+    /// is): at 1 MiB the instance's closed arm is 1,048,576,000 bytes a pass and its open arm
+    /// 3,145,728,000, so six passes are 25,165,824,000 on (over the 20 GiB cell cap) and
+    /// 6,291,456,000 off.
+    #[test]
+    fn a1_without_the_open_loop_has_none_and_its_cold_bytes_are_those_of_the_closed_arm() {
+        use crate::cells::a1::PATHS as A1;
+        use crate::cells::engine::admission_cost;
+        let (_dir, env) = env(&[
+            (Role::Hot, "http://127.0.0.1:9"),
+            (Role::Instance, "http://127.0.0.1:9"),
+        ]);
+        let build = |open_loop| {
+            let plan = with_open_loop(plan(&[1], &[MIB]), open_loop);
+            arms(&env, CellId::A1, &A1, &plan, None, None).unwrap()
+        };
+        let (on, off) = (build(true), build(false));
+        assert_eq!(
+            open(&on),
+            ["hot-1mib-open10-healthy", "instance-1mib-open10-healthy"]
+        );
+        assert!(open(&off).is_empty());
+        assert_eq!(admission_cost(&on, 6), (3_145_728_000, 25_165_824_000));
+        assert_eq!(admission_cost(&off, 6), (1_048_576_000, 6_291_456_000));
+        assert!(admission_cost(&on, 6).1 > 20 * GIB);
+        assert!(admission_cost(&off, 6).1 < 20 * GIB);
+    }
+
+    /// Catches an off switch that takes away only the 1 MiB arm, or that also takes away a
+    /// closed-loop arm: at 19 KiB and 1 MiB, off leaves exactly the arms on has less its open ones.
+    #[test]
+    fn off_removes_every_open_arm_at_every_size_and_nothing_else() {
+        let (_dir, env) = env(&[(Role::Cold, "http://127.0.0.1:9")]);
+        let sizes = [19 * 1024, MIB];
+        let build = |open_loop| {
+            let plan = with_open_loop(plan(&[1], &sizes), open_loop);
+            arms(&env, CellId::ColdPut, &PATHS[..1], &plan, None, None).unwrap()
+        };
+        let (on, off) = (build(true), build(false));
+        assert_eq!(
+            open(&on),
+            ["direct-19kib-open20-healthy", "direct-1mib-open10-healthy"]
+        );
+        let labels = |arms: &[Arm]| arms.iter().map(|a| a.label.clone()).collect::<Vec<_>>();
+        let closed: Vec<String> = labels(&on)
+            .into_iter()
+            .filter(|l| !l.contains("-open"))
+            .collect();
+        assert_eq!(labels(&off), closed);
+        assert!(off.iter().all(|a| a.pace == Pace::Closed));
     }
 
     /// Catches a run configured with none of the roles of the cell going on to send nothing.
