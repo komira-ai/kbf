@@ -130,8 +130,9 @@ fn the_helper_updates_a_hand_laid_host_from_the_last_release_to_the_next() {
     );
     if staged["result"] != "staged" && journal(&[HELPER_UNIT, KBF_UNIT]).contains(RATE_LIMITED) {
         panic!(
-            "GitHub refused the helper's release listing even with the run's token: the quota \
-             is exhausted, which says nothing of the release. Re-run the job. {staged}"
+            "GitHub refused the helper's release listing: the quota of this hosted runner's \
+             address (or of the run's token) is over, which says nothing of the release. \
+             Re-run the job. {staged}"
         );
     }
     assert_eq!(staged["result"], "staged", "{staged}");

@@ -439,28 +439,33 @@ pub fn lay_out(r: &Rehearsal, kbf_unit: &str) -> PathBuf {
             .arg(HELPER),
     );
     fs::create_dir_all("/etc/kbf").unwrap();
-    // The channel as the farm's nodes name theirs, with a token file: a hosted runner's address
-    // shares GitHub's anonymous quota with other jobs, so the helper lists the releases under
-    // the run's own read-only token. The helper reads a token file that is root's alone, so the
-    // workflow's file (the runner user's) is copied to one root owns.
-    let token = fs::read_to_string(TOKEN_FILE).unwrap_or_else(|e| panic!("{TOKEN_FILE}: {e}"));
+    // The channel as the farm's nodes name theirs, with a token file when release N's helper
+    // takes GitHub's Actions token: a hosted runner's address shares GitHub's anonymous quota
+    // with other jobs, so the helper lists the releases under the run's own read-only token.
+    // The helper reads a token file that is root's alone, so the workflow's file (the runner
+    // user's) is copied to one root owns, and removed when the rehearsal ends.
     let _ = fs::remove_file(CHANNEL_TOKEN);
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(CHANNEL_TOKEN)
-            .unwrap_or_else(|e| panic!("{CHANNEL_TOKEN}: {e}"));
-        file.write_all(token.trim().as_bytes()).unwrap();
-    }
-    install_file(
-        &format!("[channels.{CHANNEL}]\nsource = \"github\"\ntoken_file = \"{CHANNEL_TOKEN}\"\n"),
-        CHANNELS,
-        0o644,
-    );
+    let channel = if takes_actions_token(&dir.join("helper/kbf-host-install")) {
+        let token = fs::read_to_string(TOKEN_FILE).unwrap_or_else(|e| panic!("{TOKEN_FILE}: {e}"));
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(CHANNEL_TOKEN)
+                .unwrap_or_else(|e| panic!("{CHANNEL_TOKEN}: {e}"));
+            file.write_all(token.trim().as_bytes()).unwrap();
+        }
+        format!("[channels.{CHANNEL}]\nsource = \"github\"\ntoken_file = \"{CHANNEL_TOKEN}\"\n")
+    } else {
+        // Only the first release after the helper learned the token can be here: its
+        // predecessor's helper refuses a token of this length (`config_invalid`).
+        eprintln!("release {old}'s helper takes no Actions token: its channel names none");
+        format!("[channels.{CHANNEL}]\nsource = \"github\"\n")
+    };
+    install_file(&channel, CHANNELS, 0o644);
 
     // The units: the kbf unit, and the helper's unit of this checkout restarting it.
     install_file(kbf_unit, &format!("{UNIT_DIR}/{KBF_UNIT}"), 0o644);
@@ -470,6 +475,18 @@ pub fn lay_out(r: &Rehearsal, kbf_unit: &str) -> PathBuf {
     install_file(&helper_unit, &format!("{UNIT_DIR}/{HELPER_UNIT}"), 0o644);
     systemctl("daemon_reload", &["daemon-reload"]);
     host_agent
+}
+
+/// What release N's helper carries when its channel token file takes GitHub's Actions token
+/// (about 520 bytes, with dots), as `LONG_TOKEN_MARKER` of the helper says.
+const LONG_TOKEN_MARKER: &[u8] = b"kbf-host-install:token-file-takes-actions-tokens";
+
+/// Whether the helper binary at `path` carries [`LONG_TOKEN_MARKER`].
+fn takes_actions_token(path: &Path) -> bool {
+    let bytes = fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    bytes
+        .windows(LONG_TOKEN_MARKER.len())
+        .any(|w| w == LONG_TOKEN_MARKER)
 }
 
 /// Starts the helper and waits for its socket.
