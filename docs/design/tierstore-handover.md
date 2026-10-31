@@ -39,7 +39,7 @@ listeners and the lingering drain".
 | item | value | note |
 |---|---|---|
 | hook | `tierstore update-hook <step>`, user `tierstore` | the artifact's own binary; Rust, no shell |
-| `CAP_NET_ADMIN` | steps that touch nft: `prepare`, `cutover`, `rollback` | the updater's root part launches the step as a transient unit with the capability ambient (`host-updates.md` 3.4); the hook runs as `tierstore`, never as root. **Needs from the updater**: a per-step capability list. With one list per hook, `verify` and `cleanup` would hold it as well: acceptable, not wanted |
+| `CAP_NET_ADMIN` | steps that touch nft: `prepare`, `cutover`, `rollback` | the updater's root part launches the step as a transient unit with the capability ambient (`host-updates.md` 3.4); the hook runs as `tierstore`, never as root. Declared as `hook.step_capabilities.prepare`, `.cutover` and `.rollback` (`host-updates.md` 3.4); `hook.capabilities`, the fallback for the other steps, is empty |
 | address families | `AF_UNIX AF_INET AF_INET6 AF_NETLINK` | netlink for nft |
 | units | `tierstore@9301.service`, `tierstore@9302.service` | the only units it may start, stop or mask |
 | slot unit template | `tierstore@.service`, `%i` is the port | below |
@@ -48,9 +48,10 @@ listeners and the lingering drain".
 | lock files | build node `<cache>/.lock`; storage node `/var/lib/tierstore/instance.lock` | section 5 |
 | nft tables | `kbf_forward_tierstore` (redirect), `kbf_guard_tierstore` (guard) | `host-updates.md` 4.1.1 |
 | read / write paths | read `/usr/libexec/kbf`, `/usr/sbin/nft`, `/etc/tierstore`; write `/var/lib/tierstore` | the cache directory is not touched by any step |
-| timeouts (s) | `prepare` 600, `cutover` 300, `verify` 600, `rollback` 600, `cleanup` 1300 | `prepare`: self-test of the tiers (`--backend-check-wait`); `cleanup`: settle 70 + `--drain-deadline` 900 + lease 5 + margin, and the unit's `TimeoutStopSec` becomes 1100 (it is 960 in `packaging/tierstore/tierstore.service`, which assumes a 10 s wait) |
-| `verify_deadline_secs` | 1200 | at least `verify` plus `rollback` (`host-updates.md` 2.4) |
-| `promotion_bound_secs`, `promotion_ceiling_secs` | 300, 3600 | proposed fields, not in the 2.4 example; section 3, `verify` |
+| timeouts (s) | `prepare` 600, `cutover` 300, `verify` 1000, `rollback` 600, `cleanup` 1300 | `verify`: `promotion_bound_secs` 900 + margin; `prepare`: self-test of the tiers (`--backend-check-wait`); `cleanup`: settle 70 + `--drain-deadline` 900 + lease 5 + margin, and the unit's `TimeoutStopSec` becomes 1100 (it is 960 in `packaging/tierstore/tierstore.service`, which assumes a 10 s wait) |
+| `verify_deadline_secs` | 1600 | at least `verify` plus `rollback` (`host-updates.md` 2.4) |
+| `promotion_ceiling_secs` | 3600 | a top-level declaration field (`host-updates.md` 2.4); section 3, `verify` |
+| `[hook.params]` | `promotion_bound_secs = 900` | the opaque table the updater passes as `--params <file>`; section 3, `verify` |
 
 Slot unit template (flags only, no environment; the rest as today's `packaging/tierstore/tierstore.service`):
 `ExecStart=/var/lib/tierstore/slots/%i/tierstore --listen 0.0.0.0:%i --listen [::]:%i --proxy-id tierstore-%i
@@ -298,16 +299,13 @@ nft tests: see `host-updates.md` 9. The service's own tests:
 
 ## 11. Questions for the maintainers
 
-1. **`cleanup` is the commit point and cannot be rolled back** (the stop of v-current). `host-updates.md` 3.2 says a
-   failure of `cleanup` is reported and that `rollback` undoes `cutover`; it does not say what the updater does when
-   `cleanup` fails after the irreversible part. Recommendation: the updater re-runs `cleanup` (idempotent) and, if it keeps
-   failing, reports `Failed` with phase `after_commit` and does not run `rollback`; the hook answers `rollback` after
+1. *Settled in `host-updates.md` 3.2:* a failed `cleanup` after the stop is re-run forward up to `cleanup_retries`, then
+   `Failed` with phase `after_commit`; `rollback` is never run after it. The hook still answers `rollback` after
    `stopping` with `1`, `reversible:false`.
-2. **`cleanup` after a failed `prepare` or `cutover`.** 3.2 runs it; for tierstore it must not stop v-current, so the hook
-   makes it state-aware (abort path unless `verified`). Recommendation: say in 3.2 that `cleanup` may be called at any
-   point and must act from the hook's own record.
-3. **Per-step capabilities** in the declaration, so that only `prepare`, `cutover` and `rollback` hold `CAP_NET_ADMIN`.
-   Recommendation: add `hook.step_capabilities`; otherwise accept the wider grant.
+2. *Settled in 3.2:* after a failed `prepare` or `cutover` the updater runs `rollback`, and `cleanup` runs only after a
+   successful `verify`. The hook keeps acting from its own record, so a `cleanup` without `verified` still never stops
+   v-current.
+3. *Settled in 3.4:* `hook.step_capabilities.<step>`, with `hook.capabilities` as the fallback (section 2).
 4. **Listeners.** A repeatable `--listen` with explicit `IPV6_V6ONLY`, and the same for `--oci-listen`. Recommendation:
    both in the first tierstore change, or the OCI front's clients see a gap at every update.
 5. **P1 and P2** change the plain restart's drain too (a connection is closed, never answered 503). Recommendation: the
