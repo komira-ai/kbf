@@ -570,13 +570,10 @@ fn probe_2_mask_runtime_then_stop_an_active_instance_through_polkit() {
         &rule,
         format!(
             "polkit.addRule(function(action, subject) {{\n\
-             \x20 polkit.log(\"probe-polkit \" + action.id + \" unit=\" + action.lookup(\"unit\") + \" user=\" + subject.user);\n\
              \x20 if (subject.user != \"{user}\") return polkit.Result.NOT_HANDLED;\n\
              \x20 if (action.id == \"org.freedesktop.systemd1.manage-unit-files\") return polkit.Result.YES;\n\
              \x20 if (action.id == \"org.freedesktop.systemd1.manage-units\" &&\n\
              \x20     action.lookup(\"unit\") == \"probe-polkit@a.service\") return polkit.Result.YES;\n\
-             \x20 if (action.id == \"org.freedesktop.systemd1.manage-units\" &&\n\
-             \x20     action.lookup(\"unit\") == \"probe-polkit@b.service\") return polkit.Result.NO;\n\
              \x20 return polkit.Result.NOT_HANDLED;\n}});\n",
             user = account.name
         ),
@@ -584,6 +581,9 @@ fn probe_2_mask_runtime_then_stop_an_active_instance_through_polkit() {
     .unwrap();
     ok(SYSTEMCTL, &["daemon-reload"]);
     // The rules are read when polkit starts: restart it, so no wait is needed to know they are in.
+    let _ = Command::new(SYSTEMCTL)
+        .args(["reset-failed", "polkit.service"])
+        .output();
     ok(SYSTEMCTL, &["restart", "polkit.service"]);
     ok(
         SYSTEMCTL,
@@ -639,10 +639,7 @@ fn probe_2_mask_runtime_then_stop_an_active_instance_through_polkit() {
         "inactive"
     );
 
-    // The scope: another instance of the same template is not the hook's to stop, and an account
-    // with no rule at all is refused by the default, which shows that polkit is what decides.
-    let refused_stop = systemctl(&["stop"], "probe-polkit@b.service");
-    let b_state = said(SYSTEMCTL, &["is-active", "probe-polkit@b.service"]);
+    // An account with no rule at all is refused by the default: polkit is what decides.
     let stranger = Account::new(&format!("urp2s{pid}"), &[]);
     let mut stranger_spec = rig.spec();
     stranger_spec.user = stranger.name.clone();
@@ -659,34 +656,26 @@ fn probe_2_mask_runtime_then_stop_an_active_instance_through_polkit() {
             "--",
         ],
     );
-    let c_state = said(SYSTEMCTL, &["is-active", "probe-polkit@c.service"]);
-    let facts = format!(
-        "listed account stopping the other instance: {:?} ({:?}), then it is {b_state}; \
-         an account with no rule stopping an instance: {:?} ({:?}), then it is {c_state}",
-        refused_stop.outcome,
-        refused_stop.report.detail,
+    assert_eq!(
         stranger_stop.outcome,
-        stranger_stop.report.detail
+        Outcome::Failure,
+        "{}",
+        said_by(&stranger_stop)
     );
-    let pkcheck = pkcheck_facts(&rig, &account.name, &stranger.name);
-    let log = said(
-        "/usr/bin/journalctl",
-        &["--no-pager", "-u", "polkit.service", "--since", "-10min"],
+    assert!(
+        detail(&stranger_stop).contains("authentication"),
+        "{}",
+        said_by(&stranger_stop)
     );
-    let rule_text = fs::read_to_string(&rule).unwrap_or_default();
-    record(
-        "probe-2-facts",
-        &format!("{facts}\n{pkcheck}\nrule:\n{rule_text}\n{log}"),
+    assert_eq!(
+        said(SYSTEMCTL, &["is-active", "probe-polkit@c.service"]),
+        "active"
     );
-    assert_eq!(refused_stop.outcome, Outcome::Failure, "{facts}");
-    assert_eq!(b_state, "active", "{facts}");
-    assert_eq!(stranger_stop.outcome, Outcome::Failure, "{facts}");
-    assert_eq!(c_state, "active", "{facts}");
     drop(guard);
     record(
         "probe-2",
         "PROBE 2 RAN: through polkit a non-root hook account masked --runtime an active templated instance, \
-         left it running, then stopped it; a second instance of the template it was not given was refused",
+         left it running, then stopped it; an account with no rule was refused",
     );
 }
 
@@ -802,72 +791,12 @@ fn a_state_directory_the_service_can_write_is_refused_under_the_real_accounts() 
     }
 }
 
-/// What polkit itself says about the actions of the probe for each account, asked with
-/// `pkcheck` about a process the account owns: 0 authorized, 1 not, 2 needs authentication.
-fn pkcheck_facts(rig: &Rig, listed: &str, stranger: &str) -> String {
+/// The answer of polkit (`pkcheck`: 0 authorized, 1 not, 2 needs authentication) for the
+/// `manage-units` action on three units, for an account owning a process, under a rule.
+fn manage_units_answers(rig: &Rig, rule_body: &str, tag: &str) -> Vec<Option<i32>> {
     use std::os::unix::process::CommandExt;
-    let accounts = EtcAccounts::system().unwrap();
-    let mut text = String::new();
-    for name in [listed, stranger] {
-        let ids = accounts.user(name).unwrap();
-        let mut child = Command::new(rig.path("release/probe"))
-            .args(["park", "--"])
-            .uid(ids.uid)
-            .gid(ids.gid)
-            .spawn()
-            .unwrap();
-        let pid = child.id().to_string();
-        for (action, unit) in [
-            (
-                "org.freedesktop.systemd1.manage-units",
-                Some("probe-polkit@a.service"),
-            ),
-            (
-                "org.freedesktop.systemd1.manage-units",
-                Some("probe-polkit@b.service"),
-            ),
-            (
-                "org.freedesktop.systemd1.manage-units",
-                Some("probe-polkit@c.service"),
-            ),
-            ("org.freedesktop.systemd1.manage-unit-files", None),
-        ] {
-            let mut args = vec!["--action-id", action, "--process", &pid];
-            if let Some(unit) = unit {
-                args.extend(["--detail", "unit", unit]);
-            }
-            let done = Command::new("/usr/bin/pkcheck")
-                .args(&args)
-                .output()
-                .unwrap();
-            text.push_str(&format!(
-                "pkcheck {name} {action} {unit:?}: {:?} {}\n",
-                done.status.code(),
-                String::from_utf8_lossy(&done.stderr).trim()
-            ));
-        }
-        child.kill().unwrap();
-        child.wait().unwrap();
-    }
-    text
-}
-
-/// What polkit says about three units under three spellings of a rule that names one of them.
-/// Not an assertion: it records what `pkcheck` answers, so the scope of the probe's rule is
-/// known from facts.
-#[test]
-#[ignore = "needs root and systemd; run by cargo xtask sudo-test"]
-fn probe_2_scope_diagnosis() {
-    use std::os::unix::process::CommandExt;
-    let rig = Rig::new("pkdiag");
-    if !["/usr/lib/polkit-1/polkitd", "/usr/libexec/polkitd"]
-        .iter()
-        .any(|p| Path::new(p).exists())
-    {
-        refused(2, "polkitd is not installed");
-    }
-    let account = Account::new(&format!("urp2d{}", std::process::id()), &[]);
-    let rule = "/etc/polkit-1/rules.d/48-probe-pkdiag.rules".to_owned();
+    let account = Account::new(&format!("urpk{tag}{}", std::process::id()), &[]);
+    let rule = format!("/etc/polkit-1/rules.d/48-probe-{tag}.rules");
     let _guard = PolkitProbe {
         units: Vec::new(),
         files: vec![rule.clone()],
@@ -880,28 +809,19 @@ fn probe_2_scope_diagnosis() {
         .spawn()
         .unwrap();
     let pid = child.id().to_string();
-    let mut text = String::new();
-    let log = "polkit.log(\"x \" + action.id + \" \" + action.lookup(\"unit\"));";
-    let files = "if (action.id == \"org.freedesktop.systemd1.manage-unit-files\") return polkit.Result.YES;";
-    let units = "if (action.id == \"org.freedesktop.systemd1.manage-units\" && action.lookup(\"unit\") == \"probe-polkit@a.service\") return polkit.Result.YES;";
-    let scenarios = [
-        ("log+files+units", format!("{log} {files} {units}")),
-        ("files+units", format!("{files} {units}")),
-        ("log+units", format!("{log} {units}")),
-        ("units+files", format!("{units} {files}")),
-    ];
-    for (name, condition) in scenarios {
-        let body = format!(
-            "polkit.addRule(function(action, subject) {{\n  if (subject.user != \"{user}\") return polkit.Result.NOT_HANDLED;\n  {condition}\n  return polkit.Result.NOT_HANDLED;\n}});\n",
-            user = account.name
-        );
-        fs::write(&rule, body).unwrap();
-        let _ = Command::new(SYSTEMCTL)
-            .args(["reset-failed", "polkit.service"])
-            .output();
-        ok(SYSTEMCTL, &["restart", "polkit.service"]);
-        for unit in ["a", "b", "c"] {
-            let done = Command::new("/usr/bin/pkcheck")
+    let body = format!(
+        "polkit.addRule(function(action, subject) {{\n  if (subject.user != \"{user}\") return polkit.Result.NOT_HANDLED;\n  {rule_body}\n  return polkit.Result.NOT_HANDLED;\n}});\n",
+        user = account.name
+    );
+    fs::write(&rule, body).unwrap();
+    let _ = Command::new(SYSTEMCTL)
+        .args(["reset-failed", "polkit.service"])
+        .output();
+    ok(SYSTEMCTL, &["restart", "polkit.service"]);
+    let answers = ["a", "b", "c"]
+        .iter()
+        .map(|unit| {
+            Command::new("/usr/bin/pkcheck")
                 .args([
                     "--action-id",
                     "org.freedesktop.systemd1.manage-units",
@@ -910,11 +830,58 @@ fn probe_2_scope_diagnosis() {
                 ])
                 .args(["--detail", "unit", &format!("probe-polkit@{unit}.service")])
                 .output()
-                .unwrap();
-            text.push_str(&format!("{name}: unit {unit}: {:?}\n", done.status.code()));
-        }
-    }
+                .unwrap()
+                .status
+                .code()
+        })
+        .collect();
     child.kill().unwrap();
     child.wait().unwrap();
-    record("probe-2-scope", &text);
+    answers
+}
+
+const UNITS_RULE: &str = "if (action.id == \"org.freedesktop.systemd1.manage-units\" && action.lookup(\"unit\") == \"probe-polkit@a.service\") return polkit.Result.YES;";
+const FILES_RULE: &str =
+    "if (action.id == \"org.freedesktop.systemd1.manage-unit-files\") return polkit.Result.YES;";
+
+/// Probe 2, the scope: a rule that grants the `manage-units` action for one unit authorizes that
+/// unit and no other; the other instances need authentication.
+#[test]
+#[ignore = "needs root and systemd; run by cargo xtask sudo-test"]
+fn probe_2_a_rule_for_manage_units_scopes_the_account_to_the_listed_unit() {
+    if !["/usr/lib/polkit-1/polkitd", "/usr/libexec/polkitd"]
+        .iter()
+        .any(|p| Path::new(p).exists())
+    {
+        refused(2, "polkitd is not installed");
+    }
+    let rig = Rig::new("pkscope");
+    let answers = manage_units_answers(&rig, UNITS_RULE, "scope");
+    record(
+        "probe-2-scope",
+        &format!("manage-units only, units a b c: {answers:?}"),
+    );
+    assert_eq!(answers, [Some(0), Some(2), Some(2)]);
+}
+
+/// Probe 2, what the scope costs: `mask --runtime` needs the `manage-unit-files` action, and the
+/// policy of systemd says that action implies `manage-units`, so an account that holds it is
+/// authorized to manage every unit, not only the listed ones. The declaration's `units` list is
+/// therefore not a limit that a polkit rule can enforce for a hook that masks.
+#[test]
+#[ignore = "needs root and systemd; run by cargo xtask sudo-test"]
+fn probe_2_granting_manage_unit_files_authorizes_every_unit() {
+    if !["/usr/lib/polkit-1/polkitd", "/usr/libexec/polkitd"]
+        .iter()
+        .any(|p| Path::new(p).exists())
+    {
+        refused(2, "polkitd is not installed");
+    }
+    let rig = Rig::new("pkfiles");
+    let answers = manage_units_answers(&rig, &format!("{UNITS_RULE} {FILES_RULE}"), "files");
+    record(
+        "probe-2-files",
+        &format!("manage-units for a, manage-unit-files for all, units a b c: {answers:?}"),
+    );
+    assert_eq!(answers, [Some(0), Some(0), Some(0)]);
 }
