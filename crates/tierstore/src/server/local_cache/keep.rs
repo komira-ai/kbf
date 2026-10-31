@@ -72,8 +72,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use futures::future::BoxFuture;
-use futures::{FutureExt as _, StreamExt as _, stream};
+use futures::{StreamExt as _, stream};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
@@ -437,9 +436,7 @@ impl Inner {
     /// object is at the upstream), so it is a fill that is already over, with no object: the
     /// reader is answered from the upstream and starts no fill.
     fn enter(self: &Arc<Self>, name: &Name) -> Option<Flight> {
-        let over: BoxFuture<'static, Result<Filled, Error>> =
-            futures::future::ready(Ok(Filled::Skipped)).boxed();
-        let pending: Pending = over.shared();
+        let pending = Pending::finished(Filled::Skipped);
         {
             let mut flights = locked(&self.flights);
             if flights.contains_key(&name.hex) {

@@ -376,3 +376,55 @@ pub(super) async fn begin_get(rig: &Rig, client: &mut DuplexStream, key: &str) -
     piece.truncate(read);
     piece
 }
+
+/// A signed GET of `uri` for the server with `config`, sent on a connection of its own that closes
+/// after the answer: the client end of the connection, with nothing read from it yet.
+pub(super) async fn send_get(
+    server: &Arc<Server>,
+    config: &ServerConfig,
+    uri: &str,
+) -> DuplexStream {
+    let (parts, _) = sign(config, "GET", uri, &[], b"").into_parts();
+    let mut text = format!("GET {uri} HTTP/1.1\r\n");
+    for (name, value) in &parts.headers {
+        text.push_str(&format!("{name}: {}\r\n", value.to_str().unwrap()));
+    }
+    text.push_str(CLOSE);
+    text.push_str("\r\n");
+    let mut client = attach(server);
+    client.write_all(text.as_bytes()).await.unwrap();
+    client
+}
+
+/// A signed GET of `uri` for the server with `config`, on a connection of its own that closes
+/// after the answer: everything the server sends on it, the head and as much of the body as
+/// arrives before the connection ends.
+pub(super) async fn raw_get(server: &Arc<Server>, config: &ServerConfig, uri: &str) -> Vec<u8> {
+    let mut client = send_get(server, config, uri).await;
+    let mut answer = Vec::new();
+    read_rest(&mut client, &mut answer).await;
+    answer
+}
+
+/// The head of an answer as text, the `Content-Length` it gives (if it gives one) and the body
+/// that came with it. An answer that was cut before its head was complete gives an empty head and
+/// no body: the server does not flush a head it has not followed with the whole of its body.
+pub(super) fn split_answer(answer: &[u8]) -> (String, Option<usize>, &[u8]) {
+    let Some(found) = answer.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return (String::new(), None, &[]);
+    };
+    let end = found + 4;
+    let head = String::from_utf8_lossy(&answer[..end]).into_owned();
+    let length = head.to_ascii_lowercase().lines().find_map(|line| {
+        let value = line.strip_prefix("content-length: ")?;
+        value.trim().parse().ok()
+    });
+    (head, length, &answer[end..])
+}
+
+/// Whether an answer reached the client incomplete: it ends before the body of the length its head
+/// gave, or before its head was complete at all.
+pub(super) fn is_cut(answer: &[u8]) -> bool {
+    let (head, length, body) = split_answer(answer);
+    head.is_empty() || length.is_none_or(|length| body.len() < length)
+}

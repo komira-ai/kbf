@@ -719,6 +719,24 @@ struct Acc {
     cold_state: Vec<PassColdState>,
 }
 
+/// What the ledger is asked to admit for `arms` run for `passes` passes: the cost of the worst
+/// pass of one arm, and of the cell in all (every arm's bytes per pass for every pass, and the
+/// bytes its setup writes once).
+#[must_use]
+pub fn admission_cost(arms: &[Arm], passes: u32) -> (u64, u64) {
+    let worst_pass = arms
+        .iter()
+        .map(|a| a.cold_bytes_per_pass.saturating_add(a.cold_bytes_once))
+        .max()
+        .unwrap_or(0);
+    let once: u64 = arms.iter().map(|a| a.cold_bytes_once).sum();
+    let writes: u64 = arms.iter().map(|a| a.cold_bytes_per_pass).sum();
+    let total = writes
+        .saturating_mul(u64::from(passes))
+        .saturating_add(once);
+    (worst_pass, total)
+}
+
 /// Runs the arms of a cell and writes its results; see the module docs. `cleanup`, if given, runs
 /// once after the last pass, also after a trip of the gate or an error, and its notes go to every
 /// result.
@@ -737,18 +755,8 @@ pub async fn run_cell(
     cleanup: Option<Hook>,
 ) -> Result<Vec<CellResult>, BenchError> {
     env.refuse_existing(cell, &arms)?;
-    let per_pass: Vec<u64> = arms
-        .iter()
-        .map(|a| a.cold_bytes_per_pass.saturating_add(a.cold_bytes_once))
-        .collect();
-    let once: u64 = arms.iter().map(|a| a.cold_bytes_once).sum();
-    let writes: u64 = arms.iter().map(|a| a.cold_bytes_per_pass).sum();
-    env.admit(
-        per_pass.iter().copied().max().unwrap_or(0),
-        writes
-            .saturating_mul(u64::from(passes))
-            .saturating_add(once),
-    )?;
+    let (worst_pass, cell_total) = admission_cost(&arms, passes);
+    env.admit(worst_pass, cell_total)?;
     let started_unix_ms = unix_ms();
     let mut acc: BTreeMap<String, Acc> = arms
         .iter()

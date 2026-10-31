@@ -3,7 +3,7 @@
 //! The crate knows nothing of what is stored: objects are immutable byte strings under string
 //! keys, and it has no crate of the workspace it lives in among its normal dependencies, so that
 //! it can move to a repository of its own. The one exception is the feature `s3` (off by
-//! default), which adds `S3Backend`, an adapter over the S3 client of `kbf-objstore`; its tests
+//! default), which adds `S3Backend`, an adapter over the S3 client of `objstore-s3`; its tests
 //! use two crates of the workspace as dev-dependencies, which stay behind.
 //!
 //! - [`Backend`] is the minimal API of an S3-compatible store: a create-only put (it fails
@@ -103,7 +103,7 @@ pub mod server;
 mod state;
 mod tiered;
 
-pub use backend::{Backend, ByteRange, Listed, Meta, OpenUpload, PartBody, UploadsAfter};
+pub use backend::{Backend, ByteRange, Listed, Meta, OpenUpload, PartBody, ReadBody, UploadsAfter};
 pub use cache::CachedStore;
 pub use clock::{Clock, MonotonicClock, SystemClock};
 pub use dir::DirBackend;

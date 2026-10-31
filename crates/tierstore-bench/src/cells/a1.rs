@@ -87,6 +87,7 @@ mod tests {
             passes: 2,
             in_flight: vec![1],
             object_bytes: vec![4096],
+            open_loop: true,
         };
         let results = run_with(&ctx, &plan, Script::calm(), None, Some(3))
             .await
@@ -115,6 +116,7 @@ mod tests {
             passes: 2,
             in_flight: vec![1],
             object_bytes: vec![],
+            open_loop: true,
         };
         assert!(matches!(run(&ctx, &plan).await, Err(BenchError::Setup(_))));
     }
@@ -140,6 +142,7 @@ mod tests {
                 passes: 2,
                 in_flight: vec![1],
                 object_bytes: vec![4096],
+                open_loop: true,
             };
             match run_with(&ctx, &plan, Script::calm(), None, Some(1)).await {
                 Ok(_) => {

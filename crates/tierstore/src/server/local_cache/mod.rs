@@ -41,17 +41,40 @@
 //! gave every byte of the size it said, and a key named by its content (`cas/l/<sha256>`) has
 //! bytes that hash to the name. Then the sidecar is renamed into place and the file is linked
 //! into `obj/` with a create-only link, so a name appears whole or not at all (layout:
-//! [`layout`]). A fill that fails is counted by reason and removed, and the reader that started it
-//! is answered from the upstream as if the key were not kept (an upstream that failed is the
-//! reader's error). The front holds a response whole, as it always has: the memory of a read is
-//! the size of the range asked, never more because of a fill.
+//! [`layout`]). A fill that fails is counted by reason and removed.
+//!
+//! # A read
+//!
+//! A reader of the fill is given the bytes as the fill writes them (see `stream.rs`): every read
+//! of the cache is a stream of chunks of at most `fill_chunk` bytes, so the memory of a read is a
+//! chunk, not the size of the object. The readers of a key read the file the fill stages, all
+//! through the one descriptor the fill writes it with (a read and a write at an offset share
+//! nothing else), never a copy in memory. The last `fill_chunk` bytes of the window a reader asked
+//! for are given only after the fill has said the object is good, so a ranged read of an object of
+//! at most 64 MiB waits for the whole fill before its last chunk.
+//!
+//! - A fill that fails because the data is bad (the bytes do not hash to the name, the object was
+//!   written over: a changed tag, or a short or long body) ends the readers' bodies with an
+//!   error, never cleanly.
+//! - A fill that a write or a delete through the cache marks (`forget`), or that fails for a
+//!   reason of the cache (no room, the directory), is finished for each reader from the
+//!   upstream, from the byte after the last one it was given. A reader given a byte goes on only
+//!   if the upstream still has the version the byte came from (a HEAD, and another before the
+//!   last chunk): it gets the error of the upstream (`NotFound` after a delete) or `Unavailable`
+//!   after a write, never a clean end. A reader given no byte is answered as if there had been no
+//!   fill. The bytes read this way are not hashed, as a pass-through never was.
+//! - A read of more than one chunk from the upstream (a key not kept, a range over 64 MiB, the
+//!   rest of a read) is held to the version it began with in the same way.
+//! - A client that stops reading keeps the unlinked file of an evicted object, and its blocks, on
+//!   the disk until the connection's idle time ends it: those blocks are outside the budget.
 //!
 //! A fill is skipped, and counted, when the object is larger than the budget or the cache, with the
 //! bytes of the fills that are running, would pass its critical mark; the reader is served from
 //! the upstream. A key that is not named by its content is read twice by HEAD, before the first
 //! chunk and after the last: if the size or the tag changed, the object was written over during
-//! the fill and is not kept. A key named by its content whose bytes do not hash to the name is
-//! the reader's error, not passed through. A hit is not hashed again: the scrub does that.
+//! the fill and is not kept, and the readers get an error. A key named by its content whose bytes
+//! do not hash to the name is the reader's error, not passed through. A hit is not hashed again:
+//! the scrub does that.
 //!
 //! At most `max_concurrent_fills` fills run at once, each holding one chunk (`fill_chunk`, 8 MiB)
 //! in memory at a time, so the fills hold at most that many chunks. A miss of a key that has no
@@ -98,6 +121,7 @@ mod listing;
 mod metrics;
 mod scrub;
 mod selfcheck;
+mod stream;
 mod write;
 
 #[cfg(test)]
@@ -133,6 +157,8 @@ mod selfcheck_tests;
 #[cfg(test)]
 mod start_tests;
 #[cfg(test)]
+mod stream_tests;
+#[cfg(test)]
 pub(in crate::server) mod testing;
 #[cfg(test)]
 mod write_front_tests;
@@ -143,19 +169,21 @@ mod write_tests;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt as _;
 use tokio::sync::Semaphore;
 
 use crate::journal::is_reserved;
 use crate::server::lock;
-use crate::{Backend, ByteRange, Clock, Error, Listed, Meta, OpenUpload, PartBody, UploadsAfter};
+use crate::{
+    Backend, ByteRange, Clock, Error, Listed, Meta, OpenUpload, PartBody, ReadBody, UploadsAfter,
+};
 
 pub use disk::{Disk, Space, SystemDisk};
 pub use hold::{Mode, Tick};
@@ -168,6 +196,7 @@ use hold::{Hold, Standing};
 use index::Index;
 use layout::{Name, data_path, name_of};
 use metrics::{add, bump};
+use stream::eager;
 
 /// The most an uncached object may be, for a ranged read of it to fill the whole of it.
 pub const WHOLE_FILL_LIMIT: u64 = 64 << 20;
@@ -298,15 +327,6 @@ fn window(range: Option<ByteRange>, size: u64) -> Result<(u64, u64), Error> {
         return Err(Error::Other(text));
     }
     Ok((range.offset(), range.size().min(size - range.offset())))
-}
-
-/// `len` bytes of the file at `path` from `offset`.
-fn read_at(path: &Path, offset: u64, len: u64) -> io::Result<Bytes> {
-    let file = std::fs::File::open(path)?;
-    // `len` is at most the length of the file, which a 64-bit address space holds.
-    let mut bytes = vec![0; len as usize];
-    file.read_exact_at(&mut bytes, offset)?;
-    Ok(Bytes::from(bytes))
 }
 
 /// Whether `error` says the file is not there, or not as long as the cache believes.
@@ -539,51 +559,6 @@ impl Inner {
         let _ = std::fs::remove_file(data_path(root, hex));
         let _ = std::fs::remove_file(layout::meta_path(root, hex));
     }
-
-    /// The bytes of `range` of the object if it is in the cache: `hit` says whether this is a
-    /// read the cache answers on its own (a hit) or the read that follows a fill.
-    async fn lookup(
-        &self,
-        name: &Name,
-        range: Option<ByteRange>,
-        hit: bool,
-    ) -> Result<Option<Bytes>, Error> {
-        let used = locked(&self.index).used(&name.hex, self.clock.now());
-        let Some(size) = used else {
-            return Ok(None);
-        };
-        let (offset, len) = window(range, size)?;
-        let path = data_path(&self.config.path, &name.hex);
-        let reading = tokio::task::spawn_blocking(move || read_at(&path, offset, len));
-        match reading.await.expect("a read does not panic") {
-            Ok(bytes) => {
-                let counters = &self.counters;
-                if hit {
-                    bump(&counters.hits);
-                    add(&counters.bytes_served_local, len);
-                } else {
-                    add(&counters.bytes_served_upstream, len);
-                }
-                Ok(Some(bytes))
-            }
-            // A read-only cache has no say over the files: the holder may have evicted this one,
-            // or be publishing it, so the read is a miss and nothing is dropped.
-            Err(error) if gone(&error) && self.read_write() => {
-                // The file is gone or short: the entry is a lie, so it is dropped.
-                self.drop_entry(&name.hex);
-                Ok(None)
-            }
-            // Out of descriptors, a failing disk: the object may be fine, so it stays.
-            Err(_) => Ok(None),
-        }
-    }
-
-    /// The read of `range` of `key` from the upstream, which keeps nothing.
-    async fn passthrough(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
-        let bytes = self.upstream.get(key, range).await?;
-        add(&self.counters.bytes_served_upstream, bytes.len() as u64);
-        Ok(bytes)
-    }
 }
 
 #[async_trait]
@@ -657,32 +632,47 @@ impl Backend for LocalCache {
     }
 
     async fn get(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
+        let mut body = self.get_stream(key, range).await?;
+        let mut whole = BytesMut::new();
+        while let Some(chunk) = body.next().await {
+            whole.extend_from_slice(&chunk?);
+        }
+        Ok(whole.freeze())
+    }
+
+    async fn get_stream(&self, key: &str, range: Option<ByteRange>) -> Result<ReadBody, Error> {
         let inner = &self.inner;
-        let Some(name) = inner.cacheable(key) else {
-            return inner.passthrough(key, range).await;
+        let passed = |range: Option<ByteRange>| {
+            let offset = range.map_or(0, ByteRange::offset);
+            eager(inner.chunked(key, offset, range.map(ByteRange::size), None))
         };
-        if let Some(bytes) = inner.lookup(&name, range, true).await? {
-            return Ok(bytes);
+        let Some(name) = inner.cacheable(key) else {
+            return passed(range).await;
+        };
+        if let Some(body) = inner.open_kept(&name, range, true).await? {
+            return Ok(body);
         }
         if !inner.read_write() {
             // A read-only cache fills nothing: the miss goes straight to the upstream.
             bump(&inner.counters.misses);
-            return inner.passthrough(key, range).await;
+            return passed(range).await;
         }
         if let Some(wanted) = range {
             let meta = inner.upstream.head(key).await?;
             if meta.size > inner.config.whole_limit {
                 bump(&inner.counters.misses);
-                return inner.passthrough(key, Some(wanted)).await;
+                return passed(Some(wanted)).await;
             }
         }
         bump(&inner.counters.misses);
-        if inner.fill_once(key, &name).await? == fill::Filled::Kept
-            && let Some(bytes) = inner.lookup(&name, range, false).await?
-        {
-            return Ok(bytes);
+        match inner.join_or_start(key, &name) {
+            Ok(pending) => eager(inner.follow(key, range, pending)).await,
+            Err(fill::Filled::Kept) => match inner.open_kept(&name, range, false).await? {
+                Some(body) => Ok(body),
+                None => passed(range).await,
+            },
+            Err(fill::Filled::Skipped | fill::Filled::Changed) => passed(range).await,
         }
-        inner.passthrough(key, range).await
     }
 
     async fn head(&self, key: &str) -> Result<Meta, Error> {

@@ -27,7 +27,7 @@ tierstore &lt;version&gt; listen=127.0.0.1:9000</span></pre></div>
 <p class="source-note">The bodies are the strings of <code>crates/tierstore/src/server/mod.rs</code>. The probes are not signed. Once the reconciler has published the hot tier's usage, <code>/usagez</code> says <code>usage published &lt;N&gt;s ago</code>; if that usage goes stale it answers 503 with the reason. See <a href="/docs/operations/#probes">operations</a>.</p>
 
 <h2 id="drain">3. Stop it: the drain</h2>
-<p>On SIGTERM or SIGINT the process drains. <code>/readyz</code> answers 503 at once while the server keeps serving for <code>--drain-lb-wait</code>, so a load balancer sees it; then it refuses new requests, waits for those in flight (at most <code>--drain-deadline</code>), gives up the reconciler's lease and exits 0.</p>
+<p>On SIGTERM or SIGINT the process drains. <code>/readyz</code> answers 503 at once while the server keeps serving for <code>--drain-lb-wait</code>, so a load balancer sees it; every answer from then on carries <code>Connection: close</code>; at the end of that wait it stops accepting connections and closes each idle connection with a lingering close (it shuts its end for writing and reads until the client closes), and a request already on the wire is served, not answered 503. It then waits for the requests in flight and the connections to close (at most <code>--drain-deadline</code>), gives up the reconciler's lease and exits 0.</p>
 <div class="code transcript"><pre><span class="p">$</span> kill -TERM &lt;pid of tierstore&gt;
 <span class="p">$</span> curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9000/readyz
 <span class="o">503</span>

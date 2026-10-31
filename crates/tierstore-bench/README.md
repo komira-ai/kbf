@@ -131,6 +131,16 @@ run on the same ledger is refused with the lock file named. A lock a dead run le
 by the tool: check that the process is gone and delete the file. The ledger's directory must exist,
 and the ledger must resolve (through links and `..`) to a place outside the result directory.
 
+`run --open-loop on|off` (default `on`) says whether the put cells (`cold-put`, `a1`) add their
+open-loop arms: 19 KiB at 20 puts a second for 600 s, and 1 MiB at 10 a second for 300 s, for every
+path and in healthy runs only. They are about 60% of the bytes of a 1 MiB run (per path, 3,000 puts
+of 1 MiB against the 1,000 of the closed-loop arm, per pass), so a closed-loop-only measurement at
+1 MiB with six passes is `--open-loop off`: the plan is built without them, the ledger is asked to
+admit the plan as built (worst pass, cell total and what is left of the campaign), and that run fits
+the default caps where the same run with the arms does not. The other cells have no open-loop arms
+and ignore the flag. The setting is recorded as `open_loop` in the provenance of every result (a
+result that predates the field was run with the arms on) and the report names it in its header.
+
 Tierstore at v0.0.37 has no cold-only mode (`--hot` is a required flag). So the cold cells label
 their paths in the arm names and the result notes say which they are:
 

@@ -125,6 +125,10 @@ pub(in crate::server) fn digest(bytes: &[u8]) -> String {
 pub(in crate::server) struct Tamper {
     pub(in crate::server) memory: MemoryBackend,
     pub(in crate::server) short: AtomicBool,
+    /// Every read gives one byte more than it was asked for.
+    pub(in crate::server) long: AtomicBool,
+    /// Every HEAD gives an empty content tag.
+    pub(in crate::server) blank_tags: AtomicBool,
     /// The next read, once the gate lets it go, is an `Unavailable` error.
     pub(in crate::server) fail_once: AtomicBool,
     /// The next read, once the gate lets it go, panics.
@@ -163,6 +167,8 @@ impl Tamper {
         Self {
             memory: MemoryBackend::new(),
             short: AtomicBool::new(false),
+            long: AtomicBool::new(false),
+            blank_tags: AtomicBool::new(false),
             fail_once: AtomicBool::new(false),
             panic_once: AtomicBool::new(false),
             gate: Mutex::new(None),
@@ -306,11 +312,19 @@ impl Backend for Tamper {
         if self.short.load(Ordering::SeqCst) {
             return Ok(body.slice(..body.len().saturating_sub(1)));
         }
+        if self.long.load(Ordering::SeqCst) {
+            let mut more = body.to_vec();
+            more.push(0);
+            return Ok(Bytes::from(more));
+        }
         Ok(body)
     }
 
     async fn head(&self, key: &str) -> Result<Meta, Error> {
         let mut meta = self.memory.head(key).await?;
+        if self.blank_tags.load(Ordering::SeqCst) {
+            meta.tag.clear();
+        }
         if self.lie_size.load(Ordering::SeqCst) {
             meta.size += 1;
         }
@@ -779,4 +793,20 @@ impl Rig {
     pub(in crate::server) fn has_file(&self, key: &str) -> bool {
         self.file(key).is_file()
     }
+}
+
+/// The most turns `until` gives up the thread before it fails the test. A count and not a time: an
+/// event that never comes ends the test with a message, the same on a slow machine.
+const SPINS: u32 = 1_000_000;
+
+/// Waits, by giving up the thread, until `done` is true; fails the test, saying what `what` was
+/// to have happened, after [`SPINS`] turns.
+pub(in crate::server) async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..SPINS {
+        if done() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("after {SPINS} turns of the scheduler, this never happened: {what}");
 }

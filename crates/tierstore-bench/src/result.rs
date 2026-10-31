@@ -120,6 +120,15 @@ pub struct Provenance {
     /// result written before the field existed was the first try.
     #[serde(default = "first_attempt")]
     pub attempt: u32,
+    /// Whether the run added the open-loop arms of the put cells (`run --open-loop`, on unless
+    /// set off). A result written before the field existed was a run with them on.
+    #[serde(default = "open_loop_on")]
+    pub open_loop: bool,
+}
+
+/// The open-loop setting of a result that does not name one.
+const fn open_loop_on() -> bool {
+    true
 }
 
 /// The attempt number of a result that does not name one.
@@ -139,6 +148,7 @@ impl Provenance {
             tool_versions: BTreeMap::new(),
             hardware: BTreeMap::new(),
             attempt: first_attempt(),
+            open_loop: open_loop_on(),
         }
     }
 }
@@ -393,6 +403,7 @@ mod tests {
                 },
             )]),
             attempt: 2,
+            open_loop: true,
         }
     }
 
@@ -451,6 +462,24 @@ mod tests {
         let text = r.to_json();
         assert!(text.ends_with("}\n"));
         assert_eq!(CellResult::from_json(&text).unwrap(), r);
+    }
+
+    /// Catches the open-loop setting of a run not being kept in the provenance of its results,
+    /// and a result written before the field existed being read as a run without the arms.
+    #[test]
+    fn the_open_loop_setting_is_in_the_provenance_and_an_old_result_reads_as_on() {
+        let mut r = result();
+        r.provenance.open_loop = false;
+        let mut v: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
+        assert_eq!(v["provenance"]["open_loop"], false);
+        assert_eq!(CellResult::from_json(&v.to_string()).unwrap(), r);
+        v["provenance"].as_object_mut().unwrap().remove("open_loop");
+        assert!(
+            CellResult::from_json(&v.to_string())
+                .unwrap()
+                .provenance
+                .open_loop
+        );
     }
 
     /// Catches a result written before the cold state, the cold guard and the attempt were added

@@ -150,6 +150,9 @@ pub struct CellPlan {
     pub in_flight: Vec<u32>,
     /// Object sizes in bytes, one arm per value (cell G reads a tree and ignores them).
     pub object_bytes: Vec<u64>,
+    /// Whether the put cells add their open-loop arms (`run --open-loop`). The other cells have
+    /// none and ignore it.
+    pub open_loop: bool,
 }
 
 /// Runs one cell.
@@ -231,6 +234,7 @@ mod tests {
             passes: 2,
             in_flight: vec![1],
             object_bytes: vec![],
+            open_loop: true,
         };
         let bare = testkit::ctx(dir.path(), &[], Window::Busy);
         for (id, name) in [

@@ -9,7 +9,7 @@
 use std::io::{self, IoSlice};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
@@ -19,15 +19,55 @@ use tokio::sync::Notify;
 use super::Server;
 
 /// What a connection's task needs to know of its stream: whether a request is on the wire.
-#[derive(Default)]
 pub(super) struct Wire {
     /// Bytes of a request have been read and its answer has not been written and flushed in full.
     on: AtomicBool,
     /// Notified when the answer of the request on the wire is flushed.
     answered: Notify,
+    /// The streamed bodies of the request on the wire that are not over (see [`WireHold`]): the
+    /// answer is not complete while one is.
+    streams: AtomicUsize,
+    /// A write has been taken since the request on the wire was read.
+    wrote: AtomicBool,
+    /// Bytes have been written and not flushed.
+    dirty: AtomicBool,
+    server: Arc<Server>,
+}
+
+/// A streamed answer's claim on the wire: while it is held, a flush does not end the request on
+/// the wire, since hyper flushes after each frame of a body. It is dropped with the body, which
+/// hyper drops when the body has ended, has failed, or the connection has gone, and then the
+/// request is off the wire if every byte it wrote has been flushed (otherwise the flush that
+/// follows ends it).
+pub(super) struct WireHold(Arc<Wire>);
+
+impl Drop for WireHold {
+    fn drop(&mut self) {
+        let wire = &self.0;
+        let last = wire.streams.fetch_sub(1, Ordering::SeqCst) == 1;
+        if last && wire.wrote.load(Ordering::SeqCst) && !wire.dirty.load(Ordering::SeqCst) {
+            wire.clear();
+        }
+    }
 }
 
 impl Wire {
+    /// The claim of a streamed answer on the wire of its connection.
+    pub(super) fn hold(self: &Arc<Self>) -> WireHold {
+        let _ = self.streams.fetch_add(1, Ordering::SeqCst);
+        WireHold(Arc::clone(self))
+    }
+
+    /// The wire is clear of the request, if there was one.
+    fn clear(&self) {
+        self.wrote.store(false, Ordering::SeqCst);
+        if self.on.swap(false, Ordering::SeqCst) {
+            self.server.unanswered.fetch_sub(1, Ordering::SeqCst);
+            self.answered.notify_waiters();
+            self.server.idle.notify_waiters();
+        }
+    }
+
     /// Whether a request is on the wire.
     pub(super) fn is_on(&self) -> bool {
         self.on.load(Ordering::SeqCst)
@@ -73,8 +113,6 @@ pub(super) struct Lingering<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> 
     inner: Option<T>,
     server: Arc<Server>,
     wire: Arc<Wire>,
-    /// A write has been taken since the request on the wire was read.
-    wrote: bool,
     /// Set when the shutdown begins during the drain.
     hold: Option<Hold>,
 }
@@ -82,12 +120,18 @@ pub(super) struct Lingering<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Lingering<T> {
     /// `inner`, and the wire that it keeps.
     pub(super) fn new(inner: T, server: &Arc<Server>) -> (Self, Arc<Wire>) {
-        let wire = Arc::new(Wire::default());
+        let wire = Arc::new(Wire {
+            on: AtomicBool::new(false),
+            answered: Notify::new(),
+            streams: AtomicUsize::new(0),
+            wrote: AtomicBool::new(false),
+            dirty: AtomicBool::new(false),
+            server: Arc::clone(server),
+        });
         let stream = Self {
             inner: Some(inner),
             server: Arc::clone(server),
             wire: Arc::clone(&wire),
-            wrote: false,
             hold: None,
         };
         (stream, wire)
@@ -101,20 +145,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Lingering<T> {
         )
     }
 
+    /// Notes a write that was taken.
+    fn wrote(&self, written: &Poll<io::Result<usize>>) {
+        if matches!(written, Poll::Ready(Ok(_))) {
+            self.wire.wrote.store(true, Ordering::SeqCst);
+            self.wire.dirty.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// A request has been read: it is on the wire until its answer is written in full.
     fn arrived(&mut self) {
         if !self.wire.on.swap(true, Ordering::SeqCst) {
             self.server.unanswered.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    /// The wire is clear of the request, if there was one.
-    fn clear(&mut self) {
-        self.wrote = false;
-        if self.wire.on.swap(false, Ordering::SeqCst) {
-            self.server.unanswered.fetch_sub(1, Ordering::SeqCst);
-            self.wire.answered.notify_waiters();
-            self.server.idle.notify_waiters();
         }
     }
 }
@@ -143,7 +185,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for Lingerin
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         let written = this.io().poll_write(cx, buf);
-        this.wrote |= matches!(written, Poll::Ready(Ok(_)));
+        this.wrote(&written);
         written
     }
 
@@ -154,7 +196,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for Lingerin
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         let written = this.io().poll_write_vectored(cx, bufs);
-        this.wrote |= matches!(written, Poll::Ready(Ok(_)));
+        this.wrote(&written);
         written
     }
 
@@ -165,16 +207,21 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for Lingerin
     /// A flush that is taken after a write has taken everything the connection had buffered, so
     /// the answer to the request on the wire is out.
     ///
-    /// This holds because every answer of this front is one `Full` frame, which hyper queues
-    /// whole: its flush stays pending until the last byte is written. A front that streams a
-    /// body in several frames would flush after each, and must clear the mark at the end of the
-    /// body instead (a body wrapper), or a connection in the middle of an answer would be shut
-    /// when the settle ends.
+    /// This holds for an answer that is one `Full` frame, which hyper queues whole: its flush
+    /// stays pending until the last byte is written. A streamed answer is flushed after each
+    /// frame, so it holds the wire ([`WireHold`], put on the body by `Server::handle_on`) and the
+    /// mark is cleared by the flush after it has ended, or by the end of the body if the last
+    /// bytes were flushed already.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         let flushed = this.io().poll_flush(cx);
-        if this.wrote && matches!(flushed, Poll::Ready(Ok(()))) {
-            this.clear();
+        if matches!(flushed, Poll::Ready(Ok(()))) {
+            this.wire.dirty.store(false, Ordering::SeqCst);
+            // Not while a streamed body is still being sent: hyper flushes after each frame.
+            let streaming = this.wire.streams.load(Ordering::SeqCst) > 0;
+            if this.wire.wrote.load(Ordering::SeqCst) && !streaming {
+                this.wire.clear();
+            }
         }
         flushed
     }
@@ -192,7 +239,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for Lingerin
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Drop for Lingering<T> {
     fn drop(&mut self) {
-        self.clear();
+        self.wire.clear();
         let (inner, hold) = (self.inner.take(), self.hold.take());
         if let (Some(io), Some(hold)) = (inner, hold) {
             // Outside a runtime there is nothing to read with: the stream and the hold are dropped.
