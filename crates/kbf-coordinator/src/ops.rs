@@ -22,8 +22,11 @@
 //! Every change carries an [`AuditEntry`]: the store numbers it, keeps the last
 //! [`AUDIT_RING`] in the file and logs it on the target `kbf_coordinator::audit`.
 //!
-//! The operator actions ([`operate`]) are the only writers in this PR; nothing reads the
-//! store when it decides what a host is told.
+//! The writers are the operator actions ([`operate`]) and [`crate::reconcile`], which records
+//! the last good version and marks a version bad (a raise, so in memory first) and clears the
+//! mark when CI sets that version by hand. The decision reads the bad versions
+//! ([`crate::decide::decide_marked`]); nothing reads the rest when it decides what a host is
+//! told.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -110,10 +113,11 @@ pub struct ServiceOps {
     /// The halt reports an operator cleared.
     #[serde(default)]
     pub halt_acked: Vec<HaltAck>,
-    /// The newest version that converged and baked.
+    /// The newest version that converged and baked, as the coordinator recorded it; the
+    /// version an automatic rollback goes back to.
     #[serde(default)]
     pub last_good: Option<Version>,
-    /// The versions never to order again.
+    /// The versions never to order again, until CI sets one by hand.
     #[serde(default)]
     pub bad: Vec<Version>,
 }
@@ -126,7 +130,8 @@ pub struct AuditEntry {
     pub seq: u64,
     /// Who made it.
     pub by: String,
-    /// What it was (`exclude`, `include`, `set_labels`).
+    /// What it was (`exclude`, `include`, `set_labels`; the coordinator's own: `last_good`,
+    /// `clear_last_good`, `mark_bad`; CI's: `unmark_bad`).
     pub action: String,
     /// The service it concerned, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -323,6 +328,16 @@ impl OpsStore {
     #[must_use]
     pub fn state(&self) -> OpsState {
         self.lock().clone()
+    }
+
+    /// The marks of `service` now: none if it has none.
+    #[must_use]
+    pub fn marks(&self, service: &str) -> ServiceOps {
+        self.lock()
+            .services
+            .get(service)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn lock(&self) -> MutexGuard<'_, OpsState> {

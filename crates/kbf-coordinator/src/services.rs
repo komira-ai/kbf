@@ -20,6 +20,11 @@
 //! priority = 0                   # default 0; a host is offered the higher number first
 //! bake_beats = 0                 # default 0, at most 100: healthy beats before a slot frees
 //! canary = { count = 1 }         # optional: only this many hosts go until they have baked
+//! rollback = "manual"            # or "automatic": the coordinator sets the last good version
+//!                                # when a release fails on enough hosts (default manual)
+//! rollback_after_failed = { percent = 25, min_hosts = 2 }  # the larger of the two (default)
+//! min_version = "0.0.18"         # optional: the first version with update hooks; setting the
+//!                                # desired state to it forgets the last good version
 //!
 //! [service.roles.daemon]
 //! max_updating = 2               # optional; absent: the desired state's number
@@ -212,6 +217,11 @@ struct RawService {
     #[serde(default)]
     bake_beats: u32,
     canary: Option<RawCanary>,
+    #[serde(default)]
+    rollback: Rollback,
+    #[serde(default)]
+    rollback_after_failed: FailThreshold,
+    min_version: Option<Version>,
 }
 
 /// The count form of the canary. The roles and labels form is refused as an unknown field
@@ -294,6 +304,9 @@ fn service_def(
         priority,
         bake_beats,
         canary,
+        rollback,
+        rollback_after_failed,
+        min_version,
     } = raw;
     if !is_service_name(&name) {
         return invalid(format!(
@@ -323,6 +336,16 @@ fn service_def(
     {
         return invalid(format!("{name}: canary count is not 1 to {MAX_COUNT}"));
     }
+    if !(1..=100).contains(&rollback_after_failed.percent) {
+        return invalid(format!(
+            "{name}: rollback_after_failed percent is not 1 to 100"
+        ));
+    }
+    if !(1..=MAX_COUNT).contains(&rollback_after_failed.min_hosts) {
+        return invalid(format!(
+            "{name}: rollback_after_failed min_hosts is not 1 to {MAX_COUNT}"
+        ));
+    }
     let names = roles
         .keys()
         .map(|r| role_of(r))
@@ -339,9 +362,9 @@ fn service_def(
         priority,
         bake_beats,
         canary: canary.map(|c| Canary { count: c.count }),
-        rollback: Rollback::Manual,
-        rollback_after_failed: FailThreshold::default(),
-        min_version: None,
+        rollback,
+        rollback_after_failed,
+        min_version,
     })
 }
 

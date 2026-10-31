@@ -31,6 +31,9 @@
 //!    updating, not waiting for its promotion and not under an outstanding order, so a host that has not heartbeated since
 //!    a restart counts as missing.
 //!
+//! A version marked bad ([`crate::reconcile`]) is ordered to nobody, whatever the rules above
+//! say, and is held at [`Hold::Bad`] after the quiet start.
+//!
 //! The decision records nothing: the caller notes an `Update` it returns with
 //! [`Fleet::order`], under the same lock, so the next host's decision sees it. A host that
 //! asks again while its own order is outstanding is told the same again: its own order never
@@ -130,7 +133,8 @@ pub enum Decision {
 }
 
 /// The decision for the host `id` about `service` at `now`, with the rule that held when it
-/// is not an order. The only implementation of the rules; [`decide_in`] drops the reason.
+/// is not an order, for a service none of whose versions is marked bad. [`decide_in`] drops
+/// the reason.
 #[must_use]
 pub fn decide_why(
     services: &Services,
@@ -143,7 +147,8 @@ pub fn decide_why(
     decide_marked(services, desired, &[], service, fleet, id, now)
 }
 
-/// [`decide_why`] for a service whose versions `bad` are marked bad.
+/// [`decide_why`] for a service whose versions `bad` are marked bad: the only implementation
+/// of the rules.
 #[must_use]
 pub fn decide_marked(
     services: &Services,
@@ -154,14 +159,13 @@ pub fn decide_marked(
     id: &NodeId,
     now: Duration,
 ) -> Decision {
-    let _ = bad;
     let Some(def) = services.get(service) else {
         return Decision::Hold(Hold::NoDefinition);
     };
     let Some(want) = desired.get(service) else {
         return Decision::Hold(Hold::NoDesired);
     };
-    match first_hold(def, want, desired, fleet, id, now) {
+    match first_hold(def, want, desired, bad, fleet, id, now) {
         Some(why) => Decision::Hold(why),
         None => Decision::Update {
             version: want.version.clone(),
@@ -174,6 +178,7 @@ fn first_hold(
     def: &ServiceDef,
     desired: &Desired,
     all: &BTreeMap<String, Desired>,
+    bad: &[Version],
     fleet: &Fleet,
     id: &NodeId,
     now: Duration,
@@ -203,6 +208,7 @@ fn first_hold(
         .count();
     let rules = [
         (fleet.is_quiet(now), Hold::Quiet),
+        (bad.contains(&desired.version), Hold::Bad),
         (host.beat.updating.is_some(), Hold::Updating),
         (fleet.is_busy_besides(service, id, now), Hold::BusyElsewhere),
         (host.beat.version == desired.version, Hold::UpToDate),

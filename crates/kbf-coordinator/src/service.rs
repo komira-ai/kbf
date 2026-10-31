@@ -8,16 +8,17 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kbf_oidc::{Refusal, Verified, Verifier};
-use kbf_updater::wire::{Answer, Heartbeat, Reply, ServiceReply};
+use kbf_updater::wire::{Answer, Heartbeat, ServiceReply};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
 use crate::converge::{Convergence, RoleCounts, converge_kbf, converge_service, role_counts};
-use crate::decide::{Decision, Hold, decide_in, decide_why};
+use crate::decide::{Decision, Hold, decide_marked};
 use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
 use crate::fleet::{Fleet, Host};
 use crate::identity::Identity;
 use crate::ops::{self, AuditEntry, OPERATOR, OperateError, OpsError, OpsState, OpsStore};
+use crate::reconcile::{clear_bad, reconcile};
 use crate::services::{ServiceDef, Services};
 
 /// The time since the coordinator started.
@@ -303,15 +304,29 @@ impl Coordinator {
                 );
             }
         }
-        let desired = self.desired.all();
         let mut names: Vec<&str> = std::iter::once(KBF)
             .chain(announced.iter().map(|one| one.name.as_str()))
             .collect();
         // Stable: services of one priority keep the order above.
         names.sort_by_key(|name| Reverse(self.services.get(name).map_or(0, |def| def.priority)));
+        // The hosts' words are in: record the last good versions and roll back what failed,
+        // before the orders below read the desired states.
+        for def in names.iter().filter_map(|name| self.services.get(name)) {
+            reconcile(def, &self.ops, &self.desired, &fleet, now);
+        }
+        let desired = self.desired.all();
         for name in names {
-            let reply = decide_in(&self.services, &desired, name, &fleet, &who.node_id, now);
-            if let Reply::Update { version } = reply {
+            let bad = self.ops.marks(name).bad;
+            let decision = decide_marked(
+                &self.services,
+                &desired,
+                &bad,
+                name,
+                &fleet,
+                &who.node_id,
+                now,
+            );
+            if let Decision::Update { version } = decision {
                 fleet.order(name, who.node_id.clone(), version.clone(), now);
                 return ServiceReply::Update {
                     service: (name != KBF).then(|| name.to_owned()),
@@ -372,6 +387,10 @@ impl Coordinator {
             );
             return Err(SetError::Forbidden);
         }
+        // CI naming a version by hand lifts its mark. The mark goes first: a set that fails
+        // after it leaves nothing blocked, and the reverse would leave a wanted version that
+        // the next beat rolls back.
+        clear_bad(&self.ops, &service, &desired.version)?;
         self.desired.set(&service, desired.clone())?;
         tracing::info!(
             workflow = %verified.job_workflow_ref,
@@ -420,17 +439,30 @@ impl Coordinator {
             .map(|(id, host)| host_status(&fleet, KBF, id, host, now))
             .collect();
         let all = self.desired.all();
+        let ops = self.ops.state();
         let per_service = self
             .services
             .defs()
             .map(|def| {
                 let desired = self.desired.get(&def.name);
+                let bad = ops
+                    .services
+                    .get(&def.name)
+                    .map_or(&[][..], |marks| marks.bad.as_slice());
                 let roles = role_counts(def, desired.as_ref(), &fleet, now);
                 let hosts: Vec<ServiceHostStatus> = fleet
                     .hosts_of(&def.name)
                     .map(|(id, host)| ServiceHostStatus {
                         host: host_status(&fleet, &def.name, id, host, now),
-                        hold: match decide_why(&self.services, &all, &def.name, &fleet, id, now) {
+                        hold: match decide_marked(
+                            &self.services,
+                            &all,
+                            bad,
+                            &def.name,
+                            &fleet,
+                            id,
+                            now,
+                        ) {
                             Decision::Update { .. } => None,
                             Decision::Hold(why) => Some(why),
                         },
@@ -452,7 +484,7 @@ impl Coordinator {
             .collect();
         Ok(Status {
             per_service,
-            ops: self.ops.state(),
+            ops,
             desired: self.desired.get(KBF),
             services: self.desired.all(),
             quiet: fleet.is_quiet(now),
@@ -509,7 +541,7 @@ fn host_status(
 /// Where the hosts of `def` stand: the one answer both `GET /v1/convergence` and the status
 /// give. `kbf` is counted with the minimums of its desired state, as it always has been; any
 /// other service with what its definition requires of each role.
-fn convergence_of(
+pub(crate) fn convergence_of(
     def: &ServiceDef,
     desired: Option<&Desired>,
     fleet: &Fleet,
