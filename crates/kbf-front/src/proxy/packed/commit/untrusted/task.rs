@@ -74,7 +74,7 @@
 //! The wiring of the executor builds the backend so.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use kbf_meta::Closure;
 use kbf_objstore::{ByteRange, ObjectKey};
@@ -90,6 +90,7 @@ use kbf_types::Digest;
 use prost::Message as _;
 
 use super::large::Large;
+use super::metadata::claimed;
 use super::{CommitError, IssuedKeySet, IssuedPackKey, PackKeyMint, Packs, UntrustedLimits};
 use crate::backend::Backend;
 use crate::closure;
@@ -377,7 +378,7 @@ impl Ingest<'_> {
             let recorded = self.packs.commit_untrusted_pack(pack.key, new, self.limits);
             recorded.await?;
         }
-        let result = rebuilt(&manifest);
+        let result = rebuilt(&manifest, self.packs.now());
         let cached = self.cached(&result, manifest.exit_code).await?;
         let large_bytes = manifest.large.iter().map(|large| large.size()).sum();
         Ok(Ran {
@@ -652,8 +653,9 @@ fn new_pack(key: &IssuedPackKey, footer: &Footer, size: u64) -> NewPack {
 }
 
 /// The result the manifest describes, sorted by path as REAPI asks. It carries the manifest's
-/// digests, which the pack's records have been hashed to, and no execution metadata.
-fn rebuilt(manifest: &TaskManifest) -> ActionResult {
+/// digests, which the pack's records have been hashed to, and the task's claimed timing as
+/// execution metadata ([`claimed`]), anchored at `end`.
+fn rebuilt(manifest: &TaskManifest, end: SystemTime) -> ActionResult {
     let wire = digest_to_proto;
     let mut result = ActionResult {
         output_files: manifest
@@ -687,6 +689,7 @@ fn rebuilt(manifest: &TaskManifest) -> ActionResult {
         stdout_digest: manifest.stdout.as_ref().map(wire),
         stderr_digest: manifest.stderr.as_ref().map(wire),
         exit_code: manifest.exit_code,
+        execution_metadata: claimed(&manifest.timing, end),
         ..ActionResult::default()
     };
     result.output_files.sort_by(|a, b| a.path.cmp(&b.path));

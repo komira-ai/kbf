@@ -247,6 +247,78 @@ mod tests {
         assert_eq!(u.numa, [NumaBytes { node: 1, bytes: 18 }]);
     }
 
+    /// The metadata an executor run's result carries: the three phases the task claimed, as the
+    /// frontend lays them (`fetch` 2 s, `run` 5 s, `pack` 1 s, the pack read at second 28).
+    fn claimed_by_task() -> worker::Result {
+        let ts = |n| Some(Timestamp::from(secs(n)));
+        worker::Result {
+            action_result: Some(ActionResult {
+                execution_metadata: Some(ExecutedActionMetadata {
+                    input_fetch_start_timestamp: ts(20),
+                    input_fetch_completed_timestamp: ts(22),
+                    execution_start_timestamp: ts(22),
+                    execution_completed_timestamp: ts(27),
+                    output_upload_start_timestamp: ts(27),
+                    output_upload_completed_timestamp: ts(28),
+                    ..ExecutedActionMetadata::default()
+                }),
+                ..ActionResult::default()
+            }),
+            ..worker::Result::default()
+        }
+    }
+
+    /// Catches an executor run's record missing a time: the task's three phases reach the record
+    /// unchanged beside the server's three (queued, Start sent, result taken in), so the record
+    /// has all nine, as a daemon's run does, and the two ends bracket the task's phases.
+    #[test]
+    fn the_invocation_record_of_an_executor_run_has_all_nine_times() {
+        let stamp = Stamp {
+            queued: secs(10),
+            started: secs(15),
+        };
+        let run = of(&claimed_by_task(), None, stamp, secs(30), None);
+        let times = run.times.named().map(|(_, t)| t);
+        assert_eq!(
+            times,
+            [
+                at(10),
+                at(15),
+                at(20),
+                at(22),
+                at(22),
+                at(27),
+                at(27),
+                at(28),
+                at(30)
+            ]
+        );
+    }
+
+    /// Catches a time made up for a run whose task claimed none: with no metadata the four
+    /// phase pairs of the record are absent, never zero, and the server's three remain.
+    #[test]
+    fn an_executor_run_without_task_timing_has_no_phase_times() {
+        let stamp = Stamp {
+            queued: secs(10),
+            started: secs(15),
+        };
+        let bare = worker::Result {
+            action_result: Some(ActionResult::default()),
+            ..worker::Result::default()
+        };
+        let run = of(&bare, None, stamp, secs(30), None);
+        assert_eq!(
+            run.times,
+            ReapiTimes {
+                queued: at(10),
+                worker_start: at(15),
+                worker_completed: at(30),
+                ..ReapiTimes::default()
+            }
+        );
+    }
+
     /// Catches: a report without a result (a killed or lost run) given no times, or
     /// times other than the server's (queued, Start sent, taken in); and usage made
     /// up for a result that carries none.
