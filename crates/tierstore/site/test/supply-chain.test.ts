@@ -73,6 +73,7 @@ test('Node is pinned to one exact version, and both workflows build with that fi
     assert.match(wf, /npm ci --ignore-scripts --no-audit --no-fund/, file);
   }
   const publish = read(REPO, '.github', 'workflows', 'tierstore-site-publish.yml');
-  assert.ok(publish.includes('node-version-file: publish/.node-version\n'), 'the deploy job reads the version the build job used');
-  assert.ok(publish.includes(`${SITE_REL}/.node-version\n`), 'the version file travels with the artifact');
+  // The deploy job checks out the program's source and the version file, and reads the same file as the build job.
+  assert.ok(publish.includes(`            ${SITE_REL}/.node-version\n`), 'the version file is in the deploy job\'s sparse checkout');
+  assert.equal(publish.split(`node-version-file: ${SITE_REL}/.node-version\n`).length - 1, 2, 'both jobs read the same file');
 });

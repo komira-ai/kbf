@@ -37,6 +37,13 @@ const SETTINGS: [(&str, &str); 3] = [
     ("ROLE_ARN", "TIERSTORE_SITE_PUBLISH_ROLE_ARN"),
 ];
 
+/// The publish program, run from the commit's own source (Node strips the types), and the two files the deploy job checks out.
+const PROGRAM: &str = "crates/tierstore/site/tools/publish.ts";
+const PUBLISH_PATHS: [&str; 2] = [
+    "crates/tierstore/site/.node-version",
+    "crates/tierstore/site/tools/publish.ts",
+];
+
 /// The build job's commands, in the order they must run before anything is uploaded.
 const BUILD_RUNS: [&str; 4] = [
     "npm ci --ignore-scripts --no-audit --no-fund",
@@ -147,6 +154,16 @@ fn build_job(text: &str, out: &mut Vec<String>) -> Result<(), String> {
             .as_deref()
             .is_some_and(|u| u.starts_with("actions/upload-artifact@"))
     });
+    if let Some(i) = upload {
+        let path = steps[i]
+            .with
+            .iter()
+            .find(|(k, _)| k == "path")
+            .map(|(_, v)| v.as_str());
+        if path != Some("crates/tierstore/site/dist") {
+            out.push(format!("the build job's artifact path is {path:?}, not exactly `crates/tierstore/site/dist`: the artifact carries the pages only, never a program the deploy job would run"));
+        }
+    }
     match upload {
         Some(i) if i >= at => {}
         _ => out.push(
@@ -158,9 +175,15 @@ fn build_job(text: &str, out: &mut Vec<String>) -> Result<(), String> {
 }
 
 fn deploy_job(text: &str, out: &mut Vec<String>) -> Result<(), String> {
-    let perms = levels(text, "deploy")?;
-    if perms != [("id-token".to_owned(), "write".to_owned())] {
-        out.push(format!("the deploy job's permissions are {perms:?}, not `id-token: write` alone: the job needs no repository or other token right"));
+    let mut perms = levels(text, "deploy")?;
+    perms.sort();
+    if perms
+        != [
+            ("contents".to_owned(), "read".to_owned()),
+            ("id-token".to_owned(), "write".to_owned()),
+        ]
+    {
+        out.push(format!("the deploy job's permissions are {perms:?}, not `contents: read` (for the checkout) and `id-token: write` alone: the job needs no other token right"));
     }
     let environment = workflows::job_environment(text, "deploy")?;
     if environment.as_deref() != Some(ENVIRONMENT) {
@@ -177,34 +200,63 @@ fn deploy_job(text: &str, out: &mut Vec<String>) -> Result<(), String> {
     }
     let steps = workflows::job_steps(text, "deploy")?;
     conditional(&steps, "deploy", out);
-    if steps.iter().any(|s| {
-        s.uses
-            .as_deref()
-            .is_some_and(|u| u.starts_with("actions/checkout@"))
-    }) {
-        out.push("the deploy job checks out the repository: it may run only the program the build job built".to_owned());
-    }
-    for s in steps.iter().filter_map(|s| s.run.as_deref()) {
-        let first = s.split_whitespace().next().unwrap_or_default();
-        if !s.starts_with("node publish/") || matches!(first, "npm" | "npx" | "cargo" | "pip") {
-            out.push(format!("the deploy job runs `{s}`: its only command is the publish program (`node publish/...`)"));
-        }
-    }
-    let runs: Vec<usize> = steps
+    // Exactly: the program's source from the commit itself, the Node it pins, the built pages, the one command.
+    let kinds: Vec<String> = steps
         .iter()
-        .enumerate()
-        .filter(|(_, s)| s.run.is_some())
-        .map(|(i, _)| i)
+        .map(|s| match (&s.uses, &s.run) {
+            (Some(u), _) => u.split('@').next().unwrap_or_default().to_owned(),
+            (None, Some(_)) => "run".to_owned(),
+            _ => "?".to_owned(),
+        })
         .collect();
-    let download = steps.iter().position(|s| {
-        s.uses
-            .as_deref()
-            .is_some_and(|u| u.starts_with("actions/download-artifact@"))
-    });
-    match (runs.as_slice(), download) {
-        ([run], Some(d)) if *run == steps.len() - 1 && d < *run => publish_step(&steps[*run], out),
-        _ => out.push("the deploy job must download the artifact and then end with exactly one `run:` step, the publish program".to_owned()),
+    if kinds
+        != [
+            "actions/checkout",
+            "actions/setup-node",
+            "actions/download-artifact",
+            "run",
+        ]
+    {
+        out.push(format!("the deploy job's steps are {kinds:?}, not exactly a checkout, a setup-node, a download of the pages and the one publish command: the program that holds the credentials comes from the commit's own source, and nothing is installed or built beside the token"));
+        return Ok(());
     }
+    let with = |i: usize, key: &str| {
+        steps[i]
+            .with
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    };
+    let want = |i: usize, key: &str, value: &str, out: &mut Vec<String>| {
+        if with(i, key).as_deref() != Some(value) {
+            out.push(format!(
+                "the deploy job's step {} has `{key}` {:?}, not `{value}`",
+                i + 1,
+                with(i, key)
+            ));
+        }
+    };
+    want(0, "ref", "${{ github.sha }}", out);
+    want(0, "persist-credentials", "false", out);
+    want(0, "sparse-checkout-cone-mode", "false", out);
+    let sparse = with(0, "sparse-checkout").unwrap_or_default();
+    let mut paths: Vec<&str> = sparse
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    paths.sort();
+    if paths != PUBLISH_PATHS {
+        out.push(format!("the deploy job's checkout takes {paths:?}, not exactly {PUBLISH_PATHS:?}: only the publish program and the Node version file"));
+    }
+    want(1, "node-version-file", PUBLISH_PATHS[0], out);
+    want(2, "name", "tierstore-site", out);
+    want(2, "path", "dist", out);
+    let run = steps[3].run.as_deref().unwrap_or_default();
+    if !run.starts_with(&format!("node {PROGRAM} ")) || !run.contains("--dist dist ") {
+        out.push(format!("the deploy job runs `{run}`: its only command is `node {PROGRAM} --dist dist ...`, run from the checked-out source"));
+    }
+    publish_step(&steps[3], out);
     Ok(())
 }
 
@@ -229,6 +281,57 @@ fn publish_step(step: &workflows::Step, out: &mut Vec<String>) {
             out.push(format!("the publish command lacks `{flag}`: the setting must reach the program as that flag"));
         }
     }
+}
+
+/// The module specifiers `src` (TypeScript source) imports or requires, one per use, comment lines skipped.
+fn specifiers(src: &str) -> Vec<String> {
+    let quoted = |rest: &str| -> Option<String> {
+        let start = rest.find(['\'', '"'])?;
+        let quote = rest[start..].chars().next()?;
+        let body = &rest[start + 1..];
+        Some(body[..body.find(quote)?].to_owned())
+    };
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let t = line.trim_start();
+        if t.starts_with("//") || t.starts_with('*') || t.starts_with("/*") {
+            continue;
+        }
+        let from = t
+            .find(" from ")
+            .filter(|_| t.starts_with("import ") || t.starts_with("export ") || t.starts_with('}'));
+        match from {
+            Some(at) => out.extend(quoted(&t[at..])),
+            None if t.starts_with("} from ") => out.extend(quoted(t)),
+            None if t.starts_with("import ") && !t.contains('(') => out.extend(quoted(t)),
+            None => {}
+        }
+        for call in ["require(", "import("] {
+            let mut rest = t;
+            while let Some(i) = rest.find(call) {
+                rest = &rest[i + call.len()..];
+                out.extend(quoted(rest));
+            }
+        }
+    }
+    out
+}
+
+/// The program that holds the credentials runs from source with no install: it may import `node:` built-ins and nothing else,
+/// and its syntax must be what Node's type stripping erases (the site's tsconfig forbids the rest).
+pub fn source_problems(src: &str, tsconfig: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let found = specifiers(src);
+    if found.is_empty() {
+        out.push("publish.ts imports nothing: the scan read nothing".to_owned());
+    }
+    for s in found.iter().filter(|s| !s.starts_with("node:")) {
+        out.push(format!("publish.ts imports `{s}`: only `node:` built-ins, because the deploy job runs it with no install and no other file"));
+    }
+    if !tsconfig.contains("\"erasableSyntaxOnly\": true") {
+        out.push("tsconfig.json lacks `erasableSyntaxOnly: true`: an enum, namespace or parameter property in publish.ts would stop Node from running it as it is".to_owned());
+    }
+    out
 }
 
 /// A step with an `if:` or `continue-on-error:` could be skipped, or fail, with the job still green.

@@ -119,16 +119,30 @@ fn only_the_deploy_job_holds_the_token_and_it_holds_nothing_else() {
         "the build job's permissions",
     );
     refused(&plant(build, ""), "the build job's permissions");
-    let deploy = "    permissions:\n      id-token: write\n";
+    let deploy = "    permissions:\n      contents: read\n      id-token: write\n";
     refused(
         &plant(
             deploy,
-            "    permissions:\n      id-token: write\n      contents: write\n",
+            "    permissions:\n      contents: read\n      id-token: write\n      packages: write\n",
         ),
         "the deploy job's permissions",
     );
     refused(
-        &plant(deploy, "    permissions:\n      id-token: read\n"),
+        &plant(
+            deploy,
+            "    permissions:\n      contents: write\n      id-token: write\n",
+        ),
+        "the deploy job's permissions",
+    );
+    refused(
+        &plant(
+            deploy,
+            "    permissions:\n      contents: read\n      id-token: read\n",
+        ),
+        "the deploy job's permissions",
+    );
+    refused(
+        &plant(deploy, "    permissions:\n      id-token: write\n"),
         "the deploy job's permissions",
     );
     refused(&plant(deploy, ""), "the deploy job's permissions");
@@ -250,32 +264,150 @@ fn the_site_is_built_and_tested_before_anything_is_uploaded() {
 }
 
 #[test]
-fn the_deploy_job_runs_only_the_program_that_was_built_and_tested() {
-    // Catches: the deploy job gaining a checkout, a package install or build of its own beside the
-    // token, a command that is not the publish program, a step after the publish, or a publish
-    // that does not follow the download.
-    let download = "      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1\n";
+fn the_deploy_job_runs_the_commits_own_source_and_nothing_built() {
+    // Catches: the program that holds the credentials coming from the build job's artifact (which ran
+    // dependency code and could rewrite it), a checkout of another ref or one that keeps the token, a
+    // checkout wider than the program and the Node version file, an install or build beside the
+    // token, any step beyond the checkout, setup-node, download and the one command, and an artifact
+    // that carries more than the pages.
+    let reason =
+        "not exactly a checkout, a setup-node, a download of the pages and the one publish command";
     refused(
         &plant(
-            download,
-            "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1\n",
+            "      - uses: actions/download-artifact@",
+            "      - run: npm ci\n      - uses: actions/download-artifact@",
         ),
-        "checks out the repository",
+        reason,
     );
     refused(
         &plant(
-            "      - name: Upload the site and invalidate the distribution\n",
-            "      - run: npm ci\n      - name: Upload the site and invalidate the distribution\n",
+            "      - uses: actions/download-artifact@",
+            "      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1\n        with:\n          name: tierstore-site\n          path: more\n      - uses: actions/download-artifact@",
         ),
-        "its only command is the publish program",
+        reason,
     );
     refused(
-        &plant("run: node publish/", "run: node other/"),
-        "its only command is the publish program",
+        &plant("          ref: ${{ github.sha }}\n", ""),
+        "has `ref` None",
     );
-    let mut text = real();
-    text.push_str("      - run: node publish/after.js\n");
-    refused(&problems(&text), "end with exactly one `run:` step");
+    refused(
+        &plant(
+            "          ref: ${{ github.sha }}\n",
+            "          ref: main\n",
+        ),
+        "has `ref`",
+    );
+    refused(
+        &plant(
+            "          persist-credentials: false\n          sparse-checkout: |\n",
+            "          persist-credentials: true\n          sparse-checkout: |\n",
+        ),
+        "has `persist-credentials`",
+    );
+    refused(
+        &plant(
+            "            crates/tierstore/site/tools/publish.ts\n",
+            "            crates/tierstore/site/tools/publish.ts\n            crates/tierstore/site/package.json\n",
+        ),
+        "the deploy job's checkout takes",
+    );
+    refused(
+        &plant("            crates/tierstore/site/tools/publish.ts\n", ""),
+        "the deploy job's checkout takes",
+    );
+    refused(
+        &plant("          sparse-checkout-cone-mode: false\n", ""),
+        "has `sparse-checkout-cone-mode` None",
+    );
+    refused(
+        &plant(
+            "          name: tierstore-site\n          path: dist\n",
+            "          name: tierstore-site\n          path: out\n",
+        ),
+        "has `path`",
+    );
+    refused(
+        &plant(
+            "run: node crates/tierstore/site/tools/publish.ts --dist dist ",
+            "run: node publish/build/tools/tools/publish.js --dist dist ",
+        ),
+        "its only command is `node crates/tierstore/site/tools/publish.ts",
+    );
+    refused(
+        &plant(
+            "run: node crates/tierstore/site/tools/publish.ts --dist dist ",
+            "run: npx tsx crates/tierstore/site/tools/publish.ts --dist dist ",
+        ),
+        "its only command is `node crates/tierstore/site/tools/publish.ts",
+    );
+    // The artifact carries the pages only.
+    refused(
+        &plant(
+            "          path: crates/tierstore/site/dist\n",
+            "          path: crates/tierstore/site\n",
+        ),
+        "the build job's artifact path",
+    );
+}
+
+fn publish_ts() -> String {
+    std::fs::read_to_string(crate::repo_root().join("crates/tierstore/site/tools/publish.ts"))
+        .expect("publish.ts")
+}
+
+fn site_tsconfig() -> String {
+    std::fs::read_to_string(crate::repo_root().join("crates/tierstore/site/tsconfig.json"))
+        .expect("tsconfig.json")
+}
+
+#[test]
+fn the_program_that_holds_the_credentials_imports_only_node_builtins() {
+    // Catches: publish.ts gaining an import of a package or of another file of the site (the deploy
+    // job checks out nothing but this file, installs nothing, and runs it as it is), a bare built-in
+    // name (`fs`) that is not the `node:` spelling, a `require` or dynamic `import()`, a side-effect
+    // import, a re-export, a multi-line import, and a tsconfig that stops forbidding syntax Node cannot
+    // strip. Control: the real file and tsconfig.
+    let real = publish_ts();
+    let tsconfig = site_tsconfig();
+    assert_eq!(source_problems(&real, &tsconfig), Vec::<String>::new());
+    assert!(
+        specifiers(&real).len() >= 4,
+        "the scan reads the real imports"
+    );
+    for line in [
+        "import { x } from './check-dist';",
+        "import fs from 'fs';",
+        "import x from \"left-pad\";",
+        "const m = require('y');",
+        "const m = await import('z');",
+        "import {\n  a,\n} from 'pkg';",
+        "import 'pkg';",
+        "export * from './o';",
+        "import { readFileSync } from 'node:fs'; import y from 'y';",
+    ] {
+        let found = source_problems(&format!("{real}\n{line}\n"), &tsconfig);
+        assert!(
+            found.iter().any(|m| m.contains("only `node:` built-ins")),
+            "{line}: {found:?}"
+        );
+    }
+    assert_eq!(
+        source_problems(
+            &format!("{real}\nimport {{ x }} from 'node:os';\n"),
+            &tsconfig
+        ),
+        Vec::<String>::new()
+    );
+    let found = source_problems(&real, &tsconfig.replace("erasableSyntaxOnly", "other"));
+    assert!(
+        found.iter().any(|m| m.contains("erasableSyntaxOnly")),
+        "{found:?}"
+    );
+    let found = source_problems("// nothing\n", &tsconfig);
+    assert!(
+        found.iter().any(|m| m.contains("read nothing")),
+        "{found:?}"
+    );
 }
 
 #[test]

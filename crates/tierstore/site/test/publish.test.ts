@@ -9,10 +9,10 @@
 
 import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
-import { checkDist, type Deps, IMMUTABLE, type Options, PAGE, parseArgs, plan, publish } from '../tools/publish';
-import { scratch } from './support';
+import { checkDist, type Deps, IMMUTABLE, MIN_FILES, MIN_HTML_PAGES, type Options, PAGE, parseArgs, plan, publish } from '../tools/publish';
+import { read, scratch, SITE } from './support';
 
 const ACCOUNT = '123456789012';
 const GOOD: Options = {
@@ -30,13 +30,23 @@ function argvOf(o: Options): string[] {
   return ['--dist', o.dist, '--bucket', o.bucket, '--distribution-id', o.distributionId, '--role-arn', o.roleArn, '--region', o.region, '--commit', o.commit];
 }
 
-/** A built-looking dist/ in a scratch directory. */
-function fakeDist(name: string): string {
+/** A dist/ with the given file names (parent directories are made), in a scratch directory. */
+function distWith(name: string, files: string[]): string {
   const dist = join(scratch(name), 'dist');
-  mkdirSync(join(dist, 'assets', 'x'), { recursive: true });
-  writeFileSync(join(dist, 'index.html'), '<p>');
-  writeFileSync(join(dist, '404.html'), '<p>');
+  mkdirSync(join(dist, 'assets'), { recursive: true });
+  for (const f of files) {
+    mkdirSync(dirname(join(dist, f)), { recursive: true });
+    writeFileSync(join(dist, f), 'x');
+  }
   return dist;
+}
+
+const PAGES = ['index.html', '404.html', 'install/index.html', 'docs/index.html', 'about/index.html'];
+const ASSETS = ['assets/x/a.js', 'assets/x/b.js', 'assets/x/s.css'];
+
+/** A built-looking dist/: the floor's worth of pages and files. */
+function fakeDist(name: string): string {
+  return distWith(name, [...PAGES, ...ASSETS]);
 }
 
 interface Call {
@@ -49,6 +59,7 @@ function fake(opts: { sts?: string | Error; jwt?: string; failAt?: number } = {}
   const events: string[] = [];
   const calls: Call[] = [];
   const secrets = new Map<string, string>();
+  const removed: string[] = [];
   let tokenAsked = 0;
   const deps: Deps = {
     token: async () => {
@@ -60,6 +71,10 @@ function fake(opts: { sts?: string | Error; jwt?: string; failAt?: number } = {}
       const path = `/secret/${secrets.size}`;
       secrets.set(path, text);
       return path;
+    },
+    removeSecret: (path) => {
+      removed.push(path);
+      events.push('remove');
     },
     writeVersion: (commit) => `/version/${commit}`,
     run: (argv, env) => {
@@ -74,7 +89,7 @@ function fake(opts: { sts?: string | Error; jwt?: string; failAt?: number } = {}
     },
     log: (line) => events.push(`log ${line}`),
   };
-  return { deps, events, calls, secrets, tokenAsked: () => tokenAsked };
+  return { deps, events, calls, secrets, removed, tokenAsked: () => tokenAsked };
 }
 
 test('the command line must give every flag once, with a value of the right shape', () => {
@@ -219,4 +234,47 @@ test('checkDist needs index.html, 404.html and assets/', () => {
   writeFileSync(join(noAssets, 'index.html'), '<p>');
   writeFileSync(join(noAssets, '404.html'), '<p>');
   assert.throws(() => checkDist(noAssets), /assets\/ is missing/);
+});
+
+test('a nearly empty dist/ is refused before any token is asked for or a sweep could empty the bucket', async () => {
+  const assets = ASSETS;
+  const fewPages = distWith('publish-few-pages', [...PAGES.slice(0, MIN_HTML_PAGES - 1), ...assets, 'assets/x/c.js', 'assets/x/d.js', 'assets/x/e.js']);
+  assert.throws(() => checkDist(fewPages), /only 4 html pages/);
+  const fewFiles = distWith('publish-few-files', [...PAGES, 'assets/x/a.js']);
+  assert.throws(() => checkDist(fewFiles), new RegExp(`only ${PAGES.length + 1} files`));
+  const f = fake();
+  await assert.rejects(publish({ ...GOOD, dist: fewPages }, f.deps), /not a built site/);
+  assert.equal(f.tokenAsked(), 0);
+  assert.equal(f.calls.length, 0);
+  checkDist(fakeDist('publish-floor-ok'));
+});
+
+test('the floors sit below the real site and above a gutted one', () => {
+  const lines = read(SITE, 'test', 'golden.manifest').split('\n').filter((l) => l !== '');
+  const html = lines.filter((l) => l.endsWith('.html')).length;
+  assert.ok(MIN_HTML_PAGES <= html && MIN_FILES <= lines.length, `${html} pages, ${lines.length} files`);
+  assert.ok(MIN_HTML_PAGES * 2 > html && MIN_FILES * 2 > lines.length, 'a floor under half the real site would let a gutted site through');
+});
+
+test('a file type the sync would upload without a content type or cache rule is refused', () => {
+  for (const extra of ['logo.png', 'assets/x/font.woff2', 'data.json', 'robots.txt', 'x.svg']) {
+    const dist = distWith(`publish-type-${extra.replace(/[^a-z0-9]/gi, '_')}`, [...PAGES, ...ASSETS, extra]);
+    assert.throws(() => checkDist(dist), new RegExp(`${extra.replace('.', '\\.')}`), extra);
+  }
+});
+
+test('the token file is removed once the exchange is over, whether it worked or not, and before any upload', async () => {
+  const dist = fakeDist('publish-unlink');
+  const ok = fake();
+  await publish({ ...GOOD, dist }, ok.deps);
+  assert.deepEqual(ok.removed, ['/secret/0']);
+  assert.ok(ok.events.indexOf('remove') < ok.events.findIndex((e) => e.startsWith('run s3')), 'removed before the first upload');
+  for (const sts of [new Error('AccessDenied'), 'not json']) {
+    const bad = fake({ sts });
+    await assert.rejects(publish({ ...GOOD, dist }, bad.deps));
+    assert.deepEqual(bad.removed, ['/secret/0'], String(sts));
+  }
+  const noJwt = fake({ jwt: 'nope' });
+  await assert.rejects(publish({ ...GOOD, dist }, noJwt.deps));
+  assert.deepEqual(noJwt.removed, [], 'no file was written, so none is removed');
 });
