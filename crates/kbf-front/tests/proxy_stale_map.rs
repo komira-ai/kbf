@@ -202,3 +202,42 @@ async fn another_answer_is_not_tried_again() {
         assert_eq!(t.maps.fetches.load(SeqCst), 0);
     }
 }
+
+/// Catches a retry on a farm with no map to fetch (the fixed list of `--storage` nodes): the
+/// node's STALE_MAP is the client's answer, FAILED_PRECONDITION, from one call.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_farm_without_a_map_passes_the_answer_on() {
+    let fake = Fake::stale_for(1, 8, 0);
+    let front = harness::front(
+        vec![harness::owner("only", node(&fake).await)],
+        Authorizers::allow_all(),
+        None,
+    )
+    .await;
+
+    let status = client(&front)
+        .write(Request::new(small(upload("main", '6', 10))))
+        .await
+        .expect_err("stale");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(fake.calls.load(SeqCst), 1);
+}
+
+/// Catches a retry that goes on without a writer: the newer map has no node that takes
+/// writes, so the upload ends UNAVAILABLE after the one fetch, with no second call.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_newer_map_with_no_writer_is_unavailable() {
+    let before = map(7, [MemberState::Active; 3]);
+    let (kind, size, first) = writer_of(&before);
+    let mut fakes: Vec<_> = (0..3).map(|_| Fake::new(false)).collect();
+    fakes[first - 1] = Fake::stale_for(1, 8, 0);
+    let t = rig(fakes, vec![before, map(8, [MemberState::Down; 3])]).await;
+
+    let status = client(&t.front)
+        .write(Request::new(small(upload("main", kind, size))))
+        .await
+        .expect_err("no writer");
+    assert_eq!(status.code(), Code::Unavailable, "{status}");
+    assert_eq!(calls(&t.fakes).iter().sum::<usize>(), 1);
+    assert_eq!(t.maps.fetches.load(SeqCst), 1);
+}
