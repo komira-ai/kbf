@@ -77,6 +77,8 @@
 #![forbid(unsafe_code)]
 
 mod backend;
+#[cfg(test)]
+mod build_commit;
 mod cache;
 mod clock;
 mod dir;
@@ -84,8 +86,12 @@ mod error;
 mod faulty;
 mod journal;
 mod lease;
+#[cfg(test)]
+mod lease_tests;
 mod memory;
 mod metrics;
+#[cfg(test)]
+mod metrics_names_tests;
 mod reconciler;
 #[cfg(feature = "s3")]
 pub mod s3;
@@ -108,5 +114,8 @@ pub use memory::{MemoryBackend, TestClock};
 pub use reconciler::{PassReport, Reconciler, ReconcilerConfig};
 #[cfg(feature = "s3")]
 pub use s3::S3Backend;
-pub use selftest::{Check, Note, SelfTestError, SelfTestFailure, SelfTestOptions, self_test};
+pub use selftest::{
+    Check, Note, SelfTestError, SelfTestFailure, SelfTestOptions, SweepBudget, Swept, self_test,
+    sweep_probes,
+};
 pub use tiered::{Proxy, ProxyConfig};

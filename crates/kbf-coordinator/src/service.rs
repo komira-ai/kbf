@@ -199,7 +199,7 @@ impl Coordinator {
         let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         let announced = beat.services.clone().unwrap_or_default();
         let platform = beat.platform;
-        fleet.record(who.node_id.clone(), who.role, beat, now);
+        fleet.record(who.node_id.clone(), who.role.clone(), beat, now);
         for one in &announced {
             let runs_here = self
                 .services
@@ -209,7 +209,7 @@ impl Coordinator {
                 fleet.record_in(
                     &one.name,
                     who.node_id.clone(),
-                    who.role,
+                    who.role.clone(),
                     one.as_heartbeat(platform),
                     now,
                 );

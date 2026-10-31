@@ -19,6 +19,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
+use kbf_types::HostRole;
 use kbf_updater::version::Version;
 
 use serde::{Deserialize, Serialize};
@@ -39,18 +40,23 @@ pub const LEGACY_ROLES: [&str; 4] = ["frontend", "storage", "daemon", "mac-daemo
 /// The minimums an earlier build named, in the order it wrote them. `kbf` requires both.
 pub const KBF_MIN_UP: [&str; 2] = ["storage", "frontend"];
 
-/// The longest role name, in bytes.
-pub const MAX_ROLE_NAME: usize = 32;
+/// The four host roles `kbf` names, in the order the status lists them. The services loader
+/// accepts no others.
+#[must_use]
+pub fn kbf_roles() -> [HostRole; 4] {
+    [
+        HostRole::FRONTEND,
+        HostRole::STORAGE,
+        HostRole::DAEMON,
+        HostRole::MAC_DAEMON,
+    ]
+}
 
-/// Whether `name` can name a role: 1 to [`MAX_ROLE_NAME`] bytes of lowercase letters, digits and
-/// hyphens, not beginning with a hyphen.
+/// Whether `name` can name a role: the grammar of a host role ([`HostRole`]'s parse), which
+/// is the one place that says.
 #[must_use]
 pub fn is_role_name(name: &str) -> bool {
-    (1..=MAX_ROLE_NAME).contains(&name.len())
-        && !name.starts_with('-')
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    name.parse::<HostRole>().is_ok()
 }
 
 /// A number per role name: the limit on hosts updating at once, or the minimum that stays up.

@@ -626,18 +626,11 @@ async fn a_declared_length_over_the_limit_is_refused_before_any_byte_is_read() {
     assert_eq!(s3.stats().completed, 0);
 }
 
-/// Asserts that with the server taking as many streamed bodies as it may, one more is answered
-/// 503 `SlowDown` with `Retry-After` and its body is not stored, that the first is stored when
-/// its body ends, and that the permit it held is then free for the next.
-#[tokio::test(start_paused = true)]
-async fn a_put_over_the_concurrency_limit_is_answered_slow_down_and_the_next_is_taken() {
-    let rig = Rig::with(1 << 20, |config| config.max_concurrent_puts = 1).await;
+/// Starts a put of `first` whose body stalls for `stall` (tokio time) half way, and returns once
+/// it holds the only permit of the server.
+async fn hold_the_only_permit(rig: &Rig, stall: Duration) -> tokio::task::JoinHandle<StatusCode> {
     let uri = format!("/{BUCKET}/first");
-    let steps = vec![
-        Step::Data(b"ab"),
-        Step::Wait(Duration::from_secs(5)),
-        Step::Data(b"cd"),
-    ];
+    let steps = vec![Step::Data(b"ab"), Step::Wait(stall), Step::Data(b"cd")];
     let (parts, _) = sign(&rig.config, "PUT", &uri, &[], b"abcd").into_parts();
     let request = Request::from_parts(parts, Scripted::new(steps));
     let server = Arc::clone(&rig.server);
@@ -645,6 +638,21 @@ async fn a_put_over_the_concurrency_limit_is_answered_slow_down_and_the_next_is_
     while rig.server.put_permits_free() > 0 {
         tokio::task::yield_now().await;
     }
+    first
+}
+
+/// Asserts that with the server taking as many streamed bodies as it may and no wait for a
+/// permit, one more is answered 503 `SlowDown` with `Retry-After` at once and its body is not
+/// stored, that the first is stored when its body ends, and that the permit it held is then free
+/// for the next.
+#[tokio::test(start_paused = true)]
+async fn a_put_over_the_concurrency_limit_is_answered_slow_down_and_the_next_is_taken() {
+    let rig = Rig::with(1 << 20, |config| {
+        config.max_concurrent_puts = 1;
+        config.put_permit_wait = Duration::ZERO;
+    })
+    .await;
+    let first = hold_the_only_permit(&rig, Duration::from_secs(5)).await;
 
     let over = rig.put("second", b"x").await;
     assert_eq!(over.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -656,6 +664,65 @@ async fn a_put_over_the_concurrency_limit_is_answered_slow_down_and_the_next_is_
     assert_eq!(rig.hot_mem.get("first", None).await.unwrap(), "abcd");
     assert_eq!(rig.server.put_permits_free(), 1);
     assert_eq!(rig.put("third", b"x").await.status, StatusCode::OK);
+}
+
+/// Asserts that a put that arrives with the only permit taken is not refused when the permit is
+/// given back inside `put_permit_wait`: the first body ends after a 5 s stall, the second waited
+/// (tokio time, advanced by the paused runtime, not slept) and is stored, and both objects exist.
+#[tokio::test(start_paused = true)]
+async fn a_put_that_gets_a_permit_within_the_wait_is_stored() {
+    let rig = Rig::with(1 << 20, |config| {
+        config.max_concurrent_puts = 1;
+        config.put_permit_wait = Duration::from_secs(15);
+    })
+    .await;
+    let first = hold_the_only_permit(&rig, Duration::from_secs(5)).await;
+
+    let second = rig.put("second", b"x").await;
+
+    assert_eq!(second.status, StatusCode::OK);
+    assert_eq!(first.await.unwrap(), StatusCode::OK);
+    assert_eq!(rig.hot_mem.get("first", None).await.unwrap(), "abcd");
+    assert_eq!(rig.hot_mem.get("second", None).await.unwrap(), "x");
+    assert_eq!(rig.server.put_permits_free(), 1);
+}
+
+/// Asserts that a put that gets no permit within `put_permit_wait` is answered 503 `SlowDown`
+/// with `Retry-After`, that not one piece of its body was made (read) while it waited or after,
+/// that nothing of it is stored, and that the put that held the permit is not disturbed: it
+/// stalls 20 s, past the 15 s wait, and is then stored.
+#[tokio::test(start_paused = true)]
+async fn a_put_that_gets_no_permit_within_the_wait_is_answered_slow_down_without_reading_its_body()
+{
+    let rig = Rig::with(1 << 20, |config| {
+        config.max_concurrent_puts = 1;
+        config.put_permit_wait = Duration::from_secs(15);
+    })
+    .await;
+    let first = hold_the_only_permit(&rig, Duration::from_secs(20)).await;
+    let made = Arc::new(AtomicUsize::new(0));
+    let (claim, _) = truth(2);
+
+    let body = Generated::new(2, &made);
+    // The paused runtime's own clock moves only when every task waits for a timer, and then to
+    // that timer, so the time the request waited is exactly the wait it was given.
+    let started = tokio::time::Instant::now();
+    let over = answer(
+        &rig.server,
+        put_request(&rig.config, "second", &claim, &[], body),
+    )
+    .await;
+    let waited = started.elapsed();
+
+    assert_eq!(over.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(over.code(), "SlowDown");
+    assert_eq!(over.header("retry-after"), "1");
+    assert_eq!(waited, Duration::from_secs(15));
+    assert_eq!(made.load(Ordering::SeqCst), 0);
+    assert!(rig.hot_mem.get("second", None).await.is_err());
+    assert_eq!(first.await.unwrap(), StatusCode::OK);
+    assert_eq!(rig.hot_mem.get("first", None).await.unwrap(), "abcd");
+    assert_eq!(rig.server.put_permits_free(), 1);
 }
 
 /// Asserts that a body that comes in under the least average rate, once the time spent waiting

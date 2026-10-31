@@ -77,8 +77,8 @@ fn a_host_whose_role_no_definition_names_is_never_ordered() {
     let other = Services::parse("[[service]]\nname = \"other\"\n[service.roles.daemon]\n")
         .expect("services");
     let mut fleet = Fleet::new(Duration::ZERO);
-    fleet.record_in("other", id("s1"), HostRole::Storage, beat("1.0"), NOW);
-    fleet.record_in("other", id("d1"), HostRole::Daemon, beat("1.0"), NOW);
+    fleet.record_in("other", id("s1"), HostRole::STORAGE, beat("1.0"), NOW);
+    fleet.record_in("other", id("d1"), HostRole::DAEMON, beat("1.0"), NOW);
     let text = r#"{"version":"2.0","min_up":{"storage":0,"frontend":0}}"#;
     let all = BTreeMap::from([(
         "other".to_owned(),

@@ -50,6 +50,8 @@ enum Stop {
     Mismatch,
     /// The object changed while it was being read: the bytes may be of two versions.
     Changed,
+    /// The cache lost the lock of its directory while the fill ran: nothing more is written.
+    Lost,
 }
 
 impl From<io::Error> for Stop {
@@ -65,9 +67,9 @@ impl From<Error> for Stop {
 }
 
 /// A file of the stage directory, removed when it is dropped, and counted while it exists.
-struct Staged {
+pub(super) struct Staged {
     inner: Arc<Inner>,
-    file: tokio::fs::File,
+    pub(super) file: tokio::fs::File,
     path: PathBuf,
     /// Where the sidecar is written before it is renamed into place.
     sidecar: PathBuf,
@@ -76,10 +78,11 @@ struct Staged {
 impl Staged {
     /// A new file, read-only for everyone once it is made (mode 0444: the descriptor that made
     /// it can still write).
-    async fn create(inner: &Arc<Inner>) -> io::Result<Self> {
+    pub(super) async fn create(inner: &Arc<Inner>) -> io::Result<Self> {
         let number = inner.staged.fetch_add(1, Ordering::Relaxed);
-        let path = stage_dir(&inner.config.path).join(format!("{number:016x}"));
-        let sidecar = stage_dir(&inner.config.path).join(format!("{number:016x}.meta"));
+        let name = format!("{}-{number:016x}", inner.stage_prefix);
+        let path = stage_dir(&inner.config.path).join(&name);
+        let sidecar = stage_dir(&inner.config.path).join(format!("{name}.meta"));
         let mut options = OpenOptions::new();
         let file = options
             .write(true)
@@ -101,7 +104,7 @@ impl Staged {
 
     /// Writes the end of the file to the disk, so that a name linked to it is whole after a
     /// crash.
-    async fn finish(&mut self) -> io::Result<()> {
+    pub(super) async fn finish(&mut self) -> io::Result<()> {
         self.file.flush().await?;
         self.file.sync_data().await
     }
@@ -123,28 +126,50 @@ fn write_sidecar(path: &Path, text: &[u8]) -> io::Result<()> {
         .and_then(|()| std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)))
 }
 
+/// What [`publish`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Published {
+    /// The data file is new.
+    New,
+    /// The data file was there already.
+    Existed,
+    /// The cache does not own the directory any more, and nothing of the object is in it.
+    Lost,
+}
+
 /// Puts the staged file into the cache: the sidecar first, by rename, then the data file by a
-/// create-only link. Gives whether the data file is new (`false` if it was there already).
-fn publish(
+/// create-only link. `owns` is asked before the first change to the directory and again before
+/// the rename, the first step that puts the object in it: a cache that lost the lock of the
+/// directory since the fill started publishes nothing ([`Published::Lost`]).
+pub(super) fn publish(
     disk: &dyn Disk,
     root: &Path,
     hex: &str,
     staged: (&Path, &Path),
     sidecar: &[u8],
-) -> io::Result<bool> {
+    owns: &dyn Fn() -> bool,
+) -> io::Result<Published> {
     let data = data_path(root, hex);
     let (from, temporary) = staged;
     let meta = meta_path(root, hex);
-    // The three steps in one chain, so that a failure of any is one way out.
-    make_dirs(root, &object_dir(root, hex))
-        .and_then(|()| write_sidecar(temporary, sidecar))
-        .and_then(|()| std::fs::rename(temporary, &meta))?;
+    if !owns() {
+        return Ok(Published::Lost);
+    }
+    make_dirs(root, &object_dir(root, hex)).and_then(|()| write_sidecar(temporary, sidecar))?;
+    if !owns() {
+        return Ok(Published::Lost);
+    }
+    std::fs::rename(temporary, &meta)?;
     match disk.link(from, &data) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Ok(()) => Ok(Published::New),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(Published::Existed),
         Err(error) => {
-            // Nothing owns the sidecar: leave no file that says an object is there.
-            let _ = std::fs::remove_file(meta_path(root, hex));
+            // Nothing owns the sidecar: leave no file that says an object is there. A cache that
+            // has lost the directory since the rename leaves it: the name may be the new
+            // owner's by now, and a sidecar with no data file is what that owner's scan deletes.
+            if owns() {
+                let _ = std::fs::remove_file(meta_path(root, hex));
+            }
             Err(error)
         }
     }
@@ -165,9 +190,9 @@ impl Drop for Reserved {
 
 /// A fill's place in the table of the fills that run: taken out when it is dropped, whether the
 /// fill ended, panicked or was cancelled, so that no key stays marked as being filled.
-struct Flight {
-    inner: Arc<Inner>,
-    hex: String,
+pub(super) struct Flight {
+    pub(super) inner: Arc<Inner>,
+    pub(super) hex: String,
 }
 
 impl Drop for Flight {
@@ -328,6 +353,11 @@ impl Inner {
             Err(Stop::Short) => self.skipped(FailedFill::ShortBody),
             Err(Stop::Local) => self.skipped(FailedFill::LocalIo),
             Err(Stop::Changed) => self.skipped(FailedFill::Changed),
+            Err(Stop::Lost) => {
+                // Not a failure of the fill: the directory is another cache's now.
+                bump(&self.counters.fills_skipped);
+                Ok(Filled::Skipped)
+            }
             Err(Stop::Mismatch) => {
                 // The bytes are known to be wrong: they go to nobody.
                 self.counters.failed(FailedFill::HashMismatch);
@@ -343,12 +373,22 @@ impl Inner {
         Ok(Filled::Skipped)
     }
 
+    /// Reads the object into the stage directory and puts it in the cache. The fill remembers
+    /// the generation of the lock it started under and asks [`owns`](Inner::owns) before it
+    /// makes the staging file, before it writes each chunk, inside the publish and before it
+    /// puts the object in the index: a cache that lost the lock of its directory meanwhile
+    /// writes nothing more ([`Stop::Lost`]). The lock is noticed lost by a tick at most once a
+    /// second, so the step that is running when the lock file is replaced can still finish.
     async fn fetch(self: &Arc<Self>, key: &str, name: &Name) -> Result<Filled, Stop> {
+        let generation = self.generation();
         let meta = self.upstream.head(key).await?;
         let Some(reservation) = self.reserve(meta.size) else {
             bump(&self.counters.fills_skipped);
             return Ok(Filled::Skipped);
         };
+        if !self.owns(generation) {
+            return Err(Stop::Lost);
+        }
         let mut staged = Staged::create(self).await?;
         let mut hasher = Sha256::new();
         let mut offset = 0;
@@ -358,6 +398,9 @@ impl Inner {
             let chunk = self.upstream.get(key, Some(range)).await?;
             if chunk.len() as u64 != want {
                 return Err(Stop::Short);
+            }
+            if !self.owns(generation) {
+                return Err(Stop::Lost);
             }
             staged.file.write_all(&chunk).await?;
             hasher.update(&chunk);
@@ -384,7 +427,19 @@ impl Inner {
             tag: meta.tag.clone(),
             modified: meta.modified,
         };
-        let fresh = self.commit(&staged, name, &sidecar).await?;
+        let fresh = match self.commit(&staged, name, &sidecar, generation).await? {
+            Published::New => true,
+            Published::Existed => false,
+            Published::Lost => return Err(Stop::Lost),
+        };
+        #[cfg(test)]
+        self.trace_after_publish();
+        if !self.owns(generation) {
+            if fresh {
+                self.remove_linked(&name.hex);
+            }
+            return Err(Stop::Lost);
+        }
         locked(&self.index).insert(&name.hex, meta.size, meta.tag, meta.modified);
         // A delete that came while the object was being read marked this fill: what it read is
         // gone from the upstream, so it is not kept (the mark is looked for after the entry is
@@ -407,20 +462,56 @@ impl Inner {
         staged: &Staged,
         name: &Name,
         sidecar: &Sidecar,
-    ) -> io::Result<bool> {
+        generation: u64,
+    ) -> io::Result<Published> {
+        let publishing = self.begin_commit(staged, name, sidecar, generation);
+        publishing.await.expect("a publish does not panic")
+    }
+
+    /// Removes the data file and the sidecar that a fill or a keep of this cache linked just
+    /// now, when it finds that the cache no longer owns the directory.
+    ///
+    /// This is the one delete a cache makes in a directory it does not own. The caller linked
+    /// these names itself (the publish said `New`), but the new owner may publish or index the
+    /// same name in that very instant, so the removal can take away an object that is the new
+    /// owner's. That costs one refill and nothing else: whoever made it, the object is a whole
+    /// object of the key, so neither a read before the removal nor one after it gets wrong
+    /// bytes. Leaving the object is the worse choice: the new owner may not index it, and then
+    /// nothing evicts it, and a later scan indexes it, stale if the key was deleted at the
+    /// upstream in between. The call covers the whole span from the check before the rename,
+    /// through the rename, the link and the return of the publish. What is left is a whole
+    /// object that is on the disk for the moments until this removes it.
+    pub(super) fn remove_linked(&self, hex: &str) {
+        let root = &self.config.path;
+        let _ = std::fs::remove_file(data_path(root, hex));
+        let _ = std::fs::remove_file(meta_path(root, hex));
+    }
+
+    /// Starts the link of the staged file into the cache on a thread that may block, and gives
+    /// the handle of the job, which goes on when the handle is dropped. The job publishes only
+    /// while the cache still owns the directory as of `generation` (see `Inner::owns`): fills
+    /// and keeps both run it, and both give up when it says [`Published::Lost`].
+    pub(super) fn begin_commit(
+        self: &Arc<Self>,
+        staged: &Staged,
+        name: &Name,
+        sidecar: &Sidecar,
+        generation: u64,
+    ) -> JoinHandle<io::Result<Published>> {
         let disk = Arc::clone(&self.disk);
         let root = self.config.path.clone();
         let hex = name.hex.clone();
         let (from, temporary) = (staged.path.clone(), staged.sidecar.clone());
         let text = serde_json::to_vec(sidecar).unwrap_or_default();
-        let publishing = tokio::task::spawn_blocking(move || {
-            publish(&*disk, &root, &hex, (&from, &temporary), &text)
-        });
-        publishing.await.expect("a publish does not panic")
+        let inner = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let owns = || inner.owns(generation);
+            publish(&*disk, &root, &hex, (&from, &temporary), &text, &owns)
+        })
     }
 
     /// Runs a pass of the eviction if the cache is above its high water mark.
-    async fn relieve(self: &Arc<Self>) {
+    pub(super) async fn relieve(self: &Arc<Self>) {
         let held = locked(&self.index).bytes();
         if held > percent_of(self.config.budget, self.config.high_water) {
             let inner = Arc::clone(self);

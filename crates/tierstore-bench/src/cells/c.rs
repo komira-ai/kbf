@@ -219,6 +219,7 @@ impl Burst {
             .zip(&lag)
             .map(|((_, at, ok), lag)| Step {
                 label: "",
+                second_quantity: false,
                 role: Role::Cold,
                 op: Op::Put,
                 bytes: self.size,
@@ -342,6 +343,7 @@ fn arm(label: String, mode: &str, burst: &Arc<Burst>) -> Arm {
                 Ok(notes)
             }
         })),
+        faulted: burst.fault.is_some(),
         notes,
     }
 }
@@ -615,7 +617,7 @@ mod tests {
         assert!(instance.keys().is_empty());
         assert!(cold.keys().is_empty());
         let samples = std::fs::read_to_string(dir.path().join("samples.csv")).unwrap();
-        assert!(samples.lines().skip(1).all(|l| l.ends_with(',')));
+        assert!(samples.lines().skip(1).all(|l| l.ends_with(",,1")));
     }
 
     /// Catches a cold store that cannot be listed ending the run in error: the objects are

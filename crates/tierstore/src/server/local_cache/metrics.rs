@@ -30,6 +30,43 @@ const FAILED: [&str; 6] = [
     "aborted",
 ];
 
+/// Why a create-only put that the upstream took was not kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SkippedKeep {
+    /// No room: the object (or a body of no declared length, which cannot be reserved for) does
+    /// not fit the budget or the critical mark.
+    Budget,
+    /// The stage directory or the cache directory could not be written.
+    Io,
+    /// Every keep the cache may run was running, or a fill of the key was.
+    Busy,
+    /// The upstream's HEAD after the put failed or did not describe the bytes that were sent, or
+    /// the upstream did not read the body to its end.
+    Head,
+    /// The object was deleted while it was being kept.
+    Deleted,
+    /// The disk did not keep up with the body: the copy fell too far behind and was dropped,
+    /// so that the upstream was never made to wait for the disk.
+    Slow,
+    /// The keep did not end within `keep_deadline` (a hung upstream or disk) and was abandoned.
+    Deadline,
+    /// The cache is read-only, or lost the lock of its directory while the keep ran: it writes
+    /// nothing to a directory that another process holds.
+    ReadOnly,
+}
+
+/// The label of each [`SkippedKeep`], in the order of the enum.
+const SKIPPED_KEEP: [&str; 8] = [
+    "budget",
+    "io",
+    "busy",
+    "head",
+    "deleted",
+    "slow",
+    "deadline",
+    "read_only",
+];
+
 /// Why an object was evicted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Evicted {
@@ -54,9 +91,23 @@ pub struct Counters {
     pub(super) fills_skipped: AtomicU64,
     /// Of `fills_skipped`, those skipped because every fill the cache may run was running.
     pub(super) fills_skipped_busy: AtomicU64,
+    /// The create-only puts the upstream took.
+    pub(super) writes_through: AtomicU64,
+    /// The create-only puts answered `AlreadyExists`.
+    pub(super) write_exists: AtomicU64,
+    /// The puts answered before their keep ended, because it took longer than `keep_wait`.
+    pub(super) keeps_expired: AtomicU64,
+    keep_skips: [AtomicU64; SKIPPED_KEEP.len()],
     failures: [AtomicU64; FAILED.len()],
     evictions: [AtomicU64; EVICTED.len()],
     pub(super) pinned_skips: AtomicU64,
+    /// The objects the scrub hashed again, and the bytes it read for them.
+    pub(super) scrubbed_objects: AtomicU64,
+    pub(super) scrubbed_bytes: AtomicU64,
+    /// The objects the scrub dropped because their bytes did not match.
+    pub(super) scrub_mismatches: AtomicU64,
+    /// The objects the scrub could not judge because a read failed.
+    pub(super) scrub_errors: AtomicU64,
     pub(super) discarded_at_start: AtomicU64,
     /// The files in the stage directory now.
     pub(super) staging_files: AtomicU64,
@@ -90,6 +141,17 @@ impl Counters {
         bump(&self.failures[why as usize]);
     }
 
+    /// Counts a put that was taken by the upstream and not kept, for `why`.
+    pub(super) fn keep_skipped(&self, why: SkippedKeep) {
+        bump(&self.keep_skips[why as usize]);
+    }
+
+    /// The puts that were not kept for `why`.
+    #[cfg(test)]
+    pub(super) fn keeps_skipped(&self, why: SkippedKeep) -> u64 {
+        read(&self.keep_skips[why as usize])
+    }
+
     /// Counts an eviction for `why`.
     pub(super) fn evicted(&self, why: Evicted) {
         bump(&self.evictions[why as usize]);
@@ -113,6 +175,7 @@ impl Counters {
         cache_bytes: u64,
         cache_objects: u64,
         fs_free_bytes: u64,
+        read_write: bool,
     ) -> String {
         let mut text = String::new();
         let plain = [
@@ -126,7 +189,14 @@ impl Counters {
             ("fills_total", read(&self.fills)),
             ("fills_skipped_total", read(&self.fills_skipped)),
             ("fills_skipped_busy_total", read(&self.fills_skipped_busy)),
+            ("writes_through_total", read(&self.writes_through)),
+            ("write_exists_total", read(&self.write_exists)),
+            ("keeps_expired_total", read(&self.keeps_expired)),
             ("pinned_skips_total", read(&self.pinned_skips)),
+            ("scrubbed_objects_total", read(&self.scrubbed_objects)),
+            ("scrubbed_bytes_total", read(&self.scrubbed_bytes)),
+            ("scrub_mismatches_total", read(&self.scrub_mismatches)),
+            ("scrub_errors_total", read(&self.scrub_errors)),
             ("discarded_at_start_total", read(&self.discarded_at_start)),
             ("bytes", cache_bytes),
             ("objects", cache_objects),
@@ -143,12 +213,24 @@ impl Counters {
                 "tierstore_cache_fill_failures_total{{reason=\"{label}\"}} {value}"
             );
         }
+        for (label, counter) in SKIPPED_KEEP.iter().zip(&self.keep_skips) {
+            let value = read(counter);
+            let _ = writeln!(
+                text,
+                "tierstore_cache_write_keep_skipped_total{{reason=\"{label}\"}} {value}"
+            );
+        }
         for (label, counter) in EVICTED.iter().zip(&self.evictions) {
             let value = read(counter);
             let _ = writeln!(
                 text,
                 "tierstore_cache_evictions_total{{reason=\"{label}\"}} {value}"
             );
+        }
+        // One series for each mode: 1 for the one the cache is in, 0 for the other.
+        for (label, now) in [("read_only", !read_write), ("read_write", read_write)] {
+            let value = u8::from(now);
+            let _ = writeln!(text, "tierstore_cache_mode{{mode=\"{label}\"}} {value}");
         }
         text
     }
