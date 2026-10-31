@@ -8,11 +8,11 @@
 //! version lifts it at once.
 //!
 //! A host declining several orders in a row waits longer each time: the wait of the n-th
-//! episode is `initial_secs * factor^(n-1)`, at least the report's own `retry_after_secs`,
-//! at most `max_secs` ([`DeferBackoff`], the `defer_backoff` of a service definition,
-//! default 300 s, doubling, capped at 3600 s). An episode opens when a host that was ordered
-//! reports the deferral, or the first time a report is seen; the same report repeated in
-//! later heartbeats is the same episode and moves nothing.
+//! episode is `initial_secs * factor^(n-1)` capped at `max_secs`, or the report's own
+//! `retry_after_secs` if that is larger ([`DeferBackoff`], the `defer_backoff` of a service
+//! definition, default 300 s, doubling, capped at 3600 s). An episode opens when a host that
+//! was ordered reports the deferral, or the first time a report is seen; the same report
+//! repeated in later heartbeats is the same episode and moves nothing.
 //!
 //! The episodes are kept in memory only: after a restart the first report starts the count
 //! again.
@@ -39,7 +39,10 @@ pub struct DeferBackoff {
     pub initial_secs: u64,
     /// What each further deferral of the same version multiplies the wait by.
     pub factor: u32,
-    /// The longest wait, in seconds.
+    /// The longest the backoff grows to, in seconds. It does not cap the host's own
+    /// `retry_after_secs`, which the agent clamps itself (3600 s): keep this at or above 3600
+    /// unless a service should be re-offered sooner than an agent can ask to be left alone,
+    /// and then only the host's hint, not this number, decides how long that host waits.
     pub max_secs: u64,
 }
 
@@ -55,13 +58,14 @@ impl Default for DeferBackoff {
 
 impl DeferBackoff {
     /// The wait after the `episodes`-th deferral of one version, when the host asked for
-    /// `retry_after_secs`: the grown backoff, or the host's number if larger, never over
-    /// `max_secs`.
+    /// `retry_after_secs`: the grown backoff, capped at `max_secs`, or the host's number if
+    /// larger. Only the backoff is capped: ordering a host before the time it asked for just
+    /// makes it decline again.
     #[must_use]
     pub fn wait(&self, episodes: u32, retry_after_secs: u64) -> Duration {
         let growth = u64::from(self.factor).saturating_pow(episodes.saturating_sub(1));
         let grown = self.initial_secs.saturating_mul(growth);
-        Duration::from_secs(grown.max(retry_after_secs).min(self.max_secs))
+        Duration::from_secs(grown.min(self.max_secs).max(retry_after_secs))
     }
 
     /// Why the values cannot be used, if they cannot: an initial wait of zero would not
