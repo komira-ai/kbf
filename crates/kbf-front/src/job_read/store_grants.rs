@@ -40,7 +40,9 @@ pub const KEYS_PER_GRANT: usize = 600;
 pub const BODY_BYTES_PER_GRANT: usize = 46_000;
 
 /// Whether `url` is a base URL a task can append `/<bucket>/<key>` to: `http://` or `https://`,
-/// then a host and perhaps a port, with no path, query or fragment, space or control character.
+/// then a host and perhaps a port. It refuses what kbf-task's client refuses in an endpoint
+/// (anything but visible ASCII, and `?`, `#`, `@` for user information, and `\`), so that a
+/// frontend does not start with a store URL every task would then turn down, and a path.
 ///
 /// # Errors
 /// What is wrong with it.
@@ -53,8 +55,11 @@ pub fn check_store_url(url: &str) -> Result<(), &'static str> {
         return Err("must start with http:// or https://");
     };
     for c in rest.chars() {
-        if c.is_whitespace() || c.is_control() || c == '?' || c == '#' {
-            return Err("has a space, a control character, a query or a fragment");
+        if !c.is_ascii_graphic() || c == '?' || c == '#' || c == '@' || c == '\\' {
+            return Err(
+                "has a character a store address does not: a space, a control or non-ASCII \
+                 character, or one of ? # @ and a backslash",
+            );
         }
     }
     let host = rest.trim_end_matches('/');
@@ -62,6 +67,23 @@ pub fn check_store_url(url: &str) -> Result<(), &'static str> {
         return Err("must be a host and a port with no path");
     }
     Ok(())
+}
+
+/// Whether `bucket` is a name kbf-task's client takes: 1 to 63 lowercase letters, digits, `-`
+/// and `.`, not starting or ending with `.`. Tierstore takes more names than that; one of them
+/// would make every task refuse the store, so the frontend refuses it at start.
+///
+/// # Errors
+/// What is wrong with it.
+pub fn check_store_bucket(bucket: &str) -> Result<(), &'static str> {
+    let chars = bucket
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() | b.is_ascii_digit() | matches!(b, b'-' | b'.'));
+    let ends = bucket.starts_with('.') | bucket.ends_with('.');
+    if (1..=63).contains(&bucket.len()) & chars & !ends {
+        return Ok(());
+    }
+    Err("must be 1 to 63 of a-z, 0-9, - and ., not starting or ending with a dot")
 }
 
 /// What `GET /locate` signs store grants with, and where it says the store is.

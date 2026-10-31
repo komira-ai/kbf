@@ -13,7 +13,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::Full;
 use kbf_front::job_read::{
-    AccessKey, GRANT_LIFETIME, KEYS_PER_GRANT, Reply, StoreGrants, check_store_url,
+    AccessKey, GRANT_LIFETIME, KEYS_PER_GRANT, Reply, StoreGrants, check_store_bucket,
+    check_store_url,
 };
 use kbf_types::Digest;
 use serde_json::{Value, json};
@@ -608,15 +609,79 @@ fn a_store_url_is_a_scheme_and_a_host_and_nothing_else() {
         ("ftp://store:9000", "http"),
         ("store:9000", "http"),
         ("", "http"),
-        ("http://store:9000?x=1", "query"),
-        ("http://store:9000#top", "fragment"),
-        ("http://sto re:9000", "space"),
-        ("http://sto\u{7}re:9000", "control"),
+        ("http://store:9000?x=1", "character"),
+        ("http://store:9000#top", "character"),
+        ("http://sto re:9000", "character"),
+        ("http://sto\u{7}re:9000", "character"),
+        ("http://user@store:9000", "character"),
+        ("http://store\\9000", "character"),
+        ("http://st\u{f6}re:9000", "character"),
         ("https://", "host"),
         ("http://store:9000/tiers", "path"),
     ] {
         let found = check_store_url(bad).expect_err(bad);
         assert!(found.contains(why), "{bad}: {found}");
+    }
+}
+
+/// Catches: a bucket name tierstore takes and kbf-task's client refuses (so every task would
+/// turn the store down) accepted at start, and one the client takes refused.
+#[test]
+fn a_bucket_is_what_the_task_client_takes() {
+    let long = "a".repeat(63);
+    for good in ["tiers", "tier-s.2", "a", long.as_str()] {
+        assert_eq!(check_store_bucket(good), Ok(()), "{good}");
+    }
+    let too_long = "a".repeat(64);
+    for bad in [
+        "",
+        "Tiers",
+        "a_b",
+        "a b",
+        ".a",
+        "a.",
+        "..",
+        "t\u{e9}",
+        too_long.as_str(),
+    ] {
+        assert!(check_store_bucket(bad).is_err(), "{bad:?}");
+    }
+}
+
+/// Catches: the answer drifting from the shape kbf-task parses: the real answer for a fixed
+/// scope, source, key and clock is compared line by line (as JSON, so key order is free) with
+/// `tests/golden/locate_with_grants.ndjson`, which kbf-task's own tests parse with its
+/// `Table::parse` (`locate_tests.rs`, `a_real_answer_of_the_listener_is_a_table`). kbf-front
+/// cannot depend on kbf-task, so the two sides share the file.
+///
+/// The grant is a real token: tierstore's own server accepts it for exactly its two keys.
+#[tokio::test]
+async fn the_answer_is_the_golden_file_kbf_task_parses() {
+    let source = Source::default();
+    let contents = [b"alpha".to_vec(), vec![7; 2000], b"delta".to_vec()];
+    let a = build(&source, "a", &contents);
+    pack(&source, &a.files[0], span("cas/f/w/1", 0, 5));
+    source.large.lock().unwrap().insert(a.files[1], 2000);
+    let rig = rig_granting(source, small(), Some(grants()));
+    let reply = rig.locate(&rig.token(a.action)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let text = std::str::from_utf8(&reply.body).expect("utf-8");
+    let golden = include_str!("golden/locate_with_grants.ndjson");
+    let lines = |t: &str| -> Vec<Value> {
+        t.lines()
+            .map(|l| serde_json::from_str(l).expect("JSON"))
+            .collect()
+    };
+    assert_eq!(lines(text), lines(golden));
+
+    let answer = Answer::of(&reply);
+    let store = store(BUCKET, &answer.all_keys()).await;
+    for key in answer.all_keys() {
+        assert_eq!(
+            store.get(&key, &answer.tokens()[0]).await,
+            StatusCode::OK,
+            "{key}"
+        );
     }
 }
 

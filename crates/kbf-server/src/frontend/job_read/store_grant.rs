@@ -11,7 +11,9 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Arg, ArgMatches};
-use kbf_front::job_read::{AccessKey, StoreGrantError, StoreGrants, check_store_url};
+use kbf_front::job_read::{
+    AccessKey, StoreGrantError, StoreGrants, check_store_bucket, check_store_url,
+};
 use zeroize::Zeroizing;
 
 use super::{JobReadError, StoreGrantFlags};
@@ -93,6 +95,9 @@ pub(super) fn from_matches(m: &ArgMatches) -> Option<StoreGrantFlags> {
 /// or the bucket.
 pub(super) fn grants(flags: &StoreGrantFlags) -> Result<StoreGrants, JobReadError> {
     let key = read_key(&flags.key_file)?;
+    check_store_bucket(&flags.bucket).map_err(|why| JobReadError::StoreBucket {
+        reason: why.to_owned(),
+    })?;
     check_store_url(&flags.url).map_err(|why| JobReadError::StoreUrl {
         why: why.to_owned(),
     })?;

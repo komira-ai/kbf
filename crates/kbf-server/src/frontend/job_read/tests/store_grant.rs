@@ -154,6 +154,12 @@ async fn the_start_reads_the_grant_key_as_the_other_secret_files_are_read() {
         ))
     };
     assert!(bucket.contains("--job-store-bucket"), "{bucket}");
+    // A name tierstore takes and the task's client refuses.
+    for name in ["Tiers", "a_b", ".a", &"a".repeat(64)] {
+        let key = key_file(dir.path(), json_key(), 0o600);
+        let why = refusal(&with_store(flags(&files, "127.0.0.1:0"), &key, URL, name));
+        assert!(why.contains("--job-store-bucket"), "{name}: {why}");
+    }
 
     for text in [
         json_key(),
@@ -182,6 +188,9 @@ async fn the_start_refuses_a_store_url_a_task_cannot_use() {
         "http://store:9000?x=1",
         "http://store:9000#top",
         "http://sto re:9000",
+        "http://user@store:9000",
+        "http://store\\9000",
+        "http://st\u{f6}re:9000",
         "http://sto\u{7}re:9000",
         "",
     ] {
