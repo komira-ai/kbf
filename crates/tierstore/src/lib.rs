@@ -88,6 +88,8 @@ mod lease;
 mod lease_tests;
 mod memory;
 mod metrics;
+#[cfg(test)]
+mod metrics_names_tests;
 mod reconciler;
 #[cfg(feature = "s3")]
 pub mod s3;
