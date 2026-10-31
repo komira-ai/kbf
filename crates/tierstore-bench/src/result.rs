@@ -536,7 +536,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
         assert!(v["provenance"].get("rate_caps").is_none());
         let caps = RateCaps {
-            cold_rps: RateCap::per_sec(100).unwrap(),
+            cold_rps: std::num::NonZeroU32::new(100).unwrap(),
             hot_rps: RateCap::Unlimited,
             list_poll_rps: 2,
         };

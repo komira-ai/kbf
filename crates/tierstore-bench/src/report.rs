@@ -693,7 +693,7 @@ mod tests {
         let none = format_report(&[a.clone()], &Rows::new());
         assert!(none.contains(", request caps `not recorded`\n"), "{none}");
         a.provenance.rate_caps = Some(RateCaps {
-            cold_rps: RateCap::per_sec(100).unwrap(),
+            cold_rps: std::num::NonZeroU32::new(100).unwrap(),
             hot_rps: RateCap::Unlimited,
             list_poll_rps: 2,
         });

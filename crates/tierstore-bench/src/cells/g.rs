@@ -718,7 +718,7 @@ mod tests {
         let dir = temp("tb-g-caps");
         let mut ctx = testkit::ctx(dir.path(), &[], Window::Quiet);
         let rates = RateCaps {
-            cold_rps: RateCap::per_sec(7).unwrap(),
+            cold_rps: std::num::NonZeroU32::new(7).unwrap(),
             hot_rps: RateCap::Unlimited,
             list_poll_rps: 2,
         };

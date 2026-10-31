@@ -399,7 +399,7 @@ impl Env {
             load,
             cold_state: ctx.cold_state.clone(),
             guard: Mutex::new(ColdGuard::new(ctx.config.cold_guard)),
-            cold_cap: Arc::new(Throttle::capped(ctx.config.rates.cold_rps)),
+            cold_cap: Arc::new(Throttle::new(ctx.config.rates.cold_rps.get())),
             hot_cap: Arc::new(Throttle::capped(ctx.config.rates.hot_rps)),
             recorder: Recorder::open(dir)?,
             ledger: Charger(Arc::new(Mutex::new(Ledger::open(
@@ -1456,7 +1456,7 @@ mod tests {
         let mut ctx = testkit::ctx(dir.path(), &[], Window::Busy);
         assert_eq!(ctx.provenance.rate_caps, None);
         ctx.config.rates = RateCaps {
-            cold_rps: RateCap::Unlimited,
+            cold_rps: std::num::NonZeroU32::new(1_000_000).unwrap(),
             hot_rps: RateCap::per_sec(1).unwrap(),
             list_poll_rps: 5,
         };

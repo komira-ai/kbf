@@ -181,7 +181,7 @@ pub fn ctx_with_log(
         cold_guard: crate::cells::coldguard::ColdGuardLimits::default(),
         cold_state_timeout: std::time::Duration::from_secs(30),
         rates: RateCaps {
-            cold_rps: RateCap::per_sec(100_000).unwrap(),
+            cold_rps: std::num::NonZeroU32::new(100_000).unwrap(),
             hot_rps: RateCap::per_sec(100_000).unwrap(),
             list_poll_rps: 100_000,
         },

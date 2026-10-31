@@ -299,7 +299,7 @@ mod tests {
         ];
         let mut ctx = testkit::ctx(dir.path(), &stores, Window::Busy);
         let rates = RateCaps {
-            cold_rps: RateCap::Unlimited,
+            cold_rps: std::num::NonZeroU32::new(1_000_000).unwrap(),
             hot_rps: RateCap::per_sec(50_000).unwrap(),
             list_poll_rps: 2,
         };

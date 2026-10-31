@@ -176,16 +176,18 @@ the default caps where the same run with the arms does not. The other cells have
 and ignore the flag. The setting is recorded as `open_loop` in the provenance of every result (a
 result that predates the field was run with the arms on) and the report names it in its header.
 
-Request caps. `--cold-rps` (default 100) and `--hot-rps` (default 2000, held on the hot store and
-the instance) are a number of requests a second or `unlimited`; zero is refused. One cap is shared
-by every request of its role in the run, so a cell whose figure is a rate (`g`'s files a second,
-the knee between 16 and 64 in flight, a burst of `c`) measures the cap when the cap is below that
-figure. Run those cells with the cap above the figure or `unlimited`, and read the figure next to
-the caps: they are recorded as `rate_caps` in the provenance of every result (stamped where the
-throttles are made, so they are the caps that were held; a result that predates the field has
-none and the report says `not recorded`) and the report names them in its header. `unlimited` on
-the cold store lifts the one harness cap there; the cold store guard and the byte ledger still stop
-the run.
+Request caps. `--cold-rps` (default 100) is a positive number of requests a second and is never
+`unlimited`: the cold store is a shared disk store the farm depends on, so a run that asks for
+`unlimited` there is a usage error. `--hot-rps` (default 2000, held on the hot store and the
+instance) is a number or `unlimited`. Zero is refused on both. One cap is shared by every request
+of its role in the run, so a cell whose figure is a rate (`g`'s files a second, the knee between 16
+and 64 in flight, a burst of `c`) measures the cap when the cap is below that figure. Run those
+cells with the hot cap above the figure or `unlimited`, and read the figure next to the caps: they
+are recorded as `rate_caps` in the provenance of every result (stamped where the throttles are
+made, so they are the caps that were held; a result that predates the field has none and the
+report says `not recorded`) and the report names them in its header. The cold cap, the cold store
+guard and the byte ledger are three separate lines of defence for the cold store; none of them
+stands in for another.
 
 Tierstore at v0.0.37 has no cold-only mode (`--hot` is a required flag). So the cold cells label
 their paths in the arm names and the result notes say which they are:
