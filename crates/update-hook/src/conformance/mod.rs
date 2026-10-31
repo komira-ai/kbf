@@ -201,6 +201,8 @@ pub enum Violation {
     },
     #[error("the update was deferred but the world is not as it was: {changes:?}")]
     DeferredLeftState { changes: Vec<String> },
+    #[error("{step} ended {outcome:?} when the params held an updater.* key it does not know")]
+    RefusedUpdaterKey { step: Step, outcome: Outcome },
     #[error("{step} ran while another held the record lock: {outcome:?}, {changes:?}")]
     RanWhileLocked {
         step: Step,
@@ -271,6 +273,7 @@ impl<'a> Conformance<'a> {
         self.idempotence()?;
         let kill_points = self.crash_resume()?;
         let (scenarios, skipped) = self.scenarios()?;
+        self.tolerates_unknown_updater_keys()?;
         self.exclusive_record()?;
         Ok(Summary {
             kill_points,
@@ -577,6 +580,12 @@ impl<'a> Conformance<'a> {
                 return Err(Violation::DeferredLeftState { changes: moved });
             }
         }
+        Ok(())
+    }
+
+    /// A params file with one more `updater.*` key than the hook knows is no reason to refuse:
+    /// the updater may add reserved keys without breaking an older hook.
+    pub fn tolerates_unknown_updater_keys(&mut self) -> Result<(), Violation> {
         Ok(())
     }
 

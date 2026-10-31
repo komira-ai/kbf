@@ -534,6 +534,27 @@ fn a_refusal_that_changes_the_world_and_a_cleanup_that_leaves_residue_are_refuse
     }
 }
 
+/// Catches a hook that refuses a params file because it holds an `updater.*` key the hook does
+/// not know: the updater adds reserved keys over time, and an older hook must ignore them.
+#[test]
+fn a_hook_that_refuses_an_unknown_updater_key_is_refused() {
+    let scratch = Scratch::new("bad-unknown-key");
+    let hook = example_with("refuses-unknown-updater-key");
+    let mut fake = ExampleFake::default();
+    assert!(matches!(
+        Conformance::new(&hook, &mut fake, scratch.path()).tolerates_unknown_updater_keys(),
+        Err(Violation::RefusedUpdaterKey {
+            step: Step::Prepare,
+            outcome: Outcome::Failure
+        })
+    ));
+    let good = Scratch::new("good-unknown-key");
+    let mut fake = ExampleFake::default();
+    Conformance::new(&example(CONVENTION), &mut fake, good.path())
+        .tolerates_unknown_updater_keys()
+        .unwrap();
+}
+
 /// Catches a fake whose injected fault the hook does not honour, and a deferral that leaves the
 /// world changed.
 #[test]

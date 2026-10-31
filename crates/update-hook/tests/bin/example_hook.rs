@@ -156,6 +156,12 @@ impl Hook {
             report.detail = Some("the params lack the staged release or the target".to_owned());
             return Ok((Outcome::Failure, report));
         }
+        if self.defect("refuses-unknown-updater-key")
+            && params.get("updater.conformance_probe").is_some()
+        {
+            report.detail = Some("unknown updater.* key".to_owned());
+            return Ok((Outcome::Failure, report));
+        }
         if step == Step::Prepare && inv.artifact != params.staged_release() {
             report.detail =
                 Some("the artifact is not the staged release, byte for byte".to_owned());
