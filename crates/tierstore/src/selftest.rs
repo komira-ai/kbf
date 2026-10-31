@@ -24,8 +24,9 @@
 //! noted). Keys under the prefix that are older than an hour, left by a start that was killed,
 //! are deleted by [`sweep_probes`], which is not part of [`self_test`] so that a caller can run it
 //! when the start no longer waits for it. At most the first thousand keys are looked at, and a
-//! sweep is bounded by a [`SweepBudget`] (by default 100 deletes and 10 seconds on the clock it is
-//! given); what it leaves waits for the next start, and its note says so. Only keys that
+//! sweep is bounded by a [`SweepBudget`] (by default 100 deletes, and no new delete starts after
+//! 10 seconds on the clock it is given; a request already sent runs to the end of its own
+//! timeout); what it leaves waits for the next start, and its note says so. Only keys that
 //! start with the probe prefix and are not this run's are deleted, whatever a listing returns, and
 //! the age is judged by the clock of the store (the `Last-Modified` of a key the sweep writes for
 //! the purpose and deletes), not by the clock of the machine, which may be minutes from that of

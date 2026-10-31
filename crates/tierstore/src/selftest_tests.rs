@@ -729,6 +729,34 @@ async fn a_sweep_stops_at_the_time_budget_on_the_clock_it_is_given() {
     );
 }
 
+/// Asserts that a delete that fails uses up the count budget as one that works does: with a store
+/// that refuses every delete, ten stale keys and a budget of three, three deletes are sent for
+/// the keys (one more for the store-time key), the sweep says it sent three and that more are
+/// left. A count of the deletes that worked would send all ten.
+#[tokio::test]
+async fn a_failed_delete_counts_against_the_count_budget() {
+    let (_, memory) = two_hours_on(10).await;
+    let faulty = crate::FaultyBackend::new(std::sync::Arc::new(memory));
+    faulty.fail_next(crate::Op::Delete, 100);
+    let budget = SweepBudget {
+        keys: 3,
+        time: Duration::from_secs(10),
+    };
+    let (swept, notes) = sweeping(&faulty, budget, &TestClock::new()).await;
+    assert_eq!(
+        swept,
+        Swept {
+            deleted: 3,
+            more_left: true
+        }
+    );
+    assert_eq!(faulty.calls(crate::Op::Delete), 1 + 3);
+    let denied = notes
+        .iter()
+        .filter(|note| note.contains("could not delete"));
+    assert_eq!(denied.count(), 1 + 3, "{notes:?}");
+}
+
 /// Asserts that a key that is younger than an hour by the clock of the store and a key under the
 /// run's own id are never deleted, and that they do not use up the count budget: they sort before
 /// the stale keys here, and a budget of one still deletes one stale key and leaves the other.

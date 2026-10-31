@@ -19,8 +19,8 @@
 //! them wrongly, a key that may not write included, is exit status 3; one that does not answer is
 //! exit status 1, after the one try that the check of the start gives it. The probe keys that
 //! earlier starts left are deleted after the start has reported itself ready, beside the server,
-//! at most a hundred of them and for at most ten seconds (see [`sweep_probes`]); the rest waits
-//! for the next start.
+//! at most a hundred of them, and no new delete starts after ten seconds (see [`sweep_probes`]);
+//! the rest waits for the next start.
 //!
 //! With an `[oci]` table the registry front runs beside the S3 one, over the same cache: a blob
 //! or a manifest it reads is a hit on the disk or a fill from the upstream, as an S3 GET is. Its
@@ -40,8 +40,8 @@ use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
 
 use crate::{
-    Backend, Clock, Error as BackendError, SelfTestOptions, SweepBudget, SystemClock, self_test,
-    sweep_probes,
+    Backend, Clock, Error as BackendError, MonotonicClock, SelfTestOptions, SweepBudget,
+    SystemClock, self_test, sweep_probes,
 };
 
 use super::cli::{
@@ -92,12 +92,7 @@ async fn test_upstream(upstream: &dyn Backend, run: &str, spec: &str) -> Result<
 /// Deletes the probe keys that earlier starts left in the upstream, within the default budget (see
 /// [`sweep_probes`]). It runs beside the server, after the start has reported itself ready: the
 /// keys are in a prefix nothing reads, so a node need not wait for the deletes of a slow store.
-async fn sweep_upstream(
-    upstream: Arc<dyn Backend>,
-    run: String,
-    spec: String,
-    clock: Arc<dyn Clock>,
-) {
+async fn sweep_upstream(upstream: Arc<dyn Backend>, run: String, spec: String) {
     let name = format!("cold tier {spec}");
     let options = SelfTestOptions {
         name: &name,
@@ -110,7 +105,9 @@ async fn sweep_upstream(
     };
     let note = |line: String| eprintln!("tierstore: {line}");
     let budget = SweepBudget::default();
-    sweep_probes(&*upstream, &options, budget, &*clock, &note).await;
+    // The budget is a span of time, so it runs on a clock that the machine's clock being set
+    // cannot move. The age of a key is judged on the store's clock, inside the sweep.
+    sweep_probes(&*upstream, &options, budget, &MonotonicClock::new(), &note).await;
 }
 
 /// The size of the file system under `path` in bytes, or why it is not known: the system did not
@@ -223,7 +220,7 @@ pub(super) async fn serve_cache(
     // After the ready: the sweep is the one thing of the self-test that is not a gate.
     let sweeping = settings.cache.write_through.then(|| {
         let spec = settings.upstream.spec.clone();
-        tokio::spawn(sweep_upstream(Arc::clone(&upstream), run, spec, clock))
+        tokio::spawn(sweep_upstream(Arc::clone(&upstream), run, spec))
     });
     let stopping = Arc::clone(&server);
     let (oci_stop, oci_stopped) = watch::channel(false);
