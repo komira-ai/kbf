@@ -160,27 +160,33 @@ private port (exists), version from a new `tierstore_build_info` gauge (today on
 `--version` carry it, and that is the crate version, not a commit).
 
 What v-next offers, and what is new in tierstore:
-- **Read-only start** (`--read-only-cache`, new). It serves hits from the cache and sends misses and writes to the
-  upstream. It must not clear `.stage/`, delete sidecars, chmod, drop entries on a read error, or stamp file times;
-  each of those happens on today's start or read path.
-- **The cache lock** (new): `<cache>/.lock`, flock, exclusive, non-blocking, held by the read-write instance.
-  The kernel frees it when the process dies.
-- **`promote`** (new): SIGUSR1, not an HTTP route. Once the rule points at an instance, every route on its port is
-  reachable by any client. Promote takes the lock, cleans `.stage/`, rescans the index, and enables fills and
-  eviction. On a storage node it also starts the reconciler. The ack is a cache-mode gauge.
+- **Listeners** (new). The redirect rewrites a remote packet to the incoming interface's address, so the private
+  ports listen on the wildcard of both families, not on loopback; the guard keeps direct connections out. Today
+  `--listen` is one `SocketAddr` (`server/cli.rs`), so a repeatable `--listen` with an explicit `IPV6_V6ONLY` is new.
+- **The cache lock decides the mode** (new): `<cache>/.lock`, flock, exclusive, non-blocking. An instance that finds
+  it held serves read-only and retries on an interval, without blocking a thread. It must not clear `.stage/`, delete
+  sidecars, chmod, drop entries on a read error, or stamp file times. The kernel frees the lock when the holder dies,
+  so a hung v-current killed at the unit's stop timeout, a crashed one, and a reboot all resolve; a lone instance is
+  read-write at once. On the lock it cleans `.stage/`, rescans, enables fills and eviction (a storage node: the
+  reconciler, under a `--lock-file`).
+- **No promote verb.** v-next takes over by itself, so the updater observes it: `/readyz` still answers 200 and its
+  body and a gauge say `read-only` or `read-write`. A lock never protects against a v-current that predates it, so the
+  first release with the lock goes in by a plain restart (plan checks v-current reports a mode).
 - **The drain** (changed): `Connection: close` on every answer from drain start. v-current keeps accepting through
-  the settle wait (`--drain-lb-wait`, never 0 here). At the end of the settle, idle connections close, and a request
-  already on the wire is served, not answered 503. Today's drain answers 503 on kept connections.
+  the settle wait (`--drain-lb-wait`, never 0 here). At its end an idle connection gets a lingering close
+  (`shutdown(SHUT_WR)`, read to end of stream, then close), and a request on the wire is served, not answered 503.
+  The race that remains is a request within one round trip of the FIN, counted in a metric.
 
-Storage node: each slot has its own proxy id (`tierstore-a` and `tierstore-b`), so two processes never write one
-journal. v-next does not run the reconciler until it is promoted; v-current releases the lease on exit. A `dir:`
-hot tier cannot have two lease holders, so it keeps the plain restart. A restarted holder can reproduce an older
-lease body and tag (kbf#2108); a per-process nonce fixes that before the hand-over relies on the lease.
+**Commit point and client policy.** The commit is the SIGTERM to v-current: it cannot be rescinded. Before it, abort
+is swap back, then stop v-next. After it there is no swap back; the coordinator's rollback is a new hand-over. Clients
+do not retry: a retried create-only put is ambiguous (412), so the hand-over test allows no retry.
 
-Metrics: the directory gauges (`cache_bytes`, `cache_objects`, `cache_fs_free_bytes`) double-count while both
-instances run, and the fill and evict families stay 0 on v-next. No family names a slot or mode today; the build
-and mode gauges are new. Needed from the mechanics below: established flows stay on v-current, and the private
-ports are loopback-only (the guard closes the `route_localnet` trap).
+Storage node: each slot has its own proxy id (`tierstore-a`, `tierstore-b`), so two processes never write one
+journal; a `dir:` hot tier cannot have two lease holders and keeps the plain restart; a restarted holder can reproduce
+an older lease body and tag (kbf#2108), so a per-process nonce is needed.
+Metrics: the directory gauges (`cache_bytes`, `cache_objects`, `cache_fs_free_bytes`) double-count while both run, and
+the fill and evict families stay 0 on v-next; the build and mode gauges are new. Needed from the mechanics below:
+established flows stay on v-current.
 
 **Shape [D].** Clients always call the public port, here 9300. No process listens on it. Each tierstore instance listens on its own private port, 9301 or 9302, alternating. One nftables redirect per family sends public-port connections to the current instance. An update starts v-next on the idle private port, waits for its `/readyz`, swaps the rule in one transaction, lets v-current drain on the flows conntrack still maps to it, and then asks v-next to take over the cache (the **promote** verb described in the tierstore owner's section). Rollback before the commit point is swapping the rule back.
 
