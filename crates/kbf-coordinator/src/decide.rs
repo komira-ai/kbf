@@ -76,6 +76,63 @@ pub fn decide_in(
     }
 }
 
+/// Which rule held an order back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hold {
+    /// The service has no definition.
+    NoDefinition,
+    /// The service has no desired state.
+    NoDesired,
+    /// The host is unknown to the service, or its role is not one the service runs on.
+    NotAMember,
+    /// The coordinator started too recently.
+    Quiet,
+    /// The host is updating.
+    Updating,
+    /// The host has an order outstanding or is updating another service.
+    BusyElsewhere,
+    /// The host already runs the desired version.
+    UpToDate,
+    /// The host failed an update to the desired version.
+    FailedHere,
+    /// The role has no free slot.
+    NoSlot,
+    /// A role this one waits for is not done.
+    WaitingForRole,
+    /// A service this one waits for is not done.
+    WaitingForService,
+    /// Too few other hosts of the role would be up.
+    MinUp,
+}
+
+/// What `decide_why` found for one host and service.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// Update to `version`.
+    Update {
+        /// The desired version.
+        version: kbf_updater::version::Version,
+    },
+    /// Nothing, because of this rule.
+    Hold(Hold),
+}
+
+/// Like [`decide_in`], saying which rule held when the reply is nothing.
+#[must_use]
+pub fn decide_why(
+    services: &Services,
+    desired: &BTreeMap<String, Desired>,
+    service: &str,
+    fleet: &Fleet,
+    id: &NodeId,
+    now: Duration,
+) -> Decision {
+    match decide_in(services, desired, service, fleet, id, now) {
+        Reply::Update { version } => Decision::Update { version },
+        Reply::Nothing => Decision::Hold(Hold::NoDefinition),
+    }
+}
+
 fn order(
     def: &ServiceDef,
     desired: &Desired,

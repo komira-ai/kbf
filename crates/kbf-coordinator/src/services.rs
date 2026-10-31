@@ -90,6 +90,8 @@ pub struct ServiceDef {
     /// The `min_up` keys a desired state of the service must name (`kbf`: storage and
     /// frontend); a body without one is refused. Any other service may omit `min_up`.
     pub require_min_up: Vec<String>,
+    /// Which service a host is offered first when two are behind: higher first.
+    pub priority: i32,
 }
 
 impl ServiceDef {
@@ -104,6 +106,7 @@ impl ServiceDef {
                 .collect(),
             after: Vec::new(),
             require_min_up: Vec::new(),
+            priority: 0,
         }
     }
 
@@ -145,6 +148,7 @@ impl ServiceDef {
             roles,
             after: Vec::new(),
             require_min_up: KBF_MIN_UP.map(str::to_owned).into(),
+            priority: 0,
         }
     }
 }
@@ -273,6 +277,7 @@ fn service_def(
         roles,
         after,
         require_min_up: Vec::new(),
+        priority: 0,
     })
 }
 
