@@ -435,4 +435,38 @@ mod tests {
             "cold state: a file cannot be read: NotFound"
         );
     }
+
+    /// Catches `--cold-state-max-age-secs` not reaching the source: a status file 20 s old is
+    /// unreadable under a limit of 10 s and read under a limit of 60 s, through `cold_source`.
+    #[test]
+    fn the_cold_state_max_age_reaches_the_source() {
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "tb-cli-cold-age");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let file = dir.path().join("heal.json");
+        let stamp = crate::s3::unix_ms().saturating_sub(20_000);
+        std::fs::write(
+            &file,
+            format!(r#"{{"read_unix_ms": {stamp}, "healing": false, "drives": []}}"#),
+        )
+        .unwrap();
+        let ops: OpsFile = serde_json::from_value(serde_json::json!({
+            "tierstore": {"binary": "/x/t", "sha256": "00", "version": "0.0.37", "plan_flags": []},
+            "live": {"unit": "l.service", "binary": "/x/l", "port": 9300, "dirs": ["/x/live"]},
+            "test_instance": {"unit": "t.service", "port": 9411, "dirs": ["/x/state"]},
+            "cold_heal_status_file": file,
+            "mc": "/x/absent-mc"
+        }))
+        .unwrap();
+        let mut cold = testkit::ctx(
+            dir.path(),
+            &[(Role::Cold, "http://127.0.0.1:9")],
+            Window::Busy,
+        )
+        .config;
+        cold.cold_state_max_age = Duration::from_secs(10);
+        let err = cold_source(&cold, &ops).read().unwrap_err().to_string();
+        assert!(err.contains("over the limit of 10 s"), "{err}");
+        cold.cold_state_max_age = Duration::from_secs(60);
+        assert!(cold_source(&cold, &ops).read().unwrap().is_some());
+    }
 }

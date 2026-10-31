@@ -30,6 +30,7 @@ pub mod live;
 pub mod mc;
 pub mod ops;
 pub mod paper;
+pub mod trusted;
 
 use std::collections::BTreeMap;
 use std::fs;

@@ -43,6 +43,8 @@ sha2.workspace = true
 objstore-s3 = { workspace = true, features = ["testkit"] }
 # Scratch directories of the tests.
 kbf-testkit.workspace = true
+# A FIFO for the status-file tests (`tests/ops_cold_state_trust.rs`).
+rustix = { workspace = true, features = ["fs"] }
 # Raw sockets for the proxy tests and the loopback S3 stub of the operations tests
 # (`tests/ops_support`): requests as text, upstreams that answer by hand. A paused clock for the
 # throttle and the open-loop pacing tests.

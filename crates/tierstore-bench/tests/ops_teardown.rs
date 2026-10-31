@@ -190,7 +190,11 @@ struct After {
 }
 
 async fn after(name: &str, world: World) -> After {
-    let stub = Stub::start(store(world)).await;
+    after_on(name, Stub::start(store(world)).await).await
+}
+
+/// [`after`] on a store that is already running.
+async fn after_on(name: &str, stub: Stub) -> After {
     let (dir, host, _c, ops) = base(name);
     let before = prepare(&host, dir.path());
     let config = run_config(dir.path(), &stub.endpoint, Some(&stub.endpoint));
@@ -846,4 +850,91 @@ async fn run_reads_the_ops_file_and_the_snapshot_it_is_given() {
     fs::write(dir.path().join("ops.json"), ops_json().to_string()).unwrap();
     let err = run(&config, &before).await.unwrap_err();
     assert!(err.to_string().contains("before.json"), "{err}");
+}
+
+/// Catches a bucket proved removed by a list that contradicts the bucket itself: the account
+/// listing does not name the bucket, and the bucket answers with objects. One of the two is
+/// wrong, and the check must not pass on the one that says "removed". With no objects (or
+/// none read) the plain rule stands.
+#[tokio::test]
+async fn a_bucket_that_is_not_listed_but_holds_objects_is_a_contradiction() {
+    let name = "test-bucket-removed:cold";
+    let a = after(
+        "tb-down-contradiction",
+        World {
+            bucket: Bucket::Present {
+                objects: 2,
+                uploads: 0,
+            },
+            ..CLEAN
+        },
+    )
+    .await;
+    let checks = a.checks().await;
+    let check = find(&checks, name);
+    assert!(!check.passed, "{check:?}");
+    assert_eq!(
+        check.detail,
+        "the bucket is not listed but answers with objects: 2 objects"
+    );
+
+    let a = after(
+        "tb-down-no-contradiction",
+        World {
+            bucket: Bucket::Present {
+                objects: 0,
+                uploads: 0,
+            },
+            ..CLEAN
+        },
+    )
+    .await;
+    let checks = a.checks().await;
+    assert!(find(&checks, name).passed, "{checks:?}");
+}
+
+/// Catches the live-bucket guard reading a second list: the list that did not name the test
+/// bucket is the one that must name the live bucket. A store that answers every other list
+/// filtered (no live bucket) and the rest full fails the role that got a filtered one, and the
+/// verifier asks for the list once per role (two in all).
+#[tokio::test]
+async fn the_list_that_decided_not_named_is_the_list_that_must_show_the_live_bucket() {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let inner = store(CLEAN);
+    let stub = Stub::start(move |seen| {
+        if seen.path == "/" && seen.key_id() == "READER-KEYID-MARK" {
+            if calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .is_multiple_of(2)
+            {
+                named(&[])
+            } else {
+                bucket_list(false)
+            }
+        } else {
+            inner(seen)
+        }
+    })
+    .await;
+    let a = after_on("tb-down-one-list", stub).await;
+    let checks = a.checks().await;
+    let failed: Vec<&Check> = checks
+        .iter()
+        .filter(|c| c.name.starts_with("test-bucket-removed:") && !c.passed)
+        .collect();
+    assert_eq!(failed.len(), 1, "{checks:?}");
+    assert!(
+        failed[0]
+            .detail
+            .starts_with("the verifier's bucket list does not show the live bucket live-"),
+        "{:?}",
+        failed[0]
+    );
+    let lists = a
+        .stub()
+        .requests()
+        .iter()
+        .filter(|r| r.path == "/" && r.key_id() == "READER-KEYID-MARK")
+        .count();
+    assert_eq!(lists, 2, "one list per role");
 }
