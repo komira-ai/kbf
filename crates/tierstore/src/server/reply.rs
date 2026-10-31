@@ -1,21 +1,155 @@
 //! The answers: the plain ones, and S3's error answers with their status codes and codes.
 
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::StreamExt as _;
 use http_body_util::Full;
+use hyper::body::{Body, Frame, SizeHint};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Response, StatusCode};
 
-use crate::Error;
+use crate::{Error, ReadBody};
 
+use super::linger::{Wire, WireHold};
 use super::xml::error_body;
 
 /// The header that has the hash of the body that the signature covers.
 pub(crate) const PAYLOAD_HEADER: &str = "x-amz-content-sha256";
 
 /// What the server sends back.
-pub(crate) type Answer = Response<Full<Bytes>>;
+pub(crate) type Answer = Response<AnswerBody>;
+
+/// The body of an answer: held whole, or the chunks of a read that is given as it goes (the GET
+/// of an object a backend reads as a stream), so that the server holds one chunk of it at a time.
+pub struct AnswerBody {
+    kind: Kind,
+}
+
+enum Kind {
+    Whole(Full<Bytes>),
+    Streamed(Counted),
+}
+
+/// A streamed body that is complete only if it gives as many bytes as the answer says it has:
+/// fewer, more, or an error of the stream is an error of the body, which ends the connection
+/// without a clean end.
+///
+/// The length is in the answer's headers already, and a connection that has written that many
+/// bytes completes the answer without asking the body again, so an error that comes after the
+/// last byte would not be heard. The last chunk is therefore held until the stream has ended
+/// without an error: a chunk is given only when the stream has given the next one (or its end).
+/// The body holds one chunk of the stream's, as it holds none of its own.
+struct Counted {
+    chunks: ReadBody,
+    /// The bytes the stream has still to give.
+    owed: u64,
+    /// The chunk the stream gave last, not given on yet.
+    held: Option<Bytes>,
+    /// Whether the body has ended, with an error or without.
+    ended: bool,
+    /// The claim of this answer on the wire of its connection, held until the body is dropped.
+    wire: Option<WireHold>,
+}
+
+impl Counted {
+    fn poll_chunk(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, Error>>> {
+        loop {
+            if self.ended {
+                return Poll::Ready(None);
+            }
+            let chunk = match self.chunks.poll_next_unpin(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(chunk) => chunk,
+            };
+            let failure = match chunk {
+                Some(Ok(bytes)) if bytes.is_empty() => continue,
+                Some(Ok(bytes)) if bytes.len() as u64 <= self.owed => {
+                    self.owed -= bytes.len() as u64;
+                    match self.held.replace(bytes) {
+                        Some(before) => return Poll::Ready(Some(Ok(before))),
+                        None => continue,
+                    }
+                }
+                Some(Ok(_)) => Error::Other("the read gave more bytes than were asked".to_owned()),
+                Some(Err(error)) => error,
+                None if self.owed == 0 => {
+                    self.ended = true;
+                    return Poll::Ready(self.held.take().map(Ok));
+                }
+                None => Error::Other(format!("the read ended {} bytes short", self.owed)),
+            };
+            self.ended = true;
+            self.held = None;
+            return Poll::Ready(Some(Err(failure)));
+        }
+    }
+
+    /// The bytes of the body not given yet.
+    fn left(&self) -> u64 {
+        self.owed + self.held.as_ref().map_or(0, |held| held.len() as u64)
+    }
+}
+
+impl AnswerBody {
+    /// Makes a streamed body hold the wire of `wire` until it is dropped (it ends, fails, or the
+    /// connection goes). A body held whole is off the wire when it is flushed, and holds nothing.
+    pub(super) fn hold_wire(&mut self, wire: &Arc<Wire>) {
+        if let Kind::Streamed(counted) = &mut self.kind {
+            counted.wire = Some(wire.hold());
+        }
+    }
+
+    /// A body of `len` bytes that `chunks` gives.
+    pub(crate) fn streamed(len: u64, chunks: ReadBody) -> Self {
+        let kind = Kind::Streamed(Counted {
+            chunks,
+            owed: len,
+            held: None,
+            ended: false,
+            wire: None,
+        });
+        Self { kind }
+    }
+}
+
+impl Body for AnswerBody {
+    type Data = Bytes;
+    type Error = Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+        match &mut self.kind {
+            Kind::Whole(whole) => Pin::new(whole)
+                .poll_frame(cx)
+                .map(|frame| frame.map(|frame| Ok(frame.unwrap_or_else(|never| match never {})))),
+            Kind::Streamed(counted) => counted
+                .poll_chunk(cx)
+                .map(|chunk| chunk.map(|chunk| chunk.map(Frame::data))),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match &self.kind {
+            Kind::Whole(whole) => whole.is_end_stream(),
+            // The end is the stream's own: a stream that fails after the last byte must still be
+            // heard.
+            Kind::Streamed(_) => false,
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match &self.kind {
+            Kind::Whole(whole) => whole.size_hint(),
+            Kind::Streamed(counted) => SizeHint::with_exact(counted.left()),
+        }
+    }
+}
 
 /// `text` with every character that is not printable ASCII replaced by `?`, which makes it
 /// a header value.
@@ -31,7 +165,10 @@ pub(crate) fn answer(
     headers: &[(&'static str, String)],
     body: Bytes,
 ) -> Answer {
-    let mut response = Response::new(Full::new(body));
+    let body = AnswerBody {
+        kind: Kind::Whole(Full::new(body)),
+    };
+    let mut response = Response::new(body);
     *response.status_mut() = status;
     for (name, value) in headers {
         let value = HeaderValue::from_str(&header_text(value)).expect("printable ASCII");
@@ -39,6 +176,18 @@ pub(crate) fn answer(
             .headers_mut()
             .insert(HeaderName::from_static(name), value);
     }
+    response
+}
+
+/// An answer with these headers whose body is the `len` bytes that `chunks` gives.
+pub(crate) fn streamed_answer(
+    status: StatusCode,
+    headers: &[(&'static str, String)],
+    len: u64,
+    chunks: ReadBody,
+) -> Answer {
+    let mut response = answer(status, headers, Bytes::new());
+    *response.body_mut() = AnswerBody::streamed(len, chunks);
     response
 }
 
@@ -81,13 +230,6 @@ impl S3Error {
     /// A request for something this server does not do.
     pub(crate) fn unsupported(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_IMPLEMENTED, "NotImplemented", message)
-    }
-
-    /// A request after the drain began: refused, and the connection is closed.
-    pub(crate) fn draining() -> Self {
-        let text = "The server is shutting down; send the request to another endpoint.";
-        Self::new(StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable", text)
-            .with("connection", "close")
     }
 
     /// A request whose body took no byte for the idle timeout: the connection is closed.

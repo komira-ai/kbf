@@ -73,6 +73,10 @@ What they do not count:
 | `fill_failures_total` | counter | `reason`: `hash_mismatch`, `upstream_error`, `short_body`, `local_io`, `changed`, `aborted` | a fill ended without leaving an object in the cache |
 | `evictions_total` | counter | `reason`: `budget`, `floor` | an object was evicted |
 | `pinned_skips_total` | counter | none | an eviction pass passed over an object because it has more than one hard link |
+| `scrubbed_objects_total` | counter | none | the scrub hashed an object again (not in a release yet) |
+| `scrubbed_bytes_total` | counter | none | the bytes the scrub read for those objects |
+| `scrub_mismatches_total` | counter | none | the scrub dropped an object whose bytes no longer matched its digest |
+| `scrub_errors_total` | counter | none | the scrub could not judge an object because a read failed, or its check panicked |
 | `discarded_at_start_total` | counter | none | a file was removed at start: a file the scan did not find whole, or what a fill left in the stage directory at the last stop |
 
 The reasons of a failed fill:
@@ -258,6 +262,21 @@ Everything below describes series that are being added and are not in a released
 names and labels are those of the changes under review and can still change; this page is
 updated when they land. Do not build alerts on them until they are in a release.
 
+### The drain
+
+On main, not in v0.0.41. One series of the server itself, with a `# TYPE` line, shown on every
+node whatever sources it has (it comes after the blocks of the proxy, the OCI front and the
+cache):
+
+| name | type | labels | increments when |
+|---|---|---|---|
+| `tierstore_drain_late_requests_total` | counter | none | in a drain, the server had shut its end of a connection for writing and its peer wrote after that: counted once for each such connection, not for each read |
+
+It is 0 until a drain. After a restart it is the number of connections whose client sent a
+request within one round trip of the end of the stream: the request was read, dropped and not
+answered (see "Drain and restart" in [operations](operations.md)). A request that was on the wire
+before the server shut its end is served and is not counted.
+
 ### v1: changes in the next release
 
 The series of "The build-node cache (v1)" above change as follows, and the cache gains the series
@@ -266,6 +285,16 @@ of the sections after this one. They all start with `tierstore_cache_`.
 - Each family gets one `# TYPE` line: a counter, or a gauge for `tierstore_cache_bytes`, `tierstore_cache_objects`, `tierstore_cache_fs_free_bytes` and `tierstore_cache_staging_files`. `tierstore_cache_discarded_at_start_total` is declared a counter that is set once, when the cache is opened.
 - A read of a kept key that the cache does not serve is one miss on every path, counted right after the lookup and before any call to the upstream: a ranged GET whose size HEAD to the upstream then fails, a ranged GET of an object over the whole-object limit, and a fill that then fails. So a ranged GET whose HEAD fails now counts a miss. A range past the end of a held object is still neither a hit nor a miss.
 - The bytes the cache fetched from the upstream are `tierstore_cache_upstream_bytes_read_total`, in the next section.
+
+### The cache mode
+
+On main, and not in a release yet. A build node's cache is read-write when its process holds the lock of the cache directory and read-only when another process does (see [operations](operations.md#the-cache-lock-and-read-only-mode)).
+
+| name | type | labels | value |
+|---|---|---|---|
+| `tierstore_cache_mode` | gauge | `mode`: `read_only`, `read_write` | one series for each mode: 1 for the mode the cache is in now, 0 for the other |
+
+In a read-only process the families of fills, evictions and pinned skips stay at 0, `tierstore_cache_staging_files` is 0, and `tierstore_cache_discarded_at_start_total` is 0 (a read-only start deletes nothing); it counts what the process deletes when it takes the lock. `tierstore_cache_bytes` and `tierstore_cache_objects` are the scan the process made until it takes the lock. Two processes over one directory count the same directory and the same file system twice in `tierstore_cache_bytes`, `tierstore_cache_objects` and `tierstore_cache_fs_free_bytes`: read the gauges of the directory from the process whose mode is `read_write`. The counters of hits, misses and bytes served are each process's own, and their sum is right.
 
 ### v1: the cache's calls to the upstream
 
@@ -297,7 +326,7 @@ Without it, the cache is read-only and they stay 0.
 | `tierstore_cache_writes_through_total` | counter | none | the upstream took a whole-body create-only put (not a completion) |
 | `tierstore_cache_write_exists_total` | counter | none | a put was answered "already exists" |
 | `tierstore_cache_keeps_expired_total` | counter | none | a put was answered before the copy kept on the node finished, because the copy took longer than the wait |
-| `tierstore_cache_write_keep_skipped_total` | counter | `reason`: `budget`, `io`, `busy`, `head`, `deleted`, `slow`, `deadline` | the upstream took a put and the node did not keep a copy |
+| `tierstore_cache_write_keep_skipped_total` | counter | `reason`: `budget`, `io`, `busy`, `head`, `deleted`, `slow`, `deadline`, `read_only` | the upstream took a put and the node did not keep a copy; `read_only` is a node whose cache does not hold the lock of its directory, or lost it while the copy was made (see [operations](operations.md#the-cache-lock-and-read-only-mode)) |
 
 The reasons of a failed put:
 

@@ -65,7 +65,7 @@ pub fn identity_of(der: &[u8]) -> Result<Identity, IdentityError> {
     }
     let host_roles = uri_values_of(der, HostRole::URI_PREFIX)?;
     let role = match host_roles.as_slice() {
-        [name] => name.parse().ok(),
+        [name] => HostRole::parse_named(name).ok(),
         _ => None,
     }
     .ok_or(IdentityError::HostRole(host_roles))?;

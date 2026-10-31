@@ -4,8 +4,8 @@
 use std::path::Path;
 
 use bytes::Bytes;
-use kbf_objstore::s3::S3Store;
-use kbf_objstore::{ByteRange, KeyPrefix, ObjectKey, ObjectStore, PageSize};
+use objstore_s3::s3::S3Store;
+use objstore_s3::{ByteRange, KeyPrefix, ObjectKey, ObjectStore, PageSize};
 use rustix::process::Signal;
 
 use crate::binary::{run, start};

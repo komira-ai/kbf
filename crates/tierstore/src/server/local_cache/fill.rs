@@ -2,21 +2,25 @@
 //! into `obj/`; and the single flight that lets the readers of one key share it.
 
 use std::collections::hash_map::Entry;
+use std::fs::File;
+use std::future::Future;
 use std::io;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::task::{Context, Poll};
 
 use futures::FutureExt as _;
 use futures::future::{BoxFuture, OptionFuture, Shared};
 use sha2::{Digest, Sha256};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt as _;
-use tokio::sync::{OwnedSemaphorePermit, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::{ByteRange, Error};
+use crate::{ByteRange, Error, Meta};
 
 use super::layout::{Name, Sidecar, data_path, make_dirs, meta_path, object_dir, stage_dir};
 use super::metrics::{FailedFill, bump};
@@ -29,10 +33,81 @@ pub(super) enum Filled {
     Kept,
     /// It is not: the readers are answered from the upstream.
     Skipped,
+    /// The object was written over while it was read (the tag changed between the two HEADs):
+    /// a reader that was given no byte is answered from the upstream, which has the new object;
+    /// one that was given bytes of the old one gets an error.
+    Changed,
 }
 
-/// A fill that is running, which every reader of the key waits on.
-pub(super) type Pending = Shared<BoxFuture<'static, Result<Filled, Error>>>;
+/// The error of a read whose object was written over while it was being read: bytes of two
+/// versions must never be given as one.
+pub(super) fn written_over() -> Error {
+    let text = "the object was written over while it was being read";
+    Error::Unavailable(text.to_owned())
+}
+
+/// Refuses an upstream that gives no content tag for `key`: the tag is what tells one version of an
+/// object from another of the same size, so a read of it could not be held to one version.
+pub(super) fn tagged(key: &str, meta: &Meta) -> Result<(), Error> {
+    if meta.tag.is_empty() {
+        let text = format!("the upstream gives no content tag for {key}");
+        return Err(Error::Unsupported(text));
+    }
+    Ok(())
+}
+
+/// How far a fill has come, as its readers see it. The bytes are in a file, never in a copy in
+/// memory that the readers share.
+#[derive(Clone, Debug)]
+pub(super) enum Live {
+    /// The fill has not made its file yet.
+    Starting,
+    /// The bytes of the object up to `written` are in the file `file` reads, flushed. The file
+    /// stays readable through this handle after it is linked into `obj/` or removed.
+    Staging {
+        /// What the upstream said of the object when the fill began: its size, and the tag a
+        /// reader that goes on from the upstream must find still there.
+        meta: Meta,
+        file: Arc<File>,
+        written: u64,
+    },
+}
+
+/// A fill that is running: its end, which every reader of the key waits on, and its progress,
+/// which a reader that streams from the staged file follows.
+#[derive(Clone)]
+pub(super) struct Pending {
+    done: Shared<BoxFuture<'static, Result<Filled, Error>>>,
+    pub(super) live: watch::Receiver<Live>,
+}
+
+impl Pending {
+    /// A fill that never ends, for the tests that need a key to be in the table of the fills that
+    /// run.
+    #[cfg(test)]
+    pub(super) fn never() -> Self {
+        let done = futures::future::pending().boxed().shared();
+        let (_, live) = watch::channel(Live::Starting);
+        Self { done, live }
+    }
+
+    /// A fill that is over already, with no object and no progress: what a keep leaves in the table
+    /// of the fills that run (see `keep.rs`). A reader that finds it is answered from the upstream.
+    pub(super) fn finished(filled: Filled) -> Self {
+        let done = futures::future::ready(Ok(filled)).boxed().shared();
+        // The sender is dropped at once: nothing is ever written.
+        let (_, live) = watch::channel(Live::Starting);
+        Self { done, live }
+    }
+}
+
+impl Future for Pending {
+    type Output = Result<Filled, Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().done).poll(cx)
+    }
+}
 
 /// The task of a fill.
 type Task = JoinHandle<Result<Filled, Error>>;
@@ -46,10 +121,15 @@ enum Stop {
     Short,
     /// The cache directory could not be written.
     Local,
+    /// A write or a delete through the cache came while the object was being read (see `forget`):
+    /// what was read is not kept, and the readers go on from the upstream.
+    Invalidated,
     /// The bytes of a key named by its content hash to another name.
     Mismatch,
     /// The object changed while it was being read: the bytes may be of two versions.
     Changed,
+    /// The cache lost the lock of its directory while the fill ran: nothing more is written.
+    Lost,
 }
 
 impl From<io::Error> for Stop {
@@ -78,8 +158,9 @@ impl Staged {
     /// it can still write).
     pub(super) async fn create(inner: &Arc<Inner>) -> io::Result<Self> {
         let number = inner.staged.fetch_add(1, Ordering::Relaxed);
-        let path = stage_dir(&inner.config.path).join(format!("{number:016x}"));
-        let sidecar = stage_dir(&inner.config.path).join(format!("{number:016x}.meta"));
+        let name = format!("{}-{number:016x}", inner.stage_prefix);
+        let path = stage_dir(&inner.config.path).join(&name);
+        let sidecar = stage_dir(&inner.config.path).join(format!("{name}.meta"));
         let mut options = OpenOptions::new();
         let file = options
             .write(true)
@@ -123,28 +204,50 @@ fn write_sidecar(path: &Path, text: &[u8]) -> io::Result<()> {
         .and_then(|()| std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)))
 }
 
+/// What [`publish`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Published {
+    /// The data file is new.
+    New,
+    /// The data file was there already.
+    Existed,
+    /// The cache does not own the directory any more, and nothing of the object is in it.
+    Lost,
+}
+
 /// Puts the staged file into the cache: the sidecar first, by rename, then the data file by a
-/// create-only link. Gives whether the data file is new (`false` if it was there already).
-fn publish(
+/// create-only link. `owns` is asked before the first change to the directory and again before
+/// the rename, the first step that puts the object in it: a cache that lost the lock of the
+/// directory since the fill started publishes nothing ([`Published::Lost`]).
+pub(super) fn publish(
     disk: &dyn Disk,
     root: &Path,
     hex: &str,
     staged: (&Path, &Path),
     sidecar: &[u8],
-) -> io::Result<bool> {
+    owns: &dyn Fn() -> bool,
+) -> io::Result<Published> {
     let data = data_path(root, hex);
     let (from, temporary) = staged;
     let meta = meta_path(root, hex);
-    // The three steps in one chain, so that a failure of any is one way out.
-    make_dirs(root, &object_dir(root, hex))
-        .and_then(|()| write_sidecar(temporary, sidecar))
-        .and_then(|()| std::fs::rename(temporary, &meta))?;
+    if !owns() {
+        return Ok(Published::Lost);
+    }
+    make_dirs(root, &object_dir(root, hex)).and_then(|()| write_sidecar(temporary, sidecar))?;
+    if !owns() {
+        return Ok(Published::Lost);
+    }
+    std::fs::rename(temporary, &meta)?;
     match disk.link(from, &data) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Ok(()) => Ok(Published::New),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(Published::Existed),
         Err(error) => {
-            // Nothing owns the sidecar: leave no file that says an object is there.
-            let _ = std::fs::remove_file(meta_path(root, hex));
+            // Nothing owns the sidecar: leave no file that says an object is there. A cache that
+            // has lost the directory since the rename leaves it: the name may be the new
+            // owner's by now, and a sidecar with no data file is what that owner's scan deletes.
+            if owns() {
+                let _ = std::fs::remove_file(meta_path(root, hex));
+            }
             Err(error)
         }
     }
@@ -214,20 +317,6 @@ impl Inner {
         (size <= self.config.budget && total <= critical).then_some(reservation)
     }
 
-    /// The fill of `key`, started if none is running, and waited for. A key with no fill running
-    /// when all the fills the cache may run are running is not filled: the answer is
-    /// [`Filled::Skipped`] at once, and the reader goes to the upstream.
-    pub(super) async fn fill_once(
-        self: &Arc<Self>,
-        key: &str,
-        name: &Name,
-    ) -> Result<Filled, Error> {
-        match self.join_or_start(key, name) {
-            Ok(pending) => pending.await,
-            Err(filled) => Ok(filled),
-        }
-    }
-
     /// The fill of `key` to wait for (`Ok`), started if none is running; or (`Err`) the answer
     /// that needs no wait. It does not wait, and it holds no lock when it returns.
     ///
@@ -258,21 +347,28 @@ impl Inner {
                         return Err(Filled::Skipped);
                     };
                     let (sender, receiver) = oneshot::channel();
-                    let pending = self.waiting(receiver);
+                    let (live, progress) = watch::channel(Live::Starting);
+                    let pending = Pending {
+                        done: self.waiting(receiver),
+                        live: progress,
+                    };
                     slot.insert(pending.clone());
-                    (pending, Some((permit, sender)))
+                    (pending, Some((permit, sender, live)))
                 }
             }
         };
-        if let Some((permit, sender)) = launch {
-            self.start(key, name, permit, sender);
+        if let Some((permit, sender, live)) = launch {
+            self.start(key, name, (permit, live), sender);
         }
         Ok(pending)
     }
 
     /// The fill that waits for the task that `receiver` is to be given, and for its end. A task
     /// that did not end by itself is an error of the readers that waited for it, and is counted.
-    fn waiting(self: &Arc<Self>, receiver: oneshot::Receiver<Task>) -> Pending {
+    fn waiting(
+        self: &Arc<Self>,
+        receiver: oneshot::Receiver<Task>,
+    ) -> Shared<BoxFuture<'static, Result<Filled, Error>>> {
         let inner = Arc::clone(self);
         let waiting = async move {
             let task = OptionFuture::from(receiver.await.ok()).await;
@@ -296,7 +392,7 @@ impl Inner {
         self: &Arc<Self>,
         key: &str,
         name: &Name,
-        permit: OwnedSemaphorePermit,
+        held: (OwnedSemaphorePermit, watch::Sender<Live>),
         sender: oneshot::Sender<Task>,
     ) {
         let (inner, key, name) = (Arc::clone(self), key.to_owned(), name.clone());
@@ -306,9 +402,9 @@ impl Inner {
             hex: name.hex.clone(),
         };
         let task = tokio::spawn(async move {
-            let _permit = permit;
+            let (_permit, live) = held;
             let _flight = flight;
-            inner.fill(&key, &name).await
+            inner.fill(&key, &name, &live).await
         });
         // The receiver is in the fill that is in the table, and in the caller: it is there.
         let _ = sender.send(task);
@@ -316,8 +412,13 @@ impl Inner {
 
     /// Reads the object into the stage directory and, if it is whole and is what its name says,
     /// puts it in the cache.
-    async fn fill(self: &Arc<Self>, key: &str, name: &Name) -> Result<Filled, Error> {
-        match self.fetch(key, name).await {
+    async fn fill(
+        self: &Arc<Self>,
+        key: &str,
+        name: &Name,
+        live: &watch::Sender<Live>,
+    ) -> Result<Filled, Error> {
+        match self.fetch(key, name, live).await {
             Ok(filled) => Ok(filled),
             Err(Stop::Upstream(error)) => {
                 if !matches!(error, Error::NotFound(_)) {
@@ -327,7 +428,18 @@ impl Inner {
             }
             Err(Stop::Short) => self.skipped(FailedFill::ShortBody),
             Err(Stop::Local) => self.skipped(FailedFill::LocalIo),
-            Err(Stop::Changed) => self.skipped(FailedFill::Changed),
+            Err(Stop::Changed) => {
+                // Readers may have been given bytes of the first version already: each reader
+                // decides by what it was given.
+                self.counters.failed(FailedFill::Changed);
+                Ok(Filled::Changed)
+            }
+            Err(Stop::Invalidated) => self.skipped(FailedFill::Changed),
+            Err(Stop::Lost) => {
+                // Not a failure of the fill: the directory is another cache's now.
+                bump(&self.counters.fills_skipped);
+                Ok(Filled::Skipped)
+            }
             Err(Stop::Mismatch) => {
                 // The bytes are known to be wrong: they go to nobody.
                 self.counters.failed(FailedFill::HashMismatch);
@@ -343,15 +455,41 @@ impl Inner {
         Ok(Filled::Skipped)
     }
 
-    async fn fetch(self: &Arc<Self>, key: &str, name: &Name) -> Result<Filled, Stop> {
+    /// Reads the object into the stage directory and puts it in the cache. The fill remembers
+    /// the generation of the lock it started under and asks [`owns`](Inner::owns) before it
+    /// makes the staging file, before it writes each chunk, inside the publish and before it
+    /// puts the object in the index: a cache that lost the lock of its directory meanwhile
+    /// writes nothing more ([`Stop::Lost`]). The lock is noticed lost by a tick at most once a
+    /// second, so the step that is running when the lock file is replaced can still finish.
+    async fn fetch(
+        self: &Arc<Self>,
+        key: &str,
+        name: &Name,
+        live: &watch::Sender<Live>,
+    ) -> Result<Filled, Stop> {
+        let generation = self.generation();
         let meta = self.upstream.head(key).await?;
+        tagged(key, &meta)?;
         let Some(reservation) = self.reserve(meta.size) else {
             bump(&self.counters.fills_skipped);
             return Ok(Filled::Skipped);
         };
+        if !self.owns(generation) {
+            return Err(Stop::Lost);
+        }
         let mut staged = Staged::create(self).await?;
         let mut hasher = Sha256::new();
         let mut offset = 0;
+        // The readers read the staged file through a descriptor of its own, opened for the fills only
+        // (a keep has no readers).
+        let reader = Arc::new(tokio::fs::File::open(&staged.path).await?.into_std().await);
+        let (about, file) = (meta.clone(), reader);
+        let progress = |written| Live::Staging {
+            meta: about.clone(),
+            file: Arc::clone(&file),
+            written,
+        };
+        let _ = live.send_replace(progress(0));
         while offset < meta.size {
             let want = self.config.fill_chunk.max(1).min(meta.size - offset);
             let range = ByteRange::new(offset, want);
@@ -359,9 +497,15 @@ impl Inner {
             if chunk.len() as u64 != want {
                 return Err(Stop::Short);
             }
-            staged.file.write_all(&chunk).await?;
+            if !self.owns(generation) {
+                return Err(Stop::Lost);
+            }
             hasher.update(&chunk);
+            staged.file.write_all(&chunk).await?;
+            // The bytes are in the file for a reader of it once they are flushed.
+            staged.file.flush().await?;
             offset += want;
+            let _ = live.send_replace(progress(offset));
         }
         staged.finish().await?;
         // A key named by its content is checked by the hash below. Any other key could have been
@@ -384,14 +528,26 @@ impl Inner {
             tag: meta.tag.clone(),
             modified: meta.modified,
         };
-        let fresh = self.commit(&staged, name, &sidecar).await?;
+        let fresh = match self.commit(&staged, name, &sidecar, generation).await? {
+            Published::New => true,
+            Published::Existed => false,
+            Published::Lost => return Err(Stop::Lost),
+        };
+        #[cfg(test)]
+        self.trace_after_publish();
+        if !self.owns(generation) {
+            if fresh {
+                self.remove_linked(&name.hex);
+            }
+            return Err(Stop::Lost);
+        }
         locked(&self.index).insert(&name.hex, meta.size, meta.tag, meta.modified);
         // A delete that came while the object was being read marked this fill: what it read is
         // gone from the upstream, so it is not kept (the mark is looked for after the entry is
         // in the index; see `forget`).
         if self.is_invalidated(&name.hex) {
             self.drop_entry(&name.hex);
-            return Err(Stop::Changed);
+            return Err(Stop::Invalidated);
         }
         drop(reservation);
         if fresh {
@@ -407,26 +563,51 @@ impl Inner {
         staged: &Staged,
         name: &Name,
         sidecar: &Sidecar,
-    ) -> io::Result<bool> {
-        let publishing = self.begin_commit(staged, name, sidecar);
+        generation: u64,
+    ) -> io::Result<Published> {
+        let publishing = self.begin_commit(staged, name, sidecar, generation);
         publishing.await.expect("a publish does not panic")
     }
 
+    /// Removes the data file and the sidecar that a fill or a keep of this cache linked just
+    /// now, when it finds that the cache no longer owns the directory.
+    ///
+    /// This is the one delete a cache makes in a directory it does not own. The caller linked
+    /// these names itself (the publish said `New`), but the new owner may publish or index the
+    /// same name in that very instant, so the removal can take away an object that is the new
+    /// owner's. That costs one refill and nothing else: whoever made it, the object is a whole
+    /// object of the key, so neither a read before the removal nor one after it gets wrong
+    /// bytes. Leaving the object is the worse choice: the new owner may not index it, and then
+    /// nothing evicts it, and a later scan indexes it, stale if the key was deleted at the
+    /// upstream in between. The call covers the whole span from the check before the rename,
+    /// through the rename, the link and the return of the publish. What is left is a whole
+    /// object that is on the disk for the moments until this removes it.
+    pub(super) fn remove_linked(&self, hex: &str) {
+        let root = &self.config.path;
+        let _ = std::fs::remove_file(data_path(root, hex));
+        let _ = std::fs::remove_file(meta_path(root, hex));
+    }
+
     /// Starts the link of the staged file into the cache on a thread that may block, and gives
-    /// the handle of the job, which goes on when the handle is dropped.
+    /// the handle of the job, which goes on when the handle is dropped. The job publishes only
+    /// while the cache still owns the directory as of `generation` (see `Inner::owns`): fills
+    /// and keeps both run it, and both give up when it says [`Published::Lost`].
     pub(super) fn begin_commit(
         self: &Arc<Self>,
         staged: &Staged,
         name: &Name,
         sidecar: &Sidecar,
-    ) -> JoinHandle<io::Result<bool>> {
+        generation: u64,
+    ) -> JoinHandle<io::Result<Published>> {
         let disk = Arc::clone(&self.disk);
         let root = self.config.path.clone();
         let hex = name.hex.clone();
         let (from, temporary) = (staged.path.clone(), staged.sidecar.clone());
         let text = serde_json::to_vec(sidecar).unwrap_or_default();
+        let inner = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            publish(&*disk, &root, &hex, (&from, &temporary), &text)
+            let owns = || inner.owns(generation);
+            publish(&*disk, &root, &hex, (&from, &temporary), &text, &owns)
         })
     }
 

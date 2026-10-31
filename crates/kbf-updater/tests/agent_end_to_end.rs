@@ -44,7 +44,7 @@ fn a_daemon_host_updates_with_its_certificate_alone_and_no_token() {
 fn an_update_by(way: Way) {
     let dir = TestDir::under(std::env::temp_dir(), "agent-e2e");
     let pki = Pki::new();
-    let leaf = pki.updater("n1", HostRole::Daemon);
+    let leaf = pki.updater("n1", HostRole::DAEMON);
     pki.write_updater_files(&dir, &leaf);
     let token = dir.join("operator-token");
     if way == Way::Token {

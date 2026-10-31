@@ -9,8 +9,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream;
-use kbf_objstore::s3::fake::FakeS3;
 use kbf_testkit::dir::TestDir;
+use objstore_s3::s3::fake::FakeS3;
 
 use super::layout::{Sidecar, meta_path, name_of};
 use super::metrics::read;

@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::StreamExt as _;
 use futures::stream;
-use futures::{FutureExt as _, StreamExt as _};
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
@@ -805,9 +805,7 @@ async fn a_keep_that_finds_a_fill_running_for_the_key_is_skipped_as_busy() {
     let rig = Rig::writing("tscache-keep-fill-running");
     let key = "cas/b/taken";
     let hex = name_of(key).hex;
-    let running: Pending = futures::future::ready(Ok::<Filled, Error>(Filled::Skipped))
-        .boxed()
-        .shared();
+    let running = Pending::finished(Filled::Skipped);
     drop(super::locked(&rig.cache.inner.flights).insert(hex.clone(), running));
 
     let made = rig.cache.put_stream(key, Some(5), whole(b"taken"));

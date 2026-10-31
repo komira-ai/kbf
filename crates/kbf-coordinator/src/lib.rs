@@ -32,11 +32,17 @@ pub mod service;
 pub mod services;
 
 #[cfg(test)]
+mod converge_role_tests;
+#[cfg(test)]
 mod converge_tests;
 #[cfg(test)]
 mod decide_golden_tests;
 #[cfg(test)]
+mod decide_role_tests;
+#[cfg(test)]
 mod decide_tests;
+#[cfg(test)]
+mod desired_role_tests;
 #[cfg(test)]
 mod desired_tests;
 #[cfg(test)]
