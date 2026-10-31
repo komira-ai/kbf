@@ -38,6 +38,7 @@ fn plain_flags(dir: &Path, listen: &str) -> JobReadFlags {
         reads_in_flight: 32,
         read_budget_bytes: Limits::default().read_budget_bytes,
         read_idle_secs: Limits::default().held_idle.as_secs(),
+        store: None,
     }
 }
 
@@ -160,7 +161,16 @@ async fn a_plain_listener_answers_every_request_as_the_tls_listener_does() {
             .await
             .expect("plain answers");
         assert_eq!(plain.status, over_tls.status, "{method} {path}");
-        assert_eq!(plain.headers, over_tls.headers, "{method} {path}");
+        assert_eq!(
+            without_date(&plain.headers),
+            without_date(&over_tls.headers),
+            "{method} {path}"
+        );
+        assert_eq!(
+            has_date(&plain.headers),
+            has_date(&over_tls.headers),
+            "{method} {path}"
+        );
         assert_eq!(plain.body, over_tls.body, "{method} {path}");
         statuses.push(plain.status);
     }
@@ -324,4 +334,15 @@ async fn a_frontend_serves_the_job_listener_in_plain_http() {
     assert!(text.contains(ok), "{text}");
     assert!(!text.contains("listener=\"job\""), "{text}");
     served.abort();
+}
+
+/// `headers` without `date`: two answers given a moment apart may fall in different seconds, so
+/// the clock's value is no part of what the two transports must agree on.
+fn without_date(headers: &[(String, String)]) -> Vec<&(String, String)> {
+    headers.iter().filter(|(name, _)| name != "date").collect()
+}
+
+/// Whether `headers` carries a `date`.
+fn has_date(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, _)| name == "date")
 }

@@ -249,6 +249,42 @@ and readable by it alone; the pack-key mint and the grant key are made from it, 
 job-facing listener must verify grants with the same secret. No secret is a flag. Left out, no
 secret file is read and the frontend serves exactly as before.
 
+**The `cas/b/` janitor** (off by default; the `[task-runs]` table of `kbf.toml`). The packs and
+large objects tasks write under `cas/b/` are not all kept: a refused run, a run that failed after
+its write, the unused keys of a key set, and a large object the ingest has already copied into the
+CAS leave keys nothing refers to. With `--task-janitor-key-file` the leader (the server that holds
+the scheduler role) lists `cas/b/` every `--task-janitor-interval-secs` (default 900) and deletes
+a key that is older than `--task-janitor-grace-secs` (default 21600, which is also the least: the
+18000 seconds at which an ingest refuses a key, the 4 hours a presigned write is good for and an
+hour for the ingest, and an hour more as a margin between frontends), is not one an ingest is verifying
+right now, and is not recorded in the pack index (asked again for that key just before the
+delete; a pack the ingest recorded stays where it lies and is never deleted). The age is the
+minute in the key's own name, for a pack (`-<k>`) and a large object (`-L<i>`) alike; a key under
+`cas/b/` whose name does not parse is kept and counted. It never lists or deletes under `cas/l/`
+(content-bound large objects), `cas/f/<writer>/` (frontend packs) or `cas/d/` (daemon packs). The
+key file is the JSON of the tier store's GC key (`--gc-key-file` there), whose prefix must be
+exactly `cas/b/`, owned by the server's user, mode 0600 or 0400; it signs the janitor's requests to
+the store of `--pack-store-endpoint` (same endpoint, bucket and region), which the janitor needs,
+as it needs `--task-secret-file` and `--pack-index`. A sweep lists `--task-janitor-page-size`
+(default 500) keys at a time and waits `--task-janitor-page-pause-ms` (default 1000) after each
+page, which bounds how fast it lists and deletes. `--task-janitor-dry-run` counts and logs what a
+sweep would delete and deletes nothing. A key the janitor is about to delete is claimed in the
+registry the ingests hold their keys in, after the pack index's last answer and through the delete,
+and a claim and a hold on one key exclude each other: an ingest that has begun makes the janitor
+keep the key, and one that begins after the claim is refused (`claimed`) before it reads anything.
+An ingest also refuses a key 18000 s old (`expired`), so a key seen as ended only after a long
+outage is never committed. Holds and claims are per process: across frontends (clocks that differ,
+or a fenced old leader still ingesting while the new leader sweeps) a key is safe by the age rule
+alone, and its margin is the grace less 18000 s, an hour at least. The leadership is asked before each page and each delete,
+and a sweep that finds it lost stops (`..._abandoned_total`). A 401 or 403 on a delete ends the
+sweep at that key, and so do 5 deletes failing in a row; each is one `..._sweep_errors_total` and one log
+line. `GET /metrics` has `kbf_cas_b_janitor_listed_total`,
+`..._reaped_total`, `..._kept_young_total`, `..._kept_verifying_total`,
+`..._kept_referenced_total`, `..._kept_unparsed_total`, `..._kept_outside_total`,
+`..._would_reap_total`, `..._reap_errors_total` (deletes the store refused, retried by the next
+sweep), `..._sweeps_total` and `..._sweep_errors_total` (sweeps the listing or the pack index
+stopped).
+
 A daemon writes its outputs into packs with `--pack-write` (off by default; the `[packs]`
 table of `kbf.toml`), which needs `--pack-read` and `--pack-store-write-credentials-file`, a
 key pair file of the same form as `--pack-store-credentials-file` but of a key that may
@@ -346,6 +382,32 @@ two more flags that have defaults:
   broken response). A client that reads is not cut off however long its response takes in all; one
   that opens a response and never reads it holds budget for this long and no longer. The scope
   of an Action is worked out once however many tasks ask for it at the same time.
+- `--job-store-grant-key-file`, `--job-store-url` and `--job-store-bucket` (the three come
+  together, and are off unless the key file is given): tell `GET /locate` to hand out read grants
+  of the tier store. The file is the grant key the store's own `--grant-key-file` holds (JSON of
+  `access_key_id` and `secret_access_key`, or the id and the secret on two lines; mode 0600 or
+  0400, owned by the server's user, never a flag); the store must be started with the same key.
+  `--job-store-url` is the base URL a task reads the store at (`http://` or `https://`, a host
+  and a port, no path: the task dials it from its worker, so it must be an address the workers
+  reach) and `--job-store-bucket` is the store's `--bucket`. Both come from these flags and from
+  nothing in a request. A file the server cannot read, a key or bucket tierstore would refuse, or
+  a URL that is not a store's is refused at start, exit status 2, and the refusal never holds the
+  secret. Without the flags `GET /locate` answers as it did: no header line and no `g`, and a
+  task reads every blob from this listener.
+
+  With them, the first line of a `GET /locate` answer is
+  `{"store":"<url>","bucket":"<bucket>","grants":["<token>",...]}` and each `pack` and `large`
+  line carries `"g":<n>`, the index in `grants` of the grant that lists its key (all the spans of
+  one pack share one). The grants list the keys of the lines of that answer, which come from the
+  grant's scope walk, and no others; each lists at most 600 keys (so a large scope has several
+  grants), and a key tierstore refuses to list (`_journal/`, `_tiering/`) is not listed and its
+  line is `absent`. A grant ends at the earlier of the job's read grant and ten minutes after it
+  is made, never later: the store refuses a grant that ends more than its
+  `--grant-max-lifetime` (900 seconds by default) after its own clock, so ten minutes leave five
+  for this host's clock to run ahead of the store's, and a store given a shorter
+  `--grant-max-lifetime` than ten minutes refuses them (the task then reads from the listener).
+  A grant is a bearer token: it is in the answer's body only, never in a log, a metric or a
+  `Debug`, and on plain HTTP (the listener's or the store's) anyone on the path can read it.
 - The tee that copies a large blob to tierstore while it is streamed buffers up to 32 MiB for each
   live put (64 MiB in all at the default concurrency of two). That buffer is outside
   `--job-read-budget-bytes`, which counts what a read and its reply hold.

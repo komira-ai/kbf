@@ -144,6 +144,12 @@ job-read-budget-bytes = 1073741824
 job-read-idle-secs = 60
 # The blob reads this listener has open at once, at least 1: a streamed blob holds its place until its response ends, and a request over the bound waits for one to end. Needs `--job-listen`
 job-reads-in-flight = 32
+# The bucket of the tier store that read grants are made for, the store's `--bucket`. Needs `--job-store-grant-key-file`
+# job-store-bucket = "BUCKET"
+# A file with the grant key of the tier store, `{"access_key_id": "...", "secret_access_key": "..."}` (or the id on the first line and the secret on the second), owned by this user and readable by it alone (mode 0600 or 0400): the key the store's `--grant-key-file` holds. With it, `GET /locate` signs read grants for the packs and large objects its table names, each good for the Action's job and at most ten minutes, and the task reads them from the store directly with `--locate`; the store must know the same key. Without it, `GET /locate` carries no grant and the task reads every blob from this listener. The secret is never a flag. Needs `--job-store-url`, `--job-store-bucket` and `--job-listen`
+# job-store-grant-key-file = "PATH"
+# The base URL of the tier store that a task is told to read from with a grant, `http://host:port` or `https://host:port` with no path (the task dials it from its worker, so give an address the workers reach). Needs `--job-store-grant-key-file`
+# job-store-url = "URL"
 # The certificate chain (PEM) of `--job-listen`, issued by the farm CA that the jobs trust. It must carry an IP subjectAltName for each address a job dials the frontend at: the start is refused if it has none, or if `--job-listen` is on one address and the certificate does not name it, since a client that dials an IP address accepts only a certificate that names it. Read again every `--tls-reload-interval-secs`, as the other listeners' are; the names are checked at start only
 # job-tls-cert = "PATH"
 # The private key (PEM) of `--job-tls-cert`
@@ -302,6 +308,18 @@ member-ttl-secs = 15
 task-closure-max-bytes = 34359738368
 # The most distinct digests (directories and files) the input tree of a run may have: a run whose tree has more is refused, never run on a part of its inputs. Used only with `--task-secret-file`
 task-closure-max-digests = 500000
+# Log and count the keys the janitor would delete, and delete none. Used only with `--task-janitor-key-file`
+task-janitor-dry-run = false
+# How old a key must be, in seconds, before the janitor may delete it, by the minute its name says it was minted in. At least 21600 (the 18000 seconds at which an ingest refuses a key, and an hour more as a margin for hosts with different clocks and for an old leader still ingesting) and at most 604800. Used only with `--task-janitor-key-file`
+task-janitor-grace-secs = 21600
+# How often, in seconds, the janitor starts a sweep of `cas/b/`, at least 1 and at most 86400. Used only with `--task-janitor-key-file`
+task-janitor-interval-secs = 900
+# Turns on the janitor of `cas/b/`: it deletes the task packs and large objects nothing recorded (a refused run, an unused key, a large object already copied into the CAS) once they are older than `--task-janitor-grace-secs`, are not under verification and are not in the pack index. The file is the tier store's GC key, `{"access_key_id": "...", "secret_access_key": "...", "prefix": "cas/b/"}` (the prefix must be exactly `cas/b/`), owned by this user and readable by it alone (mode 0600 or 0400); it is used against `--pack-store-endpoint`'s store, which this needs. The janitor never lists or deletes under `cas/l/`, `cas/f/` or `cas/d/`. Runs on the leader only. Needs `--task-secret-file` and `--pack-store-endpoint`. Left out, nothing is deleted
+# task-janitor-key-file = "PATH"
+# How long, in milliseconds, the janitor waits after each page before it lists the next, at most 60000: with `--task-janitor-page-size`, the most keys a second it lists and deletes. Used only with `--task-janitor-key-file`
+task-janitor-page-pause-ms = 1000
+# The keys of `cas/b/` the janitor lists at a time, 1 to 1000, and so the keys it checks against the pack index in one question. Used only with `--task-janitor-key-file`
+task-janitor-page-size = 500
 # A file with the presign-only key that signs a task's writes of large objects, of the same form and with the same owner and mode rules as `--task-put-credentials-file`: a key of the tier store whose prefix allows objects up to `--task-large-max-bytes`, with a ceiling of at least 14400 seconds. Left out, no run gets a large-object key and an output over 64 MiB fails its task
 # task-large-credentials-file = "PATH"
 # The most bytes of one large object, above 67108864 (64 MiB, the most a pack record holds): the cap a task and the ingest of its run hold an object to. Used only with `--task-large-credentials-file`

@@ -106,6 +106,7 @@ fn flags(files: &Files, listen: &str) -> JobReadFlags {
         reads_in_flight: 32,
         read_budget_bytes: Limits::default().read_budget_bytes,
         read_idle_secs: Limits::default().held_idle.as_secs(),
+        store: None,
     }
 }
 
@@ -692,5 +693,7 @@ async fn a_frontend_without_the_job_flags_has_no_job_listener() {
 
 mod batch;
 mod held;
+mod locate;
 mod plain;
+mod store_grant;
 mod stream;

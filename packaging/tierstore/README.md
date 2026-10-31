@@ -314,9 +314,8 @@ is accepted, and `--print-config` refuses it with exit 2. A `--print-config` tha
 A file has one of two shapes, told apart by its tables: a storage node (`[server]`, `[hot_store]`
 and `[cold_store]`, as the flags are, and an optional `[oci]` (the read-only registry front) and
 `[[policy]]`) and a build node (`[server]`, `[local_cache]` and `[cold_store]` with no
-`[hot_store]`, and `[[policy]]`), which is a read cache and has no flag form (see "A build node"
-below). A build node has no OCI front: its file with an `[oci]` table is refused. A file for a
-storage node:
+`[hot_store]`, an optional `[oci]`, and `[[policy]]`), which is a read cache and has no flag form (see
+"A build node" below). Both shapes take the same `[oci]` table. A file for a storage node:
 
 ```toml
 [server]
@@ -372,7 +371,9 @@ the body is read. The key files of `[server]` are those of the front, as for a s
 
 With `write_through = true` in `[local_cache]` (default `false`) the node takes the writes its keys
 may do and sends each to the upstream; the answer is given only after the upstream has the object,
-and the cache keeps nothing of what is written (the first read of an object fills it). Create-only
+and a create-only put under a `cache = true` policy is also kept on the node, so the next read of
+it is a hit (a multipart upload is not kept: the first read fills it; see "What a put keeps"
+below). Create-only
 puts (with or without `If-None-Match: *`), presigned PUTs, multipart uploads (start, part,
 completion, abort) and deletes go to the upstream; the roles of the full, read-only, scoped,
 presigning and GC keys apply as on a storage node, and a put that replaces (`If-Match`) and a copy
@@ -390,6 +391,35 @@ before the address is bound; one that cannot be reached is status 1. The upstrea
 a store that takes writes under `_tiering/` (an S3 bucket, not the front of a storage node). The
 upstream's key is also the cache's: only the front's roles keep one client from another's objects.
 The start line then says `mode=write-through-cache`.
+
+What a put keeps. The body of a create-only put under a `cache = true` policy is copied into
+`.stage/` as it streams to the upstream. When the upstream has acknowledged the object, the node
+asks it for the object's tag and time (one HEAD, so the tag in the cache is the one the upstream
+gave, which for a large body is not an MD5), puts the copy in the cache, and then answers 200. The
+copy is best effort and never fails the put: if every keep slot is busy (`max_concurrent_keeps`),
+the object does not fit the budget, the stage directory cannot be written, the HEAD fails, the disk
+falls behind the body, or the object was deleted meanwhile, the copy is dropped, the put is still
+200 with the object at the upstream, and the skip is counted. The body is written to the stage file
+by a task of its own through a queue of at most 16 chunks and 4 MiB (the bytes bound the memory,
+whatever the size of the chunks; at most `max_concurrent_keeps` times 4 MiB in all), so a slow or
+hung disk never makes the upload wait: the copy is dropped instead. Once the upstream has
+acknowledged the object, the rest of the keep runs on its own task, so a client that goes away at
+that point does not leave a half-made copy. The put waits for that task for `keep_wait` and is then
+answered; the task ends within `keep_deadline` with the object kept or abandoned. A read of a key
+whose copy is still being made never waits for it: it is answered from the upstream. The eviction
+pass that a kept object may call for runs on its own task, and the put does not wait for it. A link
+that is under way when a copy is abandoned cannot be called back and is undone when it ends; if its
+thread never returns (a disk that hangs for good) the staged file and a reference to the cache stay
+until the process ends, and the undoing may remove the entry of a fill of the same key made after
+the abandonment, which costs one more trip to the upstream and never serves stale data.
+A key named by its content (`cas/l/<sha256>`) is hashed as the body streams, copied or not;
+a body that does not hash to the name is answered 400 `BadDigest`, the upstream stores nothing, and
+nothing is kept. A body that is cut leaves nothing at the upstream or in the cache.
+`/metricz` has `tierstore_cache_writes_through_total` (puts the upstream took),
+`tierstore_cache_write_exists_total` (puts answered 412) and
+`tierstore_cache_write_keep_skipped_total{reason}` with the reasons `budget` (also a body of no
+declared length), `io`, `busy`, `head`, `deleted`, `slow` (the disk did not keep up) and `deadline` (the copy was abandoned);
+`tierstore_cache_keeps_expired_total` counts the puts answered before their copy was done.
 
 ```toml
 [server]
@@ -437,8 +467,10 @@ key `cas/l/<sha256>`, the SHA-256 in the key, which the bytes must hash to or th
 discarded and counted, and the read is answered with an error, since the upstream's bytes are known
 to be wrong) only when the object is whole; a sidecar `<hex>.meta` holds the key, the
 size, the hash of the bytes and the upstream's tag. The misses of one key share one fill. A ranged
-GET of an object that is not there fills the whole object if it is at most 64 MiB, and otherwise
-passes the range through and keeps nothing. A fill that fails (a short body, an object written over
+GET of an object that is not there fills the whole object if it is at most `whole_fill_limit` (64
+MiB by default), and otherwise passes the range through and keeps nothing; each such ranged read
+costs the upstream a HEAD and a GET. A node that serves container layers through the registry front
+(see The registry front) should raise the limit to its largest layer: a layer over it is never kept. A fill that fails (a short body, an object written over
 while it was read, an upstream error, a directory that cannot be written) never fails the reader for
 the cache's reasons: the reader is answered from the upstream. A kept object is never checked
 against the upstream again, and a hit is not hashed again: put `cache = true` only on prefixes whose
@@ -490,7 +522,11 @@ scrub.
 | `local_cache.critical` | percent of the budget above which a fill is skipped (default 95, not below `high_water`) |
 | `local_cache.free_floor` | percent of the file system that is kept free (0 to 99, default 10): below it a pass evicts, even under the budget; it does not stop a fill, and `budget` may not be above the file system's size less the floor (exit status 2), unless its size cannot be read or is 0, which the start warns of and does not judge |
 | `local_cache.max_concurrent_fills` | the most fills that run at once (1 to 64, default 4); a miss that finds them all running is served from the upstream and kept nowhere |
+| `local_cache.max_concurrent_keeps` | the most create-only puts that are copied into the cache at once (1 to 64, default 8), apart from the fills; a put that finds them all running succeeds and is not kept |
+| `local_cache.keep_wait` | the longest a put waits, once the upstream has the object, for its copy to be put in the cache (default `5s`, above 0). Past it the put is answered 200 and the copy is finished in the background; counted in `tierstore_cache_keeps_expired_total`. Safe because the upstream already holds the object: a read of it that misses costs only the trip, so read-your-write on the node is best effort past this wait |
+| `local_cache.keep_deadline` | the longest a copy takes in all, from the upstream's acknowledgement (default `60s`, above 0 and not below `keep_wait`); a copy that is not done by then (a hung disk or upstream) is abandoned: its stage file is removed, its slot and room are given back, and it is counted as `deadline` |
 | `local_cache.write_through` | `false` by default: a read cache that refuses every write with 403 before the role of the key is looked at. `true`: the node takes the writes its keys may do and sends each to the upstream, which must be written with a key that may write; the start runs the upstream's self-test (create-only and multipart-conditional included) and exits with status 3 if the upstream answers one wrongly |
+| `local_cache.whole_fill_limit` | the most an object may be for a ranged read of it to fill the whole of it: a number or a size such as `"512MiB"`, from 1 byte to the `budget` (default 64 MiB); a larger object is passed through and kept nowhere. A fill reads 8 MiB at a time whatever the limit, so raising it does not raise the memory of the fills |
 | `local_cache.cache` | `true`, the default; `false` is refused (leave `[local_cache]` out to run without a cache) |
 | `local_cache.scrub_rate` | a size and `/s`, such as `"50MiB/s"`: accepted, and not used by this release |
 | `cold_store.endpoints` | a list of exactly one endpoint, in place of `endpoint`: several are refused as not supported yet, since the cache reads from one upstream |
@@ -520,16 +556,38 @@ fill included, so the byte hit ratio is the first over the sum of the two), `fil
 slot taken), `fill_failures_total{reason}` (`hash_mismatch`, `upstream_error`,
 `short_body`, `local_io`, `changed`, `aborted`), `evictions_total{reason}` (`budget`, `floor`), `pinned_skips_total`,
 `discarded_at_start_total`, and the gauges `bytes`, `objects`, `fs_free_bytes` and `staging_files`.
-A storage node has the proxy's counters instead, the same path on a node with the OCI front also
-has the OCI counters (see Counters), and a process with none of the three has one line that says
-so; the proxy's series are in "Metrics" in `crates/tierstore/README.md`.
+A storage node has the proxy's counters instead, the same path on a node with the OCI front (a
+storage node, or a build node with an `[oci]` table) also has the OCI counters (see Counters), and
+a build node with the front shows the OCI block and then the cache block; a process with none of
+the three has one line that says so; the proxy's series are in "Metrics" in
+`crates/tierstore/README.md`.
 
 ### The registry front
 
-The registry front (see The OCI read front) is the optional `[oci]` table of a storage node's file,
-left out for a server with no front. A build node's file may not have it: the front is a storage
-node's, and the file is refused with a message that names `oci`. A key of the table that is left
-out has the default of its flag:
+The registry front (see The OCI read front) is the optional `[oci]` table of a storage node's file
+or of a build node's, left out for a server with no front. The two shapes have the same keys and
+the same rules. On a storage node the front reads through the proxy; on a build node it reads
+through the local cache, so a blob or a manifest under a `[[policy]]` prefix with `cache = true`
+is served from the disk when it is there and filled from the upstream when it is not, as an S3 GET
+is. The blobs the front reads are the keys under `<prefix>blobs/sha256/` (`oci/` by default), so the
+file is refused at load, naming `oci.prefix`, unless the longest `[[policy]]` prefix that covers
+them has `cache = true`: a front whose blobs are kept nowhere would send every pull to the upstream,
+and there is no use of that to keep (a registry that passes through is a storage node's front). A
+blob over `local_cache.whole_fill_limit` is passed through, still checked against its digest, and
+not kept.
+
+A kept object is not checked again on a hit, so a blob that rotted on the cache's disk is detected
+by the front when it is read whole (the response ends in an error or a cut connection, and
+`tierstore_oci_digest_mismatches_total` counts it) but it is not evicted: it stays until the budget
+evicts it, and every pull of it fails until then. To refill it, remove its data file and its
+`.meta` sidecar under `local_cache.path`: both are named by the SHA-256 of the object's key (for
+`oci/blobs/sha256/<digest>` that is the hash of that text, not the digest) and sit in
+`obj/<first two hex digits>/<next two>/`. The next
+read finds the file gone, drops the entry and fills the object again from the upstream.
+
+The front is another listener of the same process: it starts with the node, drains with it,
+and its counters are on the `/metricz` of the S3 listener beside the cache's. A key of the table
+that is left out has the default of its flag:
 
 ```toml
 [oci]
@@ -798,7 +856,8 @@ proxy in the process: no S3 credential and no hop through the S3 listener. It is
 
 With `--config` the front is the `[oci]` table of the file and the `--oci-*` flags are refused
 (see The configuration file, which lists the key of each flag below). `--print-config` writes
-the front's flags as that table.
+the front's flags as that table. A build node's file takes the same `[oci]` table (it has no flags):
+the front then reads through the node's local cache, not a proxy (see The registry front).
 
 | flag | what |
 |---|---|
