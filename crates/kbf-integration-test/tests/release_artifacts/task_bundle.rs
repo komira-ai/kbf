@@ -486,7 +486,11 @@ fn a_bundle_step_that_breaks_a_rule_is_named() {
             "lacks `--archive",
         ),
         (
-            changed(&w, "--gh \"$RUNNER_TEMP/tools/gh\"", "--gh gh"),
+            changed(
+                &w,
+                "--gh \"$RUNNER_TEMP/tools/gh\" --repo komira-ai/jobscheduler",
+                "--gh gh --repo komira-ai/jobscheduler",
+            ),
             "lacks `--gh $RUNNER_TEMP/tools/gh`",
         ),
         (
