@@ -141,7 +141,7 @@ pub(super) enum Published {
 /// create-only link. `owns` is asked before the first change to the directory and again before
 /// the rename, the first step that puts the object in it: a cache that lost the lock of the
 /// directory since the fill started publishes nothing ([`Published::Lost`]).
-fn publish(
+pub(super) fn publish(
     disk: &dyn Disk,
     root: &Path,
     hex: &str,

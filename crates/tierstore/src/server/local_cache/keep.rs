@@ -384,8 +384,9 @@ impl Inner {
     /// with its writer.
     async fn open_stage(self: &Arc<Self>, len: Option<u64>) -> Result<Stage, SkippedKeep> {
         // A read-only cache keeps nothing: the stage directory is the holder's too. The keep
-        // asks again, with the number, before it makes the stage file, before each chunk,
-        // inside the publish and after it.
+        // asks again, with the number, before each chunk the writer writes, after the writer
+        // ends, inside the publish and after it. Nothing in between waits, so a look between
+        // the permit and the stage file would see what this one saw.
         let generation = self.generation();
         if !self.owns(generation) {
             return Err(SkippedKeep::ReadOnly);
@@ -395,9 +396,6 @@ impl Inner {
         };
         let size = len.ok_or(SkippedKeep::Budget)?;
         let reservation = self.reserve(size).ok_or(SkippedKeep::Budget)?;
-        if !self.owns(generation) {
-            return Err(SkippedKeep::ReadOnly);
-        }
         let staged = Staged::create(self).await.map_err(|_| SkippedKeep::Io)?;
         Ok(Stage {
             writer: Writer::start(self, staged),
@@ -494,15 +492,13 @@ impl Inner {
         let mut staged = ended.map_err(|_| SkippedKeep::Io)?;
         let synced = Self::before(deadline, staged.finish()).await?;
         synced.map_err(|_| SkippedKeep::Io)?;
-        if !self.owns(generation) {
-            return Err(SkippedKeep::ReadOnly);
-        }
         // An entry for the key is of an object that is gone: it must not keep the new file's
-        // place. It is asked after the last look at the lock and not gated by it again: if the
-        // lock is lost and taken again between the two, this removes an entry and files of the
-        // new ownership, which costs a refill of a whole object and never gives wrong bytes:
-        // what is removed is a valid object or nothing, and a read that misses goes to the
-        // upstream.
+        // place. It is not gated by a look at the lock (the publish looks first thing, and a
+        // keep that lost the lock ends below, with nothing linked, `Lost` included: a lost
+        // lock stays lost for this keep, the generation having changed): if the lock is lost
+        // and taken again before this runs, it removes an entry and files of the new
+        // ownership, which costs a refill of a whole object and never gives wrong bytes: what
+        // is removed is a valid object or nothing, and a read that misses goes to the upstream.
         self.drop_entry(&name.hex);
         let sidecar = Sidecar {
             key: key.to_owned(),
@@ -513,15 +509,9 @@ impl Inner {
         };
         let mut publishing = self.begin_commit(&staged, name, &sidecar, generation);
         let published = match tokio::time::timeout_at(deadline, &mut publishing).await {
-            Ok(joined) => {
-                let published = joined
-                    .expect("a publish does not panic")
-                    .map_err(|_| SkippedKeep::Io)?;
-                if published == Published::Lost {
-                    return Err(SkippedKeep::ReadOnly);
-                }
-                published
-            }
+            Ok(joined) => joined
+                .expect("a publish does not panic")
+                .map_err(|_| SkippedKeep::Io)?,
             Err(_) => {
                 // The link cannot be called back: it is left to end on its own, and then undone,
                 // so that it leaves no file that nothing indexes. A cache that does not own the

@@ -4,10 +4,12 @@
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Notify;
 
+use super::hold::Trace;
 use super::testing::{Rig, wait_advancing};
 use super::{Mode, Tick};
 
@@ -162,9 +164,22 @@ async fn the_loop_takes_the_lock_at_a_tick_after_it_is_free_and_ends_when_halted
     let halt = Arc::new(Notify::new());
     let cache = second.clone();
     let stop = Arc::clone(&halt);
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::clone(&ticks);
+    second.inner.set_trace(Trace {
+        after_tick: Some(Arc::new(move || {
+            let _ = counting.fetch_add(1, Ordering::SeqCst);
+        })),
+        ..Trace::default()
+    });
     let looping = tokio::spawn(async move { cache.hold(Duration::from_secs(1), stop).await });
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_secs(1)).await;
+    // Two ticks find the lock held and change nothing: the loop says nothing of them.
+    wait_advancing(
+        "two ticks found the lock held",
+        Duration::from_secs(1),
+        || ticks.load(Ordering::SeqCst) >= 2,
+    )
+    .await;
     assert_eq!(second.mode(), Mode::ReadOnly);
     drop(first);
     // A try may be running when the clock moves, and the loop then waits for the next interval

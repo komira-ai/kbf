@@ -3,13 +3,14 @@
 //!
 //! `Rig::cache` stands for the process that holds the directory and filled it.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
 use super::hold::Trace;
-use super::layout::name_of;
+use super::layout::{data_path, name_of};
 use super::metrics::read;
 use super::testing::{Rig, pattern, tree};
 use super::{Mode, Tick};
@@ -146,4 +147,103 @@ async fn a_delete_caught_between_its_steps_by_the_take_leaves_no_index_entry() {
     delete.join().unwrap();
     assert_eq!(reader.held(), (0, 0));
     assert!(!rig.has_file("cas/b/obj"));
+}
+
+/// Asserts that deletes that keep arriving while the take runs do not keep it waiting: a delete
+/// is noted in each of the rounds it makes, and after the eighth the notes count as an overflow,
+/// so the ninth round removes every object that is left and the take ends with an empty cache
+/// and no object file, in nine rounds, though twelve objects were each noted in a round of their
+/// own. It would catch a take that goes on for as long as deletes come.
+#[tokio::test]
+async fn deletes_that_keep_arriving_during_the_take_end_it_with_an_empty_cache() {
+    let rig = Rig::writing("tscache-forget-rounds");
+    let keys: Vec<String> = (0..12).map(|n| format!("cas/b/o{n}")).collect();
+    for key in &keys {
+        rig.put(key, &pattern(30)).await;
+        let _ = rig.cache.get(key, None).await.unwrap();
+    }
+    let holder = rig.locked();
+    let reader = rig.locked();
+    assert_eq!(reader.held(), (360, 12));
+    drop(holder);
+
+    let rounds = Arc::new(AtomicUsize::new(0));
+    let (counting, weak) = (Arc::clone(&rounds), Arc::downgrade(&reader.inner));
+    let names: Vec<String> = keys.iter().map(|key| name_of(key).hex).collect();
+    reader.inner.set_trace(Trace {
+        promote_round: Some(Arc::new(move || {
+            let round = counting.fetch_add(1, Ordering::SeqCst);
+            if let Some(hex) = names.get(round) {
+                assert!(!weak.upgrade().unwrap().may_delete(hex));
+            }
+        })),
+        ..Trace::default()
+    });
+    assert_eq!(reader.tick().unwrap(), Tick::Took);
+    assert_eq!(rounds.load(Ordering::SeqCst), 9);
+    assert_eq!(reader.held(), (0, 0));
+    for key in &keys {
+        assert!(!rig.has_file(key), "{key}");
+    }
+}
+
+/// Makes a take whose removal of the files of `gone` fails once (the data file of `gone` is
+/// replaced by a directory between the choice of the files and their removal, and the data file
+/// of `other` is removed, so that one removal finds a file already gone), with at most
+/// `limit` names noted, and asserts that the tick is an error and the cache stays read-only; that
+/// after the directory is put right the next tick takes the lock; and that no object file of
+/// either key is left, so the names that were noted when the first try failed were not lost.
+async fn a_take_whose_removal_fails(name: &str, limit: usize) {
+    let rig = Rig::writing(name);
+    let (gone, other) = ("cas/b/gone", "cas/b/other");
+    for key in [gone, other] {
+        rig.put(key, &pattern(30)).await;
+        let _ = rig.cache.get(key, None).await.unwrap();
+    }
+    let holder = rig.locked();
+    let reader = rig.locked_with(|config| config.forget_limit = limit);
+    reader.delete(gone).await.unwrap();
+    reader.delete(other).await.unwrap();
+    drop(holder);
+
+    let root = rig.config.path.clone();
+    let (gone_file, other_file) = (
+        data_path(&root, &name_of(gone).hex),
+        data_path(&root, &name_of(other).hex),
+    );
+    let done = AtomicBool::new(false);
+    let (swapped, removed) = (gone_file.clone(), other_file.clone());
+    reader.inner.set_trace(Trace {
+        promote_round: Some(Arc::new(move || {
+            if !done.swap(true, Ordering::SeqCst) {
+                std::fs::remove_file(&swapped).unwrap();
+                std::fs::create_dir(&swapped).unwrap();
+                std::fs::remove_file(&removed).unwrap();
+            }
+        })),
+        ..Trace::default()
+    });
+    assert!(reader.tick().is_err());
+    assert_eq!(reader.mode(), Mode::ReadOnly);
+
+    std::fs::remove_dir(&gone_file).unwrap();
+    std::fs::write(&gone_file, pattern(30)).unwrap();
+    assert_eq!(reader.tick().unwrap(), Tick::Took);
+    assert_eq!(reader.held(), (0, 0));
+    assert!(!rig.has_file(gone));
+    assert!(!rig.has_file(other));
+}
+
+/// Asserts the take whose removal fails with the names it noted listed (two names, room for
+/// both).
+#[tokio::test]
+async fn a_take_whose_removal_fails_tries_again_with_the_names_it_noted() {
+    a_take_whose_removal_fails("tscache-forget-failed", 8).await;
+}
+
+/// Asserts the take whose removal fails when it noted too many names to list (room for one of
+/// two): the overflow is noted again as it was, and the next try empties the cache.
+#[tokio::test]
+async fn a_take_whose_removal_fails_tries_again_with_an_overflow() {
+    a_take_whose_removal_fails("tscache-forget-failed-overflow", 1).await;
 }

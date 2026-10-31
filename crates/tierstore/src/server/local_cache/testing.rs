@@ -422,6 +422,8 @@ pub(in crate::server) struct FakeDisk {
     space_waiting: AtomicU64,
     /// The names of every call of `link`, in order: from and to.
     pub(in crate::server) linked: Mutex<Vec<(PathBuf, PathBuf)>>,
+    /// What a test has every call of `touch` do, after it is noted.
+    pub(in crate::server) touch_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl FakeDisk {
@@ -436,6 +438,7 @@ impl FakeDisk {
             space_gate: Mutex::new(None),
             space_waiting: AtomicU64::new(0),
             linked: Mutex::new(Vec::new()),
+            touch_hook: Mutex::new(None),
         }
     }
 
@@ -620,6 +623,14 @@ impl Disk for FakeDisk {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((path.to_path_buf(), millis));
+        let hook = self
+            .touch_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
         SystemDisk.touch(path, millis)
     }
 }

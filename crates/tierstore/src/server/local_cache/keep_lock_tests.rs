@@ -12,7 +12,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use super::layout::{Sidecar, data_path, meta_path, name_of, object_dir};
 use super::metrics::{SkippedKeep, read};
 use super::testing::{BlockingGate, Rig, digest, never_expires, tree, wait_until};
-use super::{Mode, Tick};
+use super::{LocalCache, Mode, Tick};
 use crate::{Backend, Error, PartBody};
 
 /// A gate that holds threads of the disk, opened when this is dropped.
@@ -85,28 +85,23 @@ async fn a_keep_published_just_before_the_lock_was_lost_is_removed() {
     assert_eq!(rig.staged_files(), 0);
 }
 
-/// Asserts that a keep that is abandoned at its deadline while its link is held on a thread, in a
-/// cache that then loses the lock and takes it again (the generation changed, the cache is
-/// read-write), leaves alone the object and the entry that the new ownership has for the same
-/// name: the keep linked nothing, so it has nothing of its own to undo. The link ends with an
-/// error (the take emptied the stage directory). It would catch a cleanup that removes the
-/// entry and the files of a name because the cache is read-write now, whoever made them.
-#[tokio::test(start_paused = true)]
-async fn an_abandoned_keep_leaves_the_object_of_the_new_ownership_alone() {
-    let rig = Rig::with("tscache-lost-keep-deadline", |config| {
+/// A put of `key` whose keep is abandoned at its deadline with its link held on a thread: the
+/// rig (a cache that writes through, a wait of 5 s and a deadline of 60 s on the paused clock),
+/// the cache, which holds the lock, and the gate that holds the link, opened when it is dropped.
+/// The clock is moved by the test and by nothing else (the test never waits idle), so the wait of
+/// the put and the deadline of the keep come when the test says.
+async fn abandoned_keep(name: &str, key: &'static str) -> (Rig, LocalCache, OpenOnDrop) {
+    let rig = Rig::with(name, |config| {
         config.write_through = true;
         config.keep_wait = Duration::from_secs(5);
         config.keep_deadline = Duration::from_secs(60);
     });
     let first = rig.locked();
-    let key = "cas/b/linking";
     // Opened when the test ends however it ends: a thread held at the gate is waited for when
     // the runtime is dropped, so a failed assertion before the gate is opened would not end the
     // test at all.
     let gate = OpenOnDrop(rig.disk.hold_links());
     let body = Bytes::from_static(b"linking");
-    // The clock is moved by the test and by nothing else (the test never waits idle), so the
-    // wait of the put and the deadline of the keep come when the test says.
     let cache = first.clone();
     let putting = tokio::spawn(async move { cache.put(key, body).await });
     wait_until("the link began", || {
@@ -121,6 +116,86 @@ async fn an_abandoned_keep_leaves_the_object_of_the_new_ownership_alone() {
         first.counters().keeps_skipped(SkippedKeep::Deadline) == 1
     })
     .await;
+    (rig, first, gate)
+}
+
+/// Asserts that a keep abandoned at its deadline is undone when its link ends, while the cache
+/// still owns the directory as it did when the keep began: the object it linked is removed, with
+/// its sidecar, and nothing is indexed. It would catch an abandoned keep that leaves a linked
+/// object that nothing indexes.
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_keep_is_undone_while_the_cache_owns_the_directory() {
+    let key = "cas/b/linking";
+    let (rig, first, gate) = abandoned_keep("tscache-keep-deadline-undone", key).await;
+    gate.0.open();
+    wait_until("the cleanup of the keep ended", || {
+        read(&first.counters().staging_files) == 0
+    })
+    .await;
+    assert!(!rig.has_file(key));
+    assert!(!meta_path(&rig.config.path, &name_of(key).hex).exists());
+    assert_eq!(first.held(), (0, 0));
+}
+
+/// Asserts that a keep abandoned at its deadline whose link ends after the cache lost the lock
+/// (and did not take it again: nothing emptied the stage directory, so the link is made) removes
+/// the object it linked, with its sidecar, and nothing is indexed. It would catch a cleanup that
+/// leaves in a directory the cache lost an object that the new owner does not index.
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_keep_that_linked_after_the_lock_was_lost_removes_what_it_linked() {
+    let key = "cas/b/linking";
+    let (rig, first, gate) = abandoned_keep("tscache-keep-deadline-lost", key).await;
+    std::fs::remove_file(rig.config.path.join(".lock")).unwrap();
+    assert_eq!(first.tick().unwrap(), Tick::Lost);
+    gate.0.open();
+    wait_until("the cleanup of the keep ended", || {
+        read(&first.counters().staging_files) == 0
+    })
+    .await;
+    assert!(!rig.has_file(key));
+    assert!(!meta_path(&rig.config.path, &name_of(key).hex).exists());
+    assert_eq!(first.held(), (0, 0));
+}
+
+/// Asserts that a keep whose link finds the object there already (another cache made it, the
+/// test says) after the cache lost the lock leaves it: the keep linked nothing, so it removes
+/// nothing, is counted as read-only, and answers the put. It would catch a keep that removes the
+/// files of a name because it lost the lock, whoever made them.
+#[tokio::test]
+async fn a_keep_that_found_the_object_there_and_lost_the_lock_leaves_it() {
+    let rig = rig("tscache-keep-existed-lost");
+    let first = rig.locked();
+    let key = "cas/b/there";
+    let gate = OpenOnDrop(rig.disk.hold_links());
+    let cache = first.clone();
+    let putting = tokio::spawn(async move { cache.put(key, Bytes::from_static(b"mine")).await });
+    wait_until("the link began", || {
+        !rig.disk.linked.lock().unwrap().is_empty()
+    })
+    .await;
+    std::fs::remove_file(rig.config.path.join(".lock")).unwrap();
+    assert_eq!(first.tick().unwrap(), Tick::Lost);
+    let file = data_path(&rig.config.path, &name_of(key).hex);
+    std::fs::write(&file, b"the other cache's").unwrap();
+    gate.0.open();
+    wait_until("the put was answered", || putting.is_finished()).await;
+    assert_eq!(putting.await.unwrap(), Ok(()));
+    assert_eq!(first.counters().keeps_skipped(SkippedKeep::ReadOnly), 1);
+    assert_eq!(std::fs::read(&file).unwrap(), b"the other cache's");
+    assert!(meta_path(&rig.config.path, &name_of(key).hex).is_file());
+    assert_eq!(first.held(), (0, 0));
+}
+
+/// Asserts that a keep that is abandoned at its deadline while its link is held on a thread, in a
+/// cache that then loses the lock and takes it again (the generation changed, the cache is
+/// read-write), leaves alone the object and the entry that the new ownership has for the same
+/// name: the keep linked nothing, so it has nothing of its own to undo. The link ends with an
+/// error (the take emptied the stage directory). It would catch a cleanup that removes the
+/// entry and the files of a name because the cache is read-write now, whoever made them.
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_keep_leaves_the_object_of_the_new_ownership_alone() {
+    let key = "cas/b/linking";
+    let (rig, first, gate) = abandoned_keep("tscache-lost-keep-deadline", key).await;
 
     // The lock is lost and taken again: this is another ownership of the directory, and it has
     // an object of its own under the name.

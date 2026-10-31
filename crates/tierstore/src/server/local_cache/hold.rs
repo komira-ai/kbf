@@ -131,7 +131,8 @@ impl Forgotten {
 
     /// Whether nothing is noted.
     fn is_empty(&self) -> bool {
-        !self.overflowed && self.names.is_empty()
+        // Both are looked at: an overflow has no names, and no names is not nothing noted.
+        self.names.is_empty() & !self.overflowed
     }
 
     /// Notes what `other` notes as well.
@@ -177,6 +178,11 @@ pub(super) struct Trace {
     /// In a fill, after the object was published and before the cache asks whether it still
     /// owns the directory.
     pub(super) after_publish: Option<Hook>,
+    /// In `promote`, in each round, after the files to remove were chosen and before they are
+    /// removed.
+    pub(super) promote_round: Option<Hook>,
+    /// In `hold`, after each tick of the loop.
+    pub(super) after_tick: Option<Hook>,
 }
 
 impl Hold {
@@ -288,6 +294,8 @@ impl Inner {
             let distrust = |f: &layout::Found| pending.overflowed || pending.names.contains(&f.hex);
             let (gone, kept): (Vec<_>, Vec<_>) = found.into_iter().partition(distrust);
             found = kept;
+            #[cfg(test)]
+            self.trace_promote_round();
             if let Err(why) = self.remove_files(&gone) {
                 // The names are noted again, so that the next try removes what is left.
                 locked(&self.hold.forgotten).merge(pending);
@@ -335,6 +343,24 @@ impl Inner {
     #[cfg(test)]
     pub(super) fn trace_between_delete_steps(&self) {
         let hook = locked(&self.hold.trace).between_delete_steps.clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Makes the call a test set for each round of the take, if there is one.
+    #[cfg(test)]
+    fn trace_promote_round(&self) {
+        let hook = locked(&self.hold.trace).promote_round.clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Makes the call a test set for after each tick of the loop, if there is one.
+    #[cfg(test)]
+    fn trace_after_tick(&self) {
+        let hook = locked(&self.hold.trace).after_tick.clone();
         if let Some(hook) = hook {
             hook();
         }
@@ -407,6 +433,8 @@ impl LocalCache {
             if let Some(line) = ticking.await.expect("a tick does not panic") {
                 eprintln!("tierstore: {line}");
             }
+            #[cfg(test)]
+            self.inner.trace_after_tick();
         }
     }
 }
