@@ -12,7 +12,8 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { checkDist, type Deps, IMMUTABLE, MIN_FILES, MIN_HTML_PAGES, type Options, PAGE, parseArgs, plan, publish } from '../tools/publish';
-import { read, scratch, SITE } from './support';
+import { listFiles } from '../tools/check-dist';
+import { buildReal, scratch } from './support';
 
 const ACCOUNT = '123456789012';
 const GOOD: Options = {
@@ -249,11 +250,12 @@ test('a nearly empty dist/ is refused before any token is asked for or a sweep c
   checkDist(fakeDist('publish-floor-ok'));
 });
 
-test('the floors sit below the real site and above a gutted one', () => {
-  const lines = read(SITE, 'test', 'golden.manifest').split('\n').filter((l) => l !== '');
-  const html = lines.filter((l) => l.endsWith('.html')).length;
-  assert.ok(MIN_HTML_PAGES <= html && MIN_FILES <= lines.length, `${html} pages, ${lines.length} files`);
-  assert.ok(MIN_HTML_PAGES * 2 > html && MIN_FILES * 2 > lines.length, 'a floor under half the real site would let a gutted site through');
+test('the floors sit below the built site and above a gutted one', () => {
+  // The built tree, the one checkDist sees (the committed manifest leaves out the pages rendered from the guide).
+  const files = listFiles(buildReal('publish-floors'));
+  const html = files.filter((l) => l.endsWith('.html')).length;
+  assert.ok(MIN_HTML_PAGES <= html && MIN_FILES <= files.length, `${html} pages, ${files.length} files`);
+  assert.ok(MIN_HTML_PAGES * 2 > html && MIN_FILES * 2 > files.length, `a floor under half the built site (${html} pages, ${files.length} files) would let a gutted site through`);
 });
 
 test('a file type the sync would upload without a content type or cache rule is refused', () => {
