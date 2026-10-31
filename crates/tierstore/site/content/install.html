@@ -40,7 +40,7 @@ tierstore-0123456789abcdef0123456789abcdef01234567-linux-arm64.tar.gz</pre></div
       <li><code>/etc/tierstore/daemons.key</code>: a read-only key (<code>--read-only-key-file</code>), which may get, head and list and nothing else;</li>
       <li><code>/etc/tierstore/hot.credentials</code> and <code>/etc/tierstore/cold.credentials</code>: the keys tierstore signs its requests to the two stores with.</li>
     </ul>
-    <p>A file holds its key as JSON or as two lines, the access key id and then the secret access key. The <a href="config.html#keys">configuration page</a> has both forms.</p>
+    <p>A file holds its key as JSON or as two lines, the access key id and then the secret access key. The <a href="/docs/keys/">configuration page</a> has both forms.</p>
   </li>
   <li>
     <h3>Start it <span class="tag tag-ok">works today</span></h3>
@@ -74,4 +74,4 @@ let config = aws_sdk_s3::Config::builder()
     .build();
 let client = aws_sdk_s3::Client::from_conf(config);</pre></div>
 <p class="source-note">From <code>packaging/tierstore/README.md</code>, "Using a stock SDK". That README also lists the settings read from the code and not tested.</p>
-<p>Next: <a href="demo.html">a start and a drain</a>, or <a href="config.html">the configuration</a>.</p>
+<p>Next: <a href="demo.html">a start and a drain</a>, or <a href="/docs/configuration/">the configuration</a>.</p>

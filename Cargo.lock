@@ -2190,6 +2190,7 @@ dependencies = [
  "kbf-mac-session",
  "kbf-outputs",
  "kbf-proto",
+ "kbf-seatbelt",
  "kbf-testkit",
  "kbf-types",
  "libc",
@@ -2967,6 +2968,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-seatbelt"
+version = "0.1.0"
+
+[[package]]
 name = "kbf-segments"
 version = "0.1.0"
 dependencies = [
@@ -3217,6 +3222,7 @@ dependencies = [
  "hex",
  "kbf-outputs",
  "kbf-proto",
+ "kbf-seatbelt",
  "kbf-segments",
  "kbf-task-pack",
  "kbf-testkit",
@@ -5226,6 +5232,28 @@ dependencies = [
  "tokio-rustls",
  "toml",
  "x509-parser",
+]
+
+[[package]]
+name = "tierstore-bench"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "futures",
+ "hex",
+ "hmac 0.13.0",
+ "httpdate",
+ "hyper",
+ "hyper-util",
+ "kbf-testkit",
+ "objstore-s3",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

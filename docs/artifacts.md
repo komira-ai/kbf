@@ -19,7 +19,7 @@ build.
 ## Pull request labels
 
 A pull request runs `ci.yml` (the checks `lint` and `test`, which gates the coverage of the fast set
-run in the `test-shard` matrix beside it) and nothing else; the full suite, the macOS jobs and the packages run on a push to `main`
+run in the `test-shard` matrix beside it, and `task-macos`, the task runner's tests on a hosted Mac) and nothing else; the full suite, the macOS jobs and the packages run on a push to `main`
 (`beta.yml`). One label opts a pull request in to more, to spare the small
 macOS runner pool. Adding it to an open pull request starts a run.
 
@@ -34,7 +34,7 @@ the package tests) runs in `beta.yml` on every push and never on a pull request;
 
 ## What is built
 
-24 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
+25 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), two Debian packages of `kbf`
 ([below](#the-kbf-package-deb)), one frontend, one update coordinator and one task runner container image per
 Linux architecture ([below](#the-frontend-and-coordinator-images-oci)) and one macOS package of `kbf-installer`
@@ -42,7 +42,7 @@ Linux architecture ([below](#the-frontend-and-coordinator-images-oci)) and one m
 
 | Asset | Runner | Target |
 |---|---|---|
-| `kbf-<commit>-darwin-arm64.tar.gz`, `kbf-deploy-<commit>-darwin-arm64.tar.gz`, `kbf-installer-<commit>-darwin-arm64.tar.gz`, `kbf-host-install-<commit>-darwin-arm64.tar.gz`, `kbf-updater-<commit>-darwin-arm64.tar.gz`, `kbf-mac-provision-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
+| `kbf-<commit>-darwin-arm64.tar.gz`, `kbf-deploy-<commit>-darwin-arm64.tar.gz`, `kbf-installer-<commit>-darwin-arm64.tar.gz`, `kbf-host-install-<commit>-darwin-arm64.tar.gz`, `kbf-updater-<commit>-darwin-arm64.tar.gz`, `kbf-mac-provision-<commit>-darwin-arm64.tar.gz`, `kbf-task-bundle-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
 | `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz`, `kbf-host-install-<commit>-linux-x86_64.tar.gz`, `kbf-updater-<commit>-linux-x86_64.tar.gz`, `kbf-signer-<commit>-linux-x86_64.tar.gz`, `tierstore-<commit>-linux-x86_64.tar.gz`, `kbf-task-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu`; `kbf-task` is built for `x86_64-unknown-linux-musl` |
 | `kbf-<commit>-linux-arm64.tar.gz`, `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz`, `kbf-host-install-<commit>-linux-arm64.tar.gz`, `kbf-updater-<commit>-linux-arm64.tar.gz`, `kbf-signer-<commit>-linux-arm64.tar.gz`, `tierstore-<commit>-linux-arm64.tar.gz`, `kbf-task-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu`; `kbf-task` is built for `aarch64-unknown-linux-musl` |
 
@@ -70,7 +70,7 @@ drives it over ssh from the operator's Linux box, and, as `kbf-updater agent`, t
 Mac runs, so it has Linux and macOS tarballs. Neither
 is a package, and neither is a component of a release: a host or an operator takes the
 tarball by digest, verifies it as every tarball is (below), and places the binary where
-the guide says. Each tarball holds one member, the binary under its own name. The macOS
+the guide says. Each tarball holds one member, the binary under its own name (the macOS `kbf-task` bundle's holds a layout, [below](#the-macos-kbf-task-bundle)). The macOS
 `kbf-host-install`, `kbf-updater` and `kbf-mac-provision` are signed and checked like the other macOS binaries. `kbf-host-install
 --version` prints its name and package version, which is all the release asks of it.
 `kbf-mac-provision` is the tool that provisions a Mac node (its host settings, worker profile and the `_kbf-updater` account); it has a darwin-arm64 tarball only.
@@ -92,7 +92,7 @@ interpreter and no needed library. The task image
 carries the same file. It writes its pack with `kbf-task-pack` (`crates/kbf-task-pack`), the task pack types
 the frontend ingests with, a crate of pure Rust that does not link the pack index or the object store client.
 
-There is no `kbf-task` asset or image for a Mac. Where no confine is built (anywhere but Linux) `kbf-task` refuses a Command that is to be denied the network (exit 15), so no workflow may package one until the Mac confine exists; a repository lint fails on such an asset, package line or image, on a `cargo build` for a Mac target that would produce it (any job), on a Mac runner job that names it or builds the whole workspace without `--exclude kbf-task`, and on a workflow that names the test-only feature `unconfined-for-tests`; a `cargo check` or `clippy` of it for a Mac target, which ships nothing, is allowed. The backstop is the pin of the release set (the asset table here and the workflow must agree, so a `kbf-task` asset for a Mac needs an edit of this file, which the lint catches); the lint's text match of workflow jobs is a tripwire.
+A Mac gets `kbf-task` only as [the bundle below](#the-macos-kbf-task-bundle); there is no bare `kbf-task` tarball, binary asset or image for a Mac. `kbf-task` has a macOS confine: it runs the Command alone under `/usr/bin/sandbox-exec`, with a profile (`crates/kbf-seatbelt`, also used by the Mac daemon's driver) that denies every network operation but to loopback and Unix sockets for a Command denied the network, and denies reading, writing, renaming and linking each file holding a credential or presigned URL it was given (the grant token file, the pack URL file, the PUT URLs file), and renaming the directories above it, for any Command. It does not limit other writes, nor `mach-lookup` of helper daemons, does not stop DNS (any Unix socket is allowed, and the system resolver is reached through one), and a connect to the node's own non-loopback address was allowed under the denial on the macOS runner. A system that is neither Linux nor macOS has no confine, and `kbf-task` refuses a Command denied the network there (exit 15). The `task-macos` job of `ci.yml` runs `cargo test -p kbf-task` on a hosted Mac, without the test-only feature. A repository lint (`crates/kbf-integration-test/tests/no_darwin_task.rs`) allows exactly the bundle and refuses: a bare `kbf-task` asset, package line or image for a Mac (any name but `kbf-task-bundle-<commit>-darwin-arm64`), a `cargo build`, `b` or `install` for a Mac target that would produce `kbf-task`, a Mac runner job that names it other than in a `cargo test`, `check` or `clippy` line, or builds the whole workspace without `--exclude kbf-task`, in any job but the bundle job (`darwin-arm64` of `artifacts.yml`), the bundle made (`cargo xtask package-task-bundle`) by any other job, and any workflow that names the test-only feature `unconfined-for-tests`; a `cargo check`, `clippy` or `test` of it for a Mac target, which ships nothing, is allowed. The backstop is the pin of the release set (the asset table here and the workflow must agree: `crates/kbf-integration-test/tests/release_artifacts`); the lint's text match of workflow jobs is a tripwire.
 
 `tierstore` is the hot and cold S3 object store proxy (`crates/tierstore`): an S3 server over two
 tiers that copies new objects to the cold tier and frees the hot one when it fills. It is built with
@@ -730,6 +730,62 @@ sudo installer -pkg kbf-installer-<commit>-darwin-arm64.pkg -target /
 
 (The flags are the installer's, as for the deb.) Installing places files and starts nothing; `sudo
 /usr/local/kbf-installer/bin/kbf-installer setup` configures the host.
+
+## The macOS kbf-task bundle
+
+The Mac executor runs `kbf-task` inside the sandbox as a bundle placed by digest, not as a layer of the
+toolchain bundle. The `darwin-arm64` job makes that bundle, and no other job does:
+
+| Asset | What it is |
+|---|---|
+| `kbf-task-bundle-<commit>-darwin-arm64.tar.gz` | the files of an OCI image layout directory, at the paths they have in it: `oci-layout`, `index.json` and `blobs/sha256/<hex>` |
+| `kbf-task-bundle-<commit>-darwin-arm64.cdx.json` | the CycloneDX SBOM of the `kbf-task` binary, which is all the one layer holds |
+
+Both are in the macOS `SHA256SUMS`, the tarball is attested like every tarball (build provenance, an SBOM
+attestation and its own `.sigstore.json` bundle; [above](#provenance-bundles-verifying-a-tarball-offline)),
+and the tarball is one of the 25. It is not a binary tarball: it holds no member named `kbf-task`, the layout
+holds it in a layer.
+
+The steps, in order, each unconditional (`crates/kbf-integration-test/tests/release_artifacts` pins them):
+`kbf-task` is built for the job's Mac target with `cargo build --locked --release -p kbf-task` and its default
+features, so it has the macOS confine (the test-only feature `unconfined-for-tests` is never named); it is signed
+ad hoc with the hardened runtime and checked by `cargo xtask sign-darwin`, exactly as the other Mac binaries
+([below](#macos-signing-what-ad-hoc-with-the-hardened-runtime-gives)), and has no entitlements; the pinned
+`js-bundle` is fetched by one command, `cargo xtask fetch-attested-tool`, which refuses the download unless its SHA-256
+is the pinned one, writes it, runs `gh attestation verify` on that file, and only then takes the program out of that
+same file; `cargo xtask stage-task-tree` copies the signed binary alone to a directory of its own, which `js-bundle pack` packs as the one tree `task` of a bundle named
+`kbf-task` (minimum macOS 14.0, the entrypoint `kbf-task`, the network level `on` and the reads `system-certs` and
+`resolver-config`, which `kbf-task` needs to reach the store and the frontend); `js-bundle verify` extracts every
+layer under the format's rules; and `cargo xtask package-task-bundle` refuses a layout that is not exactly
+one `kbf-task` bundle for a Mac (the files of a layout and no others, one manifest, every blob under the SHA-256 of
+its bytes, the config's `os`, `architecture`, `name` and entrypoint) and writes the tarball: entries sorted by
+path, mode 0644 (0755 for a directory), owner and group 0, time 0, in a gzip stream with no name and time 0, so
+the same layout is the same bytes on every runner.
+
+**What the network level means.** `--network on` sets the bundle's `seatbelt.network_max`, a ceiling the agent
+clamps a job's request to; a job's own level (`NativeSpec.network`) defaults to off. It does not bound what
+`kbf-task` itself can reach: that bound is the pf anchor for the pool uid range, not Seatbelt. Not yet verified,
+to be proven on a farm Mac in the M7/M8 slice: whether the agent runs a bundle program under its own Seatbelt,
+which would refuse the confine's nested `sandbox-exec` (`sandbox_apply: Operation not permitted`).
+
+**The digest rule.** A file is taken by the SHA-256 `SHA256SUMS` lists for its tarball. What a host places in
+its store is named by the bundle's manifest digest (`sha256:<hex>`, the one entry of `index.json`, which
+`js-bundle pack` prints and `js-bundle inspect` shows); the manifest names the config and the layer by digest,
+so the tarball's attested digest fixes the manifest digest, and a manifest digest that does not come from an
+attested tarball is not this release's `kbf-task`.
+
+**The packer pin.** `js-bundle` is a release of the jobscheduler repository, pinned in the workflow's `env`:
+`JS_BUNDLE_VERSION` is `0.1.79` (the release `v0.1.79`), `JS_BUNDLE_SHA256_AARCH64_DARWIN` is
+`dd21b0beee4d3f2d11a5f0e4f31ec2128a6fd85891f60405a283e1bf640ee50b` (the SHA-256 of
+`js-bundle-0.1.79-aarch64-apple-darwin.tar.gz` in that release's `SHA256SUMS`, checked by `cargo xtask fetch`
+before anything is unpacked), and `JS_BUNDLE_SOURCE_DIGEST` is
+`1f304ae75dbef20c9b01231b666b1e91e1f21743`, the commit that release was built from. The command runs the pinned `gh attestation verify` on the archive file (before anything is taken out of it) for the repository `komira-ai/jobscheduler`, the signer workflow
+`komira-ai/jobscheduler/.github/workflows/release.yml`, `--source-ref refs/heads/main` and
+`--source-digest` that commit, on a hosted runner. Moving the pin means
+changing the three values together with this paragraph (a test holds this file to the workflow's values).
+
+**Not notarized.** As for the other Mac binaries: signed ad hoc with no Developer ID, so no identity and no
+notarization; authenticity comes from the attestation of the tarball.
 
 ## Where the files are, and for how long
 

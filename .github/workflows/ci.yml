@@ -1,11 +1,11 @@
-# The pull-request gate: two required checks, `lint` and `test`; `test` is the coverage gate, and the
+# The pull-request gate: the required checks `lint` and `test` plus `task-macos`; `test` is the coverage gate, and the
 # tests it measures run beside it in the matrix job `test-shard`. GitHub-hosted runners only; the repository
 # lints in crates/kbf-integration-test/tests/repo_lints.rs hold every workflow to that, to commit-SHA pinned
 # actions from the set the repository's Actions policy allows (actions/* and
 # tailscale/github-action), and to a top-level `permissions: {}`.
 #
 # A pull request runs only this. The rest of the suite (the slow tests, the Arm run, the
-# jobs that need a service, root, crun or a Mac, the packages and the beta smoke) runs on a
+# jobs that need a service, root, crun or a Mac, but `task-macos`, the packages and the beta smoke) runs on a
 # push to main, in beta.yml. On a push to main this workflow is the first stage of the one
 # pipeline (pipeline.yml calls it, `workflow_call`), so the merged result meets the same gate
 # and the Cargo cache below is saved. It no longer has a push trigger of its own: a push to
@@ -182,9 +182,10 @@ jobs:
           # The oldest macOS the binaries support, as artifacts.yml builds them.
           MACOSX_DEPLOYMENT_TARGET: "14.0"
         run: cargo check --locked --target aarch64-apple-darwin -p kbf-cli --bin kbf
-      # The task runner has no confine for a Mac (a Command denied the network is refused there), and
-      # that code path compiles only for a non-Linux target: check it, without building or shipping it.
-      - name: Check for aarch64-apple-darwin the task runner, whose confine is not built there
+      # The task runner's macOS confine (the Command under `sandbox-exec`) compiles only for a Mac
+      # target: check it on this runner too, so a macOS-only error is red here before the Mac job runs.
+      # Nothing here builds or ships it.
+      - name: Check for aarch64-apple-darwin the task runner, whose confine is for macOS
         if: ${{ !cancelled() }}
         env:
           CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
@@ -541,6 +542,39 @@ jobs:
       # this run's workspace coverage artifacts.
       - if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  # The task runner's tests on a hosted Mac, without its test-only feature: they run the Command
+  # under the macOS confine for real (a denied Command's connect is refused, a credential file is
+  # unreadable, an allowed Command runs). Tests only: no binary of it is built for release here.
+  task-macos:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      - run: sw_vers
+      - run: cargo test -p kbf-task --locked --no-fail-fast
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:

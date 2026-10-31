@@ -12,6 +12,11 @@
 //!    plain HTTP, since the token is scoped to one action's inputs and expires. Without the flag
 //!    an `http` grant URL is refused at startup (exit 14), before any request; either way the
 //!    token is sent as a bearer header and is never logged;
+//!    With `--locate` the tool first asks the listener's `GET /locate` once, and reads each input
+//!    where the answer points (a byte range of a pack, or a whole large object, from the store the
+//!    answer names, with the read grants it carries), checking the bytes as always and reading
+//!    from the listener any blob whose direct read fails ([`fetch::LocatedSource`]); without the
+//!    flag `/locate` is never asked. A line on standard error counts the blobs read each way;
 //! 2. runs the Command there ([`run`]): its argv, environment and working directory, stdout and
 //!    stderr to files, under a deadline. The environment is the Command's own, preceded by `HOME`,
 //!    `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`, which name fresh directories
@@ -116,12 +121,17 @@ pub mod put_urls;
 pub mod run;
 pub mod task;
 
+#[cfg(test)]
+pub(crate) mod fake_http;
+
 // The feature that lets a denied Command run with the network where no confine exists is for tests:
-// a non-Linux build without debug assertions (a release build) that turns it on does not compile; on
-// Linux the feature does nothing, so it is allowed there (a workspace-wide `--all-features` build).
+// a build for a system that is neither Linux nor macOS, without debug assertions (a release build),
+// that turns it on does not compile. On Linux and macOS, which have a confine, the feature does
+// nothing, so it is allowed there (a workspace-wide `--all-features` build).
 #[cfg(all(
     feature = "unconfined-for-tests",
     not(target_os = "linux"),
+    not(target_os = "macos"),
     not(debug_assertions),
     not(test)
 ))]

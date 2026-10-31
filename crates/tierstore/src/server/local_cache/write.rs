@@ -1,18 +1,17 @@
-//! The writes of a cache with `write_through` on: each goes to the upstream, and none is kept.
+//! The writes of a cache with `write_through` on: each goes to the upstream before it is
+//! acknowledged, so nothing is only local and there is nothing to recover.
 //!
-//! A write is acknowledged only after the upstream has it, so nothing is only local and there is
-//! nothing to recover. The cache keeps no copy of what it writes: the first read of an object
-//! fills it, as for any other.
-//!
-//! - **Create-only put** ([`put_through`](Inner::put_through)): one HEAD of the key goes to the
-//!   upstream before the body is read. An object that is there is
+//! - **Create-only put** ([`put_through`](Inner::put_through), in `keep`): one HEAD of the key
+//!   goes to the upstream before the body is read. An object that is there is
 //!   [`AlreadyExists`](Error::AlreadyExists) at once, with no byte of the body read and no put
 //!   sent (the S3 backend would otherwise upload all the parts of a large body and learn it at the
 //!   completion). The HEAD only saves work: the upstream's create-only put is the one arbiter of
 //!   two writers of one key, and its `AlreadyExists` is passed on as it is. An upstream that
-//!   cannot answer the HEAD is the error of the put.
-//! - **Multipart** (create, part, complete, abort): passed to the upstream as they are. A
-//!   completion that succeeds drops the cache's entry for the key, if it has one.
+//!   cannot answer the HEAD is the error of the put. Under a `cache = true` policy the object is
+//!   also kept on the node (see `keep`).
+//! - **Multipart** (create, part, complete, abort): passed to the upstream as they are and not
+//!   kept (the first read fills the object). A completion that succeeds drops the cache's entry
+//!   for the key, if it has one.
 //! - **Delete** ([`delete_through`](Inner::delete_through)): the entry is dropped, then the
 //!   upstream deletes. A fill that is running for the key does not keep the object it read (see
 //!   [`forget`](Inner::forget)).
@@ -20,6 +19,8 @@
 //!
 //! The keys under `_journal/` and `_tiering/` belong to a storage node and are refused with
 //! [`Error::Reserved`], as a storage node does.
+
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::StreamExt as _;
@@ -33,7 +34,7 @@ use super::{Inner, READ_ONLY, locked};
 impl Inner {
     /// Whether the cache takes writes of `key`: it was told to, and the key is not one a storage
     /// node keeps for itself.
-    fn writable(&self, key: &str) -> Result<(), Error> {
+    pub(super) fn writable(&self, key: &str) -> Result<(), Error> {
         if !self.config.write_through {
             return Err(Error::Unsupported(READ_ONLY.to_owned()));
         }
@@ -43,28 +44,9 @@ impl Inner {
         Ok(())
     }
 
-    /// A create-only put of a body that arrives as chunks.
-    pub(super) async fn put_through(
-        &self,
-        key: &str,
-        len: Option<u64>,
-        body: PartBody<'_>,
-    ) -> Result<(), Error> {
-        self.writable(key)?;
-        match self.upstream.head(key).await {
-            Ok(_) => return Err(Error::AlreadyExists(key.to_owned())),
-            Err(Error::NotFound(_)) => {}
-            Err(other) => return Err(other),
-        }
-        self.upstream.put_stream(key, len, body).await?;
-        // The key was not there, so an entry for it is of an object that was deleted behind the
-        // cache's back.
-        self.forget(key);
-        Ok(())
-    }
-
-    /// A create-only put of a body held whole: the streamed put of a body of one chunk.
-    pub(super) async fn put_whole(&self, key: &str, body: Bytes) -> Result<(), Error> {
+    /// A create-only put of a body held whole: the streamed put of a body of one chunk (see
+    /// [`put_through`](Inner::put_through), in `keep`).
+    pub(super) async fn put_whole(self: &Arc<Self>, key: &str, body: Bytes) -> Result<(), Error> {
         let len = body.len() as u64;
         let once: PartBody<'_> = stream::once(async move { Ok(body) }).boxed();
         self.put_through(key, Some(len), once).await

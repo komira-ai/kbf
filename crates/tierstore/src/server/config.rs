@@ -23,8 +23,8 @@
 //! - `[local_cache]`: the cache directory, its budget and marks (build node only).
 //! - `[oci]`: the read-only OCI front, left out when there is none: `listen` (needed in the
 //!   table), the certificate and key files, the key prefix and the connection limits. They
-//!   follow the rules of the `--oci-*` flags. A storage node only: a build node's file with an
-//!   `[oci]` table is refused.
+//!   follow the rules of the `--oci-*` flags. Both shapes take it: a build node serves the
+//!   registry from its cache.
 //! - `[[policy]]`: the per-prefix settings. On a build node `cache = true` keeps the keys under
 //!   the prefix in the cache; on a storage node a policy is read and checked and has no
 //!   effect, and `cache = true` is refused.
@@ -209,13 +209,26 @@ pub(super) struct Dur(pub Duration);
 
 impl<'de> Deserialize<'de> for Dur {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        match parse_duration(&text) {
+        deserializer.deserialize_str(DurVisitor)
+    }
+}
+
+struct DurVisitor;
+
+impl Visitor<'_> for DurVisitor {
+    type Value = Dur;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a duration such as \"15m\" (a number and ms, s, m or h)")
+    }
+
+    fn visit_str<E: de::Error>(self, text: &str) -> Result<Dur, E> {
+        match parse_duration(text) {
             Ok(duration) => Ok(Dur(duration)),
-            // Not the reason of the flag: it holds the text, which the file's messages never repeat.
-            Err(_) => Err(de::Error::custom(
-                "not a duration; use a number and ms, s, m or h, as in 15m",
-            )),
+            // An invalid value, not a custom message and not the reason of the flag (which holds
+            // the text): the refusal of a file names the key and the kind of value it takes and
+            // never shows what was written (see `syntax`).
+            Err(_) => Err(E::invalid_value(de::Unexpected::Str(text), &self)),
         }
     }
 }
@@ -554,7 +567,11 @@ const LOCAL_CACHE_KEYS: &[&str] = &[
     "path",
     "layout",
     "max_concurrent_fills",
+    "max_concurrent_keeps",
+    "keep_wait",
+    "keep_deadline",
     "write_through",
+    "whole_fill_limit",
     "scrub_rate",
 ];
 
@@ -678,19 +695,20 @@ pub(super) fn check_policies(policies: &[Policy], caching: bool) -> Result<(), C
 }
 
 /// The OCI front's table checked as its flags are: the values of the `--oci-*` flags.
-struct OciFlags {
-    listen: Option<SocketAddr>,
-    tls_cert: Option<PathBuf>,
-    tls_key: Option<PathBuf>,
-    prefix: Option<String>,
-    max_connections: Option<u32>,
-    connection_lifetime: Option<Duration>,
+#[derive(Clone, Debug)]
+pub(super) struct OciFlags {
+    pub listen: Option<SocketAddr>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    pub prefix: Option<String>,
+    pub max_connections: Option<u32>,
+    pub connection_lifetime: Option<Duration>,
 }
 
 /// The flags `[oci]` stands for: none when the table is left out. A table without `listen` is
 /// refused (naming the key it has that needs it, if it has one), the certificate and the key go
 /// together, and the count is at least one.
-fn oci(table: Option<OciTable>) -> Result<OciFlags, ConfigError> {
+pub(super) fn oci(table: Option<OciTable>) -> Result<OciFlags, ConfigError> {
     let Some(table) = table else {
         return Ok(OciFlags {
             listen: None,
@@ -798,11 +816,7 @@ fn settings(file: File, per_run: PerRun) -> Result<Settings, ConfigError> {
             Ok(Settings::Storage(Box::new(cli)))
         }
         (None, Some(cold), Some(cache)) => {
-            if oci.is_some() {
-                let why = "is refused in the file of a build node: the OCI front is a storage node's, and this node serves only the S3 front";
-                return Err(invalid("oci", why));
-            }
-            let cache = CacheSettings::new(server, (cache, cold), &policy, per_run)?;
+            let cache = CacheSettings::new(server, (cache, cold), oci, &policy, per_run)?;
             Ok(Settings::Cache(Box::new(cache)))
         }
         (Some(_), Some(_), Some(_)) => {

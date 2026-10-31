@@ -18,6 +18,8 @@ An S3 front over a hot and a cold tier. It serves one bucket, path-style, and ch
 `Authorization` header (and presigned PUT URLs). The packaging notes, the flags and the key files
 are in `packaging/tierstore/README.md`; the roles of a key are in `src/server/keys.rs`.
 
+The operator guide (install, keys and roles, configuration, operations, troubleshooting, limits) is in `docs/`; a test of the crate (`src/server/docs_tests.rs`) holds every page of it to the code, and the site's docs pages are made from it.
+
 ## Flags or a file
 
 The settings that describe the data path are flags, or one TOML file given with `--config <path>`
@@ -41,8 +43,9 @@ counters.
 
 With `write_through = true` in `[local_cache]` (version 0.2.0 on; `tierstore --version` shows it)
 the node also takes create-only puts, presigned PUTs, multipart uploads and deletes, and sends
-each to the upstream (`src/server/local_cache/write.rs`) before it answers; it keeps no copy of
-what is written. The roles of the keys apply as on a storage node. The start tests the upstream's
+each to the upstream (`src/server/local_cache/write.rs`) before it answers; a create-only put
+under a `cache = true` policy is also kept on the node (`src/server/local_cache/keep.rs`), a
+multipart upload is not. The roles of the keys apply as on a storage node. The start tests the upstream's
 create-only and multipart-conditional answers with the self-test, so the upstream key must be one
 that writes (exit status 3 if not). `tierstore --config <path> --check-config` checks a file as a
 start does, without touching the network, and exits 0 and prints nothing, or prints the refusal and
@@ -198,6 +201,14 @@ In a file given with `--config`, the front is the optional `[oci]` table (`liste
 `tls_key_file`, `prefix`, `max_connections`, `connection_lifetime`), with the rules of the flags
 (`listen` is needed in it, the certificate and the key go together, `max_connections` is at least
 1); the `--oci-*` flags are refused with the file, and `--print-config` writes them as the table.
+
+The front runs on both shapes of the file. On a storage node it reads through the proxy. On a
+build node (`[local_cache]` and `[cold_store]`, see above) the same `[oci]` table, with the same
+keys and rules, starts the front beside the S3 listener over the node's local cache: a blob or a
+manifest is a hit on the disk when the cache holds it, and a miss under a `[[policy]]` prefix with
+`cache = true` is filled from the upstream, as an S3 GET is. A build node has no flag form, so its
+front is set only in the file; the start line ends with ` oci-listen=<address> (http|https)`, and
+`/metricz` shows the OCI block and the cache block.
 
 - `GET` and `HEAD` of `/v2/`, `/v2/<name>/manifests/sha256:<hex>` and
   `/v2/<name>/blobs/sha256:<hex>`; anything else is 404, and any other method 405.
