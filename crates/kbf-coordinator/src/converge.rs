@@ -131,17 +131,32 @@ pub fn role_counts(
         .collect()
 }
 
-/// Where the farm stands at `now` against `desired`.
+/// Where the farm stands at `now` against `desired`, for `kbf` as shipped.
 #[must_use]
 pub fn converge(desired: Option<&Desired>, fleet: &Fleet, now: Duration) -> Convergence {
-    converge_with(&ServiceDef::kbf(), desired, fleet, now, |d, role| {
+    converge_kbf(&ServiceDef::kbf(), desired, fleet, now)
+}
+
+/// Where the hosts of `kbf`, as `def` defines it (the shipped definition or a replacement),
+/// stand at `now` against `desired`: the answer clients of `kbf` have always read, so the
+/// minimum of hosts up per role is the desired state's `min_up` alone, without the floor of
+/// a `never_last` role that [`converge_service`] applies.
+#[must_use]
+pub fn converge_kbf(
+    def: &ServiceDef,
+    desired: Option<&Desired>,
+    fleet: &Fleet,
+    now: Duration,
+) -> Convergence {
+    converge_with(def, desired, fleet, now, |d, role| {
         d.min_up.min_up_of(role) as usize
     })
 }
 
 /// Where the hosts of the service `def` stand at `now` against its `desired`: like
 /// [`converge`] over the hosts that heartbeated the service, with the minimum of hosts up
-/// per role being what the service requires of the role ([`crate::services::RoleDef::required_up`]).
+/// per role being what the service requires of the role
+/// ([`crate::services::RoleDef::required_up`]).
 #[must_use]
 pub fn converge_service(
     def: &ServiceDef,
