@@ -42,6 +42,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
         with:
           persist-credentials: false
           ref: ${{ inputs.ref }}
@@ -49,25 +50,23 @@ jobs:
       - run: cargo build --locked --release -p tierstore-bench
       - name: The binary starts
         run: target/release/tierstore-bench --help
-      - name: Tar the binary (a tar keeps the executable bit) and sum both files
-        run: |
-          sha="$(git rev-parse HEAD)"
-          name="tierstore-bench-$sha-linux-x86_64"
-          mkdir -p "dist/$name"
-          tar -C target/release -czf "dist/$name/$name.tar.gz" tierstore-bench
-          cp target/release/tierstore-bench "dist/$name/tierstore-bench"
-          cd "dist/$name"
-          sha256sum tierstore-bench "$name.tar.gz" | tee SHA256SUMS
-          {
-            echo "### $name"
-            echo '```'
-            cat SHA256SUMS
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "ARTIFACT=$name" >> "$GITHUB_ENV"
+      # The commit built (a pull request builds its merge commit, a dispatch the commit `ref` names).
+      - name: Name the artifact after the commit
+        run: echo "NAME=tierstore-bench-${{ steps.checkout.outputs.commit }}-linux-x86_64" >> "$GITHUB_ENV"
+      - run: mkdir "dist"
+      - run: cp target/release/tierstore-bench dist/tierstore-bench
+      - name: Tar the binary (a tar keeps the executable bit)
+        run: tar -C dist -czf "dist/$NAME.tar.gz" tierstore-bench
+      - name: Sum the binary and the tarball
+        working-directory: dist
+        run: sha256sum tierstore-bench "$NAME.tar.gz" > SHA256SUMS
+      - name: Print the sums in the job log
+        run: cat dist/SHA256SUMS
+      - name: Print the sums in the job summary
+        run: cat dist/SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ env.ARTIFACT }}
-          path: dist/${{ env.ARTIFACT }}/
+          name: ${{ env.NAME }}
+          path: dist/
           retention-days: 30
           if-no-files-found: error
