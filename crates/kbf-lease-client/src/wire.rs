@@ -433,6 +433,15 @@ pub struct RunLimits {
     pub disk_bytes: Option<u64>,
 }
 
+/// One file the agent writes for the run before it starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunFile {
+    /// The file name.
+    pub name: String,
+    /// The contents.
+    pub contents: String,
+}
+
 /// The body of `POST /v1/leases/{id}/runs`.
 ///
 /// `Debug` prints the number of arguments and never the arguments: they may carry a
@@ -453,6 +462,9 @@ pub struct RunSpec {
     /// The mounts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<Mount>,
+    /// The files.
+    #[serde(default)]
+    pub files: Vec<RunFile>,
     /// Whether the run may change the machine.
     #[serde(default, skip_serializing_if = "is_default")]
     pub isolation: Isolation,
@@ -471,6 +483,7 @@ impl RunSpec {
             limits,
             gpu_indices: Vec::new(),
             mounts: Vec::new(),
+            files: Vec::new(),
             isolation: Isolation::default(),
             labels: BTreeMap::new(),
         }

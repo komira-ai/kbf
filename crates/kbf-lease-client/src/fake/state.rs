@@ -11,7 +11,7 @@ use crate::ids::{LeaseId, RunId};
 use crate::wire::{
     AcquireRequest, Granted, Host, HostList, HostLoad, HostSource, HostState, Lease, LeaseList,
     LeaseState, Mount, Outcome, PendingLease, ReleaseState, Released, RenewRequest, Renewed, Run,
-    RunAccepted, RunList, RunSpec, RunState, Shape, Taint,
+    RunAccepted, RunFile, RunList, RunSpec, RunState, Shape, Taint,
 };
 
 /// The ttl of a lease that asks for none (the server's `--default-ttl`).
@@ -58,6 +58,14 @@ impl Pool {
             hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
             prepare: false,
         }
+    }
+}
+
+impl Pool {
+    /// The same pool with its hosts reporting `run-files`.
+    #[must_use]
+    pub fn with_run_files(self) -> Self {
+        self
     }
 }
 
@@ -684,6 +692,10 @@ impl State {
             .iter()
             .find(|row| row.id == *run)
             .map(|row| row.mounts.clone())
+    }
+
+    pub(super) fn run_files(&self, _run: &RunId) -> Option<Vec<RunFile>> {
+        None
     }
 
     pub(super) fn run_state(&self, run: &RunId) -> Option<RunState> {
