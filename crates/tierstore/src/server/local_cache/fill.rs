@@ -344,7 +344,7 @@ impl Inner {
     }
 
     async fn fetch(self: &Arc<Self>, key: &str, name: &Name) -> Result<Filled, Stop> {
-        let meta = self.upstream.head(key).await?;
+        let meta = self.upstream_head(key).await?;
         let Some(reservation) = self.reserve(meta.size) else {
             bump(&self.counters.fills_skipped);
             return Ok(Filled::Skipped);
@@ -355,7 +355,7 @@ impl Inner {
         while offset < meta.size {
             let want = self.config.fill_chunk.max(1).min(meta.size - offset);
             let range = ByteRange::new(offset, want);
-            let chunk = self.upstream.get(key, Some(range)).await?;
+            let chunk = self.upstream_get(key, Some(range)).await?;
             if chunk.len() as u64 != want {
                 return Err(Stop::Short);
             }
@@ -366,7 +366,7 @@ impl Inner {
         staged.finish().await?;
         // A key named by its content is checked by the hash below. Any other key could have been
         // written over while it was read, and the file would hold bytes of two versions.
-        if name.content.is_none() && !self.upstream.head(key).await?.same_content(&meta) {
+        if name.content.is_none() && !self.upstream_head(key).await?.same_content(&meta) {
             return Err(Stop::Changed);
         }
         let digest = hex::encode(hasher.finalize());

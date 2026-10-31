@@ -84,7 +84,7 @@ use crate::{Error, PartBody};
 
 use super::fill::{Filled, Flight, Pending, Reserved, Staged};
 use super::layout::{Name, Sidecar};
-use super::metrics::{SkippedKeep, bump};
+use super::metrics::{SkippedKeep, add, bump};
 use super::{Inner, locked};
 
 /// The chunks of a body that may wait for the disk.
@@ -277,6 +277,17 @@ impl Keeping {
     }
 }
 
+/// The body, passed on as it is, with the bytes that pass added to `bytes`.
+pub(super) fn counting<'a>(body: PartBody<'a>, bytes: &Arc<AtomicU64>) -> PartBody<'a> {
+    let bytes = Arc::clone(bytes);
+    body.inspect(move |item| {
+        if let Ok(chunk) = item {
+            let _ = bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        }
+    })
+    .boxed()
+}
+
 /// The body, passed on as it is, with each chunk given to `keeping` on the way.
 pub(super) fn tee<'a>(key: &'a str, body: PartBody<'a>, keeping: &'a mut Keeping) -> PartBody<'a> {
     let state = (body, keeping, false);
@@ -311,13 +322,18 @@ impl Inner {
         body: PartBody<'_>,
     ) -> Result<(), Error> {
         self.writable(key)?;
-        match self.upstream.head(key).await {
+        match self.upstream_head(key).await {
             Ok(_) => {
                 bump(&self.counters.write_exists);
                 return Err(Error::AlreadyExists(key.to_owned()));
             }
             Err(Error::NotFound(_)) => {}
-            Err(other) => return Err(other),
+            Err(other) => {
+                // The HEAD before the body failed: no put was sent, and the client has an
+                // error, so it is counted as a failed put, under the reason the error maps to.
+                self.counters.put_failed(&other);
+                return Err(other);
+            }
         }
         let name = self.cacheable(key);
         let mut keeping = match &name {
@@ -327,27 +343,40 @@ impl Inner {
             }
             None => None,
         };
+        let passed = Arc::new(AtomicU64::new(0));
         let sent = match &mut keeping {
             Some(keeping) => {
                 let teed = tee(key, body, keeping);
                 self.upstream.put_stream(key, len, teed).await
             }
-            None => self.upstream.put_stream(key, len, body).await,
-        };
-        match sent {
-            Ok(()) => {}
-            Err(Error::AlreadyExists(exists)) => {
-                bump(&self.counters.write_exists);
-                return Err(Error::AlreadyExists(exists));
+            None => {
+                let counted = counting(body, &passed);
+                self.upstream.put_stream(key, len, counted).await
             }
-            Err(other) => return Err(other),
+        };
+        if let Err(error) = &sent {
+            // The put reached the upstream (the HEAD before it was another call) and failed.
+            self.counters.put_failed(error);
+            if matches!(error, Error::AlreadyExists(_)) {
+                bump(&self.counters.write_exists);
+            }
         }
+        sent?;
+        bump(&self.counters.upstream_puts);
+        let sent_bytes = keeping
+            .as_ref()
+            .map_or_else(|| passed.load(Ordering::Relaxed), |keeping| keeping.seen);
+        add(&self.counters.upstream_put_bytes, sent_bytes);
         bump(&self.counters.writes_through);
         if let (Some(name), Some(mut keeping)) = (name, keeping) {
             if !keeping.finished {
                 // The upstream took the put without reading the body to its end.
                 if keeping.wanted.is_some() {
-                    return Err(Error::BadDigest(key.to_owned()));
+                    // The upstream took the put, so it is a put (above) and, since the client is
+                    // told it failed, a failure of reason `bad_digest` too.
+                    let error = Error::BadDigest(key.to_owned());
+                    self.counters.put_failed(&error);
+                    return Err(error);
                 }
                 keeping.stage = None;
                 keeping.lost = Some(SkippedKeep::Head);
@@ -459,7 +488,7 @@ impl Inner {
     ) -> Result<(), SkippedKeep> {
         let (size, digest) = written;
         let deadline = Instant::now() + self.config.keep_deadline;
-        let meta = match Self::before(deadline, self.upstream.head(key)).await? {
+        let meta = match Self::before(deadline, self.upstream_head(key)).await? {
             Ok(meta) if meta.size == size => meta,
             _ => return Err(SkippedKeep::Head),
         };

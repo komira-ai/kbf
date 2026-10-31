@@ -21,6 +21,7 @@
 //! [`Error::Reserved`], as a storage node does.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::StreamExt as _;
@@ -29,6 +30,8 @@ use futures::stream;
 use crate::journal::is_reserved;
 use crate::{Error, PartBody};
 
+use super::keep::counting;
+use super::metrics::{add, bump};
 use super::{Inner, READ_ONLY, locked};
 
 impl Inner {
@@ -83,10 +86,18 @@ impl Inner {
         body: PartBody<'_>,
     ) -> Result<String, Error> {
         self.writable(key)?;
+        let passed = Arc::new(AtomicU64::new(0));
+        let counted = counting(body, &passed);
         let sent = self
             .upstream
-            .upload_part_with_len(key, id, number, len, body);
-        sent.await
+            .upload_part_with_len(key, id, number, len, counted);
+        let tag = sent.await?;
+        // The bytes of a part the upstream took count toward the put its completion makes.
+        add(
+            &self.counters.upstream_put_bytes,
+            passed.load(Ordering::Relaxed),
+        );
+        Ok(tag)
     }
 
     /// Completes the upload at the upstream, create-only; when the object is made, the entry for
@@ -98,7 +109,15 @@ impl Inner {
         parts: &[(u32, String)],
     ) -> Result<String, Error> {
         self.writable(key)?;
-        let tag = self.upstream.complete_upload(key, id, parts).await?;
+        let completed = self.upstream.complete_upload(key, id, parts).await;
+        let tag = match completed {
+            Ok(tag) => tag,
+            Err(error) => {
+                self.counters.put_failed(&error);
+                return Err(error);
+            }
+        };
+        bump(&self.counters.upstream_puts);
         self.forget(key);
         Ok(tag)
     }

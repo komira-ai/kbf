@@ -8,6 +8,7 @@ use bytes::Bytes;
 use kbf_testkit::dir::TestDir;
 
 use super::listing::LISTING_CALLS;
+use super::metrics::read;
 use super::testing::{FakeDisk, Rig};
 use super::{CacheConfig, LocalCache};
 use crate::{
@@ -88,6 +89,13 @@ async fn list_page_leaves_out_the_reserved_keys_and_keeps_pages_full() {
     assert!(none.is_empty());
     let nothing = rig.cache.list_page("", None, 0).await.unwrap();
     assert!(nothing.is_empty());
+
+    // Every page asked of the upstream is counted, the pages that make up a short page included,
+    // and the listings that ask nothing (a reserved prefix, no keys wanted) count nothing: the
+    // count is the upstream's own, and is more than the four listings that asked it.
+    let counted = read(&rig.cache.counters().upstream_lists);
+    assert_eq!(counted, rig.calls(Op::List));
+    assert!(counted > 4, "{counted}");
 }
 
 /// Asserts that `list_uploads` leaves out the uploads of reserved keys, makes a page up to the
@@ -129,6 +137,11 @@ async fn list_uploads_leaves_out_the_reserved_keys() {
             .unwrap()
             .is_empty()
     );
+    // Every page of uploads asked of the upstream is counted, the refills included, and the
+    // reserved prefix asked none: the count is the upstream's own.
+    let counted = read(&rig.cache.counters().upstream_list_uploads);
+    assert_eq!(counted, rig.calls(Op::ListUploads));
+    assert!(counted >= 3, "{counted}");
 }
 
 /// Asserts that a listing whose prefix is inside a reserved prefix is empty and makes no call to
@@ -177,9 +190,13 @@ async fn a_large_reserved_range_costs_about_one_call() {
     let page = rig.cache.list_page("", None, 3).await.unwrap();
     assert_eq!(keys(&page), ["A/1", "_journal0", "_tiering0"]);
     assert_eq!(rig.calls(Op::List), 3);
+    assert_eq!(read(&rig.cache.counters().upstream_lists), 3);
     let after = page.last().unwrap().key.as_str();
     let rest = rig.cache.list_page("", Some(after), 3).await.unwrap();
     assert_eq!(keys(&rest), ["b/1", "b/2"]);
+    // The jump over a reserved range is not a call: the count is still the upstream's own.
+    let counted = read(&rig.cache.counters().upstream_lists);
+    assert_eq!(counted, rig.calls(Op::List));
 }
 
 /// Asserts that a page ending on a reserved key already past the end of its range (`_journal/~~a`
@@ -282,6 +299,9 @@ async fn a_listing_of_uploads_that_never_gets_past_the_reserved_ones_stops_at_th
     let found = cache.list_uploads("", None, 2).await;
     assert!(matches!(found, Err(Error::Unavailable(_))), "{found:?}");
     assert_eq!(stuck.calls.load(Ordering::SeqCst), u64::from(LISTING_CALLS));
+    // The count is the cap, the calls the upstream itself counted.
+    let counted = read(&cache.counters().upstream_list_uploads);
+    assert_eq!(counted, stuck.calls.load(Ordering::SeqCst));
 }
 
 /// Asserts that a listing of uploads whose upstream answers a full page that ends where the page
@@ -366,4 +386,7 @@ async fn a_listing_that_never_gets_past_the_reserved_keys_stops_at_the_cap() {
     let page = cache.list_page("", None, 2).await;
     assert!(matches!(page, Err(Error::Unavailable(_))), "{page:?}");
     assert_eq!(stuck.pages.load(Ordering::SeqCst), u64::from(LISTING_CALLS));
+    // The count is the cap, the pages the upstream itself counted: not one more or less.
+    let counted = read(&cache.counters().upstream_lists);
+    assert_eq!(counted, stuck.pages.load(Ordering::SeqCst));
 }
