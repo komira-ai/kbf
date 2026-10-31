@@ -117,15 +117,16 @@ impl Sandbox {
         self.root.join("control")
     }
 
-    /// What no step may change: the artifact and `outside/`.
+    /// What no step may change: everything but the record, the world and the harness's own
+    /// kill-point count. So the staged and the previous release, `outside/`, the params file and
+    /// the files of the sandbox root.
     pub(crate) fn guarded(&self) -> io::Result<Tree> {
-        let mut all = Tree::new();
-        for (name, dir) in [("artifact", self.artifact()), ("outside", self.outside())] {
-            all.insert(PathBuf::from(name), Entry::Dir);
-            for (path, entry) in snapshot(&dir)? {
-                all.insert(Path::new(name).join(path), entry);
-            }
-        }
-        Ok(all)
+        let mut tree = snapshot(&self.root)?;
+        tree.retain(|path, _| {
+            !path.starts_with("record")
+                && !path.starts_with("world")
+                && *path != Path::new("control").join(super::gate::COUNT_FILE)
+        });
+        Ok(tree)
     }
 }

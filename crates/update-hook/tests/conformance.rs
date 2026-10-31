@@ -75,7 +75,10 @@ fn every_step_gets_the_same_params_and_prepare_gets_the_staged_release() {
     );
     assert_eq!(params.target_version(), Some("2.0.0"));
     assert_eq!(params.previous_version(), Some("1.0.0"));
-    assert_eq!(params.previous_release(), None);
+    assert_eq!(
+        params.previous_release(),
+        Some(scratch.path().join("run-1/previous"))
+    );
     assert_eq!(params.promotion_ceiling_secs(), Some(3600));
     assert_eq!(params.get_u64("promotion_bound_secs"), Some(900));
     // Written once: every sandbox's file has the same keys.
