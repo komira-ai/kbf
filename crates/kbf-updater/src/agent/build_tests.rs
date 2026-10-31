@@ -140,12 +140,6 @@ fn an_agent_is_built_for_every_kind_of_host() {
         assert_eq!(status.health, crate::wire::Health::Unhealthy);
     }
 
-    let rig = Rig::new("bd-unnamed", "cache".parse().unwrap());
-    assert_eq!(
-        build(&rig.config).err().unwrap(),
-        "cache is a host role this agent has no duties for"
-    );
-
     let mut rig = Rig::new("bd-nofiles", HostRole::DAEMON);
     std::fs::write(&rig.config.files.ca, "").unwrap();
     assert!(
@@ -480,4 +474,18 @@ fn a_cordon_directory_the_agent_cannot_write_stops_the_build_naming_the_flag() {
         .err()
         .expect("refused");
     assert!(why.contains("--cordon-dir"), "{why}");
+}
+
+/// Catches: a role the agent has no duties for being built into an agent.
+#[test]
+fn a_role_the_agent_has_no_duties_for_is_refused() {
+    let cache: HostRole = "cache".parse().unwrap();
+    assert_eq!(
+        super::build::kind_of(&cache).unwrap_err(),
+        "cache is a host role this agent has no duties for"
+    );
+    assert_eq!(
+        super::build::kind_of(&HostRole::MAC_DAEMON),
+        Ok(Role::MacDaemon)
+    );
 }

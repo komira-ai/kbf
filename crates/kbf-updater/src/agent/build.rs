@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_enroll::store::Store;
+use kbf_types::HostRole;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 
@@ -230,6 +231,19 @@ pub(super) fn frontend_ports(
     Ok((drain, health))
 }
 
+/// The kind of host a role names: what the agent has duties for, and nothing else.
+pub(super) fn kind_of(role: &HostRole) -> Result<Role, String> {
+    match role.name() {
+        "frontend" => Ok(Role::Frontend),
+        "storage" => Ok(Role::Storage),
+        "daemon" => Ok(Role::Daemon),
+        "mac-daemon" => Ok(Role::MacDaemon),
+        other => Err(format!(
+            "{other} is a host role this agent has no duties for"
+        )),
+    }
+}
+
 /// The agent of this host, with the real ports.
 ///
 /// # Errors
@@ -239,17 +253,7 @@ pub(super) fn frontend_ports(
 pub fn build(cfg: &Config) -> Result<Agent, String> {
     let platform = host_platform().ok_or("kbf has no release for this platform")?;
     let identity = identity_of_files(&cfg.files)?;
-    let role = match identity.role.name() {
-        "frontend" => Role::Frontend,
-        "storage" => Role::Storage,
-        "daemon" => Role::Daemon,
-        "mac-daemon" => Role::MacDaemon,
-        other => {
-            return Err(format!(
-                "{other} is a host role this agent has no duties for"
-            ));
-        }
-    };
+    let role = kind_of(&identity.role)?;
     if cfg.daemon_node.is_some() && role != Role::Frontend {
         return Err(
             "--daemon-node is for the agent of a frontend host that also runs a \
