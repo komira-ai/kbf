@@ -180,6 +180,10 @@ async fn scenario(core: SchedulerCore) -> Seen {
                 run.lease_epoch = 0;
                 run.lease_seq = 0;
                 run.timestamps = None;
+                // The stored result carries the times the server stamped on it.
+                if let Some(result) = run.result.as_mut() {
+                    result.hash.clear();
+                }
                 run
             })
             .collect();
