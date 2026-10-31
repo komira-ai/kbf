@@ -27,6 +27,8 @@
 //!   (`queue` plus `task` when both are observed);
 //! - `ingest`: read back as ended to the frontend's read of the pack done.
 
+use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -66,6 +68,10 @@ impl Phase {
             Self::Ingest => "ingest",
         }
     }
+
+    const fn slot(self) -> usize {
+        self as usize
+    }
 }
 
 /// A moment of a run that is stamped.
@@ -85,6 +91,16 @@ pub(crate) enum Mark {
     Done,
 }
 
+/// Each phase, with the stamp that begins it and the stamp that ends it.
+const PHASES: [(Phase, Mark, Mark); 6] = [
+    (Phase::Prepare, Mark::Seen, Mark::Prepared),
+    (Phase::Start, Mark::Prepared, Mark::Posted),
+    (Phase::Queue, Mark::Posted, Mark::Running),
+    (Phase::Task, Mark::Running, Mark::Ended),
+    (Phase::Run, Mark::Posted, Mark::Ended),
+    (Phase::Ingest, Mark::Ended, Mark::Done),
+];
+
 /// The stamps of one run.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Timeline {
@@ -92,31 +108,90 @@ pub(crate) struct Timeline {
 }
 
 impl Timeline {
-    /// Stamps `mark` at `at` if it has no stamp yet, and returns the phases that ends.
+    /// Stamps `mark` at `at` if it has no stamp yet, and returns the phases that ends: those
+    /// whose first stamp is set. A stamp that is already set is kept and ends nothing.
     pub(crate) fn mark(&mut self, mark: Mark, at: Instant) -> Vec<(Phase, Duration)> {
-        let _ = (mark, at);
-        Vec::new()
+        let slot = &mut self.marks[mark as usize];
+        if slot.is_some() {
+            return Vec::new();
+        }
+        *slot = Some(at);
+        PHASES
+            .iter()
+            .filter(|(_, _, end)| *end == mark)
+            .filter_map(|(phase, begin, _)| {
+                let begun = self.marks[*begin as usize]?;
+                Some((*phase, at.saturating_duration_since(begun)))
+            })
+            .collect()
     }
 
     /// As [`Timeline::mark`], and observes what it returns into `metrics`.
     pub(crate) fn stamp(&mut self, mark: Mark, at: Instant, metrics: &Metrics) {
-        let _ = (mark, at, metrics);
+        for (phase, took) in self.mark(mark, at) {
+            metrics.phase_took(phase, took);
+        }
     }
 }
 
+/// The upper bounds of the buckets, in microseconds, with the `le` label of each.
+const BOUNDS: [(u64, &str); 12] = [
+    (5_000, "0.005"),
+    (25_000, "0.025"),
+    (100_000, "0.1"),
+    (500_000, "0.5"),
+    (1_000_000, "1"),
+    (2_500_000, "2.5"),
+    (5_000_000, "5"),
+    (10_000_000, "10"),
+    (30_000_000, "30"),
+    (120_000_000, "120"),
+    (600_000_000, "600"),
+    (3_600_000_000, "3600"),
+];
+
 /// `kbf_executor_phase_seconds`: a histogram of the phases, one series per phase.
 #[derive(Debug, Default)]
-pub(crate) struct PhaseHistograms {}
+pub(crate) struct PhaseHistograms {
+    /// Per phase, the observations that fell in each bucket (the last is over every bound).
+    buckets: [[AtomicU64; 13]; 6],
+    micros: [AtomicU64; 6],
+}
 
 impl PhaseHistograms {
     /// Counts one `phase` of `took`.
     pub(crate) fn observe(&self, phase: Phase, took: Duration) {
-        let _ = (phase, took);
+        let micros = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
+        let bucket = BOUNDS
+            .iter()
+            .position(|(bound, _)| micros <= *bound)
+            .unwrap_or(BOUNDS.len());
+        self.buckets[phase.slot()][bucket].fetch_add(1, Ordering::Relaxed);
+        self.micros[phase.slot()].fetch_add(micros, Ordering::Relaxed);
     }
 
     /// Appends the family to `out`, in the Prometheus text format.
     pub(crate) fn render(&self, out: &mut String) {
-        let _ = out;
+        let name = "kbf_executor_phase_seconds";
+        let _ = writeln!(
+            out,
+            "# HELP {name} How long the phases of an executor run took, by phase; each \
+             phase is between two moments the executor saw, not the host's own instants\n\
+             # TYPE {name} histogram"
+        );
+        for phase in Phase::ALL {
+            let label = phase.label();
+            let mut seen = 0;
+            let bounds = BOUNDS.iter().map(|(_, le)| *le).chain(["+Inf"]);
+            for (le, count) in bounds.zip(&self.buckets[phase.slot()]) {
+                seen += count.load(Ordering::Relaxed);
+                let _ = writeln!(out, "{name}_bucket{{phase=\"{label}\",le=\"{le}\"}} {seen}");
+            }
+            let micros = self.micros[phase.slot()].load(Ordering::Relaxed);
+            let (whole, part) = (micros / 1_000_000, micros % 1_000_000);
+            let _ = writeln!(out, "{name}_sum{{phase=\"{label}\"}} {whole}.{part:06}");
+            let _ = writeln!(out, "{name}_count{{phase=\"{label}\"}} {seen}");
+        }
     }
 }
 

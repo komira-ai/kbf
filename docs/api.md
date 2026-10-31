@@ -1713,6 +1713,7 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_executor_ingests_total` | counter | what the ingest of a task's pack came to, labelled `result`: `ok`, `unavailable`, `stopped` (the ingest panicked or was cancelled) or `rejected_<reason>` for each reason of `kbf_pack_ingest_rejects_total` |
 | `kbf_executor_late_starts_total` | counter | `Start`s dropped because their window ended before the run was posted; the farm runs the action again |
 | `kbf_executor_stray_leases_released_total` | counter | leases released because none of the executor's slots held them (a lost acquire answer, an undelivered release, a lease beyond the pool's size at a restart) |
+| `kbf_executor_phase_seconds` | histogram | how long the phases of an executor run took, labelled `phase`: `prepare`, `start`, `queue`, `task`, `run` and `ingest`; stamped by the executor once per pass, so `queue`, `task` and `run` are good to a pass plus the agent's heartbeat; an unobserved phase is not counted. `docs/deploy/kbf-modes.md` says how to read them |
 
 **What ingest of a run holds and refuses.** A digest is in one place: a record of one pack or one
 large object. A digest that is a record twice, in two packs or twice in one, is `malformed` (a task builds each pack from distinct blobs, so an honest pack has none; the check now runs across packs and before anything is stored). Large objects are streamed into the CAS before the

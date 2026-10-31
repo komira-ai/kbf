@@ -44,8 +44,9 @@
 //!    lies. Nothing a manifest says is believed beyond this: it names digests, the pack's own
 //!    hashing says the records are those digests. The packs are recorded last pack first, pack 0
 //!    last, so a run that fails midway leaves no row for the pack that holds the manifest.
-//! 10. **The result** is rebuilt from the manifest's now-verified digests, sorted by path, with no
-//!     execution metadata (the task's timings are advisory and not carried). It is written to the
+//! 10. **The result** is rebuilt from the manifest's now-verified digests, sorted by path, with the
+//!     task's claimed timing as execution metadata (see [`super::metadata`]: advisory, a claim of
+//!     the task's and never used to decide anything). It is written to the
 //!     action cache only if the action exited 0 and its Action does not say `do_not_cache`, by the
 //!     same two calls a daemon's result takes ([`Backend::prepare_action_result`] and
 //!     [`Backend::commit_action_record`]); a failed action is reported and not cached. It is written

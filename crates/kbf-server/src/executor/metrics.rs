@@ -153,7 +153,6 @@ impl Metrics {
     }
 
     /// One `phase` of a run took `took`.
-    #[allow(dead_code)]
     pub(crate) fn phase_took(&self, phase: Phase, took: std::time::Duration) {
         self.phases.observe(phase, took);
     }

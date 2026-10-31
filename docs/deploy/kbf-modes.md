@@ -188,6 +188,26 @@ run fails). A setting that breaks a rule
 the executor's safety rests on (the fence time against the scheduler's grace, the lease ttl
 against the longest run) is refused at start, exit status 2.
 
+Per-action overhead of the executor, for comparing it with a daemon, is read from two places. The
+executor's own phases are the histogram `kbf_executor_phase_seconds{phase=...}` on `GET /metrics`:
+`prepare` (the `Start` first seen to its run being ready), `start` (ready to the lease server accepting
+the run), `queue` (accepted to first read back as running), `task` (first read back as running to read
+back as exited), `run` (accepted to read back as exited, whether or not it was seen running) and
+`ingest` (read back as exited to the read of the pack done). They are stamped by the executor on its
+own clock, once per pass over the host's runs, and the lease server learns a run's state from the
+agent's heartbeat, which trails the host by one or two beats: `queue`, `task` and `run` are good to a
+pass plus a heartbeat or two, not to the instant the host started or ended the run, and a run that
+starts and ends between two reads has a `run` and no `queue` or `task`. A phase that was not observed
+is absent, never zero. The task's own account of its steps (`fetch_ms`, `run_ms` and `pack_ms` of the
+manifest) is carried in the result's execution metadata as the `input_fetch`, `execution` and
+`output_upload` start and completed times, in the run history and the estimator's replay as a daemon's
+are. The manifest holds durations only, so the three are laid back to back and end at the time the
+frontend read the pack; each is as long as the task said, and none is the frontend's own measurement:
+it is a claim of the task, fine for a measurement and never for a decision. A step the task reports as
+0 ms has no timestamps. The overhead of an action is its `worker_completed - worker_start` less the
+three claimed durations, and a daemon's is its `lease_ms` less its `inputs_ms`, `run_ms` and
+`outputs_ms`.
+
 A daemon reads from the packs with `--pack-read` (off by default; the `[packs]` table of
 `kbf.toml`), which needs `--pack-store-endpoint`, `--pack-store-bucket` and
 `--pack-store-credentials-file` (a JSON key pair, mode 0600 or 0400, of a key that may read

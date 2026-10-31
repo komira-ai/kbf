@@ -35,7 +35,6 @@ mod host;
 mod load;
 mod metrics;
 mod outcome;
-#[allow(dead_code)]
 mod phases;
 mod pool;
 mod runs;
