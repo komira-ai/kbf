@@ -313,23 +313,21 @@ impl Session {
 }
 
 impl Session {
-    /// Sends `message` and closes the daemon's side of the stream, then reads the server's
-    /// side to its end: what the server sent after the message, and how the stream ended
-    /// (`None`: cleanly, which is what a server that read every message and found nothing
-    /// to refuse does).
+    /// Sends `message`, then reads the server's side until it ends the stream: what the
+    /// server sent meanwhile, and how the stream ended. `None`: the stream was still open
+    /// after [`PROMPT`] (or ended cleanly), as it is when the server took the message, which
+    /// it answers with nothing.
     async fn ended_by(
-        self,
+        mut self,
         message: daemon_message::Message,
     ) -> (Vec<ServerMessage>, Option<Status>) {
-        let Self { tx, mut inbound } = self;
-        send(&tx, message);
-        drop(tx);
+        send(&self.tx, message);
         let mut seen = Vec::new();
         loop {
-            match inbound.message().await {
-                Ok(Some(reply)) => seen.push(reply),
-                Ok(None) => return (seen, None),
-                Err(status) => return (seen, Some(status)),
+            match timeout(PROMPT, self.inbound.message()).await {
+                Ok(Ok(Some(reply))) => seen.push(reply),
+                Ok(Ok(None)) | Err(_) => return (seen, None),
+                Ok(Err(status)) => return (seen, Some(status)),
             }
         }
     }
