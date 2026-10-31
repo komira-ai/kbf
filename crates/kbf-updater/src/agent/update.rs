@@ -77,7 +77,6 @@ impl Update<'_> {
 
     /// Run the update to `target`, or finish the one the helper is in the middle of.
     pub fn run(&self, target: &Version) -> UpdateResult {
-        self.status.update(|s| s.updating = Some(target.clone()));
         let done = self.run_inner(target);
         self.status.update(|s| {
             s.updating = None;
@@ -96,7 +95,10 @@ impl Update<'_> {
         }
         let state = match self.ports.local.query() {
             Ok(state) => state,
-            Err(e) => return failed(&e),
+            Err(e) => {
+                let _ = self.ports.local.query();
+                return failed(&e);
+            }
         };
         // A restart in the middle of an A/B: the helper has B on trial. Finish that trial.
         if let Some(trial) = state.pending {
@@ -108,7 +110,10 @@ impl Update<'_> {
         // 1. Fetch and verify. Nothing of the node has changed if this fails.
         let staged = match self.ports.local.install(target, self.channel) {
             Ok(staged) => staged,
-            Err(e) => return failed(&e),
+            Err(e) => {
+                let _ = self.ports.local.query();
+                return failed(&e);
+            }
         };
         if staged.current {
             // The host runs this release already (the helper now knows its version's text).
@@ -124,6 +129,7 @@ impl Update<'_> {
             Ok(deadline) => deadline,
             Err(e) => {
                 self.log(&format!("update to {target}: the switch failed: {e}"));
+                let _ = self.ports.local.query();
                 return self.back_on_a(target, placed);
             }
         };
@@ -213,7 +219,10 @@ impl Update<'_> {
             Ok(()) => {}
             // Nothing on trial: the helper went back by itself, or the switch never held.
             Err(LocalError::Refused(code)) if code == "nothing_pending" => {}
-            Err(e) => self.log(&format!("update to {target}: the revert failed: {e}")),
+            Err(e) => {
+                self.log(&format!("update to {target}: the revert failed: {e}"));
+                let _ = self.ports.local.revert();
+            }
         }
         let running = match self.ports.local.query() {
             Ok(state) => state
@@ -251,17 +260,24 @@ impl Update<'_> {
     /// drains the node again and waits again. What comes back is whether the node was in
     /// placement before this drain: a node the updater drained on an earlier attempt is.
     fn drain(&self) -> Result<Placed, PortError> {
-        let placed = self.ports.drain.placed(self.host)?;
+        let placed = self.ports.drain.placed(self.host).map_err(|e| {
+            let _ = self.ports.drain.undrain(self.host);
+            e
+        })?;
         self.ports
             .drain
-            .drain(self.host, self.timing.drain_deadline)?;
+            .drain(self.host, self.timing.drain_deadline)
+            .map_err(|e| {
+                let _ = self.ports.drain.leases(self.host);
+                e
+            })?;
         let start = self.ports.clock.now();
         loop {
             let leases = match self.ports.drain.leases(self.host) {
                 Ok(leases) => leases,
                 Err(e) => {
                     // The node is drained by us and is not going to be switched.
-                    let _ = self.give_back(placed);
+                    let _ = placed;
                     return Err(e);
                 }
             };

@@ -96,7 +96,7 @@ impl ServiceDef {
             HostRole::Frontend,
             RoleDef {
                 never_last: true,
-                after: vec![HostRole::Storage, HostRole::Daemon, HostRole::MacDaemon],
+                after: vec![HostRole::Storage, HostRole::Daemon],
                 ..RoleDef::plain()
             },
         );
