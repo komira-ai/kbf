@@ -65,6 +65,7 @@ mod linux {
                 stderr: &dir.join("stderr"),
                 deadline: Duration::from_secs(60),
                 network: Network::Denied,
+                unreadable: &[],
             },
         ));
         match result {

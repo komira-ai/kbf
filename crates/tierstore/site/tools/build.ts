@@ -14,6 +14,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import { dirname, join, resolve } from 'path';
 import { checkDist, importsOf, listFiles } from './check-dist';
 import { renderPage, STYLESHEETS } from './layout';
+import { docsPages, loadDocs } from './docs';
 import { outPath, PAGES, rewriteLinks } from './pages';
 
 export interface BuildOptions {
@@ -23,6 +24,8 @@ export interface BuildOptions {
   staticDir: string;
   /** site/content: the page copy (<name>.html) and the recorded data (data/<name>.json). */
   contentDir: string;
+  /** crates/tierstore/docs: the operator guide, one page of the site for each .md file (docs.ts). */
+  docsDir: string;
   /** Emptied and rewritten. */
   outDir: string;
   /** Run check-dist on the result (default). The tests turn it off to run each check on its own. */
@@ -82,7 +85,8 @@ export function buildSite(opts: BuildOptions): { id: string; files: string[] } {
     }
   }
   // Only the scripts the pages name and what they import ship (types.js-like modules of types only are never loaded).
-  const entries = [...new Set(PAGES.flatMap((p) => p.scripts))].sort();
+  const pages = [...PAGES, ...docsPages(loadDocs(opts.docsDir))];
+  const entries = [...new Set(pages.flatMap((p) => p.scripts))].sort();
   for (const e of entries) if (!compiled.has(e)) throw new Error(`build: ${e} is missing; run tsc -p tsconfig.browser.json first`);
   const assets = new Map<string, Buffer>();
   for (const m of moduleGraph(compiled, entries)) assets.set(m, compiled.get(m) as Buffer);
@@ -93,8 +97,8 @@ export function buildSite(opts: BuildOptions): { id: string; files: string[] } {
 
   rmSync(opts.outDir, { recursive: true, force: true });
   for (const [path, bytes] of assets) write(join(opts.outDir, 'assets', id, path), bytes);
-  for (const page of PAGES) {
-    const main = rewriteLinks(readFileSync(join(opts.contentDir, `${page.source}.html`), 'utf8'), PAGES);
+  for (const page of pages) {
+    const main = rewriteLinks(page.html ?? readFileSync(join(opts.contentDir, `${page.source}.html`), 'utf8'), pages);
     write(join(opts.outDir, outPath(page.route)), renderPage(page, main, refs));
   }
 
@@ -109,6 +113,7 @@ if (require.main === module) {
     browserDir: join(site, 'build', 'browser'),
     staticDir: join(site, 'static'),
     contentDir: join(site, 'content'),
+    docsDir: join(site, '..', 'docs'),
     outDir: join(site, 'dist'),
   });
   process.stdout.write(`dist: ${files.length} files, assets/${id}/\n`);
