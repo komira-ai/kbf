@@ -111,7 +111,7 @@ impl Pki {
         let node_id = name.parse().unwrap();
         let cert = UpdaterCert {
             node_id: &node_id,
-            host_role: role,
+            host_role: &role,
             key: &public,
         };
         let issued = self

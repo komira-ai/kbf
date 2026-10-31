@@ -203,8 +203,11 @@ where
     let Some(body) = read(request, MAX_DESIRED_BYTES, patience).await else {
         return error(StatusCode::BAD_REQUEST, "bad_request");
     };
-    match coordinator.set_desired(token.as_deref(), &body).await {
-        Ok(desired) => json(StatusCode::OK, &desired),
+    match coordinator
+        .set_desired_noting(token.as_deref(), &body)
+        .await
+    {
+        Ok(set) => json(StatusCode::OK, &set),
         Err(SetError::Unauthorized(_)) => error(StatusCode::UNAUTHORIZED, "unauthorized"),
         Err(SetError::Unavailable) => error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
         Err(SetError::Forbidden) => error(StatusCode::FORBIDDEN, "forbidden"),

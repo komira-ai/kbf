@@ -44,6 +44,8 @@ mod decide_tests;
 #[cfg(test)]
 mod decide_why_tests;
 #[cfg(test)]
+mod desired_dropped_tests;
+#[cfg(test)]
 mod desired_role_tests;
 #[cfg(test)]
 mod desired_tests;

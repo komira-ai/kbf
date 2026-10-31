@@ -64,8 +64,11 @@ cache and error behavior, the role's permissions, the OIDC provider (one per acc
 `prod`-style policies (approval: `main` branch and `v*` tag; site: `v*` tag only). A site that needs a different policy
 changes `lib/site-stack.ts` for that site deliberately. `site/test/csp.test.ts` reads the CSP from `lib/site-stack.ts`.
 
-`.github/workflows/tierstore-site-publish.yml`, the workflow tierstore's publish role trusts, does not exist yet; until it does,
-tierstore.dev is published by the held `upload` step only.
+`.github/workflows/tierstore-site-publish.yml` is the workflow tierstore's publish role trusts. It publishes on a push to `main`
+that changes the site (and on a manual run of `main`), so its job runs in the environment `prod-site-tierstore` from the `main`
+branch: that environment's deployment rule is the branch `main`, where kbf.dev's `prod-site` admits `v*` tags only. The held
+`github` step creates the tag rule for every site, so for tierstore.dev the rule is changed by hand once, and a later `github`
+dry run reports the difference. The held `upload` step is the manual fallback.
 
 Each site has its own GitHub environments and variables, so two sites in one repository share no reviewer rule or variable.
 Every step is per site: pass `--domain` (or `--site`) to `github`, `dns`, `site`, `vars` and `upload`. `oidc-provider`

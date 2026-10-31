@@ -10,3 +10,4 @@ mod pure;
 mod query;
 mod real_output;
 mod stage_tests;
+mod tierstore_signer_tests;

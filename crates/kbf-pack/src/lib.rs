@@ -68,6 +68,6 @@ pub use packer::{
 };
 pub use reader::{DEFAULT_CONCURRENCY, DEFAULT_GAP, Fetch, Reader, ReaderConfig};
 pub use sweep::{
-    AgeOf, DEFAULT_GRACE, SWEPT_PREFIX, SweepConfig, SweepError, SweepGates, SweepReport, Sweeper,
-    task_key_age,
+    AgeOf, Claim, ClaimOf, DEFAULT_GRACE, INGEST_ALLOWANCE, MAX_KEY_LIFE, MIN_GRACE, SWEPT_PREFIX,
+    SweepConfig, SweepError, SweepGates, SweepReport, Sweeper, task_key_age,
 };

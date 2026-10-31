@@ -9,10 +9,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use clap::Parser;
-use kbf_objstore::s3::{Credentials, S3Config, S3Store};
-use kbf_objstore::{Capabilities, ObjectKey, ObjectStore};
 use kbf_testkit::dir::TestDir;
 use kbf_testkit::reaped::{first_line, spawn};
+use objstore_s3::s3::{Credentials, S3Config, S3Store};
+use objstore_s3::{Capabilities, ObjectKey, ObjectStore};
 use rustix::process::{Pid, Signal, kill_process};
 use tierstore::server::Drained;
 use tierstore::server::cli::{Addresses, Cli, run_serving};
@@ -210,8 +210,10 @@ async fn the_process_announces_the_front_and_refuses_a_bad_certificate() {
     let stdout = child.stdout.take().expect("stdout");
     let (line, _reader) = first_line(stdout, Duration::from_secs(30)).expect("a start line");
     let words: Vec<&str> = line.split_whitespace().collect();
-    assert_eq!(words.len(), 5, "{line}");
+    assert_eq!(words.len(), 6, "{line}");
     assert_eq!(words[4], "(https)", "{line}");
+    let commit = tierstore::server::build_info::COMMIT;
+    assert_eq!(words[5], format!("commit={commit}"), "{line}");
     assert!(words[2].starts_with("listen="), "{line}");
     let oci: SocketAddr = words[3]
         .strip_prefix("oci-listen=")
@@ -334,7 +336,7 @@ async fn the_process_announces_a_plain_front() {
     let stdout = child.stdout.take().expect("stdout");
     let (line, _reader) = first_line(stdout, Duration::from_secs(30)).expect("a start line");
     let words: Vec<&str> = line.split_whitespace().collect();
-    assert_eq!(words.len(), 5, "{line}");
+    assert_eq!(words.len(), 6, "{line}");
     assert_eq!(words[4], "(http)", "{line}");
     let oci: SocketAddr = words[3]
         .strip_prefix("oci-listen=")
@@ -387,7 +389,7 @@ async fn a_plain_front_off_loopback_starts_and_warns_once() {
         let mut stderr = child.stderr.take().expect("stderr");
         let (line, _reader) = first_line(stdout, Duration::from_secs(30)).expect("a start line");
         let words: Vec<&str> = line.split_whitespace().collect();
-        assert_eq!(words.len(), 5, "{line}");
+        assert_eq!(words.len(), 6, "{line}");
         assert_eq!(words[4], "(http)", "{line}");
         let bound: SocketAddr = words[3]
             .strip_prefix("oci-listen=")

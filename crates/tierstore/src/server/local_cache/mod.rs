@@ -4,14 +4,18 @@
 //! binary: any S3 store, such as a bucket of MinIO or a storage node's tierstore). By default the S3 front serves it as a read cache and
 //! refuses every write before it gets here (see `ServerConfig::cache`), so a cache has no
 //! journal, no lease and no reconciler, and nothing to recover but a directory of files it can
-//! delete. The only things that run on their own are the fills a miss starts and the eviction
-//! pass ([`LocalCache::maintain`]).
+//! delete. The only things that run on their own are the fills a miss starts, the eviction
+//! pass ([`LocalCache::maintain`]) and the scrub ([`LocalCache::scrub`]).
 //!
 //! # Writes
 //!
 //! With [`CacheConfig::write_through`] (`write_through = true` in `[local_cache]`) the cache
 //! accepts writes and sends every one of them to the upstream: nothing is acknowledged before
 //! the upstream has it, and nothing is only local. The module `write` has what each call does.
+//! A create-only put under a `cache = true` policy is also kept on the node (module `keep`):
+//! the body is copied to `.stage/` as it streams to the upstream, and once the upstream has
+//! acknowledged it and said what tag it gave the object, the copy is put in the cache before the
+//! answer. That copy is best effort and never fails the put.
 //! Without the setting every write call of the [`Backend`] is `Unsupported`, as the front
 //! refuses it before.
 //!
@@ -37,17 +41,40 @@
 //! gave every byte of the size it said, and a key named by its content (`cas/l/<sha256>`) has
 //! bytes that hash to the name. Then the sidecar is renamed into place and the file is linked
 //! into `obj/` with a create-only link, so a name appears whole or not at all (layout:
-//! [`layout`]). A fill that fails is counted by reason and removed, and the reader that started it
-//! is answered from the upstream as if the key were not kept (an upstream that failed is the
-//! reader's error). The front holds a response whole, as it always has: the memory of a read is
-//! the size of the range asked, never more because of a fill.
+//! [`layout`]). A fill that fails is counted by reason and removed.
+//!
+//! # A read
+//!
+//! A reader of the fill is given the bytes as the fill writes them (see `stream.rs`): every read
+//! of the cache is a stream of chunks of at most `fill_chunk` bytes, so the memory of a read is a
+//! chunk, not the size of the object. The readers of a key read the file the fill stages, all
+//! through the one descriptor the fill writes it with (a read and a write at an offset share
+//! nothing else), never a copy in memory. The last `fill_chunk` bytes of the window a reader asked
+//! for are given only after the fill has said the object is good, so a ranged read of an object of
+//! at most 64 MiB waits for the whole fill before its last chunk.
+//!
+//! - A fill that fails because the data is bad (the bytes do not hash to the name, the object was
+//!   written over: a changed tag, or a short or long body) ends the readers' bodies with an
+//!   error, never cleanly.
+//! - A fill that a write or a delete through the cache marks (`forget`), or that fails for a
+//!   reason of the cache (no room, the directory), is finished for each reader from the
+//!   upstream, from the byte after the last one it was given. A reader given a byte goes on only
+//!   if the upstream still has the version the byte came from (a HEAD, and another before the
+//!   last chunk): it gets the error of the upstream (`NotFound` after a delete) or `Unavailable`
+//!   after a write, never a clean end. A reader given no byte is answered as if there had been no
+//!   fill. The bytes read this way are not hashed, as a pass-through never was.
+//! - A read of more than one chunk from the upstream (a key not kept, a range over 64 MiB, the
+//!   rest of a read) is held to the version it began with in the same way.
+//! - A client that stops reading keeps the unlinked file of an evicted object, and its blocks, on
+//!   the disk until the connection's idle time ends it: those blocks are outside the budget.
 //!
 //! A fill is skipped, and counted, when the object is larger than the budget or the cache, with the
 //! bytes of the fills that are running, would pass its critical mark; the reader is served from
 //! the upstream. A key that is not named by its content is read twice by HEAD, before the first
 //! chunk and after the last: if the size or the tag changed, the object was written over during
-//! the fill and is not kept. A key named by its content whose bytes do not hash to the name is
-//! the reader's error, not passed through. A hit is not hashed again.
+//! the fill and is not kept, and the readers get an error. A key named by its content whose bytes
+//! do not hash to the name is the reader's error, not passed through. A hit is not hashed again:
+//! the scrub does that.
 //!
 //! At most `max_concurrent_fills` fills run at once, each holding one chunk (`fill_chunk`, 8 MiB)
 //! in memory at a time, so the fills hold at most that many chunks. A miss of a key that has no
@@ -67,15 +94,34 @@
 //! per pass however often it was used) so that a restart keeps it. An object with more than one
 //! link is in use by another tree: it is skipped, counted, and stays charged to the budget.
 //! Files in `.stage/` are never evicted and are removed at start.
+//!
+//! # The lock and read-only mode
+//!
+//! A cache opened with [`LocalCache::open_locked`] takes an exclusive lock on `<path>/.lock`.
+//! A second process over the directory (the next release, started beside the one that runs) is
+//! read-only until the first exits: it serves the hits its scan found, sends every miss and every
+//! write to the upstream, and creates, changes and removes nothing in the directory (no clean-up
+//! at open, no probe, no fill, no eviction, no file time, no deletion on a read error). When the
+//! lock is free, [`LocalCache::tick`] takes it, cleans up, scans again and makes the cache
+//! read-write. The module `hold` has the rules.
+//!
+//! # Scrub
+//!
+//! A background walk hashes each object again at a bounded rate and drops the ones whose bytes
+//! changed on the disk; see [`scrub`].
 
 mod disk;
 mod evict;
 mod fill;
+mod hold;
 mod index;
+mod keep;
 pub(super) mod layout;
 mod listing;
 mod metrics;
+mod scrub;
 mod selfcheck;
+mod stream;
 mod write;
 
 #[cfg(test)]
@@ -83,17 +129,35 @@ mod evict_tests;
 #[cfg(test)]
 mod fill_tests;
 #[cfg(test)]
+mod forget_tests;
+#[cfg(test)]
 mod front_tests;
 #[cfg(test)]
 mod hit_tests;
+#[cfg(test)]
+mod hold_tests;
+#[cfg(test)]
+mod keep_lock_tests;
+#[cfg(test)]
+mod keep_s3_tests;
+#[cfg(test)]
+mod keep_tests;
 #[cfg(test)]
 mod limits_tests;
 #[cfg(test)]
 mod listing_tests;
 #[cfg(test)]
+mod lost_tests;
+#[cfg(test)]
+mod read_only_tests;
+#[cfg(test)]
+mod scrub_tests;
+#[cfg(test)]
 mod selfcheck_tests;
 #[cfg(test)]
 mod start_tests;
+#[cfg(test)]
+mod stream_tests;
 #[cfg(test)]
 pub(in crate::server) mod testing;
 #[cfg(test)]
@@ -105,26 +169,34 @@ mod write_tests;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt as _;
 use tokio::sync::Semaphore;
 
 use crate::journal::is_reserved;
-use crate::{Backend, ByteRange, Clock, Error, Listed, Meta, OpenUpload, PartBody, UploadsAfter};
+use crate::server::lock;
+use crate::{
+    Backend, ByteRange, Clock, Error, Listed, Meta, OpenUpload, PartBody, ReadBody, UploadsAfter,
+};
 
 pub use disk::{Disk, Space, SystemDisk};
+pub use hold::{Mode, Tick};
 pub use metrics::Counters;
+pub use scrub::{Every, SCRUB_MIN_ROUND, SCRUB_RATE, SCRUB_TICK, ScrubPass, Scrubber, Ticker};
 pub use selfcheck::{LocalTierFailure, check_local};
 
 use fill::Pending;
+use hold::{Hold, Standing};
 use index::Index;
 use layout::{Name, data_path, name_of};
 use metrics::{add, bump};
+use stream::eager;
 
 /// The most an uncached object may be, for a ranged read of it to fill the whole of it.
 pub const WHOLE_FILL_LIMIT: u64 = 64 << 20;
@@ -134,6 +206,21 @@ pub const FILL_CHUNK: u64 = 8 << 20;
 
 /// The fills that may run at once, unless the settings say otherwise.
 pub const MAX_CONCURRENT_FILLS: usize = 4;
+
+/// The keys a read-only cache remembers it deleted or replaced, unless the settings say
+/// otherwise: 65536 names of 64 bytes, about 4 MiB.
+pub const FORGET_LIMIT: usize = 65_536;
+
+/// The keeps of a put that may run at once, unless the settings say otherwise.
+pub const MAX_CONCURRENT_KEEPS: usize = 8;
+
+/// How long a put waits for its keep after the upstream has the object, unless the settings say
+/// otherwise.
+pub const KEEP_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a keep may run in all, from the upstream's acknowledgement, before it is abandoned,
+/// unless the settings say otherwise.
+pub const KEEP_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The text of the refusal of a write at the Backend level (the front refuses it earlier).
 const READ_ONLY: &str = "this tierstore is a read cache";
@@ -163,10 +250,24 @@ pub struct CacheConfig {
     /// The most fills that run at once. A miss that finds all of them running is served from
     /// the upstream and keeps nothing. At least one (0 is read as 1).
     pub max_concurrent_fills: usize,
+    /// The most create-only puts that are copied to the stage directory at once, apart from the
+    /// fills. A put that finds them all running is not kept. At least one (0 is read as 1).
+    pub max_concurrent_keeps: usize,
+    /// The longest a put waits, after the upstream has the object, for its copy to be put in the
+    /// cache. Past it the put is answered and the keep goes on in the background; the object is
+    /// at the upstream either way, so a read that misses costs only the trip.
+    pub keep_wait: Duration,
+    /// The longest a keep runs, from the upstream's acknowledgement, before it is abandoned (its
+    /// stage file removed, its permit and room given back, its place in the table of the fills
+    /// freed) and counted as `deadline`. Not below `keep_wait`.
+    pub keep_deadline: Duration,
     /// Whether the cache takes writes and sends them to the upstream. Off, every write call is
     /// `Unsupported`. The binary sets the front's `cache_writes` from the same setting, so that
     /// the front does not refuse the writes either.
     pub write_through: bool,
+    /// The most keys a read-only cache remembers it deleted or replaced through the upstream
+    /// (see the module `hold`). Past it the cache is emptied when it takes the lock.
+    pub forget_limit: usize,
 }
 
 impl CacheConfig {
@@ -185,7 +286,11 @@ impl CacheConfig {
             fill_chunk: FILL_CHUNK,
             whole_limit: WHOLE_FILL_LIMIT,
             max_concurrent_fills: MAX_CONCURRENT_FILLS,
+            max_concurrent_keeps: MAX_CONCURRENT_KEEPS,
+            keep_wait: KEEP_WAIT,
+            keep_deadline: KEEP_DEADLINE,
             write_through: false,
+            forget_limit: FORGET_LIMIT,
         }
     }
 
@@ -224,15 +329,6 @@ fn window(range: Option<ByteRange>, size: u64) -> Result<(u64, u64), Error> {
     Ok((range.offset(), range.size().min(size - range.offset())))
 }
 
-/// `len` bytes of the file at `path` from `offset`.
-fn read_at(path: &Path, offset: u64, len: u64) -> io::Result<Bytes> {
-    let file = std::fs::File::open(path)?;
-    // `len` is at most the length of the file, which a 64-bit address space holds.
-    let mut bytes = vec![0; len as usize];
-    file.read_exact_at(&mut bytes, offset)?;
-    Ok(Bytes::from(bytes))
-}
-
 /// Whether `error` says the file is not there, or not as long as the cache believes.
 fn gone(error: &io::Error) -> bool {
     matches!(
@@ -258,12 +354,44 @@ pub(super) struct Inner {
     invalidated: Mutex<HashSet<String>>,
     /// The number of the next file in `.stage/`.
     staged: AtomicU64,
+    /// What every name in `.stage/` that this cache makes starts with: it is not the prefix of
+    /// the name of any other cache, of this process or of another, that has the directory open,
+    /// so that none of them removes the staging file of another.
+    stage_prefix: String,
     /// The bytes of the fills that are running and have no object in the index yet.
     reserved: AtomicU64,
     /// One permit for each fill that may run; a fill holds one until it ends.
     permits: Arc<Semaphore>,
+    /// One permit for each put that may be copied to the stage directory; held until it ends.
+    keeps: Arc<Semaphore>,
+    /// Run by a test just before a kept object is put in the index (see `keep`).
+    #[cfg(test)]
+    before_insert: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Whether a pass of the eviction is running.
     evicting: AtomicBool,
+    /// Whether this cache may write to its directory, and the lock that says so.
+    hold: Hold,
+}
+
+/// A prefix for the staging files of one cache that no other cache has: the process id, the time
+/// of the open in nanoseconds and the number of caches opened in this process before it.
+fn stage_prefix() -> String {
+    static OPENED: AtomicU64 = AtomicU64::new(0);
+    let since = SystemTime::now().duration_since(UNIX_EPOCH);
+    let nanos = since.map_or(0, |elapsed| elapsed.as_nanos());
+    let number = OPENED.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}-{nanos:x}-{number:x}", std::process::id())
+}
+
+/// The index of the objects a scan found, the least recently used first.
+fn index_of(mut found: Vec<layout::Found>) -> Index {
+    found.sort_by(|a, b| (a.used, &a.hex).cmp(&(b.used, &b.hex)));
+    let mut index = Index::default();
+    for found in found {
+        let sidecar = found.sidecar;
+        index.insert(&found.hex, sidecar.size, sidecar.tag, sidecar.modified);
+    }
+    index
 }
 
 /// A read-through cache of an upstream, on a directory of the local file system.
@@ -278,6 +406,10 @@ impl LocalCache {
     /// say what the file holds is deleted), the least recently used first by the time of the
     /// file.
     ///
+    /// This cache takes no lock: it is read-write whatever else has the directory open. The
+    /// binary uses [`open_locked`](Self::open_locked); a second cache over a directory that has
+    /// one must not use this.
+    ///
     /// # Errors
     /// What the system said about the directory.
     pub fn open(
@@ -286,32 +418,68 @@ impl LocalCache {
         disk: Arc<dyn Disk>,
         clock: Arc<dyn Clock>,
     ) -> io::Result<Self> {
-        let removed = layout::clear_stage(&config.path)?;
-        let mut scanned = layout::scan(&config.path)?;
-        scanned
-            .found
-            .sort_by(|a, b| (a.used, &a.hex).cmp(&(b.used, &b.hex)));
-        let mut index = Index::default();
-        for found in scanned.found {
-            let sidecar = found.sidecar;
-            index.insert(&found.hex, sidecar.size, sidecar.tag, sidecar.modified);
-        }
+        Self::start(config, upstream, disk, clock, Standing::Lockless)
+    }
+
+    /// Opens the cache as [`open`](Self::open) does, if the lock of the directory (`.lock`) is
+    /// free: this cache holds it and is read-write. If another process holds it, this one is
+    /// read-only: it reads the directory as it finds it and changes nothing in it (see
+    /// [`Mode`]), and [`tick`](Self::tick), which [`hold`](Self::hold) calls, takes the lock
+    /// when it is free and makes the cache read-write.
+    ///
+    /// # Errors
+    /// What the system said about the directory or the lock file.
+    pub fn open_locked(
+        config: CacheConfig,
+        upstream: Arc<dyn Backend>,
+        disk: Arc<dyn Disk>,
+        clock: Arc<dyn Clock>,
+    ) -> io::Result<Self> {
+        std::fs::create_dir_all(&config.path)?;
+        let standing = match lock::try_take(&config.path.join(hold::LOCK))? {
+            Some(file) => Standing::Holding(file),
+            None => Standing::Waiting,
+        };
+        Self::start(config, upstream, disk, clock, standing)
+    }
+
+    /// The cache over `config.path` as `standing` says it may treat it.
+    fn start(
+        config: CacheConfig,
+        upstream: Arc<dyn Backend>,
+        disk: Arc<dyn Disk>,
+        clock: Arc<dyn Clock>,
+        standing: Standing,
+    ) -> io::Result<Self> {
         let counters = Counters::default();
-        add(&counters.discarded_at_start, scanned.discarded + removed);
+        let scanned = if matches!(standing, Standing::Waiting) {
+            layout::read_only_scan(&config.path)
+        } else {
+            let removed = layout::clear_stage(&config.path)?;
+            let scanned = layout::scan(&config.path)?;
+            add(&counters.discarded_at_start, scanned.discarded + removed);
+            scanned
+        };
         let permits = Arc::new(Semaphore::new(config.max_concurrent_fills.max(1)));
+        let keeps = Arc::new(Semaphore::new(config.max_concurrent_keeps.max(1)));
         let inner = Inner {
             upstream,
             disk,
             clock,
             config,
-            index: Mutex::new(index),
+            index: Mutex::new(index_of(scanned.found)),
             counters,
             flights: Mutex::new(HashMap::new()),
             invalidated: Mutex::new(HashSet::new()),
             staged: AtomicU64::new(0),
+            stage_prefix: stage_prefix(),
             reserved: AtomicU64::new(0),
             permits,
+            keeps,
+            #[cfg(test)]
+            before_insert: Mutex::new(None),
             evicting: AtomicBool::new(false),
+            hold: Hold::new(standing),
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -347,7 +515,10 @@ impl LocalCache {
             .disk
             .space(&inner.config.path)
             .map_or(0, |space| space.free);
-        inner.counters.render(bytes, objects as u64, free)
+        let read_write = inner.read_write();
+        inner
+            .counters
+            .render(bytes, objects as u64, free, read_write)
     }
 }
 
@@ -370,55 +541,23 @@ impl Inner {
         locked(&self.index).get(&name.hex).map(index::Entry::meta)
     }
 
-    /// Removes the object from the index and the disk.
+    /// Removes the object from the index and, if this cache may write to its directory, from the
+    /// disk. A read-only cache forgets the object and leaves its files: they are the holder's.
+    /// It notes the name, and removes the files when it takes the lock (see `hold`), so that the
+    /// object is not served from them then: it was deleted or replaced at the upstream.
     fn drop_entry(&self, hex: &str) {
+        // Asked first: a take that is running holds the answer until it has looked at the notes,
+        // and an entry removed before that would be put back by the index it makes.
+        let may_delete = self.may_delete(hex);
+        #[cfg(test)]
+        self.trace_between_delete_steps();
         drop(locked(&self.index).remove(hex));
+        if !may_delete {
+            return;
+        }
         let root = &self.config.path;
         let _ = std::fs::remove_file(data_path(root, hex));
         let _ = std::fs::remove_file(layout::meta_path(root, hex));
-    }
-
-    /// The bytes of `range` of the object if it is in the cache: `hit` says whether this is a
-    /// read the cache answers on its own (a hit) or the read that follows a fill.
-    async fn lookup(
-        &self,
-        name: &Name,
-        range: Option<ByteRange>,
-        hit: bool,
-    ) -> Result<Option<Bytes>, Error> {
-        let used = locked(&self.index).used(&name.hex, self.clock.now());
-        let Some(size) = used else {
-            return Ok(None);
-        };
-        let (offset, len) = window(range, size)?;
-        let path = data_path(&self.config.path, &name.hex);
-        let reading = tokio::task::spawn_blocking(move || read_at(&path, offset, len));
-        match reading.await.expect("a read does not panic") {
-            Ok(bytes) => {
-                let counters = &self.counters;
-                if hit {
-                    bump(&counters.hits);
-                    add(&counters.bytes_served_local, len);
-                } else {
-                    add(&counters.bytes_served_upstream, len);
-                }
-                Ok(Some(bytes))
-            }
-            Err(error) if gone(&error) => {
-                // The file is gone or short: the entry is a lie, so it is dropped.
-                self.drop_entry(&name.hex);
-                Ok(None)
-            }
-            // Out of descriptors, a failing disk: the object may be fine, so it stays.
-            Err(_) => Ok(None),
-        }
-    }
-
-    /// The read of `range` of `key` from the upstream, which keeps nothing.
-    async fn passthrough(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
-        let bytes = self.upstream.get(key, range).await?;
-        add(&self.counters.bytes_served_upstream, bytes.len() as u64);
-        Ok(bytes)
     }
 }
 
@@ -493,27 +632,47 @@ impl Backend for LocalCache {
     }
 
     async fn get(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
+        let mut body = self.get_stream(key, range).await?;
+        let mut whole = BytesMut::new();
+        while let Some(chunk) = body.next().await {
+            whole.extend_from_slice(&chunk?);
+        }
+        Ok(whole.freeze())
+    }
+
+    async fn get_stream(&self, key: &str, range: Option<ByteRange>) -> Result<ReadBody, Error> {
         let inner = &self.inner;
-        let Some(name) = inner.cacheable(key) else {
-            return inner.passthrough(key, range).await;
+        let passed = |range: Option<ByteRange>| {
+            let offset = range.map_or(0, ByteRange::offset);
+            eager(inner.chunked(key, offset, range.map(ByteRange::size), None))
         };
-        if let Some(bytes) = inner.lookup(&name, range, true).await? {
-            return Ok(bytes);
+        let Some(name) = inner.cacheable(key) else {
+            return passed(range).await;
+        };
+        if let Some(body) = inner.open_kept(&name, range, true).await? {
+            return Ok(body);
+        }
+        if !inner.read_write() {
+            // A read-only cache fills nothing: the miss goes straight to the upstream.
+            bump(&inner.counters.misses);
+            return passed(range).await;
         }
         if let Some(wanted) = range {
             let meta = inner.upstream.head(key).await?;
             if meta.size > inner.config.whole_limit {
                 bump(&inner.counters.misses);
-                return inner.passthrough(key, Some(wanted)).await;
+                return passed(Some(wanted)).await;
             }
         }
         bump(&inner.counters.misses);
-        if inner.fill_once(key, &name).await? == fill::Filled::Kept
-            && let Some(bytes) = inner.lookup(&name, range, false).await?
-        {
-            return Ok(bytes);
+        match inner.join_or_start(key, &name) {
+            Ok(pending) => eager(inner.follow(key, range, pending)).await,
+            Err(fill::Filled::Kept) => match inner.open_kept(&name, range, false).await? {
+                Some(body) => Ok(body),
+                None => passed(range).await,
+            },
+            Err(fill::Filled::Skipped | fill::Filled::Changed) => passed(range).await,
         }
-        inner.passthrough(key, range).await
     }
 
     async fn head(&self, key: &str) -> Result<Meta, Error> {

@@ -45,6 +45,24 @@ pub enum BenchError {
     /// The load gate tripped; the results of the passes up to it are written.
     #[error(transparent)]
     Gate(#[from] crate::gate::Trip),
+    /// The cold store guard tripped: its health, as the harness's own requests saw it, went over
+    /// a limit. The results of the passes up to it are written.
+    #[error(transparent)]
+    ColdGuard(#[from] crate::result::ColdTrip),
+    /// A result file of this cell, arm and attempt is already in the result directory. The run
+    /// stops before it sends anything, or, for an arm only the passes name (`.ttfb`), instead of
+    /// replacing the file.
+    #[error(
+        "{path} already exists: a result is never overwritten. Run the retry with --attempt N (the next number), or use a fresh result directory"
+    )]
+    ResultExists {
+        /// The file.
+        path: PathBuf,
+    },
+    /// A path the run writes is, holds or lies inside a live directory (or the ops file lists
+    /// none). Nothing was created.
+    #[error("{0}")]
+    LiveDir(String),
     /// A cell cannot start or go on: what it needs first (objects to read, a client, a tree on
     /// disk) could not be made. The text names the step, with roles and counts only.
     #[error("{0}")]

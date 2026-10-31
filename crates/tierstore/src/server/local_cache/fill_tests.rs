@@ -113,7 +113,8 @@ async fn bytes_that_do_not_hash_to_their_name_are_not_kept_and_not_served() {
 }
 
 /// Asserts that an upstream that gives fewer bytes than its HEAD said leaves nothing in the
-/// cache and is counted as a short body.
+/// cache and is counted as a short body, and that the reader, who cannot be given the object
+/// from an upstream that is short too, gets an error.
 #[tokio::test]
 async fn a_short_upstream_body_is_not_kept() {
     let rig = Rig::new("tscache-short");
@@ -121,8 +122,10 @@ async fn a_short_upstream_body_is_not_kept() {
     rig.tamper
         .short
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    // The reader is served from the upstream, which is short too.
-    assert_eq!(rig.get("cas/b/obj").await.unwrap().len(), 99);
+    // The reader goes on from the upstream, which is short too: a body shorter than the object is
+    // the reader's error, not a clean end.
+    let error = rig.get("cas/b/obj").await.unwrap_err();
+    assert!(error.is_unavailable(), "{error}");
     assert_eq!(rig.cache.counters().failures(FailedFill::ShortBody), 1);
     assert_eq!(rig.cache.held(), (0, 0));
     assert!(!rig.has_file("cas/b/obj"));
@@ -318,7 +321,7 @@ async fn a_missing_key_is_not_found_and_not_a_failed_fill() {
 }
 
 /// Asserts that a range that starts past the end of an object that is not in the cache is the
-/// error any backend gives, after the object was filled (the range is judged by its size).
+/// error any backend gives (the range is judged by the object's size), and the fill goes on.
 #[tokio::test]
 async fn a_range_past_the_end_of_an_uncached_object_is_an_error() {
     let rig = Rig::new("tscache-range-past");
@@ -327,6 +330,8 @@ async fn a_range_past_the_end_of_an_uncached_object_is_an_error() {
     let text = "range starting at 101 is past the end of the 100-byte object";
     let past = rig.cache.get("cas/b/obj", Some(range)).await;
     assert_eq!(past, Err(Error::Other(text.to_owned())));
+    // The error is given as soon as the size is known; the fill goes on and keeps the object.
+    super::testing::until("the fill ended", || read(&rig.cache.counters().fills) >= 1).await;
     assert_eq!(rig.cache.held(), (100, 1));
 }
 
@@ -370,8 +375,8 @@ async fn a_fill_that_ended_after_the_miss_is_not_run_again() {
     assert_eq!(rig.get("cas/b/obj").await.unwrap().len(), 100);
     let (heads, gets) = (rig.calls(Op::Head), rig.calls(Op::Get));
     let name = name_of("cas/b/obj");
-    let late = rig.cache.inner.fill_once("cas/b/obj", &name).await;
-    assert_eq!(late, Ok(super::fill::Filled::Kept));
+    let late = rig.cache.inner.join_or_start("cas/b/obj", &name);
+    assert_eq!(late.err(), Some(super::fill::Filled::Kept));
     assert_eq!((rig.calls(Op::Head), rig.calls(Op::Get)), (heads, gets));
     assert_eq!(read(&rig.cache.counters().fills), 1);
 }
@@ -410,7 +415,8 @@ async fn fills_that_run_together_are_held_to_the_critical_mark() {
 
 /// Asserts that an object written over while it is read is not kept: the second HEAD shows
 /// another tag, the fill is counted as `changed`, nothing is left staged or indexed, and the
-/// reader is served the object as the upstream has it now. Also drives the upstream's
+/// reader, who was given no byte, is served the object as the upstream has it now (a reader given
+/// bytes of the first version gets an error: see `stream_tests`). Also drives the upstream's
 /// conditional put and delete.
 #[tokio::test]
 async fn an_object_written_over_during_its_fill_is_not_kept() {
@@ -454,7 +460,9 @@ async fn each_step_of_publishing_that_fails_fails_the_fill_not_the_read() {
         match step {
             "dirs" => std::fs::write(root.join("obj").join(&hex[..2]), b"x").unwrap(),
             "sidecar-write" => {
-                std::fs::create_dir(root.join(".stage").join("0000000000000000.meta")).unwrap();
+                let prefix = &rig.cache.inner.stage_prefix;
+                let name = format!("{prefix}-0000000000000000.meta");
+                std::fs::create_dir(root.join(".stage").join(name)).unwrap();
             }
             _ => std::fs::create_dir_all(meta_path(root, &hex)).unwrap(),
         }
