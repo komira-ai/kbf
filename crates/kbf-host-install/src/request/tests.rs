@@ -434,3 +434,41 @@ fn a_configured_service_is_a_kbf_service_and_nothing_else() {
         assert!(Unit::service(bad).is_err(), "{bad:?}");
     }
 }
+
+/// A unit of a described service is `<service>.service` or `<service>-<more>.service`, with an
+/// instance if it likes: never a unit of the system, of kbf or of another service.
+#[test]
+fn a_unit_owned_by_a_service_starts_with_its_name() {
+    for good in [
+        "js-agent.service",
+        "js-agent-helper.service",
+        "js-agent@a.service",
+        "js-agent-helper@a-1.service",
+        "js-agent-2.service",
+        "js-agent-h2lper.service",
+    ] {
+        assert_eq!(Unit::owned_by("js-agent", good).unwrap().as_str(), good);
+    }
+    for bad in [
+        "",
+        "sshd.service",
+        "kbf-daemon.service",
+        "js.service",
+        "js-agentx.service",
+        "js-agent-.service",
+        "js-agent--.service",
+        "js-agent-A.service",
+        "js-agent-a_b.service",
+        "js-agent.timer",
+        "js-agent.service.service",
+        "js-agent@.service",
+        "js-agent@-.service",
+        "js-agent@A.service",
+        "Js-agent.service",
+        "js-agent .service",
+        "js-agent/../x.service",
+    ] {
+        assert!(Unit::owned_by("js-agent", bad).is_err(), "{bad:?}");
+    }
+    assert!(Unit::owned_by("js-agent", &format!("js-agent-{}.service", "a".repeat(60))).is_err());
+}

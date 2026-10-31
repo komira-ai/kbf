@@ -626,9 +626,11 @@ pub fn rollback<E: Exec>(
 }
 
 /// Whether the release `commit` has a binary in its directory. Any will do: a release
-/// holds `kbf` (a macOS one holds nothing else) and, on Linux, maybe `kbf-daemon`.
+/// holds `kbf` (a macOS one holds nothing else) and, on Linux, maybe `kbf-daemon`; a layout
+/// of another service's tree names that service's program instead
+/// ([`Layout::release_programs`]).
 pub(crate) fn has_binary<E: Exec>(exec: &E, host: &Layout, commit: &CommitId) -> bool {
-    layout::RELEASE_BINARIES.iter().any(|name| {
+    host.release_programs().iter().any(|name| {
         matches!(
             exec.stat(&host.release_file(commit, name)),
             Ok(Some(Meta {

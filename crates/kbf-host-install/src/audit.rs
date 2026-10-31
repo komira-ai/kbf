@@ -27,6 +27,9 @@ pub struct Entry {
     /// `install`, `restart`, `query` or `apply` (the Mac's apply job); none when the request
     /// was not understood.
     pub verb: Option<&'static str>,
+    /// The service a request of the local socket was for, when it was not kbf.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
     pub version: Option<String>,
     pub channel: Option<String>,
     /// The unit a `restart` named, only on the line of a restart.

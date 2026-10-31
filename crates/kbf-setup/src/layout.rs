@@ -44,11 +44,12 @@ use kbf_host::path::{HostPath, Root};
 use super::CommitId;
 
 /// The installer's tree, and where its state is, per platform.
-const LINUX_ROOT: &str = "/var/lib/kbf-installer";
 const MACOS_ROOT: &str = "/usr/local/kbf-installer";
-const MACOS_STATE_DIR: &str = "/var/db/kbf-installer";
-const LINUX_LOCK: &str = "/run/kbf-installer/lock";
-const MACOS_LOCK: &str = "/var/run/kbf-installer/lock";
+/// The name of the installer's own tree: `/var/lib/<tree>` on Linux and `/usr/local/<tree>`
+/// on macOS, with the state in `/var/lib/<tree>` and `/var/db/<tree>` and the lock in
+/// `/run/<tree>/lock` and `/var/run/<tree>/lock`. Another service's releases keep the same
+/// layout under a tree of its own ([`Layout::with_tree`]).
+pub const DEFAULT_TREE: &str = "kbf-installer";
 const LINUX_TRUST: &str = "/usr/share/kbf/trust";
 /// Where the trust directory was while the `kbf-installer` package carried it. A host that has
 /// not yet been given the `kbf` package that carries [`LINUX_TRUST`] still has its files here.
@@ -157,24 +158,25 @@ impl Platform {
         }
     }
 
-    fn root(self) -> &'static str {
+    /// The directory of a tree's releases, `/var/lib/<tree>` or `/usr/local/<tree>`.
+    fn root(self, tree: &str) -> String {
         match self {
-            Platform::Linux => LINUX_ROOT,
-            Platform::MacOs => MACOS_ROOT,
+            Platform::Linux => format!("/var/lib/{tree}"),
+            Platform::MacOs => format!("/usr/local/{tree}"),
         }
     }
 
-    fn state_dir(self) -> &'static str {
+    fn state_dir(self, tree: &str) -> String {
         match self {
-            Platform::Linux => LINUX_ROOT,
-            Platform::MacOs => MACOS_STATE_DIR,
+            Platform::Linux => format!("/var/lib/{tree}"),
+            Platform::MacOs => format!("/var/db/{tree}"),
         }
     }
 
-    fn lock(self) -> &'static str {
+    fn lock(self, tree: &str) -> String {
         match self {
-            Platform::Linux => LINUX_LOCK,
-            Platform::MacOs => MACOS_LOCK,
+            Platform::Linux => format!("/run/{tree}/lock"),
+            Platform::MacOs => format!("/var/run/{tree}/lock"),
         }
     }
 
@@ -255,7 +257,28 @@ pub struct Layout {
     /// The trust directory is the retired package's ([`LINUX_TRUST_LEGACY`]), not the `kbf`
     /// package's. Only [`Layout::with_trust_fallback`] sets it.
     trust_legacy: bool,
+    /// The name of the tree the releases, the state and the lock are in ([`DEFAULT_TREE`]
+    /// unless [`Layout::with_tree`] says another).
+    tree: String,
+    /// The program of a release when it is not kbf's ([`Layout::with_tree`]).
+    program: Option<String>,
 }
+
+/// A tree name that is not one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotATree(pub String);
+
+impl std::fmt::Display for NotATree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} is not usable in a layout (a tree is lower-case letters, digits and -, a letter first, at most 64; a program is a plain file name)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for NotATree {}
 
 impl Layout {
     /// A layout whose trust directory is where the `kbf` package puts it.
@@ -264,7 +287,38 @@ impl Layout {
             root,
             platform,
             trust_legacy: false,
+            tree: DEFAULT_TREE.to_owned(),
+            program: None,
         }
+    }
+
+    /// This layout with the releases, links, state, scratch and lock in the tree `name`
+    /// instead of `kbf-installer`: the layout of another service's releases, whose release
+    /// directory holds the file `program` ([`Layout::release_programs`]). The trust directory
+    /// is the host's and is not moved.
+    ///
+    /// # Errors
+    /// [`NotATree`] unless `name` is a lower-case letter and then lower-case letters, digits
+    /// and `-` (at most 64 bytes), a name that cannot leave its directory, and `program` is a
+    /// plain file name (letters, digits and `. _ -`, not starting with `.` or `-`).
+    pub fn with_tree(mut self, name: &str, program: &str) -> Result<Layout, NotATree> {
+        let plain = program.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && program
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+        if !plain {
+            return Err(NotATree(program.to_owned()));
+        }
+        self.program = Some(program.to_owned());
+        let mut bytes = name.bytes();
+        let sound = name.len() <= 64
+            && bytes.next().is_some_and(|b| b.is_ascii_lowercase())
+            && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !sound {
+            return Err(NotATree(name.to_owned()));
+        }
+        self.tree = name.to_owned();
+        Ok(self)
     }
 
     /// This layout, with the trust directory the retired `kbf-installer` package put on a
@@ -312,12 +366,12 @@ impl Layout {
 
     /// The installer's tree: the releases and the links to them.
     pub fn install_root(&self) -> HostPath {
-        path(self.platform.root())
+        path(&self.platform.root(&self.tree))
     }
 
     /// `<install root>/releases`.
     pub fn releases(&self) -> HostPath {
-        path_in(self.platform.root(), RELEASES)
+        path_in(&self.platform.root(&self.tree), RELEASES)
     }
 
     /// `releases/current`: the release that runs.
@@ -331,20 +385,32 @@ impl Layout {
     }
 
     fn release_link_path(&self, name: &str) -> HostPath {
-        path_in(&format!("{}/{RELEASES}", self.platform.root()), name)
+        path_in(
+            &format!("{}/{RELEASES}", self.platform.root(&self.tree)),
+            name,
+        )
     }
 
     /// `releases/<commit>`.
     pub fn release_dir(&self, commit: &CommitId) -> HostPath {
         path_in(
-            &format!("{}/{RELEASES}", self.platform.root()),
+            &format!("{}/{RELEASES}", self.platform.root(&self.tree)),
             commit.as_str(),
         )
     }
 
+    /// The files of a release directory that are its program: kbf's are [`RELEASE_BINARIES`],
+    /// another service's the one [`Layout::with_tree`] named.
+    pub fn release_programs(&self) -> Vec<&str> {
+        match &self.program {
+            Some(program) => vec![program.as_str()],
+            None => RELEASE_BINARIES.to_vec(),
+        }
+    }
+
     /// `releases/<commit>/<name>`, for a name of [`RELEASE_BINARY`], [`RELEASE_DAEMON`],
-    /// [`RELEASE_UNITS`] or [`RELEASE_MANIFEST`].
-    pub fn release_file(&self, commit: &CommitId, name: &'static str) -> HostPath {
+    /// [`RELEASE_UNITS`] or [`RELEASE_MANIFEST`] (or a service's program).
+    pub fn release_file(&self, commit: &CommitId, name: &str) -> HostPath {
         path_in(&self.release_dir(commit).to_string(), name)
     }
 
@@ -352,24 +418,24 @@ impl Layout {
     /// [`Layout::release_dir`]. `rand` is letters and digits.
     pub fn stage_dir(&self, commit: &CommitId, rand: &str) -> HostPath {
         path_in(
-            &format!("{}/{RELEASES}", self.platform.root()),
+            &format!("{}/{RELEASES}", self.platform.root(&self.tree)),
             &format!("{STAGE_PREFIX}{commit}.{rand}"),
         )
     }
 
     /// The directory the state is in (the install root on Linux, `/var/db` on macOS).
     pub fn state_dir(&self) -> HostPath {
-        path(self.platform.state_dir())
+        path(&self.platform.state_dir(&self.tree))
     }
 
     /// `state.json`.
     pub fn state_file(&self) -> HostPath {
-        path_in(self.platform.state_dir(), STATE_FILE)
+        path_in(&self.platform.state_dir(&self.tree), STATE_FILE)
     }
 
     /// `state.json.bak`: the last state that read back whole.
     pub fn state_backup(&self) -> HostPath {
-        path_in(self.platform.state_dir(), STATE_BACKUP)
+        path_in(&self.platform.state_dir(&self.tree), STATE_BACKUP)
     }
 
     /// The state directory, root's: where `status.json` is written. The node no longer reads
@@ -382,17 +448,17 @@ impl Layout {
     /// as (mode 0700, inside root's directory). A node's `kbf.toml` names it as
     /// `[daemon] orders-dir`.
     pub fn orders_dir(&self) -> HostPath {
-        path_in(self.platform.state_dir(), ORDERS)
+        path_in(&self.platform.state_dir(&self.tree), ORDERS)
     }
 
     /// The lock the state is read and written under.
     pub fn lock(&self) -> HostPath {
-        path(self.platform.lock())
+        path(&self.platform.lock(&self.tree))
     }
 
     /// The directory a stage makes its scratch directory in (`work/`).
     pub fn work_dir(&self) -> HostPath {
-        path_in(self.platform.state_dir(), "work")
+        path_in(&self.platform.state_dir(&self.tree), "work")
     }
 
     /// The node's own `kbf.toml`: its `mode` says what this host runs.
@@ -455,7 +521,7 @@ impl Layout {
     /// `seq_floor`, beside the state: the highest `seq` that is not allowed (a staged
     /// release's `seq` must be strictly above it).
     pub fn seq_floor(&self) -> HostPath {
-        path_in(self.platform.state_dir(), SEQ_FLOOR)
+        path_in(&self.platform.state_dir(&self.tree), SEQ_FLOOR)
     }
 }
 

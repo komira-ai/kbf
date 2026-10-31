@@ -20,6 +20,7 @@ use super::backend::Fault;
 use super::core_tests::{A, B, Fx, VA, VB, World};
 use super::request::MAX_LINE_LEN;
 use super::serve::{Layout, ServeConfig, Serving, bind, passwd_ids, read_line};
+use super::services::{NoServices, Services};
 use crate::pace::fake::Fake;
 use crate::pace::{Now, Pace, real_now};
 use crate::trust::Trust;
@@ -310,6 +311,16 @@ fn with_serving(name: &str, body: impl FnOnce(&Fx, &Wire<'_>)) -> Vec<String> {
 
 /// [`with_serving`] on the clock `pace` tells.
 fn with_serving_paced(name: &str, pace: &Pace, body: impl FnOnce(&Fx, &Wire<'_>)) -> Vec<String> {
+    with_services(name, pace, &NoServices, body)
+}
+
+/// [`with_serving_paced`], with `services` serving every service but kbf.
+fn with_services(
+    name: &str,
+    pace: &Pace,
+    services: &dyn Services,
+    body: impl FnOnce(&Fx, &Wire<'_>),
+) -> Vec<String> {
     let fx = Fx::new(name);
     let lines = RefCell::new(Vec::new());
     let log = |line: &str| lines.borrow_mut().push(line.to_owned());
@@ -321,6 +332,7 @@ fn with_serving_paced(name: &str, pace: &Pace, body: impl FnOnce(&Fx, &Wire<'_>)
         audit: &audit,
         log: &log,
         pace,
+        services,
     };
     body(&fx, &Wire { serving: &serving });
     lines.into_inner()
@@ -779,3 +791,5 @@ fn the_frontend_config_flag_names_the_file() {
     ]));
     assert!(units.unwrap_err().contains("needs --frontend-container"));
 }
+
+mod services_tests;

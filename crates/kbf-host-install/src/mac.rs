@@ -200,6 +200,7 @@ fn handle_root(
     let entry = audit::Entry {
         time: audit::now(),
         verb: request.as_ref().ok().map(Request::verb),
+        service: None,
         version,
         channel,
         unit: None,

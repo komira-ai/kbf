@@ -61,6 +61,7 @@ use crate::outcome::Refusal;
 use crate::plan::Wait;
 use crate::request::{Channel, Unit, Version};
 use crate::runner::{Identity, Runner};
+use crate::service::{Descriptor, ServiceName};
 use crate::trust::{Trust, nofollow};
 
 use super::answer::Code;
@@ -111,8 +112,34 @@ impl LeaseSource for NoLeases {
     }
 }
 
+/// The service a [`Linux`] backend updates: its name, which decides the channels it may take
+/// releases from, and the program of its release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subject {
+    pub(crate) name: ServiceName,
+    /// The file of the release tarball that is the program, and of the release directory.
+    pub(crate) binary: String,
+}
+
+impl Subject {
+    /// kbf: the program of a release is `kbf`.
+    pub fn kbf() -> Self {
+        Self::of(&Descriptor::kbf(Vec::new()))
+    }
+
+    /// The service `descriptor` describes.
+    pub fn of(descriptor: &Descriptor) -> Self {
+        Self {
+            name: descriptor.name.clone(),
+            binary: descriptor.binary.clone(),
+        }
+    }
+}
+
 /// A Linux host as the backend of an update.
 pub struct Linux<E: Exec> {
+    /// The service whose releases this backend lays out.
+    pub(crate) subject: Subject,
     pub(crate) layout: Layout,
     /// The steps that move the links.
     pub(crate) exec: RefCell<E>,
@@ -280,7 +307,9 @@ impl<E: Exec> Linux<E> {
         })?;
         let trust: &Trust = &self.host.trust;
         let allowlist = MacAllowlist::load(trust, &self.allowlist).map_err(config_fault)?;
-        let channel = allowlist.channel(trust, channel).map_err(channel_fault)?;
+        let channel = allowlist
+            .channel_of(trust, channel, &self.subject.name)
+            .map_err(channel_fault)?;
         let Source::Github { token_file } = &channel.source else {
             return Err(Fault::refused(
                 Code::ConfigInvalid,
@@ -366,7 +395,8 @@ impl<E: Exec> Linux<E> {
             .map_err(|e| Fault::failed(Code::StageFailed, e.to_string()))?;
         let tarball_name = AssetKind::Tarball.name_on(origin.prefix(), &platform, &commit);
         let bundle_name = crate::mac::release::bundle_of(&tarball_name);
-        let target = partial.dl().join("kbf.tar.gz");
+        let program = self.subject.binary.clone();
+        let target = partial.dl().join("release.tar.gz");
         let copied = copy_hashing(
             &scratch.join(&tarball_name),
             &target,
@@ -376,7 +406,7 @@ impl<E: Exec> Linux<E> {
         let bundle = read_capped(&scratch.join(&bundle_name), BUNDLE_CAP)
             .map_err(|e| Fault::refused(Code::FetchFailed, format!("{bundle_name}: {e}")))?;
         let locator = Locator {
-            name: "kbf".to_owned(),
+            name: program.clone(),
             sha256: copied.sha256.clone(),
             size: copied.len,
             attestation: bundle,
@@ -384,7 +414,7 @@ impl<E: Exec> Linux<E> {
         let fetched = Fetched {
             partial,
             files: vec![Received {
-                name: "kbf".to_owned(),
+                name: program,
                 tarball: target,
                 bytes: copied.len,
                 sha256: copied.sha256,
@@ -527,8 +557,10 @@ impl<E: Exec> Backend for Linux<E> {
 
     fn has(&self, commit: &str) -> bool {
         CommitId::new(commit).is_ok_and(|id| {
+            // The program is a plain file name (checked with the descriptor).
+            let file = self.layout.release_file(&id, &self.subject.binary);
             matches!(
-                self.exec.borrow().stat(&self.layout.release_file(&id, "kbf")),
+                self.exec.borrow().stat(&file),
                 Ok(Some(meta)) if meta.kind == kbf_host::exec::Kind::File
             )
         })
@@ -592,6 +624,7 @@ pub fn production(units: Vec<Unit>) -> Linux<kbf_host::HostExec> {
     let root = Root::host();
     let layout = Layout::new(root.clone(), Platform::current()).with_trust_fallback();
     Linux {
+        subject: Subject::kbf(),
         layout,
         exec: RefCell::new(kbf_host::HostExec::new(root.clone())),
         trust: Box::new(kbf_host::HostExec::new(root)),
@@ -606,4 +639,25 @@ pub fn production(units: Vec<Unit>) -> Linux<kbf_host::HostExec> {
         owner: Owner { uid: 0, gid: 0 },
         scratch_tag: None,
     }
+}
+
+/// The host as it is, for the service `descriptor` describes (not kbf): its releases are in
+/// its own tree, its scratch and its install lock carry its name, and `descriptor.units` are
+/// what a switch and a revert restart.
+///
+/// # Errors
+/// The descriptor's tree is not a tree name (the allowlist checked it already).
+pub fn production_for(descriptor: &Descriptor) -> Result<Linux<kbf_host::HostExec>, String> {
+    let mut linux = production(descriptor.units.clone());
+    linux.layout = linux
+        .layout
+        .with_tree(&descriptor.tree, &descriptor.binary)
+        .map_err(|e| e.to_string())?;
+    linux.subject = Subject::of(descriptor);
+    linux.scratch_tag = Some(descriptor.name.as_str().to_owned());
+    linux.host.install_lock = PathBuf::from(format!(
+        "/run/kbf-host-install-{}.lock",
+        descriptor.name.as_str()
+    ));
+    Ok(linux)
 }

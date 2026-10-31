@@ -78,6 +78,7 @@ mod pace;
 mod plan;
 mod request;
 mod runner;
+mod service;
 mod trust;
 
 use std::process::ExitCode;
@@ -118,12 +119,12 @@ pub mod contract {
         pub use crate::local::serve::ServeConfig;
 
         /// The verb of `line`, when it is a request the socket accepts (`stage`, `switch`,
-        /// `confirm`, `revert` or `query`); `None` for anything it would refuse.
+        /// `confirm`, `revert` or `query`, for kbf or for a named service); `None` for anything it would refuse.
         #[must_use]
         pub fn request_verb(line: &str) -> Option<&'static str> {
-            crate::local::request::LocalRequest::parse(line)
+            crate::local::request::Addressed::parse(line)
                 .ok()
-                .map(|request| request.verb())
+                .map(|addressed| addressed.request.verb())
         }
     }
 
@@ -264,6 +265,25 @@ mod tests {
         for other in [&[][..], &["-V"], &["query"]] {
             assert!(!names_version(&args(other)), "{other:?}");
         }
+    }
+
+    /// The verb of a line is the verb of the request it makes, for kbf's lines and for the
+    /// form of another service; a line that is no request has none.
+    #[test]
+    fn the_contract_names_the_verb_of_a_request_of_any_service() {
+        let version = "0.1.7+gbbbbbbbbbbbb-3";
+        for (line, verb) in [
+            ("query".to_owned(), "query"),
+            ("revert".to_owned(), "revert"),
+            (format!("install kbf={version} from stable"), "stage"),
+            (format!("switch js-agent={version}"), "switch"),
+            (format!("confirm js-agent={version}"), "confirm"),
+            ("query js-agent".to_owned(), "query"),
+        ] {
+            assert_eq!(contract::local::request_verb(&line), Some(verb), "{line}");
+        }
+        assert_eq!(contract::local::request_verb("restart frontend=-"), None);
+        assert_eq!(contract::local::request_verb("query JS"), None);
     }
 
     #[test]
