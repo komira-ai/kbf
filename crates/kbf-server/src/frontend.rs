@@ -134,7 +134,7 @@ use tonic::service::Routes;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server};
 
 pub use self::executor_flags::{ExecutorFlags, JsAgentFlags};
-pub use self::job_read::{JobReadError, JobReadFlags};
+pub use self::job_read::{JobReadError, JobReadFlags, JobTls};
 pub use self::pack_flags::{PackFlagError, PackFlags};
 pub use self::task_flags::{TaskFlagError, TaskFlags};
 use crate::drain::Drain;
@@ -997,7 +997,9 @@ impl<'a> Prepared<'a> {
         let job_addr = job_read.as_ref().map(job_read::Prepared::local);
         let job_read = job_read
             .map(|prepared| {
-                prepared.start(Arc::new(backend.clone()), job_read::Timeouts::default())
+                prepared
+                    .with_backfill(packs.clone())
+                    .start(Arc::new(backend.clone()), job_read::Timeouts::default())
             })
             .transpose()?;
         let (job_stats, job_task) = match job_read {
@@ -1008,7 +1010,7 @@ impl<'a> Prepared<'a> {
                 read,
             }) => {
                 drain.begins().closes(latch);
-                tls_sources.push(tls);
+                tls_sources.extend(tls);
                 (Some(read), Some(task))
             }
             None => (None, None),

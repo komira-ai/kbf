@@ -277,7 +277,7 @@ async fn the_metrics_text_has_every_counter_with_its_value() {
     while read(&rig.cache.counters().staging_files) < 1 {
         tokio::task::yield_now().await;
     }
-    rig.put("cas/b/l", &pattern(11)).await;
+    rig.replace("cas/b/l", &pattern(11)).await;
     gate.add_permits(1000);
     assert_eq!(reader.await.unwrap().unwrap().len(), 11);
     rig.disk.set_space(1000, 50);

@@ -108,6 +108,7 @@ fn an_unknown_key_or_table_is_refused_by_name() {
         golden_with("[server]", "[server]\nbogus = 1"),
         golden_with("[hot_store]", "[hot_store]\nbogus = 1"),
         golden_with("[cold_store]", "[cold_store]\nbogus = 1"),
+        golden_with("[oci]", "[oci]\nbogus = 1"),
         format!("{GOLDEN}\n[bogus]\nx = 1\n"),
         format!("{GOLDEN}\n[[policy]]\nprefix = \"a/\"\nbogus = 1\n"),
         format!("bogus = 1\n{GOLDEN}"),
@@ -454,6 +455,106 @@ fn a_value_out_of_range_is_refused_with_its_key() {
     }
 }
 
+/// `MINIMAL` with the text of an `[oci]` table after it.
+fn minimal_with_oci(oci: &str) -> String {
+    format!("{MINIMAL}\n[oci]\n{oci}\n")
+}
+
+/// Asserts that an `[oci]` table makes the settings the `--oci-*` flags make: with every key
+/// given (the golden file) and with `listen` alone, where the other keys stay unset so that the
+/// front's own defaults apply; and that a file without the table opens no front.
+#[test]
+fn an_oci_table_makes_the_settings_its_flags_make() {
+    let all = from_text(GOLDEN, DEFAULTS).unwrap();
+    assert_eq!(all.oci_listen, Some("192.0.2.10:5000".parse().unwrap()));
+    assert_eq!(
+        all.oci_tls_cert.as_deref(),
+        Some(Path::new("/etc/tierstore/oci.crt"))
+    );
+    assert_eq!(
+        all.oci_tls_key.as_deref(),
+        Some(Path::new("/etc/tierstore/oci.key"))
+    );
+    assert_eq!(all.oci_prefix.as_deref(), Some("images/"));
+    assert_eq!(all.oci_max_connections, Some(16));
+    assert_eq!(all.oci_connection_lifetime, Some(Duration::from_secs(1800)));
+    assert_eq!(all, Cli::try_parse_from(golden_flags()).unwrap());
+
+    let listen_only = from_text(&minimal_with_oci("listen = \"127.0.0.1:5000\""), DEFAULTS);
+    let mut flags = MINIMAL_FLAGS.to_vec();
+    flags.push("--oci-listen=127.0.0.1:5000");
+    assert_eq!(listen_only.unwrap(), Cli::try_parse_from(flags).unwrap());
+
+    let none = from_text(MINIMAL, DEFAULTS).unwrap();
+    assert_eq!(none.oci_listen, None);
+}
+
+/// Asserts that the `[oci]` rules are the flags' rules, each refusal naming its key: a
+/// certificate without a key and a key without a certificate, any other key without `listen`
+/// (and an empty table), a connection count of zero, a duration that is not one, a table with a
+/// key it does not have, and a key that holds a secret.
+#[test]
+fn an_oci_table_is_refused_as_the_flags_are() {
+    let listen = "listen = \"127.0.0.1:5000\"\n";
+    let both = "tls_cert_file = \"/c\"\ntls_key_file = \"/k\"";
+    let cases = [
+        (
+            format!("{listen}tls_cert_file = \"/c\""),
+            "oci.tls_key_file",
+        ),
+        (
+            format!("{listen}tls_key_file = \"/k\""),
+            "oci.tls_cert_file",
+        ),
+        (both.to_owned(), "oci.tls_cert_file: it needs oci.listen"),
+        (
+            "prefix = \"oci/\"".to_owned(),
+            "oci.prefix: it needs oci.listen",
+        ),
+        (
+            "max_connections = 4".to_owned(),
+            "oci.max_connections: it needs",
+        ),
+        (
+            "connection_lifetime = \"1h\"".to_owned(),
+            "oci.connection_lifetime: it needs",
+        ),
+        (String::new(), "oci.listen: it is needed"),
+        (
+            format!("{listen}max_connections = 0"),
+            "oci.max_connections",
+        ),
+        (format!("{listen}max_connections = -1"), "max_connections"),
+        (
+            format!("{listen}connection_lifetime = \"1\""),
+            "not a duration",
+        ),
+        (
+            format!("{listen}connection_lifetime = 3600"),
+            "connection_lifetime",
+        ),
+        (format!("{listen}bogus = 1"), "bogus"),
+        (format!("{listen}tls_key = \"/k\""), "oci.tls_key: a secret"),
+        ("listen = \"nowhere\"".to_owned(), "listen"),
+    ];
+    for (oci, want) in cases {
+        let why = refusal(&minimal_with_oci(&oci));
+        assert!(why.contains(want), "{oci}: {why}");
+    }
+}
+
+/// Asserts that a refusal the start makes about an `--oci-*` flag names the key of the file.
+#[test]
+fn a_message_about_the_oci_flags_names_their_keys() {
+    let message = "--oci-tls-cert and --oci-tls-key go together; --oci-listen, --oci-prefix, \
+                   --oci-max-connections, --oci-connection-lifetime";
+    assert_eq!(
+        keys_for_flags(message),
+        "oci.tls_cert_file and oci.tls_key_file go together; oci.listen, oci.prefix, \
+         oci.max_connections, oci.connection_lifetime"
+    );
+}
+
 /// Asserts that on a storage node a policy is read and checked and has no effect: the settings
 /// with policies are the settings without; a prefix twice, a prefix inside another, a prefix that
 /// does not end in `/`, one under `_journal/` or `_tiering/`, and one that asks for a cache are
@@ -554,7 +655,7 @@ fn every_flag_has_one_key_or_is_a_per_run_knob() {
         for key in *keys {
             let (table, name) = key.split_once('.').unwrap();
             assert!(
-                ["server", "hot_store", "cold_store"].contains(&table),
+                ["server", "hot_store", "cold_store", "oci"].contains(&table),
                 "{key}"
             );
             assert!(!name.is_empty(), "{key}");

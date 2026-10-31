@@ -1002,6 +1002,7 @@ async fn tls_node(pki: &Pki, names: &[&str], dir: &str) -> SocketAddr {
         "storage".to_owned(),
         "--storage-listen=127.0.0.1:0".to_owned(),
         format!("--cold-store=file://{}", work.join("cold").display()),
+        "--cold-store-floor-bytes=1".to_owned(),
         format!("--meta-dir={}", work.join("meta").display()),
     ];
     argv.extend(pki.node_flags(names));

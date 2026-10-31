@@ -51,6 +51,10 @@ pub const SUFFIX: &str = ".oci.tar";
 /// The end of the name of the facts of an image: `<image asset name without SUFFIX>.facts.json`.
 pub const FACTS_SUFFIX: &str = ".facts.json";
 
+/// The end of the name of the SBOM of an image: `<image asset name without SUFFIX>.cdx.json`,
+/// the same ending as the SBOM of a tarball has ([`crate::package`]).
+pub const SBOM_SUFFIX: &str = ".cdx.json";
+
 /// The manifest of the base of the task image for linux/amd64, byte for byte as the registry
 /// serves it: its sha256 is the digest the Dockerfile pins (a test holds the two together).
 const BASE_LINUX_X86_64: &[u8] =
@@ -139,6 +143,25 @@ impl Image {
         matches!(self, Image::Task)
     }
 
+    /// Whether the release has an SBOM of this image: the one whose layers hold more than the
+    /// program of its own tarball (the Ubuntu base's packages). The `kbf` of the frontend image
+    /// has the SBOM of its tarball, and the coordinator has no SBOM asset yet.
+    fn has_sbom(self) -> bool {
+        matches!(self, Image::Task)
+    }
+
+    /// The file name of the CycloneDX SBOM of the asset ([`crate::pkg_image_sbom`]); none for an
+    /// image the release has no SBOM of.
+    pub fn sbom_name(self, commit: &str, platform: Platform) -> Option<String> {
+        self.has_sbom().then(|| {
+            format!(
+                "{}-{commit}-{}{SBOM_SUFFIX}",
+                self.asset_name(),
+                platform.name()
+            )
+        })
+    }
+
     /// The base the image for `platform` is built on, parsed from the manifest committed
     /// beside its Dockerfile; none for an image that has no base to check or a platform with
     /// no image.
@@ -196,6 +219,28 @@ pub fn image_of(facts: &str) -> Option<String> {
     image
         .has_facts()
         .then(|| image.file_name(&commit, platform))
+}
+
+/// The SBOM file of the image asset `asset`, when the release has an SBOM of it.
+pub fn sbom_of(asset: &str) -> Option<String> {
+    let (image, commit, platform) = parsed(asset, SUFFIX)?;
+    image.sbom_name(&commit, platform)
+}
+
+/// The image asset the SBOM file `sbom` describes: the inverse of [`sbom_of`]. The SBOM of a
+/// binary's tarball (`kbf-task-<commit>-<platform>.cdx.json`) is not one.
+pub fn image_of_sbom(sbom: &str) -> Option<String> {
+    let (image, commit, platform) = parsed(sbom, SBOM_SUFFIX)?;
+    image.has_sbom().then(|| image.file_name(&commit, platform))
+}
+
+/// The digest `index.json` names for the manifest of the image `image` (the bytes of its tar),
+/// the manifest blob hashed to it.
+///
+/// # Errors
+/// The image is not a layout with one manifest whose blobs match their digests.
+pub(crate) fn manifest_digest(image: &[u8]) -> Result<String, String> {
+    layout(image).map(|l| l.manifest_digest)
 }
 
 /// Whether `file` is the facts file of an image of `commit`: exactly [`Image::facts_name`], not

@@ -89,8 +89,9 @@
 //! answered 403 `AccessDenied` with the S3 error document before its body is read, and changes
 //! nothing. The roles of those keys are of the key and not of a prefix. A put by the full key
 //! is create-only but, when the hot tier is full, can race another put of the same key into the
-//! cold tier (see [`Proxy`](crate::Proxy)); on a storage node
-//! a presigned PUT never goes to the cold tier (with only a cold store it goes straight to it).
+//! cold tier (see [`Proxy`](crate::Proxy)); a presigned PUT never goes to the cold tier of a
+//! proxy, on a cache with `write_through` it goes to the upstream like every other put, and with
+//! only a cold store it goes straight to it.
 //! A credential that may write one object under a prefix, and expires, is a presigned PUT URL: see [`presign`], and
 //! [`ServerConfig::presign_keys`] for the keys that sign them (`--presign-key-file` in the binary).
 //! A key that lists, heads and deletes under one prefix, and does nothing else (no get, no put), is a
@@ -148,11 +149,16 @@
 //! Without [`ServerConfig::proxy`] it is 200 and says the usage is not watched. A bucket cannot
 //! be called `usagez` either.
 //!
-//! `GET /metricz` is 200 with the counters of the local cache ([`local_cache`]) in the Prometheus
-//! text format, or a line that says there is none; it is not signed either, and a bucket cannot
-//! be called `metricz`. A server that is the front of a local cache is a read cache: it answers
-//! GET and HEAD and refuses every other method, copies and multipart calls included, with 403
-//! `AccessDenied`.
+//! `GET /metricz` is 200 with the counters of every source the process has, one block after the
+//! other, in the Prometheus text format: the proxy's reads ([`Proxy::metrics`]: hits, misses,
+//! errors and bytes of each tier, the copies cold reads made into the hot tier), the OCI read
+//! front ([`oci`]) and the local cache ([`local_cache`]). A line says so when the process has
+//! none of them. It is not signed either, and a bucket cannot be called `metricz`. A cache node
+//! and a storage node are different processes; the README of the crate lists every name and
+//! label. A server that is the front of a local cache is a read cache: it answers GET and HEAD
+//! and refuses every other method, copies and multipart calls included, with 403
+//! `AccessDenied`, before the role of the key is looked at. With [`ServerConfig::cache_writes`]
+//! it takes the writes its keys may do (see [`local_cache`]): the roles apply as on any front.
 //!
 //! # Drain
 //!
@@ -182,6 +188,7 @@ mod idle;
 mod keys;
 mod launch;
 pub mod local_cache;
+pub mod oci;
 mod ops;
 pub mod presign;
 mod reply;
@@ -214,6 +221,10 @@ mod gc_server_tests;
 mod gc_tests;
 #[cfg(test)]
 mod idle_tests;
+#[cfg(test)]
+mod metrics_race_tests;
+#[cfg(test)]
+mod metrics_tests;
 #[cfg(test)]
 mod ops_tests;
 #[cfg(test)]
@@ -353,10 +364,19 @@ pub struct ServerConfig {
     /// its body is read, and `/metricz` shows the cache's counters. The binary sets the cache it
     /// serves, which is also the server's backend.
     pub cache: Option<LocalCache>,
+    /// Whether a server that is the front of a local cache takes writes: false by default, and
+    /// then the refusal of `cache` stands, before the role of the key is looked at. With it the
+    /// roles of the keys decide, as on a storage node. It does nothing without `cache`. The
+    /// binary sets it from `write_through` in `[local_cache]`, the setting that also lets the
+    /// cache send the writes on.
+    pub cache_writes: bool,
     /// The age of the usage object past which `/usagez` says 503. A server that has run this
     /// long without finding any usage object is judged the same way. Longer than the lease and
     /// the pass interval of the reconciler, so that a takeover of the lease does not show.
     pub usage_stale_after: Duration,
+    /// The counters of the OCI read front, which `GET /metricz` shows; none by default, and then
+    /// `/metricz` has no block of it. The binary sets them when it runs the front.
+    pub oci_metrics: Option<Arc<oci::OciMetrics>>,
     /// The time, for the age of a signature and of the usage object.
     pub clock: Arc<dyn Clock>,
     /// The time, for the rate of a request body (`put_min_bytes_per_sec`). It is a clock that
@@ -398,7 +418,9 @@ impl ServerConfig {
             drain_deadline: Duration::from_secs(900),
             proxy: None,
             cache: None,
+            cache_writes: false,
             usage_stale_after: Duration::from_secs(120),
+            oci_metrics: None,
             clock,
             rate_clock: Arc::new(MonotonicClock::new()),
         }
@@ -735,7 +757,7 @@ impl Server {
         }
         let signed = auth::verify(&self.config, parts)?;
         let reads = matches!(parts.method, Method::GET | Method::HEAD);
-        if self.config.cache.is_some() && !reads {
+        if self.config.cache.is_some() && !self.config.cache_writes && !reads {
             return Err(S3Error::read_cache());
         }
         signed.role.permit(&parts.method)?;
@@ -789,12 +811,28 @@ impl Server {
         Some(answer(status, &headers, Bytes::from(text)))
     }
 
-    /// The text of `/metricz`: the counters of the local cache, or a line that says there is none.
+    /// The text of `/metricz`: the block of every source of counters the process has (the
+    /// proxy's, the OCI front's, the local cache's), one after the other, each ending in a
+    /// newline, or one line that names them all when there is none. Every block that exists
+    /// renders, never one of them; a storage node has the proxy's, a cache node the cache's, and
+    /// either may have the OCI front's.
     fn metrics_probe(&self) -> String {
-        match &self.config.cache {
-            Some(cache) => cache.metrics(),
-            None => "# this tierstore has no local cache\n".to_owned(),
+        let blocks = [
+            self.config.proxy.as_ref().map(|proxy| proxy.metrics()),
+            self.config.oci_metrics.as_ref().map(|oci| oci.render()),
+            self.config.cache.as_ref().map(|cache| cache.metrics()),
+        ];
+        let mut text = String::new();
+        for block in blocks.into_iter().flatten() {
+            text.push_str(&block);
+            if !block.ends_with('\n') {
+                text.push('\n');
+            }
         }
+        if text.is_empty() {
+            text = "# this server has no proxy, no OCI read front and no local cache\n".to_owned();
+        }
+        text
     }
 
     /// The answer of `/usagez`: 200 and the age of the usage object of the reconciler while it is
