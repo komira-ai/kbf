@@ -58,6 +58,32 @@ fn a_hook_that_keeps_the_contract_passes_every_check() {
     }
 }
 
+/// Catches params that differ between steps, or a staged release that is not the argument of
+/// prepare: the updater writes one file per update and every step reads the same values. The
+/// example hook refuses any step whose params lack them or whose prepare argument differs, so
+/// the checks pass only if the harness gave every step the same file.
+#[test]
+fn every_step_gets_the_same_params_and_prepare_gets_the_staged_release() {
+    let scratch = Scratch::new("same-params");
+    let mut fake = ExampleFake::default();
+    check(&example(CONVENTION), &mut fake, scratch.path()).unwrap();
+    let file = scratch.path().join("run-1/control/params.toml");
+    let params = update_hook::Params::read(&file).unwrap();
+    assert_eq!(
+        params.staged_release(),
+        Some(scratch.path().join("run-1/artifact"))
+    );
+    assert_eq!(params.target_version(), Some("2.0.0"));
+    assert_eq!(params.previous_version(), Some("1.0.0"));
+    assert_eq!(params.previous_release(), None);
+    assert_eq!(params.promotion_ceiling_secs(), Some(3600));
+    assert_eq!(params.get_u64("promotion_bound_secs"), Some(900));
+    // Written once: every sandbox's file has the same keys.
+    let other =
+        update_hook::Params::read(&scratch.path().join("run-2/control/params.toml")).unwrap();
+    assert_eq!(other.target_version(), params.target_version());
+}
+
 /// Catches a scenario the fake cannot make being run anyway, or hidden: it is skipped and said
 /// to be.
 #[test]
@@ -506,6 +532,159 @@ fn a_refusal_that_changes_the_world_and_a_cleanup_that_leaves_residue_are_refuse
         }
         other => panic!("{other}"),
     }
+}
+
+/// Catches a hook that refuses a params file because it holds an `updater.*` key the hook does
+/// not know: the updater adds reserved keys over time, and an older hook must ignore them.
+#[test]
+fn a_hook_that_refuses_an_unknown_updater_key_is_refused() {
+    let scratch = Scratch::new("bad-unknown-key");
+    let hook = example_with("refuses-unknown-updater-key");
+    let mut fake = ExampleFake::default();
+    assert!(matches!(
+        Conformance::new(&hook, &mut fake, scratch.path()).tolerates_unknown_updater_keys(),
+        Err(Violation::RefusedUpdaterKey {
+            step: Step::Prepare,
+            outcome: Outcome::Failure
+        })
+    ));
+    let good = Scratch::new("good-unknown-key");
+    let mut fake = ExampleFake::default();
+    Conformance::new(&example(CONVENTION), &mut fake, good.path())
+        .tolerates_unknown_updater_keys()
+        .unwrap();
+}
+
+/// Catches a harness that writes one previous-release key and not the other: an update has the
+/// previous release (a real directory in the sandbox) and version, a first install neither.
+#[test]
+fn the_harness_runs_an_update_and_a_first_install() {
+    let scratch = Scratch::new("modes-update");
+    let mut fake = ExampleFake::default();
+    Conformance::new(&example(CONVENTION), &mut fake, scratch.path())
+        .idempotence()
+        .unwrap();
+    let params =
+        update_hook::Params::read(&scratch.path().join("run-1/control/params.toml")).unwrap();
+    assert_eq!(
+        params.previous_release(),
+        Some(scratch.path().join("run-1/previous"))
+    );
+    assert!(scratch.path().join("run-1/previous").is_dir());
+    assert_eq!(params.previous_version(), Some("1.0.0"));
+
+    let first = Scratch::new("modes-first");
+    let mut fake = ExampleFake::default();
+    Conformance::new(&example(CONVENTION), &mut fake, first.path())
+        .with_first_install()
+        .idempotence()
+        .unwrap();
+    let params =
+        update_hook::Params::read(&first.path().join("run-1/control/params.toml")).unwrap();
+    assert_eq!(
+        (params.previous_release(), params.previous_version()),
+        (None, None)
+    );
+}
+
+/// Catches a hook that works only with a previous release, which a first install does not have.
+#[test]
+fn a_hook_that_cannot_do_a_first_install_is_refused() {
+    assert!(matches!(
+        refused("bad-first-install", example_with("needs-previous")),
+        Violation::UnexpectedOutcome {
+            step: Step::Prepare,
+            wanted: Outcome::Success,
+            got: Outcome::Failure
+        }
+    ));
+}
+
+/// Catches a harness that compares the world and not the hook's record: a record that grows on
+/// every rerun, or differs after a resume, is a violation too.
+#[test]
+fn a_record_that_grows_or_diverges_is_refused() {
+    match refused("bad-record-grows", example_with("record-grows")) {
+        Violation::NotIdempotent { step, changes } => {
+            assert_eq!(step, Step::Cutover);
+            assert_eq!(changes, ["changed record/log"]);
+        }
+        other => panic!("{other}"),
+    }
+    let scratch = Scratch::new("bad-record-resume");
+    let hook = example_with("resume-diverges-record");
+    let mut fake = ExampleFake::default();
+    match Conformance::new(&hook, &mut fake, scratch.path()).crash_resume() {
+        Err(Violation::CrashResumeDiverges { step, changes, .. }) => {
+            assert_eq!(step, Step::Cutover);
+            assert_eq!(changes, ["changed record/marker"]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Catches crash-resume that stops at the steps of a successful update: a rollback killed
+/// part-way must be resumable too.
+#[test]
+fn a_rollback_that_diverges_after_a_crash_is_refused() {
+    let scratch = Scratch::new("bad-rollback-crash");
+    let hook = example_with("rollback-diverges");
+    let mut fake = ExampleFake::default();
+    match Conformance::new(&hook, &mut fake, scratch.path()).crash_resume() {
+        Err(Violation::CrashResumeDiverges { step, changes, .. }) => {
+            assert_eq!(step, Step::Rollback);
+            assert_eq!(changes, ["changed rb-marker"]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Catches a write guard that stops at the artifact and `outside/`: the params file and the
+/// sandbox root are guarded too.
+#[test]
+fn a_hook_that_writes_its_params_or_the_sandbox_root_is_refused() {
+    match refused("bad-writes-control", example_with("writes-control")) {
+        Violation::WroteOutside { step, changes } => {
+            assert_eq!(step, Step::Cutover);
+            assert_eq!(changes, ["changed control/params.toml"]);
+        }
+        other => panic!("{other}"),
+    }
+    match refused("bad-writes-root", example_with("writes-root")) {
+        Violation::WroteOutside { step, changes } => {
+            assert_eq!(step, Step::Cutover);
+            assert_eq!(changes, ["added stray"]);
+        }
+        other => panic!("{other}"),
+    }
+}
+
+/// Catches a step that changes things with no kill point being hidden by other steps that have
+/// them.
+#[test]
+fn a_step_with_no_kill_point_is_refused_even_when_others_have_them() {
+    let scratch = Scratch::new("bad-ungated-cutover");
+    let hook = example_with("ungated-cutover");
+    let mut fake = ExampleFake::default();
+    assert!(matches!(
+        Conformance::new(&hook, &mut fake, scratch.path()).crash_resume(),
+        Err(Violation::StepWithoutKillPoints {
+            step: Step::Cutover
+        })
+    ));
+}
+
+/// Catches a step whose `reversible` differs between two runs.
+#[test]
+fn a_step_whose_reversible_flips_on_the_second_run_is_refused() {
+    assert!(matches!(
+        refused("bad-reversible-flips", example_with("reversible-flips")),
+        Violation::RerunReversibleChanged {
+            step: Step::Cleanup,
+            first: false,
+            second: true
+        }
+    ));
 }
 
 /// Catches a fake whose injected fault the hook does not honour, and a deferral that leaves the

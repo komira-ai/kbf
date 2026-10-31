@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use update_hook::conformance::gate;
-use update_hook::{Class, Invocation, Outcome, Report, Step};
+use update_hook::{Class, Invocation, Outcome, Params, Report, Step};
 
 struct Hook {
     world: PathBuf,
@@ -32,6 +32,10 @@ struct Hook {
     faults: PathBuf,
     irreversible: bool,
     defect: String,
+    /// Skip kill points (the whole hook, or just `cutover`).
+    ungated: bool,
+    /// The params file, to overwrite it for a defect.
+    params_file: PathBuf,
     /// This is a late run of the `flaky-gates` hook: it skips a kill point.
     late: bool,
 }
@@ -47,7 +51,7 @@ impl Hook {
 
     /// A kill point, unless the hook is the one that never has any.
     fn gate(&self) {
-        if !self.defect("ungated") {
+        if !self.ungated {
             gate::point();
         }
     }
@@ -149,6 +153,28 @@ impl Hook {
             // Held to the end of the process.
             std::mem::forget(record);
         }
+        // Every step gets the same params file: the staged release and the target version.
+        let params = Params::read(&inv.params.clone().unwrap_or_default())
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        if params.staged_release().is_none() || params.target_version().is_none() {
+            report.detail = Some("the params lack the staged release or the target".to_owned());
+            return Ok((Outcome::Failure, report));
+        }
+        if self.defect("needs-previous") && params.previous_release().is_none() {
+            report.detail = Some("no previous release: a first install".to_owned());
+            return Ok((Outcome::Failure, report));
+        }
+        if self.defect("refuses-unknown-updater-key")
+            && params.get("updater.conformance_probe").is_some()
+        {
+            report.detail = Some("unknown updater.* key".to_owned());
+            return Ok((Outcome::Failure, report));
+        }
+        if step == Step::Prepare && inv.artifact != params.staged_release() {
+            report.detail =
+                Some("the artifact is not the staged release, byte for byte".to_owned());
+            return Ok((Outcome::Failure, report));
+        }
         match step {
             Step::Prepare => {
                 let artifact = inv.artifact.clone().unwrap_or_default();
@@ -169,6 +195,24 @@ impl Hook {
                 }
                 let target = self.rec_get("target").unwrap_or_default();
                 let previous = self.rec_get("previous").unwrap_or_default();
+                if self.defect("record-grows") {
+                    let mut log = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(self.record.join("log"))?;
+                    writeln!(log, "cutover")?;
+                }
+                if self.defect("resume-diverges-record") {
+                    let resumed =
+                        self.rec_get("marker").is_some() && self.rec_get("cutover").is_none();
+                    self.rec_set("marker", if resumed { "resumed" } else { "fresh" })?;
+                }
+                if self.defect("writes-control") {
+                    fs::write(&self.params_file, "")?;
+                }
+                if self.defect("writes-root") {
+                    fs::write(self.record.join("../stray"), "1")?;
+                }
                 if self.defect("non-idempotent") {
                     let mut log = fs::OpenOptions::new()
                         .create(true)
@@ -203,6 +247,10 @@ impl Hook {
                 report.reversible = !self.lost();
             }
             Step::Rollback => {
+                if self.defect("rollback-diverges") {
+                    let resumed = self.world_has("rb-marker") && self.rec_get("previous").is_some();
+                    self.world_set("rb-marker", if resumed { "resumed" } else { "fresh" })?;
+                }
                 if let Some(previous) = self.rec_get("previous") {
                     self.set_current(&previous)?;
                 }
@@ -218,6 +266,7 @@ impl Hook {
                     || (!self.lost() && !self.defect("rollback-says-irreversible"));
             }
             Step::Cleanup => {
+                let seen = self.world_has("retired");
                 if self.rec_get("verified").is_none() && !self.defect("cleanup-commits") {
                     report.detail = Some("verify has not succeeded".to_owned());
                     return Ok((Outcome::Failure, report));
@@ -232,7 +281,7 @@ impl Hook {
                 if !self.defect("cleanup-leaves-cordon") {
                     self.take(&self.world, "cordon")?;
                 }
-                report.reversible = false;
+                report.reversible = self.defect("reversible-flips") && seen;
             }
         }
         Ok(self.finish(step, report))
@@ -252,6 +301,8 @@ fn main() -> ExitCode {
         irreversible: false,
         defect: String::new(),
         late: false,
+        ungated: false,
+        params_file: PathBuf::new(),
     };
     while let Some(flag) = args.first().and_then(|a| a.to_str()) {
         if flag == "--irreversible-cutover" {
@@ -271,6 +322,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    hook.ungated =
+        hook.defect("ungated") || (hook.defect("ungated-cutover") && inv.step == Step::Cutover);
+    hook.params_file = inv.params.clone().unwrap_or_default();
     let (outcome, report) = match hook.run(&inv) {
         Ok(end) => end,
         Err(e) => {

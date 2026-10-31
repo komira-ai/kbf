@@ -327,6 +327,74 @@ fn serde_json_line(reason: &str) -> String {
     .to_line()
 }
 
+/// Catches a lenient read that throws away good fields with a bad one: a valid object keeps every
+/// valid field, an invalid field takes its default and is warned about, and a `reversible` that
+/// is present but not a boolean reads as false (a step that might have committed is treated as
+/// committed). Only a missing line, or one that is not an object, is `{}`.
+#[test]
+fn the_lenient_read_keeps_every_valid_field() {
+    let read = |line: &str| Report::read_with_warnings(line);
+    // a bad reason does not drop the commit
+    let (report, warnings) =
+        read("{\"reversible\":false,\"reason\":\"Bad Reason\",\"class\":\"environment\"}");
+    assert_eq!(
+        (report.reversible, report.reason, report.class),
+        (false, None, Class::Environment)
+    );
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("reason"), "{warnings:?}");
+    // an unknown class takes the default and keeps the rest
+    let (report, warnings) =
+        read("{\"class\":\"sideways\",\"reversible\":false,\"retry_after_secs\":9}");
+    assert_eq!(
+        (report.class, report.reversible, report.retry_after_secs),
+        (Class::Release, false, Some(9))
+    );
+    assert_eq!(warnings.len(), 1);
+    // reversible present and not a boolean: false
+    for line in [
+        "{\"reversible\":\"no\"}",
+        "{\"reversible\":null}",
+        "{\"reversible\":1}",
+    ] {
+        let (report, warnings) = read(line);
+        assert!(!report.reversible, "{line}");
+        assert_eq!(warnings.len(), 1, "{line}");
+    }
+    // every other wrongly typed field takes its default
+    let (report, warnings) = read(
+        "{\"retry_after_secs\":\"soon\",\"promotion_pending\":1,\"detail\":5,\"reason\":7,\"extra\":true}",
+    );
+    assert_eq!(report, Report::default());
+    assert_eq!(warnings.len(), 4, "{warnings:?}");
+    // a valid line: no warnings
+    let (report, warnings) = read(
+        "noise\n{\"class\":\"environment\",\"retry_after_secs\":300,\"reason\":\"drain_bound\"}\n",
+    );
+    assert_eq!(
+        (
+            report.class,
+            report.retry_after_secs,
+            report.reason.as_deref()
+        ),
+        (Class::Environment, Some(300), Some("drain_bound"))
+    );
+    assert!(warnings.is_empty());
+    // no line: {} without a warning; not an object: {} with one
+    assert_eq!(read(""), (Report::default(), Vec::new()));
+    for line in ["[1]", "nope", "{\"class\":"] {
+        let (report, warnings) = read(line);
+        assert_eq!(report, Report::default(), "{line}");
+        assert_eq!(warnings.len(), 1, "{line}");
+    }
+    // the strict read stays strict
+    assert!(matches!(
+        Report::from_stdout("{\"reversible\":\"no\"}"),
+        Err(LineError::Malformed(_))
+    ));
+    assert!(!Report::read("{\"reversible\":false,\"reason\":\"Bad\"}").reversible);
+}
+
 // --- the params table ---
 
 /// Catches a reader that drops a value or reads a type wrong.
@@ -422,6 +490,75 @@ fn the_updater_tells_the_hook_which_releases_and_versions() {
         Params::parse("\"updater.target_version\" = 3\n"),
         Err(ParamsError::BadReserved(k)) if k == "updater.target_version"
     ));
+}
+
+/// Catches a params file with one previous-release key and not the other: a first install has
+/// neither, an update has both, and a hook's validator refuses the half-way states.
+#[test]
+fn the_previous_release_and_version_go_together() {
+    let release = "\"updater.previous_release\" = \"/r/def\"\n";
+    let version = "\"updater.previous_version\" = \"1.3.0\"\n";
+    assert!(Params::parse(&format!("{release}{version}")).is_ok());
+    assert!(Params::parse("").is_ok());
+    assert!(matches!(
+        Params::parse(release),
+        Err(ParamsError::PreviousPair)
+    ));
+    assert!(matches!(
+        Params::parse(version),
+        Err(ParamsError::PreviousPair)
+    ));
+    // The updater checks the table before it writes the file.
+    let mut params = Params::default();
+    assert!(params.validate().is_ok());
+    params.insert(
+        update_hook::PREVIOUS_VERSION_KEY,
+        Scalar::Text("1.3.0".to_owned()),
+    );
+    assert!(matches!(params.validate(), Err(ParamsError::PreviousPair)));
+    params.insert(
+        update_hook::PREVIOUS_RELEASE_KEY,
+        Scalar::Text("/r/def".to_owned()),
+    );
+    assert!(params.validate().is_ok());
+    assert!(!ParamsError::PreviousPair.to_string().is_empty());
+}
+
+/// Catches a staged or previous release that is not an absolute path, which a hook would resolve
+/// against its own working directory.
+#[test]
+fn the_release_paths_must_be_absolute() {
+    for key in ["updater.staged_release", "updater.previous_release"] {
+        let with_version = if key == "updater.previous_release" {
+            "\"updater.previous_version\" = \"1\"\n"
+        } else {
+            ""
+        };
+        let text = format!("\"{key}\" = \"relative/dir\"\n{with_version}");
+        assert!(
+            matches!(Params::parse(&text), Err(ParamsError::NotAbsolute(k)) if k == key),
+            "{key}"
+        );
+    }
+    let mut params = Params::default();
+    params.insert(
+        update_hook::STAGED_RELEASE_KEY,
+        Scalar::Text("rel".to_owned()),
+    );
+    assert!(matches!(
+        params.validate(),
+        Err(ParamsError::NotAbsolute(_))
+    ));
+    params.insert(
+        update_hook::STAGED_RELEASE_KEY,
+        Scalar::Text("/abs".to_owned()),
+    );
+    assert!(params.validate().is_ok());
+    assert!(
+        !ParamsError::NotAbsolute("k".to_owned())
+            .to_string()
+            .is_empty()
+    );
 }
 
 /// Catches a declaration that sets a key only the updater may write: its own `[hook.params]`
@@ -986,6 +1123,30 @@ fn a_halt_runs_nothing_and_cleanup_is_never_rolled_back() {
             }
         }
     }
+}
+
+/// Pins the edge of the table: a rollback that fails and says `reversible: false` is the commit
+/// even when no earlier step said so, so it is Failed(after_commit), not a halt.
+#[test]
+fn a_rollback_that_reports_the_commit_itself_is_failed_after_the_commit() {
+    assert_eq!(
+        next(
+            Step::Rollback,
+            Outcome::Failure,
+            &report(RELEASE, false, None),
+            &Context::default()
+        ),
+        Next::Report(failed(Phase::AfterCommit, RELEASE))
+    );
+    assert_eq!(
+        next(
+            Step::Rollback,
+            Outcome::Failure,
+            &report(RELEASE, true, None),
+            &Context::default()
+        ),
+        Next::Report(Verdict::Halt)
+    );
 }
 
 /// Catches the updater forgetting a commit or a pending promotion between steps: `observe`

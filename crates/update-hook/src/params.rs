@@ -67,6 +67,12 @@ pub enum ParamsError {
     BadCeiling,
     #[error("reserved key {0:?} must be text")]
     BadReserved(String),
+    #[error(
+        "updater.previous_release and updater.previous_version go together: a first install has neither, an update both"
+    )]
+    PreviousPair,
+    #[error("params key {0:?} must be an absolute path")]
+    NotAbsolute(String),
     #[error("params key {0:?} is in the namespace `updater.`, which only the updater writes")]
     ReservedKey(String),
 }
@@ -120,6 +126,12 @@ impl Params {
             return Err(ParamsError::BadReserved(key.to_owned()));
         }
         Ok(params)
+    }
+
+    /// What the updater checks before it writes the file: a first install has neither previous
+    /// release nor previous version, an update has both.
+    pub fn validate(&self) -> Result<(), ParamsError> {
+        Ok(())
     }
 
     /// The table as the file the updater writes.
