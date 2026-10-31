@@ -1197,4 +1197,91 @@ mod tests {
         assert!(row(11, "| big | quiet | 10 | 10000 |"));
         assert!(row(6, "| big | quiet | 5 | 5000 |"));
     }
+
+    /// Catches a comparison that only handles the common case: an instance faster than its floor
+    /// (a minus sign, a ratio under 1), a floor of zero (no ratio), busy passes (their own row),
+    /// a second attempt (named as one, paired with its own attempt's floor), and an instance arm
+    /// with no success (no row, and no panic).
+    #[test]
+    fn the_comparison_handles_a_faster_instance_a_zero_floor_busy_passes_and_attempts() {
+        let both = |arm: &str, window: Window, attempt: u32| {
+            let mut r = result(
+                arm,
+                vec![pass(0, window, 3, None), pass(1, window, 3, None)],
+                &[],
+            );
+            r.provenance.attempt = attempt;
+            r
+        };
+        let on_attempt = |rows: Rows, attempt: u32| -> Rows {
+            rows.into_iter()
+                .map(|((c, a, _, p), v)| ((c, a, attempt, p), v))
+                .collect()
+        };
+        let data = merged(vec![
+            rows("direct-mp-4kib-c1-healthy", 1, &[4000, 5000, 6000], "200"),
+            rows("instance-4kib-c1-healthy", 1, &[1000, 2000, 3000], "200"),
+            rows("direct-mp-1kib-c1-healthy", 1, &[0, 0, 0], "200"),
+            rows("instance-1kib-c1-healthy", 1, &[1000, 1000, 1000], "200"),
+            rows("direct-mp-2kib-c1-healthy", 1, &[1000, 2000, 3000], "200"),
+            on_attempt(
+                rows("instance-2kib-c1-healthy", 1, &[2000, 3000, 4000], "200"),
+                2,
+            ),
+            on_attempt(
+                rows("direct-mp-2kib-c1-healthy", 1, &[1000, 2000, 3000], "200"),
+                2,
+            ),
+            rows("direct-mp-8kib-c1-healthy", 1, &[1000], "200"),
+        ]);
+        let results = [
+            both("direct-mp-4kib-c1-healthy", Window::Busy, 1),
+            both("instance-4kib-c1-healthy", Window::Busy, 1),
+            both("direct-mp-1kib-c1-healthy", Window::Quiet, 1),
+            both("instance-1kib-c1-healthy", Window::Quiet, 1),
+            both("direct-mp-2kib-c1-healthy", Window::Quiet, 1),
+            both("direct-mp-2kib-c1-healthy", Window::Quiet, 2),
+            both("instance-2kib-c1-healthy", Window::Quiet, 2),
+            both("direct-mp-8kib-c1-healthy", Window::Quiet, 1),
+            both("instance-8kib-c1-healthy", Window::Quiet, 1),
+        ];
+        let text = format_report(&results, &data);
+        let (_, section) = text
+            .split_once("### cold-put: instance against direct-mp")
+            .expect("a comparison section");
+        let table = section.split("\n\n").nth(1).unwrap();
+        let has = |needle: &str| table.lines().any(|l| l.starts_with(needle));
+        assert!(
+            has("| 4kib-c1-healthy | busy | 5.00 ms | 2.00 ms | -3.00 ms (0.40x) |"),
+            "{table}"
+        );
+        assert!(
+            has("| 1kib-c1-healthy | quiet | 0 us | 1.00 ms | +1.00 ms (n/a) |"),
+            "{table}"
+        );
+        assert!(
+            has("| 2kib-c1-healthy (attempt 2) | quiet | 2.00 ms | 3.00 ms | +1.00 ms (1.50x) |"),
+            "{table}"
+        );
+        assert!(!table.contains("8kib"), "{table}");
+    }
+
+    /// Catches a method that no request used being left out of the line as if the line were
+    /// missing, rather than named `none`: all the requests of the arm were in its cleanup.
+    #[test]
+    fn a_phase_with_no_proxy_request_is_reported_as_none() {
+        let r = result(
+            "a",
+            vec![
+                recorded(1, 10, &[], &[("DELETE", 10)]),
+                recorded(2, 10, &[], &[("DELETE", 10)]),
+            ],
+            &[],
+        );
+        let text = format_report(&[r], &Rows::new());
+        assert!(
+            text.contains("measured passes: during none; cleanup DELETE 1.00"),
+            "{text}"
+        );
+    }
 }
