@@ -50,11 +50,22 @@ pub(super) enum SkippedKeep {
     Slow,
     /// The keep did not end within `keep_deadline` (a hung upstream or disk) and was abandoned.
     Deadline,
+    /// The cache is read-only, or lost the lock of its directory while the keep ran: it writes
+    /// nothing to a directory that another process holds.
+    #[allow(dead_code)]
+    ReadOnly,
 }
 
 /// The label of each [`SkippedKeep`], in the order of the enum.
-const SKIPPED_KEEP: [&str; 7] = [
-    "budget", "io", "busy", "head", "deleted", "slow", "deadline",
+const SKIPPED_KEEP: [&str; 8] = [
+    "budget",
+    "io",
+    "busy",
+    "head",
+    "deleted",
+    "slow",
+    "deadline",
+    "read_only",
 ];
 
 /// Why an object was evicted.

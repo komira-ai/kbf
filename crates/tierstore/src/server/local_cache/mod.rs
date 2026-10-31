@@ -107,6 +107,8 @@ mod hit_tests;
 #[cfg(test)]
 mod hold_tests;
 #[cfg(test)]
+mod keep_lock_tests;
+#[cfg(test)]
 mod keep_s3_tests;
 #[cfg(test)]
 mod keep_tests;
