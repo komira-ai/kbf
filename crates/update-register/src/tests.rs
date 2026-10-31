@@ -217,7 +217,7 @@ fn a_registration_over_the_limit_is_not_sent() {
     let _held = register_on(client, "svc", &version, None).unwrap();
     assert_eq!(sent_line(&peer).len(), MAX_LINE);
 
-    let (client, peer) = peer_that_said(OK.as_bytes());
+    let (client, peer) = UnixStream::pair().unwrap();
     let version = "9".repeat(MAX_LINE - overhead + 1);
     match register_on(client, "svc", &version, None) {
         Err(Error::TooLong { len }) => assert_eq!(len, MAX_LINE + 1),
