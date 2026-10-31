@@ -106,7 +106,12 @@ fn a_download_that_is_not_the_pinned_digest_is_refused_before_anything_is_writte
     assert!(err.to_string().contains("not the pinned"), "{err}");
     assert!(gh.seen.borrow().is_empty());
     assert!(!req.archive.exists() && !req.out.exists());
-    assert!(!req.archive.parent().expect("the archive has a directory").exists());
+    assert!(
+        !req.archive
+            .parent()
+            .expect("the archive has a directory")
+            .exists()
+    );
 }
 
 #[test]
