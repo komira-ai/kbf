@@ -426,7 +426,7 @@ pub async fn run_with(
 
 #[cfg(test)]
 mod tests {
-    use kbf_objstore::s3::fake::FakeS3;
+    use objstore_s3::s3::fake::FakeS3;
 
     use super::*;
     use crate::cells::testkit::{self, Script, SwitchLog};

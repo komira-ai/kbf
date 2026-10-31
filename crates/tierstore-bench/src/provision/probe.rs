@@ -5,8 +5,8 @@
 //! empty. The requests do not go through the request log: that log is the proof of what the
 //! measurements sent, and a probe of a live bucket (refused by design) must not be in it.
 
-use kbf_objstore::s3::{Credentials, S3Config, S3Store};
-use kbf_objstore::{
+use objstore_s3::s3::{Credentials, S3Config, S3Store};
+use objstore_s3::{
     ByteRange, Capabilities, KeyPrefix, ObjectKey, ObjectStore as _, ObjectStoreError, PageSize,
 };
 

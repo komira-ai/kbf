@@ -211,7 +211,8 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
                 .and_then(|()| RequestLog::create(&config.result_dir.join("requests.jsonl")))?;
             let provenance = provenance(&config.result_dir, &args.run_id, &args.git_sha)?;
             // Before a request is sent: the ledger is begun or found, or the run stops.
-            let campaign = Campaign::begin(
+            // The lock is held until the arm ends, the run with it.
+            let (campaign, _lock) = Campaign::begin(
                 &args.campaign_ledger,
                 args.new_campaign,
                 &config.result_dir,

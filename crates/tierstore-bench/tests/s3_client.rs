@@ -5,10 +5,10 @@ use std::fs;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use kbf_objstore::PageSize;
-use kbf_objstore::s3::PART_BYTES;
-use kbf_objstore::s3::fake::{Failure, FakeS3};
 use kbf_testkit::dir::TestDir;
+use objstore_s3::PageSize;
+use objstore_s3::s3::PART_BYTES;
+use objstore_s3::s3::fake::{Failure, FakeS3};
 use tierstore_bench::config::{Secret, StoreSpec};
 use tierstore_bench::error::BenchError;
 use tierstore_bench::requestlog::{RequestLog, RequestRecord};
@@ -266,7 +266,7 @@ async fn a_multipart_put_logs_each_request_and_is_timed_as_the_whole() {
     assert!(put.latency_us() >= sum, "{} < {sum}", put.latency_us());
     let stats = fake.stats();
     assert_eq!((stats.parts, stats.completed, stats.aborted), (2, 1, 0));
-    let key = kbf_objstore::ObjectKey::new("mp/a").unwrap();
+    let key = objstore_s3::ObjectKey::new("mp/a").unwrap();
     assert_eq!(fake.object_len(&key), Some(PART_BYTES + 1000));
     assert_eq!(
         s3.head("mp/a").await.unwrap().result.unwrap(),

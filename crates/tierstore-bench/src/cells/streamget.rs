@@ -1,6 +1,6 @@
 //! A signed GET that is read as it arrives, to time the first byte and the last.
 //!
-//! The S3 client of `kbf-objstore` answers a read with the body whole, so it cannot say when the
+//! The S3 client of `objstore-s3` answers a read with the body whole, so it cannot say when the
 //! first byte came. This one sends the same request (path-style, SigV4, plain HTTP, the
 //! `x-amz-content-sha256` of an empty body) and reads the answer chunk by chunk. Its signer is a
 //! copy of that crate's, which keeps it private; the test below holds it to the example of the
@@ -120,7 +120,7 @@ impl StreamGet {
     /// [`BenchError`] if the key is malformed or the log cannot be written; whatever goes wrong
     /// at the store is in the [`Streamed`] that comes back.
     pub async fn get(&self, key: &str, range: Option<(u64, u64)>) -> Result<Streamed, BenchError> {
-        kbf_objstore::ObjectKey::new(key)?;
+        objstore_s3::ObjectKey::new(key)?;
         if let Some(cap) = &self.cap {
             cap.acquire().await;
         }
@@ -306,7 +306,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use kbf_objstore::s3::fake::FakeS3;
+    use objstore_s3::s3::fake::FakeS3;
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpListener;
 

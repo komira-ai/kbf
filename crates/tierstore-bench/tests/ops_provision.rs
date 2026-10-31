@@ -107,7 +107,9 @@ async fn an_apply_makes_the_bucket_quota_policy_and_account_in_order() {
         want.push(words(&["admin", "user", "list", "tbops"]));
     }
     for (role, bucket, key, _) in expected {
-        let name = format!("tierstore-bench-{role}");
+        // The name `plan` prints for the role, and the literal it must be.
+        let name = format!("tb-tierstore-bench-{role}");
+        assert!(config.plan_lines().contains(&format!("policy={name}")));
         let target = format!("tbops/{bucket}");
         want.push(words(&["ls", "tbops"]));
         want.push(words(&["mb", &target]));

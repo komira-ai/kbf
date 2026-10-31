@@ -376,7 +376,7 @@ pub async fn run_with(
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use kbf_objstore::s3::fake::FakeS3;
+    use objstore_s3::s3::fake::FakeS3;
     use tokio::task::JoinHandle;
 
     use super::*;

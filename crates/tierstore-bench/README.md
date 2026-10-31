@@ -22,7 +22,9 @@ Every verb that loads a configuration needs a test prefix: `test_prefix` in the 
 closing dash (`bench7-`). Every test bucket and every scoped account id (`hot`, `cold`) must start
 with it, or the verb stops before any store call and names the offending value. `plan` prints what
 the run file resolves to, one `key=value` per line and nothing else: `test_prefix=`, then for each
-store its `bucket=`, and for `hot` and `cold` its `account=`. It reads the run file and sends
+store its `bucket=`, and for `hot` and `cold` its `account=` and, right after it, the `policy=`
+(`<test prefix>tierstore-bench-<role>`) that `provision` creates for that account, so two
+campaigns on one store do not share a policy. It reads the run file and sends
 nothing, so a script can compare it with its own site file.
 
 `provision --apply` changes only what it made. It looks (read-only) for the bucket and the account
@@ -34,7 +36,7 @@ given to `mc` on its standard input, never in its arguments.
 
 ```
 tierstore-bench preflight        read-only checks and the before-snapshot
-tierstore-bench plan             the test prefix, bucket names and account ids a run file resolves to
+tierstore-bench plan             the test prefix, bucket names, account ids and policy names a run file resolves to
 tierstore-bench provision        test buckets and scoped accounts (dry run unless --apply)
 tierstore-bench run              cells cold-put, cold-read, g (first stage); a1, b, c (with a hot tier)
 tierstore-bench fault-proxy      the loopback proxy that slows, refuses or blackholes the cold side
@@ -73,7 +75,11 @@ The ledger counts the cold bytes written by the whole campaign against the caps.
 the count must not restart). `run` stops if the file is missing, unless `--new-campaign` is given,
 which makes it and refuses if it is already there. A pass is counted before it is sent (its planned
 bytes), and the count is corrected to what was written when the pass ends; a run that dies leaves
-the reservation counted. The file is replaced atomically on every save.
+the reservation counted. The file is replaced atomically on every save. A run holds the lock
+file `FILE.lock` (made exclusively, holding the process id) from its start to its end, and a second
+run on the same ledger is refused with the lock file named. A lock a dead run left is never broken
+by the tool: check that the process is gone and delete the file. The ledger's directory must exist,
+and the ledger must resolve (through links and `..`) to a place outside the result directory.
 
 Tierstore at v0.0.37 has no cold-only mode (`--hot` is a required flag). So the cold cells label
 their paths in the arm names and the result notes say which they are:

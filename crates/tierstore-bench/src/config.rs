@@ -416,7 +416,7 @@ impl RunConfig {
 
     /// The names a verb would create, write or delete, one `key=value` per line: `test_prefix=`,
     /// then for each configured store role, in the order of [`Role::ALL`], its `bucket=`, and for `hot` and
-    /// `cold` its `account=`. Reads nothing and sends nothing; the held scripts compare it with
+    /// `cold` its `account=` and the `policy=` that `provision` creates for it. Reads nothing and sends nothing; the held scripts compare it with
     /// their site file.
     #[must_use]
     pub fn plan_lines(&self) -> Vec<String> {
@@ -425,6 +425,7 @@ impl RunConfig {
             lines.push(format!("bucket={}", spec.bucket));
             if gets_account(role) {
                 lines.push(format!("account={}", spec.access_key_id));
+                lines.push(format!("policy={}", policy_name(&self.test_prefix, role)));
             }
         }
         lines
@@ -440,6 +441,13 @@ impl RunConfig {
             field: "store configuration",
         })
     }
+}
+
+/// The name of the policy `provision` creates for `role`'s scoped account: the test prefix, then
+/// `tierstore-bench-<role>`, so that two campaigns on one store never share (or overwrite) one.
+#[must_use]
+pub fn policy_name(test_prefix: &str, role: Role) -> String {
+    format!("{test_prefix}tierstore-bench-{role}")
 }
 
 /// The last flag for `role`, else the run file's value.
@@ -770,8 +778,10 @@ mod tests {
                 "test_prefix=t-",
                 "bucket=t-hot-test",
                 "account=t-hot-id",
+                "policy=t-tierstore-bench-hot",
                 "bucket=t-cold-test",
                 "account=t-cold-id",
+                "policy=t-tierstore-bench-cold",
                 "bucket=t-inst",
             ]
         );

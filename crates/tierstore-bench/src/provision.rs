@@ -260,7 +260,7 @@ fn prepare<'a>(
         spec,
         live_bucket,
         mc: Mc::for_role(host, ops, role, spec, &config.result_dir)?,
-        policy_name: format!("tierstore-bench-{role}"),
+        policy_name: crate::config::policy_name(&config.test_prefix, role),
         policy_file: config.result_dir.join(format!("policy-{role}.json")),
     })
 }

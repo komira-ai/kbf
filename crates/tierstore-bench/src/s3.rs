@@ -1,5 +1,5 @@
 //! The S3 client the cells use: [`BenchS3`], one bucket of one store role, over the SigV4 client
-//! of `kbf-objstore` (path-style, plain HTTP, which is what the tierstore front and the stores
+//! of `objstore-s3` (path-style, plain HTTP, which is what the tierstore front and the stores
 //! behind it speak).
 //!
 //! Every call is timed, and every call is written to the [`RequestLog`] before it returns. A
@@ -19,8 +19,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures::StreamExt as _;
-use kbf_objstore::s3::{Credentials, PART_BYTES, S3Config, S3Store};
-use kbf_objstore::{
+use objstore_s3::s3::{Credentials, PART_BYTES, S3Config, S3Store};
+use objstore_s3::{
     BodyStream, ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectKey,
     ObjectStore as _, ObjectStoreError, PageSize,
 };
@@ -37,7 +37,7 @@ use crate::role::Role;
 pub struct Timeouts {
     /// Limit on opening a connection.
     pub connect: Duration,
-    /// Limit on a request, see `kbf_objstore::s3::S3Config::request_timeout`.
+    /// Limit on a request, see `objstore_s3::s3::S3Config::request_timeout`.
     pub request: Duration,
 }
 

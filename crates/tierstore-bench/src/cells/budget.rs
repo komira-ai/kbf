@@ -11,7 +11,9 @@
 //! written once the pass ends ([`Ledger::settle`]); a run that dies in the middle leaves the
 //! reservation counted. Every save replaces the file atomically ([`crate::atomic`]). A ledger is
 //! made only by `--new-campaign` ([`Campaign::begin`]); a missing one is a refusal, never a fresh
-//! start, and `--new-campaign` over a ledger that exists is a refusal too.
+//! start, and `--new-campaign` over a ledger that exists is a refusal too. A run holds the
+//! ledger's lock file ([`LedgerLock`]) from [`Campaign::begin`] to its end, so two runs never
+//! write one ledger.
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
@@ -214,35 +216,121 @@ pub struct Campaign {
     pub ledger: PathBuf,
 }
 
+/// The exclusive hold of one run on a ledger: the file `<ledger>.lock`, made with `create_new`
+/// and holding the process id, removed when the hold is dropped. Two runs that read the ledger,
+/// charge it and write it back would lose one another's charges, so a second run is refused
+/// while the first lives. A lock that a dead run left is never broken by the tool (that could
+/// not be told from a live run on another host): the refusal names the file, and removing it is
+/// the operator's step.
+#[derive(Debug)]
+pub struct LedgerLock {
+    path: PathBuf,
+}
+
+impl LedgerLock {
+    /// Takes the lock of the ledger file `ledger` (already resolved).
+    fn acquire(ledger: &Path) -> Result<Self, BenchError> {
+        let mut name = ledger.file_name().unwrap_or_default().to_owned();
+        name.push(".lock");
+        let path = ledger.with_file_name(name);
+        let io = |source| BenchError::Io {
+            path: path.clone(),
+            source,
+        };
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let holder = std::fs::read_to_string(&path).unwrap_or_default();
+                return Err(BenchError::Budget(format!(
+                    "the campaign ledger is in use: the lock file {} exists (process {}). If no \
+                     run is using the ledger, check that the process is gone and delete the lock \
+                     file by hand",
+                    path.display(),
+                    holder.trim()
+                )));
+            }
+            Err(e) => return Err(io(e)),
+        };
+        // The process id only tells the operator who held the lock; the file is the lock.
+        write!(file, "{}", std::process::id()).ok();
+        Ok(Self { path })
+    }
+
+    /// The lock file.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for LedgerLock {
+    fn drop(&mut self) {
+        // Nothing to do about a failure here; the lock file is then a stale one.
+        std::fs::remove_file(&self.path).ok();
+    }
+}
+
+/// `ledger` with its directory (and itself, if it is there) resolved through links and `..`.
+fn resolve_ledger(ledger: &Path) -> Result<PathBuf, BenchError> {
+    let name = ledger.file_name().ok_or_else(|| {
+        BenchError::Budget(format!(
+            "the campaign ledger path {} names no file",
+            ledger.display()
+        ))
+    })?;
+    let parent = ledger
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let parent = parent.canonicalize().map_err(|source| BenchError::Io {
+        path: parent.to_owned(),
+        source,
+    })?;
+    let file = parent.join(name);
+    Ok(file.canonicalize().unwrap_or(file))
+}
+
+/// `dir` made absolute, with its longest existing part resolved through links and `..` (the
+/// result directory may not exist yet).
+fn resolve_dir(dir: &Path) -> PathBuf {
+    let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_owned());
+    abs.ancestors()
+        .find_map(|a| a.canonicalize().ok().map(|real| (a, real)))
+        .map_or(abs.clone(), |(a, real)| {
+            real.join(abs.strip_prefix(a).unwrap_or(Path::new("")))
+        })
+}
+
 impl Campaign {
     /// Begins (`new`) or continues the campaign whose ledger is `ledger`, for a run whose results
-    /// go to `result_dir`. The ledger must lie outside `result_dir`, so that clearing a result
-    /// directory does not start the count again.
+    /// go to `result_dir`, and takes the ledger's lock, which the caller holds for the whole run.
+    /// The ledger must lie outside `result_dir` once both are resolved through links and `..`
+    /// (the ledger's directory must exist), so that clearing a result directory does not start
+    /// the count again.
     ///
     /// # Errors
-    /// [`BenchError::Budget`] for a ledger inside the result directory, a missing one without
-    /// `new`, an existing one with it; [`BenchError::Io`], [`BenchError::Result`] as
-    /// [`Ledger::open`] and [`Ledger::create`] say.
+    /// [`BenchError::Budget`] for a ledger inside the result directory, a ledger in use by
+    /// another run (its lock file exists), a missing one without `new`, an existing one with it;
+    /// [`BenchError::Io`], [`BenchError::Result`] as [`Ledger::open`] and [`Ledger::create`] say.
     pub fn begin(
         ledger: &Path,
         new: bool,
         result_dir: &Path,
         caps: ByteCaps,
-    ) -> Result<Self, BenchError> {
-        let absolute = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_owned());
-        if absolute(ledger).starts_with(absolute(result_dir)) {
+    ) -> Result<(Self, LedgerLock), BenchError> {
+        let resolved = resolve_ledger(ledger)?;
+        if resolved.starts_with(resolve_dir(result_dir)) {
             return Err(BenchError::Budget(
                 "the campaign ledger must be outside the result directory".to_owned(),
             ));
         }
+        let lock = LedgerLock::acquire(&resolved)?;
         if new {
-            Ledger::create(ledger, caps)?;
+            Ledger::create(&resolved, caps)?;
         } else {
-            Ledger::open(ledger, caps)?;
+            Ledger::open(&resolved, caps)?;
         }
-        Ok(Self {
-            ledger: ledger.to_owned(),
-        })
+        Ok((Self { ledger: resolved }, lock))
     }
 }
 
@@ -400,14 +488,17 @@ mod tests {
 
     /// Catches a campaign begun the wrong way: a ledger inside the result directory (cleaning
     /// the directory would reset the count), no ledger without `--new-campaign`, a ledger made
-    /// over one that exists, and the plain cases that work. An empty path has no absolute form
-    /// and is refused as a ledger that is not there.
+    /// over one that exists, and the plain cases that work. An empty path has no file name and
+    /// is refused.
     #[test]
     fn a_campaign_begins_with_a_new_ledger_outside_the_results_and_continues_with_it() {
         let dir = TestDir::under(std::env::temp_dir(), "tb-campaign");
         let results = dir.path().join("results");
         let ledger = dir.path().join("campaign").join("ledger.json");
         std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&results).unwrap();
+        let real = ledger.parent().unwrap().canonicalize().unwrap();
+        let real = real.join("ledger.json");
 
         let inside = results.join("ledger.json");
         let err = Campaign::begin(&inside, true, &results, CAPS).unwrap_err();
@@ -420,21 +511,134 @@ mod tests {
         let err = Campaign::begin(&ledger, false, &results, CAPS).unwrap_err();
         assert!(err.to_string().contains("no campaign ledger"), "{err}");
         assert!(!ledger.exists());
+        assert!(!real.with_file_name("ledger.json.lock").exists());
 
-        let campaign = Campaign::begin(&ledger, true, &results, CAPS).unwrap();
-        assert_eq!(campaign.ledger, ledger);
+        let (campaign, lock) = Campaign::begin(&ledger, true, &results, CAPS).unwrap();
+        assert_eq!(campaign.ledger, real);
         assert!(ledger.is_file());
+        drop(lock);
         let err = Campaign::begin(&ledger, true, &results, CAPS).unwrap_err();
         assert!(err.to_string().contains("would reset it"), "{err}");
         assert_eq!(
-            Campaign::begin(&ledger, false, &results, CAPS).unwrap(),
+            Campaign::begin(&ledger, false, &results, CAPS).unwrap().0,
             campaign
         );
 
         let err = Campaign::begin(Path::new(""), false, &results, CAPS).unwrap_err();
+        assert!(err.to_string().contains("names no file"), "{err}");
+        let err = Campaign::begin(Path::new("/"), false, &results, CAPS).unwrap_err();
+        assert!(err.to_string().contains("names no file"), "{err}");
+        let err = Campaign::begin(
+            &dir.path().join("none").join("l.json"),
+            true,
+            &results,
+            CAPS,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BenchError::Io { .. }), "{err}");
+    }
+
+    /// Catches an inside-the-results check that is only lexical: a ledger reached through a
+    /// link to the result directory, and one reached through `..` (both are inside, and
+    /// cleaning the result directory would take them), the same with the result directory given
+    /// by a link or not made yet, and a ledger beside the result directory (not inside, so
+    /// refusing it would be a different defect).
+    #[cfg(unix)]
+    #[test]
+    fn a_ledger_that_resolves_into_the_results_is_refused() {
+        let dir = TestDir::under(std::env::temp_dir(), "tb-campaign-resolve");
+        let results = dir.path().join("results");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&results).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&results, &link).unwrap();
+
+        let through_link = link.join("ledger.json");
+        let err = Campaign::begin(&through_link, true, &results, CAPS).unwrap_err();
+        assert!(err.to_string().contains("outside the result"), "{err}");
+        let through_dots = other.join("..").join("results").join("ledger.json");
+        let err = Campaign::begin(&through_dots, true, &results, CAPS).unwrap_err();
+        assert!(err.to_string().contains("outside the result"), "{err}");
+        let err = Campaign::begin(&results.join("ledger.json"), true, &link, CAPS).unwrap_err();
+        assert!(err.to_string().contains("outside the result"), "{err}");
+        assert!(!results.join("ledger.json").exists());
         assert!(
-            matches!(err, BenchError::Budget(_) | BenchError::Io { .. }),
-            "{err}"
+            !results.join("ledger.json.lock").exists(),
+            "a refusal locks nothing"
         );
+        let err = Campaign::begin(&other.join("l.json"), true, Path::new(""), CAPS).unwrap_err();
+        assert!(matches!(err, BenchError::Budget(_)), "{err}");
+
+        let not_yet = link.join("not-yet").join("deeper");
+        assert!(Campaign::begin(&other.join("l.json"), true, &not_yet, CAPS).is_ok());
+        assert!(Campaign::begin(&results.join("m.json"), true, &other, CAPS).is_ok());
+    }
+
+    /// Catches two runs sharing a ledger (each would write back its own total and lose the
+    /// other's charges): a second `begin` while the first run's hold lives is refused with the
+    /// lock file named, nothing of the ledger changes, and the hold is released when it is
+    /// dropped, also when `begin` fails after taking it.
+    #[test]
+    fn a_ledger_in_use_refuses_a_second_run_and_is_free_again_afterwards() {
+        let dir = TestDir::under(std::env::temp_dir(), "tb-campaign-lock");
+        let results = dir.path().join("results");
+        let ledger = dir.path().join("ledger.json");
+        let lock_file = dir.path().join("ledger.json.lock");
+
+        let (_, first) = Campaign::begin(&ledger, true, &results, CAPS).unwrap();
+        assert_eq!(first.path().file_name(), lock_file.file_name());
+        assert_eq!(
+            std::fs::read_to_string(&lock_file).unwrap(),
+            std::process::id().to_string()
+        );
+        Ledger::open(&ledger, CAPS).unwrap().charge(3).unwrap();
+        for new in [false, true] {
+            let err = Campaign::begin(&ledger, new, &results, CAPS).unwrap_err();
+            let text = err.to_string();
+            assert!(matches!(err, BenchError::Budget(_)), "{text}");
+            assert!(text.contains("ledger.json.lock"), "{text}");
+            assert!(text.contains(&std::process::id().to_string()), "{text}");
+        }
+        assert_eq!(Ledger::open(&ledger, CAPS).unwrap().spent(), 3);
+        assert!(lock_file.exists(), "a refused run leaves the holder's lock");
+
+        drop(first);
+        assert!(!lock_file.exists());
+        // `begin` fails after taking the lock (new over an existing ledger): the lock goes too.
+        Campaign::begin(&ledger, true, &results, CAPS).unwrap_err();
+        assert!(!lock_file.exists());
+        let (_, second) = Campaign::begin(&ledger, false, &results, CAPS).unwrap();
+        assert!(lock_file.exists());
+        drop(second);
+        assert!(!lock_file.exists());
+    }
+
+    /// Catches a stale lock being broken by the tool (it cannot tell a dead run from one on
+    /// another host): the run is refused, the message says how to clear it, the file stays; once
+    /// the operator deletes it, the run goes. A lock file that cannot be made at all (a name over
+    /// the file-name limit) is an I/O error, not a refusal.
+    #[test]
+    fn a_stale_lock_is_never_broken_and_the_refusal_says_how_to_clear_it() {
+        let dir = TestDir::under(std::env::temp_dir(), "tb-campaign-stale");
+        let results = dir.path().join("results");
+        let ledger = dir.path().join("ledger.json");
+        Ledger::create(&ledger, CAPS).unwrap();
+        let lock_file = dir.path().join("ledger.json.lock");
+        std::fs::write(&lock_file, "4000000\n").unwrap();
+
+        let err = Campaign::begin(&ledger, false, &results, CAPS).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("ledger.json.lock"), "{text}");
+        assert!(text.contains("4000000"), "{text}");
+        assert!(text.contains("delete the lock file"), "{text}");
+        assert_eq!(std::fs::read_to_string(&lock_file).unwrap(), "4000000\n");
+
+        std::fs::remove_file(&lock_file).unwrap();
+        assert!(Campaign::begin(&ledger, false, &results, CAPS).is_ok());
+
+        let long = dir.path().join("a".repeat(255));
+        let err = Campaign::begin(&long, true, &results, CAPS).unwrap_err();
+        assert!(matches!(err, BenchError::Io { .. }), "{err}");
     }
 }

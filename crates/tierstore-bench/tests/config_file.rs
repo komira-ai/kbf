@@ -91,7 +91,8 @@ fn the_test_prefix_comes_from_the_run_file_and_is_required() {
         [
             "test_prefix=bench9-",
             "bucket=bench9-cold",
-            "account=bench9-key"
+            "account=bench9-key",
+            "policy=bench9-tierstore-bench-cold"
         ]
     );
 

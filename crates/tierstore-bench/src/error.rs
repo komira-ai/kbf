@@ -16,10 +16,10 @@ pub enum BenchError {
     Config(#[from] ConfigError),
     /// A store's address or name is not one the S3 client accepts.
     #[error("store configuration: {0}")]
-    Store(#[from] kbf_objstore::s3::S3ConfigError),
+    Store(#[from] objstore_s3::s3::S3ConfigError),
     /// An object key is not one the S3 client accepts.
     #[error("object key: {0}")]
-    Key(#[from] kbf_objstore::KeyError),
+    Key(#[from] objstore_s3::KeyError),
     /// A range or a page size of zero or beyond what the S3 client allows.
     #[error("{0}")]
     Request(&'static str),

@@ -146,7 +146,7 @@ mod tests {
             tree.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(all.len(), 250);
         for file in &tree.files {
-            assert!(kbf_objstore::ObjectKey::new(format!("t/{}", file.path)).is_ok());
+            assert!(objstore_s3::ObjectKey::new(format!("t/{}", file.path)).is_ok());
         }
     }
 

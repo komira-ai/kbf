@@ -101,8 +101,8 @@ fn plan_prints_the_prefix_the_buckets_and_the_accounts() {
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "test_prefix=bench-\n\
-         bucket=bench-hot\naccount=bench-hot-key\n\
-         bucket=bench-cold\naccount=bench-cold-key\n\
+         bucket=bench-hot\naccount=bench-hot-key\npolicy=bench-tierstore-bench-hot\n\
+         bucket=bench-cold\naccount=bench-cold-key\npolicy=bench-tierstore-bench-cold\n\
          bucket=bench-front\n"
     );
     assert!(!String::from_utf8_lossy(&out.stdout).contains("SECRET"));

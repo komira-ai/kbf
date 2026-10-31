@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
-use kbf_objstore::s3::fake::FakeS3;
 use kbf_testkit::dir::TestDir;
+use objstore_s3::s3::fake::FakeS3;
 use tierstore_bench::cli::{self, Cli};
 use tierstore_bench::config::{Secret, StoreSpec};
 use tierstore_bench::error::BenchError;
