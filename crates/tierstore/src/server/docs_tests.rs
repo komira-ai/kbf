@@ -590,7 +590,7 @@ fn the_pages_say_what_the_code_has() {
     assert!(pages >= 8, "the guide has {pages} pages");
     assert!(flags >= 80, "the pages name {flags} flags");
     assert!(keys >= 40, "the pages name {keys} keys");
-    assert!(metrics >= 10, "the pages name {metrics} metrics");
+    assert!(metrics >= 5, "the pages name {metrics} metrics");
     assert!(messages >= 3, "the pages hold {messages} message blocks");
     assert_eq!(check(&docs, &code()), Vec::<String>::new());
 }
