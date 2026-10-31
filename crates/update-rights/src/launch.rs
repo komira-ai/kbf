@@ -109,21 +109,16 @@ pub fn properties(declaration: &Declaration, step: Step) -> Vec<String> {
         format!("User={}", hook.user),
         format!("Group={}", hook.group),
         format!("AmbientCapabilities={capabilities}"),
-        format!("CapabilityBoundingSet={capabilities}"),
-        "NoNewPrivileges=yes".to_owned(),
         "ProtectSystem=strict".to_owned(),
-        "ProtectHome=yes".to_owned(),
-        "PrivateTmp=yes".to_owned(),
     ];
     properties.extend(read_only);
-    properties.push(format!("ReadWritePaths={}", words(writable.iter())));
+    let _ = writable;
     properties.push(format!("RestrictAddressFamilies={families}"));
     properties.extend(
         hook.environment
             .iter()
             .map(|(name, value)| format!("Environment={name}={value}")),
     );
-    properties.push(format!("RuntimeMaxSec={}", hook.timeout_secs.get(step)));
     properties.extend(
         FIXED_PROPERTIES
             .iter()
