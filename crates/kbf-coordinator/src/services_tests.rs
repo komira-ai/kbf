@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use kbf_types::HostRole::{Daemon, Frontend, MacDaemon, Storage};
+use kbf_types::HostRole::{Daemon, MacDaemon, Storage};
 use kbf_updater::wire::{MAX_SERVICE_NAME, MAX_SERVICES, Reply};
 
 use crate::decide::decide_in;
@@ -60,11 +60,11 @@ fn kbf_is_built_in_as_data() {
     assert!(kbf.after.is_empty());
     assert_eq!(kbf.roles.len(), 4);
     for role in [Storage, Daemon, MacDaemon] {
-        assert_eq!(kbf.roles[&role], RoleDef::plain(), "{role:?}");
+        assert_eq!(kbf.roles[role.name()], RoleDef::plain(), "{role:?}");
     }
-    let frontend = &kbf.roles[&Frontend];
+    let frontend = &kbf.roles["frontend"];
     assert!(frontend.never_last);
-    assert_eq!(frontend.after, [Storage, Daemon, MacDaemon]);
+    assert_eq!(frontend.after, ["storage", "daemon", "mac-daemon"]);
     assert_eq!(Services::default().get(KBF), Some(&kbf));
 }
 
@@ -76,7 +76,7 @@ fn a_services_file_defines_further_services() {
     let s = Services::parse(TWO).expect("parsed");
     let agent = s.get("agent").expect("defined");
     assert_eq!(agent.after, ["server"]);
-    let daemon = &agent.roles[&Daemon];
+    let daemon = &agent.roles["daemon"];
     assert_eq!((daemon.max_updating, daemon.min_up), (Some(2), Some(0)));
     assert!(!daemon.never_last);
     assert!(s.get(KBF).is_some() && s.get("server").is_some());
@@ -310,7 +310,7 @@ fn a_definitions_limits_and_waits_decide_over_the_desired_state() {
         [service.roles.storage]\nmax_updating = 1\nafter = [\"daemon\"]\nmin_up = 0\n";
     let s = Services::parse(text).expect("parsed");
     let mut want = desired("2.0", 0, 0);
-    want.max_updating.daemon = 4;
+    want.max_updating.set("daemon", 4);
     let w = wants(&[("svc", &want)]);
     let mut f = Fleet::new(Duration::ZERO);
     f.record_in("svc", id("d1"), Daemon, beat("1.0"), NOW);

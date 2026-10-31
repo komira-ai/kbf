@@ -32,12 +32,12 @@ fn a_farm_all_at_the_desired_version_has_converged() {
     assert_eq!(c.state, State::Converged);
     assert_eq!(c.desired.as_ref().expect("desired").as_str(), "2.0");
     assert!(!c.quiet);
-    let names: Vec<&str> = c.roles.iter().map(|r| r.role).collect();
+    let names: Vec<&str> = c.roles.iter().map(|r| r.role.as_str()).collect();
     assert_eq!(names, ["frontend", "storage", "daemon"]);
     assert_eq!(
         *role(&c, "storage"),
         RoleCounts {
-            role: "storage",
+            role: "storage".to_owned(),
             at_desired: 2,
             updating: 0,
             failed: 0,
@@ -175,7 +175,7 @@ fn a_silent_host_is_down_and_nothing_else() {
     assert_eq!(
         *role(&c, "daemon"),
         RoleCounts {
-            role: "daemon",
+            role: "daemon".to_owned(),
             at_desired: 2,
             updating: 0,
             failed: 0,
@@ -278,5 +278,5 @@ fn a_service_converges_on_its_own_hosts_and_its_own_minimums() {
     );
     let none = converge_service(def, None, &two, secs(NOW));
     assert_eq!((none.desired, none.state), (None, State::InProgress));
-    assert!(role_counts("agent", None, &two, secs(NOW)).is_empty());
+    assert!(role_counts(def, None, &two, secs(NOW)).is_empty());
 }

@@ -95,9 +95,9 @@ fn the_first_pass_of_a_roll_with_the_default_limits() {
 fn the_limits_of_the_desired_state_replace_the_defaults_per_role() {
     let mut f = all_roles("1.0");
     let mut d = desired("2.0", 1, 1);
-    d.max_updating.storage = 2;
-    d.max_updating.daemon = 1;
-    d.max_updating.mac_daemon = 0;
+    d.max_updating.set("storage", 2);
+    d.max_updating.set("daemon", 1);
+    d.max_updating.set("mac-daemon", 0);
     assert_eq!(
         run(&mut f, &d, &ALL, NOW, true),
         [

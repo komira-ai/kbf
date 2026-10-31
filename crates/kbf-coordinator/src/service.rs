@@ -77,7 +77,7 @@ pub struct HostStatus {
     /// The node id from its certificate.
     pub node_id: String,
     /// The host role from its certificate.
-    pub role: &'static str,
+    pub role: String,
     /// Heartbeated within the down limit.
     pub live: bool,
     /// Live, healthy and not updating.
@@ -204,7 +204,7 @@ impl Coordinator {
             let runs_here = self
                 .services
                 .get(&one.name)
-                .is_some_and(|def| def.roles.contains_key(&who.role));
+                .is_some_and(|def| def.roles.contains_key(who.role.name()));
             if runs_here {
                 fleet.record_in(
                     &one.name,
@@ -254,8 +254,7 @@ impl Coordinator {
         body: &[u8],
     ) -> Result<Desired, SetError> {
         let verified = self.ci(bearer).await?;
-        let (service, desired) =
-            Desired::parse_request_for(body, |name| self.services.get(name).is_some())?;
+        let (service, desired) = Desired::parse_request_for(body, &self.services)?;
         if !verified.services.contains(&service) {
             tracing::warn!(
                 workflow = %verified.job_workflow_ref,
@@ -289,7 +288,7 @@ impl Coordinator {
             .hosts()
             .map(|(id, host)| HostStatus {
                 node_id: id.to_string(),
-                role: host.role.name(),
+                role: host.role_name().to_owned(),
                 live: host.is_live(now),
                 up: fleet.is_up(KBF, id, host, now),
                 holds_slot: fleet.holds_slot(KBF, id, host, now),
@@ -299,11 +298,11 @@ impl Coordinator {
             .collect();
         let per_service = self
             .services
-            .names()
-            .map(|name| {
-                let desired = self.desired.get(name);
-                let roles = role_counts(name, desired.as_ref(), &fleet, now);
-                (name.to_owned(), ServiceStatus { desired, roles })
+            .defs()
+            .map(|def| {
+                let desired = self.desired.get(&def.name);
+                let roles = role_counts(def, desired.as_ref(), &fleet, now);
+                (def.name.clone(), ServiceStatus { desired, roles })
             })
             .collect();
         Ok(Status {
