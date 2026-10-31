@@ -846,6 +846,29 @@ mod tests {
         }
     }
 
+    /// Catches `--cold-rps unlimited` being accepted: the cold store is a shared disk store the
+    /// farm depends on, so its request cap must be a number, and the refusal must say why.
+    #[test]
+    fn an_unlimited_cold_rate_is_a_usage_error_naming_the_reason() {
+        let parsed = Wrap::try_parse_from(["t", "--result-dir", "out", "--cold-rps", "unlimited"]);
+        let err = parsed.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(err.contains("--cold-rps"), "{err}");
+        assert!(err.contains("unlimited"), "{err}");
+        assert!(err.contains("shared"), "{err}");
+    }
+
+    /// Catches the refusal reaching `--hot-rps`: only the hot store and the instance may run
+    /// without a cap, and a zero is refused on both flags.
+    #[test]
+    fn only_the_hot_rate_may_be_unlimited() {
+        let ok = Wrap::try_parse_from(["t", "--result-dir", "out", "--hot-rps", "unlimited"]);
+        assert!(ok.is_ok());
+        for flag in ["--cold-rps", "--hot-rps"] {
+            let argv = ["t", "--result-dir", "out", flag, "0"];
+            assert!(Wrap::try_parse_from(argv).is_err(), "{flag}");
+        }
+    }
+
     /// Catches `--cold-rps` and `--hot-rps` not reaching the configuration, swapped, or a typo
     /// taken as no cap: `unlimited` on the hot flag leaves the cold cap as given.
     #[test]
