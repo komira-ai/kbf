@@ -374,11 +374,14 @@ impl Conn {
     /// The whole body of a 2xx answer, read a piece at a time: it may take as long as
     /// it needs while a piece arrives within `request_timeout` of the one before.
     async fn read_body(&self, mut resp: Response) -> Result<Bytes, ObjectStoreError> {
-        let mut body = BytesMut::new();
-        while let Some(piece) = self.within(resp.chunk()).await?.map_err(transport)? {
-            body.extend_from_slice(&piece);
-        }
-        Ok(body.freeze())
+        let whole = async {
+            let mut body = BytesMut::new();
+            while let Some(piece) = resp.chunk().await.map_err(transport)? {
+                body.extend_from_slice(&piece);
+            }
+            Ok(body.freeze())
+        };
+        self.within(whole).await?
     }
 
     /// The signed request, with no limit set and no body attached.
