@@ -48,6 +48,12 @@ pub const AUDIT_RING: usize = 64;
 /// Who an operator change is logged as: the holder of the operator token.
 pub const OPERATOR: &str = "operator";
 
+/// The most hosts with labels the file holds. Raise it here if a farm needs more.
+pub const MAX_HOSTS: usize = 4096;
+
+/// The most exclusions the file holds. Raise it here if a farm needs more.
+pub const MAX_EXCLUDED: usize = 4096;
+
 /// The most labels one host has.
 pub const MAX_LABELS: usize = 8;
 
@@ -392,8 +398,39 @@ enum Action {
     /// Replaces the labels of a host (none removes them all).
     SetLabels {
         node_id: String,
+        #[serde(deserialize_with = "labels_once")]
         labels: BTreeMap<String, String>,
     },
+}
+
+/// A map of labels in which no key is given twice.
+fn labels_once<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    struct Once;
+
+    impl<'de> serde::de::Visitor<'de> for Once {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an object of labels")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut labels = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, String>()? {
+                if labels.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom("a label key is given twice"));
+                }
+            }
+            Ok(labels)
+        }
+    }
+
+    deserializer.deserialize_map(Once)
 }
 
 /// Why an operator action was not done.
@@ -405,6 +442,17 @@ pub enum OperateError {
     /// The body is no action this coordinator accepts; the text says which part.
     #[error("{0}")]
     Invalid(&'static str),
+    /// The file already holds the most of something it keeps; the constant that sets the
+    /// most is named.
+    #[error(
+        "the ops file holds at most {max} {what}: remove some, or raise the constant in ops.rs"
+    )]
+    Capped {
+        /// What there is too much of, with the constant.
+        what: &'static str,
+        /// The most.
+        max: usize,
+    },
     /// The ops file could not be written.
     #[error(transparent)]
     Store(#[from] OpsError),
@@ -467,6 +515,16 @@ pub fn operate(
                 node_id: node(&node_id)?,
                 reason: reason(&why)?,
             };
+            let known = store.state().excluded.iter().any(|e| {
+                (e.service.as_str(), e.node_id.as_str())
+                    == (exclusion.service.as_str(), exclusion.node_id.as_str())
+            });
+            if !known && store.state().excluded.len() >= MAX_EXCLUDED {
+                return Err(OperateError::Capped {
+                    what: "exclusions (MAX_EXCLUDED)",
+                    max: MAX_EXCLUDED,
+                });
+            }
             let mut entry = AuditEntry::new(by, "exclude");
             entry.service = Some(exclusion.service.clone());
             entry.node_id = Some(exclusion.node_id.clone());
@@ -499,6 +557,13 @@ pub fn operate(
                 return Err(OperateError::Invalid(
                     "labels are at most 8, each key and value 1 to 32 bytes of [a-z0-9-]",
                 ));
+            }
+            let grows = !labels.is_empty() && !store.state().hosts.contains_key(&id);
+            if grows && store.state().hosts.len() >= MAX_HOSTS {
+                return Err(OperateError::Capped {
+                    what: "hosts with labels (MAX_HOSTS)",
+                    max: MAX_HOSTS,
+                });
             }
             let mut entry = AuditEntry::new(by, "set_labels");
             entry.node_id = Some(id.clone());

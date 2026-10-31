@@ -235,15 +235,20 @@ where
     B: Body,
     B::Error: Into<BoxError>,
 {
+    // The token first: a caller without it costs no read of the body and learns nothing from
+    // its size or its stalling.
     let token = bearer(&request).map(str::to_owned);
+    if coordinator.operator(token.as_deref()).is_err() {
+        return error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
     let Some(body) = read(request, MAX_OPERATOR_BYTES, patience).await else {
         return error(StatusCode::BAD_REQUEST, "bad_request");
     };
     match coordinator.operate(token.as_deref(), &body) {
         Ok(entry) => json(StatusCode::OK, &entry),
         Err(OperateError::Unauthorized(_)) => error(StatusCode::UNAUTHORIZED, "unauthorized"),
-        Err(OperateError::Invalid(why)) => {
-            tracing::warn!(why, "refused an operator action");
+        Err(why @ (OperateError::Invalid(_) | OperateError::Capped { .. })) => {
+            tracing::warn!(%why, "refused an operator action");
             error(StatusCode::BAD_REQUEST, "bad_request")
         }
         Err(OperateError::Store(why)) => {

@@ -569,6 +569,8 @@ The coordinator keeps its desired state per service name, and `kbf` is the only 
 - `{"action":"include","service":"<name>","node_id":"<id>"}`: removes the exclusion (no error when there is none).
 - `{"action":"set_labels","node_id":"<id>","labels":{"<key>":"<value>"}}`: replaces the host's labels; at most 8, each key and value 1 to 32 bytes of `[a-z0-9-]`; an empty object removes them. Only this call sets labels: a heartbeat that carries them changes nothing.
 
+The token is checked before the body is read (no token is a 401 whatever the body). The file holds at most 4096 hosts with labels and 4096 exclusions (`MAX_HOSTS` and `MAX_EXCLUDED` in `ops.rs`, the one place to raise them); an action that would add one more is a 400 and the log line names the cap. A label key given twice in one body is a 400.
+
 Each accepted action is written to the file before it takes effect (a failed write is a 500 and the old state stands), numbered, appended to the ring, and logged at info on the target `kbf_coordinator::audit` with `by`, `action`, `service`, `node_id` and `reason`; the answer is that entry. A bad body is a 400. In this release the coordinator records these changes and shows them in the status; nothing yet reads them when it decides what a host is told.
 
 `cargo xtask deploy-farm` (one `run:` line):

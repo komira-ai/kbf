@@ -405,7 +405,7 @@ impl Coordinator {
 
     /// Whether `bearer` is the operator token, compared in constant time. CI's token is no
     /// operator token and the operator token is no CI token.
-    fn operator(&self, bearer: Option<&str>) -> Result<(), Unauthorized> {
+    pub fn operator(&self, bearer: Option<&str>) -> Result<(), Unauthorized> {
         let presented = bearer.ok_or(Unauthorized)?.as_bytes();
         if bool::from(presented.ct_eq(self.operator_token.as_bytes())) {
             Ok(())
@@ -416,7 +416,8 @@ impl Coordinator {
 
     /// Does the operator action in `body` (`docs/design/host-updates.md`, section 5), if
     /// `bearer` is the operator token, and answers the audit entry it made. The token is
-    /// checked before the body is looked at.
+    /// checked here before the body is looked at; the transport checks it
+    /// ([`Self::operator`]) before it reads the body at all.
     ///
     /// # Errors
     /// [`OperateError`].
