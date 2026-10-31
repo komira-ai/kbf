@@ -10,7 +10,7 @@ npm ci --ignore-scripts --no-audit --no-fund
 npm run typecheck
 npm test            # compiles, then runs test/*.test.ts
 npm run build       # writes dist/
-npm run golden      # after a change meant to alter the output: rewrites test/golden.manifest
+npm run golden      # after a change meant to alter a hand-made page or asset: rewrites test/golden.manifest
 ```
 
 ## Why it is here
@@ -25,12 +25,13 @@ repository needs that file too, or the policy copied beside the site.
 
 | Path | What |
 |---|---|
+| `../docs/*.md` | the operator guide, rendered by `tools/docs.ts` into `/docs/` and `/docs/<name>/` (a page for each file, so a new file is a new page; `Not in a release yet` sections are marked). The crate's test `src/server/docs_tests.rs` holds the guide to the code, so the pages cannot say what the code does not. A minimal renderer for the subset the guide uses, no dependency; it refuses what it does not read |
 | `content/*.html` | the page copy: the inside of each page's `<main>`. Each claim comes from the crate's documentation, `packaging/tierstore/README.md` or the code; a page says where |
 | `static/theme.css` | the shared theme (kbf.dev, mopm.dev, ucdk.dev, tierstore.dev), copied byte for byte; `test/theme.test.ts` pins its sha256 |
 | `static/site.css` | this site's own rules, loaded after the theme |
 | `src/copy.ts` | copy buttons on command blocks |
 | `tools/` | `pages.ts` (routes, titles, the white-paper URL), `layout.ts` (the page shell, with the `> tierstore` mark), `build.ts`, `check-dist.ts`, `links.ts`, `csp.ts` |
-| `test/` | golden output, links, Content-Security-Policy, theme digest, the white-paper slot, the "not built" statements and demo strings held to the crate source (`claims.test.ts`), public-repo scan, supply-chain policy |
+| `test/` | golden output (`golden.manifest` guards the hand-made pages and assets, the docs index included; the pages rendered from the guide (`docs/<name>/index.html`) are left out of it and held by `docs.test.ts` and the crate's `docs_tests.rs`, so a guide edit needs no new manifest), the docs pages (`docs.test.ts`), links, Content-Security-Policy, theme digest, the white-paper slot, the "not built" statements and demo strings held to the crate source (`claims.test.ts`), public-repo scan, supply-chain policy |
 
 ## The demo
 

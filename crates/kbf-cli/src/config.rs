@@ -256,6 +256,12 @@ const GROUPS: &[(&str, &[&str])] = &[
         &[
             "task-closure-max-bytes",
             "task-closure-max-digests",
+            "task-janitor-dry-run",
+            "task-janitor-grace-secs",
+            "task-janitor-interval-secs",
+            "task-janitor-key-file",
+            "task-janitor-page-pause-ms",
+            "task-janitor-page-size",
             "task-large-credentials-file",
             "task-large-max-bytes",
             "task-max-large",
