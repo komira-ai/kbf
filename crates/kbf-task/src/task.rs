@@ -39,7 +39,7 @@ use kbf_types::Digest;
 
 use crate::digest;
 use crate::fetch::{
-    BlobSource, FetchError, HttpBlobSource, fetch_message, materialize, native_roots,
+    BlobSource, FetchError, HttpBlobSource, LocatedSource, fetch_message, materialize, native_roots,
 };
 use crate::network;
 use crate::outputs::{Blobs, OutputLimits, collect_outputs};
@@ -694,6 +694,17 @@ fn put_urls(cli: &Cli) -> Result<PutUrls, Failure> {
     }
 }
 
+/// The host's roots and the DER certificates `--root-der` names.
+fn trusted_roots(cli: &Cli) -> Result<Vec<Vec<u8>>, Failure> {
+    let mut roots = native_roots();
+    for path in &cli.root_der {
+        roots.push(
+            std::fs::read(path).map_err(|e| Failure::Setup(format!("{}: {e}", path.display())))?,
+        );
+    }
+    Ok(roots)
+}
+
 /// The trusted roots and the real source and sink the flags name.
 fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
     check_lease(cli)?;
@@ -704,12 +715,7 @@ fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
         cli.grant_token_file.as_deref(),
         cli.grant_token.as_deref(),
     )?;
-    let mut roots = native_roots();
-    for path in &cli.root_der {
-        roots.push(
-            std::fs::read(path).map_err(|e| Failure::Setup(format!("{}: {e}", path.display())))?,
-        );
-    }
+    let roots = trusted_roots(cli)?;
     let urls = put_urls(cli)?;
     let source =
         HttpBlobSource::new_with(&cli.grant_url, &token, &roots, cli.allow_plain_http_grant)?
@@ -731,7 +737,17 @@ fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
 /// `/locate` is never asked.
 fn connect_located(cli: &Cli) -> Result<(Box<dyn BlobSource>, HttpSink), Failure> {
     let (source, sink) = connect(cli)?;
-    Ok((Box::new(source), sink))
+    if !cli.locate {
+        return Ok((Box::new(source), sink));
+    }
+    let roots = trusted_roots(cli)?;
+    let located = LocatedSource::open(
+        source,
+        &roots,
+        cli.allow_plain_http_grant,
+        cli.work_dir.clone(),
+    );
+    Ok((Box::new(located), sink))
 }
 
 /// Runs the task the flags describe against the real grant and the real presigned URL, and turns
