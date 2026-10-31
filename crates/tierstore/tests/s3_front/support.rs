@@ -4,8 +4,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_objstore::Capabilities;
-use kbf_objstore::s3::{Credentials, S3Config, S3Store};
+use objstore_s3::Capabilities;
+use objstore_s3::s3::{Credentials, S3Config, S3Store};
 use tierstore::server::{Drained, Server, ServerConfig};
 use tierstore::{Clock, FaultyBackend, MemoryBackend, Proxy, ProxyConfig, SystemClock, TestClock};
 use tokio::net::TcpListener;
