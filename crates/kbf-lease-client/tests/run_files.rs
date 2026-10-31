@@ -61,7 +61,7 @@ fn debug_of_a_spec_and_a_file_never_shows_contents() {
 /// capability would run the job without its secrets) and one that refuses them everywhere.
 #[tokio::test]
 async fn the_fake_refuses_files_for_a_host_without_run_files() {
-    let (server, client) = fake().await;
+    let (_server, client) = fake().await;
     let id = lease(&client).await;
     let error = client
         .queue_run(id, &with_files(vec![file("put-url", SECRET)]))
@@ -79,14 +79,13 @@ async fn the_fake_refuses_files_for_a_host_without_run_files() {
     assert_eq!(kept, [file("put-url", SECRET)]);
     // A start without files needs no capability.
     assert!(client.queue_run(id, &run_of(100, 1)).await.is_ok());
-    drop(server);
 }
 
 /// Asserts that a pool made with `with_run_files` says so in its host list, and that a
 /// default pool does not. It catches a fake whose answer and whose behaviour disagree.
 #[tokio::test]
 async fn the_fake_reports_run_files_as_a_capability_only_when_asked() {
-    let (_, client) = fake().await;
+    let (_server, client) = fake().await;
     let hosts = client.hosts().await.unwrap();
     assert!(!hosts[0].capabilities.contains_key("run-files"));
     let server = FakeLeaseServer::start(Pool::with_run_files(pool())).await;
@@ -168,7 +167,7 @@ async fn the_fake_refuses_each_bad_file_without_echoing_it() {
 /// that has not acquired yet.
 #[tokio::test]
 async fn a_bad_file_is_answered_before_the_lease_is_looked_at() {
-    let (_, client, _) = files_fake().await;
+    let (_server, client, _) = files_fake().await;
     let nobody: LeaseId = "4-99".parse().unwrap();
     let bad = with_files(vec![file("../x", "y")]);
     let error = client.queue_run(nobody, &bad).await.unwrap_err();
