@@ -10,7 +10,7 @@ use std::time::Duration;
 use super::coordinator::{Coordinator, CoordinatorError};
 use super::local::{Ended, HostState, Local, LocalError, Staged, Trial};
 use crate::inventory::{Host, Role};
-use crate::ports::{Clock, Drain, Health, HealthCheck, Placed, PortError};
+use crate::ports::{Clock, Drain, Health, HealthCheck, Placed, PortError, Seen};
 use crate::version::Version;
 use crate::wire::{self, Heartbeat, Reply, ServiceReply};
 
@@ -386,6 +386,14 @@ impl Drain for ServingNode {
             return Ok(None);
         }
         self.placed(host).map(Some)
+    }
+
+    fn seen_if_known(&self, host: &Host) -> Result<Option<Seen>, PortError> {
+        Ok(self.placed_if_known(host)?.map(|placed| match placed {
+            Placed::In => Seen::Serving,
+            Placed::Out if *lock(&self.cordoned) => Seen::Cordoned,
+            Placed::Out => Seen::Draining,
+        }))
     }
 
     fn drain(&self, _host: &Host, _deadline: Option<Duration>) -> Result<(), PortError> {
