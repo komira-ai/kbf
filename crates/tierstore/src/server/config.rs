@@ -51,6 +51,7 @@ use super::cli::{
 };
 use super::config_cache::{CacheSettings, LocalCacheTable};
 use super::front::FrontSettings;
+use super::listen::{Addrs, has_duplicate};
 use crate::journal::{JOURNAL_PREFIX, TIERING_PREFIX};
 
 /// The flags that stay flags: the file is for the data path, and these are per run.
@@ -348,7 +349,8 @@ pub(super) struct File {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ServerTable {
-    pub listen: SocketAddr,
+    /// One address, or a list of them.
+    pub listen: Addrs,
     pub proxy_id: String,
     pub bucket: String,
     pub region: Option<String>,
@@ -423,8 +425,9 @@ pub(super) struct TierTable {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct OciTable {
+    /// One address, or a list of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub listen: Option<SocketAddr>,
+    pub listen: Option<Addrs>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_cert_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -697,10 +700,23 @@ pub(super) fn check_policies(policies: &[Policy], caching: bool) -> Result<(), C
     Ok(())
 }
 
+/// The addresses of the `listen` key `key`: at least one, and none twice. The message names the
+/// key and not an address.
+fn addresses(key: &str, listen: Addrs) -> Result<Vec<SocketAddr>, ConfigError> {
+    if listen.0.is_empty() {
+        return Err(invalid(key, "it needs at least one address"));
+    }
+    if has_duplicate(&listen.0) {
+        return Err(invalid(key, "the same address is listed twice"));
+    }
+    Ok(listen.0)
+}
+
 /// The OCI front's table checked as its flags are: the values of the `--oci-*` flags.
 #[derive(Clone, Debug)]
 pub(super) struct OciFlags {
-    pub listen: Option<SocketAddr>,
+    /// The addresses; none when there is no front.
+    pub listen: Vec<SocketAddr>,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub prefix: Option<String>,
@@ -714,7 +730,7 @@ pub(super) struct OciFlags {
 pub(super) fn oci(table: Option<OciTable>) -> Result<OciFlags, ConfigError> {
     let Some(table) = table else {
         return Ok(OciFlags {
-            listen: None,
+            listen: Vec::new(),
             tls_cert: None,
             tls_key: None,
             prefix: None,
@@ -733,6 +749,7 @@ pub(super) fn oci(table: Option<OciTable>) -> Result<OciFlags, ConfigError> {
         refuse("oci", "it needs oci.listen", &others)?;
     }
     let listen = require("oci", "listen", table.listen)?;
+    let listen = addresses("oci.listen", listen)?;
     match (&table.tls_cert_file, &table.tls_key_file) {
         (Some(_), None) => {
             let why = "it is needed with oci.tls_cert_file: give both, or neither";
@@ -749,7 +766,7 @@ pub(super) fn oci(table: Option<OciTable>) -> Result<OciFlags, ConfigError> {
         None => None,
     };
     Ok(OciFlags {
-        listen: Some(listen),
+        listen,
         tls_cert: table.tls_cert_file,
         tls_key: table.tls_key_file,
         prefix: table.prefix,
@@ -967,7 +984,7 @@ pub(super) fn front_of(server: ServerTable, per_run: PerRun) -> Result<Shared, C
         u32::MAX,
     )?;
     let front = FrontSettings {
-        listen: server.listen,
+        listen: addresses("server.listen", server.listen)?,
         proxy_id: server.proxy_id,
         bucket: server.bucket,
         region: server.region.unwrap_or_else(|| DEFAULT_REGION.to_owned()),

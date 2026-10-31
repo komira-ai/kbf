@@ -36,7 +36,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
 
 use crate::{
@@ -46,13 +45,13 @@ use crate::{
 
 use super::build_info::{COMMIT, VERSION};
 use super::cli::{
-    Addresses, Error, S3Flags, bind_oci, oci_cut_note, oci_setup_of, open_tier, probe_run_id,
-    serve_oci, signals,
+    Addresses, Error, S3Flags, bind_oci, bind_s3, oci_cut_note, oci_setup_of, open_tier,
+    probe_run_id, serve_oci, signals,
 };
 use super::config_cache::CacheSettings;
 use super::front::{InvalidFlags, server_config};
+use super::listen::{joined, local_addrs};
 use super::local_cache::{CacheConfig, Disk, LocalCache, SystemDisk, check_local};
-use super::oci::OciListener;
 use super::{Drained, Server};
 
 /// How often the eviction pass runs beside the server.
@@ -207,17 +206,9 @@ pub(super) async fn serve_cache(
     // The registry front reads what the S3 front reads: through the cache.
     let backend: Arc<dyn Backend> = Arc::new(cache.clone());
     let server = Server::new(Arc::clone(&backend), config);
-    let address = settings.front.listen;
-    let bound = TcpListener::bind(address).await;
-    let listener = bound.map_err(|why| format!("binding {address}: {why}"))?;
+    let listeners = bind_s3(&settings.front.listen)?;
     let oci = bind_oci(oci, backend).await?;
-    let oci_addr = oci.as_ref().map(OciListener::local_addr).transpose()?;
-    let oci_mode = oci.as_ref().map(OciListener::mode);
-    ready(Addresses {
-        s3: listener.local_addr()?,
-        oci: oci_addr,
-        oci_mode,
-    });
+    ready(Addresses::of(local_addrs(&listeners)?, oci.as_ref())?);
     // After the ready: the sweep is the one thing of the self-test that is not a gate.
     let sweeping = settings.cache.write_through.then(|| {
         let spec = settings.upstream.spec.clone();
@@ -235,7 +226,7 @@ pub(super) async fn serve_cache(
     let halt = Arc::new(Notify::new());
     let halting = Arc::clone(&halt);
     let serving = async move {
-        let drained = server.serve(listener).await;
+        let drained = server.serve_all(listeners).await;
         halting.notify_one();
         drained
     };
@@ -282,10 +273,11 @@ pub(super) async fn serve_cache_until_signalled(settings: CacheSettings) -> Resu
         "read-cache"
     };
     let announce = |bound: Addresses| {
-        let mut line = format!("tierstore {VERSION} listen={} mode={mode}", bound.s3);
-        if let Some(oci) = bound.oci {
+        let listen = joined(&bound.s3_all);
+        let mut line = format!("tierstore {VERSION} listen={listen} mode={mode}");
+        if bound.oci.is_some() {
             let how = bound.oci_mode.unwrap_or_default().as_str();
-            line.push_str(&format!(" oci-listen={oci} ({how})"));
+            line.push_str(&format!(" oci-listen={} ({how})", joined(&bound.oci_all)));
         }
         println!("{line} commit={COMMIT}");
     };

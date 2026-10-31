@@ -468,7 +468,7 @@ fn minimal_with_oci(oci: &str) -> String {
 #[test]
 fn an_oci_table_makes_the_settings_its_flags_make() {
     let all = from_text(GOLDEN, DEFAULTS).unwrap();
-    assert_eq!(all.oci_listen, Some("192.0.2.10:5000".parse().unwrap()));
+    assert_eq!(all.oci_listen, vec!["192.0.2.10:5000".parse().unwrap()]);
     assert_eq!(
         all.oci_tls_cert.as_deref(),
         Some(Path::new("/etc/tierstore/oci.crt"))
@@ -488,7 +488,7 @@ fn an_oci_table_makes_the_settings_its_flags_make() {
     assert_eq!(listen_only.unwrap(), Cli::try_parse_from(flags).unwrap());
 
     let none = from_text(MINIMAL, DEFAULTS).unwrap();
-    assert_eq!(none.oci_listen, None);
+    assert!(none.oci_listen.is_empty());
 }
 
 /// Asserts that the `[oci]` rules are the flags' rules, each refusal naming its key: a
@@ -726,4 +726,77 @@ fn the_example_in_the_readme_loads() {
     assert_eq!(cli.hot, "s3:tierstore-hot");
     assert_eq!(cli.cold, "s3:tierstore-cold");
     assert_eq!(cli.read_only_key_file.len(), 1);
+}
+
+/// `GOLDEN` with the value of `server.listen` and of `oci.listen` replaced.
+fn golden_listening(server: &str, oci: &str) -> String {
+    let text = golden_with("\"192.0.2.10:9300\"", server);
+    assert!(text.contains("\"192.0.2.10:5000\""));
+    text.replacen("\"192.0.2.10:5000\"", oci, 1)
+}
+
+/// Asserts that `server.listen` and `oci.listen` take one address as a string or a list of
+/// addresses: the list of one makes the settings the string does (so a file written before the
+/// lists loads as it did), and a list of two makes the settings two repeated flags make.
+#[test]
+fn a_listen_key_takes_one_address_or_a_list_of_them() {
+    let single = from_text(GOLDEN, DEFAULTS).unwrap();
+    let listed = golden_listening("[\"192.0.2.10:9300\"]", "[\"192.0.2.10:5000\"]");
+    assert_eq!(from_text(&listed, DEFAULTS).unwrap(), single);
+
+    let server = "[\"0.0.0.0:9300\", \"[::]:9300\"]";
+    let oci = "[\"0.0.0.0:5000\", \"[::]:5000\"]";
+    let from_file = from_text(&golden_listening(server, oci), DEFAULTS).unwrap();
+    let flags: Vec<&str> = golden_flags()
+        .into_iter()
+        .flat_map(|flag| match flag {
+            "--listen=192.0.2.10:9300" => vec!["--listen=0.0.0.0:9300", "--listen=[::]:9300"],
+            "--oci-listen=192.0.2.10:5000" => {
+                vec!["--oci-listen=0.0.0.0:5000", "--oci-listen=[::]:5000"]
+            }
+            other => vec![other],
+        })
+        .collect();
+    assert_eq!(from_file, Cli::try_parse_from(flags).unwrap());
+    assert_eq!(from_file.listen.len(), 2);
+    assert_eq!(from_file.oci_listen.len(), 2);
+}
+
+/// Asserts that a `listen` list that cannot work is refused with its key, and with no address and
+/// no text of the value in the message: an empty list, an address twice, and a value that is
+/// no address.
+#[test]
+fn a_listen_list_that_cannot_work_is_refused_by_its_key() {
+    let one_server = "\"192.0.2.10:9300\"";
+    let one_oci = "\"192.0.2.10:5000\"";
+    let twice_server = "[\"192.0.2.10:9300\", \"192.0.2.10:9300\"]";
+    let twice_oci = "[\"192.0.2.10:5000\", \"192.0.2.10:5000\"]";
+    let cases = [
+        (
+            golden_listening("[]", one_oci),
+            "server.listen: it needs at least one address",
+        ),
+        (
+            golden_listening(one_server, "[]"),
+            "oci.listen: it needs at least one address",
+        ),
+        (
+            golden_listening(twice_server, one_oci),
+            "server.listen: the same address is listed twice",
+        ),
+        (
+            golden_listening(one_server, twice_oci),
+            "oci.listen: the same address is listed twice",
+        ),
+        (
+            golden_listening("[\"192.0.2.10:9300\", \"secret-word\"]", one_oci),
+            "listen: invalid socket address syntax",
+        ),
+    ];
+    for (text, want) in cases {
+        let why = refusal(&text);
+        assert!(why.contains(want), "{want}: {why}");
+        assert!(!why.contains("192.0.2.10"), "{why}");
+        assert!(!why.contains("secret-word"), "{why}");
+    }
 }
