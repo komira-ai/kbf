@@ -34,6 +34,10 @@ pub(super) enum Filled {
     Kept,
     /// It is not: the readers are answered from the upstream.
     Skipped,
+    /// The object was written over while it was read (the tag changed between the two HEADs):
+    /// a reader that was given no byte is answered from the upstream, which has the new object;
+    /// one that was given bytes of the old one gets an error.
+    Changed,
 }
 
 /// The error of a read whose object was written over while it was being read: bytes of two
@@ -41,6 +45,16 @@ pub(super) enum Filled {
 pub(super) fn written_over() -> Error {
     let text = "the object was written over while it was being read";
     Error::Unavailable(text.to_owned())
+}
+
+/// Refuses an upstream that gives no content tag for `key`: the tag is what tells one version of an
+/// object from another of the same size, so a read of it could not be held to one version.
+pub(super) fn tagged(key: &str, meta: &Meta) -> Result<(), Error> {
+    if meta.tag.is_empty() {
+        let text = format!("the upstream gives no content tag for {key}");
+        return Err(Error::Unsupported(text));
+    }
+    Ok(())
 }
 
 /// How far a fill has come, as its readers see it. The bytes are in a file, never in a copy in
@@ -390,9 +404,10 @@ impl Inner {
             Err(Stop::Short) => self.skipped(FailedFill::ShortBody),
             Err(Stop::Local) => self.skipped(FailedFill::LocalIo),
             Err(Stop::Changed) => {
-                // Readers may have been given bytes of the first version already.
+                // Readers may have been given bytes of the first version already: each reader
+                // decides by what it was given.
                 self.counters.failed(FailedFill::Changed);
-                Err(written_over())
+                Ok(Filled::Changed)
             }
             Err(Stop::Invalidated) => self.skipped(FailedFill::Changed),
             Err(Stop::Mismatch) => {
@@ -417,6 +432,7 @@ impl Inner {
         live: &watch::Sender<Live>,
     ) -> Result<Filled, Stop> {
         let meta = self.upstream.head(key).await?;
+        tagged(key, &meta)?;
         let Some(reservation) = self.reserve(meta.size) else {
             bump(&self.counters.fills_skipped);
             return Ok(Filled::Skipped);

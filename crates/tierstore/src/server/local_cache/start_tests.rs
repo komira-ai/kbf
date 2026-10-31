@@ -280,9 +280,7 @@ async fn the_metrics_text_has_every_counter_with_its_value() {
     }
     rig.replace("cas/b/l", &pattern(11)).await;
     gate.add_permits(1000);
-    // A fill that sees the object written over is the readers' error: they may hold bytes of the
-    // first version.
-    assert!(reader.await.unwrap().unwrap_err().is_unavailable());
+    assert_eq!(reader.await.unwrap().unwrap().len(), 11);
     rig.disk.set_space(1000, 50);
     assert_eq!(rig.cache.evict().evicted, 1);
     rig.disk.set_space(1000, 1000);

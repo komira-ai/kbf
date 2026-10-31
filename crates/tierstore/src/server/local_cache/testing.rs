@@ -38,6 +38,8 @@ pub(in crate::server) struct Tamper {
     pub(in crate::server) short: AtomicBool,
     /// Every read gives one byte more than it was asked for.
     pub(in crate::server) long: AtomicBool,
+    /// Every HEAD gives an empty content tag.
+    pub(in crate::server) blank_tags: AtomicBool,
     /// The next read, once the gate lets it go, is an `Unavailable` error.
     pub(in crate::server) fail_once: AtomicBool,
     /// The next read, once the gate lets it go, panics.
@@ -68,6 +70,7 @@ impl Tamper {
             memory: MemoryBackend::new(),
             short: AtomicBool::new(false),
             long: AtomicBool::new(false),
+            blank_tags: AtomicBool::new(false),
             fail_once: AtomicBool::new(false),
             panic_once: AtomicBool::new(false),
             gate: Mutex::new(None),
@@ -183,7 +186,11 @@ impl Backend for Tamper {
     }
 
     async fn head(&self, key: &str) -> Result<Meta, Error> {
-        self.memory.head(key).await
+        let mut meta = self.memory.head(key).await?;
+        if self.blank_tags.load(Ordering::SeqCst) {
+            meta.tag.clear();
+        }
+        Ok(meta)
     }
 
     async fn delete(&self, key: &str) -> Result<(), Error> {

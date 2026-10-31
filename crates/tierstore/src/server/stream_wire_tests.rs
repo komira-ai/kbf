@@ -1,6 +1,7 @@
 //! A streamed GET on a connection: the answer says how long it is, and a body that cannot be
 //! completed is cut, so that a client reads less than the length it was told. The server is run
-//! over an in-memory pipe, as a client of a socket would meet it; nothing here waits for a time.
+//! over an in-memory duplex pipe, not a socket (hyper's logic for a cut body is the same on both);
+//! nothing here waits for a time.
 
 use std::sync::Arc;
 

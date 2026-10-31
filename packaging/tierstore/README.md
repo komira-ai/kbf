@@ -394,7 +394,7 @@ ends with an error). A read of more than one chunk from the upstream is held to 
 began with (a HEAD before the first chunk and another before the last); the bytes of a `cas/l`
 object read from the upstream this way are not hashed, as a pass-through never was. A client that
 stops reading keeps the unlinked file of an object that is evicted meanwhile, with its blocks,
-until the connection's idle time ends it; those blocks are outside the budget. A storage node
+until the connection's idle time ends it; those blocks are outside the budget. The cache needs the upstream to give a content tag (an entity tag, a checksum) that changes with the bytes: a fill of an object whose tag is empty, and a read held to one version, are refused with `Unsupported`, since a same-size overwrite could not be seen. A storage node
 still holds the bytes of a GET whole. A fill that panics or is cancelled frees its slot and its
 key, and the readers that waited for it get a 503 (`fill_failures_total{reason="aborted"}`).
 

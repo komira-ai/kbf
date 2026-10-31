@@ -27,7 +27,7 @@ use tokio::sync::watch;
 
 use crate::{ByteRange, Error, Meta, ReadBody};
 
-use super::fill::{Filled, Live, Pending, written_over};
+use super::fill::{Filled, Live, Pending, tagged, written_over};
 use super::layout::{Name, data_path};
 use super::metrics::{add, bump};
 use super::{Inner, gone, locked, window};
@@ -317,6 +317,10 @@ impl Follower {
                     let error = error.clone();
                     return self.fail(error);
                 }
+                // The object was written over: a reader given bytes of the old one cannot go on.
+                Some(Ok(Filled::Changed)) if self.sent > self.first => {
+                    return self.fail(written_over());
+                }
                 Some(Ok(_)) => self.resume(),
                 None => {
                     tokio::select! {
@@ -363,6 +367,7 @@ impl Chunks {
             return Ok(());
         }
         let meta = self.inner.upstream.head(&self.key).await?;
+        tagged(&self.key, &meta)?;
         if self
             .expect
             .as_ref()

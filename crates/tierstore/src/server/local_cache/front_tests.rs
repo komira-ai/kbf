@@ -285,8 +285,8 @@ async fn a_body_that_fails_the_hash_is_a_broken_answer_not_a_clean_end() {
     assert_eq!(front.rig.cache.held(), (0, 0));
 }
 
-/// Asserts, on a connection, that a `cas/l` object whose bytes do not hash to its name is cut
-/// before its length: the answer gives the length of the object, and the connection ends with
+/// Asserts, on a duplex pipe (not a socket), that a `cas/l` object whose bytes do not hash to its
+/// name is cut before its length: the answer gives the length of the object, and the connection ends with
 /// less than that, so a client sees the answer as incomplete (the check of the hash is in the
 /// last chunk, which is not sent).
 #[tokio::test]

@@ -503,7 +503,7 @@ impl Backend for LocalCache {
                 Some(body) => Ok(body),
                 None => passed(range).await,
             },
-            Err(fill::Filled::Skipped) => passed(range).await,
+            Err(fill::Filled::Skipped | fill::Filled::Changed) => passed(range).await,
         }
     }
 

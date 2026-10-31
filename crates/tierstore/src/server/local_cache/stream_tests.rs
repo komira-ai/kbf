@@ -593,3 +593,66 @@ async fn a_window_past_the_end_is_cut_there_and_an_upstream_that_gives_more_is_a
     let error = rig.cache.get_stream("plain/obj", Some(range)).await;
     assert!(matches!(error, Err(Error::Other(_))));
 }
+
+/// Asserts the two ends of an object written over during its fill (a key not named by its
+/// content, so the second HEAD finds another tag): a reader given no byte (a range of 50 bytes,
+/// held until the fill is checked) is answered from the upstream with the new bytes, as a fresh
+/// read would be; a reader given 500 bytes of the old object gets an `Unavailable` error, never a
+/// body of two versions. The fill is counted as changed and keeps nothing.
+#[tokio::test]
+async fn a_reader_given_bytes_of_an_object_written_over_gets_the_error_and_one_given_none_the_new_bytes()
+ {
+    let rig = rig("tsstream-written-over");
+    rig.put("cas/b/obj", &pattern(SIZE)).await;
+    let gate = rig.tamper.hold();
+    open(&gate, 5);
+    let mut mid = rig.cache.get_stream("cas/b/obj", None).await.unwrap();
+    let given = take(&mut mid, 500).await;
+    let zero = tokio::spawn(read_through(
+        rig.cache.clone(),
+        "cas/b/obj".to_owned(),
+        Some(ByteRange::new(0, 50)),
+    ));
+    until_misses(&rig, 2).await;
+
+    let new = vec![3u8; SIZE];
+    rig.replace("cas/b/obj", &new).await;
+    open(&gate, 64);
+    let (chunks, error) = zero.await.unwrap().expect("the object is there");
+    assert_eq!(error, None);
+    assert_eq!(joined(&chunks), &new[..50]);
+    let (rest, error) = drain(mid).await;
+    let error = error.expect("a body of two versions does not end cleanly");
+    assert!(error.is_unavailable(), "{error}");
+    assert!(given.len() + joined(&rest).len() <= SIZE - CHUNK as usize);
+    assert_eq!(rig.cache.counters().failures(FailedFill::Changed), 1);
+    assert_eq!(rig.cache.held(), (0, 0));
+    assert!(!rig.has_file("cas/b/obj"));
+    assert_eq!(staged(&rig), 0);
+}
+
+/// Asserts that an upstream that gives no content tag is refused where a version is needed: a fill
+/// of its object is the reader's error (and nothing is kept), and so is a whole pass-through, which
+/// is held to one version; a read of one chunk or less, which needs no version, is served.
+#[tokio::test]
+async fn an_upstream_without_content_tags_is_refused_where_a_version_is_needed() {
+    let rig = rig("tsstream-blank-tags");
+    let body = pattern(SIZE);
+    rig.put("cas/b/obj", &body).await;
+    rig.put("plain/obj", &body).await;
+    rig.tamper.blank_tags.store(true, Ordering::SeqCst);
+    let fill = rig.cache.get_stream("cas/b/obj", None).await;
+    assert!(matches!(fill, Err(Error::Unsupported(_))));
+    assert_eq!(rig.cache.held(), (0, 0));
+    let whole = rig.cache.get_stream("plain/obj", None).await;
+    assert!(matches!(whole, Err(Error::Unsupported(_))));
+    let range = ByteRange::new(10, 50);
+    let stream = rig
+        .cache
+        .get_stream("plain/obj", Some(range))
+        .await
+        .unwrap();
+    let (chunks, error) = drain(stream).await;
+    assert_eq!(error, None);
+    assert_eq!(joined(&chunks), &body[10..60]);
+}
