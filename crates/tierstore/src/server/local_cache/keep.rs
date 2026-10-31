@@ -498,7 +498,11 @@ impl Inner {
             return Err(SkippedKeep::ReadOnly);
         }
         // An entry for the key is of an object that is gone: it must not keep the new file's
-        // place.
+        // place. It is asked after the last look at the lock and not gated by it again: if the
+        // lock is lost and taken again between the two, this removes an entry and files of the
+        // new ownership, which costs a refill of a whole object and never gives wrong bytes:
+        // what is removed is a valid object or nothing, and a read that misses goes to the
+        // upstream.
         self.drop_entry(&name.hex);
         let sidecar = Sidecar {
             key: key.to_owned(),
@@ -527,10 +531,14 @@ impl Inner {
                 drop(tokio::spawn(async move {
                     let ended = publishing.await;
                     let linked = matches!(ended, Ok(Ok(Published::New)));
-                    if linked && !inner.owns(generation) {
-                        inner.remove_linked(&hex);
-                    } else {
+                    // Under the ownership the keep began in, the link is undone as it was. Past
+                    // it (the cache lost the lock, and may have taken it again, which is a
+                    // read-write cache with another generation) the name may be the new
+                    // ownership's: nothing is touched unless this keep linked it.
+                    if inner.owns(generation) {
                         inner.drop_entry(&hex);
+                    } else if linked {
+                        inner.remove_linked(&hex);
                     }
                     drop(staged);
                 }));
