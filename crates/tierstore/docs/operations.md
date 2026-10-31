@@ -12,13 +12,14 @@ With the OCI front on, the line gets ` oci-listen=<address> (https)` or ` (http)
 
 ## Probes
 
-Three paths of the S3 listener answer a GET or HEAD without a signature, so a bucket cannot have any of these names.
+Four paths of the S3 listener answer a GET or HEAD without a signature, so a bucket cannot have any of these names.
 
 | Path | Answer | Use it for |
 |---|---|---|
 | `/healthz` | 200 `ok` while the process runs | liveness |
 | `/readyz` | 200 `ready` until the drain begins, then 503 `draining` | a load balancer's health check |
 | `/usagez` | 200 with the age of the hot tier's published usage, or 503 with the reason | alerting |
+| `/metricz` | 200 with the counters, in the Prometheus text format (see [Metrics](operations.md#metrics)) | scraping |
 
 `/readyz` does not look at the usage: one stopped reconciler would otherwise make every node unready. `/usagez` is for alerting, not for a load balancer.
 
@@ -84,7 +85,7 @@ At start the process makes the directory, removes what a fill left half done, re
 
 ## Metrics
 
-`GET /metricz` on the S3 listener (unsigned) answers 200 in the Prometheus text format. On main it has the hit, miss, byte and cold-read counters of the hot and cold tiers, the counters of the OCI read front, such as `tierstore_oci_requests_total`, and the counters of the cache of a build node, all named `tierstore_` and a word; without `--oci-listen` it says the front is not enabled, and a node with no cache says so on a line of its own. The tier counters are not in the latest release (v0.0.38). The full list of metric names, their labels and queries to alert on is in [metrics](metrics.md).
+`GET /metricz` on the S3 listener (unsigned) answers 200 in the Prometheus text format. On main it has the hit, miss, byte and cold-read counters of the hot and cold tiers, the counters of the OCI read front, such as `tierstore_oci_requests_total`, and the counters of the cache of a build node, all named `tierstore_` and a word; without `--oci-listen` it says the front is not enabled, and a node with no cache says so on a line of its own. The tier counters are on main and not in v0.0.40. The full list of metric names, their labels and queries to alert on is in [metrics](metrics.md).
 
 ## Not in a release yet
 

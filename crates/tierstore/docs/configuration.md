@@ -2,7 +2,7 @@
 
 tierstore is configured by flags, or by one TOML file given with `--config <path>`. The two make the same settings and run the same code: the file is read into the settings the flags make, and a key that is left out has the default of its flag. A file holds no secret, only the paths of key files.
 
-> `--config` and `--print-config` are on main and not in the latest release (v0.0.38). Every flag below works in every release. A file has one of two shapes, told apart by its tables: a storage node (a hot tier and a cold tier, as the flags have) and a build node (a read cache on local disk in front of one upstream, `[local_cache]`). The build node is on main and has no flag form (`--check-config` checks a file of either shape).
+> `--config` and `--print-config` came with v0.0.39, the build-node shape with v0.0.40; `--check-config` and `local_cache.write_through` are on main and not in v0.0.40. Every flag below works in every release. A file has one of two shapes, told apart by its tables: a storage node (a hot tier and a cold tier, as the flags have) and a build node (a read cache on local disk in front of one upstream, `[local_cache]`). The build node has no flag form.
 
 ## A file for a storage node
 
@@ -224,9 +224,11 @@ These describe one run, not the data path, and have no key:
 |---|---|---|
 | `--config` | none | the file |
 | `--print-config` | off | print the file for the flags given, and exit |
-| `--check-config` | off | with `--config`: load and check the file as a start does, and the key files it names, then exit 0 and print nothing, or print the refusal and exit 2. It binds nothing and asks no store; the disk checks of a start (the cache directory, the budget against the file system) and the self-test are not made. Without `--config` it is a usage error |
+| `--check-config` | off | with `--config`: load the file, read the key files it names, and for an `[oci]` table check the prefix, the connection lifetime and the TLS files; then exit 0 and print nothing, or print the refusal and exit 2. It binds nothing and asks no store. What it does not check is listed below. Without `--config` it is a usage error |
 | `--drain-lb-wait` | `10s` | on SIGTERM, how long `/readyz` says 503 while the server goes on serving |
 | `--drain-deadline` | `15m` | then how long it waits for requests in flight |
+
+`--check-config` finds what the loader refuses (see "What the loader refuses"), a `bucket` that is a probe path name, a zero `body_idle_timeout`, a key file that is not owned by the user, is open to others or is a link, two keys with one id, and, in the file of a build node, a zero `s3_request_timeout`. It does not find what a start checks after that: the water marks out of order, `reconcile_interval` not below `lease_ttl`, `usage_stale_after` not above `lease_ttl`, or a zero `s3_request_timeout` in a storage node's file (a start exits 1 on each, and the unit tries again every 30 seconds); a tier that is down or answers the self-test wrongly; the cache directory and a `budget` over the size of its file system. A file that passes `--check-config` can still fail to start.
 
 `--help` and `--version` are the usual. A start that gives `--config` and any other flag but `--drain-lb-wait`, `--drain-deadline` and `--check-config` is refused with exit status 2.
 

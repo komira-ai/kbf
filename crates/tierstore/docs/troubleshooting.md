@@ -5,15 +5,15 @@
 | Status | Meaning | The unit |
 |---|---|---|
 | 0 | a clean drain, or `--print-config` or `--help` done | stays stopped |
-| 1 | a start that failed: a tier that could not be reached, an address in use, a key file refused after parsing | restarts after 30 seconds |
-| 2 | flags or a file the process refused, or two keys with one id | does not restart: a restart cannot mend it |
+| 1 | a start that failed: a tier that could not be reached, an address in use, a key file refused after parsing, and the flags that depend on each other (see "Messages at start") | restarts after 30 seconds |
+| 2 | a flag the parser refused, a file that does not load, a limit of the OCI front, or two keys with one id | does not restart: a restart cannot mend it |
 | 3 | a tier answered the start-up self-test wrongly | does not restart: the same store would answer the same way |
 
 Messages go to stderr, prefixed `tierstore: `, and so to the journal: `journalctl -u tierstore`. None carries a secret.
 
 ## Messages at start
 
-Flags that depend on each other (status 2 as a flag or key; a file's message names the key where a flag's names the flag):
+Flags that depend on each other. These are checked after the flags and the file have parsed, and a start that fails one exits with status 1, not 2, so the unit starts again every 30 seconds until the value is fixed (a file's message names the key where a flag's names the flag):
 
 ```message
 --low-water must be below --high-water
@@ -21,10 +21,11 @@ Flags that depend on each other (status 2 as a flag or key; a file's message nam
 --reconcile-interval must be shorter than --lease-ttl
 --usage-stale-after must be longer than --lease-ttl
 --body-idle-timeout must be longer than zero
+--s3-request-timeout must be longer than zero
 --bucket <name> is the name of a probe path
 ```
 
-Fix the value. In a file these name `hot_store.low_water`, `hot_store.high_water` and so on.
+Fix the value; `journalctl -u tierstore` shows the message at every try. `--check-config` does not find these (see [configuration](configuration.md#the-flags-that-stay-flags)). In a file these name `hot_store.low_water`, `hot_store.high_water` and so on.
 
 A key file:
 

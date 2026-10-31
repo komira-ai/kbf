@@ -12,6 +12,9 @@
 //! page describes what is on its way and not in the code yet. Everything else in a page is held
 //! to the code.
 //!
+//! What it does not check: a message that a page quotes in an ordinary sentence or an inline span,
+//! and not in a `message` block, is not looked for in the source. Quote a message in a block.
+//!
 //! The checker is a function of the pages and the code, so the tests below run it on pages that
 //! have been made wrong and see it say so.
 
@@ -21,7 +24,7 @@ use std::path::{Path, PathBuf};
 use clap::CommandFactory;
 
 use super::cli::Cli;
-use super::config::{KEYS, settings_from_text};
+use super::config::{KEYS, Policy, settings_from_text};
 use super::config_cache::LocalCacheTable;
 use super::config_testing::DEFAULTS;
 
@@ -41,7 +44,8 @@ const UNDOCUMENTED_KEYS: &[&str] = &[];
 /// a name that no change adds, for the test of this rule to link to whatever pages land.
 const PENDING_PAGES: &[&str] = &["metrics.md", "a-page-no-change-adds.md"];
 
-/// The tables of the file, and the keys of `[[policy]]`, which are not in the key table.
+/// The tables of the file. The keys of `[[policy]]` and `[local_cache]`, which are not in the key
+/// table, are read from their structs (see `table_keys`).
 const SECTIONS: &[&str] = &[
     "server",
     "hot_store",
@@ -49,23 +53,6 @@ const SECTIONS: &[&str] = &[
     "oci",
     "policy",
     "local_cache",
-];
-const POLICY_KEYS: &[&str] = &["policy.prefix", "policy.cache"];
-
-/// The keys of `[local_cache]`, which have no flag and so are not in the key table (the test
-/// `the_cache_table_has_the_keys_listed` holds this list to the table).
-const LOCAL_CACHE_KEYS: &[&str] = &[
-    "local_cache.path",
-    "local_cache.layout",
-    "local_cache.budget",
-    "local_cache.high_water",
-    "local_cache.low_water",
-    "local_cache.critical",
-    "local_cache.free_floor",
-    "local_cache.max_concurrent_fills",
-    "local_cache.write_through",
-    "local_cache.cache",
-    "local_cache.scrub_rate",
 ];
 
 /// One page.
@@ -78,6 +65,11 @@ struct Doc {
 struct Code {
     flags: BTreeSet<String>,
     keys: BTreeSet<String>,
+    /// The keys of `[local_cache]`, which have no flag and so are not in `keys`: every page must
+    /// name each.
+    cache_keys: BTreeSet<String>,
+    /// The keys of `[[policy]]`, which a page may name.
+    policy_keys: BTreeSet<String>,
     /// The non-test source of the crate with its comments and the backslashes of its escapes out.
     source: String,
 }
@@ -239,7 +231,7 @@ fn check(docs: &[Doc], code: &Code) -> Vec<String> {
     let mut named_flags = BTreeSet::new();
     let mut named_keys = BTreeSet::new();
     let known_key = |key: &str| {
-        code.keys.contains(key) || POLICY_KEYS.contains(&key) || LOCAL_CACHE_KEYS.contains(&key)
+        code.keys.contains(key) || code.policy_keys.contains(key) || code.cache_keys.contains(key)
     };
     for (doc, page) in &parsed {
         let name = &doc.name;
@@ -333,10 +325,9 @@ fn check(docs: &[Doc], code: &Code) -> Vec<String> {
     let missing_keys = code
         .keys
         .iter()
-        .map(String::as_str)
-        .chain(LOCAL_CACHE_KEYS.iter().copied())
+        .chain(&code.cache_keys)
         .filter(|k| !named_keys.contains(*k));
-    for key in missing_keys.filter(|k| !UNDOCUMENTED_KEYS.contains(k)) {
+    for key in missing_keys.filter(|k| !UNDOCUMENTED_KEYS.contains(&k.as_str())) {
         problems.push(format!("no page names the key {key}"));
     }
     problems
@@ -478,8 +469,30 @@ fn code() -> Code {
     Code {
         flags,
         keys,
+        cache_keys: table_keys::<LocalCacheTable>("local_cache"),
+        policy_keys: table_keys::<Policy>("policy"),
         source,
     }
+}
+
+/// The `table.key` of every key that the struct `T` of a table of the file takes. The struct
+/// refuses an unknown key, and serde's message for that lists the keys it takes, so a field that
+/// is added to the struct is in the list without anyone writing it down.
+fn table_keys<T: serde::de::DeserializeOwned>(table: &str) -> BTreeSet<String> {
+    let refused = toml::from_str::<T>("zz_not_a_key = 1\n").err();
+    let message = refused
+        .expect("an unknown key is refused")
+        .message()
+        .to_owned();
+    let (_, expected) = message
+        .split_once("expected")
+        .expect("serde's message lists the keys");
+    expected
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .map(|key| format!("{table}.{key}"))
+        .collect()
 }
 
 /// The pages with `change` made to the one named `name`; the text it replaces must be in it.
@@ -529,6 +542,36 @@ fn with_appended(name: &str, extra: &str) -> Vec<Doc> {
     docs
 }
 
+/// How much the checker has to look at: the pages, and the flag, key and metric names and the
+/// message blocks outside the skipped sections. The real-run test holds these above floors, so a
+/// parser that stopped finding them could not make that test pass with nothing checked.
+fn amounts(docs: &[Doc]) -> (usize, usize, usize, usize, usize) {
+    let (mut flags, mut keys, mut metrics, mut messages) = (0, 0, 0, 0);
+    for doc in docs {
+        let page = parse(&doc.text);
+        let blocks = page.blocks.iter().map(|b| b.body.as_str());
+        let spans = page.spans.iter().map(|(_, text)| text.as_str());
+        flags += spans
+            .clone()
+            .chain(blocks.clone())
+            .map(|t| flags_in(t).len())
+            .sum::<usize>();
+        keys += spans
+            .filter(|s| {
+                s.split_once('.')
+                    .is_some_and(|(table, _)| SECTIONS.contains(&table))
+            })
+            .count();
+        let prose = page.prose.iter().map(|(_, text)| text.as_str());
+        metrics += prose
+            .chain(blocks)
+            .map(|t| metrics_in(t).len())
+            .sum::<usize>();
+        messages += page.blocks.iter().filter(|b| b.info == "message").count();
+    }
+    (docs.len(), flags, keys, metrics, messages)
+}
+
 fn said(problems: &[String], needle: &str) -> bool {
     problems.iter().any(|p| p.contains(needle))
 }
@@ -543,6 +586,12 @@ fn the_pages_say_what_the_code_has() {
         docs.iter().any(|d| d.name == "configuration.md"),
         "the guide's pages are in docs/"
     );
+    let (pages, flags, keys, metrics, messages) = amounts(&docs);
+    assert!(pages >= 8, "the guide has {pages} pages");
+    assert!(flags >= 80, "the pages name {flags} flags");
+    assert!(keys >= 40, "the pages name {keys} keys");
+    assert!(metrics >= 10, "the pages name {metrics} metrics");
+    assert!(messages >= 3, "the pages hold {messages} message blocks");
     assert_eq!(check(&docs, &code()), Vec::<String>::new());
 }
 
@@ -565,21 +614,27 @@ fn a_flag_that_is_not_the_binarys_is_found() {
     ));
 }
 
-/// Asserts that the list of the keys of `[local_cache]` above is the table's: a file that gives
-/// each of them loads as a build node, and the table written back has just those keys.
+/// Asserts that the keys of a table are read from its struct: a struct that takes a field has the
+/// key, so a field added to `[local_cache]` or `[[policy]]` is one the pages must name or the
+/// checks of the keys fail. A planted struct with an extra field has it, and the real tables have
+/// the keys that the pages know them by.
 #[test]
-fn the_cache_table_has_the_keys_listed() {
-    let text = "[local_cache]\npath = \"/var/cache\"\nlayout = \"digest-v1\"\nbudget = \"1GiB\"\nhigh_water = 90\nlow_water = 75\ncritical = 95\nfree_floor = 10\nmax_concurrent_fills = 4\nwrite_through = false\ncache = true\nscrub_rate = \"1MiB/s\"\n";
-    let table: LocalCacheTable = toml::from_str::<toml::Table>(text)
-        .expect("the TOML parses")
-        .remove("local_cache")
-        .expect("the table is there")
-        .try_into()
-        .expect("every listed key is a key of the table");
-    let written = toml::Table::try_from(table).expect("the table serializes");
-    let keys: BTreeSet<String> = written.keys().map(|k| format!("local_cache.{k}")).collect();
-    let listed: BTreeSet<String> = LOCAL_CACHE_KEYS.iter().map(|k| (*k).to_owned()).collect();
-    assert_eq!(keys, listed);
+fn the_keys_of_a_table_are_read_from_its_struct() {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct Planted {
+        first: u8,
+        second: Option<u8>,
+        added_later: Option<bool>,
+    }
+    let planted: Vec<String> = table_keys::<Planted>("t").into_iter().collect();
+    assert_eq!(planted, ["t.added_later", "t.first", "t.second"]);
+    let code = code();
+    assert!(code.cache_keys.contains("local_cache.path"));
+    assert!(code.cache_keys.contains("local_cache.write_through"));
+    assert!(code.policy_keys.contains("policy.prefix"));
+    assert!(code.policy_keys.contains("policy.cache"));
 }
 
 /// Asserts that a key that the table does not have is found, in a span and in a TOML block, and

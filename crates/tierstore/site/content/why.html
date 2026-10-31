@@ -27,7 +27,7 @@
 <p>The copy-back means the hot tier also works as a read cache of what was used lately. On a storage node that is the only caching.</p>
 
 <h2 id="cache">The per-node read-through cache is a build node</h2>
-<p>The crate has a <code>CachedStore</code>, a read cache in RAM for any backend. The <code>tierstore</code> binary does not use it. Its per-node cache is on disk: a configuration file (on main, not yet in a release) with <code>[local_cache]</code> and <code>[cold_store]</code> and no <code>[hot_store]</code> runs the binary as a read cache in front of one upstream. It serves GET and HEAD of the keys that a <code>[[policy]]</code> with <code>cache = true</code> holds from a directory of raw files, fills it from the upstream on a miss, evicts the least recently used objects under a byte budget, refuses every write, and does not scrub. It has no flag form. See <a href="/docs/configuration/#a-file-for-a-build-node">configuration</a>.</p>
+<p>The crate has a <code>CachedStore</code>, a read cache in RAM for any backend. The <code>tierstore</code> binary does not use it. Its per-node cache is on disk: a configuration file (from v0.0.40) with <code>[local_cache]</code> and <code>[cold_store]</code> and no <code>[hot_store]</code> runs the binary as a read cache in front of one upstream. It serves GET and HEAD of the keys that a <code>[[policy]]</code> with <code>cache = true</code> holds from a directory of raw files, fills it from the upstream on a miss, evicts the least recently used objects under a byte budget, refuses every write, and does not scrub. It has no flag form. See <a href="/docs/configuration/#a-file-for-a-build-node">configuration</a>.</p>
 
 <h2 id="guards">What keeps it honest</h2>
 <ul>

@@ -16,9 +16,9 @@ import { DOCS, read, SITE } from './support';
 const SRC = resolve(SITE, '..', 'src');
 const isTestFile = (f: string): boolean => /(_tests|_testing|testing)\.rs$/.test(f);
 
-/** The binary's own source: main.rs and the server module's files that are not tests. */
+/** The binary's own source: main.rs, the tiers' counters (metrics.rs) and the server module's files that are not tests. */
 function binarySource(): Map<string, string> {
-  const files = new Map<string, string>([['main.rs', read(SRC, 'main.rs')]]);
+  const files = new Map<string, string>([['main.rs', read(SRC, 'main.rs')], ['metrics.rs', read(SRC, 'metrics.rs')]]);
   const walk = (dir: string): void => {
     for (const e of readdirSync(join(SRC, dir), { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       if (e.isDirectory()) walk(`${dir}/${e.name}`);
@@ -29,6 +29,9 @@ function binarySource(): Map<string, string> {
   return files;
 }
 
+/** The files that export metrics: the OCI front's, the cache's and the tiers'. */
+const EXPORTERS = new Set(['server/oci/metrics.rs', 'server/local_cache/metrics.rs', 'metrics.rs']);
+
 /** What in the source no longer matches the pages. Each problem names the pages to change. */
 export function staleClaims(src: ReadonlyMap<string, string>): string[] {
   const out: string[] = [];
@@ -38,7 +41,7 @@ export function staleClaims(src: ReadonlyMap<string, string>): string[] {
     out.push('config.rs no longer reads a build node ([local_cache] with [cold_store]): update docs/configuration.md, docs/operations.md ("A build node"), content/why.html and content/index.html (the status table)');
   }
   for (const [name, text] of all) {
-    if (name !== 'server/oci/metrics.rs' && name !== 'server/local_cache/metrics.rs' && /# TYPE |tierstore_cache_\{/.test(text)) out.push(`${name} exports metrics: the OCI front's and the cache's counters were the only ones; update docs/operations.md ("Metrics"), docs/metrics.md and content/why.html ("Where it stops")`);
+    if (!EXPORTERS.has(name) && /# TYPE |tierstore_cache_\{/.test(text)) out.push(`${name} exports metrics: the counters of the OCI front, the cache and the tiers (EXPORTERS) were the only ones; update docs/operations.md ("Metrics"), docs/metrics.md and content/why.html ("Where it stops")`);
     if (/\bCachedStore\b/.test(text)) out.push(`${name} uses CachedStore: the binary has a cache now; update content/why.html ("The per-node read-through cache is not in the binary") and content/index.html`);
   }
   const routes = new Set([...(src.get('server/mod.rs') ?? '').matchAll(/\(true, "(\/[a-z]+)"/g)].map((m) => m[1]));

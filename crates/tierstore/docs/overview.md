@@ -4,7 +4,7 @@ tierstore is an S3-compatible object store server that puts a small, fast tier i
 
 This guide is for the person who installs and runs it. It describes what is on the main branch of the source today. A piece that is planned and not in the code is described only under a heading titled "Not in a release yet", so you can tell the two apart.
 
-> The configuration file (`--config`, `--print-config`) and the OCI read front (`--oci-listen`) are on main and are not in the latest release (v0.0.38). The command-line flags of every other setting work in every release. The node-local read cache (a build node, `[local_cache]`) is on main too and has no flag form. The pages say where a setting needs a build of main.
+> Which release first carries what: the configuration file (`--config`, `--print-config`) came with v0.0.39; the OCI read front (`--oci-listen`) and the build node (`[local_cache]`, the read cache) with v0.0.40. `--check-config`, `local_cache.write_through` and the hot and cold counters on `/metricz` are on main and not in v0.0.40. The command-line flags of every other setting work in every release. The pages say where a setting needs a build of main.
 
 ## The shape of a deployment
 

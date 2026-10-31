@@ -37,7 +37,7 @@ The JSON form needs exactly the two fields, both non-empty; a file with another 
 
 ## File permissions
 
-Each key file must be owned by the user the server runs as, with mode 0600 or 0400. The process refuses a file that its group or others can access, and, for GC and scoped keys, a symbolic link. No message of the process carries a secret. The server reads the environment for nothing, and a secret is never on the command line or in the configuration file: the file holds only the paths of key files.
+Each key file must be owned by the user the server runs as, with mode 0600 or 0400. The process refuses a file that its group or others can access, and a symbolic link (for any key file). No message of the process carries a secret. The server reads the environment for nothing, and a secret is never on the command line or in the configuration file: the file holds only the paths of key files.
 
 The access key ids of all the keys of one server must differ, because a request names its key by its id. A start with two keys that share an id is refused with exit status 2.
 
