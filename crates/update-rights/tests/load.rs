@@ -914,9 +914,9 @@ fn a_root_hook_may_write_only_below_a_directory_named_for_its_service() {
     let host = Host::new("service-dirs");
     for account in ["root", "toor"] {
         for path in [
-            "/var/lib/sudo",
-            "/run/udev",
-            "/var/lib/cloud",
+            "/var/lib/chrony",
+            "/run/chrony",
+            "/var/lib/other",
             "/var/lib/tierstorex",
             "/var/cache/other/tierstore",
         ] {
@@ -951,7 +951,7 @@ fn a_root_hook_may_write_only_below_a_directory_named_for_its_service() {
         assert!(loaded.refused.is_empty(), "{account}: {:?}", loaded.refused);
     }
     let mut ordinary = Spec::new("tierstore");
-    ordinary.write = vec!["/var/lib/sudo".to_owned()];
+    ordinary.write = vec!["/var/lib/chrony".to_owned()];
     host.put(&ordinary);
     assert!(host.load().refused.is_empty());
 }
