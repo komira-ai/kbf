@@ -49,6 +49,12 @@ pub const AUDIT_RING: usize = 64;
 /// Who an operator change is logged as: the holder of the operator token.
 pub const OPERATOR: &str = "operator";
 
+/// The most hosts with labels the file holds. Raise it here if a farm needs more.
+pub const MAX_HOSTS: usize = 4096;
+
+/// The most exclusions the file holds. Raise it here if a farm needs more.
+pub const MAX_EXCLUDED: usize = 4096;
+
 /// The most labels one host has.
 pub const MAX_LABELS: usize = 8;
 
