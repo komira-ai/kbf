@@ -152,7 +152,35 @@ After a crash of a service: its strategy is not involved; systemd restarts it pe
 
 Written by the tierstore owner for the service side; the mechanics of the forward are here because they are updater-side.
 
-<!-- TIERSTORE-OWNER-SUMMARY: 15 to 25 lines, and the link to docs/design/tierstore-handover.md. Covers the service side: read-only mode, the lock and the `promote` verb v-next offers, the lease, proxy id and journal, the drain fixes and tierstore's own failure cases. Do not repeat the nftables mechanics below. -->
+**Service side.** The full contract, with code references, failure cases and tests, is in
+[tierstore-handover.md](tierstore-handover.md).
+
+Registers: name `tierstore`, strategy id `port-forward-handover`, health `GET /readyz` on the instance's
+private port (exists), version from a new `tierstore_build_info` gauge (today only the start line and
+`--version` carry it, and that is the crate version, not a commit).
+
+What v-next offers, and what is new in tierstore:
+- **Read-only start** (`--read-only-cache`, new). It serves hits from the cache and sends misses and writes to the
+  upstream. It must not clear `.stage/`, delete sidecars, chmod, drop entries on a read error, or stamp file times;
+  each of those happens on today's start or read path.
+- **The cache lock** (new): `<cache>/.lock`, flock, exclusive, non-blocking, held by the read-write instance.
+  The kernel frees it when the process dies.
+- **`promote`** (new): SIGUSR1, not an HTTP route. Once the rule points at an instance, every route on its port is
+  reachable by any client. Promote takes the lock, cleans `.stage/`, rescans the index, and enables fills and
+  eviction. On a storage node it also starts the reconciler. The ack is a cache-mode gauge.
+- **The drain** (changed): `Connection: close` on every answer from drain start. v-current keeps accepting through
+  the settle wait (`--drain-lb-wait`, never 0 here). At the end of the settle, idle connections close, and a request
+  already on the wire is served, not answered 503. Today's drain answers 503 on kept connections.
+
+Storage node: each slot has its own proxy id (`tierstore-a` and `tierstore-b`), so two processes never write one
+journal. v-next does not run the reconciler until it is promoted; v-current releases the lease on exit. A `dir:`
+hot tier cannot have two lease holders, so it keeps the plain restart. A restarted holder can reproduce an older
+lease body and tag (kbf#2108); a per-process nonce fixes that before the hand-over relies on the lease.
+
+Metrics: the directory gauges (`cache_bytes`, `cache_objects`, `cache_fs_free_bytes`) double-count while both
+instances run, and the fill and evict families stay 0 on v-next. No family names a slot or mode today; the build
+and mode gauges are new. Needed from the mechanics below: established flows stay on v-current, and the private
+ports are loopback-only (the guard closes the `route_localnet` trap).
 
 **Shape [D].** Clients always call the public port, here 9300. No process listens on it. Each tierstore instance listens on its own private port, 9301 or 9302, alternating. One nftables redirect per family sends public-port connections to the current instance. An update starts v-next on the idle private port, waits for its `/readyz`, swaps the rule in one transaction, lets v-current drain on the flows conntrack still maps to it, and then asks v-next to take over the cache (the **promote** verb described in the tierstore owner's section). Rollback before the commit point is swapping the rule back.
 
