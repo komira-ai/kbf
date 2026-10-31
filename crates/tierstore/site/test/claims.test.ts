@@ -69,7 +69,9 @@ test('the code still matches those statements', () => {
 test('the check can fail: a second metrics exporter, a CachedStore use and a dropped build-node shape are each reported with the page to change', () => {
   const real = binarySource();
   const with_ = (name: string, f: (s: string) => string): Map<string, string> => new Map([...real].map(([k, v]) => [k, k === name ? f(v) : v]));
-  assert.match(staleClaims(with_('server/mod.rs', (s) => s + '\n# TYPE x counter')).join('\n'), /exports metrics.*docs\/operations\.md/);
+  // Planted in a file that is no exporter, so a file added to EXPORTERS later does not hide it.
+  const planted = new Map([...real, ['server/planted.rs', '# TYPE x counter']]);
+  assert.match(staleClaims(planted).join('\n'), /server\/planted\.rs exports metrics.*docs\/operations\.md/);
   assert.match(staleClaims(with_('main.rs', (s) => s + '\nuse tierstore::CachedStore;')).join('\n'), /uses CachedStore.*content\/why\.html/);
   assert.match(staleClaims(with_('server/config.rs', (s) => s.replace('build-node shape', 'ok'))).join('\n'), /no longer reads a build node.*docs\/configuration\.md/);
   assert.match(staleClaims(with_('server/mod.rs', (s) => s.replace('"/usagez"', '"/usagez2"'))).join('\n'), /probe routes/);
@@ -81,9 +83,11 @@ test('every output line of the demo is a string the program prints', () => {
   assert.ok(mod.includes('no usage yet, {secs}s since start'), 'the /usagez body changed: update content/demo.html and docs/operations.md');
   assert.ok(mod.includes('usage published {secs}s ago'), 'the /usagez body changed: update content/demo.html and docs/operations.md');
   const cli = binarySource().get('server/cli.rs') as string;
-  for (const line of ['tierstore: testing the {name}', 'tierstore: tested the {name} in {took} ms', 'tierstore {version} listen={}']) {
+  for (const line of ['tierstore: testing the {name}', 'tierstore: tested the {name} in {took} ms']) {
     assert.ok(cli.includes(line), `"${line}" is not in server/cli.rs: update content/demo.html`);
   }
+  // The start line, whatever the name of its version argument: `tierstore {version} listen=...`.
+  assert.match(cli, /"tierstore \{[A-Za-z_]+\} listen=\{/, 'the start line "tierstore <version> listen=<address>" is not in server/cli.rs: update content/demo.html');
   const demo = page('demo');
   for (const shown of ['tierstore: testing the hot tier', 'tierstore: tested the cold tier', 'tierstore &lt;version&gt; listen=127.0.0.1:9000', '<span class="o">ok</span>', '<span class="o">ready</span>', '<span class="o">draining</span>']) {
     assert.ok(demo.includes(shown), `the demo no longer shows ${shown}`);
