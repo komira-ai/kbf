@@ -318,10 +318,10 @@ jobs:
         working-directory: previous
         run: sha256sum --check --strict SHA256SUMS
       # The release before the build jobs recorded version facts has none, and the same for the
-      # facts of the task image (`kbf-task-image-<commit>-<platform>.facts.json`): the flag waives
-      # both kinds, and this is the only check that waives them: the release being made
-      # (`release check dist`) never does. Remove the flag once the release before this one was
-      # made with both kinds of facts.
+      # facts of the task image (`kbf-task-image-<commit>-<platform>.facts.json`) and its CycloneDX
+      # SBOM (`kbf-task-image-<commit>-<platform>.cdx.json`): the flag waives all three kinds, and
+      # this is the only check that waives them: the release being made (`release check dist`)
+      # never does. Remove the flag once the release before this one was made with all three.
       - name: Every one is an asset of the previous release's commit, with its bundle
         if: ${{ steps.previous.outputs.previous != '' }}
         env:

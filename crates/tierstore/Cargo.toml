@@ -1,6 +1,8 @@
 [package]
 name = "tierstore"
-version.workspace = true
+# Its own version, not the workspace's: 0.2.0 is the first release whose cache node can write
+# through (`[local_cache] write_through`), which `tierstore --version` shows.
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -39,6 +41,9 @@ server = [
     "dep:ring",
     "dep:rustix",
     "dep:roxmltree",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:x509-parser",
     "dep:toml",
     "s3",
     "tokio/macros",
@@ -87,6 +92,9 @@ ring = { workspace = true, optional = true }
 rustix = { workspace = true, features = ["fs", "process"], optional = true }
 # The body of a CompleteMultipartUpload request (`server`).
 roxmltree = { workspace = true, optional = true }
+# The TLS of the OCI read front (`server`): the certificate and key are read at start, and the
+# acceptor is made with the ring provider the rest of the workspace uses.
+rustls = { workspace = true, optional = true }
 # The journal objects, the checkpoints and the usage object are JSON.
 serde.workspace = true
 serde_json.workspace = true
@@ -98,6 +106,10 @@ toml = { workspace = true, optional = true }
 # `sync` for the batches of the journal, `time` for the linger, the back-pressure and the
 # injected delays.
 tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
+# The handshake of the OCI read front's connections (`server`).
+tokio-rustls = { workspace = true, optional = true }
+# The IP subjectAltNames of the OCI front's certificate, which the start checks (`server`).
+x509-parser = { workspace = true, optional = true }
 
 [dev-dependencies]
 # A stock S3 SDK (aws-sdk-rust) and its plain-HTTP client, which tests/s3_front/sdk.rs drives
@@ -113,8 +125,13 @@ hmac.workspace = true
 kbf-objstore = { workspace = true, features = ["testkit"] }
 # Scratch directories and key files of the tests of the binary.
 kbf-testkit.workspace = true
+# A test CA and a leaf with IP subjectAltNames, for the tests of the OCI read front.
+rcgen.workspace = true
 # Sends the requests the S3 client does not: unsigned ones and ones signed by hand.
 reqwest.workspace = true
+# The TLS client of the tests of the OCI read front.
+rustls.workspace = true
+tokio-rustls.workspace = true
 # SIGTERM to the binary.
 rustix = { workspace = true, features = ["process"] }
 # Turns the `server` feature on for this crate's own tests, and for the clippy and coverage

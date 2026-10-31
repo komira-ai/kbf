@@ -359,6 +359,22 @@ fn the_settings_are_made_from_the_flags() {
     assert_eq!(built.reconciler.retention, Duration::from_secs(24 * 3600));
 }
 
+/// Asserts that a file whose `[server] bucket` is the name of a probe path, `metricz` among them,
+/// is refused as the flag is, naming the probe path. It would catch a file that reaches the
+/// server with a bucket the probe answers for.
+#[test]
+fn a_file_with_a_probe_path_as_the_bucket_is_refused() {
+    use crate::server::config::from_text;
+    use crate::server::config_testing::{DEFAULTS, MINIMAL};
+    for name in ["healthz", "readyz", "usagez", "metricz"] {
+        let text = MINIMAL.replacen("tier-bucket", name, 1);
+        let cli = from_text(&text, DEFAULTS).unwrap();
+        assert_eq!(cli.bucket, name);
+        let why = build(&cli).err().expect("refused").to_string();
+        assert!(why.contains("probe path"), "{name}: {why}");
+    }
+}
+
 /// Asserts that flags that do not fit together are refused with a message that names them: the
 /// water marks out of order, a reconcile interval that is not shorter than the lease, a bucket
 /// called like a probe path, an idle timeout of zero, a request timeout of zero for the S3
@@ -383,6 +399,7 @@ fn flags_that_do_not_fit_together_are_refused() {
     assert!(refused(&|cli| cli.bucket = "readyz".to_owned()).contains("probe path"));
     assert!(refused(&|cli| cli.bucket = "healthz".to_owned()).contains("probe path"));
     assert!(refused(&|cli| cli.bucket = "usagez".to_owned()).contains("probe path"));
+    assert!(refused(&|cli| cli.bucket = "metricz".to_owned()).contains("probe path"));
     let idle = refused(&|cli| cli.body_idle_timeout = Duration::ZERO);
     assert!(idle.contains("--body-idle-timeout"), "{idle}");
     let wait = refused(&|cli| cli.s3_request_timeout = Duration::ZERO);

@@ -18,8 +18,8 @@ build.
 
 ## Pull request labels
 
-A pull request runs the two jobs of `ci.yml` (`lint`, and `test` on the fast set) and nothing
-else; the full suite, the macOS jobs and the packages run on a push to `main`
+A pull request runs `ci.yml` (the checks `lint` and `test`, which gates the coverage of the fast set
+run in the `test-shard` matrix beside it) and nothing else; the full suite, the macOS jobs and the packages run on a push to `main`
 (`beta.yml`). One label opts a pull request in to more, to spare the small
 macOS runner pool. Adding it to an open pull request starts a run.
 
@@ -102,7 +102,7 @@ tools above, and its tarball holds one member, the binary under its own name. Th
 not update it: the farm places it, and the example unit and the flags to fill in are in
 [`packaging/tierstore`](../packaging/tierstore/README.md).
 
-The packages are the two Linux jobs' debs (one each) and container images (three each, and the facts of the task image), and the macOS job's `.pkg`:
+The packages are the two Linux jobs' debs (one each) and container images (three each, and the facts and the SBOM of the task image), and the macOS job's `.pkg`:
 
 | Asset | Built by | Holds |
 |---|---|---|
@@ -116,6 +116,8 @@ The packages are the two Linux jobs' debs (one each) and container images (three
 | `kbf-task-image-<commit>-linux-arm64.oci.tar` | the `linux-arm64` job | the same for arm64, on the arm64 manifest of the same base |
 | `kbf-task-image-<commit>-linux-x86_64.facts.json` | the `linux-x86_64` job (`pkg-image-asset`) | the digest of the task image's manifest, of its config and of its layers, and the digest of the base manifest it is built on |
 | `kbf-task-image-<commit>-linux-arm64.facts.json` | the `linux-arm64` job | the same for arm64 |
+| `kbf-task-image-<commit>-linux-x86_64.cdx.json` | the `linux-x86_64` job (`pkg-image-sbom`, syft) | the CycloneDX SBOM of the task image, read from its layers: the packages of the Ubuntu base and the `kbf-task`; the SBOM of the `kbf-task` tarball describes the binary alone |
+| `kbf-task-image-<commit>-linux-arm64.cdx.json` | the `linux-arm64` job | the same for arm64 |
 | `kbf-installer-<commit>-darwin-arm64.pkg` | the `darwin-arm64` job (`macos-15`, `cargo xtask pkg build`) | the `kbf-installer` of the tarball of the same name, its LaunchDaemon property list, the pinned darwin `gh` and a trust directory |
 
 The set above is pinned: `crates/kbf-integration-test/tests/release_artifacts` fails a pull request
@@ -174,7 +176,8 @@ listed `kbf` tarball whose `kbf-<commit>-<platform>.version.json` is not listed,
 listed facts file whose `kbf` tarball is not; `release check` takes that name and no other
 `.version.json`, and `release offer` calls a platform incomplete without its facts, whatever
 other tarballs it lists. The release made before the build jobs recorded the facts has none:
-`release check --without-version-facts` waives the first rule (and nothing else), and
+`release check --without-version-facts` waives the first rule (and nothing else; it waives the same for the task image,
+which a release lists with its facts and its SBOM: the rules of [the images](#the-frontend-and-coordinator-images-oci) below), and
 `release.yml` gives it to the check of the previous release only (the lint holds that); remove
 the flag once the release before the one being made was made with the facts. The workflow lint
 (`crates/kbf-integration-test/tests/release_artifacts`) names a build job that does not run
@@ -285,7 +288,7 @@ renamed.
 | Event | What happens |
 |---|---|
 | Pull request, merge queue | A build check: every asset is built, signed, packaged and summed, and `SHA256SUMS` is checked. Nothing is attested, so nothing is published. |
-| Push to `main` | The same, as the second stage of the one pipeline (`pipeline.yml`: `ci` and `beta` (the source tests) together, `artifacts` (the builds and sums, `stage: build`) beside them, `artifacts-sign` (the attest and verify jobs, `stage: sign`) after `ci` and `artifacts`, `smoke` on these files after `artifacts-sign`, then the release; `artifacts.yml` is called twice by it, and reads the push as its own event; the attest jobs are in that file because it is the signer identity the installers verify), then, per platform group (Linux: `sums-linux`, `attest-linux`, `verify-linux`; macOS: `sums-darwin-arm64`, `attest-darwin-arm64`, `verify-darwin-arm64`, so the Linux files are attested as soon as the Linux builds finish, however long the macOS runners queue), the `attest-*` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`), an SBOM attestation for every tarball (`actions/attest-sbom`) and a build provenance attestation of each tarball alone, whose bundle it saves (artifact `bundles-linux` or `bundles-darwin-arm64`), and nothing else. The `verify-*` job of the group then assembles the group's `SHA256SUMS` (artifact `sha256sums-linux` or `sha256sums-darwin-arm64`, listing only that group's files, each with the same subject as in the commit's one `SHA256SUMS`) again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below, for the branch that was pushed (`--source-ref "$GITHUB_REF"`), and every tarball against its bundle, offline, for the commit (`--commit "$GITHUB_SHA"`). |
+| Push to `main` | The same, as the second stage of the one pipeline (`pipeline.yml`: `ci` and `beta` (the source tests) together, `artifacts` (the builds and sums, `stage: build`) beside them, `artifacts-sign` (the attest and verify jobs, `stage: sign`) after `ci` and `artifacts`, `smoke` on these files after `artifacts-sign`, then the release; `artifacts.yml` is called twice by it, and reads the push as its own event; the attest jobs are in that file because it is the signer identity the installers verify), then, per platform group (Linux: `sums-linux`, `attest-linux`, `verify-linux`; macOS: `sums-darwin-arm64`, `attest-darwin-arm64`, `verify-darwin-arm64`, so the Linux files are attested as soon as the Linux builds finish, however long the macOS runners queue), the `attest-*` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`), an SBOM attestation for every tarball and for the task image (`actions/attest-sbom`) and a build provenance attestation of each tarball alone, whose bundle it saves (artifact `bundles-linux` or `bundles-darwin-arm64`), and nothing else. The `verify-*` job of the group then assembles the group's `SHA256SUMS` (artifact `sha256sums-linux` or `sha256sums-darwin-arm64`, listing only that group's files, each with the same subject as in the commit's one `SHA256SUMS`) again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below, for the branch that was pushed (`--source-ref "$GITHUB_REF"`), and every tarball against its bundle, offline, for the commit (`--commit "$GITHUB_SHA"`). |
 
 An attestation names the ref it was signed on, and only `refs/heads/main` signs now.
 Until main became the only integration branch, pushes to a development branch,
@@ -306,7 +309,8 @@ actions and for a `cp` that names each bundle (below). Every action is pinned by
 SHA, and that lint refuses one that is not.
 
 The attest job of a platform group names each tarball of the group and its SBOM, one `actions/attest-sbom` step per
-tarball, and runs only on a push to one of those two branches. So that a binary added to a build job cannot reach
+tarball (and, in the Linux group, one for each task image, whose subject is the image tarball and whose SBOM is the image's own,
+`kbf-task-image-<commit>-<platform>.cdx.json`), and runs only on a push to one of those two branches. So that a binary added to a build job cannot reach
 `main` without its step, the repository lint (`crates/kbf-integration-test/tests/attested_assets`)
 reads the workflow's `cargo xtask package` lines and its attest steps on every pull
 request, and refuses a packaged tarball with no step pairing it with its own SBOM, or a
@@ -619,12 +623,28 @@ without their image, and `verify-assets attestations` checks the facts for build
 SBOM. They carry no bundle and no SBOM attestation of their own; the attestation of `SHA256SUMS`
 that covers every other file covers them.
 
+Also for the task image, `cargo xtask pkg-image-sbom` (after the image is an asset) writes
+`kbf-task-image-<commit>-<platform>.cdx.json` beside it and lists it in `SHA256SUMS`: the CycloneDX SBOM syft
+reads from the image's OCI layout, so it lists the deb packages of the Ubuntu base as well as the `kbf-task`.
+syft is fetched by version and by the SHA-256 of its release archive (`SYFT_VERSION`, `SYFT_SHA256_X86_64_LINUX`
+and `SYFT_SHA256_AARCH64_LINUX` in the workflow), as nfpm and `gh` are. The file is reproducible: syft stamps a
+random `serialNumber` and the time it ran, so `pkg-image-sbom` replaces them with a UUID made of the digest of the
+image's manifest and with the commit's time (`SOURCE_DATE_EPOCH`, the one the image's own build uses); the rest of
+what syft prints is a function of the image and of syft's version. (The SBOM is attested, and is not one of the two
+files the job compares: the two image builds are.) `pkg-image-sbom` refuses a document that is not CycloneDX, that
+is not of a container whose version is the image's manifest digest, that lists no deb package, or that is over
+8 MiB. `pkg-image-sbom --verify-only` makes the same checks on the SBOM beside the signed image, in the verify job.
+`verify-assets sums` refuses a listed task image without its SBOM (the previous release, read with
+`--without-version-facts`, may lack it, like the facts) and an SBOM without its image.
+
 It is attested like a deb: build provenance (one subject of the `SHA256SUMS` attestation, and alone,
 with its bundle `kbf-<service>-image-<commit>-<platform>.oci.tar.sigstore.json` in `bundles-linux`)
-and **no SBOM attestation**. The `kbf` of the frontend image has the SBOM of its tarball. The
-coordinator has no tarball and so no SBOM asset yet; the task runner's SBOM is that of its tarball,
-which describes the binary and not the Ubuntu base the task image carries, so it is not attested as the image's
-(an SBOM of the whole image needs a tool that reads the base's packages; that is not in the release yet). The verify job checks both
+and **no SBOM attestation**, except the task image's: it also has an SBOM attestation (`actions/attest-sbom`, predicate
+type `https://cyclonedx.org/bom`) whose subject is the image tarball and whose SBOM is its own
+`kbf-task-image-<commit>-<platform>.cdx.json`, which `verify-assets attestations` requires exactly when the sums list that
+SBOM. The `kbf` of the frontend image has the SBOM of its tarball. The
+coordinator has no tarball and so no SBOM asset yet; the task runner's SBOM that is the tarball's describes the binary and
+not the Ubuntu base the task image carries, so it is not attested as the image's: the image has its own. The verify job checks both
 offline and runs `cargo xtask pkg-image-asset --verify-only` on each signed file (for the
 coordinator and the task runner that makes the checks of the image alone: the verify job has not the binary the build
 compared it with). Verify one before loading it, as for the `kbf` deb above:
