@@ -88,8 +88,9 @@ use tokio::sync::{Notify, watch};
 
 use crate::s3::{Capabilities, Credentials, S3Config};
 use crate::{
-    Backend, Check, Clock, DirBackend, MemoryBackend, Proxy, ProxyConfig, Reconciler,
-    ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SystemClock, self_test,
+    Backend, Check, Clock, DirBackend, MemoryBackend, MonotonicClock, Proxy, ProxyConfig,
+    Reconciler, ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SweepBudget,
+    SystemClock, self_test, sweep_probes,
 };
 
 use super::cache_cli::serve_cache_until_signalled;
@@ -812,6 +813,10 @@ async fn probe_tiers(
         let took = started.elapsed().as_millis();
         eprintln!("tierstore: tested the {name} in {took} ms");
         outcome?;
+        // Bounded in the keys and in the time after which no delete starts, on a clock that
+        // setting the machine's clock does not move.
+        let budget = SweepBudget::default();
+        sweep_probes(backend, &options, budget, &MonotonicClock::new(), &note).await;
     }
     Ok(())
 }

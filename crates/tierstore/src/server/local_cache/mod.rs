@@ -12,6 +12,10 @@
 //! With [`CacheConfig::write_through`] (`write_through = true` in `[local_cache]`) the cache
 //! accepts writes and sends every one of them to the upstream: nothing is acknowledged before
 //! the upstream has it, and nothing is only local. The module `write` has what each call does.
+//! A create-only put under a `cache = true` policy is also kept on the node (module `keep`):
+//! the body is copied to `.stage/` as it streams to the upstream, and once the upstream has
+//! acknowledged it and said what tag it gave the object, the copy is put in the cache before the
+//! answer. That copy is best effort and never fails the put.
 //! Without the setting every write call of the [`Backend`] is `Unsupported`, as the front
 //! refuses it before.
 //!
@@ -72,6 +76,7 @@ mod disk;
 mod evict;
 mod fill;
 mod index;
+mod keep;
 pub(super) mod layout;
 mod listing;
 mod metrics;
@@ -86,6 +91,10 @@ mod fill_tests;
 mod front_tests;
 #[cfg(test)]
 mod hit_tests;
+#[cfg(test)]
+mod keep_s3_tests;
+#[cfg(test)]
+mod keep_tests;
 #[cfg(test)]
 mod limits_tests;
 #[cfg(test)]
@@ -109,6 +118,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -134,6 +144,17 @@ pub const FILL_CHUNK: u64 = 8 << 20;
 
 /// The fills that may run at once, unless the settings say otherwise.
 pub const MAX_CONCURRENT_FILLS: usize = 4;
+
+/// The keeps of a put that may run at once, unless the settings say otherwise.
+pub const MAX_CONCURRENT_KEEPS: usize = 8;
+
+/// How long a put waits for its keep after the upstream has the object, unless the settings say
+/// otherwise.
+pub const KEEP_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a keep may run in all, from the upstream's acknowledgement, before it is abandoned,
+/// unless the settings say otherwise.
+pub const KEEP_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The text of the refusal of a write at the Backend level (the front refuses it earlier).
 const READ_ONLY: &str = "this tierstore is a read cache";
@@ -163,6 +184,17 @@ pub struct CacheConfig {
     /// The most fills that run at once. A miss that finds all of them running is served from
     /// the upstream and keeps nothing. At least one (0 is read as 1).
     pub max_concurrent_fills: usize,
+    /// The most create-only puts that are copied to the stage directory at once, apart from the
+    /// fills. A put that finds them all running is not kept. At least one (0 is read as 1).
+    pub max_concurrent_keeps: usize,
+    /// The longest a put waits, after the upstream has the object, for its copy to be put in the
+    /// cache. Past it the put is answered and the keep goes on in the background; the object is
+    /// at the upstream either way, so a read that misses costs only the trip.
+    pub keep_wait: Duration,
+    /// The longest a keep runs, from the upstream's acknowledgement, before it is abandoned (its
+    /// stage file removed, its permit and room given back, its place in the table of the fills
+    /// freed) and counted as `deadline`. Not below `keep_wait`.
+    pub keep_deadline: Duration,
     /// Whether the cache takes writes and sends them to the upstream. Off, every write call is
     /// `Unsupported`. The binary sets the front's `cache_writes` from the same setting, so that
     /// the front does not refuse the writes either.
@@ -185,6 +217,9 @@ impl CacheConfig {
             fill_chunk: FILL_CHUNK,
             whole_limit: WHOLE_FILL_LIMIT,
             max_concurrent_fills: MAX_CONCURRENT_FILLS,
+            max_concurrent_keeps: MAX_CONCURRENT_KEEPS,
+            keep_wait: KEEP_WAIT,
+            keep_deadline: KEEP_DEADLINE,
             write_through: false,
         }
     }
@@ -262,6 +297,11 @@ pub(super) struct Inner {
     reserved: AtomicU64,
     /// One permit for each fill that may run; a fill holds one until it ends.
     permits: Arc<Semaphore>,
+    /// One permit for each put that may be copied to the stage directory; held until it ends.
+    keeps: Arc<Semaphore>,
+    /// Run by a test just before a kept object is put in the index (see `keep`).
+    #[cfg(test)]
+    before_insert: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Whether a pass of the eviction is running.
     evicting: AtomicBool,
 }
@@ -299,6 +339,7 @@ impl LocalCache {
         let counters = Counters::default();
         add(&counters.discarded_at_start, scanned.discarded + removed);
         let permits = Arc::new(Semaphore::new(config.max_concurrent_fills.max(1)));
+        let keeps = Arc::new(Semaphore::new(config.max_concurrent_keeps.max(1)));
         let inner = Inner {
             upstream,
             disk,
@@ -311,6 +352,9 @@ impl LocalCache {
             staged: AtomicU64::new(0),
             reserved: AtomicU64::new(0),
             permits,
+            keeps,
+            #[cfg(test)]
+            before_insert: Mutex::new(None),
             evicting: AtomicBool::new(false),
         };
         Ok(Self {
