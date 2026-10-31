@@ -69,6 +69,8 @@ To restart for a new binary or a new key file, replace the file, then `systemctl
 
 Before it serves, the process asks each tier, under a probe key in `_tiering/selftest/` that is new for each start and deleted afterwards, the questions its guarantees rest on: a create-only put refuses a key that exists, an `If-Match` put replaces only on the right content tag, a range read gives the range, a head has `Last-Modified`, a listing honors `start-after`, and on the cold tier a multipart completion is create-only. A tier that answers one wrongly exits the process with status 3, naming the tier, the check and the answer. A tier that cannot be reached is asked again, with pauses from one second doubling to thirty, for `--backend-check-wait` (5m), and then the start exits 1.
 
+The same prefix can hold probe keys that a start which was killed left behind. A start deletes the ones older than an hour, at most 100 keys and for at most 10 seconds each time, and writes one line to stderr: `tierstore: <tier>: swept N stale probe keys in T ms`, with `(more left)` when a limit stopped it; the rest is deleted at a later start. A storage node does this after the checks and before it binds its address, so it waits at most those 10 seconds for each tier. A build node with `write_through` does it after it has printed its ready line, beside the server, so the sweep never delays readiness.
+
 `--skip-backend-check multipart-conditional=<reason>` leaves out the last check, for a store you have shown to be safe another way; the reason is written to stderr at every start. No other check can be skipped.
 
 ## A build node
