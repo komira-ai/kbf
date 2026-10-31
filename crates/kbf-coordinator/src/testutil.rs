@@ -30,6 +30,12 @@ pub fn beat(running: &str) -> Heartbeat {
         last_update: None,
         updating: None,
         services: None,
+        agent_features: Vec::new(),
+        step: None,
+        commit: None,
+        step_secs: Default::default(),
+        promotion_pending: false,
+        deferred: None,
     }
 }
 
@@ -44,10 +50,7 @@ pub fn updating(mut b: Heartbeat, target: &str) -> Heartbeat {
 }
 
 pub fn last(mut b: Heartbeat, target: &str, outcome: Outcome) -> Heartbeat {
-    b.last_update = Some(UpdateResult {
-        target: version(target),
-        outcome,
-    });
+    b.last_update = Some(UpdateResult::new(version(target), outcome));
     b
 }
 

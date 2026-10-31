@@ -64,10 +64,7 @@ pub struct Update<'a> {
 }
 
 fn result(target: &Version, outcome: Outcome) -> UpdateResult {
-    UpdateResult {
-        target: target.clone(),
-        outcome,
-    }
+    UpdateResult::new(target.clone(), outcome)
 }
 
 impl Update<'_> {
