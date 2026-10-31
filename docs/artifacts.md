@@ -34,7 +34,7 @@ the package tests) runs in `beta.yml` on every push and never on a pull request;
 
 ## What is built
 
-25 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
+23 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), two Debian packages of `kbf`
 ([below](#the-kbf-package-deb)), one frontend, one update coordinator and one task runner container image per
 Linux architecture ([below](#the-frontend-and-coordinator-images-oci)) and one macOS package of `kbf-installer`

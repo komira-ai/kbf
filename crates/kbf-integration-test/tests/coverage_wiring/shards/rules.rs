@@ -125,7 +125,10 @@ fn each_drift_of_the_partition_is_refused() {
             "the `legacy` entries do not all say `parts: 2`, so their parts are of different splits",
         ),
         (
-            legacy_only(&format!("{l1}{}{js}", entry("legacy", 2, 2, "--workspace"))),
+            legacy_only(&format!(
+                "{l1}{}{js}",
+                entry("legacy", 2, 2, "--workspace --exclude kbf-front")
+            )),
             "the `legacy` entries do not run the same packages (`args`), so the parts are not parts of one set of tests",
         ),
         (
