@@ -156,7 +156,9 @@ impl Origin {
     /// The (repository, workflow) pairs an attestation of this origin's releases may name:
     /// for kbf's own pair also its former name (the transition), else only the pair. The
     /// `tierstore` asset (by its prefix, nothing else) also accepts kbf's pairs and
-    /// [`TIERSTORE_REPO`]'s, whatever repository the channel names; no other asset does.
+    /// [`TIERSTORE_REPO`]'s, when the channel names kbf's, its former name's or tierstore's
+    /// repository; a channel for any other repository gets only its own pair, and no other
+    /// asset gets more.
     /// The pairs are compared whole and exactly.
     pub fn signers(&self) -> Vec<(&str, &str)> {
         let mut signers = vec![(self.repository(), self.workflow())];
@@ -165,7 +167,8 @@ impl Origin {
                 signers.push(pair);
             }
         };
-        if self.prefix == TIERSTORE_PREFIX {
+        let pinned = [REPO, FORMER_REPO, TIERSTORE_REPO].contains(&self.repository.as_str());
+        if self.prefix == TIERSTORE_PREFIX && pinned {
             add((REPO, WORKFLOW));
             add((FORMER_REPO, FORMER_WORKFLOW));
             add((TIERSTORE_REPO, TIERSTORE_WORKFLOW));
