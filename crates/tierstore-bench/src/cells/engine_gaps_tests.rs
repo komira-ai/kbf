@@ -607,6 +607,115 @@ async fn the_p99_is_taken_over_whole_requests_only() {
     assert!((trip.value - 3_000.0).abs() < 1e-9, "{trip}");
 }
 
+/// A read of cell B as it reports it: the whole direct read of the cold bucket (`.cold-direct`,
+/// a request to the cold store), then the first read through the instance with its time to the
+/// first byte (`.ttfb`) and the second read (`.second`), which are requests to the instance.
+/// From request `from_index` on, the direct read turns `turn`.
+fn cell_b_reads(label: &str, requests: u64, from_index: u64, turn: Turn) -> Arm {
+    let mut arm = arm(label, requests, &Arc::new(AtomicU64::new(0)));
+    arm.work = work(move |unit| async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let direct = match (unit.index >= from_index, turn) {
+            (false, _) => step(Role::Cold, 20_000, true),
+            (true, Turn::Slow) => step(Role::Cold, 3_000_000, true),
+            (true, Turn::Erroring) => step(Role::Cold, 1_000, false),
+        };
+        Ok(vec![
+            Step {
+                label: ".cold-direct",
+                ..direct
+            },
+            Step {
+                label: ".ttfb",
+                ..step(Role::Instance, 1_000, true)
+            },
+            step(Role::Instance, 20_000, true),
+            Step {
+                label: ".second",
+                ..step(Role::Instance, 20_000, true)
+            },
+        ])
+    });
+    arm
+}
+
+/// Catches direct reads of the cold bucket that the guard does not see because they carry a
+/// label: cell B's `.cold-direct` reads fail from the 31st, and the second failure is 2 of 32
+/// cold requests, over 5%. The instance's steps are not cold requests and do not count.
+#[tokio::test(start_paused = true)]
+async fn cell_bs_direct_reads_that_fail_trip_the_error_share() {
+    let dir = temp("tb-gaps-guard-b-errors");
+    let err = run_cell(
+        &env(dir.path(), 1, no_cold()),
+        CellId::B,
+        vec![cell_b_reads("a", 200, 30, Turn::Erroring)],
+        3,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, BenchError::ColdGuard(_)), "{err}");
+    let result = written(dir.path(), CellId::B, "a", 1);
+    let trip = result.passes[0].cold_guard.clone().unwrap();
+    assert_eq!(trip.metric, "error_share");
+    assert_eq!(trip.requests, 32);
+    assert!((trip.value - 2.0 / 32.0).abs() < 1e-9, "{trip}");
+}
+
+/// Catches the same blindness for latency: cell B's direct reads turn to 3 s from the 31st and
+/// the p99 of the window is that, over 2,000 ms.
+#[tokio::test(start_paused = true)]
+async fn cell_bs_direct_reads_that_turn_slow_trip_the_p99() {
+    let dir = temp("tb-gaps-guard-b-slow");
+    let err = run_cell(
+        &env(dir.path(), 1, no_cold()),
+        CellId::B,
+        vec![cell_b_reads("a", 200, 30, Turn::Slow)],
+        3,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, BenchError::ColdGuard(_)), "{err}");
+    let result = written(dir.path(), CellId::B, "a", 1);
+    let trip = result.passes[0].cold_guard.clone().unwrap();
+    assert_eq!(trip.metric, "p99_ms");
+    assert_eq!(trip.requests, 31);
+    assert!((trip.value - 3_000.0).abs() < 1e-9, "{trip}");
+}
+
+/// Catches a fix that counts every labelled step: cold requests of cell B that all succeed,
+/// 15 of them with a first-byte pair each, are 15 requests, fewer than the 20 the guard needs
+/// to judge, though they are 30 cold steps and 15 more instance steps; their 3 s would stop the run.
+#[tokio::test(start_paused = true)]
+async fn direct_reads_with_a_first_byte_pair_still_count_once() {
+    let dir = temp("tb-gaps-guard-b-pair");
+    let mut arm = arm("a", 15, &Arc::new(AtomicU64::new(0)));
+    arm.work = work(|_| async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        Ok(vec![
+            Step {
+                label: ".cold-direct",
+                ..step(Role::Cold, 3_000_000, true)
+            },
+            Step {
+                label: ".ttfb",
+                ..step(Role::Cold, 1_000, true)
+            },
+        ])
+    });
+    let results = run_cell(
+        &env(dir.path(), 1, no_cold()),
+        CellId::B,
+        vec![arm],
+        1,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(results[0].passes[0].cold_guard.is_none());
+}
+
 /// A cold state source that notes the limit it was given, and answers at once.
 struct Noting(std::sync::Mutex<Vec<Duration>>);
 
