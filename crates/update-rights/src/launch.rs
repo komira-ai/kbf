@@ -204,7 +204,6 @@ impl Spawner for Systemd {
     fn run(&self, command: &SystemdRun) -> io::Result<Finished> {
         let output = Command::new(&self.program)
             .args(&command.args)
-            .env_clear()
             .stdin(Stdio::null())
             .output()?;
         Ok(Finished {
