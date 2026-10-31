@@ -136,6 +136,7 @@ fn a_services_file_that_cannot_work_is_refused() {
     assert!(refusal(&twice).contains("twice"));
     assert!(refusal(&svc("a", "", "")).contains("no roles"));
     assert!(refusal(&svc("a", "", "[service.roles.cook]\n")).contains("cook is not a host role"));
+    assert!(refusal(&svc("a", "", "[service.roles.cache]\n")).contains("cache is not a host role"));
     assert!(
         refusal(&svc("a", "", "[service.roles.daemon]\nmin_up = 10001\n")).contains("over 10000")
     );

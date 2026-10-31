@@ -84,12 +84,16 @@ impl MaxUpdating {
     /// so no orders.
     #[must_use]
     pub fn of(&self, role: &HostRole) -> u32 {
-        match role.name() {
-            "frontend" => self.frontend,
-            "storage" => self.storage,
-            "daemon" => self.daemon,
-            "mac-daemon" => self.mac_daemon,
-            _ => 0,
+        if *role == HostRole::FRONTEND {
+            self.frontend
+        } else if *role == HostRole::STORAGE {
+            self.storage
+        } else if *role == HostRole::DAEMON {
+            self.daemon
+        } else if *role == HostRole::MAC_DAEMON {
+            self.mac_daemon
+        } else {
+            0
         }
     }
 }
@@ -109,11 +113,14 @@ impl MinUp {
     /// not name needs `u32::MAX` hosts up, which no farm has, so it is never ordered.
     #[must_use]
     pub fn of(&self, role: &HostRole) -> u32 {
-        match role.name() {
-            "storage" => self.storage,
-            "frontend" => self.frontend,
-            "daemon" | "mac-daemon" => 0,
-            _ => u32::MAX,
+        if *role == HostRole::STORAGE {
+            self.storage
+        } else if *role == HostRole::FRONTEND {
+            self.frontend
+        } else if *role == HostRole::DAEMON || *role == HostRole::MAC_DAEMON {
+            0
+        } else {
+            u32::MAX
         }
     }
 }

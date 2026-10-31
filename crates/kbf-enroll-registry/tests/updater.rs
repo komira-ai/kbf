@@ -287,7 +287,7 @@ fn a_row_with_a_host_role_that_is_not_one_is_unreadable() {
     // row, 12 of a node row) is set to a name that is no host role.
     let bogus = |tag: u8| {
         let mut bytes = vec![tag, 5];
-        bytes.extend_from_slice(b"bogus");
+        bytes.extend_from_slice(b"cache");
         bytes
     };
     for (key, tag) in [("enroll/token/", 0x72), ("enroll/updater/", 0x62)] {

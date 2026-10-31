@@ -247,6 +247,13 @@ impl Default for Services {
 }
 
 impl Services {
+    /// These services and `def`, for a test that needs a role the loader refuses.
+    #[cfg(test)]
+    pub(crate) fn with(mut self, def: ServiceDef) -> Self {
+        self.defs.insert(def.name.clone(), def);
+        self
+    }
+
     /// The services of the file text `text`, with `kbf` built in.
     ///
     /// # Errors

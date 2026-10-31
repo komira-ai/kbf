@@ -119,6 +119,7 @@ fn an_updater_must_name_exactly_one_host_role_the_farm_has() {
         &["storage", "daemon"],
         &["storage", "storage"],
         &["gateway"],
+        &["cache"],
         &["Storage"],
         &["mac_daemon"],
         &[""],

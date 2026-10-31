@@ -411,3 +411,29 @@ fn a_role_the_code_does_not_name_is_ordered_nothing() {
     let f = fleet(NOW, &[("c1", cache, beat("1.0"))]);
     assert_eq!(ask(&desired("2.0", 1, 1), &f, "c1"), Reply::Nothing);
 }
+
+/// Catches: a definition that names a role the code does not (reachable once the loader
+/// takes any role) granting it a slot: it is still ordered nothing, however far behind.
+#[test]
+fn a_definition_that_names_an_unnamed_role_still_orders_it_nothing() {
+    use crate::decide::decide_in;
+    use crate::desired::KBF;
+    use crate::services::{RoleDef, ServiceDef, Services};
+
+    let cache: HostRole = "cache".parse().expect("well formed");
+    let mut def = ServiceDef::kbf();
+    def.roles.insert(cache.clone(), RoleDef::plain());
+    let services = Services::default().with(def);
+    let d = desired("2.0", 1, 1);
+    let wants = std::collections::BTreeMap::from([(KBF.to_owned(), d.clone())]);
+    let f = fleet(NOW, &[("c1", cache, beat("1.0"))]);
+    assert_eq!(
+        decide_in(&services, &wants, KBF, &f, &id("c1"), NOW),
+        Reply::Nothing
+    );
+    let behind = fleet(NOW, &[("d1", HostRole::DAEMON, beat("1.0"))]);
+    assert_eq!(
+        decide_in(&services, &wants, KBF, &behind, &id("d1"), NOW),
+        update("2.0")
+    );
+}
