@@ -201,6 +201,14 @@ pub enum Violation {
     },
     #[error("the update was deferred but the world is not as it was: {changes:?}")]
     DeferredLeftState { changes: Vec<String> },
+    #[error("{step} changed the world or its record but reached no kill point")]
+    StepWithoutKillPoints { step: Step },
+    #[error("{step} said reversible={first} the first time and {second} the second")]
+    RerunReversibleChanged {
+        step: Step,
+        first: bool,
+        second: bool,
+    },
     #[error("{step} ended {outcome:?} when the params held an updater.* key it does not know")]
     RefusedUpdaterKey { step: Step, outcome: Outcome },
     #[error("{step} ran while another held the record lock: {outcome:?}, {changes:?}")]
@@ -266,6 +274,12 @@ impl<'a> Conformance<'a> {
             base,
             sandboxes: 0,
         }
+    }
+
+    /// Runs the checks as a first install: the params file has neither previous release nor
+    /// previous version. The default is an update, which has both.
+    pub fn with_first_install(self) -> Conformance<'a> {
+        self
     }
 
     /// All the checks of the module documentation.

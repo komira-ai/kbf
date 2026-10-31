@@ -76,7 +76,9 @@ pub struct Sandbox {
 }
 
 impl Sandbox {
-    const DIRS: [&'static str; 5] = ["artifact", "record", "world", "outside", "control"];
+    const DIRS: [&'static str; 6] = [
+        "artifact", "previous", "record", "world", "outside", "control",
+    ];
 
     /// Makes the five directories under `root` (which may be new).
     pub fn create(root: PathBuf) -> io::Result<Sandbox> {
@@ -96,6 +98,11 @@ impl Sandbox {
 
     pub fn record(&self) -> PathBuf {
         self.root.join("record")
+    }
+
+    /// The previous release, staged by the harness for an update; unused on a first install.
+    pub fn previous(&self) -> PathBuf {
+        self.root.join("previous")
     }
 
     pub fn world(&self) -> PathBuf {

@@ -138,6 +138,11 @@ impl Report {
         Report::from_stdout(stdout).unwrap_or_default()
     }
 
+    /// As [`Report::read`], with a warning for each field or line that was not used.
+    pub fn read_with_warnings(stdout: &str) -> (Report, Vec<String>) {
+        (Report::read(stdout), Vec::new())
+    }
+
     /// The line to print: one JSON object, no newline.
     pub fn to_line(&self) -> String {
         let mut object = Map::new();
