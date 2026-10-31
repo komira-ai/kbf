@@ -32,6 +32,8 @@ pub(crate) struct Answer {
     pub status: u16,
     /// The body.
     pub body: Vec<u8>,
+    /// Whether the connection ends before the body does.
+    pub cut: bool,
 }
 
 impl Answer {
@@ -39,6 +41,15 @@ impl Answer {
         Self {
             status,
             body: body.into(),
+            cut: false,
+        }
+    }
+
+    /// An answer whose connection ends eight bytes before its body does.
+    pub fn cut(status: u16, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            cut: true,
+            ..Self::new(status, body)
         }
     }
 }
@@ -109,10 +120,13 @@ fn serve(mut stream: std::net::TcpStream, handler: &Handler, log: &Mutex<Vec<See
         let head = format!(
             "HTTP/1.1 {} X\r\nContent-Length: {}\r\n\r\n",
             answer.status,
-            answer.body.len()
+            answer.body.len() + if answer.cut { 8 } else { 0 }
         );
         stream.write_all(head.as_bytes()).expect("head");
         stream.write_all(&answer.body).expect("body");
+        if answer.cut {
+            return;
+        }
         line.clear();
     }
 }
