@@ -1,3 +1,4 @@
+#![allow(unused)]
 //! The contract between a host updater and the update hook a service ships, and the harness that
 //! proves a hook keeps it. See the README of this crate, and docs/design/host-updates.md for why.
 //!

@@ -27,30 +27,18 @@ pub enum Outcome {
 impl Outcome {
     /// The code a hook exits with for this outcome.
     pub const fn code(self) -> i32 {
-        match self {
-            Outcome::Success => EXIT_OK,
-            Outcome::Failure => EXIT_FAILURE,
-            Outcome::Deferred => EXIT_DEFERRED,
-            Outcome::Halt => EXIT_HALT,
-        }
+        todo!()
     }
 
     /// The outcome of one of the four defined codes, `None` for any other.
     pub const fn from_code(code: i32) -> Option<Outcome> {
-        match code {
-            EXIT_OK => Some(Outcome::Success),
-            EXIT_FAILURE => Some(Outcome::Failure),
-            EXIT_DEFERRED => Some(Outcome::Deferred),
-            EXIT_HALT => Some(Outcome::Halt),
-            _ => None,
-        }
+        todo!()
     }
 
     /// How the updater reads a step's end: the four codes by their meaning; any other code, and
     /// a step with no code (killed by its timeout or by a signal), is a failure.
     pub fn from_exit(code: Option<i32>) -> Outcome {
-        code.and_then(Outcome::from_code)
-            .unwrap_or(Outcome::Failure)
+        todo!()
     }
 }
 

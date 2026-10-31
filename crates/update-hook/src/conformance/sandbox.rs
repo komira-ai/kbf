@@ -18,9 +18,7 @@ pub type Tree = BTreeMap<PathBuf, Entry>;
 
 /// Reads the whole tree under `root`. Links are recorded, not followed.
 pub fn snapshot(root: &Path) -> io::Result<Tree> {
-    let mut tree = Tree::new();
-    walk(root, root, &mut tree)?;
-    Ok(tree)
+    todo!()
 }
 
 fn walk(base: &Path, dir: &Path, tree: &mut Tree) -> io::Result<()> {
@@ -43,20 +41,7 @@ fn walk(base: &Path, dir: &Path, tree: &mut Tree) -> io::Result<()> {
 
 /// The paths added, removed or changed between two snapshots, one line each.
 pub fn changes(before: &Tree, after: &Tree) -> Vec<String> {
-    let mut out = Vec::new();
-    for (path, was) in before {
-        match after.get(path) {
-            None => out.push(format!("removed {}", path.display())),
-            Some(now) if now != was => out.push(format!("changed {}", path.display())),
-            Some(_) => {}
-        }
-    }
-    for path in after.keys() {
-        if !before.contains_key(path) {
-            out.push(format!("added {}", path.display()));
-        }
-    }
-    out
+    todo!()
 }
 
 /// The five directories of one run:

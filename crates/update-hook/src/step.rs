@@ -33,13 +33,7 @@ impl Step {
 
     /// The word the updater puts on the command line.
     pub const fn name(self) -> &'static str {
-        match self {
-            Step::Prepare => "prepare",
-            Step::Cutover => "cutover",
-            Step::Verify => "verify",
-            Step::Rollback => "rollback",
-            Step::Cleanup => "cleanup",
-        }
+        todo!()
     }
 }
 
@@ -95,41 +89,11 @@ impl Invocation {
     where
         I: IntoIterator<Item = OsString>,
     {
-        let mut args = args.into_iter();
-        let first = args.next().ok_or(ArgsError::MissingStep)?;
-        let step: Step = first.to_string_lossy().parse()?;
-        let mut artifact = None;
-        let mut params = None;
-        while let Some(arg) = args.next() {
-            if arg == "--params" {
-                let file = args.next().ok_or(ArgsError::MissingParamsFile)?;
-                if params.replace(PathBuf::from(file)).is_some() {
-                    return Err(ArgsError::DuplicateParams);
-                }
-            } else if step == Step::Prepare && artifact.is_none() {
-                artifact = Some(PathBuf::from(arg));
-            } else {
-                return Err(ArgsError::Unexpected(arg));
-            }
-        }
-        if step == Step::Prepare && artifact.is_none() {
-            return Err(ArgsError::MissingArtifact);
-        }
-        Ok(Invocation {
-            step,
-            artifact,
-            params,
-        })
+        todo!()
     }
 
     /// The arguments the updater passes after `hook_args`: the inverse of [`Invocation::parse`].
     pub fn to_args(&self) -> Vec<OsString> {
-        let mut args = vec![OsString::from(self.step.name())];
-        args.extend(self.artifact.iter().map(OsString::from));
-        if let Some(file) = &self.params {
-            args.push(OsString::from("--params"));
-            args.push(OsString::from(file));
-        }
-        args
+        todo!()
     }
 }

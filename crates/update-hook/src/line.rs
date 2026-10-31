@@ -29,10 +29,7 @@ pub enum Class {
 impl Class {
     /// The word in the JSON.
     pub const fn as_str(self) -> &'static str {
-        match self {
-            Class::Release => "release",
-            Class::Environment => "environment",
-        }
+        todo!()
     }
 }
 
@@ -53,10 +50,7 @@ pub const MAX_REASON_LEN: usize = 64;
 /// Whether `reason` is a machine-readable token: lowercase letters, digits and `_`, at most
 /// [`MAX_REASON_LEN`] bytes, not empty (`state_invalid`, `drain_bound`).
 pub fn is_reason_token(reason: &str) -> bool {
-    (1..=MAX_REASON_LEN).contains(&reason.len())
-        && reason
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    todo!()
 }
 
 /// What a step tells the updater besides its exit code.
@@ -109,28 +103,12 @@ fn last_line(stdout: &str) -> Option<&str> {
 impl Report {
     /// Reads one line as the report object.
     pub fn parse_line(line: &str) -> Result<Report, LineError> {
-        let wire: Wire =
-            serde_json::from_str(line).map_err(|e| LineError::Malformed(e.to_string()))?;
-        wire.reason
-            .as_deref()
-            .filter(|reason| !is_reason_token(reason))
-            .map_or(Ok(()), |reason| {
-                Err(LineError::BadReason(reason.to_owned()))
-            })?;
-        Ok(Report {
-            class: wire.class.unwrap_or_default(),
-            reason: wire.reason,
-            retry_after_secs: wire.retry_after_secs,
-            reversible: wire.reversible.unwrap_or(true),
-            promotion_pending: wire.promotion_pending.unwrap_or(false),
-            detail: wire.detail,
-        })
+        todo!()
     }
 
     /// Reads the last non-blank line of `stdout`, strictly.
     pub fn from_stdout(stdout: &str) -> Result<Report, LineError> {
-        let line = last_line(stdout).ok_or(LineError::Missing)?;
-        Report::parse_line(line)
+        todo!()
     }
 
     /// Reads the last line the way the updater does: a missing or malformed line is `{}`.
@@ -140,22 +118,7 @@ impl Report {
 
     /// The line to print: one JSON object, no newline.
     pub fn to_line(&self) -> String {
-        let mut object = Map::new();
-        object.insert("class".to_owned(), Value::from(self.class.as_str()));
-        object.insert("reversible".to_owned(), Value::from(self.reversible));
-        object.insert(
-            "promotion_pending".to_owned(),
-            Value::from(self.promotion_pending),
-        );
-        let optional = [
-            ("reason", self.reason.clone().map(Value::from)),
-            ("retry_after_secs", self.retry_after_secs.map(Value::from)),
-            ("detail", self.detail.clone().map(Value::from)),
-        ];
-        for (key, value) in optional {
-            object.extend(value.map(|value| (key.to_owned(), value)));
-        }
-        Value::Object(object).to_string()
+        todo!()
     }
 
     /// Writes the line and a newline: what a hook does last, to its standard output.

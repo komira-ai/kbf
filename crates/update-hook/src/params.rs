@@ -53,32 +53,12 @@ impl Params {
 
     /// Reads the text of a params file.
     pub fn parse(text: &str) -> Result<Params, ParamsError> {
-        let table: toml::Table = text
-            .parse()
-            .map_err(|e: toml::de::Error| ParamsError::Syntax(e.message().to_owned()))?;
-        let mut values = BTreeMap::new();
-        for (key, value) in table {
-            let scalar = match value {
-                toml::Value::Boolean(b) => Scalar::Bool(b),
-                toml::Value::Integer(n) => Scalar::Integer(n),
-                toml::Value::Float(f) => Scalar::Float(f),
-                toml::Value::String(s) => Scalar::Text(s),
-                _ => return Err(ParamsError::NotScalar(key)),
-            };
-            values.insert(key, scalar);
-        }
-        let params = Params(values);
-        if params.0.contains_key(PROMOTION_CEILING_KEY) && params.promotion_ceiling_secs().is_none()
-        {
-            return Err(ParamsError::BadCeiling);
-        }
-        Ok(params)
+        todo!()
     }
 
     /// The table as the file the updater writes.
     pub fn to_toml(&self) -> String {
-        // A flat map of scalars always serializes; an empty table is the empty file.
-        toml::to_string(&self.0).unwrap_or_default()
+        todo!()
     }
 
     /// Sets a value.
@@ -88,11 +68,7 @@ impl Params {
 
     /// Sets the reserved ceiling.
     pub fn with_promotion_ceiling_secs(mut self, secs: u64) -> Params {
-        self.insert(
-            PROMOTION_CEILING_KEY,
-            Scalar::Integer(i64::try_from(secs).unwrap_or(i64::MAX)),
-        );
-        self
+        todo!()
     }
 
     pub fn get(&self, key: &str) -> Option<&Scalar> {
@@ -101,17 +77,11 @@ impl Params {
 
     /// A whole, non-negative number.
     pub fn get_u64(&self, key: &str) -> Option<u64> {
-        match self.get(key) {
-            Some(Scalar::Integer(n)) => u64::try_from(*n).ok(),
-            _ => None,
-        }
+        todo!()
     }
 
     pub fn get_bool(&self, key: &str) -> Option<bool> {
-        match self.get(key) {
-            Some(Scalar::Bool(b)) => Some(*b),
-            _ => None,
-        }
+        todo!()
     }
 
     /// The reserved ceiling, when the updater set it.

@@ -35,11 +35,7 @@ impl Gate {
     /// From the values of the two variables; `None` without a directory. A missing or unreadable
     /// number is `0`: count, never stop.
     pub fn parse(dir: Option<OsString>, kill_at: Option<OsString>) -> Option<Gate> {
-        let dir = PathBuf::from(dir?);
-        let kill_at = kill_at
-            .and_then(|value| value.to_str()?.parse().ok())
-            .unwrap_or(0);
-        Some(Gate { dir, kill_at })
+        todo!()
     }
 
     /// From this process's environment.
@@ -53,20 +49,12 @@ impl Gate {
     /// Counts one point and returns its number, `0` if the count cannot be kept (the harness
     /// then sees no points and refuses the hook).
     pub fn count(&self) -> u64 {
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.dir.join(COUNT_FILE))
-            .and_then(|mut file| file.write_all(b".").map(|()| file))
-            .and_then(|file| file.metadata())
-            .map_or(0, |meta| meta.len())
+        todo!()
     }
 
     /// Counts a point and calls `stop` if it is the target.
     pub fn reach_then(&self, stop: &dyn Fn()) {
-        if self.count() == self.kill_at {
-            stop();
-        }
+        todo!()
     }
 }
 

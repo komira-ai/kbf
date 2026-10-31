@@ -257,15 +257,7 @@ impl<'a> Conformance<'a> {
 
     /// All the checks of the module documentation.
     pub fn check_all(&mut self) -> Result<Summary, Violation> {
-        self.idempotence()?;
-        let kill_points = self.crash_resume()?;
-        let (scenarios, skipped) = self.scenarios()?;
-        self.exclusive_record()?;
-        Ok(Summary {
-            kill_points,
-            scenarios,
-            skipped,
-        })
+        todo!()
     }
 
     /// A new sandbox, initialised by the fake, with the params file written.
@@ -304,26 +296,7 @@ impl<'a> Conformance<'a> {
 
     /// Runs `step` and reads how it ended, refusing an end the contract does not allow.
     fn exec(&self, sandbox: &Sandbox, step: Step) -> Result<Done, Violation> {
-        let run = self.exec_at(sandbox, step, 0)?;
-        let code = run.code.ok_or(Violation::DiedBySignal { step })?;
-        let outcome = Outcome::from_code(code).ok_or_else(|| Violation::UnknownExit {
-            step,
-            code,
-            stderr: run.stderr.clone(),
-        })?;
-        let report = Report::from_stdout(&run.stdout).map_err(|error| Violation::Line {
-            step,
-            error,
-            stderr: run.stderr.clone(),
-        })?;
-        if outcome == Outcome::Deferred && report.retry_after_secs.is_none() {
-            return Err(Violation::DeferredWithoutRetryAfter { step });
-        }
-        Ok(Done {
-            outcome,
-            report,
-            run,
-        })
+        todo!()
     }
 
     /// Runs `step` and requires success.
@@ -335,24 +308,7 @@ impl<'a> Conformance<'a> {
 
     /// Runs `step` twice in a row and requires the second to be a no-op. Returns the first.
     fn twice(&self, sandbox: &Sandbox, step: Step) -> Result<Done, Violation> {
-        let first = self.exec_ok(sandbox, step)?;
-        let before = Self::world(sandbox)?;
-        let second = self.exec(sandbox, step)?;
-        if second.outcome != first.outcome {
-            return Err(Violation::RerunOutcomeChanged {
-                step,
-                first: first.outcome,
-                second: second.outcome,
-            });
-        }
-        let moved = changes(&before, &Self::world(sandbox)?);
-        if !moved.is_empty() {
-            return Err(Violation::NotIdempotent {
-                step,
-                changes: moved,
-            });
-        }
-        Ok(first)
+        todo!()
     }
 
     /// After a successful `cleanup`: nothing of the update left.
@@ -394,49 +350,14 @@ impl<'a> Conformance<'a> {
     /// Each step of a successful update run twice, then the same for `rollback` after
     /// `cutover`, then `cleanup` after the rollback.
     pub fn idempotence(&mut self) -> Result<(), Violation> {
-        let sandbox = self.fresh()?;
-        for step in SUCCESS_PATH {
-            self.twice(&sandbox, step)?;
-        }
-        self.finished(&sandbox)?;
-
-        let sandbox = self.fresh()?;
-        let start = Self::world(&sandbox)?;
-        self.exec_ok(&sandbox, Step::Prepare)?;
-        self.exec_ok(&sandbox, Step::Cutover)?;
-        let rolled = self.twice(&sandbox, Step::Rollback)?;
-        self.rolled_back(&sandbox, &start, &rolled.report)?;
-        // The hook must not finish an update that was rolled back.
-        let before = Self::world(&sandbox)?;
-        self.exec(&sandbox, Step::Cleanup)?;
-        let moved = changes(&before, &Self::world(&sandbox)?);
-        if !moved.is_empty() {
-            return Err(Violation::CleanupCommitted { changes: moved });
-        }
-        Ok(())
+        todo!()
     }
 
     /// Stops each step at each of its kill points, and runs each step again after it finished;
     /// in both cases runs on to the end and compares the world with an uninterrupted run's.
     /// Returns the number of kill points.
     pub fn crash_resume(&mut self) -> Result<u64, Violation> {
-        let sandbox = self.fresh()?;
-        let mut points = Vec::new();
-        for step in SUCCESS_PATH {
-            points.push(self.exec_ok(&sandbox, step)?.run.gates);
-        }
-        self.finished(&sandbox)?;
-        let want = Self::world(&sandbox)?;
-        let total: u64 = points.iter().sum();
-        if total == 0 {
-            return Err(Violation::NoKillPoints);
-        }
-        for (index, gates) in points.into_iter().enumerate() {
-            for kill_at in 0..=gates {
-                self.resume_from(index, kill_at, &want)?;
-            }
-        }
-        Ok(total)
+        todo!()
     }
 
     /// Runs the steps before `SUCCESS_PATH[index]`, then that step stopped at kill point
@@ -502,45 +423,7 @@ impl<'a> Conformance<'a> {
     /// Drives the updater's table with these faults injected: `None` if the fake cannot make
     /// one of them.
     pub fn scenario(&mut self, faults: &[(Step, Fault)]) -> Result<Option<Trace>, Violation> {
-        let sandbox = self.fresh()?;
-        for (step, fault) in faults {
-            if !self.fake.inject(&sandbox, *step, *fault)? {
-                return Ok(None);
-            }
-        }
-        let start = Self::world(&sandbox)?;
-        let mut ctx = Context::default();
-        let mut step = Step::Prepare;
-        let mut steps = Vec::new();
-        let mut tries: BTreeMap<Step, u32> = BTreeMap::new();
-        loop {
-            let done = self.exec(&sandbox, step)?;
-            let wanted = faults
-                .iter()
-                .find(|(faulted, _)| *faulted == step)
-                .map_or(Outcome::Success, |(_, fault)| fault.outcome());
-            require(step, wanted, done.outcome)?;
-            steps.push((step, done.outcome));
-            if step == Step::Rollback && done.outcome == Outcome::Success {
-                self.rolled_back(&sandbox, &start, &done.report)?;
-            }
-            ctx.observe(step, &done.report);
-            let tried = tries.entry(step).or_default();
-            *tried += 1;
-            ctx.retries_left = *tried <= RETRIES;
-            ctx.verify_deadline_passed = *tried > RETRIES;
-            match next(step, done.outcome, &done.report, &ctx) {
-                Next::Run(to) | Next::Again { step: to, .. } => step = to,
-                Next::Rollback { then } => {
-                    ctx.then = Some(then);
-                    step = Step::Rollback;
-                }
-                Next::Report(verdict) => {
-                    self.concluded(&sandbox, &start, &verdict)?;
-                    return Ok(Some(Trace { steps, verdict }));
-                }
-            }
-        }
+        todo!()
     }
 
     /// A deferral leaves the world as it was.
@@ -562,26 +445,7 @@ impl<'a> Conformance<'a> {
     /// With an exclusive lock held on the record directory, each step refuses and changes
     /// nothing; once the lock is released, a step runs.
     pub fn exclusive_record(&mut self) -> Result<(), Violation> {
-        let sandbox = self.fresh()?;
-        let held = File::open(sandbox.record())?;
-        held.lock()?;
-        let world = Self::world(&sandbox)?;
-        let record = snapshot(&sandbox.record())?;
-        for step in Step::ALL {
-            let done = self.exec(&sandbox, step)?;
-            let mut moved = changes(&world, &Self::world(&sandbox)?);
-            moved.extend(changes(&record, &snapshot(&sandbox.record())?));
-            if done.outcome != Outcome::Failure || !moved.is_empty() {
-                return Err(Violation::RanWhileLocked {
-                    step,
-                    outcome: done.outcome,
-                    changes: moved,
-                });
-            }
-        }
-        held.unlock()?;
-        self.exec_ok(&sandbox, Step::Prepare)?;
-        Ok(())
+        todo!()
     }
 }
 

@@ -78,75 +78,12 @@ pub struct Context {
 impl Context {
     /// Records what a finished step told: the commit, and `verify`'s pending promotion.
     pub fn observe(&mut self, step: Step, report: &Report) {
-        self.committed |= !report.reversible;
-        if step == Step::Verify {
-            self.promotion_pending = report.promotion_pending;
-        }
+        todo!()
     }
 }
 
 /// The updater's next move after `step` ended as `outcome` with `report` (the hook's last line,
 /// `Report::default()` when it wrote none).
 pub fn next(step: Step, outcome: Outcome, report: &Report, ctx: &Context) -> Next {
-    let committed = ctx.committed || !report.reversible;
-    let class = report.class;
-    let after_secs = report.retry_after_secs;
-    let failed = |phase| Verdict::Failed { phase, class };
-    let before_or_after = if committed {
-        Phase::AfterCommit
-    } else {
-        Phase::BeforeCommit
-    };
-    let gate = match (committed, class) {
-        (true, _) => Phase::AfterCommit,
-        (false, Class::Release) => Phase::GateRelease,
-        (false, Class::Environment) => Phase::GateEnvironment,
-    };
-    let rollback_then = |then| Next::Rollback { then };
-    match (step, outcome) {
-        (_, Outcome::Halt) => Next::Report(Verdict::Halt),
-        (Step::Prepare, Outcome::Success) => Next::Run(Step::Cutover),
-        (Step::Cutover, Outcome::Success) => Next::Run(Step::Verify),
-        (Step::Verify, Outcome::Success) => Next::Run(Step::Cleanup),
-        (Step::Cleanup, Outcome::Success) => Next::Report(Verdict::Succeeded {
-            promotion_pending: ctx.promotion_pending,
-        }),
-        (Step::Rollback, Outcome::Success) => {
-            Next::Report(ctx.then.clone().unwrap_or_else(|| failed(before_or_after)))
-        }
-        (Step::Prepare | Step::Cutover, Outcome::Failure) => rollback_then(failed(before_or_after)),
-        (Step::Prepare, Outcome::Deferred) => rollback_then(Verdict::Deferred {
-            retry_after_secs: after_secs,
-        }),
-        // A deferral is only valid before anything irreversible: after it, a failure.
-        (Step::Cutover, Outcome::Deferred) if committed => rollback_then(failed(before_or_after)),
-        (Step::Cutover, Outcome::Deferred) => rollback_then(Verdict::Deferred {
-            retry_after_secs: after_secs,
-        }),
-        (Step::Verify, Outcome::Failure) => rollback_then(failed(gate)),
-        (Step::Verify, Outcome::Deferred) if ctx.verify_deadline_passed => {
-            rollback_then(failed(gate))
-        }
-        (Step::Verify, Outcome::Deferred) => Next::Again {
-            step: Step::Verify,
-            after_secs,
-        },
-        (Step::Rollback, Outcome::Deferred) if ctx.retries_left => Next::Again {
-            step: Step::Rollback,
-            after_secs,
-        },
-        // A rollback that fails after the commit and says it cannot give it back is a failure
-        // to page for; one that says nothing, or says it can, leaves a host nothing repairs.
-        (Step::Rollback, Outcome::Failure | Outcome::Deferred) if !report.reversible => {
-            Next::Report(failed(Phase::AfterCommit))
-        }
-        (Step::Rollback, Outcome::Failure | Outcome::Deferred) => Next::Report(Verdict::Halt),
-        (Step::Cleanup, Outcome::Failure | Outcome::Deferred) if ctx.retries_left => Next::Again {
-            step: Step::Cleanup,
-            after_secs,
-        },
-        (Step::Cleanup, Outcome::Failure | Outcome::Deferred) => {
-            Next::Report(failed(Phase::AfterCommit))
-        }
-    }
+    todo!()
 }
