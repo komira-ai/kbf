@@ -24,6 +24,8 @@ on:
     branches: [main]
     paths:
       - crates/tierstore/site/**
+      - crates/tierstore/docs/**
+      - crates/tierstore/src/**
       - infra/site/lib/site-stack.ts
       - .github/workflows/tierstore-site-publish.yml
   workflow_dispatch:

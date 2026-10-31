@@ -41,7 +41,7 @@ function distWith(name: string, files: string[]): string {
   return dist;
 }
 
-const PAGES = ['index.html', '404.html', 'install/index.html', 'docs/index.html', 'about/index.html'];
+const PAGES = ['index.html', '404.html', 'install/index.html', 'docs/index.html', 'about/index.html', 'why/index.html', 'config/index.html', 'demo/index.html'];
 const ASSETS = ['assets/x/a.js', 'assets/x/b.js', 'assets/x/s.css'];
 
 /** A built-looking dist/: the floor's worth of pages and files. */
@@ -239,7 +239,7 @@ test('checkDist needs index.html, 404.html and assets/', () => {
 test('a nearly empty dist/ is refused before any token is asked for or a sweep could empty the bucket', async () => {
   const assets = ASSETS;
   const fewPages = distWith('publish-few-pages', [...PAGES.slice(0, MIN_HTML_PAGES - 1), ...assets, 'assets/x/c.js', 'assets/x/d.js', 'assets/x/e.js']);
-  assert.throws(() => checkDist(fewPages), /only 4 html pages/);
+  assert.throws(() => checkDist(fewPages), new RegExp(`only ${MIN_HTML_PAGES - 1} html pages`));
   const fewFiles = distWith('publish-few-files', [...PAGES, 'assets/x/a.js']);
   assert.throws(() => checkDist(fewFiles), new RegExp(`only ${PAGES.length + 1} files`));
   const f = fake();
