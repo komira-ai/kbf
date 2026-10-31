@@ -84,14 +84,13 @@ impl<'a> Launch<'a> {
         release: &'a Path,
         params: Option<&'a Path>,
     ) -> Launch<'a> {
-        let _ = hook_uid;
         Launch {
             declaration,
             step,
             generation,
             release,
             params,
-            hook_uid: u32::MAX,
+            hook_uid,
         }
     }
 

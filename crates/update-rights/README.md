@@ -36,7 +36,7 @@ The crate names no product and depends on no crate of this workspace but the hoo
   that runs as root: the design allows a string only for a key a schema lists, and none exists,
   so a root hook is refused a string. A float parameter that is `nan` is never a lowered number.
 - **The targets are checked again.** `recheck_targets` repeats the reserved-path rules on what each
-  entry points to now; `run_step` calls it before every launch and refuses the launch (`RunError::Recheck`)
+  entry points to now; `run_step` calls it before every launch (`Declared::recheck` for a loaded one) and refuses the launch (`RunError::Recheck`)
   when a target changed, because a link can be re-pointed after the load. `check_state_dir` is the same for the record directory.
 - **The deny list** also holds `/run/systemd/{transient,generator*,system.control}` and
   `/var/lib/polkit-1`; `/proc`, `/sys` and `/dev` may be read and never written.
@@ -54,13 +54,22 @@ The crate names no product and depends on no crate of this workspace but the hoo
 - **A root hook's paths cannot be swapped.** `ReadWritePaths=` follows links, so for a hook that
   runs as root every existing directory above a read or write path (and above what it resolves to)
   must be owned by root and closed to the group and others; `recheck_targets` repeats it before
-  each launch. "Root" is the account that resolves to uid 0 (`Launch::root_hook`), whatever its name.
+  each launch. "Root" is the account that resolves to uid 0 (`Launch::root_hook`, derived from the uid in `Launch::new`), whatever its name.
 - **A root hook writes in its own directory.** For a hook that runs as root each write path is at or
   below `<write root>/<service>` or a name beginning with the service's and a `-`
   (`/var/lib/svc`, `/var/lib/svc-state`), so the one-component rule cannot hand it `/var/lib/sudo` or
   `/run/udev`.
-- **Environment names.** `LD_*`, `MALLOC_*`, `PYTHON*`, `DYLD_*` and a list of loader, resolver, shell
-  and interpreter names (`GCONV_PATH`, `BASH_ENV`, `IFS`, `PERL5OPT`, `RUBYOPT`, `NODE_OPTIONS`, and the like;
+- **The dash rule stops at another service.** A root hook's directory `<root>/<service>-…` is
+  refused when it begins with a longer declared name (`tierstore` may not write `/var/lib/tierstore-b/x`
+  if `tierstore-b` is a service of the host), across declarations like the conflicts. A service
+  may not be named for a directory of the system (`names::SYSTEM_NAMES`), and the reserved list is the
+  last word on `/var/lib/sudo`, `/run/udev`, `/run/tmpfiles.d`, `/run/systemd/network`,
+  `/var/lib/apt` and `/var/lib/cloud`.
+- **Root is derived once.** `Launch::new` takes the hook's uid and `Launch::of` a loaded declaration;
+  the flag is private, `Declared::recheck` supplies the uid to `recheck_targets`, and nothing a
+  caller passes can turn the root rules off.
+- **Environment names.** `LD_*`, `MALLOC_*`, `PYTHON*`, `DYLD_*`, `GIT_*` and a list of loader, resolver, shell
+  and interpreter names (`GCONV_PATH`, `BASH_ENV`, `IFS`, `PERL5OPT`, `RUBYOPT`, `NODE_OPTIONS`, `GLIBC_TUNABLES`, `OPENSSL_CONF`, `GIT_*`, and the like;
   `names::HIJACKING_ENV`) are refused for every hook, and `PATH` only as a list of absolute
   directories.
 

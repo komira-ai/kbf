@@ -180,8 +180,7 @@ fn swappable_above(path: &str) -> Option<String> {
 /// The reserved-path rules on what each entry points to now, for the step runner to call before
 /// every launch: a link can be re-pointed after the load.
 pub fn recheck_targets(declaration: &Declaration, hook_uid: u32) -> Result<(), Refusal> {
-    let _ = hook_uid;
-    check_targets(declaration, false)
+    check_targets(declaration, hook_uid == 0)
 }
 
 fn account_error(what: &str, name: &str) -> Refusal {
@@ -319,7 +318,8 @@ pub fn load_dir(dir: &Path, policy: &Policy<'_>) -> Result<Loaded, io::Error> {
         let other = good
             .iter()
             .filter(|b| b.declaration.name != declared.declaration.name)
-            .find_map(|b| conflict(declared, b).map(|what| (what, b.declaration.name.clone())));
+            .find_map(|b| conflict(declared, b).map(|what| (what, b.declaration.name.clone())))
+            .or_else(|| trespass(declared, &good));
         match other {
             Some((what, with)) => loaded.refused.push(Refused {
                 file: declared.file.clone(),
@@ -335,4 +335,34 @@ pub fn load_dir(dir: &Path, policy: &Policy<'_>) -> Result<Loaded, io::Error> {
     }
     loaded.refused.sort_by(|a, b| a.file.cmp(&b.file));
     Ok(loaded)
+}
+
+/// A write path of a hook that runs as root in the directory of another declared service: the
+/// first component under the write root belongs to the declared name it begins with, the longest
+/// one, so `tierstore` may write `/var/lib/tierstore-state` and not `/var/lib/tierstore-b/x` when
+/// `tierstore-b` is a service of this host. Returns what the two fight over and the owner.
+fn trespass(declared: &Declared, good: &[Declared]) -> Option<(&'static str, String)> {
+    if declared.hook.uid != 0 {
+        return None;
+    }
+    let own = &declared.declaration.name;
+    declared
+        .declaration
+        .hook
+        .write_paths
+        .iter()
+        .find_map(|path| {
+            let first = reserved::first_below_a_write_root(path)?;
+            let owner = good
+                .iter()
+                .map(|g| g.declaration.name.as_str())
+                .filter(|name| reserved::belongs_to(first, name))
+                .max_by_key(|name| name.len())?;
+            (owner != own).then(|| {
+                (
+                    "a write path in the directory of another service",
+                    owner.to_owned(),
+                )
+            })
+        })
 }

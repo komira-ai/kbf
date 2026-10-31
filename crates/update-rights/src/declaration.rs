@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use update_hook::{Params, Step};
 
 use crate::names::{
-    Capability, Family, PathError, UnitError, check_path, check_relative, check_unit, env_allowed,
-    is_account_name, is_env_name, is_env_value, is_service_name,
+    Capability, Family, PathError, SYSTEM_NAMES, UnitError, check_path, check_relative, check_unit,
+    env_allowed, is_account_name, is_env_name, is_env_value, is_service_name,
 };
 use crate::reserved::{self, Kind};
 
@@ -281,6 +281,12 @@ impl Declaration {
             return Err(value(
                 "name",
                 format!("{:?} is not a service name", self.name),
+            ));
+        }
+        if SYSTEM_NAMES.contains(&self.name.as_str()) {
+            return Err(value(
+                "name",
+                format!("{:?} is the name of a directory of the system", self.name),
             ));
         }
         check_relative(&self.binary).map_err(|why| value("binary", format!("{why}")))?;

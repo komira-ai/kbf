@@ -183,12 +183,39 @@ pub const HIJACKING_ENV: &[&str] = &[
     "PHP_INI_SCAN_DIR",
     "GEM_PATH",
     "GEM_HOME",
+    // What the C library, TLS libraries, git and the shell read at start.
+    "GLIBC_TUNABLES",
+    "OPENSSL_CONF",
+    "OPENSSL_ENGINES",
+    "OPENSSL_MODULES",
+    "SSLKEYLOGFILE",
+    "ZDOTDIR",
+];
+
+/// Service names that are the names of directories of the system under the write roots (`/var/lib/sudo`,
+/// `/run/udev`): a service of that name would be handed the directory by the rule that a root hook
+/// writes in a directory named for its service.
+pub const SYSTEM_NAMES: &[&str] = &[
+    "apt",
+    "cloud",
+    "cloud-init",
+    "cron",
+    "dbus",
+    "dpkg",
+    "netplan",
+    "network",
+    "polkit-1",
+    "ssh",
+    "sudo",
+    "systemd",
+    "tmpfiles",
+    "udev",
 ];
 
 /// Whether a hook may be given the variable `name` with `value`: not a name of [`HIJACKING_ENV`],
-/// not `LD_*`, `MALLOC_*`, `PYTHON*` or `DYLD_*`, and `PATH` only as a list of absolute directories.
+/// not `LD_*`, `MALLOC_*`, `PYTHON*`, `DYLD_*` or `GIT_*`, and `PATH` only as a list of absolute directories.
 pub fn env_allowed(name: &str, value: &str) -> bool {
-    let hijack = ["LD_", "MALLOC_", "PYTHON", "DYLD_"]
+    let hijack = ["LD_", "MALLOC_", "PYTHON", "DYLD_", "GIT_"]
         .iter()
         .any(|prefix| name.starts_with(prefix))
         | HIJACKING_ENV.contains(&name);

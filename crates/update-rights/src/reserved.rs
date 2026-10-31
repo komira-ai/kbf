@@ -34,17 +34,23 @@ pub const RESERVED: &[&str] = &[
     "/run/systemd/generator",
     "/run/systemd/generator.early",
     "/run/systemd/generator.late",
+    "/run/systemd/network",
     "/run/systemd/system",
     "/run/systemd/system.control",
     "/run/systemd/transient",
+    "/run/tmpfiles.d",
+    "/run/udev",
     "/run/updater",
     "/sbin",
     "/usr",
     "/usr/lib/systemd/system",
     "/usr/share/polkit-1",
     "/var/cache/apt",
+    "/var/lib/apt",
+    "/var/lib/cloud",
     "/var/lib/dpkg",
     "/var/lib/polkit-1",
+    "/var/lib/sudo",
     "/var/lib/updater",
     "/var/spool/cron",
 ];
@@ -92,22 +98,28 @@ pub const WRITE_ROOTS: [&str; 4] = ["/var/lib", "/var/cache", "/run", "/opt"];
 /// write root whose name is the service's, or the service's followed by `-` and more
 /// (`/var/lib/svc`, `/opt/svc/data`, `/var/lib/svc-update`).
 pub fn check_service_write(path: &str, service: &str) -> Result<(), Violation> {
-    let own = WRITE_ROOTS.iter().any(|root| {
-        path.strip_prefix(root)
-            .and_then(|rest| rest.strip_prefix('/'))
-            .is_some_and(|rest| {
-                let first = rest.split('/').next().unwrap_or_default();
-                (first == service)
-                    | first
-                        .strip_prefix(service)
-                        .is_some_and(|more| more.starts_with('-'))
-            })
-    });
+    let own = first_below_a_write_root(path).is_some_and(|first| belongs_to(first, service));
     if own {
         Ok(())
     } else {
         Err(Violation::NotTheServices)
     }
+}
+
+/// The first component of `path` under the write root it lies in: `svc` for `/var/lib/svc/x`.
+pub fn first_below_a_write_root(path: &str) -> Option<&str> {
+    WRITE_ROOTS.iter().find_map(|root| {
+        let rest = path.strip_prefix(root)?.strip_prefix('/')?;
+        rest.split('/').next()
+    })
+}
+
+/// Whether the directory name `first` is `service`'s: the name, or the name followed by `-` and more.
+pub fn belongs_to(first: &str, service: &str) -> bool {
+    (first == service)
+        | first
+            .strip_prefix(service)
+            .is_some_and(|more| more.starts_with('-'))
 }
 
 /// Whether `path` is `dir` or lies below it. Both are absolute and in the path grammar.
