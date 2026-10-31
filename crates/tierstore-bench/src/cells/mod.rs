@@ -39,7 +39,9 @@
 //! control and counters files (`run --fault-control`). Without one only the healthy arms are
 //! run.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -153,6 +155,37 @@ pub struct CellPlan {
     /// Whether the put cells add their open-loop arms (`run --open-loop`). The other cells have
     /// none and ignore it.
     pub open_loop: bool,
+    /// What cell `c` is asked for beyond its defaults; the other cells ignore it.
+    pub copy_lag: CopyLag,
+}
+
+/// What `run` asks of cell `c`: the burst, the time to drain it, and the delete arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CopyLag {
+    /// Objects in a burst, whatever their size (`--burst-objects`); the cell's own count by
+    /// size (1,000 up to 1 MiB, 8 above) if absent.
+    pub burst_objects: Option<NonZeroU64>,
+    /// How long after the last acknowledgement an object not on the cold store is a failure
+    /// (`--drain-deadline-secs`).
+    pub drain_deadline: Duration,
+    /// Whether the cell adds the arm that deletes the burst and watches the keys go
+    /// (`--copy-lag-delete`).
+    pub delete: bool,
+}
+
+impl CopyLag {
+    /// The deadline of a drain when none is asked for.
+    pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(600);
+}
+
+impl Default for CopyLag {
+    fn default() -> Self {
+        Self {
+            burst_objects: None,
+            drain_deadline: Self::DEFAULT_DEADLINE,
+            delete: false,
+        }
+    }
 }
 
 /// Runs one cell.
@@ -185,17 +218,7 @@ pub async fn run_with_faults(
         CellId::ColdRead => cold_read::run_with(ctx, plan, load(), faults, None).await,
         CellId::A1 => a1::run_with(ctx, plan, load(), faults, None).await,
         CellId::B => b::run_with(ctx, plan, load(), None).await,
-        CellId::C => {
-            c::run_with(
-                ctx,
-                plan,
-                load(),
-                faults,
-                c::polling(ctx.config.rates.list_poll_rps),
-                None,
-            )
-            .await
-        }
+        CellId::C => c::run_with(ctx, plan, load(), faults, c::polling_for(ctx, plan), None).await,
         CellId::G => g::run_with(ctx, plan, load(), None).await,
     }
 }
@@ -235,6 +258,7 @@ mod tests {
             in_flight: vec![1],
             object_bytes: vec![],
             open_loop: true,
+            copy_lag: CopyLag::default(),
         };
         let bare = testkit::ctx(dir.path(), &[], Window::Busy);
         for (id, name) in [

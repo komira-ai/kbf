@@ -29,6 +29,7 @@ use std::path::Path;
 
 use crate::cells::CellId;
 use crate::cells::stats::{self, bootstrap_ci};
+use crate::config::RateCaps;
 use crate::error::BenchError;
 use crate::result::{CellResult, Window};
 
@@ -322,11 +323,12 @@ fn format_report(results: &[CellResult], rows: &Rows) -> String {
         let p = &first.provenance;
         writeln!(
             out,
-            "run `{}`, tool commit `{}`, binary `{}`, open loop `{}`\n",
+            "run `{}`, tool commit `{}`, binary `{}`, open loop `{}`, request caps {}\n",
             p.run_id,
             p.git_sha,
             p.binary_digest,
-            if p.open_loop { "on" } else { "off" }
+            if p.open_loop { "on" } else { "off" },
+            caps_text(p.rate_caps)
         )
         .expect("a string takes text");
     }
@@ -418,6 +420,12 @@ pub fn render(result_dir: &Path) -> Result<String, BenchError> {
     Ok(format_report(&results, &rows))
 }
 
+/// The request caps of a run, as the header of the report shows them: a figure of files or
+/// requests per second is read next to these.
+fn caps_text(_caps: Option<RateCaps>) -> String {
+    "`not recorded`".to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +448,7 @@ mod tests {
             }),
             gate_tripped: None,
             cold_guard: None,
+            drain: None,
         }
     }
 
@@ -665,6 +674,26 @@ mod tests {
         a.provenance.open_loop = false;
         let off = format_report(&[a], &Rows::new());
         assert!(off.contains(", open loop `off`"), "{off}");
+    }
+
+    /// Catches the header of the report not showing the request caps of the run (a rate in the
+    /// table would stand without them): a number, `unlimited` and a result that recorded none.
+    #[test]
+    fn the_report_header_shows_the_request_caps() {
+        use crate::config::{RateCap, RateCaps};
+        let mut a = result("a", vec![pass(1, Window::Quiet, 1, None)], &[]);
+        let none = format_report(&[a.clone()], &Rows::new());
+        assert!(none.contains(", request caps `not recorded`\n"), "{none}");
+        a.provenance.rate_caps = Some(RateCaps {
+            cold_rps: RateCap::per_sec(100).unwrap(),
+            hot_rps: RateCap::Unlimited,
+            list_poll_rps: 2,
+        });
+        let shown = format_report(&[a], &Rows::new());
+        assert!(
+            shown.contains(", request caps cold `100`/s, hot `unlimited`/s, list poll `2`/s\n"),
+            "{shown}"
+        );
     }
 
     /// A result of `arm` at `attempt`, with one quiet pass of 1,000 requests, and the cold store

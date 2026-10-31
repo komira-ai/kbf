@@ -88,6 +88,7 @@ mod tests {
             in_flight: vec![1],
             object_bytes: vec![4096],
             open_loop: true,
+            copy_lag: crate::cells::CopyLag::default(),
         };
         let results = run_with(&ctx, &plan, Script::calm(), None, Some(3))
             .await
@@ -117,6 +118,7 @@ mod tests {
             in_flight: vec![1],
             object_bytes: vec![],
             open_loop: true,
+            copy_lag: crate::cells::CopyLag::default(),
         };
         assert!(matches!(run(&ctx, &plan).await, Err(BenchError::Setup(_))));
     }
@@ -143,6 +145,7 @@ mod tests {
                 in_flight: vec![1],
                 object_bytes: vec![4096],
                 open_loop: true,
+                copy_lag: crate::cells::CopyLag::default(),
             };
             match run_with(&ctx, &plan, Script::calm(), None, Some(1)).await {
                 Ok(_) => {

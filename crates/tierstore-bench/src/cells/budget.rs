@@ -25,13 +25,14 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use crate::atomic;
-use crate::config::ByteCaps;
+use crate::config::{ByteCaps, RateCap};
 use crate::error::BenchError;
 
 /// A cap on the requests per second of one store role. Cloned `Arc`s of it share one budget.
 #[derive(Debug)]
 pub struct Throttle {
-    gap: Duration,
+    /// The time between two requests; `None` for no cap.
+    gap: Option<Duration>,
     next: Mutex<Instant>,
 }
 
@@ -39,19 +40,36 @@ impl Throttle {
     /// A cap of `per_sec` requests per second (zero is taken as one).
     #[must_use]
     pub fn new(per_sec: u32) -> Self {
+        Self::with_gap(Some(Duration::from_secs(1) / per_sec.max(1)))
+    }
+
+    /// The cap a run asked for: a rate, or none at all.
+    #[must_use]
+    pub fn capped(cap: RateCap) -> Self {
+        match cap {
+            RateCap::PerSec(n) => Self::new(n.get()),
+            RateCap::Unlimited => Self::new(1),
+        }
+    }
+
+    fn with_gap(gap: Option<Duration>) -> Self {
         Self {
-            gap: Duration::from_secs(1) / per_sec.max(1),
+            gap,
             next: Mutex::new(Instant::now()),
         }
     }
 
     /// Waits until this request may be sent. Requests are served in the order they ask, one
-    /// `gap` apart, so a burst is spread and the rate over any span is at most the cap.
+    /// `gap` apart, so a burst is spread and the rate over any span is at most the cap. Without a
+    /// cap it returns at once.
     pub async fn acquire(&self) {
+        let Some(gap) = self.gap else {
+            return;
+        };
         let at = {
             let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
             let at = (*next).max(Instant::now());
-            *next = at + self.gap;
+            *next = at + gap;
             at
         };
         tokio::time::sleep_until(at).await;
@@ -362,6 +380,24 @@ mod tests {
             throttle.acquire().await;
         }
         assert_eq!(start.elapsed(), Duration::from_millis(400));
+    }
+
+    /// Catches a cap that was asked to be none still spacing requests (a 10,000-request burst
+    /// takes no time on the paused clock), and the capped kind not spacing them: 11 requests at
+    /// 10 a second take a second.
+    #[tokio::test(start_paused = true)]
+    async fn an_unlimited_throttle_never_waits_and_a_capped_one_spreads() {
+        let start = Instant::now();
+        let free = Throttle::capped(RateCap::Unlimited);
+        for _ in 0..10_000 {
+            free.acquire().await;
+        }
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        let capped = Throttle::capped(RateCap::per_sec(10).unwrap());
+        for _ in 0..11 {
+            capped.acquire().await;
+        }
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
     }
 
     /// Catches a cap of zero dividing by zero, and a cap that waits when the requests are

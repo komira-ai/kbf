@@ -93,6 +93,7 @@ impl PreflightReport {
             hardware: self.hardware.clone(),
             attempt: 1,
             open_loop: true,
+            rate_caps: None,
         }
     }
 }

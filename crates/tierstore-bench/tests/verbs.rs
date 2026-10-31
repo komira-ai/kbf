@@ -373,7 +373,7 @@ fn parsed_run(extra: &[&str]) -> Result<cli::RunArgs, clap::Error> {
     ];
     argv.extend_from_slice(extra);
     match Cli::try_parse_from(argv)?.command {
-        cli::Command::Run(args) => Ok(args),
+        cli::Command::Run(args) => Ok(*args),
         other => panic!("{other:?}"),
     }
 }

@@ -98,6 +98,7 @@ mod tests {
             in_flight: vec![2],
             object_bytes: sizes.to_vec(),
             open_loop: true,
+            copy_lag: crate::cells::CopyLag::default(),
         }
     }
 

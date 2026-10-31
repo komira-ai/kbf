@@ -210,6 +210,7 @@ fn arm(label: String, in_flight: u32, misses: &Arc<Misses>) -> Arm {
             async move { Ok(vec![misses.remove(pass).await?]) }
         })),
         faulted: false,
+        drain: None,
         notes,
     }
 }
@@ -254,6 +255,7 @@ mod tests {
             in_flight: in_flight.to_vec(),
             object_bytes: sizes.to_vec(),
             open_loop: true,
+            copy_lag: crate::cells::CopyLag::default(),
         }
     }
 
@@ -280,6 +282,37 @@ mod tests {
         assert_eq!(
             [4096, 65_536, MIB, 128 * MIB].map(objects_for),
             [1000, 1000, 300, 8]
+        );
+    }
+
+    /// Catches the miss read's results (the cold ms over warm ms is read next to the cap that
+    /// held the reads back) not naming the request caps the run held: every arm's result carries
+    /// them.
+    #[tokio::test]
+    async fn every_result_names_the_caps_it_ran_under() {
+        use crate::config::{RateCap, RateCaps};
+        let dir = temp("tb-b-caps");
+        let (instance, cold) = (FakeS3::start().await, FakeS3::start().await);
+        let stores = [
+            (Role::Instance, instance.endpoint()),
+            (Role::Cold, cold.endpoint()),
+        ];
+        let mut ctx = testkit::ctx(dir.path(), &stores, Window::Busy);
+        let rates = RateCaps {
+            cold_rps: RateCap::Unlimited,
+            hot_rps: RateCap::per_sec(50_000).unwrap(),
+            list_poll_rps: 2,
+        };
+        ctx.config.rates = rates;
+        mirror(&ctx, 4096, 2, 1).await;
+        let results = run_with(&ctx, &plan(&[2], &[4096]), Script::calm(), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 4);
+        assert!(
+            results
+                .iter()
+                .all(|r| r.provenance.rate_caps == Some(rates))
         );
     }
 

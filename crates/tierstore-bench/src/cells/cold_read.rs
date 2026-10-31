@@ -375,6 +375,7 @@ fn arm(
             }
         })),
         faulted,
+        drain: None,
         notes,
     }
 }
@@ -442,6 +443,7 @@ mod tests {
             in_flight: in_flight.to_vec(),
             object_bytes: sizes.to_vec(),
             open_loop: true,
+            copy_lag: crate::cells::CopyLag::default(),
         }
     }
 

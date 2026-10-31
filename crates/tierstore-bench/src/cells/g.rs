@@ -435,6 +435,7 @@ fn arm(
             )]))
         })),
         faulted: false,
+        drain: None,
         notes,
     }
 }
@@ -499,6 +500,7 @@ mod tests {
             in_flight: in_flight.to_vec(),
             object_bytes: vec![],
             open_loop: true,
+            copy_lag: crate::cells::CopyLag::default(),
         }
     }
 
@@ -706,6 +708,30 @@ mod tests {
         );
         let instance_note = results[4].notes.join(" ");
         assert!(instance_note.contains("two-tier"), "{instance_note}");
+    }
+
+    /// Catches the tree read's results (where a files-per-second figure is read) not naming the
+    /// request caps the run held: every arm's result carries them, `unlimited` included.
+    #[tokio::test]
+    async fn every_result_names_the_caps_it_ran_under() {
+        use crate::config::{RateCap, RateCaps};
+        let dir = temp("tb-g-caps");
+        let mut ctx = testkit::ctx(dir.path(), &[], Window::Quiet);
+        let rates = RateCaps {
+            cold_rps: RateCap::per_sec(7).unwrap(),
+            hot_rps: RateCap::Unlimited,
+            list_poll_rps: 2,
+        };
+        ctx.config.rates = rates;
+        let results = run_with(&ctx, &plan(&[1]), Script::calm(), Some(3))
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
+        assert!(
+            results
+                .iter()
+                .all(|r| r.provenance.rate_caps == Some(rates))
+        );
     }
 
     /// Catches a run with no store still measuring something: the two local baselines run on

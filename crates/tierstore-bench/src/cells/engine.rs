@@ -49,8 +49,8 @@ use crate::gate::{LoadSample, Trip};
 use crate::proxy::FaultMode;
 use crate::requestlog::RequestLog;
 use crate::result::{
-    CellResult, ColdTrip, Op, PassColdState, PassResult, Percentiles, Provenance, SCHEMA_VERSION,
-    Sample, Window,
+    CellResult, ColdTrip, Drain, Op, PassColdState, PassResult, Percentiles, Provenance,
+    SCHEMA_VERSION, Sample, Window,
 };
 use crate::role::Role;
 use crate::s3::{BenchS3, Outcome, Timeouts, unix_ms};
@@ -261,9 +261,15 @@ pub struct Arm {
     /// cold store guard is not shown the arm's cold requests: they are meant to be slow or to
     /// fail.
     pub faulted: bool,
+    /// What the arm saw of the copy of its objects to the cold store in a pass, asked after the
+    /// pass (and its `after` hook) and stamped into the arm's own result for that pass.
+    pub drain: Option<DrainFn>,
     /// Prose of the cell's for every result of the arm.
     pub notes: Vec<String>,
 }
+
+/// What an arm tells of the drain of a pass: the figures of that pass, if it has them.
+pub type DrainFn = Arc<dyn Fn(u32) -> Option<Drain> + Send + Sync>;
 
 /// Which rate cap a client is held to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -382,14 +388,16 @@ impl Env {
         })?;
         Ok(Self {
             config: ctx.config.clone(),
+            // The caps the throttles below hold, stamped where they are made, so a result cannot
+            // name a cap other than the one that was in force.
             provenance: ctx.provenance.clone(),
             log: ctx.log.clone(),
             timeouts: Timeouts::default(),
             load,
             cold_state: ctx.cold_state.clone(),
             guard: Mutex::new(ColdGuard::new(ctx.config.cold_guard)),
-            cold_cap: Arc::new(Throttle::new(ctx.config.rates.cold_rps)),
-            hot_cap: Arc::new(Throttle::new(ctx.config.rates.hot_rps)),
+            cold_cap: Arc::new(Throttle::capped(ctx.config.rates.cold_rps)),
+            hot_cap: Arc::new(Throttle::capped(ctx.config.rates.hot_rps)),
             recorder: Recorder::open(dir)?,
             ledger: Charger(Arc::new(Mutex::new(Ledger::open(
                 &ctx.campaign.ledger,
@@ -708,6 +716,7 @@ fn pass_result(
         percentiles,
         gate_tripped: trip.map(|t| t.metric.to_owned()),
         cold_guard: cold_trip.cloned(),
+        drain: None,
     }
 }
 
@@ -895,6 +904,7 @@ async fn run_pass(
     if let Some(after) = &arm.after {
         notes.extend(after(pass).await?);
     }
+    let drain: Option<Drain> = None;
     env.ledger
         .settle(planned, driven.steps.iter().map(|s| s.cold_write).sum())?;
     let window = if driven.trip.is_some() || driven.cold_trip.is_some() {
@@ -927,7 +937,7 @@ async fn run_pass(
                 .csv_row(&env.provenance),
             );
         }
-        let result = pass_result(
+        let mut result = pass_result(
             pass,
             window,
             driven.elapsed,
@@ -935,6 +945,9 @@ async fn run_pass(
             driven.cold_trip.as_ref(),
             &steps,
         );
+        if suffix.is_empty() {
+            result.drain = drain;
+        }
         let slot = acc.entry(label).or_default();
         slot.passes.push(result);
         slot.cold_state
@@ -1007,6 +1020,7 @@ mod tests {
             before: None,
             after: None,
             faulted: false,
+            drain: None,
             notes: vec!["a note of the cell".to_owned()],
         }
     }
@@ -1371,6 +1385,94 @@ mod tests {
         let now = Instant::now();
         assert_eq!(lateness_us(now, now + Duration::from_millis(3)), 3000);
         assert_eq!(lateness_us(now + Duration::from_millis(3), now), 0);
+    }
+
+    /// Catches a drain asked before the pass's own hook has run, asked twice, given to a pass
+    /// other than the one it is for, or given to the result of a second quantity (`.second`)
+    /// as well as the arm's own: the drain of pass `n` is asked once, after `after n`, and only the
+    /// arm's own result carries it.
+    #[tokio::test]
+    async fn an_arms_drain_is_asked_once_after_each_pass_and_lands_in_its_own_result_only() {
+        let dir = temp("tb-engine-drain");
+        let env = env(dir.path(), Window::Busy, Script::calm());
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut a = arm("a", 1, 1, &Arc::new(Mutex::new(vec![])));
+        a.work = work(|_| async {
+            let second = Step {
+                label: ".second",
+                second_quantity: true,
+                ..step(7, 0)
+            };
+            Ok(vec![step(5, 0), second])
+        });
+        let after = events.clone();
+        a.after = Some(hook(move |pass| {
+            let events = after.clone();
+            async move {
+                events.lock().unwrap().push(format!("after {pass}"));
+                Ok(vec![])
+            }
+        }));
+        let asked = events.clone();
+        a.drain = Some(Arc::new(move |pass| {
+            asked.lock().unwrap().push(format!("drain {pass}"));
+            Some(Drain {
+                acked: u64::from(pass) + 10,
+                observed: 0,
+                ack_span_us: 0,
+                from_first_ack_us: None,
+                from_last_ack_us: Some(u64::from(pass)),
+                peak_backlog: 0,
+                polls: 1,
+            })
+        }));
+        let results = run_cell(&env, CellId::C, vec![a], 2, None).await.unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["after 0", "drain 0", "after 1", "drain 1"]
+        );
+        let by_arm = |name: &str| results.iter().find(|r| r.arm == name).unwrap();
+        let own: Vec<Option<u64>> = by_arm("a")
+            .passes
+            .iter()
+            .map(|p| p.drain.map(|d| d.acked))
+            .collect();
+        assert_eq!(own, [Some(10), Some(11)]);
+        assert!(by_arm("a.second").passes.iter().all(|p| p.drain.is_none()));
+    }
+
+    /// Catches the caps a result names not being the caps the run held: the provenance of the
+    /// environment (and so of every result a cell writes) is stamped from the configuration even
+    /// when the context's own provenance has none, and the cold cap is the cold role's and the
+    /// hot cap the hot role's: with the cold cap off and the hot one at 1 a second, a hundred cold
+    /// requests take no time and three hot ones two seconds.
+    #[tokio::test(start_paused = true)]
+    async fn the_environment_stamps_the_caps_it_holds_and_holds_each_role_to_its_own() {
+        use crate::config::{RateCap, RateCaps};
+        let dir = temp("tb-engine-caps");
+        let mut ctx = testkit::ctx(dir.path(), &[], Window::Busy);
+        assert_eq!(ctx.provenance.rate_caps, None);
+        ctx.config.rates = RateCaps {
+            cold_rps: RateCap::Unlimited,
+            hot_rps: RateCap::per_sec(1).unwrap(),
+            list_poll_rps: 5,
+        };
+        let env = Env::new(&ctx, Script::calm()).unwrap();
+        assert_eq!(env.provenance.rate_caps, Some(ctx.config.rates));
+        let start = tokio::time::Instant::now();
+        for _ in 0..100 {
+            env.cap(Cap::Cold).acquire().await;
+        }
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        for _ in 0..3 {
+            env.cap(Cap::Hot).acquire().await;
+        }
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
+        let seen = Arc::new(Mutex::new(vec![]));
+        let results = run_cell(&env, CellId::ColdPut, vec![arm("a", 1, 1, &seen)], 2, None)
+            .await
+            .unwrap();
+        assert_eq!(results[0].provenance.rate_caps, Some(ctx.config.rates));
     }
 
     /// Catches hooks run out of order or with the wrong pass, and their notes not reaching the

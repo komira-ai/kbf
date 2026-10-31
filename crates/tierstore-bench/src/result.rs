@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::cells::CellId;
+use crate::config::RateCaps;
 use crate::error::BenchError;
 use crate::role::Role;
 
@@ -124,6 +125,12 @@ pub struct Provenance {
     /// set off). A result written before the field existed was a run with them on.
     #[serde(default = "open_loop_on")]
     pub open_loop: bool,
+    /// The request-rate caps the run held (`--cold-rps`, `--hot-rps`, `--list-poll-rps`), each a
+    /// rate or `unlimited`. Stamped when a cell's environment is made, from the same value the
+    /// throttles are made from, so a files-per-second or a burst figure is read next to the cap
+    /// it ran under. Absent in a result written before the field existed, and in a preflight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_caps: Option<RateCaps>,
 }
 
 /// The open-loop setting of a result that does not name one.
@@ -149,6 +156,7 @@ impl Provenance {
             hardware: BTreeMap::new(),
             attempt: first_attempt(),
             open_loop: open_loop_on(),
+            rate_caps: None,
         }
     }
 }
@@ -247,6 +255,39 @@ pub struct PassResult {
     /// The cold store guard's trip that aborted the pass, if one did.
     #[serde(default)]
     pub cold_guard: Option<ColdTrip>,
+    /// How the copy of the pass's objects to the cold store (or the disappearance of their keys
+    /// from a listing) went; only the cells that watch one set it (`c`). Absent otherwise and in
+    /// a result written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain: Option<Drain>,
+}
+
+/// How a burst of acknowledged operations showed up on the cold store: the drain of a pass of
+/// cell `c`, put by put or delete by delete.
+///
+/// The cold store is listed once per poll; an operation is seen at the first poll that lists its
+/// object (a put) or no longer lists it (a delete). The clock of every figure is the
+/// acknowledgement the instance gave.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Drain {
+    /// Operations acknowledged (the ones that failed are not counted).
+    pub acked: u64,
+    /// Of those, seen on the cold store by the end of the watch.
+    pub observed: u64,
+    /// From the first acknowledgement to the last, microseconds: with `acked`, the rate the burst
+    /// arrived at.
+    pub ack_span_us: u64,
+    /// From the first acknowledgement until every acknowledged operation was seen; `None` if the
+    /// deadline passed first.
+    pub from_first_ack_us: Option<u64>,
+    /// From the last acknowledgement until every acknowledged operation was seen: the time a
+    /// burst takes to drain once it has stopped arriving. `None` if the deadline passed first,
+    /// so a pass that never drained is a missing figure, not a zero.
+    pub from_last_ack_us: Option<u64>,
+    /// The most operations acknowledged and not yet seen at any poll.
+    pub peak_backlog: u64,
+    /// Listings taken.
+    pub polls: u64,
 }
 
 /// The result of one arm of one cell: the contents of one result JSON.
@@ -404,6 +445,7 @@ mod tests {
             )]),
             attempt: 2,
             open_loop: true,
+            rate_caps: None,
         }
     }
 
@@ -437,6 +479,7 @@ mod tests {
                     requests: 40,
                     window_secs: 60,
                 }),
+                drain: None,
             }],
             notes: vec!["a note".to_owned()],
             cold_state: vec![PassColdState {
@@ -479,6 +522,65 @@ mod tests {
                 .unwrap()
                 .provenance
                 .open_loop
+        );
+    }
+
+    /// Catches the request caps of a run being left out of its results (a files-per-second figure
+    /// would stand without the cap it ran under), written when there are none, or an old result
+    /// failing to read: they are in the provenance as a number or `unlimited`, absent when not
+    /// recorded, and a result without the field reads as not recorded.
+    #[test]
+    fn the_rate_caps_are_in_the_provenance_and_an_old_result_reads_as_not_recorded() {
+        use crate::config::{RateCap, RateCaps};
+        let mut r = result();
+        let v: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
+        assert!(v["provenance"].get("rate_caps").is_none());
+        let caps = RateCaps {
+            cold_rps: RateCap::per_sec(100).unwrap(),
+            hot_rps: RateCap::Unlimited,
+            list_poll_rps: 2,
+        };
+        r.provenance.rate_caps = Some(caps);
+        let mut v: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
+        assert_eq!(
+            v["provenance"]["rate_caps"],
+            serde_json::json!({"cold_rps": 100, "hot_rps": "unlimited", "list_poll_rps": 2})
+        );
+        assert_eq!(CellResult::from_json(&v.to_string()).unwrap(), r);
+        v["provenance"].as_object_mut().unwrap().remove("rate_caps");
+        let old = CellResult::from_json(&v.to_string()).unwrap();
+        assert_eq!(old.provenance.rate_caps, None);
+    }
+
+    /// Catches the drain of a pass being lost, written when a pass has none, or an old result
+    /// failing to read: it round-trips, a missing last-acknowledgement figure stays missing (not
+    /// zero), and a result without the field reads as no drain.
+    #[test]
+    fn the_drain_of_a_pass_round_trips_and_a_pass_without_one_has_none() {
+        let mut r = result();
+        let v: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
+        assert!(v["passes"][0].get("drain").is_none());
+        let drain = Drain {
+            acked: 1000,
+            observed: 998,
+            ack_span_us: 2_500_000,
+            from_first_ack_us: None,
+            from_last_ack_us: None,
+            peak_backlog: 640,
+            polls: 31,
+        };
+        r.passes[0].drain = Some(drain);
+        let mut v: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
+        assert_eq!(
+            v["passes"][0]["drain"]["from_last_ack_us"],
+            serde_json::Value::Null
+        );
+        assert_eq!(v["passes"][0]["drain"]["peak_backlog"], 640);
+        assert_eq!(CellResult::from_json(&v.to_string()).unwrap(), r);
+        v["passes"][0].as_object_mut().unwrap().remove("drain");
+        assert_eq!(
+            CellResult::from_json(&v.to_string()).unwrap().passes[0].drain,
+            None
         );
     }
 

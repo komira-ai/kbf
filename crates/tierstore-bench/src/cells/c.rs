@@ -16,15 +16,32 @@
 //! in microseconds, and an object that is not listed by the deadline is a failure whose latency
 //! is the time it waited. The notes give, per pass, the time to drain (from the first
 //! acknowledgement to the last object listed) and the backlog (acknowledged and not yet listed)
-//! at each poll. Mode `healthy` leaves the cold store as it is; with a fault proxy, mode
-//! `stopped-restored` refuses the cold store while the burst is sent and restores it before the
-//! first poll, so the lag is the recovery.
+//! at each poll, and the same as a [`Drain`] in the result of the pass: how many were
+//! acknowledged and seen, the span the acknowledgements arrived over (so the rate the burst really
+//! had), the time from the first and from the last acknowledgement until every object was listed
+//! (a missing figure, not a zero, if the deadline passed first), and the peak backlog. Mode
+//! `healthy` leaves the cold store as it is; with a fault proxy, mode `stopped-restored` refuses
+//! the cold store while the burst is sent and restores it before the first poll, so the lag is the
+//! recovery.
+//!
+//! Mode `delete` (`--copy-lag-delete on`) is the same in the other direction: the burst is put and
+//! waited out until every object is on the cold store, then deleted through the instance, and the
+//! lag of an object is the time from its delete's acknowledgement until a poll no longer lists it,
+//! in the cold bucket (the arm itself) and in a listing through the instance (the arm with the
+//! suffix `.instance-list`, what a client that lists a prefix to confirm a delete sees). An object
+//! whose put failed or never reached the cold store is a failure and is not deleted by the arm.
+//!
+//! The size of a burst (`--burst-objects`) and the time to wait for it to drain
+//! (`--drain-deadline-secs`) are the plan's. The requests of a burst are held to the hot cap; a
+//! burst that is meant to arrive faster than it is run with `--hot-rps unlimited`, and its
+//! [`Drain`] and the provenance of the result say what rate it had and what cap it ran under.
 //!
 //! Needs the instance and the cold roles. Writes under `tierstore-bench/<run id>/c/`; after each
 //! pass deletes the burst's keys through the instance and whatever is under the prefix of the cold
 //! bucket.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -42,8 +59,7 @@ use crate::cells::putcell::size_label;
 use crate::cells::{CellContext, CellId, CellPlan};
 use crate::error::BenchError;
 use crate::proxy::FaultMode;
-use crate::result::CellResult;
-use crate::result::Op;
+use crate::result::{CellResult, Drain, Op};
 use crate::role::Role;
 use crate::s3::{BenchS3, unix_ms};
 
@@ -77,6 +93,12 @@ pub fn polling(list_poll_rps: u32) -> Polling {
         deadline: Duration::from_secs(600),
         page: 1000,
     }
+}
+
+/// The poll of a run: [`polling`] with the deadline the plan asks for (`--drain-deadline-secs`).
+#[must_use]
+pub fn polling_for(ctx: &CellContext, _plan: &CellPlan) -> Polling {
+    polling(ctx.config.rates.list_poll_rps)
 }
 
 /// What a watch of a burst found: the lag of each put that was seen, the backlog at each poll,
@@ -124,6 +146,21 @@ where
     Ok((lag, backlog, drained))
 }
 
+/// The [`Drain`] of a watch: `acked` are the operations as they were acknowledged, `watched` what
+/// the polls found. Only the operations that succeeded count; the clock is their acknowledgement.
+fn drain_of(acked: &[(String, Instant, bool)], watched: &Watched) -> Drain {
+    let _ = (acked, watched);
+    Drain {
+        acked: 0,
+        observed: 0,
+        ack_span_us: 0,
+        from_first_ack_us: None,
+        from_last_ack_us: None,
+        peak_backlog: 0,
+        polls: 0,
+    }
+}
+
 /// What one arm sends and watches.
 struct Burst {
     instance: Arc<BenchS3>,
@@ -135,7 +172,11 @@ struct Burst {
     in_flight: u32,
     body: Bytes,
     polling: Polling,
+    /// Whether the arm times the disappearance of deleted keys instead of the arrival of puts.
+    delete: bool,
     note: Mutex<Vec<String>>,
+    /// The [`Drain`] of each pass, until the engine asks for it.
+    drains: Mutex<BTreeMap<u32, Drain>>,
 }
 
 impl Burst {
@@ -145,11 +186,20 @@ impl Burst {
 
     /// Every key under `prefix` of the cold bucket, over all pages.
     async fn listed(&self, prefix: &str) -> Result<Option<Vec<String>>, BenchError> {
+        self.listed_in(&self.cold, prefix).await
+    }
+
+    /// Every key under `prefix` of the bucket `store` reaches, over all pages; `None` if a page
+    /// could not be had.
+    async fn listed_in(
+        &self,
+        store: &BenchS3,
+        prefix: &str,
+    ) -> Result<Option<Vec<String>>, BenchError> {
         let mut keys = Vec::new();
         let mut after = None;
         loop {
-            let page = self
-                .cold
+            let page = store
                 .list_page(prefix, after.as_ref(), self.polling.page)
                 .await?;
             let Ok(page) = page.result else {
@@ -197,12 +247,17 @@ impl Burst {
 
     /// Sends the burst of `pass` and watches it drain; one step per object.
     async fn run(&self, pass: u32) -> Result<Vec<Step>, BenchError> {
+        if self.delete {
+            return self.run_delete(pass).await;
+        }
         let acked = self.send(pass).await?;
         if let Some(switch) = &self.fault {
             switch.set_mode(FaultMode::Pass)?;
         }
         let started_unix_ms = unix_ms();
-        let (lag, backlog, drained) = self.watch(pass, &acked).await?;
+        let watched = self.watch(pass, &acked).await?;
+        self.keep(pass, drain_of(&acked, &watched));
+        let (lag, backlog, drained) = watched;
         let first = acked.iter().map(|(_, at, _)| *at).min();
         let drain_us = drained.zip(first).map_or(0, |(end, start)| {
             micros(end.saturating_duration_since(start))
@@ -231,6 +286,92 @@ impl Burst {
                 in_flight: 0,
             })
             .collect())
+    }
+
+    /// Keeps the drain of `pass` for the engine to ask for.
+    fn keep(&self, pass: u32, drain: Drain) {
+        self.drains
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(pass, drain);
+    }
+
+    /// The drain kept for `pass`, once.
+    fn take(&self, pass: u32) -> Option<Drain> {
+        self.drains
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&pass)
+    }
+
+    /// Deletes through the instance the objects of `puts` that were acknowledged and found on
+    /// the cold store (`landed`); the others are not deleted and are failures in the result.
+    /// Gives, for every object of `puts` in order, the key, the time of the delete's
+    /// acknowledgement (that of the put for one not deleted) and whether it was a success.
+    async fn send_deletes(
+        &self,
+        puts: &[(String, Instant, bool)],
+        landed: &[Option<Duration>],
+    ) -> Result<Vec<(String, Instant, bool)>, BenchError> {
+        let wanted: Vec<(String, Instant, bool)> = puts
+            .iter()
+            .zip(landed)
+            .map(|((key, at, ok), lag)| (key.clone(), *at, *ok && lag.is_some()))
+            .collect();
+        let deleted = futures::stream::iter(wanted)
+            .map(|(key, at, wanted)| async move {
+                if !wanted {
+                    return Ok::<_, BenchError>((key, at, false));
+                }
+                let gone = self.instance.delete(&key).await?;
+                Ok((key, Instant::now(), gone.is_ok()))
+            })
+            .buffered(self.in_flight.max(1) as usize)
+            .collect::<Vec<_>>()
+            .await;
+        deleted.into_iter().collect()
+    }
+
+    /// Lists the bucket `store` reaches until every key of `acked` that was deleted is gone from
+    /// it or the deadline passes: as [`Burst::watch`], with the lag the time to the first poll
+    /// that does not list the key. A listing that fails shows nothing as gone.
+    async fn watch_gone(
+        &self,
+        store: &BenchS3,
+        pass: u32,
+        acked: &[(String, Instant, bool)],
+    ) -> Result<Watched, BenchError> {
+        let prefix = format!("{}/p{pass}/", self.prefix);
+        let (this, prefix) = (self, prefix.as_str());
+        watch_with(self.polling, acked, || async move {
+            let Some(keys) = this.listed_in(store, prefix).await? else {
+                return Ok(HashSet::new());
+            };
+            let present: HashSet<&str> = keys.iter().map(String::as_str).collect();
+            Ok(acked
+                .iter()
+                .filter(|(key, _, _)| !present.contains(key.as_str()))
+                .map(|(key, _, _)| key.clone())
+                .collect())
+        })
+        .await
+    }
+
+    /// Puts the burst of `pass`, waits until it is on the cold store, deletes it through the
+    /// instance and watches the keys leave the cold bucket and the instance's listing; one step
+    /// per object for each listing.
+    async fn run_delete(&self, pass: u32) -> Result<Vec<Step>, BenchError> {
+        let puts = self.send(pass).await?;
+        let (landed, _, _) = self.watch(pass, &puts).await?;
+        let deletes = self.send_deletes(&puts, &landed).await?;
+        let started_unix_ms = unix_ms();
+        let (cold, instance) = futures::future::try_join(
+            self.watch_gone(&self.cold, pass, &deletes),
+            self.watch_gone(&self.instance, pass, &deletes),
+        )
+        .await?;
+        let _ = (cold, instance, started_unix_ms);
+        Ok(vec![])
     }
 
     /// Deletes the burst's keys through the instance and whatever the cold bucket holds under
@@ -272,11 +413,13 @@ pub fn arms(
     let cold = env.s3(Role::Cold, Cap::Cold)?;
     let modes = [("healthy", None)]
         .into_iter()
-        .chain(faults.map(|switch| ("stopped-restored", Some(switch))));
+        .chain(faults.map(|switch| ("stopped-restored", Some(switch))))
+        .chain(plan.copy_lag.delete.then_some(("delete", None)));
     let mut out = Vec::new();
     for (mode, fault) in modes {
         for &size in &sizes {
             for &in_flight in plan.in_flight.iter().filter(|&&n| width_ok(n, size)) {
+                let _asked: Option<NonZeroU64> = plan.copy_lag.burst_objects;
                 let count = burst_for(size).min(limit.unwrap_or(u64::MAX));
                 let label = slug(&format!("{count}x{}-c{in_flight}-{mode}", size_label(size)));
                 let burst = Arc::new(Burst {
@@ -289,7 +432,9 @@ pub fn arms(
                     in_flight,
                     body: content::body(env.config.seed ^ size, size),
                     polling,
+                    delete: mode == "delete",
                     note: Mutex::new(Vec::new()),
+                    drains: Mutex::new(BTreeMap::new()),
                 });
                 out.push(arm(label, mode, &burst));
             }
@@ -299,13 +444,16 @@ pub fn arms(
 }
 
 fn arm(label: String, mode: &str, burst: &Arc<Burst>) -> Arm {
-    let (run, before, after) = (burst.clone(), burst.clone(), burst.clone());
+    let (run, before, after, drain) = (burst.clone(), burst.clone(), burst.clone(), burst.clone());
+    let what = if burst.delete {
+        "deletes through the instance of plain puts that are on the cold store, seen gone by one prefix LIST of the cold test bucket (the arm) and of the instance (the arm .instance-list)"
+    } else {
+        "plain puts through the instance (acknowledged from its hot tier), seen by one prefix LIST of the cold test bucket"
+    };
     let notes = vec![
         format!(
-            "c: copy lag of {} plain puts of {} through the instance (acknowledged from its hot tier), seen by one prefix LIST of the cold test bucket every {:?}; each object is a request, its latency its lag, the resolution that of the poll",
-            burst.count,
-            size_label(burst.size),
-            burst.polling.every
+            "c: copy lag of {} {what} every {:?}; each object is a request, its latency its lag, the resolution that of the poll; the drain of each pass (from the first and from the last acknowledgement) is in the pass's drain figures",
+            burst.count, burst.polling.every
         ),
         format!("test instance and test buckets; mode {mode}"),
         "the load gate is read before the burst, not during it".to_owned(),
@@ -344,6 +492,7 @@ fn arm(label: String, mode: &str, burst: &Arc<Burst>) -> Arm {
             }
         })),
         faulted: burst.fault.is_some(),
+        drain: Some(Arc::new(move |pass| drain.take(pass))),
         notes,
     }
 }
@@ -354,8 +503,15 @@ fn arm(label: String, mode: &str, burst: &Arc<Burst>) -> Arm {
 /// [`BenchError`] if the instance or cold role is not configured, the ledger refuses the cell,
 /// the load gate trips or cannot be read, or a file or the request log fails.
 pub async fn run(ctx: &CellContext, plan: &CellPlan) -> Result<Vec<CellResult>, BenchError> {
-    let poll = polling(ctx.config.rates.list_poll_rps);
-    run_with(ctx, plan, Arc::new(ProcLoad), None, poll, None).await
+    run_with(
+        ctx,
+        plan,
+        Arc::new(ProcLoad),
+        None,
+        polling_for(ctx, plan),
+        None,
+    )
+    .await
 }
 
 /// [`run`] with the machine, the fault proxy, the poll and a cap on the objects of a burst given.
@@ -382,6 +538,7 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::*;
+    use crate::cells::CopyLag;
     use crate::cells::testkit::{self, Script, SwitchLog};
     use crate::requestlog::RequestLog;
     use crate::result::Window;
@@ -393,6 +550,7 @@ mod tests {
             in_flight: in_flight.to_vec(),
             object_bytes: sizes.to_vec(),
             open_loop: true,
+            copy_lag: crate::cells::CopyLag::default(),
         }
     }
 
@@ -713,6 +871,440 @@ mod tests {
         assert_eq!(modes.iter().filter(|m| **m == FaultMode::Pass).count(), 4);
         assert_eq!(modes.last(), Some(&FaultMode::Pass));
         assert!(results[1].passes.iter().all(|p| p.failures == 0));
+    }
+
+    fn plan_with(mut plan: CellPlan, copy_lag: CopyLag) -> CellPlan {
+        plan.copy_lag = copy_lag;
+        plan
+    }
+
+    fn delete_plan(in_flight: &[u32]) -> CellPlan {
+        let copy_lag = CopyLag {
+            delete: true,
+            ..CopyLag::default()
+        };
+        plan_with(plan(in_flight, &[4096]), copy_lag)
+    }
+
+    /// A stand-in for the instance's copier that also carries its deletes to the cold store: what
+    /// the instance holds appears on the cold store, and what it no longer holds goes from it.
+    fn syncer(from: FakeS3, to: &FakeS3) -> JoinHandle<()> {
+        let spec = testkit::spec(to.endpoint());
+        let to = to.clone();
+        tokio::spawn(async move {
+            let log = Arc::new(RequestLog::to_writer(std::io::sink()));
+            let target = BenchS3::new(Role::Cold, &spec, Timeouts::default(), log).unwrap();
+            loop {
+                for key in from.keys() {
+                    if !to.keys().contains(&key) {
+                        target.put(&key, Bytes::from_static(b"copy")).await.unwrap();
+                    }
+                }
+                let held = from.keys();
+                for key in to.keys() {
+                    if !held.contains(&key) {
+                        target.delete(&key).await.unwrap();
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    }
+
+    fn deletes_to(dir: &std::path::Path, role: Role) -> usize {
+        testkit::requests(dir)
+            .iter()
+            .filter(|r| (r.method.as_str(), r.role) == ("DELETE", role))
+            .count()
+    }
+
+    /// Catches the first and the last acknowledgement mixed up, a failed put taken for the last
+    /// acknowledgement (the clock of a drain is that of an operation that was acknowledged), a
+    /// backlog or a poll count lost, and a drain that did not finish reported as a time: the
+    /// figures of a watch of four puts, one failed, seen at the end of a second.
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_is_measured_from_the_first_and_from_the_last_acknowledgement() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let acked = vec![
+            ("a".to_owned(), at(0), true),
+            ("b".to_owned(), at(100), true),
+            ("c".to_owned(), at(300), true),
+            ("x".to_owned(), at(900), false),
+        ];
+        let lag = vec![
+            Some(Duration::from_millis(1000)),
+            Some(Duration::from_millis(900)),
+            Some(Duration::from_millis(700)),
+            None,
+        ];
+        let drain = drain_of(&acked, &(lag.clone(), vec![3, 2, 0], Some(at(1000))));
+        assert_eq!(
+            drain,
+            Drain {
+                acked: 3,
+                observed: 3,
+                ack_span_us: 300_000,
+                from_first_ack_us: Some(1_000_000),
+                from_last_ack_us: Some(700_000),
+                peak_backlog: 3,
+                polls: 3,
+            }
+        );
+        let late = drain_of(
+            &acked,
+            &(
+                vec![Some(Duration::ZERO), None, None, None],
+                vec![2, 2],
+                None,
+            ),
+        );
+        assert_eq!(
+            (
+                late.acked,
+                late.observed,
+                late.from_first_ack_us,
+                late.from_last_ack_us
+            ),
+            (3, 1, None, None)
+        );
+        let none_acked = vec![("x".to_owned(), at(5), false)];
+        let nothing = drain_of(&none_acked, &(vec![None], vec![], Some(at(9))));
+        assert_eq!(
+            nothing,
+            Drain {
+                acked: 0,
+                observed: 0,
+                ack_span_us: 0,
+                from_first_ack_us: None,
+                from_last_ack_us: None,
+                peak_backlog: 0,
+                polls: 0,
+            }
+        );
+    }
+
+    /// Catches the drain of a pass not reaching its result, kept for the wrong pass or under the
+    /// wrong arm: every pass of a copied burst carries the figures of its own four puts, the
+    /// time from the last acknowledgement no more than the time from the first, and the span the
+    /// puts arrived over; the pass is asked once (a second ask has nothing).
+    #[tokio::test]
+    async fn every_pass_carries_the_drain_of_its_own_burst() {
+        let dir = temp("tb-c-drain");
+        let (instance, cold) = (FakeS3::start().await, FakeS3::start().await);
+        let stores = [
+            (Role::Instance, instance.endpoint()),
+            (Role::Cold, cold.endpoint()),
+        ];
+        let ctx = testkit::ctx(dir.path(), &stores, Window::Busy);
+        let copying = copier(instance.clone(), &cold);
+        let mut p = plan(&[2], &[4096]);
+        p.passes = 3;
+        let results = run_with(
+            &ctx,
+            &p,
+            Script::calm(),
+            None,
+            quick(Duration::from_secs(60)),
+            Some(4),
+        )
+        .await
+        .unwrap();
+        copying.abort();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].passes.len(), 3);
+        for pass in &results[0].passes {
+            let drain = pass.drain.expect("a pass of cell c has a drain");
+            assert_eq!((drain.acked, drain.observed), (4, 4));
+            let (first, last) = (drain.from_first_ack_us, drain.from_last_ack_us);
+            assert!(last.unwrap() <= first.unwrap(), "{drain:?}");
+            assert!(drain.polls >= 1 && drain.peak_backlog <= 4, "{drain:?}");
+        }
+    }
+
+    /// Catches objects that never reach the cold store being given a time to drain (they were a
+    /// zero in the note): after the deadline the drain has no time from either acknowledgement,
+    /// and says how many were acknowledged and how many were seen.
+    #[tokio::test]
+    async fn a_burst_that_never_drains_has_no_time_to_drain() {
+        let dir = temp("tb-c-undrained");
+        let (instance, cold) = (FakeS3::start().await, FakeS3::start().await);
+        let stores = [
+            (Role::Instance, instance.endpoint()),
+            (Role::Cold, cold.endpoint()),
+        ];
+        let ctx = testkit::ctx(dir.path(), &stores, Window::Busy);
+        let results = run_with(
+            &ctx,
+            &plan(&[1], &[4096]),
+            Script::calm(),
+            None,
+            quick(Duration::ZERO),
+            Some(3),
+        )
+        .await
+        .unwrap();
+        for pass in &results[0].passes {
+            let drain = pass.drain.unwrap();
+            assert_eq!((drain.acked, drain.observed), (3, 0));
+            assert_eq!(
+                (drain.from_first_ack_us, drain.from_last_ack_us),
+                (None, None)
+            );
+            assert_eq!(drain.peak_backlog, 3);
+        }
+    }
+
+    /// Catches `--burst-objects` and `--drain-deadline-secs` not reaching the arms and the poll:
+    /// 7 objects in each arm whatever the size (the cell's own count without the flag), cut by
+    /// the test's own limit when that is smaller, and the poll's deadline the plan's.
+    #[tokio::test]
+    async fn the_burst_size_and_the_deadline_are_the_plans_when_given() {
+        let dir = temp("tb-c-plan");
+        let stores = [
+            (Role::Instance, "http://127.0.0.1:9"),
+            (Role::Cold, "http://127.0.0.1:9"),
+        ];
+        let ctx = testkit::ctx(dir.path(), &stores, Window::Busy);
+        let env = Env::new(&ctx, Script::calm()).unwrap();
+        let asked = CopyLag {
+            burst_objects: NonZeroU64::new(7),
+            drain_deadline: Duration::from_secs(90),
+            delete: false,
+        };
+        let p = plan_with(plan(&[1], &[4096, 128 * MIB]), asked);
+        let poll = polling_for(&ctx, &p);
+        assert_eq!(poll.deadline, Duration::from_secs(90));
+        assert_eq!(poll.every, polling(ctx.config.rates.list_poll_rps).every);
+        let labels = |limit| -> Vec<String> {
+            arms(&env, &p, None, poll, limit)
+                .unwrap()
+                .into_iter()
+                .map(|a| a.label)
+                .collect()
+        };
+        assert_eq!(labels(None), ["7x4kib-c1-healthy", "7x128mib-c1-healthy"]);
+        assert_eq!(
+            labels(Some(3)),
+            ["3x4kib-c1-healthy", "3x128mib-c1-healthy"]
+        );
+        let own = plan(&[1], &[4096, 128 * MIB]);
+        assert_eq!(polling_for(&ctx, &own).deadline, Duration::from_secs(600));
+        let default: Vec<String> = arms(&env, &own, None, poll, None)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.label)
+            .collect();
+        assert_eq!(default, ["1000x4kib-c1-healthy", "8x128mib-c1-healthy"]);
+    }
+
+    /// Catches the delete arm timing something other than the keys leaving a listing, or
+    /// timing them from the wrong acknowledgement: puts waited out on the cold store, deleted
+    /// through the instance, and the cold bucket's listing (the arm) and the instance's
+    /// (`.instance-list`) watched until the keys are gone; four objects a pass, nothing left on
+    /// either store, a drain on the arm and none on the second quantity.
+    #[tokio::test]
+    async fn the_delete_arm_times_the_keys_leaving_the_cold_and_the_instance_listings() {
+        let dir = temp("tb-c-delete");
+        let (instance, cold) = (FakeS3::start().await, FakeS3::start().await);
+        let stores = [
+            (Role::Instance, instance.endpoint()),
+            (Role::Cold, cold.endpoint()),
+        ];
+        let ctx = testkit::ctx(dir.path(), &stores, Window::Busy);
+        let syncing = syncer(instance.clone(), &cold);
+        let results = run_with(
+            &ctx,
+            &delete_plan(&[2]),
+            Script::calm(),
+            None,
+            quick(Duration::from_secs(60)),
+            Some(4),
+        )
+        .await
+        .unwrap();
+        syncing.abort();
+        let labels: Vec<&str> = results.iter().map(|r| r.arm.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "4x4kib-c2-delete",
+                "4x4kib-c2-delete.instance-list",
+                "4x4kib-c2-healthy"
+            ]
+        );
+        let arm = |name: &str| results.iter().find(|r| r.arm == name).unwrap();
+        for name in ["4x4kib-c2-delete", "4x4kib-c2-delete.instance-list"] {
+            assert!(
+                arm(name)
+                    .passes
+                    .iter()
+                    .all(|p| (p.requests, p.failures) == (4, 0) && p.percentiles.is_some()),
+                "{name}"
+            );
+        }
+        for pass in &arm("4x4kib-c2-delete").passes {
+            let drain = pass.drain.expect("the delete arm has a drain");
+            assert_eq!((drain.acked, drain.observed), (4, 4));
+            assert!(drain.from_last_ack_us.is_some());
+        }
+        let second = arm("4x4kib-c2-delete.instance-list");
+        assert!(second.passes.iter().all(|p| p.drain.is_none()));
+        assert!(instance.keys().is_empty());
+        assert!(cold.keys().is_empty());
+        let samples = std::fs::read_to_string(dir.path().join("samples.csv")).unwrap();
+        let delete_rows = |role: &str| {
+            samples
+                .lines()
+                .filter(|l| {
+                    l.contains(",4x4kib-c2-delete") && l.contains(&format!(",{role},delete,"))
+                })
+                .count()
+        };
+        assert_eq!((delete_rows("cold"), delete_rows("instance")), (8, 8));
+    }
+
+    /// Catches a key that is still listed being taken for gone: a cold store that keeps what the
+    /// instance deleted makes every object of the arm a failure after the deadline and the drain
+    /// has no time, while the instance's own listing (empty at once) is good; the cleanup still
+    /// clears the cold bucket.
+    #[tokio::test]
+    async fn a_listing_that_keeps_deleted_keys_fails_the_arm_and_not_the_instances_listing() {
+        let dir = temp("tb-c-delete-kept");
+        let (instance, cold) = (FakeS3::start().await, FakeS3::start().await);
+        let stores = [
+            (Role::Instance, instance.endpoint()),
+            (Role::Cold, cold.endpoint()),
+        ];
+        let ctx = testkit::ctx(dir.path(), &stores, Window::Busy);
+        let copying = copier(instance.clone(), &cold);
+        let results = run_with(
+            &ctx,
+            &delete_plan(&[2]),
+            Script::calm(),
+            None,
+            quick(Duration::from_millis(50)),
+            Some(4),
+        )
+        .await
+        .unwrap();
+        copying.abort();
+        let arm = |name: &str| results.iter().find(|r| r.arm == name).unwrap();
+        for pass in &arm("4x4kib-c2-delete").passes {
+            assert_eq!((pass.requests, pass.failures), (4, 4));
+            let drain = pass.drain.unwrap();
+            assert_eq!((drain.acked, drain.observed), (4, 0));
+            assert_eq!(drain.from_last_ack_us, None);
+        }
+        for pass in &arm("4x4kib-c2-delete.instance-list").passes {
+            assert_eq!((pass.requests, pass.failures), (4, 0));
+        }
+        assert!(instance.keys().is_empty());
+        assert!(cold.keys().is_empty());
+    }
+
+    /// Catches objects that never reached the cold store being deleted anyway (their delete
+    /// would time nothing but the instance's own): with no copier no delete is sent by the arm,
+    /// only the cleanup's (3 a pass), and both arms fail every object.
+    #[tokio::test]
+    async fn objects_not_on_the_cold_store_are_not_deleted_by_the_arm() {
+        let dir = temp("tb-c-delete-unlanded");
+        let (instance, cold) = (FakeS3::start().await, FakeS3::start().await);
+        let stores = [
+            (Role::Instance, instance.endpoint()),
+            (Role::Cold, cold.endpoint()),
+        ];
+        let ctx = testkit::ctx(dir.path(), &stores, Window::Busy);
+        let results = run_with(
+            &ctx,
+            &delete_plan(&[1]),
+            Script::calm(),
+            None,
+            quick(Duration::ZERO),
+            Some(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 3);
+        for result in results.iter().filter(|r| r.arm.contains("-delete")) {
+            assert!(
+                result
+                    .passes
+                    .iter()
+                    .all(|p| (p.requests, p.failures) == (3, 3)),
+                "{}",
+                result.arm
+            );
+        }
+        // The cleanup of each of the two arms deletes its 3 objects in each of 2 passes; an arm
+        // that deleted what never landed would add 6 more.
+        assert_eq!(deletes_to(dir.path(), Role::Instance), 12);
+        let own = results
+            .iter()
+            .find(|r| r.arm == "3x4kib-c1-delete")
+            .unwrap();
+        for pass in &own.passes {
+            assert_eq!(pass.drain.unwrap().acked, 0);
+        }
+    }
+
+    /// Catches a store that cannot be listed showing every key as gone (an empty answer taken for
+    /// an empty bucket): with the cold store down nothing is on it, so nothing is deleted, and
+    /// the arm and its second quantity fail every object; with the instance down the puts fail
+    /// and the same holds.
+    #[tokio::test]
+    async fn a_store_that_cannot_be_reached_never_shows_the_keys_gone() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        for dead_role in [Role::Cold, Role::Instance] {
+            let dir = temp("tb-c-delete-dead");
+            let live = FakeS3::start().await;
+            let stores = [
+                (
+                    Role::Instance,
+                    if dead_role == Role::Instance {
+                        dead.as_str()
+                    } else {
+                        live.endpoint()
+                    },
+                ),
+                (
+                    Role::Cold,
+                    if dead_role == Role::Cold {
+                        dead.as_str()
+                    } else {
+                        live.endpoint()
+                    },
+                ),
+            ];
+            let ctx = testkit::ctx(dir.path(), &stores, Window::Busy);
+            let results = run_with(
+                &ctx,
+                &delete_plan(&[1]),
+                Script::calm(),
+                None,
+                quick(Duration::ZERO),
+                Some(2),
+            )
+            .await
+            .unwrap();
+            let deleting: Vec<_> = results
+                .iter()
+                .filter(|r| r.arm.contains("-delete"))
+                .collect();
+            assert_eq!(deleting.len(), 2);
+            for result in deleting {
+                assert!(
+                    result
+                        .passes
+                        .iter()
+                        .all(|p| (p.requests, p.failures) == (2, 2)),
+                    "{dead_role}: {}",
+                    result.arm
+                );
+            }
+        }
     }
 
     /// Catches a run that goes on without the instance or the cold role, and `run` doing

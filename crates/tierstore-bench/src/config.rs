@@ -4,15 +4,18 @@
 //! machines: caps, gate thresholds, the window, the seed, and `ROLE=VALUE` pairs for endpoints
 //! and buckets. The run file (`--run-file`, JSON, outside every repository) carries what a flag
 //! must not: the access key pairs, and, if one prefers, the endpoints and buckets too. A flag
-//! overrides the run file for the same role. Nothing here is serialised into a result: a
+//! overrides the run file for the same role. Nothing here is serialised into a result but the rate
+//! caps ([`RateCaps`], on purpose: a rate is only a finding next to the cap it ran under): a
 //! [`RunConfig`] has no `Serialize`, so a result cannot embed it by accident.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::cells::coldguard::ColdGuardLimits;
 use crate::gate::LoadGate;
@@ -30,6 +33,9 @@ pub enum ConfigError {
     /// A `ROLE=VALUE` flag without the `=`.
     #[error("expected ROLE=VALUE, got {0:?}")]
     BadPair(String),
+    /// A rate cap that is neither a positive number nor `unlimited`.
+    #[error("a rate cap is a positive number of requests per second or `unlimited`, got {0:?}")]
+    BadRateCap(String),
     /// The run file could not be read.
     #[error("run file {path}: {source}")]
     RunFileRead {
@@ -192,13 +198,84 @@ pub struct ByteCaps {
     pub cell: u64,
 }
 
-/// Request-rate caps, per second, held by the harness whatever a cell asks for.
+/// A cap on the requests per second of one store role: a positive number, or none.
+///
+/// `Unlimited` is a setting a run may choose (for the cells whose figure is a rate, which a cap
+/// would turn into the cap itself); it is recorded in the provenance of every result beside the
+/// numbers it let through ([`RateCaps`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RateCap {
+    /// At most this many requests a second.
+    PerSec(NonZeroU32),
+    /// No cap.
+    Unlimited,
+}
+
+impl RateCap {
+    /// The text a flag and a result use for [`RateCap::Unlimited`].
+    pub const UNLIMITED: &'static str = "unlimited";
+
+    /// A cap of `per_sec` requests a second; `None` for zero, which is no cap at all and must be
+    /// asked for by name.
+    #[must_use]
+    pub fn per_sec(per_sec: u32) -> Option<Self> {
+        NonZeroU32::new(per_sec).map(Self::PerSec)
+    }
+}
+
+impl FromStr for RateCap {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, ConfigError> {
+        s.parse::<u32>()
+            .ok()
+            .and_then(Self::per_sec)
+            .ok_or_else(|| ConfigError::BadRateCap(s.to_owned()))
+    }
+}
+
+impl fmt::Display for RateCap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PerSec(n) => write!(f, "{n}"),
+            Self::Unlimited => f.write_str(Self::UNLIMITED),
+        }
+    }
+}
+
+impl Serialize for RateCap {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::PerSec(n) => serializer.serialize_u32(n.get()),
+            Self::Unlimited => serializer.serialize_str(Self::UNLIMITED),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RateCap {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Number(u32),
+            Text(String),
+        }
+        let text = match Wire::deserialize(deserializer)? {
+            Wire::Number(n) => n.to_string(),
+            Wire::Text(t) => t,
+        };
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Request-rate caps, per second, held by the harness whatever a cell asks for. Recorded in the
+/// provenance of every result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateCaps {
     /// Requests to the cold store (token bucket, global).
-    pub cold_rps: u32,
-    /// Requests to the hot store, applied inside a drained window only.
-    pub hot_rps: u32,
+    pub cold_rps: RateCap,
+    /// Requests to the hot store and the instance (token bucket, global).
+    pub hot_rps: RateCap,
     /// Prefix LISTs a copy-lag poll may issue.
     pub list_poll_rps: u32,
 }
@@ -260,12 +337,15 @@ pub struct ConfigArgs {
     /// run stops, the reading being unreadable, if it takes longer.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     pub cold_state_timeout_secs: u64,
-    /// Cap on requests per second to the cold store.
-    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..))]
-    pub cold_rps: u32,
-    /// Cap on requests per second to the hot store.
-    #[arg(long, default_value_t = 2000, value_parser = clap::value_parser!(u32).range(1..))]
-    pub hot_rps: u32,
+    /// Cap on requests per second to the cold store: a positive number or `unlimited`. Recorded
+    /// in the provenance of every result.
+    #[arg(long, default_value = "100", value_name = "N|unlimited")]
+    pub cold_rps: RateCap,
+    /// Cap on requests per second to the hot store and the instance: a positive number or
+    /// `unlimited`. A cell whose figure is a rate (files per second, a burst) is valid only
+    /// with a cap above that figure. Recorded in the provenance of every result.
+    #[arg(long, default_value = "2000", value_name = "N|unlimited")]
+    pub hot_rps: RateCap,
     /// Cap on prefix LISTs per second of a copy-lag poll.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..))]
     pub list_poll_rps: u32,
@@ -552,8 +632,8 @@ mod tests {
         assert_eq!(cfg.bytes.campaign, 200 * GIB);
         assert_eq!(cfg.bytes.pass, 8 * GIB);
         assert_eq!(cfg.bytes.cell, 20 * GIB);
-        assert_eq!(cfg.rates.cold_rps, 100);
-        assert_eq!(cfg.rates.hot_rps, 2000);
+        assert_eq!(cfg.rates.cold_rps, RateCap::per_sec(100).unwrap());
+        assert_eq!(cfg.rates.hot_rps, RateCap::per_sec(2000).unwrap());
         assert_eq!(cfg.rates.list_poll_rps, 2);
         assert_eq!(cfg.window, Window::Busy);
         assert!(cfg.stores.is_empty());
@@ -726,6 +806,53 @@ mod tests {
             "--pass-cap-gib",
         ] {
             let argv = ["t", "--result-dir", "out", flag, "0"];
+            assert!(Wrap::try_parse_from(argv).is_err(), "{flag}");
+        }
+    }
+
+    /// Catches a rate cap that takes zero, a negative number or a word other than `unlimited`
+    /// (a typo would run uncapped), and one that does not survive a result file: both forms
+    /// parse, print and round-trip, and a value that is neither is refused on the way back in.
+    #[test]
+    fn a_rate_cap_is_a_positive_number_or_unlimited() {
+        let per_sec = |n| RateCap::per_sec(n).unwrap();
+        assert_eq!("250".parse::<RateCap>().unwrap(), per_sec(250));
+        assert_eq!("unlimited".parse::<RateCap>().unwrap(), RateCap::Unlimited);
+        for bad in ["0", "-1", "", "fast", "1.5", "Unlimited", "4294967296"] {
+            let err = bad.parse::<RateCap>().unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::BadRateCap(t) if t == bad),
+                "{bad}"
+            );
+        }
+        assert_eq!(RateCap::per_sec(0), None);
+        assert_eq!(per_sec(250).to_string(), "250");
+        assert_eq!(RateCap::Unlimited.to_string(), "unlimited");
+        let caps = RateCaps {
+            cold_rps: RateCap::Unlimited,
+            hot_rps: per_sec(2000),
+            list_poll_rps: 2,
+        };
+        let json = serde_json::to_value(caps).unwrap();
+        let expected =
+            serde_json::json!({"cold_rps": "unlimited", "hot_rps": 2000, "list_poll_rps": 2});
+        assert_eq!(json, expected);
+        assert_eq!(serde_json::from_value::<RateCaps>(json).unwrap(), caps);
+        for bad in ["0", "\"warp\"", "true"] {
+            assert!(serde_json::from_str::<RateCap>(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Catches `--cold-rps` and `--hot-rps` not reaching the configuration, swapped, or a typo
+    /// taken as no cap: `unlimited` on the hot flag leaves the cold cap as given.
+    #[test]
+    fn the_rate_flags_take_a_number_or_unlimited_and_reach_the_configuration() {
+        let a = args(&["--cold-rps", "7", "--hot-rps", "unlimited"]);
+        let cfg = RunConfig::resolve(&a, None).unwrap();
+        assert_eq!(cfg.rates.cold_rps, RateCap::per_sec(7).unwrap());
+        assert_eq!(cfg.rates.hot_rps, RateCap::Unlimited);
+        for flag in ["--cold-rps", "--hot-rps"] {
+            let argv = ["t", "--result-dir", "out", flag, "fast"];
             assert!(Wrap::try_parse_from(argv).is_err(), "{flag}");
         }
     }

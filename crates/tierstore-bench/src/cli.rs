@@ -12,7 +12,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::cells::budget::{Campaign, lock_path};
 use crate::cells::engine::FaultSwitch;
-use crate::cells::{self, CellContext, CellId, CellPlan};
+use crate::cells::{self, CellContext, CellId, CellPlan, CopyLag};
 use crate::coldstate::{ColdStateSource, NoColdState, OpsColdState};
 use crate::config::{ConfigArgs, RunConfig};
 use crate::error::BenchError;
@@ -46,7 +46,7 @@ pub enum Command {
     /// Create the test buckets, scoped accounts and quotas (a dry run unless `--apply`).
     Provision(ProvisionArgs),
     /// Run cells.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Serve the fault proxy in front of a store.
     FaultProxy(ProxyArgs),
     /// Check, against the before-snapshot, that nothing the run made is left and nothing live
@@ -130,6 +130,19 @@ pub struct RunArgs {
     /// turns the rest of that arm into a healthy one.
     #[arg(long, value_name = "SECS", default_value = "300")]
     pub fault_ttl_secs: NonZeroU64,
+    /// Cell `c`: objects in a burst, whatever their size (default: 1,000 up to 1 MiB, 8 above).
+    /// A larger burst is refused up front if its bytes do not fit the cell cap.
+    #[arg(long, value_name = "N")]
+    pub burst_objects: Option<NonZeroU64>,
+    /// Cell `c`: seconds after the last acknowledgement that an object not yet on the cold store
+    /// is a failure and the watch of the burst ends.
+    #[arg(long, value_name = "SECS", default_value = "600")]
+    pub drain_deadline_secs: NonZeroU64,
+    /// Whether cell `c` adds the arm that deletes the burst once it is on the cold store and times
+    /// how long the keys stay in a listing of the cold bucket and of the instance. `off` leaves
+    /// it out of the plan and of the ledger's admission.
+    #[arg(long, value_enum, default_value_t = Switch::Off, value_name = "on|off")]
+    pub copy_lag_delete: Switch,
     /// The campaign ledger: the file that counts the bytes written to the cold store across all
     /// runs of a campaign, kept outside every result directory. It must exist, unless
     /// `--new-campaign` says this run starts the campaign.
@@ -146,6 +159,13 @@ impl RunArgs {
     #[must_use]
     pub fn open_loop(&self) -> bool {
         self.open_loop == Switch::On
+    }
+
+    /// What cell `c` is asked for (`--burst-objects`, `--drain-deadline-secs`,
+    /// `--copy-lag-delete`).
+    #[must_use]
+    pub fn copy_lag(&self) -> CopyLag {
+        CopyLag::default()
     }
 
     /// The switch of the fault proxy `--fault-control` names, with `--fault-ttl-secs`.
@@ -303,11 +323,13 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
                 .fault_switch()
                 .map(|switch| Arc::new(switch) as Arc<dyn FaultSwitch>);
             let open_loop = args.open_loop();
+            let copy_lag = args.copy_lag();
             let plan = CellPlan {
                 passes: args.passes,
                 in_flight: args.in_flight,
                 object_bytes: args.object_bytes,
                 open_loop,
+                copy_lag,
             };
             let ctx = CellContext {
                 provenance,
@@ -369,7 +391,7 @@ mod tests {
         ];
         argv.extend_from_slice(extra);
         match Cli::try_parse_from(argv)?.command {
-            Command::Run(args) => Ok(args),
+            Command::Run(args) => Ok(*args),
             other => panic!("not the run verb: {other:?}"),
         }
     }
@@ -403,6 +425,34 @@ mod tests {
             (off.run_id.as_str(), off.git_sha.as_str(), off.attempt),
             ("run-1", "abc", 3)
         );
+    }
+
+    /// Catches the copy-lag flags not reaching the plan, a default other than the cell's own
+    /// burst size, a 600 s drain and no delete arm, and a zero (no objects, no time to drain)
+    /// taken: each flag lands in its own field.
+    #[test]
+    fn the_copy_lag_flags_reach_the_plan_and_default_to_the_cells_own() {
+        assert_eq!(run_args(&[]).unwrap().copy_lag(), CopyLag::default());
+        let asked = run_args(&[
+            "--burst-objects",
+            "10000",
+            "--drain-deadline-secs",
+            "90",
+            "--copy-lag-delete",
+            "on",
+        ])
+        .unwrap()
+        .copy_lag();
+        assert_eq!(asked.burst_objects.map(NonZeroU64::get), Some(10_000));
+        assert_eq!(asked.drain_deadline, Duration::from_secs(90));
+        assert!(asked.delete);
+        for bad in [
+            ["--burst-objects", "0"],
+            ["--drain-deadline-secs", "0"],
+            ["--copy-lag-delete", "yes"],
+        ] {
+            assert!(run_args(&bad).is_err(), "{bad:?}");
+        }
     }
 
     /// Catches the source of the cold state being chosen by the wrong test: a run with no cold

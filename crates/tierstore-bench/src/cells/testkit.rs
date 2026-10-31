@@ -9,7 +9,7 @@ use crate::cells::CellContext;
 use crate::cells::budget::{Campaign, Ledger};
 use crate::cells::engine::LoadSource;
 use crate::coldstate::{ColdStateSource, NoColdState};
-use crate::config::{ByteCaps, RateCaps, RunConfig, Secret, StoreSpec};
+use crate::config::{ByteCaps, RateCap, RateCaps, RunConfig, Secret, StoreSpec};
 use crate::error::BenchError;
 use crate::gate::{LoadGate, LoadSample};
 use crate::requestlog::RequestLog;
@@ -181,8 +181,8 @@ pub fn ctx_with_log(
         cold_guard: crate::cells::coldguard::ColdGuardLimits::default(),
         cold_state_timeout: std::time::Duration::from_secs(30),
         rates: RateCaps {
-            cold_rps: 100_000,
-            hot_rps: 100_000,
+            cold_rps: RateCap::per_sec(100_000).unwrap(),
+            hot_rps: RateCap::per_sec(100_000).unwrap(),
             list_poll_rps: 100_000,
         },
         bytes: CAPS,
