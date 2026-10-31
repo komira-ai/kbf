@@ -32,7 +32,7 @@ use std::process::{Command, Stdio};
 
 use update_hook::{Invocation, Outcome, Report, Step};
 
-use crate::declaration::Declaration;
+use crate::declaration::{Declaration, Refusal};
 
 /// Where `systemd-run` is.
 pub const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
@@ -68,6 +68,9 @@ pub struct Launch<'a> {
     pub release: &'a Path,
     /// The file of the `[hook.params]` table, if the step is given one.
     pub params: Option<&'a Path>,
+    /// Whether the hook account is uid 0, as the loader resolved it (`Declared::hook`): a root hook
+    /// gets the stricter checks of its paths before it is started.
+    pub root_hook: bool,
 }
 
 /// Why a step could not be started.
@@ -228,6 +231,8 @@ pub struct StepRun {
 pub enum RunError {
     #[error(transparent)]
     Launch(#[from] LaunchError),
+    #[error("the targets changed since the load: {0}")]
+    Recheck(Refusal),
     #[error("systemd-run could not be started: {0}")]
     Spawn(#[from] io::Error),
 }

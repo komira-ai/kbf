@@ -108,3 +108,26 @@ fn the_example_in_the_design_is_a_declaration() {
     assert_eq!(declaration.name, "tierstore");
     assert_eq!(declaration.hook.units.len(), 2);
 }
+
+/// Catches a shipped declaration of a hook that runs as root naming a write path the root rule
+/// would refuse when it is loaded: each write path is at or below a directory named for the
+/// service.
+#[test]
+fn the_write_paths_of_shipped_root_hooks_are_named_for_their_service() {
+    let mut checked = 0;
+    for file in shipped() {
+        let declaration = Declaration::parse(&fs::read_to_string(&file).unwrap()).unwrap();
+        if declaration.hook.user != "root" {
+            continue;
+        }
+        for path in &declaration.hook.write_paths {
+            let verdict = update_rights::reserved::check_service_write(path, &declaration.name);
+            assert_eq!(verdict, Ok(()), "{}: {path}", file.display());
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 2,
+        "the js-agent fixture writes in two places: {checked}"
+    );
+}

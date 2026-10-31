@@ -244,6 +244,27 @@ fn a_hook_sees_the_declared_environment_and_nothing_of_the_updaters() {
         .push(("UPDATER_PROBE".to_owned(), "declared".to_owned()));
     let run = rig.run(&spec, Step::Prepare, &["env", "UPDATER_PROBE", "--"]);
     assert_eq!(detail(&run), "declared", "{}", said_by(&run));
+    // The harness holds the two secrets in its own environment, so each "unset" below is an answer
+    // and not an absence of a question: the spawner clears the environment of `systemd-run`.
+    // SAFETY: the root job runs one test at a time (`--test-threads=1`), so nothing else reads or
+    // writes the environment while it is changed.
+    unsafe {
+        std::env::set_var("HARNESS_SECRET", "planted");
+        std::env::set_var("GITHUB_TOKEN", "planted");
+    }
+    // And a `systemd-run` started with a secret it was not asked to drop: its unit does not have it.
+    let command = rig.command(&spec, Step::Prepare, &["env", "HARNESS_SECRET", "--"]);
+    let done = Command::new("/usr/bin/systemd-run")
+        .args(&command.args)
+        .output()
+        .unwrap();
+    let seen = update_hook::Report::read(&String::from_utf8_lossy(&done.stdout));
+    assert_eq!(
+        seen.detail.as_deref(),
+        Some("unset"),
+        "{}",
+        String::from_utf8_lossy(&done.stderr)
+    );
     for absent in [
         "HARNESS_SECRET",
         "SUDO_USER",
@@ -1032,16 +1053,16 @@ fn a_write_path_pointed_at_etc_after_the_load_is_refused_by_the_recheck() {
     let mut spec = rig.spec();
     spec.write = vec![link.display().to_string()];
     let declaration = rig.declaration(&spec, &["ok", "--"]);
-    assert_eq!(update_rights::recheck_targets(&declaration), Ok(()));
+    assert_eq!(update_rights::recheck_targets(&declaration, false), Ok(()));
     fs::remove_file(&link).unwrap();
     symlink("/etc", &link).unwrap();
-    match update_rights::recheck_targets(&declaration) {
+    match update_rights::recheck_targets(&declaration, false) {
         Err(Refusal::Reserved { field, .. }) => assert_eq!(field, "hook.write_paths"),
         other => panic!("{other:?}"),
     }
     fs::remove_file(&link).unwrap();
     symlink("/var/log", &link).unwrap();
-    match update_rights::recheck_targets(&declaration) {
+    match update_rights::recheck_targets(&declaration, false) {
         Err(Refusal::Reserved { field, why, .. }) => {
             assert_eq!(field, "hook.write_paths");
             assert_eq!(why, update_rights::reserved::Violation::NotAllowed);
@@ -1065,7 +1086,7 @@ fn a_root_hook_path_below_a_directory_others_control_is_refused() {
     spec.write = vec![closed.join("work").display().to_string()];
     let declaration = rig.declaration(&spec, &["ok", "--"]);
     assert_eq!(
-        update_rights::recheck_targets(&declaration),
+        update_rights::recheck_targets(&declaration, true),
         Ok(()),
         "below a closed root directory"
     );
@@ -1081,7 +1102,7 @@ fn a_root_hook_path_below_a_directory_others_control_is_refused() {
         }
         spec.write = vec![dir.join("work").display().to_string()];
         let declaration = rig.declaration(&spec, &["ok", "--"]);
-        match update_rights::recheck_targets(&declaration) {
+        match update_rights::recheck_targets(&declaration, true) {
             Err(Refusal::Ancestor { ancestor, .. }) => {
                 assert_eq!(ancestor, dir.display().to_string(), "{name}")
             }

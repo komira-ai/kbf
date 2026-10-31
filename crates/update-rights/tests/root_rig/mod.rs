@@ -171,13 +171,10 @@ pub struct Rig {
 }
 
 impl Rig {
-    /// `/var/lib/updater-rights-<pid>-<tag>`: not under `/tmp` (the hook has a private one) and not
+    /// `/var/lib/probe-<tag>-<pid>`, named for the service so a root hook may write in it: not under `/tmp` (the hook has a private one) and not
     /// under a home (it has none).
     pub fn new(tag: &str) -> Rig {
-        let dir = PathBuf::from(format!(
-            "/var/lib/updater-rights-{}-{tag}",
-            std::process::id()
-        ));
+        let dir = PathBuf::from(format!("/var/lib/probe-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         make_dir(&dir, 0o755);
         for sub in ["release", "w", "ro", "state"] {
@@ -280,6 +277,7 @@ impl Rig {
             generation: GENERATION.fetch_add(1, Ordering::Relaxed),
             release: &release,
             params: None,
+            root_hook: spec.user == "root",
         };
         run_step(&Systemd::system(), &launch)
             .unwrap_or_else(|e| panic!("the step did not run: {e}"))
@@ -300,6 +298,7 @@ impl Rig {
             generation: GENERATION.fetch_add(1, Ordering::Relaxed),
             release: &release,
             params: None,
+            root_hook: spec.user == "root",
         };
         command(&launch).expect("the command builds")
     }
@@ -320,6 +319,7 @@ impl Rig {
             generation: GENERATION.fetch_add(1, Ordering::Relaxed),
             release: &release,
             params,
+            root_hook: spec.user == "root",
         };
         let command = command(&launch).expect("the command builds");
         Systemd::system().run(&command).expect("systemd-run starts")

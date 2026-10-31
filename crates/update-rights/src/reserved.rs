@@ -78,11 +78,22 @@ pub enum Violation {
         "is not below a directory a hook may write in (one component under /var/lib, /var/cache, /run or /opt)"
     )]
     NotAllowed,
+    #[error(
+        "is not at or below a directory named for the service, which a hook that runs as root needs"
+    )]
+    NotTheServices,
 }
 
 /// The directories a hook may write below, one component down and anything under that: a
 /// `write_paths` entry outside them is refused, whatever the deny list says.
 pub const WRITE_ROOTS: [&str; 4] = ["/var/lib", "/var/cache", "/run", "/opt"];
+
+/// Whether a hook that runs as root may write `path` for `service`: at or below a directory of a
+/// write root whose name is the service's, or the service's followed by `-` and more
+/// (`/var/lib/svc`, `/opt/svc/data`, `/var/lib/svc-update`). Not yet.
+pub fn check_service_write(_path: &str, _service: &str) -> Result<(), Violation> {
+    Ok(())
+}
 
 /// Whether `path` is `dir` or lies below it. Both are absolute and in the path grammar.
 pub fn is_within(path: &str, dir: &str) -> bool {

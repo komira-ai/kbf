@@ -6,14 +6,15 @@ mod support;
 use std::cell::RefCell;
 use std::ffi::OsString;
 use std::io;
+use std::os::unix::fs::symlink;
 use std::path::Path;
 
-use support::{sample, with};
+use support::{Scratch, sample, with};
 use update_hook::{Class, Outcome, Step};
 use update_rights::launch::FIXED_PROPERTIES;
 use update_rights::{
-    Declaration, Finished, Launch, LaunchError, RunError, Spawner, Systemd, SystemdRun, command,
-    properties, run_step, unit_name,
+    Declaration, Finished, Launch, LaunchError, Refusal, RunError, Spawner, Systemd, SystemdRun,
+    command, properties, run_step, unit_name,
 };
 
 const RELEASE: &str = "/var/lib/updater/releases/tierstore/abc";
@@ -26,6 +27,7 @@ fn launch<'a>(d: &'a Declaration, step: Step, params: Option<&'a Path>) -> Launc
         generation: 7,
         release: Path::new(RELEASE),
         params,
+        root_hook: false,
     }
 }
 
@@ -507,4 +509,62 @@ fn no_step_is_given_a_polkit_or_unit_file_right() {
             );
         }
     }
+}
+
+/// Catches a step started on targets that changed since the load: a link that pointed somewhere
+/// harmless when the declaration was read and points at `/etc` when the step is about to run. The
+/// launch is refused and nothing is spawned; before the change it runs.
+#[test]
+fn a_step_is_not_started_when_a_target_changed_since_the_load() {
+    let scratch = Scratch::new("run-recheck");
+    let real = scratch.dir("real", 0o755);
+    let link = scratch.path().join("link");
+    symlink(&real, &link).unwrap();
+    let d = Declaration::parse(&with(
+        "\"/etc/tierstore\"",
+        &format!("\"{}\"", link.display()),
+    ))
+    .unwrap();
+    let fake = Fake::answering(Some(0), "", "");
+    run_step(&fake, &launch(&d, Step::Verify, None)).expect("the targets are as loaded");
+    assert_eq!(fake.seen.borrow().len(), 1);
+    std::fs::remove_file(&link).unwrap();
+    symlink("/etc", &link).unwrap();
+    let error = run_step(&fake, &launch(&d, Step::Verify, None)).unwrap_err();
+    assert!(
+        matches!(error, RunError::Recheck(Refusal::Reserved { .. })),
+        "{error}"
+    );
+    assert!(error.to_string().contains("changed since the load"));
+    assert_eq!(
+        fake.seen.borrow().len(),
+        1,
+        "nothing was spawned for the refused step"
+    );
+}
+
+/// Catches the launcher not telling a root hook from another: for a hook that runs as root a path
+/// below a directory an ordinary account owns is refused at launch, and for another hook it is
+/// not.
+#[test]
+fn a_root_hook_is_launched_only_below_directories_root_controls() {
+    let scratch = Scratch::new("run-root");
+    let inside = scratch.path().join("data");
+    let d = Declaration::parse(&with(
+        "\"/etc/tierstore\"",
+        &format!("\"{}\"", inside.display()),
+    ))
+    .unwrap();
+    let fake = Fake::answering(Some(0), "", "");
+    run_step(&fake, &launch(&d, Step::Verify, None)).expect("an ordinary hook");
+    let root = Launch {
+        root_hook: true,
+        ..launch(&d, Step::Verify, None)
+    };
+    let error = run_step(&fake, &root).unwrap_err();
+    assert!(
+        matches!(error, RunError::Recheck(Refusal::Ancestor { .. })),
+        "{error}"
+    );
+    assert_eq!(fake.seen.borrow().len(), 1);
 }

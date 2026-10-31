@@ -127,6 +127,7 @@ pub fn accounts() -> EtcAccounts {
          tierstore-update:x:991:991::/nonexistent:/usr/sbin/nologin\n\
          other:x:992:992::/nonexistent:/usr/sbin/nologin\n\
          other-update:x:993:993::/nonexistent:/usr/sbin/nologin\n\
+         toor:x:0:0:root by another name:/root:/bin/sh\n\
          tsb:x:995:995::/nonexistent:/usr/sbin/nologin\n\
          tsb-update:x:996:996::/nonexistent:/usr/sbin/nologin\n\
          alias:x:990:990::/nonexistent:/usr/sbin/nologin\n",
@@ -135,6 +136,7 @@ pub fn accounts() -> EtcAccounts {
          tierstore-update:x:991:\n\
          other:x:992:\n\
          other-update:x:993:\n\
+         toor:x:0:\n\
          tsb:x:995:\n\
          tsb-update:x:996:\n\
          alias:x:990:\n\

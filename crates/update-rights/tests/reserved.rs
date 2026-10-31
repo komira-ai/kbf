@@ -338,3 +338,46 @@ fn the_deny_list_still_catches_names_inside_the_write_roots() {
         }
     }
 }
+
+/// Catches the root rule letting through a directory of the system that is one component under a
+/// write root, and refusing the service's own: at or below `<root>/<service>`, or a name that
+/// begins with the service's and a `-`; nothing else, not the roots, not a name that merely begins
+/// the same, not the service's name further down.
+#[test]
+fn a_root_hook_writes_at_or_below_a_directory_named_for_its_service() {
+    use update_rights::reserved::check_service_write;
+    for path in [
+        "/var/lib/svc",
+        "/var/lib/svc/x/y",
+        "/var/lib/svc-update",
+        "/var/lib/svc-update/x",
+        "/var/cache/svc",
+        "/run/svc/sock",
+        "/opt/svc",
+        "/opt/svc/data",
+    ] {
+        assert_eq!(check_service_write(path, "svc"), Ok(()), "{path}");
+    }
+    for path in [
+        "/var/lib/sudo",
+        "/var/lib/apt",
+        "/var/lib/cloud",
+        "/run/udev",
+        "/run/tmpfiles.d",
+        "/run/systemd/network",
+        "/var/lib/svcx",
+        "/var/lib/sv",
+        "/var/lib/other/svc",
+        "/var/lib",
+        "/opt",
+        "/srv/svc",
+        "/var/lib/svc2/x",
+        "/tmp/svc",
+    ] {
+        assert_eq!(
+            check_service_write(path, "svc"),
+            Err(Violation::NotTheServices),
+            "{path}"
+        );
+    }
+}

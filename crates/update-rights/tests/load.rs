@@ -732,17 +732,21 @@ fn a_target_pointed_at_a_reserved_place_after_the_load_is_refused_by_the_recheck
     let loaded = host.load();
     assert!(loaded.refused.is_empty(), "{:?}", loaded.refused);
     let declaration = &loaded.services["tierstore"].declaration;
-    assert_eq!(recheck_targets(declaration), Ok(()));
+    assert_eq!(recheck_targets(declaration, false), Ok(()));
     for (link, field) in [(&read, "hook.read_paths"), (&state, "state_dir")] {
         fs::remove_file(link).unwrap();
         symlink("/etc", link).unwrap();
-        match recheck_targets(declaration) {
+        match recheck_targets(declaration, false) {
             Err(Refusal::Reserved { field: found, .. }) => assert_eq!(found, field),
             other => panic!("{field}: {other:?}"),
         }
         fs::remove_file(link).unwrap();
         symlink(&real, link).unwrap();
-        assert_eq!(recheck_targets(declaration), Ok(()), "{field} put back");
+        assert_eq!(
+            recheck_targets(declaration, false),
+            Ok(()),
+            "{field} put back"
+        );
     }
 }
 
@@ -849,8 +853,104 @@ fn the_ancestor_rule_is_for_root_hooks_and_passes_root_owned_directories() {
     let mut root = Spec::new("tierstore");
     root.hook_user = "root".to_owned();
     root.read = vec!["/usr/sbin/nft".to_owned()];
-    root.write = vec!["/var/lib/updater-ancestor-probe/work".to_owned()];
+    root.write = vec!["/var/lib/tierstore-probe/work".to_owned()];
     host.put(&root);
     let loaded = host.load();
     assert!(loaded.refused.is_empty(), "{:?}", loaded.refused);
+}
+
+/// Catches the root checks keying on the name `root`: an account with uid 0 under another name is
+/// root, and a hook that runs as it is held to the ancestor rule and takes no string parameter.
+#[test]
+fn a_hook_account_with_uid_zero_under_another_name_is_a_root_hook() {
+    let host = Host::new("toor");
+    let mut spec = Spec::new("tierstore");
+    spec.hook_user = "toor".to_owned();
+    spec.read = vec![host.scratch.path().join("data").display().to_string()];
+    host.put(&spec);
+    let loaded = host.load();
+    assert!(
+        matches!(refused(&loaded, "tierstore"), Refusal::Ancestor { .. }),
+        "{:?}",
+        loaded.refused
+    );
+
+    let mut plain = Spec::new("tierstore");
+    plain.hook_user = "toor".to_owned();
+    host.scratch_file(
+        "tierstore.toml",
+        &format!("{}\n[hook.params]\nname = \"a string\"\n", plain.text()),
+    );
+    let loaded = host.load();
+    match refused(&loaded, "tierstore") {
+        Refusal::Value { field, .. } => assert_eq!(field, "hook.params"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Catches `recheck_targets` ignoring whether the hook is root: told it is, it applies the
+/// ancestor rule to the same declaration it passes when told it is not.
+#[test]
+fn the_recheck_applies_the_ancestor_rule_when_told_the_hook_is_root() {
+    let host = Host::new("recheck-root");
+    let mut spec = Spec::new("tierstore");
+    spec.read = vec![host.scratch.path().join("data").display().to_string()];
+    host.put(&spec);
+    let loaded = host.load();
+    let declaration = &loaded.services["tierstore"].declaration;
+    assert_eq!(recheck_targets(declaration, false), Ok(()));
+    assert!(matches!(
+        recheck_targets(declaration, true),
+        Err(Refusal::Ancestor { .. })
+    ));
+}
+
+/// Catches a root hook being granted a directory of the system that happens to be one component
+/// under a write root (`/var/lib/sudo`, `/run/udev`, `/var/lib/cloud`): it may write at or below a
+/// directory named for its service, and a hook that is not root keeps the one-component rule.
+#[test]
+fn a_root_hook_may_write_only_below_a_directory_named_for_its_service() {
+    let host = Host::new("service-dirs");
+    for account in ["root", "toor"] {
+        for path in [
+            "/var/lib/sudo",
+            "/run/udev",
+            "/var/lib/cloud",
+            "/var/lib/tierstorex",
+            "/var/cache/other/tierstore",
+        ] {
+            let mut spec = Spec::new("tierstore");
+            spec.hook_user = account.to_owned();
+            spec.write = vec![path.to_owned()];
+            host.put(&spec);
+            let loaded = host.load();
+            match refused(&loaded, "tierstore") {
+                Refusal::Reserved { field, why, .. } => {
+                    assert_eq!(
+                        (field, why),
+                        ("hook.write_paths", Violation::NotTheServices),
+                        "{account} {path}"
+                    );
+                }
+                other => panic!("{account} {path}: {other:?}"),
+            }
+        }
+        let mut spec = Spec::new("tierstore");
+        spec.hook_user = account.to_owned();
+        spec.write = [
+            "/var/lib/tierstore",
+            "/var/lib/tierstore/a/b",
+            "/var/cache/tierstore-state",
+            "/run/tierstore",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        host.put(&spec);
+        let loaded = host.load();
+        assert!(loaded.refused.is_empty(), "{account}: {:?}", loaded.refused);
+    }
+    let mut ordinary = Spec::new("tierstore");
+    ordinary.write = vec!["/var/lib/sudo".to_owned()];
+    host.put(&ordinary);
+    assert!(host.load().refused.is_empty());
 }

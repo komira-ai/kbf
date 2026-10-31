@@ -161,7 +161,7 @@ fn swappable_above(path: &str) -> Option<String> {
 
 /// The reserved-path rules on what each entry points to now, for the step runner to call before
 /// every launch: a link can be re-pointed after the load.
-pub fn recheck_targets(declaration: &Declaration) -> Result<(), Refusal> {
+pub fn recheck_targets(declaration: &Declaration, _root_hook: bool) -> Result<(), Refusal> {
     check_targets(declaration)
 }
 
