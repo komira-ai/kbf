@@ -46,7 +46,8 @@ fn a_desired_state_reads_every_limit_and_defaults_the_rest() {
 
 /// Catches: a desired state accepted that the host-side rule or the schema refuses: a
 /// version with a shell word or an option, a missing minimum, an unknown field (a URL for the
-/// release, say), a count over the cap, a negative count, and text that is no JSON.
+/// release, say), a count over the cap, a negative count, and text that is no JSON. A limit
+/// key that is no role name is refused in `desired_role_tests`.
 #[test]
 fn a_desired_state_that_is_not_one_is_refused() {
     let over = format!(
@@ -71,7 +72,6 @@ fn a_desired_state_that_is_not_one_is_refused() {
         r#"{"min_up":{"storage":1,"frontend":1}}"#,
         r#"{"version":"1.0","min_up":{"storage":1}}"#,
         r#"{"version":"1.0","min_up":{"storage":1,"frontend":1},"url":"https://x.example"}"#,
-        r#"{"version":"1.0","max_updating":{"other":1},"min_up":{"storage":1,"frontend":1}}"#,
         r#"{"version":"1.0","min_up":{"storage":-1,"frontend":1}}"#,
         "not json",
         "",
