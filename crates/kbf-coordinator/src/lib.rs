@@ -42,6 +42,8 @@ pub mod services;
 #[cfg(test)]
 mod bake_canary_tests;
 #[cfg(test)]
+mod bake_review_tests;
+#[cfg(test)]
 mod converge_role_tests;
 #[cfg(test)]
 mod converge_tests;
