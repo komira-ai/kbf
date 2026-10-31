@@ -431,7 +431,7 @@ fn reserved_paths_are_refused_everywhere() {
             "\"/var/lib/updater/hooks/tierstore\"",
             "\"/var/lib\"",
             "state_dir",
-            Violation::Contains("/var/lib/dpkg"),
+            Violation::Contains("/var/lib/apt"),
         ),
         (
             "\"/var/lib/updater/hooks/tierstore\"",
@@ -662,6 +662,18 @@ fn the_environment_cannot_hijack_the_runtime() {
         "MALLOC_PERTURB_",
         "HOSTALIASES",
         "RES_OPTIONS",
+        "GLIBC_TUNABLES",
+        "OPENSSL_CONF",
+        "OPENSSL_ENGINES",
+        "OPENSSL_MODULES",
+        "SSLKEYLOGFILE",
+        "ZDOTDIR",
+        "GIT_SSH_COMMAND",
+        "GIT_EXEC_PATH",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_ASKPASS",
         // What a script run by the hook would load or evaluate before its own text.
         "BASH_ENV",
         "ENV",
@@ -721,7 +733,7 @@ fn the_environment_cannot_hijack_the_runtime() {
         "{ PATH = \"/opt/x/bin\" }",
         "{ TMPDIR = \"/run/x\", LANG = \"C\", TZ = \"UTC\" }",
         "{ LDX = \"1\", LDAP_URI = \"x\", MALLOCX = \"1\" }",
-        "{ ENVIRONMENT = \"x\", IFS_X = \"1\", NODE_ENV = \"production\" }",
+        "{ GITHUB_TOKEN = \"x\", ENVIRONMENT = \"x\", IFS_X = \"1\", NODE_ENV = \"production\" }",
     ] {
         assert!(Declaration::parse(&at(ok)).is_ok(), "{ok}");
     }

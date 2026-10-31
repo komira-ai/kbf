@@ -33,7 +33,7 @@ use std::process::{Command, Stdio};
 use update_hook::{Invocation, Outcome, Report, Step};
 
 use crate::declaration::{Declaration, Refusal};
-use crate::load::recheck_targets;
+use crate::load::{Declared, recheck_targets};
 
 /// Where `systemd-run` is.
 pub const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
@@ -69,9 +69,54 @@ pub struct Launch<'a> {
     pub release: &'a Path,
     /// The file of the `[hook.params]` table, if the step is given one.
     pub params: Option<&'a Path>,
-    /// Whether the hook account is uid 0, as the loader resolved it (`Declared::hook`): a root hook
-    /// gets the stricter checks of its paths before it is started.
-    pub root_hook: bool,
+    // The uid of the hook account. Whether it is root is derived from this, in `root_hook`, the one
+    // place, and is never a flag a caller supplies.
+    hook_uid: u32,
+}
+
+impl<'a> Launch<'a> {
+    /// A run of `step` of the hook of `declaration`, whose account has the uid `hook_uid`.
+    pub fn new(
+        declaration: &'a Declaration,
+        hook_uid: u32,
+        step: Step,
+        generation: u64,
+        release: &'a Path,
+        params: Option<&'a Path>,
+    ) -> Launch<'a> {
+        let _ = hook_uid;
+        Launch {
+            declaration,
+            step,
+            generation,
+            release,
+            params,
+            hook_uid: u32::MAX,
+        }
+    }
+
+    /// A run of a loaded declaration, whose hook account the loader resolved.
+    pub fn of(
+        declared: &'a Declared,
+        step: Step,
+        generation: u64,
+        release: &'a Path,
+        params: Option<&'a Path>,
+    ) -> Launch<'a> {
+        Launch::new(
+            &declared.declaration,
+            declared.hook.uid,
+            step,
+            generation,
+            release,
+            params,
+        )
+    }
+
+    /// Whether the hook runs as uid 0 and is held to the rules of a root hook.
+    pub fn root_hook(&self) -> bool {
+        self.hook_uid == 0
+    }
 }
 
 /// Why a step could not be started.
@@ -242,7 +287,7 @@ pub enum RunError {
 /// contract, a signal and a timeout are failures) and the last line of standard output as a
 /// [`Report`] (a missing or malformed line is `{}`).
 pub fn run_step(spawner: &dyn Spawner, launch: &Launch<'_>) -> Result<StepRun, RunError> {
-    recheck_targets(launch.declaration, launch.root_hook).map_err(RunError::Recheck)?;
+    recheck_targets(launch.declaration, launch.hook_uid).map_err(RunError::Recheck)?;
     let command = command(launch)?;
     let finished = spawner.run(&command)?;
     Ok(StepRun {

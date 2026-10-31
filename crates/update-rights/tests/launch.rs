@@ -19,16 +19,11 @@ use update_rights::{
 
 const RELEASE: &str = "/var/lib/updater/releases/tierstore/abc";
 const PARAMS: &str = "/run/updater/params.toml";
+/// The uid of a hook account that is not root.
+const ORDINARY: u32 = 65534;
 
 fn launch<'a>(d: &'a Declaration, step: Step, params: Option<&'a Path>) -> Launch<'a> {
-    Launch {
-        declaration: d,
-        step,
-        generation: 7,
-        release: Path::new(RELEASE),
-        params,
-        root_hook: false,
-    }
+    Launch::new(d, ORDINARY, step, 7, Path::new(RELEASE), params)
 }
 
 fn args_of(d: &Declaration, step: Step, params: Option<&Path>) -> Vec<String> {
@@ -332,10 +327,14 @@ fn the_wait_collect_and_pipe_options_come_first() {
 #[test]
 fn a_relative_path_is_refused() {
     let d = sample();
-    let relative = Launch {
-        release: Path::new("releases/x"),
-        ..launch(&d, Step::Prepare, None)
-    };
+    let relative = Launch::new(
+        &d,
+        ORDINARY,
+        Step::Prepare,
+        7,
+        Path::new("releases/x"),
+        None,
+    );
     assert_eq!(
         command(&relative),
         Err(LaunchError::RelativeRelease("releases/x".into()))
@@ -438,10 +437,7 @@ fn a_missing_or_malformed_last_line_is_the_empty_report() {
 fn a_step_that_does_not_run_says_why() {
     let d = sample();
     let fake = Fake::answering(Some(0), "", "");
-    let relative = Launch {
-        release: Path::new("x"),
-        ..launch(&d, Step::Verify, None)
-    };
+    let relative = Launch::new(&d, ORDINARY, Step::Verify, 7, Path::new("x"), None);
     let error = run_step(&fake, &relative).unwrap_err();
     assert!(matches!(error, RunError::Launch(_)), "{error}");
     assert!(fake.seen.borrow().is_empty());
@@ -557,14 +553,24 @@ fn a_root_hook_is_launched_only_below_directories_root_controls() {
     .unwrap();
     let fake = Fake::answering(Some(0), "", "");
     run_step(&fake, &launch(&d, Step::Verify, None)).expect("an ordinary hook");
-    let root = Launch {
-        root_hook: true,
-        ..launch(&d, Step::Verify, None)
-    };
+    let root = Launch::new(&d, 0, Step::Verify, 7, Path::new(RELEASE), None);
+    assert!(root.root_hook());
+    assert!(!launch(&d, Step::Verify, None).root_hook());
     let error = run_step(&fake, &root).unwrap_err();
     assert!(
         matches!(error, RunError::Recheck(Refusal::Ancestor { .. })),
         "{error}"
     );
     assert_eq!(fake.seen.borrow().len(), 1);
+}
+
+/// Catches the root rules depending on how a `Launch` is built: the hook's uid is all it is built
+/// from, so a hook of uid 0 is a root hook whatever a caller meant, and no uid but 0 is.
+#[test]
+fn a_launch_is_a_root_launch_exactly_when_the_hook_uid_is_zero() {
+    let d = sample();
+    for (uid, root) in [(0, true), (1, false), (65534, false), (u32::MAX, false)] {
+        let launch = Launch::new(&d, uid, Step::Verify, 1, Path::new(RELEASE), None);
+        assert_eq!(launch.root_hook(), root, "uid {uid}");
+    }
 }

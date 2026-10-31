@@ -8,10 +8,11 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 use support::{Scratch, accounts, my_gid, my_uid};
+use update_hook::Step;
 use update_rights::reserved::Violation;
 use update_rights::{
-    Digest, EtcAccounts, Loaded, Policy, Refusal, UserIds, check_state_dir, load_dir,
-    recheck_targets,
+    Digest, EtcAccounts, Finished, Launch, Loaded, Policy, Refusal, Spawner, SystemdRun, UserIds,
+    check_state_dir, load_dir, recheck_targets, run_step,
 };
 
 /// One declaration, small enough to vary: the account names, the claims that can collide, the
@@ -732,18 +733,18 @@ fn a_target_pointed_at_a_reserved_place_after_the_load_is_refused_by_the_recheck
     let loaded = host.load();
     assert!(loaded.refused.is_empty(), "{:?}", loaded.refused);
     let declaration = &loaded.services["tierstore"].declaration;
-    assert_eq!(recheck_targets(declaration, false), Ok(()));
+    assert_eq!(recheck_targets(declaration, 65534), Ok(()));
     for (link, field) in [(&read, "hook.read_paths"), (&state, "state_dir")] {
         fs::remove_file(link).unwrap();
         symlink("/etc", link).unwrap();
-        match recheck_targets(declaration, false) {
+        match recheck_targets(declaration, 65534) {
             Err(Refusal::Reserved { field: found, .. }) => assert_eq!(found, field),
             other => panic!("{field}: {other:?}"),
         }
         fs::remove_file(link).unwrap();
         symlink(&real, link).unwrap();
         assert_eq!(
-            recheck_targets(declaration, false),
+            recheck_targets(declaration, 65534),
             Ok(()),
             "{field} put back"
         );
@@ -898,9 +899,9 @@ fn the_recheck_applies_the_ancestor_rule_when_told_the_hook_is_root() {
     host.put(&spec);
     let loaded = host.load();
     let declaration = &loaded.services["tierstore"].declaration;
-    assert_eq!(recheck_targets(declaration, false), Ok(()));
+    assert_eq!(recheck_targets(declaration, 65534), Ok(()));
     assert!(matches!(
-        recheck_targets(declaration, true),
+        recheck_targets(declaration, 0),
         Err(Refusal::Ancestor { .. })
     ));
 }
@@ -953,4 +954,126 @@ fn a_root_hook_may_write_only_below_a_directory_named_for_its_service() {
     ordinary.write = vec!["/var/lib/sudo".to_owned()];
     host.put(&ordinary);
     assert!(host.load().refused.is_empty());
+}
+
+/// A spawner that succeeds at once, for the tests that only ask whether a step is started.
+struct Silent;
+
+impl Spawner for Silent {
+    fn run(&self, _command: &SystemdRun) -> std::io::Result<Finished> {
+        Ok(Finished {
+            code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
+    }
+}
+
+/// Catches the root rules being a matter of how a `Launch` or a recheck is called: for a loaded
+/// declaration the hook's uid is what the loader resolved, and a uid of 0 gets the ancestor rule
+/// from `Declared::recheck` and from a `Launch` made of it, with nothing a caller can pass to
+/// turn it off. The declaration here names an ordinary account, so only the uid can decide.
+#[test]
+fn a_loaded_declaration_whose_hook_has_uid_zero_is_held_to_the_root_rules_however_it_is_called() {
+    let host = Host::new("uid-zero");
+    let mut spec = Spec::new("tierstore");
+    host.put(&spec);
+    spec.read = vec![host.scratch.path().join("data").display().to_string()];
+    let mut declared = {
+        let loaded = host.load();
+        loaded.services["tierstore"].clone()
+    };
+    declared.declaration.hook.read_paths = spec.read.iter().cloned().collect();
+    let release = host.scratch.path();
+
+    declared.hook = UserIds {
+        uid: 65534,
+        gid: 65534,
+    };
+    assert_eq!(declared.recheck(), Ok(()));
+    let ordinary = Launch::of(&declared, Step::Verify, 1, release, None);
+    assert!(!ordinary.root_hook());
+    run_step(&Silent, &ordinary).expect("an ordinary hook");
+
+    declared.hook = UserIds { uid: 0, gid: 0 };
+    assert!(matches!(declared.recheck(), Err(Refusal::Ancestor { .. })));
+    let root = Launch::of(&declared, Step::Verify, 1, release, None);
+    assert!(root.root_hook());
+    assert!(matches!(
+        run_step(&Silent, &root),
+        Err(update_rights::RunError::Recheck(Refusal::Ancestor { .. }))
+    ));
+    let by_hand = Launch::new(&declared.declaration, 0, Step::Verify, 1, release, None);
+    assert!(matches!(
+        run_step(&Silent, &by_hand),
+        Err(update_rights::RunError::Recheck(Refusal::Ancestor { .. }))
+    ));
+}
+
+/// Catches a root hook writing in another declared service's directory through the `-` rule:
+/// the service `tierstore` may write `/var/lib/tierstore-state`, which begins with its name and a
+/// dash, but not `/var/lib/tierstore-b/x`, where `tierstore-b` is a service of this host. The
+/// directory belongs to the longest declared name it begins with, and a service's own stays its
+/// own. The rule is across declarations, like the conflicts, and is for hooks that run as root.
+#[test]
+fn a_root_hook_may_not_write_in_the_directory_of_another_declared_service() {
+    let host = Host::new("other-services");
+    let mut a = Spec::new("tierstore");
+    a.hook_user = "root".to_owned();
+    a.write = vec![
+        "/var/lib/tierstore-state".to_owned(),
+        "/var/lib/tierstore-b/x".to_owned(),
+    ];
+    let mut b = Spec::new("tierstore-b");
+    b.uid = "tsb".to_owned();
+    b.hook_user = "root".to_owned();
+    b.write = vec![
+        "/var/lib/tierstore-b".to_owned(),
+        "/var/lib/tierstore-b-state/y".to_owned(),
+    ];
+    host.put(&a);
+    host.put(&b);
+    let loaded = host.load();
+    assert_eq!(
+        conflict(&loaded, "tierstore"),
+        (
+            "a write path in the directory of another service",
+            "tierstore-b".to_owned()
+        )
+    );
+    assert_eq!(loaded.services.keys().collect::<Vec<_>>(), ["tierstore-b"]);
+
+    // Without the path into the other's directory both load, and a hook that is not root is not
+    // held to the rule (it is held to the allow-list alone).
+    a.write = vec!["/var/lib/tierstore-state".to_owned()];
+    host.put(&a);
+    let loaded = host.load();
+    assert!(loaded.refused.is_empty(), "{:?}", loaded.refused);
+    a.write = vec!["/var/lib/tierstore-b/x".to_owned()];
+    a.hook_user = "tierstore-update".to_owned();
+    host.put(&a);
+    let loaded = host.load();
+    assert!(loaded.refused.is_empty(), "{:?}", loaded.refused);
+}
+
+/// Catches a service named for a directory of the system, which the rule that a root hook writes
+/// in a directory named for its service would then hand to it: such a name is refused whatever
+/// the hook runs as.
+#[test]
+fn a_service_may_not_be_named_for_a_directory_of_the_system() {
+    let host = Host::new("system-names");
+    for name in [
+        "sudo", "udev", "systemd", "polkit-1", "apt", "dpkg", "cron", "network",
+    ] {
+        let mut spec = Spec::new(name);
+        spec.uid = "tierstore".to_owned();
+        spec.hook_user = "root".to_owned();
+        host.put(&spec);
+        let loaded = host.load();
+        match refused(&loaded, name) {
+            Refusal::Value { field, .. } => assert_eq!(field, "name", "{name}"),
+            other => panic!("{name}: {other:?}"),
+        }
+        fs::remove_file(host.dir.join(format!("{name}.toml"))).unwrap();
+    }
 }

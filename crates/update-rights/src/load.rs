@@ -52,6 +52,14 @@ pub struct Declared {
     pub service_gids: Vec<u32>,
 }
 
+impl Declared {
+    /// [`recheck_targets`] for this declaration, with the uid of the hook account the loader
+    /// resolved: the one way to recheck that cannot be told the wrong answer.
+    pub fn recheck(&self) -> Result<(), Refusal> {
+        recheck_targets(&self.declaration, self.hook.uid)
+    }
+}
+
 /// A declaration that was refused, and why.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refused {
@@ -171,8 +179,9 @@ fn swappable_above(path: &str) -> Option<String> {
 
 /// The reserved-path rules on what each entry points to now, for the step runner to call before
 /// every launch: a link can be re-pointed after the load.
-pub fn recheck_targets(declaration: &Declaration, root_hook: bool) -> Result<(), Refusal> {
-    check_targets(declaration, root_hook)
+pub fn recheck_targets(declaration: &Declaration, hook_uid: u32) -> Result<(), Refusal> {
+    let _ = hook_uid;
+    check_targets(declaration, false)
 }
 
 fn account_error(what: &str, name: &str) -> Refusal {

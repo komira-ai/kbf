@@ -271,14 +271,14 @@ impl Rig {
     pub fn run(&self, spec: &Spec, step: Step, hook_args: &[&str]) -> StepRun {
         let declaration = self.declaration(spec, hook_args);
         let release = self.release(spec);
-        let launch = Launch {
-            declaration: &declaration,
+        let launch = Launch::new(
+            &declaration,
+            hook_uid(spec),
             step,
-            generation: GENERATION.fetch_add(1, Ordering::Relaxed),
-            release: &release,
-            params: None,
-            root_hook: spec.user == "root",
-        };
+            GENERATION.fetch_add(1, Ordering::Relaxed),
+            &release,
+            None,
+        );
         run_step(&Systemd::system(), &launch)
             .unwrap_or_else(|e| panic!("the step did not run: {e}"))
     }
@@ -292,14 +292,14 @@ impl Rig {
     ) -> update_rights::SystemdRun {
         let declaration = self.declaration(spec, hook_args);
         let release = self.release(spec);
-        let launch = Launch {
-            declaration: &declaration,
+        let launch = Launch::new(
+            &declaration,
+            hook_uid(spec),
             step,
-            generation: GENERATION.fetch_add(1, Ordering::Relaxed),
-            release: &release,
-            params: None,
-            root_hook: spec.user == "root",
-        };
+            GENERATION.fetch_add(1, Ordering::Relaxed),
+            &release,
+            None,
+        );
         command(&launch).expect("the command builds")
     }
 
@@ -313,14 +313,14 @@ impl Rig {
     ) -> Finished {
         let declaration = self.declaration(spec, hook_args);
         let release = self.release(spec);
-        let launch = Launch {
-            declaration: &declaration,
+        let launch = Launch::new(
+            &declaration,
+            hook_uid(spec),
             step,
-            generation: GENERATION.fetch_add(1, Ordering::Relaxed),
-            release: &release,
+            GENERATION.fetch_add(1, Ordering::Relaxed),
+            &release,
             params,
-            root_hook: spec.user == "root",
-        };
+        );
         let command = command(&launch).expect("the command builds");
         Systemd::system().run(&command).expect("systemd-run starts")
     }
@@ -338,4 +338,9 @@ pub fn said_by(run: &StepRun) -> String {
         "outcome {:?}, detail {:?}, stderr {:?}",
         run.outcome, run.report.detail, run.stderr
     )
+}
+
+/// The uid of the account a spec runs the hook as: 0 for root, `nobody`'s otherwise.
+pub fn hook_uid(spec: &Spec) -> u32 {
+    if spec.user == "root" { 0 } else { nobody().0 }
 }

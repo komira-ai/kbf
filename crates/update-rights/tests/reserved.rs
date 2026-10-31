@@ -47,7 +47,7 @@ fn no_entry_names_a_reserved_directory() {
 fn no_entry_contains_a_reserved_directory() {
     for (path, holds) in [
         ("/var", "/var/cache/apt"),
-        ("/var/lib", "/var/lib/dpkg"),
+        ("/var/lib", "/var/lib/apt"),
         ("/etc/systemd", "/etc/systemd/system"),
         ("/run", "/run/systemd/generator"),
         ("/run/systemd", "/run/systemd/generator"),
@@ -176,17 +176,23 @@ fn the_list_is_exactly_this() {
             "/run/systemd/generator",
             "/run/systemd/generator.early",
             "/run/systemd/generator.late",
+            "/run/systemd/network",
             "/run/systemd/system",
             "/run/systemd/system.control",
             "/run/systemd/transient",
+            "/run/tmpfiles.d",
+            "/run/udev",
             "/run/updater",
             "/sbin",
             "/usr",
             "/usr/lib/systemd/system",
             "/usr/share/polkit-1",
             "/var/cache/apt",
+            "/var/lib/apt",
+            "/var/lib/cloud",
             "/var/lib/dpkg",
             "/var/lib/polkit-1",
+            "/var/lib/sudo",
             "/var/lib/updater",
             "/var/spool/cron",
         ]
@@ -378,6 +384,34 @@ fn a_root_hook_writes_at_or_below_a_directory_named_for_its_service() {
             check_service_write(path, "svc"),
             Err(Violation::NotTheServices),
             "{path}"
+        );
+    }
+}
+
+/// Catches the directories a root hook named for the system could be handed by the rule that lets
+/// it write in a directory named for its service: the reserved list is the final word on them
+/// (`/var/lib/sudo`, `/run/udev`, `/run/tmpfiles.d`, `/run/systemd/network`, `/var/lib/apt`,
+/// `/var/lib/cloud`), so even a service of that name cannot be given them.
+#[test]
+fn the_directories_of_the_system_under_the_write_roots_are_reserved() {
+    for dir in [
+        "/var/lib/sudo",
+        "/run/udev",
+        "/run/tmpfiles.d",
+        "/run/systemd/network",
+        "/var/lib/apt",
+        "/var/lib/cloud",
+    ] {
+        for kind in KINDS {
+            assert!(
+                matches!(check(kind, dir), Err(Violation::Names(_))),
+                "{dir}"
+            );
+        }
+        let below = format!("{dir}/x");
+        assert!(
+            matches!(check(Kind::Write, &below), Err(Violation::Inside(_))),
+            "{below}"
         );
     }
 }

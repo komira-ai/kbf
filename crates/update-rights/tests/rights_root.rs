@@ -1053,16 +1053,16 @@ fn a_write_path_pointed_at_etc_after_the_load_is_refused_by_the_recheck() {
     let mut spec = rig.spec();
     spec.write = vec![link.display().to_string()];
     let declaration = rig.declaration(&spec, &["ok", "--"]);
-    assert_eq!(update_rights::recheck_targets(&declaration, false), Ok(()));
+    assert_eq!(update_rights::recheck_targets(&declaration, 65534), Ok(()));
     fs::remove_file(&link).unwrap();
     symlink("/etc", &link).unwrap();
-    match update_rights::recheck_targets(&declaration, false) {
+    match update_rights::recheck_targets(&declaration, 65534) {
         Err(Refusal::Reserved { field, .. }) => assert_eq!(field, "hook.write_paths"),
         other => panic!("{other:?}"),
     }
     fs::remove_file(&link).unwrap();
     symlink("/var/log", &link).unwrap();
-    match update_rights::recheck_targets(&declaration, false) {
+    match update_rights::recheck_targets(&declaration, 65534) {
         Err(Refusal::Reserved { field, why, .. }) => {
             assert_eq!(field, "hook.write_paths");
             assert_eq!(why, update_rights::reserved::Violation::NotAllowed);
@@ -1086,7 +1086,7 @@ fn a_root_hook_path_below_a_directory_others_control_is_refused() {
     spec.write = vec![closed.join("work").display().to_string()];
     let declaration = rig.declaration(&spec, &["ok", "--"]);
     assert_eq!(
-        update_rights::recheck_targets(&declaration, true),
+        update_rights::recheck_targets(&declaration, 0),
         Ok(()),
         "below a closed root directory"
     );
@@ -1102,7 +1102,7 @@ fn a_root_hook_path_below_a_directory_others_control_is_refused() {
         }
         spec.write = vec![dir.join("work").display().to_string()];
         let declaration = rig.declaration(&spec, &["ok", "--"]);
-        match update_rights::recheck_targets(&declaration, true) {
+        match update_rights::recheck_targets(&declaration, 0) {
             Err(Refusal::Ancestor { ancestor, .. }) => {
                 assert_eq!(ancestor, dir.display().to_string(), "{name}")
             }
