@@ -128,6 +128,8 @@ async fn a_read_that_passes_through_asks_the_upstream_one_chunk_at_a_time() {
     }
     assert_eq!(got, body);
     assert!(stream.next().await.is_none());
+    // A body that has ended stays ended.
+    assert!(stream.next().await.is_none());
     // One HEAD before the first chunk and one before the last, ten reads, none for the end.
     assert_eq!((rig.calls(Op::Head), rig.calls(Op::Get)), (2, 10));
     assert_eq!(rig.cache.held(), (0, 0));
@@ -560,4 +562,28 @@ async fn a_staged_file_removed_while_it_is_read_does_not_fail_the_reader() {
     assert_eq!(got, body);
     assert_eq!(rig.cache.counters().failures(FailedFill::LocalIo), 1);
     assert_eq!(rig.cache.held(), (0, 0));
+}
+
+/// Asserts that a read of a window that runs past the end of the object (the last 50 bytes of a
+/// range of 100) gives the bytes there are and ends cleanly, as a backend's range does, and that
+/// an upstream that gives more bytes than were asked is the error of the call.
+#[tokio::test]
+async fn a_window_past_the_end_is_cut_there_and_an_upstream_that_gives_more_is_an_error() {
+    let rig = rig("tsstream-window-end");
+    let body = pattern(SIZE);
+    rig.put("plain/obj", &body).await;
+    let range = ByteRange::new(950, 100);
+    let stream = rig
+        .cache
+        .get_stream("plain/obj", Some(range))
+        .await
+        .unwrap();
+    let (chunks, error) = drain(stream).await;
+    assert_eq!(error, None);
+    assert_eq!(joined(&chunks), &body[950..]);
+
+    rig.tamper.long.store(true, Ordering::SeqCst);
+    let range = ByteRange::new(0, 50);
+    let error = rig.cache.get_stream("plain/obj", Some(range)).await;
+    assert!(matches!(error, Err(Error::Other(_))));
 }

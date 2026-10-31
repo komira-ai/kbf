@@ -36,6 +36,8 @@ pub(in crate::server) fn digest(bytes: &[u8]) -> String {
 pub(in crate::server) struct Tamper {
     pub(in crate::server) memory: MemoryBackend,
     pub(in crate::server) short: AtomicBool,
+    /// Every read gives one byte more than it was asked for.
+    pub(in crate::server) long: AtomicBool,
     /// The next read, once the gate lets it go, is an `Unavailable` error.
     pub(in crate::server) fail_once: AtomicBool,
     /// The next read, once the gate lets it go, panics.
@@ -65,6 +67,7 @@ impl Tamper {
         Self {
             memory: MemoryBackend::new(),
             short: AtomicBool::new(false),
+            long: AtomicBool::new(false),
             fail_once: AtomicBool::new(false),
             panic_once: AtomicBool::new(false),
             gate: Mutex::new(None),
@@ -170,6 +173,11 @@ impl Backend for Tamper {
         }
         if self.short.load(Ordering::SeqCst) {
             return Ok(body.slice(..body.len().saturating_sub(1)));
+        }
+        if self.long.load(Ordering::SeqCst) {
+            let mut more = body.to_vec();
+            more.push(0);
+            return Ok(Bytes::from(more));
         }
         Ok(body)
     }
