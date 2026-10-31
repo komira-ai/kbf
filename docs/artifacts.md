@@ -175,11 +175,10 @@ carry it. It has no SBOM and no bundle of its own. The set is closed over it:
 listed `kbf` tarball whose `kbf-<commit>-<platform>.version.json` is not listed, and a
 listed facts file whose `kbf` tarball is not; `release check` takes that name and no other
 `.version.json`, and `release offer` calls a platform incomplete without its facts, whatever
-other tarballs it lists. The release made before the build jobs recorded the facts has none:
-`release check --without-version-facts` waives the first rule (and nothing else; it waives the same for the task image,
-which a release lists with its facts and its SBOM: the rules of [the images](#the-frontend-and-coordinator-images-oci) below), and
-`release.yml` gives it to the check of the previous release only (the lint holds that); remove
-the flag once the release before the one being made was made with the facts. The workflow lint
+other tarballs it lists. No flag waives the rule: `release check` holds the previous release to it as it
+holds the release being made, and the same for the task image, which a release lists with its facts and
+its SBOM (the rules of [the images](#the-frontend-and-coordinator-images-oci) below). The previous release
+is v0.0.41 or later, which lists them; `release.yml` passes no waiver (the lint holds that). The workflow lint
 (`crates/kbf-integration-test/tests/release_artifacts`) names a build job that does not run
 the verb once, for its own platform, between the identity check of `kbf` and its package,
 for the same `--binary` path the job packages.
@@ -618,8 +617,7 @@ manifest, the digest a registry pin or a pull by digest uses; the manifest blob 
 every layer digest bottom first, `base` (the digest of the pinned base manifest), the commit and the
 platform. The file is a function of the image: `--verify-only` computes it again from the signed image
 and refuses unless the file beside it is those bytes. `verify-assets sums` refuses a listed task image
-without its facts (the previous release, read with `--without-version-facts`, may lack them) and facts
-without their image, and `verify-assets attestations` checks the facts for build provenance, as it does an
+without its facts and facts without their image, and `verify-assets attestations` checks the facts for build provenance, as it does an
 SBOM. They carry no bundle and no SBOM attestation of their own; the attestation of `SHA256SUMS`
 that covers every other file covers them.
 
@@ -634,8 +632,7 @@ what syft prints is a function of the image and of syft's version. (The SBOM is 
 files the job compares: the two image builds are.) `pkg-image-sbom` refuses a document that is not CycloneDX, that
 is not of a container whose version is the image's manifest digest, that lists no deb package, or that is over
 8 MiB. `pkg-image-sbom --verify-only` makes the same checks on the SBOM beside the signed image, in the verify job.
-`verify-assets sums` refuses a listed task image without its SBOM (the previous release, read with
-`--without-version-facts`, may lack it, like the facts) and an SBOM without its image.
+`verify-assets sums` refuses a listed task image without its SBOM and an SBOM without its image.
 
 It is attested like a deb: build provenance (one subject of the `SHA256SUMS` attestation, and alone,
 with its bundle `kbf-<service>-image-<commit>-<platform>.oci.tar.sigstore.json` in `bundles-linux`)
