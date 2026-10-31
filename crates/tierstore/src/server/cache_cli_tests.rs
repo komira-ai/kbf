@@ -12,7 +12,7 @@ use bytes::Bytes;
 use kbf_objstore::s3::{Credentials, S3Config, S3Store};
 use kbf_objstore::{ByteRange, Capabilities, ObjectKey, ObjectStore};
 use kbf_testkit::dir::TestDir;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 use super::Drained;
 use super::cache_cli::{run_cache, serve_cache, size_of_file_system, unjudged_warning};
@@ -22,7 +22,7 @@ use super::config::{PerRun, Settings, settings_from_text};
 use super::config_cache::CacheSettings;
 use super::local_cache::testing::{FakeDisk, Quirk, digest, pattern};
 use super::local_cache::{Disk, SystemDisk};
-use crate::selftest_tests::{Flaw, Flawed};
+use crate::selftest_tests::{Flaw, Flawed, Watched};
 use crate::{
     Backend, ByteRange as TierRange, Error as BackendError, FaultyBackend, Listed, MemoryBackend,
     Meta,
@@ -524,6 +524,53 @@ async fn a_write_through_node_takes_a_put_and_a_read_cache_refuses_it() {
         assert_eq!(stored.ok(), writes.then(|| Bytes::from_static(b"made")));
         assert!(flat.inner.list("_tiering/").await.unwrap().is_empty());
     }
+}
+
+/// Asserts that a write-through start reports itself ready before it deletes the probe key that
+/// an earlier start left, and that it deletes it once it is: the upstream holds one stale probe
+/// key, and an event log that the ready callback and the delete of the stale key both write to has
+/// the ready first. The checks of the self-test (their own keys) still run before the ready, which
+/// the test above holds to by refusing a wrong answer before the address is bound.
+#[tokio::test]
+async fn a_write_through_start_is_ready_before_it_sweeps_old_probe_keys() {
+    let node = Node::new("tscache-cli-wthru-sweep");
+    let disk: Arc<dyn Disk> = Arc::new(SystemDisk);
+    let (_, memory) = crate::selftest_tests::two_hours_on(1).await;
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let swept = Arc::new(Notify::new());
+    let (noting, told) = (Arc::clone(&log), Arc::clone(&swept));
+    let upstream = Arc::new(Watched::new(memory, move |key| {
+        if key.contains("/old-") {
+            noting.lock().unwrap().push("swept");
+            told.notify_one();
+        }
+    }));
+    let settings = node.settings("", "write_through = true");
+    let (stop, stopped) = oneshot::channel::<()>();
+    let (bound, addr) = oneshot::channel::<SocketAddr>();
+    let readying = Arc::clone(&log);
+    let running = serve_cache(
+        &settings,
+        upstream.clone(),
+        disk,
+        async move {
+            let _ = stopped.await;
+        },
+        move |address| {
+            readying.lock().unwrap().push("ready");
+            let _ = bound.send(address.s3);
+        },
+    );
+    let driving = async {
+        if addr.await.is_ok() {
+            swept.notified().await;
+        }
+        let _ = stop.send(());
+    };
+    let (drained, ()) = tokio::join!(running, driving);
+    assert_eq!(drained.unwrap(), Drained { abandoned: 0 });
+    assert_eq!(*log.lock().unwrap(), ["ready", "swept"]);
+    assert!(upstream.inner.list("_tiering/").await.unwrap().is_empty());
 }
 
 /// Asserts what `--check-config` finds in the settings of a build node: a file that is whole
