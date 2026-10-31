@@ -240,3 +240,21 @@ async fn a_node_no_frontend_holds_is_not_found() {
 
     assert_eq!(detail(&farm, &WorkerId::new("nobody")), None);
 }
+
+/// Asserts that a node whose `cordon-owner/` row cannot be read is still answered, with its
+/// placement, and shown as the operator's. Catches: a read of a node that fails, or hides
+/// the cordon, because the owner could not be read.
+#[tokio::test(start_paused = true)]
+async fn an_owner_row_that_cannot_be_read_shows_the_operator() {
+    let store = Racing::new();
+    let drained = drained_through_the_other_frontend(&store, true);
+    store.fail_reads(Some("cordon-owner/"));
+
+    let read = detail(&drained.own, &drained.node).expect("a node connected here");
+
+    assert_eq!(read.owner, Some(crate::fleet::Owner::Operator));
+    assert!(matches!(
+        read.node.placement,
+        PlacementView::Draining { .. }
+    ));
+}

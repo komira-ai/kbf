@@ -10,7 +10,10 @@
 use kbf_types::Resources;
 
 use super::*;
-use crate::fleet::{NodeDetail, NodeView, PhaseView, PlacementView, ResourcesView, shown_deadline};
+use crate::farm::cordon_owner;
+use crate::fleet::{
+    NodeDetail, NodeView, Owner, PhaseView, PlacementView, ResourcesView, shown_deadline,
+};
 
 impl Engine {
     /// Whether another frontend of the store holds `worker`: this frontend does not, and the
@@ -27,6 +30,24 @@ impl Engine {
             Ok(())
         });
         held
+    }
+
+    /// `detail` of `worker` with the owner of its cordon, if it is out of placement: the
+    /// operator's when the store has no `cordon-owner/` row for it, has a malformed one, or
+    /// cannot be read (a farm with no store has none).
+    pub(in crate::farm) fn with_cordon_owner(
+        &self,
+        detail: NodeDetail,
+        worker: &WorkerId,
+    ) -> NodeDetail {
+        cordon_owner::with_owner(detail, || {
+            let mut owner = Owner::Operator;
+            self.durably("a cordon owner look", |d| {
+                owner = cordon_owner::read(&*d.store, worker)?;
+                Ok(())
+            });
+            owner
+        })
     }
 
     /// `worker`, which another frontend holds, as the state store has it, placed as `cordon`
@@ -77,6 +98,7 @@ impl Engine {
             leases,
             load: None,
             input_cache: None,
+            owner: None,
         })
     }
 }

@@ -65,6 +65,7 @@ mod driver;
 mod ack;
 mod ambient;
 mod beat;
+mod cordon_owner;
 pub(crate) mod durable;
 mod engine;
 pub(crate) mod failed_actions;
@@ -995,6 +996,8 @@ fn wire_lease(lease: LeaseId) -> worker::LeaseId {
     }
 }
 
+#[cfg(test)]
+mod cordon_owner_tests;
 mod from_listeners;
 #[cfg(test)]
 mod learned_tests;

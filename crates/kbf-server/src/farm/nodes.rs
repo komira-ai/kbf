@@ -70,7 +70,8 @@ impl Farm {
             Some(true) => {
                 let cordon = cordons.ok_or_else(unread)?.get(worker).copied();
                 let stored = state.engine.stored_detail(worker, cordon);
-                return stored.map(Some).ok_or_else(unread);
+                let owned = stored.map(|detail| state.engine.with_cordon_owner(detail, worker));
+                return owned.map(Some).ok_or_else(unread);
             }
             // The store cannot say who holds the node: only one connected here is answered.
             None if !connected => return Err(unread()),
@@ -87,13 +88,8 @@ impl Farm {
             .input_caches
             .get(worker)
             .map(InputCacheView::from);
-        Ok(Some(detail_of(
-            node,
-            &state.engine.sched,
-            worker,
-            load,
-            input_cache,
-        )))
+        let detail = detail_of(node, &state.engine.sched, worker, load, input_cache);
+        Ok(Some(state.engine.with_cordon_owner(detail, worker)))
     }
 
     /// One node's view; `worker` is registered, and every closed stream noted
@@ -178,6 +174,7 @@ pub(super) fn detail_of(
         leases,
         load,
         input_cache,
+        owner: None,
     }
 }
 
