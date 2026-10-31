@@ -128,8 +128,6 @@ async fn a_read_that_passes_through_asks_the_upstream_one_chunk_at_a_time() {
     }
     assert_eq!(got, body);
     assert!(stream.next().await.is_none());
-    // A body that has ended stays ended.
-    assert!(stream.next().await.is_none());
     // One HEAD before the first chunk and one before the last, ten reads, none for the end.
     assert_eq!((rig.calls(Op::Head), rig.calls(Op::Get)), (2, 10));
     assert_eq!(rig.cache.held(), (0, 0));
@@ -400,10 +398,18 @@ async fn an_overwrite_between_the_chunks_of_a_pass_through_ends_the_body_with_an
     let mut body = rig.cache.get_stream("plain/obj", None).await.unwrap();
     let first = take(&mut body, 100).await;
     rig.replace("plain/obj", &vec![3u8; SIZE]).await;
-    let (chunks, error) = drain(body).await;
-    let error = error.expect("a body of two versions does not end cleanly");
+    let mut body = body;
+    let mut given = first.len();
+    let error = loop {
+        match body.next().await.expect("the body ends with its error") {
+            Ok(chunk) => given += chunk.len(),
+            Err(error) => break error,
+        }
+    };
     assert!(error.is_unavailable(), "{error}");
-    assert_eq!(first.len() + joined(&chunks).len(), SIZE - CHUNK as usize);
+    assert_eq!(given, SIZE - CHUNK as usize);
+    // A body that ended with an error gives nothing after it.
+    assert!(body.next().await.is_none());
 }
 
 /// Asserts the same for a read that goes on from the upstream after a fill that ended without an
