@@ -64,8 +64,9 @@ pub struct LiveTierstore {
     pub binary: PathBuf,
     /// Its port.
     pub port: u16,
-    /// Its state and data directories.
-    #[serde(default)]
+    /// Its state and data directories. Required: `run` refuses a result directory, a campaign
+    /// ledger or a ledger lock that is, holds or lies inside one of them (links and `..`
+    /// resolved), and refuses an ops file that lists none.
     pub dirs: Vec<PathBuf>,
 }
 

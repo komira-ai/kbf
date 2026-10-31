@@ -135,6 +135,7 @@ fn step_of(role: Role, file: &TreeFile, digest: Option<&str>, fetched: &Fetched)
     };
     Step {
         label: "",
+        second_quantity: false,
         role,
         op: Op::Get,
         bytes: fetched.body.as_ref().map_or(0, |b| b.len() as u64),
@@ -433,6 +434,7 @@ fn arm(
                 used as f64 / CLOCK_TICKS
             )]))
         })),
+        faulted: false,
         notes,
     }
 }
@@ -496,6 +498,7 @@ mod tests {
             passes: 2,
             in_flight: in_flight.to_vec(),
             object_bytes: vec![],
+            open_loop: true,
         }
     }
 

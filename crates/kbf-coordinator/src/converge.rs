@@ -22,12 +22,11 @@
 
 use std::time::Duration;
 
-use kbf_types::HostRole;
 use kbf_updater::version::Version;
 use kbf_updater::wire::Outcome;
 use serde::Serialize;
 
-use crate::desired::{Desired, KBF};
+use crate::desired::Desired;
 use crate::fleet::{Fleet, Host};
 use crate::services::ServiceDef;
 
@@ -45,10 +44,10 @@ pub enum State {
 }
 
 /// The hosts of one role, by where they stand.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RoleCounts {
-    /// The role (`frontend`, `storage`, `daemon`, `mac-daemon`).
-    pub role: &'static str,
+    /// The role (`frontend`, `storage`, `daemon`, `mac-daemon`, or another a definition names).
+    pub role: String,
     /// Live and running the desired version.
     pub at_desired: usize,
     /// Live and updating.
@@ -87,7 +86,7 @@ fn failed_to_reach(host: &Host, desired: &Desired) -> bool {
 
 fn counts(
     service: &str,
-    role: HostRole,
+    role: &str,
     desired: &Desired,
     fleet: &Fleet,
     now: Duration,
@@ -96,10 +95,10 @@ fn counts(
         fleet
             .hosts_of(service)
             .map(|(_, h)| h)
-            .filter(move |h| h.role == role)
+            .filter(move |h| h.role_name() == role)
     };
     RoleCounts {
-        role: role.name(),
+        role: role.to_owned(),
         at_desired: mine()
             .filter(|h| h.is_live(now) && h.beat.version == desired.version)
             .count(),
@@ -113,11 +112,11 @@ fn counts(
     }
 }
 
-/// The counts of every role of `service` that has a host, in role order; none when no
-/// desired state was set.
+/// The counts of every role of `def` that has a host, in role order
+/// ([`ServiceDef::role_names`]); none when no desired state was set.
 #[must_use]
 pub fn role_counts(
-    service: &str,
+    def: &ServiceDef,
     desired: Option<&Desired>,
     fleet: &Fleet,
     now: Duration,
@@ -125,9 +124,9 @@ pub fn role_counts(
     let Some(desired) = desired else {
         return Vec::new();
     };
-    HostRole::ALL
+    def.role_names()
         .into_iter()
-        .map(|role| counts(service, role, desired, fleet, now))
+        .map(|role| counts(&def.name, role, desired, fleet, now))
         .filter(|c| c.at_desired + c.updating + c.failed + c.down > 0)
         .collect()
 }
@@ -135,8 +134,8 @@ pub fn role_counts(
 /// Where the farm stands at `now` against `desired`.
 #[must_use]
 pub fn converge(desired: Option<&Desired>, fleet: &Fleet, now: Duration) -> Convergence {
-    converge_with(KBF, desired, fleet, now, |d, role| {
-        d.min_up.of(role) as usize
+    converge_with(&ServiceDef::kbf(), desired, fleet, now, |d, role| {
+        d.min_up.min_up_of(role) as usize
     })
 }
 
@@ -150,17 +149,17 @@ pub fn converge_service(
     fleet: &Fleet,
     now: Duration,
 ) -> Convergence {
-    converge_with(&def.name, desired, fleet, now, |d, role| {
-        def.roles.get(&role).map_or(0, |r| r.required_up(role, d))
+    converge_with(def, desired, fleet, now, |d, role| {
+        def.roles.get(role).map_or(0, |r| r.required_up(role, d))
     })
 }
 
 fn converge_with(
-    service: &str,
+    def: &ServiceDef,
     desired: Option<&Desired>,
     fleet: &Fleet,
     now: Duration,
-    minimum: impl Fn(&Desired, HostRole) -> usize,
+    minimum: impl Fn(&Desired, &str) -> usize,
 ) -> Convergence {
     let quiet = fleet.is_quiet(now);
     let Some(desired) = desired else {
@@ -172,17 +171,18 @@ fn converge_with(
             commit: crate::BUILD_COMMIT,
         };
     };
-    let roles = role_counts(service, Some(desired), fleet, now);
+    let service = def.name.as_str();
+    let roles = role_counts(def, Some(desired), fleet, now);
     let live = fleet
         .hosts_of(service)
-        .filter(|(_, h)| h.is_live(now))
+        .filter(|(_, h)| def.roles.contains_key(h.role_name()) && h.is_live(now))
         .count();
     let at_desired: usize = roles.iter().map(|c| c.at_desired).sum();
     let clear = roles.iter().all(|c| c.updating == 0 && c.failed == 0);
-    let up = |role| {
+    let up = |role: &str| {
         fleet
             .hosts_of(service)
-            .filter(|(_, h)| h.role == role && h.is_up(now))
+            .filter(|(_, h)| h.role_name() == role && h.is_up(now))
             .count()
     };
     let state = if roles.iter().any(|c| c.failed > 0) {
@@ -191,7 +191,8 @@ fn converge_with(
         && live > 0
         && at_desired == live
         && clear
-        && HostRole::ALL
+        && def
+            .role_names()
             .into_iter()
             .all(|role| up(role) >= minimum(desired, role))
     {

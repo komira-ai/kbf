@@ -1,4 +1,4 @@
-//! [`S3Backend`]: a [`Backend`] over the S3 client of `kbf-objstore` (feature `s3`).
+//! [`S3Backend`]: a [`Backend`] over the S3 client of `objstore-s3` (feature `s3`).
 //!
 //! The backend is an adapter and keeps no state: each call of the trait is the S3 request of
 //! the same meaning, sent by the client the workspace already has (path-style addressing,
@@ -99,16 +99,16 @@ use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use futures::future;
 use futures::stream;
-use kbf_objstore::s3::{S3Store, StampedObject};
-use kbf_objstore::{
+use objstore_s3::s3::{S3Store, StampedObject};
+use objstore_s3::{
     BodyStream, KeyPrefix, ListToken, ObjectKey, ObjectStore, ObjectStoreError, PageSize,
 };
 use tokio::sync::mpsc;
 
 use crate::{Backend, ByteRange, Error, Listed, Meta, OpenUpload, PartBody, UploadsAfter};
 
-pub use kbf_objstore::Capabilities;
-pub use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError};
+pub use objstore_s3::Capabilities;
+pub use objstore_s3::s3::{Credentials, S3Config, S3ConfigError};
 
 /// The greatest byte position a `Range` names. A store reads the positions as signed 64-bit
 /// numbers and refuses or ignores a larger one, so a range is cut here before it is sent.
@@ -155,7 +155,7 @@ impl S3Backend {
     ) -> Result<Bytes, Error> {
         let room = LAST_POSITION.saturating_sub(range.offset());
         let len = range.size().min(room);
-        if let Some(asked) = kbf_objstore::ByteRange::new(range.offset(), len) {
+        if let Some(asked) = objstore_s3::ByteRange::new(range.offset(), len) {
             match self.store.get_range(object, asked).await {
                 Err(ObjectStoreError::InvalidRange { .. }) => {}
                 answer => return answer.map_err(|e| map_error(e, key)),
@@ -225,7 +225,7 @@ fn listed_of(object: StampedObject) -> Listed {
 }
 
 /// An upload of a listing of the client as one of this crate.
-fn open_of(upload: kbf_objstore::s3::OpenUpload) -> OpenUpload {
+fn open_of(upload: objstore_s3::s3::OpenUpload) -> OpenUpload {
     OpenUpload {
         key: upload.key.as_str().to_owned(),
         id: upload.upload_id,

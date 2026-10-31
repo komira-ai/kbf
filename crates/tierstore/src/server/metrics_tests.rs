@@ -12,7 +12,7 @@ use super::testing::{Reply, Rig};
 pub(super) const BUDGET: u64 = 1 << 20;
 
 /// Every series of `/metricz` with its labels, as the text names it.
-const SERIES: [&str; 26] = [
+const SERIES: [&str; 27] = [
     "tierstore_hits_total{tier=\"hot\",op=\"get\"}",
     "tierstore_hits_total{tier=\"hot\",op=\"head\"}",
     "tierstore_hits_total{tier=\"cold\",op=\"get\"}",
@@ -39,6 +39,7 @@ const SERIES: [&str; 26] = [
     "tierstore_promotions_skipped_total{reason=\"full\"}",
     "tierstore_promotions_skipped_total{reason=\"raced\"}",
     "tierstore_promotions_skipped_total{reason=\"failed\"}",
+    "tierstore_drain_late_requests_total",
 ];
 
 async fn metricz(rig: &Rig) -> Reply {
@@ -116,16 +117,48 @@ async fn metricz_lists_every_series_with_its_labels() {
     }
 }
 
-/// Asserts that a server with no proxy and no OCI front answers `/metricz` 200 with one comment
-/// line that names the sources and no series. It would catch a probe that fails or says nothing
-/// when there is nothing to count.
+/// Asserts that `/metricz` has the build gauge with the crate version and the commit the build
+/// embeds, with value 1, once, whatever else the server has. It would catch a gauge that is not
+/// exported, one that names another version or no commit, and one on only some shapes.
 #[tokio::test]
-async fn metricz_without_a_source_is_one_line_naming_them() {
+async fn metricz_has_the_build_gauge_with_version_and_commit() {
+    use super::build_info::COMMIT;
+    let expected = format!(
+        "tierstore_build_info{{version=\"{}\",commit=\"{COMMIT}\"}} 1",
+        env!("CARGO_PKG_VERSION")
+    );
+    for rig in [
+        Rig::new(BUDGET).await,
+        Rig::with(BUDGET, |config| config.proxy = None).await,
+    ] {
+        let body = metricz(&rig).await.body;
+        let lines: Vec<&str> = body.lines().collect();
+        let found = lines.iter().filter(|l| **l == expected).count();
+        assert_eq!(found, 1, "{body}");
+        assert!(
+            body.contains("# TYPE tierstore_build_info gauge\n"),
+            "{body}"
+        );
+        assert!(!COMMIT.is_empty());
+    }
+}
+
+/// Asserts that a server with no proxy and no OCI front answers `/metricz` 200 with one comment
+/// line that names the sources, and then the server's own series, the late requests of the drain,
+/// at zero, and (left out here) the build gauge, and nothing else. It would catch a probe that
+/// fails or says nothing when there is nothing to count, and a server whose own series is shown
+/// only with a source.
+#[tokio::test]
+async fn metricz_without_a_source_is_the_line_naming_them_and_the_servers_own_series() {
     let rig = Rig::with(BUDGET, |config| config.proxy = None).await;
     let reply = metricz(&rig).await;
     assert_eq!(reply.status, StatusCode::OK);
-    let lines: Vec<&str> = reply.body.lines().collect();
-    assert_eq!(lines.len(), 1, "{}", reply.body);
+    let lines: Vec<&str> = reply
+        .body
+        .lines()
+        .filter(|line| !line.contains("tierstore_build_info"))
+        .collect();
+    assert_eq!(lines.len(), 3, "{}", reply.body);
     for name in ["proxy", "OCI read front", "local cache"] {
         assert!(
             lines[0].starts_with('#') && lines[0].contains(name),
@@ -133,6 +166,11 @@ async fn metricz_without_a_source_is_one_line_naming_them() {
             reply.body
         );
     }
+    assert_eq!(
+        lines[1],
+        "# TYPE tierstore_drain_late_requests_total counter"
+    );
+    assert_eq!(lines[2], "tierstore_drain_late_requests_total 0");
 }
 
 /// Asserts that a server with a proxy and an OCI front shows both blocks, the proxy's first, each
@@ -428,7 +466,9 @@ async fn no_series_is_emitted_twice() {
         assert!(number.parse::<u64>().is_ok(), "{line}");
         assert!(seen.insert(name.to_owned()), "{name} twice in:\n{text}");
     }
-    assert_eq!(seen.len(), SERIES.len());
+    // Every series of SERIES, and the build gauge, whose labels name the build and so are not in
+    // the list.
+    assert_eq!(seen.len(), SERIES.len() + 1);
 }
 
 /// Asserts that a ranged GET of a cold object while the hot tier is above its critical mark

@@ -38,6 +38,9 @@ const SAFETY: Duration = Duration::from_secs(86_400);
 /// The header line that has the server close the connection after the answer.
 const CLOSE: &str = "connection: close\r\n";
 
+/// What a request that keeps the connection alive has in place of the `connection` header line.
+const KEPT: &str = "";
+
 /// What `waiting` gives, or a failure of the test if it never gives it.
 async fn bounded<F: Future>(waiting: F) -> F::Output {
     let waited = tokio::time::timeout(SAFETY, waiting).await;
@@ -172,6 +175,60 @@ pub(super) async fn read_answer(client: &mut DuplexStream) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Writes a signed request that keeps the connection alive, and its body, on `client`.
+pub(super) async fn send(
+    client: &mut DuplexStream,
+    rig: &Rig,
+    method: &str,
+    uri: &str,
+    extra: &[(&str, &str)],
+    body: &[u8],
+) {
+    let text = head(rig, method, uri, extra, body, KEPT);
+    client.write_all(text.as_bytes()).await.unwrap();
+    client.write_all(body).await.unwrap();
+}
+
+/// Whether `bytes` hold a whole answer: its head and as many bytes of body as it says.
+fn is_whole(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let length = head.lines().find_map(|line| {
+        let line = line.to_ascii_lowercase();
+        let value = line.strip_prefix("content-length: ")?;
+        value.trim().parse::<usize>().ok()
+    });
+    body.len() >= length.unwrap_or(0)
+}
+
+/// Reads one whole answer, which may leave the connection open: the head and the body its
+/// `content-length` gives.
+pub(super) async fn read_response(client: &mut DuplexStream) -> String {
+    let mut bytes = Vec::new();
+    let mut piece = vec![0_u8; CHUNK];
+    while !is_whole(&bytes) {
+        let read = bounded(client.read(&mut piece)).await.unwrap();
+        assert!(read > 0, "the connection ended inside an answer");
+        bytes.extend_from_slice(&piece[..read]);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Sends a signed request that keeps the connection alive and reads its answer.
+pub(super) async fn exchange(
+    client: &mut DuplexStream,
+    rig: &Rig,
+    method: &str,
+    uri: &str,
+    extra: &[(&str, &str)],
+    body: &[u8],
+) -> String {
+    send(client, rig, method, uri, extra, body).await;
+    read_response(client).await
+}
+
 /// Reads the rest of the answer, to the end of the connection, after `answer`.
 pub(super) async fn read_rest(client: &mut DuplexStream, answer: &mut Vec<u8>) {
     bounded(client.read_to_end(answer)).await.unwrap();
@@ -237,14 +294,39 @@ impl Stalled {
     /// Sends on `client` the head of a put to `uri` signed for the server of `rig` with these extra
     /// headers, and the first `sent` bytes of `body`. The connection closes after the answer.
     pub(super) async fn open(
-        mut client: DuplexStream,
+        client: DuplexStream,
         rig: &Rig,
         uri: &str,
         extra: &[(&str, &str)],
         body: &[u8],
         sent: usize,
     ) -> Self {
-        let text = head(rig, "PUT", uri, extra, body, CLOSE);
+        Self::begin(client, rig, uri, extra, body, sent, CLOSE).await
+    }
+
+    /// The same, for a connection that is kept alive: the client does not ask for it to close.
+    pub(super) async fn open_kept(
+        client: DuplexStream,
+        rig: &Rig,
+        uri: &str,
+        extra: &[(&str, &str)],
+        body: &[u8],
+        sent: usize,
+    ) -> Self {
+        Self::begin(client, rig, uri, extra, body, sent, KEPT).await
+    }
+
+    /// Sends the head with the `connection` header line `connection`, and the first `sent` bytes.
+    async fn begin(
+        mut client: DuplexStream,
+        rig: &Rig,
+        uri: &str,
+        extra: &[(&str, &str)],
+        body: &[u8],
+        sent: usize,
+        connection: &str,
+    ) -> Self {
+        let text = head(rig, "PUT", uri, extra, body, connection);
         client.write_all(text.as_bytes()).await.unwrap();
         client.write_all(&body[..sent]).await.unwrap();
         Self {
@@ -293,4 +375,56 @@ pub(super) async fn begin_get(rig: &Rig, client: &mut DuplexStream, key: &str) -
     let read = bounded(client.read(&mut piece)).await.unwrap();
     piece.truncate(read);
     piece
+}
+
+/// A signed GET of `uri` for the server with `config`, sent on a connection of its own that closes
+/// after the answer: the client end of the connection, with nothing read from it yet.
+pub(super) async fn send_get(
+    server: &Arc<Server>,
+    config: &ServerConfig,
+    uri: &str,
+) -> DuplexStream {
+    let (parts, _) = sign(config, "GET", uri, &[], b"").into_parts();
+    let mut text = format!("GET {uri} HTTP/1.1\r\n");
+    for (name, value) in &parts.headers {
+        text.push_str(&format!("{name}: {}\r\n", value.to_str().unwrap()));
+    }
+    text.push_str(CLOSE);
+    text.push_str("\r\n");
+    let mut client = attach(server);
+    client.write_all(text.as_bytes()).await.unwrap();
+    client
+}
+
+/// A signed GET of `uri` for the server with `config`, on a connection of its own that closes
+/// after the answer: everything the server sends on it, the head and as much of the body as
+/// arrives before the connection ends.
+pub(super) async fn raw_get(server: &Arc<Server>, config: &ServerConfig, uri: &str) -> Vec<u8> {
+    let mut client = send_get(server, config, uri).await;
+    let mut answer = Vec::new();
+    read_rest(&mut client, &mut answer).await;
+    answer
+}
+
+/// The head of an answer as text, the `Content-Length` it gives (if it gives one) and the body
+/// that came with it. An answer that was cut before its head was complete gives an empty head and
+/// no body: the server does not flush a head it has not followed with the whole of its body.
+pub(super) fn split_answer(answer: &[u8]) -> (String, Option<usize>, &[u8]) {
+    let Some(found) = answer.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return (String::new(), None, &[]);
+    };
+    let end = found + 4;
+    let head = String::from_utf8_lossy(&answer[..end]).into_owned();
+    let length = head.to_ascii_lowercase().lines().find_map(|line| {
+        let value = line.strip_prefix("content-length: ")?;
+        value.trim().parse().ok()
+    });
+    (head, length, &answer[end..])
+}
+
+/// Whether an answer reached the client incomplete: it ends before the body of the length its head
+/// gave, or before its head was complete at all.
+pub(super) fn is_cut(answer: &[u8]) -> bool {
+    let (head, length, body) = split_answer(answer);
+    head.is_empty() || length.is_none_or(|length| body.len() < length)
 }

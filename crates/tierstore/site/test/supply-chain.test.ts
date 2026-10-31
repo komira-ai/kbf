@@ -60,12 +60,20 @@ test('the policy checks can fail', () => {
   assert.match(lockProblems({ lockfileVersion: 3, packages: { 'node_modules/a': { resolved: 'https://registry.npmjs.org/a', integrity: 'sha512-x', hasInstallScript: true } } }).join(), /runs an install script/);
 });
 
-test('Node is pinned to one exact version, and the workflow builds with that file, scripts off', () => {
+test('Node is pinned to one exact version, and both workflows build with that file, scripts off', () => {
   assert.match(read(SITE, '.node-version'), /^\d+\.\d+\.\d+\n$/);
   assert.equal(read(SITE, '.node-version'), '24.21.0\n');
-  const wf = read(REPO, '.github', 'workflows', 'tierstore-site.yml');
-  assert.ok(wf.includes(`node-version-file: ${SITE_REL}/.node-version\n`), 'the workflow reads .node-version of the site');
-  assert.ok(wf.includes(`working-directory: ${SITE_REL}\n`), 'the workflow runs in the site directory');
-  assert.equal(/^\s*node-version:/m.test(wf), false, 'a literal node-version would shadow .node-version');
-  assert.match(wf, /npm ci --ignore-scripts --no-audit --no-fund/);
+  // The check workflow and the publish workflow build the same way; the publish workflow's deploy job reads the version
+  // from the file that the build job hands on, at publish/.node-version.
+  for (const file of ['tierstore-site.yml', 'tierstore-site-publish.yml']) {
+    const wf = read(REPO, '.github', 'workflows', file);
+    assert.ok(wf.includes(`node-version-file: ${SITE_REL}/.node-version\n`), `${file} reads .node-version of the site`);
+    assert.ok(wf.includes(`working-directory: ${SITE_REL}\n`), `${file} runs in the site directory`);
+    assert.equal(/^\s*node-version:/m.test(wf), false, `a literal node-version in ${file} would shadow .node-version`);
+    assert.match(wf, /npm ci --ignore-scripts --no-audit --no-fund/, file);
+  }
+  const publish = read(REPO, '.github', 'workflows', 'tierstore-site-publish.yml');
+  // The deploy job checks out the program's source and the version file, and reads the same file as the build job.
+  assert.ok(publish.includes(`            ${SITE_REL}/.node-version\n`), 'the version file is in the deploy job\'s sparse checkout');
+  assert.equal(publish.split(`node-version-file: ${SITE_REL}/.node-version\n`).length - 1, 2, 'both jobs read the same file');
 });

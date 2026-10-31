@@ -20,6 +20,10 @@ pub enum Error {
     /// A client write to a key under a prefix the proxy keeps for itself.
     #[error("key {0} is under a reserved prefix")]
     Reserved(String),
+    /// A body whose bytes do not hash to the name of the object it is written under (a key
+    /// named by its content). Nothing is stored.
+    #[error("the body of {0} does not hash to the name of the object")]
+    BadDigest(String),
     /// A completion of a multipart upload names a part that was not uploaded, or one whose
     /// content tag is not the one that was named.
     #[error("invalid part: {0}")]

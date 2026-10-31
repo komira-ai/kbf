@@ -216,6 +216,14 @@ pub struct Campaign {
     pub ledger: PathBuf,
 }
 
+/// The lock file of the ledger file `ledger`: its name and `.lock`, beside it.
+#[must_use]
+pub fn lock_path(ledger: &Path) -> PathBuf {
+    let mut name = ledger.file_name().unwrap_or_default().to_owned();
+    name.push(".lock");
+    ledger.with_file_name(name)
+}
+
 /// The exclusive hold of one run on a ledger: the file `<ledger>.lock`, made with `create_new`
 /// and holding the process id, removed when the hold is dropped. Two runs that read the ledger,
 /// charge it and write it back would lose one another's charges, so a second run is refused
@@ -230,9 +238,7 @@ pub struct LedgerLock {
 impl LedgerLock {
     /// Takes the lock of the ledger file `ledger` (already resolved).
     fn acquire(ledger: &Path) -> Result<Self, BenchError> {
-        let mut name = ledger.file_name().unwrap_or_default().to_owned();
-        name.push(".lock");
-        let path = ledger.with_file_name(name);
+        let path = lock_path(ledger);
         let io = |source| BenchError::Io {
             path: path.clone(),
             source,

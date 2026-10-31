@@ -10,6 +10,7 @@ use super::cli::Cli;
 use super::config::{
     ConfigError, Dur, File, Kind, OciTable, PerRun, ServerTable, Size, TierTable, from_text,
 };
+use super::listen::Addrs;
 
 /// What the file starts with.
 const HEADER: &str = "\
@@ -77,6 +78,7 @@ pub(super) fn render(cli: &Cli) -> Result<String, ConfigError> {
     hot.copy_parallel = Some(cli.copy_parallel);
     hot.lease_ttl = Some(Dur(cli.lease_ttl));
     hot.reconcile_interval = Some(Dur(cli.reconcile_interval));
+    hot.lock_file.clone_from(&cli.lock_file);
     hot.usage_stale_after = Some(Dur(cli.usage_stale_after));
     hot.journal_linger = Some(Dur(cli.journal_linger));
     hot.journal_retention = Some(Dur(cli.journal_retention));
@@ -93,7 +95,7 @@ pub(super) fn render(cli: &Cli) -> Result<String, ConfigError> {
         .collect();
     cold.skip_checks = Some(skipped);
     let server = ServerTable {
-        listen: cli.listen,
+        listen: Addrs(cli.listen.clone()),
         proxy_id: cli.proxy_id.clone(),
         bucket: cli.bucket.clone(),
         region: Some(cli.region.clone()),
@@ -105,6 +107,7 @@ pub(super) fn render(cli: &Cli) -> Result<String, ConfigError> {
         presign_max_expires: Some(Dur(cli.presign_max_expires)),
         max_request_bytes: Some(cli.max_request_bytes),
         max_concurrent_puts: Some(cli.max_concurrent_puts),
+        put_permit_wait: Some(Dur(cli.put_permit_wait)),
         put_min_bytes_per_sec: Some(cli.put_min_bytes_per_sec),
         put_rate_grace: Some(Dur(cli.put_rate_grace)),
         body_idle_timeout: Some(Dur(cli.body_idle_timeout)),
@@ -112,8 +115,8 @@ pub(super) fn render(cli: &Cli) -> Result<String, ConfigError> {
         backend_check_wait: Some(Dur(cli.backend_check_wait)),
     };
     // The flags that need `--oci-listen` cannot be given without it, so the table is the front.
-    let oci = cli.oci_listen.map(|listen| OciTable {
-        listen: Some(listen),
+    let oci = (!cli.oci_listen.is_empty()).then(|| OciTable {
+        listen: Some(Addrs(cli.oci_listen.clone())),
         tls_cert_file: cli.oci_tls_cert.clone(),
         tls_key_file: cli.oci_tls_key.clone(),
         prefix: cli.oci_prefix.clone(),
