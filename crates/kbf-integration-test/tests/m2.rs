@@ -243,12 +243,16 @@ mod fake {
             1
         };
         // Real crun makes `.cache` in its root beside the container's state: not a
-        // container.
-        std::fs::create_dir_all(lease.join("crun").join(".cache")).expect("crun's cache");
+        // container. The whole root appears at once, by a rename from a name the harness
+        // does not read: a harness polling between two `create_dir_all` calls would see
+        // the first of two containers alone, count one, and pass the defect.
+        let staged = lease.join("crun-staged");
+        std::fs::create_dir_all(staged.join(".cache")).expect("crun's cache");
         for i in 0..containers {
-            std::fs::create_dir_all(lease.join("crun").join(format!("{name}-{i}")))
+            std::fs::create_dir_all(staged.join(format!("{name}-{i}")))
                 .expect("a container's state");
         }
+        std::fs::rename(&staged, lease.join("crun")).expect("crun's root");
         let secs = args
             .iter()
             .find_map(|a| a.strip_prefix("kbf_m2.sleep_secs="));
