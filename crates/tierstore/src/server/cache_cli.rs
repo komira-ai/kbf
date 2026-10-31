@@ -24,9 +24,16 @@
 //! flags and files are checked as a storage node's are (see `oci_setup_of`), before the cache is
 //! opened, and it drains with the S3 front.
 //!
-//! On SIGTERM or SIGINT the process drains as a storage node does; the eviction pass is the only
-//! thing running beside the server, and it stops with it. Nothing is owed to the upstream: no
-//! journal, no lease, no copy in flight.
+//! The cache directory has a lock (`<path>/.lock`, see [`local_cache`](super::local_cache)). The
+//! process that holds it is read-write; one that starts while another holds it is read-only: it
+//! does not make the probe of the file system (the probe writes to the directory), `/readyz`
+//! says `ready read-only`, and a task tries the lock every second, so that it becomes
+//! read-write when the holder has exited. A start that is alone holds the lock before it binds
+//! the address, so it is read-write from its first answer.
+//!
+//! On SIGTERM or SIGINT the process drains as a storage node does; the eviction pass and the
+//! lock task are the only things running beside the server, and they stop with it. Nothing is
+//! owed to the upstream: no journal, no lease, no copy in flight.
 
 use std::future::Future;
 use std::path::Path;
@@ -44,12 +51,16 @@ use super::cli::{
 };
 use super::config_cache::CacheSettings;
 use super::front::{InvalidFlags, server_config};
-use super::local_cache::{CacheConfig, Disk, LocalCache, SystemDisk, check_local};
+use super::local_cache::{CacheConfig, Disk, LocalCache, Mode, SystemDisk, check_local};
 use super::oci::OciListener;
 use super::{Drained, Server};
 
 /// How often the eviction pass runs beside the server.
 const PASS_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How often a cache that does not hold the lock of its directory tries it again, and one that
+/// holds it checks that the lock file is still the file at the path.
+const LOCK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Asks the upstream a HEAD of a key that is not there: any answer but 404 is a problem.
 async fn reach(upstream: &dyn Backend, run: &str, spec: &str) -> Result<(), Error> {
@@ -115,14 +126,23 @@ async fn open(
 ) -> Result<LocalCache, Error> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let (upstream, disk) = (Arc::clone(upstream), Arc::clone(disk));
-    let opened = LocalCache::open(config.clone(), upstream, Arc::clone(&disk), clock);
+    let opened = LocalCache::open_locked(config.clone(), upstream, Arc::clone(&disk), clock);
     let cache = opened.map_err(|why| {
         format!(
             "opening the local cache at {}: {why}",
             config.path.display()
         )
     })?;
-    check_local(&*disk, cache.path(), run)?;
+    // The probe writes under `.stage/` and `obj/`: only the process that holds the lock may. A
+    // read-only one is on the directory, and the file system, that the holder's check passed.
+    match cache.mode() {
+        Mode::ReadWrite => check_local(&*disk, cache.path(), run)?,
+        Mode::ReadOnly => eprintln!(
+            "tierstore: local cache at {}: another process holds the lock; read-only, and the \
+             file system check is left to it",
+            config.path.display()
+        ),
+    }
     // A file system whose size cannot be read is not judged: the start says so and goes on.
     match size_of_file_system(&*disk, cache.path()) {
         Ok(total) if config.budget > config.room(total) => {
@@ -141,9 +161,11 @@ async fn open(
     }
     let (bytes, objects) = cache.held();
     eprintln!(
-        "tierstore: local cache at {}: {objects} objects, {bytes} bytes, {} files removed at start",
+        "tierstore: local cache at {}: {objects} objects, {bytes} bytes, {} files removed at \
+         start, {}",
         config.path.display(),
-        cache.counters().discarded_at_start()
+        cache.counters().discarded_at_start(),
+        cache.mode().as_str()
     );
     Ok(cache)
 }
@@ -201,13 +223,18 @@ pub(super) async fn serve_cache(
     });
     let halt = Arc::new(Notify::new());
     let halting = Arc::clone(&halt);
+    let lock_halt = Arc::new(Notify::new());
+    let lock_halting = Arc::clone(&lock_halt);
     let serving = async move {
         let drained = server.serve(listener).await;
         halting.notify_one();
+        lock_halting.notify_one();
         drained
     };
     let maintaining = cache.maintain(PASS_INTERVAL, halt);
-    let (drained, (), oci_cut) = tokio::join!(serving, maintaining, serve_oci(oci, oci_stopped));
+    let holding = cache.hold(LOCK_INTERVAL, lock_halt);
+    let (drained, (), (), oci_cut) =
+        tokio::join!(serving, maintaining, holding, serve_oci(oci, oci_stopped));
     watcher.abort();
     eprint!("{}", oci_cut_note(oci_cut));
     Ok(drained)

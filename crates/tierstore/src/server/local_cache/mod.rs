@@ -67,6 +67,16 @@
 //! per pass however often it was used) so that a restart keeps it. An object with more than one
 //! link is in use by another tree: it is skipped, counted, and stays charged to the budget.
 //! Files in `.stage/` are never evicted and are removed at start.
+//!
+//! # The lock and read-only mode
+//!
+//! A cache opened with [`LocalCache::open_locked`] takes an exclusive lock on `<path>/.lock`.
+//! A second process over the directory (the next release, started beside the one that runs) is
+//! read-only until the first exits: it serves the hits its scan found, sends every miss and every
+//! write to the upstream, and creates, changes and removes nothing in the directory (no clean-up
+//! at open, no probe, no fill, no eviction, no file time, no deletion on a read error). When the
+//! lock is free, [`LocalCache::tick`] takes it, cleans up, scans again and makes the cache
+//! read-write. The module `hold` has the rules.
 
 mod disk;
 mod evict;
