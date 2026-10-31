@@ -188,7 +188,9 @@ visible, and the test below asserts it is zero for clients that are never idle.
 
 `--drain-lb-wait` is the **settle wait** in a hand-over and is never `0s`: v-current keeps accepting and serving through
 it, so a connection whose SYN was mapped to v-current just before the swap (in its accept queue, or a retransmitted SYN)
-is served, not reset (`host-updates.md`, 4.1.3). A keep-alive connection that outlives `drain_deadline` is closed by
+is served, not reset (`host-updates.md`, 4.1.3). The updater passes the strategy's `settle` (default **130 s**, the
+whole default SYN retransmit schedule, 4.1.3) as `--drain-lb-wait`; tierstore's own default stays 10 s for a plain
+restart. The longer settle costs only update time: v-current serves everything throughout it. A keep-alive connection that outlives `drain_deadline` is closed by
 v-current (`finish_by_deadline`, `finish`) and the cut requests are counted in `Drained.abandoned` and printed by
 `cut_note`: an idle one costs the client a reconnect; a request still running fails, as in a plain restart.
 
