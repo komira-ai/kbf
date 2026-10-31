@@ -81,7 +81,7 @@ test('every output line of the demo is a string the program prints', () => {
   assert.ok(mod.includes('no usage yet, {secs}s since start'), 'the /usagez body changed: update content/demo.html and docs/operations.md');
   assert.ok(mod.includes('usage published {secs}s ago'), 'the /usagez body changed: update content/demo.html and docs/operations.md');
   const cli = binarySource().get('server/cli.rs') as string;
-  for (const line of ['tierstore: testing the {name}', 'tierstore: tested the {name} in {took} ms', 'tierstore {version} listen={}']) {
+  for (const line of ['tierstore: testing the {name}', 'tierstore: tested the {name} in {took} ms', 'tierstore {VERSION} listen={}']) {
     assert.ok(cli.includes(line), `"${line}" is not in server/cli.rs: update content/demo.html`);
   }
   const demo = page('demo');
