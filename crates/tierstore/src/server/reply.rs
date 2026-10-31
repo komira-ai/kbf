@@ -1,6 +1,7 @@
 //! The answers: the plain ones, and S3's error answers with their status codes and codes.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use hyper::{Response, StatusCode};
 
 use crate::{Error, ReadBody};
 
+use super::linger::{Wire, WireHold};
 use super::xml::error_body;
 
 /// The header that has the hash of the body that the signature covers.
@@ -49,6 +51,8 @@ struct Counted {
     held: Option<Bytes>,
     /// Whether the body has ended, with an error or without.
     ended: bool,
+    /// The claim of this answer on the wire of its connection, held until the body is dropped.
+    wire: Option<WireHold>,
 }
 
 impl Counted {
@@ -91,6 +95,14 @@ impl Counted {
 }
 
 impl AnswerBody {
+    /// Makes a streamed body hold the wire of `wire` until it is dropped (it ends, fails, or the
+    /// connection goes). A body held whole is off the wire when it is flushed, and holds nothing.
+    pub(super) fn hold_wire(&mut self, wire: &Arc<Wire>) {
+        if let Kind::Streamed(counted) = &mut self.kind {
+            counted.wire = Some(wire.hold());
+        }
+    }
+
     /// A body of `len` bytes that `chunks` gives.
     pub(crate) fn streamed(len: u64, chunks: ReadBody) -> Self {
         let kind = Kind::Streamed(Counted {
@@ -98,6 +110,7 @@ impl AnswerBody {
             owed: len,
             held: None,
             ended: false,
+            wire: None,
         });
         Self { kind }
     }
@@ -217,13 +230,6 @@ impl S3Error {
     /// A request for something this server does not do.
     pub(crate) fn unsupported(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_IMPLEMENTED, "NotImplemented", message)
-    }
-
-    /// A request after the drain began: refused, and the connection is closed.
-    pub(crate) fn draining() -> Self {
-        let text = "The server is shutting down; send the request to another endpoint.";
-        Self::new(StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable", text)
-            .with("connection", "close")
     }
 
     /// A request whose body took no byte for the idle timeout: the connection is closed.

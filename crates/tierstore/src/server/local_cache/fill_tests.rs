@@ -460,7 +460,9 @@ async fn each_step_of_publishing_that_fails_fails_the_fill_not_the_read() {
         match step {
             "dirs" => std::fs::write(root.join("obj").join(&hex[..2]), b"x").unwrap(),
             "sidecar-write" => {
-                std::fs::create_dir(root.join(".stage").join("0000000000000000.meta")).unwrap();
+                let prefix = &rig.cache.inner.stage_prefix;
+                let name = format!("{prefix}-0000000000000000.meta");
+                std::fs::create_dir(root.join(".stage").join(name)).unwrap();
             }
             _ => std::fs::create_dir_all(meta_path(root, &hex)).unwrap(),
         }

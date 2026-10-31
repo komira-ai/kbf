@@ -146,7 +146,9 @@ impl Inner {
                 let from = if hit { Served::Local } else { Served::Upstream };
                 Ok(Some(self.from_file(Arc::new(file), (offset, len), from)))
             }
-            Err(error) if gone(&error) => {
+            // A read-only cache has no say over the files: the holder may have evicted this one, or
+            // be publishing it, so the read is a miss and nothing is dropped.
+            Err(error) if gone(&error) && self.read_write() => {
                 // The file is gone or short: the entry is a lie, so it is dropped.
                 self.drop_entry(&name.hex);
                 Ok(None)

@@ -38,6 +38,9 @@ const SAFETY: Duration = Duration::from_secs(86_400);
 /// The header line that has the server close the connection after the answer.
 const CLOSE: &str = "connection: close\r\n";
 
+/// What a request that keeps the connection alive has in place of the `connection` header line.
+const KEPT: &str = "";
+
 /// What `waiting` gives, or a failure of the test if it never gives it.
 async fn bounded<F: Future>(waiting: F) -> F::Output {
     let waited = tokio::time::timeout(SAFETY, waiting).await;
@@ -172,6 +175,60 @@ pub(super) async fn read_answer(client: &mut DuplexStream) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Writes a signed request that keeps the connection alive, and its body, on `client`.
+pub(super) async fn send(
+    client: &mut DuplexStream,
+    rig: &Rig,
+    method: &str,
+    uri: &str,
+    extra: &[(&str, &str)],
+    body: &[u8],
+) {
+    let text = head(rig, method, uri, extra, body, KEPT);
+    client.write_all(text.as_bytes()).await.unwrap();
+    client.write_all(body).await.unwrap();
+}
+
+/// Whether `bytes` hold a whole answer: its head and as many bytes of body as it says.
+fn is_whole(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let length = head.lines().find_map(|line| {
+        let line = line.to_ascii_lowercase();
+        let value = line.strip_prefix("content-length: ")?;
+        value.trim().parse::<usize>().ok()
+    });
+    body.len() >= length.unwrap_or(0)
+}
+
+/// Reads one whole answer, which may leave the connection open: the head and the body its
+/// `content-length` gives.
+pub(super) async fn read_response(client: &mut DuplexStream) -> String {
+    let mut bytes = Vec::new();
+    let mut piece = vec![0_u8; CHUNK];
+    while !is_whole(&bytes) {
+        let read = bounded(client.read(&mut piece)).await.unwrap();
+        assert!(read > 0, "the connection ended inside an answer");
+        bytes.extend_from_slice(&piece[..read]);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Sends a signed request that keeps the connection alive and reads its answer.
+pub(super) async fn exchange(
+    client: &mut DuplexStream,
+    rig: &Rig,
+    method: &str,
+    uri: &str,
+    extra: &[(&str, &str)],
+    body: &[u8],
+) -> String {
+    send(client, rig, method, uri, extra, body).await;
+    read_response(client).await
+}
+
 /// Reads the rest of the answer, to the end of the connection, after `answer`.
 pub(super) async fn read_rest(client: &mut DuplexStream, answer: &mut Vec<u8>) {
     bounded(client.read_to_end(answer)).await.unwrap();
@@ -237,14 +294,39 @@ impl Stalled {
     /// Sends on `client` the head of a put to `uri` signed for the server of `rig` with these extra
     /// headers, and the first `sent` bytes of `body`. The connection closes after the answer.
     pub(super) async fn open(
-        mut client: DuplexStream,
+        client: DuplexStream,
         rig: &Rig,
         uri: &str,
         extra: &[(&str, &str)],
         body: &[u8],
         sent: usize,
     ) -> Self {
-        let text = head(rig, "PUT", uri, extra, body, CLOSE);
+        Self::begin(client, rig, uri, extra, body, sent, CLOSE).await
+    }
+
+    /// The same, for a connection that is kept alive: the client does not ask for it to close.
+    pub(super) async fn open_kept(
+        client: DuplexStream,
+        rig: &Rig,
+        uri: &str,
+        extra: &[(&str, &str)],
+        body: &[u8],
+        sent: usize,
+    ) -> Self {
+        Self::begin(client, rig, uri, extra, body, sent, KEPT).await
+    }
+
+    /// Sends the head with the `connection` header line `connection`, and the first `sent` bytes.
+    async fn begin(
+        mut client: DuplexStream,
+        rig: &Rig,
+        uri: &str,
+        extra: &[(&str, &str)],
+        body: &[u8],
+        sent: usize,
+        connection: &str,
+    ) -> Self {
+        let text = head(rig, "PUT", uri, extra, body, connection);
         client.write_all(text.as_bytes()).await.unwrap();
         client.write_all(&body[..sent]).await.unwrap();
         Self {

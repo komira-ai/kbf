@@ -58,8 +58,8 @@ ExecStart=/usr/libexec/kbf/tierstore \
   --cold-credentials-file /etc/tierstore/cold.credentials \
   --drain-lb-wait 10s \
   --drain-deadline 15m
-# On SIGTERM the process drains: /readyz says 503 and it serves for --drain-lb-wait, then refuses
-# new requests and waits for those in flight for at most --drain-deadline, gives up the
+# On SIGTERM the process drains: /readyz says 503 and it serves for --drain-lb-wait, then stops
+# accepting, closes idle connections and waits for those in flight for at most --drain-deadline, gives up the
 # reconciler's lease (5 s at most) and exits 0. Seconds: 960 is the 10 s and the 15 m of the flags
 # above and the lease, with a margin, so that systemd never sends SIGKILL to a drain in progress.
 # Raise it with --drain-deadline.
