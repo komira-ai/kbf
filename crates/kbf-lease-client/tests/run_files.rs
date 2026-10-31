@@ -214,3 +214,58 @@ async fn the_fake_never_lists_contents() {
     assert_eq!(server.run_files(&run_id), Some(spec.files));
     assert_eq!(server.run_files(&"run-4-99".parse().unwrap()), None);
 }
+
+/// Asserts the order the lease server refuses a start in: a host that cannot deliver files is
+/// `409 files-unsupported` whether it is lost, tainted or refusing runs, and the same host is
+/// still refused for its own reason when the start has no files. It catches a fake that tests
+/// the host's state first: a caller that retries elsewhere on a host fault and gives up on
+/// "this job would run without its secrets" would see a different answer from the real server.
+#[tokio::test]
+async fn a_lost_or_tainted_host_without_run_files_is_refused_files_unsupported() {
+    type Break = fn(&FakeLeaseServer);
+    let cases: [(&str, Break, ErrorCode); 3] = [
+        (
+            "lost",
+            |server| assert!(server.set_lost("node1", true)),
+            ErrorCode::HostLost,
+        ),
+        (
+            "tainted",
+            |server| assert!(server.taint_host("node1", "scratch-not-clean")),
+            ErrorCode::HostTainted,
+        ),
+        (
+            "refusing",
+            |server| assert!(server.refuse_posts("node1", Some("quota-unavailable"))),
+            ErrorCode::QuotaUnavailable,
+        ),
+    ];
+    for (what, break_host, own) in cases {
+        let (server, client) = fake().await;
+        let id = lease(&client).await;
+        break_host(&server);
+        let with = client
+            .queue_run(id, &with_files(vec![file("put-url", SECRET)]))
+            .await
+            .unwrap_err();
+        assert_eq!(refused(with), (409, ErrorCode::FilesUnsupported), "{what}");
+        let without = client.queue_run(id, &run_of(100, 1)).await.unwrap_err();
+        assert_eq!(refused(without), (409, own), "{what}: no files");
+    }
+}
+
+/// Asserts that a file name with a non-ASCII character is refused: the grammar is checked
+/// byte by byte, so an accented letter, a multibyte letter and an emoji are not alphanumeric
+/// or punctuation of the grammar, in any position. It catches a check written on `char`s that
+/// takes `is_alphanumeric` for Unicode letters.
+#[tokio::test]
+async fn a_non_ascii_file_name_is_refused() {
+    let (_server, client, id) = files_fake().await;
+    for name in ["é", "aé", "日本", "a\u{1F600}", "\u{FF21}bc"] {
+        let error = client
+            .queue_run(id, &with_files(vec![file(name, "x")]))
+            .await
+            .unwrap_err();
+        assert_eq!(refused(error), (400, ErrorCode::InvalidFile), "{name:?}");
+    }
+}
