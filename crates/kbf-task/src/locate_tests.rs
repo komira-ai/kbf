@@ -871,3 +871,40 @@ fn a_store_that_cannot_be_reached_is_tried_once() {
 
 #[path = "locate_http_tests.rs"]
 mod http;
+
+/// Catches: the listener's real `/locate` answer (kbf-front's `GET /locate` with a grant key, for a
+/// fixed scope, source, key and clock) being a table the task cannot use. The file is the one
+/// kbf-front's test `the_answer_is_the_golden_file_kbf_task_parses` compares with that answer;
+/// kbf-front cannot be a dependency of this crate, so both read it. The store, the bucket, the
+/// one grant, a pack place and a large place come out, and the absent lines locate nothing.
+#[test]
+fn a_real_answer_of_the_listener_is_a_table() {
+    let golden = include_str!("../../kbf-front/tests/golden/locate_with_grants.ndjson");
+    let table = Table::parse(golden.as_bytes());
+    assert_eq!(
+        table.store(),
+        Some(("http://store.farm.test:9000", "tiers"))
+    );
+    assert_eq!(table.len(), 2);
+    let pack = digest_of(b"alpha");
+    let (place, grant) = table.locate(&pack).expect("the pack line is a place");
+    assert_eq!(
+        place,
+        &Place::Pack {
+            key: "cas/f/w/1".to_owned(),
+            offset: 0,
+            length: 5
+        }
+    );
+    assert!(grant.starts_with("dGllcnN0b3JlLWdyYW50LXYxC"), "{grant}");
+    let large = digest_of(&[7; 2000]);
+    let (place, same) = table.locate(&large).expect("the large line is a place");
+    assert_eq!(
+        place,
+        &Place::Large {
+            key: format!("cas/l/{}", large.hash)
+        }
+    );
+    assert_eq!(same, grant);
+    assert_eq!(table.place(&digest_of(b"delta")), None);
+}
