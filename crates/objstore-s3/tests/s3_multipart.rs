@@ -7,9 +7,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream;
-use kbf_objstore::s3::fake::{Failure, FakeS3};
-use kbf_objstore::s3::{MULTIPART_THRESHOLD, PART_BYTES};
-use kbf_objstore::{BodyStream, ByteRange, Capabilities, ObjectKey, ObjectStore, ObjectStoreError};
+use objstore_s3::s3::fake::{Failure, FakeS3};
+use objstore_s3::s3::{MULTIPART_THRESHOLD, PART_BYTES};
+use objstore_s3::{BodyStream, ByteRange, Capabilities, ObjectKey, ObjectStore, ObjectStoreError};
 
 const CONDITIONAL: Capabilities = Capabilities {
     conditional_put: true,
@@ -461,4 +461,26 @@ async fn a_store_without_conditional_writes_replaces_a_key() {
     let refused = reqwest::Client::new().delete(unknown).send().await.unwrap();
     assert_eq!(refused.status(), 404);
     assert!(refused.text().await.unwrap().contains("NoSuchUpload"));
+}
+
+/// Catches a fake S3 service that lists the uploads of a bucket when asked for the uploads of
+/// one key: S3 lists uploads per bucket only, so `GET <key>?uploads` is a request the fake
+/// does not serve, answered 501 and not with a listing.
+#[tokio::test]
+async fn the_fake_lists_uploads_of_a_bucket_and_not_of_a_key() {
+    let s3 = FakeS3::start().await;
+    let client = reqwest::Client::new();
+    let bucket = client
+        .get(format!("{}/kbf-fake?uploads", s3.endpoint()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bucket.status(), 200);
+    let key = client
+        .get(format!("{}/kbf-fake/cas/k?uploads", s3.endpoint()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(key.status(), 501);
+    assert!(key.text().await.unwrap().contains("NotImplemented"));
 }
