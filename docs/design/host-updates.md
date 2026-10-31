@@ -1,12 +1,14 @@
 # One host updater with update hooks, and a generic coordinator
 
-Status: DRAFT. **The shape in this document is decided** (rev 4): a generic updater on every host that knows no service, and an update hook that each service ships as a subcommand of its own binary. What remains open are the Questions in section 10. No code. Facts were read at `origin/main` 80436afe7 unless a section says otherwise; a `path:line` is a line of that file at that commit. Where a statement is an inference or a claim about software we do not own, it says so.
+Status: DRAFT. **The shape in this document is decided** (rev 4): a generic updater on every host that knows no service, and an update hook that each service ships in its release. The hook is **any executable**, a binary or a script; our services use a subcommand of their own binary by convention. What remains open are the Questions in section 10. No code. Facts were read at `origin/main` 80436afe7 unless a section says otherwise; a `path:line` is a line of that file at that commit. Where a statement is an inference or a claim about software we do not own, it says so.
 
 Labels: **[F]** read in the code at the commit above, **[I]** inference, **[D]** a design choice made here, **[V]** to verify before building on it.
 
 Sections 4.1 (tierstore) and 4.2 (js-agent) are the owners' hook sections, written as `update-hook` steps. The nftables mechanics of 4.1 are the tierstore owner's.
 
 ## Changes in rev 4.3
+
+Wording pass: the hook is any executable, a binary or a script, named by the declaration (`binary`, with optional `hook_args`, default `["update-hook"]`); the step contract, the declared rights and the verified-release requirement apply to whatever it is; "Rust, tested with the service, no shell" is the repository rule for our own services and not part of the updater contract (0, 2.4, 3.2, 3.3, 6).
 
 Final text fixes after the re-check of rev 4.2. A failing `rollback` is a `halt` only before the commit (3.2); the step capabilities in 3.4 read `prepare`, `cutover` and `rollback`; `state_dir` is 0750 with the service's group where units execute from it, and the service may read and never write (3.4.1); the reserved-path rule says "name or contain" and lets a single file inside a reserved directory be read-only (3.3); section 11 carries the six probe items and assigns each to the root job of step 3; the reviewer notes are rewritten for rev 4.2 and copied into the PR body.
 
@@ -23,7 +25,7 @@ Follow-up to the owners' restated hook sections. (1) **What runs next, per outco
 The shape changed; rev 3 is superseded. What was decided:
 
 1. **The updater is generic and knows no service.** The per-service strategy library and the closed set of root verbs are gone.
-2. **Each service ships its hook as a subcommand of its own binary**, for example `tierstore update-hook <step>`: Rust, tested with the service, no shell. The cutover logic for a version ships with that version.
+2. **Each service ships its hook in its release.** The hook is **any executable** (a binary or a script) that the declaration names by a path within the verified release; the updater requires nothing of its language. Our own services follow the repository rule, which is a rule for our code and not part of the updater contract: the hook is a subcommand of the service's own binary (for example `tierstore update-hook <step>`), Rust, tested with the service, no shell. The cutover logic for a version ships with that version.
 3. **A fixed step contract:** `prepare <artifact>`, `cutover`, `verify`, `rollback`, `cleanup`. Each step is safe to run twice; the updater persists the step it reached and resumes after a crash (3.2, 3.5).
 4. **Hooks are declared in a root-owned file the package installs** (`/etc/updater.d/<service>.toml`): the hook binary, the rights it needs, bounds per step. They are never registered at runtime. At runtime a service registers only liveness and version (2). A hook runs with exactly its declared rights (3.4).
 5. **Trust (3.3):** the hook binary is the artifact the updater verified (sha256 and attestation) before anything from it runs; a declaration that is not root-owned, or is group- or world-writable, is refused.
@@ -51,7 +53,7 @@ Today every host runs an unprivileged agent (`kbf-updater agent`) beside a root 
 The decided shape moves that knowledge out of the updater and into the service:
 
 1. **The updater is a generic process.** On every host it fetches the release, verifies it (sha256 and attestation), stages it, runs the service's hook through a fixed five-step contract, persists which step it reached, reports to the coordinator, and rolls back. It knows no service.
-2. **Each service ships its update hook as a subcommand of its own binary.** The cutover logic for a version ships with that version, is written in Rust, and is tested in the service's own CI. The updater never contains a service's cutover logic.
+2. **Each service ships its update hook in its release, as any executable.** The cutover logic for a version ships with that version. For our own services it is a subcommand of the service's binary, written in Rust and tested in the service's own CI; that is the repository rule for our code, not a requirement of the updater. The updater never contains a service's cutover logic.
 3. **The declaration of a hook is a root-owned file the package installs.** It names the hook binary and the rights it needs. A service cannot register code at runtime; at runtime it registers only that it is alive and which version it runs.
 4. **The coordinator is generic over services**: it holds the desired version per service, the hosts, slots, canary and bake (5).
 
@@ -105,7 +107,8 @@ The accepted registration is written to the updater's state directory (mode 0700
 # /etc/updater.d/tierstore.toml   root:root, mode 0644, installed with the release
 # Top-level keys come first: in TOML a key after a table header belongs to that table.
 name   = "tierstore"
-binary = "tierstore"                    # file name inside the artifact; the hook is `<binary> update-hook <step>`
+binary = "tierstore"                    # path of the hook executable within the verified release (a binary or a script)
+# hook_args = ["update-hook"]           # leading arguments before the step; this is the default (our convention); [] for an executable that takes the step first
 signer = { repository = "...", workflow = "artifacts.yml" }   # whose attestation the artifact must carry
 uid    = "tierstore"                    # the account the service runs as and registers as
 registration_ttl_secs  = 300
@@ -168,7 +171,7 @@ The updater decides nothing about any service in this sequence: it does not drai
 
 ### 3.2 The step contract
 
-A hook is `<binary> update-hook <step> [args]`, run by the updater with the rights of the declaration (3.4). Rust, no shell. The five steps:
+A hook is **any executable**: a binary or a script. The declaration names it (`binary`, a path within the verified release) and declares its rights; the updater runs `<executable> <hook_args> <step> [args]`, where `hook_args` defaults to `["update-hook"]`, the convention our services follow (`tierstore update-hook <step>`), and is `[]` for an executable that takes the step as its first argument. It is run by the updater with the rights of the declaration (3.4). **The contract below applies to whatever executable it is:** the arguments, the exit codes, the last-line JSON and the idempotency; the declared rights apply to it too, and it must come from the verified release (3.3). Our own services follow the repository rule (Rust, tested with the service, no shell); that is a rule for our code, not part of this contract. The five steps:
 
 | step | arguments | what it must do | reversibility is the hook's |
 |---|---|---|---|
@@ -211,7 +214,7 @@ A hook is `<binary> update-hook <step> [args]`, run by the updater with the righ
 
 **Trust.**
 - The declaration is **root-owned and installed with the package**. A declaration that is not owned by root, or is group- or world-writable, or lives in a directory that is, is refused.
-- The hook binary is **inside the artifact the updater verified** (sha256 and attestation). The updater runs a hook only from a staged release it verified; a hook from an unverified artifact never runs, as root or as anything. The check is made again when a step is resumed after a crash (the staged directory's digest is in the step record).
+- The hook executable (binary or script) is **inside the artifact the updater verified** (sha256 and attestation). The updater runs a hook only from a staged release it verified; a hook from an unverified artifact never runs, as root or as anything. The check is made again when a step is resumed after a crash (the staged directory's digest is in the step record).
 - Running the hook as root is never an effect of a runtime message: the registration socket carries liveness and version only (2).
 
 **Which binary runs which step.**
@@ -603,7 +606,7 @@ Per host, already true: `decide.rs:105` orders nothing to a host that has any se
 
 **The updater** is generic code in kbf: the crates exist (`kbf-updater`, `kbf-host-install`, `kbf-installer`), their tests pin today's behaviour, and the release pipeline already signs and attests them (`crates/kbf-installer/src/attest.rs:1-17`, a list of accepted signers at `:136-137`). It names no product; a lint checks that its public items and its tests name no service.
 
-**Hooks** live with their services, in their repositories, as subcommands of the service's binary. The updater depends on no service; a service depends on no updater crate except one **dev-dependency**, the conformance suite (9): a crate with no kbf product dependency, which a service uses in its own CI to prove that its hook satisfies the contract. The contract is a document and a golden test in the updater's repository.
+**Hooks** live with their services, in their repositories, shipped in the service's release; ours are subcommands of the service's binary. The updater depends on no service; a service depends on no updater crate except one **dev-dependency**, the conformance suite (9): a crate with no kbf product dependency, which a service uses in its own CI to prove that its hook satisfies the contract. The contract is a document and a golden test in the updater's repository.
 
 **The coordinator** is generic code in kbf (5), with a lint of the same kind.
 
