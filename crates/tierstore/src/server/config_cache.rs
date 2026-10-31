@@ -253,12 +253,17 @@ impl CacheSettings {
             cache.max_concurrent_fills = usize::from(fills);
         }
         cache.write_through = table.write_through.unwrap_or(false);
+        let scrub_min_round = duration(table.scrub_min_round, SCRUB_MIN_ROUND);
+        if !scrub_min_round.is_zero() && scrub_min_round < Duration::from_secs(1) {
+            let why = "must be at least 1s (the scrub ticks once a second), or 0s for no minimum";
+            return Err(invalid("local_cache.scrub_min_round", why));
+        }
         Ok(Self {
             front: shared.front,
             s3_request_timeout: shared.s3_request_timeout,
             upstream,
             cache,
-            scrub_min_round: duration(table.scrub_min_round, SCRUB_MIN_ROUND),
+            scrub_min_round,
             scrub_rate: Some(table.scrub_rate.map_or(SCRUB_RATE, |rate| rate.0)).filter(|n| *n > 0),
         })
     }

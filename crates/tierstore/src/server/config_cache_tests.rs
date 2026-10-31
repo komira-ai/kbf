@@ -360,6 +360,31 @@ fn a_build_node_file_is_refused_when_it_cannot_be_run() {
     let why = refusal(&cache_with("\"50MiB/s\"", "\"fast\""));
     assert!(why.contains("scrub_rate"), "{why}");
     assert!(!why.contains("fast"), "{why}");
+    // The same for a minimum between rounds that is not a duration.
+    let text = cache_with("scrub_min_round = \"30m\"", "scrub_min_round = \"soon\"");
+    let why = refusal(&text);
+    assert!(why.contains("scrub_min_round"), "{why}");
+    assert!(!why.contains("soon"), "{why}");
+}
+
+/// Asserts that a minimum between rounds under one second is refused naming its key (it would
+/// round down to no minimum), and that exactly `0s` and one second are accepted.
+#[test]
+fn a_scrub_min_round_under_a_second_is_refused_except_zero() {
+    let with = |value: &str| {
+        cache_with(
+            "scrub_min_round = \"30m\"",
+            &format!("scrub_min_round = \"{value}\""),
+        )
+    };
+    let why = refusal(&with("500ms"));
+    assert!(why.contains("local_cache.scrub_min_round"), "{why}");
+    assert!(why.contains("at least 1s"), "{why}");
+    assert_eq!(cache_of(&with("0s")).scrub_min_round, Duration::ZERO);
+    assert_eq!(
+        cache_of(&with("1s")).scrub_min_round,
+        Duration::from_secs(1)
+    );
 }
 
 /// Asserts the edges of the water marks: a low water mark one under the high one, a high one

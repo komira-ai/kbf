@@ -556,6 +556,7 @@ const LOCAL_CACHE_KEYS: &[&str] = &[
     "max_concurrent_fills",
     "write_through",
     "scrub_rate",
+    "scrub_min_round",
 ];
 
 /// Whether `key` is a name some table of the file holds: the last part of a key in [`KEYS`], a

@@ -428,7 +428,7 @@ read, or that reports 0 bytes, is not judged: the start warns on stderr and goes
 | `local_cache.max_concurrent_fills` | the most fills that run at once (1 to 64, default 4); a miss that finds them all running is served from the upstream and kept nowhere |
 | `local_cache.write_through` | `false` by default: a read cache that refuses every write with 403 before the role of the key is looked at. `true`: the node takes the writes its keys may do and sends each to the upstream, which must be written with a key that may write; the start runs the upstream's self-test (create-only and multipart-conditional included) and exits with status 3 if the upstream answers one wrongly |
 | `local_cache.cache` | `true`, the default; `false` is refused (leave `[local_cache]` out to run without a cache) |
-| `local_cache.scrub_min_round` | the least time between the starts of two rounds of the scrub (default `"1h"`; `"0s"`: a round starts as soon as the last is done): a small cache is not read again and again at the rate |
+| `local_cache.scrub_min_round` | the least time between the starts of two rounds of the scrub (default `"1h"`; at least `"1s"`, or `"0s"`: a round starts as soon as the last is done): a small cache is not read again and again at the rate |
 | `local_cache.scrub_rate` | the bytes a second the scrub reads, a size and `/s` such as `"50MiB/s"` (default `"16MiB/s"`); `"off"` turns the scrub off |
 | `cold_store.endpoints` | a list of exactly one endpoint, in place of `endpoint`: several are refused as not supported yet, since the cache reads from one upstream |
 
