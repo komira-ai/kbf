@@ -4,9 +4,12 @@
 //!
 //! It reads the ops file (`ops.json` of the result directory) and the snapshot named by
 //! `--before`, and checks:
-//! - `test-bucket-removed:<role>`: the verifier's key pair (the ops file's `verifier` entry) is
-//!   told there is no such bucket;
-//! - `no-multipart-uploads:<role>`: no upload is open (a removed bucket holds none);
+//! - `test-bucket-removed:<role>`: the verifier's key pair (the ops file's `verifier` entry) reads
+//!   the store's bucket list (`ListBuckets`) and the test bucket is not in it. A list that cannot
+//!   be read fails the check, and so does a refusal on the bucket itself; a `NoSuchBucket` on the
+//!   bucket is noted and never decides alone;
+//! - `no-multipart-uploads:<role>`: no upload is open (a bucket the list does not name holds
+//!   none; an uploads listing that works counts whether or not the objects listing does);
 //! - `scoped-account-gone:<role>`: a request signed with the scoped account's key is refused as
 //!   from an unknown access key;
 //! - `request-log-test-buckets-only`: every record of `requests.jsonl` names the test bucket of
@@ -27,7 +30,7 @@ use crate::preflight::host::{Host, SystemHost};
 use crate::preflight::ops::{OpsFile, read_key_pair};
 use crate::preflight::{Snapshot, all_passed, check, live, print_checks, why, write_json};
 use crate::provision::SHARED_ROLES;
-use crate::provision::probe::{self, Access, BucketState};
+use crate::provision::probe::{self, Access, BucketState, Reading};
 use crate::requestlog::RequestRecord;
 use crate::result::Check;
 use crate::role::Role;
@@ -110,22 +113,53 @@ async fn verifier_state(
     probe::bucket_state(&reader).await.map_err(|e| why(&e))
 }
 
+/// What a reading says of the entries it counted: `3 objects`, or why it did not count.
+fn counted(reading: &Reading, noun: &str) -> String {
+    match reading {
+        Reading::Count(n) => format!("{n} {noun}"),
+        Reading::NoSuchBucket => format!("{noun} not read (status 404 NoSuchBucket)"),
+        Reading::Failed(reason) => format!("{noun} not read ({reason})"),
+    }
+}
+
+/// `test-bucket-removed`: `Ok` only if the account listing was read and does not name the bucket.
+/// A refusal on the bucket itself is never read as removal, and a `NoSuchBucket` on it is only
+/// noted beside a listing that does not name it.
+fn removed(state: &BucketState) -> Result<String, String> {
+    match &state.listed {
+        Err(reason) => Err(format!(
+            "cannot tell: the bucket list cannot be read: {reason}"
+        )),
+        Ok(true) => Err(format!(
+            "the bucket is listed: {}, {}",
+            counted(&state.objects, "objects"),
+            counted(&state.uploads, "uploads")
+        )),
+        Ok(false) if state.objects == Reading::NoSuchBucket => Ok(
+            "the store's bucket list does not name it (the bucket itself answers NoSuchBucket)"
+                .to_owned(),
+        ),
+        Ok(false) => Ok("the store's bucket list does not name it".to_owned()),
+    }
+}
+
+/// `no-multipart-uploads`: the uploads listing decides when it was read, whether or not the
+/// bucket's other listings were; a bucket the account listing does not name holds none.
+fn uploads_closed(state: &BucketState) -> Result<String, String> {
+    match &state.uploads {
+        Reading::Count(0) => Ok("no upload is open".to_owned()),
+        Reading::Count(open) => Err(format!("{open} uploads are open")),
+        _ if state.listed == Ok(false) => Ok("the bucket is gone, so are its uploads".to_owned()),
+        Reading::NoSuchBucket => Err("cannot tell: status 404 NoSuchBucket".to_owned()),
+        Reading::Failed(reason) => Err(format!("cannot tell: {reason}")),
+    }
+}
+
 /// The three checks of one shared store's test bucket and account.
 async fn store_checks(host: &dyn Host, ops: &OpsFile, role: Role, spec: &StoreSpec) -> Vec<Check> {
     let state = verifier_state(host, ops, role, spec).await;
-    let removed = state.clone().and_then(|state| match state {
-        BucketState::Gone => Ok("the store has no such bucket".to_owned()),
-        BucketState::Present { objects, uploads } => Err(format!(
-            "the bucket is there: {objects} objects, {uploads} uploads on the first pages"
-        )),
-        BucketState::Unreadable(reason) => Err(format!("cannot tell: {reason}")),
-    });
-    let uploads = state.and_then(|state| match state {
-        BucketState::Gone => Ok("the bucket is gone, so are its uploads".to_owned()),
-        BucketState::Present { uploads: 0, .. } => Ok("no upload is open".to_owned()),
-        BucketState::Present { uploads, .. } => Err(format!("{uploads} uploads are open")),
-        BucketState::Unreadable(reason) => Err(format!("cannot tell: {reason}")),
-    });
+    let removed = state.clone().and_then(|state| removed(&state));
+    let uploads = state.and_then(|state| uploads_closed(&state));
     let account =
         probe::can_list(spec)
             .await

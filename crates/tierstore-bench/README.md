@@ -90,6 +90,15 @@ A credentials file (`admin`, `verifier`) is JSON of `access_key_id` and `secret_
 `verifier`, `mc`, `node`, `cold_heal_status_file` and `paper` are optional; `tierstore`, `live`
 (with `dirs`) and `test_instance` are not.
 
+`verify-teardown` reads the store with the `verifier` key. That key needs `s3:ListAllMyBuckets`
+(the bucket list) and read on the test bucket (`s3:GetObject`, `s3:ListBucket`,
+`s3:ListBucketMultipartUploads`, `s3:GetBucketLocation`). `test-bucket-removed` passes only when
+the bucket list, read with that key, does not name the test bucket. It fails if the bucket is
+listed and fails if the list cannot be read (`AccessDenied` included). An `AccessDenied` on the
+bucket itself is never read as removal; a `NoSuchBucket` on it is noted and does not decide
+alone. `no-multipart-uploads` reads the uploads of the bucket whenever `s3:ListBucketMultipartUploads`
+is granted, whether or not the other listings work.
+
 ### The live directories
 
 `live.dirs` lists the live tierstore's state and data directories on this node. It is required
