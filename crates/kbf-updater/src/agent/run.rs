@@ -19,6 +19,7 @@
 //! over and over; the failure is in the next heartbeat, and the coordinator keeps the host's
 //! slot while it is not healthy.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
@@ -27,7 +28,7 @@ use std::time::Duration;
 
 use super::coordinator::{Coordinator, CoordinatorError};
 use super::flags::Timing;
-use super::hold::{ANNOUNCED, Deferral, Features, Fit, Hold, MAX_RETRY_SECS, Marks, fit};
+use super::hold::{ANNOUNCED, Deferral, Features, Fit, Halt, Hold, MAX_RETRY_SECS, Marks, fit};
 use super::local::{HostState, Local};
 use super::renew::Renewer;
 use super::status::{Shared, Status, version_of_commit};
@@ -112,7 +113,7 @@ struct Slot {
     deferral: Mutex<Option<Deferral>>,
     /// Why the service is held after a halt: no order for it runs while the coordinator
     /// advertises `halt-v1`.
-    halted: Mutex<Option<Token>>,
+    halted: Mutex<Option<Halt>>,
 }
 
 fn held<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -176,6 +177,8 @@ pub struct Agent {
     announced: Vec<String>,
     /// Which of them the coordinator's last reply advertised.
     advertised: Mutex<Features>,
+    /// The clear generations of the last reply, by unit.
+    generations: Mutex<BTreeMap<String, u64>>,
     /// Where deferrals are kept, for an agent that announces.
     marks: Option<Marks>,
     /// The most bytes of a heartbeat that are sent.
@@ -201,6 +204,7 @@ impl Agent {
             slots: vec![kbf],
             announced: Vec::new(),
             advertised: Mutex::new(Features::default()),
+            generations: Mutex::new(BTreeMap::new()),
             marks: None,
             max_beat: MAX_HEARTBEAT_BYTES,
         }
@@ -221,6 +225,10 @@ impl Agent {
                     *held(&slot.deferral) = deferral.map(|d| d.read_at(now));
                 }
                 Err(e) => self.log(&slot.say(&format!("a deferral on disk is ignored: {e}"))),
+            }
+            match marks.load_halt(slot.unit()) {
+                Ok(halt) => *held(&slot.halted) = halt,
+                Err(e) => self.log(&slot.say(&format!("a halt on disk is ignored: {e}"))),
             }
         }
         self.announced = ANNOUNCED.iter().map(|name| (*name).to_owned()).collect();
@@ -437,6 +445,7 @@ impl Agent {
         if !self.announced.is_empty() {
             let answer = coordinator.heartbeat_answer(beat)?;
             self.learn(answer.features.as_deref().unwrap_or_default());
+            self.clear_halts(&answer.halts);
             Ok(answer.reply)
         } else if self.slots.len() == 1 {
             coordinator.heartbeat(beat).map(ServiceReply::from)
@@ -511,7 +520,7 @@ impl Agent {
         let features = self.features();
         let unix = (self.world.unix_now)();
         if features.halt
-            && let Some(reason) = held(&slot.halted).as_ref()
+            && let Some(Halt { reason, .. }) = held(&slot.halted).as_ref()
         {
             self.log(&slot.say(&format!(
                 "update to {target}: not run, the service is held after a halt ({})",
@@ -573,13 +582,61 @@ impl Agent {
         let done = update.run_for(target, self.features());
         match &done.hold {
             Some(Hold::Deferred { reason }) => self.defer(slot, target, reason),
-            Some(Hold::Halt { reason }) => *held(&slot.halted) = Some(reason.clone()),
+            Some(Hold::Halt { reason }) => self.halt(slot, reason),
             None => {}
         }
         let deferred = matches!(done.hold, Some(Hold::Deferred { .. }));
         *held(&slot.failed) = (done.result.outcome == Outcome::Failed && !deferred)
             .then(|| (done.result.target.clone(), self.world.clock.now()));
         self.refresh();
+    }
+
+    /// The unit cannot be repaired by a retry: hold it, under the clear generation of the last
+    /// reply, in memory and on disk.
+    fn halt(&self, slot: &Slot, reason: &Token) {
+        let generation = held(&self.generations)
+            .get(slot.unit())
+            .copied()
+            .unwrap_or(0);
+        let halt = Halt {
+            reason: reason.clone(),
+            generation,
+        };
+        if let Err(e) = self
+            .marks
+            .as_ref()
+            .map_or(Ok(()), |m| m.save_halt(slot.unit(), &halt))
+        {
+            self.log(&slot.say(&format!("the halt could not be recorded on disk: {e}")));
+        }
+        *held(&slot.halted) = Some(halt);
+    }
+
+    /// Take the clear generations a reply carries: a held unit whose generation is newer than
+    /// the one it halted under is cleared, and its hold is lifted.
+    fn clear_halts(&self, halts: &BTreeMap<String, u64>) {
+        *held(&self.generations) = halts.clone();
+        if !self.features().halt {
+            return;
+        }
+        for slot in &self.slots {
+            let generation = halts.get(slot.unit()).copied().unwrap_or(0);
+            let mut halted = held(&slot.halted);
+            if halted.as_ref().is_some_and(|h| generation > h.generation) {
+                *halted = None;
+                drop(halted);
+                self.log(&slot.say(&format!(
+                    "the halt is lifted: cleared (generation {generation})"
+                )));
+                if let Err(e) = self
+                    .marks
+                    .as_ref()
+                    .map_or(Ok(()), |m| m.clear_halt(slot.unit()))
+                {
+                    self.log(&slot.say(&format!("the halt on disk could not be removed: {e}")));
+                }
+            }
+        }
     }
 
     /// The host declined `target`: remember until when, in memory and on disk.

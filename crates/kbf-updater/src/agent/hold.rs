@@ -10,6 +10,9 @@
 //! - **The deferral.** A deferred update leaves a [`Deferral`] on disk per unit
 //!   (`defer-<unit>` in the agent's state directory), so a restart keeps the `retry_after`. It
 //!   is in Unix seconds, because a restart has no memory of the process clock.
+//! - **The halt.** A halt leaves a [`Halt`] (`halt-<unit>`): the reason and the clear generation
+//!   the agent saw in the last reply before it halted. A reply whose `halts` has a newer
+//!   generation for the unit lifts the hold.
 //! - **The size.** A heartbeat over [`crate::wire::MAX_HEARTBEAT_BYTES`] is read by no
 //!   coordinator. [`fit`] drops the optional facts first and refuses the beat if that is not
 //!   enough.
@@ -129,7 +132,15 @@ impl Deferral {
     }
 }
 
-/// The deferrals on disk, one file per unit.
+/// A service held after a halt, and the clear generation the agent had seen in the last reply
+/// before it halted: a reply with a newer one is a clear that came after the halt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Halt {
+    pub reason: Token,
+    pub generation: u64,
+}
+
+/// The deferrals and halts on disk, one file each per unit.
 #[derive(Clone, Debug)]
 pub struct Marks {
     dir: PathBuf,
@@ -145,13 +156,31 @@ impl Marks {
         self.dir.join(format!("defer-{unit}"))
     }
 
+    fn halt_path(&self, unit: &str) -> PathBuf {
+        self.dir.join(format!("halt-{unit}"))
+    }
+
     /// The deferral of `unit`, if there is one.
     ///
     /// # Errors
     /// The file is there and cannot be read, is too long, or is no deferral.
     pub fn load(&self, unit: &str) -> Result<Option<Deferral>, String> {
-        let path = self.path(unit);
-        let read = std::fs::File::open(&path).and_then(|file| {
+        self.read(&self.path(unit))
+    }
+
+    /// The halt of `unit`, if there is one.
+    ///
+    /// # Errors
+    /// The file is there and cannot be read, is too long, or is no halt.
+    pub fn load_halt(&self, unit: &str) -> Result<Option<Halt>, String> {
+        self.read(&self.halt_path(unit))
+    }
+
+    fn read<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Option<T>, String> {
+        let read = std::fs::File::open(path).and_then(|file| {
             let mut text = Vec::new();
             file.take(MARK_MAX + 1).read_to_end(&mut text).map(|_| text)
         });
@@ -172,9 +201,25 @@ impl Marks {
     /// # Errors
     /// The directory does not take it.
     pub fn save(&self, unit: &str, deferral: &Deferral) -> std::io::Result<()> {
-        let path = self.path(unit);
-        let temp = self.dir.join(format!(".defer-{unit}.tmp"));
-        serde_json::to_vec(deferral)
+        self.write(&self.path(unit), &format!(".defer-{unit}.tmp"), deferral)
+    }
+
+    /// Record `halt` for `unit`, the same way.
+    ///
+    /// # Errors
+    /// The directory does not take it.
+    pub fn save_halt(&self, unit: &str, halt: &Halt) -> std::io::Result<()> {
+        self.write(&self.halt_path(unit), &format!(".halt-{unit}.tmp"), halt)
+    }
+
+    fn write<T: Serialize>(
+        &self,
+        path: &std::path::Path,
+        temp: &str,
+        value: &T,
+    ) -> std::io::Result<()> {
+        let temp = self.dir.join(temp);
+        serde_json::to_vec(value)
             .map_err(std::io::Error::other)
             .and_then(|body| {
                 OpenOptions::new()
@@ -185,7 +230,7 @@ impl Marks {
                     .open(&temp)
                     .and_then(|mut file| file.write_all(&body).and_then(|()| file.sync_all()))
             })
-            .and_then(|()| std::fs::rename(&temp, &path))
+            .and_then(|()| std::fs::rename(&temp, path))
             .and_then(|()| std::fs::File::open(&self.dir).and_then(|dir| dir.sync_all()))
     }
 
@@ -194,7 +239,19 @@ impl Marks {
     /// # Errors
     /// The file is there and cannot be removed.
     pub fn clear(&self, unit: &str) -> std::io::Result<()> {
-        match std::fs::remove_file(self.path(unit)) {
+        Self::remove(&self.path(unit))
+    }
+
+    /// Forget the halt of `unit`; none is not an error.
+    ///
+    /// # Errors
+    /// The file is there and cannot be removed.
+    pub fn clear_halt(&self, unit: &str) -> std::io::Result<()> {
+        Self::remove(&self.halt_path(unit))
+    }
+
+    fn remove(path: &std::path::Path) -> std::io::Result<()> {
+        match std::fs::remove_file(path) {
             Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         }

@@ -825,3 +825,37 @@ fn the_hold_survives_a_restart_with_its_generation() {
     rig.take_order(&restarted);
     assert_eq!(rig.installs(), 2, "lifted by a clear after the halt");
 }
+
+/// Catches: a halt file that does not round-trip, or a bad one that is taken: an unreadable
+/// one is an error that the agent logs and goes on with.
+#[test]
+fn halts_on_disk_round_trip_and_bad_files_are_errors() {
+    use super::hold::Halt;
+    let dir = scratch("hold-halt-marks");
+    let marks = Marks::new(&dir);
+    assert_eq!(marks.load_halt("kbf"), Ok(None));
+    let halt = Halt {
+        reason: token("rollback_failed"),
+        generation: 7,
+    };
+    marks.save_halt("kbf", &halt).unwrap();
+    assert_eq!(marks.load_halt("kbf"), Ok(Some(halt.clone())));
+    marks.clear_halt("kbf").unwrap();
+    marks.clear_halt("kbf").unwrap();
+    assert_eq!(marks.load_halt("kbf"), Ok(None));
+    std::fs::write(dir.join("halt-kbf"), "{}").unwrap();
+    assert!(marks.load_halt("kbf").is_err());
+    std::fs::remove_file(dir.join("halt-kbf")).unwrap();
+    std::fs::create_dir(dir.join("halt-kbf")).unwrap();
+    assert!(marks.clear_halt("kbf").is_err());
+    assert!(
+        Marks::new(dir.join("missing"))
+            .save_halt("kbf", &halt)
+            .is_err()
+    );
+
+    let rig = Rig::new("hold-halt-bad-file");
+    std::fs::write(rig.dir.join("halt-kbf"), "not json").unwrap();
+    let _agent = rig.announcing();
+    assert!(rig.logged("a halt on disk is ignored"));
+}
