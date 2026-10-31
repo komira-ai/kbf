@@ -67,15 +67,29 @@ impl Default for MaxUpdating {
     }
 }
 
+/// The four host roles `kbf` names, in the order the status lists them. The services loader
+/// accepts no others.
+#[must_use]
+pub fn kbf_roles() -> [HostRole; 4] {
+    [
+        HostRole::FRONTEND,
+        HostRole::STORAGE,
+        HostRole::DAEMON,
+        HostRole::MAC_DAEMON,
+    ]
+}
+
 impl MaxUpdating {
-    /// The limit for hosts of `role`.
+    /// The limit for hosts of `role`. A role the four fields do not name gets 0: no slot,
+    /// so no orders.
     #[must_use]
-    pub const fn of(&self, role: HostRole) -> u32 {
-        match role {
-            HostRole::Frontend => self.frontend,
-            HostRole::Storage => self.storage,
-            HostRole::Daemon => self.daemon,
-            HostRole::MacDaemon => self.mac_daemon,
+    pub fn of(&self, role: &HostRole) -> u32 {
+        match role.as_str() {
+            "frontend" => self.frontend,
+            "storage" => self.storage,
+            "daemon" => self.daemon,
+            "mac-daemon" => self.mac_daemon,
+            _ => 0,
         }
     }
 }
@@ -91,13 +105,15 @@ pub struct MinUp {
 }
 
 impl MinUp {
-    /// The minimum for hosts of `role`: the other roles have none.
+    /// The minimum for hosts of `role`: the daemon roles have none. A role the code does
+    /// not name needs `u32::MAX` hosts up, which no farm has, so it is never ordered.
     #[must_use]
-    pub const fn of(&self, role: HostRole) -> u32 {
-        match role {
-            HostRole::Storage => self.storage,
-            HostRole::Frontend => self.frontend,
-            HostRole::Daemon | HostRole::MacDaemon => 0,
+    pub fn of(&self, role: &HostRole) -> u32 {
+        match role.as_str() {
+            "storage" => self.storage,
+            "frontend" => self.frontend,
+            "daemon" | "mac-daemon" => 0,
+            _ => u32::MAX,
         }
     }
 }

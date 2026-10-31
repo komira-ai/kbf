@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_enroll::store::Store;
-use kbf_types::HostRole;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 
@@ -240,11 +239,16 @@ pub(super) fn frontend_ports(
 pub fn build(cfg: &Config) -> Result<Agent, String> {
     let platform = host_platform().ok_or("kbf has no release for this platform")?;
     let identity = identity_of_files(&cfg.files)?;
-    let role = match identity.role {
-        HostRole::Frontend => Role::Frontend,
-        HostRole::Storage => Role::Storage,
-        HostRole::Daemon => Role::Daemon,
-        HostRole::MacDaemon => Role::MacDaemon,
+    let role = match identity.role.as_str() {
+        "frontend" => Role::Frontend,
+        "storage" => Role::Storage,
+        "daemon" => Role::Daemon,
+        "mac-daemon" => Role::MacDaemon,
+        other => {
+            return Err(format!(
+                "{other} is a host role this agent has no duties for"
+            ));
+        }
     };
     if cfg.daemon_node.is_some() && role != Role::Frontend {
         return Err(

@@ -42,7 +42,7 @@ impl Rig {
     fn new(name: &str) -> Self {
         let pki = Pki::new();
         let dir = TestDir::under(std::env::temp_dir(), name);
-        let updater = pki.updater("n1", HostRole::Daemon);
+        let updater = pki.updater("n1", HostRole::DAEMON);
         let files = write_files(&dir, &pki, &updater);
         Self {
             pki,
@@ -144,7 +144,7 @@ fn the_agent_drains_reads_and_undrains_its_node_with_its_certificate_and_no_toke
         let who = identity_of(one.client.as_deref().expect("a client certificate")).unwrap();
         assert_eq!(
             (who.node_id.to_string(), who.role),
-            ("n1".to_owned(), HostRole::Daemon)
+            ("n1".to_owned(), HostRole::DAEMON)
         );
     }
 }
@@ -307,7 +307,7 @@ fn a_swapped_pair_a_bad_file_and_a_dead_frontend_are_refused() {
     let h = host(Role::Daemon);
     let (addr, server) = rig.frontend(vec![ok("{}")]);
     let api = rig.api(addr);
-    let other = rig.pki.updater("n2", HostRole::Daemon);
+    let other = rig.pki.updater("n2", HostRole::DAEMON);
     write_files(&rig.dir, &rig.pki, &other);
     let err = super::build::drain_for(Role::Daemon, &api)
         .drain(&h, Some(Duration::from_secs(1)))

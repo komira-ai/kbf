@@ -162,7 +162,7 @@ pub fn create_token(
         created_at: now,
         created_by: spec.created_by.clone(),
         revoked_at: None,
-        host_role: spec.host_role.map(|role| role.name().to_owned()),
+        host_role: spec.host_role.as_ref().map(|role| role.name().to_owned()),
     };
     let txn = Txn::new().put(rows::token_key(id), row.encode_to_vec(), Cond::Absent);
     if store.txn(txn)?.is_err() {

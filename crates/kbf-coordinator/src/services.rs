@@ -28,7 +28,7 @@ use kbf_types::HostRole;
 use kbf_updater::wire::{MAX_SERVICE_NAME, MAX_SERVICES, is_service_name};
 use serde::Deserialize;
 
-use crate::desired::{Desired, KBF, MAX_COUNT};
+use crate::desired::{Desired, KBF, MAX_COUNT, kbf_roles};
 
 /// What one role of a service is allowed and required to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,14 +59,14 @@ impl RoleDef {
 
     /// The limit on hosts of the role updating at once under `desired`.
     #[must_use]
-    pub fn max_updating(&self, role: HostRole, desired: &Desired) -> usize {
+    pub fn max_updating(&self, role: &HostRole, desired: &Desired) -> usize {
         self.max_updating
             .unwrap_or_else(|| desired.max_updating.of(role)) as usize
     }
 
     /// How many other hosts of the role must be up while one updates under `desired`.
     #[must_use]
-    pub fn required_up(&self, role: HostRole, desired: &Desired) -> usize {
+    pub fn required_up(&self, role: &HostRole, desired: &Desired) -> usize {
         let floor = usize::from(self.never_last);
         (self.min_up.unwrap_or_else(|| desired.min_up.of(role)) as usize).max(floor)
     }
@@ -88,15 +88,15 @@ impl ServiceDef {
     /// every other role and are never the last one up.
     #[must_use]
     pub fn kbf() -> Self {
-        let mut roles: BTreeMap<HostRole, RoleDef> = HostRole::ALL
+        let mut roles: BTreeMap<HostRole, RoleDef> = kbf_roles()
             .into_iter()
             .map(|role| (role, RoleDef::plain()))
             .collect();
         roles.insert(
-            HostRole::Frontend,
+            HostRole::FRONTEND,
             RoleDef {
                 never_last: true,
-                after: vec![HostRole::Storage, HostRole::Daemon, HostRole::MacDaemon],
+                after: vec![HostRole::STORAGE, HostRole::DAEMON, HostRole::MAC_DAEMON],
                 ..RoleDef::plain()
             },
         );
