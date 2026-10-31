@@ -84,6 +84,8 @@ mod error;
 mod faulty;
 mod journal;
 mod lease;
+#[cfg(test)]
+mod lease_tests;
 mod memory;
 mod metrics;
 mod reconciler;
