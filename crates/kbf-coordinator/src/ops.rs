@@ -472,9 +472,10 @@ pub fn operate(
             entry.node_id = Some(exclusion.node_id.clone());
             entry.reason = Some(exclusion.reason.clone());
             store.change(Write::BeforeMemory, entry, |state| {
-                state
-                    .excluded
-                    .retain(|e| e.service != exclusion.service || e.node_id != exclusion.node_id);
+                state.excluded.retain(|e| {
+                    (e.service.as_str(), e.node_id.as_str())
+                        != (exclusion.service.as_str(), exclusion.node_id.as_str())
+                });
                 state.excluded.push(exclusion);
             })?
         }
@@ -487,9 +488,9 @@ pub fn operate(
             entry.service = Some(name.clone());
             entry.node_id = Some(id.clone());
             store.change(Write::BeforeMemory, entry, |state| {
-                state
-                    .excluded
-                    .retain(|e| e.service != name || e.node_id != id);
+                state.excluded.retain(|e| {
+                    (e.service.as_str(), e.node_id.as_str()) != (name.as_str(), id.as_str())
+                });
             })?
         }
         Action::SetLabels { node_id, labels } => {

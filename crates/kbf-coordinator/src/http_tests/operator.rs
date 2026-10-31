@@ -262,7 +262,7 @@ async fn labels_replace_the_old_set_and_an_empty_set_removes_it() {
     )
     .await;
     post(&rig, Some(OPERATOR), &set("d2", r#"{"zone":"b"}"#)).await;
-    let (code, entry) = post(&rig, Some(OPERATOR), &set("d1", r#"{"zone":"c"}"#)).await;
+    let (code, entry) = post(&rig, Some(OPERATOR), &set("d1", r#"{"zone-1":"c-d"}"#)).await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(
         entry,
@@ -271,7 +271,7 @@ async fn labels_replace_the_old_set_and_an_empty_set_removes_it() {
     rig.restart();
     assert_eq!(
         status(&rig).await["ops"]["hosts"],
-        json!({"d1":{"labels":{"zone":"c"}},"d2":{"labels":{"zone":"b"}}})
+        json!({"d1":{"labels":{"zone-1":"c-d"}},"d2":{"labels":{"zone":"b"}}})
     );
     post(&rig, Some(OPERATOR), &set("d1", "{}")).await;
     assert_eq!(
@@ -341,32 +341,24 @@ async fn every_action_is_logged_with_who_and_what() {
         .collect();
     assert_eq!(lines.len(), 3, "{text}");
     for line in &lines {
-        assert!(
-            line.contains("INFO") && line.contains("by=operator"),
-            "{line}"
-        );
+        assert!(line.contains("INFO"), "{line}");
+        assert!(line.contains("by=operator"), "{line}");
     }
-    assert!(
-        lines[0].contains("seq=1")
-            && lines[0].contains("action=exclude")
-            && lines[0].contains("service=kbf")
-            && lines[0].contains("node_id=d1")
-            && lines[0].contains("reason=disk swap"),
-        "{}",
-        lines[0]
-    );
-    assert!(
-        lines[1].contains("seq=2")
-            && lines[1].contains("action=set_labels")
-            && lines[1].contains("node_id=d2"),
-        "{}",
-        lines[1]
-    );
-    assert!(
-        lines[2].contains("seq=3") && lines[2].contains("action=include"),
-        "{}",
-        lines[2]
-    );
+    for want in [
+        "seq=1",
+        "action=exclude",
+        "service=kbf",
+        "node_id=d1",
+        "reason=disk swap",
+    ] {
+        assert!(lines[0].contains(want), "{want}: {}", lines[0]);
+    }
+    for want in ["seq=2", "action=set_labels", "node_id=d2"] {
+        assert!(lines[1].contains(want), "{want}: {}", lines[1]);
+    }
+    for want in ["seq=3", "action=include"] {
+        assert!(lines[2].contains(want), "{want}: {}", lines[2]);
+    }
 }
 
 /// Catches: a failed write reported as success or leaving the change in memory: the answer is
@@ -383,10 +375,8 @@ async fn an_action_that_cannot_be_written_is_a_500_and_changes_nothing() {
     assert_eq!(body, json!({"error": "internal"}));
     assert!(status(&rig).await.get("ops").is_none());
     let text = log.text();
-    assert!(
-        text.contains("ERROR") && text.contains("disk full"),
-        "{text}"
-    );
+    assert!(text.contains("ERROR"), "{text}");
+    assert!(text.contains("disk full"), "{text}");
 }
 
 /// Catches: the ring not shown, or shown whole: after 66 actions the status holds the last 64,
