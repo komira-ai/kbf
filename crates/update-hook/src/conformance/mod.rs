@@ -27,6 +27,10 @@
 //! 7. **One at a time.** With an exclusive lock held on the record directory, every step
 //!    refuses (exit `1`) and changes nothing.
 //!
+//! The params file is written once per sandbox and given to every step: the staged release
+//! (byte for byte the argument of `prepare`), the target and the previous version, the
+//! promotion ceiling and the fake's own table.
+//!
 //! Nothing here waits for a time: the only waiting is for a child to exit or to announce that it
 //! is parked at a kill point.
 
@@ -42,7 +46,10 @@ use std::path::{Path, PathBuf};
 
 pub use sandbox::{Entry, Sandbox, Tree, changes, snapshot};
 
-use crate::{Context, Invocation, LineError, Next, Outcome, Params, Report, Step, Verdict, next};
+use crate::{
+    Context, Invocation, LineError, Next, Outcome, PREVIOUS_VERSION_KEY, Params, Report,
+    STAGED_RELEASE_KEY, Scalar, Step, TARGET_VERSION_KEY, Verdict, next,
+};
 use run::{Run, run_step};
 
 /// The steps of a successful update, in order.
@@ -52,6 +59,10 @@ const SUCCESS_PATH: [Step; 4] = [Step::Prepare, Step::Cutover, Step::Verify, Ste
 /// retried, before it says the deadline has passed or the retries are used up. Counts, not
 /// times.
 const RETRIES: u32 = 2;
+
+/// The versions the harness puts in the params file.
+const TARGET_VERSION: &str = "2.0.0";
+const PREVIOUS_VERSION: &str = "1.0.0";
 
 /// The seconds the harness puts in the reserved ceiling of the params file.
 const CEILING_SECS: u64 = 3600;
@@ -273,7 +284,17 @@ impl<'a> Conformance<'a> {
         self.sandboxes += 1;
         let sandbox = Sandbox::create(self.base.join(format!("run-{}", self.sandboxes)))?;
         self.fake.init(&sandbox)?;
-        let params = self.fake.params().with_promotion_ceiling_secs(CEILING_SECS);
+        // One file for the whole update, the same for every step, as the updater writes it.
+        let mut params = self.fake.params().with_promotion_ceiling_secs(CEILING_SECS);
+        params.insert(
+            STAGED_RELEASE_KEY,
+            Scalar::Text(sandbox.artifact().to_string_lossy().into_owned()),
+        );
+        params.insert(TARGET_VERSION_KEY, Scalar::Text(TARGET_VERSION.to_owned()));
+        params.insert(
+            PREVIOUS_VERSION_KEY,
+            Scalar::Text(PREVIOUS_VERSION.to_owned()),
+        );
         fs::write(sandbox.control().join("params.toml"), params.to_toml())?;
         Ok(sandbox)
     }

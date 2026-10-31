@@ -58,6 +58,32 @@ fn a_hook_that_keeps_the_contract_passes_every_check() {
     }
 }
 
+/// Catches params that differ between steps, or a staged release that is not the argument of
+/// prepare: the updater writes one file per update and every step reads the same values. The
+/// example hook refuses any step whose params lack them or whose prepare argument differs, so
+/// the checks pass only if the harness gave every step the same file.
+#[test]
+fn every_step_gets_the_same_params_and_prepare_gets_the_staged_release() {
+    let scratch = Scratch::new("same-params");
+    let mut fake = ExampleFake::default();
+    check(&example(CONVENTION), &mut fake, scratch.path()).unwrap();
+    let file = scratch.path().join("run-1/control/params.toml");
+    let params = update_hook::Params::read(&file).unwrap();
+    assert_eq!(
+        params.staged_release(),
+        Some(scratch.path().join("run-1/artifact"))
+    );
+    assert_eq!(params.target_version(), Some("2.0.0"));
+    assert_eq!(params.previous_version(), Some("1.0.0"));
+    assert_eq!(params.previous_release(), None);
+    assert_eq!(params.promotion_ceiling_secs(), Some(3600));
+    assert_eq!(params.get_u64("promotion_bound_secs"), Some(900));
+    // Written once: every sandbox's file has the same keys.
+    let other =
+        update_hook::Params::read(&scratch.path().join("run-2/control/params.toml")).unwrap();
+    assert_eq!(other.target_version(), params.target_version());
+}
+
 /// Catches a scenario the fake cannot make being run anyway, or hidden: it is skipped and said
 /// to be.
 #[test]

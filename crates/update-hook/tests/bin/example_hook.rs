@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use update_hook::conformance::gate;
-use update_hook::{Class, Invocation, Outcome, Report, Step};
+use update_hook::{Class, Invocation, Outcome, Params, Report, Step};
 
 struct Hook {
     world: PathBuf,
@@ -148,6 +148,18 @@ impl Hook {
             }
             // Held to the end of the process.
             std::mem::forget(record);
+        }
+        // Every step gets the same params file: the staged release and the target version.
+        let params = Params::read(&inv.params.clone().unwrap_or_default())
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        if params.staged_release().is_none() || params.target_version().is_none() {
+            report.detail = Some("the params lack the staged release or the target".to_owned());
+            return Ok((Outcome::Failure, report));
+        }
+        if step == Step::Prepare && inv.artifact != params.staged_release() {
+            report.detail =
+                Some("the artifact is not the staged release, byte for byte".to_owned());
+            return Ok((Outcome::Failure, report));
         }
         match step {
             Step::Prepare => {
