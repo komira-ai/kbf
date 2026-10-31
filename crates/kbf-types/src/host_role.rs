@@ -96,4 +96,47 @@ mod tests {
             "not a host role: frontend, storage, daemon or mac-daemon"
         );
     }
+
+    /// Catches: the four names parsing to anything but their own strings, and a new
+    /// well-formed name being refused as it was when the roles were a closed enum.
+    #[test]
+    fn a_new_well_formed_name_parses() {
+        for name in ["cache", "a", "build-farm-2", "x1", &"a".repeat(32)] {
+            let role: HostRole = name.parse().unwrap_or_else(|e| panic!("{name:?}: {e}"));
+            assert_eq!(role.to_string(), name);
+        }
+    }
+
+    /// Catches: a malformed name reaching a certificate, a row or an order: case, spaces,
+    /// lookalike letters, separators, and the hyphen rules.
+    #[test]
+    fn malformed_names_are_refused() {
+        let too_long = "a".repeat(33);
+        for bad in [
+            "",
+            "Cache",
+            "CACHE",
+            "ca che",
+            " cache",
+            "cache ",
+            "\tcache",
+            "cache\n",
+            "c\u{430}che",
+            "\u{ff43}ache",
+            "caché",
+            "1cache",
+            "-cache",
+            "cache-",
+            "ca--che",
+            "ca_che",
+            "ca.che",
+            "ca/che",
+            "ca%2Fche",
+            "ca\0che",
+            "\0",
+            too_long.as_str(),
+        ] {
+            assert_eq!(bad.parse::<HostRole>(), Err(HostRoleError), "{bad:?}");
+        }
+    }
 }
