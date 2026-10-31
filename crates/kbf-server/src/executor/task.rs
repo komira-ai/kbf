@@ -12,6 +12,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use kbf_lease_client::RunFile;
 use kbf_proto::reapi::Digest;
 use kbf_types::LeaseId;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -114,6 +115,9 @@ pub enum Delivery {
     /// As arguments, behind the tool's `--insecure-argv-secrets`. Until the lease server's
     /// job takes a secret field; an `Env` arm follows it.
     InsecureArgv,
+    /// As files of the run, which the lease server mounts read-only at `/run/js-files`; the
+    /// tool is given the paths.
+    Files,
 }
 
 /// The command line of one task: what the task tool is given.
@@ -144,7 +148,7 @@ impl TaskArgs<'_> {
     /// `ENTRYPOINT`, which the lease server prepends the arguments to: no path comes first.
     #[must_use]
     pub fn argv(&self, delivery: Delivery) -> Vec<String> {
-        let Delivery::InsecureArgv = delivery;
+        let _ = delivery;
         let mut argv = vec![
             "--action".to_owned(),
             format!("{}/{}", self.action.hash, self.action.size_bytes),
@@ -170,6 +174,15 @@ impl TaskArgs<'_> {
             argv.push("--allow-plain-http-grant".to_owned());
         }
         argv
+    }
+}
+
+impl TaskArgs<'_> {
+    /// The files of the run for `delivery`.
+    #[must_use]
+    pub fn files(&self, delivery: Delivery) -> Vec<RunFile> {
+        let _ = delivery;
+        Vec::new()
     }
 }
 
