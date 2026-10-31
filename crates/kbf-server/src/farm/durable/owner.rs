@@ -374,6 +374,13 @@ impl Engine {
             return;
         };
         for op in arrival.leases {
+            // An operation this frontend took in while it was queued, and another frontend
+            // has granted to this node since, is still held queued until the next intake
+            // poll sees its `queue/` row gone. It leaves the queue now, as the poll would
+            // have it, so the lease the node holds is taken up and its result is accepted.
+            if self.sched.queued().any(|queued| queued == op.operation) {
+                self.hand_off(op.operation);
+            }
             // An operation the scheduler finished and retired, whose finish is not written
             // yet, is not taken in again: it would run twice.
             if !self.known_operation(op.operation) {

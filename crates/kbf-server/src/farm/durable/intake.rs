@@ -406,7 +406,7 @@ impl Engine {
     }
 
     /// Forgets `operation`, which another frontend took, and keeps its callers.
-    fn hand_off(&mut self, operation: OperationId) {
+    pub(super) fn hand_off(&mut self, operation: OperationId) {
         let callers = self.sched.forget_queued(operation).unwrap_or_default();
         self.keep_following(operation, callers);
     }
