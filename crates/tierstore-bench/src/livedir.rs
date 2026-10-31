@@ -126,10 +126,8 @@ mod tests {
         let dir = TestDir::under(std::env::temp_dir(), "tb-livedir-overlap");
         let (root, live) = live_of(dir.path());
         let same = refused(&[("result directory", &root.join("live"))], &live);
-        assert!(
-            same.contains("result directory") && same.contains(" is the live"),
-            "{same}"
-        );
+        assert!(same.contains("result directory"), "{same}");
+        assert!(same.contains(" is the live"), "{same}");
         let inside = refused(&[("campaign ledger", &root.join("live/data"))], &live);
         assert!(inside.contains("is inside the live directory"), "{inside}");
         let absent = refused(

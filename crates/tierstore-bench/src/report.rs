@@ -740,8 +740,11 @@ mod tests {
         let first = with_cold("a", 1, &[false, false]);
         let second = with_cold("a", 2, &[false, false]);
         let lone = with_cold("b", 1, &[false, false]);
+        // A lone attempt that is not the first is still named.
+        let retried = with_cold("c", 3, &[false, false]);
         let data = merged(vec![rows_of(1, &[100, 100, 100]), rows_of(2, &[900, 900])]);
-        let text = format_report(&[first, second, lone], &data);
+        let text = format_report(&[first, second, lone, retried], &data);
+        assert!(text.contains("| c (attempt 3) |"), "{text}");
         let one = text
             .lines()
             .find(|l| l.contains("| a (attempt 1) | quiet |"))
@@ -750,11 +753,10 @@ mod tests {
             .lines()
             .find(|l| l.contains("| a (attempt 2) | quiet |"))
             .unwrap();
-        assert!(one.contains("100 us [") && !one.contains("900"), "{one}");
-        assert!(
-            two.contains("900 us [") && !two.contains("100 us ["),
-            "{two}"
-        );
+        assert!(one.contains("100 us ["), "{one}");
+        assert!(!one.contains("900"), "{one}");
+        assert!(two.contains("900 us ["), "{two}");
+        assert!(!two.contains("100 us ["), "{two}");
         assert!(text.contains("| b | quiet |"), "{text}");
         assert!(text.contains("- arm a (attempt 2): label v1"), "{text}");
     }

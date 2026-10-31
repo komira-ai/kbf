@@ -196,9 +196,10 @@ async fn the_report_verb_renders_a_directory_and_stops_on_a_missing_one() {
     assert!(matches!(err, BenchError::Io { .. }), "{err}");
 }
 
-/// Catches a result directory that cannot be made being ignored.
+/// Catches a result directory that is no directory (a file in the way, so no ops file in it)
+/// being ignored.
 #[tokio::test]
-async fn a_result_directory_that_cannot_be_made_stops_the_run() {
+async fn a_result_directory_that_is_no_directory_stops_the_run() {
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-nodir");
     let file = dir.path().join("a-file");
     std::fs::write(&file, "x").unwrap();

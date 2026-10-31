@@ -249,12 +249,8 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
                 ],
                 &ops.live.dirs,
             )?;
-            let log = std::fs::create_dir_all(&config.result_dir)
-                .map_err(|source| BenchError::Io {
-                    path: config.result_dir.clone(),
-                    source,
-                })
-                .and_then(|()| RequestLog::create(&config.result_dir.join("requests.jsonl")))?;
+            // The result directory is there: the ops file was read from it.
+            let log = RequestLog::create(&config.result_dir.join("requests.jsonl"))?;
             let provenance = provenance(
                 &config.result_dir,
                 &args.run_id,

@@ -142,15 +142,10 @@ mod tests {
         assert_eq!(drives.len(), 3);
         assert!(drives.windows(2).all(|w| w[0].id < w[1].id));
         let text = serde_json::to_string(&drives).unwrap();
-        assert!(
-            !text.contains("host-mark") && !text.contains("private-mark"),
-            "{text}"
-        );
-        assert!(
-            drives
-                .iter()
-                .all(|d| d.id.len() == 10 && d.id.starts_with("d-"))
-        );
+        assert!(!text.contains("host-mark"), "{text}");
+        assert!(!text.contains("private-mark"), "{text}");
+        assert!(drives.iter().all(|d| d.id.len() == 10));
+        assert!(drives.iter().all(|d| d.id.starts_with("d-")));
         let healing: Vec<_> = drives.iter().filter(|d| d.healing).collect();
         assert_eq!(healing.len(), 1);
         assert_eq!(healing[0].state, "ok");

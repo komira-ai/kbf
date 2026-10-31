@@ -387,7 +387,8 @@ async fn a_cold_store_that_turns_slow_stops_the_run_and_the_trip_is_recorded() {
     let trip = pass.cold_guard.clone().unwrap();
     assert_eq!(err.to_string(), trip.to_string());
     assert_eq!(trip.metric, "p99_ms");
-    assert!((trip.value - 3_000.0).abs() < 1e-9 && (trip.limit - 2_000.0).abs() < 1e-9);
+    assert!((trip.value - 3_000.0).abs() < 1e-9);
+    assert!((trip.limit - 2_000.0).abs() < 1e-9);
     assert_eq!((trip.requests, trip.window_secs), (31, 60));
     assert_eq!(
         (pass.window, pass.gate_tripped.as_deref()),
