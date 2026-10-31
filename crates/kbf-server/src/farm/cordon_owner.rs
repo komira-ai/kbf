@@ -27,8 +27,14 @@ pub(super) fn key(worker: &WorkerId) -> String {
 }
 
 /// The owner a row's `value` names; `None` if it names none.
-pub(super) fn parse(_value: &[u8]) -> Option<Owner> {
-    None
+pub(super) fn parse(value: &[u8]) -> Option<Owner> {
+    match std::str::from_utf8(value).ok()? {
+        "operator" => Some(Owner::Operator),
+        text => match text.strip_prefix("updater:")? {
+            "" => None,
+            unit => Some(Owner::Updater(unit.to_owned())),
+        },
+    }
 }
 
 /// The owner of `worker`'s cordon in `store`: the operator if there is no row or the row
@@ -36,8 +42,18 @@ pub(super) fn parse(_value: &[u8]) -> Option<Owner> {
 ///
 /// # Errors
 /// The store cannot be read.
-pub(super) fn read(_store: &dyn Store, worker: &WorkerId) -> Result<Owner, StoreError> {
-    Ok(parse(key(worker).as_bytes()).unwrap_or_default())
+pub(super) fn read(store: &dyn Store, worker: &WorkerId) -> Result<Owner, StoreError> {
+    let Some(row) = store.get(&key(worker))? else {
+        return Ok(Owner::Operator);
+    };
+    Ok(parse(&row.value).unwrap_or_else(|| {
+        tracing::warn!(
+            %worker,
+            bytes = row.value.len(),
+            "the cordon owner row is malformed: the operator's"
+        );
+        Owner::Operator
+    }))
 }
 
 /// [`read`] for a farm that may have no store, which logs a store that cannot be read and
