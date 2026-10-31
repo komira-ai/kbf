@@ -243,7 +243,56 @@ Taken from the tierstore owner's section, listed here only so the updater side i
 
 ### 4.2 js-agent: lease-drain-restart
 
-Written by the js-agent owner. Placeholder: the strategy drains leases, restarts the service, and has it re-register. What this document asks of that section: the commit point; the abort; the bounds as config; the recovery after a crash mid-drain.
+Written by the js-agent owner. Facts are from the jobscheduler repository: **[F]** is merged code on its main (a path or PR is given), **[F-open]** is an open pull request (jobscheduler#509 the farm unit, #493 the image pull and the store lock, #516 the `crun` runtime wiring), **[new]** is work this design adds, **[D]** a design choice, **[V]** to verify before building on it. Where the interface of 3.3 does not fit, the text says so.
+
+**The shape [D].** The strategy drains, then stops the agent, swaps the release, starts it, and waits to see it join the lease server again. The agent is never killed first: until the keeper exists, a `crun` container can outlive an agent that dies without cleaning up (a claim of the jobscheduler owner, **[V]**: the runtime's doc says `crun run` dies with its parent, and the sweep still kills a stray cgroup, `crates/js-agent/src/crun/mod.rs` in jobscheduler#508). No lease is handed over: a job either finishes inside the drain, or is stopped at its end and the lease server runs it again from the rerun budget **[F]** (same file).
+
+**What exists.**
+- *The agent's own drain [F]* (`crates/js-agent/src/lib.rs`, `cli.rs`): SIGTERM or SIGINT sends a heartbeat with the phase `draining` at once, takes no new job, lets running jobs finish for `--drain-wait` (default the stop grace, at most 3600 s), stops the rest with `--stop-grace` (default 10 s, at most 3600 s), and keeps heartbeating until the server has acknowledged every result, then exits 0. A second signal ends it at once.
+- *The unit [F-open #509]* (`packaging/js-agent/js-agent-crun.service`): `Delegate=yes`, `DelegateSubgroup=supervisor` (agent in `<unit>/supervisor`, lease cgroups in `<unit>/actions`), `KillMode=mixed`, `--drain-wait 3600 --stop-grace 120`, `TimeoutStopSec=3900`, `Restart=always`, `RestartSec=30`. A host that lacks what `crun` needs makes the agent exit 2 with every missing piece named (`crun_host.rs`).
+- *The sweep [F]* (jobscheduler#508): `CrunRuntime::open` removes every lease whose sidecar (`<scratch>/oci-labels/*.json`) names this agent id: kills what runs in the lease cgroup, deletes the container, the cgroup, the directories, then the sidecar. It leaves another agent's and malformed sidecars alone and reports them; a lease it cannot remove keeps its sidecar for the next start. The swept runs are lost, not adopted.
+- *Taint and owed checks [F]* (`lifecycle/mod.rs`): a marker under `--state-root` taints the host; an `owed-*` record means a job's checks did not finish, and a restart or SIGTERM inside that window taints the next start. A tainted agent refuses every start (`host-tainted`) and nothing clears it: "the host is reimaged".
+- *Locks [F-open #493, #516]*: agents take the image store's lock shared; the start-time stage sweep runs only if `LOCK_EX|LOCK_NB` succeeds; #516 adds a per-scratch-root claim, so a second `crun` agent on the same roots is refused.
+- *The server's view [F]*: the hello carries `agent_version` (`js-agent-wire/src/hello.rs`); `GET /v1/hosts` lists hosts with it (`js-lease-server/src/hosts.rs`), and kbf already has a typed client for it (`kbf-lease-client`). A second hello for a live host id is a 409 `host-live`, retried with backoff.
+- *Cordon [F]*: `js-sched` has `Cordon`, `Drain(deadline)` and `Uncordon` as operator actions on a worker; a drain never kills a lease and pauses at its deadline (`js-sched/src/cordon.rs`, `js-server-core/src/core.rs`); the rows persist in the store (`js-store/src/cordon.rs`). I found no HTTP route or CLI for them in the lease server or `js-cli` **[V]**. `kbf cluster drain <node>` (`kbf-cli/src/cluster.rs`) is the kbf frontend's node drain; whether it reaches a js-agent host is **[V]**.
+- *`js-agent --version` [F]*: clap prints the package version. The line `runtimes: docker crun` is **[new]** (not in #509 or main as read), and the runtime in the hello is komira's pending addition (`contract.rs`) **[new]**.
+
+**Registration.** The agent has no loopback health listener and no registration client **[F]** (no listen or health flag in `cli.rs`). The services file gives the host a synthetic registration (2.3): name, unit, uid, strategy `lease-drain-restart`, and no `health` address. Health is learned from the lease server instead (checks, below) **[new]**.
+
+**Mapped onto 3.1 and 3.3.**
+
+| step | lease-drain-restart |
+|---|---|
+| plan | pure. Refuse if the staged release is not an agent of this service, the services file's bounds are inconsistent (below), or the host is tainted (the journal or `GET /v1/hosts`). Returns the three bounds. |
+| prepare | `stage` has fetched and verified the release (3.1 step 2). The executor then runs `<new> --version` as the service's user; the line must name the runtimes the services file requires (`crun`) **[new]**. Then **cordon**: no new leases **[new]**; the first choice is the lease server's `Cordon`/`Drain` for this host if a route exists, else nothing (the agent's SIGTERM already announces `draining`). Then wait up to `drain_wait` for `GET /v1/hosts` to show no lease on the host. The new version cannot run beside the old (one agent per host id and scratch root), so "beside" here means staged and checked, not started. |
+| switch | `unit stop` (SIGTERM, then the agent's drain of at most `drain_wait + stop_grace`, bounded by `TimeoutStopSec`; the unit has `KillMode=mixed`, so only after that is the cgroup killed), `slot-set` to the new release, `unit start`. The three are idempotent given the executor's record. Done as the executor's `trial` (3.4), whose restart is the drain, so the dead-man deadline reverts the host by itself if the updater is gone. |
+| checks | all of: a hello after the start time carrying the staged `agent_version` and `runtime=crun`; the sweep ran clean (no foreign or malformed sidecar, no lease kept: nothing reports the `SweepReport` outside the log today, **[new]**); no taint and no `owed-*` record. Bounded by `health_bound`. |
+| commit | the executor's `confirm`, issued only after every check has passed once and the host has been seen `ready` in `GET /v1/hosts` for `bake` consecutive polls. From that moment the old release cannot be put back by `abort`; a bad release is then a new update. Cordon is lifted by `finish` (`Uncordon`), and only if this update placed it. |
+| abort | before `confirm`: `revert` (old release back, `unit start`), then uncordon if this update cordoned. Runs stopped during the switch are not brought back; the server reruns them. Abort during `prepare` is only uncordon. |
+| recover | below. |
+
+**Recovery after a crash [D].** The executor's record wins (3.5). From the journal phase and `query`:
+- *Updater died during the wait in `prepare`:* nothing but the cordon was changed. If the cordon is ours and the drain bound has passed, abort (uncordon); else resume the wait.
+- *Updater died during `switch`:* if the pending trial exists, go forward from the health step; the unit's state and the slot say which of stop, slot-set, start were done; each is re-run only if not. If no trial is recorded, abort.
+- *Agent crashed mid-drain, or the host rebooted:* systemd restarts it (`Restart=always`). The new process sweeps the previous run's leases (the sidecar ledger), which are lost and rerun, and starts clean. A crash inside the cleanup window leaves an `owed-*` record, so it starts tainted: **the updater stops, reports `Failed` with the taint, and pages; it never clears a taint or an owed record, and never retries** (no clear flow exists **[F]**).
+- *Trial deadline passes while draining:* the confirm window must exceed `stop_timeout` plus start and checks (below), or the executor reverts a healthy drain.
+
+**Bounds, all flags of the services file [D].** None is a literal in the strategy. Defaults match the unit.
+
+| name | default | meaning |
+|---|---|---|
+| `drain_wait_secs` | 3600 | most time to wait for leases to end; equals the unit's `--drain-wait` |
+| `stop_grace_secs` | 120 | the unit's `--stop-grace` |
+| `stop_timeout_secs` | 3900 | the unit's `TimeoutStopSec` |
+| `health_bound_secs` | to set | most time for the checks after start (new work: no default exists; the agent's `RestartSec` is 30 s) |
+| `bake_polls` | to set | consecutive ready observations before `confirm` |
+| `confirm_window_secs` | at least `drain_wait + stop_grace + 30 + health_bound` plus a margin | lifted above the 1800 s cap of 3.4 for this service |
+
+The plan refuses if the services file's `drain_wait + stop_grace` exceeds `stop_timeout`, or the unit's own flags (read from the staged unit) differ from the file's; otherwise `systemd` would kill a drain the updater is still waiting on.
+
+**New work [new], in one list.** (1) `<new> --version` prints the runtimes. (2) The runtime in the hello (komira, `contract.rs`). (3) The updater reads `GET /v1/hosts` for its own host id, with a read credential. (4) An operator cordon route on the lease server, or accept that SIGTERM's `draining` is the cordon. (5) Reporting the sweep result outside the log. (6) The synthetic registration without a health address. (7) The bounds above in the services file.
+
+**Open points.** (a) *The keeper:* until it lands, a stop that reaches `TimeoutStopSec` or a cgroup kill is the only way a container leaves; the strategy never kills the agent first, and a kill is the unit's. (b) *Lease hand-off:* none, by design; a stopped job reruns, so a job that cannot rerun must not be on a host that is updated. (c) *Cgroup layout across versions:* `supervisor` and `actions` are names two versions must agree on; a release that changes them cannot be adopted by the sweep of the old one. Plan should compare the staged unit's layout with the running one and refuse a change **[new]**.
 
 ### 4.3 kbf-daemon: node-drain-restart (today's behaviour)
 
