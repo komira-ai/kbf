@@ -466,7 +466,9 @@ async fn no_series_is_emitted_twice() {
         assert!(number.parse::<u64>().is_ok(), "{line}");
         assert!(seen.insert(name.to_owned()), "{name} twice in:\n{text}");
     }
-    assert_eq!(seen.len(), SERIES.len());
+    // Every series of SERIES, and the build gauge, whose labels name the build and so are not in
+    // the list.
+    assert_eq!(seen.len(), SERIES.len() + 1);
 }
 
 /// Asserts that a ranged GET of a cold object while the hot tier is above its critical mark
