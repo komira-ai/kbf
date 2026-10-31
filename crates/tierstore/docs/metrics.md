@@ -73,6 +73,10 @@ What they do not count:
 | `fill_failures_total` | counter | `reason`: `hash_mismatch`, `upstream_error`, `short_body`, `local_io`, `changed`, `aborted` | a fill ended without leaving an object in the cache |
 | `evictions_total` | counter | `reason`: `budget`, `floor` | an object was evicted |
 | `pinned_skips_total` | counter | none | an eviction pass passed over an object because it has more than one hard link |
+| `scrubbed_objects_total` | counter | none | the scrub hashed an object again (not in a release yet) |
+| `scrubbed_bytes_total` | counter | none | the bytes the scrub read for those objects |
+| `scrub_mismatches_total` | counter | none | the scrub dropped an object whose bytes no longer matched its digest |
+| `scrub_errors_total` | counter | none | the scrub could not judge an object because a read failed, or its check panicked |
 | `discarded_at_start_total` | counter | none | a file was removed at start: a file the scan did not find whole, or what a fill left in the stage directory at the last stop |
 
 The reasons of a failed fill:
@@ -105,11 +109,139 @@ These four are gauges, measured when `/metricz` is read.
 | `fs_free_bytes` | gauge | free bytes of the file system of the cache directory |
 | `staging_files` | gauge | files in the stage directory now: fills that are running |
 
+## The hot and cold tiers (v2)
+
+The text of these series has no `# TYPE` line, so Prometheus stores them as untyped; `rate()` works on them anyway.
+
+One labelled family per measure. `tier` is `hot` or `cold`, and `op` is `get` or `head`. The
+value `local` of `tier` is reserved for the build node's cache.
+
+| name | type | labels | increments when |
+|---|---|---|---|
+| `tierstore_hits_total` | counter | `tier`, `op` | the tier had the object |
+| `tierstore_misses_total` | counter | `tier`, `op` | the tier answered "not found" (a hot miss goes on to the cold tier) |
+| `tierstore_read_errors_total` | counter | `tier`, `op` | the tier failed with anything but "not found": it is down, refused, or timed out |
+| `tierstore_reads_total` | counter | `tier`, `op` | a read reached the tier: its hits, misses and errors added up. For `tier="cold"`, the reads that had to go to the cold store |
+| `tierstore_bytes_served_total` | counter | `tier` | bytes of object data that gets answered, by the tier that gave them, after a range is applied |
+| `tierstore_bytes_read_total` | counter | `tier` | bytes of object data that gets read from the tier. For `cold`, the whole object, whatever range was asked, except a ranged read made while the hot tier is at its critical mark, which reads only the range |
+| `tierstore_promotions_total` | counter | none | a get copied an object from the cold tier into the hot tier |
+| `tierstore_promoted_bytes_total` | counter | none | bytes of those objects: the whole object, whatever range the get asked |
+| `tierstore_promotions_skipped_total` | counter | `reason`: `critical`, `full`, `raced`, `failed` | a get found the object in the cold tier and did not copy it into the hot tier |
+
+What they do not count, and how to read them:
+
+- An S3 GET reaches the proxy as a HEAD and then a GET. A GET that is answered at the HEAD shows only under `op="head"`: a key that exists in neither tier, a conditional request that is answered 304 or 412, and a range that cannot be satisfied. So `op="head"` is a lookup rate: it mixes the clients' HEADs with the HEAD that starts every GET. `op="get"` counts only the reads that went on to fetch data.
+- An error is neither a hit nor a miss. A tier that is down does not lower its hit rate; it shows in `read_errors_total`. A hot-tier error ends the read: the cold tier is not asked, so a hot outage does not show as cold reads.
+- Bytes are counted when the proxy hands them to the front, so a client that disconnects while they are sent still has them counted. A range that cannot be satisfied after a cold read has counted the cold hit and the cold bytes read, and no bytes served.
+- A ranged GET that misses the hot tier, while the hot tier is at its critical mark, asks the cold tier for the range alone and copies nothing: it counts a `critical` skip, and its `bytes_read` and `bytes_served` are both the range.
+- Otherwise a ranged GET that misses the hot tier reads the whole object from the cold tier, promotes the whole object, and serves the range. Its `bytes_read` and `promoted_bytes` are the object's size, and its `bytes_served` is the range.
+- A HEAD promotes nothing.
+- `critical` is a skip because the hot tier is at or above its critical mark by the usage the reconciler last published, and also while the proxy takes the hot tier to be full because it answered an earlier copy with "full" a moment ago. `full` is the hot tier answering this copy with "full". `raced` is another read having copied the object first: two concurrent cold GETs of one object read it twice and promote it once, and the second counts `raced`. `failed` is any other error of the copy.
+- `promotions_total` counts a copy when the hot tier has taken it, before the entry for it is appended to the journal. That append can fail, and then the object can later leave the hot tier with no trace in these counters.
+- A GET that is dropped while it copies has counted its cold hit and its bytes, and neither a promotion nor a skip. So promotions plus skips can be fewer than cold hits.
+
+### Tier queries
+
+All of these use a `5m` window. Every `sum` is outside the `rate`. Shorten the window to see a
+change sooner and lengthen it to smooth a quiet node; keep it at least four scrape intervals.
+
+### Tier hit rates
+
+The hot tier, over the reads that fetch data:
+
+```promql
+sum(rate(tierstore_hits_total{tier="hot",op="get"}[5m]))
+  /
+(sum(rate(tierstore_hits_total{tier="hot",op="get"}[5m]))
+  + sum(rate(tierstore_misses_total{tier="hot",op="get"}[5m])))
+```
+
+The cold tier is asked only after a hot miss, so its hit rate is the share of those that the
+cold store had:
+
+```promql
+sum(rate(tierstore_hits_total{tier="cold",op="get"}[5m]))
+  /
+(sum(rate(tierstore_hits_total{tier="cold",op="get"}[5m]))
+  + sum(rate(tierstore_misses_total{tier="cold",op="get"}[5m])))
+```
+
+To count errors as non-hits, divide by `tierstore_reads_total` for the tier instead.
+
+### Cold-read share of GETs
+
+Every GET asks the hot tier first, so the share of GETs that had to read the cold tier is the
+cold reads over the hot reads:
+
+```promql
+sum(rate(tierstore_reads_total{tier="cold",op="get"}[5m]))
+  /
+sum(rate(tierstore_reads_total{tier="hot",op="get"}[5m]))
+```
+
+A hot error ends the read before the cold tier, so it is in the denominator and not the
+numerator. For the share of GETs that the cold tier answered, use its hits:
+
+```promql
+sum(rate(tierstore_hits_total{tier="cold",op="get"}[5m]))
+  /
+sum(rate(tierstore_hits_total{op="get"}[5m]))
+```
+
+### Tier read amplification
+
+Bytes read from the tier divided by bytes served.
+
+For the cold tier, and then for all gets:
+
+```promql
+sum(rate(tierstore_bytes_read_total{tier="cold"}[5m]))
+  /
+sum(rate(tierstore_bytes_served_total{tier="cold"}[5m]))
+```
+
+```promql
+sum(rate(tierstore_bytes_read_total[5m]))
+  /
+sum(rate(tierstore_bytes_served_total[5m]))
+```
+
+On the hot tier the two byte counters are equal, so the second query is 1 plus the extra bytes
+that whole-object cold reads cost.
+
+### Promotions per cold hit
+
+```promql
+sum(rate(tierstore_promotions_total[5m]))
+  /
+sum(rate(tierstore_hits_total{tier="cold",op="get"}[5m]))
+```
+
+This is at most 1. What keeps it under 1 is the skips, which add up to the rest, plus the GETs
+that were dropped while they copied:
+
+```promql
+sum by (reason) (rate(tierstore_promotions_skipped_total[5m]))
+  /
+ignoring (reason) group_left
+sum(rate(tierstore_hits_total{tier="cold",op="get"}[5m]))
+```
+
+Bytes promoted per cold byte read, which is 1 when every cold read is promoted:
+
+```promql
+sum(rate(tierstore_promoted_bytes_total[5m]))
+  /
+sum(rate(tierstore_bytes_read_total{tier="cold"}[5m]))
+```
+
 ## On `/metricz` today
 
-The OCI read front, when it is enabled, exports these series. Without it, `/metricz` has one
-comment line that says the front is not enabled. After that block, a node that runs no local
-cache has one more comment line, "this tierstore has no local cache".
+`/metricz` shows the blocks of the sources a process has, one after the other: the proxy's (the
+hot and cold tier series above), then the OCI read front's, then the cache's. A source a process
+does not have shows nothing. When it has none, the whole text is one line, "this server has no
+proxy, no OCI read front and no local cache". The OCI read front, when it is enabled, exports
+these series:
 
 | name | type | labels | what it counts |
 |---|---|---|---|
@@ -118,14 +250,32 @@ cache has one more comment line, "this tierstore has no local cache".
 | `tierstore_oci_digest_mismatches_total` | counter | none | objects whose bytes were not the digest they are named by |
 | `tierstore_oci_front_info` | gauge | `mode`: `https`, `http` | always 1; the label is the mode the front runs in |
 
+Every `/metricz`, with or without the front, ends with one more series, on main and not in v0.0.41:
+
+| name | type | labels | what it says |
+|---|---|---|---|
+| `tierstore_build_info` | gauge | `version`: the crate version; `commit`: the commit the binary was built from, twelve hex digits, or `unknown` outside a git checkout | always 1; says which build answered |
+
 ## Not in a release yet
 
 Everything below describes series that are being added and are not in a released tierstore. The
 names and labels are those of the changes under review and can still change; this page is
 updated when they land. Do not build alerts on them until they are in a release.
 
-The text of the v2 series has no `# TYPE` line, so Prometheus stores them as untyped; `rate()`
-works on them anyway.
+### The drain
+
+On main, not in v0.0.41. One series of the server itself, with a `# TYPE` line, shown on every
+node whatever sources it has (it comes after the blocks of the proxy, the OCI front and the
+cache):
+
+| name | type | labels | increments when |
+|---|---|---|---|
+| `tierstore_drain_late_requests_total` | counter | none | in a drain, the server had shut its end of a connection for writing and its peer wrote after that: counted once for each such connection, not for each read |
+
+It is 0 until a drain. After a restart it is the number of connections whose client sent a
+request within one round trip of the end of the stream: the request was read, dropped and not
+answered (see "Drain and restart" in [operations](operations.md)). A request that was on the wire
+before the server shut its end is served and is not counted.
 
 ### v1: changes in the next release
 
@@ -135,6 +285,16 @@ of the sections after this one. They all start with `tierstore_cache_`.
 - Each family gets one `# TYPE` line: a counter, or a gauge for `tierstore_cache_bytes`, `tierstore_cache_objects`, `tierstore_cache_fs_free_bytes` and `tierstore_cache_staging_files`. `tierstore_cache_discarded_at_start_total` is declared a counter that is set once, when the cache is opened.
 - A read of a kept key that the cache does not serve is one miss on every path, counted right after the lookup and before any call to the upstream: a ranged GET whose size HEAD to the upstream then fails, a ranged GET of an object over the whole-object limit, and a fill that then fails. So a ranged GET whose HEAD fails now counts a miss. A range past the end of a held object is still neither a hit nor a miss.
 - The bytes the cache fetched from the upstream are `tierstore_cache_upstream_bytes_read_total`, in the next section.
+
+### The cache mode
+
+On main, and not in a release yet. A build node's cache is read-write when its process holds the lock of the cache directory and read-only when another process does (see [operations](operations.md#the-cache-lock-and-read-only-mode)).
+
+| name | type | labels | value |
+|---|---|---|---|
+| `tierstore_cache_mode` | gauge | `mode`: `read_only`, `read_write` | one series for each mode: 1 for the mode the cache is in now, 0 for the other |
+
+In a read-only process the families of fills, evictions and pinned skips stay at 0, `tierstore_cache_staging_files` is 0, and `tierstore_cache_discarded_at_start_total` is 0 (a read-only start deletes nothing); it counts what the process deletes when it takes the lock. `tierstore_cache_bytes` and `tierstore_cache_objects` are the scan the process made until it takes the lock. Two processes over one directory count the same directory and the same file system twice in `tierstore_cache_bytes`, `tierstore_cache_objects` and `tierstore_cache_fs_free_bytes`: read the gauges of the directory from the process whose mode is `read_write`. The counters of hits, misses and bytes served are each process's own, and their sum is right.
 
 ### v1: the cache's calls to the upstream
 
@@ -166,7 +326,7 @@ Without it, the cache is read-only and they stay 0.
 | `tierstore_cache_writes_through_total` | counter | none | the upstream took a whole-body create-only put (not a completion) |
 | `tierstore_cache_write_exists_total` | counter | none | a put was answered "already exists" |
 | `tierstore_cache_keeps_expired_total` | counter | none | a put was answered before the copy kept on the node finished, because the copy took longer than the wait |
-| `tierstore_cache_write_keep_skipped_total` | counter | `reason`: `budget`, `io`, `busy`, `head`, `deleted`, `slow`, `deadline` | the upstream took a put and the node did not keep a copy |
+| `tierstore_cache_write_keep_skipped_total` | counter | `reason`: `budget`, `io`, `busy`, `head`, `deleted`, `slow`, `deadline`, `read_only` | the upstream took a put and the node did not keep a copy; `read_only` is a node whose cache does not hold the lock of its directory, or lost it while the copy was made (see [operations](operations.md#the-cache-lock-and-read-only-mode)) |
 
 The reasons of a failed put:
 
@@ -184,42 +344,12 @@ What they do not count:
 - A completion counts one put and no bytes of its own: the bytes are those of its parts.
 - `writes_through_total` counts whole-body puts only, `upstream_puts_total` counts those and completions, and `write_exists_total` counts the HEAD's answer and the upstream's together.
 
-### v2: the hot and cold tiers
-
-One labelled family per measure. `tier` is `hot` or `cold`, and `op` is `get` or `head`. The
-value `local` of `tier` is reserved for the build node's cache, whose series are those of the cache;
-see "Query: one dashboard for both" below.
-
-| name | type | labels | increments when |
-|---|---|---|---|
-| `tierstore_hits_total` | counter | `tier`, `op` | the tier had the object |
-| `tierstore_misses_total` | counter | `tier`, `op` | the tier answered "not found" (a hot miss goes on to the cold tier) |
-| `tierstore_read_errors_total` | counter | `tier`, `op` | the tier failed with anything but "not found": it is down, refused, or timed out |
-| `tierstore_reads_total` | counter | `tier`, `op` | a read reached the tier: its hits, misses and errors added up. For `tier="cold"`, the reads that had to go to the cold store |
-| `tierstore_bytes_served_total` | counter | `tier` | bytes of object data that gets answered, by the tier that gave them, after a range is applied |
-| `tierstore_bytes_read_total` | counter | `tier` | bytes of object data that gets read from the tier. For `cold`, the whole object, whatever range was asked, except a ranged read made while the hot tier is at its critical mark, which reads only the range |
-| `tierstore_promotions_total` | counter | none | a get copied an object from the cold tier into the hot tier |
-| `tierstore_promoted_bytes_total` | counter | none | bytes of those objects: the whole object, whatever range the get asked |
-| `tierstore_promotions_skipped_total` | counter | `reason`: `critical`, `full`, `raced`, `failed` | a get found the object in the cold tier and did not copy it into the hot tier |
-
-What they do not count, and how to read them:
-
-- An S3 GET reaches the proxy as a HEAD and then a GET. A GET that is answered at the HEAD shows only under `op="head"`: a key that exists in neither tier, a conditional request that is answered 304 or 412, and a range that cannot be satisfied. So `op="head"` is a lookup rate: it mixes the clients' HEADs with the HEAD that starts every GET. `op="get"` counts only the reads that went on to fetch data.
-- An error is neither a hit nor a miss. A tier that is down does not lower its hit rate; it shows in `read_errors_total`. A hot-tier error ends the read: the cold tier is not asked, so a hot outage does not show as cold reads.
-- Bytes are counted when the proxy hands them to the front, so a client that disconnects while they are sent still has them counted. A range that cannot be satisfied after a cold read has counted the cold hit and the cold bytes read, and no bytes served.
-- A ranged GET that misses the hot tier, while the hot tier is at its critical mark, asks the cold tier for the range alone and copies nothing: it counts a `critical` skip, and its `bytes_read` and `bytes_served` are both the range.
-- Otherwise a ranged GET that misses the hot tier reads the whole object from the cold tier, promotes the whole object, and serves the range. Its `bytes_read` and `promoted_bytes` are the object's size, and its `bytes_served` is the range.
-- A HEAD promotes nothing.
-- `critical` is a skip because the hot tier is at or above its critical mark by the usage the reconciler last published, and also while the proxy takes the hot tier to be full because it answered an earlier copy with "full" a moment ago. `full` is the hot tier answering this copy with "full". `raced` is another read having copied the object first: two concurrent cold GETs of one object read it twice and promote it once, and the second counts `raced`. `failed` is any other error of the copy.
-- `promotions_total` counts a copy when the hot tier has taken it, before the entry for it is appended to the journal. That append can fail, and then the object can later leave the hot tier with no trace in these counters.
-- A GET that is dropped while it copies has counted its cold hit and its bytes, and neither a promotion nor a skip. So promotions plus skips can be fewer than cold hits.
-
 ### The queries
 
 All of these use a `5m` window. Every `sum` is outside the `rate`. Shorten the window to see a
 change sooner and lengthen it to smooth a quiet node; keep it at least four scrape intervals.
 
-### Query: hit rate per tier
+### Query: cache hit rate (v1)
 
 The v1 local cache, from the cache's own series. Errors are not in either term, so a failing
 upstream does not lower the rate:
@@ -238,27 +368,6 @@ sum(rate(tierstore_cache_bytes_served_local_total[5m]))
 (sum(rate(tierstore_cache_bytes_served_local_total[5m]))
   + sum(rate(tierstore_cache_bytes_served_upstream_total[5m])))
 ```
-
-The v2 hot tier, over the reads that fetch data:
-
-```promql
-sum(rate(tierstore_hits_total{tier="hot",op="get"}[5m]))
-  /
-(sum(rate(tierstore_hits_total{tier="hot",op="get"}[5m]))
-  + sum(rate(tierstore_misses_total{tier="hot",op="get"}[5m])))
-```
-
-The v2 cold tier is asked only after a hot miss, so its hit rate is the share of those that the
-cold store had:
-
-```promql
-sum(rate(tierstore_hits_total{tier="cold",op="get"}[5m]))
-  /
-(sum(rate(tierstore_hits_total{tier="cold",op="get"}[5m]))
-  + sum(rate(tierstore_misses_total{tier="cold",op="get"}[5m])))
-```
-
-To count errors as non-hits, divide by `tierstore_reads_total` for the tier instead.
 
 ### Query: one dashboard for both, the v1 cache as tier="local"
 
@@ -323,29 +432,9 @@ the fills and the evictions have none either, and `tierstore_cache_head_hits_tot
 clients' HEADs, not `op="head"` of the shared family. The `local` values count a GET once per reader at the cache, and the `hot` and `cold`
 values once per GET at the proxy, so compare the rates, not the totals.
 
-### Query: cold-read share of GETs (v2)
+### Query: cache read amplification (v1)
 
-Every GET asks the hot tier first, so the share of GETs that had to read the cold tier is the
-cold reads over the hot reads:
-
-```promql
-sum(rate(tierstore_reads_total{tier="cold",op="get"}[5m]))
-  /
-sum(rate(tierstore_reads_total{tier="hot",op="get"}[5m]))
-```
-
-A hot error ends the read before the cold tier, so it is in the denominator and not the
-numerator. For the share of GETs that the cold tier answered, use its hits:
-
-```promql
-sum(rate(tierstore_hits_total{tier="cold",op="get"}[5m]))
-  /
-sum(rate(tierstore_hits_total{op="get"}[5m]))
-```
-
-### Query: read amplification
-
-Bytes read from below divided by bytes served. For the v1 cache, over all answers, and over the
+Bytes fetched from the upstream divided by bytes served. For the v1 cache, over all answers, and over the
 answers that went upstream:
 
 ```promql
@@ -365,23 +454,6 @@ The second is the fill amplification: it is above 1 when ranged misses fill whol
 close to 1 when clients read whole objects. It is not exactly 1 for whole reads, because the read
 that follows a fill counts its bytes under `bytes_served_upstream` and the fill's chunks under
 `upstream_bytes_read`, and a fill that fails counts bytes fetched and none served.
-
-For v2, the cold tier, and then all gets:
-
-```promql
-sum(rate(tierstore_bytes_read_total{tier="cold"}[5m]))
-  /
-sum(rate(tierstore_bytes_served_total{tier="cold"}[5m]))
-```
-
-```promql
-sum(rate(tierstore_bytes_read_total[5m]))
-  /
-sum(rate(tierstore_bytes_served_total[5m]))
-```
-
-On the hot tier the two byte counters are equal, so the second query is 1 plus the extra bytes
-that whole-object cold reads cost.
 
 ### Query: write-through put failure rate by reason (v1)
 
@@ -415,30 +487,4 @@ sum(rate(tierstore_cache_write_exists_total[5m]))
 (sum(rate(tierstore_cache_upstream_puts_total[5m]))
   + sum(rate(tierstore_cache_write_exists_total[5m]))
   + sum(rate(tierstore_cache_upstream_put_failures_total{reason!="exists"}[5m])))
-```
-
-### Query: promotions per cold hit (v2)
-
-```promql
-sum(rate(tierstore_promotions_total[5m]))
-  /
-sum(rate(tierstore_hits_total{tier="cold",op="get"}[5m]))
-```
-
-This is at most 1. What keeps it under 1 is the skips, which add up to the rest, plus the GETs
-that were dropped while they copied:
-
-```promql
-sum by (reason) (rate(tierstore_promotions_skipped_total[5m]))
-  /
-ignoring (reason) group_left
-sum(rate(tierstore_hits_total{tier="cold",op="get"}[5m]))
-```
-
-Bytes promoted per cold byte read, which is 1 when every cold read is promoted:
-
-```promql
-sum(rate(tierstore_promoted_bytes_total[5m]))
-  /
-sum(rate(tierstore_bytes_read_total{tier="cold"}[5m]))
 ```

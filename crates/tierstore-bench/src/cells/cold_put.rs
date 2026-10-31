@@ -97,6 +97,7 @@ mod tests {
             passes: 2,
             in_flight: vec![2],
             object_bytes: sizes.to_vec(),
+            open_loop: true,
         }
     }
 
@@ -224,7 +225,7 @@ mod tests {
         }
         let samples = std::fs::read_to_string(dir.path().join("samples.csv")).unwrap();
         assert!(
-            samples.lines().skip(1).all(|l| l.ends_with(',')),
+            samples.lines().skip(1).all(|l| l.ends_with(",,1")),
             "no status when no answer"
         );
     }

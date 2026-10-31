@@ -11,10 +11,10 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use bytes::Bytes;
-use kbf_objstore::s3::fake::FakeS3;
-use kbf_objstore::{Capabilities, ObjectKey, ObjectStore};
 use kbf_testkit::dir::TestDir;
 use kbf_testkit::reaped::{Reaped, first_line, spawn};
+use objstore_s3::s3::fake::FakeS3;
+use objstore_s3::{Capabilities, ObjectKey, ObjectStore};
 use rustix::process::{Pid, Signal, kill_process};
 
 use crate::client::Conn;
@@ -117,9 +117,11 @@ cache  = true
         let stdout = child.stdout.take().expect("stdout");
         let (line, _reader) = first_line(stdout, Duration::from_secs(30)).expect("a start line");
         let words: Vec<&str> = line.split_whitespace().collect();
-        assert_eq!(words.len(), 6, "{line}");
+        assert_eq!(words.len(), 7, "{line}");
         assert_eq!(words[3], "mode=read-cache", "{line}");
         assert_eq!(words[5], "(http)", "{line}");
+        let commit = tierstore::server::build_info::COMMIT;
+        assert_eq!(words[6], format!("commit={commit}"), "{line}");
         let s3 = words[2].strip_prefix("listen=").expect("listen=");
         let oci = words[4].strip_prefix("oci-listen=").expect("oci-listen=");
         Self {

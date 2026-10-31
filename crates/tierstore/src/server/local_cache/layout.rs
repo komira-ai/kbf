@@ -210,9 +210,31 @@ fn is_sidecar(path: &Path) -> bool {
 /// # Errors
 /// What the system said about making the directory.
 pub(super) fn scan(root: &Path) -> io::Result<Scanned> {
+    make_dirs(root, &objects_dir(root))?;
+    Ok(walk(root, true))
+}
+
+/// Reads the object directory as [`scan`] does and changes nothing in it: the directory is not
+/// made, and a file that is not part of a whole object is left where it is and not counted. It
+/// is what a cache that does not hold the lock of its directory may do: the file may be the
+/// middle of a publish by the one that does. A directory that is not there has no objects.
+pub(super) fn read_only_scan(root: &Path) -> Scanned {
+    walk(root, false)
+}
+
+/// Removes `path` if `delete`, and says whether it did.
+fn discard(path: &Path, delete: bool) -> u64 {
+    if delete {
+        u64::from(std::fs::remove_file(path).is_ok())
+    } else {
+        0
+    }
+}
+
+/// The walk of [`scan`] and [`read_only_scan`]: `delete` says whether what is not whole goes.
+fn walk(root: &Path, delete: bool) -> Scanned {
     let mut scanned = Scanned::default();
     let objects = objects_dir(root);
-    make_dirs(root, &objects)?;
     for first in children(&objects, Path::is_dir) {
         for second in children(&first, Path::is_dir) {
             let (sidecars, data): (Vec<PathBuf>, Vec<PathBuf>) = children(&second, Path::is_file)
@@ -221,16 +243,16 @@ pub(super) fn scan(root: &Path) -> io::Result<Scanned> {
             for path in data {
                 match whole(root, &path) {
                     Some(found) => scanned.found.push(found),
-                    None => scanned.discarded += u64::from(std::fs::remove_file(&path).is_ok()),
+                    None => scanned.discarded += discard(&path, delete),
                 }
             }
             // After the data files: a sidecar is kept only by a data file that is still there.
             for path in sidecars {
                 if !path.with_extension("").is_file() {
-                    scanned.discarded += u64::from(std::fs::remove_file(&path).is_ok());
+                    scanned.discarded += discard(&path, delete);
                 }
             }
         }
     }
-    Ok(scanned)
+    scanned
 }

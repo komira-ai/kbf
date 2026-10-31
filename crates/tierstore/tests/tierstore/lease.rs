@@ -8,6 +8,18 @@ fn down() -> Error {
     Error::Unavailable("on purpose".to_owned())
 }
 
+/// Asserts that a lease body is the holder, a nonce of 32 hex digits and the count, one to a line.
+fn assert_lease(body: &str, holder: &str, count: &str) {
+    let lines: Vec<&str> = body.split('\n').collect();
+    assert_eq!(lines.len(), 3, "{body:?}");
+    assert_eq!(lines[0], holder);
+    assert!(
+        lines[1].len() == 32 && lines[1].bytes().all(|b| b.is_ascii_hexdigit()),
+        "{body:?}"
+    );
+    assert_eq!(lines[2], count);
+}
+
 /// Asserts that the first reconciler to pass takes the lease and works, that a second finds it
 /// held and does nothing at all, and that the holder renews it on its next pass.
 #[tokio::test(start_paused = true)]
@@ -21,7 +33,7 @@ async fn one_reconciler_holds_the_lease_and_the_other_does_nothing() {
     let report = one.pass().await;
     assert!(report.held);
     assert_eq!(report.copied, 1);
-    assert_eq!(text(&*rig.hot_mem, "_tiering/lease").await, "r1\n1");
+    assert_lease(&text(&*rig.hot_mem, "_tiering/lease").await, "r1", "1");
 
     proxy.put("b", body("2")).await.unwrap();
     assert_eq!(two.pass().await, PassReport::default());
@@ -29,7 +41,7 @@ async fn one_reconciler_holds_the_lease_and_the_other_does_nothing() {
     assert_eq!(two.hot_bytes(), 0);
 
     assert!(one.pass().await.held);
-    assert_eq!(text(&*rig.hot_mem, "_tiering/lease").await, "r1\n2");
+    assert_lease(&text(&*rig.hot_mem, "_tiering/lease").await, "r1", "2");
     assert_eq!(keys(&*rig.cold_mem).await, ["a", "b"]);
 }
 
@@ -104,7 +116,7 @@ async fn a_holder_that_cannot_read_the_lease_when_it_stops_leaves_it_in_place() 
 
     one.stop().await;
     assert_eq!(rig.hot.calls(Op::Delete), 0);
-    assert_eq!(text(&*rig.hot_mem, "_tiering/lease").await, "r1\n1");
+    assert_lease(&text(&*rig.hot_mem, "_tiering/lease").await, "r1", "1");
 }
 
 /// Asserts that a reconciler that cannot create the lease object does not hold it, and holds
