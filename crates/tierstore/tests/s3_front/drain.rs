@@ -63,15 +63,14 @@ async fn an_idle_connection_gets_a_clean_end_of_stream_and_is_held_until_it_clos
     }
     h.server.begin_drain();
 
-    let first = tokio::time::timeout(SAFETY, client.read(&mut piece)).await;
-    assert_eq!(first.unwrap().unwrap(), 0, "a clean end of stream");
+    let first = client.read(&mut piece).await;
+    assert_eq!(first.unwrap(), 0, "a clean end of stream");
     assert_eq!(h.server.lingering_connections(), 1);
     client.write_all(HEALTHZ).await.unwrap();
-    let second = tokio::time::timeout(SAFETY, client.read(&mut piece)).await;
-    assert_eq!(second.unwrap().unwrap(), 0, "still the end of stream");
+    let second = client.read(&mut piece).await;
+    assert_eq!(second.unwrap(), 0, "still the end of stream");
     assert!(!h.served.is_finished());
 
     client.shutdown().await.unwrap();
-    let drained = tokio::time::timeout(SAFETY, h.served).await;
-    assert_eq!(drained.unwrap().unwrap(), Drained { abandoned: 0 });
+    assert_eq!(h.served.await.unwrap(), Drained { abandoned: 0 });
 }

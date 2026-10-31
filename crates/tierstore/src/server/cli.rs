@@ -46,8 +46,9 @@
 //! with status 1. The start line gets ` oci-listen=<address> (http)` or ` (https)`.
 //!
 //! On SIGTERM or SIGINT the process drains (see the [`server`](super) docs): `/readyz` says 503,
-//! it serves for `--drain-lb-wait`, refuses new requests, waits for those in flight and for the
-//! answers it is sending for at most `--drain-deadline`, gives the reconciler's lease up and
+//! it serves for `--drain-lb-wait`, stops accepting and closes idle connections, waits for the
+//! requests in flight, the answers it is sending and the connections it closes for at most
+//! `--drain-deadline`, gives the reconciler's lease up and
 //! exits with status 0. A start that fails exits with status 1. Flags that are not valid exit
 //! with status 2: those the parser refuses, two keys that have one id, and a config file that is
 //! refused or given with flags that describe the data path.
@@ -268,8 +269,8 @@ pub struct Cli {
     /// 503 of `/readyz` is seen: a number and `ms`, `s`, `m` or `h`.
     #[arg(long, default_value = "10s", value_parser = parse_duration)]
     pub drain_lb_wait: Duration,
-    /// How long the drain waits for requests in flight, and for the answers being sent, once it
-    /// refuses new requests.
+    /// How long the drain waits for requests in flight, for the answers being sent, and for the
+    /// connections it closes, once the settle is over.
     #[arg(long, default_value = "15m", value_parser = parse_duration)]
     pub drain_deadline: Duration,
     /// How long a batch of journal entries waits for more before it is written.

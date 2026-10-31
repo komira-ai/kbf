@@ -164,6 +164,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for Lingerin
 
     /// A flush that is taken after a write has taken everything the connection had buffered, so
     /// the answer to the request on the wire is out.
+    ///
+    /// This holds because every answer of this front is one `Full` frame, which hyper queues
+    /// whole: its flush stays pending until the last byte is written. A front that streams a
+    /// body in several frames would flush after each, and must clear the mark at the end of the
+    /// body instead (a body wrapper), or a connection in the middle of an answer would be shut
+    /// when the settle ends.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         let flushed = this.io().poll_flush(cx);
@@ -175,10 +181,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for Lingerin
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if this.hold.is_none() && !this.server.is_ready() {
+        if !this.server.is_ready() {
             // Counted before the end of the stream is sent, so that a client that has read it
-            // finds the connection held.
-            this.hold = Some(Hold::enter(&this.server));
+            // finds the connection held. Once, however many times the shutdown is polled.
+            this.hold.get_or_insert_with(|| Hold::enter(&this.server));
         }
         this.io().poll_shutdown(cx)
     }
@@ -197,7 +203,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Drop for Lingering<T> {
 
 /// Reads `io` and drops what it reads until the peer closes its end or the bound passes. The
 /// first bytes are a request that came too late to be answered: the server's end was already
-/// shut. Counted once for the connection, not for each read.
+/// shut. Counted once for the connection, not for each read. The count is not exact: the unread
+/// body of a request that was answered early (a refusal sent before its body was read) also
+/// arrives after the end of the stream and is counted, because the mark of the request on the
+/// wire is clear once its answer is out.
 async fn linger<T: AsyncRead + Unpin>(mut io: T, hold: Hold) {
     let server = Arc::clone(&hold.0);
     let bound = tokio::time::sleep(server.config.header_timeout);
