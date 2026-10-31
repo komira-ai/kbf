@@ -885,3 +885,135 @@ fn probe_2_granting_manage_unit_files_authorizes_every_unit() {
     );
     assert_eq!(answers, [Some(0), Some(0), Some(0)]);
 }
+
+/// What a test plants outside the rig and removes when it ends.
+struct Planted(Vec<std::path::PathBuf>);
+
+impl Drop for Planted {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = fs::remove_dir_all(path);
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Runs the probe as `nobody` without any of the sandbox, to show what the sandbox took away.
+fn as_nobody(rig: &Rig, args: &[&str]) -> update_hook::Report {
+    use std::os::unix::process::CommandExt;
+    let (uid, gid) = nobody();
+    let done = Command::new(rig.path("release/probe"))
+        .args(args)
+        .uid(uid)
+        .gid(gid)
+        .output()
+        .unwrap();
+    update_hook::Report::read(&String::from_utf8_lossy(&done.stdout))
+}
+
+/// Catches `RuntimeMaxSec=` being dropped: a step that never ends on its own passes its bound and
+/// systemd kills it, which the updater reads as a failure with no report. The bound is one second
+/// and nothing here waits for it: the step ends when systemd ends it. A step that ends within the
+/// bound is not touched.
+#[test]
+#[ignore = "needs root and systemd; run by cargo xtask sudo-test"]
+fn a_step_that_passes_its_bound_is_killed_and_read_as_a_failure() {
+    let rig = Rig::new("bound");
+    let mut spec = rig.spec();
+    spec.timeout_secs = 1;
+    let quick = rig.run(&spec, Step::Verify, &["ok", "--"]);
+    assert_eq!(quick.outcome, Outcome::Success, "{}", said_by(&quick));
+    let stuck = rig.run(&spec, Step::Verify, &["park", "--"]);
+    assert_eq!(stuck.outcome, Outcome::Failure, "{}", said_by(&stuck));
+    assert_eq!(
+        stuck.report,
+        update_hook::Report::default(),
+        "a killed step wrote no report"
+    );
+    record(
+        "rights-bound",
+        "a step that never ends was killed at its RuntimeMaxSec and read as a failure with no report",
+    );
+}
+
+/// Catches `NoNewPrivileges=` being dropped: a setuid-root program, started as the hook account,
+/// keeps the hook's identity. Started the same way outside the sandbox it becomes root.
+#[test]
+#[ignore = "needs root and systemd; run by cargo xtask sudo-test"]
+fn a_setuid_program_does_not_gain_privilege_in_a_step() {
+    let rig = Rig::new("nnp");
+    let suid = rig.dir.join("suid");
+    make_dir(&suid, 0o755);
+    fs::copy(PROBE, suid.join("probe")).unwrap();
+    fs::set_permissions(suid.join("probe"), fs::Permissions::from_mode(0o4755)).unwrap();
+    let (uid, _) = nobody();
+    let outside = {
+        use std::os::unix::process::CommandExt;
+        let done = Command::new(suid.join("probe"))
+            .args(["ids", "--"])
+            .uid(uid)
+            .output()
+            .unwrap();
+        update_hook::Report::read(&String::from_utf8_lossy(&done.stdout))
+    };
+    assert!(
+        outside
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with(&format!("uid={uid}\t0\t")),
+        "the setuid program did not become root outside the sandbox: {outside:?}"
+    );
+    let mut spec = rig.spec();
+    spec.release = Some(suid);
+    let run = rig.run(&spec, Step::Verify, &["ids", "--"]);
+    assert!(
+        detail(&run).starts_with(&format!("uid={uid}\t{uid}\t")),
+        "the setuid program gained privilege: {}",
+        said_by(&run)
+    );
+    record(
+        "rights-nnp",
+        "a setuid-root program stayed the hook account in a step and became root outside it",
+    );
+}
+
+/// Catches `ProtectHome=` being dropped: a file under /home that the hook account can read is not
+/// there for the hook.
+#[test]
+#[ignore = "needs root and systemd; run by cargo xtask sudo-test"]
+fn a_hook_cannot_see_home() {
+    let rig = Rig::new("home");
+    let home = Path::new("/home").join(format!("urprobe-{}", std::process::id()));
+    let _planted = Planted(vec![home.clone()]);
+    make_dir(&home, 0o755);
+    let secret = home.join("secret");
+    fs::write(&secret, "in a home\n").unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+    let path = secret.display().to_string();
+    let outside = as_nobody(&rig, &["read", &path, "--"]);
+    assert_eq!(outside.detail.as_deref(), Some("in a home"), "{outside:?}");
+    let run = rig.run(&rig.spec(), Step::Verify, &["read", &path, "--"]);
+    assert_eq!(run.outcome, Outcome::Failure, "{}", said_by(&run));
+}
+
+/// Catches `PrivateTmp=` being dropped: a file in the host's /tmp that the hook account can read
+/// is not in the hook's /tmp.
+#[test]
+#[ignore = "needs root and systemd; run by cargo xtask sudo-test"]
+fn a_hook_has_a_private_tmp() {
+    let rig = Rig::new("tmp");
+    let file = Path::new("/tmp").join(format!("urprobe-{}.txt", std::process::id()));
+    let _planted = Planted(vec![file.clone()]);
+    fs::write(&file, "in the hosts tmp\n").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    let path = file.display().to_string();
+    let outside = as_nobody(&rig, &["read", &path, "--"]);
+    assert_eq!(
+        outside.detail.as_deref(),
+        Some("in the hosts tmp"),
+        "{outside:?}"
+    );
+    let run = rig.run(&rig.spec(), Step::Verify, &["read", &path, "--"]);
+    assert_eq!(run.outcome, Outcome::Failure, "{}", said_by(&run));
+}

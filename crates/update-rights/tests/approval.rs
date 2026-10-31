@@ -237,7 +237,7 @@ fn the_new_file_is_not_written_through_a_link_and_a_missing_directory_is_an_erro
     let missing = scratch.path().join("no-such-dir").join("approved");
     assert!(matches!(
         approve(&missing, my_uid(), my_uid(), "tierstore", &d).unwrap_err(),
-        ApprovalError::Write(_)
+        ApprovalError::Untrusted(_)
     ));
 }
 
@@ -257,4 +257,53 @@ fn a_stale_new_file_is_overwritten() {
         fs::read_to_string(&path).unwrap(),
         format!("{d} tierstore\n")
     );
+}
+
+/// Catches a record in a directory others can write, or that is not the trusted account's: the
+/// file could be replaced there whatever its own mode is. Nothing is written.
+#[test]
+fn the_directory_of_the_record_must_be_the_trusted_accounts_and_closed() {
+    let scratch = Scratch::new("approve-parent");
+    let d = digest("a");
+    for mode in [0o775, 0o757, 0o777] {
+        let dir = scratch.dir("open", mode);
+        let path = dir.join("approved");
+        let error = approve(&path, my_uid(), my_uid(), "tierstore", &d).unwrap_err();
+        assert!(matches!(error, ApprovalError::Untrusted(_)), "{mode:o}");
+        assert!(!path.exists(), "{mode:o}");
+    }
+    let dir = scratch.dir("closed", 0o755);
+    let path = dir.join("approved");
+    assert!(approve(&path, my_uid() + 1, my_uid() + 1, "tierstore", &d).is_err());
+    assert!(!path.exists());
+    assert_eq!(
+        approve(&path, my_uid(), my_uid(), "tierstore", &d).unwrap(),
+        Approved::Recorded
+    );
+}
+
+/// Catches two approvals made at once losing one: each reads the record, adds its line and
+/// replaces the file, so without a lock the later replace drops the earlier line, or they
+/// collide on the new file. Every approval from many threads is there afterwards.
+#[test]
+fn concurrent_approvals_all_land() {
+    let scratch = Scratch::new("approve-concurrent");
+    let path = scratch.path().join("approved");
+    let digests: Vec<Digest> = (0..16)
+        .map(|n| digest(&format!("declaration {n}")))
+        .collect();
+    std::thread::scope(|scope| {
+        for d in &digests {
+            let path = &path;
+            scope.spawn(move || {
+                approve(path, my_uid(), my_uid(), "tierstore", d)
+                    .expect("the approval is recorded");
+            });
+        }
+    });
+    let approvals = Approvals::read(&path, my_uid()).unwrap();
+    assert_eq!(approvals.len(), 16);
+    for d in &digests {
+        assert!(approvals.contains(d));
+    }
 }

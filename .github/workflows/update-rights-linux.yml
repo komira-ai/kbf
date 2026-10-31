@@ -47,6 +47,7 @@ jobs:
       - run: sudo apt-get install -y --no-install-recommends nftables polkitd
       # The tests, as root: systemd-run of system units, accounts, nft and polkit.
       - run: cargo xtask sudo-test -p update-rights --test rights_root -- --nocapture --test-threads=1
+        timeout-minutes: 15
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:

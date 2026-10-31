@@ -155,6 +155,8 @@ pub struct Spec {
     /// The release the hook is run from; the rig's own by default.
     pub release: Option<PathBuf>,
     pub binary: String,
+    /// The bound of every step, in seconds.
+    pub timeout_secs: u64,
 }
 
 fn list(items: &[String]) -> String {
@@ -213,6 +215,7 @@ impl Rig {
             units: Vec::new(),
             release: None,
             binary: "probe".to_owned(),
+            timeout_secs: 60,
         }
     }
 
@@ -237,8 +240,9 @@ impl Rig {
              read_paths = {read}\nwrite_paths = {write}\nunits = {units}\n\
              address_families = {families}\nenvironment = {{ {env} }}\n\
              [hook.step_capabilities]\n{steps}\
-             [hook.timeout_secs]\nprepare = 60\ncutover = 60\nverify = 60\nrollback = 60\ncleanup = 60\n",
+             [hook.timeout_secs]\nprepare = {t}\ncutover = {t}\nverify = {t}\nrollback = {t}\ncleanup = {t}\n",
             binary = spec.binary,
+            t = spec.timeout_secs,
             args = list(&args),
             state = self.path("state"),
             user = spec.user,
@@ -276,6 +280,25 @@ impl Rig {
         };
         run_step(&Systemd::system(), &launch)
             .unwrap_or_else(|e| panic!("the step did not run: {e}"))
+    }
+
+    /// The command line of a step, for a test that runs `systemd-run` itself.
+    pub fn command(
+        &self,
+        spec: &Spec,
+        step: Step,
+        hook_args: &[&str],
+    ) -> update_rights::SystemdRun {
+        let declaration = self.declaration(spec, hook_args);
+        let release = self.release(spec);
+        let launch = Launch {
+            declaration: &declaration,
+            step,
+            generation: GENERATION.fetch_add(1, Ordering::Relaxed),
+            release: &release,
+            params: None,
+        };
+        command(&launch).expect("the command builds")
     }
 
     /// The same, with everything `systemd-run` returned.

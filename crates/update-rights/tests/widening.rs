@@ -374,4 +374,13 @@ fn a_parameter_that_is_not_a_lowered_number_widens() {
         })
         .is_empty()
     );
+    // NaN is a valid TOML float and is neither above nor below anything: any comparison with
+    // it is a widening.
+    let mut with_nan = text.clone();
+    with_nan.hook.params.insert("c".into(), f64::NAN.into());
+    assert_eq!(widening(&text, &with_nan), ["hook.params.c"]);
+    let mut huge = with_nan.clone();
+    huge.hook.params.insert("c".into(), 1e300.into());
+    assert_eq!(widening(&with_nan, &huge), ["hook.params.c"]);
+    assert_eq!(widening(&with_nan, &with_nan), ["hook.params.c"]);
 }

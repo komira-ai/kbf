@@ -431,7 +431,7 @@ fn reserved_paths_are_refused_everywhere() {
             "\"/var/lib/updater/hooks/tierstore\"",
             "\"/var/lib\"",
             "state_dir",
-            Violation::Contains("/var/lib/updater"),
+            Violation::Contains("/var/lib/polkit-1"),
         ),
         (
             "\"/var/lib/updater/hooks/tierstore\"",
@@ -580,6 +580,25 @@ fn params_are_scalars_and_not_the_updaters() {
         "hook.params"
     );
     assert_eq!(field_of(&refusal(&at("updater.x = 5"))), "hook.params");
+}
+
+/// Catches a string parameter reaching a hook that runs as root: the design allows strings only
+/// for keys a schema lists, and none exists, so a root hook takes numbers and booleans. A hook
+/// that is not root keeps its strings.
+#[test]
+fn a_root_hook_takes_no_string_parameter() {
+    let root = |params: &str| {
+        with_in(
+            &with("promotion_bound_secs = 900", params),
+            "user = \"tierstore-update\"",
+            "user = \"root\"",
+        )
+    };
+    assert!(Declaration::parse(&root("a = 1\nb = true\nc = 1.5")).is_ok());
+    assert_eq!(field_of(&refusal(&root("c = \"s\""))), "hook.params");
+    assert_eq!(field_of(&refusal(&root("a = 1\nz = \"\""))), "hook.params");
+    let plain = with("promotion_bound_secs = 900", "c = \"s\"");
+    assert!(Declaration::parse(&plain).is_ok());
 }
 
 /// Every refusal says what it is about.

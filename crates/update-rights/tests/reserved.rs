@@ -1,6 +1,8 @@
 //! The reserved-path deny list: what no declaration may read, write or keep its record in.
 
-use update_rights::reserved::{HOOKS_ROOT, Kind, RESERVED, Violation, check, is_within};
+use update_rights::reserved::{
+    HOOKS_ROOT, Kind, RESERVED, Violation, WRITE_FORBIDDEN, check, is_within,
+};
 
 const KINDS: [Kind; 3] = [Kind::Read, Kind::Write, Kind::State];
 
@@ -44,11 +46,11 @@ fn no_entry_names_a_reserved_directory() {
 #[test]
 fn no_entry_contains_a_reserved_directory() {
     for (path, holds) in [
-        ("/var", "/var/lib/updater"),
-        ("/var/lib", "/var/lib/updater"),
+        ("/var", "/var/lib/polkit-1"),
+        ("/var/lib", "/var/lib/polkit-1"),
         ("/etc/systemd", "/etc/systemd/system"),
-        ("/run", "/run/systemd/system"),
-        ("/run/systemd", "/run/systemd/system"),
+        ("/run", "/run/systemd/generator"),
+        ("/run/systemd", "/run/systemd/generator"),
         ("/lib", "/lib/systemd/system"),
         ("/usr/share", "/usr/share/polkit-1"),
     ] {
@@ -141,5 +143,92 @@ fn violations_read_as_sentences() {
         Violation::Inside("/etc"),
     ] {
         assert!(violation.to_string().contains("/etc"));
+    }
+}
+
+/// Catches a reserved directory dropped from the list: the list is pinned entry by entry, so
+/// deleting `/run/updater`, `/etc/polkit-1` or `/usr/lib/systemd/system` is a red test and not a
+/// silent widening. Adding one means adding it here.
+#[test]
+fn the_list_is_exactly_this() {
+    assert_eq!(
+        RESERVED,
+        [
+            "/",
+            "/boot",
+            "/etc",
+            "/etc/polkit-1",
+            "/etc/sudoers.d",
+            "/etc/systemd/system",
+            "/etc/updater.d",
+            "/lib/systemd/system",
+            "/root",
+            "/run/systemd/generator",
+            "/run/systemd/generator.early",
+            "/run/systemd/generator.late",
+            "/run/systemd/system",
+            "/run/systemd/system.control",
+            "/run/systemd/transient",
+            "/run/updater",
+            "/usr",
+            "/usr/lib/systemd/system",
+            "/usr/share/polkit-1",
+            "/var/lib/polkit-1",
+            "/var/lib/updater",
+        ]
+    );
+    assert_eq!(WRITE_FORBIDDEN, ["/dev", "/proc", "/sys"]);
+}
+
+/// Catches the unit directories that systemd reads at run time (transient units, generators,
+/// the runtime overrides of `systemctl set-property`) and the polkit state being writable or
+/// nameable: each is refused for every kind, and a file inside one only for reading.
+#[test]
+fn the_runtime_unit_and_polkit_directories_are_reserved() {
+    for dir in [
+        "/run/systemd/transient",
+        "/run/systemd/generator",
+        "/run/systemd/generator.early",
+        "/run/systemd/generator.late",
+        "/run/systemd/system.control",
+        "/var/lib/polkit-1",
+    ] {
+        for kind in KINDS {
+            assert_eq!(
+                check(kind, dir),
+                Err(Violation::Names(
+                    RESERVED.iter().find(|r| **r == dir).unwrap()
+                ))
+            );
+        }
+        let inside = format!("{dir}/x.conf");
+        assert_eq!(check(Kind::Read, &inside), Ok(()), "{inside}");
+        for kind in [Kind::Write, Kind::State] {
+            assert!(
+                matches!(check(kind, &inside), Err(Violation::Inside(_))),
+                "{inside}"
+            );
+        }
+    }
+}
+
+/// Catches `/proc`, `/sys` and `/dev` being writable by a declaration: nothing there is a file
+/// to write (a hook that wants a kernel setting is not a hook), and each may still be read.
+#[test]
+fn the_kernel_and_device_trees_are_never_written() {
+    for dir in WRITE_FORBIDDEN {
+        for inside in [dir.to_owned(), format!("{dir}/x"), format!("{dir}/a/b")] {
+            for kind in [Kind::Write, Kind::State] {
+                assert_eq!(
+                    check(kind, &inside),
+                    Err(Violation::Inside(dir)),
+                    "{inside}"
+                );
+            }
+            assert_eq!(check(Kind::Read, &inside), Ok(()), "{inside}");
+        }
+    }
+    for near in ["/devices", "/processes", "/system", "/dev-x", "/sysfs"] {
+        assert_eq!(check(Kind::Write, near), Ok(()), "{near}");
     }
 }

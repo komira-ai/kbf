@@ -28,5 +28,7 @@ pub use launch::{
     Finished, Launch, LaunchError, RunError, Spawner, StepRun, Systemd, SystemdRun, command,
     properties, run_step, unit_name,
 };
-pub use load::{DECLARATION_DIR, Declared, Loaded, Policy, Refused, check_state_dir, load_dir};
+pub use load::{
+    DECLARATION_DIR, Declared, Loaded, Policy, Refused, check_state_dir, load_dir, recheck_targets,
+};
 pub use widening::widening;

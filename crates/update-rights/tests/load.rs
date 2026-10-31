@@ -11,6 +11,7 @@ use support::{Scratch, accounts, my_gid, my_uid};
 use update_rights::reserved::Violation;
 use update_rights::{
     Digest, EtcAccounts, Loaded, Policy, Refusal, UserIds, check_state_dir, load_dir,
+    recheck_targets,
 };
 
 /// One declaration, small enough to vary: the account names, the claims that can collide, the
@@ -703,4 +704,100 @@ fn two_declarations_of_services_that_run_as_root_both_load() {
         conflict(&loaded, "other"),
         ("a health port", "tierstore".to_owned())
     );
+}
+
+/// Catches a link re-pointed after the load: the targets were resolved once, when the file was
+/// read, and a step that runs later must check again. Each kind of entry is re-pointed at a
+/// reserved place and refused under its own field.
+#[test]
+fn a_target_pointed_at_a_reserved_place_after_the_load_is_refused_by_the_recheck() {
+    let host = Host::new("recheck");
+    let real = host.scratch.dir("real", 0o755);
+    let (read, write, state) = (
+        host.scratch.path().join("read-link"),
+        host.scratch.path().join("write-link"),
+        host.scratch.path().join("state-link"),
+    );
+    for link in [&read, &write, &state] {
+        symlink(&real, link).unwrap();
+    }
+    let mut spec = Spec::new("tierstore");
+    spec.read = vec![read.display().to_string()];
+    spec.write = vec![write.display().to_string()];
+    spec.state_dir = state.display().to_string();
+    host.put(&spec);
+    let loaded = host.load();
+    assert!(loaded.refused.is_empty(), "{:?}", loaded.refused);
+    let declaration = &loaded.services["tierstore"].declaration;
+    assert_eq!(recheck_targets(declaration), Ok(()));
+    for (link, field) in [
+        (&read, "hook.read_paths"),
+        (&write, "hook.write_paths"),
+        (&state, "state_dir"),
+    ] {
+        fs::remove_file(link).unwrap();
+        symlink("/etc", link).unwrap();
+        match recheck_targets(declaration) {
+            Err(Refusal::Reserved { field: found, .. }) => assert_eq!(found, field),
+            other => panic!("{field}: {other:?}"),
+        }
+        fs::remove_file(link).unwrap();
+        symlink(&real, link).unwrap();
+        assert_eq!(recheck_targets(declaration), Ok(()), "{field} put back");
+    }
+}
+
+/// Catches a hook account that is another service's own account, which would let that hook
+/// write what the other service owns and run as it; and two services sharing one hook account,
+/// which would let each write the other's record. Root is exempt in both.
+#[test]
+fn a_hook_account_may_not_be_another_services_account_or_shared() {
+    let host = Host::new("hook-accounts");
+    let mut a = Spec::new("tierstore");
+    a.hook_user = "other".to_owned();
+    host.put(&a);
+    host.put(&Spec::new("other"));
+    host.put(&Spec::new("tsb"));
+    let loaded = host.load();
+    assert_eq!(
+        conflict(&loaded, "tierstore"),
+        (
+            "a hook account that is another service's account",
+            "other".to_owned()
+        )
+    );
+    assert_eq!(
+        conflict(&loaded, "other"),
+        (
+            "a hook account that is another service's account",
+            "tierstore".to_owned()
+        )
+    );
+    assert_eq!(loaded.services.keys().collect::<Vec<_>>(), ["tsb"]);
+
+    let host = Host::new("hook-shared");
+    for name in ["tierstore", "other"] {
+        let mut spec = Spec::new(name);
+        spec.hook_user = "tsb-update".to_owned();
+        host.put(&spec);
+    }
+    let loaded = host.load();
+    assert_eq!(
+        conflict(&loaded, "tierstore"),
+        ("a hook account", "other".to_owned())
+    );
+    assert_eq!(
+        conflict(&loaded, "other"),
+        ("a hook account", "tierstore".to_owned())
+    );
+
+    // Root hooks are the one exception: several hooks run as root together.
+    let host = Host::new("hook-roots");
+    for name in ["tierstore", "other"] {
+        let mut spec = Spec::new(name);
+        spec.hook_user = "root".to_owned();
+        host.put(&spec);
+    }
+    let loaded = host.load();
+    assert!(loaded.refused.is_empty(), "{:?}", loaded.refused);
 }

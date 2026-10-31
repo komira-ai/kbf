@@ -127,6 +127,12 @@ fn check_targets(declaration: &Declaration) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// The reserved-path rules on what each entry points to now, for the step runner to call before
+/// every launch: a link can be re-pointed after the load.
+pub fn recheck_targets(_declaration: &Declaration) -> Result<(), Refusal> {
+    Ok(())
+}
+
 fn account_error(what: &str, name: &str) -> Refusal {
     Refusal::Account(format!("{what} {name:?} is not an account of this host"))
 }

@@ -34,6 +34,10 @@ pub const RESERVED: &[&str] = &[
     "/var/lib/updater",
 ];
 
+/// The trees where nothing is written: a declaration may read them (a hook reads `/proc`) and
+/// may not name them, or anything inside, in `write_paths` or as `state_dir`.
+pub const WRITE_FORBIDDEN: [&str; 3] = ["/dev", "/proc", "/sys"];
+
 /// The one place inside the reserved directories where a hook may write: the record directories
 /// of the hooks (`state_dir`).
 pub const HOOKS_ROOT: &str = "/var/lib/updater/hooks";

@@ -489,3 +489,22 @@ fn the_spawner_returns_the_status_the_error_output_and_a_missing_program() {
     assert_eq!(missing.kind(), io::ErrorKind::NotFound);
     assert!(format!("{:?}", Systemd::system().clone()).contains("/usr/bin/systemd-run"));
 }
+
+/// Catches the launcher granting a hook the right to change unit files: a polkit rule scoped to
+/// the listed units fails the moment `manage-unit-files` is granted, which implies every unit, so
+/// no step is given anything about polkit or unit files, and the command names neither.
+#[test]
+fn no_step_is_given_a_polkit_or_unit_file_right() {
+    for step in Step::ALL {
+        let args = args_of(&sample(), step, None).join(" ");
+        for word in ["manage-unit-files", "polkit", "ReadWritePaths=/etc", "mask"] {
+            assert!(!args.contains(word), "{step}: {word} in {args}");
+        }
+        for property in properties(&sample(), step) {
+            assert!(
+                !property.contains("unit-files") && !property.contains("polkit"),
+                "{property}"
+            );
+        }
+    }
+}
