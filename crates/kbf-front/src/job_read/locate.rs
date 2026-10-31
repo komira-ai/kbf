@@ -260,7 +260,13 @@ impl JobRead {
             return self.refuse_locate(Outcome::Unavailable, "store_unavailable");
         };
         // The grants cover the keys of the lines to be sent, and those only.
-        let granted = self.grants_for(claims.not_after, &digests, &entries);
+        let mut keys = Vec::new();
+        if self.store_grants.is_some() {
+            for (digest, entry) in digests.iter().zip(&entries) {
+                keys.push(key_of(digest, entry));
+            }
+        }
+        let granted = self.grants_for(claims.not_after, &keys);
         let mut body = String::new();
         if let Some((store, minted)) = &granted {
             body.push_str(&store.header(minted).to_string());
@@ -274,8 +280,8 @@ impl JobRead {
             let mut grant = None;
             let mut entry = entry;
             if let Some((_, minted)) = &granted {
-                if let Some(key) = key_of(digest, entry) {
-                    grant = minted.grant_of(&key);
+                if let Some(key) = &keys[at] {
+                    grant = minted.grant_of(key);
                 }
                 if grant.is_none() {
                     entry = &Entry::Absent;
@@ -309,25 +315,22 @@ impl JobRead {
         reply
     }
 
-    /// The store grants for the keys of `entries` (those of `digests`, in order), ending at the
+    /// The store grants for `keys`, the store key of each line (if it has one), ending at the
     /// earlier of `not_after` (the job's read grant) and [`GRANT_LIFETIME`] from now; none
     /// without a grant key.
     fn grants_for(
         &self,
         not_after: u64,
-        digests: &[Digest],
-        entries: &[Entry],
+        keys: &[Option<String>],
     ) -> Option<(&StoreGrants, Minted)> {
         let store = self.store_grants.as_ref()?;
-        let mut keys = BTreeSet::new();
-        for (digest, entry) in digests.iter().zip(entries) {
-            if let Some(key) = key_of(digest, entry) {
-                keys.insert(key);
-            }
+        let mut distinct = BTreeSet::new();
+        for key in keys.iter().flatten() {
+            distinct.insert(key.clone());
         }
         let end = GRANT_LIFETIME.as_secs();
         let expires = not_after.min(self.grants.now().saturating_add(end));
-        Some((store, store.mint(&keys, expires)))
+        Some((store, store.mint(&distinct, expires)))
     }
 
     fn refuse_locate(&self, outcome: Outcome, reason: &'static str) -> Reply {
