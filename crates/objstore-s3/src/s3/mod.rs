@@ -1098,14 +1098,15 @@ mod tests {
         socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = socket.local_addr().unwrap();
         let _listener = socket.listen(1).unwrap();
-        let mut held = Vec::new();
+        // Four connects, each polled once: the poll sends the SYN, and the kernel has
+        // answered or dropped it before the poll returns. The connects are kept, finished
+        // or not, so no socket closes and the queue stays full.
+        let mut fillers = Vec::new();
         for _ in 0..4 {
             let filler = tokio::net::TcpSocket::new_v4().unwrap();
-            if let Ok(Ok(c)) =
-                tokio::time::timeout(Duration::from_millis(200), filler.connect(addr)).await
-            {
-                held.push(c);
-            }
+            let mut connecting = Box::pin(filler.connect(addr));
+            let _ = futures::poll!(connecting.as_mut());
+            fillers.push(connecting);
         }
         let client = client_builder(Duration::from_millis(100), POOL_IDLE_TIMEOUT)
             .build()

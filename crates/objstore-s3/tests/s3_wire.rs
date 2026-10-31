@@ -515,6 +515,9 @@ fn a_held_port_cannot_be_taken_by_another_listener() {
 /// answer; the wait must still be running when the second has been cut, and end once the
 /// store answers 403. The test waits for those events, never for a time: the pace of the
 /// retries is the wait's own.
+///
+/// It spends about 0.5 s of real time in the wait's two `WAIT_RETRY` sleeps, and asserts
+/// nothing about it.
 #[tokio::test]
 async fn wait_answering_waits_for_a_late_store_and_takes_403_as_an_answer() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

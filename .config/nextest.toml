@@ -63,6 +63,7 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 # They wait for events (the fake store's `wait_for`, a notify of a scripted server) or for tokio's
 # clock, which they pause and move; a test that waits for an event that never comes is ended
 # after two minutes and fails, where it would hang the run. The tests take milliseconds.
+# The guard applies under nextest only: `cargo test` has none.
 [[profile.default.overrides]]
 filter = 'package(objstore-s3)'
 slow-timeout = { period = "30s", terminate-after = 4 }
