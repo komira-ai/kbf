@@ -1,5 +1,5 @@
 //! The conformance harness, proven against a small example hook (`bin/example_hook.rs`) driven
-//! on a fake service, and against copies of that hook with one planted defect each, which the
+//! on a fake service, and against copies of that hook with one deliberate flaw each, which the
 //! harness must refuse by name.
 
 use std::ffi::OsString;
