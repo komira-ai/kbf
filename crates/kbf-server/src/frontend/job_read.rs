@@ -104,6 +104,18 @@ pub struct JobTls {
     pub key: PathBuf,
 }
 
+/// The store a task reads with the grants of `GET /locate`: the three `--job-store-*` flags,
+/// which come together.
+#[derive(Clone, Debug)]
+pub struct StoreGrantFlags {
+    /// `--job-store-grant-key-file`: the key the grants are signed with, the tier store's own.
+    pub key_file: PathBuf,
+    /// `--job-store-url`: the base URL a task reads the store at.
+    pub url: String,
+    /// `--job-store-bucket`: the bucket the grants are for.
+    pub bucket: String,
+}
+
 /// The job-facing read's flags: the listen address, the transport and the grant secret, or
 /// none; the last four have defaults.
 #[derive(Clone, Debug)]
@@ -122,6 +134,9 @@ pub struct JobReadFlags {
     pub read_budget_bytes: u64,
     /// `--job-read-idle-secs`: how long a held response may go with no chunk taken.
     pub read_idle_secs: u64,
+    /// `--job-store-grant-key-file` and its two companions; `None` gives `GET /locate` no
+    /// grants to hand out.
+    pub store: Option<StoreGrantFlags>,
 }
 
 /// The nine flags.
@@ -271,6 +286,7 @@ pub(super) fn from_matches(m: &ArgMatches) -> Option<JobReadFlags> {
         reads_in_flight: *m.get_one::<u32>(READS).expect("clap gives it a default"),
         read_budget_bytes: *m.get_one::<u64>(BUDGET).expect("clap gives it a default"),
         read_idle_secs: *m.get_one::<u64>(IDLE).expect("clap gives it a default"),
+        store: None,
     })
 }
 

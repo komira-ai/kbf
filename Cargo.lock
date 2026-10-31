@@ -2320,6 +2320,7 @@ dependencies = [
  "futures",
  "hmac 0.13.0",
  "http-body 1.1.0",
+ "http-body-util",
  "kbf-auth",
  "kbf-caps",
  "kbf-front",
