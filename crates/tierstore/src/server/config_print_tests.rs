@@ -17,6 +17,7 @@ use crate::server::config_testing::{MINIMAL_FLAGS, golden_flags, write_private};
 fn s3_flags() -> Vec<&'static str> {
     let mut flags = golden_flags();
     flags.extend([
+        "--listen-from-systemd",
         "--drain-lb-wait=7s",
         "--drain-deadline=3m",
         "--print-config",
