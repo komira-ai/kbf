@@ -99,6 +99,7 @@ use super::front::read_key;
 use super::front::{InvalidFlags, server_config};
 use super::keys::read_credentials;
 use super::launch::{Launch, Refused, resolve};
+use super::listen::{bind_all, has_duplicate, joined, local_addrs};
 use super::local_cache::LocalTierFailure;
 use super::oci::{
     self, OciError, OciFront, OciLimits, OciListener, OciMetrics, OciMode, OciPrefix,
@@ -151,9 +152,12 @@ pub struct Cli {
     /// error.
     #[arg(long)]
     pub check_config: bool,
-    /// The address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on.
-    #[arg(long)]
-    pub listen: SocketAddr,
+    /// An address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on. Give the flag
+    /// again for each further address (for instance `0.0.0.0:P` and `[::]:P`, which a firewall
+    /// redirect to the port needs): one server, one drain and one limit on connections serve
+    /// them all. An address that is given twice is refused.
+    #[arg(long, value_name = "ADDR", required = true)]
+    pub listen: Vec<SocketAddr>,
     /// The id of this proxy, which names its journal in the hot tier and its lease. Keep it
     /// across restarts, and give each process over the same tiers one of its own.
     #[arg(long)]
@@ -367,9 +371,11 @@ pub struct Cli {
     /// is plain HTTP, served at any address: on loopback (127/8 or `::1`) a node's own engine
     /// pulls from its own store and the traffic never leaves the host; off loopback the start
     /// prints one warning line, since a plain connection can be read and changed on its path,
-    /// and the certificate and key are advised. Left out, no such listener is opened.
+    /// and the certificate and key are advised. Give the flag again for each further address, as
+    /// for `--listen`; the certificate must name each of them. Left out, no such listener is
+    /// opened.
     #[arg(long, value_name = "ADDR")]
-    pub oci_listen: Option<SocketAddr>,
+    pub oci_listen: Vec<SocketAddr>,
     /// The certificate chain (PEM) of `--oci-listen`, leaf first, issued by the CA the clients
     /// trust. Read once at start: a new certificate takes a restart. Given with
     /// `--oci-tls-key` or not at all.
@@ -469,7 +475,8 @@ struct Built {
 
 /// The OCI front, as far as the flags and files go: the proxy it reads is not open yet.
 pub(super) struct OciSetup {
-    listen: SocketAddr,
+    /// The addresses, which are at least one.
+    listen: Vec<SocketAddr>,
     /// `None` serves plain HTTP.
     acceptor: Option<tokio_rustls::TlsAcceptor>,
     prefix: OciPrefix,
@@ -644,7 +651,7 @@ const OCI_HANDSHAKE: Duration = Duration::from_secs(10);
 /// is printed; `--check-config` leaves it out, as it prints nothing when the file is fine.
 fn oci_setup(cli: &Cli, server: &ServerConfig, warn: bool) -> Result<Option<OciSetup>, Error> {
     let flags = OciFlags {
-        listen: cli.oci_listen,
+        listen: cli.oci_listen.clone(),
         tls_cert: cli.oci_tls_cert.clone(),
         tls_key: cli.oci_tls_key.clone(),
         prefix: cli.oci_prefix.clone(),
@@ -661,9 +668,13 @@ pub(super) fn oci_setup_of(
     server: &ServerConfig,
     warn: bool,
 ) -> Result<Option<OciSetup>, Error> {
-    let Some(listen) = flags.listen else {
+    if flags.listen.is_empty() {
         return Ok(None);
-    };
+    }
+    let listen = flags.listen.clone();
+    if has_duplicate(&listen) {
+        return Err(InvalidFlags("--oci-listen is given the same address twice".into()).into());
+    }
     let refuse = |why: OciError| -> Error {
         if why.is_invalid_flags() {
             InvalidFlags(why.to_string()).into()
@@ -680,9 +691,10 @@ pub(super) fn oci_setup_of(
     let prefix = flags.prefix.as_deref().unwrap_or(DEFAULT_OCI_PREFIX);
     let prefix = OciPrefix::new(prefix).map_err(refuse)?;
     let acceptor = match (&flags.tls_cert, &flags.tls_key) {
-        (Some(cert), Some(key)) => Some(oci::acceptor(cert, key, listen).map_err(refuse)?),
+        (Some(cert), Some(key)) => Some(oci::acceptor_for(cert, key, &listen).map_err(refuse)?),
         (None, None) => {
-            if let Some(warning) = oci::plain_warning(listen).filter(|_| warn) {
+            let warnings = listen.iter().filter_map(|addr| oci::plain_warning(*addr));
+            for warning in warnings.filter(|_| warn) {
                 eprintln!("{warning}");
             }
             None
@@ -816,14 +828,48 @@ async fn probe_tiers(
 }
 
 /// The addresses [`run_serving`] is bound to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Addresses {
-    /// The S3 front, `/healthz`, `/readyz`, `/usagez` and `/metricz`.
+    /// The S3 front, `/healthz`, `/readyz`, `/usagez` and `/metricz`: the first address of
+    /// [`s3_all`](Self::s3_all).
     pub s3: SocketAddr,
-    /// The OCI read front, if `--oci-listen` was given.
+    /// Every address the S3 front is bound to, in the order of the `--listen` flags.
+    pub s3_all: Vec<SocketAddr>,
+    /// The OCI read front, if `--oci-listen` was given: the first address of
+    /// [`oci_all`](Self::oci_all).
     pub oci: Option<SocketAddr>,
+    /// Every address the OCI front is bound to; empty when there is none.
+    pub oci_all: Vec<SocketAddr>,
     /// How the OCI front carries its connections: `Some` exactly when [`oci`](Self::oci) is.
     pub oci_mode: Option<OciMode>,
+}
+
+impl Addresses {
+    /// The addresses of the sockets bound: the S3 front's, which are at least one, and the OCI
+    /// front's, if it is served.
+    ///
+    /// # Errors
+    /// A socket's address cannot be read, or the S3 front has none.
+    pub(super) fn of(s3_all: Vec<SocketAddr>, oci: Option<&OciListener>) -> std::io::Result<Self> {
+        let oci_all = oci.map(OciListener::local_addrs).transpose()?;
+        let oci_all = oci_all.unwrap_or_default();
+        let none = || std::io::Error::other("--listen is needed");
+        Ok(Self {
+            s3: s3_all.first().copied().ok_or_else(none)?,
+            s3_all,
+            oci: oci_all.first().copied(),
+            oci_all,
+            oci_mode: oci.map(OciListener::mode),
+        })
+    }
+}
+
+/// Binds the S3 front's sockets, one for each of `addrs`.
+///
+/// # Errors
+/// An address cannot be bound; the message names it.
+pub(super) fn bind_s3(addrs: &[SocketAddr]) -> Result<Vec<TcpListener>, Error> {
+    bind_all(addrs).map_err(|(addr, why)| format!("binding {addr}: {why}").into())
 }
 
 /// Opens the proxy and serves it until `stop` resolves, and then drains.
@@ -866,17 +912,9 @@ pub async fn run_serving(
     built.server.proxy = Some(Arc::clone(&proxy));
     let oci_backend: Arc<dyn Backend> = proxy.clone();
     let server = Server::new(proxy, built.server);
-    let address = cli.listen;
-    let bound = TcpListener::bind(address).await;
-    let listener = bound.map_err(|why| format!("binding {address}: {why}"))?;
+    let listeners = bind_s3(&cli.listen)?;
     let oci = bind_oci(built.oci, oci_backend).await?;
-    let oci_addr = oci.as_ref().map(OciListener::local_addr).transpose()?;
-    let oci_mode = oci.as_ref().map(OciListener::mode);
-    ready(Addresses {
-        s3: listener.local_addr()?,
-        oci: oci_addr,
-        oci_mode,
-    });
+    ready(Addresses::of(local_addrs(&listeners)?, oci.as_ref())?);
     let stopping = Arc::clone(&server);
     let (oci_stop, oci_stopped) = watch::channel(false);
     let lb_wait = cli.drain_lb_wait;
@@ -889,7 +927,7 @@ pub async fn run_serving(
     let halt = Arc::new(Notify::new());
     let halting = Arc::clone(&halt);
     let serving = async move {
-        let drained = server.serve(listener).await;
+        let drained = server.serve_all(listeners).await;
         halting.notify_one();
         drained
     };
@@ -925,10 +963,7 @@ pub(super) async fn bind_oci(
         return Ok(None);
     };
     let front = Arc::new(OciFront::new(backend, setup.prefix, setup.metrics));
-    let bound = match setup.acceptor {
-        Some(tls) => OciListener::bind(setup.listen, tls, front, setup.limits).await,
-        None => OciListener::bind_plain(setup.listen, front, setup.limits).await,
-    };
+    let bound = OciListener::bind_all(&setup.listen, setup.acceptor, front, setup.limits).await;
     Ok(Some(bound?))
 }
 
@@ -968,10 +1003,10 @@ async fn serve_until_signalled(cli: Cli) -> Result<(), Error> {
     let stop = signals()?;
     let version = env!("CARGO_PKG_VERSION");
     let announce = |bound: Addresses| {
-        let mut line = format!("tierstore {version} listen={}", bound.s3);
-        if let Some(oci) = bound.oci {
+        let mut line = format!("tierstore {version} listen={}", joined(&bound.s3_all));
+        if bound.oci.is_some() {
             let mode = bound.oci_mode.unwrap_or_default().as_str();
-            line.push_str(&format!(" oci-listen={oci} ({mode})"));
+            line.push_str(&format!(" oci-listen={} ({mode})", joined(&bound.oci_all)));
         }
         println!("{line}");
     };

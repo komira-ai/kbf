@@ -12,6 +12,7 @@ use super::ServerConfig;
 use super::cli::{Cli, Error};
 use super::gc::{ensure_distinct as gc_distinct, gc_keys, ids as gc_ids};
 use super::keys::{ensure_distinct, read_credentials, read_only_keys};
+use super::listen::has_duplicate;
 use super::presign::{ensure_distinct as presign_distinct, presign_keys};
 use super::scoped::{ensure_distinct as scoped_distinct, ids as scoped_ids, scoped_keys};
 
@@ -30,7 +31,8 @@ pub(super) fn read_key(path: &Path) -> Result<(String, String), String> {
 /// the names, the key files and the limits.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct FrontSettings {
-    pub listen: SocketAddr,
+    /// The addresses of the S3 front, which are at least one.
+    pub listen: Vec<SocketAddr>,
     pub proxy_id: String,
     pub bucket: String,
     pub region: String,
@@ -53,7 +55,7 @@ impl Cli {
     /// The settings of the S3 front.
     pub(super) fn front(&self) -> FrontSettings {
         FrontSettings {
-            listen: self.listen,
+            listen: self.listen.clone(),
             proxy_id: self.proxy_id.clone(),
             bucket: self.bucket.clone(),
             region: self.region.clone(),
@@ -89,6 +91,9 @@ pub(super) fn server_config(
     }
     if front.body_idle_timeout.is_zero() {
         return Err("--body-idle-timeout must be longer than zero".into());
+    }
+    if has_duplicate(&front.listen) {
+        return Err(InvalidFlags("--listen is given the same address twice".into()).into());
     }
     let (key_id, secret) = read_key(&front.access_key_file)?;
     let read_only = read_only_keys(&front.read_only_key_file)?;

@@ -128,6 +128,37 @@ fn the_oci_flags_are_printed_as_the_oci_table() {
     assert!(!table.contains_key("oci"));
 }
 
+/// Asserts that repeated `--listen` and `--oci-listen` are printed as lists, that the file loads
+/// back to the settings of the flags, and that a flag given once is still printed as a string, so
+/// that a file printed for one address is the file it always was.
+#[test]
+fn repeated_listen_flags_are_printed_as_lists_and_load_back() {
+    let mut flags = dir_flags();
+    flags.retain(|flag| !flag.starts_with("--listen="));
+    flags.extend([
+        "--listen=0.0.0.0:9300",
+        "--listen=[::]:9300",
+        "--oci-listen=0.0.0.0:5000",
+        "--oci-listen=[::]:5000",
+    ]);
+    let (cli, per_run) = parse(flags);
+    assert_eq!((cli.listen.len(), cli.oci_listen.len()), (2, 2));
+    let text = render(&cli).unwrap();
+    let table: toml::Table = toml::from_str(&text).unwrap();
+    let count = |name: &str| table[name]["listen"].as_array().map(Vec::len);
+    assert_eq!(count("server"), Some(2), "{text}");
+    assert_eq!(count("oci"), Some(2), "{text}");
+    let expected = Cli {
+        print_config: false,
+        ..cli
+    };
+    assert_eq!(from_text(&text, per_run).unwrap(), expected);
+
+    let (cli, _) = parse(dir_flags());
+    let table: toml::Table = toml::from_str(&render(&cli).unwrap()).unwrap();
+    assert_eq!(table["server"]["listen"].as_str(), Some("127.0.0.1:0"));
+}
+
 /// Asserts that, across the sets of flags of these tests, every flag of the binary is given at
 /// least once, so that the round trip tests all of them: a flag added without being added to a
 /// set fails here.

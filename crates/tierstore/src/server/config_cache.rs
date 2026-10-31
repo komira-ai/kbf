@@ -153,7 +153,7 @@ pub(super) struct CacheSettings {
     pub upstream: TierParts,
     /// The cache.
     pub cache: CacheConfig,
-    /// The OCI front, as `[oci]` and the `--oci-*` flags make it: `listen` is `None` for none.
+    /// The OCI front, as `[oci]` and the `--oci-*` flags make it: `listen` is empty for none.
     pub oci: OciFlags,
     /// The rate at which a scrubber would run, in bytes a second, if the file gave one.
     pub scrub_rate: Option<u64>,
@@ -191,7 +191,7 @@ fn percent(key: &str, value: Option<u8>, default: u8, low: u8) -> Result<u8, Con
 /// the upstream; a registry that is meant to pass through is a storage node's front, or no
 /// cache, so there is no use of this to keep.
 fn check_oci_is_kept(oci: &OciFlags, policy: &[Policy]) -> Result<(), ConfigError> {
-    if oci.listen.is_none() {
+    if oci.listen.is_empty() {
         return Ok(());
     }
     let prefix = oci.prefix.as_deref().unwrap_or(DEFAULT_OCI_PREFIX);
