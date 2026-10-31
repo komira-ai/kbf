@@ -70,8 +70,10 @@ impl From<Token> for String {
 
 /// Whether `text` is 1 to `max` bytes of lowercase letters, digits and `_`.
 fn is_word(text: &str, max: usize) -> bool {
-    let _ = (text, max);
-    true
+    (1..=max).contains(&text.len())
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
 /// The name of an update step (`prepare`, `cutover`): a [`Token`] of at most
@@ -172,9 +174,7 @@ where
     T: DeserializeOwned,
 {
     let value = serde_json::Value::deserialize(d)?;
-    T::deserialize(value)
-        .map(Some)
-        .map_err(serde::de::Error::custom)
+    Ok(T::deserialize(value).ok())
 }
 
 /// A field that is the default of `T` when it is absent or `null`.
@@ -205,7 +205,17 @@ pub(crate) fn features_text<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Strin
 }
 
 fn check_features(names: &[String]) -> Result<(), &'static str> {
-    let _ = (names, is_feature_name(""), MAX_FEATURE_NAME, MAX_FEATURES);
+    if names.len() > MAX_FEATURES {
+        return Err("too many features");
+    }
+    for (i, name) in names.iter().enumerate() {
+        if !is_feature_name(name) {
+            return Err("not a feature name");
+        }
+        if names[..i].contains(name) {
+            return Err("a feature is listed twice");
+        }
+    }
     Ok(())
 }
 
@@ -213,7 +223,11 @@ fn check_features(names: &[String]) -> Result<(), &'static str> {
 pub(crate) fn step_secs_text<'de, D: Deserializer<'de>>(
     d: D,
 ) -> Result<BTreeMap<StepName, u64>, D::Error> {
+    use serde::de::Error;
     let secs = or_default::<_, BTreeMap<StepName, u64>>(d)?;
+    if secs.len() > MAX_STEP_SECS {
+        return Err(D::Error::custom("too many steps"));
+    }
     Ok(secs)
 }
 

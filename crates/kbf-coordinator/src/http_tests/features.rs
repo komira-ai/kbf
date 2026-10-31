@@ -29,8 +29,9 @@ mod frozen {
     }
 }
 
-fn beat(extra: &str) -> String {
-    format!(r#"{{"platform":"linux-x86_64","version":"1.0","health":"healthy"{extra}}}"#)
+/// A heartbeat of a host running kbf `running`, with `extra` after its fields.
+fn beat(running: &str, extra: &str) -> String {
+    format!(r#"{{"platform":"linux-x86_64","version":"{running}","health":"healthy"{extra}}}"#)
 }
 
 const OTHER: &str = r#","services":[{"name":"other","version":"1.0","health":"healthy"}]"#;
@@ -82,11 +83,11 @@ async fn beat_text(rig: &Rig, host: &str, role: &str, body: &str) -> String {
 #[tokio::test]
 async fn an_agent_that_announced_nothing_gets_the_reply_alone() {
     let rig = rig("http-features-none", &["deferred-v1"]).await;
-    let nothing = beat_text(&rig, "d1", "daemon", &beat("")).await;
+    let nothing = beat_text(&rig, "d1", "daemon", &beat("2.0", "")).await;
     assert_eq!(nothing, r#"{"reply":"nothing"}"#);
-    let kbf_order = beat_text(&rig, "st1", "storage", &beat("")).await;
+    let kbf_order = beat_text(&rig, "d2", "daemon", &beat("1.0", "")).await;
     assert_eq!(kbf_order, r#"{"reply":"update","version":"2.0"}"#);
-    let service_order = beat_text(&rig, "d2", "daemon", &beat(OTHER)).await;
+    let service_order = beat_text(&rig, "d3", "daemon", &beat("2.0", OTHER)).await;
     assert_eq!(
         service_order,
         r#"{"reply":"update","service":"other","version":"3.0"}"#
@@ -105,19 +106,22 @@ async fn an_agent_that_announced_nothing_gets_the_reply_alone() {
 #[tokio::test]
 async fn an_agent_that_announced_features_gets_the_supported_subset() {
     let rig = rig("http-features-subset", &["deferred-v1", "halt-v1"]).await;
-    let both = beat(r#","agent_features":["halt-v1","unknown-v9","deferred-v1"]"#);
+    let both = beat(
+        "2.0",
+        r#","agent_features":["halt-v1","unknown-v9","deferred-v1"]"#,
+    );
     assert_eq!(
         beat_text(&rig, "d1", "daemon", &both).await,
         r#"{"reply":"nothing","features":["deferred-v1","halt-v1"]}"#
     );
-    let unknown = beat(r#","agent_features":["unknown-v9"]"#);
+    let unknown = beat("2.0", r#","agent_features":["unknown-v9"]"#);
     assert_eq!(
         beat_text(&rig, "d1", "daemon", &unknown).await,
         r#"{"reply":"nothing","features":[]}"#
     );
-    let order = beat(r#","agent_features":["halt-v1"]"#);
+    let order = beat("1.0", r#","agent_features":["halt-v1"]"#);
     assert_eq!(
-        beat_text(&rig, "st1", "storage", &order).await,
+        beat_text(&rig, "d2", "daemon", &order).await,
         r#"{"reply":"update","version":"2.0","features":["halt-v1"]}"#
     );
 }
@@ -127,7 +131,7 @@ async fn an_agent_that_announced_features_gets_the_supported_subset() {
 #[tokio::test]
 async fn a_coordinator_that_advertises_nothing_answers_an_announcing_agent_with_an_empty_list() {
     let rig = rig("http-features-empty", FEATURES).await;
-    let announcing = beat(r#","agent_features":["deferred-v1","halt-v1"]"#);
+    let announcing = beat("2.0", r#","agent_features":["deferred-v1","halt-v1"]"#);
     assert_eq!(
         beat_text(&rig, "d1", "daemon", &announcing).await,
         r#"{"reply":"nothing","features":[]}"#
@@ -140,16 +144,21 @@ async fn a_coordinator_that_advertises_nothing_answers_an_announcing_agent_with_
 #[tokio::test]
 async fn a_bad_announcement_is_dropped_and_the_host_is_answered_as_an_old_agent() {
     let rig = rig("http-features-bad", &["halt-v1"]).await;
-    for bad in [
+    let bad = [
         r#","agent_features":["Halt-V1"]"#,
         r#","agent_features":["halt-v1","halt-v1"]"#,
         r#","agent_features":["a","b","c","d","e","f","g","h","i"]"#,
         r#","agent_features":[""]"#,
-    ] {
+    ];
+    assert_eq!(
+        beat_text(&rig, "d1", "daemon", &beat("1.0", bad[0])).await,
+        r#"{"reply":"update","version":"2.0"}"#
+    );
+    for list in bad {
         assert_eq!(
-            beat_text(&rig, "st1", "storage", &beat(bad)).await,
-            r#"{"reply":"update","version":"2.0"}"#,
-            "{bad}"
+            beat_text(&rig, "d2", "daemon", &beat("2.0", list)).await,
+            r#"{"reply":"nothing"}"#,
+            "{list}"
         );
     }
 }
@@ -165,7 +174,7 @@ async fn a_heartbeat_with_every_new_fact_is_accepted_and_ordered_as_without_them
         r#""deferred":{"target":"1.2","reason":"drain_bound","retry_after_secs":300}"#
     );
     assert_eq!(
-        beat_text(&rig, "st1", "storage", &beat(facts)).await,
+        beat_text(&rig, "d1", "daemon", &beat("1.0", facts)).await,
         r#"{"reply":"update","version":"2.0"}"#
     );
 }

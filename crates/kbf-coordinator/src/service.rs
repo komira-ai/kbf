@@ -243,8 +243,13 @@ impl Coordinator {
         let reply = self.reply_to(who, beat);
         // Only an agent that announced features gets `features`: an older agent reads the
         // reply strictly and refuses a field it does not know.
-        let _ = (asked, &self.features);
-        let features = None;
+        let features = (!asked.is_empty()).then(|| {
+            self.features
+                .iter()
+                .filter(|name| asked.contains(name))
+                .cloned()
+                .collect()
+        });
         Answer { reply, features }
     }
 

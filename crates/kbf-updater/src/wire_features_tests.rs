@@ -26,11 +26,13 @@ fn full_beat() -> Value {
         "promotion_pending": true,
         "deferred": {"target": "1.2", "reason": "drain_bound", "retry_after_secs": 300},
     });
-    let mut service = json!({"name": "db", "version": "1.0", "health": "healthy"});
+    let mut service = json!({"name": "db", "version": "1.0", "health": "healthy",
+        "last_update": null, "updating": null});
     let mut top = json!({
         "platform": "linux-x86_64", "version": "1.0", "health": "unhealthy",
         "last_update": {"target": "1.1", "outcome": "failed", "phase": "halt",
                         "class": "environment", "reason": "state_invalid"},
+        "updating": null,
         "agent_features": ["deferred-v1", "halt-v1"],
     });
     for (key, value) in facts.as_object().expect("an object") {

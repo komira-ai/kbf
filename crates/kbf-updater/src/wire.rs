@@ -302,7 +302,7 @@ pub fn read_heartbeat(bytes: &[u8]) -> Result<HeartbeatRead, serde_json::Error> 
             let Some(read) = without_droppable(bytes) else {
                 return Err(why);
             };
-            if read.services_dropped.is_none() {
+            if read.services_dropped.is_none() && read.extras_dropped.is_none() {
                 // Nothing the loose read dropped explains the refusal.
                 return Err(why);
             }
@@ -387,7 +387,7 @@ fn without_droppable(bytes: &[u8]) -> Option<HeartbeatRead> {
     Some(HeartbeatRead {
         beat,
         services_dropped: (!services_why.is_empty()).then(|| services_why.join("; ")),
-        extras_dropped: None,
+        extras_dropped: (!extras.is_empty()).then(|| extras.join("; ")),
     })
 }
 
