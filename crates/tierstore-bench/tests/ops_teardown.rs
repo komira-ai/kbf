@@ -41,6 +41,9 @@ enum Listing {
     Has,
     /// `AccessDenied`.
     Denied,
+    /// The list is empty: a key without `s3:ListAllMyBuckets` sees only the buckets it may use,
+    /// and the live buckets are not among them.
+    Blind,
 }
 
 /// How the store is: the test bucket as the verifier sees it, what the account listing says, and
@@ -60,10 +63,15 @@ const CLEAN: World = World {
 
 /// The answer to `ListBuckets`: a live bucket always, the test buckets if `has`.
 fn bucket_list(has: bool) -> (u16, String) {
-    let mut names = vec!["live-cold-bucket-mark"];
+    let mut names = vec!["live-cold-bucket-mark", "live-hot-bucket-mark"];
     if has {
         names.extend(["tb-cold-test-bucket-mark", "tb-hot-test-bucket-mark"]);
     }
+    named(&names)
+}
+
+/// The answer to `ListBuckets` that names exactly `names`.
+fn named(names: &[&str]) -> (u16, String) {
     let items: String = names
         .iter()
         .map(|n| format!("<Bucket><Name>{n}</Name><CreationDate>2026-10-29T10:00:00.000Z</CreationDate></Bucket>"))
@@ -91,6 +99,7 @@ fn store(world: World) -> impl Fn(&Seen) -> (u16, String) + Send + Sync + 'stati
             return match world.listing {
                 Listing::Absent => bucket_list(false),
                 Listing::Has => bucket_list(true),
+                Listing::Blind => named(&[]),
                 Listing::Denied => s3_error(403, "AccessDenied"),
             };
         }
@@ -441,6 +450,72 @@ async fn a_bucket_is_removed_only_when_the_account_listing_does_not_name_it() {
         find(&checks, name).detail,
         "the bucket is listed: objects not read (status 404 NoSuchBucket), uploads not read (status 404 NoSuchBucket)"
     );
+}
+
+/// Catches the verifier's blind spot: a key without `s3:ListAllMyBuckets` is shown only the
+/// buckets it may use, so a mis-scoped verifier sees an empty list and "not named" proves nothing.
+/// The list is trusted only if it names the role's live bucket (the ops file's `live_buckets`):
+/// a list naming neither bucket fails and says why; one naming the live bucket and not the test
+/// bucket passes; one naming both fails as listed; no live bucket configured fails, and says so.
+#[tokio::test]
+async fn a_list_that_does_not_show_the_live_bucket_cannot_prove_removal() {
+    let name = "test-bucket-removed:cold";
+
+    let a = after(
+        "tb-down-blind",
+        World {
+            listing: Listing::Blind,
+            ..CLEAN
+        },
+    )
+    .await;
+    let checks = a.checks().await;
+    assert!(!find(&checks, name).passed, "{checks:?}");
+    assert_eq!(
+        find(&checks, name).detail,
+        "the verifier's bucket list does not show the live bucket live-cold-bucket-mark: the key lacks s3:ListAllMyBuckets, so the list cannot prove removal"
+    );
+    assert_eq!(
+        find(&checks, "test-bucket-removed:hot").detail,
+        "the verifier's bucket list does not show the live bucket live-hot-bucket-mark: the key lacks s3:ListAllMyBuckets, so the list cannot prove removal"
+    );
+
+    // The live bucket named, the test bucket not: removal is proved.
+    let a = after("tb-down-live-named", CLEAN).await;
+    let checks = a.checks().await;
+    assert!(find(&checks, name).passed, "{checks:?}");
+
+    // Both named: the test bucket is still there.
+    let a = after(
+        "tb-down-both-named",
+        World {
+            bucket: Bucket::Present {
+                objects: 0,
+                uploads: 0,
+            },
+            listing: Listing::Has,
+            ..CLEAN
+        },
+    )
+    .await;
+    let checks = a.checks().await;
+    assert!(!find(&checks, name).passed);
+    assert_eq!(
+        find(&checks, name).detail,
+        "the bucket is listed: 0 objects, 0 uploads"
+    );
+
+    // No live bucket for the role: the guard cannot be applied, which is a failure.
+    let a = after("tb-down-no-live", CLEAN).await;
+    let mut ops = a.ops.clone();
+    ops.live_buckets.remove(&Role::Cold);
+    let checks = gather(&a.host, &a.config, &ops, &a.before).await.unwrap();
+    assert!(!find(&checks, name).passed);
+    assert_eq!(
+        find(&checks, name).detail,
+        "the ops file names no live bucket for cold, so the bucket list cannot prove removal"
+    );
+    assert!(find(&checks, "test-bucket-removed:hot").passed);
 }
 
 /// Catches an existing bucket turned into "cannot tell" when the verifier may list uploads: with
