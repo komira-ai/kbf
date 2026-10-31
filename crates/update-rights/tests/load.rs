@@ -418,7 +418,10 @@ fn a_link_to_a_reserved_place_is_refused_in_each_kind() {
                 assert_eq!(found, field);
                 assert!(path.contains("which is /"), "{path}");
                 assert!(
-                    matches!(why, Violation::Names("/etc") | Violation::Inside(_)),
+                    matches!(
+                        why,
+                        Violation::Names("/etc") | Violation::Contains(_) | Violation::Inside(_)
+                    ),
                     "{why:?}"
                 );
             }

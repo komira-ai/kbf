@@ -570,6 +570,7 @@ fn probe_2_mask_runtime_then_stop_an_active_instance_through_polkit() {
         &rule,
         format!(
             "polkit.addRule(function(action, subject) {{\n\
+             \x20 polkit.log(\"probe-polkit \" + action.id + \" unit=\" + action.lookup(\"unit\") + \" user=\" + subject.user);\n\
              \x20 if (subject.user != \"{user}\") return polkit.Result.NOT_HANDLED;\n\
              \x20 if (action.id == \"org.freedesktop.systemd1.manage-unit-files\") return polkit.Result.YES;\n\
              \x20 if (action.id == \"org.freedesktop.systemd1.manage-units\" &&\n\
@@ -584,8 +585,23 @@ fn probe_2_mask_runtime_then_stop_an_active_instance_through_polkit() {
     ok(SYSTEMCTL, &["restart", "polkit.service"]);
     ok(
         SYSTEMCTL,
-        &["start", "probe-polkit@a.service", "probe-polkit@b.service"],
+        &[
+            "start",
+            "probe-polkit@a.service",
+            "probe-polkit@b.service",
+            "probe-polkit@c.service",
+        ],
     );
+    let started: Vec<String> = ["a", "b", "c"]
+        .iter()
+        .map(|i| {
+            said(
+                SYSTEMCTL,
+                &["is-active", &format!("probe-polkit@{i}.service")],
+            )
+        })
+        .collect();
+    assert_eq!(started, ["active", "active", "active"]);
     assert_eq!(
         said(SYSTEMCTL, &["is-active", "probe-polkit@a.service"]),
         "active"
@@ -650,7 +666,11 @@ fn probe_2_mask_runtime_then_stop_an_active_instance_through_polkit() {
         stranger_stop.outcome,
         stranger_stop.report.detail
     );
-    record("probe-2-facts", &facts);
+    let log = said(
+        "/usr/bin/journalctl",
+        &["-u", "polkit.service", "-n", "40", "--no-pager"],
+    );
+    record("probe-2-facts", &format!("{facts}\n{log}"));
     assert_eq!(refused_stop.outcome, Outcome::Failure, "{facts}");
     assert_eq!(b_state, "active", "{facts}");
     assert_eq!(stranger_stop.outcome, Outcome::Failure, "{facts}");
