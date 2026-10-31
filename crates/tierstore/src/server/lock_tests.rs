@@ -77,6 +77,31 @@ fn a_network_file_system_is_refused() {
     }
 }
 
+/// Asserts that the file systems whose locks are not a promise between processes on one host
+/// are refused by name: FUSE (sshfs, glusterfs, virtiofs), Lustre, GPFS, OCFS2, 9p and AFS, as
+/// well as NFS, SMB, CIFS and Ceph. It would catch a lock file on a FUSE mount taken as if the
+/// lock were kept.
+#[test]
+fn the_file_systems_that_do_not_keep_a_lock_are_refused_by_type() {
+    let path = Path::new("/mnt/shared/instance.lock");
+    let named = [
+        ("nfs", 0x6969),
+        ("smb", 0x517B),
+        ("cifs", 0xFF53_4D42),
+        ("smb2", 0xFE53_4D42),
+        ("ceph", 0x00C3_6400),
+        ("fuse", 0x6573_5546),
+        ("lustre", 0x0BD0_0BD0),
+        ("gpfs", 0x4750_4653),
+        ("ocfs2", 0x7461_636F),
+        ("9p", 0x0102_1997),
+        ("afs", 0x5346_414F),
+    ];
+    for (name, magic) in named {
+        assert!(check_type(magic, path).is_err(), "{name}");
+    }
+}
+
 /// Asserts that a lock path must be absolute and name a file, with the words a refusal uses.
 #[test]
 fn a_lock_path_is_an_absolute_path_that_names_a_file() {
