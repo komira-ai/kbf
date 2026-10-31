@@ -304,7 +304,7 @@ fn one_role_behind_keeps_the_frontends_waiting() {
                 ("f2", HostRole::FRONTEND, beat("1.0")),
             ],
         );
-        f.record(id(host), role, beat("1.0"), NOW);
+        f.record(id(host), role.clone(), beat("1.0"), NOW);
         assert_eq!(
             run(
                 &mut f,
