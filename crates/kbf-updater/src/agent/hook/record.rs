@@ -122,6 +122,13 @@ impl Record {
         self.target == target && self.digest == digest
     }
 
+    /// The host runs the target already: there is nothing to prepare, switch or confirm, and
+    /// every step after this one succeeds without a call.
+    pub fn made_current(&mut self) {
+        self.current = true;
+        self.prepared = true;
+    }
+
     /// The update is over, one way or the other: a new `prepare` for the same release starts a
     /// new one.
     pub fn is_over(&self) -> bool {

@@ -252,7 +252,7 @@ impl<'a> Hook<'a> {
             return self.adopt(&trial);
         }
         if state.version.as_ref() == Some(&self.target) {
-            self.update(|rec| rec.current = true)?;
+            self.update(Record::made_current)?;
             return Ok(Done::ok());
         }
         let staged = world
@@ -261,7 +261,7 @@ impl<'a> Hook<'a> {
             .map_err(|e| self.stopped(Done::helper("install_failed", &e)))?;
         if staged.current {
             // The host runs this release already (the helper now knows its version's text).
-            self.update(|rec| rec.current = true)?;
+            self.update(Record::made_current)?;
             return Ok(Done::ok());
         }
         self.drain()?;

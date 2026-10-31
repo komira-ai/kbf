@@ -17,11 +17,11 @@ const ROLLBACK: [Step; 3] = [Step::Prepare, Step::Cutover, Step::Rollback];
 
 /// What a rig leaves behind: the record, whether the node is drained, and the helper's state.
 fn state(rig: &Rig) -> (Option<Record>, bool, HostState) {
-    (
-        rig.record(),
-        rig.drain.is_drained(),
-        rig.local.world().state.clone(),
-    )
+    // The fake helper writes `last` on every revert, even one of nothing: it is not part of the
+    // state a rerun is held to.
+    let mut host = rig.local.world().state.clone();
+    host.last = None;
+    (rig.record(), rig.drain.is_drained(), host)
 }
 
 /// A gate that counts the writes of the record it sees.

@@ -204,10 +204,12 @@ impl HealthCheck for FakeHealth {
     }
 
     fn check_held(&self, _host: &Host, target: &Version) -> Result<Health, PortError> {
-        let running = self.0.helper().version;
+        let file = self.0.helper();
+        let running = file.version;
+        // The fault is the release on trial's: the old release is healthy all the same.
         Ok(if running != target.as_str() {
             Health::Waiting(format!("{running} runs, not {target}"))
-        } else if self.0.fault("verify").as_deref() == Some("fail") {
+        } else if file.pending && self.0.fault("verify").as_deref() == Some("fail") {
             Health::Abandoned("the fault says so".to_owned())
         } else {
             Health::Healthy

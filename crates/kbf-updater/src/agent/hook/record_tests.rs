@@ -52,7 +52,7 @@ fn a_record_that_is_not_ours_is_refused() {
     .unwrap();
     let older = store.load().unwrap().unwrap();
     assert_eq!(older, Record::new("2.0.0", "d"));
-    for text in ["", "[]", "{\"schema\": \"one\"}", "{\"prepared\": 3}"] {
+    for text in ["", "null", "{\"schema\": \"one\"}", "{\"prepared\": 3}"] {
         std::fs::write(dir.join(FILE), text).unwrap();
         let error = store.load().unwrap_err();
         assert!(
