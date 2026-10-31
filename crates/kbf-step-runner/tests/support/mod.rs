@@ -303,6 +303,7 @@ impl Rig {
             service: "svc".to_owned(),
             target_version: "2.0.0".to_owned(),
             previous_version: Some("1.0.0".to_owned()),
+            artifact_digest: "ab".repeat(32),
             staged: Staged::seal(&self.new_dir).unwrap(),
             previous: Some(Staged::seal(&self.old_dir).unwrap()),
             hook_binary: PathBuf::from("hook"),

@@ -74,7 +74,11 @@ pub struct UpdateOrder {
     pub service: String,
     pub target_version: String,
     pub previous_version: Option<String>,
-    /// The verified staged release.
+    /// The sha256 of the release artifact the updater verified (its attested tarball): 64
+    /// lower-case hex digits, the value in the order and in the release's SHA256SUMS. It is
+    /// written to every step's params file as `updater.artifact_digest` = `sha256:<hex>`.
+    pub artifact_digest: String,
+    /// The verified staged release (the unpacked tree of that artifact).
     pub staged: Staged,
     /// The release being replaced, kept staged until `cleanup` has succeeded; `None` on the first
     /// install.

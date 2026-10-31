@@ -1007,14 +1007,16 @@ fn a_service_name_may_hold_dashes_and_underscores() {
     assert_eq!(unit, "updater-my-svc_1-prepare-1");
 }
 
-/// Catches a params file that does not name the artifact the updater verified: every step of an
-/// update, `rollback` included, is given `updater.artifact_digest` as `sha256:` and the digest
-/// of the staged tree the order names.
+/// Catches a params file that names the staged tree instead of the artifact the updater verified:
+/// every step of an update, `rollback` included, is given `updater.artifact_digest` as `sha256:`
+/// and the digest of the artifact the order names (its tarball, as in SHA256SUMS), which is not the
+/// digest of the unpacked tree.
 #[test]
 fn every_steps_params_file_names_the_verified_artifact() {
     let rig = Rig::new("run-params-digest");
     rig.fake.say(Step::Verify, &[FAIL]);
     let order = rig.order();
+    assert_ne!(order.artifact_digest, order.staged.digest);
     rig.runner().run(&order).unwrap();
     let runs = rig.fake.runs();
     assert_eq!(runs.len(), 4);
@@ -1026,7 +1028,29 @@ fn every_steps_params_file_names_the_verified_artifact() {
         let params = Params::parse(&params).unwrap();
         assert_eq!(
             params.artifact_digest().unwrap(),
-            Some(format!("sha256:{}", order.staged.digest).as_str())
+            Some(format!("sha256:{}", order.artifact_digest).as_str())
         );
     }
+}
+
+/// Catches an artifact digest that is not a sha256 being written to the hooks: anything but 64
+/// lower-case hex digits is refused before anything runs.
+#[test]
+fn an_artifact_digest_that_is_not_a_sha256_is_refused() {
+    let rig = Rig::new("run-bad-artifact-digest");
+    for bad in [
+        "",
+        "abc",
+        &"AB".repeat(32),
+        &"zz".repeat(32),
+        &"ab".repeat(33),
+    ] {
+        let mut order = rig.order();
+        order.artifact_digest = bad.to_owned();
+        assert!(
+            matches!(rig.runner().run(&order), Err(RunError::BadOrder(_))),
+            "{bad}"
+        );
+    }
+    assert!(rig.fake.events().is_empty());
 }
