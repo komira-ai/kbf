@@ -95,7 +95,7 @@ fn the_rendered_text_is_the_text_built_from_the_names() {
 /// section, so a name the code exports is never missing from the page.
 #[test]
 fn every_family_name_is_on_the_metrics_page() {
-    let page = include_str!("../docs/metrics.md");
+    let page = include_str!("../docs/metrics.txt");
     let released = page
         .split("\n## Not in a release yet")
         .next()
