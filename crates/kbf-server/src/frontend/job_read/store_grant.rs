@@ -27,6 +27,11 @@ const BUCKET: &str = "job_store_bucket";
 /// The most bytes the key file may hold.
 const MAX_KEY_FILE_BYTES: usize = 4096;
 
+/// The fewest bytes a grant secret may have: a grant is an HMAC over a body of known form, so whoever
+/// sees one token can test guesses of the secret offline. tierstore refuses shorter ones too; the
+/// check is here as well so the minimum does not move with the tierstore pin.
+const MIN_SECRET_BYTES: usize = 32;
+
 /// What a key file that is not a key is told.
 const NOT_KEY: &str = "not JSON of exactly access_key_id and secret_access_key, both not \
                        empty, nor the id and the secret on two lines";
@@ -142,6 +147,11 @@ fn read_key(path: &Path) -> Result<AccessKey, JobReadError> {
     };
     if id.is_empty() || secret.is_empty() {
         return Err(bad(NOT_KEY.to_owned()));
+    }
+    if secret.len() < MIN_SECRET_BYTES {
+        return Err(bad(format!(
+            "the secret is shorter than {MIN_SECRET_BYTES} bytes"
+        )));
     }
     Ok(AccessKey::new(&id, &secret))
 }

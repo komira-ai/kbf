@@ -386,7 +386,8 @@ two more flags that have defaults:
   together, and are off unless the key file is given): tell `GET /locate` to hand out read grants
   of the tier store. The file is the grant key the store's own `--grant-key-file` holds (JSON of
   `access_key_id` and `secret_access_key`, or the id and the secret on two lines; mode 0600 or
-  0400, owned by the server's user, never a flag); the store must be started with the same key.
+  0400, owned by the server's user, never a flag; the secret is at least 32 bytes); the store
+  must be started with the same key.
   `--job-store-url` is the base URL a task reads the store at (`http://` or `https://`, a host
   and a port, no path: the task dials it from its worker, so it must be an address the workers
   reach) and `--job-store-bucket` is the store's `--bucket`. Both come from these flags and from
@@ -408,6 +409,10 @@ two more flags that have defaults:
   `--grant-max-lifetime` than ten minutes refuses them (the task then reads from the listener).
   A grant is a bearer token: it is in the answer's body only, never in a log, a metric or a
   `Debug`, and on plain HTTP (the listener's or the store's) anyone on the path can read it.
+  A grant lists whole pack keys, and the store serves any byte range of a key a grant lists, so a
+  task holding the grant for one blob of a pack can read every blob in that pack, including blobs
+  outside its Action's inputs. Turn these flags on only where that is acceptable: a farm whose
+  builds all belong to one tenant, or whose pack contents are not secret from one another.
 - The tee that copies a large blob to tierstore while it is streamed buffers up to 32 MiB for each
   live put (64 MiB in all at the default concurrency of two). That buffer is outside
   `--job-read-budget-bytes`, which counts what a read and its reply hold.
