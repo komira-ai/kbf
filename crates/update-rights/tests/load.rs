@@ -849,7 +849,7 @@ fn the_ancestor_rule_is_for_root_hooks_and_passes_root_owned_directories() {
     let mut root = Spec::new("tierstore");
     root.hook_user = "root".to_owned();
     root.read = vec!["/usr/sbin/nft".to_owned()];
-    root.write = vec!["/opt/updater-ancestor-probe/work".to_owned()];
+    root.write = vec!["/var/lib/updater-ancestor-probe/work".to_owned()];
     host.put(&root);
     let loaded = host.load();
     assert!(loaded.refused.is_empty(), "{:?}", loaded.refused);

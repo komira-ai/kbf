@@ -244,7 +244,13 @@ fn the_kernel_and_device_trees_are_never_written() {
         }
     }
     for near in ["/devices", "/processes", "/system", "/dev-x", "/sysfs"] {
-        assert_eq!(check(Kind::Write, near), Ok(()), "{near}");
+        // Not inside the trees, so not refused for being there; outside the write roots all the same.
+        assert_eq!(
+            check(Kind::Write, near),
+            Err(Violation::NotAllowed),
+            "{near}"
+        );
+        assert_eq!(check(Kind::Read, near), Ok(()), "{near}");
     }
 }
 
@@ -267,9 +273,8 @@ fn a_write_path_must_be_below_one_of_the_write_roots() {
     ] {
         assert_eq!(check(Kind::Write, path), Ok(()), "{path}");
     }
+    // (`/var/lib` and `/var/cache` hold reserved directories and are refused as containing them.)
     for path in [
-        "/var/lib",
-        "/var/cache",
         "/run",
         "/opt",
         "/srv/x",
