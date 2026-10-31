@@ -47,12 +47,6 @@ impl HostRole {
         &self.0
     }
 
-    /// [`HostRole::name`], for a `match`.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
     /// The role a certificate's URI names: [`HostRole::URI_PREFIX`] exactly, then a name.
     /// `None` for any other URI, and for a prefix followed by a malformed name.
     #[must_use]

@@ -239,7 +239,7 @@ pub(super) fn frontend_ports(
 pub fn build(cfg: &Config) -> Result<Agent, String> {
     let platform = host_platform().ok_or("kbf has no release for this platform")?;
     let identity = identity_of_files(&cfg.files)?;
-    let role = match identity.role.as_str() {
+    let role = match identity.role.name() {
         "frontend" => Role::Frontend,
         "storage" => Role::Storage,
         "daemon" => Role::Daemon,
