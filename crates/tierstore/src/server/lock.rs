@@ -86,14 +86,33 @@ impl Drop for LockFile {
 }
 
 /// The file system types whose `flock` is not exclusive between processes on other hosts, or
-/// not kept at all: NFS, SMB, CIFS, SMB2 and Ceph (the `f_type` magic numbers of `statfs(2)`).
-pub(super) const NETWORK: [i128; 5] = [0x6969, 0x517B, 0xFF53_4D42, 0xFE53_4D42, 0x00C3_6400];
+/// not kept at all (the `f_type` magic numbers of `statfs(2)`): NFS, SMB, CIFS, SMB2, Ceph,
+/// FUSE (sshfs, glusterfs, virtiofs), Lustre, GPFS, OCFS2, 9p and AFS. A file system with no
+/// stable magic number is not in the list.
+///
+/// The lock file is `<cache>/.lock`, opened without following a link, so the file system of the
+/// cache directory is the one of the lock file, and checking the lock file checks both; a
+/// storage node's lock file is checked, and nothing else it has is.
+pub(super) const NETWORK: [i128; 11] = [
+    0x6969,
+    0x517B,
+    0xFF53_4D42,
+    0xFE53_4D42,
+    0x00C3_6400,
+    0x6573_5546,
+    0x0BD0_0BD0,
+    0x4750_4653,
+    0x7461_636F,
+    0x0102_1997,
+    0x5346_414F,
+];
 
 /// Refuses a lock file on a file system whose `statfs` type is `magic`.
 pub(super) fn check_type(magic: i128, path: &Path) -> io::Result<()> {
     if NETWORK.contains(&magic) {
         let why = format!(
-            "{} is on a network file system; a lock file must be on a local one",
+            "{} is on a network file system (FUSE and cluster file systems included); a lock \
+             file must be on a local one",
             path.display()
         );
         return Err(io::Error::other(why));

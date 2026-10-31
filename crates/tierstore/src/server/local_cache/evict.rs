@@ -42,6 +42,10 @@ impl Inner {
         }
         let touched = locked(&self.index).take_touched();
         for (hex, at) in touched {
+            // Asked for each file: a pass that straddles the loss of the lock stamps no more.
+            if !self.read_write() {
+                break;
+            }
             // An object that was evicted since it was used has no file to stamp.
             let _ = self.disk.touch(&data_path(&self.config.path, &hex), at);
         }

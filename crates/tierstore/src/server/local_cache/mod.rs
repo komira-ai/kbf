@@ -126,8 +126,9 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -288,6 +289,10 @@ pub(super) struct Inner {
     invalidated: Mutex<HashSet<String>>,
     /// The number of the next file in `.stage/`.
     staged: AtomicU64,
+    /// What every name in `.stage/` that this cache makes starts with: it is not the prefix of
+    /// the name of any other cache, of this process or of another, that has the directory open,
+    /// so that none of them removes the staging file of another.
+    stage_prefix: String,
     /// The bytes of the fills that are running and have no object in the index yet.
     reserved: AtomicU64,
     /// One permit for each fill that may run; a fill holds one until it ends.
@@ -296,6 +301,16 @@ pub(super) struct Inner {
     evicting: AtomicBool,
     /// Whether this cache may write to its directory, and the lock that says so.
     hold: Hold,
+}
+
+/// A prefix for the staging files of one cache that no other cache has: the process id, the time
+/// of the open in nanoseconds and the number of caches opened in this process before it.
+fn stage_prefix() -> String {
+    static OPENED: AtomicU64 = AtomicU64::new(0);
+    let since = SystemTime::now().duration_since(UNIX_EPOCH);
+    let nanos = since.map_or(0, |elapsed| elapsed.as_nanos());
+    let number = OPENED.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}-{nanos:x}-{number:x}", std::process::id())
 }
 
 /// The index of the objects a scan found, the least recently used first.
@@ -386,6 +401,7 @@ impl LocalCache {
             flights: Mutex::new(HashMap::new()),
             invalidated: Mutex::new(HashSet::new()),
             staged: AtomicU64::new(0),
+            stage_prefix: stage_prefix(),
             reserved: AtomicU64::new(0),
             permits,
             evicting: AtomicBool::new(false),
@@ -456,10 +472,13 @@ impl Inner {
     /// It notes the name, and removes the files when it takes the lock (see `hold`), so that the
     /// object is not served from them then: it was deleted or replaced at the upstream.
     fn drop_entry(&self, hex: &str) {
-        drop(locked(&self.index).remove(hex));
         #[cfg(test)]
         self.trace_before_delete();
-        if !self.may_delete(hex) {
+        // Asked first: a take that is running holds the answer until it has looked at the notes,
+        // and an entry removed before that would be put back by the index it makes.
+        let may_delete = self.may_delete(hex);
+        drop(locked(&self.index).remove(hex));
+        if !may_delete {
             return;
         }
         let root = &self.config.path;

@@ -27,12 +27,18 @@
 //! index; only then does the cache say it is read-write. The holder checks, at every tick, that
 //! `.lock` still leads to the file it holds: a file that was replaced is a lock that nothing
 //! else looks at, so the cache lets it go, is read-only again, and takes the new file when it
-//! can.
+//! can. A fill that is running then writes nothing more: it remembers the number of times the
+//! cache lost the lock when it started (the generation), and asks before it makes its staging
+//! file, before each chunk, inside the publish before the first change to the directory and
+//! before the rename, and before the index. The names of the staging files start with a prefix of
+//! the cache, so a cache never removes the staging file of another. The loss is noticed by a
+//! tick, once a second at most: until then the cache still believes it holds the lock, and the
+//! step of a fill that is running when the lock file is replaced can finish.
 
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -116,6 +122,21 @@ impl Forgotten {
             let _ = self.names.insert(hex.to_owned());
         }
     }
+
+    /// Whether nothing is noted.
+    fn is_empty(&self) -> bool {
+        !self.overflowed && self.names.is_empty()
+    }
+
+    /// Notes what `other` notes as well.
+    fn merge(&mut self, other: Forgotten) {
+        self.overflowed |= other.overflowed;
+        if self.overflowed {
+            self.names.clear();
+        } else {
+            self.names.extend(other.names);
+        }
+    }
 }
 
 /// The lock a cache holds, if any, and the mode that follows from it.
@@ -123,9 +144,13 @@ pub(super) struct Hold {
     standing: Mutex<Standing>,
     /// Read on every request, so it is not behind the mutex that a scan holds for its length.
     read_write: AtomicBool,
+    /// Counts the times the cache lost the lock. A fill remembers the number it started under
+    /// and gives up when it is not the number now, so that a fill of a time the cache held the
+    /// directory does not write to it after another cache holds it.
+    generation: AtomicU64,
     /// Taken before `read_write` is read by whoever acts on it, and held by [`Inner::promote`]
-    /// until `read_write` is set: a delete is noted before the promotion looks at the notes, or
-    /// finds the cache read-write and removes the files itself.
+    /// from its last look at the notes until `read_write` is set: a delete is noted before the
+    /// promotion looks at the notes, or finds the cache read-write and removes the files itself.
     forgotten: Mutex<Forgotten>,
     /// Calls a test makes at fixed points of the take and of a delete, to order them.
     #[cfg(test)]
@@ -153,6 +178,7 @@ impl Hold {
         Self {
             standing: Mutex::new(standing),
             read_write: AtomicBool::new(read_write),
+            generation: AtomicU64::new(0),
             forgotten: Mutex::new(Forgotten::default()),
             #[cfg(test)]
             trace: Mutex::new(Trace::default()),
@@ -174,6 +200,20 @@ impl Inner {
         self.hold.read_write.load(Ordering::SeqCst)
     }
 
+    /// The number of times the cache lost the lock; a fill takes it when it starts.
+    pub(super) fn generation(&self) -> u64 {
+        self.hold.generation.load(Ordering::SeqCst)
+    }
+
+    /// Whether a fill that started when [`generation`](Self::generation) was `generation` may
+    /// still write to the directory: the cache is read-write and has not lost the lock since.
+    /// The lock is noticed lost by a tick, once a second at most, so a write that is under way
+    /// when the lock file is replaced can still finish: the window is one tick and the step of
+    /// the fill that is running.
+    pub(super) fn owns(&self, generation: u64) -> bool {
+        self.read_write() && self.generation() == generation
+    }
+
     /// The lock file of the directory.
     fn lock_path(&self) -> PathBuf {
         self.config.path.join(LOCK)
@@ -187,6 +227,8 @@ impl Inner {
                 return Ok(Tick::Held);
             }
             *standing = Standing::Waiting;
+            // The generation first: a fill that sees the cache read-only has the old number.
+            let _ = self.hold.generation.fetch_add(1, Ordering::SeqCst);
             self.hold.read_write.store(false, Ordering::SeqCst);
             return Ok(Tick::Lost);
         }
@@ -219,30 +261,51 @@ impl Inner {
 
     /// What taking the lock does to the directory and the index, and then makes the cache
     /// read-write. After the scan it removes the files of the objects a delete or put through
-    /// this cache, while it was read-only, said are gone or replaced at the upstream, and drops
-    /// them from the index; if more were noted than the limit holds, it removes every object
+    /// this cache, while it was read-only, said are gone or replaced at the upstream, and leaves
+    /// them out of the index; if more were noted than the limit holds, it removes every object
     /// and the index starts empty. Nothing is trusted that the holder left for a name that was
     /// deleted.
+    ///
+    /// The notes are taken out of the cache first and the files are removed without holding the
+    /// lock on them, since a delete on a request waits for that lock. What was noted meanwhile
+    /// is taken and removed in the next round, and the round that finds nothing noted flips the
+    /// mode while it holds the lock.
     fn promote(&self) -> io::Result<()> {
         let removed = layout::clear_stage(&self.config.path)?;
         let scanned = layout::scan(&self.config.path)?;
-        let mut forgotten = locked(&self.hold.forgotten);
-        let distrust = |hex: &String| forgotten.overflowed || forgotten.names.contains(hex);
-        let (gone, kept): (Vec<_>, Vec<_>) =
-            scanned.found.into_iter().partition(|f| distrust(&f.hex));
-        for found in &gone {
+        let mut found = scanned.found;
+        let mut pending = std::mem::take(&mut *locked(&self.hold.forgotten));
+        #[cfg(test)]
+        self.trace_promote();
+        loop {
+            let distrust = |f: &layout::Found| pending.overflowed || pending.names.contains(&f.hex);
+            let (gone, kept): (Vec<_>, Vec<_>) = found.into_iter().partition(distrust);
+            found = kept;
+            if let Err(why) = self.remove_files(&gone) {
+                // The names are noted again, so that the next try removes what is left.
+                locked(&self.hold.forgotten).merge(pending);
+                return Err(why);
+            }
+            let mut forgotten = locked(&self.hold.forgotten);
+            if forgotten.is_empty() {
+                add(
+                    &self.counters.discarded_at_start,
+                    scanned.discarded + removed,
+                );
+                *locked(&self.index) = index_of(found);
+                let _ = self.hold.read_write.swap(true, Ordering::SeqCst);
+                return Ok(());
+            }
+            pending = std::mem::take(&mut *forgotten);
+        }
+    }
+
+    /// Removes the data files and the sidecars of `gone`.
+    fn remove_files(&self, gone: &[layout::Found]) -> io::Result<()> {
+        for found in gone {
             remove_if_there(&layout::data_path(&self.config.path, &found.hex))?;
             remove_if_there(&layout::meta_path(&self.config.path, &found.hex))?;
         }
-        #[cfg(test)]
-        self.trace_promote();
-        add(
-            &self.counters.discarded_at_start,
-            scanned.discarded + removed,
-        );
-        *locked(&self.index) = index_of(kept);
-        *forgotten = Forgotten::default();
-        self.hold.read_write.store(true, Ordering::SeqCst);
         Ok(())
     }
 
