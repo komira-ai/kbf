@@ -29,7 +29,10 @@ applies to a pending promotion and the hook must not fail for. The updater write
 reserved keys, all in the namespace `updater.`, which a hook only reads: `updater.staged_release`
 (the absolute path of the verified staged release tree; equal to the argument of `prepare`),
 `updater.previous_release` (absent on a first install), `updater.target_version` and
-`updater.previous_version` (absent on a first install). A declaration's own `[hook.params]` may not
+`updater.previous_version` (absent on a first install) and `updater.artifact_digest` (text,
+`sha256:` and 64 lowercase hex digits, the digest of the artifact the updater verified; present on
+every step). The digest is an identity the hook keys its record on; it is not for verifying the
+artifact again. `Params::artifact_digest` refuses any other shape. A declaration's own `[hook.params]` may not
 set any `updater.*` key (`Params::parse_declared` refuses it). **A hook still validates every value
 it reads from this file against its own record directory and its declaration**: a value read from a
 file is untrusted input.
