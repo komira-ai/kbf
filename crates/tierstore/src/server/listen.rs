@@ -14,9 +14,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::task::{Context, Poll};
 
-use rustix::net::{
-    AddressFamily, SocketFlags, SocketType, bind as bind_socket, listen, socket_with, sockopt,
-};
+use rustix::io::{FdFlags, fcntl_setfd};
+use rustix::net::{AddressFamily, SocketType, bind as bind_socket, listen, socket, sockopt};
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::net::{TcpListener, TcpStream};
@@ -94,8 +93,10 @@ pub(crate) fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
         SocketAddr::V4(_) => AddressFamily::INET,
         SocketAddr::V6(_) => AddressFamily::INET6,
     };
-    let flags = SocketFlags::CLOEXEC | SocketFlags::NONBLOCK;
-    let socket = socket_with(family, SocketType::STREAM, flags, None)?;
+    // The close-on-exec flag is set after the socket is made, not by the call that makes it: that
+    // call takes the flag on Linux only, and this code is built for macOS as well.
+    let socket = socket(family, SocketType::STREAM, None)?;
+    fcntl_setfd(&socket, FdFlags::CLOEXEC)?;
     // As `std` does for a listener: a restart does not wait for the connections of the last run.
     sockopt::set_socket_reuseaddr(&socket, true)?;
     if addr.is_ipv6() {
@@ -103,7 +104,9 @@ pub(crate) fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
     }
     bind_socket(&socket, &addr)?;
     listen(&socket, BACKLOG)?;
-    TcpListener::from_std(std::net::TcpListener::from(socket))
+    let listener = std::net::TcpListener::from(socket);
+    listener.set_nonblocking(true)?;
+    TcpListener::from_std(listener)
 }
 
 /// A listener on each of `addrs`, in the order given, or the first that cannot be bound with
