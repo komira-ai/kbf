@@ -227,7 +227,7 @@ fn a_service_nothing_declares_is_refused() {
 fn a_health_address_the_declaration_does_not_allow_is_refused() {
     let live = Live::start("regc-badhealth", me(), |s| s);
     let cases = [
-        (health("10.1.2.3:9301", "/readyz"), Refusal::HealthAddress),
+        (health("0.0.0.0:9301", "/readyz"), Refusal::HealthAddress),
         (health("127.0.0.1:9301", "readyz"), Refusal::HealthAddress),
         (
             health("127.0.0.1:9301", "/ready?x=1"),
@@ -300,8 +300,8 @@ fn the_longest_line_the_server_reads_is_the_longest_the_client_sends() {
 fn a_socket_nobody_listens_on_is_a_connect_error() {
     let scratch = Scratch::new("regc-nosock");
     let sock: &Path = &scratch.path().join("none");
-    assert!(matches!(
-        register(sock, "svc", "1.0.0", None),
-        Err(Error::Connect { .. })
-    ));
+    match register(sock, "svc", "1.0.0", None) {
+        Err(Error::Connect { path, .. }) => assert_eq!(path, sock),
+        other => panic!("{other:?}"),
+    }
 }

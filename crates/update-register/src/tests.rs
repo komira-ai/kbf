@@ -1,11 +1,9 @@
-//! The client against a peer it controls: a socket pair for the bytes, a listener in a directory
-//! for the path.
+//! The client against a peer it controls: a socket pair for the bytes. The path to a real
+//! socket is tried against the real server, in the tests of `kbf-step-runner`.
 
-use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 
 use serde_json::{Value, json};
 
@@ -29,10 +27,6 @@ fn sent_line(peer: &UnixStream) -> String {
     let mut line = String::new();
     BufReader::new(peer).read_line(&mut line).unwrap();
     line
-}
-
-fn loopback_health() -> Health {
-    Health::new("127.0.0.1:9301".parse().unwrap(), "/readyz")
 }
 
 fn refused(said: &str) -> Refusal {
@@ -235,56 +229,16 @@ fn a_registration_over_the_limit_is_not_sent() {
     assert!(rest.is_empty());
 }
 
-/// A directory in the temporary directory, unique to the test, removed when dropped.
-struct Dir(PathBuf);
-
-impl Dir {
-    fn new() -> Dir {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let n = NEXT.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("ur{}-{n}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        Dir(dir)
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-/// `register` connects to the path it is given and says what it was given.
-#[test]
-fn register_connects_to_the_socket_path() {
-    let dir = Dir::new();
-    let sock = dir.0.join("s");
-    let listener = UnixListener::bind(&sock).unwrap();
-    let updater = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let line = sent_line(&stream);
-        stream.write_all(OK.as_bytes()).unwrap();
-        line
-    });
-    let health = loopback_health();
-    let _held = register(&sock, "svc", "3.1.4", Some(&health)).unwrap();
-    let sent: Value = serde_json::from_str(&updater.join().unwrap()).unwrap();
-    assert_eq!(sent["name"], "svc");
-    assert_eq!(sent["version"], "3.1.4");
-    assert_eq!(sent["health"]["path"], "/readyz");
-}
-
-/// A socket that is not there is `Connect`, with the path in the message.
+/// A socket path nothing listens on is a connect error that names the path.
 #[test]
 fn a_missing_socket_names_its_path() {
-    let dir = Dir::new();
-    let sock = dir.0.join("nobody-listens");
-    match register(&sock, "svc", "1.0.0", None) {
+    let sock = Path::new("/nonexistent-update-register/none");
+    match register(sock, "svc", "1.0.0", None) {
         Err(Error::Connect { path, source }) => {
             assert_eq!(path, sock);
             assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
             let shown = Error::Connect { path, source }.to_string();
-            assert!(shown.contains("nobody-listens"), "{shown}");
+            assert!(shown.contains("nonexistent-update-register"), "{shown}");
         }
         other => panic!("{other:?}"),
     }
