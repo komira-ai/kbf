@@ -34,6 +34,12 @@ set any `updater.*` key (`Params::parse_declared` refuses it). **A hook still va
 it reads from this file against its own record directory and its declaration**: a value read from a
 file is untrusted input.
 
+The updater writes **one params file per update** and passes that same file, with the same
+values, to every step (`prepare`, `cutover`, `verify`, `rollback`, `cleanup`), so
+`updater.staged_release` and `updater.target_version` are present on every step. The argument of
+`prepare` is **byte for byte** the string in `updater.staged_release`; a hook may compare them
+exactly, with no canonicalisation. The conformance harness gives every step one such file.
+
 **Exit codes.** `0` success; `1` failure; `75` deferred (the host is busy, nothing irreversible
 happened, try later); `76` halt (no version can repair this). Any other code, a timeout and a signal
 are failures.
