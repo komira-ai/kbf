@@ -105,6 +105,11 @@ pub enum Hold {
     WaitingForService,
     /// Fewer hosts of the role would stay up than the role requires.
     MinUp,
+    /// Every slot of the host's role is held, at least one of them by a host that runs the
+    /// desired version and has not yet baked.
+    Baking,
+    /// The service's canary gate is closed and the host is not one of the canaries.
+    CanaryWait,
 }
 
 /// What [`decide_why`] found for one host and service.

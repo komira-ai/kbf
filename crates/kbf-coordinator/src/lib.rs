@@ -20,6 +20,7 @@
 /// `GET /v1/convergence` say it as `commit`.
 pub const BUILD_COMMIT: &str = env!("KBF_BUILD_COMMIT");
 
+pub mod canary;
 pub mod config;
 pub mod converge;
 pub mod decide;
@@ -31,6 +32,8 @@ pub mod listen;
 pub mod service;
 pub mod services;
 
+#[cfg(test)]
+mod bake_canary_tests;
 #[cfg(test)]
 mod converge_role_tests;
 #[cfg(test)]
