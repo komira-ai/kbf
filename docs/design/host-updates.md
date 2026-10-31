@@ -200,7 +200,7 @@ A hook is **any executable**: a binary or a script. The declaration names it (`b
 
 **Exit codes.** `0` success. `1` failure. `75` deferred: the host is busy or not ready, nothing irreversible happened, try later (rev 3's `Deferred`). `76` halt: the failure is one no version can repair and acting further would make it worse (rev 3's `halt`, 3.8). A step killed by its timeout or a signal is a failure. Any other code is a failure.
 
-**Structured output.** The last line the hook writes to stdout is one JSON object, which the updater reads; a missing or malformed line is read as `{}`:
+**Structured output.** The last line the hook writes to stdout is one JSON object, which the updater reads; a missing line, or one that is not a JSON object, is read as `{}`. A JSON object is read field by field: a field of the wrong type, or a `reason` outside the token grammar (`[a-z0-9_]`, 1 to 64 bytes), takes its default and is logged, and the other fields stand; a `reversible` that is present but not a boolean is read as `false`, so a step that may have committed is treated as having committed:
 
 ```json
 {"class":"release","reason":"...","retry_after_secs":300,
