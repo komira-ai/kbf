@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use kbf_types::HostRole::{Daemon, Frontend, MacDaemon, Storage};
+use kbf_types::HostRole;
 use kbf_updater::wire::{Heartbeat, Outcome, Reply};
 
 use crate::decide::decide;
@@ -48,17 +48,17 @@ fn all_roles(version: &str) -> Fleet {
     fleet(
         NOW,
         &[
-            ("s1", Storage, beat(version)),
-            ("s2", Storage, beat(version)),
-            ("s3", Storage, beat(version)),
-            ("d1", Daemon, beat(version)),
-            ("d2", Daemon, beat(version)),
-            ("d3", Daemon, beat(version)),
-            ("m1", MacDaemon, beat(version)),
-            ("m2", MacDaemon, beat(version)),
-            ("m3", MacDaemon, beat(version)),
-            ("f1", Frontend, beat(version)),
-            ("f2", Frontend, beat(version)),
+            ("s1", HostRole::STORAGE, beat(version)),
+            ("s2", HostRole::STORAGE, beat(version)),
+            ("s3", HostRole::STORAGE, beat(version)),
+            ("d1", HostRole::DAEMON, beat(version)),
+            ("d2", HostRole::DAEMON, beat(version)),
+            ("d3", HostRole::DAEMON, beat(version)),
+            ("m1", HostRole::MAC_DAEMON, beat(version)),
+            ("m2", HostRole::MAC_DAEMON, beat(version)),
+            ("m3", HostRole::MAC_DAEMON, beat(version)),
+            ("f1", HostRole::FRONTEND, beat(version)),
+            ("f2", HostRole::FRONTEND, beat(version)),
         ],
     )
 }
@@ -124,15 +124,15 @@ fn a_roll_in_progress() {
     let mut f = fleet(
         NOW,
         &[
-            ("s1", Storage, updating(beat("1.0"), "2.0")),
-            ("s2", Storage, beat("2.0")),
-            ("s3", Storage, beat("1.0")),
-            ("d1", Daemon, beat("2.0")),
-            ("d2", Daemon, updating(beat("1.0"), "2.0")),
-            ("d3", Daemon, beat("1.0")),
-            ("m1", MacDaemon, beat("2.0")),
-            ("f1", Frontend, beat("1.0")),
-            ("f2", Frontend, beat("1.0")),
+            ("s1", HostRole::STORAGE, updating(beat("1.0"), "2.0")),
+            ("s2", HostRole::STORAGE, beat("2.0")),
+            ("s3", HostRole::STORAGE, beat("1.0")),
+            ("d1", HostRole::DAEMON, beat("2.0")),
+            ("d2", HostRole::DAEMON, updating(beat("1.0"), "2.0")),
+            ("d3", HostRole::DAEMON, beat("1.0")),
+            ("m1", HostRole::MAC_DAEMON, beat("2.0")),
+            ("f1", HostRole::FRONTEND, beat("1.0")),
+            ("f2", HostRole::FRONTEND, beat("1.0")),
         ],
     );
     let hosts = ["s1", "s2", "s3", "d1", "d2", "d3", "m1", "f1", "f2"];
@@ -159,12 +159,12 @@ fn frontends_go_last_and_one_at_a_time() {
     let mut f = fleet(
         NOW,
         &[
-            ("s1", Storage, beat("2.0")),
-            ("d1", Daemon, beat("2.0")),
-            ("m1", MacDaemon, beat("2.0")),
-            ("f1", Frontend, beat("1.0")),
-            ("f2", Frontend, beat("1.0")),
-            ("f3", Frontend, beat("1.0")),
+            ("s1", HostRole::STORAGE, beat("2.0")),
+            ("d1", HostRole::DAEMON, beat("2.0")),
+            ("m1", HostRole::MAC_DAEMON, beat("2.0")),
+            ("f1", HostRole::FRONTEND, beat("1.0")),
+            ("f2", HostRole::FRONTEND, beat("1.0")),
+            ("f3", HostRole::FRONTEND, beat("1.0")),
         ],
     );
     assert_eq!(
@@ -184,8 +184,8 @@ fn frontends_go_last_and_one_at_a_time() {
 #[test]
 fn the_minimums_hold_whatever_the_limits_say() {
     // f2 has been silent for 900 s: f1 is the last frontend up.
-    let mut f = fleet(NOW, &[("f1", Frontend, beat("1.0"))]);
-    f.record(id("f2"), Frontend, beat("1.0"), secs(100));
+    let mut f = fleet(NOW, &[("f1", HostRole::FRONTEND, beat("1.0"))]);
+    f.record(id("f2"), HostRole::FRONTEND, beat("1.0"), secs(100));
     assert_eq!(
         run(&mut f, &desired("2.0", 0, 0), &["f1"], NOW, false),
         ["f1: nothing"]
@@ -193,7 +193,10 @@ fn the_minimums_hold_whatever_the_limits_say() {
     // Two storage hosts, a minimum of two others up: nobody goes. With one more, the first does.
     let mut two = fleet(
         NOW,
-        &[("s1", Storage, beat("1.0")), ("s2", Storage, beat("1.0"))],
+        &[
+            ("s1", HostRole::STORAGE, beat("1.0")),
+            ("s2", HostRole::STORAGE, beat("1.0")),
+        ],
     );
     assert_eq!(
         run(&mut two, &desired("2.0", 2, 1), &["s1", "s2"], NOW, true),
@@ -202,9 +205,9 @@ fn the_minimums_hold_whatever_the_limits_say() {
     let mut three = fleet(
         NOW,
         &[
-            ("s1", Storage, beat("1.0")),
-            ("s2", Storage, beat("1.0")),
-            ("s3", Storage, beat("1.0")),
+            ("s1", HostRole::STORAGE, beat("1.0")),
+            ("s2", HostRole::STORAGE, beat("1.0")),
+            ("s3", HostRole::STORAGE, beat("1.0")),
         ],
     );
     assert_eq!(
@@ -232,10 +235,14 @@ fn a_failed_host_is_not_ordered_again() {
         fleet(
             NOW,
             &[
-                ("d1", Daemon, failed(beat("1.0"), "2.0")),
-                ("d2", Daemon, if d2_healthy { d2 } else { unhealthy(d2) }),
-                ("d3", Daemon, beat("1.0")),
-                ("d4", Daemon, failed(beat("1.0"), "1.5")),
+                ("d1", HostRole::DAEMON, failed(beat("1.0"), "2.0")),
+                (
+                    "d2",
+                    HostRole::DAEMON,
+                    if d2_healthy { d2 } else { unhealthy(d2) },
+                ),
+                ("d3", HostRole::DAEMON, beat("1.0")),
+                ("d4", HostRole::DAEMON, failed(beat("1.0"), "1.5")),
             ],
         )
     };
@@ -282,15 +289,19 @@ fn a_failed_host_is_not_ordered_again() {
 /// that is behind goes. (Macs are the role the frontend wait names last.)
 #[test]
 fn one_role_behind_keeps_the_frontends_waiting() {
-    for (role, host) in [(Storage, "s1"), (Daemon, "d1"), (MacDaemon, "m1")] {
+    for (role, host) in [
+        (HostRole::STORAGE, "s1"),
+        (HostRole::DAEMON, "d1"),
+        (HostRole::MAC_DAEMON, "m1"),
+    ] {
         let mut f = fleet(
             NOW,
             &[
-                ("s1", Storage, beat("2.0")),
-                ("d1", Daemon, beat("2.0")),
-                ("m1", MacDaemon, beat("2.0")),
-                ("f1", Frontend, beat("1.0")),
-                ("f2", Frontend, beat("1.0")),
+                ("s1", HostRole::STORAGE, beat("2.0")),
+                ("d1", HostRole::DAEMON, beat("2.0")),
+                ("m1", HostRole::MAC_DAEMON, beat("2.0")),
+                ("f1", HostRole::FRONTEND, beat("1.0")),
+                ("f2", HostRole::FRONTEND, beat("1.0")),
             ],
         );
         f.record(id(host), role, beat("1.0"), NOW);
@@ -319,7 +330,10 @@ fn one_role_behind_keeps_the_frontends_waiting() {
 fn an_order_ages_out_after_120_seconds() {
     let mut f = fleet(
         NOW,
-        &[("s1", Storage, beat("1.0")), ("s2", Storage, beat("1.0"))],
+        &[
+            ("s1", HostRole::STORAGE, beat("1.0")),
+            ("s2", HostRole::STORAGE, beat("1.0")),
+        ],
     );
     let d = desired("2.0", 0, 1);
     let mut lines = Vec::new();
@@ -331,8 +345,8 @@ fn an_order_ages_out_after_120_seconds() {
         (1_120, "s2"),
     ] {
         let at = secs(at);
-        f.record(id("s1"), Storage, beat("1.0"), at);
-        f.record(id("s2"), Storage, beat("1.0"), at);
+        f.record(id("s1"), HostRole::STORAGE, beat("1.0"), at);
+        f.record(id("s2"), HostRole::STORAGE, beat("1.0"), at);
         let line = run(&mut f, &d, &[host], at, true);
         lines.push(format!("t={} {}", at.as_secs(), line[0]));
     }
@@ -353,7 +367,7 @@ fn an_order_ages_out_after_120_seconds() {
 #[test]
 fn thirty_seconds_of_quiet_and_forty_five_of_silence() {
     let mut f = Fleet::new(secs(970));
-    f.record(id("d1"), Daemon, beat("1.0"), secs(999));
+    f.record(id("d1"), HostRole::DAEMON, beat("1.0"), secs(999));
     let d = desired("2.0", 1, 1);
     assert_eq!(run(&mut f, &d, &["d1"], secs(999), false), ["d1: nothing"]);
     assert_eq!(
@@ -361,8 +375,8 @@ fn thirty_seconds_of_quiet_and_forty_five_of_silence() {
         ["d1: update 2.0"]
     );
     for (seen, want) in [(956, "update 2.0"), (955, "nothing")] {
-        let mut f = fleet(NOW, &[("s1", Storage, beat("1.0"))]);
-        f.record(id("s2"), Storage, beat("1.0"), secs(seen));
+        let mut f = fleet(NOW, &[("s1", HostRole::STORAGE, beat("1.0"))]);
+        f.record(id("s2"), HostRole::STORAGE, beat("1.0"), secs(seen));
         assert_eq!(
             run(&mut f, &d, &["s1"], NOW, false),
             [format!("s1: {want}")],
@@ -378,11 +392,11 @@ fn a_rollback_follows_the_same_rules() {
     let mut f = fleet(
         NOW,
         &[
-            ("s1", Storage, beat("2.0")),
-            ("s2", Storage, beat("2.0")),
-            ("s3", Storage, beat("2.0")),
-            ("f1", Frontend, beat("2.0")),
-            ("f2", Frontend, beat("2.0")),
+            ("s1", HostRole::STORAGE, beat("2.0")),
+            ("s2", HostRole::STORAGE, beat("2.0")),
+            ("s3", HostRole::STORAGE, beat("2.0")),
+            ("f1", HostRole::FRONTEND, beat("2.0")),
+            ("f2", HostRole::FRONTEND, beat("2.0")),
         ],
     );
     assert_eq!(
@@ -403,7 +417,10 @@ fn a_rollback_follows_the_same_rules() {
     );
     let mut thin = fleet(
         NOW,
-        &[("s1", Storage, beat("2.0")), ("s2", Storage, beat("2.0"))],
+        &[
+            ("s1", HostRole::STORAGE, beat("2.0")),
+            ("s2", HostRole::STORAGE, beat("2.0")),
+        ],
     );
     assert_eq!(
         run(&mut thin, &desired("1.0", 2, 1), &["s1", "s2"], NOW, true),
