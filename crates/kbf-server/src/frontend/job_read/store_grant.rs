@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Arg, ArgMatches};
-use kbf_front::job_read::{AccessKey, StoreGrantError, StoreGrants};
+use kbf_front::job_read::{AccessKey, StoreGrantError, StoreGrants, check_store_url};
 use zeroize::Zeroizing;
 
 use super::{JobReadError, StoreGrantFlags};
@@ -93,7 +93,9 @@ pub(super) fn from_matches(m: &ArgMatches) -> Option<StoreGrantFlags> {
 /// or the bucket.
 pub(super) fn grants(flags: &StoreGrantFlags) -> Result<StoreGrants, JobReadError> {
     let key = read_key(&flags.key_file)?;
-    check_url(&flags.url)?;
+    check_store_url(&flags.url).map_err(|why| JobReadError::StoreUrl {
+        why: why.to_owned(),
+    })?;
     // The key and the bucket are tried by making a grant with them: tierstore's own verdict.
     StoreGrants::new(key, &flags.url, &flags.bucket).map_err(|error| match error {
         StoreGrantError::Bucket => JobReadError::StoreBucket {
@@ -137,28 +139,4 @@ fn read_key(path: &Path) -> Result<AccessKey, JobReadError> {
         return Err(bad(NOT_KEY.to_owned()));
     }
     Ok(AccessKey::new(&id, &secret))
-}
-
-/// Whether `url` is a base URL a task can append `/<bucket>/<key>` to.
-fn check_url(url: &str) -> Result<(), JobReadError> {
-    let bad = |why: &str| JobReadError::StoreUrl {
-        why: why.to_owned(),
-    };
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .ok_or_else(|| bad("must start with http:// or https://"))?;
-    if rest
-        .chars()
-        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '?' | '#'))
-    {
-        return Err(bad(
-            "has a space, a control character, a query or a fragment",
-        ));
-    }
-    let host = rest.trim_end_matches('/');
-    if host.is_empty() || host.contains('/') {
-        return Err(bad("must be a host and a port with no path"));
-    }
-    Ok(())
 }

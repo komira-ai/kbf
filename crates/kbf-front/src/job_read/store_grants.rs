@@ -39,6 +39,31 @@ pub const KEYS_PER_GRANT: usize = 600;
 /// four thirds of this, under the 64 KiB tierstore takes.
 pub const BODY_BYTES_PER_GRANT: usize = 46_000;
 
+/// Whether `url` is a base URL a task can append `/<bucket>/<key>` to: `http://` or `https://`,
+/// then a host and perhaps a port, with no path, query or fragment, space or control character.
+///
+/// # Errors
+/// What is wrong with it.
+pub fn check_store_url(url: &str) -> Result<(), &'static str> {
+    let rest = if let Some(rest) = url.strip_prefix("https://") {
+        rest
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        rest
+    } else {
+        return Err("must start with http:// or https://");
+    };
+    for c in rest.chars() {
+        if c.is_whitespace() || c.is_control() || c == '?' || c == '#' {
+            return Err("has a space, a control character, a query or a fragment");
+        }
+    }
+    let host = rest.trim_end_matches('/');
+    if host.is_empty() || host.contains('/') {
+        return Err("must be a host and a port with no path");
+    }
+    Ok(())
+}
+
 /// What `GET /locate` signs store grants with, and where it says the store is.
 #[derive(Debug)]
 pub struct StoreGrants {

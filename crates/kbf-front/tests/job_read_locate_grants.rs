@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::Full;
-use kbf_front::job_read::{AccessKey, GRANT_LIFETIME, KEYS_PER_GRANT, Reply, StoreGrants};
+use kbf_front::job_read::{
+    AccessKey, GRANT_LIFETIME, KEYS_PER_GRANT, Reply, StoreGrants, check_store_url,
+};
 use kbf_types::Digest;
 use serde_json::{Value, json};
 use tierstore::server::{GRANT_HEADER, Server, ServerConfig};
@@ -588,6 +590,34 @@ fn a_key_or_bucket_tierstore_refuses_is_refused_when_the_grants_are_made() {
     assert!(StoreGrants::new(AccessKey::new("id/with/slash", SECRET), STORE, BUCKET).is_err());
     assert!(StoreGrants::new(AccessKey::new(KEY_ID, ""), STORE, BUCKET).is_err());
     assert!(StoreGrants::new(AccessKey::new(KEY_ID, SECRET), STORE, "").is_err());
+}
+
+/// Catches: a store URL a task could not append `/<bucket>/<key>` to (no http or https scheme,
+/// no host, a path, a query, a fragment, a space or a control character) taken, and one it could
+/// use refused.
+#[test]
+fn a_store_url_is_a_scheme_and_a_host_and_nothing_else() {
+    for good in [
+        "http://127.0.0.1:9000",
+        "https://store.farm.test",
+        "https://[::1]:9000/",
+    ] {
+        assert_eq!(check_store_url(good), Ok(()), "{good}");
+    }
+    for (bad, why) in [
+        ("ftp://store:9000", "http"),
+        ("store:9000", "http"),
+        ("", "http"),
+        ("http://store:9000?x=1", "query"),
+        ("http://store:9000#top", "fragment"),
+        ("http://sto re:9000", "space"),
+        ("http://sto\u{7}re:9000", "control"),
+        ("https://", "host"),
+        ("http://store:9000/tiers", "path"),
+    ] {
+        let found = check_store_url(bad).expect_err(bad);
+        assert!(found.contains(why), "{bad}: {found}");
+    }
 }
 
 /// Catches: a grant minted here that tierstore's server does not accept, or accepts for more

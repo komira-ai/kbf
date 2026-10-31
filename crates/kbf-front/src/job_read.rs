@@ -76,7 +76,9 @@ mod walk;
 
 pub use self::locate::{HEADS_IN_FLIGHT, LOCATE_PATH, MAX_LOCATE_LINE_BYTES, Span, large_key};
 pub use self::source::BlobSource;
-pub use self::store_grants::{BODY_BYTES_PER_GRANT, GRANT_LIFETIME, KEYS_PER_GRANT, StoreGrants};
+pub use self::store_grants::{
+    BODY_BYTES_PER_GRANT, GRANT_LIFETIME, KEYS_PER_GRANT, StoreGrants, check_store_url,
+};
 pub use tierstore::server::{AccessKey, GrantError as StoreGrantError};
 
 pub use self::walk::MAX_SCOPE_BLOB_BYTES;
