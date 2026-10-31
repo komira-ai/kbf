@@ -5,7 +5,7 @@
 //! YAML parser (`saphyr-parser`, through [`yaml`]) and evaluates the document. It
 //! refuses a workflow if:
 //! - `on` names the `pull_request_target` trigger, or the `workflow_run` trigger in any shape
-//!   but the one `release.yml` uses ([`workflow_run`]); both run with the base repository's
+//!   but the one `release.yml` and `pipeline-rerun.yml` use ([`workflow_run`]); both run with the base repository's
 //!   secrets and token. Any form (a string, a list or a mapping, block or flow) is read;
 //! - a job's `runs-on` is not exactly one GitHub-hosted runner label from
 //!   [`HOSTED_LABELS`], written out literally: a string, a one-entry list, or a
@@ -14,14 +14,16 @@
 //!   label, such as `ubuntu-gpu`) or a second label could select a non-hosted runner,
 //!   so each is refused because the lint cannot tell where it lands;
 //! - a job's `permissions` grants anything but `read` or `none`, except `actions` ([`ACTIONS_SCOPES`]: the
-//!   pipeline's watch job cancels its own run), which may be `write` only in a job whose `if:` is exactly
-//!   [`SIGNING_PUSH_ONLY`], and the two scopes
+//!   pipeline's watch job cancels its own run, and the rerun of its failed jobs), which may be `write` only in a job whose `if:` is exactly
+//!   [`SIGNING_PUSH_ONLY`] or exactly [`RERUN_ONLY`], and the two scopes
 //!   that sign build provenance ([`SIGNING_SCOPES`]: `id-token` and `attestations`),
 //!   which may be `write` only in a job whose `if:` is exactly [`SIGNING_PUSH_ONLY`] or exactly
 //!   [`SIGNING_STAGE_ONLY`] (the same push to main, and the called artifacts workflow's `sign`
 //!   stage; a caller job has no `inputs`, so it keeps [`SIGNING_PUSH_ONLY`]) (`id-token`
 //!   also in a job whose `if:` is exactly [`RELEASE_PUSH_ONLY`], for the release's deploy step,
-//!   [`DEPLOY_SCOPE`]), and
+//!   [`DEPLOY_SCOPE`]; and in a job whose `if:` is exactly [`SITE_DEPLOY_IF`] and whose `environment:` is exactly
+//!   [`SITE_DEPLOY_ENVIRONMENT`], tierstore.dev's deploy: a push to `main` or a manual run of `main`, in the one environment
+//!   its AWS role trusts), and
 //!   `contents` ([`RELEASE_SCOPES`]), which may be `write` only in a job whose `if:` is
 //!   exactly [`RELEASE_PUSH_ONLY`]. So no pull request or merge-queue run holds a
 //!   token that can sign an attestation, every attestation this repository signs names
@@ -89,9 +91,9 @@ mod yaml;
 
 mod jobs;
 pub use jobs::{
-    concurrency, job_env, job_environment, job_has_key, job_needs, job_outputs,
-    job_permission_levels, job_uses, job_with, push_filters, top_defaults_shell, top_env,
-    trigger_filters,
+    concurrency, job_env, job_environment, job_has_key, job_matrix, job_name, job_needs,
+    job_outputs, job_permission_levels, job_uses, job_with, push_filters, top_defaults_shell,
+    top_env, trigger_filters,
 };
 
 use yaml::{Node, Value};
@@ -173,6 +175,16 @@ const SIGNING_STAGE_ONLY: &str = "${{ github.event_name == 'push' && github.ref 
 /// `release.yml` holds the one job that has it to `contents: read` beside it.
 const DEPLOY_SCOPE: &str = "id-token";
 
+/// The one `if:` spelling under which the site deploy job may hold [`DEPLOY_SCOPE`] for writing, together with
+/// [`SITE_DEPLOY_ENVIRONMENT`] (both must hold): a push to `main` or a manual run, on the ref `main`.
+/// A pull request run satisfies neither event.
+const SITE_DEPLOY_IF: &str = "${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}";
+
+/// The GitHub environment the site deploy job runs in: the one AWS role of tierstore.dev trusts (its `sub` names it), whose
+/// settings are the bucket and the role. `id-token: write` under [`SITE_DEPLOY_IF`] is allowed in a job of this environment
+/// and no other. `site_deploy_workflow` holds the rest of the deploy's shape.
+const SITE_DEPLOY_ENVIRONMENT: &str = "prod-site-tierstore";
+
 /// Token scopes a job may set to `write` when it runs only for a push to `main` that releases:
 /// the repository's contents, which creating a release and uploading its assets need.
 const RELEASE_SCOPES: &[&str] = &["contents"];
@@ -190,6 +202,12 @@ const ISSUE_SCOPES: &[&str] = &["issues"];
 /// Token scopes a job may set to `write` when it runs only for a push to `main`: the Actions API,
 /// which the pipeline's watch job uses to cancel its own run when another job has failed.
 const ACTIONS_SCOPES: &[&str] = &["actions"];
+
+/// The second `if:` spelling under which a job may hold [`ACTIONS_SCOPES`] for writing (and only
+/// those): the completed pipeline run of a push to `main` of this repository that failed or was
+/// cancelled (the watch cancels a run for a failed job), in its first attempt. `pipeline-rerun.yml`
+/// reruns the failed jobs of that run once; the attempt test is what stops it looping.
+const RERUN_ONLY: &str = "${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}";
 
 /// The one `if:` spelling under which a job may hold [`ISSUE_SCOPES`] for writing: a run
 /// whose ref is `main` (a scheduled run, a push to `main`, a manual run of `main`). A pull
@@ -603,7 +621,8 @@ impl Lint<'_> {
             }
         }
         if let Some(p) = get(job_map, "permissions") {
-            self.job_permissions(p, get(job_map, "if").and_then(Node::as_str));
+            let environment = get(job_map, "environment").and_then(Node::as_str);
+            self.job_permissions(p, get(job_map, "if").and_then(Node::as_str), environment);
         }
         match get(job_map, "runs-on") {
             Some(r) => self.runs_on(r),
@@ -665,10 +684,11 @@ impl Lint<'_> {
     /// A job may narrow its token to `read` or `none` scopes; it may not widen it, but
     /// for [`SIGNING_SCOPES`] set to `write` in a job whose `if:` (`condition`) is
     /// exactly [`SIGNING_PUSH_ONLY`], [`RELEASE_SCOPES`] set to `write` in one whose
-    /// `if:` is exactly [`RELEASE_PUSH_ONLY`], and [`ISSUE_SCOPES`] in one whose `if:`
-    /// is exactly [`ISSUES_MAIN_ONLY`]. Scope names and levels are compared
+    /// `if:` is exactly [`RELEASE_PUSH_ONLY`], [`ISSUE_SCOPES`] in one whose `if:`
+    /// is exactly [`ISSUES_MAIN_ONLY`], and `id-token` alone in a job whose `if:` is exactly
+    /// [`SITE_DEPLOY_IF`] and whose `environment:` is exactly [`SITE_DEPLOY_ENVIRONMENT`]. Scope names and levels are compared
     /// exactly, so another spelling is refused (the safe side).
-    fn job_permissions(&mut self, p: &Node, condition: Option<&str>) {
+    fn job_permissions(&mut self, p: &Node, condition: Option<&str>, environment: Option<&str>) {
         let Value::Map(scopes) = &p.value else {
             self.refuse(
                 p,
@@ -685,12 +705,20 @@ impl Lint<'_> {
             if name == DEPLOY_SCOPE && granted == "write" && condition == Some(RELEASE_PUSH_ONLY) {
                 continue;
             }
+            // The site deploy: the OIDC token alone (no attestation), for main only, in the site's own environment.
+            if name == DEPLOY_SCOPE
+                && granted == "write"
+                && condition == Some(SITE_DEPLOY_IF)
+                && environment == Some(SITE_DEPLOY_ENVIRONMENT)
+            {
+                continue;
+            }
             let gate: &[&str] = if SIGNING_SCOPES.contains(&name) {
                 &[SIGNING_PUSH_ONLY, SIGNING_STAGE_ONLY]
             } else if RELEASE_SCOPES.contains(&name) {
                 &[RELEASE_PUSH_ONLY]
             } else if ACTIONS_SCOPES.contains(&name) {
-                &[SIGNING_PUSH_ONLY]
+                &[SIGNING_PUSH_ONLY, RERUN_ONLY]
             } else if ISSUE_SCOPES.contains(&name) {
                 &[ISSUES_MAIN_ONLY]
             } else {

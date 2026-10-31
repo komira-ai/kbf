@@ -78,6 +78,87 @@ fn the_printed_file_loads_to_the_settings_of_the_flags() {
     }
 }
 
+/// Asserts that the front's flags are written as an `[oci]` table and only then: every flag of it
+/// gives its key, `--oci-listen` alone gives the table with `listen` only (a plain-HTTP front)
+/// and loads back to the same settings, and flags without the front give no table.
+#[test]
+fn the_oci_flags_are_printed_as_the_oci_table() {
+    let (cli, _) = parse(s3_flags());
+    let table: toml::Table = toml::from_str(&render(&cli).unwrap()).unwrap();
+    let oci = table["oci"].as_table().expect("an [oci] table");
+    let keys: Vec<&str> = oci.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        [
+            "connection_lifetime",
+            "listen",
+            "max_connections",
+            "prefix",
+            "tls_cert_file",
+            "tls_key_file"
+        ]
+    );
+    assert_eq!(oci["listen"].as_str(), Some("192.0.2.10:5000"));
+    assert_eq!(
+        oci["tls_cert_file"].as_str(),
+        Some("/etc/tierstore/oci.crt")
+    );
+    assert_eq!(oci["connection_lifetime"].as_str(), Some("30m"));
+
+    let mut flags = dir_flags();
+    flags.push("--oci-listen=127.0.0.1:5000");
+    let (cli, per_run) = parse(flags);
+    let text = render(&cli).unwrap();
+    let table: toml::Table = toml::from_str(&text).unwrap();
+    let keys: Vec<&str> = table["oci"]
+        .as_table()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, ["listen"]);
+    let expected = Cli {
+        print_config: false,
+        ..cli
+    };
+    assert_eq!(from_text(&text, per_run).unwrap(), expected);
+
+    let (cli, _) = parse(dir_flags());
+    let table: toml::Table = toml::from_str(&render(&cli).unwrap()).unwrap();
+    assert!(!table.contains_key("oci"));
+}
+
+/// Asserts that repeated `--listen` and `--oci-listen` are printed as lists, that the file loads
+/// back to the settings of the flags, and that a flag given once is still printed as a string, so
+/// that a file printed for one address is the file it always was.
+#[test]
+fn repeated_listen_flags_are_printed_as_lists_and_load_back() {
+    let mut flags = dir_flags();
+    flags.retain(|flag| !flag.starts_with("--listen="));
+    flags.extend([
+        "--listen=0.0.0.0:9300",
+        "--listen=[::]:9300",
+        "--oci-listen=0.0.0.0:5000",
+        "--oci-listen=[::]:5000",
+    ]);
+    let (cli, per_run) = parse(flags);
+    assert_eq!((cli.listen.len(), cli.oci_listen.len()), (2, 2));
+    let text = render(&cli).unwrap();
+    let table: toml::Table = toml::from_str(&text).unwrap();
+    let count = |name: &str| table[name]["listen"].as_array().map(Vec::len);
+    assert_eq!(count("server"), Some(2), "{text}");
+    assert_eq!(count("oci"), Some(2), "{text}");
+    let expected = Cli {
+        print_config: false,
+        ..cli
+    };
+    assert_eq!(from_text(&text, per_run).unwrap(), expected);
+
+    let (cli, _) = parse(dir_flags());
+    let table: toml::Table = toml::from_str(&render(&cli).unwrap()).unwrap();
+    assert_eq!(table["server"]["listen"].as_str(), Some("127.0.0.1:0"));
+}
+
 /// Asserts that, across the sets of flags of these tests, every flag of the binary is given at
 /// least once, so that the round trip tests all of them: a flag added without being added to a
 /// set fails here.
@@ -90,11 +171,14 @@ fn every_flag_is_given_in_one_of_the_round_trips() {
         .map(|word| word.split('=').next().unwrap().to_owned())
         .collect();
     let command = Cli::command();
-    // `--config` is the file itself: a round trip never gives it.
-    for arg in command
-        .get_arguments()
-        .filter(|arg| arg.get_long() != Some("config"))
-    {
+    // `--config` is the file itself, `--check-config` only checks one, and `--capabilities` prints
+    // and exits before any setting is read: a round trip never gives any of them.
+    for arg in command.get_arguments().filter(|arg| {
+        !matches!(
+            arg.get_long(),
+            Some("config" | "check-config" | "capabilities")
+        )
+    }) {
         let long = arg.get_long().unwrap();
         assert!(given.contains(long), "--{long} is in no set of flags");
     }

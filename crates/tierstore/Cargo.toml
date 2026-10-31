@@ -1,6 +1,8 @@
 [package]
 name = "tierstore"
-version.workspace = true
+# Its own version, not the workspace's: 0.2.0 is the first release whose cache node can write
+# through (`[local_cache] write_through`), which `tierstore --version` shows.
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -10,16 +12,15 @@ publish.workspace = true
 # A generic hot/cold object store over S3-compatible backends. It knows nothing of kbf and its
 # normal dependencies include no kbf crate unless the `s3` feature is on, so it can move to a
 # repository of its own (crates/kbf-integration-test/tests/layering.rs keeps it that way). The
-# tests use `kbf-objstore` and `kbf-testkit` as dev-dependencies, which stay behind when it
-# moves.
+# tests use `kbf-testkit` as a dev-dependency, which stays behind when it moves.
 
 [features]
-# `S3Backend`, a `Backend` over the S3 client of `kbf-objstore`. Off by default: without it the
+# `S3Backend`, a `Backend` over the S3 client of `objstore-s3`. Off by default: without it the
 # crate's own dependencies include no kbf crate (crates/kbf-integration-test/tests/layering.rs
-# checks the normal dependencies without it; the tests always build `kbf-objstore`, see
+# checks the normal dependencies without it; the tests always build `objstore-s3`, see
 # `[dev-dependencies]`). `server` turns it on. CI runs the tests and clippy with it on
 # (.github/workflows/ci.yml).
-s3 = ["dep:kbf-objstore"]
+s3 = ["dep:objstore-s3"]
 # `server`: the S3 API front of the proxy (the `server` module) and the `tierstore` binary that
 # runs it. Off by default, so the library carries no HTTP stack; the crate's own tests turn it on
 # through the dev-dependency on itself, so the workspace runs build and test it. It turns `s3`
@@ -39,6 +40,9 @@ server = [
     "dep:ring",
     "dep:rustix",
     "dep:roxmltree",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:x509-parser",
     "dep:toml",
     "s3",
     "tokio/macros",
@@ -74,18 +78,23 @@ http-body-util = { workspace = true, optional = true }
 # The HTTP/1.1 server under the S3 front (`server`).
 hyper = { workspace = true, features = ["http1", "server"], optional = true }
 hyper-util = { workspace = true, features = ["tokio"], optional = true }
-# `s3` only: the S3 client that `S3Backend` adapts.
-kbf-objstore = { workspace = true, optional = true }
 # The MD5 a client may send as the `Content-MD5` of a body (`server`).
 md-5 = { workspace = true, optional = true }
+# `s3` only: the S3 client that `S3Backend` adapts.
+objstore-s3 = { workspace = true, optional = true }
 # The decoding of a request's path and query, and the encoding SigV4 signs (`server`).
 percent-encoding = { workspace = true, optional = true }
 # The SHA-1 a client may send as the `x-amz-checksum-sha1` of a body (`server`).
 ring = { workspace = true, optional = true }
-# The user id the server runs as, which a key file must belong to (`server`).
-rustix = { workspace = true, features = ["process"], optional = true }
+# The user id the server runs as, which a key file must belong to, and the free space, the link count and
+# the times of the files of the local cache, and the listening sockets, which `std` cannot bind
+# with `IPV6_V6ONLY` set (`server`).
+rustix = { workspace = true, features = ["fs", "net", "process"], optional = true }
 # The body of a CompleteMultipartUpload request (`server`).
 roxmltree = { workspace = true, optional = true }
+# The TLS of the OCI read front (`server`): the certificate and key are read at start, and the
+# acceptor is made with the ring provider the rest of the workspace uses.
+rustls = { workspace = true, optional = true }
 # The journal objects, the checkpoints and the usage object are JSON.
 serde.workspace = true
 serde_json.workspace = true
@@ -97,6 +106,10 @@ toml = { workspace = true, optional = true }
 # `sync` for the batches of the journal, `time` for the linger, the back-pressure and the
 # injected delays.
 tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
+# The handshake of the OCI read front's connections (`server`).
+tokio-rustls = { workspace = true, optional = true }
+# The IP subjectAltNames of the OCI front's certificate, which the start checks (`server`).
+x509-parser = { workspace = true, optional = true }
 
 [dev-dependencies]
 # A stock S3 SDK (aws-sdk-rust) and its plain-HTTP client, which tests/s3_front/sdk.rs drives
@@ -106,14 +119,19 @@ aws-sdk-s3.workspace = true
 aws-smithy-http-client.workspace = true
 # Signs the requests the tests of the S3 front send by hand, apart from the code that checks them.
 hmac.workspace = true
-# The S3 client kbf itself uses, which the tests of the S3 front drive it with, and the loopback
+# The S3 client (the one kbf itself uses), which the tests of the S3 front drive it with, and the loopback
 # S3 service of the tests of `S3Backend`. A dev-dependency is built for every test build, with
 # the `s3` feature or without it, though only the `s3` tests use the service.
-kbf-objstore = { workspace = true, features = ["testkit"] }
+objstore-s3 = { workspace = true, features = ["testkit"] }
 # Scratch directories and key files of the tests of the binary.
 kbf-testkit.workspace = true
+# A test CA and a leaf with IP subjectAltNames, for the tests of the OCI read front.
+rcgen.workspace = true
 # Sends the requests the S3 client does not: unsigned ones and ones signed by hand.
 reqwest.workspace = true
+# The TLS client of the tests of the OCI read front.
+rustls.workspace = true
+tokio-rustls.workspace = true
 # SIGTERM to the binary.
 rustix = { workspace = true, features = ["process"] }
 # Turns the `server` feature on for this crate's own tests, and for the clippy and coverage

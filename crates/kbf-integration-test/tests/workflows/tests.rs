@@ -518,7 +518,7 @@ fn actions_write_needs_a_job_that_runs_only_for_a_push_to_main() {
         assert_eq!(
             scan(&workflow(&body)),
             vec![format!(
-                "line {}: `actions: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}`",
+                "line {}: `actions: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}` or exactly `{RERUN_ONLY}`",
                 if cond.is_empty() { 7 } else { 8 }
             )],
             "{body}"
@@ -722,6 +722,66 @@ fn id_token_write_is_also_allowed_for_a_release_push_to_main_and_nothing_wider()
         &format!("    runs-on: ubuntu-latest\n{TAG_PUSH_IF}    permissions: {{id-token: admin}}\n"),
         "a job's `permissions`",
     );
+}
+
+/// The `if:` and `environment:` lines of the site deploy job, as the lint requires them.
+const SITE_DEPLOY_IF_LINE: &str = "    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}\n";
+const SITE_DEPLOY_ENV_LINE: &str = "    environment: prod-site-tierstore\n";
+
+#[test]
+fn id_token_write_is_allowed_for_the_site_deploy_and_only_in_its_environment_on_main() {
+    // Catches: tierstore.dev's deploy refused where it needs the OIDC token, and the exception
+    // taken beyond what it names: any other environment (or none, or a mapping form the lint does
+    // not read), a loosened or missing condition (the pull-request events, the signing push, the
+    // bare main ref), another scope (`attestations`, `contents`) or another level.
+    let job = |cond: &str, env: &str, perms: &str| {
+        format!("    runs-on: ubuntu-latest\n{cond}{env}    permissions: {perms}\n")
+    };
+    clean(&workflow(&job(
+        SITE_DEPLOY_IF_LINE,
+        SITE_DEPLOY_ENV_LINE,
+        "{id-token: write}",
+    )));
+    clean(&workflow(&job(
+        SITE_DEPLOY_IF_LINE,
+        SITE_DEPLOY_ENV_LINE,
+        "{contents: read, id-token: write}",
+    )));
+    let want = format!(
+        "`id-token: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}`"
+    );
+    for env in [
+        "",
+        "    environment: prod\n",
+        "    environment: prod-site\n",
+        "    environment: prod-site-tierstore-2\n",
+        "    environment: PROD-SITE-TIERSTORE\n",
+        "    environment: {name: prod-site-tierstore}\n",
+    ] {
+        refused(&job(SITE_DEPLOY_IF_LINE, env, "{id-token: write}"), &want);
+    }
+    for cond in [
+        "",
+        MAIN_REF_IF,
+        "    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}\n",
+        "    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && github.ref == 'refs/heads/main' }}\n",
+        "    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}\n",
+        "    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' || true }}\n",
+    ] {
+        refused(&job(cond, SITE_DEPLOY_ENV_LINE, "{id-token: write}"), &want);
+    }
+    for (perms, why) in [
+        (
+            "{attestations: write}",
+            "`attestations: write` is allowed only",
+        ),
+        ("{contents: write}", "`contents: write` is allowed only"),
+        ("{packages: write}", "a job's `permissions`"),
+        ("{id-token: admin}", "a job's `permissions`"),
+        ("write-all", "a job's `permissions`"),
+    ] {
+        refused(&job(SITE_DEPLOY_IF_LINE, SITE_DEPLOY_ENV_LINE, perms), why);
+    }
 }
 
 /// The `if:` line under which a job may write issues, as the lint requires it.
@@ -978,4 +1038,132 @@ fn unreadable_bytes_are_refused_and_a_bom_is_dropped() {
         .chain(w.encode_utf16().flat_map(u16::to_le_bytes))
         .collect();
     assert!(decode(&utf16).is_err());
+}
+
+/// A job `a` with the given `strategy:` lines under it.
+fn with_strategy(strategy: &str) -> String {
+    workflow(&format!(
+        "    runs-on: ubuntu-latest\n    strategy:\n{strategy}    steps:\n      - run: echo\n"
+    ))
+}
+
+#[test]
+fn a_matrix_of_include_entries_is_read_in_order() {
+    // Catches: a reader that drops an entry, reorders keys or reads a number as no value.
+    let text = with_strategy(
+        "      fail-fast: false\n      matrix:\n        include:\n          - core: legacy\n            part: 1\n            args: -p a --features x/y\n          - { core: js, part: 2 }\n",
+    );
+    let got = job_matrix(&text, "a").expect("matrix");
+    let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+    assert_eq!(
+        got,
+        vec![
+            vec![
+                pair("core", "legacy"),
+                pair("part", "1"),
+                pair("args", "-p a --features x/y")
+            ],
+            vec![pair("core", "js"), pair("part", "2")],
+        ]
+    );
+}
+
+#[test]
+fn a_matrix_of_another_shape_is_an_error_not_an_empty_answer() {
+    // Catches: a rewritten matrix (axes, no list, an empty list, a nested value) that the
+    // reader would take for no entries, so a lint over it passed by reading nothing.
+    let cases = [
+        (
+            "    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n",
+            "the job `a` has no `strategy` mapping",
+        ),
+        (
+            "      fail-fast: false\n",
+            "the `strategy` of job `a` has no `matrix` mapping",
+        ),
+        (
+            "      matrix:\n        core: [legacy, js]\n        include:\n          - core: x\n",
+            "the matrix of job `a` has a key besides `include`",
+        ),
+        (
+            "      matrix:\n        include: x\n",
+            "the matrix of job `a` has no `include` list",
+        ),
+        (
+            "      matrix:\n        include: []\n",
+            "the matrix of job `a` has no entry",
+        ),
+        (
+            "      matrix:\n        include:\n          - [a, b]\n",
+            "a matrix entry of job `a` is not a mapping",
+        ),
+        (
+            "      matrix:\n        include:\n          - core: [a]\n",
+            "a matrix entry of job `a` has a value that is not a scalar",
+        ),
+    ];
+    for (strategy, want) in cases {
+        let text = if want.contains("no `strategy`") {
+            workflow(strategy)
+        } else {
+            with_strategy(strategy)
+        };
+        let e = job_matrix(&text, "a").expect_err(want);
+        assert!(e.contains(want), "want `{want}`, got `{e}`");
+    }
+    assert!(
+        job_matrix(
+            &with_strategy("      matrix:\n        include:\n          - a: 1\n"),
+            "b"
+        )
+        .is_err()
+    );
+}
+
+/// The `if:` line under which a job may rerun the failed jobs of a pipeline run (`pipeline-rerun.yml`).
+const RERUN_IF: &str = "    if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}\n";
+
+#[test]
+fn actions_write_is_also_allowed_for_the_first_attempt_of_a_failed_pipeline_run_and_nothing_wider()
+{
+    // Catches: the rerun workflow's `actions: write` refused; the exception loosened so that it
+    // runs for any attempt (a rerun loop), a run that was not a push to main, another branch or
+    // repository, or a green run; and the exception taken for any other write scope.
+    assert_eq!(format!("    if: {RERUN_ONLY}\n"), RERUN_IF);
+    clean(&workflow(&format!(
+        "    runs-on: ubuntu-latest\n{RERUN_IF}    permissions: {{contents: read, actions: write}}\n"
+    )));
+    for cond in [
+        "if: ${{ github.event.workflow_run.conclusion == 'failure' }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 2 && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion != 'success') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 }}",
+        "if: ${{ github.ref == 'refs/heads/main' }}",
+    ] {
+        let body = format!(
+            "    runs-on: ubuntu-latest\n    {cond}\n    permissions: {{actions: write}}\n"
+        );
+        let found = scan(&workflow(&body));
+        assert!(
+            found
+                .iter()
+                .any(|m| m
+                    .contains("`actions: write` is allowed only in a job whose `if:` is exactly")),
+            "{body}\n-> {found:?}"
+        );
+    }
+    for scope in ["contents", "id-token", "attestations", "issues"] {
+        let body =
+            format!("    runs-on: ubuntu-latest\n{RERUN_IF}    permissions: {{{scope}: write}}\n");
+        let found = scan(&workflow(&body));
+        assert!(
+            found
+                .iter()
+                .any(|m| m.contains(&format!("`{scope}: write` is allowed only"))),
+            "{body}\n-> {found:?}"
+        );
+    }
 }

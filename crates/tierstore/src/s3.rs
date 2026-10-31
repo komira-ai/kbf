@@ -1,4 +1,4 @@
-//! [`S3Backend`]: a [`Backend`] over the S3 client of `kbf-objstore` (feature `s3`).
+//! [`S3Backend`]: a [`Backend`] over the S3 client of `objstore-s3` (feature `s3`).
 //!
 //! The backend is an adapter and keeps no state: each call of the trait is the S3 request of
 //! the same meaning, sent by the client the workspace already has (path-style addressing,
@@ -83,7 +83,9 @@
 //!   are [`Error::Unavailable`] (a server error may be gone on the next try). 507
 //!   (Insufficient Storage, which is how MinIO reports a full drive) is [`Error::Full`]. 501 (Not
 //!   Implemented: the store does not do what was asked) and anything else that is not a success
-//!   is [`Error::Other`].
+//!   is [`Error::Other`]. A 409 `ConditionalRequestConflict` (two writers racing a conditional
+//!   write of one key; the store does not say which won) is [`Error::Unavailable`]: a retry is
+//!   answered 412 if the other writer won.
 //!
 //! Each request is bounded by the `request_timeout` of the [`S3Config`], and a read is sent
 //! again after a failure in transport; a write never is. A part is the exception to the bound:
@@ -97,16 +99,16 @@ use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use futures::future;
 use futures::stream;
-use kbf_objstore::s3::{S3Store, StampedObject};
-use kbf_objstore::{
+use objstore_s3::s3::{S3Store, StampedObject};
+use objstore_s3::{
     BodyStream, KeyPrefix, ListToken, ObjectKey, ObjectStore, ObjectStoreError, PageSize,
 };
 use tokio::sync::mpsc;
 
 use crate::{Backend, ByteRange, Error, Listed, Meta, OpenUpload, PartBody, UploadsAfter};
 
-pub use kbf_objstore::Capabilities;
-pub use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError};
+pub use objstore_s3::Capabilities;
+pub use objstore_s3::s3::{Credentials, S3Config, S3ConfigError};
 
 /// The greatest byte position a `Range` names. A store reads the positions as signed 64-bit
 /// numbers and refuses or ignores a larger one, so a range is cut here before it is sent.
@@ -153,7 +155,7 @@ impl S3Backend {
     ) -> Result<Bytes, Error> {
         let room = LAST_POSITION.saturating_sub(range.offset());
         let len = range.size().min(room);
-        if let Some(asked) = kbf_objstore::ByteRange::new(range.offset(), len) {
+        if let Some(asked) = objstore_s3::ByteRange::new(range.offset(), len) {
             match self.store.get_range(object, asked).await {
                 Err(ObjectStoreError::InvalidRange { .. }) => {}
                 answer => return answer.map_err(|e| map_error(e, key)),
@@ -223,7 +225,7 @@ fn listed_of(object: StampedObject) -> Listed {
 }
 
 /// An upload of a listing of the client as one of this crate.
-fn open_of(upload: kbf_objstore::s3::OpenUpload) -> OpenUpload {
+fn open_of(upload: objstore_s3::s3::OpenUpload) -> OpenUpload {
     OpenUpload {
         key: upload.key.as_str().to_owned(),
         id: upload.upload_id,
@@ -239,6 +241,14 @@ fn map_error(error: ObjectStoreError, key: &str) -> Error {
         ObjectStoreError::NotFound(_) => Error::NotFound(key),
         ObjectStoreError::AlreadyExists(_) => Error::AlreadyExists(key),
         ObjectStoreError::Transport(_) => Error::Unavailable(message),
+        // 409 `ConditionalRequestConflict`: another write of the key was in flight when this
+        // conditional write arrived (S3 and MinIO both answer it for two writers racing a
+        // create-only put). Neither the store's documentation nor its answer says which writer
+        // won, so the outcome is unknown, and the answer is the one the documentation gives for
+        // it: try again. A retry gets a plain 412 if the other writer won.
+        ObjectStoreError::Service { ref code, .. } if code == "ConditionalRequestConflict" => {
+            Error::Unavailable(message)
+        }
         ObjectStoreError::Service { status, .. } => by_status(status, key, message),
         _ => Error::Other(message),
     }
@@ -558,6 +568,15 @@ mod tests {
             let other = map_error(service(status), "k");
             assert!(matches!(other, Error::Other(_)), "{status}: {other}");
         }
+        // Two writers racing a create-only put: the store does not say who won, so the answer
+        // is retryable; a 409 of any other code is still an other error.
+        let racing = ObjectStoreError::Service {
+            status: 409,
+            code: "ConditionalRequestConflict".to_owned(),
+            message: "conflict".to_owned(),
+        };
+        let conflict = map_error(racing, "k");
+        assert!(conflict.is_unavailable(), "{conflict}");
         let odd = map_error(ObjectStoreError::Protocol("odd".to_owned()), "k");
         assert!(odd.to_string().contains("odd"), "{odd}");
     }

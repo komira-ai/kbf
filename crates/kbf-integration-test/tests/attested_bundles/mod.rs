@@ -417,9 +417,15 @@ const WORKFLOW_ENV: &[&str] = &[
     "UPGRADE_FROM_KBF_SHA256_X86_64",
     "UPGRADE_FROM_INSTALLER_SHA256_AARCH64",
     "UPGRADE_FROM_KBF_SHA256_AARCH64",
+    "JS_BUNDLE_VERSION",
+    "JS_BUNDLE_SHA256_AARCH64_DARWIN",
+    "JS_BUNDLE_SOURCE_DIGEST",
     "NFPM_VERSION",
     "NFPM_SHA256_X86_64_LINUX",
     "NFPM_SHA256_AARCH64_LINUX",
+    "SYFT_VERSION",
+    "SYFT_SHA256_X86_64_LINUX",
+    "SYFT_SHA256_AARCH64_LINUX",
 ];
 
 /// The checks of the attest job `job` are `sha256sum` run by the workflow's bash: the workflow's

@@ -16,10 +16,11 @@
 //!   file in `<dir>` (but the provenance bundles, which are made after the sums and so
 //!   cannot be listed: [`crate::bundles`]), each once, and each matches its line, and
 //!   every listed `kbf` tarball has its version facts listed too
-//!   ([`version_facts::facts_of`]; [`verify_sums_with`] waives that for the release made
-//!   before the facts were recorded) and every listed facts file its tarball
+//!   ([`version_facts::facts_of`]) and every listed facts file its tarball
 //!   ([`version_facts::tarball_of`]); the same for a listed task image and its facts
-//!   ([`pkg_image_asset::facts_of`], [`pkg_image_asset::image_of`]). Control: a copy of the first tarball with its last byte
+//!   ([`pkg_image_asset::facts_of`], [`pkg_image_asset::image_of`]), and for a listed task image its
+//!   CycloneDX SBOM and the reverse ([`pkg_image_asset::sbom_of`], [`pkg_image_asset::image_of_sbom`]).
+//!   Control: a copy of the first tarball with its last byte
 //!   flipped must not match that line, so a check that accepts anything fails instead of
 //!   passing.
 //! - `verify-assets attestations <dir> --repo <owner/repo> --workflow-ref <ref> --commit
@@ -32,7 +33,9 @@
 //!   A `.deb` or `.pkg` (the `kbf-installer` package, [`crate::pkg_asset`], the `kbf` package,
 //!   [`crate::pkg_kbf_asset`], and [`crate::pkg_macos_asset`]) is listed and verified
 //!   like a tarball except that it has no SBOM attestation: build provenance and its own
-//!   bundle. The version facts of a `kbf` ([`crate::version_facts`]) and the facts of the task
+//!   bundle, except a task image that has its SBOM listed ([`crate::pkg_image_sbom`]): it also has an SBOM
+//!   attestation, whose subject is the image tarball. The version facts of a `kbf`
+//!   ([`crate::version_facts`]) and the facts of the task
 //!   image ([`crate::pkg_image_asset::facts_text`]) are verified like an
 //!   SBOM: build provenance, and nothing else.
 //!   First, before `gh` is run, `<dir>` holds exactly one bundle per listed tarball and
@@ -61,7 +64,7 @@ use crate::bundles;
 use crate::fetch::Sha256;
 use crate::package::{Platform, read, write_new};
 use crate::pkg_image_asset;
-use crate::version_facts::{self, Pairing};
+use crate::version_facts;
 
 /// The file name of the merged sums file.
 pub const SUMS: &str = "SHA256SUMS";
@@ -254,17 +257,9 @@ fn flipped_tarball<'a>(dir: &Path, lines: &'a [Line]) -> Result<(&'a Line, Vec<u
 
 /// The `verify-assets sums` verb, with the digest `digest` (the real one is
 /// [`Sha256::of`]; tests pass a broken one to see the control refuse it): the line to
-/// print. Every `kbf` tarball must have its version facts listed.
+/// print. Every `kbf` tarball must have its version facts listed, and every task image its
+/// facts and its SBOM.
 pub fn verify_sums(dir: &Path, digest: fn(&[u8]) -> Sha256) -> Result<String, Error> {
-    verify_sums_with(dir, digest, Pairing::Required)
-}
-
-/// [`verify_sums`], holding a `kbf` tarball to its version facts as `pairing` says.
-pub fn verify_sums_with(
-    dir: &Path,
-    digest: fn(&[u8]) -> Sha256,
-    pairing: Pairing,
-) -> Result<String, Error> {
     let lines = read_sums(&dir.join(SUMS))?;
     let mut problems: Vec<String> = duplicates(&lines)
         .iter()
@@ -289,12 +284,10 @@ pub fn verify_sums_with(
         }
     }
     // The facts a `kbf` states of itself are part of its release: the tarball of `kbf`
-    // does not go without them (unless the release is one made before they were recorded),
-    // and they do not go without the tarball they state the facts of.
+    // does not go without them, and they do not go without the tarball they state the facts of.
     let listed = |name: &str| lines.iter().any(|m| m.name == name);
     for l in &lines {
         if let Some(facts) = version_facts::facts_of(&l.name)
-            && pairing == Pairing::Required
             && !listed(&facts)
         {
             problems.push(format!(
@@ -313,7 +306,6 @@ pub fn verify_sums_with(
         // The same for the image that has a base: its facts carry the digest of its manifest
         // and of its base, which the attestation of these sums is to cover.
         if let Some(facts) = pkg_image_asset::facts_of(&l.name)
-            && pairing == Pairing::Required
             && !listed(&facts)
         {
             problems.push(format!(
@@ -326,6 +318,25 @@ pub fn verify_sums_with(
         {
             problems.push(format!(
                 "{}: the image it states the facts of, {image}, is not listed in {SUMS}",
+                l.name
+            ));
+        }
+        // And its CycloneDX SBOM, which names the packages of the base the image carries: the
+        // attest job signs an SBOM attestation with the image as its subject, so the SBOM is part
+        // of the set.
+        if let Some(sbom) = pkg_image_asset::sbom_of(&l.name)
+            && !listed(&sbom)
+        {
+            problems.push(format!(
+                "{}: its image SBOM {sbom} is not listed in {SUMS}",
+                l.name
+            ));
+        }
+        if let Some(image) = pkg_image_asset::image_of_sbom(&l.name)
+            && !listed(&image)
+        {
+            problems.push(format!(
+                "{}: the image it describes, {image}, is not listed in {SUMS}",
                 l.name
             ));
         }
@@ -602,10 +613,24 @@ pub fn verify_attestations(dir: &Path, a: &Attestations) -> Result<Vec<String>, 
             printed.push(format!("verified: {} (provenance, SBOM, bundle)", l.name));
         } else if bundles::is_package(&l.name) {
             // A package has build provenance and its own bundle, and no SBOM attestation
-            // (docs/artifacts.md): what it holds is the tarball's binary, which has one.
+            // (docs/artifacts.md): what it holds is the tarball's binary, which has one. The
+            // exception is an image the release lists an SBOM of (the task image): the attest
+            // job signs an SBOM attestation with the image as its subject, so one is required
+            // exactly when the sums list that SBOM (`verify-assets sums` holds the listing to
+            // the image: the previous release, which has none, is read as it was made).
             a.require(&file, workflow, None)?;
+            let sbom = pkg_image_asset::sbom_of(&l.name)
+                .is_some_and(|sbom| lines.iter().any(|m| m.name == sbom));
+            if sbom {
+                a.require(&file, workflow, Some(SBOM_PREDICATE))?;
+            }
             a.require_bundle(dir, &l.name, workflow)?;
-            printed.push(format!("verified: {} (provenance, bundle)", l.name));
+            let kinds = if sbom {
+                "provenance, SBOM, bundle"
+            } else {
+                "provenance, bundle"
+            };
+            printed.push(format!("verified: {} ({kinds})", l.name));
         } else if l.name.ends_with(".cdx.json")
             || l.name.ends_with(version_facts::SUFFIX)
             || l.name.ends_with(pkg_image_asset::FACTS_SUFFIX)

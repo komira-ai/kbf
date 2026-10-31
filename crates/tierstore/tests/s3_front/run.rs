@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use clap::Parser;
-use kbf_objstore::s3::{Credentials, S3Config, S3Store};
-use kbf_objstore::{ByteRange, Capabilities, ObjectKey, ObjectStore};
+use objstore_s3::s3::{Credentials, S3Config, S3Store};
+use objstore_s3::{ByteRange, Capabilities, ObjectKey, ObjectStore};
 use tierstore::server::Drained;
 use tierstore::server::cli::{Cli, run};
 use tokio::sync::oneshot;

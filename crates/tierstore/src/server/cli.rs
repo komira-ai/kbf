@@ -3,7 +3,10 @@
 //! One process runs three things over the same pair of tiers: a [`Proxy`] with the given id,
 //! the S3 front of that proxy ([`Server`]), and a [`Reconciler`], which works only while it
 //! holds the lease in the hot tier, so that any number of these processes may run over the same
-//! tiers. The settings are flags, or one TOML file given with `--config` (see
+//! tiers. With `--lock-file` it works only while the process also holds an exclusive lock on
+//! that file (see [`Gate`]): a second process over the same node, started beside the first,
+//! serves at once and reconciles when the first has exited. The settings are flags, or one TOML
+//! file given with `--config` (see
 //! [`config`](super::config) for the format, and `--print-config`, which prints the file for
 //! the flags given); the process reads no environment variable, and the secret access key is
 //! read from a file, not from the command line or the config file. The file is read into the
@@ -35,9 +38,27 @@
 //! first byte that is not white space is `{`. Only its owner may read the file (mode 0600 or
 //! 0400), and no message of the process names a secret.
 //!
+//! `--oci-listen` adds a fourth thing: a read-only OCI distribution front (see
+//! [`oci`](super::oci)), served from the same proxy, so that podman pulls an image by digest from
+//! the tiers. With `--oci-tls-cert` and `--oci-tls-key` it is HTTPS (the certificate must carry an
+//! IP subjectAltName for the address and be valid now, and the key file must not be readable by
+//! every user; the start checks). With neither it is plain HTTP, at any address; off loopback
+//! the start prints one warning line on stderr, and a certificate is advised. One of the two
+//! flags without the other, and a certificate, key or prefix that cannot work, exit with status
+//! 2; a file that cannot be read
+//! with status 1. The start line gets ` oci-listen=<address> (http)` or ` (https)`.
+//! The start line ends with ` commit=<the commit the binary was built from>`.
+//!
+//! `--listen` and `--oci-listen` may each be given more than once (the file's `listen` keys take a
+//! string or a list): a socket is bound for each address, an IPv6 one for IPv6 only (see
+//! [`listen`](super::listen)), and one server, one drain and one limit on connections serve them
+//! all. An address given twice is refused with status 2, and a start that cannot bind every address
+//! is refused with status 1. The start line names every address, separated by commas.
+//!
 //! On SIGTERM or SIGINT the process drains (see the [`server`](super) docs): `/readyz` says 503,
-//! it serves for `--drain-lb-wait`, refuses new requests, waits for those in flight and for the
-//! answers it is sending for at most `--drain-deadline`, gives the reconciler's lease up and
+//! it serves for `--drain-lb-wait`, stops accepting and closes idle connections, waits for the
+//! requests in flight, the answers it is sending and the connections it closes for at most
+//! `--drain-deadline`, gives the reconciler's lease up and
 //! exits with status 0. A start that fails exits with status 1. Flags that are not valid exit
 //! with status 2: those the parser refuses, two keys that have one id, and a config file that is
 //! refused or given with flags that describe the data path.
@@ -55,6 +76,11 @@
 //! need a write are skipped, with a line that says so. `--skip-backend-check` leaves the
 //! multipart-completion check out, for a reason that is logged at the start; no other check can
 //! be left out.
+//!
+//! A file of the build-node shape (`[local_cache]` and `[cold_store]` and no `[hot_store]`) is a
+//! different start: a read cache in front of one upstream, with none of the above (no proxy, no
+//! tiers to test, no reconciler). `cache_cli.rs` has its start and its checks; the exit statuses
+//! are the same, and a file system under the cache that fails its check is status 3.
 
 use std::ffi::OsString;
 use std::future::Future;
@@ -68,36 +94,43 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 use crate::s3::{Capabilities, Credentials, S3Config};
 use crate::{
-    Backend, Check, Clock, DirBackend, MemoryBackend, Proxy, ProxyConfig, Reconciler,
-    ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SystemClock, self_test,
+    Backend, Check, Clock, DirBackend, MemoryBackend, MonotonicClock, Proxy, ProxyConfig,
+    Reconciler, ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SweepBudget,
+    SystemClock, self_test, sweep_probes,
 };
 
-use super::config::keys_for_flags;
+use super::build_info::{CAPABILITIES, COMMIT, RELEASE_VERSION, VERSION, capabilities_text};
+use super::cache_cli::serve_cache_until_signalled;
+use super::config::{OciFlags, Settings, keys_for_flags};
 use super::config_print::render;
-use super::gc::{ensure_distinct as gc_distinct, gc_keys, ids as gc_ids};
-use super::keys::{ensure_distinct, read_credentials, read_only_keys};
+#[cfg(test)]
+use super::front::read_key;
+use super::front::{InvalidFlags, server_config};
+use super::keys::read_credentials;
 use super::launch::{Launch, Refused, resolve};
-use super::presign::{ensure_distinct as presign_distinct, presign_keys};
-use super::scoped::{ensure_distinct as scoped_distinct, ids as scoped_ids, scoped_keys};
+use super::listen::{bind_all, has_duplicate, joined, local_addrs};
+use super::local_cache::LocalTierFailure;
+use super::lock::{self, LockFile, check_lock_path};
+use super::oci::{
+    self, OciError, OciFront, OciLimits, OciListener, OciMetrics, OciMode, OciPrefix,
+};
 use super::{Drained, Server, ServerConfig};
 
 /// A start-up error, for the operator.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-/// Flags that cannot go together, which only the files they name show: the process exits with
-/// status 2, as for flags the parser refused, since a restart cannot mend them.
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct InvalidFlags(String);
-
 pub(super) const DEFAULT_MAX_REQUEST_BYTES: u64 = 256 << 20;
 
 /// The streamed bodies taken at once: 32 of them hold at most 32 x (16 MiB + a few pieces).
 pub(super) const DEFAULT_MAX_CONCURRENT_PUTS: u32 = 32;
+
+/// How long a put that finds all the slots taken waits for one before it is answered 503
+/// (`--put-permit-wait`'s default, `15s`).
+pub(super) const DEFAULT_PUT_PERMIT_WAIT: Duration = Duration::from_secs(15);
 
 /// The least average rate of a body, in bytes a second.
 pub(super) const DEFAULT_PUT_MIN_BYTES_PER_SEC: u64 = 1024;
@@ -118,7 +151,7 @@ const S3_MIN_BODY_RATE: Option<NonZeroU64> = NonZeroU64::new(1 << 20);
 /// read-only keys, writes new objects to the hot tier, copies them to the cold tier in the
 /// background, and frees the hot tier when it fills.
 #[derive(Clone, Debug, PartialEq, Parser)]
-#[command(name = "tierstore", version)]
+#[command(name = "tierstore", version = RELEASE_VERSION)]
 pub struct Cli {
     /// The configuration file: a TOML file with the tables `[server]`, `[hot_store]` and
     /// `[cold_store]` that holds what the flags below hold, except `--drain-lb-wait` and
@@ -131,9 +164,26 @@ pub struct Cli {
     /// path, never their contents), and exits with status 0 without starting anything.
     #[arg(long)]
     pub print_config: bool,
-    /// The address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on.
+    /// With `--config`: loads and checks the file as a start does (the file, and the key files it
+    /// names) and exits with status 0 and no output, or prints the refusal and exits with status
+    /// 2. Nothing is bound, opened or asked of the network. Without `--config` it is a usage
+    /// error.
     #[arg(long)]
-    pub listen: SocketAddr,
+    pub check_config: bool,
+    /// Prints the capabilities of this build, one to a line, and exits with status 0 without
+    /// starting anything. It needs no other flag and is refused with any (status 2). A host
+    /// updater asks it of a release before it hands over to it.
+    // Never read: `main` finds the flag in the raw arguments before they are parsed, since a
+    // parse would demand `--listen`. The field is here so that `--help` and the docs checks
+    // know the flag.
+    #[arg(long)]
+    pub capabilities: bool,
+    /// An address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on. Give the flag
+    /// again for each further address (for instance `0.0.0.0:P` and `[::]:P`, which a firewall
+    /// redirect to the port needs): one server, one drain and one limit on connections serve
+    /// them all. An address that is given twice is refused.
+    #[arg(long, value_name = "ADDR", required = true)]
+    pub listen: Vec<SocketAddr>,
     /// The id of this proxy, which names its journal in the hot tier and its lease. Keep it
     /// across restarts, and give each process over the same tiers one of its own.
     #[arg(long)]
@@ -248,8 +298,8 @@ pub struct Cli {
     /// 503 of `/readyz` is seen: a number and `ms`, `s`, `m` or `h`.
     #[arg(long, default_value = "10s", value_parser = parse_duration)]
     pub drain_lb_wait: Duration,
-    /// How long the drain waits for requests in flight, and for the answers being sent, once it
-    /// refuses new requests.
+    /// How long the drain waits for requests in flight, for the answers being sent, and for the
+    /// connections it closes, once the settle is over.
     #[arg(long, default_value = "15m", value_parser = parse_duration)]
     pub drain_deadline: Duration,
     /// How long a batch of journal entries waits for more before it is written.
@@ -267,6 +317,13 @@ pub struct Cli {
     /// How often the reconciler works: shorter than `--lease-ttl`.
     #[arg(long, default_value = "5s", value_parser = parse_duration)]
     pub reconcile_interval: Duration,
+    /// The lock file of this node: an absolute path on a local file system, in a directory that
+    /// nothing removes (not under `/run`), the same for every process of one node. The reconciler
+    /// works only while this process holds an exclusive lock on the file; a process that finds
+    /// it held serves reads and writes through its own proxy and tries the lock again every
+    /// second. Without it the reconciler works as soon as the process starts.
+    #[arg(long, value_name = "PATH")]
+    pub lock_file: Option<PathBuf>,
     /// How old the usage the reconciler publishes may be before `/usagez` says 503 with the
     /// reason (`/readyz` does not look at it): a number and `ms`, `s`, `m` or `h`, longer than
     /// `--lease-ttl`, so that a reconciler that takes over the lease does not show. A usage that
@@ -288,8 +345,9 @@ pub struct Cli {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub max_request_bytes: u64,
-    /// The most put bodies and upload parts taken at once. One more is answered 503 `SlowDown`
-    /// with `Retry-After: 1` and its body is not read. A body in flight holds a few pieces of
+    /// The most put bodies and upload parts taken at once. One more waits for a slot, at most
+    /// `--put-permit-wait`, and is then answered 503 `SlowDown` with `Retry-After: 1`; its body
+    /// is not read, while it waits or after. A body in flight holds a few pieces of
     /// at most the size the connection delivers (tens of KiB), and an S3 tier up to 16 MiB
     /// more, so 32 bodies hold about half a GiB at most, with S3 tiers, and a few MiB with
     /// directory tiers.
@@ -299,6 +357,13 @@ pub struct Cli {
         value_parser = clap::value_parser!(u32).range(1..)
     )]
     pub max_concurrent_puts: u32,
+    /// How long a put body or upload part that arrives when `--max-concurrent-puts` bodies are
+    /// already being taken waits for one of them to end: a number and `ms`, `s`, `m` or `h`. If a
+    /// slot is free in that time the body is taken; if not, it is answered 503 `SlowDown` with
+    /// `Retry-After: 1`. The request's body is not read while it waits, so a slow tier makes
+    /// clients queue here, up to this long, instead of retrying at once. 0 answers 503 at once.
+    #[arg(long, default_value = "15s", value_parser = parse_duration)]
+    pub put_permit_wait: Duration,
     /// The least average rate, in bytes a second, at which a request body may come in, counted
     /// over the time the server spends waiting for the client to send the next piece, once that
     /// time has passed `--put-rate-grace`. Time the server spends not waiting for the client (a
@@ -337,6 +402,46 @@ pub struct Cli {
     /// answers wrongly is not asked again.
     #[arg(long, default_value = "5m", value_parser = parse_duration)]
     pub backend_check_wait: Duration,
+    /// Serves a read-only OCI distribution front at this address, from the same tiers (see the
+    /// [`oci`](super::oci) docs): `GET` and `HEAD` of `/v2/`, of `/v2/<name>/manifests/<digest>`
+    /// and of `/v2/<name>/blobs/<digest>`, so that podman and other registry clients pull an
+    /// image by digest. Anonymous: no token is ever asked for. Objects are read at
+    /// `<--oci-prefix>blobs/sha256/<hex>`. With `--oci-tls-cert` and `--oci-tls-key` it is
+    /// HTTPS, and clients dial an IP address, so the certificate must carry an IP subjectAltName
+    /// for this address (any IP, if it is unspecified), which the start checks. With neither it
+    /// is plain HTTP, served at any address: on loopback (127/8 or `::1`) a node's own engine
+    /// pulls from its own store and the traffic never leaves the host; off loopback the start
+    /// prints one warning line, since a plain connection can be read and changed on its path,
+    /// and the certificate and key are advised. Give the flag again for each further address, as
+    /// for `--listen`; the certificate must name each of them. Left out, no such listener is
+    /// opened.
+    #[arg(long, value_name = "ADDR")]
+    pub oci_listen: Vec<SocketAddr>,
+    /// The certificate chain (PEM) of `--oci-listen`, leaf first, issued by the CA the clients
+    /// trust. Read once at start: a new certificate takes a restart. Given with
+    /// `--oci-tls-key` or not at all.
+    #[arg(long, value_name = "PATH", requires_all = ["oci_listen", "oci_tls_key"])]
+    pub oci_tls_cert: Option<PathBuf>,
+    /// The private key (PEM) of `--oci-tls-cert`. A file any user can read (a mode with the
+    /// "other" bits set) is refused at start; a group may read it.
+    #[arg(long, value_name = "PATH", requires_all = ["oci_listen", "oci_tls_cert"])]
+    pub oci_tls_key: Option<PathBuf>,
+    /// The prefix of the keys the OCI front reads, ending in `/` (`oci/` if not given): an
+    /// object is at `<prefix>blobs/sha256/<64 lowercase hex digits>`. A prefix inside
+    /// `_journal/` or `_tiering/` is refused at start (exit 2).
+    #[arg(long, value_name = "PREFIX", requires = "oci_listen")]
+    pub oci_prefix: Option<String>,
+    /// The most connections the OCI front has open at once (64 if not given); the others wait
+    /// in the kernel's backlog. Memory is bounded by connections times the buffer a connection
+    /// holds (up to 4 MiB: a blob chunk or a manifest), so the default is about 256 MiB at worst.
+    #[arg(long, requires = "oci_listen", value_parser = clap::value_parser!(u32).range(1..))]
+    pub oci_max_connections: Option<u32>,
+    /// The longest an OCI connection lives (1h if not given): a number and `ms`, `s`, `m` or
+    /// `h`. A request being answered when it ends is finished first. The time a client has to
+    /// send a request, and the time it may leave an answer unread, are those of the S3 front's
+    /// timeouts (a minute, and `--body-idle-timeout`).
+    #[arg(long, requires = "oci_listen", value_parser = parse_duration)]
+    pub oci_connection_lifetime: Option<Duration>,
 }
 
 /// A check of the self-test that the operator leaves out, and why.
@@ -406,13 +511,25 @@ struct Built {
     reconciler: ReconcilerConfig,
     hot: Arc<dyn Backend>,
     cold: Arc<dyn Backend>,
+    oci: Option<OciSetup>,
+}
+
+/// The OCI front, as far as the flags and files go: the proxy it reads is not open yet.
+pub(super) struct OciSetup {
+    /// The addresses, which are at least one.
+    listen: Vec<SocketAddr>,
+    /// `None` serves plain HTTP.
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
+    prefix: OciPrefix,
+    pub(super) metrics: Arc<OciMetrics>,
+    limits: OciLimits,
 }
 
 /// The flags that say how to reach a tier that is an S3 bucket.
-struct S3Flags<'a> {
-    endpoint: Option<&'a str>,
-    region: Option<&'a str>,
-    credentials: Option<&'a Path>,
+pub(super) struct S3Flags<'a> {
+    pub(super) endpoint: Option<&'a str>,
+    pub(super) region: Option<&'a str>,
+    pub(super) credentials: Option<&'a Path>,
 }
 
 impl S3Flags<'_> {
@@ -449,7 +566,7 @@ impl Cli {
 
 /// The tier a flag names, with the flags that go with it: a bucket of an S3-compatible store,
 /// or one of the kinds that `tier` opens, which have no use for those flags.
-fn open_tier(
+pub(super) fn open_tier(
     flag: &str,
     spec: &str,
     s3: &S3Flags<'_>,
@@ -513,11 +630,6 @@ fn tier(flag: &str, spec: &str) -> Result<Arc<dyn Backend>, String> {
     }
 }
 
-/// The access key id and the secret access key in the file of `--access-key-file`.
-fn read_key(path: &Path) -> Result<(String, String), String> {
-    read_credentials("--access-key-file", path)
-}
-
 /// Checks the flags that depend on each other, and makes the settings they stand for.
 fn build(cli: &Cli) -> Result<Built, Error> {
     if cli.low_water >= cli.high_water {
@@ -532,49 +644,18 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     if cli.usage_stale_after <= cli.lease_ttl {
         return Err("--usage-stale-after must be longer than --lease-ttl".into());
     }
-    if matches!(cli.bucket.as_str(), "healthz" | "readyz" | "usagez") {
-        let name = &cli.bucket;
-        return Err(format!("--bucket {name:?} is the name of a probe path").into());
-    }
-    if cli.body_idle_timeout.is_zero() {
-        return Err("--body-idle-timeout must be longer than zero".into());
-    }
     if cli.s3_request_timeout.is_zero() {
         return Err("--s3-request-timeout must be longer than zero".into());
     }
-    let (key_id, secret) = read_key(&cli.access_key_file)?;
-    let read_only = read_only_keys(&cli.read_only_key_file)?;
-    ensure_distinct(&key_id, &read_only).map_err(InvalidFlags)?;
-    let presign = presign_keys(&cli.presign_key_file)?;
-    let gc = gc_keys(&cli.gc_key_file)?;
-    let scoped = scoped_keys(&cli.scoped_key_file)?;
-    let mut others: Vec<&str> = std::iter::once(key_id.as_str())
-        .chain(read_only.iter().map(|key| key.id.as_str()))
-        .collect();
-    gc_distinct(&others, &gc).map_err(InvalidFlags)?;
-    others.extend(gc_ids(&gc));
-    scoped_distinct(&others, &scoped).map_err(InvalidFlags)?;
-    others.extend(scoped_ids(&scoped));
-    presign_distinct(&others, &presign).map_err(InvalidFlags)?;
+    if let Some(path) = &cli.lock_file {
+        check_lock_path(path).map_err(|why| format!("--lock-file {path:?} {why}"))?;
+    }
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let mut server = server_config(&cli.front(), Arc::clone(&clock))?;
+    server.usage_stale_after = cli.usage_stale_after;
     let timeout = cli.s3_request_timeout;
     let hot = open_tier("--hot", &cli.hot, &cli.hot_s3(), timeout)?;
     let cold = open_tier("--cold", &cli.cold, &cli.cold_s3(), timeout)?;
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let mut server = ServerConfig::new(&cli.bucket, &key_id, &secret, Arc::clone(&clock));
-    server.read_only_keys = read_only;
-    server.presign_keys = presign;
-    server.gc_keys = gc;
-    server.scoped_keys = scoped;
-    server.presign_max_expires = cli.presign_max_expires;
-    server.region = cli.region.clone();
-    server.max_request_bytes = usize::try_from(cli.max_request_bytes).unwrap_or(usize::MAX);
-    server.body_idle_timeout = cli.body_idle_timeout;
-    server.max_concurrent_puts = cli.max_concurrent_puts as usize;
-    server.put_min_bytes_per_sec = cli.put_min_bytes_per_sec;
-    server.put_rate_grace = cli.put_rate_grace;
-    server.drain_lb_wait = cli.drain_lb_wait;
-    server.drain_deadline = cli.drain_deadline;
-    server.usage_stale_after = cli.usage_stale_after;
     let mut proxy = ProxyConfig::new(&cli.proxy_id, cli.hot_bytes, Arc::clone(&clock));
     proxy.critical = share(cli.critical);
     proxy.linger = cli.journal_linger;
@@ -584,17 +665,117 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     reconciler.parallel = cli.copy_parallel as usize;
     reconciler.lease_ttl = cli.lease_ttl;
     reconciler.retention = cli.journal_retention;
+    let oci = oci_setup(cli, &server, true)?;
+    server.oci_metrics = oci.as_ref().map(|setup| Arc::clone(&setup.metrics));
     Ok(Built {
         server,
         proxy,
         reconciler,
         hot,
         cold,
+        oci,
     })
+}
+
+/// The default of `--oci-prefix`.
+pub(super) const DEFAULT_OCI_PREFIX: &str = "oci/";
+
+/// The default of `--oci-max-connections`.
+const DEFAULT_OCI_CONNECTIONS: u32 = 64;
+
+/// The default of `--oci-connection-lifetime`.
+const DEFAULT_OCI_LIFETIME: Duration = Duration::from_secs(3600);
+
+/// How long a client has to finish the TLS handshake with the OCI front.
+const OCI_HANDSHAKE: Duration = Duration::from_secs(10);
+
+/// Checks the OCI front's flags and files, and makes its TLS, if `--oci-listen` is given. A prefix,
+/// certificate or key that cannot work is an `InvalidFlags` (exit 2, as a restart cannot mend it);
+/// a file that cannot be read is exit 1. `warn` says whether the warning for a plain-text listener
+/// is printed; `--check-config` leaves it out, as it prints nothing when the file is fine.
+fn oci_setup(cli: &Cli, server: &ServerConfig, warn: bool) -> Result<Option<OciSetup>, Error> {
+    let flags = OciFlags {
+        listen: cli.oci_listen.clone(),
+        tls_cert: cli.oci_tls_cert.clone(),
+        tls_key: cli.oci_tls_key.clone(),
+        prefix: cli.oci_prefix.clone(),
+        max_connections: cli.oci_max_connections,
+        connection_lifetime: cli.oci_connection_lifetime,
+    };
+    oci_setup_of(&flags, server, warn)
+}
+
+/// [`oci_setup`] for the values the flags or the `[oci]` table of a file make: the one place the
+/// front's rules are applied, for a storage node and for a build node.
+pub(super) fn oci_setup_of(
+    flags: &OciFlags,
+    server: &ServerConfig,
+    warn: bool,
+) -> Result<Option<OciSetup>, Error> {
+    if flags.listen.is_empty() {
+        return Ok(None);
+    }
+    let listen = flags.listen.clone();
+    if has_duplicate(&listen) {
+        return Err(InvalidFlags("--oci-listen is given the same address twice".into()).into());
+    }
+    let refuse = |why: OciError| -> Error {
+        if why.is_invalid_flags() {
+            InvalidFlags(why.to_string()).into()
+        } else {
+            why.into()
+        }
+    };
+    let lifetime = flags.connection_lifetime.unwrap_or(DEFAULT_OCI_LIFETIME);
+    if lifetime.is_zero() {
+        return Err(
+            InvalidFlags("--oci-connection-lifetime must be longer than zero".into()).into(),
+        );
+    }
+    let prefix = flags.prefix.as_deref().unwrap_or(DEFAULT_OCI_PREFIX);
+    let prefix = OciPrefix::new(prefix).map_err(refuse)?;
+    let acceptor = match (&flags.tls_cert, &flags.tls_key) {
+        (Some(cert), Some(key)) => Some(oci::acceptor_for(cert, key, &listen).map_err(refuse)?),
+        (None, None) => {
+            let warnings = listen.iter().filter_map(|addr| oci::plain_warning(*addr));
+            for warning in warnings.filter(|_| warn) {
+                eprintln!("{warning}");
+            }
+            None
+        }
+        _ => {
+            let why = "--oci-tls-cert and --oci-tls-key go together: give both, or neither";
+            return Err(refuse(OciError::Missing(why.to_owned())));
+        }
+    };
+    let mode = if acceptor.is_some() {
+        OciMode::Https
+    } else {
+        OciMode::Http
+    };
+    let connections = flags.max_connections.unwrap_or(DEFAULT_OCI_CONNECTIONS);
+    let limits = OciLimits {
+        max_connections: connections as usize,
+        handshake_timeout: OCI_HANDSHAKE,
+        header_timeout: server.header_timeout,
+        write_idle: server.body_idle_timeout,
+        lifetime,
+        drain_deadline: server.drain_deadline,
+    };
+    Ok(Some(OciSetup {
+        listen,
+        acceptor,
+        prefix,
+        metrics: Arc::new(OciMetrics::with_mode(mode)),
+        limits,
+    }))
 }
 
 /// How long [`reconcile`] waits for the lease to be given up once it is halted.
 const STOP_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a process that does not hold the `--lock-file` waits between two tries of it.
+const LOCK_RETRY: Duration = Duration::from_secs(1);
 
 /// Runs a pass of `reconciler` now and then every `interval`, until `halt` is notified. Then
 /// it gives the lease up. The calls that failed in a pass are reported on stderr.
@@ -604,10 +785,34 @@ const STOP_WAIT: Duration = Duration::from_secs(5);
 /// create-only and the checkpoints conditional, so the next reconciler does again what the pass
 /// had not finished.
 pub(crate) async fn reconcile(mut reconciler: Reconciler, interval: Duration, halt: Arc<Notify>) {
+    let _ = run_passes(&mut reconciler, interval, &halt, None).await;
+    let _ = tokio::time::timeout(STOP_WAIT, reconciler.stop()).await;
+}
+
+/// What ended a run of passes.
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    /// The halt.
+    Halted,
+    /// The lock file at the path is not the file that is held.
+    Lost,
+}
+
+/// Runs passes as [`reconcile`] does, until the halt or, if there is a `lock`, until the lock
+/// file is not the one at its path any more (looked at before each pass).
+async fn run_passes(
+    reconciler: &mut Reconciler,
+    interval: Duration,
+    halt: &Notify,
+    lock: Option<&LockFile>,
+) -> Ended {
     loop {
+        if lock.is_some_and(|file| !file.is_current()) {
+            return Ended::Lost;
+        }
         tokio::select! {
             biased;
-            () = halt.notified() => break,
+            () = halt.notified() => return Ended::Halted,
             report = reconciler.pass() => {
                 for error in &report.failed {
                     eprintln!("tierstore: reconciler: {error}");
@@ -615,9 +820,85 @@ pub(crate) async fn reconcile(mut reconciler: Reconciler, interval: Duration, ha
             }
         }
         tokio::select! {
-            () = halt.notified() => break,
+            () = halt.notified() => return Ended::Halted,
             () = tokio::time::sleep(interval) => {}
         }
+    }
+}
+
+/// The lock file a storage node's reconciler works under (`--lock-file`).
+#[derive(Debug)]
+pub(crate) struct Gate {
+    path: PathBuf,
+    /// How long to wait between two tries of a lock that is held by another process.
+    retry: Duration,
+    /// The lock, if the try at the start took it; the reconciler's first run uses it.
+    taken: Option<LockFile>,
+}
+
+impl Gate {
+    /// Opens the lock file at `path` and tries the lock once, now.
+    ///
+    /// # Errors
+    /// What the system said about the file: it cannot be made or opened, it is a link, or it is
+    /// on a network file system.
+    pub(crate) fn open(path: &Path, retry: Duration) -> std::io::Result<Self> {
+        Ok(Self {
+            path: path.to_owned(),
+            retry,
+            taken: lock::try_take(path)?,
+        })
+    }
+}
+
+/// Tries the lock every `retry` until it is taken (`Some`) or `halt` is notified (`None`). A try
+/// that fails is said on stderr and tried again. It runs on a thread that may block, so nothing
+/// waits on the lock on the runtime.
+async fn wait_for_lock(path: &Path, retry: Duration, halt: &Notify) -> Option<LockFile> {
+    loop {
+        tokio::select! {
+            biased;
+            () = halt.notified() => return None,
+            () = tokio::time::sleep(retry) => {}
+        }
+        let owned = path.to_owned();
+        let trying = tokio::task::spawn_blocking(move || lock::try_take(&owned));
+        match trying.await.expect("a try of the lock does not panic") {
+            Ok(Some(file)) => return Some(file),
+            Ok(None) => {}
+            Err(why) => eprintln!("tierstore: lock file {}: {why}", path.display()),
+        }
+    }
+}
+
+/// [`reconcile`], but only while this process holds the lock file of `gate`: it does not touch
+/// the tiers (no lease, no pass) until it holds the lock, takes it by trying every
+/// `gate.retry` while another process holds it, and stops (giving the lease up) and waits for the
+/// lock again if the lock file is replaced. The process that held the lock gives its lease up
+/// when it exits (see [`reconcile`]), so the first pass after the lock is taken finds it free.
+pub(crate) async fn reconcile_gated(
+    mut reconciler: Reconciler,
+    interval: Duration,
+    halt: Arc<Notify>,
+    mut gate: Gate,
+) {
+    loop {
+        let file = match gate.taken.take() {
+            Some(file) => file,
+            None => match wait_for_lock(&gate.path, gate.retry, &halt).await {
+                Some(file) => file,
+                None => break,
+            },
+        };
+        if run_passes(&mut reconciler, interval, &halt, Some(&file)).await == Ended::Halted {
+            break;
+        }
+        eprintln!(
+            "tierstore: lock file {}: the file was replaced; the reconciler stops until the lock \
+             is taken again",
+            gate.path.display()
+        );
+        let _ = tokio::time::timeout(STOP_WAIT, reconciler.stop()).await;
     }
     let _ = tokio::time::timeout(STOP_WAIT, reconciler.stop()).await;
 }
@@ -625,7 +906,7 @@ pub(crate) async fn reconcile(mut reconciler: Reconciler, interval: Duration, ha
 /// The id of a start for the probe keys of its self-test: the proxy id (with any character a
 /// key cannot carry replaced by `_`), the time of the start and the process id, so that two
 /// starts never share a probe key.
-fn probe_run_id(proxy_id: &str, now: u64, process: u32) -> String {
+pub(super) fn probe_run_id(proxy_id: &str, now: u64, process: u32) -> String {
     let safe = |c: char| {
         if c.is_ascii_alphanumeric() || c == '-' {
             c
@@ -689,8 +970,57 @@ async fn probe_tiers(
         let took = started.elapsed().as_millis();
         eprintln!("tierstore: tested the {name} in {took} ms");
         outcome?;
+        // Bounded in the keys and in the time after which no delete starts, on a clock that
+        // setting the machine's clock does not move.
+        let budget = SweepBudget::default();
+        sweep_probes(backend, &options, budget, &MonotonicClock::new(), &note).await;
     }
     Ok(())
+}
+
+/// The addresses [`run_serving`] is bound to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Addresses {
+    /// The S3 front, `/healthz`, `/readyz`, `/usagez` and `/metricz`: the first address of
+    /// [`s3_all`](Self::s3_all).
+    pub s3: SocketAddr,
+    /// Every address the S3 front is bound to, in the order of the `--listen` flags.
+    pub s3_all: Vec<SocketAddr>,
+    /// The OCI read front, if `--oci-listen` was given: the first address of
+    /// [`oci_all`](Self::oci_all).
+    pub oci: Option<SocketAddr>,
+    /// Every address the OCI front is bound to; empty when there is none.
+    pub oci_all: Vec<SocketAddr>,
+    /// How the OCI front carries its connections: `Some` exactly when [`oci`](Self::oci) is.
+    pub oci_mode: Option<OciMode>,
+}
+
+impl Addresses {
+    /// The addresses of the sockets bound: the S3 front's, which are at least one, and the OCI
+    /// front's, if it is served.
+    ///
+    /// # Errors
+    /// A socket's address cannot be read, or the S3 front has none.
+    pub(super) fn of(s3_all: Vec<SocketAddr>, oci: Option<&OciListener>) -> std::io::Result<Self> {
+        let oci_all = oci.map(OciListener::local_addrs).transpose()?;
+        let oci_all = oci_all.unwrap_or_default();
+        let none = || std::io::Error::other("--listen is needed");
+        Ok(Self {
+            s3: s3_all.first().copied().ok_or_else(none)?,
+            s3_all,
+            oci: oci_all.first().copied(),
+            oci_all,
+            oci_mode: oci.map(OciListener::mode),
+        })
+    }
+}
+
+/// Binds the S3 front's sockets, one for each of `addrs`.
+///
+/// # Errors
+/// An address cannot be bound; the message names it.
+pub(super) fn bind_s3(addrs: &[SocketAddr]) -> Result<Vec<TcpListener>, Error> {
+    bind_all(addrs).map_err(|(addr, why)| format!("binding {addr}: {why}").into())
 }
 
 /// Opens the proxy and serves it until `stop` resolves, and then drains.
@@ -708,49 +1038,122 @@ pub async fn run(
     stop: impl Future<Output = ()> + Send + 'static,
     ready: impl FnOnce(SocketAddr),
 ) -> Result<Drained, Error> {
+    run_serving(cli, stop, |bound| ready(bound.s3)).await
+}
+
+/// [`run`], telling `ready` the address of the OCI front too when it is served.
+///
+/// The OCI front keeps serving through `--drain-lb-wait`, as the S3 front does, then takes no
+/// new connection, lets the requests being answered finish, and closes them within
+/// `--drain-deadline`.
+///
+/// # Errors
+/// As [`run`], and the OCI front's flags and files (see [`OciError`]).
+pub async fn run_serving(
+    cli: &Cli,
+    stop: impl Future<Output = ()> + Send + 'static,
+    ready: impl FnOnce(Addresses),
+) -> Result<Drained, Error> {
     let mut built = build(cli)?;
+    // One try now, so that a lock file that cannot be used stops the start; the reconciler's
+    // loop takes it later if another process holds it now.
+    let gate = match &cli.lock_file {
+        Some(path) => {
+            let opened = Gate::open(path, LOCK_RETRY);
+            Some(opened.map_err(|why| format!("--lock-file {}: {why}", path.display()))?)
+        }
+        None => None,
+    };
     let (hot, cold) = (built.hot.as_ref(), built.cold.as_ref());
     probe_tiers(cli, hot, cold, cli.backend_check_wait).await?;
     let (hot, cold) = (Arc::clone(&built.hot), Arc::clone(&built.cold));
     let opened = Proxy::open(hot, cold, built.proxy).await;
     let proxy = Arc::new(opened.map_err(|why| format!("opening the proxy: {why}"))?);
     built.server.proxy = Some(Arc::clone(&proxy));
+    let oci_backend: Arc<dyn Backend> = proxy.clone();
     let server = Server::new(proxy, built.server);
-    let address = cli.listen;
-    let bound = TcpListener::bind(address).await;
-    let listener = bound.map_err(|why| format!("binding {address}: {why}"))?;
-    ready(listener.local_addr()?);
+    let listeners = bind_s3(&cli.listen)?;
+    let oci = bind_oci(built.oci, oci_backend).await?;
+    ready(Addresses::of(local_addrs(&listeners)?, oci.as_ref())?);
     let stopping = Arc::clone(&server);
+    let (oci_stop, oci_stopped) = watch::channel(false);
+    let lb_wait = cli.drain_lb_wait;
     let watcher = tokio::spawn(async move {
         stop.await;
         stopping.begin_drain();
+        tokio::time::sleep(lb_wait).await;
+        let _ = oci_stop.send(true);
     });
     let halt = Arc::new(Notify::new());
     let halting = Arc::clone(&halt);
     let serving = async move {
-        let drained = server.serve(listener).await;
+        let drained = server.serve_all(listeners).await;
         halting.notify_one();
         drained
     };
+    let oci_serving = serve_oci(oci, oci_stopped);
     let reconciler = Reconciler::new(built.hot, built.cold, built.reconciler);
-    let reconciling = reconcile(reconciler, cli.reconcile_interval, halt);
-    let (drained, ()) = tokio::join!(serving, reconciling);
+    let interval = cli.reconcile_interval;
+    let reconciling = async move {
+        match gate {
+            Some(gate) => reconcile_gated(reconciler, interval, halt, gate).await,
+            None => reconcile(reconciler, interval, halt).await,
+        }
+    };
+    let (drained, (), oci_cut) = tokio::join!(serving, reconciling, oci_serving);
     watcher.abort();
     eprint!("{}", cut_note(drained));
+    eprint!("{}", oci_cut_note(oci_cut));
     Ok(drained)
 }
 
 /// What [`run`] reports on stderr of a drain: a line when the drain deadline cut requests, and
 /// nothing when it cut none.
-fn cut_note(drained: Drained) -> String {
+pub(super) fn cut_note(drained: Drained) -> String {
     match drained.abandoned {
         0 => String::new(),
         cut => format!("tierstore: {cut} requests were cut at the drain deadline\n"),
     }
 }
 
+/// Binds the OCI front over `backend` as `setup` says: none when there is no setup. The backend
+/// is whatever the node reads from: the proxy of a storage node, the cache of a build node.
+///
+/// # Errors
+/// An address that cannot be bound.
+pub(super) async fn bind_oci(
+    setup: Option<OciSetup>,
+    backend: Arc<dyn Backend>,
+) -> Result<Option<OciListener>, Error> {
+    let Some(setup) = setup else {
+        return Ok(None);
+    };
+    let front = Arc::new(OciFront::new(backend, setup.prefix, setup.metrics));
+    let bound = OciListener::bind_all(&setup.listen, setup.acceptor, front, setup.limits).await;
+    Ok(Some(bound?))
+}
+
+/// Serves the OCI front until `stopped` says so; the connections it cut. 0 when there is none.
+pub(super) async fn serve_oci(
+    listener: Option<OciListener>,
+    stopped: watch::Receiver<bool>,
+) -> usize {
+    match listener {
+        Some(listener) => listener.serve(stopped).await,
+        None => 0,
+    }
+}
+
+/// The same for the connections of the OCI front.
+pub(super) fn oci_cut_note(cut: usize) -> String {
+    match cut {
+        0 => String::new(),
+        cut => format!("tierstore: {cut} OCI connections were cut at the drain deadline\n"),
+    }
+}
+
 /// Resolves on SIGTERM or SIGINT. The handlers are in place when this returns.
-fn signals() -> std::io::Result<impl Future<Output = ()> + Send + 'static> {
+pub(super) fn signals() -> std::io::Result<impl Future<Output = ()> + Send + 'static> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
@@ -764,22 +1167,49 @@ fn signals() -> std::io::Result<impl Future<Output = ()> + Send + 'static> {
 
 async fn serve_until_signalled(cli: Cli) -> Result<(), Error> {
     let stop = signals()?;
-    let version = env!("CARGO_PKG_VERSION");
-    let announce = |addr: SocketAddr| println!("tierstore {version} listen={addr}");
-    run(&cli, stop, announce).await?;
+    let announce = |bound: Addresses| {
+        let mut line = format!("tierstore {VERSION} listen={}", joined(&bound.s3_all));
+        if bound.oci.is_some() {
+            let mode = bound.oci_mode.unwrap_or_default().as_str();
+            line.push_str(&format!(" oci-listen={} ({mode})", joined(&bound.oci_all)));
+        }
+        println!("{line} commit={COMMIT}");
+    };
+    run_serving(&cli, stop, announce).await?;
     Ok(())
 }
 
-fn blocking(cli: Cli) -> Result<(), Error> {
+fn blocking(start: impl Future<Output = Result<(), Error>>) -> Result<(), Error> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(serve_until_signalled(cli))
+    runtime.block_on(start)
+}
+
+/// `--capabilities`: the capabilities of this build, one to a line, on stdout and status 0 (see
+/// [`CAPABILITIES`]); or, when `args` (the program name first) hold anything else, the first of
+/// it named on stderr and status 2, with nothing on stdout.
+fn capabilities(args: &[OsString]) -> ExitCode {
+    match args.iter().skip(1).find(|arg| *arg != "--capabilities") {
+        Some(other) => {
+            let other = other.to_string_lossy();
+            eprintln!("tierstore: --capabilities takes no other flag, got {other}");
+            ExitCode::from(2)
+        }
+        None => {
+            print!("{}", capabilities_text(CAPABILITIES));
+            ExitCode::SUCCESS
+        }
+    }
 }
 
 /// The binary: flags in, exit status out.
 #[must_use]
 pub fn main(args: Vec<OsString>) -> ExitCode {
+    // Before the flags are parsed: it needs none of the flags a start requires.
+    if args.iter().skip(1).any(|arg| arg == "--capabilities") {
+        return capabilities(&args);
+    }
     let launch = match resolve(args) {
         Ok(launch) => launch,
         Err(Refused::Usage(usage)) => {
@@ -791,11 +1221,20 @@ pub fn main(args: Vec<OsString>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let Launch { cli, from_file } = launch;
-    if cli.print_config {
-        return print_config(&cli);
+    let Launch {
+        settings,
+        from_file,
+        check_only,
+    } = launch;
+    if check_only {
+        return check_config(&settings);
     }
-    match blocking(cli) {
+    let started = match settings {
+        Settings::Storage(cli) if cli.print_config => return print_config(&cli),
+        Settings::Storage(cli) => blocking(serve_until_signalled(*cli)),
+        Settings::Cache(cache) => blocking(serve_cache_until_signalled(*cache)),
+    };
+    match started {
         Ok(()) => ExitCode::SUCCESS,
         Err(why) => {
             // The messages of the flags' checks name flags; in a start from a file they name keys.
@@ -807,6 +1246,43 @@ pub fn main(args: Vec<OsString>) -> ExitCode {
             };
             eprintln!("tierstore: {text}");
             ExitCode::from(exit_status(&why))
+        }
+    }
+}
+
+/// `--check-config`: what a start refuses before it opens anything, asked of the settings of a
+/// file: the front's settings, which reads the key files it names, and the limits a start
+/// checks first. Status 0 and no output if there is nothing to refuse; else the start's message
+/// on stderr and status 2. It binds nothing and asks nothing of a tier. It does not make the
+/// checks that a start makes of the disk and the stores: the budget of a cache against the size
+/// of its file system (`free_floor`), the cache directory, the credentials of a tier, the
+/// self-test.
+fn check_config(settings: &Settings) -> ExitCode {
+    match checked(settings) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(why) => {
+            eprintln!("tierstore: {}", keys_for_flags(&why.to_string()));
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// What `--check-config` finds wrong with the settings, if anything.
+pub(super) fn checked(settings: &Settings) -> Result<(), Error> {
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    match settings {
+        Settings::Storage(cli) => {
+            let server = server_config(&cli.front(), clock)?;
+            // The `oci_*` fields: the prefix, the lifetime and the TLS files, as a start checks them.
+            oci_setup(cli, &server, false).map(drop)
+        }
+        Settings::Cache(cache) if cache.s3_request_timeout.is_zero() => {
+            Err("--s3-request-timeout must be longer than zero".into())
+        }
+        Settings::Cache(cache) => {
+            let server = server_config(&cache.front, clock)?;
+            // The `[oci]` table, with the checks a start makes of it.
+            oci_setup_of(&cache.oci, &server, false).map(drop)
         }
     }
 }
@@ -833,11 +1309,14 @@ fn print_config(cli: &Cli) -> ExitCode {
 }
 
 /// The exit status of a start that failed: 2 for flags that cannot go together, 3 for a tier
-/// that answered the self-test wrongly, 1 for anything else (a tier that could not be reached
+/// or a cache directory that answered the self-test wrongly, 1 for anything else (a tier that could not be reached
 /// among it: a restart may mend that).
-fn exit_status(why: &Error) -> u8 {
+pub(super) fn exit_status(why: &Error) -> u8 {
     if why.downcast_ref::<InvalidFlags>().is_some() {
         return 2;
+    }
+    if why.downcast_ref::<LocalTierFailure>().is_some() {
+        return 3;
     }
     match why.downcast_ref::<SelfTestError>() {
         Some(SelfTestError::Violation(_)) => 3,
@@ -848,3 +1327,7 @@ fn exit_status(why: &Error) -> u8 {
 #[cfg(test)]
 #[path = "cli_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "oci_cli_tests.rs"]
+mod oci_tests;

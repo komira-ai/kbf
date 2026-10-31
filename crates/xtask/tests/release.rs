@@ -73,17 +73,6 @@ fn check(dir: &Path, commit: &str) -> (Option<i32>, String, String) {
     (out.status.code(), text(&out.stdout), text(&out.stderr))
 }
 
-/// `cargo xtask release check --without-version-facts`, as the previous release is read.
-fn check_without_facts(dir: &Path, commit: &str) -> (Option<i32>, String, String) {
-    let out = Command::new(XTASK)
-        .args(["release", "check", s(dir), "--commit", commit])
-        .arg("--without-version-facts")
-        .output()
-        .expect("run xtask");
-    let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-    (out.status.code(), text(&out.stdout), text(&out.stderr))
-}
-
 /// Writes GitHub's answers, `(path, JSON)`, to the fake's `gh-api.json`.
 fn answers(root: &Path, answers: &[(String, serde_json::Value)]) {
     let map: serde_json::Map<String, serde_json::Value> = answers.iter().cloned().collect();
@@ -876,13 +865,11 @@ fn check_takes_the_version_facts_of_kbf_for_the_commit() {
 }
 
 #[test]
-fn check_waives_the_version_facts_of_a_release_made_before_them_and_only_that() {
-    // Catches: the first release after the facts were recorded failing at its check of the
-    // previous release (a `kbf` tarball and no facts: nothing is published), and a waiver
-    // that is a general pass: without the flag the same directory is refused, with it
-    // facts without their tarball are still refused, and so is a changed file. Catches:
-    // the flag ignored; the flag skipping the whole pairing; the flag skipping the sums.
-    let root = scratch("check-waived");
+fn check_refuses_a_kbf_tarball_without_its_version_facts() {
+    // Catches: a previous release or a release being made whose `kbf` tarball lists no facts
+    // passing the check (the check has one rule for both), and facts with no tarball passing.
+    // Also a changed file passing.
+    let root = scratch("check-no-facts");
     let d = dist_with_kbf(&root, "linux-arm64", false);
     let facts = format!("kbf-{COMMIT}-linux-arm64.version.json");
     let tarball = format!("kbf-{COMMIT}-linux-arm64.tar.gz");
@@ -891,27 +878,103 @@ fn check_waives_the_version_facts_of_a_release_made_before_them_and_only_that() 
     let want =
         format!("xtask: {tarball}: its version facts {facts} are not listed in SHA256SUMS\n");
     assert_eq!(err, want);
-    let (code, out, err) = check_without_facts(&d, COMMIT);
-    assert_eq!(code, Some(0), "{err}");
-    assert!(out.contains("sums: 7 files match"), "{out}");
-    assert!(out.contains("each of the 4 tarballs"), "{out}");
-    // Facts with no tarball are refused whether or not the flag is given.
     let orphan_root = scratch("check-orphan");
     let orphan = dist_with(&orphan_root, &facts);
     let want = format!(
         "xtask: {facts}: the tarball it states the facts of, {tarball}, is not listed in \
          SHA256SUMS\n"
     );
-    for run in [check, check_without_facts] {
-        let (code, _, err) = run(&orphan, COMMIT);
-        assert_eq!(code, Some(1), "{err}");
-        assert_eq!(err, want);
-    }
-    // The sums are still read.
-    std::fs::write(d.join(&tarball), "other").expect("change");
-    let (code, _, err) = check_without_facts(&d, COMMIT);
+    let (code, _, err) = check(&orphan, COMMIT);
+    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(err, want);
+    let whole_root = scratch("check-changed");
+    let whole = dist_with_kbf(&whole_root, "linux-arm64", true);
+    std::fs::write(whole.join(&tarball), "other").expect("change");
+    let (code, _, err) = check(&whole, COMMIT);
     assert_eq!(code, Some(1), "{err}");
     assert!(err.contains("does not match its line"), "{err}");
+}
+
+#[test]
+fn check_takes_no_waiver_flag() {
+    // Catches: the waiver `--without-version-facts` (once given to the check of the previous
+    // release) still being accepted, so that a previous release without its facts, its task
+    // image facts or its SBOM could be read again. A usage error exits 2 and checks nothing.
+    let root = scratch("check-no-waiver-flag");
+    let d = dist_with_kbf(&root, "linux-arm64", false);
+    let out = Command::new(XTASK)
+        .args(["release", "check", s(&d), "--commit", COMMIT])
+        .arg("--without-version-facts")
+        .output()
+        .expect("run xtask");
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--without-version-facts"), "{err}");
+    assert!(out.stdout.is_empty());
+}
+
+/// [`dist`] with the task image of `platform` and its bundle, and the facts and the SBOM
+/// beside it as `facts` and `sbom` say.
+fn dist_with_task_image(root: &Path, platform: &str, facts: bool, sbom: bool) -> PathBuf {
+    let d = dist(root, COMMIT);
+    let mut sums = std::fs::read_to_string(d.join("SHA256SUMS")).expect("sums");
+    let image = format!("kbf-task-image-{COMMIT}-{platform}.oci.tar");
+    let mut names = vec![image.clone()];
+    if facts {
+        names.push(format!("kbf-task-image-{COMMIT}-{platform}.facts.json"));
+    }
+    if sbom {
+        names.push(format!("kbf-task-image-{COMMIT}-{platform}.cdx.json"));
+    }
+    for name in names {
+        let bytes = format!("{name} bytes");
+        std::fs::write(d.join(&name), &bytes).expect("file");
+        let sha = sha_of(&bytes);
+        sums.push_str(&format!("{sha}  {name}\n"));
+        if name == image {
+            let bundle = d.join(format!("{name}.sigstore.json"));
+            std::fs::write(bundle, bundle_text(&sha)).expect("bundle");
+        }
+    }
+    std::fs::write(d.join("SHA256SUMS"), sums).expect("sums");
+    d
+}
+
+#[test]
+fn check_takes_the_task_image_with_its_facts_and_its_sbom() {
+    // Catches: the image's CycloneDX SBOM refused as no asset of the commit (it is named like a
+    // tarball's SBOM, `<stem>.cdx.json`, with the image's stem), which would stop every release
+    // once the build jobs list it. Control for the next tests.
+    let root = scratch("check-image-sbom");
+    let d = dist_with_task_image(&root, "linux-arm64", true, true);
+    let (code, out, err) = check(&d, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("is an asset of"), "{out}");
+    assert!(out.contains("and 1 package(s)"), "{out}");
+}
+
+#[test]
+fn check_refuses_a_task_image_without_its_sbom() {
+    // Catches: a release, the previous one included, whose task image goes without its SBOM
+    // (the Ubuntu base's packages attested nowhere) passing, and an SBOM with no image passing.
+    // The control is the set with both, in `check_takes_the_task_image_with_its_facts_and_its_sbom`.
+    let root = scratch("check-image-no-sbom");
+    let d = dist_with_task_image(&root, "linux-arm64", true, false);
+    let image = format!("kbf-task-image-{COMMIT}-linux-arm64.oci.tar");
+    let sbom = format!("kbf-task-image-{COMMIT}-linux-arm64.cdx.json");
+    let (code, _, err) = check(&d, COMMIT);
+    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(
+        err,
+        format!("xtask: {image}: its image SBOM {sbom} is not listed in SHA256SUMS\n")
+    );
+    let orphan_root = scratch("check-image-orphan-sbom");
+    let orphan = dist_with(&orphan_root, &sbom);
+    let want =
+        format!("xtask: {sbom}: the image it describes, {image}, is not listed in SHA256SUMS\n");
+    let (code, _, err) = check(&orphan, COMMIT);
+    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(err, want);
 }
 
 #[test]
@@ -1657,6 +1720,11 @@ fn check_accepts_the_task_image_of_each_linux_arch_and_refuses_it_on_the_mac() {
             &format!("kbf-task-image-{COMMIT}-{platform}.facts.json"),
             false,
         );
+        add_deb(
+            &listed,
+            &format!("kbf-task-image-{COMMIT}-{platform}.cdx.json"),
+            false,
+        );
     }
     let (code, _, err) = check(&listed, COMMIT);
     assert_eq!(code, Some(0), "{err}");
@@ -1670,24 +1738,27 @@ fn check_accepts_the_task_image_of_each_linux_arch_and_refuses_it_on_the_mac() {
 }
 
 #[test]
-fn check_wants_the_facts_of_the_task_image_and_the_previous_release_may_lack_them() {
-    // Catches: a release that lists a task image without the facts that carry its manifest and
-    // base digests (the digest a registry pin is checked against would be unattested), facts
-    // listed for no image, and the waiver for the release made before the facts (the previous
-    // release is read with it) skipping more than the missing facts.
+fn check_wants_the_facts_of_the_task_image() {
+    // Catches: a release, the previous one included, that lists a task image without the facts
+    // that carry its manifest and base digests (the digest a registry pin is checked against
+    // would be unattested) passing, and facts listed for no image passing.
     let root = scratch("check-task-facts");
     let d = dist(&root, COMMIT);
     let image = format!("kbf-task-image-{COMMIT}-linux-arm64.oci.tar");
     let facts = format!("kbf-task-image-{COMMIT}-linux-arm64.facts.json");
+    // Its SBOM is listed, so that the facts are the one thing missing.
     add_deb(&d, &image, true);
+    add_deb(
+        &d,
+        &format!("kbf-task-image-{COMMIT}-linux-arm64.cdx.json"),
+        false,
+    );
     let (code, _, err) = check(&d, COMMIT);
     assert_eq!(code, Some(1), "{err}");
     assert_eq!(
         err,
         format!("xtask: {image}: its image facts {facts} are not listed in SHA256SUMS\n")
     );
-    let (code, _, err) = check_without_facts(&d, COMMIT);
-    assert_eq!(code, Some(0), "{err}");
     add_deb(&d, &facts, false);
     let (code, _, err) = check(&d, COMMIT);
     assert_eq!(code, Some(0), "{err}");
@@ -1697,10 +1768,27 @@ fn check_wants_the_facts_of_the_task_image_and_the_previous_release_may_lack_the
     let want = format!(
         "xtask: {facts}: the image it states the facts of, {image}, is not listed in SHA256SUMS\n"
     );
-    for run in [check, check_without_facts] {
-        let (code, _, err) = run(&orphan, COMMIT);
-        assert_eq!(code, Some(1), "{err}");
-        assert_eq!(err, want);
+    let (code, _, err) = check(&orphan, COMMIT);
+    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(err, want);
+}
+
+#[test]
+fn check_names_both_the_facts_and_the_sbom_a_task_image_lacks() {
+    // Catches: a previous release made before the image had facts and an SBOM (a task image
+    // listed alone) passing, or refused for one of the two only, so the other goes unnoticed.
+    let root = scratch("check-task-image-alone");
+    let d = dist_with_task_image(&root, "linux-arm64", false, false);
+    let image = format!("kbf-task-image-{COMMIT}-linux-arm64.oci.tar");
+    let facts = format!("kbf-task-image-{COMMIT}-linux-arm64.facts.json");
+    let sbom = format!("kbf-task-image-{COMMIT}-linux-arm64.cdx.json");
+    let (code, _, err) = check(&d, COMMIT);
+    assert_eq!(code, Some(1), "{err}");
+    for want in [
+        format!("{image}: its image facts {facts} are not listed in SHA256SUMS"),
+        format!("{image}: its image SBOM {sbom} is not listed in SHA256SUMS"),
+    ] {
+        assert!(err.contains(&want), "wanted {want:?} in {err}");
     }
 }
 
@@ -1729,6 +1817,11 @@ fn check_takes_only_the_facts_of_the_task_image_for_the_commit() {
         true,
     );
     add_deb(&d, &facts, false);
+    add_deb(
+        &d,
+        &format!("kbf-task-image-{other}-linux-arm64.cdx.json"),
+        false,
+    );
     let (code, out, err) = check(&d, COMMIT);
     assert_eq!(code, Some(1), "{out}");
     assert!(

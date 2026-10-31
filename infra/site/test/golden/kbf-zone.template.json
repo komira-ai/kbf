@@ -1,0 +1,34 @@
+{
+  "Resources": {
+    "ZoneA5DE4B68": {
+      "Type": "AWS::Route53::HostedZone",
+      "Properties": {
+        "HostedZoneConfig": {
+          "Comment": "kbf.dev public zone"
+        },
+        "Name": "kbf.dev."
+      },
+      "UpdateReplacePolicy": "Retain",
+      "DeletionPolicy": "Retain"
+    }
+  },
+  "Outputs": {
+    "NameServers": {
+      "Description": "The four name servers of this zone, comma separated",
+      "Value": {
+        "Fn::Join": [
+          ",",
+          {
+            "Fn::GetAtt": [
+              "ZoneA5DE4B68",
+              "NameServers"
+            ]
+          }
+        ]
+      }
+    },
+    "ZoneName": {
+      "Value": "kbf.dev"
+    }
+  }
+}

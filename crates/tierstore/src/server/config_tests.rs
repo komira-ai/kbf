@@ -87,8 +87,8 @@ fn a_file_is_read_from_its_path_and_its_refusals_name_it() {
     let good = dir.path().join("tierstore.toml");
     std::fs::write(&good, GOLDEN).unwrap();
     assert_eq!(
-        load(&good, DEFAULTS).unwrap(),
-        from_text(GOLDEN, DEFAULTS).unwrap()
+        load(&good, DEFAULTS).unwrap().into_storage(),
+        Some(from_text(GOLDEN, DEFAULTS).unwrap())
     );
     let missing = load(&dir.path().join("none.toml"), DEFAULTS).unwrap_err();
     assert!(matches!(missing, ConfigError::Read { .. }), "{missing}");
@@ -108,6 +108,7 @@ fn an_unknown_key_or_table_is_refused_by_name() {
         golden_with("[server]", "[server]\nbogus = 1"),
         golden_with("[hot_store]", "[hot_store]\nbogus = 1"),
         golden_with("[cold_store]", "[cold_store]\nbogus = 1"),
+        golden_with("[oci]", "[oci]\nbogus = 1"),
         format!("{GOLDEN}\n[bogus]\nx = 1\n"),
         format!("{GOLDEN}\n[[policy]]\nprefix = \"a/\"\nbogus = 1\n"),
         format!("bogus = 1\n{GOLDEN}"),
@@ -272,21 +273,22 @@ fn a_fault_inside_a_multi_line_string_shows_nothing_of_the_string() {
     assert!(!why.contains("SENTINEL"), "{why}");
 }
 
-/// Asserts that `[local_cache]` is refused as not supported yet, with or without the other
-/// tables, and that a file missing `[hot_store]` or `[cold_store]` is refused for the shape.
+/// Asserts that `[local_cache]` along with `[hot_store]` is refused, with the reason, and that a
+/// file with neither shape's tables (`[local_cache]` alone, or a storage node's file missing
+/// `[hot_store]` or `[cold_store]`) is refused for the shape.
 #[test]
-fn a_local_cache_and_any_shape_but_the_storage_node_are_refused() {
+fn a_local_cache_with_a_hot_store_and_any_shape_but_the_two_are_refused() {
     let cache = format!("{GOLDEN}\n[local_cache]\npath = \"/var/cache\"\n");
     let why = refusal(&cache);
     assert!(
-        why.contains("local_cache") && why.contains("not supported yet"),
+        why.contains("local_cache") && why.contains("is refused with [hot_store]"),
         "{why}"
     );
     let only_cache = minimal_with(
         "[hot_store]\nkind   = \"memory\"\nbudget = 1000\n\n[cold_store]\nkind = \"memory\"\n",
         "[local_cache]\npath = \"/c\"\n",
     );
-    assert!(refusal(&only_cache).contains("not supported yet"));
+    assert!(refusal(&only_cache).contains("[local_cache] and [cold_store]"));
     let no_cold = minimal_with("[cold_store]\nkind = \"memory\"\n", "");
     let no_hot = minimal_with("[hot_store]\nkind   = \"memory\"\nbudget = 1000\n", "");
     for text in [no_cold, no_hot] {
@@ -368,6 +370,7 @@ fn the_keys_only_one_tier_has_are_refused_in_the_other() {
         "critical = 1",
         "copy_parallel = 1",
         "reconcile_interval = \"1s\"",
+        "lock_file = \"/var/lib/tierstore/instance.lock\"",
         "usage_stale_after = \"1s\"",
         "journal_linger = \"1s\"",
         "journal_retention = \"1s\"",
@@ -431,7 +434,24 @@ fn a_value_out_of_range_is_refused_with_its_key() {
         (
             "budget = 1000",
             "budget = 1000\nlease_ttl = \"soon\"",
-            "not a duration",
+            "lease_ttl: not a value this key takes (it is not shown); expected a duration such as",
+        ),
+        // A lock file is an absolute path that names a file: two processes of one node must
+        // lock one file, whatever their working directories are.
+        (
+            "budget = 1000",
+            "budget = 1000\nlock_file = \"instance.lock\"",
+            "hot_store.lock_file: \"instance.lock\" must be an absolute path",
+        ),
+        (
+            "budget = 1000",
+            "budget = 1000\nlock_file = \"\"",
+            "hot_store.lock_file: \"\" must be an absolute path",
+        ),
+        (
+            "budget = 1000",
+            "budget = 1000\nlock_file = \"/\"",
+            "hot_store.lock_file: \"/\" must name a file",
         ),
         (
             "\"tier-bucket\"",
@@ -446,7 +466,7 @@ fn a_value_out_of_range_is_refused_with_its_key() {
         (
             "\"tier-bucket\"",
             "\"tier-bucket\"\nbody_idle_timeout = \"30\"",
-            "not a duration",
+            "body_idle_timeout: not a value this key takes (it is not shown); expected a duration such as",
         ),
     ];
     for (from, to, want) in cases {
@@ -455,11 +475,112 @@ fn a_value_out_of_range_is_refused_with_its_key() {
     }
 }
 
-/// Asserts that a policy is read and checked and has no effect: the settings with policies are
-/// the settings without; a prefix twice, a prefix inside another, a prefix that does not end in
-/// `/`, one under `_journal/` or `_tiering/`, and one that asks for a cache are refused.
+/// `MINIMAL` with the text of an `[oci]` table after it.
+fn minimal_with_oci(oci: &str) -> String {
+    format!("{MINIMAL}\n[oci]\n{oci}\n")
+}
+
+/// Asserts that an `[oci]` table makes the settings the `--oci-*` flags make: with every key
+/// given (the golden file) and with `listen` alone, where the other keys stay unset so that the
+/// front's own defaults apply; and that a file without the table opens no front.
 #[test]
-fn a_policy_is_checked_and_has_no_effect_yet() {
+fn an_oci_table_makes_the_settings_its_flags_make() {
+    let all = from_text(GOLDEN, DEFAULTS).unwrap();
+    assert_eq!(all.oci_listen, vec!["192.0.2.10:5000".parse().unwrap()]);
+    assert_eq!(
+        all.oci_tls_cert.as_deref(),
+        Some(Path::new("/etc/tierstore/oci.crt"))
+    );
+    assert_eq!(
+        all.oci_tls_key.as_deref(),
+        Some(Path::new("/etc/tierstore/oci.key"))
+    );
+    assert_eq!(all.oci_prefix.as_deref(), Some("images/"));
+    assert_eq!(all.oci_max_connections, Some(16));
+    assert_eq!(all.oci_connection_lifetime, Some(Duration::from_secs(1800)));
+    assert_eq!(all, Cli::try_parse_from(golden_flags()).unwrap());
+
+    let listen_only = from_text(&minimal_with_oci("listen = \"127.0.0.1:5000\""), DEFAULTS);
+    let mut flags = MINIMAL_FLAGS.to_vec();
+    flags.push("--oci-listen=127.0.0.1:5000");
+    assert_eq!(listen_only.unwrap(), Cli::try_parse_from(flags).unwrap());
+
+    let none = from_text(MINIMAL, DEFAULTS).unwrap();
+    assert!(none.oci_listen.is_empty());
+}
+
+/// Asserts that the `[oci]` rules are the flags' rules, each refusal naming its key: a
+/// certificate without a key and a key without a certificate, any other key without `listen`
+/// (and an empty table), a connection count of zero, a duration that is not one, a table with a
+/// key it does not have, and a key that holds a secret.
+#[test]
+fn an_oci_table_is_refused_as_the_flags_are() {
+    let listen = "listen = \"127.0.0.1:5000\"\n";
+    let both = "tls_cert_file = \"/c\"\ntls_key_file = \"/k\"";
+    let cases = [
+        (
+            format!("{listen}tls_cert_file = \"/c\""),
+            "oci.tls_key_file",
+        ),
+        (
+            format!("{listen}tls_key_file = \"/k\""),
+            "oci.tls_cert_file",
+        ),
+        (both.to_owned(), "oci.tls_cert_file: it needs oci.listen"),
+        (
+            "prefix = \"oci/\"".to_owned(),
+            "oci.prefix: it needs oci.listen",
+        ),
+        (
+            "max_connections = 4".to_owned(),
+            "oci.max_connections: it needs",
+        ),
+        (
+            "connection_lifetime = \"1h\"".to_owned(),
+            "oci.connection_lifetime: it needs",
+        ),
+        (String::new(), "oci.listen: it is needed"),
+        (
+            format!("{listen}max_connections = 0"),
+            "oci.max_connections",
+        ),
+        (format!("{listen}max_connections = -1"), "max_connections"),
+        (
+            format!("{listen}connection_lifetime = \"1\""),
+            "connection_lifetime: not a value this key takes (it is not shown); expected a duration such as",
+        ),
+        (
+            format!("{listen}connection_lifetime = 3600"),
+            "connection_lifetime",
+        ),
+        (format!("{listen}bogus = 1"), "bogus"),
+        (format!("{listen}tls_key = \"/k\""), "oci.tls_key: a secret"),
+        ("listen = \"nowhere\"".to_owned(), "listen"),
+    ];
+    for (oci, want) in cases {
+        let why = refusal(&minimal_with_oci(&oci));
+        assert!(why.contains(want), "{oci}: {why}");
+    }
+}
+
+/// Asserts that a refusal the start makes about an `--oci-*` flag names the key of the file.
+#[test]
+fn a_message_about_the_oci_flags_names_their_keys() {
+    let message = "--oci-tls-cert and --oci-tls-key go together; --oci-listen, --oci-prefix, \
+                   --oci-max-connections, --oci-connection-lifetime";
+    assert_eq!(
+        keys_for_flags(message),
+        "oci.tls_cert_file and oci.tls_key_file go together; oci.listen, oci.prefix, \
+         oci.max_connections, oci.connection_lifetime"
+    );
+}
+
+/// Asserts that on a storage node a policy is read and checked and has no effect: the settings
+/// with policies are the settings without; a prefix twice, a prefix inside another, a prefix that
+/// does not end in `/`, one under `_journal/` or `_tiering/`, and one that asks for a cache are
+/// refused.
+#[test]
+fn a_policy_is_checked_and_has_no_effect_on_a_storage_node() {
     let policies = "\n[[policy]]\nprefix = \"cas/b/\"\n\n[[policy]]\nprefix = \"cas/d/\"\ncache = false\n\n[[policy]]\nprefix = \"\"\n";
     let with = from_text(&format!("{GOLDEN}{policies}"), DEFAULTS).unwrap();
     assert_eq!(with, from_text(GOLDEN, DEFAULTS).unwrap());
@@ -554,7 +675,7 @@ fn every_flag_has_one_key_or_is_a_per_run_knob() {
         for key in *keys {
             let (table, name) = key.split_once('.').unwrap();
             assert!(
-                ["server", "hot_store", "cold_store"].contains(&table),
+                ["server", "hot_store", "cold_store", "oci"].contains(&table),
                 "{key}"
             );
             assert!(!name.is_empty(), "{key}");
@@ -623,4 +744,77 @@ fn the_example_in_the_readme_loads() {
     assert_eq!(cli.hot, "s3:tierstore-hot");
     assert_eq!(cli.cold, "s3:tierstore-cold");
     assert_eq!(cli.read_only_key_file.len(), 1);
+}
+
+/// `GOLDEN` with the value of `server.listen` and of `oci.listen` replaced.
+fn golden_listening(server: &str, oci: &str) -> String {
+    let text = golden_with("\"192.0.2.10:9300\"", server);
+    assert!(text.contains("\"192.0.2.10:5000\""));
+    text.replacen("\"192.0.2.10:5000\"", oci, 1)
+}
+
+/// Asserts that `server.listen` and `oci.listen` take one address as a string or a list of
+/// addresses: the list of one makes the settings the string does (so a file written before the
+/// lists loads as it did), and a list of two makes the settings two repeated flags make.
+#[test]
+fn a_listen_key_takes_one_address_or_a_list_of_them() {
+    let single = from_text(GOLDEN, DEFAULTS).unwrap();
+    let listed = golden_listening("[\"192.0.2.10:9300\"]", "[\"192.0.2.10:5000\"]");
+    assert_eq!(from_text(&listed, DEFAULTS).unwrap(), single);
+
+    let server = "[\"0.0.0.0:9300\", \"[::]:9300\"]";
+    let oci = "[\"0.0.0.0:5000\", \"[::]:5000\"]";
+    let from_file = from_text(&golden_listening(server, oci), DEFAULTS).unwrap();
+    let flags: Vec<&str> = golden_flags()
+        .into_iter()
+        .flat_map(|flag| match flag {
+            "--listen=192.0.2.10:9300" => vec!["--listen=0.0.0.0:9300", "--listen=[::]:9300"],
+            "--oci-listen=192.0.2.10:5000" => {
+                vec!["--oci-listen=0.0.0.0:5000", "--oci-listen=[::]:5000"]
+            }
+            other => vec![other],
+        })
+        .collect();
+    assert_eq!(from_file, Cli::try_parse_from(flags).unwrap());
+    assert_eq!(from_file.listen.len(), 2);
+    assert_eq!(from_file.oci_listen.len(), 2);
+}
+
+/// Asserts that a `listen` list that cannot work is refused with its key, and with no address and
+/// no text of the value in the message: an empty list, an address twice, and a value that is
+/// no address.
+#[test]
+fn a_listen_list_that_cannot_work_is_refused_by_its_key() {
+    let one_server = "\"192.0.2.10:9300\"";
+    let one_oci = "\"192.0.2.10:5000\"";
+    let twice_server = "[\"192.0.2.10:9300\", \"192.0.2.10:9300\"]";
+    let twice_oci = "[\"192.0.2.10:5000\", \"192.0.2.10:5000\"]";
+    let cases = [
+        (
+            golden_listening("[]", one_oci),
+            "server.listen: it needs at least one address",
+        ),
+        (
+            golden_listening(one_server, "[]"),
+            "oci.listen: it needs at least one address",
+        ),
+        (
+            golden_listening(twice_server, one_oci),
+            "server.listen: the same address is listed twice",
+        ),
+        (
+            golden_listening(one_server, twice_oci),
+            "oci.listen: the same address is listed twice",
+        ),
+        (
+            golden_listening("[\"192.0.2.10:9300\", \"secret-word\"]", one_oci),
+            "listen: invalid socket address syntax",
+        ),
+    ];
+    for (text, want) in cases {
+        let why = refusal(&text);
+        assert!(why.contains(want), "{want}: {why}");
+        assert!(!why.contains("192.0.2.10"), "{why}");
+        assert!(!why.contains("secret-word"), "{why}");
+    }
 }

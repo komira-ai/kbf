@@ -3,7 +3,7 @@
 //! The crate knows nothing of what is stored: objects are immutable byte strings under string
 //! keys, and it has no crate of the workspace it lives in among its normal dependencies, so that
 //! it can move to a repository of its own. The one exception is the feature `s3` (off by
-//! default), which adds `S3Backend`, an adapter over the S3 client of `kbf-objstore`; its tests
+//! default), which adds `S3Backend`, an adapter over the S3 client of `objstore-s3`; its tests
 //! use two crates of the workspace as dev-dependencies, which stay behind.
 //!
 //! - [`Backend`] is the minimal API of an S3-compatible store: a create-only put (it fails
@@ -69,10 +69,16 @@
 //! `tierstore` binary, which runs a proxy, that front and a [`Reconciler`] in one process
 //! (`cargo build -p tierstore --features server`), over memory, directory or S3 tiers; the
 //! feature turns `s3` on.
+//!
+//! The same feature adds a read-only OCI distribution front, over HTTPS or over plain HTTP on
+//! loopback (`--oci-listen`, `server::oci`), which serves the objects under a key prefix by
+//! their SHA-256 digest, so that a container engine pulls an image from the tiers.
 
 #![forbid(unsafe_code)]
 
 mod backend;
+#[cfg(test)]
+mod build_commit;
 mod cache;
 mod clock;
 mod dir;
@@ -80,7 +86,12 @@ mod error;
 mod faulty;
 mod journal;
 mod lease;
+#[cfg(test)]
+mod lease_tests;
 mod memory;
+mod metrics;
+#[cfg(test)]
+mod metrics_names_tests;
 mod reconciler;
 #[cfg(feature = "s3")]
 pub mod s3;
@@ -92,7 +103,7 @@ pub mod server;
 mod state;
 mod tiered;
 
-pub use backend::{Backend, ByteRange, Listed, Meta, OpenUpload, PartBody, UploadsAfter};
+pub use backend::{Backend, ByteRange, Listed, Meta, OpenUpload, PartBody, ReadBody, UploadsAfter};
 pub use cache::CachedStore;
 pub use clock::{Clock, MonotonicClock, SystemClock};
 pub use dir::DirBackend;
@@ -103,5 +114,8 @@ pub use memory::{MemoryBackend, TestClock};
 pub use reconciler::{PassReport, Reconciler, ReconcilerConfig};
 #[cfg(feature = "s3")]
 pub use s3::S3Backend;
-pub use selftest::{Check, Note, SelfTestError, SelfTestFailure, SelfTestOptions, self_test};
+pub use selftest::{
+    Check, Note, SelfTestError, SelfTestFailure, SelfTestOptions, SweepBudget, Swept, self_test,
+    sweep_probes,
+};
 pub use tiered::{Proxy, ProxyConfig};

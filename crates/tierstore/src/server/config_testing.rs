@@ -30,6 +30,7 @@ gc_key_files          = ["/etc/tierstore/pack-gc.key"]
 scoped_key_files      = ["/etc/tierstore/scoped.key"]
 presign_max_expires   = "10m"
 max_concurrent_puts   = 8
+put_permit_wait       = "25s"
 put_min_bytes_per_sec = 2048
 put_rate_grace        = "45s"
 body_idle_timeout     = "20s"
@@ -49,6 +50,7 @@ critical           = 97
 copy_parallel      = 8
 lease_ttl          = "40s"
 reconcile_interval = "4s"
+lock_file          = "/var/lib/tierstore/instance.lock"
 usage_stale_after  = "3m"
 journal_linger     = "50ms"
 journal_retention  = "12h"
@@ -60,6 +62,14 @@ endpoint         = "http://127.0.0.1:30900"
 region           = "us-west-2"
 credentials_file = "/etc/tierstore/cold.credentials"
 skip_checks      = ["multipart-conditional=store-ignores-if-none-match-on-completion"]
+
+[oci]
+listen              = "192.0.2.10:5000"
+tls_cert_file       = "/etc/tierstore/oci.crt"
+tls_key_file        = "/etc/tierstore/oci.key"
+prefix              = "images/"
+max_connections     = 16
+connection_lifetime = "30m"
 "#;
 
 /// The flags that say what `GOLDEN` says.
@@ -79,6 +89,7 @@ pub(crate) fn golden_flags() -> Vec<&'static str> {
         "--scoped-key-file=/etc/tierstore/scoped.key",
         "--presign-max-expires=10m",
         "--max-concurrent-puts=8",
+        "--put-permit-wait=25s",
         "--put-min-bytes-per-sec=2048",
         "--put-rate-grace=45s",
         "--body-idle-timeout=20s",
@@ -95,6 +106,7 @@ pub(crate) fn golden_flags() -> Vec<&'static str> {
         "--copy-parallel=8",
         "--lease-ttl=40s",
         "--reconcile-interval=4s",
+        "--lock-file=/var/lib/tierstore/instance.lock",
         "--usage-stale-after=3m",
         "--journal-linger=50ms",
         "--journal-retention=12h",
@@ -103,6 +115,12 @@ pub(crate) fn golden_flags() -> Vec<&'static str> {
         "--cold-region=us-west-2",
         "--cold-credentials-file=/etc/tierstore/cold.credentials",
         "--skip-backend-check=multipart-conditional=store-ignores-if-none-match-on-completion",
+        "--oci-listen=192.0.2.10:5000",
+        "--oci-tls-cert=/etc/tierstore/oci.crt",
+        "--oci-tls-key=/etc/tierstore/oci.key",
+        "--oci-prefix=images/",
+        "--oci-max-connections=16",
+        "--oci-connection-lifetime=30m",
     ]
 }
 

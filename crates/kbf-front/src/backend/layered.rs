@@ -33,6 +33,29 @@ pub(crate) struct Layered<'a> {
     pub rest: &'a dyn Blobs,
 }
 
+impl Layered<'_> {
+    /// The blobs `digests`, one answer each in the order asked, as [`Blobs::read_blob`]
+    /// answers one: the packs are asked for all of them together (one index lookup, and blobs
+    /// that lie close in a pack are one ranged read), and what they do not serve is read from
+    /// `rest`, one by one at once.
+    pub(crate) async fn read_many(&self, digests: &[Digest]) -> Vec<Answer<Bytes>> {
+        let packed = self.packs.read_many(digests).await;
+        futures::future::join_all(
+            digests
+                .iter()
+                .zip(packed)
+                .map(|(digest, packed)| async move {
+                    match packed {
+                        Ok(Some(bytes)) => Ok(bytes),
+                        Ok(None) => self.rest.read_blob(digest).await,
+                        Err(status) => Err(unavailable(status)),
+                    }
+                }),
+        )
+        .await
+    }
+}
+
 impl Blobs for Layered<'_> {
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<Bytes>> {
         Box::pin(async move {

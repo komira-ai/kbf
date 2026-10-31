@@ -101,6 +101,53 @@ async fn an_http_listener_url_is_refused_at_start() {
     }
 }
 
+/// Catches a plain-http read url accepted without the opt-in, and the opt-in widening more than
+/// the scheme: with it `http://host[:port]` starts a preparer whose grants point there, and a
+/// path, a missing host or another scheme is refused all the same.
+#[tokio::test]
+async fn a_plain_http_read_url_is_accepted_only_with_the_opt_in() {
+    let parts = Parts::new();
+    let store = Watched::holding(parts.blobs.clone()).await;
+    let storage: Arc<dyn Storage> = store.clone();
+    let mut plain = config();
+    plain.read_url = "http://127.0.0.1:8443".to_owned();
+    let error = RunPrep::new(Backend::remote(storage.clone()), plain).expect_err("refused");
+    assert_eq!(
+        error,
+        ConfigError::ReadUrl {
+            url: "http://127.0.0.1:8443".to_owned(),
+            why: "is not https"
+        }
+    );
+    let mut allowed = config();
+    allowed.read_url = "http://127.0.0.1:8443".to_owned();
+    allowed.allow_plain_read_url = true;
+    let prep = RunPrep::new(Backend::remote(storage.clone()), allowed).expect("accepted");
+    let inputs = prep
+        .prepare_run(LEASE, &parts.action, now())
+        .await
+        .expect("prepared");
+    assert_eq!(inputs.read_grant.url, "http://127.0.0.1:8443");
+    for url in [
+        "http://127.0.0.1:8443/jobs",
+        "http://",
+        "ftp://127.0.0.1:8443",
+    ] {
+        let mut bad = config();
+        bad.read_url = url.to_owned();
+        bad.allow_plain_read_url = true;
+        let error = RunPrep::new(Backend::remote(storage.clone()), bad).expect_err("refused");
+        assert!(
+            matches!(error, ConfigError::ReadUrl { .. }),
+            "{url}: {error:?}"
+        );
+    }
+    assert!(kbf_front::prepare_run::check_read_url_allowing("http://127.0.0.1:8443", true).is_ok());
+    assert!(
+        kbf_front::prepare_run::check_read_url_allowing("http://127.0.0.1:8443", false).is_err()
+    );
+}
+
 #[tokio::test]
 async fn a_put_endpoint_that_is_not_http_or_https_host_is_refused_at_start() {
     let parts = Parts::new();

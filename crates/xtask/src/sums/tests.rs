@@ -14,9 +14,8 @@ fn scratch(name: &str) -> TestDir {
     TestDir::under(deps.join("xtask-sums-unit"), name)
 }
 
-/// One row of the pairing test: what is listed, then the problem wanted when the pairing is
-/// required and when it is waived.
-type PairingRow<'a> = (&'a str, &'a [&'a str], Option<&'a str>, Option<&'a str>);
+/// One row of the pairing test: what is listed, then the problem wanted (none when it passes).
+type PairingRow<'a> = (&'a str, &'a [&'a str], Option<&'a str>);
 
 fn line(name: &str, bytes: &[u8]) -> String {
     format!("{}  {name}\n", Sha256::of(bytes))
@@ -99,10 +98,9 @@ fn verify_sums_passes_when_listed_is_present_and_each_matches() {
 
 #[test]
 fn a_kbf_tarball_and_its_version_facts_are_listed_together() {
-    // Catches: the pairing in one direction only, the waiver skipping more than the facts
-    // of a tarball, and a waiver that is ignored. Rows: a `kbf` tarball without facts is
-    // refused, and passes when the pairing is waived; facts without their tarball are
-    // refused either way; both listed pass either way. Catches: either `if` dropped.
+    // Catches: the pairing in one direction only. Rows: a `kbf` tarball without facts is
+    // refused; facts without their tarball are refused; both listed pass. Catches: either `if`
+    // dropped.
     let tarball = "kbf-c0ffee012345-linux-x86_64.tar.gz";
     let facts = "kbf-c0ffee012345-linux-x86_64.version.json";
     let no_facts = format!("{tarball}: its version facts {facts} are not listed in {SUMS}");
@@ -110,22 +108,60 @@ fn a_kbf_tarball_and_its_version_facts_are_listed_together() {
         format!("{facts}: the tarball it states the facts of, {tarball}, is not listed in {SUMS}");
     let (no_facts, no_tarball) = (no_facts.as_str(), no_tarball.as_str());
     let rows: [PairingRow; 3] = [
-        ("tarball", &[tarball], Some(no_facts), None),
-        ("facts", &[facts], Some(no_tarball), Some(no_tarball)),
-        ("both", &[tarball, facts], None, None),
+        ("tarball", &[tarball], Some(no_facts)),
+        ("facts", &[facts], Some(no_tarball)),
+        ("both", &[tarball, facts], None),
     ];
     let bytes: &[u8] = b"bytes";
-    for (what, listed, required, waived) in rows {
+    for (what, listed, wanted) in rows {
         let dir = scratch(&format!("verify-pairing-{what}"));
         let files: Vec<(&str, &[u8])> = listed.iter().map(|n| (*n, bytes)).collect();
         let sums: String = listed.iter().map(|n| line(n, bytes)).collect();
         assets(&dir, &files, &sums);
-        for (pairing, wanted) in [(Pairing::Required, required), (Pairing::Waived, waived)] {
-            let got = verify_sums_with(&dir, Sha256::of, pairing);
-            match wanted {
-                Some(problem) => assert_eq!(refused(got), [problem], "{what} {pairing:?}"),
-                None => assert!(got.is_ok(), "{what} {pairing:?}: {got:?}"),
-            }
+        let got = verify_sums(&dir, Sha256::of);
+        match wanted {
+            Some(problem) => assert_eq!(refused(got), [problem], "{what}"),
+            None => assert!(got.is_ok(), "{what}: {got:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_task_image_and_its_sbom_are_listed_together() {
+    // Catches: the pairing in one direction only, and the SBOM of the `kbf-task` binary (a tarball's, named
+    // `kbf-task-<commit>-<platform>.cdx.json`) or an image that has no SBOM (the frontend's)
+    // taken for the pair. Rows: a task image with its facts and no SBOM is refused; one with its SBOM
+    // and no facts is refused; an SBOM without its image is refused; the set with both passes.
+    // Catches: either `if` dropped. (A tarball is listed in every row: the
+    // control that flips its last byte needs one.)
+    let image = "kbf-task-image-c0ffee012345-linux-x86_64.oci.tar";
+    let facts = "kbf-task-image-c0ffee012345-linux-x86_64.facts.json";
+    let sbom = "kbf-task-image-c0ffee012345-linux-x86_64.cdx.json";
+    let binary_sbom = "kbf-task-c0ffee012345-linux-x86_64.cdx.json";
+    let frontend = "kbf-frontend-image-c0ffee012345-linux-x86_64.oci.tar";
+    let no_sbom = format!("{image}: its image SBOM {sbom} is not listed in {SUMS}");
+    let no_image = format!("{sbom}: the image it describes, {image}, is not listed in {SUMS}");
+    let (no_sbom, no_image) = (no_sbom.as_str(), no_image.as_str());
+    let no_facts = format!("{image}: its image facts {facts} are not listed in {SUMS}");
+    let no_facts = no_facts.as_str();
+    let rows: [PairingRow; 6] = [
+        ("image", &[A, image, facts], Some(no_sbom)),
+        ("image-no-facts", &[A, image, sbom], Some(no_facts)),
+        ("sbom", &[A, sbom], Some(no_image)),
+        ("both", &[A, image, facts, sbom], None),
+        ("binary-sbom", &[A, binary_sbom], None),
+        ("frontend", &[A, frontend], None),
+    ];
+    let bytes: &[u8] = b"bytes";
+    for (what, listed, wanted) in rows {
+        let dir = scratch(&format!("verify-image-sbom-{what}"));
+        let files: Vec<(&str, &[u8])> = listed.iter().map(|n| (*n, bytes)).collect();
+        let sums: String = listed.iter().map(|n| line(n, bytes)).collect();
+        assets(&dir, &files, &sums);
+        let got = verify_sums(&dir, Sha256::of);
+        match wanted {
+            Some(problem) => assert_eq!(refused(got), [problem], "{what}"),
+            None => assert!(got.is_ok(), "{what}: {got:?}"),
         }
     }
 }

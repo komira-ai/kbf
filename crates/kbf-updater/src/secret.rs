@@ -38,7 +38,7 @@ pub fn read_token(path: &Path) -> Result<String, String> {
 
 /// The bytes of a secret file that passes the file rule, at most `limit` of them (and one
 /// more, so that a longer file is seen to be too long). The error text names `flag`.
-pub(crate) fn read_secret(path: &Path, flag: &str, limit: u64) -> Result<Vec<u8>, String> {
+pub fn read_secret(path: &Path, flag: &str, limit: u64) -> Result<Vec<u8>, String> {
     let fail = |why: &str| format!("{flag}: {why}");
     let io = |e: std::io::Error| fail(&e.kind().to_string());
     let (file, meta) = open_checked(path).map_err(io)?;

@@ -78,6 +78,15 @@ trait Plane: Send + Sync {
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Answer<Vec<Digest>>>;
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<bytes::Bytes>>;
     fn read_stream<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<ReadStream>>;
+    /// Each blob of `digests` read as [`Plane::read_blob`] reads one; a plane with packs
+    /// reads the packed ones together.
+    fn read_many<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Vec<Answer<bytes::Bytes>>> {
+        Box::pin(futures::future::join_all(
+            digests.iter().map(|digest| self.read_blob(digest)),
+        ))
+    }
+    /// The packs a plane keeps its client uploads in, if it has any.
+    fn packs(&self) -> Option<&Packs>;
     fn action_result<'a>(
         &'a self,
         action: &'a Digest,
@@ -177,6 +186,41 @@ impl Backend {
     /// the first chunk is an error item of the stream.
     pub async fn read_stream(&self, digest: &Digest) -> Result<ReadStream, StorageError> {
         self.0.read_stream(digest).await
+    }
+
+    /// The blobs `digests`, one answer each in the order asked, each as
+    /// [`Backend::read_blob`] answers one. With packs, the blobs in them are read together
+    /// (the index is asked once, and blobs that lie close in a pack are one ranged read of the
+    /// store) and only the rest are read from the storage nodes, one by one.
+    pub async fn read_many(&self, digests: &[Digest]) -> Vec<Result<bytes::Bytes, StorageError>> {
+        self.0.read_many(digests).await
+    }
+
+    /// Where the blob of each of `digests` lies in a pack, in the order asked, `None` for one that
+    /// is in none; all `None` for a store without packs. One batched ask of the pack index.
+    ///
+    /// # Errors
+    /// As the pack index answers.
+    pub async fn locate_packed(
+        &self,
+        digests: &[Digest],
+    ) -> Result<Vec<Option<kbf_pack_index::Location>>, StorageError> {
+        let Some(packs) = self.0.packs() else {
+            return Ok(vec![None; digests.len()]);
+        };
+        packs.locate(digests).await.map_err(layered::unavailable)
+    }
+
+    /// The length of the object `key` in the object store the packs live in (a HEAD), `None` if
+    /// there is none or the store has no packs.
+    ///
+    /// # Errors
+    /// As the object store answers.
+    pub async fn object_len(&self, key: &str) -> Result<Option<u64>, StorageError> {
+        let Some(packs) = self.0.packs() else {
+            return Ok(None);
+        };
+        packs.object_len(key).await.map_err(layered::unavailable)
     }
 
     pub(crate) async fn action_result(
@@ -282,6 +326,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> Plane for Local<M, O> {
         })
     }
 
+    fn packs(&self) -> Option<&Packs> {
+        None
+    }
     fn action_result<'a>(
         &'a self,
         action: &'a Digest,
@@ -404,6 +451,21 @@ impl Plane for Remote {
         self.storage.read_range(digest, 0, 0)
     }
 
+    fn read_many<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Vec<Answer<bytes::Bytes>>> {
+        match &self.packs {
+            None => Box::pin(futures::future::join_all(
+                digests.iter().map(|digest| self.storage.read_blob(digest)),
+            )),
+            Some(packs) => Box::pin(async move {
+                let held = Held(&*self.storage);
+                Layered { packs, rest: &held }.read_many(digests).await
+            }),
+        }
+    }
+
+    fn packs(&self) -> Option<&Packs> {
+        self.packs.as_ref()
+    }
     fn action_result<'a>(
         &'a self,
         action: &'a Digest,
@@ -559,6 +621,26 @@ impl Plane for RoutedPlane {
         }
     }
 
+    fn read_many<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Vec<Answer<bytes::Bytes>>> {
+        match (self.routing(), &self.packs) {
+            (Some(router), None) => Box::pin(futures::future::join_all(
+                digests.iter().map(|digest| router.read_blob(digest)),
+            )),
+            (Some(router), Some(packs)) => Box::pin(async move {
+                let primary = Primary(router);
+                let layered = Layered {
+                    packs,
+                    rest: &primary,
+                };
+                layered.read_many(digests).await
+            }),
+            (None, _) => self.bootstrap.read_many(digests),
+        }
+    }
+
+    fn packs(&self) -> Option<&Packs> {
+        self.packs.as_ref()
+    }
     fn action_result<'a>(
         &'a self,
         action: &'a Digest,

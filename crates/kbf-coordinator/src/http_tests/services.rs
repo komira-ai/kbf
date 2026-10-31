@@ -180,7 +180,8 @@ const GOLDEN_STATUS: &str = concat!(
 /// Pins: the bytes of kbf's status and convergence stay what they were. With only kbf
 /// managed, the convergence is byte for byte the old answer followed by the build `commit`,
 /// whether or not `?service=kbf` is given, and the status is the old answer followed by the
-/// new `per_service` key and then `commit`.
+/// new `per_service` key (kbf's `desired` and `roles` as they were, then `hosts`, `up`,
+/// `slots_held` and `convergence`) and then `commit`.
 #[tokio::test]
 async fn the_kbf_status_and_convergence_bytes_are_unchanged() {
     let rig = Rig::new("http-golden-status");
@@ -222,9 +223,16 @@ async fn the_kbf_status_and_convergence_bytes_are_unchanged() {
     assert_eq!(code, 200);
     let tail = concat!(
         r#","per_service":{"kbf":{"desired":{"version":"2.0","max_updating":{"frontend":1,"storage":1,"daemon":2,"mac-daemon":2},"min_up":{"storage":1,"frontend":0}},"#,
-        r#""roles":[{"role":"storage","at_desired":1,"updating":0,"failed":0,"down":0}]}}"#
+        r#""roles":[{"role":"storage","at_desired":1,"updating":0,"failed":0,"down":0}],"#,
+        r#""hosts":[{"node_id":"st1","role":"storage","live":true,"up":true,"holds_slot":false,"silent_secs":0,"#,
+        r#""platform":"linux-x86_64","version":"2.0","health":"healthy","last_update":null,"updating":null,"hold":"up_to_date"}],"#,
+        r#""up":1,"slots_held":0,"convergence":"#,
     );
-    assert_eq!(status, format!("{GOLDEN_STATUS}{tail}{commit}"));
+    // The convergence in the status is the answer of `GET /v1/convergence`, with its commit.
+    assert_eq!(
+        status,
+        format!("{GOLDEN_STATUS}{tail}{converged}}}}}{commit}")
+    );
 }
 
 /// Behaviour: `?service=` picks the service a convergence read is about, over HTTP. With
