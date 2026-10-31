@@ -116,10 +116,19 @@ async fn a_reading_that_never_answers_is_stopped_and_is_unreadable() {
         .unwrap()
         .clone();
     let source = OpsColdState::new(host.clone(), ops, spec, dir.path().to_owned());
-    let err = source
-        .read_within(Duration::from_secs(30))
-        .await
-        .unwrap_err();
+    let limit = Duration::from_secs(30);
+    let read = source.read_within(limit);
+    tokio::pin!(read);
+    // Polled once, the read has started the command and the timer. The paused clock does not
+    // advance by itself while a thread of the blocking pool works, so the test advances it past
+    // the limit by hand.
+    tokio::select! {
+        biased;
+        _ = &mut read => panic!("the read ended before its limit"),
+        () = tokio::task::yield_now() => {}
+    }
+    tokio::time::advance(limit + Duration::from_secs(1)).await;
+    let err = read.await.unwrap_err();
     assert!(matches!(err, BenchError::Ops(_)), "{err}");
     assert!(
         err.to_string().starts_with("cold state: unreadable"),
