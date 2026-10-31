@@ -834,3 +834,49 @@ fn a_finished_update_is_followed_by_the_next_generation() {
     assert_eq!(units[0], "updater-svc-prepare-2");
     assert!(rig.fake.stops().is_empty());
 }
+
+/// Catches a params file that is not kept for the whole update or is left behind: it is the
+/// path the record names, the same for every step including those after a resume, and gone
+/// once the update has ended.
+#[test]
+fn the_params_file_lives_as_long_as_the_update() {
+    let rig = Rig::new("run-params-life");
+    rig.fake
+        .lose_run
+        .store(3, std::sync::atomic::Ordering::SeqCst);
+    assert!(rig.runner().run(&rig.order()).is_err());
+    let Loaded::Current(rec) = rig.store().load().unwrap() else {
+        panic!("a record")
+    };
+    assert_eq!(rec.params, rig.state.join("params.toml"));
+    let before = fs::read_to_string(&rec.params).unwrap();
+    rig.fake.clear();
+    assert_eq!(run(&rig), ok());
+    for e in rig.fake.runs() {
+        let support::Event::Run {
+            params_file,
+            params,
+            ..
+        } = e
+        else {
+            unreachable!()
+        };
+        assert_eq!(params_file, rec.params);
+        assert_eq!(params, before);
+    }
+    assert!(!rec.params.exists());
+}
+
+/// Catches a state directory that others can read or write holding the params file: the runner
+/// refuses it before anything runs.
+#[test]
+fn a_state_directory_open_to_others_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let rig = Rig::new("run-open-state");
+    fs::set_permissions(&rig.state, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(matches!(
+        rig.runner().run(&rig.order()),
+        Err(RunError::Record(_))
+    ));
+    assert!(rig.fake.events().is_empty());
+}

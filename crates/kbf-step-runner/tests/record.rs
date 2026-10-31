@@ -20,6 +20,7 @@ fn record() -> Record {
         artifact_digest: "abc".to_owned(),
         previous_digest: Some("def".to_owned()),
         generation: 7,
+        params: "/state/params.toml".into(),
         step: Step::Verify,
         attempt: 2,
         state: State::Running {

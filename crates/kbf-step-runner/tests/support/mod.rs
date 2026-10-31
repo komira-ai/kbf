@@ -264,6 +264,7 @@ impl Rig {
             fs::write(dir.join("lib").join("data"), text).unwrap();
         }
         fs::create_dir_all(&state).unwrap();
+        fs::set_permissions(&state, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
         Rig {
             scratch,
             clock: FakeClock::new(),

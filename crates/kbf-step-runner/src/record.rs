@@ -83,6 +83,9 @@ pub struct Record {
     pub previous_digest: Option<String>,
     /// The number of this update on this host; the unit names carry it.
     pub generation: u64,
+    /// The params file of this update: written once, the same path for every step, removed when
+    /// the update ends or is abandoned.
+    pub params: PathBuf,
     pub step: Step,
     pub attempt: u32,
     pub state: State,
@@ -186,6 +189,29 @@ impl RecordStore {
             serde_json::to_vec_pretty(record).map_err(|e| RecordError::Corrupt(e.to_string()))?;
         write_atomic(&self.dir, RECORD_FILE, &bytes)?;
         self.cross(CrashPoint::AfterWrite(n))
+    }
+
+    /// Refuses a state directory that is not the updater's alone: the params file and the record
+    /// live there, so it must be owned by the running user and closed to group and others.
+    pub fn check_private(&self) -> Result<(), RecordError> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(&self.dir)?;
+        let mine = meta.uid() == rustix::process::geteuid().as_raw();
+        if meta.is_dir() && mine && meta.mode() & 0o077 == 0 {
+            return Ok(());
+        }
+        Err(RecordError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the state directory is not a private directory of the updater",
+        )))
+    }
+
+    /// Removes the params file; one that is not there is fine.
+    pub fn remove_params(&self) -> Result<(), RecordError> {
+        match fs::remove_file(self.params_path()) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
     }
 
     /// Writes the params file, durably.

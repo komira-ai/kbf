@@ -186,6 +186,7 @@ impl StepRunner {
                 reason: Some(REASON_UPDATER_OLD.to_owned()),
             });
         }
+        self.store.check_private()?;
         let generation = match self.store.load()? {
             Loaded::Newer { schema } => return Err(RunError::RecordNewer(schema)),
             Loaded::Absent => 1,
@@ -240,6 +241,7 @@ impl StepRunner {
             artifact_digest: order.staged.digest.clone(),
             previous_digest: order.previous.as_ref().map(|p| p.digest.clone()),
             generation,
+            params: self.store.params_path(),
             step: Step::Prepare,
             attempt: 1,
             state: State::Pending,
@@ -253,7 +255,10 @@ impl StepRunner {
     fn advance(&self, order: &UpdateOrder, mut rec: Record) -> Result<Finished, RunError> {
         loop {
             match rec.state.clone() {
-                State::Finished { verdict, reason } => return Ok(Finished { verdict, reason }),
+                State::Finished { verdict, reason } => {
+                    self.store.remove_params()?;
+                    return Ok(Finished { verdict, reason });
+                }
                 State::Running { .. } => {
                     // The updater died with the step's unit possibly alive: stop it by name and
                     // wait for it to end before the step is started again (3.5).
@@ -333,7 +338,7 @@ impl StepRunner {
             invocation: Invocation {
                 step: rec.step,
                 artifact,
-                params: Some(self.store.params_path()),
+                params: Some(rec.params.clone()),
             },
             executable,
             unit: &unit,

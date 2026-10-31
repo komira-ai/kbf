@@ -29,7 +29,7 @@ last line, the params table, the next-step table) are those of `update-hook`.
 - `cleanup` runs only after `verify` succeeded and is never rolled back; the watcher never rolls back.
 - `rollback` runs the new release's hook, and the previous release's only when the new hook cannot
   start at all.
-- The updater writes one params file per update and passes the same file to every step.
+- The updater writes one params file per update, in its private state directory (refused unless owned by the running user and closed to others), names it in the step record, passes the same path to every step including those after a resume, and removes it when the update ends.
 - Tests never wait for a time: a fake clock moves when a `sleep` or a test moves it, the dead-man thread
   is ended by a handshake, and crash tests stop the updater at every point of every record write.
 
