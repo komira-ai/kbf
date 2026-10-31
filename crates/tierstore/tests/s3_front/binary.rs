@@ -68,6 +68,11 @@ pub(crate) fn start(flags: &[String]) -> Running {
 }
 
 impl Running {
+    /// The address the binary said it listens on.
+    pub(crate) fn addr(&self) -> &str {
+        &self.addr
+    }
+
     /// The client of kbf with the key of the key file.
     pub(crate) fn store(&self) -> S3Store {
         self.store_as(BIN_KEY_ID, BIN_SECRET)

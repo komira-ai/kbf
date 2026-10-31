@@ -73,6 +73,9 @@ pub struct Spy {
     reject_puts: AtomicU32,
     reject_reads: AtomicU32,
     reject_lens: AtomicU32,
+    /// The range reads so far, and the number of the one that fails (`u64::MAX`: none).
+    reads: AtomicU64,
+    fail_read_at: AtomicU64,
     shave_len: AtomicU64,
     reject_big_reads: AtomicU32,
     reject_large_lens: AtomicU32,
@@ -122,6 +125,8 @@ impl Spy {
             reject_puts: AtomicU32::new(0),
             reject_reads: AtomicU32::new(0),
             reject_lens: AtomicU32::new(0),
+            reads: AtomicU64::new(0),
+            fail_read_at: AtomicU64::new(u64::MAX),
             shave_len: AtomicU64::new(0),
             reject_big_reads: AtomicU32::new(0),
             reject_large_lens: AtomicU32::new(0),
@@ -176,6 +181,13 @@ impl Spy {
     /// The next `n` range reads fail (after they are logged).
     pub fn reject_reads(&self, n: u32) {
         self.reject_reads.store(n, SeqCst);
+    }
+
+    /// The range read after the next `skip` ones fails, and only that one (the first read is
+    /// number 0 of those after this call).
+    pub fn reject_read_after(&self, skip: u64) {
+        let now = self.reads.load(SeqCst);
+        self.fail_read_at.store(now + skip, SeqCst);
     }
 
     /// The next `n` length questions fail.
@@ -349,7 +361,8 @@ impl ObjectStore for Spy {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(asked);
-        if fires(&self.reject_reads) {
+        let number = self.reads.fetch_add(1, SeqCst);
+        if fires(&self.reject_reads) || number == self.fail_read_at.load(SeqCst) {
             return Err(injected());
         }
         if range.size() >= 1 << 20 && fires(&self.reject_big_reads) {

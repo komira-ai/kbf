@@ -140,7 +140,7 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server}
 
 pub use self::executor_flags::{ExecutorFlags, JsAgentFlags};
 pub use self::janitor::{Janitor, JanitorFlagError, JanitorFlags, JanitorMetrics};
-pub use self::job_read::{JobReadError, JobReadFlags};
+pub use self::job_read::{JobReadError, JobReadFlags, JobTls};
 pub use self::pack_flags::{PackFlagError, PackFlags};
 pub use self::task_flags::{TaskFlagError, TaskFlags};
 use crate::drain::Drain;
@@ -1043,7 +1043,7 @@ impl<'a> Prepared<'a> {
                 read,
             }) => {
                 drain.begins().closes(latch);
-                tls_sources.push(tls);
+                tls_sources.extend(tls);
                 (Some(read), Some(task))
             }
             None => (None, None),

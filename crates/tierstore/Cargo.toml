@@ -1,6 +1,8 @@
 [package]
 name = "tierstore"
-version.workspace = true
+# Its own version, not the workspace's: 0.2.0 is the first release whose cache node can write
+# through (`[local_cache] write_through`), which `tierstore --version` shows.
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -85,8 +87,9 @@ md-5 = { workspace = true, optional = true }
 percent-encoding = { workspace = true, optional = true }
 # The SHA-1 a client may send as the `x-amz-checksum-sha1` of a body (`server`).
 ring = { workspace = true, optional = true }
-# The user id the server runs as, which a key file must belong to (`server`).
-rustix = { workspace = true, features = ["process"], optional = true }
+# The user id the server runs as, which a key file must belong to, and the free space, the link count and
+# the times of the files of the local cache (`server`).
+rustix = { workspace = true, features = ["fs", "process"], optional = true }
 # The body of a CompleteMultipartUpload request (`server`).
 roxmltree = { workspace = true, optional = true }
 # The TLS of the OCI read front (`server`): the certificate and key are read at start, and the

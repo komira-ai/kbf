@@ -420,6 +420,9 @@ const WORKFLOW_ENV: &[&str] = &[
     "NFPM_VERSION",
     "NFPM_SHA256_X86_64_LINUX",
     "NFPM_SHA256_AARCH64_LINUX",
+    "SYFT_VERSION",
+    "SYFT_SHA256_X86_64_LINUX",
+    "SYFT_SHA256_AARCH64_LINUX",
 ];
 
 /// The checks of the attest job `job` are `sha256sum` run by the workflow's bash: the workflow's

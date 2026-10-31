@@ -86,6 +86,7 @@ fn a_hot_store_below_a_directory_the_user_cannot_enter_is_refused() {
         &[
             "--storage-listen=127.0.0.1:0".to_owned(),
             format!("--cold-store=file://{}", dir.join("cold").display()),
+            "--cold-store-floor-bytes=1".to_owned(),
             format!("--hot-store=file://{}", locked.join("hot").display()),
             format!("--meta-dir={}", dir.join("meta").display()),
         ],
@@ -117,6 +118,7 @@ fn a_lax_key_file_beside_the_loaded_config_is_refused() {
         &[
             "--storage-listen=127.0.0.1:0".to_owned(),
             format!("--cold-store=file://{}", dir.join("cold").display()),
+            "--cold-store-floor-bytes=1".to_owned(),
             format!("--meta-dir={}", dir.join("meta").display()),
         ],
     )
