@@ -172,6 +172,26 @@ async fn the_start_reads_the_grant_key_as_the_other_secret_files_are_read() {
     }
 }
 
+/// Catches: a grant key whose secret is under the 32 bytes tierstore requires being accepted at
+/// the start and refused at the first `GET /locate` that signs with it (every answer would then
+/// carry no grant), and the refusal naming the flag and the file without the secret.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_start_refuses_a_grant_secret_shorter_than_32_bytes() {
+    let dir = scratch_dir("job-read-store-short-secret");
+    let farm = ca("farm CA");
+    let files = files(dir.path(), &farm, vec![ip("127.0.0.1")]);
+    let short = "s".repeat(31);
+    let key = key_file(dir.path(), format!("{ID}\n{short}\n"), 0o600);
+    let why = refusal(&with_store(flags(&files, "127.0.0.1:0"), &key, URL, BUCKET));
+    assert!(why.contains("--job-store-grant-key-file"), "{why}");
+    assert!(why.contains("32 bytes"), "{why}");
+    assert!(!why.contains(&short), "{why}");
+    let exact = "s".repeat(32);
+    let key = key_file(dir.path(), format!("{ID}\n{exact}\n"), 0o600);
+    let ok = prepare(&with_store(flags(&files, "127.0.0.1:0"), &key, URL, BUCKET));
+    assert!(ok.is_ok());
+}
+
 /// Catches: a store URL a task could not use accepted at the start (and found out at the first
 /// run): no http or https scheme, no host, a path, a query, a fragment, a space.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
