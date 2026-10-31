@@ -98,7 +98,7 @@ A unix socket in a directory owned by root with group `updater-register`, mode 0
 
 - **Declared, never registered:** reported to the coordinator as `absent` (a new health value; today there are `healthy` and `unhealthy`, `wire.rs:29-35`). The coordinator does not count an absent service toward `min_up` and does not order it unless the service definition says `install_when_absent`.
 - **Registered, now not running:** the connection closed. The registration stays for `registration_ttl` (a declaration value); the service is reported unhealthy with `stopped`. A hook is told the service is stopped (an input, not a different step set).
-- **Registered twice:** a second registration of the same name from the same uid replaces the first; from another uid it is refused and logged.
+- **Registered twice:** a second registration of the same name from the same uid replaces the first; from another uid it is refused and logged. For `root` this is not a separation: a root service's registration is trusted only as far as root is, and it carries only liveness and version.
 - **A service with no registration client or listener** (the js-agent today) would read `absent` for ever. Two ways out: it links the **registration client**, a tiny crate with no kbf product dependency that sends the three fields over the socket (a migration step, 8); or, as the **fallback only for a service that cannot link it**, the declaration can ask for a synthetic registration, in which case the updater reports liveness from the unit's state and the version from the staged release.
 - **kbf itself** has a declaration like any service; hosts configured today with `--service` flags get a synthetic declaration read from the same file format until the flags are retired (8).
 
@@ -154,7 +154,7 @@ promotion_bound_secs = 900              # how long verify waits for v-next to ta
 # a service with a cordon puts its lease and cap here, e.g. cordon_lease_secs = 300, cordon_max_secs = 13500
 ```
 
-`[hook.params]` is an opaque table: the updater validates only that it is a table of scalars, writes it to a file in the step's runtime directory and passes the path as `--params <file>` (configuration is flags, not environment). The file also carries reserved keys under the prefix `updater.`, written by the updater and never set by a declaration; a `[hook.params]` that sets any `updater.*` key is refused at load:
+`[hook.params]` is an opaque table: the updater validates only that it is a table of scalars, writes it once per update to a file in a directory the updater owns (root-only, kept until the update ends or is abandoned) and passes the path as `--params <file>` to every step (configuration is flags, not environment). The file also carries reserved keys under the prefix `updater.`, written by the updater and never set by a declaration; a `[hook.params]` that sets any `updater.*` key is refused at load:
 
 | key | value |
 |---|---|
@@ -168,7 +168,7 @@ The updater writes one params file per update and passes the same file, with the
 
 **Placement is checked.** A repository test parses every declaration shipped in the repository and asserts that each key is in the table the loader reads it from (the rights under `[hook]`, the deadlines at the top level, nothing but scalars under `[hook.params]`); the loader refuses an unknown key anywhere. Quoted numbers above are the tierstore owner's (`tierstore-handover.md`, section 2); the account `tierstore-update`, `state_dir`, and the empty `write_paths` are changes this document asks of that section (3.4.1).
 
-Load rules, applied to every declaration and across all of them: `hook.user` differs from `uid` unless it is `root`; `state_dir` is not inside any path the service's account can write; the file is root-owned and not group- or world-writable (else refused); a name mapped to a uid that another declaration uses is refused (`root` excepted: several services may run as root, and uid isolation does not separate them anyway); two declarations that claim the same unit or port range are refused; a unit name must match the grammar for that service (never an existing system unit); `verify_deadline_secs` must be at least the `verify` bound plus the `rollback` bound (else the updater would roll back a verify that is still allowed to run). **A declaration that fails a rule refuses that one service** (it becomes `unmanaged` and raises an alert); the updater goes on with every other service. Grants (user, capabilities, paths, units, signer) and tunables (timeouts, deadlines) may be kept in two files per service so a change of tunables in review is not mistaken for a change of grant.
+Load rules, applied to every declaration and across all of them: `hook.user` differs from `uid` unless it is `root`; `state_dir` is not inside any path the service's account can write; the file is root-owned and not group- or world-writable (else refused); a name mapped to a uid that another declaration uses is refused (`root` excepted: several services may run as root, and uid isolation does not separate them anyway); two declarations that claim the same unit or port range are refused; two declarations whose `state_dir` is the same path or one inside the other are refused; a unit name must match the grammar for that service (never an existing system unit); `verify_deadline_secs` must be at least the `verify` bound plus the `rollback` bound (else the updater would roll back a verify that is still allowed to run). **A declaration that fails a rule refuses that one service** (it becomes `unmanaged` and raises an alert); the updater goes on with every other service. Grants (user, capabilities, paths, units, signer) and tunables (timeouts, deadlines) may be kept in two files per service so a change of tunables in review is not mistaken for a change of grant.
 
 ## 3. The generic updater
 
@@ -529,7 +529,7 @@ user  = "root"
 group = "root"
 capabilities = []                       # root keeps file ownership and systemd's dbus authority; no DAC override
 read_paths   = ["<release dir>", "/var/lib/js-agent", "<client credential>"]   # state root read-only: taint and owed-* markers
-write_paths  = ["<release dir>", "<release link dir>", "/var/lib/js-agent-update"]   # the hook record: root:root 0700, flock'ed, not writable by the job user or the agent's non-root parts; NOT under the state root (a file there is read as a marker)
+write_paths  = ["<release dir>", "<release link dir>", "/var/lib/js-agent-update"]   # the hook record: root:root 0700, flock'ed, not writable by the job user; NOT under the state root (a file there is read as a marker)
 units        = ["js-agent-crun.service"]
 address_families = ["AF_UNIX", "AF_INET", "AF_INET6"]   # dbus; the lease server
 environment  = { }
