@@ -578,8 +578,8 @@ impl Server {
     }
 
     /// The streamed bodies that may still be taken at once.
-    #[cfg(test)]
-    pub(super) fn put_permits_free(&self) -> usize {
+    #[must_use]
+    pub fn put_permits_free(&self) -> usize {
         self.puts.available_permits()
     }
 
