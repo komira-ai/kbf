@@ -18,6 +18,9 @@ type Hook = Box<dyn FnOnce() + Send>;
 pub struct Hooked {
     pub fake: Arc<Fake>,
     pub clock: Arc<ManualClock>,
+    /// Woken after every batch the store applied, so a test waits for a write instead of
+    /// polling for it.
+    pub written: tokio::sync::Notify,
     after_get: Mutex<Option<(String, Hook)>>,
     counts: Mutex<Vec<(String, Arc<AtomicUsize>)>>,
     conflict_on: Mutex<Option<String>>,
@@ -43,6 +46,7 @@ impl Hooked {
         Arc::new(Hooked {
             fake: Arc::new(Fake::with_flaw(Arc::clone(&clock), Flaw::None)),
             clock,
+            written: tokio::sync::Notify::new(),
             after_get: Mutex::new(None),
             counts: Mutex::new(Vec::new()),
             conflict_on: Mutex::new(None),
@@ -175,6 +179,7 @@ impl Store for Hooked {
             }
             answers.push(answer);
         }
+        self.written.notify_waiters();
         Ok(answers)
     }
 
