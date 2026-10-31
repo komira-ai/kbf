@@ -25,6 +25,7 @@
 //! cannot say is printed with every report ([`NOT_RECORDED`]); nothing is estimated.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write;
 
 use serde_json::{Value, json};
 
@@ -87,28 +88,264 @@ pub struct ArmStats {
 }
 
 impl ArmStats {
-    /// Kills of `kind` per 1,000 attempts; `None` for an arm with no attempt.
+    /// `kills` per 1,000 attempts of this arm; `None` for an arm with no attempt.
     pub fn per_thousand(&self, kills: u64) -> Option<f64> {
-        let _ = kills;
-        None
+        (self.attempts > 0).then(|| kills as f64 * 1000.0 / self.attempts as f64)
+    }
+}
+
+/// The value at percentile `p` (1 to 100) of `sorted`, by nearest rank.
+fn nearest(sorted: &[u64], p: u64) -> Option<u64> {
+    let rank = (p * sorted.len() as u64).div_ceil(100).max(1);
+    sorted.get((rank - 1) as usize).copied()
+}
+
+fn percentiles(mut values: Vec<u64>) -> Percentiles {
+    values.sort_unstable();
+    Percentiles {
+        p50: nearest(&values, 50),
+        p90: nearest(&values, 90),
     }
 }
 
 /// The numbers of `rows`.
 pub fn analyze(rows: &[Row]) -> ArmStats {
-    let _ = rows;
-    ArmStats::default()
+    let mut stats = ArmStats::default();
+    let (mut waits, mut walls) = (Vec::new(), Vec::new());
+    let mut first_queued: Option<u64> = None;
+    let mut last_ended: Option<u64> = None;
+    for row in rows {
+        stats.attempts += 1;
+        match row.memory_kill.as_str() {
+            "none" => {}
+            "own_limit" => stats.kills.own_limit += 1,
+            "node_pressure" => stats.kills.node_pressure += 1,
+            _ => stats.kills.other += 1,
+        }
+        first_queued = first_queued
+            .min(Some(row.queued_us))
+            .or(Some(row.queued_us));
+        last_ended = last_ended.max(row.ended_us);
+        let Some(started) = row.started_us else {
+            *stats.never_started.entry(row.outcome.clone()).or_default() += 1;
+            continue;
+        };
+        stats.started += 1;
+        match started.checked_sub(row.queued_us) {
+            Some(wait) => waits.push(wait),
+            None => stats.out_of_order += 1,
+        }
+        if row.outcome != "ok" {
+            continue;
+        }
+        match row.ended_us.map(|ended| ended.checked_sub(started)) {
+            None => stats.ok_without_end += 1,
+            Some(None) => stats.out_of_order += 1,
+            Some(Some(wall)) => walls.push(wall),
+        }
+    }
+    stats.makespan_us = last_ended
+        .zip(first_queued)
+        .map(|(e, q)| e.saturating_sub(q));
+    stats.queue_wait_samples = waits.len() as u64;
+    stats.queue_wait = percentiles(waits);
+    stats.wall_samples = walls.len() as u64;
+    stats.wall = percentiles(walls);
+    stats
+}
+
+const LABEL_WIDTH: usize = 34;
+const CELL_WIDTH: usize = 14;
+
+/// One table row: the label, then A, B and B less A, right-aligned.
+fn line(out: &mut String, label: &str, cells: [String; 3]) {
+    let _ = write!(out, "{label:<LABEL_WIDTH$}");
+    for cell in cells {
+        let _ = write!(out, "{cell:>CELL_WIDTH$}");
+    }
+    out.push('\n');
+}
+
+/// Seconds with three decimals (half up) of a signed microsecond value.
+fn secs(us: i128) -> String {
+    let ms = (us.abs() + 500) / 1000;
+    let sign = if us < 0 { "-" } else { "" };
+    format!("{sign}{}.{:03}", ms / 1000, ms % 1000)
+}
+
+fn count_row(out: &mut String, label: &str, a: u64, b: u64) {
+    let diff = i128::from(b) - i128::from(a);
+    line(out, label, [a.to_string(), b.to_string(), diff.to_string()]);
+}
+
+fn duration_row(out: &mut String, label: &str, a: Option<u64>, b: Option<u64>) {
+    let cell = |v: Option<u64>| v.map_or_else(|| "-".to_owned(), |v| secs(i128::from(v)));
+    let diff = a
+        .zip(b)
+        .map(|(a, b)| secs(i128::from(b) - i128::from(a)))
+        .unwrap_or_else(|| "-".to_owned());
+    line(out, label, [cell(a), cell(b), diff]);
+}
+
+fn rate_row(out: &mut String, label: &str, a: Option<f64>, b: Option<f64>) {
+    let cell = |v: Option<f64>| v.map_or_else(|| "-".to_owned(), |v| format!("{v:.2}"));
+    let diff = a.zip(b).map(|(a, b)| b - a);
+    line(out, label, [cell(a), cell(b), cell(diff)]);
 }
 
 /// The two arms as a table: A, B and B less A.
 pub fn render_text(a: &ArmStats, b: &ArmStats) -> String {
-    let _ = (a, b, BTreeSet::<u8>::new());
-    String::new()
+    let mut out = String::new();
+    out.push_str("kbf estimator replay: two arms\n");
+    for (name, arm) in [("A", a), ("B", b)] {
+        if arm.attempts == 0 {
+            let _ = writeln!(
+                out,
+                "arm {name} has no attempts: its numbers are absent (-), not zero"
+            );
+        }
+    }
+    line(
+        &mut out,
+        "",
+        ["A".to_owned(), "B".to_owned(), "B - A".to_owned()],
+    );
+    count_row(&mut out, "attempts", a.attempts, b.attempts);
+    count_row(&mut out, "started", a.started, b.started);
+    let outcomes: BTreeSet<&String> = a
+        .never_started
+        .keys()
+        .chain(b.never_started.keys())
+        .collect();
+    for outcome in outcomes {
+        let n = |arm: &ArmStats| arm.never_started.get(outcome).copied().unwrap_or(0);
+        count_row(&mut out, &format!("never started: {outcome}"), n(a), n(b));
+    }
+    count_row(
+        &mut out,
+        "queue wait samples",
+        a.queue_wait_samples,
+        b.queue_wait_samples,
+    );
+    duration_row(
+        &mut out,
+        "queue wait p50 (s)",
+        a.queue_wait.p50,
+        b.queue_wait.p50,
+    );
+    duration_row(
+        &mut out,
+        "queue wait p90 (s)",
+        a.queue_wait.p90,
+        b.queue_wait.p90,
+    );
+    count_row(
+        &mut out,
+        "wall samples (ok runs)",
+        a.wall_samples,
+        b.wall_samples,
+    );
+    duration_row(&mut out, "wall p50 (s)", a.wall.p50, b.wall.p50);
+    duration_row(&mut out, "wall p90 (s)", a.wall.p90, b.wall.p90);
+    duration_row(&mut out, "makespan (s)", a.makespan_us, b.makespan_us);
+    rate_row(
+        &mut out,
+        "kills/1000 own_limit",
+        a.per_thousand(a.kills.own_limit),
+        b.per_thousand(b.kills.own_limit),
+    );
+    rate_row(
+        &mut out,
+        "kills/1000 node_pressure",
+        a.per_thousand(a.kills.node_pressure),
+        b.per_thousand(b.kills.node_pressure),
+    );
+    count_row(
+        &mut out,
+        "kills of another kind",
+        a.kills.other,
+        b.kills.other,
+    );
+    count_row(
+        &mut out,
+        "ok without an end",
+        a.ok_without_end,
+        b.ok_without_end,
+    );
+    count_row(
+        &mut out,
+        "times out of order",
+        a.out_of_order,
+        b.out_of_order,
+    );
+    out.push_str("Not recorded (not estimated):\n");
+    for gap in NOT_RECORDED {
+        let _ = writeln!(out, "  - {gap}");
+    }
+    out
+}
+
+fn arm_json(arm: &ArmStats) -> Value {
+    json!({
+        "attempts": arm.attempts,
+        "started": arm.started,
+        "never_started": arm.never_started,
+        "queue_wait_samples": arm.queue_wait_samples,
+        "queue_wait_us": {"p50": arm.queue_wait.p50, "p90": arm.queue_wait.p90},
+        "wall_samples": arm.wall_samples,
+        "wall_us": {"p50": arm.wall.p50, "p90": arm.wall.p90},
+        "makespan_us": arm.makespan_us,
+        "kills": {
+            "own_limit": arm.kills.own_limit,
+            "node_pressure": arm.kills.node_pressure,
+            "other": arm.kills.other,
+        },
+        "kills_per_1000": {
+            "own_limit": arm.per_thousand(arm.kills.own_limit),
+            "node_pressure": arm.per_thousand(arm.kills.node_pressure),
+        },
+        "ok_without_end": arm.ok_without_end,
+        "out_of_order": arm.out_of_order,
+    })
+}
+
+/// `b - a` as a number, or `null` when either is absent.
+fn delta(a: Option<u64>, b: Option<u64>) -> Value {
+    a.zip(b)
+        .map_or(Value::Null, |(a, b)| json!(i128::from(b) - i128::from(a)))
+}
+
+fn rate_delta(a: Option<f64>, b: Option<f64>) -> Value {
+    a.zip(b).map_or(Value::Null, |(a, b)| json!(b - a))
 }
 
 /// The two arms as one JSON document (times in microseconds, `null` for absent).
 pub fn render_json(a: &ArmStats, b: &ArmStats) -> String {
-    let _: Value = json!({});
-    let _ = (a, b);
-    String::new()
+    let doc = json!({
+        "arms": {"a": arm_json(a), "b": arm_json(b)},
+        "difference": {
+            "attempts": delta(Some(a.attempts), Some(b.attempts)),
+            "queue_wait_us": {
+                "p50": delta(a.queue_wait.p50, b.queue_wait.p50),
+                "p90": delta(a.queue_wait.p90, b.queue_wait.p90),
+            },
+            "wall_us": {
+                "p50": delta(a.wall.p50, b.wall.p50),
+                "p90": delta(a.wall.p90, b.wall.p90),
+            },
+            "makespan_us": delta(a.makespan_us, b.makespan_us),
+            "kills_per_1000": {
+                "own_limit": rate_delta(
+                    a.per_thousand(a.kills.own_limit),
+                    b.per_thousand(b.kills.own_limit),
+                ),
+                "node_pressure": rate_delta(
+                    a.per_thousand(a.kills.node_pressure),
+                    b.per_thousand(b.kills.node_pressure),
+                ),
+            },
+        },
+        "not_recorded": NOT_RECORDED,
+    });
+    format!("{doc:#}\n")
 }
