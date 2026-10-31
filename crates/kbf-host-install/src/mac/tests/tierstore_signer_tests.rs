@@ -133,16 +133,28 @@ fn lookalike_identities_are_not_the_tierstore_signer() {
         let signers = signers_of(pair, "kbf");
         assert_eq!(signers, owned(&[pair]), "{pair:?}");
         let for_tierstore = signers_of(pair, "tierstore");
-        assert_eq!(owned(&[pair])[0], for_tierstore[0], "{pair:?}");
-        // The lookalike stays a distinct entry beside the pinned pair; it is never merged
-        // into it, and the pinned pair's own strings are exact.
-        assert_eq!(
-            for_tierstore
-                .iter()
-                .filter(|p| has(std::slice::from_ref(p), TIERSTORE))
-                .count(),
-            1,
-            "{pair:?}"
-        );
+        if pair.0 == "komira-ai/tierstore" {
+            // The repository is the pinned one, so the pinned pairs follow the channel's own
+            // (which a channel still needs a `trusted_workflows` entry for).
+            assert_eq!(for_tierstore[0], owned(&[pair])[0], "{pair:?}");
+            assert_eq!(for_tierstore.len(), 4, "{pair:?}");
+        } else {
+            assert_eq!(for_tierstore, owned(&[pair]), "{pair:?}");
+        }
+    }
+}
+
+/// A channel for any other trusted repository gets exactly its own pair for the `tierstore`
+/// prefix: the pinned pairs are added only for kbf's, its former name's and tierstore's own
+/// repository.
+#[test]
+fn another_trusted_repository_with_the_tierstore_prefix_gets_only_its_own_pair() {
+    let other = ("owner/other", "owner/other/.github/workflows/release.yml");
+    assert_eq!(signers_of(other, "tierstore"), owned(&[other]));
+    for channel in [KBF, FORMER, TIERSTORE] {
+        let signers = signers_of(channel, "tierstore");
+        assert!(has(&signers, TIERSTORE), "{channel:?}");
+        assert!(has(&signers, KBF), "{channel:?}");
+        assert!(has(&signers, FORMER), "{channel:?}");
     }
 }
