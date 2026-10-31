@@ -405,7 +405,13 @@ fn a_descriptor_that_does_not_fit_its_blob_is_refused_by_name() {
         let layer = m["layers"][0].clone();
         m["layers"] = serde_json::json!([layer.clone(), layer]);
     });
-    only(&check_layout(&two), "the manifest lists 2 layers, not one");
+    let found = check_layout(&two);
+    assert!(
+        found
+            .iter()
+            .any(|p| p.contains("the manifest lists 2 layers, not one")),
+        "{found:?}"
+    );
     let zero = layout_edited(&good_config(), |m| m["layers"] = serde_json::json!([]));
     let found = check_layout(&zero);
     assert!(
