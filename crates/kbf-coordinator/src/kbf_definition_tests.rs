@@ -19,6 +19,7 @@ fn role(
         min_up,
         never_last,
         after: after.iter().map(|r| (*r).to_owned()).collect(),
+        pool: None,
     }
 }
 
@@ -36,7 +37,13 @@ fn the_shipped_kbf_definition_equals_the_frozen_built_in() {
                 "frontend",
                 role(None, None, true, &["storage", "daemon", "mac-daemon"]),
             ),
-            ("storage", role(None, None, false, &[])),
+            (
+                "storage",
+                RoleDef {
+                    pool: Some("storage".to_owned()),
+                    ..role(None, None, false, &[])
+                },
+            ),
             ("daemon", role(None, None, false, &[])),
             ("mac-daemon", role(None, None, false, &[])),
         ]

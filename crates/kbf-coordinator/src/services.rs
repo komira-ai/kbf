@@ -55,6 +55,9 @@ pub struct RoleDef {
     /// The roles of the same service whose live hosts must all run the desired version, and
     /// not be updating, before a host of this role is ordered.
     pub after: Vec<String>,
+    /// The named pool whose update slots this role shares with every other service's role
+    /// of the same name in the same pool. `None`: the service's slots are its own.
+    pub pool: Option<String>,
 }
 
 impl RoleDef {
@@ -66,6 +69,7 @@ impl RoleDef {
             min_up: None,
             never_last: false,
             after: Vec::new(),
+            pool: None,
         }
     }
 
@@ -198,6 +202,7 @@ struct RawRole {
     never_last: bool,
     #[serde(default)]
     after: Vec<String>,
+    pool: Option<String>,
 }
 
 fn invalid<T>(why: String) -> Result<T, ServicesError> {
@@ -247,6 +252,7 @@ fn role_def(
         min_up: raw.min_up,
         never_last: raw.never_last,
         after,
+        pool: raw.pool,
     })
 }
 
