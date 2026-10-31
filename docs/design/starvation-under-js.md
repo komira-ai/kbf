@@ -174,20 +174,30 @@ Retarget the rule to jobscheduler: open an issue there with section 3.2 and the 
 the both-core farm test, document `--placement-load` interplay", and close it when that
 lands. Do not close it as superseded: `--scheduler-core js` does not change the behaviour
 (2.1), so the report is still true on every kbf configuration with the default flags.
-Until then the supported workaround is `--placement-load on`, which has the hold (2.2).
+Until the default flips (4.1), `--placement-load on` is the workaround: it has the hold (2.2).
 
-## 4. Open questions for the maintainers
+## 4. Decisions
 
-1. Is `--placement-load off` still a supported kbf default? In js it is a rollback-only
-   switch, and it is the reason #169 reproduces. Flipping the default to `On` would give
-   the hold today without a js change, but is a change in where work lands for every farm.
-2. Hold the worker chosen by load ratio (today) or the one that empties soonest (needs
-   remaining-life data js has only with learned profiles)? Ratio is simpler; the bound in
-   3.3 then depends on the longest lease there.
-3. Should a long-waiting low-QoS request ever pass a stream of higher-QoS work (aging
-   across classes)? This note says no; it would turn QoS from a priority into a weight.
-4. One hold per pool (today) serialises several large requests, each paying a drain.
-   Acceptable for the report (two 24-CPU, six 40 GiB), or does a farm of few nodes need
-   more than one?
-5. VM leases: fold into this rule (3.2 does) or keep the separate VM reservation that
-   `macos-vms.md` describes?
+1. **Load placement is the only mode (decided).** Load-based placement is the only mode,
+   with the CPU slack a setting (default 1.1x). So kbf's `--placement-load` defaults to
+   `on`, and the `off` path (the booked rule under `PlacementLoad::Off`) is legacy to
+   remove, not a mode to support: the head hold of 2.2 then holds on every farm. The rule
+   of 3.2 is still needed for what `on` lacks today (the wait bound, cold-cap and VM
+   refusals, the test of the #169 shape), and the widening of `Fit.blocked` "under `Off`"
+   in 3.2 falls away with the `off` path. The first kbf step is the default flip (with the
+   both-core test of 3.4 run on it), then the removal of `off`.
+2. **The held worker: by load ratio, as today (recommended).** The worker that empties
+   soonest needs remaining-life data that js has only with learned profiles. Keep the
+   ratio now; the bound of 3.3 is then `head_hold_after` plus the longest lease on the
+   held worker, which the sweep measures. Revisit when profiles give remaining life.
+3. **No aging across QoS (recommended).** A long-waiting low-QoS request does not pass a
+   stream of higher-QoS work; aging across classes would turn QoS from a priority into a
+   weight. Starvation inside one class is what the hold fixes.
+4. **One hold per pool, first (recommended).** It serialises several large requests, each
+   paying a drain; for the report (two 24-CPU and six 40 GiB requests) that is slower but
+   never stuck. Add a bounded number of holds per pool only if the sweep of 3.4 shows the
+   serial drains exceed the bound of 3.3 on a farm of few nodes.
+5. **VM leases fold into this rule (recommended).** One mechanism for every refusal: a VM
+   lease that waits past `head_hold_after` takes the same hold, with a VM-room reason in
+   `Blocked`. The separate VM reservation that `macos-vms.md` plans is then not built;
+   that document is updated to point here.
