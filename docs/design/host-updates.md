@@ -6,6 +6,10 @@ Labels: **[F]** read in the code at the commit above, **[I]** inference, **[D]**
 
 Sections 4.1 (tierstore) and 4.2 (js-agent) are the owners' hook sections, written as `update-hook` steps. The nftables mechanics of 4.1 are the tierstore owner's.
 
+## Changes in rev 4.2
+
+Text-only round on the generic parts, from the check of rev 4.1. (1) **Post-commit failures (3.2, 3.8):** the post-success watcher is outside the step table with its own rule; the one ceiling is the declaration's `promotion_ceiling_secs`, applied by the updater and passed to the hook; a `rollback` that exits `1` with `reversible: false` after the commit is `Failed(after_commit)`, and `halt` is only for `76` or a `rollback` that reports it cannot repair. (2) **Concurrency (3.5):** the transient unit is named deterministically; resume stops and waits for the old unit; a hook takes an exclusive lock on its record directory. (3) **What a hook may trust (3.4.1):** the record directory is hook-owned and outside the service's write paths, the hook runs as an account other than the service's, every value read is validated against the declaration, the staged tree is root-owned and read-only. (4) **Widening (3.3):** defined as any change other than removing a set element or lowering a number, fail closed on unknown fields, a reserved-path deny list and a path grammar, numeric params for root hooks, a mutation test per field. (5) **The 2.4 example** is valid TOML and quotes the tierstore owner's numbers; a repository test parses every declaration and checks key placement. (6) The smaller items: the polkit scope, the rollback fallback, the record read back one version, `min_version`, restoring a declaration, the boot entry point, the default class, the first-install path, the watcher yielding to a new order, and the question-numbering sentence.
+
 ## Changes in rev 4.1
 
 Follow-up to the owners' restated hook sections. (1) **What runs next, per outcome (3.2):** every step acts on the hook's own durable record; after a failed, timed-out or killed `prepare` or `cutover` the updater runs **`rollback`** (the hook decides from its record, including that `cutover` was irreversible), and runs **`cleanup` only after `verify` succeeded**. A step that reports `reversible: false` is the commit. A `cleanup` that fails is re-run forward and never rolled back; a `halt` runs nothing further. (2) **Registration (2.1, 2.2):** `health` is optional; a tiny registration client crate with no kbf product dependency is a migration step (8); a synthetic registration from the declaration is only the fallback for a service that cannot link it. (3) **Declaration (2.4):** per-step capabilities (`hook.step_capabilities`), an opaque `[hook.params]` table passed to the hook (the cordon lease and cap, the promotion bound), `promotion_ceiling_secs`, `cleanup_retries`. (4) **First hook-bearing release (3.3):** has no previous hook, so it is installed through the interim workflow (7); a declaration with `user = "root"` is `Deferred` as `rights_change` on first install until approved, once per host or by a fleet approval file. (5) The questions are renumbered to match the owners' references (10).
@@ -95,50 +99,55 @@ The accepted registration is written to the updater's state directory (mode 0700
 ### 2.4 The declaration
 
 ```toml
-# /etc/updater.d/tierstore.toml   root:root, mode 0644, installed with the package
+# /etc/updater.d/tierstore.toml   root:root, mode 0644, installed with the release
+# Top-level keys come first: in TOML a key after a table header belongs to that table.
 name   = "tierstore"
 binary = "tierstore"                    # file name inside the artifact; the hook is `<binary> update-hook <step>`
 signer = { repository = "...", workflow = "artifacts.yml" }   # whose attestation the artifact must carry
 uid    = "tierstore"                    # the account the service runs as and registers as
-registration_ttl_secs = 300
-health_ports = [9301, 9302]             # loopback ports a registration may name (omit for a service with no listener)
-promotion_ceiling_secs = 3600           # after verify reports promotion_pending: this long, then Failed(after_commit)
-cleanup_retries = 3                     # cleanup failing is re-run forward this many times, never rolled back
+registration_ttl_secs  = 300
+health_ports           = [9301, 9302]   # loopback ports a registration may name (omit for a service with no listener)
+verify_deadline_secs   = 1600           # after cutover succeeds: verify must succeed by then, or the updater runs rollback
+promotion_ceiling_secs = 3600           # the only ceiling: the updater applies it and passes it to the hook (3.2)
+cleanup_retries        = 3              # cleanup failing is re-run forward this many times, never rolled back
+state_dir              = "/var/lib/updater/hooks/tierstore"   # owned by the hook's account, 0700, outside the service's write paths (3.4.1)
+boot                   = "restore"      # a boot-time entry point run at the updater's start, before units start (3.5)
+min_version            = "..."          # the first release that carries a hook; below it a fleet rollback goes through the first-install path (7)
 
 [hook]
-user  = "tierstore"                     # the account the hook runs as (a name; resolved at load)
-group = "tierstore"
+user  = "tierstore-update"              # not `uid`: the hook's account owns the record, the service cannot write it (3.4.1)
+group = "tierstore-update"
 capabilities = []                       # hook-wide grant; the fallback for a step with no entry below
-
-[hook.step_capabilities]                # per step: a capability is held only in the steps that need it
-prepare  = []
-cutover  = ["CAP_NET_ADMIN"]            # the nft swap
-verify   = []
-rollback = ["CAP_NET_ADMIN"]            # swap back
-cleanup  = ["CAP_NET_ADMIN"]            # retire the old slot
-
-[hook.params]                           # opaque to the updater; written to a file and passed as `--params <file>`
-promotion_bound_secs = 900              # how long verify waits for v-next to take the cache lock before it reports promotion_pending
-# a service with a cordon puts its lease and cap here, e.g. cordon_lease_secs = 300, cordon_max_secs = 13500
-read_paths   = ["/usr/libexec/kbf", "/etc/tierstore"]
-write_paths  = ["/var/lib/tierstore", "/run/tierstore"]
+read_paths   = ["/usr/libexec/kbf", "/usr/sbin/nft", "/etc/tierstore"]
+write_paths  = []                       # state_dir is writable implicitly; the cache directory is not touched by any step
 units        = ["tierstore@9301.service", "tierstore@9302.service"]   # the only units the hook may start, stop, mask
 address_families = ["AF_UNIX", "AF_INET", "AF_INET6", "AF_NETLINK"]
 environment  = { }                      # only these variables; nothing is inherited
 
-[hook.timeout_secs]                     # per step; the updater kills a step that passes its bound
-prepare = 600
-cutover = 300
-verify  = 600
-rollback = 600
-cleanup = 4000
+[hook.step_capabilities]                # per step: held only in the steps that need it (the tierstore owner's list)
+prepare  = ["CAP_NET_ADMIN"]
+cutover  = ["CAP_NET_ADMIN"]
+verify   = []
+rollback = ["CAP_NET_ADMIN"]
+cleanup  = []
 
-verify_deadline_secs = 1200             # after cutover succeeds: verify must succeed by then, or the updater runs rollback
+[hook.timeout_secs]                     # per step; the updater kills a step that passes its bound
+prepare  = 600
+cutover  = 300
+verify   = 1000
+rollback = 600
+cleanup  = 1300
+
+[hook.params]                           # opaque to the updater; written to a file and passed as `--params <file>`; numbers and booleans only
+promotion_bound_secs = 900              # how long verify waits for v-next to take the cache lock before it reports promotion_pending
+# a service with a cordon puts its lease and cap here, e.g. cordon_lease_secs = 300, cordon_max_secs = 13500
 ```
 
 `[hook.params]` is an opaque table: the updater validates only that it is a table of scalars, writes it to a file in the step's runtime directory and passes the path as `--params <file>` (configuration is flags, not environment). The updater itself reads only `promotion_ceiling_secs`, `cleanup_retries`, the timeouts and `verify_deadline_secs`.
 
-Load rules, applied to every declaration and across all of them: the file is root-owned and not group- or world-writable (else refused); a name mapped to a uid that another declaration uses is refused; two declarations that claim the same unit or port range are refused; a unit name must match the grammar for that service (never an existing system unit); `verify_deadline_secs` must be at least the `verify` bound plus the `rollback` bound (else the updater would roll back a verify that is still allowed to run). **A declaration that fails a rule refuses that one service** (it becomes `unmanaged` and raises an alert); the updater goes on with every other service. Grants (user, capabilities, paths, units, signer) and tunables (timeouts, deadlines) may be kept in two files per service so a change of tunables in review is not mistaken for a change of grant.
+**Placement is checked.** A repository test parses every declaration shipped in the repository and asserts that each key is in the table the loader reads it from (the rights under `[hook]`, the deadlines at the top level, nothing but scalars under `[hook.params]`); the loader refuses an unknown key anywhere. Quoted numbers above are the tierstore owner's (`tierstore-handover.md`, section 2); the account `tierstore-update`, `state_dir`, and the empty `write_paths` are changes this document asks of that section (3.4.1).
+
+Load rules, applied to every declaration and across all of them: `hook.user` differs from `uid` unless it is `root`; `state_dir` is not inside any path the service's account can write; the file is root-owned and not group- or world-writable (else refused); a name mapped to a uid that another declaration uses is refused; two declarations that claim the same unit or port range are refused; a unit name must match the grammar for that service (never an existing system unit); `verify_deadline_secs` must be at least the `verify` bound plus the `rollback` bound (else the updater would roll back a verify that is still allowed to run). **A declaration that fails a rule refuses that one service** (it becomes `unmanaged` and raises an alert); the updater goes on with every other service. Grants (user, capabilities, paths, units, signer) and tunables (timeouts, deadlines) may be kept in two files per service so a change of tunables in review is not mistaken for a change of grant.
 
 ## 3. The generic updater
 
@@ -173,11 +182,11 @@ A hook is `<binary> update-hook <step> [args]`, run by the updater with the righ
 **Structured output.** The last line the hook writes to stdout is one JSON object, which the updater reads; a missing or malformed line is read as `{}`:
 
 ```json
-{"phase":"after_commit","class":"release","reason":"...","retry_after_secs":300,
+{"class":"release","reason":"...","retry_after_secs":300,
  "reversible":true,"promotion_pending":false,"detail":"..."}
 ```
 
-`class` is `release` or `environment` (3.8). `retry_after_secs` is used with `75`. `reversible` says whether the hook can still undo what it has done (the updater reports it; it does not decide with it). `promotion_pending` is set by `verify` when the service is serving but not yet fully its own (3.8). `detail` is a short text for the log and the alert. The hook's stderr goes to the log.
+`class` is `release` or `environment` (3.8); a step that dies without the line, or a hook that cannot run or panics, is `release`, and `environment` only when the hook says so. The hook does not set the phase: **the updater assigns `before_commit`, `gate_release`, `gate_environment`, `after_commit` or `halt` itself** from the step, the exit code and `reversible`. `retry_after_secs` is used with `75`. `reversible` says whether the hook can still undo what it has done (the updater reports it; it does not decide with it). `promotion_pending` is set by `verify` when the service is serving but not yet fully its own (3.8). `detail` is a short text for the log and the alert. The hook's stderr goes to the log.
 
 **Every step acts on the hook's own durable record.** The updater does not know what a step did, and a step may be started again after a crash. A hook therefore keeps its own record (what it placed, what it changed, how far it got, whether it did something irreversible) and every step, `rollback` and `cleanup` included, decides what to do from that record and not from the order the updater called it in. In particular **`cleanup` after a failure must not commit**: the updater never calls it after a failure, but a hook must also refuse to act as a finish unless its record says `verify` succeeded.
 
@@ -190,10 +199,10 @@ A hook is `<binary> update-hook <step> [args]`, run by the updater with the righ
 | `prepare` | `cutover` | `rollback`, then report `Failed` (phase `before_commit`, or `after_commit` if a step reported `reversible: false`) | `rollback`, then report `Deferred` | stop, run nothing further, report `halt` |
 | `cutover` | `verify` | `rollback` (the hook decides from its record whether it was reversible), then report `Failed` | `rollback`, then report `Deferred`; only valid if nothing irreversible happened | stop, report `halt` |
 | `verify` | `cleanup` | `rollback`, then report `Failed` with the hook's class | `verify` again with the backoff, until `verify_deadline_secs`, then `rollback` | stop, report `halt` |
-| `rollback` | report the original `Failed` or `Deferred` | report `halt` (a host nothing automatic can repair) | run `rollback` again up to its bound, then `halt` | stop, report `halt` |
+| `rollback` | report the original `Failed` or `Deferred` | **before the commit:** report `halt` (a host nothing automatic can repair). **After the commit** (the hook reported `reversible: false`): exit `1` is `Failed` (phase `after_commit`); `halt` only if the hook reports it cannot repair (`76`, or `1` with no line or with `reversible: true`, a host the old release cannot be restored on) | run `rollback` again up to its bound, then as for failure | stop, report `halt` |
 | `cleanup` | report `Succeeded` (with `promotion_pending` from the last `verify`) | run `cleanup` again, forward, up to `cleanup_retries`, then `Failed` (phase `after_commit`); **never `rollback`** | run `cleanup` again later, within the same retries | stop, report `halt` |
 
-A `halt` runs no further step. When it comes after the commit it skips `cleanup`, so a cordon the hook placed is not lifted by the update; because the cordon is a renewable lease (3.6) it expires, which is harmless for the case a `halt` stands for: a tainted js-agent refuses to start, so no work is lost to the cordon. If `rollback` itself fails, the host is in a state nothing automatic can repair, which is a `halt`.
+**The post-success watcher is outside this table.** After `cleanup` has succeeded and `verify` reported `promotion_pending`, the updater keeps running `verify` (idempotent) until it exits `0` without the flag, which clears the state. Any other result, or the updater's own **`promotion_ceiling_secs`**, ends the watch as `Failed` with phase `after_commit` and the hook's class, and **never runs `rollback`**: the commit has happened. The ceiling has one source of truth, the declaration's `promotion_ceiling_secs`; the updater applies it and passes it to the hook in the `--params` file under the reserved key `updater.promotion_ceiling_secs`, so the hook must not exit `1` for it. A new order for the host stops the watcher first, before its `prepare`. A `halt` runs no further step. When it comes after the commit it skips `cleanup`, so a cordon the hook placed is not lifted by the update; because the cordon is a renewable lease (3.6) it expires, which is harmless for the case a `halt` stands for: a tainted js-agent refuses to start, so no work is lost to the cordon. If `rollback` itself fails, the host is in a state nothing automatic can repair, which is a `halt`.
 
 ### 3.3 Which binary runs, from where, and what is trusted
 
@@ -209,10 +218,10 @@ A `halt` runs no further step. When it comes after the commit it skips `cleanup`
 | `prepare <artifact>` | the **new** version's hook | the staged release, `<artifact>/<binary>` |
 | `cutover`, `verify`, `cleanup` | the **new** version's hook | the staged release (or, once the updater has moved the link, the current path, which is the same file) |
 | `rollback` | the hook of the version that did the cutover, i.e. the **new** one, because it knows what it changed | the staged release |
-| `rollback`, if the new hook cannot run at all (the binary is missing or killed by a signal on start) | the **previous** version's hook | the previous release, which the updater keeps staged until `cleanup` has succeeded |
+| `rollback`, **only if the new hook cannot run at all** (the binary is missing or killed by a signal on start; a hook that starts and then fails is the failure row of 3.2, not a reason to try another hook) | the **previous** version's hook | the previous release, which the updater keeps staged until `cleanup` has succeeded |
 | any step of an update **to an older version** (a rollback of the fleet) | that older version's hook | its staged release; it is an ordinary update whose "new" version is the older one |
 
-**The declaration and the package.** The declaration comes **with the release**: each artifact carries `updater.d/<service>.toml`, and the updater's own trusted install step, not the hook and not a runtime message, installs it into `/etc/updater.d/` after the artifact is verified and **before `prepare`**, because `prepare` runs the new hook and the new hook is declared by the new release. **The first release that carries a hook has no previous hook,** so it cannot be installed by the updater's hook path (there is no previous version's `rollback` to fall back to, and no declaration yet). It is installed through the interim workflow (7) as an ordinary package or release install, which also places its first declaration. A package manager that installs the same file on a host that has one is equivalent and wins; the updater installs the file only when no package manager owns it. Two copies are kept, the active declaration and the previous one, because `rollback` of the previous version and the fall-back above need the old rights. **A declaration may not widen rights by itself.** If the new declaration asks for more than the installed one (a capability, a path, a unit, a larger bound) the update is `Deferred` with the reason `rights_change` until an operator has approved that exact declaration (`updater approve <service> <sha256>`, a root act, audited); equal or narrower is installed automatically. A declaration with `hook.user = "root"` (the kbf hook, the js-agent hook) therefore **is `Deferred` as `rights_change` the first time it is installed**, until approved. This is expected behaviour, done once per host with `updater approve`, or once for a fleet by an approval file the operator installs (a root-owned `/etc/updater.d/approved`, a list of declaration digests); an approved digest is not asked about again. Reason: a compromise of a service's release pipeline can already run a hook of its choosing with the rights already granted; it must not also be able to grant itself more.
+**The declaration and the package.** The declaration comes **with the release**: each artifact carries `updater.d/<service>.toml`, and the updater's own trusted install step, not the hook and not a runtime message, installs it into `/etc/updater.d/` after the artifact is verified and **before `prepare`**, because `prepare` runs the new hook and the new hook is declared by the new release. **The record is read one version back:** a hook writes its record so that the previous version's hook can read it (a `schema` field and a backward-read rule; the conformance suite writes with N and reads with N-1), because `rollback` may run the previous hook. **`min_version`** in the service definition is the first release that carries a hook; the coordinator's `last_good` never names an older one, and a fleet rollback below it goes through the first-install path (7). **The first release that carries a hook has no previous hook,** so it cannot be installed by the updater's hook path (there is no previous version's `rollback` to fall back to, and no declaration yet). It is installed through the interim workflow (7) as an ordinary package or release install, which also places its first declaration. A package manager that installs the same file on a host that has one is equivalent and wins; the updater installs the file only when no package manager owns it. Two copies are kept, the active declaration and the previous one, because `rollback` of the previous version and the fall-back above need the old rights. **A declaration may not widen rights by itself.** *Widening* is **any change other than removing an element from a set or lowering a number**, in **every** field: `signer`, `hook.user`, `group`, `uid`, `binary`, `capabilities` and `step_capabilities` (a step that gains a capability is a widening even if the total shrinks), `read_paths`, `write_paths`, `state_dir`, `units`, `address_families`, `environment`, `health_ports`, the keys of `[hook.params]`, the timeouts and every bound. A change of `signer`, `hook.user` or `binary` always needs approval, and any field the comparer does not know is a widening (fail closed). If the new declaration widens, the update is `Deferred` with the reason `rights_change` until an operator has approved that exact declaration (`updater approve <service> <sha256>`, a root act, audited); equal or narrower is installed automatically. A declaration with `hook.user = "root"` (the kbf hook, the js-agent hook) therefore **is `Deferred` as `rights_change` the first time it is installed**, until approved. This is expected behaviour, done once per host with `updater approve`, or once for a fleet by an approval file the operator installs (a root-owned `/etc/updater.d/approved`, a list of declaration digests); an approved digest is not asked about again. Also: the load rules keep a **reserved-path deny list** (`/`, `/etc`, `/usr`, `/boot`, `/root`, `/etc/updater.d`, `/etc/sudoers.d`, the polkit and systemd unit directories, the updater's own directories) that no `read_paths`, `write_paths` or `state_dir` may name or contain, and a grammar for paths and unit names that excludes systemd's `-`, `+` and `!` prefixes and anything but absolute paths. `[hook.params]` values are numbers and booleans unless the declaration lists a string key in its schema, which a hook that runs as root may not have unless whitelisted. A declaration installed before `prepare` is **restored** (the previous one reinstalled) if the update fails and rolls back. Reason: a compromise of a service's release pipeline can already run a hook of its choosing with the rights already granted; it must not also be able to grant itself more.
 
 ### 3.4 Rights: how a hook runs
 
@@ -232,13 +241,24 @@ The updater runs each step as a **transient systemd unit** with the properties i
 
 **Least privilege of the updater.** Two parts of one program, as the agent and the helper are today. The part that talks to the coordinator over mutual TLS, parses its reply and reads the registration socket runs unprivileged (`kbf-updater-agent.service:32-43`, empty capability set). The part that needs root runs only to **launch hooks with the declared rights, to install a verified release and its declaration, and to replace binaries**; it takes no free-form command, path or nft text from the other part, only "run step S of service N for version V", and everything it runs comes from a verified release and a root-owned declaration. It writes the step record (3.5). It is reached over a unix socket of mode 0600 owned by the one account (`local/serve.rs:1-30` is the pattern), and is concurrent: it serves queries and the step record on threads of their own, so a step that runs for an hour never delays a read of the record or the enforcement of a deadline.
 
+#### 3.4.1 What a hook may trust
+
+A hook that runs as the service's own account trusts nothing the service can write. The rules:
+
+- **The record directory** (`state_dir` in the declaration) is created by the updater, owned by the hook's account (or root), mode 0700, and lies **outside every path the service's account can write**: the load rules refuse a declaration whose `state_dir` is inside the service's data or write paths. The hook's slot links, markers and lock live there. Because it must not be writable by the service, **the hook runs as an account other than the service's** (`hook.user`, for example `tierstore-update`, distinct from `uid`) unless it is `root`; the service has read access to what it needs through group membership, never write.
+- **Every value a hook reads** from its record, its params file or the environment is untrusted input: it validates ports, units and paths against the declaration (it never takes a port from the record).
+- **The staged release tree** is root-owned and read-only (`/var/lib/updater/releases/<service>/<digest>/`, mode 0555, in root-owned parents), so it cannot be swapped between the digest check and the exec; the hook is executed from that path.
+- **Polkit scope.** A rule that lets the hook's account manage the listed units attaches to the account, so it must be a hook-only account: with a distinct `hook.user` the service itself gains nothing. For a service that cannot have one, the root-with-restrictions option applies.
+- **Test:** a state file planted in the service-writable area must not change what the hook does (9).
+
 ### 3.5 The step record, resume and the dead-man
 
 Before each step the root part writes and fsyncs a **step record**: `{schema, service, target version, artifact digest, step, attempt, state: running, started (boot id and a monotonic base), deadline}`; when the step ends it records `done` with the exit code and the hook's last line. The record is the updater's memory; it holds no secrets and is versioned with a `schema` number (a record newer than the binary is read-only).
 
-- **After a crash** of the updater, the root part or the host, the updater reads the record. A step that is `running` is **run again**: it is idempotent by contract, so that is safe. A step that is `done` is not run again. The next step is the one after the last `done`. A step record under a different boot id is treated as running.
+- **After a crash** of the updater, the root part or the host, the updater reads the record. A step that is `running` is **run again**, but never while the previous run may still be alive: hook steps run as transient units that outlive an updater crash, so the unit is named deterministically (`updater-<service>-<step>-<generation>`), and **resume first stops that unit and waits for it to end**, records that it did, and only then starts the step again. A hook also takes an **exclusive lock on its record directory for the whole step**, so a second copy would refuse. "Safe to run twice" means one after the other; the conformance suite adds a concurrency case (start a step, kill the updater, resume, assert a single writer). Before it kills a step for its bound, the updater reads the step's own `done` marker in the hook's record; a hook that finished and was killed anyway is read as finished. A `stop_begun`-style marker set with the signal never sent counts as irreversible and as `after_commit` toward the fleet count: conservative, and it is the hook's record that says so. A step that is `done` is not run again. The next step is the one after the last `done`. A step record under a different boot id is treated as running.
 - **The dead-man.** The root part enforces the deadlines itself, on a thread of its own, whatever the unprivileged part is doing: a step that passes its bound is killed and recorded as failed; after `cutover` succeeds, if `verify` has not succeeded by `verify_deadline_secs` it runs `rollback`. So a host whose unprivileged updater is gone is still brought back, which is the property today's helper has (`local/core.rs:173`).
 - **Resume and the first step.** If the artifact digest in the record no longer matches the staged directory, the update stops as a `halt` and pages; nothing from the directory runs.
+- **Boot.** Nothing in the updater starts a service's units. A declaration may name a boot-time entry point (`boot = "restore"`) which the root part runs at its own start, before the units, with the same rights and step record; for tierstore it re-applies the rule for the active port and starts the active slot, and when the step record says a step is pending it follows the table of 3.2 (a pending `cutover` is rolled back). Services whose units have an `[Install]` (the kbf units) need none.
 - **Updating the updater itself.** The updater and its root part are part of the kbf release and are updated by the kbf daemon's hook as today, but never inside the trial they guard: after `verify` of the kbf update has succeeded, a follow-on step stages the new binary beside the old, finishes the current step record, replies and exits cleanly, and systemd starts the new binary; an `OnFailure=` fallback unit flips the binary link back to the previous one after `StartLimitBurst` failed starts, and the test plants a binary that exits at start. A hook that needs a newer updater than the one running declares it (`min_updater_protocol`); the update is `Deferred` with the reason `updater_old` until the follow-on step has run.
 
 ### 3.6 Cordons and drains
@@ -594,7 +614,7 @@ How it maps onto the generic pieces later:
 | restart timeout, active wait and confirm window as per-service config of the helper | the same values, in the declaration (2.4) |
 | records the attempt | the coordinator's `bad` mark |
 
-Nothing in the workflow is thrown away without its replacement being in place first; it is deleted by the last PR of section 8.
+Nothing in the workflow is thrown away without its replacement being in place first; it is kept, renamed the first-install path, after section 8: it installs each service's first hook-bearing release.
 
 ## 8. Migration order
 
@@ -604,7 +624,7 @@ Each step is one PR, independently shippable, tests first with a red proof. Size
 |---|---|---|---|---|
 | 1 | **Characterisation.** A kbf-only golden for `decide`; goldens for the helper's timeouts and window; the agent's `run_inner` call order against the fake ports | S | | each golden fails against an altered constant |
 | 2 | **The hook contract and the conformance crate.** The contract document, the exit codes and the JSON line, a crate with a fake service and a harness: run each step twice, crash-resume at every step boundary. No updater yet | M | | a hook whose step is not idempotent fails the suite; a hook that ignores a crash between steps fails it |
-| 3 | **Declarations and rights.** The declaration loader and its load rules (root-owned, not group- or world-writable, across-file conflicts, per-service refusal), the transient-unit launcher with the rights of 3.4, the approval of a widened declaration. A root job (`cargo xtask sudo-test`) | M | 2 | a hook that tries to exceed its rights fails (9); a non-root-owned or writable declaration is refused; a widened declaration without approval is `Deferred` |
+| 3 | **Declarations and rights.** The declaration loader and its load rules (root-owned, not group- or world-writable, across-file conflicts, per-service refusal), the transient-unit launcher with the rights of 3.4, the approval of a widened declaration. A root job (`cargo xtask sudo-test`) | M | 2 | a hook that tries to exceed its rights fails (9); a non-root-owned or writable declaration is refused; a widened declaration without approval is `Deferred`; a mutation test per declaration field (each change that is not a removal or a lowered number is a widening); a test that parses every shipped declaration and checks key placement |
 | 4 | **The step runner.** The persisted step record and its schema, resume, the dead-man on its own thread, the exit codes to outcomes, the verified-artifact check before any run, the registration socket (liveness and version), `absent`/`stopped`, the self-update follow-on with its systemd fallback | M | 2, 3 | kill the updater at every boundary and resume; an artifact altered after verification never runs; a planted updater binary that exits at start is replaced by the previous |
 | 4a | **The registration client crate.** A tiny crate, no kbf product dependency, that sends name, version and an optional health address to the socket with `SO_PEERCRED`; the js-agent and tierstore link it | S | 4 | a client with the wrong uid is refused; a service without a health address is not read as `absent` |
 | 5 | **The kbf hook.** Port today's sequence to `kbf update-hook` (4.3), behind the step runner; behaviour tests against the existing fake ports | M | 1, 2, 3, 4 | the order of calls equals today's; a drain deadline exits `75` with the node left drained |
@@ -614,7 +634,7 @@ Each step is one PR, independently shippable, tests first with a red proof. Size
 | 7 | **tierstore service changes** (the tierstore owner): the cache lock, read-only mode, self-promotion, wildcard listeners, the drain with a lingering close, the settle, the build and mode gauges | M | | the owner's section |
 | 8 | **The tierstore hook and the hand-over tests** (the tierstore owner): the nftables mechanics of 4.1.1 to 4.1.5, its declaration, the root-namespace CI probe and tests | M | 3, 4, 7 | the owner's section; the probe of 9 first |
 | 9 | **The js-agent hook** (the js-agent owner) | M | 3, 4, the lease server's own-host cordon route | the owner's section |
-| 10 | **Retire the interim workflow** (it installs the first hook-bearing release of each service, 3.3), the static `--service` flags and the helper's old verbs | S | 5, 8, 9 | |
+| 10 | **Retire the static `--service` flags and the helper's old verbs.** The interim workflow is **not** retired: it is renamed the first-install path, because it installs the first hook-bearing release of each service (3.3) and a new service has no other way in | S | 5, 8, 9 | |
 
 The critical path for tierstore is 2, 3, 4, 7, 8. 6a and 6b are independent of it and are the largest part.
 
@@ -625,6 +645,8 @@ The rules for all of them: **no test asserts on or depends on elapsed time**; se
 **The conformance suite.** A crate that a service uses as a **dev-dependency** and that has no kbf product dependency. It runs the service's real hook binary against a fake service and checks the contract: (1) each of the five steps run **twice in a row** leaves the same observable state as once; (2) **crash-resume at every step boundary**: the harness kills the hook (and, in the updater's own tests, the updater) at the start, in the middle and at the end of each step, runs the step again, and checks the final state is the one an uninterrupted run reaches; (3) the exit codes and the last-line JSON are well formed for success, failure, `75` and `76`; (4) `rollback` after `cutover` returns the fake service to its earlier state, or says `"reversible": false`; (5) `cleanup` after `rollback` and after success leaves nothing behind. A hook must pass it in its service's CI; the updater's own repository runs it against the kbf hook.
 
 **Rights.** In a root job, a test hook declared with a narrow set of rights **tries to exceed it, and must fail**: open a file outside its paths, write where the filesystem is read-only, use `CAP_NET_ADMIN` without it (an `nft` call fails), start or stop a unit not in `units`, read an environment variable not listed, open an address family not listed, run past its timeout (it is killed), gain privilege through `setuid` or `NoNewPrivileges` bypass. Each is a separate test with a red proof (the same hook with the rights widened succeeds).
+
+**Hook state.** A state file planted in the service-writable area (the service's data directory, the old `state.json` location) must not change what the hook does; a record directory writable by the service account is refused at load; two copies of one step (resume while the old transient unit lives) never run at once.
 
 **Trust.** A declaration not owned by root, or group- or world-writable, or in a writable directory, is refused; a hook in an artifact whose digest changed after verification never runs, even when a step is resumed; a declaration that widens rights is `Deferred` until approved; a name mapped to a shared uid, two declarations claiming one unit, a bad file beside a good one (only the bad service is refused).
 
@@ -638,7 +660,7 @@ The rules for all of them: **no test asserts on or depends on elapsed time**; se
 
 ## 10. Questions
 
-Each with a recommendation. The shape (generic updater, hooks in the service's binary, declarations in root-owned files) is decided and is not a question. The numbers are the ones the owners' sections refer to. The owners also keep their own questions for the maintainers (the tierstore deep dive, section 11; the misfit list in 4.2).
+Each with a recommendation. The shape (generic updater, hooks in the service's binary, declarations in root-owned files) is decided and is not a question. The js-agent section refers to these numbers (9, 16 and 17 match); the tierstore deep dive keeps its own list of questions, and where it means this list it writes "(host-updates.md Question N)". The owners also keep their own questions for the maintainers (the tierstore deep dive, section 11; the misfit list in 4.2).
 
 1. **Serialisation.** Per host only, per host plus slots shared across services, or global. *Recommend per host (`decide.rs:105`, already true) and slots per (service, role), with an opt-in named pool, tierstore and kbf sharing one on `storage`.*
 2. **Who owns automatic rollback.** *Recommend the coordinator (`last_good`, a `bad` mark), limited to post-commit and release-gate failures, never `Deferred` or `halt`.*
