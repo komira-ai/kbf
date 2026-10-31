@@ -3,7 +3,9 @@
 
 use super::*;
 use crate::http::{MAX_OPERATOR_BYTES, OPERATOR_PATH};
-use crate::ops::{OpsError, OpsState, OpsStore};
+use crate::ops::{
+    Exclusion, HostOps, MAX_EXCLUDED, MAX_HOSTS, OperateError, OpsError, OpsState, OpsStore,
+};
 use crate::testutil::Log;
 
 const EXCLUDE: &str = r#"{"action":"exclude","service":"kbf","node_id":"d1","reason":"disk swap"}"#;
@@ -443,4 +445,127 @@ async fn operator_changes_do_not_change_what_a_host_is_told() {
         plain.0
     );
     assert_eq!(plain, operated);
+}
+
+/// Catches: the token checked only after the body is read: a caller with no token or a wrong
+/// one is refused with 401 before any byte of the body is taken, so a body over the limit does
+/// not turn the answer into a 400, and a body that never ends does not hold the connection
+/// for the patience and then answer 400. `operate` refuses such a caller too.
+#[tokio::test]
+async fn a_caller_without_the_token_is_refused_before_the_body_is_read() {
+    let rig = Rig::new("op-token-before-read");
+    let oversized = format!("{EXCLUDE}{}", " ".repeat(MAX_OPERATOR_BYTES));
+    for bearer in [None, Some("nope")] {
+        let (code, body) = post(&rig, bearer, &oversized).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED, "{bearer:?}");
+        assert_eq!(body, json!({"error": "unauthorized"}));
+
+        let mut builder = Request::builder().method("POST").uri(OPERATOR_PATH);
+        if let Some(token) = bearer {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        let stalled = builder.body(Stalled).expect("a request");
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            handle(
+                &rig.coordinator,
+                Surface::Control,
+                &None,
+                stalled,
+                std::time::Duration::from_secs(3_600),
+            ),
+        )
+        .await
+        .expect("refused without waiting for the body");
+        assert_eq!(answered.status(), StatusCode::UNAUTHORIZED, "{bearer:?}");
+    }
+    for bearer in [None, Some("nope")] {
+        let refused = rig.coordinator.operate(bearer, EXCLUDE.as_bytes());
+        assert!(matches!(refused, Err(OperateError::Unauthorized(_))));
+    }
+    assert!(!ops_file(&rig).exists());
+}
+
+/// A coordinator whose ops state already holds `hosts` labelled hosts and `excluded`
+/// exclusions of `kbf`, named `n0`, `n1`, ...
+fn full(rig: &mut Rig, hosts: usize, excluded: usize) {
+    let mut state = OpsState::default();
+    for n in 0..hosts {
+        state.hosts.insert(
+            format!("n{n}"),
+            HostOps {
+                labels: [("a".to_owned(), "b".to_owned())].into(),
+            },
+        );
+    }
+    for n in 0..excluded {
+        state.excluded.push(Exclusion {
+            service: "kbf".to_owned(),
+            node_id: format!("n{n}"),
+            reason: "r".to_owned(),
+        });
+    }
+    let writer = Box::new(|_: &OpsState| Ok(()));
+    rig.coordinator =
+        Rig::start(&rig.dir, &rig.clock).with_ops(OpsStore::with_writer(state, writer));
+}
+
+/// Catches: a file that grows without bound: with the file at its caps, a new labelled host
+/// or a new exclusion is a 400 and the log names the cap and where to raise it; what does not
+/// grow it is still accepted (replacing a host's labels, removing them, replacing an
+/// exclusion, an include), and after an include one more exclusion fits.
+#[tokio::test]
+async fn the_ops_file_counts_are_capped() {
+    let mut rig = Rig::new("op-caps");
+    full(&mut rig, MAX_HOSTS, MAX_EXCLUDED);
+    let log = Log::default();
+    let _installed = log.install();
+    let labels = |node: &str, set: &str| {
+        format!(r#"{{"action":"set_labels","node_id":"{node}","labels":{set}}}"#)
+    };
+    let exclude = |node: &str| EXCLUDE.replace("d1", node);
+    let (code, _) = post(&rig, Some(OPERATOR), &labels("new", r#"{"a":"b"}"#)).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert!(log.text().contains("MAX_HOSTS"), "{}", log.text());
+    assert!(log.text().contains("4096"), "{}", log.text());
+    let (code, _) = post(&rig, Some(OPERATOR), &exclude("new")).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert!(log.text().contains("MAX_EXCLUDED"), "{}", log.text());
+
+    for body in [
+        labels("n0", r#"{"c":"d"}"#),
+        labels("n1", "{}"),
+        labels("absent", "{}"),
+        exclude("n0"),
+        INCLUDE.replace("d1", "n1"),
+    ] {
+        let (code, _) = post(&rig, Some(OPERATOR), &body).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+    }
+    let (code, _) = post(&rig, Some(OPERATOR), &exclude("new")).await;
+    assert_eq!(code, StatusCode::OK);
+    let (code, _) = post(&rig, Some(OPERATOR), &labels("new", r#"{"a":"b"}"#)).await;
+    assert_eq!(code, StatusCode::OK);
+}
+
+/// Catches: a label key given twice in one body taken last-wins (the operator meant one of
+/// them): each of these is a 400 and changes nothing; a body that is not an object of labels
+/// is a 400 too.
+#[tokio::test]
+async fn duplicate_label_keys_are_refused() {
+    let rig = Rig::new("op-dup-labels");
+    for labels in [
+        r#"{"a":"x","a":"y"}"#,
+        r#"{"a":"x","b":"y","a":"x"}"#,
+        "[]",
+        r#""a""#,
+    ] {
+        let body = format!(r#"{{"action":"set_labels","node_id":"d1","labels":{labels}}}"#);
+        let (code, answer) = post(&rig, Some(OPERATOR), &body).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{labels}");
+        assert_eq!(answer, json!({"error": "bad_request"}));
+    }
+    assert!(!ops_file(&rig).exists());
+    let ok = r#"{"action":"set_labels","node_id":"d1","labels":{"a":"x","b":"x"}}"#;
+    assert_eq!(post(&rig, Some(OPERATOR), ok).await.0, StatusCode::OK);
 }
