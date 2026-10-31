@@ -692,5 +692,6 @@ async fn a_frontend_without_the_job_flags_has_no_job_listener() {
 
 mod batch;
 mod held;
+mod locate;
 mod plain;
 mod stream;
