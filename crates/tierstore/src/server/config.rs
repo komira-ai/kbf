@@ -96,6 +96,7 @@ pub(super) const KEYS: &[(&str, &[&str])] = &[
     ("scoped-key-file", &["server.scoped_key_files"]),
     ("grant-key-file", &["server.grant_key_files"]),
     ("presign-max-expires", &["server.presign_max_expires"]),
+    ("grant-max-lifetime", &["server.grant_max_lifetime"]),
     ("journal-linger", &["hot_store.journal_linger"]),
     ("journal-retention", &["hot_store.journal_retention"]),
     ("copy-parallel", &["hot_store.copy_parallel"]),
@@ -350,6 +351,7 @@ pub(super) struct ServerTable {
     #[serde(default)]
     pub grant_key_files: Vec<PathBuf>,
     pub presign_max_expires: Option<Dur>,
+    pub grant_max_lifetime: Option<Dur>,
     pub max_request_bytes: Option<u64>,
     pub max_concurrent_puts: Option<u32>,
     pub put_min_bytes_per_sec: Option<u64>,
@@ -897,6 +899,7 @@ fn storage(
         scoped_key_file: front.scoped_key_file,
         grant_key_file: front.grant_key_file,
         presign_max_expires: front.presign_max_expires,
+        grant_max_lifetime: front.grant_max_lifetime,
         drain_lb_wait: front.drain_lb_wait,
         drain_deadline: front.drain_deadline,
         journal_linger: duration(hot.journal_linger, Duration::from_millis(20)),
@@ -963,6 +966,7 @@ pub(super) fn front_of(server: ServerTable, per_run: PerRun) -> Result<Shared, C
         scoped_key_file: server.scoped_key_files,
         grant_key_file: server.grant_key_files,
         presign_max_expires: duration(server.presign_max_expires, Duration::from_secs(15 * 60)),
+        grant_max_lifetime: duration(server.grant_max_lifetime, Duration::from_secs(15 * 60)),
         max_request_bytes,
         max_concurrent_puts,
         put_min_bytes_per_sec: server

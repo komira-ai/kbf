@@ -5,6 +5,7 @@ use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine as _;
 use hyper::Request;
@@ -327,12 +328,41 @@ fn a_grant_is_for_one_bucket_and_ends_at_its_second() {
         assert_eq!(ok(&token).unwrap_err(), EXPIRED, "{now}");
     }
     let never = mint_grant(&key, BUCKET, u64::MAX, ["cas/a"]).unwrap();
-    assert!(ok(&never).is_ok());
+    assert_eq!(ok(&never).unwrap_err(), TOO_LONG);
     let zero = mint_grant(&key, BUCKET, 0, ["cas/a"]).unwrap();
     assert_eq!(ok(&zero).unwrap_err(), EXPIRED);
     clock.set(NOW);
     let elsewhere = mint_grant(&key, "other-bucket", EXPIRES, ["cas/a"]).unwrap();
     assert_eq!(ok(&elsewhere).unwrap_err(), OTHER_BUCKET);
+}
+
+/// Asserts the longest life of a grant (`grant_max_lifetime`, 900 seconds by default): a grant
+/// that ends exactly that long after the clock is good, one second more is refused with the
+/// answer of a bad grant (403 `AccessDenied`), and so is the largest expiry; the cap moves with
+/// the clock and with the setting; and an expiry in the past is still the answer for an expired
+/// grant, not for a long one.
+#[test]
+fn a_grant_that_ends_later_than_the_cap_allows_is_refused() {
+    let (mut config, clock) = server(BUCKET);
+    assert_eq!(config.grant_max_lifetime, Duration::from_secs(900));
+    let key = AccessKey::new(ID, SECRET);
+    let now = NOW / 1000;
+    let check = |config: &ServerConfig, at: u64| {
+        let token = mint_grant(&key, BUCKET, at, ["cas/a"]).unwrap();
+        verify(config, &carrying_token(&token))
+    };
+    assert!(check(&config, now + 900).is_ok());
+    let past = check(&config, now + 901).unwrap_err();
+    assert_eq!(past, TOO_LONG);
+    assert_eq!(past.code, "AccessDenied");
+    assert_eq!(check(&config, u64::MAX).unwrap_err(), TOO_LONG);
+    assert_eq!(check(&config, now - 1).unwrap_err(), EXPIRED);
+    clock.set(NOW + 2000);
+    assert!(check(&config, now + 902).is_ok());
+    assert_eq!(check(&config, now + 903).unwrap_err(), TOO_LONG);
+    config.grant_max_lifetime = Duration::from_secs(60);
+    assert!(check(&config, now + 62).is_ok());
+    assert_eq!(check(&config, now + 63).unwrap_err(), TOO_LONG);
 }
 
 /// Asserts the check of a call against the names of a grant: an object it lists is allowed, one

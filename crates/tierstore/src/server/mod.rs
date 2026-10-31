@@ -323,6 +323,10 @@ pub struct ServerConfig {
     pub grant_keys: Vec<AccessKey>,
     /// The longest `X-Amz-Expires` a presigned URL may have, whatever the ceiling of its key says.
     pub presign_max_expires: Duration,
+    /// The longest a read grant may still have to live when the server checks it: a grant that
+    /// ends more than this after the server's clock is refused as any bad grant is. 15 minutes by
+    /// default.
+    pub grant_max_lifetime: Duration,
     /// The most bytes of a request body: the longest object that one put takes, and the
     /// longest part of an upload. It is an upper bound on a length, not on memory: the body of
     /// a put or of a part is streamed to the backend and is never held whole. (The body of a
@@ -413,6 +417,7 @@ impl ServerConfig {
             scoped_keys: Vec::new(),
             grant_keys: Vec::new(),
             presign_max_expires: Duration::from_secs(900),
+            grant_max_lifetime: Duration::from_secs(900),
             max_request_bytes: 256 << 20,
             body_idle_timeout: Duration::from_secs(30),
             max_concurrent_puts: 32,

@@ -153,7 +153,9 @@ counterpart here.
 
 A read grant is a token the process that starts a job makes with `server::mint_grant`; the byte
 format is in "Read grants" in `packaging/tierstore/README.md`. It works on the storage front and on
-the front of a build node alike.
+the front of a build node alike. A grant is a bearer token (replayable until it expires; use TLS
+where that matters), and the server refuses one that ends beyond `--grant-max-lifetime` (15 minutes
+by default).
 
 ### Scoped keys
 

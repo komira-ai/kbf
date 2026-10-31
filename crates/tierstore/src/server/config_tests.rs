@@ -240,7 +240,18 @@ fn a_fault_in_the_file_is_reported_without_the_value() {
             "presign_max_expires",
         ),
         (
-            golden_with("kind               = \"s3\"", "kind = \"SENTINEL\""),
+            golden_with(
+                "grant_max_lifetime    = \"5m\"",
+                "grant_max_lifetime = \"SENTINEL\"",
+            ),
+            "grant_max_lifetime",
+        ),
+        (
+            golden_with("grant_max_lifetime    = \"5m\"", "grant_max_lifetime = 5"),
+            "grant_max_lifetime",
+        ),
+        (
+            golden_with("kind              = \"s3\"", "kind = \"SENTINEL\""),
             "kind",
         ),
         (

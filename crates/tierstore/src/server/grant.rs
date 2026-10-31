@@ -13,6 +13,11 @@
 //! request has one credential. The grant works wherever the S3 front does: on a storage node and
 //! on a build node.
 //!
+//! A grant is a bearer token: whoever holds it can replay it until it expires, and on plain HTTP
+//! anyone on the path can read it. The server also refuses a grant that ends more than
+//! [`ServerConfig::grant_max_lifetime`] (15 minutes by default) after its own clock, so that no
+//! grant is good for ever; the answer is the same 403 as for any other bad grant.
+//!
 //! # The token
 //!
 //! The request header is `x-tierstore-grant: <token>`, once. The token is
@@ -103,6 +108,13 @@ const EXPIRED: Refusal = Refusal {
     message: "Access Denied: the read grant has expired.",
 };
 
+/// The answer for a grant that ends more than `grant_max_lifetime` from now. It is given after the
+/// tag has matched, so only a holder of a grant key can see it.
+pub(super) const TOO_LONG: Refusal = Refusal {
+    code: "AccessDenied",
+    message: "Access Denied: the read grant lasts longer than the server allows.",
+};
+
 const OTHER_BUCKET: Refusal = Refusal {
     code: "AccessDenied",
     message: "Access Denied: the read grant is for another bucket.",
@@ -150,7 +162,8 @@ pub enum GrantError {
 
 /// Makes the token that lets a request to the bucket `bucket` read the objects `names` until the
 /// unix time `expires_at` (seconds), signed with the grant key `key`. The names are sorted, and
-/// one given twice is listed once.
+/// one given twice is listed once. The server refuses a grant that ends more than its
+/// `grant_max_lifetime` after its clock; this function has no clock and does not check that.
 ///
 /// # Errors
 /// [`GrantError`]: a key, a bucket or a name the server would refuse, no name, too many names, or
@@ -255,6 +268,7 @@ fn check_names(names: &[&str]) -> Result<(), GrantError> {
 struct Fields<'a> {
     key_id: &'a str,
     bucket: &'a str,
+    /// Unix time in seconds (the clock of the server reads milliseconds).
     expires: u64,
     names: Vec<&'a str>,
 }
@@ -287,7 +301,7 @@ impl<'a> Fields<'a> {
 ///
 /// # Errors
 /// The [`Refusal`] for a grant that is malformed, too large, not signed by a key of the server,
-/// expired, or for another bucket, and for a request that carries an `Authorization` header too.
+/// expired, ending too far ahead, or for another bucket, and for a request that carries an `Authorization` header too.
 pub(super) fn verify(config: &ServerConfig, parts: &Parts) -> Result<Signed, Refusal> {
     if parts.headers.contains_key("authorization") {
         return Err(TWO_CREDENTIALS);
@@ -314,8 +328,15 @@ pub(super) fn verify(config: &ServerConfig, parts: &Parts) -> Result<Signed, Ref
     if fields.bucket != config.bucket {
         return Err(OTHER_BUCKET);
     }
-    if fields.expires.saturating_mul(1000) <= config.clock.now() {
+    // `expires` is in seconds and the clock reads milliseconds.
+    let ends = fields.expires.saturating_mul(1000);
+    let now = config.clock.now();
+    if ends <= now {
         return Err(EXPIRED);
+    }
+    let longest = u64::try_from(config.grant_max_lifetime.as_millis()).unwrap_or(u64::MAX);
+    if ends > now.saturating_add(longest) {
+        return Err(TOO_LONG);
     }
     let names = fields.names.iter().map(|name| (*name).to_owned()).collect();
     Ok(Signed {

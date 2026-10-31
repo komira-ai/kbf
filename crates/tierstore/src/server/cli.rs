@@ -271,6 +271,10 @@ pub struct Cli {
     /// says: a number and `ms`, `s`, `m` or `h`.
     #[arg(long, default_value = "15m", value_parser = parse_duration)]
     pub presign_max_expires: Duration,
+    /// The longest a read grant may have left to live when the server checks it: a grant that
+    /// ends later than this from now is refused. A number and `ms`, `s`, `m` or `h`.
+    #[arg(long, default_value = "15m", value_parser = parse_duration)]
+    pub grant_max_lifetime: Duration,
     /// How long, after the drain began, the server goes on serving everything, so that the
     /// 503 of `/readyz` is seen: a number and `ms`, `s`, `m` or `h`.
     #[arg(long, default_value = "10s", value_parser = parse_duration)]

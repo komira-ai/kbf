@@ -361,13 +361,22 @@ struct Front {
 
 impl Front {
     async fn new(name: &str) -> Self {
-        let rig = CacheRig::new(name);
+        Self::with(CacheRig::new(name), false).await
+    }
+
+    /// The same over a cache with `write_through` on, whose front takes writes.
+    async fn writing(name: &str) -> Self {
+        Self::with(CacheRig::writing(name), true).await
+    }
+
+    async fn with(rig: CacheRig, writes: bool) -> Self {
         rig.clock.set(NOW);
         rig.put("cas/b/obj", TEXT.as_bytes()).await;
         rig.put("cas/b/hidden", TEXT.as_bytes()).await;
         let mut config = ServerConfig::new(BUCKET, KEY_ID, FULL_SECRET, rig.clock.clone());
         config.rate_clock = rig.clock.clone();
         config.cache = Some(rig.cache.clone());
+        config.cache_writes = writes;
         config.grant_keys = vec![key()];
         let backend: Arc<dyn Backend> = Arc::new(rig.cache.clone());
         let server = Server::new(backend, config);
@@ -426,4 +435,110 @@ async fn a_grant_reads_through_the_front_of_a_cache() {
     assert_eq!(refused(&write), access_denied());
     let missing = front.answer(request("garbage", "GET", &object, &[])).await;
     assert_eq!(refused(&missing), access_denied());
+}
+
+/// The calls of the upstream that write, not counting a HEAD.
+fn upstream_writes(rig: &CacheRig) -> u64 {
+    let ops = [
+        Op::Put,
+        Op::PutIfMatch,
+        Op::Delete,
+        Op::CreateUpload,
+        Op::UploadPart,
+        Op::CompleteUpload,
+        Op::AbortUpload,
+    ];
+    ops.iter().map(|op| rig.calls(*op)).sum()
+}
+
+/// Asserts that on a cache whose front takes writes (`write_through`), a grant is still read-only:
+/// a PUT, a DELETE and a POST (create, complete) of an object the grant lists, and of one it lists
+/// that does not exist, are each 403, answered by the grant and not by the write path: the
+/// upstream sees no write call, the cache stages and holds nothing new, the object is as it was,
+/// and the absent one is not made.
+#[tokio::test]
+async fn a_grant_does_not_write_through_a_cache_that_takes_writes() {
+    let front = Front::writing("tsgrant-cache-writes").await;
+    let t = token(&["cas/b/new", "cas/b/obj"]);
+    let (object, absent) = (uri("cas/b/obj"), uri("cas/b/new"));
+    let writes = upstream_writes(&front.rig);
+    let held = front.rig.cache.held();
+    let staged = front.rig.staged_files();
+    let none: &[(&str, &str)] = &[];
+    let create: &[(&str, &str)] = &[("if-none-match", "*")];
+    let calls: Vec<Call> = vec![
+        ("PUT", object.clone(), none),
+        ("PUT", absent.clone(), create),
+        ("PUT", absent.clone(), none),
+        ("DELETE", object.clone(), none),
+        ("DELETE", absent.clone(), none),
+        ("POST", format!("{absent}?uploads"), none),
+        ("POST", format!("{object}?uploadId=u"), none),
+        ("PUT", format!("{absent}?partNumber=1&uploadId=u"), none),
+        ("DELETE", format!("{object}?uploadId=u"), none),
+    ];
+    for (method, uri, extra) in calls {
+        let reply = front.answer(request(&t, method, &uri, extra)).await;
+        assert_eq!(refused(&reply), access_denied(), "{method} {uri}");
+        assert!(message(&reply).contains("GET or HEAD"), "{method} {uri}");
+    }
+    assert_eq!(upstream_writes(&front.rig), writes);
+    assert_eq!(front.rig.cache.held(), held);
+    assert_eq!(front.rig.staged_files(), staged);
+    assert!(front.rig.tamper.memory.head("cas/b/new").await.is_err());
+    let read = front.answer(request(&t, "GET", &object, &[])).await;
+    assert_eq!(read.body, TEXT);
+}
+
+/// Asserts the longest life of a grant on the server: with the clock where it is, a grant that
+/// ends 900 seconds on (the default cap) reads, one that ends a second later is 403 and reads
+/// nothing, and one with the largest expiry is 403, so no grant is good for ever.
+#[tokio::test(start_paused = true)]
+async fn a_grant_that_ends_beyond_the_cap_reads_nothing() {
+    let f = fixture().await;
+    let object = uri("cas/b/pack-a");
+    let ending = |at: u64| mint_grant(&key(), BUCKET, at, ["cas/b/pack-a"]).unwrap();
+    let inside = ending(NOW / 1000 + 900);
+    let reply = f.with_grant(&inside, "GET", &object, &[]).await;
+    assert_eq!((reply.status, reply.body.as_str()), (StatusCode::OK, TEXT));
+    for at in [NOW / 1000 + 901, u64::MAX] {
+        for method in ["GET", "HEAD"] {
+            let reply = f.with_grant(&ending(at), method, &object, &[]).await;
+            assert_eq!(refused(&reply), access_denied(), "{method} {at}");
+            assert!(!reply.body.contains(TEXT));
+        }
+    }
+    f.clock.set(NOW + 1000);
+    let reply = f
+        .with_grant(&ending(NOW / 1000 + 901), "GET", &object, &[])
+        .await;
+    assert_eq!(reply.body, TEXT);
+}
+
+/// Asserts that a grant beside the parameters of a presigned URL (`X-Amz-Algorithm`, `-Expires`,
+/// `-Signature`) is refused for a listed object, GET and HEAD: the grant takes no query parameter
+/// but `x-id`, and the call is not read as a presigned one.
+#[tokio::test(start_paused = true)]
+async fn a_grant_beside_a_presigned_style_query_is_refused() {
+    let f = fixture().await;
+    let t = token(&["cas/b/pack-a"]);
+    let signature = "0".repeat(64);
+    let query = format!(
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID%2F20260101%2Fus-east-1%2Fs3%2Faws4_request\
+         &X-Amz-Date=20260101T000000Z&X-Amz-Expires=60&X-Amz-SignedHeaders=host&X-Amz-Signature={signature}"
+    );
+    for method in ["GET", "HEAD"] {
+        for suffix in [
+            query.as_str(),
+            "X-Amz-Signature=00",
+            "x-id=GetObject&X-Amz-Signature=00",
+        ] {
+            let target = format!("{}?{suffix}", uri("cas/b/pack-a"));
+            let reply = f.with_grant(&t, method, &target, &[]).await;
+            assert_eq!(refused(&reply), access_denied(), "{method} {suffix}");
+            assert!(!reply.body.contains(TEXT));
+        }
+    }
+    let plain = f.with_grant(&t, "GET", &uri("cas/b/pack-a"), &[]).await;
+    assert_eq!(plain.body, TEXT);
 }

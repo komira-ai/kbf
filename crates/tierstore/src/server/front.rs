@@ -42,6 +42,7 @@ pub(super) struct FrontSettings {
     pub scoped_key_file: Vec<PathBuf>,
     pub grant_key_file: Vec<PathBuf>,
     pub presign_max_expires: Duration,
+    pub grant_max_lifetime: Duration,
     pub max_request_bytes: u64,
     pub max_concurrent_puts: u32,
     pub put_min_bytes_per_sec: u64,
@@ -66,6 +67,7 @@ impl Cli {
             scoped_key_file: self.scoped_key_file.clone(),
             grant_key_file: self.grant_key_file.clone(),
             presign_max_expires: self.presign_max_expires,
+            grant_max_lifetime: self.grant_max_lifetime,
             max_request_bytes: self.max_request_bytes,
             max_concurrent_puts: self.max_concurrent_puts,
             put_min_bytes_per_sec: self.put_min_bytes_per_sec,
@@ -117,6 +119,7 @@ pub(super) fn server_config(
     server.scoped_keys = scoped;
     server.grant_keys = grant;
     server.presign_max_expires = front.presign_max_expires;
+    server.grant_max_lifetime = front.grant_max_lifetime;
     server.region = front.region.clone();
     server.max_request_bytes = usize::try_from(front.max_request_bytes).unwrap_or(usize::MAX);
     server.body_idle_timeout = front.body_idle_timeout;

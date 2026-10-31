@@ -223,30 +223,28 @@ Two uses, for the pieces of kbf that keep their objects in a tierstore bucket:
 ## Read grants
 
 A read grant lets a client that holds no S3 key read a fixed set of objects for a short time. The
-process that hands out the grant (the one that starts a build job) signs it with a grant key; the
-client sends it as one request header, `x-tierstore-grant`, on `GET` and `HEAD`. It works on a
-storage node and on a build node, since both run the same front.
+process that starts a build job signs it with a grant key; the client sends it as one request
+header, `x-tierstore-grant`, on `GET` and `HEAD`. It works on a storage node and on a build node.
 
-The grant key (`--grant-key-file`, once per key; mode 0600, not a symbolic link, owned by the user
-the server runs as) is a file in the form of the other credentials files: JSON of exactly
-`access_key_id` and `secret_access_key`, or the id on the first line and the secret on the second.
-The key signs no request: a SigV4 request that names its id is `InvalidAccessKeyId`. Its id differs
-from the ids of all other keys (exit status 2 otherwise). The secret is the HMAC key of the grants,
-so give it as many random bytes as any other secret.
+The grant key (`--grant-key-file`, once per key; mode 0600, not a symbolic link, owned by the
+server's user) is a file like the other credentials files: JSON of exactly `access_key_id` and
+`secret_access_key`, or the id and secret on two lines. It signs no request (a SigV4 request naming
+its id is `InvalidAccessKeyId`); its id differs from all other key ids (exit status 2 otherwise).
+A grant is a bearer token: whoever holds it can replay it until it expires, and on plain HTTP
+anyone on the path can read it, so use TLS where that matters. The server refuses a grant that ends
+more than `--grant-max-lifetime` (default 15 minutes) after its own clock.
 
-What the server allows for a request with a valid grant: `GET` or `HEAD` of an object the grant
-lists, with or without a `Range` header, and with no query parameter but `x-id`. Everything else is
-`403 AccessDenied`, answered before any body is read, and the refusal for an object that is not
-listed is the same whether the object exists or not:
+A valid grant allows `GET` or `HEAD` of a listed object, with or without `Range`, and no query
+parameter but `x-id`. Everything else is `403 AccessDenied` before any body is read; an unlisted
+object is refused the same whether or not it exists:
 
 | request | answer |
 |---|---|
 | GET or HEAD of a listed object, whole or ranged | served |
 | GET or HEAD of an object that is not listed | 403 |
-| PUT, POST or DELETE of anything, a part, a completion, an abort | 403 |
-| a listing of the bucket or of the open uploads, a call on the bucket or the root | 403 |
+| PUT, POST or DELETE of anything (parts too), a listing, a call on the bucket or the root | 403 |
 | GET of a listed object with `partNumber`, `uploadId`, `uploads` or any other parameter | 403 |
-| a grant that is expired, malformed, over 64 KiB, for another bucket, signed with another secret, or by a key id the server does not have, or edited after it was signed | 403 |
+| a grant that is expired, ends beyond `--grant-max-lifetime`, is malformed, over 64 KiB, for another bucket, signed with another secret, or by a key id the server does not have, or edited after it was signed | 403 |
 | a grant and an `Authorization` header, or two grant headers | 403 |
 
 ### The token
@@ -263,22 +261,20 @@ body   = "tierstore-grant-v1" LF key-id LF bucket LF expires LF name { LF name }
   feed at its end, and no carriage return anywhere.
 - `key-id` is the access key id of the grant key. `bucket` is the name of the bucket the server
   serves (`--bucket`).
-- `expires` is a unix time in seconds, in decimal digits with no sign and no leading zero. The
-  grant is good while the clock of the server reads less than that second, so a grant ends at the
-  start of second `expires`.
+- `expires` is a unix time in seconds, as decimal digits with no sign or leading zero. The grant
+  is good while the server's clock reads less than it, and no more than `--grant-max-lifetime`
+  ahead of that clock.
 - Each `name` is the exact key of an object, as it appears in the path of the request after
   percent-decoding: UTF-8, at most 1024 bytes, not empty, no control character, no `..`, no `.`
-  segment, not under `_journal/` or `_tiering/`. There is at least one name and at most 4096; the
-  limit on the header value below is reached first, at about 700 names of ordinary length (the
-  token is about 4/3 of the body), so plan for that many. The names are in strictly ascending
-  order of their bytes, so none is listed twice.
-- The header value (the token) is at most 65536 bytes. The server compares the tag in constant
-  time, with the body exactly as received, and trusts no field of the body but `key-id`, which
-  names the key to check it with, until the tag matches.
+  segment, not under `_journal/` or `_tiering/`. There is at least one name and at most 4096, but
+  the header limit below is reached first, at about 700 ordinary names (the token is about 4/3 of
+  the body). The names are in strictly ascending byte order, so none is listed twice.
+- The header value is at most 65536 bytes. The server compares the tag in constant time over the
+  body as received, and trusts no field but `key-id` (it names the key) until the tag matches.
 
-An example. The grant key has the id `build-grant` and the secret `grant-secret-0123456789`; the
-bucket is `tierstore`; the grant ends at 1800000600 and lists `cas/b/lease-7/pack-a` and
-`cas/l/blob-1`. The body is these five lines joined by line feeds, as above:
+An example: key id `build-grant`, secret `grant-secret-0123456789`, bucket `tierstore`, ending at
+1800000600 and listing `cas/b/lease-7/pack-a` and `cas/l/blob-1`. The body is these lines joined by
+line feeds:
 
 ```text
 tierstore-grant-v1
@@ -289,8 +285,7 @@ cas/b/lease-7/pack-a
 cas/l/blob-1
 ```
 
-Its tag, in hex, is `89a5a69f31086eda88d1f54a6403013bd55156c18d8904ccbc31c870b3975c39`, and the
-header is
+Its tag in hex is `89a5a69f31086eda88d1f54a6403013bd55156c18d8904ccbc31c870b3975c39`; the header is
 
 ```text
 x-tierstore-grant: dGllcnN0b3JlLWdyYW50LXYxCmJ1aWxkLWdyYW50CnRpZXJzdG9yZQoxODAwMDAwNjAwCmNhcy9iL2xlYXNlLTcvcGFjay1hCmNhcy9sL2Jsb2ItMQ.iaWmnzEIbtqI0fVKZAMBO9VRVsGNiQTMvDHIcLOXXDk
@@ -298,9 +293,9 @@ x-tierstore-grant: dGllcnN0b3JlLWdyYW50LXYxCmJ1aWxkLWdyYW50CnRpZXJzdG9yZQoxODAwM
 
 A program in Rust that links the `tierstore` library with its `server` feature makes the token with
 `tierstore::server::mint_grant(&key, bucket, expires, names)`, which sorts the names, lists each once
-and refuses what the server would. A grant lists whole objects; it does not limit the ranges read
-from them. A test in `crates/tierstore/src/server/grant_tests.rs` checks that the example above is
-what `mint_grant` makes and what the server accepts.
+and refuses what the server would (not a lifetime over the cap: it has no clock). A grant lists
+whole objects, not ranges. `grant_tests.rs` checks that the example above is what `mint_grant`
+makes and what the server accepts.
 
 ## The configuration file
 
@@ -586,6 +581,7 @@ the flags of the binary against this table, so a flag added without a key fails 
 | `--scoped-key-file` | `server.scoped_key_files` | a list of scoped key files |
 | `--grant-key-file` | `server.grant_key_files` | a list of grant key files |
 | `--presign-max-expires` | `server.presign_max_expires` | the longest expiry of any presigned URL |
+| `--grant-max-lifetime` | `server.grant_max_lifetime` | the furthest ahead of the clock a read grant may end (15m) |
 | `--journal-linger` | `hot_store.journal_linger` | how long a batch of journal entries waits for more |
 | `--journal-retention` | `hot_store.journal_retention` | how long an applied journal object is kept |
 | `--copy-parallel` | `hot_store.copy_parallel` | the most objects the reconciler copies at once |
@@ -691,7 +687,7 @@ The unit's `ExecStart=` is a complete command line. The flags to edit:
 | `--presign-key-file`, `--presign-max-expires` | a presigning key with its ceiling (given once for each key), and the longest expiry of any URL; see Presigned PUT URLs |
 | `--gc-key-file` | a GC key (given once for each key); see GC keys |
 | `--scoped-key-file` | a scoped key (given once for each key); see Scoped keys |
-| `--grant-key-file` | a grant key (given once for each key); see Read grants |
+| `--grant-key-file`, `--grant-max-lifetime` | a grant key (given once for each key), and how far ahead a grant may end; see Read grants |
 | `--hot`, `--cold` | the tiers: `s3:<bucket>` for a bucket of an S3-compatible store (also `dir:<path>` and `memory`; a `dir:` path must also be writable under `ProtectSystem=strict`, so add it to `ReadWritePaths=`) |
 | `--hot-endpoint`, `--cold-endpoint` | where the tier's store is, `http://host[:port]` (TLS is not built yet); `--hot-region` and `--cold-region` set the signing region of a tier, `us-east-1` if not given |
 | `--hot-bytes` | the bytes the hot tier is meant to hold; the water marks are shares of it (`--high-water`, `--low-water`, `--critical`) |

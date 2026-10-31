@@ -148,6 +148,7 @@ fn the_flags_have_their_defaults() {
     assert!(cli.scoped_key_file.is_empty());
     assert!(cli.grant_key_file.is_empty());
     assert_eq!(cli.presign_max_expires, Duration::from_secs(900));
+    assert_eq!(cli.grant_max_lifetime, Duration::from_secs(900));
     assert!(
         cli.skip_backend_check.is_empty(),
         "no check is skipped by default"
@@ -534,7 +535,9 @@ fn grant_key_files_are_built_into_the_server_and_their_ids_must_differ() {
     let two = key_file(&dir, "two", &text("GR2"), 0o600);
     let mut ok = cli(&dir);
     ok.grant_key_file = vec![one.clone(), two];
+    ok.grant_max_lifetime = Duration::from_secs(300);
     let built = build(&ok).expect("built");
+    assert_eq!(built.server.grant_max_lifetime, Duration::from_secs(300));
     let keys = &built.server.grant_keys;
     let ids: Vec<&str> = keys.iter().map(|key| key.id.as_str()).collect();
     assert_eq!(ids, ["GR1", "GR2"]);

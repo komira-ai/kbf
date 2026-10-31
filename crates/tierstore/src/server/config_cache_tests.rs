@@ -21,6 +21,7 @@ access_key_file       = "/etc/tierstore-cache/access.key"
 read_only_key_files   = ["/etc/tierstore-cache/clients.key"]
 grant_key_files       = ["/etc/tierstore-cache/grant.key"]
 presign_max_expires   = "10m"
+grant_max_lifetime    = "5m"
 max_concurrent_puts   = 8
 put_min_bytes_per_sec = 2048
 put_rate_grace        = "45s"
@@ -125,6 +126,7 @@ fn a_build_node_file_makes_a_cache() {
         [PathBuf::from("/etc/tierstore-cache/grant.key")]
     );
     assert_eq!(front.presign_max_expires, Duration::from_secs(600));
+    assert_eq!(front.grant_max_lifetime, Duration::from_secs(300));
     assert_eq!(front.max_concurrent_puts, 8);
     assert_eq!(front.put_min_bytes_per_sec, 2048);
     assert_eq!(front.put_rate_grace, Duration::from_secs(45));
