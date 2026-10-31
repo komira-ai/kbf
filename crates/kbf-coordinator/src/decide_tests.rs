@@ -106,11 +106,11 @@ fn the_limit_is_per_role_and_follows_the_desired_state() {
         "one storage host at a time"
     );
     assert_eq!(ask(&d, &f, "m2"), Reply::Nothing, "two Macs at a time");
-    d.max_updating.storage = 2;
-    d.max_updating.mac_daemon = 3;
+    d.max_updating.set("storage", 2);
+    d.max_updating.set("mac-daemon", 3);
     assert_eq!(ask(&d, &f, "s2"), update("2.0"));
     assert_eq!(ask(&d, &f, "m2"), update("2.0"));
-    d.max_updating.mac_daemon = 0;
+    d.max_updating.set("mac-daemon", 0);
     assert_eq!(
         ask(&d, &f, "m2"),
         Reply::Nothing,
@@ -180,7 +180,7 @@ fn a_frontend_updates_only_while_the_minimum_stays_up() {
 #[test]
 fn a_storage_host_updates_only_while_the_minimum_stays_up() {
     let mut d = desired("2.0", 2, 1);
-    d.max_updating.storage = 3;
+    d.max_updating.set("storage", 3);
     let with = |third: kbf_updater::wire::Heartbeat| {
         fleet(
             NOW,
@@ -205,7 +205,7 @@ fn a_storage_host_updates_only_while_the_minimum_stays_up() {
 #[test]
 fn the_minimum_counts_live_heartbeats_not_known_hosts() {
     let mut d = desired("2.0", 3, 1);
-    d.max_updating.storage = 3;
+    d.max_updating.set("storage", 3);
     let two_heard = fleet(
         NOW,
         &[
@@ -323,7 +323,7 @@ fn storage_and_daemons_go_before_frontends() {
 #[test]
 fn a_failed_host_keeps_its_slot_until_it_heartbeats_healthy() {
     let mut d = desired("2.0", 1, 1);
-    d.max_updating.daemon = 1;
+    d.max_updating.set("daemon", 1);
     let failed = last(beat("1.0"), "2.0", Outcome::Failed);
     let f = |d1: kbf_updater::wire::Heartbeat| {
         fleet(
@@ -412,23 +412,30 @@ fn a_role_the_code_does_not_name_is_ordered_nothing() {
     assert_eq!(ask(&desired("2.0", 1, 1), &f, "c1"), Reply::Nothing);
 }
 
-/// Catches: a definition that names a role the code does not (reachable once the loader
-/// takes any role) granting it a slot: it is still ordered nothing, however far behind.
+/// Catches: a definition that names a role the code has no constant for being refused the
+/// slots of the four: a role the definition names is ordered by the default limits (one at
+/// a time, none required up), and a host whose role it does not name is ordered nothing.
 #[test]
-fn a_definition_that_names_an_unnamed_role_still_orders_it_nothing() {
+fn a_definition_that_names_an_unnamed_role_orders_it_by_the_default() {
     use crate::decide::decide_in;
     use crate::desired::KBF;
     use crate::services::{RoleDef, ServiceDef, Services};
 
     let cache: HostRole = "cache".parse().expect("well formed");
     let mut def = ServiceDef::kbf();
-    def.roles.insert(cache.clone(), RoleDef::plain());
+    def.roles.insert(cache.name().to_owned(), RoleDef::plain());
     let services = Services::default().with(def);
     let d = desired("2.0", 1, 1);
     let wants = std::collections::BTreeMap::from([(KBF.to_owned(), d.clone())]);
     let f = fleet(NOW, &[("c1", cache, beat("1.0"))]);
     assert_eq!(
         decide_in(&services, &wants, KBF, &f, &id("c1"), NOW),
+        update("2.0")
+    );
+    let other: HostRole = "queue".parse().expect("well formed");
+    let f = fleet(NOW, &[("q1", other, beat("1.0"))]);
+    assert_eq!(
+        decide_in(&services, &wants, KBF, &f, &id("q1"), NOW),
         Reply::Nothing
     );
     let behind = fleet(NOW, &[("d1", HostRole::DAEMON, beat("1.0"))]);

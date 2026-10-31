@@ -265,6 +265,8 @@ mod slow_reader_tests;
 #[cfg(test)]
 mod stream_put_tests;
 #[cfg(test)]
+mod stream_wire_tests;
+#[cfg(test)]
 mod testing;
 #[cfg(test)]
 mod time_tests;
@@ -283,7 +285,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::Full;
 use hyper::header::{CONNECTION, HeaderName, HeaderValue};
 use hyper::http::request::Parts;
 use hyper::server::conn::http1;
@@ -306,6 +307,7 @@ pub use scoped::{Prefixes, ScopedKey};
 use idle::Watched;
 use linger::Lingering;
 use listen::Listeners;
+pub use reply::AnswerBody;
 use reply::{Answer, S3Error, answer};
 use request::{BoxError, Check, Query, Reader, Target, resolve};
 
@@ -744,12 +746,13 @@ impl Server {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let server = Arc::clone(self);
-        let service = service_fn(move |request| {
-            let server = Arc::clone(&server);
-            async move { Ok::<_, Infallible>(server.handle(request).await) }
-        });
         let watched = Watched::new(stream, self.config.body_idle_timeout, peer);
         let (stream, wire) = Lingering::new(watched, self);
+        let on_wire = Arc::clone(&wire);
+        let service = service_fn(move |request| {
+            let (server, wire) = (Arc::clone(&server), Arc::clone(&on_wire));
+            async move { Ok::<_, Infallible>(server.handle_on(request, Some(&wire)).await) }
+        });
         let serving = http1::Builder::new()
             .timer(TokioTimer::new())
             .header_read_timeout(self.config.header_timeout)
@@ -776,7 +779,23 @@ impl Server {
     }
 
     /// Answers one request.
-    pub async fn handle<B>(&self, request: Request<B>) -> Response<Full<Bytes>>
+    pub async fn handle<B>(&self, request: Request<B>) -> Response<AnswerBody>
+    where
+        B: hyper::body::Body + Send,
+        B::Data: Send,
+        B::Error: Into<BoxError>,
+    {
+        self.handle_on(request, None).await
+    }
+
+    /// [`Server::handle`] for a request that came on a connection with this `wire`: a streamed
+    /// answer holds the wire until its body is over, so that the drain does not close the
+    /// connection in the middle of it.
+    async fn handle_on<B>(
+        &self,
+        request: Request<B>,
+        wire: Option<&Arc<linger::Wire>>,
+    ) -> Response<AnswerBody>
     where
         B: hyper::body::Body + Send,
         B::Data: Send,
@@ -801,6 +820,9 @@ impl Server {
         if !self.is_ready() {
             let close = HeaderValue::from_static("close");
             response.headers_mut().insert(CONNECTION, close);
+        }
+        if let Some(wire) = wire {
+            response.body_mut().hold_wire(wire);
         }
         response
     }

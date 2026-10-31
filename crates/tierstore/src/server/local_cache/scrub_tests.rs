@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::FutureExt as _;
 use tokio::sync::{Notify, mpsc};
 
 use super::layout::{Sidecar, data_path, meta_path, name_of};
@@ -184,7 +183,7 @@ async fn an_object_whose_fill_is_running_is_not_touched() {
     let keys = fill(&rig, 1, 400).await;
     rot(&rig, &keys[0]);
     let hex = name_of(&keys[0]).hex;
-    let held = futures::future::pending().boxed().shared();
+    let held = super::fill::Pending::never();
     super::locked(&rig.cache.inner.flights).insert(hex.clone(), held);
 
     let mut state = Scrubber::new(1 << 20);
@@ -545,7 +544,7 @@ async fn a_scrub_does_not_touch_the_object_of_a_fill_that_a_forget_marked() {
     rot(&rig, &keys[0]);
     let hex = name_of(&keys[0]).hex;
     let inner = &rig.cache.inner;
-    let held = futures::future::pending().boxed().shared();
+    let held = super::fill::Pending::never();
     super::locked(&inner.flights).insert(hex.clone(), held);
     super::locked(&inner.invalidated).insert(hex.clone());
     let mut state = Scrubber::new(1 << 20);
@@ -635,7 +634,7 @@ async fn a_fill_that_starts_before_the_drop_keeps_the_object() {
     let hex = name_of(&keys[0]).hex;
     let inner = &rig.cache.inner;
     let verdict = inner.scrub_object_between(&hex, &Scrubber::new(1 << 20), || {
-        let held = futures::future::pending().boxed().shared();
+        let held = super::fill::Pending::never();
         super::locked(&inner.flights).insert(hex.clone(), held);
     });
     assert_eq!(verdict, Verdict::Left);

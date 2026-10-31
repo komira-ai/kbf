@@ -93,6 +93,7 @@ impl PreflightReport {
             tool_versions: self.tool_versions.clone(),
             hardware: self.hardware.clone(),
             attempt: 1,
+            open_loop: true,
         }
     }
 }
