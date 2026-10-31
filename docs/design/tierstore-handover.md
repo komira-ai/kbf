@@ -1,0 +1,246 @@
+# tierstore update strategy: port-forward hand-over
+
+Status: DESIGN, for the maintainers. Nothing here is built. Checked against `main` at the commit this branch starts
+from; each claim about today's code names the file and function.
+
+This is the tierstore deep dive of the host update design. The host updater (one daemon per host; services register
+with it) does fetch, sha256 and attestation verification, staging, reporting and rollback. The coordinator decides the
+desired version per service, one host at a time, canary, health gate and rollback on a failed check. Both, and the port
+forwarding, are designed in `host-updates.md`; this page says what tierstore must offer and do.
+
+## 1. Shape
+
+A new tierstore (v-next) runs beside the running one (v-current), each on its own private loopback port (slot `a` 9301,
+slot `b` 9302); clients call 9300. v-next starts read-only, serves once it is ready, takes the public port by a swap the
+host updater makes, and, when v-current has exited, takes the cache lock and enables writes.
+
+`crates/tierstore/src/server/handover.rs` is not a process hand-over: it hands a put's body from the request to the
+backend's task (`hand_over`, `carry`, `received`). Nothing on `main` serves this.
+
+Two shapes run from one binary (`Settings::Storage`, `Settings::Cache`; `server/config.rs`; started by
+`serve_until_signalled` in `server/cli.rs` and `serve_cache_until_signalled` in `server/cache_cli.rs`):
+
+- **Build node (cache)**: a `LocalCache` over a directory; no journal, no lease (`server/local_cache/mod.rs` header).
+  The overlap hazard is the shared directory (section 4).
+- **Storage node (proxy plus reconciler)**: the proxy is stateless; the reconciler runs under a lease (`lib.rs`,
+  `reconciler.rs`, `lease.rs`). The overlap hazard is the lease and the journal (section 5).
+
+## 2. Relies on host-updates.md: port forwarding
+
+The nft rule, its atomic swap, the guard and the output chain are in `host-updates.md` and not repeated here. This
+strategy needs three facts from it:
+
+- an established flow stays on v-current while it drains (conntrack), and new flows go to v-next after the swap;
+- the private ports are reachable from loopback only, and the rule is the only way in from outside;
+- the DNAT to `127.0.0.1` from an outside interface needs `route_localnet=1`, which also lets outside packets reach
+  loopback; the guard must close that.
+
+## 3. What v-next must offer, and the steps
+
+**Registration** (per instance, one health URL for each slot while two run):
+
+| field | value | today |
+|---|---|---|
+| name | `tierstore` | new; nothing registers today |
+| version | the running binary's version | **gap**: only the start line `tierstore <version> listen=...` (`serve_until_signalled`, `serve_cache_until_signalled`) and `--version`, and the value is `CARGO_PKG_VERSION`, the crate's, not a commit. New: `tierstore_build_info{version,slot,mode}` on `/metricz` (section 7) |
+| health endpoint | `GET /readyz` on the private port | **exists**: 200 until the drain begins, 503 after (`Server::respond`, `probe`, `server/mod.rs`); `/healthz` is 200 while the process runs; unsigned |
+| strategy id | `port-forward-handover` | new |
+
+**What the host updater can ask of tierstore, and what exists:**
+
+| need | today | proposal |
+|---|---|---|
+| a loopback address and port | `--listen <SocketAddr>` (`cli.rs`, field `listen`; key `listen`, `config_cache.rs`) | none |
+| start read-only | none | `--read-only-cache` (section 4) |
+| a proxy id per slot | `--proxy-id` | `tierstore-a`, `tierstore-b` (section 5) |
+| ready | `/readyz` | none |
+| drain | SIGTERM (`signals`), `--drain-lb-wait`, `--drain-deadline`, `Drained.abandoned` | P1, P2 (section 6) |
+| **promote** | none | **SIGUSR1** to v-next; the ack is `tierstore_cache_mode{mode="read_write"}` |
+
+Promote is a signal, not an endpoint, on purpose: every route of the S3 listener, `/healthz` and `/metricz` included, is
+reachable by any client through the public port once the rule points at the instance, and an unsigned mutating route
+there would be open to them. A signal is local (the binary already handles SIGTERM and SIGINT, `signals`).
+
+**Ordered steps** (the host updater runs them; a failed check runs that step's rollback):
+
+| # | step | check | rollback |
+|---|---|---|---|
+| 1 | start v-next on the free slot, read-only | process up, start line seen | stop v-next |
+| 2 | wait for ready | `/readyz` 200 on its private port | stop v-next |
+| 3 | swap the rule to v-next | a request through 9300 is answered by v-next (the build gauge) | swap back, stop v-next |
+| 4 | drain v-current (SIGTERM; it accepts through the settle wait, then stops; deadline) | in flight reaches 0, or the deadline passes | swap back, only before the settle ends (the commit point of `host-updates.md` 4.1; section 8) |
+| 5 | v-current exits | exit status 0 | none: v-next serves; a hung v-current is killed at the unit's stop timeout (`TimeoutStopSec=960`, `packaging/tierstore/tierstore.service`) and the lock frees itself |
+| 6 | promote v-next (lock, writes on) | mode gauge is `read_write` | v-next keeps serving read-only; the step fails |
+| 7 | report healthy | `/readyz` 200 and the mode gauge | the coordinator's rollback is this strategy with the old version |
+
+Rollback after step 6 is the whole hand-over in reverse. It works only if the old version can start read-only; before
+the first release that can, it is a plain restart with a gap, and the updater says so in its result.
+
+## 4. Cache read-only mode and the lock contract (build node)
+
+**Read-only mode** (`--read-only-cache`, new). It serves hits from the existing directory; every miss and write goes to
+the upstream. Nothing like it exists: `CacheConfig::write_through` is about client writes, and a read cache already
+refuses client writes at the front (`Server::respond`, `read_cache`). Serving a hit beside v-current is safe because the
+data file is a create-only hard link of a complete file (`fill.rs: publish` renames the sidecar, then links the data
+file last), so a name that exists is whole, and an eviction unlinks a name without touching bytes a reader has open.
+v-next's index is a snapshot from its start: an object v-current fills later is a miss (served from the upstream); one it
+evicted is a failed read and a miss. The five writes to the shared directory today, and how each is disabled:
+
+| write today | how read-only disables it |
+|---|---|
+| `LocalCache::open` runs `layout::clear_stage` (empties `.stage/`, where v-current's fills are) and `layout::scan` (deletes a sidecar with no data file: the middle of v-current's `publish`) | a read-only open reads and skips; deletes nothing, empties nothing |
+| `check_local` writes a probe under `.stage/` (`local_cache/selfcheck.rs`) | probe a directory of its own on the same file system, or skip |
+| `layout::make_dirs` chmods directories (in `open`, `scan`, `publish`) | not called on the shared tree |
+| `Inner::lookup` calls `drop_entry` on `NotFound`, deleting files v-current may just have refilled | a read error is a miss and touches nothing |
+| `flush_touches` stamps file times (`utimensat`) in `maintain` and `evict_pass` | `maintain` does not run |
+
+It also starts no fills, keeps, eviction or scrub (`scrub_rate` is accepted and ignored today, `serve_cache`).
+
+**The lock** (new; no `flock` or lock file exists under `crates/tierstore/src`).
+
+- File `<path>/.lock`, `flock(LOCK_EX | LOCK_NB)` on a descriptor the holder keeps open. Old binaries ignore it (`scan`
+  reads `obj/` and `.stage/` only): additive.
+- **Holder**: the one process that may mutate the directory (fill, publish, evict, touch, `clear_stage`, `scan` with
+  deletes). A read-only process holds nothing, opens files under `obj/` for reading, and calls the upstream.
+- **Promotion** (step 6): try without blocking, retried on an injected clock until a deadline; on success run the
+  writing open (`clear_stage`, `scan`, replace the index), then enable fills, keeps and eviction. v-current's last act is
+  `flush_touches` at the end of `maintain`, so the rebuild sees its recency.
+- **v-current crashes mid-drain**: the kernel releases the lock; promotion's `clear_stage` and `scan` clean `.stage/`
+  and a half-published sidecar.
+- **v-next asks while v-current holds it**: the try fails; v-next stays read-only and never waits on the lock while
+  serving; after the deadline it reports `promotion_blocked` and the step fails.
+- **v-current has no lock** (the first upgrade onto this design): the lock would be granted at once while v-current still
+  writes, so the updater's observation that v-current exited is the first guard and the lock the second.
+- **A replaced `.lock`** is a lock on nothing: at promotion the holder compares `fstat` of its descriptor with `stat` of
+  the path and refuses a mismatch.
+
+## 5. Journal, lease and proxy id (storage node)
+
+The reconciler takes the lease, in `Reconciler::pass` through `Lease::ensure` (`lease.rs`), on `_tiering/lease` in the
+hot tier: create-only, renewed or taken over by `put_if_match` after `lease_ttl`. The proxy writes
+`_journal/<proxy_id>/<seq>` create-only and skips a taken number (`Inner::write_batch`, `tiered.rs`).
+
+- **Two proxies are safe**: any number work over the same tiers (`lib.rs`), and `Proxy::open` goes on after the highest
+  number it finds.
+- **One proxy id for both is wrong.** Two writers on one journal interleave, and the reconciler treats it as one stream
+  (oldest first by journal order within a proxy). The unit already says to give each process its own id
+  (`tierstore.service`, above `[Unit]`). Proposal: the slot is the id, `tierstore-a` and `tierstore-b`, stable across
+  upgrades, so ids do not pile up under `_tiering/proxies/`.
+- **One lease holder name is a small real bug.** `ReconcilerConfig::holder` is the proxy id and the body is
+  `holder\n<generation>` counting from 1 in each process (`Lease::body`); the content tag hashes the body. A restarted
+  process can write a body equal to an older one, and a stale renew with that old tag then succeeds. It needs a long
+  pause, so it is narrow; slot-named holders and a start nonce in the body remove it.
+- **A `dir:` hot tier cannot have two holders**: `DirBackend::put_if_match` is atomic among the calls of one backend only
+  (`dir.rs`, the doc of `DirBackend`). An S3 hot tier does not have this problem.
+
+Settled: **v-next does not run the reconcile loop until promoted**; it serves reads and writes through its own proxy at
+once. v-current already holds the lease and runs the loop through the whole drain (`reconcile` ends only when `serve`
+returns, `run_serving`); a second runner takes the lease only by expiry or makes v-current lose it silently, which
+`Lease` documents as a pass that can run beside another's; and with a `dir:` hot tier it is unsafe. v-current gives the
+lease up on exit (`Reconciler::stop`, at most `STOP_WAIT` = 5 s), so v-next's first `ensure` after promotion finds it
+free. If v-next never promotes, nothing reconciles after v-current exits: the step fails and the copy lag shows in
+`/usagez`. For a storage node, "enable writes" in step 6 means starting the reconcile loop.
+
+## 6. The drain of v-current: P1 and P2
+
+Today, when told to stop: `/readyz` 503 at once; for `drain_lb_wait` (default 10 s) it serves everything; then the
+phase is REFUSING, the listener is dropped, and every request **on a connection still open** is answered 503
+`ServiceUnavailable` with `Connection: close`; then it waits for the requests in flight, at most `drain_deadline`
+(default 15 min); then it closes the connections (`Server::serve_from`, `respond`, `finish`).
+
+With port forwarding that gives a 503 window. After the swap no new flow reaches v-current, but each established
+keep-alive connection does, and after `drain_lb_wait` its next request gets a 503 while one long transfer holds the
+drain. Two changes in tierstore (new, independent of how the port moves):
+
+- **P1** from the moment the drain begins, every answer carries `Connection: close`; the client reconnects after its next
+  answer and lands on v-next;
+- **P2** when the server stops accepting, idle connections close at once, and a request already on the wire is served,
+  not answered 503.
+
+`--drain-lb-wait` is the **settle wait** in a hand-over and is never `0s`: v-current keeps accepting and serving through
+it, so a connection whose SYN was mapped to v-current just before the swap (in its accept queue, or a retransmitted
+SYN) is served, not reset (`host-updates.md`, 4.1.3). P2 applies at the end of the settle. A keep-alive connection that outlives
+`drain_deadline` is closed by v-current (`finish_by_deadline`, `finish`) and the cut requests are counted in
+`Drained.abandoned` and printed by `cut_note`: an idle one costs the client a reconnect; a request still running fails,
+as in a plain restart.
+
+## 7. Metrics
+
+`/metricz` is one block per source (`Server::metrics_probe`). Read-only and overlapping:
+
+| family (`tierstore_`) | read-only v-next | with two processes |
+|---|---|---|
+| `cache_hits_total`, `cache_misses_total`, `cache_bytes_served_local_total`, `cache_bytes_served_upstream_total` | count | per process; the sum is right |
+| `cache_fills_total`, `cache_fills_skipped_total`, `cache_fills_skipped_busy_total`, `cache_fill_failures_total{reason}`, `cache_evictions_total{reason}`, `cache_pinned_skips_total`, `cache_staging_files` | stay 0 | v-current only |
+| `cache_discarded_at_start_total` | 0 (read-only open deletes nothing) | v-current's |
+| `cache_bytes`, `cache_objects` | start snapshot, never updated | **double-count** one directory |
+| `cache_fs_free_bytes` | live | **double-count** one file system |
+| `hits_total`, `misses_total`, `read_errors_total`, `reads_total`, `bytes_served_total`, `bytes_read_total` (`tier`, `op`), `promotions_total`, `promoted_bytes_total`, `promotions_skipped_total{reason}` (storage) | count | per process; the sum is right |
+| `oci_requests_total`, `oci_bytes_served_total`, `oci_digest_mismatches_total`, `oci_front_info` | count | per process |
+
+Counters restart at 0 in a new process; a rate handles it. The directory gauges are read from the process that holds
+the lock. No family names a build, slot or mode today (the only process-level label is `oci_front_info{mode}`), and a
+scrape of 9300 reaches whichever instance the rule points at without saying which. Proposal: scrape the private ports and
+add `tierstore_build_info{version,slot,mode="current|read_only"}` and `tierstore_cache_mode{mode}`. One private port is
+down between upgrades, so an alert is on "no instance up", not on `up == 0`. `/readyz` on v-next is 200 before promotion:
+it means "serves requests", not "holds the lock"; the mode gauge says that.
+
+## 8. Failure cases
+
+| case | what happens | state after |
+|---|---|---|
+| v-next not ready (step 2) | stop it; nothing moved | v-current serves; failed |
+| the swap fails (step 3) | the updater's swap is one transaction: the old rule stays | v-current serves; v-next stopped |
+| v-next ready but wrong through 9300 | swap back, stop v-next | as before |
+| v-next crashes before the swap | nothing moved | v-current serves |
+| v-next crashes after the swap, before the commit point | swap back; v-current still accepts (it has not been signalled, or is inside its settle wait), so the updater does not signal v-current until v-next has passed the health gate through the public port (step 4 waits on step 3's check) | v-current serves |
+| v-next crashes after the commit point | v-current has stopped accepting, so a swap back would send new connections to a closed port; systemd restarts v-next, read-only, and the coordinator rolls back | a gap until v-next is up again; failed |
+| v-current hangs past the deadline | `Drained.abandoned` counts what was cut; connections close; the unit is killed at `TimeoutStopSec` | the kernel releases the lock; promotion cleans `.stage/` |
+| v-current crashes during the overlap | the updater (which holds the rule) swaps to v-next if not yet | v-next serves read-only, then promotes |
+| v-next never promotes | a storage node's reconciler stays off; a cache node never writes locally | step 6 fails; `/usagez` shows the lag; the updater reports and retries |
+| the disk fills while both run | v-current's fills and eviction handle it as today (`critical`, `free_floor`); v-next writes nothing; stale index entries are misses | no corruption |
+| reboot mid-overlap | one instance starts, from the slot the rule names | no overlap |
+
+## 9. Test plan (tests first)
+
+House rules: nothing asserts timing, no real sleeps, injected clocks and counted events. Each test names the defect it
+catches and is written red before the code. nft tests: see `host-updates.md`.
+
+- **T1 hand-over under load.** N clients put and get, keep-alive and new connections, with no pause, while the steps
+  run end to end. Zero failed requests, no client retry; every written object reads back with its bytes and hash; both
+  instances answered (build gauge), so it is not vacuous; the directory passes `scan` with nothing discarded. Without P1
+  and P2 it fails with 503s. (It needs the nft setup of `host-updates.md`.)
+- **T2 lock contract.** Two processes on one directory: the second's try fails while the first holds the lock; after the
+  first is killed it succeeds and its `scan` cleans a half-published sidecar; a replaced `.lock` is refused.
+- **T3 read-only writes nothing.** Start read-only on a directory with a half-published sidecar and files in `.stage/`;
+  serve hits and misses; compare the whole tree (names, sizes, modes, mtimes) before and after. One case per row of the
+  table in section 4: remove its fix and the tree differs.
+- **T4 stale index.** v-current evicts then refills an object while v-next holds the old entry and is asked for it:
+  v-next serves it and deletes nothing.
+- **T5 rollback.** Hand over, then back, under T1's load: zero failures, objects intact.
+- **T6 lease and journal.** Two proxies with slot ids over one hot tier write separate journals; v-next's reconciler makes
+  no `ensure` call before promotion (a counted event); after promotion it takes the lease v-current released; two starts
+  never write the same lease body.
+- **T7 metrics.** Read-only v-next shows 0 for the fill and eviction families after a miss-heavy run; the build gauge
+  differs between instances.
+- **T8 drain.** P1 and P2 on a paused clock over in-memory pipes (the pattern of `drain_tests.rs`): every answer after
+  the drain begins says `Connection: close`; an idle connection ends when accepting stops; no request gets 503.
+- **T9 promote.** SIGUSR1 to a read-only instance with the lock free turns on fills (a counted fill) and the mode gauge;
+  with the lock held it changes nothing and reports `promotion_blocked`.
+
+## 10. Questions for the maintainers
+
+1. **Promote by signal.** Recommendation: SIGUSR1 plus the mode gauge as the ack, not an unsigned endpoint, because the
+   S3 listener is reachable by every client through the public port.
+2. **P1 and P2** change the plain restart's drain too (a connection is closed, never answered 503). Recommendation:
+   the only behaviour, not a flag, so there is one drain.
+3. **Rollback past the first read-only release** is a restart with a gap. Recommendation: accept it and say so in the
+   result.
+4. **The OCI front** has its own listener (`--oci-listen`). Recommendation: the same two-slot treatment, or its clients
+   see a gap at every upgrade.
+5. **A `dir:` hot tier** cannot have two lease holders. Recommendation: the hand-over is for S3 hot tiers; `dir:` keeps
+   the plain restart.
+6. **Version source.** The registered version has no source today. Recommendation: the build gauge, with the commit baked
+   into the binary rather than the crate version.
+7. **Scraping private ports** is blocked by the loopback guard from off the host. Recommendation: a scraper on the node
+   reads loopback.
