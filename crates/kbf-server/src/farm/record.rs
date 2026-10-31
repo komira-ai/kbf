@@ -56,7 +56,16 @@ impl Side {
         });
     }
 
-    pub(super) fn record_started(&self, _start: &StartLease) {}
+    pub(super) fn record_started(&self, start: &StartLease) {
+        if !self.is_recorded(start.operation) {
+            return;
+        }
+        self.recorder.emit(Event::Started {
+            operation: start.operation,
+            lease: start.lease,
+            at: wall_now(),
+        });
+    }
 
     pub(super) fn record_requeue(&self, requeue: &Requeue) {
         if !self.is_recorded(requeue.operation) {
