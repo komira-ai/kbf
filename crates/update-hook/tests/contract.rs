@@ -561,6 +561,48 @@ fn the_release_paths_must_be_absolute() {
     );
 }
 
+/// Catches a digest that is not `sha256:` and 64 lowercase hex digits: the hook keys its record
+/// on it, so a different shape would be a different identity for the same artifact.
+#[test]
+fn the_artifact_digest_is_sha256_and_64_lowercase_hex() {
+    assert_eq!(update_hook::ARTIFACT_DIGEST_KEY, "updater.artifact_digest");
+    let good = format!("sha256:{}", "0123456789abcdef".repeat(4));
+    let params = Params::parse(&format!("\"updater.artifact_digest\" = \"{good}\"\n")).unwrap();
+    assert_eq!(params.artifact_digest().unwrap(), Some(good.as_str()));
+    assert_eq!(Params::default().artifact_digest().unwrap(), None);
+    let short = format!("sha256:{}", "a".repeat(63));
+    let long = format!("sha256:{}", "a".repeat(65));
+    let upper = format!("sha256:{}", "A".repeat(64));
+    let other = format!("sha512:{}", "a".repeat(64));
+    let bare = "a".repeat(64);
+    for bad in [short, long, upper, other, bare, String::new()] {
+        let text = format!("\"updater.artifact_digest\" = \"{bad}\"\n");
+        assert!(
+            matches!(Params::parse(&text), Err(ParamsError::BadDigest(d)) if d == bad),
+            "{bad}"
+        );
+        let mut params = Params::default();
+        params.insert(update_hook::ARTIFACT_DIGEST_KEY, Scalar::Text(bad.clone()));
+        assert!(
+            matches!(params.artifact_digest(), Err(ParamsError::BadDigest(_))),
+            "{bad}"
+        );
+    }
+    assert!(matches!(
+        Params::parse("\"updater.artifact_digest\" = 5\n"),
+        Err(ParamsError::BadReserved(_))
+    ));
+    assert!(matches!(
+        Params::parse_declared(&format!("\"updater.artifact_digest\" = \"{good}\"\n")),
+        Err(ParamsError::ReservedKey(_))
+    ));
+    assert!(
+        !ParamsError::BadDigest("x".to_owned())
+            .to_string()
+            .is_empty()
+    );
+}
+
 /// Catches a declaration that sets a key only the updater may write: its own `[hook.params]`
 /// may carry anything but the `updater.` namespace.
 #[test]

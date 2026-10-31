@@ -1,4 +1,4 @@
-//! The S3 backend over the loopback S3 service of `kbf-objstore`: the checks every backend
+//! The S3 backend over the loopback S3 service of `objstore-s3`: the checks every backend
 //! passes, and the cases only S3 has (ranges that S3 answers 416 to, listings of more than one
 //! page, names the client cannot sign, a store that cannot be reached, the proxy and the
 //! reconciler working over S3 backends).
@@ -10,11 +10,12 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{StreamExt, stream};
-use kbf_objstore::s3::fake::{Failure, FakeS3, part_etag};
+use objstore_s3::s3::fake::{Failure, FakeS3, part_etag};
 use tierstore::s3::{Capabilities, Credentials, S3Config};
 use tierstore::{
     Backend, ByteRange, Check, Clock, Error, PartBody, Proxy, ProxyConfig, Reconciler,
-    ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SystemClock, self_test,
+    ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SweepBudget, SystemClock,
+    TestClock, self_test, sweep_probes,
 };
 
 use crate::conformance;
@@ -72,11 +73,11 @@ fn self_test_options(run_id: &str, multipart: bool) -> SelfTestOptions<'_> {
     }
 }
 
-/// Asserts that a probe key an earlier start left is deleted when the service's own clock, read
+/// Asserts that a probe key an earlier start left is swept when the service's own clock, read
 /// from the time it stamps a key the test writes, says it is over an hour old, as listed with the
 /// time the service stamped it with; and that a key that is not yet an hour old stays.
 #[tokio::test]
-async fn the_self_test_sweeps_probe_keys_of_an_earlier_start_over_the_s3_service() {
+async fn the_sweep_deletes_probe_keys_of_an_earlier_start_over_the_s3_service() {
     let (s3, backend) = backend().await;
     let left = bytes::Bytes::from_static(b"x");
     s3.set_time(1);
@@ -93,18 +94,27 @@ async fn the_self_test_sweeps_probe_keys_of_an_earlier_start_over_the_s3_service
 
     // 3000 s on the service's clock: the first key is under an hour old.
     s3.set_time(3_000);
-    self_test(&backend, &options, &|line: String| panic!("{line}"))
-        .await
-        .unwrap();
+    let notes = Mutex::new(Vec::new());
+    let note = |line: String| notes.lock().unwrap().push(line);
+    let budget = SweepBudget::default();
+    let timer = TestClock::new();
+    let swept = sweep_probes(&backend, &options, budget, &timer, &note).await;
+    assert_eq!((swept.deleted, swept.more_left), (0, false));
     assert_eq!(s3.keys().len(), 2, "{:?}", s3.keys());
 
     // 4000 s: the first key, written at 1 s, is over an hour old; the second, at 5000 s, is not
     // older than now.
     s3.set_time(4_000);
-    self_test(&backend, &options, &|line: String| panic!("{line}"))
-        .await
-        .unwrap();
+    let swept = sweep_probes(&backend, &options, budget, &timer, &note).await;
+    assert_eq!((swept.deleted, swept.more_left), (1, false));
     assert_eq!(s3.keys(), ["_tiering/selftest/running-start/create"]);
+    assert_eq!(
+        *notes.lock().unwrap(),
+        [
+            "the service: swept 0 stale probe keys in 0 ms",
+            "the service: swept 1 stale probe keys in 0 ms"
+        ]
+    );
 }
 
 /// Asserts that a 500 from the service is not a wrong answer: the cold tier's multipart check is
@@ -155,19 +165,14 @@ async fn the_self_test_calls_a_service_that_does_not_answer_unreachable() {
     };
     assert_eq!(backend, "the service");
     assert!(error.contains("create-only"), "{error}");
-    // With a wait of zero the notes are: the time of the store that could not be read (for the
-    // sweep), and the delete of the check's key that failed before the attempt and after the
-    // check; no repeat.
+    // With a wait of zero the test ends at the first check, and the notes are the two deletes of
+    // that check's key that failed (before the attempt and after the check); no repeat. The
+    // sweep, which noted that the time of the store could not be read, is not part of the test.
     let notes = notes.lock().unwrap();
     let count = |text: &str| notes.iter().filter(|note| note.contains(text)).count();
-    assert_eq!(
-        count("could not read the time of the store"),
-        1,
-        "{notes:?}"
-    );
     assert_eq!(count("trying again"), 0, "{notes:?}");
     assert_eq!(count("could not delete the probe key"), 2, "{notes:?}");
-    assert_eq!(notes.len(), 3, "{notes:?}");
+    assert_eq!(notes.len(), 2, "{notes:?}");
 }
 
 /// A service that answers every write (a PUT or a POST) with `status`, a whole HTTP reply, a
@@ -231,8 +236,7 @@ fn refusing_writes(status: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
 
 /// Asserts that a 507 from a store, through the real S3 mapping, is a full tier and not a wrong
 /// answer: the hot tier's checks that need a write are each skipped with a note (five), the test
-/// passes, and nothing but writes, deletes were sent (no listing: the time of the store could not
-/// be read).
+/// passes, and nothing but writes and deletes were sent.
 #[tokio::test]
 async fn a_507_from_the_store_skips_the_write_checks_through_the_s3_mapping() {
     let (endpoint, seen) = refusing_writes(

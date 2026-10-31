@@ -190,7 +190,7 @@ fn updater_role<'a>(a: &'a str, b: &'a str) -> Result<&'a str, Refusal> {
     let host = host
         .strip_prefix(HostRole::URI_PREFIX)
         .ok_or(Refusal::RoleUri)?;
-    host.parse::<HostRole>().map_err(|_| Refusal::RoleUri)?;
+    HostRole::parse_named(host).map_err(|_| Refusal::RoleUri)?;
     match role.strip_prefix(ROLE_URI_PREFIX) {
         Some(role @ "updater") => Ok(role),
         _ => Err(Refusal::RoleUri),

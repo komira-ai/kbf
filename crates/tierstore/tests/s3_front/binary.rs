@@ -9,12 +9,13 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream;
-use kbf_objstore::s3::fake::FakeS3;
-use kbf_objstore::s3::{Credentials, MULTIPART_THRESHOLD, S3Config, S3Store};
-use kbf_objstore::{BodyStream, ByteRange, Capabilities, ObjectKey, ObjectStore, ObjectStoreError};
 use kbf_testkit::reaped::{Reaped, first_line, spawn};
+use objstore_s3::s3::fake::FakeS3;
+use objstore_s3::s3::{Credentials, MULTIPART_THRESHOLD, S3Config, S3Store};
+use objstore_s3::{BodyStream, ByteRange, Capabilities, ObjectKey, ObjectStore, ObjectStoreError};
 use reqwest::Client;
 use rustix::process::{Pid, Signal, kill_process};
+use tierstore::server::build_info::{CAPABILITIES, COMMIT};
 
 use crate::client::assert_refused;
 use crate::files::{BIN_KEY_ID, BIN_SECRET, Files, with};
@@ -41,6 +42,8 @@ pub(crate) struct Running {
     child: Option<Reaped>,
     pid: Pid,
     addr: String,
+    /// The start line the binary printed.
+    line: String,
     /// Keeps the pipe of the binary's stdout open.
     _stdout: std::io::BufReader<std::process::ChildStdout>,
 }
@@ -63,11 +66,17 @@ pub(crate) fn start(flags: &[String]) -> Running {
         child: Some(child),
         pid,
         addr: listen.to_owned(),
+        line,
         _stdout: reader,
     }
 }
 
 impl Running {
+    /// The start line the binary printed.
+    pub(crate) fn line(&self) -> &str {
+        &self.line
+    }
+
     /// The address the binary said it listens on.
     pub(crate) fn addr(&self) -> &str {
         &self.addr
@@ -196,7 +205,8 @@ fn the_flags_are_parsed_and_refused_as_the_usage_says() {
     }
     let (code, out, _) = run(&["--version".to_owned()]);
     assert_eq!(code, 0);
-    let version = format!("tierstore {}", env!("CARGO_PKG_VERSION"));
+    // The form the release check reads: the name, the package version, `+`, the commit.
+    let version = format!("tierstore {}+{COMMIT}", env!("CARGO_PKG_VERSION"));
     assert_eq!(out.trim_end(), version);
     let (code, _, err) = run(&[]);
     assert_eq!(code, 2);
@@ -207,6 +217,98 @@ fn the_flags_are_parsed_and_refused_as_the_usage_says() {
     assert_eq!(run(&unknown).0, 2);
     let bad_value = files.flags(&["--drain-lb-wait", "soon"]);
     assert_eq!(run(&bad_value).0, 2);
+}
+
+/// Asserts that `--capabilities`, alone, exits 0 and prints one line for each capability of the
+/// build and nothing else, on stdout, and that it needs none of the flags a start requires.
+/// Catches: a flag that is not there, one that still asks for `--listen`, a start that goes on to
+/// serve, and output on stderr or text besides the names.
+#[test]
+fn capabilities_prints_the_names_one_to_a_line_and_exits_0() {
+    let (code, out, err) = run(&["--capabilities".to_owned()]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    let expected: String = CAPABILITIES
+        .iter()
+        .map(|name| format!("{name}\n"))
+        .collect();
+    assert_eq!(out, expected);
+}
+
+/// Asserts that `--capabilities` with any other flag is refused with status 2, naming it, and
+/// prints nothing on stdout, so that a script that reads the list never takes a refusal for one.
+/// Catches: the other flags ignored (a start's flags given by mistake read as a list), and a
+/// refusal that does not say which flag.
+#[test]
+fn capabilities_with_another_flag_is_refused_naming_it() {
+    for other in [
+        vec!["--listen", "127.0.0.1:0"],
+        vec!["--version"],
+        vec!["--check-config"],
+    ] {
+        let mut flags = vec!["--capabilities".to_owned()];
+        flags.extend(other.iter().map(|flag| (*flag).to_owned()));
+        let (code, out, err) = run(&flags);
+        assert_eq!((code, out.as_str()), (2, ""), "{other:?}");
+        assert!(
+            err.starts_with("tierstore: --capabilities takes no other flag, got "),
+            "{err}"
+        );
+        assert!(err.contains(other[0]), "{other:?}: {err}");
+    }
+}
+
+/// Asserts that the refusal does not depend on where `--capabilities` stands, that a repeated
+/// `--capabilities` is the one flag given twice and not another flag, and that
+/// `--capabilities=x` is not `--capabilities`: the parser refuses it, as a flag that takes no
+/// value. Catches: a refusal that looks only at the argument after the flag, a repeat taken for
+/// another flag, and a prefix match that takes `--capabilities=x` for the flag.
+#[test]
+fn capabilities_is_found_wherever_it_stands() {
+    let flags = |list: &[&str]| -> Vec<String> { list.iter().map(|s| (*s).to_owned()).collect() };
+    let (code, out, err) = run(&flags(&["--listen", "127.0.0.1:0", "--capabilities"]));
+    assert_eq!((code, out.as_str()), (2, ""));
+    assert!(
+        err.starts_with("tierstore: --capabilities takes no other flag, got --listen"),
+        "{err}"
+    );
+    let (once, once_out, _) = run(&flags(&["--capabilities"]));
+    let (twice, twice_out, twice_err) = run(&flags(&["--capabilities", "--capabilities"]));
+    assert_eq!((twice, twice_err.as_str()), (once, ""));
+    assert_eq!(twice_out, once_out);
+    let (code, out, err) = run(&flags(&["--capabilities=x"]));
+    assert_eq!((code, out.as_str()), (2, ""));
+    assert!(!err.contains("takes no other flag"), "{err}");
+    assert!(err.contains("--capabilities"), "{err}");
+}
+
+/// Asserts that the start line ends with `commit=` and the commit the build embeds, and that the
+/// words before it are as they were, and that `/metricz` of the process names the same commit in
+/// its build gauge. Catches: a start line that leaves the commit out or puts it where a reader
+/// of the address words would take it for one, and a gauge and a start line that disagree.
+#[tokio::test]
+async fn the_start_line_and_the_gauge_name_the_commit() {
+    let files = Files::new("bin-commit");
+    let mut running = start(&files.flags(&["--drain-lb-wait", "50ms"]));
+    let line = running.line().to_owned();
+    let words: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(words.len(), 4, "{line}");
+    assert_eq!(words[3], format!("commit={COMMIT}"), "{line}");
+    let url = format!("http://{}/metricz", running.addr());
+    let body = Client::new()
+        .get(&url)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let gauge = format!(
+        "tierstore_build_info{{version=\"{}\",commit=\"{COMMIT}\"}} 1\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    assert!(body.contains(&gauge), "{body}");
+    running.signal(Signal::TERM);
+    assert_eq!(running.exit_code().await, Some(0));
 }
 
 /// Asserts that a start that cannot go on exits with status 1 and a reason that names the flag:

@@ -61,7 +61,15 @@ opening the proxy: <why>
 binding <address>: <why>
 ```
 
-`tier unreachable` is a store that did not answer for `--backend-check-wait`: check the endpoint, the network and the store. The process asks again with growing pauses before it gives up, so a store that is slow to come up after a reboot does not fail a start. `binding` is an address in use, or one that is not on this host.
+`tier unreachable` is a store that did not answer for `--backend-check-wait`: check the endpoint, the network and the store. The process asks again with growing pauses before it gives up, so a store that is slow to come up after a reboot does not fail a start. `binding` is an address in use, or one that is not on this host. On main, not in v0.0.41, a server given several S3 or registry listen addresses (see [configuration](configuration.md)) starts only if it can bind every one: the message names the first that failed, and nothing is served.
+
+An address given twice (on main, not in v0.0.41) exits 2 before anything is bound; the message names the flag or the key and never the address:
+
+```message
+<flag> is given the same address twice
+<key>: the same address is listed twice
+<key>: it needs at least one address
+```
 
 A tier that answers a self-test question wrongly exits 3 and names the tier, the check and what it answered: the store overwrites on a create-only put, ignores `If-Match`, answers a range with the whole object, or completes a multipart upload over an existing object. Use a store that does these properly. `--skip-backend-check multipart-conditional=<reason>` is for the last only.
 
@@ -76,13 +84,17 @@ A tier that answers a self-test question wrongly exits 3 and names the tier, the
 | 412 `PreconditionFailed` | the key already exists in either tier: puts are create-only |
 | 413 `EntityTooLarge` | a body longer than `--max-request-bytes` (or the presigning key's ceiling) |
 | 400 `RequestTimeout` | a body that stalled for `--body-idle-timeout` or came slower than `--put-min-bytes-per-sec`; nothing is stored |
-| 503 `SlowDown` | more than `--max-concurrent-puts` bodies at once, or a put that met a full tier; retry |
-| 503 `ServiceUnavailable` | the server is draining, or a tier could not be reached |
+| 503 `SlowDown` | more than `--max-concurrent-puts` bodies at once for longer than `--put-permit-wait`, or a put that met a full tier; retry |
+| 503 `ServiceUnavailable` | a tier could not be reached; in v0.0.41 and before also a request on a connection that was open when the drain's settle ended. On main a drain answers no request 503 (see "A connection ends during a restart") |
 | 501 `NotImplemented` | an `aws-chunked` or trailing-checksum body, CRC-64/NVMe, or `encoding-type=url` on a listing; set the SDK's checksum calculation to "when required" |
 
 ## The hot tier keeps filling
 
 Check `/usagez` first. A 503 there means the reconciler is not publishing: look at its process (`journalctl`), at the cold tier's reachability and at the lease. If usage is fresh and still high, the cold tier is taking copies slower than clients write: raise `--copy-parallel` if the cold store has room for more at once, or give the hot tier a larger `--hot-bytes`. See [operations](operations.md) for what a full hot tier does.
+
+## A connection ends during a restart
+
+On main, not in v0.0.41. From the moment a stop begins every answer carries `Connection: close`, and at the end of the settle (`--drain-lb-wait`) the server closes each idle connection by shutting its end for writing: a client reads the end of the stream, not a reset, and opens a new connection. A client that sent a request in the one round trip before it read that end gets no answer: the server read the request, dropped it and counted it in `tierstore_drain_late_requests_total`. Do not retry such a request unless it is safe to repeat: a retried create-only put answers 412 whether its first try was stored or another writer stored the key. Only a connection that was idle for the whole settle can meet this, and the server cannot remove it; a count that is large after every restart means clients that send on a connection without looking at `Connection: close`.
 
 ## At drain deadline
 

@@ -8,11 +8,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::cells::CellContext;
 use crate::cells::budget::{Campaign, Ledger};
 use crate::cells::engine::LoadSource;
+use crate::coldstate::{ColdStateSource, NoColdState};
 use crate::config::{ByteCaps, RateCaps, RunConfig, Secret, StoreSpec};
 use crate::error::BenchError;
 use crate::gate::{LoadGate, LoadSample};
 use crate::requestlog::RequestLog;
-use crate::result::{Provenance, Window};
+use crate::result::{ColdState, Provenance, Window};
 use crate::role::Role;
 
 /// A machine at rest.
@@ -58,6 +59,57 @@ impl LoadSource for Script {
             .pop_front();
         next.unwrap_or(Some(calm()))
             .ok_or(BenchError::NotYet("load sample"))
+    }
+}
+
+/// A cold store that answers what it was told, in order, and then the last answer for ever; an
+/// `Err` entry is a store that cannot be asked.
+pub struct ColdScript {
+    answers: Mutex<VecDeque<Result<ColdState, ()>>>,
+    last: Mutex<Option<ColdState>>,
+    reads: std::sync::atomic::AtomicU32,
+}
+
+/// A reading of a store that is `healing` or not, taken at `read_unix_ms`.
+pub fn cold_state(healing: bool, read_unix_ms: u64) -> ColdState {
+    ColdState {
+        healing,
+        percent_done: healing.then_some(40.0),
+        drives: vec![crate::result::DriveState {
+            id: "d-00000000".to_owned(),
+            state: "ok".to_owned(),
+            healing,
+        }],
+        read_unix_ms,
+    }
+}
+
+impl ColdScript {
+    /// A store that answers `answers` in turn; after the last it keeps giving that one.
+    pub fn of(answers: Vec<Result<ColdState, ()>>) -> Arc<Self> {
+        Arc::new(Self {
+            answers: Mutex::new(answers.into()),
+            last: Mutex::new(None),
+            reads: 0.into(),
+        })
+    }
+
+    /// How many times it was asked.
+    pub fn reads(&self) -> u32 {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl ColdStateSource for ColdScript {
+    fn read(&self) -> Result<Option<ColdState>, BenchError> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut answers = self.answers.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(next) = answers.pop_front() {
+            let next = next.map_err(|()| BenchError::NotYet("cold state"))?;
+            *last = Some(next);
+        }
+        Ok(last.clone())
     }
 }
 
@@ -126,6 +178,8 @@ pub fn ctx_with_log(
             max_psi_io_avg10: 10.0,
             max_disk_util_pct: 60.0,
         },
+        cold_guard: crate::cells::coldguard::ColdGuardLimits::default(),
+        cold_state_timeout: std::time::Duration::from_secs(30),
         rates: RateCaps {
             cold_rps: 100_000,
             hot_rps: 100_000,
@@ -143,6 +197,7 @@ pub fn ctx_with_log(
         config,
         log,
         campaign: Campaign { ledger },
+        cold_state: Arc::new(NoColdState),
         provenance: Provenance {
             run_id: "test-run".to_owned(),
             ..Provenance::unrecorded()

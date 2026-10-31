@@ -160,6 +160,10 @@ impl Hook {
             report.detail = Some("the params lack the staged release or the target".to_owned());
             return Ok((Outcome::Failure, report));
         }
+        if !matches!(params.artifact_digest(), Ok(Some(_))) {
+            report.detail = Some("the params lack a well-formed artifact digest".to_owned());
+            return Ok((Outcome::Failure, report));
+        }
         if self.defect("needs-previous") && params.previous_release().is_none() {
             report.detail = Some("no previous release: a first install".to_owned());
             return Ok((Outcome::Failure, report));

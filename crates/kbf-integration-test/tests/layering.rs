@@ -70,10 +70,11 @@
 //! - the hot/cold object store library (`tierstore`) depending, directly or through another
 //!   crate, on any other crate of this workspace, which would stop it from moving to a
 //!   repository of its own (its `s3` feature, off by default, adds the S3 client of
-//!   `kbf-objstore`, and so does its `server` feature, which the `tierstore` binary needs;
+//!   `objstore-s3`, and so does its `server` feature, which the `tierstore` binary needs;
 //!   the check reads the tree of the crate built alone, so the features that its own tests
 //!   turn on do not count); and a walk that cannot see its dependencies, which would make
-//!   that check pass vacuously;
+//!   that check pass vacuously; and, with every feature and its dev-dependencies, `tierstore`
+//!   reaching a `kbf-*` crate other than `kbf-testkit`, or a walk that does not reach `objstore-s3`;
 //! - the S3 client and object store trait (`objstore-s3`, which `kbf-objstore` re-exports)
 //!   depending, directly or through another crate, on any other crate of this workspace, which
 //!   would stop it from leaving with `tierstore`; a walk that cannot see its dependencies; and
@@ -735,7 +736,7 @@ fn pack_adopt_reaches_neither_the_frontend_nor_the_daemon() {
 /// and through other crates, include no other crate of this workspace, and that the walk
 /// sees its dependencies (it reaches `tokio`), so the check does not pass on an empty walk.
 /// The tree is that of `cargo build -p tierstore`, with the features the crate has by default:
-/// its `s3` feature, which adds `kbf-objstore`, is off in it, and so is `server`, which turns
+/// its `s3` feature, which adds `objstore-s3`, is off in it, and so is `server`, which turns
 /// `s3` on for the `tierstore` binary. It is not the graph of `cargo metadata`, which has the
 /// features of the whole workspace, where the tests of `tierstore` turn `server` on.
 #[test]
@@ -878,20 +879,95 @@ fn the_update_rights_crate_reaches_only_the_hook_contract() {
     );
 }
 
-/// Asserts that the tree of `cargo build -p tierstore --features s3` holds `kbf-objstore` (the
+/// Asserts that the tree of `cargo build -p tierstore --features s3` holds `objstore-s3` (the
 /// S3 client that `S3Backend` adapts) and that of `--features server` holds it too, so that the
 /// check above sees the edge it guards, and that `server` turns `s3` on.
 #[test]
 fn tierstore_links_the_s3_client_only_with_its_s3_or_server_feature() {
     let bare = linked_by("tierstore");
-    assert!(
-        !bare.contains("kbf-objstore"),
-        "without a feature: {bare:?}"
-    );
+    assert!(!bare.contains("objstore-s3"), "without a feature: {bare:?}");
     for features in ["s3", "server"] {
         let linked = linked_with("tierstore", features);
-        assert!(linked.contains("kbf-objstore"), "{features}: {linked:?}");
+        assert!(linked.contains("objstore-s3"), "{features}: {linked:?}");
     }
+}
+
+/// Asserts that `tierstore`, with every feature on and with its dev-dependencies, reaches no
+/// `kbf-*` crate of this workspace but `kbf-testkit`, a dev-dependency (the scratch directories
+/// and the child-process helper of its tests) that a later change removes, and that the walk
+/// sees `objstore-s3`, the S3 client it is built on, so the check does not pass on an empty
+/// walk. The walk follows every kind of edge of the resolved `cargo metadata` graph, which has
+/// the features of the whole workspace (the `server` and `s3` features are on through the
+/// crate's dev-dependency on itself), so it covers what the two tests above leave out: the
+/// dev-dependencies and the `s3` feature's tree together.
+#[test]
+fn tierstore_with_its_tests_reaches_no_kbf_crate_but_the_test_helpers() {
+    let cargo = std::env::var("CARGO").expect("CARGO is set when cargo runs a test");
+    let out = Command::new(cargo)
+        .args(["metadata", "--format-version", "1", "--locked"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run cargo metadata");
+    assert!(
+        out.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta: Value = serde_json::from_slice(&out.stdout).expect("cargo metadata emits JSON");
+    let nodes = meta["resolve"]["nodes"].as_array().expect("resolve.nodes");
+    let edges: BTreeMap<&str, Vec<&str>> = nodes
+        .iter()
+        .map(|node| {
+            let id = node["id"].as_str().expect("node id");
+            let deps = node["deps"]
+                .as_array()
+                .expect("deps")
+                .iter()
+                .map(|d| d["pkg"].as_str().expect("dep pkg"))
+                .collect();
+            (id, deps)
+        })
+        .collect();
+    let name_of: BTreeMap<&str, &str> = meta["packages"]
+        .as_array()
+        .expect("packages")
+        .iter()
+        .map(|p| {
+            (
+                p["id"].as_str().expect("package id"),
+                p["name"].as_str().expect("package name"),
+            )
+        })
+        .collect();
+    let root = name_of
+        .iter()
+        .find(|(_, name)| **name == "tierstore")
+        .map(|(id, _)| *id)
+        .expect("tierstore is a workspace member");
+    let mut seen = BTreeSet::from([root]);
+    let mut queue = VecDeque::from([root]);
+    while let Some(id) = queue.pop_front() {
+        for dep in edges.get(id).into_iter().flatten() {
+            if seen.insert(dep) {
+                queue.push_back(dep);
+            }
+        }
+    }
+    let reached: BTreeSet<&str> = seen.iter().map(|id| name_of[id]).collect();
+    assert!(
+        reached.contains("objstore-s3"),
+        "tierstore's walk must reach objstore-s3, or this check proves nothing: {reached:?}"
+    );
+    let kbf: BTreeSet<&str> = reached
+        .iter()
+        .copied()
+        .filter(|name| name.starts_with("kbf-"))
+        .collect();
+    assert_eq!(
+        kbf,
+        BTreeSet::from(["kbf-testkit"]),
+        "the kbf crates tierstore reaches, with its features and dev-dependencies"
+    );
 }
 
 /// Asserts that the S3 client and the object store trait (`objstore-s3`) link no other crate of

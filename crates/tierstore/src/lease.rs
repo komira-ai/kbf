@@ -1,5 +1,7 @@
 //! The lease that makes one reconciler the runner.
 
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -7,7 +9,20 @@ use bytes::Bytes;
 use crate::journal::LEASE_KEY;
 use crate::{Backend, Clock, Error};
 
-/// A lease on the object `_tiering/lease` of the hot tier.
+/// 128 random bits as hex, from the keys the standard library seeds each `RandomState` with
+/// from the operating system's randomness, so that no crate is needed for it. It only has to
+/// differ between two leases, and a guess of it gains nothing: the content tag is not a secret.
+fn new_nonce() -> String {
+    let bits = |salt: u8| {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u8(salt);
+        hasher.finish()
+    };
+    format!("{:016x}{:016x}", bits(0), bits(1))
+}
+
+/// A lease on the object `_tiering/lease` of the hot tier. Its body is the holder's name, the
+/// nonce of this lease and the count of bodies written so far, one to a line.
 ///
 /// It is taken by a create-only put, and renewed by a put that replaces the object only if it
 /// still has the content tag the last write gave (`If-Match`), which also moves the object's
@@ -27,8 +42,12 @@ pub(crate) struct Lease {
     clock: Arc<dyn Clock>,
     holder: String,
     ttl: u64,
-    /// Counts the bodies written, so that every body differs from the one before and no
-    /// holder is mistaken for another by the content tag.
+    /// Random at `new`, in every body: another process of the same holder name counts its
+    /// bodies from the same start, and without the nonce would write the same bodies and so
+    /// the same content tags.
+    nonce: String,
+    /// Counts the bodies written, so that every body of this lease differs from the one
+    /// before. With the nonce, no holder is mistaken for another by the content tag.
     generation: u64,
     /// The content tag of the lease object as this holder last wrote it, while it holds it.
     etag: Option<String>,
@@ -47,6 +66,7 @@ impl Lease {
             clock,
             holder: holder.to_owned(),
             ttl: ttl_millis,
+            nonce: new_nonce(),
             generation: 0,
             etag: None,
         }
@@ -77,7 +97,10 @@ impl Lease {
 
     fn body(&mut self) -> Bytes {
         self.generation += 1;
-        Bytes::from(format!("{}\n{}", self.holder, self.generation))
+        Bytes::from(format!(
+            "{}\n{}\n{}",
+            self.holder, self.nonce, self.generation
+        ))
     }
 
     async fn renew(&mut self, etag: &str) -> bool {
@@ -95,7 +118,9 @@ impl Lease {
         }
     }
 
-    /// Reads the content tag of the lease object this holder just created.
+    /// Reads the content tag of the lease object this holder just created. `Backend::put`
+    /// returns no tag, so if the object was replaced since, this holder adopts the other holder's
+    /// tag. The nonce does not close that; a create-only put that returns the tag would.
     async fn learn_tag(&mut self) -> bool {
         self.etag = self.hot.head(LEASE_KEY).await.ok().map(|meta| meta.tag);
         self.etag.is_some()
