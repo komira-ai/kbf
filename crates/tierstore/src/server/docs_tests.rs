@@ -42,7 +42,7 @@ const UNDOCUMENTED_KEYS: &[&str] = &[];
 
 /// Pages that another change adds; a link to one of them is let stand until it exists. The last is
 /// a name that no change adds, for the test of this rule to link to whatever pages land.
-const PENDING_PAGES: &[&str] = &["metrics.md", "a-page-no-change-adds.md"];
+const PENDING_PAGES: &[&str] = &["a-page-no-change-adds.md"];
 
 /// The tables of the file. The keys of `[[policy]]` and `[local_cache]`, which are not in the key
 /// table, are read from their structs (see `table_keys`).
