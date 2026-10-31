@@ -14,12 +14,15 @@
 //!   coordinator. [`fit`] drops the optional facts first and refuses the beat if that is not
 //!   enough.
 
+use std::fs::OpenOptions;
+use std::io::{ErrorKind, Read as _, Write as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use crate::version::Version;
-use crate::wire::{DeferredReport, Heartbeat, Token};
+use crate::wire::{DeferredReport, Heartbeat, Token, UpdateResult};
 
 /// The reply may carry a deferred update's report and the agent may decline for it.
 pub const DEFERRED_V1: &str = "deferred-v1";
@@ -36,6 +39,9 @@ pub const DRAIN_BOUND: &str = "drain_bound";
 /// The reason of a halt: the helper could not put the previous release back and it does not run
 /// healthy.
 pub const ROLLBACK_FAILED: &str = "rollback_failed";
+
+/// The most bytes of a deferral file that are read.
+const MARK_MAX: u64 = 4096;
 
 /// What the coordinator's last reply let the agent use.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -92,19 +98,21 @@ impl Deferral {
     /// The report for the heartbeat at `now`: none once the retry time has come.
     #[must_use]
     pub fn report(&self, now: u64) -> Option<DeferredReport> {
-        let _ = now;
-        None::<DeferredReport>
+        (now < self.retry_after_unix).then(|| DeferredReport {
+            target: self.target.clone(),
+            reason: self.reason.clone(),
+            retry_after_secs: self.retry_after_unix - now,
+        })
     }
 
     /// Whether an order for `target` at `now` is one this deferral declines.
     #[must_use]
     pub fn declines(&self, target: &Version, now: u64) -> bool {
-        let _ = (target, now);
-        false
+        self.target == *target && now < self.retry_after_unix
     }
 }
 
-/// The deferrals on disk, one file per unit. Not kept yet.
+/// The deferrals on disk, one file per unit.
 #[derive(Clone, Debug)]
 pub struct Marks {
     dir: PathBuf,
@@ -116,25 +124,63 @@ impl Marks {
         Self { dir: dir.into() }
     }
 
+    fn path(&self, unit: &str) -> PathBuf {
+        self.dir.join(format!("defer-{unit}"))
+    }
+
+    /// The deferral of `unit`, if there is one.
+    ///
     /// # Errors
-    /// Never yet.
+    /// The file is there and cannot be read, is too long, or is no deferral.
     pub fn load(&self, unit: &str) -> Result<Option<Deferral>, String> {
-        let _ = (&self.dir, unit);
-        Ok(None)
+        let path = self.path(unit);
+        let read = std::fs::File::open(&path).and_then(|file| {
+            let mut text = Vec::new();
+            file.take(MARK_MAX + 1).read_to_end(&mut text).map(|_| text)
+        });
+        let bad = |why: &dyn std::fmt::Display| format!("{}: {why}", path.display());
+        let text = match read {
+            Ok(text) => text,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(bad(&e)),
+        };
+        if text.len() as u64 > MARK_MAX {
+            return Err(bad(&"it is too long"));
+        }
+        serde_json::from_slice(&text).map(Some).map_err(|e| bad(&e))
     }
 
+    /// Record `deferral` for `unit`: written beside, synced and renamed over.
+    ///
     /// # Errors
-    /// Never yet.
+    /// The directory does not take it.
     pub fn save(&self, unit: &str, deferral: &Deferral) -> std::io::Result<()> {
-        let _ = (unit, deferral);
-        Ok(())
+        let path = self.path(unit);
+        let temp = self.dir.join(format!(".defer-{unit}.tmp"));
+        serde_json::to_vec(deferral)
+            .map_err(std::io::Error::other)
+            .and_then(|body| {
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&temp)
+                    .and_then(|mut file| file.write_all(&body).and_then(|()| file.sync_all()))
+            })
+            .and_then(|()| std::fs::rename(&temp, &path))
+            .and_then(|()| std::fs::File::open(&self.dir).and_then(|dir| dir.sync_all()))
     }
 
+    /// Forget the deferral of `unit`; none is not an error.
+    ///
     /// # Errors
-    /// Never yet.
+    /// The file is there and cannot be removed.
     pub fn clear(&self, unit: &str) -> std::io::Result<()> {
-        let _ = unit;
-        Ok(())
+        match std::fs::remove_file(self.path(unit)) {
+            Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -149,9 +195,50 @@ pub enum Fit {
     Oversized,
 }
 
-/// `beat` as it is, whatever its size. Not checked yet.
+fn size(beat: &Heartbeat) -> usize {
+    serde_json::to_vec(beat).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+/// `beat` if it is at most `max` bytes as JSON; else `beat` without the facts the coordinator
+/// can do without (`agent_features`, the step, commit, durations, `promotion_pending`,
+/// `deferred`, and the phase, class and reason of a result, of `kbf` and of every service);
+/// else nothing.
 #[must_use]
 pub fn fit(beat: Heartbeat, max: usize) -> Fit {
-    let _ = max;
-    Fit::Whole(beat)
+    if size(&beat) <= max {
+        return Fit::Whole(beat);
+    }
+    let bare = bare(beat);
+    if size(&bare) <= max {
+        Fit::Trimmed(bare)
+    } else {
+        Fit::Oversized
+    }
+}
+
+fn bare_result(result: &mut Option<UpdateResult>) {
+    if let Some(result) = result {
+        result.phase = None;
+        result.class = None;
+        result.reason = None;
+    }
+}
+
+fn bare(mut beat: Heartbeat) -> Heartbeat {
+    beat.agent_features.clear();
+    beat.step = None;
+    beat.commit = None;
+    beat.step_secs.clear();
+    beat.promotion_pending = false;
+    beat.deferred = None;
+    bare_result(&mut beat.last_update);
+    for service in beat.services.iter_mut().flatten() {
+        service.step = None;
+        service.commit = None;
+        service.step_secs.clear();
+        service.promotion_pending = false;
+        service.deferred = None;
+        bare_result(&mut service.last_update);
+    }
+    beat
 }
