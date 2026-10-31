@@ -210,12 +210,13 @@ pub struct Reply {
 }
 
 impl std::fmt::Debug for Reply {
-    /// Shows the status and the sizes, never the body: a `/locate` body carries bearer tokens.
+    /// Shows the status, the size of the body and the stream (its size, never its bytes), and not
+    /// the body: a `/locate` body carries bearer tokens.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Reply")
             .field("status", &self.status)
             .field("body_len", &self.body.len())
-            .field("streamed", &self.stream.is_some())
+            .field("stream", &self.stream)
             .finish_non_exhaustive()
     }
 }
