@@ -289,12 +289,13 @@ fn a_store_that_cannot_be_asked_fails_its_own_check_with_the_reason() {
 
     let mut no_key = ops.clone();
     no_key.admin.remove(&tierstore_bench::role::Role::Cold);
+    no_key.cold_heal_status_file = None;
     let report = gather(&host, &only_cold, &no_key);
     assert_eq!(
         find(&report, "store-version:cold").detail,
         "the ops file has no admin key file for cold"
     );
-    assert_eq!(report.tool_versions["cold-heal"], "healing 6% done");
+    assert!(!find(&report, "cold-heal-state").passed);
 
     host.files
         .lock()

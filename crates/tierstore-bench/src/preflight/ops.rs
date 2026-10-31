@@ -159,11 +159,14 @@ impl OpsFile {
             .map_err(|e| BenchError::Ops(format!("{FILE_NAME} is not an ops file: {e}")))
     }
 
-    /// True if the cold role is read from its heal status file alone: the ops file has no admin
-    /// key for `cold` and names a status file. `mc` is then never run for the cold role.
+    /// The heal status file the cold role is read from alone (file mode): the ops file has no
+    /// admin key for `cold` and names a status file. `mc` is then never run for the cold role.
     #[must_use]
-    pub fn cold_file_mode(&self) -> bool {
-        !self.admin.contains_key(&Role::Cold) && self.cold_heal_status_file.is_some()
+    pub fn cold_file_mode(&self) -> Option<&Path> {
+        if self.admin.contains_key(&Role::Cold) {
+            return None;
+        }
+        self.cold_heal_status_file.as_deref()
     }
 
     /// What is wrong with the test instance's isolation from the live one, one text per

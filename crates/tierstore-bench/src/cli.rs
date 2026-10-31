@@ -321,7 +321,7 @@ mod tests {
 
     /// Catches the source of the cold state being chosen by the wrong test: a run with no cold
     /// role reads nothing, and a run with one reads through the preflight's source, which here,
-    /// with no `mc` to run and no status file, says it cannot tell (so the run would stop).
+    /// with no admin key to read, says it cannot tell (so the run would stop).
     #[test]
     fn a_cold_role_is_read_through_the_ops_file_and_no_cold_role_is_not_read() {
         let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "tb-cli-cold-source");
@@ -341,10 +341,9 @@ mod tests {
             Window::Busy,
         );
         let err = cold_source(&cold.config, &ops).read().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("neither the admin info nor a status file"),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "cold state: a file cannot be read: NotFound"
         );
     }
 }

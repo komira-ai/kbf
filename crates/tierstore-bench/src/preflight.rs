@@ -258,18 +258,14 @@ impl HealFile {
     }
 }
 
-/// The status file of the ops file, read in file mode and refused unless its own stamp is at
+/// The status file `path` (see [`OpsFile::cold_file_mode`]), read in file mode and refused unless its own stamp is at
 /// most `max_age` before `now_ms` and at most five seconds after it.
 pub(crate) fn read_heal_file(
     host: &dyn Host,
-    ops: &OpsFile,
+    path: &Path,
     now_ms: u64,
     max_age: Duration,
 ) -> Result<HealFile, String> {
-    let path = ops
-        .cold_heal_status_file
-        .as_ref()
-        .ok_or_else(|| "the ops file names no heal status file".to_owned())?;
     let text = read_text(host, path).map_err(|e| why(&e))?;
     let file: HealFile =
         serde_json::from_str(&text).map_err(|e| format!("heal status file: {e}"))?;
@@ -329,8 +325,10 @@ fn store_checks(
 ) -> Vec<Check> {
     let mut checks = Vec::new();
     let mut cold_info = None;
-    let file = (config.stores.contains_key(&Role::Cold) && ops.cold_file_mode())
-        .then(|| read_heal_file(host, ops, now_ms, config.cold_state_max_age));
+    let path = ops
+        .cold_file_mode()
+        .filter(|_| config.stores.contains_key(&Role::Cold));
+    let file = path.map(|path| read_heal_file(host, path, now_ms, config.cold_state_max_age));
     for role in [Role::Cold, Role::Hot] {
         let Some(spec) = config.stores.get(&role) else {
             continue;

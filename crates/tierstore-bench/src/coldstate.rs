@@ -119,10 +119,9 @@ impl OpsColdState {
             stop,
         };
         let host: &dyn Host = &bounded;
-        if self.ops.cold_file_mode() {
+        if let Some(path) = self.ops.cold_file_mode() {
             let now = (self.now_ms)();
-            let file =
-                read_heal_file(host, &self.ops, now, self.max_age).map_err(|e| unreadable(&e))?;
+            let file = read_heal_file(host, path, now, self.max_age).map_err(|e| unreadable(&e))?;
             return Ok(Some(ColdState {
                 healing: file.is_healing(),
                 percent_done: file.percent_done,
