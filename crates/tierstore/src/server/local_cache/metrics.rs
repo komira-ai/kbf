@@ -52,7 +52,6 @@ pub(super) enum SkippedKeep {
     Deadline,
     /// The cache is read-only, or lost the lock of its directory while the keep ran: it writes
     /// nothing to a directory that another process holds.
-    #[allow(dead_code)]
     ReadOnly,
 }
 
