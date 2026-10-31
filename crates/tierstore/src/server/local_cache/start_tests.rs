@@ -263,7 +263,8 @@ async fn the_metrics_text_has_every_counter_with_its_value() {
     let _ = rig.get("cas/b/big").await.unwrap();
     assert!(rig.get(&wrong).await.is_err());
     rig.tamper.short.store(true, Ordering::SeqCst);
-    let _ = rig.get("cas/b/s").await.unwrap();
+    // The upstream is short for the reader too, which is the reader's error.
+    assert!(rig.get("cas/b/s").await.is_err());
     rig.tamper.short.store(false, Ordering::SeqCst);
     rig.upstream.fail_next(Op::Head, 1);
     assert!(rig.get("cas/b/u").await.is_err());
