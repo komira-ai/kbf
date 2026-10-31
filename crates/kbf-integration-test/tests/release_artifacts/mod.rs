@@ -68,6 +68,10 @@
 //!   install test runs before the asset; its downloads are pinned. The verify job then
 //!   runs `pkg-macos-asset --verify-only` on the signed `.pkg` with `--expect-ref
 //!   "$GITHUB_REF"`.
+//! - **The darwin `kbf-task` bundle.** The darwin job builds `kbf-task` with the macOS confine, signs it,
+//!   packs it with the pinned `js-bundle` into an OCI image layout and makes that layout an asset
+//!   (`cargo xtask package-task-bundle`, [`ASSETS`]'s `kbf-task-bundle`), a tarball with an SBOM like the
+//!   binaries'. Its steps, pin and docs are held to one shape by `task_bundle`.
 //! - **macOS.** Every binary the darwin job packages is signed by `cargo xtask
 //!   sign-darwin` before it is packaged and checked by `cargo xtask darwin-asset` on
 //!   the tarball after, each in a step that cannot be skipped.
@@ -83,6 +87,7 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-host-install", "darwin-arm64"),
     ("kbf-updater", "darwin-arm64"),
     ("kbf-mac-provision", "darwin-arm64"),
+    ("kbf-task-bundle", "darwin-arm64"),
     ("kbf", "linux-x86_64"),
     ("kbf-daemon", "linux-x86_64"),
     ("kbf-server", "linux-x86_64"),
@@ -950,7 +955,7 @@ mod rules {
                 }
             }
             for name in &mine {
-                if platform == "darwin-arm64" {
+                if platform == "darwin-arm64" && *name != xtask::task_bundle::NAME {
                     w.push_str(&format!(
                         "      - name: Sign {name}\n        run: cargo xtask sign-darwin \"target/$TARGET/release/{name}\" --minos 14.0\n"
                     ));
@@ -964,6 +969,11 @@ mod rules {
             }
             w.push_str(&facts_step(platform));
             for name in &mine {
+                if *name == xtask::task_bundle::NAME {
+                    // Not a binary: the darwin kbf-task bundle has its own verb, and its own rules (`task_bundle`).
+                    w.push_str("      - name: Package the bundle\n        run: cargo xtask package-task-bundle --layout l --sbom s.json --commit \"$GITHUB_SHA\" --out dist\n");
+                    continue;
+                }
                 w.push_str(&format!(
                     "      - name: Package {name}\n        run: cargo xtask package --binary \"target/$TARGET/release/{name}\" --sbom s.json --platform {platform} --commit \"$GITHUB_SHA\" --out dist\n"
                 ));
@@ -1909,3 +1919,4 @@ mod images;
 #[cfg(test)]
 mod installer;
 mod kbf_package;
+mod task_bundle;
