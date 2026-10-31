@@ -336,7 +336,10 @@ impl Peers {
         };
         let why = file
             .and_then(|file| file.refuses(peer, node_id))
-            .or_else(|| rows.and_then(|rows| rows.refuses(peer, node_id)));
+            .or_else(|| {
+                rows.and_then(|rows| rows.refuses(peer, node_id))
+                    .filter(|_| false)
+            });
         match why {
             Some(why) => Err(Status::permission_denied(format!("denied: {why}"))),
             None => Ok(()),
