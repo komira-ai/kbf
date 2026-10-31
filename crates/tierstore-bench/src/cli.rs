@@ -10,18 +10,22 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::cells::budget::Campaign;
+use crate::cells::budget::{Campaign, lock_path};
 use crate::cells::engine::FaultSwitch;
 use crate::cells::{self, CellContext, CellId, CellPlan};
+use crate::coldstate::{ColdStateSource, NoColdState, OpsColdState};
 use crate::config::{ConfigArgs, RunConfig};
 use crate::error::BenchError;
 use crate::faultfile::FileSwitch;
+use crate::preflight::host::SystemHost;
+use crate::preflight::ops::OpsFile;
 use crate::preflight::{self, PreflightReport};
 use crate::provision::{self, Mode};
 use crate::proxy::{self, FaultMode, ProxyConfig};
 use crate::requestlog::RequestLog;
 use crate::result::Provenance;
-use crate::{report, teardown};
+use crate::role::Role;
+use crate::{livedir, report, teardown};
 
 /// A measurement tool for tierstore.
 #[derive(Debug, Parser)]
@@ -83,6 +87,12 @@ pub struct RunArgs {
     /// Names the run in every result and in the keys it writes (role names and digits; no host).
     #[arg(long)]
     pub run_id: String,
+    /// Which try of the run this is, from 1. The results of try `N` are
+    /// `<cell>-<arm>-a<N>.json`; a run never writes over a result file, so a retry of a cell and
+    /// arm that has a result is run with the next number, and every attempt is kept. The report
+    /// reads them all and labels them.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+    pub attempt: u32,
     /// The commit this binary was built from, copied into every result.
     #[arg(long)]
     pub git_sha: String,
@@ -169,13 +179,35 @@ pub struct ReportArgs {
 
 /// The provenance of a run: the facts of the passed preflight in the result directory, with the
 /// run's id and commit.
-fn provenance(result_dir: &Path, run_id: &str, git_sha: &str) -> Result<Provenance, BenchError> {
+fn provenance(
+    result_dir: &Path,
+    run_id: &str,
+    git_sha: &str,
+    attempt: u32,
+) -> Result<Provenance, BenchError> {
     let path = result_dir.join(preflight::REPORT_FILE);
     let text = std::fs::read(&path).map_err(|source| BenchError::Io { path, source })?;
     let report: PreflightReport = serde_json::from_slice(&text)
         .map_err(|_| BenchError::Result("preflight.json is not a preflight report".to_owned()))?;
     preflight::all_passed("run", &report.checks)?;
-    Ok(report.provenance(run_id, git_sha))
+    Ok(Provenance {
+        attempt,
+        ..report.provenance(run_id, git_sha)
+    })
+}
+
+/// Where the run reads the cold store's state from: the preflight's source on this machine, or
+/// nothing if the run has no cold store.
+fn cold_source(config: &RunConfig, ops: &OpsFile) -> Arc<dyn ColdStateSource> {
+    match config.stores.get(&Role::Cold) {
+        Some(spec) => Arc::new(OpsColdState::new(
+            Arc::new(SystemHost),
+            ops.clone(),
+            spec.clone(),
+            config.result_dir.clone(),
+        )),
+        None => Arc::new(NoColdState),
+    }
 }
 
 /// Runs the verb.
@@ -203,13 +235,32 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
         }
         Command::Run(args) => {
             let config = RunConfig::load(&args.config)?;
+            // Before anything is created: the result directory, the ledger and its lock stay
+            // clear of the live tierstore's directories.
+            let ops = OpsFile::load(&SystemHost, &config.result_dir)?;
+            livedir::check_outside(
+                &[
+                    ("result directory", config.result_dir.as_path()),
+                    ("campaign ledger", args.campaign_ledger.as_path()),
+                    (
+                        "campaign ledger lock",
+                        lock_path(&args.campaign_ledger).as_path(),
+                    ),
+                ],
+                &ops.live.dirs,
+            )?;
             let log = std::fs::create_dir_all(&config.result_dir)
                 .map_err(|source| BenchError::Io {
                     path: config.result_dir.clone(),
                     source,
                 })
                 .and_then(|()| RequestLog::create(&config.result_dir.join("requests.jsonl")))?;
-            let provenance = provenance(&config.result_dir, &args.run_id, &args.git_sha)?;
+            let provenance = provenance(
+                &config.result_dir,
+                &args.run_id,
+                &args.git_sha,
+                args.attempt,
+            )?;
             // Before a request is sent: the ledger is begun or found, or the run stops.
             // The lock is held until the arm ends, the run with it.
             let (campaign, _lock) = Campaign::begin(
@@ -228,6 +279,7 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
             };
             let ctx = CellContext {
                 provenance,
+                cold_state: cold_source(&config, &ops),
                 config,
                 log: Arc::new(log),
                 campaign,
@@ -259,5 +311,41 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
             print!("{table}");
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cells::testkit;
+    use crate::result::Window;
+
+    /// Catches the source of the cold state being chosen by the wrong test: a run with no cold
+    /// role reads nothing, and a run with one reads through the preflight's source, which here,
+    /// with no `mc` to run and no status file, says it cannot tell (so the run would stop).
+    #[test]
+    fn a_cold_role_is_read_through_the_ops_file_and_no_cold_role_is_not_read() {
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "tb-cli-cold-source");
+        let ops: OpsFile = serde_json::from_value(serde_json::json!({
+            "tierstore": {"binary": "/x/t", "sha256": "00", "version": "0.0.37", "plan_flags": []},
+            "live": {"unit": "l.service", "binary": "/x/l", "port": 9300, "dirs": ["/x/live"]},
+            "test_instance": {"unit": "t.service", "port": 9411, "dirs": ["/x/state"]},
+            "admin": {"cold": "/x/absent-key.json"},
+            "mc": "/x/absent-mc"
+        }))
+        .unwrap();
+        let none = testkit::ctx(dir.path(), &[], Window::Busy).config;
+        assert_eq!(cold_source(&none, &ops).read().unwrap(), None);
+        let cold = testkit::ctx(
+            dir.path(),
+            &[(Role::Cold, "http://127.0.0.1:9")],
+            Window::Busy,
+        );
+        let err = cold_source(&cold.config, &ops).read().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("neither the admin info nor a status file"),
+            "{err}"
+        );
     }
 }

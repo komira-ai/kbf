@@ -59,14 +59,64 @@ so run each proxied arm once with `pass` as the control.
 
 ## Results
 
-One JSON per cell (`schema_version`, see `result.rs`) and a CSV of raw samples with the git SHA,
-the binary digest, the pass index and a quiet or busy flag on every row.
+One JSON per cell, arm and attempt (`schema_version`, see `result.rs`) and a CSV of raw samples
+with the git SHA, the binary digest, the pass index, a quiet or busy flag and the attempt on every
+row. The newer fields (`cold_state`, `cold_guard`, `provenance.attempt`) are optional on reading:
+a result written without them reads as a first attempt with no cold readings.
+
+## The ops file
+
+The verbs that look at the node (`preflight`, `provision`, `verify-teardown`) and `run` read
+`ops.json` in the result directory. It is private (paths, units, ports, credential files), so it
+is never committed and nothing of it is copied into a result. Shape:
+
+```json
+{
+  "tierstore": {"binary": "...", "sha256": "...", "version": "0.0.37", "plan_flags": ["--hot"]},
+  "live": {"unit": "...", "binary": "...", "port": 9300, "dirs": ["..."]},
+  "test_instance": {"unit": "...", "port": 9301, "dirs": ["..."]},
+  "live_buckets": {"cold": "..."},
+  "admin": {"cold": "/path/to/admin-key.json"},
+  "verifier": {"cold": "/path/to/reader-key.json"},
+  "mc": "/path/to/mc",
+  "node": {"roles": ["instance", "generator"], "link_interface": "..."},
+  "cold_heal_status_file": "/path/to/heal.json",
+  "paper": {"page": "...", "map": "..."}
+}
+```
+
+A credentials file (`admin`, `verifier`) is JSON of `access_key_id` and `secret_access_key`.
+`cold_heal_status_file` is JSON of `percent_done`, kept by the operator. `live_buckets`, `admin`,
+`verifier`, `mc`, `node`, `cold_heal_status_file` and `paper` are optional; `tierstore`, `live`
+(with `dirs`) and `test_instance` are not.
+
+### The live directories
+
+`live.dirs` lists the live tierstore's state and data directories on this node. It is required
+and must not be empty. `run` resolves the result directory, the campaign ledger and the ledger's
+lock file (`FILE.lock`) and each live directory (relative paths made absolute, `..` applied, links
+followed, also a link to something that is not there yet) and refuses, before it creates anything,
+a result directory, ledger or lock that is, contains or lies inside a live directory. `preflight`
+does not check this: it writes `preflight.json` and `before.json` to the result directory, so keep
+that directory clear of the live ones all the same.
+
+## Attempts
+
+`run --attempt N` (N from 1, 1 unless set) names the try of the run. The results of attempt N are
+`<cell>-<arm>-a<N>.json` (an arm with a step suffix is `<cell>-<arm>.ttfb-a<N>.json`), and every
+row of `samples.csv` ends in the attempt (column `attempt`). A run never writes over a result
+file: if a result of one of its arms for its attempt is in the result directory it stops with
+`ResultExists` before it sends one request, and a file that appears while it runs is not replaced
+either (the file is made exclusively). To retry a cell and arm, run it again with the next
+attempt number; every attempt is kept. `report` reads all of them: an arm that has more than one
+attempt, or an attempt other than the first, is shown as `arm (attempt N)`, and its samples are
+joined to its own attempt.
 
 ## Cells
 
 `run --cell NAME [--cell NAME ...] --passes N --in-flight 1,16 --object-bytes 4096,1048576`
 runs the cells in order. Every cell writes under `tierstore-bench/<run id>/` of its test bucket,
-deletes what it wrote, and leaves in the result directory `<cell>-<arm>.json` per arm,
+deletes what it wrote, and leaves in the result directory `<cell>-<arm>-a<N>.json` per arm and attempt,
 `samples.csv` (one row per counted request), `requests.jsonl` (every request the tool sent) and
 the campaign ledger.
 
@@ -108,9 +158,56 @@ flags a `run` measures the healthy arms. Every line the switch writes is `MODE t
 falls back to `pass` by itself; the time must be longer than the longest stretch a cell holds one
 mode. The file is replaced atomically.
 
-`run` needs `--run-id`, `--git-sha`, `--campaign-ledger` (see above), and a passed `preflight` in the result directory: its
-`preflight.json` gives the binary digest, versions and hardware that every result carries.
+`run` needs `--run-id`, `--git-sha`, `--campaign-ledger` (see above), the ops file (`ops.json`, see
+above) and a passed `preflight` in the result directory: its `preflight.json` gives the binary
+digest, versions and hardware that every result carries. `--attempt N` is optional (see Attempts).
 
-`report --result-dir DIR` prints one table per cell: per arm and window, requests, failures with
-their time to failure, p50 and p95 with a bootstrap interval, p99 where it may be claimed, the
-slowest, and the rate; labelled as measurements of a test instance on test buckets.
+## The cold store: state before every pass, and the guard
+
+The load gate sees this machine only. Two things look at the cold store itself.
+
+**State.** Preflight reads whether the cold store is healing once; a campaign of hours cannot
+carry that reading. Before every pass of every arm `run` reads it again, through what preflight
+uses and read-only: `mc admin info` of the cold role (its drives and whether any reports healing)
+and the status file of the ops file (`cold_heal_status_file`, `percent_done`). It is healing if a
+drive says so or the status file is under 100. A reading that cannot be made (neither source
+answers, or the status file is not one) stops the run. A run with no `cold` role reads nothing.
+Each reading is stamped into the `cold_state` array of the result of the arm, one entry per pass:
+
+```json
+"cold_state": [{"pass": 0, "healing": false, "percent_done": 100.0,
+                "drives": [{"id": "d-1a2b3c4d", "state": "ok", "healing": false}],
+                "read_unix_ms": 1790000000000}]
+```
+
+`drives` is the set the admin info listed, each drive named by the first eight hex digits of the
+SHA-256 of its endpoint, so a change of the set shows without a host or path in the result.
+`report` labels an arm `v1` only if the cold store was read before every one of its passes (the
+warm-up included) and was healing in none; otherwise it prints `not labelled v1` with the passes
+that saw it healing, or the passes that have no reading. `v1` here means only that: the figures
+are still those of a test instance on test buckets.
+
+**Guard.** The tool keeps the harness's own requests to the cold role over a sliding window and
+stops the run, as the load gate does (the pass is cut and marked busy, the run ends, the results
+so far are written), when either holds:
+
+| flag | default | trips when |
+|---|---|---|
+| `--cold-abort-p99-ms` | 2000 | the p99 latency of the window is above it, milliseconds |
+| `--cold-abort-error-share` | 0.05 | the share of the window's requests that failed or timed out is above it (0 to 1) |
+| `--cold-abort-window-secs` | 60 | the length of the window, seconds |
+
+Equal to a limit is within it. A window of fewer than 20 requests is not judged. A failed request
+counts in the share and, with the time it took to fail, in the p99. Only requests the harness
+sent to the cold role are counted (steps of the `cold` role): requests to the instance are not,
+and neither are the arms that put the cold store in a fault on purpose (the arms through the fault
+proxy other than `proxy-pass`), whose requests are meant to be slow or to fail. The trip is in the
+result, in the pass it cut (`cold_guard`: `metric` `p99_ms` or `error_share`, `value`, `limit`,
+`requests` in the window, `window_secs`), and `report` lists it under the table. The flags are
+accepted by every verb that takes the shared flags, like the load gate's.
+
+`report --result-dir DIR` prints one table per cell: per arm, attempt and window, requests, failures
+with their time to failure, p50 and p95 with a bootstrap interval, p99 where it may be claimed, the
+slowest, and the rate; labelled as measurements of a test instance on test buckets. Under each
+table: the cell's notes, the `v1` label or the reason it is refused for each arm, the passes cut
+by the load gate or the cold store guard, and the notes of the passes.

@@ -12,6 +12,12 @@
 //!   busy row and a thin row print p50, p95 and the maximum, and say why there is no p99.
 //! - A request that failed is counted and its time is shown apart (time to failure), never
 //!   among the latencies.
+//! - A result file is one attempt (`<cell>-<arm>-a<N>.json`, `run --attempt`): every attempt in
+//!   the directory is read, and an arm that has more than one, or an attempt other than the
+//!   first, is shown as `arm (attempt N)`; the CSV rows are joined to their attempt.
+//! - An arm is labelled `v1` only if the cold store was read before every one of its passes (the
+//!   warm-up included) and was healing in none of them. A pass that saw it healing, or a result
+//!   with no reading, is listed under the table with the reason, and the label is refused.
 //! - Every arm label names its path (`direct`, `direct-mp`, `instance`, `hot`, ...); the notes of
 //!   the cell say which mode the instance ran in. The tables are labelled as measurements of a
 //!   test instance on test buckets; a cold store that is healing, or busy with other work,
@@ -32,8 +38,8 @@ struct Row {
     latency_us: u64,
 }
 
-/// The rows of the CSV by (cell, arm, pass).
-type Rows = BTreeMap<(String, String, u32), Vec<Row>>;
+/// The rows of the CSV by (cell, arm, attempt, pass).
+type Rows = BTreeMap<(String, String, u32, u32), Vec<Row>>;
 
 /// Splits one CSV line (RFC 4180: a field in quotes may hold commas and `""`).
 fn split_csv(line: &str) -> Vec<String> {
@@ -66,6 +72,8 @@ fn parse_samples(text: &str) -> Result<Rows, BenchError> {
     };
     let (cell, arm, pass) = (column("cell")?, column("arm")?, column("pass")?);
     let (status, latency) = (column("status")?, column("latency_us")?);
+    // A file from before attempts existed has no such column: every row is of the first.
+    let attempt = header.iter().position(|h| h == "attempt");
     let mut rows = Rows::new();
     for (number, line) in lines.enumerate().filter(|(_, l)| !l.is_empty()) {
         let bad =
@@ -86,9 +94,20 @@ fn parse_samples(text: &str) -> Result<Rows, BenchError> {
         let ok = at(status)?
             .parse::<u16>()
             .is_ok_and(|s| (200..300).contains(&s));
-        rows.entry((at(cell)?.to_owned(), at(arm)?.to_owned(), pass_no))
-            .or_default()
-            .push(Row { ok, latency_us });
+        let attempt_no: u32 = match attempt {
+            Some(i) => at(i)?
+                .parse()
+                .map_err(|_| bad("the attempt is not a number"))?,
+            None => 1,
+        };
+        rows.entry((
+            at(cell)?.to_owned(),
+            at(arm)?.to_owned(),
+            attempt_no,
+            pass_no,
+        ))
+        .or_default()
+        .push(Row { ok, latency_us });
     }
     Ok(rows)
 }
@@ -114,7 +133,13 @@ fn read_results(dir: &Path) -> Result<Vec<CellResult>, BenchError> {
         }
     }
     let order = |cell: CellId| CellId::ALL.iter().position(|c| *c == cell);
-    results.sort_by(|a, b| (order(a.cell), &a.arm).cmp(&(order(b.cell), &b.arm)));
+    results.sort_by(|a, b| {
+        (order(a.cell), &a.arm, a.provenance.attempt).cmp(&(
+            order(b.cell),
+            &b.arm,
+            b.provenance.attempt,
+        ))
+    });
     Ok(results)
 }
 
@@ -168,6 +193,7 @@ fn gather(result: &CellResult, rows: &Rows, window: Window) -> Option<Group> {
         let key = (
             result.cell.as_str().to_owned(),
             result.arm.clone(),
+            result.provenance.attempt,
             pass.pass,
         );
         for row in rows.get(&key).into_iter().flatten() {
@@ -237,13 +263,59 @@ fn table_row(arm: &str, window: Window, mut group: Group) -> String {
     )
 }
 
+/// Why `result` may not be labelled `v1`, or `None` if it may: the cold store was read before
+/// every pass of it (the warm-up included) and was healing before none.
+#[must_use]
+pub fn v1_refusal(result: &CellResult) -> Option<String> {
+    let mut healing: Vec<u32> = result
+        .cold_state
+        .iter()
+        .filter(|r| r.state.healing)
+        .map(|r| r.pass)
+        .collect();
+    healing.sort_unstable();
+    healing.dedup();
+    if !healing.is_empty() {
+        let passes: Vec<String> = healing.iter().map(u32::to_string).collect();
+        return Some(format!(
+            "the cold store was healing before pass {}",
+            passes.join(", ")
+        ));
+    }
+    if result.passes.is_empty() {
+        return Some("it has no pass".to_owned());
+    }
+    let unread = result
+        .passes
+        .iter()
+        .filter(|p| !result.cold_state.iter().any(|r| r.pass == p.pass))
+        .count();
+    (unread > 0).then(|| {
+        format!(
+            "the cold store's state was not read before {unread} of {} passes",
+            result.passes.len()
+        )
+    })
+}
+
+/// How the table names the arm of `result`: its label, and its attempt if the cell has more
+/// than one attempt of the arm or this is not the first.
+fn arm_name(result: &CellResult, of_cell: &[&CellResult]) -> String {
+    let tries = of_cell.iter().filter(|r| r.arm == result.arm).count();
+    if tries > 1 || result.provenance.attempt != 1 {
+        format!("{} (attempt {})", result.arm, result.provenance.attempt)
+    } else {
+        result.arm.clone()
+    }
+}
+
 /// The report for `results` with their `rows`.
 fn format_report(results: &[CellResult], rows: &Rows) -> String {
     let mut out = String::new();
     writeln!(out, "# tierstore-bench report\n").expect("a string takes text");
     writeln!(
         out,
-        "Measurements of a test instance on test buckets. Not figures of the v1 farm: a cold store that is healing or busy with other work moves cold numbers; the environment block of the run records it. Tierstore at the pinned tag has no cold-only mode, so every `instance` arm ran two-tier (a hot tier of its own beside the cold tier). Pass 0 of every arm is a warm-up and is left out; percentiles are nearest rank over the requests that succeeded; a p99 is printed only for quiet passes with at least 1000 successes.\n"
+        "Measurements of a test instance on test buckets. A cold store that is healing or busy with other work moves cold numbers: the cold store is read again before every pass and the reading is in the result (`cold_state`), and an arm is labelled `v1` below only if it was read before every pass and was healing in none. Tierstore at the pinned tag has no cold-only mode, so every `instance` arm ran two-tier (a hot tier of its own beside the cold tier). Pass 0 of every arm is a warm-up and is left out; percentiles are nearest rank over the requests that succeeded; a p99 is printed only for quiet passes with at least 1000 successes.\n"
     )
     .expect("a string takes text");
     if let Some(first) = results.first() {
@@ -271,7 +343,8 @@ fn format_report(results: &[CellResult], rows: &Rows) -> String {
         for result in &of_cell {
             for window in [Window::Quiet, Window::Busy] {
                 if let Some(group) = gather(result, rows, window) {
-                    writeln!(out, "{}", table_row(&result.arm, window, group))
+                    let name = arm_name(result, &of_cell);
+                    writeln!(out, "{}", table_row(&name, window, group))
                         .expect("a string takes text");
                 }
             }
@@ -289,18 +362,36 @@ fn format_report(results: &[CellResult], rows: &Rows) -> String {
             }
         }
         for result in &of_cell {
+            let name = arm_name(result, &of_cell);
+            let label = match v1_refusal(result) {
+                None => format!(
+                    "label v1 (the cold store was read before each of its {} passes and was healing in none)",
+                    result.passes.len()
+                ),
+                Some(why) => format!("not labelled v1: {why}"),
+            };
+            writeln!(out, "- arm {name}: {label}").expect("a string takes text");
             for pass in result.passes.iter().filter(|p| p.gate_tripped.is_some()) {
                 writeln!(
                     out,
-                    "- arm {}: pass {} was cut by the load gate ({})",
-                    result.arm,
+                    "- arm {name}: pass {} was cut by the load gate ({})",
                     pass.pass,
                     pass.gate_tripped.as_deref().unwrap_or_default()
                 )
                 .expect("a string takes text");
             }
+            for pass in result.passes.iter() {
+                if let Some(trip) = &pass.cold_guard {
+                    writeln!(
+                        out,
+                        "- arm {name}: pass {} was cut by the cold store guard ({trip})",
+                        pass.pass
+                    )
+                    .expect("a string takes text");
+                }
+            }
             for note in result.notes.iter().filter(|n| n.starts_with("pass ")) {
-                writeln!(out, "- arm {}: {note}", result.arm).expect("a string takes text");
+                writeln!(out, "- arm {name}: {note}").expect("a string takes text");
             }
         }
         out.push('\n');
@@ -345,6 +436,7 @@ mod tests {
                 max_us: 3,
             }),
             gate_tripped: None,
+            cold_guard: None,
         }
     }
 
@@ -363,13 +455,14 @@ mod tests {
             },
             passes,
             notes: notes.iter().map(|n| (*n).to_owned()).collect(),
+            cold_state: vec![],
         }
     }
 
     fn rows(arm: &str, pass: u32, latencies: &[u64], status: &str) -> Rows {
         let lines: Vec<String> = latencies
             .iter()
-            .map(|l| format!("r,s,d,cold-put,{arm},{pass},quiet,cold,put,10,1,5,{l},{status}"))
+            .map(|l| format!("r,s,d,cold-put,{arm},{pass},quiet,cold,put,10,1,5,{l},{status},1"))
             .collect();
         let text = format!(
             "{}\n{}\n",
@@ -407,7 +500,7 @@ mod tests {
             rows("a", 2, &[40], ""),
             rows("b", 1, &[50], "204"),
         ]);
-        let key = |arm: &str, pass| ("cold-put".to_owned(), arm.to_owned(), pass);
+        let key = |arm: &str, pass| ("cold-put".to_owned(), arm.to_owned(), 1, pass);
         let ok = |k| all[&k].iter().filter(|r| r.ok).count();
         assert_eq!((all[&key("a", 1)].len(), ok(key("a", 1))), (3, 2));
         assert_eq!((all[&key("a", 2)].len(), ok(key("a", 2))), (1, 0));
@@ -418,7 +511,7 @@ mod tests {
         let header = crate::result::Sample::CSV_HEADER;
         assert!(err(&format!("{header}\nshort\n")).contains("line 2: too few fields"));
         let line = |pass: &str, lat: &str| {
-            format!("r,s,d,cold-put,a,{pass},quiet,cold,put,10,1,5,{lat},200")
+            format!("r,s,d,cold-put,a,{pass},quiet,cold,put,10,1,5,{lat},200,1")
         };
         assert!(
             err(&format!("{header}\n{}\n", line("x", "1"))).contains("the pass is not a number")
@@ -557,6 +650,151 @@ mod tests {
         );
         assert!(text.contains("run `run-7`, tool commit `abc`, binary `def`"));
         assert!(text.contains("two-tier"));
+    }
+
+    /// A result of `arm` at `attempt`, with one quiet pass of 1,000 requests, and the cold store
+    /// read before each of `passes` passes with `healing[pass]`.
+    fn with_cold(arm: &str, attempt: u32, healing: &[bool]) -> CellResult {
+        let mut r = result(
+            arm,
+            (0..healing.len() as u32)
+                .map(|p| pass(p, Window::Quiet, 1000, None))
+                .collect(),
+            &[],
+        );
+        r.provenance.attempt = attempt;
+        r.cold_state = healing
+            .iter()
+            .enumerate()
+            .map(|(p, h)| crate::result::PassColdState {
+                pass: p as u32,
+                state: crate::result::ColdState {
+                    healing: *h,
+                    percent_done: None,
+                    drives: vec![],
+                    read_unix_ms: 7,
+                },
+            })
+            .collect();
+        r
+    }
+
+    /// Catches a result labelled v1 that saw the cold store healing in any pass (the warm-up
+    /// included), one labelled on no reading or on a reading missing for a pass, and a result
+    /// refused that was read before every pass and found quiet each time.
+    #[test]
+    fn a_result_is_labelled_v1_only_if_no_pass_saw_the_cold_store_healing() {
+        assert_eq!(v1_refusal(&with_cold("a", 1, &[false, false, false])), None);
+        let why = v1_refusal(&with_cold("a", 1, &[false, true, false])).unwrap();
+        assert_eq!(why, "the cold store was healing before pass 1");
+        let why = v1_refusal(&with_cold("a", 1, &[true, true, false])).unwrap();
+        assert_eq!(why, "the cold store was healing before pass 0, 1");
+        let mut unread = with_cold("a", 1, &[false, false, false]);
+        unread.cold_state.remove(1);
+        let why = v1_refusal(&unread).unwrap();
+        assert_eq!(
+            why,
+            "the cold store's state was not read before 1 of 3 passes"
+        );
+        let mut none = unread.clone();
+        none.cold_state.clear();
+        assert!(v1_refusal(&none).unwrap().contains("3 of 3 passes"));
+        let mut empty = with_cold("a", 1, &[]);
+        empty.passes.clear();
+        assert_eq!(v1_refusal(&empty).unwrap(), "it has no pass");
+
+        let text = format_report(
+            &[
+                with_cold("quiet", 1, &[false, false]),
+                with_cold("healing", 1, &[false, true]),
+            ],
+            &Rows::new(),
+        );
+        assert!(text.contains("- arm quiet: label v1 (the cold store was read before each of its 2 passes and was healing in none)"), "{text}");
+        assert!(
+            text.contains(
+                "- arm healing: not labelled v1: the cold store was healing before pass 1"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("- arm healing: label v1"), "{text}");
+    }
+
+    /// Catches attempts read as one: the two attempts of an arm are two rows, each labelled with
+    /// its number, each joined to its own samples (the same pass index in both), while an arm
+    /// with a single first attempt keeps its plain name.
+    #[test]
+    fn every_attempt_is_read_and_labelled_and_keeps_its_own_samples() {
+        let rows_of = |attempt: u32, latencies: &[u64]| {
+            let lines: Vec<String> = latencies
+                .iter()
+                .map(|l| format!("r,s,d,cold-put,a,1,quiet,cold,put,10,1,5,{l},200,{attempt}"))
+                .collect();
+            let text = format!(
+                "{}\n{}\n",
+                crate::result::Sample::CSV_HEADER,
+                lines.join("\n")
+            );
+            parse_samples(&text).unwrap()
+        };
+        let first = with_cold("a", 1, &[false, false]);
+        let second = with_cold("a", 2, &[false, false]);
+        let lone = with_cold("b", 1, &[false, false]);
+        let data = merged(vec![rows_of(1, &[100, 100, 100]), rows_of(2, &[900, 900])]);
+        let text = format_report(&[first, second, lone], &data);
+        let one = text
+            .lines()
+            .find(|l| l.contains("| a (attempt 1) | quiet |"))
+            .unwrap();
+        let two = text
+            .lines()
+            .find(|l| l.contains("| a (attempt 2) | quiet |"))
+            .unwrap();
+        assert!(one.contains("100 us [") && !one.contains("900"), "{one}");
+        assert!(
+            two.contains("900 us [") && !two.contains("100 us ["),
+            "{two}"
+        );
+        assert!(text.contains("| b | quiet |"), "{text}");
+        assert!(text.contains("- arm a (attempt 2): label v1"), "{text}");
+    }
+
+    /// Catches a samples file from before attempts existed being refused, or its rows put under
+    /// an attempt other than the first; and an attempt that is not a number being taken.
+    #[test]
+    fn a_samples_file_without_an_attempt_column_is_the_first_attempt() {
+        let old_header = crate::result::Sample::CSV_HEADER.trim_end_matches(",attempt");
+        let text = format!("{old_header}\nr,s,d,cold-put,a,1,quiet,cold,put,10,1,5,100,200\n");
+        let rows = parse_samples(&text).unwrap();
+        assert!(rows.contains_key(&("cold-put".to_owned(), "a".to_owned(), 1, 1)));
+        let header = crate::result::Sample::CSV_HEADER;
+        let bad = format!("{header}\nr,s,d,cold-put,a,1,quiet,cold,put,10,1,5,100,200,x\n");
+        assert!(
+            parse_samples(&bad)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("the attempt is not a number")
+        );
+    }
+
+    /// Catches a pass cut by the cold store guard going unsaid: the report lists the pass with
+    /// the measure and the numbers.
+    #[test]
+    fn a_pass_cut_by_the_cold_store_guard_is_listed() {
+        let mut cut = pass(1, Window::Busy, 40, None);
+        cut.cold_guard = Some(crate::result::ColdTrip {
+            metric: "error_share".to_owned(),
+            value: 0.0625,
+            limit: 0.05,
+            requests: 32,
+            window_secs: 60,
+        });
+        let text = format_report(&[result("a", vec![cut], &[])], &Rows::new());
+        assert!(
+            text.contains("- arm a: pass 1 was cut by the cold store guard (cold store guard: error_share is 0.0625, over the limit 0.05 (over 32 requests of the last 60 s))"),
+            "{text}"
+        );
     }
 
     /// Catches times printed in the wrong unit.

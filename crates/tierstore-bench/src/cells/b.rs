@@ -209,6 +209,7 @@ fn arm(label: String, in_flight: u32, misses: &Arc<Misses>) -> Arm {
             let misses = after.clone();
             async move { Ok(vec![misses.remove(pass).await?]) }
         })),
+        faulted: false,
         notes,
     }
 }

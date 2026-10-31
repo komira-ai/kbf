@@ -11,7 +11,11 @@
 //!   marks its samples busy and ends the run (the passes so far are written first);
 //! - the byte ledger admits a cell before it sends anything and is charged what each pass
 //!   wrote to the cold store;
-//! - the CSV of samples has one row per counted step, and one result JSON per arm;
+//! - the cold store's state is read again before every pass and stamped into the results, and
+//!   the cold store guard ([`crate::cells::coldguard`]) watches the harness's own cold requests as
+//!   they complete: a trip ends the pass and the run, as a trip of the load gate does;
+//! - the CSV of samples has one row per counted step, and one result JSON per arm and attempt
+//!   (`<cell>-<arm>-a<N>.json`), never written over an existing one;
 //! - a percentile of a pass is of the requests that succeeded; the p99 of a pass is filled in
 //!   only for a quiet pass of 1,000 successes or more.
 //!
@@ -34,16 +38,19 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::cells::budget::{Ledger, Throttle};
+use crate::cells::coldguard::ColdGuard;
 use crate::cells::stats;
 use crate::cells::streamget::{StreamGet, Streamed};
 use crate::cells::{CellContext, CellId};
+use crate::coldstate::ColdStateSource;
 use crate::config::RunConfig;
 use crate::error::BenchError;
 use crate::gate::{LoadSample, Trip};
 use crate::proxy::FaultMode;
 use crate::requestlog::RequestLog;
 use crate::result::{
-    CellResult, Op, PassResult, Percentiles, Provenance, SCHEMA_VERSION, Sample, Window,
+    CellResult, ColdTrip, Op, PassColdState, PassResult, Percentiles, Provenance, SCHEMA_VERSION,
+    Sample, Window,
 };
 use crate::role::Role;
 use crate::s3::{BenchS3, Outcome, Timeouts, unix_ms};
@@ -235,6 +242,10 @@ pub struct Arm {
     pub before: Option<Hook>,
     /// After each pass, also one that the gate cut short.
     pub after: Option<Hook>,
+    /// Whether the arm puts the cold store in a fault on purpose (through the fault proxy). The
+    /// cold store guard is not shown the arm's cold requests: they are meant to be slow or to
+    /// fail.
+    pub faulted: bool,
     /// Prose of the cell's for every result of the arm.
     pub notes: Vec<String>,
 }
@@ -333,6 +344,8 @@ pub struct Env {
     /// Limits on a request's connect and whole life.
     pub timeouts: Timeouts,
     load: Arc<dyn LoadSource>,
+    cold_state: Arc<dyn ColdStateSource>,
+    guard: Mutex<ColdGuard>,
     cold_cap: Arc<Throttle>,
     hot_cap: Arc<Throttle>,
     recorder: Recorder,
@@ -358,6 +371,8 @@ impl Env {
             log: ctx.log.clone(),
             timeouts: Timeouts::default(),
             load,
+            cold_state: ctx.cold_state.clone(),
+            guard: Mutex::new(ColdGuard::new(ctx.config.cold_guard)),
             cold_cap: Arc::new(Throttle::new(ctx.config.rates.cold_rps)),
             hot_cap: Arc::new(Throttle::new(ctx.config.rates.hot_rps)),
             recorder: Recorder::open(dir)?,
@@ -412,6 +427,56 @@ impl Env {
         Ok(self.config.gate.check(&self.load.sample()?).err())
     }
 
+    /// Shows the cold store guard the cold requests among `steps`, which finished now, and judges
+    /// its window: the trip, if the cold store's health is over a limit.
+    fn watch_cold(&self, steps: &[Step]) -> Option<ColdTrip> {
+        let mut cold = steps.iter().filter(|s| s.role == Role::Cold).peekable();
+        cold.peek()?;
+        let now = Instant::now();
+        let mut guard = self.guard.lock().unwrap_or_else(PoisonError::into_inner);
+        for step in cold {
+            guard.record(now, step.latency_us, !step.ok);
+        }
+        guard.check(now).err()
+    }
+
+    /// The result file of `arm` of `cell` for this run's attempt.
+    #[must_use]
+    pub fn result_path(&self, cell: CellId, arm: &str) -> PathBuf {
+        self.config
+            .result_dir
+            .join(result_name(cell, arm, self.provenance.attempt))
+    }
+
+    /// Refuses the run, before anything is sent, if a result file of one of `arms` for this
+    /// attempt is there already (an arm with a step suffix, `.ttfb`, is found too).
+    fn refuse_existing(&self, cell: CellId, arms: &[Arm]) -> Result<(), BenchError> {
+        let dir = &self.config.result_dir;
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Ok(());
+        };
+        let tail = format!("-a{}.json", self.provenance.attempt);
+        let names: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|name| name.ends_with(&tail))
+            .collect();
+        for arm in arms {
+            let stem = format!("{}-{}", cell.as_str(), arm.label);
+            let exact = format!("{stem}{tail}");
+            let suffixed = format!("{stem}.");
+            if let Some(found) = names
+                .iter()
+                .find(|n| **n == exact || n.starts_with(&suffixed))
+            {
+                return Err(BenchError::ResultExists {
+                    path: dir.join(found),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn admit(&self, pass_cost: u64, cell_cost: u64) -> Result<(), BenchError> {
         let ledger = self.ledger.0.lock().unwrap_or_else(PoisonError::into_inner);
         ledger.admit(pass_cost, cell_cost)
@@ -429,6 +494,12 @@ impl Env {
         let ledger = self.ledger.0.lock().unwrap_or_else(PoisonError::into_inner);
         ledger.spent()
     }
+}
+
+/// The file name of the result of `arm` of `cell` for `attempt`: `<cell>-<arm>-a<N>.json`.
+#[must_use]
+pub fn result_name(cell: CellId, arm: &str, attempt: u32) -> String {
+    format!("{}-{arm}-a{attempt}.json", cell.as_str())
 }
 
 /// `text` with every character that is not `a-z`, `0-9` or `-` replaced by `-` (letters
@@ -481,6 +552,22 @@ struct Driven {
     steps: Vec<Step>,
     elapsed: Duration,
     trip: Option<Trip>,
+    cold_trip: Option<ColdTrip>,
+}
+
+/// What ended a run early: the load gate, or the cold store guard.
+enum Stop {
+    Gate(Trip),
+    Cold(ColdTrip),
+}
+
+impl From<Stop> for BenchError {
+    fn from(stop: Stop) -> Self {
+        match stop {
+            Stop::Gate(trip) => BenchError::Gate(trip),
+            Stop::Cold(trip) => BenchError::ColdGuard(trip),
+        }
+    }
 }
 
 /// Sends the requests of one pass of `arm` and collects their steps, reading the gate as they
@@ -539,13 +626,23 @@ async fn drive(env: &Env, arm: &Arm, pass: u32) -> Result<Driven, BenchError> {
     let mut steps = Vec::new();
     let mut done = 0u64;
     let mut trip = None;
+    let mut cold_trip = None;
     while let Some(result) = rx.recv().await {
-        steps.extend(result?);
+        let got = result?;
+        // `&`: both are plain reads of a flag and an option.
+        if !arm.faulted & cold_trip.is_none() {
+            cold_trip = env.watch_cold(&got);
+            if cold_trip.is_some() {
+                stop.store(true, Ordering::SeqCst);
+            }
+        }
+        steps.extend(got);
         done += 1;
-        // `&`: both are plain reads of a number and an option.
         if done.is_multiple_of(every) & trip.is_none() {
             trip = env.gate()?;
-            stop.store(trip.is_some(), Ordering::SeqCst);
+            if trip.is_some() {
+                stop.store(true, Ordering::SeqCst);
+            }
         }
     }
     while tasks.join_next().await.is_some() {}
@@ -553,6 +650,7 @@ async fn drive(env: &Env, arm: &Arm, pass: u32) -> Result<Driven, BenchError> {
         steps,
         elapsed: clock.elapsed(),
         trip,
+        cold_trip,
     })
 }
 
@@ -562,6 +660,7 @@ fn pass_result(
     window: Window,
     elapsed: Duration,
     trip: Option<&Trip>,
+    cold_trip: Option<&ColdTrip>,
     steps: &[&Step],
 ) -> PassResult {
     let mut latencies: Vec<u64> = steps
@@ -586,6 +685,7 @@ fn pass_result(
         elapsed_us: micros(elapsed),
         percentiles,
         gate_tripped: trip.map(|t| t.metric.to_owned()),
+        cold_guard: cold_trip.cloned(),
     }
 }
 
@@ -594,6 +694,7 @@ fn pass_result(
 struct Acc {
     passes: Vec<PassResult>,
     notes: Vec<String>,
+    cold_state: Vec<PassColdState>,
 }
 
 /// Runs the arms of a cell and writes its results; see the module docs. `cleanup`, if given, runs
@@ -601,8 +702,10 @@ struct Acc {
 /// result.
 ///
 /// # Errors
-/// [`BenchError::Budget`] before anything is sent if the ledger refuses the cell;
-/// [`BenchError::Gate`] after the results so far are written if the gate tripped; any error of a
+/// [`BenchError::ResultExists`] before anything is sent if a result file of this attempt is
+/// there; [`BenchError::Budget`] before anything is sent if the ledger refuses the cell;
+/// [`BenchError::Gate`] or [`BenchError::ColdGuard`] after the results so far are written if the
+/// load gate or the cold store guard tripped; any error of a
 /// piece of work, a hook, the files or the log stops the run at once (the cleanup still runs).
 pub async fn run_cell(
     env: &Env,
@@ -611,6 +714,7 @@ pub async fn run_cell(
     passes: u32,
     cleanup: Option<Hook>,
 ) -> Result<Vec<CellResult>, BenchError> {
+    env.refuse_existing(cell, &arms)?;
     let per_pass: Vec<u64> = arms
         .iter()
         .map(|a| a.cold_bytes_per_pass.saturating_add(a.cold_bytes_once))
@@ -633,6 +737,7 @@ pub async fn run_cell(
                 Acc {
                     passes: vec![],
                     notes,
+                    cold_state: vec![],
                 },
             )
         })
@@ -663,22 +768,42 @@ pub async fn run_cell(
             provenance: env.provenance.clone(),
             passes: got.passes,
             notes,
+            cold_state: got.cold_state,
         };
-        let path = env
-            .config
-            .result_dir
-            .join(format!("{}-{}.json", cell.as_str(), result.arm));
-        std::fs::write(&path, result.to_json())
-            .map_err(|source| BenchError::Io { path, source })?;
+        write_new(&env.result_path(cell, &result.arm), &result.to_json())?;
         results.push(result);
     }
     match stopped {
         None => Ok(results),
-        Some(trip) => Err(BenchError::Gate(trip)),
+        Some(stop) => Err(stop.into()),
     }
 }
 
-/// The passes of every arm, interleaved; gives the trip that ended them early, if one did.
+/// Writes `text` to a new file `path`; a file that is there is never replaced.
+pub(crate) fn write_new(path: &Path, text: &str) -> Result<(), BenchError> {
+    let io = |source| BenchError::Io {
+        path: path.to_owned(),
+        source,
+    };
+    let mut file = File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| {
+            if source.kind() == std::io::ErrorKind::AlreadyExists {
+                BenchError::ResultExists {
+                    path: path.to_owned(),
+                }
+            } else {
+                io(source)
+            }
+        })?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.flush())
+        .map_err(io)
+}
+
+/// The passes of every arm, interleaved; gives what ended them early, if something did.
 async fn run_passes(
     env: &Env,
     cell: CellId,
@@ -686,7 +811,7 @@ async fn run_passes(
     passes: u32,
     acc: &mut BTreeMap<String, Acc>,
     order: &mut Vec<String>,
-) -> Result<Option<Trip>, BenchError> {
+) -> Result<Option<Stop>, BenchError> {
     for pass in 0..passes {
         let turn: Vec<&Arm> = (0..arms.len())
             .map(|k| &arms[(k + pass as usize) % arms.len()])
@@ -699,27 +824,31 @@ async fn run_passes(
                 .join(" ")
         ));
         for arm in turn {
-            if let Some(trip) = run_pass(env, cell, arm, pass, acc).await? {
-                return Ok(Some(trip));
+            if let Some(stop) = run_pass(env, cell, arm, pass, acc).await? {
+                return Ok(Some(stop));
             }
         }
     }
     Ok(None)
 }
 
-/// One pass of one arm; gives the trip if the gate stopped it, before or during.
+/// One pass of one arm; gives what stopped it (the load gate before or during, the cold store
+/// guard during), if something did.
 async fn run_pass(
     env: &Env,
     cell: CellId,
     arm: &Arm,
     pass: u32,
     acc: &mut BTreeMap<String, Acc>,
-) -> Result<Option<Trip>, BenchError> {
+) -> Result<Option<Stop>, BenchError> {
     if let Some(trip) = env.gate()? {
-        let empty = pass_result(pass, Window::Busy, Duration::ZERO, Some(&trip), &[]);
+        let empty = pass_result(pass, Window::Busy, Duration::ZERO, Some(&trip), None, &[]);
         acc.entry(arm.label.clone()).or_default().passes.push(empty);
-        return Ok(Some(trip));
+        return Ok(Some(Stop::Gate(trip)));
     }
+    // Read again before every pass, not once at preflight: a heal can start or end in a campaign
+    // of hours. The read is one short command of this process; nothing else runs meanwhile.
+    let cold_state = env.cold_state.read()?;
     // The pass's planned bytes are counted before anything is sent, so a run that dies in the
     // middle of a pass, or a ledger read by another run meanwhile, never sees fewer bytes than
     // may have landed. After the pass the count becomes what was written (a failed put counts).
@@ -735,7 +864,7 @@ async fn run_pass(
     }
     env.ledger
         .settle(planned, driven.steps.iter().map(|s| s.cold_write).sum())?;
-    let window = if driven.trip.is_some() {
+    let window = if driven.trip.is_some() || driven.cold_trip.is_some() {
         Window::Busy
     } else {
         env.config.window
@@ -765,16 +894,31 @@ async fn run_pass(
                 .csv_row(&env.provenance),
             );
         }
-        let result = pass_result(pass, window, driven.elapsed, driven.trip.as_ref(), &steps);
+        let result = pass_result(
+            pass,
+            window,
+            driven.elapsed,
+            driven.trip.as_ref(),
+            driven.cold_trip.as_ref(),
+            &steps,
+        );
         let slot = acc.entry(label).or_default();
         slot.passes.push(result);
+        slot.cold_state
+            .extend(cold_state.iter().map(|state| PassColdState {
+                pass,
+                state: state.clone(),
+            }));
         slot.notes
             .extend(notes.iter().map(|n| format!("pass {pass}: {n}")));
     }
     if !rows.is_empty() {
         env.recorder.append(&rows)?;
     }
-    Ok(driven.trip)
+    Ok(driven
+        .trip
+        .map(Stop::Gate)
+        .or_else(|| driven.cold_trip.map(Stop::Cold)))
 }
 
 #[cfg(test)]
@@ -828,6 +972,7 @@ mod tests {
             }),
             before: None,
             after: None,
+            faulted: false,
             notes: vec!["a note of the cell".to_owned()],
         }
     }
@@ -885,7 +1030,7 @@ mod tests {
             rows.iter()
                 .all(|r| (1..=3).contains(&r[10].parse::<u32>().unwrap()))
         );
-        let on_disk = std::fs::read_to_string(dir.path().join("cold-put-a.json")).unwrap();
+        let on_disk = std::fs::read_to_string(dir.path().join("cold-put-a-a1.json")).unwrap();
         assert_eq!(CellResult::from_json(&on_disk).unwrap(), results[0]);
     }
 
@@ -905,8 +1050,8 @@ mod tests {
             notes[1].ends_with("pass 0: a b; pass 1: b a; pass 2: a b"),
             "{notes:?}"
         );
-        assert!(dir.path().join("g-a.json").exists());
-        assert!(dir.path().join("g-b.json").exists());
+        assert!(dir.path().join("g-a-a1.json").exists());
+        assert!(dir.path().join("g-b-a1.json").exists());
         assert!(results[1].passes.iter().all(|p| p.window == Window::Busy));
     }
 
@@ -917,7 +1062,7 @@ mod tests {
         let many = |n: u64| (0..n).map(|i| step(i + 1, 0)).collect::<Vec<_>>();
         let run = |window, steps: &[Step]| {
             let refs: Vec<&Step> = steps.iter().collect();
-            pass_result(1, window, Duration::from_secs(2), None, &refs)
+            pass_result(1, window, Duration::from_secs(2), None, None, &refs)
         };
         let thousand = many(1000);
         let p = run(Window::Quiet, &thousand).percentiles.unwrap();
@@ -975,7 +1120,7 @@ mod tests {
         );
         assert!(seen.lock().unwrap().is_empty());
         assert_eq!(csv_rows(dir.path()).len(), 0);
-        let written = std::fs::read_to_string(dir.path().join("cold-put-a.json")).unwrap();
+        let written = std::fs::read_to_string(dir.path().join("cold-put-a-a1.json")).unwrap();
         let result = CellResult::from_json(&written).unwrap();
         assert_eq!(result.passes.len(), 1);
         assert_eq!(result.passes[0].gate_tripped.as_deref(), Some("loadavg_1m"));
@@ -1010,7 +1155,7 @@ mod tests {
             err.to_string(),
             "load gate: loadavg_1m is 99, over the limit 8"
         );
-        let written = std::fs::read_to_string(dir.path().join("cold-put-a.json")).unwrap();
+        let written = std::fs::read_to_string(dir.path().join("cold-put-a-a1.json")).unwrap();
         let result = CellResult::from_json(&written).unwrap();
         assert_eq!(result.passes.len(), 1);
         let pass = &result.passes[0];
@@ -1041,6 +1186,13 @@ mod tests {
 
     fn env_with(dir: &Path, load: Arc<dyn LoadSource>) -> Env {
         env(dir, Window::Busy, load)
+    }
+
+    /// An environment for the `attempt`-th try of a run whose results are in `dir`.
+    fn env_attempt(dir: &Path, load: Arc<dyn LoadSource>, attempt: u32) -> Env {
+        let mut ctx = testkit::ctx(dir, &[], Window::Busy);
+        ctx.provenance.attempt = attempt;
+        Env::new(&ctx, load).unwrap()
     }
 
     /// Catches a cell that is run when the ledger would be over: nothing is sent, nothing is
@@ -1236,7 +1388,7 @@ mod tests {
         let names: Vec<&str> = results.iter().map(|r| r.arm.as_str()).collect();
         assert_eq!(names, ["read", "read.ttfb"]);
         assert_eq!(results[1].passes[1].percentiles.unwrap().p50_us, 40);
-        assert!(dir.path().join("cold-read-read.ttfb.json").exists());
+        assert!(dir.path().join("cold-read-read.ttfb-a1.json").exists());
         let rows = csv_rows(dir.path());
         assert_eq!(rows.iter().filter(|r| r[4] == "read.ttfb").count(), 4);
     }
@@ -1281,12 +1433,24 @@ mod tests {
         a.after = Some(hook(|_| async { Err(BenchError::Request("hook")) }));
         assert!(run_cell(&env, CellId::G, vec![a], 2, None).await.is_err());
 
-        std::fs::create_dir(dir.path().join("g-blocked.json")).unwrap();
+        // A name taken (by anything) is a result that is there: the run does not start.
+        std::fs::create_dir(dir.path().join("g-blocked-a1.json")).unwrap();
         let blocked = arm("blocked", 1, 1, &Arc::new(Mutex::new(vec![])));
         let err = run_cell(&env, CellId::G, vec![blocked], 2, None)
             .await
             .unwrap_err();
-        assert!(matches!(err, BenchError::Io { .. }));
+        assert!(matches!(err, BenchError::ResultExists { .. }), "{err}");
+
+        // A result directory that has gone is a file that cannot be written.
+        let gone = temp("tb-engine-gone");
+        let sub = gone.path().join("sub");
+        let gone_env = env_attempt(&sub, Script::calm(), 1);
+        std::fs::remove_dir_all(&sub).unwrap();
+        let a = arm("a", 1, 1, &Arc::new(Mutex::new(vec![])));
+        let err = run_cell(&gone_env, CellId::G, vec![a], 2, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BenchError::Io { .. }), "{err}");
 
         let read_only = std::fs::File::open(dir.path().join("samples.csv")).unwrap();
         let recorder = Recorder {
@@ -1319,8 +1483,8 @@ mod tests {
     #[tokio::test]
     async fn the_samples_file_has_one_header_however_many_runs_append() {
         let dir = temp("tb-engine-header");
-        for _ in 0..2 {
-            let env = env(dir.path(), Window::Busy, Script::calm());
+        for attempt in 1..=2 {
+            let env = env_attempt(dir.path(), Script::calm(), attempt);
             let a = arm("a", 1, 1, &Arc::new(Mutex::new(vec![])));
             run_cell(&env, CellId::G, vec![a], 2, None).await.unwrap();
         }
@@ -1422,7 +1586,7 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 1);
         assert!(results[0].notes.contains(&"cleanup note".to_owned()));
 
-        let env = env_with(dir.path(), Script::of(vec![Some(busy())]));
+        let env = env_attempt(dir.path(), Script::of(vec![Some(busy())]), 2);
         let err = run_cell(
             &env,
             CellId::G,
@@ -1435,7 +1599,7 @@ mod tests {
         assert!(matches!(err, BenchError::Gate(_)));
         assert_eq!(ran.load(Ordering::SeqCst), 2);
 
-        let env = env_with(dir.path(), Script::calm());
+        let env = env_attempt(dir.path(), Script::calm(), 3);
         let err = run_cell(
             &env,
             CellId::G,

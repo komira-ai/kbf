@@ -342,6 +342,7 @@ fn arm(label: String, mode: &str, burst: &Arc<Burst>) -> Arm {
                 Ok(notes)
             }
         })),
+        faulted: burst.fault.is_some(),
         notes,
     }
 }

@@ -277,6 +277,9 @@ fn arm(
     let before = fault.clone().map(|(mode, switch)| {
         hook(move |_| std::future::ready(switch.set_mode(mode).map(|()| vec![])))
     });
+    let faulted = fault
+        .as_ref()
+        .is_some_and(|(mode, _)| *mode != FaultMode::Pass);
     let switch = fault.map(|(_, switch)| switch);
     Arm {
         label,
@@ -300,6 +303,7 @@ fn arm(
                 putter.clean(pass, requests).await
             }
         })),
+        faulted,
         notes,
     }
 }

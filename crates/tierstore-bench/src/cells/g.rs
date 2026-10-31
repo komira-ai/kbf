@@ -433,6 +433,7 @@ fn arm(
                 used as f64 / CLOCK_TICKS
             )]))
         })),
+        faulted: false,
         notes,
     }
 }
