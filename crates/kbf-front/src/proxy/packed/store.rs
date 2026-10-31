@@ -15,7 +15,7 @@ use kbf_pack::{
     Blob, FRONTEND_PACK_BYTES, Fetch, PackError, PackKeys, Packed, Packer, PackerConfig, ReadCache,
     ReadError, Reader, ReaderConfig, check_create_only,
 };
-use kbf_pack_index::{BlobDigest, MAX_BATCH, PackIndex, PackIndexError};
+use kbf_pack_index::{BlobDigest, Location, MAX_BATCH, PackIndex, PackIndexError};
 use kbf_types::{Digest, DigestFunction};
 use tonic::Status;
 
@@ -318,6 +318,48 @@ impl Packs {
         self.metrics.asked.add(asked.len() as u64);
         self.metrics.found.add((asked.len() - absent.len()) as u64);
         Ok(absent)
+    }
+
+    /// Where the blob of each of `asked` lies, in the order asked: `None` for one with no row in
+    /// the index, or over [`Packs::max_blob_bytes`] (never packed). The index is asked in calls
+    /// of at most [`MAX_BATCH`]; nothing is read from a pack and nothing is written.
+    ///
+    /// # Errors
+    /// UNAVAILABLE when the index fails.
+    pub async fn locate(&self, asked: &[Digest]) -> Result<Vec<Option<Location>>, Status> {
+        let inside: Vec<BlobDigest> = asked
+            .iter()
+            .filter(|d| self.fits(d))
+            .map(to_index)
+            .collect();
+        let mut found = Vec::with_capacity(inside.len());
+        for chunk in inside.chunks(MAX_BATCH) {
+            let wanted = chunk.to_vec();
+            let index = Arc::clone(&self.index);
+            let located = offload(move || index.locate(&wanted)).await;
+            found.extend(located.map_err(index_failed)?);
+        }
+        let mut found = found.into_iter();
+        Ok(asked
+            .iter()
+            .map(|digest| {
+                if self.fits(digest) {
+                    found.next().flatten()
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// The length of the object `key` in the pack store (a HEAD), `None` if there is none.
+    ///
+    /// # Errors
+    /// UNAVAILABLE when the store fails or `key` is not an object key.
+    pub async fn object_len(&self, key: &str) -> Result<Option<u64>, Status> {
+        let failed = |e: &dyn fmt::Display| Status::unavailable(format!("object store: {e}"));
+        let key = ObjectKey::new(key).map_err(|e| failed(&e))?;
+        self.store.len(&key).await.map_err(|e| failed(&e))
     }
 
     /// Writes `blobs` into packs and records them. They are in the pack index, and the packs
