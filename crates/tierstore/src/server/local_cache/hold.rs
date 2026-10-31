@@ -165,11 +165,12 @@ pub(super) type Hook = Arc<dyn Fn() + Send + Sync>;
 #[cfg(test)]
 #[derive(Default)]
 pub(super) struct Trace {
-    /// In `promote`, after the notes were taken into account for the scan and before the index
-    /// is replaced.
-    pub(super) promote: Option<Hook>,
-    /// In `drop_entry`, just before it asks whether the files may be removed.
-    pub(super) before_delete: Option<Hook>,
+    /// In `drop_entry`, between asking whether the files may be removed and removing the index
+    /// entry.
+    pub(super) between_delete_steps: Option<Hook>,
+    /// In a fill, after the object was published and before the cache asks whether it still
+    /// owns the directory.
+    pub(super) after_publish: Option<Hook>,
 }
 
 impl Hold {
@@ -275,8 +276,6 @@ impl Inner {
         let scanned = layout::scan(&self.config.path)?;
         let mut found = scanned.found;
         let mut pending = std::mem::take(&mut *locked(&self.hold.forgotten));
-        #[cfg(test)]
-        self.trace_promote();
         loop {
             let distrust = |f: &layout::Found| pending.overflowed || pending.names.contains(&f.hex);
             let (gone, kept): (Vec<_>, Vec<_>) = found.into_iter().partition(distrust);
@@ -315,19 +314,19 @@ impl Inner {
         *locked(&self.hold.trace) = trace;
     }
 
-    /// Makes the call a test set for the take, if there is one.
+    /// Makes the call a test set between the two steps of a delete, if there is one.
     #[cfg(test)]
-    fn trace_promote(&self) {
-        let hook = locked(&self.hold.trace).promote.clone();
+    pub(super) fn trace_between_delete_steps(&self) {
+        let hook = locked(&self.hold.trace).between_delete_steps.clone();
         if let Some(hook) = hook {
             hook();
         }
     }
 
-    /// Makes the call a test set for a delete, if there is one.
+    /// Makes the call a test set for after a publish, if there is one.
     #[cfg(test)]
-    pub(super) fn trace_before_delete(&self) {
-        let hook = locked(&self.hold.trace).before_delete.clone();
+    pub(super) fn trace_after_publish(&self) {
+        let hook = locked(&self.hold.trace).after_publish.clone();
         if let Some(hook) = hook {
             hook();
         }

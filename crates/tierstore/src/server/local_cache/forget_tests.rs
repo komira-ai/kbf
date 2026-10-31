@@ -107,14 +107,18 @@ async fn more_deletes_than_the_cache_remembers_empty_it_when_it_takes_the_lock()
     assert_eq!(read(&reader.counters().fills), 1);
 }
 
-/// Asserts that a delete that reaches a read-only cache while it is taking the lock leaves no
-/// entry in the index: the take has decided which files to trust, the delete arrives and is
-/// ordered after the decision (the take is held, by the test, between the two), and when both are
-/// done the index has no entry and the files are gone. It would catch a delete that removes the
-/// index entry first and then waits for the take, which puts the entry back for an object that
-/// is deleted, to be answered by HEAD for good.
+/// Asserts that a delete that is caught between its two steps by a take that runs to the end
+/// leaves no entry in the index and no file. The deleter is stopped by the test between asking
+/// whether the files may be removed and removing the index entry (`drop_entry`, the line after
+/// `may_delete`), the whole take runs and the cache becomes read-write, and then the deleter
+/// goes on. In the order that removes the index entry first and asks second, the stop falls
+/// between the two the other way round: the entry is removed from the index of the read-only
+/// cache, the take then builds a new index that has the entry (nothing was noted yet), and the
+/// deleter, now allowed, removes the files and leaves that entry, which HEAD answers for an
+/// object that is deleted. In this order the deleter was told the cache was read-only, so it
+/// noted the name, and the take removed the files and left the entry out.
 #[tokio::test]
-async fn a_delete_that_arrives_during_the_take_leaves_no_index_entry() {
+async fn a_delete_caught_between_its_steps_by_the_take_leaves_no_index_entry() {
     let rig = Rig::writing("tscache-forget-during");
     rig.put("cas/b/obj", &pattern(30)).await;
     let _ = rig.cache.get("cas/b/obj", None).await.unwrap();
@@ -123,29 +127,22 @@ async fn a_delete_that_arrives_during_the_take_leaves_no_index_entry() {
     assert_eq!(reader.held(), (30, 1));
     drop(holder);
 
-    let (started_tx, started_rx) = mpsc::channel::<()>();
     let (resume_tx, resume_rx) = mpsc::channel::<()>();
     let (arrived_tx, arrived_rx) = mpsc::channel::<()>();
-    let (started_tx, resume_rx) = (Mutex::new(started_tx), Mutex::new(resume_rx));
-    let arrived_tx = Mutex::new(arrived_tx);
+    let (resume_rx, arrived_tx) = (Mutex::new(resume_rx), Mutex::new(arrived_tx));
     reader.inner.set_trace(Trace {
-        promote: Some(Arc::new(move || {
-            started_tx.lock().unwrap().send(()).unwrap();
+        between_delete_steps: Some(Arc::new(move || {
+            arrived_tx.lock().unwrap().send(()).unwrap();
             resume_rx.lock().unwrap().recv().unwrap();
         })),
-        before_delete: Some(Arc::new(move || {
-            arrived_tx.lock().unwrap().send(()).unwrap();
-        })),
+        ..Trace::default()
     });
-    let taking = reader.clone();
-    let take = std::thread::spawn(move || taking.tick().unwrap());
-    started_rx.recv().unwrap();
     let hex = name_of("cas/b/obj").hex;
     let deleting = reader.clone();
     let delete = std::thread::spawn(move || deleting.inner.drop_entry(&hex));
     arrived_rx.recv().unwrap();
+    assert_eq!(reader.tick().unwrap(), Tick::Took);
     resume_tx.send(()).unwrap();
-    assert_eq!(take.join().unwrap(), Tick::Took);
     delete.join().unwrap();
     assert_eq!(reader.held(), (0, 0));
     assert!(!rig.has_file("cas/b/obj"));

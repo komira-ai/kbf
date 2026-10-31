@@ -428,6 +428,8 @@ impl Inner {
             Published::Existed => false,
             Published::Lost => return Err(Stop::Lost),
         };
+        #[cfg(test)]
+        self.trace_after_publish();
         if !self.owns(generation) {
             return Err(Stop::Lost);
         }

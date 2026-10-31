@@ -472,11 +472,11 @@ impl Inner {
     /// It notes the name, and removes the files when it takes the lock (see `hold`), so that the
     /// object is not served from them then: it was deleted or replaced at the upstream.
     fn drop_entry(&self, hex: &str) {
-        #[cfg(test)]
-        self.trace_before_delete();
         // Asked first: a take that is running holds the answer until it has looked at the notes,
         // and an entry removed before that would be put back by the index it makes.
         let may_delete = self.may_delete(hex);
+        #[cfg(test)]
+        self.trace_between_delete_steps();
         drop(locked(&self.index).remove(hex));
         if !may_delete {
             return;
