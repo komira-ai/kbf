@@ -126,9 +126,9 @@ pub enum Class {
 pub enum Phase {
     /// Before the hook's commit point: nothing irreversible happened.
     BeforeCommit,
-    /// After the commit, the release's own check failed.
+    /// `verify` failed before the commit; the hook's class is `release`.
     GateRelease,
-    /// After the commit, a check that depends on the environment failed.
+    /// `verify` failed before the commit; the hook's class is `environment`.
     GateEnvironment,
     /// After the commit, any other failure.
     AfterCommit,

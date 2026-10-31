@@ -354,13 +354,56 @@ fn loose<T: Default + serde::de::DeserializeOwned>(
     })
 }
 
+/// Removes from each entry of the `services` list in `value` every new fact that does not
+/// read, and records it in `why` as `services[<name>].<fact>: <error>`. The structural rules
+/// of the list (names, duplicates, `kbf`, the count) are left to [`services_text`], so a bad
+/// fact costs that fact and never the host's services.
+fn scrub_service_facts(value: &mut serde_json::Value, why: &mut Vec<String>) {
+    let Some(entries) = value.as_array_mut() else {
+        return;
+    };
+    for entry in entries {
+        let name = entry
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let Some(object) = entry.as_object_mut() else {
+            continue;
+        };
+        for fact in [
+            "step",
+            "commit",
+            "step_secs",
+            "promotion_pending",
+            "deferred",
+        ] {
+            let Some(fact_value) = object.get(fact).cloned() else {
+                continue;
+            };
+            let read = match fact {
+                "step" => serde_json::from_value::<Option<StepRun>>(fact_value).err(),
+                "commit" => serde_json::from_value::<Option<CommitState>>(fact_value).err(),
+                "step_secs" => step_secs_text(fact_value).err(),
+                "promotion_pending" => or_default::<_, bool>(fact_value).err(),
+                _ => serde_json::from_value::<Option<DeferredReport>>(fact_value).err(),
+            };
+            if let Some(error) = read {
+                object.remove(fact);
+                why.push(format!("services[{name}].{fact}: {error}"));
+            }
+        }
+    }
+}
+
 /// The heartbeat in `bytes` with each bad droppable value dropped, if what is left is a
 /// heartbeat.
 fn without_droppable(bytes: &[u8]) -> Option<HeartbeatRead> {
     let rest: HeartbeatLoose = serde_json::from_slice(bytes).ok()?;
     let mut extras = Vec::new();
     let mut services_why = Vec::new();
-    let services = rest.services.and_then(|value| {
+    let services = rest.services.and_then(|mut value| {
+        scrub_service_facts(&mut value, &mut extras);
         services_text(value)
             .map_err(|e| services_why.push(e.to_string()))
             .ok()
