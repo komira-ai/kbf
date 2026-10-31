@@ -98,7 +98,7 @@ fn cold_store_key_file_must_be_a_regular_file_that_exists() {
 }
 
 /// Catches: file content echoed in an error (the serde message of a wrong type repeats the
-/// value), and content that is not the pair, or holds an empty key, accepted.
+/// value), and content that is not the pair, holds an empty key or is far too long, accepted.
 #[test]
 fn cold_store_key_file_content_is_never_echoed() {
     let dir = scratch_dir("cold-key-content");
@@ -110,6 +110,8 @@ fn cold_store_key_file_content_is_never_echoed() {
         pair("", SECRET),
         pair("hunter2", ""),
         String::new(),
+        // Longer than a key file may be, whatever it holds.
+        format!("{}{SECRET}", " ".repeat(8192)),
     ];
     for text in cases {
         let path = file(dir.path(), "bad.json", &text, 0o600);
