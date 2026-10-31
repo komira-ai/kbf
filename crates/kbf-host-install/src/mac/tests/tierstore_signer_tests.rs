@@ -17,17 +17,34 @@ const TIERSTORE: (&str, &str) = (
     "komira-ai/tierstore/.github/workflows/artifacts.yml",
 );
 
-fn origin(pair: (&str, &str), prefix: &str) -> Origin {
-    Origin::new(pair.0, pair.1, prefix).unwrap()
+/// The signers of a channel for `prefix` files that names `pair`, as owned strings.
+fn signers_of(pair: (&str, &str), prefix: &str) -> Vec<(String, String)> {
+    let origin = Origin::new(pair.0, pair.1, prefix).unwrap();
+    origin
+        .signers()
+        .into_iter()
+        .map(|(r, w)| (r.to_owned(), w.to_owned()))
+        .collect()
+}
+
+fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(r, w)| ((*r).to_owned(), (*w).to_owned()))
+        .collect()
+}
+
+fn has(signers: &[(String, String)], pair: (&str, &str)) -> bool {
+    signers.contains(&(pair.0.to_owned(), pair.1.to_owned()))
 }
 
 /// A tierstore asset signed by kbf's identity (the last release kbf shipped, a rollback)
 /// verifies, under the name kbf had then as well.
 #[test]
 fn a_tierstore_asset_signed_by_kbf_is_accepted() {
-    let signers = origin(KBF, "tierstore").signers();
-    assert!(signers.contains(&KBF), "{signers:?}");
-    assert!(signers.contains(&FORMER), "{signers:?}");
+    let signers = signers_of(KBF, "tierstore");
+    assert!(has(&signers, KBF), "{signers:?}");
+    assert!(has(&signers, FORMER), "{signers:?}");
 }
 
 /// A tierstore asset signed by komira-ai/tierstore's artifacts workflow is accepted, whether
@@ -35,19 +52,22 @@ fn a_tierstore_asset_signed_by_kbf_is_accepted() {
 #[test]
 fn a_tierstore_asset_signed_by_the_tierstore_repository_is_accepted() {
     for channel in [KBF, TIERSTORE] {
-        let signers = origin(channel, "tierstore").signers();
-        assert!(signers.contains(&TIERSTORE), "{channel:?}: {signers:?}");
-        assert!(signers.contains(&KBF), "{channel:?}: {signers:?}");
+        let signers = signers_of(channel, "tierstore");
+        assert!(has(&signers, TIERSTORE), "{channel:?}: {signers:?}");
+        assert!(has(&signers, KBF), "{channel:?}: {signers:?}");
     }
 }
 
 /// The exact set for the tierstore asset: nothing else rides along.
 #[test]
 fn the_tierstore_asset_accepts_exactly_kbf_its_former_name_and_tierstore() {
-    assert_eq!(origin(KBF, "tierstore").signers(), [KBF, FORMER, TIERSTORE]);
     assert_eq!(
-        origin(TIERSTORE, "tierstore").signers(),
-        [TIERSTORE, KBF, FORMER]
+        signers_of(KBF, "tierstore"),
+        owned(&[KBF, FORMER, TIERSTORE])
+    );
+    assert_eq!(
+        signers_of(TIERSTORE, "tierstore"),
+        owned(&[TIERSTORE, KBF, FORMER])
     );
 }
 
@@ -56,14 +76,14 @@ fn the_tierstore_asset_accepts_exactly_kbf_its_former_name_and_tierstore() {
 #[test]
 fn another_asset_does_not_accept_the_tierstore_signer() {
     for prefix in ["kbf", "kbf-daemon", "kbf-host-install", "other"] {
-        let signers = origin(KBF, prefix).signers();
-        assert_eq!(signers, [KBF, FORMER], "{prefix}");
-        assert!(!signers.contains(&TIERSTORE), "{prefix}");
+        let signers = signers_of(KBF, prefix);
+        assert_eq!(signers, owned(&[KBF, FORMER]), "{prefix}");
+        assert!(!has(&signers, TIERSTORE), "{prefix}");
     }
-    let own = origin(TIERSTORE, "kbf");
+    let own = signers_of(TIERSTORE, "kbf");
     assert_eq!(
-        own.signers(),
-        [TIERSTORE],
+        own,
+        owned(&[TIERSTORE]),
         "a tierstore channel for kbf files"
     );
 }
@@ -78,8 +98,8 @@ fn a_lookalike_prefix_is_not_the_tierstore_asset() {
         "tier",
         "xtierstore",
     ] {
-        let signers = origin(KBF, prefix).signers();
-        assert!(!signers.contains(&TIERSTORE), "{prefix}: {signers:?}");
+        let signers = signers_of(KBF, prefix);
+        assert!(!has(&signers, TIERSTORE), "{prefix}: {signers:?}");
     }
 }
 
@@ -110,14 +130,17 @@ fn lookalike_identities_are_not_the_tierstore_signer() {
             "other/tierstore/.github/workflows/artifacts.yml",
         ),
     ] {
-        let signers = origin(pair, "kbf").signers();
-        assert_eq!(signers, [pair], "{pair:?}");
-        let for_tierstore = origin(pair, "tierstore").signers();
-        assert_eq!(for_tierstore[0], pair, "{pair:?}");
+        let signers = signers_of(pair, "kbf");
+        assert_eq!(signers, owned(&[pair]), "{pair:?}");
+        let for_tierstore = signers_of(pair, "tierstore");
+        assert_eq!(owned(&[pair])[0], for_tierstore[0], "{pair:?}");
         // The lookalike stays a distinct entry beside the pinned pair; it is never merged
         // into it, and the pinned pair's own strings are exact.
         assert_eq!(
-            for_tierstore.iter().filter(|p| **p == TIERSTORE).count(),
+            for_tierstore
+                .iter()
+                .filter(|p| has(std::slice::from_ref(p), TIERSTORE))
+                .count(),
             1,
             "{pair:?}"
         );
