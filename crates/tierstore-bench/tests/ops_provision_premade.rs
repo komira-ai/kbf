@@ -29,14 +29,24 @@ fn farm() -> impl Fn(&Seen) -> (u16, String) + Send + Sync + 'static {
     }
 }
 
-/// What `mc quota info` prints for a bucket with this quota.
-fn quota_line(quota: Option<u64>) -> String {
-    match quota {
-        Some(bytes) => format!(
-            "{{\"status\":\"success\",\"bucket\":\"b\",\"quota\":{bytes},\"quotatype\":\"hard\"}}\n"
-        ),
-        None => "{\"status\":\"success\",\"bucket\":\"b\"}\n".to_owned(),
+/// What `mc quota info --json` prints for a bucket with this quota and type: an indented,
+/// multi-line object whose `quota` and `type` keys are omitted when empty (mc `quota-set.go`).
+fn quota_text(quota: Option<u64>, kind: Option<&str>) -> String {
+    let mut fields = vec![
+        "\"status\": \"success\"".to_owned(),
+        "\"bucket\": \"b\"".to_owned(),
+    ];
+    if let Some(bytes) = quota {
+        fields.push(format!("\"quota\": {bytes}"));
     }
+    if let Some(kind) = kind {
+        fields.push(format!("\"type\": \"{kind}\""));
+    }
+    format!("{{\n {}\n}}\n", fields.join(",\n "))
+}
+
+fn quota_line(quota: Option<u64>) -> String {
+    quota_text(quota, quota.map(|_| "hard"))
 }
 
 /// A machine whose store holds the buckets in `present`, each with `quota`. It lets through only
@@ -46,6 +56,14 @@ fn quota_line(quota: Option<u64>) -> String {
 fn premade_store(
     present: &'static [&'static str],
     quota: Option<u64>,
+) -> impl Fn(&Cmd) -> io::Result<CmdOutput> + Send + Sync + 'static {
+    premade_store_saying(present, quota_line(quota))
+}
+
+/// [`premade_store`], answering `quota info` with `line` as it stands.
+fn premade_store_saying(
+    present: &'static [&'static str],
+    line: String,
 ) -> impl Fn(&Cmd) -> io::Result<CmdOutput> + Send + Sync + 'static {
     move |cmd| {
         let args: Vec<&str> = cmd.args[3..].iter().map(String::as_str).collect();
@@ -60,7 +78,7 @@ fn premade_store(
                     failed(1, "Bucket does not exist")
                 }
             }
-            ["quota", "info", _] => ok(&quota_line(quota)),
+            ["quota", "info", _] => ok(&line),
             other => failed(1, &format!("not allowed to the dev-box key: {other:?}")),
         }
     }
@@ -397,4 +415,117 @@ async fn the_default_mode_runs_the_same_commands_as_before() {
             format!("admin policy attach tbops {name} --user tb-KEYID-MARK-cold"),
         ]
     );
+}
+
+/// Catches a quota that is not a hard one being taken as the limit: a soft quota, one of an
+/// unknown type, a differently cased one and an answer with no type each stop the verb before a
+/// probe, and a hard one is accepted.
+#[tokio::test]
+async fn a_quota_that_is_not_hard_is_refused() {
+    for (name, kind, refused) in [
+        ("tb-prem-t-soft", Some("fifo"), true),
+        ("tb-prem-t-odd", Some("other"), true),
+        ("tb-prem-t-none", None, true),
+        ("tb-prem-t-hard", Some("hard"), false),
+        ("tb-prem-t-caps", Some("HARD"), true),
+    ] {
+        let line = quota_text(Some(1024), kind);
+        let stub = Stub::start(farm()).await;
+        let (dir, host, _c, ops) = base(name);
+        host.answer(premade_store_saying(COLD, line));
+        let config = run_config(dir.path(), &stub.endpoint, None);
+        let got = run_with_supply(&host, &config, &ops, Mode::Apply, Supply::Premade).await;
+        if refused {
+            let text = got.unwrap_err().to_string();
+            assert!(text.contains("quota"), "{name}: {text}");
+            assert!(stub.requests().is_empty(), "{name}");
+            assert!(!dir.path().join(STATE_FILE).exists(), "{name}");
+        } else {
+            got.unwrap();
+        }
+    }
+}
+
+const MADE_RECORD: &str =
+    r#"{"buckets": ["tb-cold-test-bucket-mark"], "accounts": ["tb-KEYID-MARK-cold"]}"#;
+const PREMADE_RECORD: &str = r#"{"buckets": ["tb-cold-test-bucket-mark"], "accounts": ["tb-KEYID-MARK-cold"], "premade": true}"#;
+
+/// Catches a premade run relabelling what an earlier run made: over a record with entries and no
+/// `premade` marker, an apply and a dry run are each refused before any command or request, the
+/// refusal names the result directory, and the record is as it was.
+#[tokio::test]
+async fn a_premade_run_over_a_created_record_is_refused() {
+    for (name, mode) in [
+        ("tb-prem-mix-apply", Mode::Apply),
+        ("tb-prem-mix-dry", Mode::DryRun),
+    ] {
+        let stub = Stub::start(farm()).await;
+        let (dir, host, _c, ops) = base(name);
+        host.answer(premade_store(COLD, Some(QUOTA_30_GIB)));
+        fs::write(dir.path().join(STATE_FILE), MADE_RECORD).unwrap();
+        let config = run_config(dir.path(), &stub.endpoint, None);
+        let text = run_with_supply(&host, &config, &ops, mode, Supply::Premade)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains(&dir.path().display().to_string()),
+            "{name}: {text}"
+        );
+        assert!(text.contains("fresh result"), "{name}: {text}");
+        assert!(host.ran().is_empty(), "{name}");
+        assert!(stub.requests().is_empty(), "{name}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join(STATE_FILE)).unwrap(),
+            MADE_RECORD,
+            "{name}"
+        );
+        assert!(!dir.path().join(STEPS_FILE).exists(), "{name}");
+    }
+}
+
+/// Catches a created run adopting a premade record: an apply and a dry run over a record with the
+/// `premade` marker are each refused before any command, naming the result directory.
+#[tokio::test]
+async fn a_created_run_over_a_premade_record_is_refused() {
+    for (name, mode) in [
+        ("tb-prem-rev-apply", Mode::Apply),
+        ("tb-prem-rev-dry", Mode::DryRun),
+    ] {
+        let stub = Stub::start(farm()).await;
+        let (dir, host, _c, ops) = base(name);
+        fs::write(dir.path().join(STATE_FILE), PREMADE_RECORD).unwrap();
+        let config = run_config(dir.path(), &stub.endpoint, None);
+        let text = run_with_supply(&host, &config, &ops, mode, Supply::Create)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains(&dir.path().display().to_string()),
+            "{name}: {text}"
+        );
+        assert!(text.contains("fresh result"), "{name}: {text}");
+        assert!(host.ran().is_empty(), "{name}");
+        assert!(stub.requests().is_empty(), "{name}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join(STATE_FILE)).unwrap(),
+            PREMADE_RECORD,
+            "{name}"
+        );
+    }
+}
+
+/// Catches a re-run being refused: a premade apply over a premade record of the same prefix
+/// proceeds and leaves a premade record.
+#[tokio::test]
+async fn a_premade_run_over_a_premade_record_proceeds() {
+    let stub = Stub::start(farm()).await;
+    let (dir, host, _c, ops) = base("tb-prem-rerun");
+    host.answer(premade_store(COLD, Some(QUOTA_30_GIB)));
+    fs::write(dir.path().join(STATE_FILE), PREMADE_RECORD).unwrap();
+    let config = run_config(dir.path(), &stub.endpoint, None);
+    run_with_supply(&host, &config, &ops, Mode::Apply, Supply::Premade)
+        .await
+        .unwrap();
+    assert!(State::load(dir.path(), "tb-").unwrap().is_premade());
 }
