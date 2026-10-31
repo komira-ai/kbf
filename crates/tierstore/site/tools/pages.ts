@@ -2,7 +2,7 @@
 // which scripts it loads. The content files are the page copy as written for the site (content/*.html: the inside of
 // <main>); the document around them is layout.ts.
 
-export type NavKey = 'install' | 'demo' | 'why' | 'config' | 'operations';
+export type NavKey = 'install' | 'demo' | 'why' | 'docs';
 
 export interface Page {
   /** The URL path: '/' or '/name/' or '/404.html'. */
@@ -19,6 +19,8 @@ export interface Page {
   /** The home runs in bands that each carry their own .wrap; every other page sits in one. */
   bands: boolean;
   noindex?: boolean;
+  /** The inside of <main>, when the page is generated (docs.ts) and not copy under content/. */
+  html?: string;
 }
 
 export const SITE_NAME = 'tierstore';
@@ -40,8 +42,7 @@ export const NAV: readonly { key: NavKey; label: string; route: string }[] = [
   { key: 'install', label: 'Install', route: '/install/' },
   { key: 'demo', label: 'Demo', route: '/demo/' },
   { key: 'why', label: 'Why', route: '/why/' },
-  { key: 'config', label: 'Configuration', route: '/docs/config/' },
-  { key: 'operations', label: 'Operations', route: '/docs/operations/' },
+  { key: 'docs', label: 'Docs', route: '/docs/' },
 ];
 
 export const PAGES: readonly Page[] = [
@@ -56,24 +57,6 @@ export const PAGES: readonly Page[] = [
   { route: '/install/', source: 'install', title: 'Install', description: 'Get tierstore from a kbf release and run it.', nav: 'install', scripts: ['copy.js'], bands: false },
   { route: '/demo/', source: 'demo', title: 'Demo', description: 'A start, the probes and a drain of tierstore, as the code prints them.', nav: 'demo', scripts: ['copy.js'], bands: false },
   { route: '/why/', source: 'why', title: 'Why tierstore', description: 'The problem tierstore solves and how the tiers work.', nav: 'why', scripts: ['copy.js'], bands: false },
-  {
-    route: '/docs/config/',
-    source: 'config',
-    title: 'Configuration',
-    description: 'The tierstore TOML file, the flags and the key files.',
-    nav: 'config',
-    scripts: ['copy.js'],
-    bands: false,
-  },
-  {
-    route: '/docs/operations/',
-    source: 'operations',
-    title: 'Operations',
-    description: 'Starting, stopping, health probes, usage and the start-up self-test of tierstore.',
-    nav: 'operations',
-    scripts: ['copy.js'],
-    bands: false,
-  },
   {
     route: '/404.html',
     source: '404',

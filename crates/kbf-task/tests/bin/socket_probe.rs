@@ -6,7 +6,7 @@
 //! (a socket of that domain), `pair-inet` or `pair-unix` (`socketpair`), `uring`
 //! (`io_uring_setup`), `x32` (`socket(AF_INET)` under the x32 number, `x86_64` only), or
 //! `child <mode>`: the same, in a copy of this program that this one starts and waits for, to
-//! show that a descendant has the same limits. Other modes: `touch <path>` makes a file (to show
+//! show that a descendant has the same limits. Other modes: `read <path>` reads a file (exit 0, or the errno), `link-read <from> <to>` and `rename-read <from> <to>` make a hard link or rename and then read the new name (the errno of the first step that fails), `touch <path>` makes a file (to show
 //! the program ran), `ifaces` prints the network interfaces it sees, `ids` prints its user and
 //! group id, `tcp-loopback` (listen on 127.0.0.1, connect, accept: exit 0 or the errno) and
 //! `tcp-outside` (connect to an address outside any local network: the errno), `int80` (`x86_64`) makes a 32-bit system call, `steal <pid> <fd>` takes a
@@ -33,10 +33,25 @@ fn probe(args: &[&str]) -> u8 {
         ["inet"] => socket(libc::AF_INET),
         ["inet6"] => socket(libc::AF_INET6),
         ["unix"] => socket(libc::AF_UNIX),
+        ["read", path] => match std::fs::read(path) {
+            Ok(_) => 0,
+            Err(e) => errno_of(&e),
+        },
+        ["link-read", from, to] => {
+            std::fs::hard_link(from, to).map_or_else(|e| errno_of(&e), |()| probe(&["read", to]))
+        }
+        ["rename-dir-read", from, to, name] => std::fs::rename(from, to).map_or_else(
+            |e| errno_of(&e),
+            |()| probe(&["read", &format!("{to}/{name}")]),
+        ),
+        ["rename-read", from, to] => {
+            std::fs::rename(from, to).map_or_else(|e| errno_of(&e), |()| probe(&["read", to]))
+        }
         ["touch", path] => u8::from(std::fs::File::create(path).is_err()),
         ["ifaces"] => ifaces(),
         ["tcp-loopback"] => tcp_loopback(),
         ["tcp-outside"] => tcp_outside(),
+        ["tcp-loopback6"] => tcp_loopback6(),
         ["ids"] => ids(),
         ["hidden", pid] => hidden(pid),
         #[cfg(target_arch = "x86_64")]
@@ -197,8 +212,26 @@ fn tcp_loopback() -> u8 {
 fn tcp_outside() -> u8 {
     // An address of the documentation range (RFC 5737): no route to it exists in an empty
     // namespace, so the connect fails at once with `ENETUNREACH`.
-    match std::net::TcpStream::connect("192.0.2.1:9") {
+    // A bounded wait: where the network is open the packets may get no answer at all, which is
+    // reported as `ETIMEDOUT`, not waited for.
+    let address = std::net::SocketAddr::from(([192, 0, 2, 1], 9));
+    match std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(3)) {
         Ok(_) => 0,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            u8::try_from(libc::ETIMEDOUT).unwrap_or(UNKNOWN_MODE)
+        }
         Err(e) => errno_of(&e),
     }
+}
+
+/// Listens on `[::1]` and connects to it: 0, or the errno of the step that failed.
+fn tcp_loopback6() -> u8 {
+    let run = || -> std::io::Result<()> {
+        let listener = std::net::TcpListener::bind("[::1]:0")?;
+        let client = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (_server, _) = listener.accept()?;
+        drop(client);
+        Ok(())
+    };
+    run().map_or_else(|e| errno_of(&e), |()| 0)
 }

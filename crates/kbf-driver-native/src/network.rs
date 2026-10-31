@@ -72,8 +72,10 @@ pub const PROPERTY: &str = "network";
 /// The node report key that says how the network is kept off.
 pub const CAPABILITY: &str = "network_isolation";
 
-/// Where macOS keeps `sandbox-exec`.
-pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+// Where macOS keeps `sandbox-exec`, and the rules every profile carries after the network rules
+// (the CoreDevice, `remoted` and `usbmuxd` denies), written once in `kbf-seatbelt`: the task
+// runner's profile uses the same text.
+pub use kbf_seatbelt::{NO_DEVICE_RULES, SANDBOX_EXEC};
 
 /// The profile parameter that names the lease directory (`-D KBF_LEASE=<path>`), as
 /// its real path: the sandbox compares the paths of the files written, with every link
@@ -120,17 +122,16 @@ pub const BASE_PROFILE: &str = "(version 1)\n\
 
 /// The sandbox profile for an action without the network: [`BASE_PROFILE`], and no
 /// network operation but to loopback and Unix sockets.
-pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
-(allow default)\n\
-(deny job-creation)\n\
-(deny lsopen)\n\
-(deny user-preference-write)\n\
-(deny file-write*)\n\
-(allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n\
-(deny network*)\n\
-(allow network-inbound (local ip \"localhost:*\"))\n\
-(allow network* (remote ip \"localhost:*\"))\n\
-(allow network* (remote unix-socket))\n";
+pub const NO_NETWORK_PROFILE: &str = concat!(
+    "(version 1)\n",
+    "(allow default)\n",
+    "(deny job-creation)\n",
+    "(deny lsopen)\n",
+    "(deny user-preference-write)\n",
+    "(deny file-write*)\n",
+    "(allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n",
+    kbf_seatbelt::deny_network_rules!()
+);
 
 /// The data-vault folders under `/private/var/protected` where a GPU framework's first
 /// use in a process of a uid leaves files (analytics and trust stores, one folder per
@@ -208,10 +209,7 @@ pub const SLOT_NO_NETWORK_PROFILE: &str = concat!(
     "(allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n",
     protected_deny!(),
     "\n",
-    "(deny network*)\n",
-    "(allow network-inbound (local ip \"localhost:*\"))\n",
-    "(allow network* (remote ip \"localhost:*\"))\n",
-    "(allow network* (remote unix-socket))\n"
+    kbf_seatbelt::deny_network_rules!()
 );
 
 /// The profile of a slot user's action under `network`: [`SLOT_PROFILE`] or
@@ -237,16 +235,9 @@ pub fn slot_write_rules(home: &Path, folders: &Path) -> std::io::Result<String> 
     ))
 }
 
-/// `path` as a sandbox profile string literal.
+/// `path` as a sandbox profile string literal ([`kbf_seatbelt::quoted`]).
 fn quoted(path: &Path) -> std::io::Result<String> {
-    let text = path.to_str().unwrap_or("\"");
-    if text.contains(['"', '\\']) {
-        return Err(std::io::Error::other(format!(
-            "{} cannot be named in a sandbox profile",
-            path.display()
-        )));
-    }
-    Ok(format!("\"{text}\""))
+    kbf_seatbelt::quoted(path).map_err(std::io::Error::other)
 }
 
 /// A change made to the generated profile, to see a canary go red on a Mac: for the
@@ -280,26 +271,6 @@ impl WeakenedProfile {
         }
     }
 }
-
-/// The rules every profile carries (after the network rules): no lookup of a
-/// CoreDevice mach service or XPC service (`com.apple.CoreDevice.CoreDeviceService`,
-/// which `devicectl` asks for everything, `com.apple.CoreDevice.remotepairingd`,
-/// `com.apple.CoreDevice.CoreDeviceDDIUpdaterService` and the rest of the prefix), none
-/// of `remoted`'s (`com.apple.remoted`, its `.coredevice` and `.control` services and
-/// the rest of the prefix: RemoteXPC, the tunnel CoreDevice talks to a device through),
-/// and no connect to `usbmuxd`'s socket, which the sandbox names by its real path
-/// (`/var/run` is a link to `/private/var/run`; a rule on the link's path matches
-/// nothing). `tests/devices.rs` shows each refused on the macOS runner, and reached
-/// without the sandbox, `remotepairingd`, `.coredevice` and `.control` among them; this
-/// module's tests check that each mach rule is a `global-name-prefix` covering every
-/// name listed here. Their place in the profile does
-/// not decide: with the `usbmuxd` rule before [`NO_NETWORK_PROFILE`]'s allow for every
-/// Unix socket (a defect), the runner still refused the connect. A lease that books a
-/// device is to get a profile without these (`docs/design/ios-devices.md`, section
-/// 6.1); none does yet.
-pub const NO_DEVICE_RULES: &str = "(deny mach-lookup (global-name-prefix \"com.apple.CoreDevice.\"))\n\
-(deny mach-lookup (global-name-prefix \"com.apple.remoted\"))\n\
-(deny network-outbound (literal \"/private/var/run/usbmuxd\"))\n";
 
 /// What an action asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -916,5 +887,15 @@ mod tests {
             ok,
             "(allow file-write* (subpath \"/h\") (subpath \"/f\"))\n"
         );
+    }
+
+    /// Catches the daemon's network-off profiles drifting from the rules the task runner's
+    /// profile also uses (`kbf-seatbelt`): both must end with the same denial.
+    #[test]
+    fn the_network_off_profiles_end_with_the_shared_network_denial() {
+        use kbf_seatbelt::DENY_NETWORK_RULES;
+        assert!(NO_NETWORK_PROFILE.ends_with(DENY_NETWORK_RULES));
+        assert!(SLOT_NO_NETWORK_PROFILE.ends_with(DENY_NETWORK_RULES));
+        assert!(!BASE_PROFILE.contains("network"));
     }
 }

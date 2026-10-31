@@ -481,8 +481,22 @@ skipped for uid 0)`.
 `kbf-task` also makes itself non-dumpable (`PR_SET_DUMPABLE` 0) before it opens a socket, so
 the Command, which runs as the same user, cannot `ptrace` it, take its sockets with
 `pidfd_getfd` or read its memory through `/proc`. This property does not reach the Mac driver, which has its own
-[`network`](#network) property. Where `kbf-task` is built for a system other than Linux (a developer's machine; the
-release is a Linux build), there is no filter and the tool says so on standard error.
+[`network`](#network) property.
+
+On macOS `kbf-task` has no seccomp filter or namespace. It runs the Command alone under
+`/usr/bin/sandbox-exec`, with the profile of `crates/kbf-seatbelt` (the rules the Mac driver's
+`network=off` profile uses): everything is allowed except handing work to `launchd` and writing a
+preference, a Command denied the network gets the `network=off` denial of the table below
+(loopback and Unix sockets only), and for every Command reading the files this tool holds a
+credential or presigned URL in is denied, as are writing it and renaming or removing the
+directories above it (`--grant-token-file`, `--pack-url-file`, `--put-urls-file`). A Command with `kbf-network=allow` gets the profile without the network
+clause. The line for a denied Command is `kbf-task: action <digest>: network: sandbox-exec profile
+(no network but loopback and unix sockets)`. The limits are the driver's: any Unix socket stays
+open, so DNS lookups still go out through the system's resolver, and a connect to the node's own
+non-loopback address was allowed under the denial on the macOS runner. The profile does not limit
+other writes, helper daemons reached by `mach-lookup` and other services on the node stay reachable, and a credential given as a flag value (`--insecure-argv-secrets`) stays in this tool's
+argv. No macOS `kbf-task` is released yet. On a system that is neither Linux nor macOS there is
+no confine, and a Command denied the network is refused there (exit 15).
 
 ## `network`
 
