@@ -149,3 +149,44 @@ fn the_rigs_two_releases_differ() {
         tree_digest(&rig.old_dir).unwrap()
     );
 }
+
+/// Catches a staged release that others can change, or reached through a link, being trusted: a
+/// tree writable by group, a parent writable by others, and a path with a linked component are
+/// `Untrusted`; the same tree closed is accepted.
+#[test]
+fn the_tree_and_its_parents_must_be_closed_and_unlinked() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Scratch::new("art-place");
+    let outer = s.path().join("outer");
+    let inner = outer.join("inner");
+    fs::create_dir_all(inner.join("bin")).unwrap();
+    fs::write(inner.join("bin/hook"), "#!hook\n").unwrap();
+    let staged = Staged::seal(&inner).unwrap();
+    let hook = Path::new("bin/hook");
+    staged.check(hook).unwrap();
+
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o775)).unwrap();
+    let err = staged.check(hook).unwrap_err();
+    assert!(matches!(&err, ArtifactError::Untrusted(p) if p == &inner));
+    assert!(err.to_string().contains("closed to group and others"));
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o755)).unwrap();
+
+    fs::set_permissions(&outer, fs::Permissions::from_mode(0o757)).unwrap();
+    assert!(matches!(
+        staged.check(hook).unwrap_err(),
+        ArtifactError::Untrusted(p) if p == outer
+    ));
+    fs::set_permissions(&outer, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let link = s.path().join("link");
+    symlink(&outer, &link).unwrap();
+    let through = Staged {
+        dir: link.join("inner"),
+        digest: staged.digest.clone(),
+    };
+    assert!(matches!(
+        through.check(hook).unwrap_err(),
+        ArtifactError::Untrusted(p) if p == link
+    ));
+    staged.check(hook).unwrap();
+}

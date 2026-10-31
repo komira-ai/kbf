@@ -653,6 +653,14 @@ fn a_hook_path_outside_the_release_never_runs() {
     let got = rig.runner().run(&order).unwrap();
     assert_eq!(got, fin(Verdict::Halt));
     assert!(rig.fake.events().is_empty());
+    // The halt is the record's verdict, reached through a failed `prepare` and a `rollback` that
+    // could not start either.
+    assert_eq!(rig.runner().last_result().unwrap(), Some(got));
+    let Loaded::Current(rec) = rig.store().load().unwrap() else {
+        panic!("a record")
+    };
+    assert_eq!(rec.step, Step::Rollback);
+    assert_eq!(rec.hook, kbf_step_runner::record::HookSel::Previous);
 }
 
 /// Catches a launcher failure being swallowed: the runner stops with the error, the step stays
@@ -812,28 +820,131 @@ fn only_the_same_order_resumes_an_unfinished_update() {
     assert_eq!(rig.runner().run(&rig.order()).unwrap(), ok());
 }
 
-/// Catches a finished update that is run over: the next order for the host starts the next
-/// generation (its units are numbered 2), and the verdict of the finished one is read with
-/// `last_result`.
+/// Catches a new order after a verdict being refused or run as the old generation: an order for
+/// another target, or for another artifact, after `Succeeded` or `Failed` starts the next
+/// generation (its units are numbered 2).
 #[test]
-fn a_finished_update_is_followed_by_the_next_generation() {
-    let rig = Rig::new("run-generation");
+fn a_new_order_after_a_verdict_starts_the_next_generation() {
+    let unit_of_first_run = |rig: &Rig| match &rig.fake.runs()[0] {
+        support::Event::Run { unit, .. } => unit.clone(),
+        support::Event::Stop(_) => unreachable!(),
+    };
+    let rig = Rig::new("run-generation-ok");
     assert_eq!(run(&rig), ok());
-    assert_eq!(rig.runner().last_result().unwrap(), Some(ok()));
     rig.fake.clear();
+    let mut next = rig.order();
+    next.target_version = "3.0.0".to_owned();
+    assert_eq!(rig.runner().run(&next).unwrap(), ok());
+    assert_eq!(unit_of_first_run(&rig), "updater-svc-prepare-2");
+    assert!(rig.fake.stops().is_empty());
+
+    let rig = Rig::new("run-generation-failed");
     rig.fake.say(Step::Verify, &[FAIL]);
     assert_eq!(run(&rig), failed(Phase::GateRelease, Class::Release));
-    let units: Vec<String> = rig
-        .fake
-        .runs()
-        .iter()
-        .filter_map(|e| match e {
-            support::Event::Run { unit, .. } => Some(unit.clone()),
-            support::Event::Stop(_) => None,
-        })
-        .collect();
-    assert_eq!(units[0], "updater-svc-prepare-2");
-    assert!(rig.fake.stops().is_empty());
+    rig.fake.clear();
+    fs::write(rig.new_dir.join("lib/data"), "a rebuilt release").unwrap();
+    let rebuilt = rig.order();
+    assert_eq!(rig.runner().run(&rebuilt).unwrap(), ok());
+    assert_eq!(unit_of_first_run(&rig), "updater-svc-prepare-2");
+}
+
+/// Catches an identical order delivered again after a verdict being run again: after `Succeeded` or
+/// `Failed` it gets the stored verdict and nothing runs. A `Deferred` is the one verdict that is
+/// run again, because the order comes back after its wait.
+#[test]
+fn a_redelivered_order_gets_the_stored_verdict_and_runs_nothing() {
+    for (name, verify) in [("ok", OK), ("failed", FAIL)] {
+        let rig = Rig::new(&format!("run-redeliver-{name}"));
+        rig.fake.say(Step::Verify, &[verify]);
+        let order = rig.order();
+        let first = rig.runner().run(&order).unwrap();
+        rig.fake.clear();
+        assert_eq!(rig.runner().run(&order).unwrap(), first);
+        assert_eq!(rig.runner().run(&order).unwrap(), first);
+        assert!(rig.fake.events().is_empty(), "{name}");
+        assert_eq!(rig.runner().last_result().unwrap(), Some(first));
+    }
+    let rig = Rig::new("run-redeliver-deferred");
+    rig.fake.say(Step::Prepare, &[DEFER]);
+    let order = rig.order();
+    assert!(matches!(
+        rig.runner().run(&order).unwrap().verdict,
+        Verdict::Deferred { .. }
+    ));
+    rig.fake.clear();
+    assert_eq!(rig.runner().run(&order).unwrap(), ok());
+    assert_eq!(rig.fake.steps().len(), 4);
+}
+
+/// Catches a halt that a new order or the same one runs over: after `halt` nothing runs for the
+/// service, whatever the order, until `clear_halt`; clearing says whether there was a halt, and
+/// after it the next order runs.
+#[test]
+fn a_halt_holds_the_service_until_it_is_cleared() {
+    let rig = Rig::new("run-halt-held");
+    assert!(!rig.runner().clear_halt().unwrap());
+    rig.fake.say(Step::Prepare, &[HALT]);
+    let order = rig.order();
+    assert_eq!(rig.runner().run(&order).unwrap(), fin(Verdict::Halt));
+    rig.fake.clear();
+    let mut newer = rig.order();
+    newer.target_version = "3.0.0".to_owned();
+    for o in [&order, &newer] {
+        assert_eq!(rig.runner().run(o).unwrap(), fin(Verdict::Halt));
+    }
+    assert!(rig.fake.events().is_empty());
+    assert!(rig.runner().clear_halt().unwrap());
+    assert!(!rig.runner().clear_halt().unwrap());
+    assert_eq!(rig.runner().run(&newer).unwrap(), ok());
+    assert!(!rig.runner().clear_halt().unwrap());
+
+    let rig = Rig::new("run-halt-clear-newer");
+    fs::write(rig.state.join(RECORD_FILE), r#"{"schema": 99}"#).unwrap();
+    assert!(matches!(
+        rig.runner().clear_halt(),
+        Err(RunError::RecordNewer(99))
+    ));
+}
+
+/// Catches a zero bound handed to a launcher (systemd reads `RuntimeMaxSec=0` as no limit): a
+/// `verify` resumed after its window has passed is not started, the update rolls back, and no
+/// run is given a bound of 0.
+#[test]
+fn a_verify_resumed_after_its_window_is_not_started() {
+    let rig = Rig::new("run-window-gone");
+    let order = rig.order();
+    rig.fake
+        .lose_run
+        .store(3, std::sync::atomic::Ordering::SeqCst);
+    assert!(rig.runner().run(&order).is_err());
+    rig.clock.advance(2000);
+    rig.fake.clear();
+    assert_eq!(
+        rig.runner().run(&order).unwrap(),
+        failed(Phase::GateRelease, Class::Release)
+    );
+    assert_eq!(rig.fake.steps(), [Step::Rollback]);
+    assert_eq!(rig.fake.stops(), ["updater-svc-verify-1"]);
+    for e in rig.fake.runs() {
+        let support::Event::Run { timeout_secs, .. } = e else {
+            unreachable!()
+        };
+        assert_ne!(timeout_secs, 0);
+    }
+}
+
+/// Catches a staged release in a place others can change being run: a tree or a parent that is
+/// writable by group or others, and a path through a link, halt the update with nothing run.
+#[test]
+fn a_release_in_an_untrusted_place_never_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    let rig = Rig::new("run-untrusted");
+    let order = rig.order();
+    fs::set_permissions(&rig.new_dir, fs::Permissions::from_mode(0o775)).unwrap();
+    let got = rig.runner().run(&order).unwrap();
+    assert_eq!(got.verdict, Verdict::Halt);
+    assert_eq!(got.reason.as_deref(), Some("artifact_changed"));
+    assert!(rig.fake.events().is_empty());
 }
 
 /// Catches a params file that is not kept for the whole update or is left behind: it is the

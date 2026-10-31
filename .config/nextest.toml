@@ -68,6 +68,12 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 filter = 'package(kbf-daemon) & binary(cache)'
 slow-timeout = { period = "30s", terminate-after = 4 }
 
+# Hang guard for the step runner's tests that wait on a socket peer or a thread: no test asserts
+# how long it takes, and a test that waits for something that never comes is stopped and fails.
+[[profile.default.overrides]]
+filter = 'package(kbf-step-runner)'
+slow-timeout = { period = "60s", terminate-after = 2 }
+
 # The general budget: every other test, of every package, is ended after eight minutes
 # (120 seconds x 4). The slowest of them in the full run on main takes about 240 seconds
 # (kbf-server::frontend, a_frontend_dialing_a_node_with_another_nodes_certificate_is_refused),

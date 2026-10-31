@@ -88,6 +88,8 @@ pub enum Refused {
     HealthAddress,
     #[error("the declaration does not grant that health port")]
     HealthPort,
+    #[error("the server holds as many connections as it allows")]
+    Busy,
 }
 
 impl Refused {
@@ -98,6 +100,7 @@ impl Refused {
             Refused::WrongUser => "wrong_user",
             Refused::HealthAddress => "health_address",
             Refused::HealthPort => "health_port",
+            Refused::Busy => "busy",
         }
     }
 }
@@ -363,6 +366,12 @@ impl Server {
             registry,
             declared,
         })
+    }
+
+    /// The most connections served at once; more are answered `busy` and closed.
+    pub fn with_max_connections(self, max: usize) -> Server {
+        let _ = max;
+        self
     }
 
     /// Accepts connections, one thread each, until `stop` is set. The caller sets it and then

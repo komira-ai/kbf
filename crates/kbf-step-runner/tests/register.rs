@@ -49,6 +49,10 @@ struct Rig {
 
 impl Rig {
     fn new(name: &str, uid: u32) -> Rig {
+        Rig::capped(name, uid, None)
+    }
+
+    fn capped(name: &str, uid: u32, cap: Option<usize>) -> Rig {
         let scratch = Scratch::new(name);
         let dir = scratch.path().join("run");
         let state = scratch.path().join("state");
@@ -59,8 +63,12 @@ impl Rig {
         let registry = Arc::new(Registry::load(&state, clock.clone()).unwrap());
         let table = Table(Mutex::new(BTreeMap::from([("svc".to_owned(), grant(uid))])));
         let sock = dir.join("s");
-        let server =
-            Arc::new(Server::bind(&sock, me(), None, registry.clone(), Arc::new(table)).unwrap());
+        let mut server =
+            Server::bind(&sock, me(), None, registry.clone(), Arc::new(table)).unwrap();
+        if let Some(cap) = cap {
+            server = server.with_max_connections(cap);
+        }
+        let server = Arc::new(server);
         Rig {
             scratch,
             clock,
@@ -419,4 +427,67 @@ fn the_server_accepts_on_the_socket_until_stopped() {
     drop(UnixStream::connect(&rig.sock).unwrap());
     loop_thread.join().unwrap().unwrap();
     drop(client);
+}
+
+/// Catches a server that serves any number of connections: with a limit of one, a second peer is
+/// answered `busy` and closed while the first still holds its registration.
+#[test]
+fn connections_over_the_limit_are_answered_busy() {
+    let rig = Rig::capped("reg-cap", me(), Some(1));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (server, flag) = (rig.server.clone(), stop.clone());
+    let loop_thread = std::thread::spawn(move || server.serve(&flag));
+    let first = UnixStream::connect(&rig.sock).unwrap();
+    assert_eq!(say(&first, &registration("2.0.0", None))["ok"], true);
+    let second = UnixStream::connect(&rig.sock).unwrap();
+    second.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(answer(&second)["error"], "busy");
+    assert_eq!(rig.registry.report("svc", Some("2.0.0")), Reported::Healthy);
+    stop.store(true, Ordering::Release);
+    drop(UnixStream::connect(&rig.sock).unwrap());
+    loop_thread.join().unwrap().unwrap();
+    drop(first);
+}
+
+/// Catches a registered peer that can talk for ever: more than the size limit sent after the
+/// registration ends the connection (the service is then stopped) although the peer never closes it.
+#[test]
+fn a_registered_peer_that_floods_is_dropped() {
+    let rig = Rig::new("reg-flood", me());
+    let (client, served) = rig.connect();
+    assert_eq!(say(&client, &registration("2.0.0", None))["ok"], true);
+    (&client).write_all(&vec![b'a'; MAX_LINE + 100]).unwrap();
+    served.join().unwrap().unwrap();
+    assert_eq!(
+        rig.registry.report("svc", Some("2.0.0")),
+        Reported::Unhealthy(Why::Stopped)
+    );
+    drop(client);
+}
+
+/// Catches `stopped` being forgotten across a restart: a service whose connection closed is still
+/// stopped when the registrations are loaded again, not believed healthy until its time-to-live.
+#[test]
+fn a_stopped_service_is_still_stopped_after_a_restart() {
+    let rig = Rig::new("reg-stopped-persist", me());
+    let (client, served) = rig.connect();
+    say(&client, &registration("2.0.0", None));
+    drop(client);
+    served.join().unwrap().unwrap();
+    let after = Registry::load(&rig.scratch.path().join("state"), rig.clock.clone()).unwrap();
+    assert_eq!(
+        after.report("svc", Some("2.0.0")),
+        Reported::Unhealthy(Why::Stopped)
+    );
+}
+
+/// Catches a close that cannot be recorded passing as handled: the error reaches the caller.
+#[test]
+fn a_close_that_cannot_be_kept_is_an_error() {
+    let rig = Rig::new("reg-stopped-unwritable", me());
+    let (client, served) = rig.connect();
+    say(&client, &registration("2.0.0", None));
+    fs::remove_dir_all(rig.scratch.path().join("state")).unwrap();
+    drop(client);
+    assert!(matches!(served.join().unwrap(), Err(RegistryError::Io(_))));
 }

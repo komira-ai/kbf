@@ -214,3 +214,101 @@ fn only_a_closed_directory_of_the_user_is_private() {
             .is_err()
     );
 }
+
+/// Catches a change to the persisted schema: the record, its states and the verdicts are files on
+/// disk that an older or newer updater reads, so their JSON is pinned as written here, and read
+/// back to the same values.
+#[test]
+fn the_record_on_disk_has_this_shape() {
+    let stamp = || Stamp {
+        boot_id: "b".to_owned(),
+        mono_secs: 7,
+    };
+    let verdicts = [
+        (
+            Verdict::Succeeded {
+                promotion_pending: true,
+            },
+            r#"{"Succeeded":{"promotion_pending":true}}"#,
+        ),
+        (
+            Verdict::Failed {
+                phase: Phase::AfterCommit,
+                class: Class::Environment,
+            },
+            r#"{"Failed":{"phase":"after_commit","class":"environment"}}"#,
+        ),
+        (
+            Verdict::Deferred {
+                retry_after_secs: Some(5),
+            },
+            r#"{"Deferred":{"retry_after_secs":5}}"#,
+        ),
+        (
+            Verdict::Deferred {
+                retry_after_secs: None,
+            },
+            r#"{"Deferred":{"retry_after_secs":null}}"#,
+        ),
+        (Verdict::Halt, r#""Halt""#),
+    ];
+    for (verdict, json) in verdicts {
+        assert_eq!(serde_json::to_string(&verdict).unwrap(), json);
+        assert_eq!(serde_json::from_str::<Verdict>(json).unwrap(), verdict);
+    }
+    let states = [
+        (State::Pending, r#"{"state":"pending"}"#),
+        (
+            State::Running {
+                started: stamp(),
+                deadline_secs: 9,
+            },
+            r#"{"state":"running","started":{"boot_id":"b","mono_secs":7},"deadline_secs":9}"#,
+        ),
+        (
+            State::Done {
+                code: Some(75),
+                last_line: Some("{}".to_owned()),
+            },
+            r#"{"state":"done","code":75,"last_line":"{}"}"#,
+        ),
+        (
+            State::Finished {
+                verdict: Verdict::Halt,
+                reason: Some("x".to_owned()),
+            },
+            r#"{"state":"finished","verdict":"Halt","reason":"x"}"#,
+        ),
+    ];
+    for (state, json) in states {
+        assert_eq!(serde_json::to_string(&state).unwrap(), json);
+        assert_eq!(serde_json::from_str::<State>(json).unwrap(), state);
+    }
+    let rec = Record {
+        schema: SCHEMA,
+        service: "svc".to_owned(),
+        target_version: "2.0.0".to_owned(),
+        artifact_digest: "abc".to_owned(),
+        previous_digest: Some("def".to_owned()),
+        generation: 7,
+        params: "/state/params.toml".into(),
+        step: Step::Verify,
+        attempt: 2,
+        state: State::Pending,
+        hook: HookSel::Previous,
+        progress: Progress {
+            committed: true,
+            promotion_pending: false,
+            then: Some(Verdict::Deferred {
+                retry_after_secs: None,
+            }),
+            retry: 2,
+            verify_started: Some(stamp()),
+            watching: None,
+            reason: Some("remote_down".to_owned()),
+        },
+    };
+    let json = r#"{"schema":1,"service":"svc","target_version":"2.0.0","artifact_digest":"abc","previous_digest":"def","generation":7,"params":"/state/params.toml","step":"verify","attempt":2,"state":{"state":"pending"},"hook":"previous","progress":{"committed":true,"promotion_pending":false,"then":{"Deferred":{"retry_after_secs":null}},"retry":2,"verify_started":{"boot_id":"b","mono_secs":7},"watching":null,"reason":"remote_down"}}"#;
+    assert_eq!(serde_json::to_string(&rec).unwrap(), json);
+    assert_eq!(serde_json::from_str::<Record>(json).unwrap(), rec);
+}

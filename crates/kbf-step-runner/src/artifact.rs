@@ -23,6 +23,10 @@ pub enum ArtifactError {
     Unsupported(PathBuf),
     #[error("the staged release changed after it was verified: it was {expected}, it is {found}")]
     Changed { expected: String, found: String },
+    #[error(
+        "{0:?} is not a directory owned by the updater or root and closed to group and others, or is a link"
+    )]
+    Untrusted(PathBuf),
     #[error("the hook path {0:?} is not a relative path of plain names")]
     BadHookPath(PathBuf),
     #[error("the hook {0:?} is not a regular file of the staged release")]

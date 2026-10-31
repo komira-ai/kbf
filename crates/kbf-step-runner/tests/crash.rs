@@ -7,7 +7,8 @@
 mod support;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use kbf_step_runner::{CrashPoint, Finished};
 use support::{DEFER, FAIL, IRREVERSIBLE_OK, OK, PENDING, Rig};
@@ -22,7 +23,13 @@ enum Kind {
     PendingPromotion,
 }
 
-fn script(rig: &Rig, kind: Kind) {
+type Seen = Arc<Mutex<Vec<(Step, u64, bool)>>>;
+
+/// Plays the scenario and watches every run start: the record must say the step is `running`, and
+/// no (step, attempt, watcher) is run twice, so a step the record holds as done never runs again.
+fn arm(rig: &Rig, kind: Kind) -> Seen {
+    let seen: Seen = Arc::default();
+    let cleaned = Arc::new(AtomicBool::new(false));
     match kind {
         Kind::Success => {}
         Kind::VerifyFails => rig.fake.say(Step::Verify, &[FAIL; 4]),
@@ -31,14 +38,48 @@ fn script(rig: &Rig, kind: Kind) {
             rig.fake.say(Step::Verify, &[FAIL; 4]);
         }
         Kind::DeferredVerify => rig.fake.say(Step::Verify, &[DEFER, OK]),
-        Kind::PendingPromotion => rig.fake.say(Step::Verify, &[PENDING, OK]),
+        Kind::PendingPromotion => {
+            // The world decides, so a step run again answers as it did: pending until cleaned up.
+            let done = cleaned.clone();
+            rig.fake.reply_with(move |s| {
+                (s == Step::Verify && !done.load(Ordering::SeqCst)).then_some(PENDING)
+            });
+        }
     }
+    let (record, log) = (rig.state.join("step-record.json"), seen.clone());
+    rig.fake.on_run(move |call| {
+        if call.invocation.step == Step::Cleanup {
+            cleaned.store(true, Ordering::SeqCst);
+        }
+        let rec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        assert_eq!(rec["state"]["state"], "running");
+        let attempt = rec["attempt"].as_u64().unwrap();
+        let watching = !rec["progress"]["watching"].is_null();
+        log.lock()
+            .unwrap()
+            .push((call.invocation.step, attempt, watching));
+    });
+    seen
 }
 
-/// The verdict, the number of record writes and the number of step runs of an uninterrupted update.
-fn baseline(kind: Kind) -> (Finished, u64, u64) {
+/// The steps run, a step run again straight after itself counted once.
+fn sequence(rig: &Rig) -> Vec<Step> {
+    let mut steps = rig.fake.steps();
+    steps.dedup();
+    steps
+}
+
+struct Baseline {
+    done: Finished,
+    writes: u64,
+    runs: u64,
+    steps: Vec<Step>,
+}
+
+fn baseline(kind: Kind) -> Baseline {
     let rig = Rig::new(&format!("crash-base-{kind:?}"));
-    script(&rig, kind);
+    arm(&rig, kind);
     let most = Arc::new(AtomicU64::new(0));
     let seen = most.clone();
     let gate = Arc::new(move |p| {
@@ -47,17 +88,18 @@ fn baseline(kind: Kind) -> (Finished, u64, u64) {
         }
         false
     });
-    let got = rig.runner_gated(gate).run(&rig.order()).unwrap();
-    (
-        got,
-        most.load(Ordering::SeqCst),
-        rig.fake.runs().len() as u64,
-    )
+    let done = rig.runner_gated(gate).run(&rig.order()).unwrap();
+    Baseline {
+        done,
+        writes: most.load(Ordering::SeqCst),
+        runs: rig.fake.runs().len() as u64,
+        steps: sequence(&rig),
+    }
 }
 
-fn crash_once(kind: Kind, id: &str, at: Option<CrashPoint>, lose_run: u64, want: &Finished) {
+fn crash_once(kind: Kind, id: &str, at: Option<CrashPoint>, lose_run: u64, want: &Baseline) {
     let rig = Rig::new(&format!("crash-{id}"));
-    script(&rig, kind);
+    let seen = arm(&rig, kind);
     rig.fake.lose_run.store(lose_run, Ordering::SeqCst);
     let order = rig.order();
     let first = rig
@@ -72,15 +114,23 @@ fn crash_once(kind: Kind, id: &str, at: Option<CrashPoint>, lose_run: u64, want:
             None => rig.runner().run(&order).unwrap(),
         },
     };
-    assert_eq!(&got, want, "{kind:?} killed at {at:?} / run {lose_run}");
+    let what = format!("{kind:?} killed at {at:?} / run {lose_run}");
+    assert_eq!(got, want.done, "{what}");
+    assert_eq!(sequence(&rig), want.steps, "{what}");
+    let mut keys = seen.lock().unwrap().clone();
+    let all = keys.len();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(keys.len(), all, "a step recorded done ran again: {what}");
     if lose_run != 0 {
         // The step the updater died in had its unit stopped by name before anything went on.
-        assert_eq!(rig.fake.stops().len(), 1, "{kind:?} lost run {lose_run}");
+        assert_eq!(rig.fake.stops().len(), 1, "{what}");
     }
 }
 
 fn sweep(kind: Kind) {
-    let (want, writes, runs) = baseline(kind);
+    let want = baseline(kind);
+    let (writes, runs) = (want.writes, want.runs);
     assert!(
         writes >= 8 && runs >= 4,
         "{kind:?}: {writes} writes, {runs} runs"

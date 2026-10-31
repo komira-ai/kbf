@@ -121,6 +121,7 @@ pub enum Event {
 }
 
 type Effect = Box<dyn Fn(&StepCall<'_>) + Send + Sync>;
+type Decide = Box<dyn Fn(Step) -> Option<Reply> + Send + Sync>;
 
 /// A launcher that plays a script: per step, the replies in order, then success.
 #[derive(Default)]
@@ -128,6 +129,7 @@ pub struct Fake {
     pub log: Mutex<Vec<Event>>,
     script: Mutex<BTreeMap<Step, VecDeque<Reply>>>,
     effect: Mutex<Option<Effect>>,
+    decide: Mutex<Option<Decide>>,
     stop_failures: Mutex<u32>,
     /// Hands out run numbers so a test can name the run that is lost.
     runs: AtomicU64,
@@ -149,6 +151,11 @@ impl Fake {
     /// Runs `f` at the start of every run (it may change the world or the clock).
     pub fn on_run(&self, f: impl Fn(&StepCall<'_>) + Send + Sync + 'static) {
         *self.effect.lock().unwrap() = Some(Box::new(f));
+    }
+
+    /// Answers a step from the state of the world; `None` falls back to the script.
+    pub fn reply_with(&self, f: impl Fn(Step) -> Option<Reply> + Send + Sync + 'static) {
+        *self.decide.lock().unwrap() = Some(Box::new(f));
     }
 
     pub fn fail_stops(&self, n: u32) {
@@ -211,12 +218,13 @@ impl StepLauncher for Fake {
         if self.lose_run.load(Ordering::SeqCst) == n {
             return Err(LaunchError::Launcher("the updater died".to_owned()));
         }
-        let reply = self
-            .script
-            .lock()
-            .unwrap()
-            .get_mut(&call.invocation.step)
-            .and_then(VecDeque::pop_front)
+        let step = call.invocation.step;
+        let decided = self.decide.lock().unwrap().as_ref().and_then(|f| f(step));
+        let reply = decided
+            .or_else(|| {
+                let mut script = self.script.lock().unwrap();
+                script.get_mut(&step).and_then(VecDeque::pop_front)
+            })
             .unwrap_or(OK);
         match reply {
             Reply::Exit(code, line) => Ok(StepExit {

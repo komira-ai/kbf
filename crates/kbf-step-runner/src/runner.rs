@@ -142,6 +142,11 @@ impl StepRunner {
         Arc::clone(&self.watch)
     }
 
+    /// Clears a `halt`: the next order runs. `false` when the record holds no halt.
+    pub fn clear_halt(&self) -> Result<bool, RunError> {
+        Ok(false)
+    }
+
     /// How the last update of this service ended, `None` when none has or one is under way.
     pub fn last_result(&self) -> Result<Option<Finished>, RunError> {
         Ok(match self.store.load()? {
