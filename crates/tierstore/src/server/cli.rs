@@ -70,6 +70,10 @@
 //! different start: a read cache in front of one upstream, with none of the above (no proxy, no
 //! tiers to test, no reconciler). `cache_cli.rs` has its start and its checks; the exit statuses
 //! are the same, and a file system under the cache that fails its check is status 3.
+//!
+//! A file with `[cold_store]` alone is a third: a front that sends every call to the cold store,
+//! with no proxy, no hot tier and no reconciler. `cold_cli.rs` has its start; the cold store gets
+//! the whole self-test, the multipart check included, and nothing can be skipped.
 
 use std::ffi::OsString;
 use std::future::Future;
@@ -92,6 +96,7 @@ use crate::{
 };
 
 use super::cache_cli::serve_cache_until_signalled;
+use super::cold_cli::serve_cold_until_signalled;
 use super::config::{Settings, keys_for_flags};
 use super::config_print::render;
 #[cfg(test)]
@@ -743,10 +748,10 @@ pub(super) fn probe_run_id(proxy_id: &str, now: u64, process: u32) -> String {
 
 /// The pause before the first repeat of a check of the self-test that could not reach its tier;
 /// each repeat waits twice as long as the one before.
-const SELF_TEST_FIRST_PAUSE: Duration = Duration::from_secs(1);
+pub(super) const SELF_TEST_FIRST_PAUSE: Duration = Duration::from_secs(1);
 
 /// The longest pause between two attempts at a tier the self-test could not reach.
-const SELF_TEST_MAX_PAUSE: Duration = Duration::from_secs(30);
+pub(super) const SELF_TEST_MAX_PAUSE: Duration = Duration::from_secs(30);
 
 /// Asks each tier the questions of the self-test, the hot tier first, and says on stderr which
 /// checks the flags leave out, a line before and after each tier with how long it took, and
@@ -980,6 +985,7 @@ pub fn main(args: Vec<OsString>) -> ExitCode {
         Settings::Storage(cli) if cli.print_config => return print_config(&cli),
         Settings::Storage(cli) => blocking(serve_until_signalled(*cli)),
         Settings::Cache(cache) => blocking(serve_cache_until_signalled(*cache)),
+        Settings::Cold(cold) => blocking(serve_cold_until_signalled(*cold)),
     };
     match started {
         Ok(()) => ExitCode::SUCCESS,
@@ -1027,6 +1033,10 @@ pub(super) fn checked(settings: &Settings) -> Result<(), Error> {
             Err("--s3-request-timeout must be longer than zero".into())
         }
         Settings::Cache(cache) => server_config(&cache.front, clock).map(drop),
+        Settings::Cold(cold) if cold.s3_request_timeout.is_zero() => {
+            Err("--s3-request-timeout must be longer than zero".into())
+        }
+        Settings::Cold(cold) => server_config(&cold.front, clock).map(drop),
     }
 }
 

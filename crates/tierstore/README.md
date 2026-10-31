@@ -48,6 +48,15 @@ that writes (exit status 3 if not). `tierstore --config <path> --check-config` c
 start does, without touching the network, and exits 0 and prints nothing, or prints the refusal and
 exits 2.
 
+## A cold store alone: a pass-through front
+
+A file with `[server]` and `[cold_store]` and no other tier runs the same binary as a front that
+sends every call (reads, listings, create-only puts, multipart uploads, deletes, presigned puts,
+every key role) straight to the cold store, with no journal, no lease and no reconciler
+(`src/server/cold_cli.rs`, the file's tables in `src/server/config_cold.rs`). Create-only is the
+cold store's: the start asks it the whole self-test, and `skip_checks` is refused. See "A cold store
+alone" in `packaging/tierstore/README.md`.
+
 ## Metrics
 
 `GET /metricz` on the S3 listener (not signed; a bucket cannot be called `metricz`) is the

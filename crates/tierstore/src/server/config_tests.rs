@@ -274,10 +274,11 @@ fn a_fault_inside_a_multi_line_string_shows_nothing_of_the_string() {
 }
 
 /// Asserts that `[local_cache]` along with `[hot_store]` is refused, with the reason, and that a
-/// file with neither shape's tables (`[local_cache]` alone, or a storage node's file missing
-/// `[hot_store]` or `[cold_store]`) is refused for the shape.
+/// file with none of the shapes' tables (`[local_cache]` alone, or a storage node's file missing
+/// `[cold_store]`) is refused for the shape. A storage node's file missing `[hot_store]` is the
+/// pass-through shape (see `config_cold_tests.rs`).
 #[test]
-fn a_local_cache_with_a_hot_store_and_any_shape_but_the_two_are_refused() {
+fn a_local_cache_with_a_hot_store_and_any_shape_but_the_three_are_refused() {
     let cache = format!("{GOLDEN}\n[local_cache]\npath = \"/var/cache\"\n");
     let why = refusal(&cache);
     assert!(
@@ -290,11 +291,8 @@ fn a_local_cache_with_a_hot_store_and_any_shape_but_the_two_are_refused() {
     );
     assert!(refusal(&only_cache).contains("[local_cache] and [cold_store]"));
     let no_cold = minimal_with("[cold_store]\nkind = \"memory\"\n", "");
-    let no_hot = minimal_with("[hot_store]\nkind   = \"memory\"\nbudget = 1000\n", "");
-    for text in [no_cold, no_hot] {
-        let why = refusal(&text);
-        assert!(why.contains("both [hot_store] and [cold_store]"), "{why}");
-    }
+    let why = refusal(&no_cold);
+    assert!(why.contains("both [hot_store] and [cold_store]"), "{why}");
 }
 
 /// Asserts that a key of a tier is refused when it does not fit the tier's kind (a path for a

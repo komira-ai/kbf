@@ -90,7 +90,8 @@
 //! nothing. The roles of those keys are of the key and not of a prefix. A put by the full key
 //! is create-only but, when the hot tier is full, can race another put of the same key into the
 //! cold tier (see [`Proxy`](crate::Proxy)); a presigned PUT never goes to the cold tier of a
-//! proxy, and on a cache with `write_through` it goes to the upstream like every other put.
+//! proxy, on a cache with `write_through` it goes to the upstream like every other put, and with
+//! only a cold store it goes straight to it.
 //! A credential that may write one object under a prefix, and expires, is a presigned PUT URL: see [`presign`], and
 //! [`ServerConfig::presign_keys`] for the keys that sign them (`--presign-key-file` in the binary).
 //! A key that lists, heads and deletes under one prefix, and does nothing else (no get, no put), is a
@@ -175,8 +176,10 @@
 mod auth;
 mod cache_cli;
 pub mod cli;
+mod cold_cli;
 mod config;
 mod config_cache;
+mod config_cold;
 mod config_print;
 mod front;
 pub mod gc;
@@ -201,9 +204,13 @@ mod body_stall_tests;
 #[cfg(test)]
 mod cache_cli_tests;
 #[cfg(test)]
+mod cold_cli_tests;
+#[cfg(test)]
 mod completion_tests;
 #[cfg(test)]
 mod config_cache_tests;
+#[cfg(test)]
+mod config_cold_tests;
 #[cfg(test)]
 mod config_testing;
 #[cfg(test)]
