@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use super::serve::{DEFAULT_WINDOW_SECS, ServeConfig};
+use super::serve::{DEFAULT_WINDOW_SECS, REVERT_RETRY, ServeConfig};
 use crate::plan::{
     ACTIVE_POLL_MILLIS, ACTIVE_WAIT, ACTIVE_WAIT_SECS, IS_ACTIVE_TIMEOUT_SECS, LOCK_TIMEOUT_SECS,
     RESTART_TIMEOUT_SECS, RUNNING_BUILD_TIMEOUT_SECS, RUNTIME_MAX_SECS, Wait, restart_unit,
@@ -46,6 +46,13 @@ fn the_timeout_constants_are_those_of_today() {
          runtime_max_secs=1800\n\
          default_window_secs=600\n"
     );
+}
+
+/// After a revert that failed, the serve loop leaves reverting alone for 30 s before it tries
+/// again.
+#[test]
+fn a_failed_revert_is_left_alone_for_30_seconds() {
+    assert_eq!(REVERT_RETRY, Duration::from_secs(30));
 }
 
 /// The commands and the wait a restart is made of carry those limits: the restart is killed
