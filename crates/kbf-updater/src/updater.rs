@@ -59,7 +59,7 @@
 //! updater is poisoned: every operation answers `state_lost` until [`Updater::reload`] (or a
 //! new process) has read `roll.json` again and so knows what the disk says.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::api::{
@@ -71,6 +71,7 @@ use crate::ports::{
     Placed, PortError, SafeToStop, Stop,
 };
 use crate::record::{FORMAT, Record, RollStore, StoreError, roll_id};
+use crate::server::AuditSink;
 use crate::timing::Timing;
 use crate::version::Version;
 
@@ -164,6 +165,8 @@ pub struct Updater {
     store: RollStore,
     ports: Ports,
     timing: Timing,
+    /// Where the roll's warnings go; nowhere until [`Updater::with_log`].
+    log: AuditSink,
     state: Mutex<State>,
 }
 
@@ -211,6 +214,7 @@ impl Updater {
             store,
             ports,
             timing,
+            log: Arc::new(|_| {}),
             state: Mutex::new(State {
                 rec,
                 driving: false,
@@ -218,6 +222,17 @@ impl Updater {
                 poisoned: false,
             }),
         })
+    }
+
+    /// Send the roll's warnings (a node it leaves out, with the reason) to `log`.
+    pub fn with_log(mut self, log: AuditSink) -> Updater {
+        self.log = log;
+        self
+    }
+
+    /// Say that the roll leaves `host`'s node out, because its cordon is not the roll's.
+    fn warn_left_out(&self, host: &Host) {
+        let _ = (&self.log, host);
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, State> {
@@ -710,6 +725,7 @@ impl Updater {
             )
         })?;
         if placed == Placed::Out {
+            self.warn_left_out(host);
             return Ok(false);
         }
         self.ports

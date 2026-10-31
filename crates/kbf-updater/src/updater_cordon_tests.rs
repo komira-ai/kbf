@@ -3,7 +3,7 @@
 //! back after a failed attempt and a retry and after a restart.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::agent::cordon::OwnCordon;
@@ -302,4 +302,109 @@ fn a_placement_that_cannot_be_read_at_the_give_back_leaves_the_node_drained() {
     assert_eq!(f.code, ErrorCode::UndrainFailed);
     assert!(f.detail.contains("is left drained"), "{}", f.detail);
     assert!(!dm_words(&rig).contains(&"undrain".to_owned()));
+}
+
+/// The roll's log lines, as an updater with `with_log` wrote them.
+fn lines(u: Updater) -> (Updater, Arc<Mutex<Vec<String>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let u = u.with_log(Arc::new(move |line| {
+        sink.lock().expect("lines").push(line.to_owned());
+    }));
+    (u, seen)
+}
+
+fn left_out_lines(seen: &Mutex<Vec<String>>, node: &str) -> usize {
+    let want = format!(
+        "{node}: left out after the roll: its cordon is not marked as this roll's (an operator's, \
+         or placement was unknown at the drain); uncordon it by hand if it should serve"
+    );
+    seen.lock()
+        .expect("lines")
+        .iter()
+        .filter(|l| l.contains(&want))
+        .count()
+}
+
+/// A node an operator drained before the roll is left out, and the roll says so once, at warn,
+/// naming the node.
+///
+/// Catches: a node left out silently, with nothing for the operator to act on.
+#[test]
+fn a_node_left_out_for_an_operators_cordon_is_logged() {
+    let rig = Rig::new("cordon-log-op");
+    rig.drain.operator_drained("dm");
+    serving_never_answers(&rig);
+    let (u, seen) = lines(rig.open());
+    let roll = roll_dm(&u, "k");
+    assert_eq!(roll.state, RollState::Done, "{:?}", roll.failure);
+    assert_eq!(left_out_lines(&seen, "dm-node"), 1, "{:?}", seen.lock());
+    assert!(
+        seen.lock()
+            .expect("lines")
+            .iter()
+            .all(|l| l.starts_with("warn: ")),
+        "{:?}",
+        seen.lock()
+    );
+}
+
+/// A node the roll drained and gave back says nothing.
+///
+/// Catches: the line logged for every give-back.
+#[test]
+fn a_node_the_roll_gave_back_is_not_logged() {
+    let rig = Rig::new("cordon-log-own");
+    let node = ServingNode::new();
+    let (u, seen) = lines(open_with(&rig, own(&rig, &node)));
+    let roll = roll_dm(&u, "k");
+    assert_eq!(roll.state, RollState::Done, "{:?}", roll.failure);
+    assert!(node.is_serving());
+    assert!(seen.lock().expect("lines").is_empty(), "{:?}", seen.lock());
+}
+
+/// A node the frontend does not know at the drain (so nothing is marked) and knows, cordoned,
+/// at the give-back.
+struct LateNode(ServingNode);
+
+impl Drain for LateNode {
+    fn placed(&self, host: &Host) -> Result<Placed, PortError> {
+        self.0.placed(host)
+    }
+    fn placed_if_known(&self, host: &Host) -> Result<Option<Placed>, PortError> {
+        self.0.placed_if_known(host)
+    }
+    fn drain(&self, host: &Host, deadline: Option<Duration>) -> Result<(), PortError> {
+        self.0.drain(host, deadline)?;
+        // The node appears at the frontend, cordoned, once the drain call is over.
+        *self.0.absent.lock().expect("absent") = false;
+        self.0.operator_drains();
+        Ok(())
+    }
+    fn leases(&self, host: &Host) -> Result<usize, PortError> {
+        self.0.leases(host)
+    }
+    fn undrain(&self, host: &Host) -> Result<(), PortError> {
+        self.0.undrain(host)
+    }
+}
+
+/// Catches: an unmarked drain (placement unknown) that leaves the node out with no word.
+#[test]
+fn a_node_drained_unmarked_because_placement_was_unknown_is_logged() {
+    let rig = Rig::new("cordon-log-unknown");
+    let node = ServingNode::new();
+    node.no_node();
+    serving_never_answers(&rig);
+    let drain = Box::new(OwnCordon::new(
+        Arc::new(LateNode(node.clone())),
+        &rig.dir,
+        "roll",
+    ));
+    let (u, seen) = lines(open_with(&rig, drain));
+    let roll = roll_dm(&u, "k");
+    assert_eq!(roll.state, RollState::Done, "{:?}", roll.failure);
+    assert!(!node.is_serving());
+    assert_eq!(marks(&rig.dir), 0);
+    assert_eq!(left_out_lines(&seen, "dm-node"), 1, "{:?}", seen.lock());
 }
