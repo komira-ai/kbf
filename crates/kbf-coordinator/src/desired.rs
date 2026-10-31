@@ -147,8 +147,14 @@ fn write_max_updating<S: serde::Serializer>(limits: &RoleLimits, s: S) -> Result
     s.collect_map(limits.ordered(&LEGACY_ROLES))
 }
 
+/// The minimums in the order the old struct wrote them. The old struct requires `storage` and
+/// `frontend`, so a state that names neither writes them as 0, which is what none means.
 fn write_min_up<S: serde::Serializer>(limits: &RoleLimits, s: S) -> Result<S::Ok, S::Error> {
-    s.collect_map(limits.ordered(&KBF_MIN_UP))
+    let mut written = limits.clone();
+    for role in KBF_MIN_UP {
+        written.0.entry(role.to_owned()).or_insert(0);
+    }
+    s.collect_map(written.ordered(&KBF_MIN_UP))
 }
 
 /// The limits as written, with the four legacy roles filled in with their defaults.
@@ -245,10 +251,32 @@ impl Desired {
         }
         let mut desired: Self = serde_json::from_value(fields.into()).map_err(malformed)?;
         desired.checked(&def.require_min_up)?;
+        desired.refuse_unnamed(services)?;
         let has = |role: &str| def.roles.contains_key(role);
         desired.max_updating.retain(&LEGACY_ROLES, has);
         desired.min_up.retain(&KBF_MIN_UP, has);
         Ok((service, desired))
+    }
+
+    /// Refuses a limits key that is neither a legacy name nor a role of any service, so that a
+    /// typo is an error and not a limit silently lost; one body still serves every service.
+    fn refuse_unnamed(&self, services: &Services) -> Result<(), DesiredError> {
+        let maps = [
+            ("max_updating", &self.max_updating, &LEGACY_ROLES[..]),
+            ("min_up", &self.min_up, &KBF_MIN_UP[..]),
+        ];
+        for (map, limits, legacy) in maps {
+            let unnamed = limits.0.keys().find(|role| {
+                !legacy.contains(&role.as_str())
+                    && !services.defs().any(|def| def.roles.contains_key(*role))
+            });
+            if let Some(role) = unnamed {
+                return Err(DesiredError::Malformed(format!(
+                    "{map}: {role} is no role of any service"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Whether the state is acceptable: every limit key a role name, every count within
