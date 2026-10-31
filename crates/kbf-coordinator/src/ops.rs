@@ -25,8 +25,6 @@
 //! The operator actions ([`operate`]) are the only writers in this PR; nothing reads the
 //! store when it decides what a host is told.
 
-#![allow(dead_code, unused_imports, unused_variables, unused_mut)]
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -37,7 +35,7 @@ use kbf_types::NodeId;
 use kbf_updater::version::Version;
 use serde::{Deserialize, Serialize};
 
-use crate::desired::StoreError;
+use crate::desired::{StoreError, io_at, write_whole};
 use crate::service::Unauthorized;
 use crate::services::Services;
 
@@ -223,7 +221,7 @@ pub enum OpsError {
 }
 
 /// Which order a change reaches the file and memory in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub enum Write {
     /// In memory first, written after: for a change that raises protection (a halt). A
     /// failed write leaves it raised, and the next write carries it.
@@ -279,8 +277,29 @@ impl OpsStore {
     /// # Errors
     /// [`OpsError`]: the file exists and cannot be read, holds a key this build does not
     /// know, or has another schema.
-    pub fn open(_path: &Path) -> Result<Self, OpsError> {
-        Ok(Self::volatile())
+    pub fn open(path: &Path) -> Result<Self, OpsError> {
+        let state = match fs::read(path) {
+            Ok(bytes) => parse(path, &bytes)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => OpsState::default(),
+            Err(source) => {
+                return Err(StoreError::Io {
+                    path: path.to_owned(),
+                    source,
+                }
+                .into());
+            }
+        };
+        let path = path.to_owned();
+        Ok(Self::with_writer(
+            state,
+            Box::new(move |state| {
+                let mut text = serde_json::to_vec_pretty(state)
+                    .map_err(io::Error::from)
+                    .map_err(io_at(&path))?;
+                text.push(b'\n');
+                Ok(write_whole(&path, &text)?)
+            }),
+        ))
     }
 
     /// A store over `state` that puts every change through `write` instead of a file.
@@ -322,6 +341,25 @@ impl OpsStore {
         mut entry: AuditEntry,
         edit: impl FnOnce(&mut OpsState),
     ) -> Result<AuditEntry, OpsError> {
+        let _writer = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut next = self.state();
+        edit(&mut next);
+        entry.seq = next.audit.last().map_or(1, |last| last.seq + 1);
+        next.audit.push(entry.clone());
+        let surplus = next.audit.len().saturating_sub(AUDIT_RING);
+        next.audit.drain(..surplus);
+        match write {
+            Write::AfterMemory => {
+                *self.lock() = next.clone();
+                announce(&entry);
+                (self.write)(&next)?;
+            }
+            Write::BeforeMemory => {
+                (self.write)(&next)?;
+                *self.lock() = next;
+                announce(&entry);
+            }
+        }
         Ok(entry)
     }
 }
@@ -411,10 +449,65 @@ fn label(text: &str) -> bool {
 /// [`OperateError::Invalid`]: the body is no action, or names an unknown service, a bad node
 /// id, a bad reason or bad labels. [`OperateError::Store`]: the file could not be written.
 pub fn operate(
-    _store: &OpsStore,
-    _services: &Services,
-    _by: &str,
-    _body: &[u8],
+    store: &OpsStore,
+    services: &Services,
+    by: &str,
+    body: &[u8],
 ) -> Result<AuditEntry, OperateError> {
-    Err(OperateError::Invalid("not implemented"))
+    let action: Action = serde_json::from_slice(body)
+        .map_err(|_| OperateError::Invalid("the body is not an operator action"))?;
+    Ok(match action {
+        Action::Exclude {
+            service: name,
+            node_id,
+            reason: why,
+        } => {
+            let exclusion = Exclusion {
+                service: service(services, &name)?.to_owned(),
+                node_id: node(&node_id)?,
+                reason: reason(&why)?,
+            };
+            let mut entry = AuditEntry::new(by, "exclude");
+            entry.service = Some(exclusion.service.clone());
+            entry.node_id = Some(exclusion.node_id.clone());
+            entry.reason = Some(exclusion.reason.clone());
+            store.change(Write::BeforeMemory, entry, |state| {
+                state
+                    .excluded
+                    .retain(|e| e.service != exclusion.service || e.node_id != exclusion.node_id);
+                state.excluded.push(exclusion);
+            })?
+        }
+        Action::Include {
+            service: name,
+            node_id,
+        } => {
+            let (name, id) = (service(services, &name)?.to_owned(), node(&node_id)?);
+            let mut entry = AuditEntry::new(by, "include");
+            entry.service = Some(name.clone());
+            entry.node_id = Some(id.clone());
+            store.change(Write::BeforeMemory, entry, |state| {
+                state
+                    .excluded
+                    .retain(|e| e.service != name || e.node_id != id);
+            })?
+        }
+        Action::SetLabels { node_id, labels } => {
+            let id = node(&node_id)?;
+            if labels.len() > MAX_LABELS || !labels.iter().all(|(k, v)| label(k) && label(v)) {
+                return Err(OperateError::Invalid(
+                    "labels are at most 8, each key and value 1 to 32 bytes of [a-z0-9-]",
+                ));
+            }
+            let mut entry = AuditEntry::new(by, "set_labels");
+            entry.node_id = Some(id.clone());
+            store.change(Write::BeforeMemory, entry, |state| {
+                if labels.is_empty() {
+                    state.hosts.remove(&id);
+                } else {
+                    state.hosts.insert(id, HostOps { labels });
+                }
+            })?
+        }
+    })
 }
