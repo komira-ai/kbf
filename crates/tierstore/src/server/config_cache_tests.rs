@@ -36,6 +36,7 @@ low_water  = 60
 critical   = 97
 free_floor = 15
 max_concurrent_fills = 6
+write_through = true
 cache      = true
 scrub_rate = "50MiB/s"
 
@@ -150,6 +151,7 @@ fn a_build_node_file_makes_a_cache() {
     assert_eq!((config.fill_chunk, config.whole_limit), (8 << 20, 64 << 20));
     assert_eq!((FILL_CHUNK, WHOLE_FILL_LIMIT), (8 << 20, 64 << 20));
     assert_eq!(config.max_concurrent_fills, 6);
+    assert!(config.write_through);
     let upstream = &cache.upstream;
     assert_eq!(upstream.spec, "s3:tierstore");
     assert_eq!(upstream.endpoint.as_deref(), Some("http://192.0.2.20:9300"));
@@ -191,6 +193,10 @@ fn a_build_node_file_has_the_defaults_of_the_flags_and_of_the_cache() {
         (90, 75, 95, 10)
     );
     assert_eq!(config.max_concurrent_fills, 4);
+    assert!(
+        !config.write_through,
+        "a file that leaves it out is a read cache"
+    );
     assert_eq!(config.budget, 1000);
     assert_eq!(cache.front.region, "us-east-1");
     assert_eq!(cache.front.max_request_bytes, 256 << 20);
@@ -312,7 +318,10 @@ fn a_build_node_file_is_refused_when_it_cannot_be_run() {
             cache_with("high_water = 85", "high_water = 101"),
             "local_cache.high_water",
         ),
-        (cache_with("\"50MiB/s\"", "\"fast\""), "not a rate"),
+        (
+            cache_with("\"50MiB/s\"", "\"fast\""),
+            "expected a rate such as",
+        ),
         (cache_with("\"50MiB/s\"", "50"), "scrub_rate"),
         (no_cache_policy, "no policy has cache = true"),
         (
@@ -435,6 +444,10 @@ fn a_build_node_file_is_refused_when_it_cannot_be_run() {
         let why = refusal(&text);
         assert!(why.contains(want), "{want}: {why}");
     }
+    // A rate that does not parse is refused naming its key, and the value is not shown.
+    let why = refusal(&cache_with("\"50MiB/s\"", "\"fast\""));
+    assert!(why.contains("scrub_rate"), "{why}");
+    assert!(!why.contains("fast"), "{why}");
 }
 
 /// Asserts the edges of the water marks: a low water mark one under the high one, a high one
@@ -501,7 +514,12 @@ fn a_storage_node_refuses_a_list_of_endpoints_and_a_cache_policy() {
         "[hot_store]\nendpoints = [\"http://h:1\"]\n",
         1,
     );
-    let cold = format!("{GOLDEN}endpoints = [\"http://c:1\"]\n");
+    // Put in [cold_store] itself, not at the end of the file, which ends with another table.
+    let cold = GOLDEN.replacen(
+        "[cold_store]\n",
+        "[cold_store]\nendpoints = [\"http://c:1\"]\n",
+        1,
+    );
     for (text, key) in [(hot, "hot_store.endpoints"), (cold, "cold_store.endpoints")] {
         let why = refusal(&text);
         assert!(why.contains(key), "{why}");
@@ -526,6 +544,17 @@ fn a_storage_node_refuses_a_list_of_endpoints_and_a_cache_policy() {
     assert!(why.contains("keeps no cache"), "{why}");
 }
 
+/// Asserts that a build node's file with an `[oci]` table is refused, with a message that names
+/// `oci`, whether or not the table has `listen`.
+#[test]
+fn a_build_node_refuses_an_oci_table() {
+    for table in ["listen = \"127.0.0.1:5000\"", "prefix = \"cas/\""] {
+        let why = refusal(&format!("{CACHE}\n[oci]\n{table}\n"));
+        assert!(why.contains("oci"), "{why}");
+        assert!(why.contains("build node"), "{why}");
+    }
+}
+
 /// Asserts that a rate reads as a size and `/s`, is refused otherwise, and is written back as a
 /// rate that reads as the same.
 #[test]
@@ -535,7 +564,7 @@ fn a_rate_is_a_size_and_a_per_second() {
     assert_eq!(rate("7B/s").unwrap(), Rate(7));
     for bad in ["50MiB", "x/s", "-1B/s", "/s", "1 B/s"] {
         let why = rate(bad).unwrap_err().to_string();
-        assert!(why.contains("not a rate"), "{bad}: {why}");
+        assert!(why.contains("a rate such as"), "{bad}: {why}");
     }
     let why = serde_json::from_str::<Rate>("5").unwrap_err().to_string();
     assert!(why.contains("a rate such as"), "{why}");
@@ -554,7 +583,7 @@ fn a_build_node_file_written_back_makes_the_same_settings() {
 }
 
 /// The keys of `[local_cache]`, which the README of the packaging must document each in a row.
-const LOCAL_CACHE_KEYS: [&str; 10] = [
+const LOCAL_CACHE_KEYS: [&str; 11] = [
     "path",
     "layout",
     "budget",
@@ -563,6 +592,7 @@ const LOCAL_CACHE_KEYS: [&str; 10] = [
     "critical",
     "free_floor",
     "max_concurrent_fills",
+    "write_through",
     "cache",
     "scrub_rate",
 ];

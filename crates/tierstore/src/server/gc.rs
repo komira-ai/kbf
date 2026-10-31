@@ -34,7 +34,8 @@
 //! malformed-request error rather than 403.
 //!
 //! A delete through the proxy removes the object from both tiers and journals the delete, as for
-//! any key. **A delete by a GC key is not create-only: it is the only way an object leaves
+//! any key; through a cache with `write_through` it drops the cache's copy of the object and then
+//! deletes it at the upstream (there is no journal). **A delete by a GC key is not create-only: it is the only way an object leaves
 //! `cas/b/`**, since the presigning key can only create, and the full key is not meant for the
 //! frontend.
 

@@ -1,5 +1,5 @@
 //! The start of a build node: a [`LocalCache`] in front of one upstream, served by the S3 front
-//! as a read cache.
+//! as a read cache, or as a cache that writes through when the file says `write_through`.
 //!
 //! The settings come from a file of the build-node shape (see
 //! [`config_cache`](super::config_cache)). Before the address is bound the start asks the file
@@ -9,9 +9,15 @@
 //! the key is accepted (an upstream that does not answer is exit status 1: a restart may mend
 //! it). A `budget` above the size of the file system less the `free_floor` is refused as
 //! flags that cannot go together (exit status 2); a file system whose size cannot be read, or
-//! that reports 0 bytes, is not judged: the start says so on stderr and goes on. The build
-//! node's upstream is read with a read-only key, so the write checks of the storage node's
-//! self-test are not run against it.
+//! that reports 0 bytes, is not judged: the start says so on stderr and goes on.
+//!
+//! Without `write_through` the build node's upstream is read with a read-only key, so the write
+//! checks of the storage node's self-test are not run against it. With it the node writes to the
+//! upstream, and the start runs the whole self-test there (a create-only put that refuses a key
+//! that exists, a multipart completion that does the same, and the reads the checks rest on)
+//! under probe keys in `_tiering/selftest/`, which it deletes. An upstream that answers one of
+//! them wrongly, a key that may not write included, is exit status 3; one that does not answer is
+//! exit status 1, after the one try that the check of the start gives it.
 //!
 //! An S3 upstream is a list of one or more endpoints (see [`endpoints`](super::endpoints)), all
 //! taken to be ready at the start (the HEAD above is the start's check), and a poll of every
@@ -31,7 +37,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
-use crate::{Backend, Clock, Error as BackendError, SystemClock};
+use crate::{Backend, Clock, Error as BackendError, SelfTestOptions, SystemClock, self_test};
 
 use super::cli::{Error, S3Flags, open_tier, probe_run_id, signals};
 use super::config_cache::CacheSettings;
@@ -54,6 +60,28 @@ async fn reach(upstream: &dyn Backend, run: &str, spec: &str) -> Result<(), Erro
             Err(format!("cold tier {spec}: the upstream did not answer a HEAD: {why}").into())
         }
     }
+}
+
+/// Asks the upstream the questions of the self-test, all of them: the node is about to write
+/// to it. A key that may not write, or a store whose create-only answers are wrong, is a
+/// violation (exit status 3); an upstream that cannot be asked is exit status 1. The upstream
+/// has just answered `reach`, so the checks are tried once each.
+async fn test_upstream(upstream: &dyn Backend, run: &str, spec: &str) -> Result<(), Error> {
+    let name = format!("cold tier {spec}");
+    let options = SelfTestOptions {
+        name: &name,
+        run_id: run,
+        multipart: true,
+        skip: &[],
+        wait: Duration::ZERO,
+        pause: Duration::from_secs(1),
+        max_pause: Duration::from_secs(30),
+    };
+    let note = |line: String| eprintln!("tierstore: {line}");
+    eprintln!("tierstore: testing the {name} for writes");
+    self_test(upstream, &options, &note).await?;
+    eprintln!("tierstore: tested the {name}");
+    Ok(())
 }
 
 /// The size of the file system under `path` in bytes, or why it is not known: the system did not
@@ -155,6 +183,10 @@ pub(super) async fn serve_cache_over(
     let run = probe_run_id(&settings.front.proxy_id, clock.now(), std::process::id());
     let cache = open(&settings.cache, &upstream, &disk, &run).await?;
     reach(&*upstream, &run, &settings.upstream.spec).await?;
+    if settings.cache.write_through {
+        test_upstream(&*upstream, &run, &settings.upstream.spec).await?;
+        config.cache_writes = true;
+    }
     if let Some(rate) = settings.scrub_rate {
         eprintln!("tierstore: scrub_rate {rate} B/s is accepted; this release does not scrub");
     }
@@ -235,7 +267,12 @@ pub(super) async fn run_cache(
 pub(super) async fn serve_cache_until_signalled(settings: CacheSettings) -> Result<(), Error> {
     let stop = signals()?;
     let version = env!("CARGO_PKG_VERSION");
-    let announce = |addr: SocketAddr| println!("tierstore {version} listen={addr} mode=read-cache");
+    let mode = if settings.cache.write_through {
+        "write-through-cache"
+    } else {
+        "read-cache"
+    };
+    let announce = |addr: SocketAddr| println!("tierstore {version} listen={addr} mode={mode}");
     let drained = run_cache(&settings, stop, announce).await?;
     eprint!("{}", super::cli::cut_note(drained));
     Ok(())

@@ -4,7 +4,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
@@ -15,7 +15,7 @@ use tokio::sync::Semaphore;
 
 use crate::{
     Backend, ByteRange, Error, FaultyBackend, Listed, MemoryBackend, Meta, Op, OpenUpload,
-    TestClock, UploadsAfter,
+    PartBody, TestClock, UploadsAfter,
 };
 
 use super::layout::{data_path, name_of};
@@ -42,6 +42,19 @@ pub(in crate::server) struct Tamper {
     pub(in crate::server) panic_once: AtomicBool,
     /// The gate and the one key it holds (every key if none).
     gate: Mutex<Option<Gate>>,
+    /// The gate that holds a read after it has read the object, and the one key it holds.
+    after: Mutex<Option<Gate>>,
+    /// The reads that have read their object and wait at `after`, counted when they arrive.
+    parked: AtomicU64,
+    /// The gate that holds a delete before it deletes.
+    deletes: Mutex<Option<Arc<Semaphore>>>,
+    /// The deletes that wait at `deletes`, counted when they arrive.
+    deleting: AtomicU64,
+    /// The next delete is applied and then answers with an `Unavailable` error, as a store does
+    /// whose answer is lost after it committed.
+    pub(in crate::server) lose_delete_answer: AtomicBool,
+    /// What `needs_length` says.
+    pub(in crate::server) needs_len: AtomicBool,
 }
 
 /// A semaphore that reads wait on, and the key whose reads wait (every key if none).
@@ -55,7 +68,42 @@ impl Tamper {
             fail_once: AtomicBool::new(false),
             panic_once: AtomicBool::new(false),
             gate: Mutex::new(None),
+            after: Mutex::new(None),
+            parked: AtomicU64::new(0),
+            deletes: Mutex::new(None),
+            deleting: AtomicU64::new(0),
+            lose_delete_answer: AtomicBool::new(false),
+            needs_len: AtomicBool::new(false),
         }
+    }
+
+    /// Holds every delete from now on, before it deletes, until a permit is added to the gate
+    /// that is returned.
+    pub(in crate::server) fn hold_deletes(&self) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        let mut held = self.deletes.lock().unwrap_or_else(PoisonError::into_inner);
+        *held = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// How many deletes have arrived at the gate of [`hold_deletes`](Self::hold_deletes).
+    pub(in crate::server) fn deleting(&self) -> u64 {
+        self.deleting.load(Ordering::SeqCst)
+    }
+
+    /// Holds the reads of `key` from now on after they have read the object, until a permit is
+    /// added to the gate that is returned: the bytes are in hand, and the answer is not given.
+    pub(in crate::server) fn hold_key_after_read(&self, key: &str) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        let mut held = self.after.lock().unwrap_or_else(PoisonError::into_inner);
+        *held = Some((Some(key.to_owned()), Arc::clone(&gate)));
+        gate
+    }
+
+    /// How many reads have read their object and wait at the gate of
+    /// [`hold_key_after_read`](Self::hold_key_after_read).
+    pub(in crate::server) fn parked(&self) -> u64 {
+        self.parked.load(Ordering::SeqCst)
     }
 
     /// Holds every read from now on until a permit is added to the gate that is returned.
@@ -79,6 +127,10 @@ impl Tamper {
 
 #[async_trait]
 impl Backend for Tamper {
+    fn needs_length(&self) -> bool {
+        self.needs_len.load(Ordering::SeqCst)
+    }
+
     async fn put(&self, key: &str, body: Bytes) -> Result<(), Error> {
         self.memory.put(key, body).await
     }
@@ -106,6 +158,16 @@ impl Backend for Tamper {
             ));
         }
         let body = self.memory.get(key, range).await?;
+        let after = self
+            .after
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some((_, gate)) = after.filter(|(only, _)| only.as_deref().is_none_or(|k| k == key))
+        {
+            let _ = self.parked.fetch_add(1, Ordering::SeqCst);
+            gate.acquire().await.expect("the gate stays open").forget();
+        }
         if self.short.load(Ordering::SeqCst) {
             return Ok(body.slice(..body.len().saturating_sub(1)));
         }
@@ -117,7 +179,20 @@ impl Backend for Tamper {
     }
 
     async fn delete(&self, key: &str) -> Result<(), Error> {
-        self.memory.delete(key).await
+        let gate = self
+            .deletes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(gate) = gate {
+            let _ = self.deleting.fetch_add(1, Ordering::SeqCst);
+            gate.acquire().await.expect("the gate stays open").forget();
+        }
+        self.memory.delete(key).await?;
+        if self.lose_delete_answer.swap(false, Ordering::SeqCst) {
+            return Err(Error::Unavailable("the answer was lost".to_owned()));
+        }
+        Ok(())
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<Listed>, Error> {
@@ -126,6 +201,29 @@ impl Backend for Tamper {
 
     async fn create_upload(&self, key: &str) -> Result<String, Error> {
         self.memory.create_upload(key).await
+    }
+
+    async fn upload_part(
+        &self,
+        key: &str,
+        id: &str,
+        number: u32,
+        body: PartBody<'_>,
+    ) -> Result<String, Error> {
+        self.memory.upload_part(key, id, number, body).await
+    }
+
+    async fn complete_upload(
+        &self,
+        key: &str,
+        id: &str,
+        parts: &[(u32, String)],
+    ) -> Result<String, Error> {
+        self.memory.complete_upload(key, id, parts).await
+    }
+
+    async fn abort_upload(&self, key: &str, id: &str) -> Result<(), Error> {
+        self.memory.abort_upload(key, id).await
     }
 
     async fn list_uploads(
@@ -276,6 +374,18 @@ impl Rig {
         Self::with(name, |_| {})
     }
 
+    /// The same, with `write_through` on.
+    pub(in crate::server) fn writing(name: &str) -> Self {
+        Self::with(name, |config| config.write_through = true)
+    }
+
+    /// The files in the stage directory of the cache now.
+    pub(in crate::server) fn staged_files(&self) -> usize {
+        std::fs::read_dir(self.config.path.join(".stage"))
+            .expect("the stage directory")
+            .count()
+    }
+
     /// The same, with the settings changed by `change`.
     pub(in crate::server) fn with(name: &str, change: impl FnOnce(&mut CacheConfig)) -> Self {
         let dir = TestDir::under(std::env::temp_dir(), name);
@@ -328,6 +438,13 @@ impl Rig {
     pub(in crate::server) async fn put(&self, key: &str, body: &[u8]) {
         let body = Bytes::copy_from_slice(body);
         self.tamper.put(key, body).await.expect("a put");
+    }
+
+    /// Writes other bytes over an object the upstream holds (its `put` refuses a key that exists,
+    /// so the old object is deleted first).
+    pub(in crate::server) async fn replace(&self, key: &str, body: &[u8]) {
+        self.tamper.delete(key).await.expect("a delete");
+        self.put(key, body).await;
     }
 
     /// A whole read through the cache.

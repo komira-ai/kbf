@@ -99,15 +99,16 @@ pub fn tarball_of(file: &str) -> Option<String> {
     facts_of(&tarball).map(|_| tarball)
 }
 
-/// Whether `verify-assets sums` holds each listed `kbf` tarball to listing its facts.
+/// Whether `verify-assets sums` holds each listed `kbf` tarball to listing its facts, and each
+/// listed task image to listing its facts and its SBOM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pairing {
-    /// A `kbf` tarball without its facts is refused: every release made since the build
-    /// jobs record them.
+    /// A `kbf` tarball without its facts, or a task image without its facts or its SBOM, is
+    /// refused: every release made since the build jobs record them.
     Required,
-    /// A `kbf` tarball may go without facts: the release before the build jobs recorded
-    /// them, which `release check previous` reads. Facts without their tarball are
-    /// refused either way.
+    /// A `kbf` tarball may go without facts, and a task image without facts or SBOM: the release
+    /// before the build jobs recorded them, which `release check previous` reads. Facts and an
+    /// SBOM without their tarball or image are refused either way.
     Waived,
 }
 

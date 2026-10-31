@@ -242,6 +242,9 @@ const GROUPS: &[(&str, &[&str])] = &[
             "job-grant-secret-file",
             "job-listen",
             "job-max-blob-bytes",
+            "job-plain-http",
+            "job-read-budget-bytes",
+            "job-read-idle-secs",
             "job-reads-in-flight",
             "job-tls-cert",
             "job-tls-key",
@@ -273,6 +276,7 @@ const GROUPS: &[(&str, &[&str])] = &[
         "executor",
         &[
             "executor",
+            "executor-allow-plain-http-grant",
             "executor-allow-plain-http-put",
             "executor-arch",
             "executor-base-image",

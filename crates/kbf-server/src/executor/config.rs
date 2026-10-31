@@ -122,6 +122,10 @@ pub struct Config {
     pub work_dir: Option<String>,
     /// Whether the task may `PUT` over plain http.
     pub allow_plain_http_put: bool,
+    /// Whether the task may read its inputs through a read grant served over plain http, and
+    /// the executor may post a run whose grant url is `http://` (the bearer token then crosses
+    /// the job network in clear).
+    pub allow_plain_http_grant: bool,
     /// The most bytes of a pack the frontend takes.
     pub max_pack_bytes: u64,
     /// The most bytes of one blob in a pack.
@@ -236,6 +240,7 @@ impl Config {
             insecure_argv_secrets: false,
             work_dir: None,
             allow_plain_http_put: false,
+            allow_plain_http_grant: false,
             max_pack_bytes: 128 << 20,
             max_blob_bytes: 64 << 20,
             presign_ceiling: PRESIGN_LIMIT,
