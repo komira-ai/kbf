@@ -176,8 +176,22 @@ pub struct ColdState {
     pub percent_done: Option<f64>,
     /// The drives the admin info listed, sorted by id.
     pub drives: Vec<DriveState>,
-    /// When it was read, milliseconds since the Unix epoch.
+    /// When it was read, milliseconds since the Unix epoch: by this tool for `mc`, by the
+    /// writer of the status file (its own stamp) for `file`.
     pub read_unix_ms: u64,
+    /// Where the reading came from; absent in results written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ColdSource>,
+}
+
+/// Where a [`ColdState`] came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColdSource {
+    /// The operator's heal status file, stamped by its writer.
+    File,
+    /// `mc admin info` of the cold role.
+    Mc,
 }
 
 /// The reading taken before one pass of an arm.
@@ -450,6 +464,7 @@ mod tests {
                         healing: true,
                     }],
                     read_unix_ms: 1_500,
+                    source: Some(ColdSource::File),
                 },
             }],
         }
