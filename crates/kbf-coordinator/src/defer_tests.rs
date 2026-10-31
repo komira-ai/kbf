@@ -130,6 +130,7 @@ fn a_deferred_host_is_not_ordered_before_not_before_and_is_at_it() {
 #[test]
 fn the_backoff_doubles_per_episode_and_stops_at_the_cap() {
     let mut farm = Farm::new("");
+    farm.beat("d1", beat("1.0"), 1_000);
     let mut at = 1_000;
     for wait in [300, 600, 1_200, 2_400, 3_600, 3_600] {
         assert_eq!(farm.ask("d1", at), update("2.0"), "ordered at {at}");
@@ -212,6 +213,7 @@ fn an_update_that_starts_ends_the_episodes() {
 #[test]
 fn the_definitions_backoff_is_the_one_used() {
     let mut farm = Farm::new("defer_backoff = { initial_secs = 10, factor = 3, max_secs = 100 }");
+    farm.beat("d1", beat("1.0"), 1_000);
     let mut at = 1_000;
     for wait in [10, 30, 90, 100] {
         assert_eq!(farm.ask("d1", at), update("2.0"));
