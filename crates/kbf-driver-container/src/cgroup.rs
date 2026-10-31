@@ -68,12 +68,12 @@ pub fn cpu_weight(cpu_millis: u64) -> Option<u64> {
 /// ([`SwapWatch`]): a rise in swap between two samples across which `max` grew is the
 /// lease's own (reclaim at its cap moved it there); a rise across which `max` did not
 /// grow is not (host pressure, or the `actions/` limit, moved it there while the lease
-/// was below its cap); a fall comes out of the lease's own share first. It kills the
-/// lease (`cgroup.kill`, every process in it) when, all three at once, `max` grew
-/// since the previous sample, `memory.swap.current` rose since the previous sample,
-/// and the lease's own share is above [`SwapKill::threshold`]: the lease is at its
-/// own cap now, reclaim at that cap is still moving it into swap, and what it put
-/// there itself is past the margin. The kill is reported as the lease's own
+/// was below its cap), unless `max` grew across the sample before and the lease still
+/// holds about its cap in RAM (the swap-out of one reclaim at the cap outlasts the
+/// `max` event that began it); a fall comes out of the lease's own share first. It kills the
+/// lease (`cgroup.kill`, every process in it) when its own share is above
+/// [`SwapKill::threshold`]: the lease is at its own cap, reclaim at that cap moved
+/// it into swap, and what it put there itself is past the margin. The kill is reported as the lease's own
 /// out-of-memory kill.
 ///
 /// So swap that host pressure moves while the lease is below its cap (no `max`
@@ -117,6 +117,11 @@ impl SwapKill {
     }
 }
 
+/// A lease holds "about its cap" in RAM when `memory.current` is within this fraction
+/// (1/8) of `memory.max`: reclaim at the cap runs while the lease keeps faulting, and
+/// a sample inside it read 96 % of the cap.
+const AT_CAP_SLACK: u64 = 8;
+
 /// One sample of a lease cgroup for [`SwapKill`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Pressure {
@@ -155,28 +160,42 @@ pub(crate) struct SwapWatch {
     last: Pressure,
     /// Of `last.swap`, what the lease did not push there at its cap.
     not_own: u64,
+    /// The lease's `memory.max`.
+    cap: u64,
+    /// Whether `max` grew across the last sample.
+    grew: bool,
 }
 
 impl SwapWatch {
     /// The watch of a new lease, killed past `threshold` bytes of its own swap.
-    pub(crate) fn new(threshold: u64) -> Self {
+    pub(crate) fn new(threshold: u64, cap: u64) -> Self {
         Self {
             threshold,
+            cap,
             last: Pressure::default(),
             not_own: 0,
+            grew: false,
         }
     }
 
     /// Takes the sample `now` and says whether [`SwapKill`] kills the lease: what it
     /// pushed into swap itself at its cap ([`SwapWatch::own`]) is now above the
-    /// threshold. That share grows only across a sample in which `max` grew and swap
-    /// rose, so the kill comes only at such a sample: the lease is pressing its cap
-    /// into swap now.
+    /// threshold. That share grows only across a sample in which swap rose and `max`
+    /// grew, or `max` grew across the sample before and the lease still holds about
+    /// its cap in RAM: the lease is pressing its cap into swap now.
     pub(crate) fn kills(&mut self, now: Pressure) -> bool {
-        let pressed = now.max > self.last.max;
+        let grew = now.max > self.last.max;
+        // The kernel counts a `max` event when a charge at the cap first fails, then
+        // swaps pages out for a few hundred milliseconds with no further event, so
+        // the rest of that reclaim shows in the next sample with `max` unchanged, the
+        // lease still holding about its cap in RAM. Host reclaim of a lease below its
+        // cap takes its RAM down with it.
+        let at_cap = now.current >= self.cap - self.cap / AT_CAP_SLACK;
+        let pressed = grew || (self.grew && at_cap);
         if now.swap > self.last.swap && !pressed {
             self.not_own = self.not_own.saturating_add(now.swap - self.last.swap);
         }
+        self.grew = grew;
         // A fall comes out of the lease's own share first: the rest is what is left.
         self.not_own = self.not_own.min(now.swap);
         self.last = now;
@@ -204,7 +223,7 @@ pub(crate) async fn presses_into_swap(
         return std::future::pending().await;
     }
     // The lease cgroup is new, so its `max` events and its swap count from 0.
-    let mut watch = SwapWatch::new(threshold);
+    let mut watch = SwapWatch::new(threshold, cap.unwrap_or(0));
     loop {
         tokio::time::sleep(every).await;
         // Three file reads that can wait on the kernel: not on an async worker.
@@ -787,18 +806,25 @@ mod tests {
     }
 
     const MIB: u64 = 1 << 20;
+    /// The cap of the leases the samples describe, and the RAM they hold: at it.
+    const CAP: u64 = 536 * MIB;
 
     /// The index of the sample, fed in order to the watch of a new lease, at which it
     /// kills the lease: each sample is (`memory.events` `max`, `memory.swap.current`).
     fn killed_at(samples: &[(u64, u64)], threshold: u64) -> Option<usize> {
-        let mut watch = SwapWatch::new(threshold);
-        samples.iter().position(|&(max, swap)| {
-            watch.kills(Pressure {
-                max,
-                current: 0,
-                swap,
-            })
-        })
+        let held: Vec<_> = samples
+            .iter()
+            .map(|&(max, swap)| (max, CAP, swap))
+            .collect();
+        killed_at_holding(&held, threshold)
+    }
+
+    /// As [`killed_at`], with each sample's `memory.current` too: (`max`, RAM, swap).
+    fn killed_at_holding(samples: &[(u64, u64, u64)], threshold: u64) -> Option<usize> {
+        let mut watch = SwapWatch::new(threshold, CAP);
+        samples
+            .iter()
+            .position(|&(max, current, swap)| watch.kills(Pressure { max, current, swap }))
     }
 
     /// Catches the false positive seen on the real-crun arm job (a lease killed as out of memory
@@ -818,11 +844,11 @@ mod tests {
         }
         samples.push((7800, 143_265_792));
         assert_eq!(killed_at(&samples, 8 * MIB), None);
-        let mut watch = SwapWatch::new(8 * MIB);
+        let mut watch = SwapWatch::new(8 * MIB, CAP);
         for &(max, swap) in &samples {
             watch.kills(Pressure {
                 max,
-                current: 0,
+                current: CAP,
                 swap,
             });
         }
@@ -860,6 +886,35 @@ mod tests {
         assert_eq!(killed_at(&samples[..4], 8 * MIB), None);
     }
 
+    /// Catches a reclaim at the cap whose swap-out spans two samples being credited to
+    /// the host. The kernel counts one `max` event when a charge at the cap first
+    /// fails, then swaps pages out for a few hundred milliseconds with no further
+    /// event; a sample that lands inside that window sees `max` already counted and
+    /// the swap still rising. Seen on a runner at 50 ms: `max` 1 from 24 MB to 241 MB
+    /// of swap, and on a failed run `max` 1 across the rise from under the threshold
+    /// to 439 MB, then `max` 1241 with swap flat (the buffer was all out already).
+    #[test]
+    fn swap_rising_in_the_sample_after_the_first_max_event_is_the_leases_own() {
+        let samples = [
+            (0, 0),
+            (1, 100 * MIB),
+            (1, 439 * MIB),
+            (1241, 441 * MIB),
+            (2211, 441 * MIB),
+        ];
+        assert_eq!(killed_at(&samples, 128 * MIB), Some(2));
+        // Two samples after the event is host swap again, and a rise with no event at
+        // all in the previous sample is the host's.
+        let samples = [(1, 0), (1, MIB), (1, 439 * MIB)];
+        assert_eq!(killed_at(&samples, 128 * MIB), None);
+        let samples = [(0, 0), (0, 439 * MIB), (1, 440 * MIB)];
+        assert_eq!(killed_at(&samples, 128 * MIB), None);
+        // The sample after the event finds the lease well below its cap: the host's
+        // reclaim took its RAM down with it, not the lease's own pressure.
+        let samples = [(1, CAP, 0), (1, CAP / 4, 439 * MIB)];
+        assert_eq!(killed_at_holding(&samples, 128 * MIB), None);
+    }
+
     /// Catches a share reset when the lease's `max` events pause (a lease pressing its
     /// cap into swap in bursts never killed), and swap the host moves during the pause
     /// counted as the lease's. The lease pushes 5 MiB at its cap, pauses (`max` flat)
@@ -874,8 +929,14 @@ mod tests {
             (20, 109 * MIB),
         ];
         assert_eq!(killed_at(&samples, 8 * MIB), Some(3));
-        let samples = [(10, 5 * MIB), (10, 105 * MIB), (20, 106 * MIB)];
-        assert_eq!(killed_at(&samples, 8 * MIB), None);
+        // Also in the sample right after the lease's last `max` event, when the host's
+        // reclaim has taken the lease's RAM well below its cap.
+        let samples = [
+            (10, CAP, 5 * MIB),
+            (10, CAP / 2, 105 * MIB),
+            (20, CAP, 106 * MIB),
+        ];
+        assert_eq!(killed_at_holding(&samples, 8 * MIB), None);
     }
 
     /// Catches a fall in swap taken from the host's share first: pages read back at the
@@ -901,7 +962,7 @@ mod tests {
     fn swap_without_max_events_or_max_events_without_swap_kill_nothing() {
         assert_eq!(killed_at(&[(0, 1 << 40)], 8 * MIB), None);
         assert_eq!(
-            killed_at(&[(3, 0), (3, 1 << 40), (3, 1 << 41)], 8 * MIB),
+            killed_at_holding(&[(3, 0, 0), (3, 0, 1 << 40), (3, 0, 1 << 41)], 8 * MIB),
             None
         );
         assert_eq!(killed_at(&[(9, 0), (99, 0), (999, 0)], 8 * MIB), None);
