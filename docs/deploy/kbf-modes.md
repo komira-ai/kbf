@@ -178,7 +178,10 @@ presigned write and the read token are never part of an error, a log line or a m
 private home, on top of the bytes of its inputs and a fixed 1 GiB margin),
 `--executor-allow-plain-http-put` (until the store serves TLS), and
 `--executor-allow-plain-http-grant` (a read listener without TLS, on a farm's own network; both
-plain-http flags are off by default). A setting that breaks a rule
+plain-http flags are off by default), and `--executor-locate` (off by default: the task is given
+`--locate`, asks the listener's `GET /locate` once and reads each input straight from the store the
+answer names, from the listener when that read fails; with no grants in the answer it reads from the
+listener as before; refused with `--executor kbf-daemon`). A setting that breaks a rule
 the executor's safety rests on (the fence time against the scheduler's grace, the lease ttl
 against the longest run) is refused at start, exit status 2.
 

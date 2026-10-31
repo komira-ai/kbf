@@ -172,6 +172,9 @@ impl TaskArgs<'_> {
         if self.allow_plain_http_grant {
             argv.push("--allow-plain-http-grant".to_owned());
         }
+        if self.locate {
+            argv.push("--locate".to_owned());
+        }
         argv
     }
 }
