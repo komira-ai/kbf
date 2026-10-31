@@ -341,7 +341,7 @@ nothing is kept. A body that is cut leaves nothing at the upstream or in the cac
 `/metricz` has `tierstore_cache_writes_through_total` (puts the upstream took),
 `tierstore_cache_write_exists_total` (puts answered 412) and
 `tierstore_cache_write_keep_skipped_total{reason}` with the reasons `budget` (also a body of no
-declared length), `io`, `busy`, `head`, `deleted`, `slow` (the disk did not keep up) and `deadline` (the copy was abandoned);
+declared length), `io`, `busy`, `head`, `deleted`, `slow` (the disk did not keep up), `deadline` (the copy was abandoned) and `read_only` (on main, not in v0.0.41: the cache does not hold the lock of its directory, so it copies nothing);
 `tierstore_cache_keeps_expired_total` counts the puts answered before their copy was done.
 
 ```toml
@@ -568,6 +568,7 @@ the flags of the binary against this table, so a flag added without a key fails 
 | `--copy-parallel` | `hot_store.copy_parallel` | the most objects the reconciler copies at once |
 | `--lease-ttl` | `hot_store.lease_ttl` | how long the reconciler's lease lasts without a renewal |
 | `--reconcile-interval` | `hot_store.reconcile_interval` | how often the reconciler works |
+| `--lock-file` | `hot_store.lock_file` | the lock file the reconciler works under: only the process that holds it reconciles (on main, not in v0.0.41) |
 | `--usage-stale-after` | `hot_store.usage_stale_after` | how old the published usage may be before `/usagez` says 503 |
 | `--max-request-bytes` | `server.max_request_bytes` | the longest body of a request |
 | `--max-concurrent-puts` | `server.max_concurrent_puts` | the most put bodies and parts taken at once |

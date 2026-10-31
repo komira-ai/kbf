@@ -52,6 +52,7 @@ use super::cli::{
 use super::config_cache::{CacheSettings, LocalCacheTable};
 use super::front::FrontSettings;
 use super::listen::{Addrs, has_duplicate};
+use super::lock::check_lock_path;
 use crate::journal::{JOURNAL_PREFIX, TIERING_PREFIX};
 
 /// The flags that stay flags: the file is for the data path, and these are per run.
@@ -102,6 +103,7 @@ pub(super) const KEYS: &[(&str, &[&str])] = &[
     ("copy-parallel", &["hot_store.copy_parallel"]),
     ("lease-ttl", &["hot_store.lease_ttl"]),
     ("reconcile-interval", &["hot_store.reconcile_interval"]),
+    ("lock-file", &["hot_store.lock_file"]),
     ("usage-stale-after", &["hot_store.usage_stale_after"]),
     ("max-request-bytes", &["server.max_request_bytes"]),
     ("max-concurrent-puts", &["server.max_concurrent_puts"]),
@@ -405,6 +407,8 @@ pub(super) struct TierTable {
     pub lease_ttl: Option<Dur>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconcile_interval: Option<Dur>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_stale_after: Option<Dur>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -794,6 +798,7 @@ pub(super) fn refuse_hot_keys(cold: &TierTable) -> Result<(), ConfigError> {
         ("copy_parallel", cold.copy_parallel.is_some()),
         ("lease_ttl", cold.lease_ttl.is_some()),
         ("reconcile_interval", cold.reconcile_interval.is_some()),
+        ("lock_file", cold.lock_file.is_some()),
         ("usage_stale_after", cold.usage_stale_after.is_some()),
         ("journal_linger", cold.journal_linger.is_some()),
         ("journal_retention", cold.journal_retention.is_some()),
@@ -897,6 +902,11 @@ fn storage(
     let critical = percent("critical", hot.critical, 95)?;
     let copy_parallel = hot.copy_parallel.unwrap_or(16);
     let copy_parallel = within("hot_store", "copy_parallel", copy_parallel, 1, u32::MAX)?;
+    let lock_file = hot.lock_file.clone();
+    if let Some(path) = &lock_file {
+        check_lock_path(path)
+            .map_err(|why| invalid("hot_store.lock_file", format!("{path:?} {why}")))?;
+    }
     let oci = oci(oci_table)?;
     let shared = front_of(server, per_run)?;
     let front = shared.front;
@@ -935,6 +945,7 @@ fn storage(
         copy_parallel,
         lease_ttl: duration(hot.lease_ttl, Duration::from_secs(30)),
         reconcile_interval: duration(hot.reconcile_interval, Duration::from_secs(5)),
+        lock_file,
         usage_stale_after: duration(hot.usage_stale_after, Duration::from_secs(120)),
         max_request_bytes: front.max_request_bytes,
         max_concurrent_puts: front.max_concurrent_puts,
