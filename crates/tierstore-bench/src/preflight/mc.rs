@@ -27,6 +27,9 @@ const ALIAS: &str = "tbops";
 /// The quota on a test bucket: 30 GiB, in the unit `mc` takes.
 pub const QUOTA_SIZE: &str = "30GiB";
 
+/// [`QUOTA_SIZE`] in bytes.
+pub const QUOTA_BYTES: u64 = 30 * 1024 * 1024 * 1024;
+
 /// `text` with every byte outside `A-Z a-z 0-9 - . _ ~` as `%XX`.
 #[must_use]
 pub fn percent_encode(text: &str) -> String {
@@ -117,13 +120,18 @@ impl<'a> Mc<'a> {
         args: &[&str],
         input: Option<String>,
     ) -> Result<String, BenchError> {
+        run_ok(self.host, what, &self.command(args, input))
+    }
+
+    /// The command line of `mc` with `args` after the global flags.
+    fn command(&self, args: &[&str], input: Option<String>) -> Cmd {
         let config_dir = self.config_dir.display().to_string();
         let mut all = vec!["--config-dir", config_dir.as_str(), "--json"];
         all.extend_from_slice(args);
         let mut cmd = Cmd::new(&self.program, &all)
             .with_env(&format!("MC_HOST_{ALIAS}"), self.alias_url.clone());
         cmd.stdin = input;
-        run_ok(self.host, what, &cmd)
+        cmd
     }
 
     /// `alias/bucket`.
@@ -152,6 +160,36 @@ impl<'a> Mc<'a> {
         Ok(json_lines("mc ls", &out)?
             .iter()
             .any(|line| line.get("key").and_then(Value::as_str) == Some(wanted.as_str())))
+    }
+
+    /// Whether the store has the bucket `bucket`, asked of the bucket alone (`mc ls` of
+    /// `alias/bucket`), which needs only the right to list that bucket. A bucket that is not
+    /// there and one that may not be listed both exit 1 and read the same: the caller needs the
+    /// bucket and may list it, or stops.
+    ///
+    /// # Errors
+    /// [`BenchError::Ops`] if the command cannot be started.
+    pub fn bucket_present(&self, bucket: &str) -> Result<bool, BenchError> {
+        let cmd = self.command(&["ls", &Self::target(bucket)], None);
+        let out = self
+            .host
+            .run(&cmd)
+            .map_err(|e| BenchError::Ops(format!("mc ls: cannot start: {:?}", e.kind())))?;
+        Ok(out.success)
+    }
+
+    /// The hard quota of `bucket` in bytes (`mc quota info`, which needs `admin:GetBucketQuota`
+    /// and nothing that changes anything), or `None` if the answer carries no quota or a quota
+    /// of 0.
+    ///
+    /// # Errors
+    /// [`BenchError::Ops`] if the command fails or a line of its answer is not JSON.
+    pub fn quota_info(&self, bucket: &str) -> Result<Option<u64>, BenchError> {
+        let out = self.run("mc quota info", &["quota", "info", &Self::target(bucket)])?;
+        Ok(json_lines("mc quota info", &out)?
+            .iter()
+            .find_map(|line| line.get("quota").and_then(Value::as_u64))
+            .filter(|bytes| *bytes > 0))
     }
 
     /// Whether the store has an account whose access key id is `access_key_id` (`mc admin user
