@@ -881,3 +881,17 @@ fn a_state_directory_open_to_others_is_refused() {
     ));
     assert!(rig.fake.events().is_empty());
 }
+
+/// Catches a service name with `-` or `_` being refused: both are in the name grammar and carry
+/// into the unit names.
+#[test]
+fn a_service_name_may_hold_dashes_and_underscores() {
+    let rig = Rig::new("run-name");
+    let mut order = rig.order();
+    order.service = "my-svc_1".to_owned();
+    assert_eq!(rig.runner().run(&order).unwrap(), ok());
+    let support::Event::Run { unit, .. } = &rig.fake.runs()[0] else {
+        unreachable!()
+    };
+    assert_eq!(unit, "updater-my-svc_1-prepare-1");
+}

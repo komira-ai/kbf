@@ -196,8 +196,10 @@ impl RecordStore {
     pub fn check_private(&self) -> Result<(), RecordError> {
         use std::os::unix::fs::MetadataExt;
         let meta = fs::symlink_metadata(&self.dir)?;
+        // One comparison: a directory, mine, and closed to group and others.
         let mine = meta.uid() == rustix::process::geteuid().as_raw();
-        if meta.is_dir() && mine && meta.mode() & 0o077 == 0 {
+        let private = (meta.is_dir(), mine, meta.mode() & 0o077 == 0);
+        if private == (true, true, true) {
             return Ok(());
         }
         Err(RecordError::Io(io::Error::new(

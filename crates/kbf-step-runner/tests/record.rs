@@ -175,3 +175,42 @@ fn the_params_file_is_written_where_the_store_says() {
     assert_eq!(store.params_path(), dir.path().join(PARAMS_FILE));
     assert_eq!(fs::read_to_string(store.params_path()).unwrap(), "a = 1\n");
 }
+
+/// Catches a params file left behind or a removal that hides an error: removing one that is
+/// there removes it, one that is not there is fine, and one that cannot be removed is an error.
+#[test]
+fn removing_the_params_file_reports_only_real_errors() {
+    let dir = Scratch::new("rec-rm-params");
+    let store = RecordStore::new(dir.path());
+    store.save_params("a = 1\n").unwrap();
+    store.remove_params().unwrap();
+    assert!(!store.params_path().exists());
+    store.remove_params().unwrap();
+    fs::create_dir(store.params_path()).unwrap();
+    assert!(matches!(store.remove_params(), Err(RecordError::Io(_))));
+}
+
+/// Catches a private-directory check that passes a file, a link or a directory others can enter.
+#[test]
+fn only_a_closed_directory_of_the_user_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Scratch::new("rec-private");
+    let closed = dir.path().join("closed");
+    fs::create_dir(&closed).unwrap();
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o700)).unwrap();
+    RecordStore::new(&closed).check_private().unwrap();
+    let file = dir.path().join("file");
+    fs::write(&file, "").unwrap();
+    assert!(RecordStore::new(&file).check_private().is_err());
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&closed, &link).unwrap();
+    assert!(RecordStore::new(&link).check_private().is_err());
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o770)).unwrap();
+    let err = RecordStore::new(&closed).check_private().unwrap_err();
+    assert!(err.to_string().contains("private directory"));
+    assert!(
+        RecordStore::new(&dir.path().join("absent"))
+            .check_private()
+            .is_err()
+    );
+}

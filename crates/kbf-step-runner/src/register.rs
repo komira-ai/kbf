@@ -433,7 +433,7 @@ fn reply(stream: &UnixStream, error: Option<&'static str>) -> Result<(), Registr
         ok: error.is_none(),
         error,
     })
-    .map_err(|e| RegistryError::Corrupt(e.to_string()))?;
+    .unwrap_or_default();
     line.push(b'\n');
     let mut out = stream;
     Ok(out.write_all(&line)?)
