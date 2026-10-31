@@ -59,7 +59,7 @@ const fn two() -> u32 {
 impl Default for MaxUpdating {
     fn default() -> Self {
         Self {
-            frontend: two(),
+            frontend: one(),
             storage: one(),
             daemon: two(),
             mac_daemon: two(),

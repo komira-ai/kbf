@@ -75,7 +75,7 @@ impl Host {
             .last_update
             .as_ref()
             .is_some_and(|r| r.outcome == Outcome::Failed);
-        self.beat.updating.is_some() || (failed && self.beat.health != Health::Healthy && false)
+        self.beat.updating.is_some() || (failed && self.beat.health != Health::Healthy)
     }
 }
 
