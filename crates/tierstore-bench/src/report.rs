@@ -673,6 +673,7 @@ mod tests {
                     percent_done: None,
                     drives: vec![],
                     read_unix_ms: 7,
+                    source: None,
                 },
             })
             .collect();

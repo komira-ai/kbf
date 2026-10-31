@@ -7,7 +7,8 @@ use std::fs;
 
 use tierstore_bench::error::BenchError;
 use tierstore_bench::preflight::{
-    self, PreflightReport, Snapshot, gather, heal_state, instance_leftovers, run_with, why,
+    self, PreflightReport, Snapshot, gather, gather_at, heal_state, instance_leftovers, run_with,
+    why,
 };
 use tierstore_bench::result::Check;
 
@@ -763,4 +764,101 @@ async fn run_reads_the_ops_file_and_on_a_machine_without_the_fixtures_it_fails_i
     assert!(text.contains("pinned-binary-digest"), "{text}");
     assert!(dir.path().join("preflight.json").exists());
     assert!(dir.path().join("before.json").exists());
+}
+
+/// The cold store only, file mode: no cold admin entry, the status file `text`, any command
+/// refused.
+fn file_mode_report(name: &str, text: &str, now_ms: u64) -> (FakeHost, PreflightReport) {
+    let (dir, host, _config, ops) = base(name);
+    let only_cold = run_config(dir.path(), "http://host-mark:9000", None);
+    host.file("/private-mark/heal.json", text);
+    host.answer(|cmd| {
+        if cmd.program.ends_with("mc") {
+            failed(1, "mc must not run in file mode")
+        } else {
+            ok("not-found\n")
+        }
+    });
+    let report = gather_at(&host, &only_cold, &file_mode(&ops), now_ms);
+    (host, report)
+}
+
+/// Catches a file mode that spends an `mc` call, a version that is not the file's, a heal state
+/// that is not the file's and a fresh file that fails a check: both store checks pass on a fresh
+/// file, the version and the heal state in the report are the file's, and no `mc` ran.
+#[test]
+fn file_mode_takes_the_version_and_the_heal_state_from_a_fresh_file() {
+    let (host, report) = file_mode_report("tb-pre-file", &status_file(NOW_MS - 1_000), NOW_MS);
+    let version = find(&report, "store-version:cold");
+    assert!(version.passed, "{}", version.detail);
+    assert!(
+        version.detail.contains("RELEASE.2025-file-mark"),
+        "{}",
+        version.detail
+    );
+    assert_eq!(
+        report.tool_versions.get("cold-store").map(String::as_str),
+        Some("RELEASE.2025-file-mark")
+    );
+    let heal = find(&report, "cold-heal-state");
+    assert!(heal.passed);
+    assert_eq!(heal.detail, "healing 12% done");
+    assert!(
+        host.ran().iter().all(|c| !c.program.ends_with("mc")),
+        "{:?}",
+        host.ran()
+    );
+}
+
+/// Catches a file with no version failing the check, or passing without saying the version is
+/// unknown, and the version being invented.
+#[test]
+fn file_mode_without_a_version_says_so_and_passes() {
+    let text = format!(r#"{{"read_unix_ms": {NOW_MS}, "healing": false, "drives": []}}"#);
+    let (_host, report) = file_mode_report("tb-pre-file-nover", &text, NOW_MS);
+    let version = find(&report, "store-version:cold");
+    assert!(version.passed);
+    assert_eq!(version.detail, "version unknown (file mode)");
+    assert!(!report.tool_versions.contains_key("cold-store"));
+    assert_eq!(find(&report, "cold-heal-state").detail, "none");
+}
+
+/// Catches a stale or future file passing the preflight, and a missing or malformed one: the
+/// version check and the heal-state check both fail, with the freshness reason, at 30 s old
+/// (the limit of the configuration) but not at 30 s exactly.
+#[test]
+fn file_mode_fails_on_a_stale_future_or_bad_file() {
+    let (_h, report) = file_mode_report("tb-pre-file-edge", &status_file(NOW_MS - 30_000), NOW_MS);
+    assert!(find(&report, "store-version:cold").passed);
+    for (what, text) in [
+        ("stale", status_file(NOW_MS - 30_001)),
+        ("future", status_file(NOW_MS + 5_001)),
+        ("no stamp", r#"{"healing": false, "drives": []}"#.to_owned()),
+        ("malformed", "nope".to_owned()),
+    ] {
+        let (_h, report) = file_mode_report("tb-pre-file-bad", &text, NOW_MS);
+        for name in ["store-version:cold", "cold-heal-state"] {
+            let c = find(&report, name);
+            assert!(!c.passed, "{what}: {name}: {}", c.detail);
+        }
+    }
+    let (_h, report) = file_mode_report("tb-pre-file-stale", &status_file(NOW_MS - 31_000), NOW_MS);
+    assert!(find(&report, "store-version:cold").detail.contains("old"));
+    let (_h, report) = file_mode_report("tb-pre-file-fut", &status_file(NOW_MS + 9_000), NOW_MS);
+    assert!(find(&report, "cold-heal-state").detail.contains("future"));
+}
+
+/// Catches a role with an admin entry changing: the same status file, stale, does not matter to
+/// the checks when the admin entry answers (mc first, as before).
+#[test]
+fn with_an_admin_entry_the_preflight_is_unchanged() {
+    let (dir, host, _config, ops) = base("tb-pre-file-admin");
+    let only_cold = run_config(dir.path(), "http://host-mark:9000", None);
+    host.file("/private-mark/heal.json", &status_file(1));
+    let report = gather_at(&host, &only_cold, &ops, NOW_MS);
+    assert!(find(&report, "store-version:cold").passed);
+    assert_eq!(
+        find(&report, "store-version:cold").detail,
+        "RELEASE.2025-mark"
+    );
 }

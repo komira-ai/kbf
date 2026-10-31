@@ -457,6 +457,18 @@ fn paper_checks(host: &dyn Host, ops: &OpsFile) -> Vec<Check> {
 /// Runs every check against `host` and returns the report. Writes nothing.
 #[must_use]
 pub fn gather(host: &dyn Host, config: &RunConfig, ops: &OpsFile) -> PreflightReport {
+    gather_at(host, config, ops, crate::s3::unix_ms())
+}
+
+/// [`gather`], the time now being `_now_ms` (milliseconds since the Unix epoch): the clock a
+/// status file's stamp is compared with.
+#[must_use]
+pub fn gather_at(
+    host: &dyn Host,
+    config: &RunConfig,
+    ops: &OpsFile,
+    _now_ms: u64,
+) -> PreflightReport {
     let mut report = PreflightReport::default();
     let (binary, digest) = binary_checks(host, ops, &mut report.snapshot);
     report.binary_digest = digest;

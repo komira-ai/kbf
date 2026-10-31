@@ -28,7 +28,7 @@ use crate::preflight::host::{Cmd, CmdOutput, Host};
 use crate::preflight::mc::Mc;
 use crate::preflight::ops::OpsFile;
 use crate::preflight::{heal_percent, is_healing, live::sha256_hex};
-use crate::result::{ColdState, DriveState};
+use crate::result::{ColdSource, ColdState, DriveState};
 use crate::role::Role;
 use crate::s3::unix_ms;
 
@@ -71,7 +71,12 @@ pub struct OpsColdState {
     ops: OpsFile,
     spec: StoreSpec,
     result_dir: PathBuf,
+    max_age: Duration,
+    now_ms: NowMs,
 }
+
+/// The clock of file mode: milliseconds since the Unix epoch now.
+pub type NowMs = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 impl OpsColdState {
     /// A source for the cold store `spec`, asked with the cold admin key the ops file names;
@@ -83,7 +88,23 @@ impl OpsColdState {
             ops,
             spec,
             result_dir,
+            max_age: Duration::from_secs(30),
+            now_ms: Arc::new(unix_ms),
         }
+    }
+
+    /// The oldest a status file's stamp may be in file mode (30 s unless set).
+    #[must_use]
+    pub fn with_max_age(mut self, max_age: Duration) -> Self {
+        self.max_age = max_age;
+        self
+    }
+
+    /// The clock the status file's stamp is compared with (the system clock unless set).
+    #[must_use]
+    pub fn with_clock(mut self, now_ms: NowMs) -> Self {
+        self.now_ms = now_ms;
+        self
     }
 
     /// One reading, its commands stopped (and killed) once `stop` is set.
@@ -109,6 +130,7 @@ impl OpsColdState {
             percent_done: percent,
             drives: info.as_ref().map(drives_of).unwrap_or_default(),
             read_unix_ms: unix_ms(),
+            source: Some(ColdSource::Mc),
         }))
     }
 }

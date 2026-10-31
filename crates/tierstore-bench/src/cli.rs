@@ -200,12 +200,15 @@ fn provenance(
 /// nothing if the run has no cold store.
 fn cold_source(config: &RunConfig, ops: &OpsFile) -> Arc<dyn ColdStateSource> {
     match config.stores.get(&Role::Cold) {
-        Some(spec) => Arc::new(OpsColdState::new(
-            Arc::new(SystemHost),
-            ops.clone(),
-            spec.clone(),
-            config.result_dir.clone(),
-        )),
+        Some(spec) => Arc::new(
+            OpsColdState::new(
+                Arc::new(SystemHost),
+                ops.clone(),
+                spec.clone(),
+                config.result_dir.clone(),
+            )
+            .with_max_age(config.cold_state_max_age),
+        ),
         None => Arc::new(NoColdState),
     }
 }
