@@ -338,6 +338,28 @@ pub fn check_tarball(tgz: &[u8], files: &Files) -> Vec<String> {
     problems
 }
 
+/// The `stage-task-tree` verb: `binary` (a file named `kbf-task`) copied, mode 0755, to `<out>/kbf-task` in a
+/// directory made new for it, the one tree `js-bundle pack` packs. The line to print.
+pub fn stage_tree(binary: &Path, out: &Path) -> Result<String, Error> {
+    if binary.file_name().and_then(|n| n.to_str()) != Some(BUNDLE_NAME) {
+        return Err(Error::Failed(format!(
+            "{} is not a file named {BUNDLE_NAME}",
+            binary.display()
+        )));
+    }
+    let bytes = read(binary)?;
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(Error::spawn(format!("create {}", parent.display())))?;
+    }
+    std::fs::create_dir(out).map_err(Error::spawn(format!("create {}", out.display())))?;
+    let file = out.join(BUNDLE_NAME);
+    write_new(&file, &bytes)?;
+    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .map_err(Error::spawn(format!("chmod {}", file.display())))?;
+    Ok(format!("staged {} as {}", binary.display(), file.display()))
+}
+
 /// The `package-task-bundle` verb: the lines to print.
 pub fn package_task_bundle(
     layout: &Path,

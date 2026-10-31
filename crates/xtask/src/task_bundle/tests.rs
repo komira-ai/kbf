@@ -273,3 +273,36 @@ fn a_commit_that_is_not_one_is_refused() {
     let err = package_task_bundle(&dir, &dir, "main", &dir).expect_err("commit");
     assert!(matches!(err, Error::NotACommit(_)), "{err}");
 }
+
+#[test]
+fn the_tree_is_a_new_directory_holding_the_binary_alone_mode_0755() {
+    // Asserts: `<out>/kbf-task` has the binary's bytes and mode 0755 and is the only entry; an existing
+    // directory is refused; a binary not named kbf-task is refused, and nothing is made for it.
+    let dir = scratch("tree");
+    let bin = dir.join("target/kbf-task");
+    std::fs::create_dir_all(bin.parent().expect("parent")).expect("dirs");
+    std::fs::write(&bin, b"signed bytes").expect("binary");
+    let out = dir.join("tmp/task-tree");
+    stage_tree(&bin, &out).expect("stages");
+    assert_eq!(
+        std::fs::read(out.join("kbf-task")).expect("file"),
+        b"signed bytes"
+    );
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(out.join("kbf-task"))
+            .expect("meta")
+            .permissions(),
+    );
+    assert_eq!(mode & 0o777, 0o755);
+    assert_eq!(std::fs::read_dir(&out).expect("list").count(), 1);
+    let again = stage_tree(&bin, &out).expect_err("existing directory");
+    assert!(again.to_string().contains("create"), "{again}");
+    let other = dir.join("target/kbf-other");
+    std::fs::write(&other, b"x").expect("other");
+    let wrong = stage_tree(&other, &dir.join("tmp/other-tree")).expect_err("name");
+    assert!(
+        wrong.to_string().contains("is not a file named kbf-task"),
+        "{wrong}"
+    );
+    assert!(!dir.join("tmp/other-tree").exists());
+}

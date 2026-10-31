@@ -8,11 +8,12 @@
 //! 1. build `kbf-task` once for `$TARGET`, `--release --locked`, with no feature (the macOS confine is the
 //!    default; `unconfined-for-tests` is `no_darwin_task`'s to refuse everywhere);
 //! 2. sign that binary (`cargo xtask sign-darwin`), as the other Mac tools are signed;
-//! 3. fetch the pinned `js-bundle` archive (`cargo xtask fetch`, url `v$JS_BUNDLE_VERSION`, sha256
-//!    `$JS_BUNDLE_SHA256_AARCH64_DARWIN`), verify its attestation (`gh attestation verify` for the jobscheduler
-//!    repository, its `release.yml`, `refs/heads/main` and the commit `$JS_BUNDLE_SOURCE_DIGEST`), and only then
-//!    take the program out of that same local file (`tar -xzf`), not out of a second download;
-//! 4. copy the signed binary into the tree directory, and `js-bundle pack` that directory
+//! 3. fetch the pinned `js-bundle` with one command, `cargo xtask fetch-attested-tool` (url `v$JS_BUNDLE_VERSION`,
+//!    sha256 `$JS_BUNDLE_SHA256_AARCH64_DARWIN`, the pinned `gh`, the jobscheduler repository, its `release.yml`,
+//!    `refs/heads/main` and the commit `$JS_BUNDLE_SOURCE_DIGEST`), which checks the digest and the
+//!    attestation of the downloaded file and takes the program out of that file (`xtask::fetch_attested`
+//!    holds those checks); the plain `cargo xtask fetch` of that archive is refused;
+//! 4. stage the signed binary alone in the tree directory (`cargo xtask stage-task-tree`), and `js-bundle pack` it
 //!    (`--tree task=<dir>`), with the bundle named `kbf-task`, the entrypoint `kbf-task` and the macOS the
 //!    binaries are built for (`--os-version "$MACOSX_DEPLOYMENT_TARGET"`);
 //! 5. `js-bundle verify` the layout the pack wrote, then `cargo xtask package-task-bundle` it with the SBOM of
@@ -91,11 +92,6 @@ fn line_of(
     found: impl Fn(&str) -> bool,
 ) -> Option<&str> {
     lines(&steps[at?]).find(|l| found(l))
-}
-
-/// Whether `line` is a `gh attestation verify` of the pinned archive for the jobscheduler release workflow.
-fn verifies_archive(line: &str) -> bool {
-    line.contains("/gh attestation verify ")
 }
 
 fn is_fetch_of_archive(line: &str) -> bool {
@@ -186,106 +182,63 @@ pub fn rules(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
             .is_some_and(|a| a.first().is_some_and(|b| base(b) == "kbf-task"))
     };
     let sign = one("sign kbf-task", &steps, out, is_sign);
-    let is_download = is_fetch_of_archive;
-    let download = one(
-        "fetch the pinned js-bundle archive",
-        &steps,
-        out,
-        is_download,
-    );
+    // The archive is fetched, checked against its digest and its attestation, and unpacked by one command
+    // (`cargo xtask fetch-attested-tool`): the plain `cargo xtask fetch` checks the digest only.
     for step in &steps {
         for line in lines(step).filter(|l| is_fetch_of_archive(l)) {
-            let a = args(line, "cargo xtask fetch ").unwrap_or_default();
-            if flag(&a, "--sha256") != Some(SHA_VAR) {
-                out.push(format!(
-                    "`{DARWIN_JOB}`: a fetch of the js-bundle archive is not pinned by `--sha256 \"{SHA_VAR}\"`: {line}"
-                ));
-            }
-        }
-    }
-    // The program is taken out of the file the attestation check read, not out of a second download.
-    let is_unpack = |l: &str| l.contains("&& tar ") || l.starts_with("tar ");
-    let unpack = one("take js-bundle out of the archive", &steps, out, is_unpack);
-    if let Some(line) = line_of(&steps, unpack, is_unpack) {
-        let a = words(line);
-        let downloaded = download
-            .and_then(|d| line_of(&steps, Some(d), is_download))
-            .and_then(|l| flag(&words(l), "--out"));
-        let member = "js-bundle-$JS_BUNDLE_VERSION-$TARGET/js-bundle";
-        if flag(&a, "-xzf").is_none()
-            || flag(&a, "-xzf") != downloaded
-            || flag(&a, "-C") != Some("$RUNNER_TEMP/tools")
-            || !a.contains(&"--strip-components=1")
-            || a.last() != Some(&member)
-        {
             out.push(format!(
-                "`{DARWIN_JOB}`: the unpack does not take `{member}` out of the archive the attestation check read ({downloaded:?}) into `$RUNNER_TEMP/tools`: {line}"
+                "`{DARWIN_JOB}`: the js-bundle archive is fetched with `cargo xtask fetch`, which does not check its attestation; use `cargo xtask fetch-attested-tool`: {line}"
             ));
         }
     }
-    let verify = one(
-        "verify the attestation of the js-bundle archive",
+    let is_gh = |l: &str| {
+        args(l, "cargo xtask fetch ")
+            .is_some_and(|a| flag(&a, "--out") == Some("$RUNNER_TEMP/tools/gh"))
+    };
+    let gh = one("fetch the pinned gh", &steps, out, is_gh);
+    let is_fetch = |l: &str| args(l, "cargo xtask fetch-attested-tool ").is_some();
+    let fetch = one(
+        "fetch js-bundle, checked against its digest and its attestation",
         &steps,
         out,
-        verifies_archive,
+        is_fetch,
     );
-    if let Some(line) = line_of(&steps, verify, verifies_archive) {
-        let a = words(line);
-        let archive = flag(&a, "verify");
-        let downloaded = download
-            .and_then(|d| line_of(&steps, Some(d), is_download))
-            .and_then(|l| flag(&words(l), "--out"));
-        if archive.is_none() || archive != downloaded {
-            out.push(format!(
-                "`{DARWIN_JOB}`: the attestation check is not of the archive the fetch wrote ({downloaded:?}): {line}"
-            ));
-        }
+    if let Some(line) = line_of(&steps, fetch, is_fetch) {
+        let a = args(line, "cargo xtask fetch-attested-tool ").unwrap_or_default();
         for (name, want) in [
+            ("--url", RELEASE_URL),
+            ("--sha256", SHA_VAR),
+            (
+                "--archive",
+                "$RUNNER_TEMP/js-bundle-release/js-bundle-$JS_BUNDLE_VERSION-$TARGET.tar.gz",
+            ),
+            ("--member", "js-bundle-$JS_BUNDLE_VERSION-$TARGET/js-bundle"),
+            ("--out", "$RUNNER_TEMP/tools/js-bundle"),
+            ("--gh", "$RUNNER_TEMP/tools/gh"),
             ("--repo", "komira-ai/jobscheduler"),
             (
                 "--signer-workflow",
                 "komira-ai/jobscheduler/.github/workflows/release.yml",
-            ),
-            (
-                "--cert-oidc-issuer",
-                "https://token.actions.githubusercontent.com",
             ),
             ("--source-ref", "refs/heads/main"),
             ("--source-digest", "$JS_BUNDLE_SOURCE_DIGEST"),
         ] {
             if flag(&a, name) != Some(want) {
                 out.push(format!(
-                    "`{DARWIN_JOB}`: the attestation check of the js-bundle archive lacks `{name} {want}`: {line}"
+                    "`{DARWIN_JOB}`: the js-bundle fetch lacks `{name} {want}`: {line}"
                 ));
             }
         }
     }
-    let tree_copy = one("copy kbf-task into the bundle's tree", &steps, out, |l| {
-        l.starts_with("mkdir ") && l.contains("&& cp ")
-    });
-    let tree = tree_copy
-        .and_then(|i| line_of(&steps, Some(i), |l| l.contains("&& cp ")))
-        .map(words);
-    let tree_dir = tree.as_ref().and_then(|w| {
-        w.iter()
-            .position(|x| *x == "-p")
-            .and_then(|i| w.get(i + 1))
-            .copied()
-    });
-    if let Some(w) = &tree {
-        let cp = w.iter().position(|x| *x == "cp").map(|i| &w[i + 1..]);
-        let expected = tree_dir.map(|d| format!("{d}/kbf-task"));
-        if cp
-            != Some(
-                &[
-                    "target/$TARGET/release/kbf-task",
-                    expected.as_deref().unwrap_or("?"),
-                ][..],
-            )
-        {
+    let is_stage = |l: &str| args(l, "cargo xtask stage-task-tree ").is_some();
+    let tree_copy = one("stage kbf-task as the bundle's tree", &steps, out, is_stage);
+    let mut tree_dir = None;
+    if let Some(line) = line_of(&steps, tree_copy, is_stage) {
+        let a = args(line, "cargo xtask stage-task-tree ").unwrap_or_default();
+        tree_dir = flag(&a, "--out");
+        if flag(&a, "--binary") != Some("target/$TARGET/release/kbf-task") || tree_dir.is_none() {
             out.push(format!(
-                "`{DARWIN_JOB}`: the tree of the bundle is not the signed `target/$TARGET/release/kbf-task` copied to `<tree>/kbf-task`: {}",
-                w.join(" ")
+                "`{DARWIN_JOB}`: the tree of the bundle is not the signed `target/$TARGET/release/kbf-task` (`--binary`, `--out`): {line}"
             ));
         }
     }
@@ -357,14 +310,13 @@ pub fn rules(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
             out.push(format!("`{DARWIN_JOB}`: package-task-bundle does not take the layout js-bundle pack wrote ({layout:?}): {line}"));
         }
     }
-    // The order: build, sign, copy, pack; download, attestation, unpack, pack; pack, verify, package.
-    let order: [(&str, Option<usize>); 9] = [
+    // The order: build, sign, stage, pack; gh, fetch, pack; pack, verify, package.
+    let order: [(&str, Option<usize>); 8] = [
         ("the kbf-task build", build),
         ("the signing of kbf-task", sign),
-        ("the copy of kbf-task into the tree", tree_copy),
-        ("the download of the js-bundle archive", download),
-        ("the attestation check of the archive", verify),
-        ("the unpack of js-bundle", unpack),
+        ("the staging of kbf-task into the tree", tree_copy),
+        ("the fetch of the pinned gh", gh),
+        ("the attested fetch of js-bundle", fetch),
         ("the pack", pack),
         ("js-bundle verify", bundle_verify),
         ("package-task-bundle", package),
@@ -379,24 +331,13 @@ pub fn rules(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
             ));
         }
     };
-    before(0, 1, "an unsigned binary would be copied", out);
-    before(1, 2, "an unsigned binary would be copied", out);
-    before(2, 6, "the pack would not hold the signed binary", out);
-    before(
-        3,
-        4,
-        "the archive must be checked before it is taken from",
-        out,
-    );
-    before(
-        4,
-        5,
-        "the program must not run, or be taken, before its attestation is checked",
-        out,
-    );
-    before(5, 6, "the pack needs the program", out);
-    before(6, 7, "the layout is checked after it is written", out);
-    before(7, 8, "the asset is made from a verified layout", out);
+    before(0, 1, "an unsigned binary would be staged", out);
+    before(1, 2, "an unsigned binary would be staged", out);
+    before(2, 5, "the pack would not hold the signed binary", out);
+    before(3, 4, "the attestation is checked with the pinned gh", out);
+    before(4, 5, "the pack needs the program", out);
+    before(5, 6, "the layout is checked after it is written", out);
+    before(6, 7, "the asset is made from a verified layout", out);
     Ok(())
 }
 
@@ -482,8 +423,8 @@ fn the_asset_table_the_workflow_and_the_pin_agree_on_the_darwin_kbf_task_bundle(
 fn a_bundle_step_that_breaks_a_rule_is_named() {
     // Asserts: each changed copy of the committed workflow is reported with the rule's own text:
     // the unconfined feature in the kbf-task build, the build for another target, the unsigned binary (the
-    // signing step removed), the pack before the attestation check, the archive pinned by another
-    // variable, a missing source commit, a pack of another directory, a verify of another layout, a
+    // signing step removed), the pack before the attested fetch, the archive pinned by another
+    // variable, a missing source commit, another archive path or gh, the plain fetch of the archive, a pack of another directory, a verify of another layout, a
     // package of another layout, a conditional step, a second job that packs, and a pin that is not hex.
     let w = workflow_text();
     let build = "cargo build --locked --release --target \"$TARGET\" -p kbf-task --bin kbf-task";
@@ -517,11 +458,7 @@ fn a_bundle_step_that_breaks_a_rule_is_named() {
             "has 0 steps that sign kbf-task",
         ),
         (
-            changed(
-                &w,
-                "--source-digest \"$JS_BUNDLE_SOURCE_DIGEST\" --deny-self-hosted-runners",
-                "--deny-self-hosted-runners",
-            ),
+            changed(&w, " --source-digest \"$JS_BUNDLE_SOURCE_DIGEST\"", ""),
             "lacks `--source-digest $JS_BUNDLE_SOURCE_DIGEST`",
         ),
         (
@@ -535,18 +472,38 @@ fn a_bundle_step_that_breaks_a_rule_is_named() {
         (
             changed(
                 &w,
-                "--sha256 \"$JS_BUNDLE_SHA256_AARCH64_DARWIN\" --out \"$RUNNER_TEMP/js-bundle-release",
-                "--sha256 \"$GH_SHA256_AARCH64_DARWIN\" --out \"$RUNNER_TEMP/js-bundle-release",
+                "--sha256 \"$JS_BUNDLE_SHA256_AARCH64_DARWIN\" --archive",
+                "--sha256 \"$GH_SHA256_AARCH64_DARWIN\" --archive",
             ),
-            "not pinned by `--sha256",
+            "lacks `--sha256 $JS_BUNDLE_SHA256_AARCH64_DARWIN`",
         ),
         (
             changed(
                 &w,
-                "tar -xzf \"$RUNNER_TEMP/js-bundle-release/js-bundle-$JS_BUNDLE_VERSION-$TARGET.tar.gz\"",
-                "tar -xzf \"$RUNNER_TEMP/other.tar.gz\"",
+                "--archive \"$RUNNER_TEMP/js-bundle-release/",
+                "--archive \"$RUNNER_TEMP/other/",
             ),
-            "the unpack does not take",
+            "lacks `--archive",
+        ),
+        (
+            changed(&w, "--gh \"$RUNNER_TEMP/tools/gh\"", "--gh gh"),
+            "lacks `--gh $RUNNER_TEMP/tools/gh`",
+        ),
+        (
+            changed(
+                &w,
+                "cargo xtask fetch-attested-tool --url",
+                "cargo xtask fetch --url",
+            ),
+            "which does not check its attestation",
+        ),
+        (
+            changed(
+                &w,
+                "stage-task-tree --binary \"target/$TARGET/release/kbf-task\"",
+                "stage-task-tree --binary \"target/release/kbf-task\"",
+            ),
+            "the tree of the bundle is not the signed",
         ),
         (
             changed(
@@ -622,10 +579,8 @@ fn a_bundle_step_that_breaks_a_rule_is_named() {
             .any(|p| p.contains("only `darwin-arm64` makes the kbf-task bundle")),
         "{got:?}"
     );
-    // The order: the pack moved before the attestation check of the archive.
-    let verify_at = w
-        .find("      - name: The js-bundle archive is attested")
-        .expect("verify step");
+    // The order: the pack moved before the attested fetch of js-bundle.
+    let fetch_at = w.find("      - name: Fetch js-bundle").expect("fetch step");
     let pack_at = w
         .find("      - name: Pack the signed kbf-task")
         .expect("pack step");
@@ -636,9 +591,9 @@ fn a_bundle_step_that_breaks_a_rule_is_named() {
     let pack_step = &w[pack_at..next];
     let moved = format!(
         "{}{}{}{}",
-        &w[..verify_at],
+        &w[..fetch_at],
         pack_step,
-        &w[verify_at..pack_at],
+        &w[fetch_at..pack_at],
         &w[next..]
     );
     let got = found(&moved);

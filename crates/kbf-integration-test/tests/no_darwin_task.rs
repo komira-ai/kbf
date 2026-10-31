@@ -30,6 +30,8 @@
 //!   image) except a `cargo test`, `check` or `clippy` line. In every job, the bundle job included, no
 //!   `cargo build`, `b`, `install`, `test`, `nextest`, `check`, `clippy` or `llvm-cov` line on a Mac runs over
 //!   `--workspace` or `--all` without `--exclude kbf-task`;
+//!   (A reference to the bundle asset, `kbf-task-bundle-<commit>-darwin-arm64` and its SBOM and provenance bundle, in the
+//!   attest, sums, verify and publish jobs is not a mention of `kbf-task`: only other mentions are refused there.)
 //! - **The bundle from another job.** No job but the bundle job runs `cargo xtask package-task-bundle` or
 //!   the `js-bundle` that packs one;
 //! - no line naming `kbf-task` interpolates a matrix, env or input value (a name the text cannot
@@ -176,7 +178,11 @@ fn problems(files: &[(String, String)]) -> Vec<String> {
         for (i, line) in lines.iter().enumerate() {
             let at = format!("{name}:{}", i + 1);
             let comment = workflow && line.trim_start().starts_with('#');
-            if !comment && !is_cross_check(line) && line.split_whitespace().any(is_bare_darwin_task)
+            // `${{ x }}` is one word, whatever its spaces.
+            let joined = line.replace("${{ ", "${{").replace(" }}", "}}");
+            if !comment
+                && !is_cross_check(line)
+                && joined.split_whitespace().any(is_bare_darwin_task)
             {
                 out.push(format!(
                     "{at}: names a darwin kbf-task other than the kbf-task bundle, the only one that ships (`kbf-task-bundle-<commit>-darwin-arm64`): {}",
@@ -232,7 +238,9 @@ fn problems(files: &[(String, String)]) -> Vec<String> {
                 }
                 if mac
                     && !bundle_job
-                    && line.contains("kbf-task")
+                    && line
+                        .replace("kbf-task-bundle", "kbf-bundle")
+                        .contains("kbf-task")
                     && !excludes_task(&words)
                     && !is_cross_check(line)
                 {
@@ -551,6 +559,44 @@ fn the_guard_allows_the_bundle_and_names_each_other_way_a_darwin_kbf_task_would_
         )),
         Vec::<String>::new()
     );
+
+    // The jobs after the build refer to the bundle asset by name: allowed; any other darwin kbf-task mention
+    // in them is refused by the rules above.
+    for job in [
+        "attest-darwin-arm64",
+        "sums-darwin-arm64",
+        "verify-darwin-arm64",
+        "publish-darwin-arm64",
+    ] {
+        let jobs = |lines: &[&str]| {
+            let mut text = format!("jobs:\n  {job}:\n    runs-on: ubuntu-24.04\n    steps:\n");
+            for l in lines {
+                text.push_str(&format!("      {l}\n"));
+            }
+            with(BUNDLE_WORKFLOW, &text)
+        };
+        assert_eq!(
+            problems(&jobs(&[
+                "- uses: actions/attest-sbom@v1",
+                "  with:",
+                "    subject-path: dist/kbf-task-bundle-${{ github.sha }}-darwin-arm64.tar.gz",
+                "    sbom-path: dist/kbf-task-bundle-${{ github.sha }}-darwin-arm64.cdx.json",
+                "- id: provenance-kbf-task-bundle-darwin-arm64",
+                "  run: cp \"$B\" \"dist/kbf-task-bundle-${GITHUB_SHA}-darwin-arm64.tar.gz.sigstore.json\"",
+            ])),
+            Vec::<String>::new(),
+            "{job}"
+        );
+        let got = problems(&jobs(&[
+            "- uses: actions/attest-sbom@v1",
+            "  with:",
+            "    subject-path: dist/kbf-task-${{ github.sha }}-darwin-arm64.tar.gz",
+        ]));
+        assert!(got.iter().any(|p| p.contains(BARE)), "{job}: {got:?}");
+        assert!(got.iter().any(|p| p.contains(MAC_NAMES)), "{job}: {got:?}");
+        let got = problems(&jobs(&["- run: cp target/release/kbf-task dist/"]));
+        assert!(got.iter().any(|p| p.contains(MAC_NAMES)), "{job}: {got:?}");
+    }
 
     // Rule: the whole workspace on a Mac, kbf-task included (the bundle job too).
     const WORKSPACE: &str = "builds the whole workspace";

@@ -279,18 +279,15 @@ jobs:
         run: cargo xtask sign-darwin "target/$TARGET/release/kbf-task" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
       - name: The signed kbf-task names the commit
         run: cargo xtask build-commit check "target/$TARGET/release/kbf-task" "$GITHUB_SHA"
-      # The packer is a release of the jobscheduler repository, pinned by tag and by the archive's SHA-256 (JS_BUNDLE_*),
-      # and checked for the workflow and commit that built it before it runs.
-      - name: Fetch the pinned js-bundle release archive
-        run: cargo xtask fetch --url "https://github.com/komira-ai/jobscheduler/releases/download/v$JS_BUNDLE_VERSION/js-bundle-$JS_BUNDLE_VERSION-$TARGET.tar.gz" --sha256 "$JS_BUNDLE_SHA256_AARCH64_DARWIN" --out "$RUNNER_TEMP/js-bundle-release/js-bundle-$JS_BUNDLE_VERSION-$TARGET.tar.gz"
-      - name: The js-bundle archive is attested by the jobscheduler release workflow, on main, at the pinned commit
+      # The packer is a release of the jobscheduler repository, pinned by tag and by the archive's SHA-256 (JS_BUNDLE_*).
+      # One command: the download must have the pinned digest and `gh attestation verify` must accept that same file
+      # (this repository, the release workflow, main, the pinned commit) before the program is taken out of it.
+      - name: Fetch js-bundle: pinned digest, verified attestation, then the program out of that file
         env:
           GH_TOKEN: ${{ github.token }}
-        run: $RUNNER_TEMP/tools/gh attestation verify "$RUNNER_TEMP/js-bundle-release/js-bundle-$JS_BUNDLE_VERSION-$TARGET.tar.gz" --repo komira-ai/jobscheduler --signer-workflow komira-ai/jobscheduler/.github/workflows/release.yml --cert-oidc-issuer https://token.actions.githubusercontent.com --source-ref refs/heads/main --source-digest "$JS_BUNDLE_SOURCE_DIGEST" --deny-self-hosted-runners
-      - name: Take js-bundle out of the verified archive
-        run: mkdir -p "$RUNNER_TEMP/tools" && tar -xzf "$RUNNER_TEMP/js-bundle-release/js-bundle-$JS_BUNDLE_VERSION-$TARGET.tar.gz" -C "$RUNNER_TEMP/tools" --strip-components=1 "js-bundle-$JS_BUNDLE_VERSION-$TARGET/js-bundle"
+        run: cargo xtask fetch-attested-tool --url "https://github.com/komira-ai/jobscheduler/releases/download/v$JS_BUNDLE_VERSION/js-bundle-$JS_BUNDLE_VERSION-$TARGET.tar.gz" --sha256 "$JS_BUNDLE_SHA256_AARCH64_DARWIN" --archive "$RUNNER_TEMP/js-bundle-release/js-bundle-$JS_BUNDLE_VERSION-$TARGET.tar.gz" --member "js-bundle-$JS_BUNDLE_VERSION-$TARGET/js-bundle" --out "$RUNNER_TEMP/tools/js-bundle" --gh "$RUNNER_TEMP/tools/gh" --repo komira-ai/jobscheduler --signer-workflow komira-ai/jobscheduler/.github/workflows/release.yml --source-ref refs/heads/main --source-digest "$JS_BUNDLE_SOURCE_DIGEST"
       - name: The one tree of the bundle is the signed kbf-task
-        run: mkdir -p "$RUNNER_TEMP/task-tree" && cp "target/$TARGET/release/kbf-task" "$RUNNER_TEMP/task-tree/kbf-task"
+        run: cargo xtask stage-task-tree --binary "target/$TARGET/release/kbf-task" --out "$RUNNER_TEMP/task-tree"
       - name: Pack the signed kbf-task into a bundle in an OCI layout
         run: $RUNNER_TEMP/tools/js-bundle pack --out "$RUNNER_TEMP/task-bundle" --name kbf-task --bundle-version "$GITHUB_SHA" --os-version "$MACOSX_DEPLOYMENT_TARGET" --tree "task=$RUNNER_TEMP/task-tree" --license task=Apache-2.0 --source-url task=https://github.com/komira-ai/kbf --annotation org.opencontainers.image.source=https://github.com/komira-ai/kbf --annotation "org.opencontainers.image.revision=$GITHUB_SHA" --entrypoint 'kbf-task=${tree:task}/kbf-task' --network on --read system-certs --read resolver-config
       - name: The layout is a good bundle, every layer extracted under the format's rules

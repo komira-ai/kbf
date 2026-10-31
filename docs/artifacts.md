@@ -751,8 +751,9 @@ The steps, in order, each unconditional (`crates/kbf-integration-test/tests/rele
 features, so it has the macOS confine (the test-only feature `unconfined-for-tests` is never named); it is signed
 ad hoc with the hardened runtime and checked by `cargo xtask sign-darwin`, exactly as the other Mac binaries
 ([below](#macos-signing-what-ad-hoc-with-the-hardened-runtime-gives)), and has no entitlements; the pinned
-`js-bundle` is fetched, its attestation verified, and the program taken out of the verified archive; the signed
-binary is copied to a directory of its own, which `js-bundle pack` packs as the one tree `task` of a bundle named
+`js-bundle` is fetched by one command, `cargo xtask fetch-attested-tool`, which refuses the download unless its SHA-256
+is the pinned one, writes it, runs `gh attestation verify` on that file, and only then takes the program out of that
+same file; `cargo xtask stage-task-tree` copies the signed binary alone to a directory of its own, which `js-bundle pack` packs as the one tree `task` of a bundle named
 `kbf-task` (minimum macOS 14.0, the entrypoint `kbf-task`, the network level `on` and the reads `system-certs` and
 `resolver-config`, which `kbf-task` needs to reach the store and the frontend); `js-bundle verify` extracts every
 layer under the format's rules; and `cargo xtask package-task-bundle` refuses a layout that is not exactly
@@ -778,10 +779,9 @@ attested tarball is not this release's `kbf-task`.
 `dd21b0beee4d3f2d11a5f0e4f31ec2128a6fd85891f60405a283e1bf640ee50b` (the SHA-256 of
 `js-bundle-0.1.79-aarch64-apple-darwin.tar.gz` in that release's `SHA256SUMS`, checked by `cargo xtask fetch`
 before anything is unpacked), and `JS_BUNDLE_SOURCE_DIGEST` is
-`1f304ae75dbef20c9b01231b666b1e91e1f21743`, the commit that release was built from. The pinned `gh` then
-runs `gh attestation verify` on the archive for the repository `komira-ai/jobscheduler`, the signer workflow
+`1f304ae75dbef20c9b01231b666b1e91e1f21743`, the commit that release was built from. The command runs the pinned `gh attestation verify` on the archive file (before anything is taken out of it) for the repository `komira-ai/jobscheduler`, the signer workflow
 `komira-ai/jobscheduler/.github/workflows/release.yml`, `--source-ref refs/heads/main` and
-`--source-digest` that commit, on a hosted runner, before the program is taken out of it. Moving the pin means
+`--source-digest` that commit, on a hosted runner. Moving the pin means
 changing the three values together with this paragraph (a test holds this file to the workflow's values).
 
 **Not notarized.** As for the other Mac binaries: signed ad hoc with no Developer ID, so no identity and no
