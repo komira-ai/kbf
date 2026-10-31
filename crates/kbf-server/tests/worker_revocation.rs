@@ -313,21 +313,33 @@ impl Session {
 }
 
 impl Session {
-    /// Sends `message`, then reads the server's side until it ends the stream: what the
-    /// server sent meanwhile, and how the stream ended. `None`: the stream was still open
-    /// after [`PROMPT`] (or ended cleanly), as it is when the server took the message, which
-    /// it answers with nothing.
+    /// Sends `message`, then a heartbeat behind it, and reads the server's side until the
+    /// first of: the stream ends (the status), or the heartbeat is acknowledged (`None`). The
+    /// messages in between are returned. The stream is read in order, so when the heartbeat
+    /// has been answered `message` has been handled, and when the stream ended it ended at
+    /// `message` or at the heartbeat: which of the two is told by the refusal counts
+    /// ([`Farm::refused`]), not by this.
     async fn ended_by(
         mut self,
         message: daemon_message::Message,
     ) -> (Vec<ServerMessage>, Option<Status>) {
         send(&self.tx, message);
+        // The stream may be closed by now: that is the answer, not an error.
+        let _ = self.tx.unbounded_send(DaemonMessage {
+            message: Some(daemon_message::Message::Heartbeat(Heartbeat {
+                seq: 99,
+                ..Heartbeat::default()
+            })),
+        });
         let mut seen = Vec::new();
         loop {
-            match timeout(PROMPT, self.inbound.message()).await {
-                Ok(Ok(Some(reply))) => seen.push(reply),
-                Ok(Ok(None)) | Err(_) => return (seen, None),
-                Ok(Err(status)) => return (seen, Some(status)),
+            match self.inbound.message().await {
+                Ok(Some(ServerMessage {
+                    message: Some(server_message::Message::HeartbeatAck(_)),
+                })) => return (seen, None),
+                Ok(Some(reply)) => seen.push(reply),
+                Ok(None) => panic!("the stream ended cleanly: {seen:?}"),
+                Err(status) => return (seen, Some(status)),
             }
         }
     }
@@ -355,6 +367,20 @@ impl Farm {
         let (status, body) = self.call("GET", format!("/v1/nodes/{node}"), "").await;
         assert_eq!(status, 200, "{body}");
         serde_json::from_str(&body).expect("JSON")
+    }
+
+    /// The refusal counts on `/metrics`, by message kind.
+    async fn refused(&self) -> std::collections::BTreeMap<String, u64> {
+        let (status, body) = self.call("GET", "/metrics".to_owned(), "").await;
+        assert_eq!(status, 200, "{body}");
+        let prefix = "kbf_worker_admission_refused_total{message=\"";
+        body.lines()
+            .filter_map(|line| line.strip_prefix(prefix))
+            .map(|rest| {
+                let (kind, count) = rest.split_once("\"} ").expect("a sample");
+                (kind.to_owned(), count.parse().expect("a count"))
+            })
+            .collect()
     }
 
     /// Enrolls `node`, opens its session, makes sure it is heard, and revokes it.
@@ -437,8 +463,24 @@ async fn taking_a_revoked_node_off_the_deny_list_readmits_it() {
 }
 
 fn assert_denied(ended: Option<Status>) {
-    let status = ended.expect("the message ended the stream");
+    let status = ended.expect("the stream ended");
     assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+}
+
+/// Asserts that the worker listener refused exactly one message, of kind `message`: the
+/// one the test sent, not the heartbeat behind it.
+async fn assert_refused_once(farm: &Farm, message: &str) {
+    let counts = farm.refused().await;
+    let expected = [
+        "hello",
+        "heartbeat",
+        "result",
+        "node_status",
+        "map_request",
+        "update_status",
+    ]
+    .map(|kind| (kind.to_owned(), u64::from(kind == message)));
+    assert_eq!(counts, expected.into_iter().collect(), "refusals");
 }
 
 /// A revoked node's `Result` is refused before the farm sees it: the stream ends
@@ -455,6 +497,7 @@ async fn a_revoked_nodes_result_is_refused_and_never_reaches_the_farm() {
     };
     let (seen, ended) = open.ended_by(daemon_message::Message::Result(result)).await;
     assert_denied(ended);
+    assert_refused_once(&farm, "result").await;
     assert!(seen.is_empty(), "{seen:?}");
 }
 
@@ -477,12 +520,13 @@ async fn a_revoked_nodes_node_status_does_not_reach_the_node_view() {
     let open = farm.revoked("node-07").await;
     let (seen, ended) = open.ended_by(status()).await;
     assert_denied(ended);
+    assert_refused_once(&farm, "node_status").await;
     assert!(seen.is_empty(), "{seen:?}");
     assert!(farm.node("node-07").await["software"].is_null());
 }
 
-/// A revoked node's `UpdateStatus` is refused: the stream ends PERMISSION_DENIED where a
-/// server that kept it would end the stream cleanly when the daemon closed it.
+/// A revoked node's `UpdateStatus` is refused: the stream ends PERMISSION_DENIED at it, which
+/// the refusal count shows (the heartbeat behind it is never read).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_revoked_nodes_update_status_is_refused() {
     let farm = Farm::start("update-status", &[]).await;
@@ -495,12 +539,13 @@ async fn a_revoked_nodes_update_status_is_refused() {
         .ended_by(daemon_message::Message::UpdateStatus(status))
         .await;
     assert_denied(ended);
+    assert_refused_once(&farm, "update_status").await;
     assert!(seen.is_empty(), "{seen:?}");
 }
 
-/// A revoked node's `MapRequest` is refused: the stream ends PERMISSION_DENIED. This
-/// frontend holds no map yet, so a request that was admitted is answered with nothing and
-/// the stream ends cleanly.
+/// A revoked node's `MapRequest` is refused: the stream ends PERMISSION_DENIED at it, which
+/// the refusal count shows. This frontend holds no map yet, so an admitted request would be
+/// answered with nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_revoked_nodes_map_request_is_refused() {
     let farm = Farm::start("map-request", &[]).await;
@@ -511,6 +556,7 @@ async fn a_revoked_nodes_map_request_is_refused() {
         }))
         .await;
     assert_denied(ended);
+    assert_refused_once(&farm, "map_request").await;
     assert!(seen.is_empty(), "{seen:?}");
 }
 
@@ -529,6 +575,7 @@ async fn a_revoked_nodes_resent_hello_does_not_resize_the_node() {
     let open = farm.revoked("node-07").await;
     let (seen, ended) = open.ended_by(hello_with_cpus("node-07", "3")).await;
     assert_denied(ended);
+    assert_refused_once(&farm, "hello").await;
     assert!(seen.is_empty(), "{seen:?}");
     assert_eq!(farm.node("node-07").await["capacity"]["cpu_millis"], 1000);
 }
