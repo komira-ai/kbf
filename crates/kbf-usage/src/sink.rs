@@ -157,8 +157,8 @@ impl ProfileSink {
     ///
     /// # Errors
     /// The store failed, or the row is not a profile row.
-    pub fn profile(&self, _: &ProfileKey) -> Result<Option<KeyProfile>, ProfileError> {
-        Ok(None)
+    pub fn profile(&self, key: &ProfileKey) -> Result<Option<KeyProfile>, ProfileError> {
+        self.lock().profiles.profile(key)
     }
 
     /// Forgets a node that left the pool, with its open readings.
