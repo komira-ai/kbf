@@ -24,7 +24,7 @@ async fn every_verb_reaches_its_module() {
     let snapshot = snapshot.to_str().unwrap();
 
     // The ops verbs read `ops.json` of the result directory first; there is none here.
-    let ops_verbs: [&[&str]; 4] = [
+    let ops_verbs: [&[&str]; 5] = [
         &["preflight", "--result-dir", out, "--test-prefix", "tb-"],
         &["provision", "--result-dir", out, "--test-prefix", "tb-"],
         &[
@@ -33,6 +33,15 @@ async fn every_verb_reaches_its_module() {
             out,
             "--test-prefix",
             "tb-",
+            "--apply",
+        ],
+        &[
+            "provision",
+            "--result-dir",
+            out,
+            "--test-prefix",
+            "tb-",
+            "--premade",
             "--apply",
         ],
         &[
