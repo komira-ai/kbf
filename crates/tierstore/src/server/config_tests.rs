@@ -433,7 +433,7 @@ fn a_value_out_of_range_is_refused_with_its_key() {
         (
             "budget = 1000",
             "budget = 1000\nlease_ttl = \"soon\"",
-            "not a duration",
+            "lease_ttl: not a value this key takes (it is not shown); expected a duration such as",
         ),
         (
             "\"tier-bucket\"",
@@ -448,7 +448,7 @@ fn a_value_out_of_range_is_refused_with_its_key() {
         (
             "\"tier-bucket\"",
             "\"tier-bucket\"\nbody_idle_timeout = \"30\"",
-            "not a duration",
+            "body_idle_timeout: not a value this key takes (it is not shown); expected a duration such as",
         ),
     ];
     for (from, to, want) in cases {
@@ -529,7 +529,7 @@ fn an_oci_table_is_refused_as_the_flags_are() {
         (format!("{listen}max_connections = -1"), "max_connections"),
         (
             format!("{listen}connection_lifetime = \"1\""),
-            "not a duration",
+            "connection_lifetime: not a value this key takes (it is not shown); expected a duration such as",
         ),
         (
             format!("{listen}connection_lifetime = 3600"),
