@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 
-use super::testing::Rig;
+use super::testing::{Rig, wait_advancing};
 use super::{Mode, Tick};
 
 /// Asserts that a cache holds the lock when it opens with the lock free, and that a second cache
@@ -169,10 +169,10 @@ async fn the_loop_takes_the_lock_at_a_tick_after_it_is_free_and_ends_when_halted
     drop(first);
     // A try may be running when the clock moves, and the loop then waits for the next interval
     // from a later time: the clock moves once for each turn of the wait.
-    while second.mode() == Mode::ReadOnly {
-        tokio::time::advance(Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
-    }
+    wait_advancing("the loop took the lock", Duration::from_secs(1), || {
+        second.mode() == Mode::ReadWrite
+    })
+    .await;
     assert_eq!(second.mode(), Mode::ReadWrite);
     halt.notify_one();
     looping.await.unwrap();

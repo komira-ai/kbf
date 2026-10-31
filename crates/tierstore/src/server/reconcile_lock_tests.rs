@@ -100,10 +100,16 @@ async fn a_reconciler_under_a_held_lock_file_does_nothing_until_it_takes_the_loc
         assert!(tiers.cold_mem.get("k", None).await.is_err());
         drop(holder);
         tiers.lease(true, Duration::from_secs(1)).await;
-        while tiers.cold_mem.get("k", None).await.is_err() {
+        let mut copied = false;
+        for _ in 0..100_000 {
+            copied = tiers.cold_mem.get("k", None).await.is_ok();
+            if copied {
+                break;
+            }
             tokio::time::advance(Duration::from_secs(1)).await;
             tokio::task::yield_now().await;
         }
+        assert!(copied, "the object was never copied to the cold tier");
         halt.notify_one();
     };
     tokio::join!(working, watching);

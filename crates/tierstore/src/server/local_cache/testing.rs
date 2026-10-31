@@ -75,6 +75,41 @@ pub(in crate::server) fn never_expires(config: &mut CacheConfig) {
     config.keep_deadline = std::time::Duration::from_secs(3600);
 }
 
+/// The turns of the scheduler a test gives an event that another task or a thread brings about
+/// before it fails: some seconds of real time, which a disk under load needs for a file sync, and
+/// no virtual time, which only the test moves.
+pub(in crate::server) const TURNS: u32 = 10_000_000;
+
+/// Waits, by giving up the thread, until `done` is true; fails the test, saying what `what` was
+/// to have happened, if it has not after [`TURNS`] turns. A wait that is not bounded turns a
+/// regression into a test that runs until it is killed.
+pub(in crate::server) async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..TURNS {
+        if done() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("after {TURNS} turns of the scheduler, this never happened: {what}");
+}
+
+/// [`wait_until`] on a paused clock, which it moves by `step` at each turn: for an event that
+/// waits for a timer (a retry, a deadline) as well as for another task.
+pub(in crate::server) async fn wait_advancing(
+    what: &str,
+    step: std::time::Duration,
+    mut done: impl FnMut() -> bool,
+) {
+    for _ in 0..TURNS {
+        if done() {
+            return;
+        }
+        tokio::time::advance(step).await;
+        tokio::task::yield_now().await;
+    }
+    panic!("after {TURNS} turns of the scheduler, this never happened: {what}");
+}
+
 /// `len` bytes that differ from one place to the next, so that a wrong range shows.
 pub(in crate::server) fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| ((i * 7 + 3) % 251) as u8).collect()

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use super::hold::Trace;
 use super::layout::meta_path;
 use super::metrics::read;
-use super::testing::{Rig, pattern};
+use super::testing::{Rig, pattern, wait_until};
 use super::{Mode, Tick};
 use crate::Backend;
 
@@ -59,9 +59,10 @@ async fn a_fill_in_flight_across_a_lost_lock_publishes_nothing_and_leaves_the_ne
     let gate = rig.tamper.hold();
     let cache = first.clone();
     let old = tokio::spawn(async move { cache.get("cas/b/old", None).await });
-    while read(&first.counters().staging_files) < 1 {
-        tokio::task::yield_now().await;
-    }
+    wait_until("the first fill made its stage file", || {
+        read(&first.counters().staging_files) >= 1
+    })
+    .await;
 
     // The lock file is replaced and another cache makes the new one and holds it.
     std::fs::remove_file(rig.config.path.join(".lock")).unwrap();
@@ -69,9 +70,10 @@ async fn a_fill_in_flight_across_a_lost_lock_publishes_nothing_and_leaves_the_ne
     assert_eq!(second.mode(), Mode::ReadWrite);
     let cache = second.clone();
     let new = tokio::spawn(async move { cache.get("cas/b/new", None).await });
-    while read(&second.counters().staging_files) < 1 {
-        tokio::task::yield_now().await;
-    }
+    wait_until("the second fill made its stage file", || {
+        read(&second.counters().staging_files) >= 1
+    })
+    .await;
     assert_eq!(first.tick().unwrap(), Tick::Lost);
 
     gate.add_permits(1000);

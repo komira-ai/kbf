@@ -11,9 +11,18 @@ use futures::{FutureExt as _, StreamExt as _};
 
 use super::layout::{Sidecar, data_path, meta_path, name_of, object_dir};
 use super::metrics::{SkippedKeep, read};
-use super::testing::{Rig, digest, never_expires, tree};
+use super::testing::{BlockingGate, Rig, digest, never_expires, tree, wait_until};
 use super::{Mode, Tick};
 use crate::{Backend, Error, PartBody};
+
+/// A gate that holds threads of the disk, opened when this is dropped.
+struct OpenOnDrop(Arc<BlockingGate>);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
 
 /// A rig of a cache that writes through, its keeps never expiring.
 fn rig(name: &str) -> Rig {
@@ -91,16 +100,27 @@ async fn an_abandoned_keep_leaves_the_object_of_the_new_ownership_alone() {
     });
     let first = rig.locked();
     let key = "cas/b/linking";
-    let gate = rig.disk.hold_links();
+    // Opened when the test ends however it ends: a thread held at the gate is waited for when
+    // the runtime is dropped, so a failed assertion before the gate is opened would not end the
+    // test at all.
+    let gate = OpenOnDrop(rig.disk.hold_links());
     let body = Bytes::from_static(b"linking");
-    assert_eq!(first.put(key, body).await, Ok(()));
-    while rig.disk.linked.lock().unwrap().is_empty() {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::sleep(Duration::from_secs(60)).await;
-    while first.counters().keeps_skipped(SkippedKeep::Deadline) == 0 {
-        tokio::task::yield_now().await;
-    }
+    // The clock is moved by the test and by nothing else (the test never waits idle), so the
+    // wait of the put and the deadline of the keep come when the test says.
+    let cache = first.clone();
+    let putting = tokio::spawn(async move { cache.put(key, body).await });
+    wait_until("the link began", || {
+        !rig.disk.linked.lock().unwrap().is_empty()
+    })
+    .await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    wait_until("the put was answered", || putting.is_finished()).await;
+    assert_eq!(putting.await.unwrap(), Ok(()));
+    tokio::time::advance(Duration::from_secs(60)).await;
+    wait_until("the keep was abandoned at its deadline", || {
+        first.counters().keeps_skipped(SkippedKeep::Deadline) == 1
+    })
+    .await;
 
     // The lock is lost and taken again: this is another ownership of the directory, and it has
     // an object of its own under the name.
@@ -121,10 +141,11 @@ async fn an_abandoned_keep_leaves_the_object_of_the_new_ownership_alone() {
     std::fs::write(meta_path(root, &hex), serde_json::to_vec(&sidecar).unwrap()).unwrap();
     super::locked(&first.inner.index).insert(&hex, 11, "new".to_owned(), 0);
 
-    gate.open();
-    while read(&first.counters().staging_files) != 0 {
-        tokio::task::yield_now().await;
-    }
+    gate.0.open();
+    wait_until("the cleanup of the keep ended", || {
+        read(&first.counters().staging_files) == 0
+    })
+    .await;
     assert_eq!(first.held(), (11, 1));
     assert_eq!(
         std::fs::read(data_path(root, &hex)).unwrap(),
