@@ -18,13 +18,19 @@ fn descriptor(bytes: &[u8]) -> serde_json::Value {
 
 /// A layout as `js-bundle pack` writes one for `kbf-task`: a config, one layer, a manifest, an index.
 fn layout_with(config: &serde_json::Value) -> Files {
+    layout_edited(config, |_| {})
+}
+
+/// `layout_with`, with `change` applied to the manifest before it is stored and named by the index.
+fn layout_edited(config: &serde_json::Value, change: impl FnOnce(&mut serde_json::Value)) -> Files {
     let layer = b"the layer's bytes".to_vec();
     let config = serde_json::to_vec(config).expect("config");
-    let manifest = serde_json::to_vec(&serde_json::json!({
+    let mut manifest = serde_json::json!({
         "config": descriptor(&config),
         "layers": [descriptor(&layer)],
-    }))
-    .expect("manifest");
+    });
+    change(&mut manifest);
+    let manifest = serde_json::to_vec(&manifest).expect("manifest");
     let index = serde_json::to_vec(&serde_json::json!({"manifests": [descriptor(&manifest)]}))
         .expect("index");
     let mut files = Files::new();
@@ -305,4 +311,281 @@ fn the_tree_is_a_new_directory_holding_the_binary_alone_mode_0755() {
         "{wrong}"
     );
     assert!(!dir.join("tmp/other-tree").exists());
+}
+
+/// A gzip of `tar`.
+fn gzip(tar: &[u8]) -> Vec<u8> {
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), Compression::fast());
+    std::io::Write::write_all(&mut gz, tar).expect("gzip");
+    gz.finish().expect("gzip")
+}
+
+/// The gzip tar of `entries` (header and body each), as a hand-made tarball of a layout.
+fn tgz_of(entries: &[(tar::Header, &[u8])]) -> Vec<u8> {
+    let mut b = tar::Builder::new(Vec::new());
+    for (h, body) in entries {
+        b.append(h, *body).expect("append");
+    }
+    gzip(&b.into_inner().expect("tar"))
+}
+
+#[test]
+fn a_layout_with_a_broken_oci_layout_file_or_index_is_refused_by_name() {
+    // Asserts: an oci-layout that is not JSON, one that names another version, and an index
+    // that is missing or lists no manifest are each named, and a missing index is named once (not
+    // also as a count of manifests).
+    let mut broken = good();
+    broken.insert("oci-layout".to_owned(), b"not json".to_vec());
+    only(&check_layout(&broken), "oci-layout is not JSON");
+
+    let mut version = good();
+    version.insert(
+        "oci-layout".to_owned(),
+        br#"{"imageLayoutVersion":"2.0.0"}"#.to_vec(),
+    );
+    only(
+        &check_layout(&version),
+        "oci-layout: imageLayoutVersion is not 1.0.0",
+    );
+
+    let mut no_index = good();
+    no_index.remove("index.json");
+    let found = check_layout(&no_index);
+    assert!(
+        found.contains(&"index.json is missing".to_owned()),
+        "{found:?}"
+    );
+    assert!(!found.iter().any(|p| p.contains("manifests")), "{found:?}");
+
+    let mut none = good();
+    none.insert("index.json".to_owned(), br#"{"manifests":[]}"#.to_vec());
+    let found = check_layout(&none);
+    assert!(
+        found
+            .iter()
+            .any(|p| p.contains("lists 0 manifests, not exactly one")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_descriptor_that_does_not_fit_its_blob_is_refused_by_name() {
+    // Asserts: a digest that is not 64 lowercase hex digits after `sha256:` (too short, capitals,
+    // another algorithm), a blob the descriptor names that is absent, and a size that is not the
+    // blob's length are each named with the descriptor they come from; a manifest with two layers
+    // or none is refused by its count.
+    let capitals = format!("sha256:{}", "A".repeat(64));
+    for digest in ["sha256:abc", capitals.as_str(), "md5:xyz"] {
+        let files = layout_edited(&good_config(), |m| m["config"]["digest"] = digest.into());
+        let found = check_layout(&files);
+        assert!(
+            found.iter().any(|p| p.contains(&format!(
+                "the manifest's config: {digest:?} is not a sha256 digest"
+            ))),
+            "{digest}: {found:?}"
+        );
+    }
+
+    let mut gone = good();
+    let layer = gone
+        .keys()
+        .find(|p| gone[*p] == b"the layer's bytes")
+        .cloned()
+        .expect("layer");
+    gone.remove(&layer);
+    only(
+        &check_layout(&gone),
+        &format!("the manifest's layer: its blob {layer} is missing"),
+    );
+
+    let short = layout_edited(&good_config(), |m| m["layers"][0]["size"] = 1.into());
+    only(&check_layout(&short), "is not 1 bytes");
+
+    let two = layout_edited(&good_config(), |m| {
+        let layer = m["layers"][0].clone();
+        m["layers"] = serde_json::json!([layer.clone(), layer]);
+    });
+    only(&check_layout(&two), "the manifest lists 2 layers, not one");
+    let zero = layout_edited(&good_config(), |m| m["layers"] = serde_json::json!([]));
+    let found = check_layout(&zero);
+    assert!(
+        found
+            .iter()
+            .any(|p| p.contains("the manifest lists 0 layers, not one")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_path_too_long_for_a_tar_header_is_refused_by_the_tarball_writer() {
+    // Asserts: a file name of 300 characters is an error naming the path, not a truncated entry.
+    let mut files = good();
+    let long = "a".repeat(300);
+    files.insert(long.clone(), Vec::new());
+    let err = tarball(&files).expect_err("too long");
+    assert!(
+        err.contains("cannot be a tar entry name") && err.contains(&long),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_tarball_that_is_not_a_gzip_tar_is_named() {
+    // Asserts: bytes that are not gzip, and a gzip of bytes that are not a tar, are each one problem.
+    let files = good();
+    let found = check_tarball(b"plain text, not gzip", &files);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].starts_with("not a gzip stream: "), "{found:?}");
+
+    let found = check_tarball(&gzip(&[b'A'; 1024]), &files);
+    assert!(
+        found.iter().any(|p| p.starts_with("not a tar: ")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_tarball_entry_of_another_type_with_an_owner_name_or_listed_twice_is_named() {
+    // Asserts: a symlink entry is refused by type (and its fields not examined), an entry with an
+    // owner name is refused, and a path listed twice is named; the other files of the layout are
+    // then reported missing, one problem per path.
+    let files = good();
+    let link = header("index.json", tar::EntryType::Symlink, 0, FILE_MODE).expect("header");
+    let found = check_tarball(&tgz_of(&[(link, &b""[..])]), &files);
+    assert!(
+        found
+            .iter()
+            .any(|p| p.starts_with("index.json: the type is Symlink, not a file or a directory")),
+        "{found:?}"
+    );
+    assert!(
+        !found.iter().any(|p| p.contains("the mode")),
+        "a refused type is not also examined: {found:?}"
+    );
+
+    let mut named = header("index.json", tar::EntryType::Regular, 0, FILE_MODE).expect("header");
+    named.set_username("root").expect("name");
+    named.set_cksum();
+    let found = check_tarball(&tgz_of(&[(named, &b""[..])]), &files);
+    assert!(
+        found.contains(&"index.json: the owner name is not empty".to_owned()),
+        "{found:?}"
+    );
+
+    let once = header("index.json", tar::EntryType::Regular, 0, FILE_MODE).expect("header");
+    let found = check_tarball(
+        &tgz_of(&[(once.clone(), &b""[..]), (once, &b""[..])]),
+        &files,
+    );
+    assert!(
+        found.contains(&"index.json: listed twice".to_owned()),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_directory_entry_with_the_wrong_mode_is_named() {
+    // Asserts: a directory the tar lists is held to mode 0755 like a file to 0644, so a tar of
+    // the right paths with another mode is refused.
+    let files = good();
+    let dir = header("blobs/", tar::EntryType::Directory, 0, 0o700).expect("header");
+    let found = check_tarball(&tgz_of(&[(dir, b"")]), &files);
+    assert!(
+        found
+            .iter()
+            .any(|p| p.contains("blobs/: the mode is Some(448), not 493")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_symlink_in_the_layout_directory_and_an_empty_sbom_are_refused_and_nothing_is_written() {
+    // Asserts: a symlink in the layout directory is named as neither a directory nor a regular
+    // file (it is not followed), and the verb writes no asset for it; an empty SBOM is refused
+    // by name, also before anything is written.
+    let dir = scratch("odd");
+    let layout = dir.join("layout");
+    write_layout(&layout, &good());
+    std::os::unix::fs::symlink("index.json", layout.join("link")).expect("symlink");
+    let sbom = dir.join("sbom.cdx.json");
+    std::fs::write(&sbom, b"{}").expect("sbom");
+    let out = dir.join("dist");
+    let err = package_task_bundle(&layout, &sbom, COMMIT, &out).expect_err("symlink");
+    assert!(
+        err.to_string()
+            .contains("link: neither a directory nor a regular file"),
+        "{err}"
+    );
+    assert!(!out.exists());
+
+    let clean = dir.join("clean");
+    write_layout(&clean, &good());
+    let empty = dir.join("empty.cdx.json");
+    std::fs::write(&empty, b"").expect("empty");
+    let err = package_task_bundle(&clean, &empty, COMMIT, &out).expect_err("empty sbom");
+    assert!(err.to_string().contains("is empty"), "{err}");
+    assert!(!out.exists());
+}
+
+#[test]
+fn a_tarball_that_reads_back_as_another_layout_is_refused_and_no_sbom_or_sum_is_written() {
+    // Asserts: when the file written is not the layout's tarball (here the writer is handed
+    // another layout's), the verb names the tarball's path and the differing file, and leaves no
+    // SBOM and no SHA256SUMS line behind.
+    let dir = scratch("readback");
+    let layout = dir.join("layout");
+    write_layout(&layout, &good());
+    let sbom = dir.join("sbom.cdx.json");
+    std::fs::write(&sbom, b"{}").expect("sbom");
+    let out = dir.join("dist");
+    let mut other = good();
+    other.insert("extra".to_owned(), b"x".to_vec());
+    let wrong = |_: &Files| tarball(&other);
+    let err = package_with(&layout, &sbom, COMMIT, &out, &wrong).expect_err("readback");
+    let text = err.to_string();
+    assert!(
+        text.contains(&format!(
+            "kbf-task-bundle-{COMMIT}-darwin-arm64.tar.gz: extra: not a file of the layout"
+        )),
+        "{text}"
+    );
+    assert!(
+        !out.join(format!("kbf-task-bundle-{COMMIT}-darwin-arm64.cdx.json"))
+            .exists()
+            && !out.join("SHA256SUMS.darwin-arm64").exists()
+    );
+}
+
+#[test]
+fn a_tarball_writer_that_fails_stops_the_verb() {
+    // Asserts: the writer's own error reaches the caller unchanged and nothing is written.
+    let dir = scratch("writer");
+    let layout = dir.join("layout");
+    write_layout(&layout, &good());
+    let sbom = dir.join("sbom.cdx.json");
+    std::fs::write(&sbom, b"{}").expect("sbom");
+    let out = dir.join("dist");
+    let fails = |_: &Files| Err("no tar for you".to_owned());
+    let err = package_with(&layout, &sbom, COMMIT, &out, &fails).expect_err("writer");
+    assert!(err.to_string().contains("no tar for you"), "{err}");
+    assert!(!out.join("SHA256SUMS.darwin-arm64").exists());
+}
+
+#[test]
+fn a_tree_whose_directory_cannot_be_made_is_refused_by_name() {
+    // Asserts: an --out below a regular file, and an --out with no parent (the root), are
+    // errors naming what could not be created, and the binary is not copied.
+    let dir = scratch("tree-errors");
+    let bin = dir.join("kbf-task");
+    std::fs::write(&bin, b"signed bytes").expect("binary");
+    let file = dir.join("a-file");
+    std::fs::write(&file, b"x").expect("file");
+    let err = stage_tree(&bin, &file.join("below/tree")).expect_err("parent is a file");
+    assert!(
+        err.to_string()
+            .contains(&format!("create {}", file.join("below").display())),
+        "{err}"
+    );
+    let err = stage_tree(&bin, Path::new("/")).expect_err("the root");
+    assert!(err.to_string().contains("create /"), "{err}");
 }

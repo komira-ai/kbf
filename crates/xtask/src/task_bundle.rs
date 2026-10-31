@@ -308,9 +308,8 @@ pub fn check_tarball(tgz: &[u8], files: &Files) -> Vec<String> {
             problems.push(format!("{path}: the owner name is not empty"));
         }
         let mut held = Vec::new();
-        if entry.read_to_end(&mut held).is_err() {
-            problems.push(format!("{path}: unreadable"));
-        }
+        // A read of an entry of a tar held in memory cannot fail: a short body shows as other bytes.
+        entry.read_to_end(&mut held).expect("a tar entry in memory");
         if seen.insert(path.clone(), held).is_some() {
             problems.push(format!("{path}: listed twice"));
         }
@@ -367,6 +366,18 @@ pub fn package_task_bundle(
     commit: &str,
     out: &Path,
 ) -> Result<Vec<String>, Error> {
+    package_with(layout, sbom, commit, out, &tarball)
+}
+
+/// [`package_task_bundle`] with the tarball writer given, so a test can hand the read-back a
+/// tarball that is not the layout's.
+fn package_with(
+    layout: &Path,
+    sbom: &Path,
+    commit: &str,
+    out: &Path,
+    pack: &dyn Fn(&Files) -> Result<Vec<u8>, String>,
+) -> Result<Vec<String>, Error> {
     if !build_commit::is_commit(commit) {
         return Err(Error::NotACommit(commit.to_owned()));
     }
@@ -403,7 +414,7 @@ pub fn package_task_bundle(
             l.name
         )));
     }
-    let tgz = tarball(&files).map_err(Error::Failed)?;
+    let tgz = pack(&files).map_err(Error::Failed)?;
     let path = out.join(&tgz_name);
     write_new(&path, &tgz)?;
     let found = check_tarball(&read(&path)?, &files);

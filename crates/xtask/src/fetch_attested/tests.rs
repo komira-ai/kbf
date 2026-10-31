@@ -154,3 +154,45 @@ fn a_member_that_leaves_the_archive_is_refused_before_any_download() {
     }
     assert!(!dir.join("release").exists() && !dir.join("tools").exists());
 }
+
+#[test]
+fn an_archive_directory_that_cannot_be_made_is_an_error_and_nothing_is_verified() {
+    // Asserts: an --archive below a regular file, and an --archive with no parent at all, are
+    // errors naming what failed; gh is not asked and no program is written.
+    let dir = scratch("archive-dir");
+    let bytes = archive("tool-1/tool");
+    let file = dir.join("a-file");
+    std::fs::write(&file, b"x").expect("file");
+    let mut req = request(&dir, &bytes, "tool-1/tool");
+    req.archive = file.join("release/tool.tar.gz");
+    let gh = Fake::new(true);
+    let err = install_verified(&req, &bytes, &gh).expect_err("parent is a file");
+    assert!(
+        err.to_string()
+            .contains(&format!("create {}", file.join("release").display())),
+        "{err}"
+    );
+    req.archive = PathBuf::new();
+    let err = install_verified(&req, &bytes, &gh).expect_err("no parent");
+    assert!(err.to_string().contains("write "), "{err}");
+    assert!(gh.seen.borrow().is_empty());
+    assert!(!req.out.exists());
+}
+
+#[test]
+fn the_gh_program_is_run_on_the_archive_and_its_answer_and_failure_to_start_are_reported() {
+    // Asserts: a program that exits 0 accepts the file, one that exits non-zero refuses it, and a
+    // program that does not exist is an error naming it (not a refusal that reads as an answer).
+    let file = Path::new("x.tar.gz");
+    let (accepted, _) = Gh(Path::new("true")).verify(file, &[]).expect("true runs");
+    assert!(accepted);
+    let (accepted, said) = Gh(Path::new("false"))
+        .verify(file, &[])
+        .expect("false runs");
+    assert!(!accepted);
+    assert_eq!(said, "");
+    let err = Gh(Path::new("/nonexistent/gh"))
+        .verify(file, &[])
+        .expect_err("no such program");
+    assert!(err.to_string().contains("/nonexistent/gh"), "{err}");
+}

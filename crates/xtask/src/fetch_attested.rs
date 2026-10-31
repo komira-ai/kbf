@@ -21,6 +21,8 @@
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+use rustls::pki_types::CertificateDer;
+
 use crate::bundles;
 use crate::fetch::{self, Sha256, Unpack};
 use crate::package::write_new;
@@ -136,15 +138,23 @@ pub fn install_verified(
 
 /// The `fetch-attested-tool` verb: the line to print.
 pub fn fetch_attested_tool(req: &Request<'_>, gh: &Path) -> Result<String, Error> {
+    download_and_install(req, &fetch::host_roots, &Gh(gh))
+}
+
+/// The verb with the TLS roots (read only after `--member` is accepted) and the verifier given.
+pub fn download_and_install(
+    req: &Request<'_>,
+    roots: &dyn Fn() -> Vec<CertificateDer<'static>>,
+    gh: &dyn Verifier,
+) -> Result<String, Error> {
     if !plain(&req.member) {
         return Err(Error::Usage(format!(
             "--member {:?} is not a relative path of plain names",
             req.member
         )));
     }
-    let roots = fetch::host_roots();
-    let bytes = fetch::download(req.url, &roots)?;
-    install_verified(req, &bytes, &Gh(gh))
+    let bytes = fetch::download(req.url, &roots())?;
+    install_verified(req, &bytes, gh)
 }
 
 #[cfg(test)]
