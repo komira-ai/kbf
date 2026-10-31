@@ -30,7 +30,7 @@ fn refused(found: &[String], want: &str) {
 #[test]
 fn the_real_workflow_keeps_every_rule() {
     // Catches: a workflow that drifts from the rules (or a rule that stops matching the file and
-    // passes vacuously): the control for every planted defect below.
+    // passes vacuously): the control for every planted case below.
     assert_eq!(problems(&real()), Vec::<String>::new());
 }
 

@@ -762,7 +762,6 @@ fn id_token_write_is_allowed_for_the_site_deploy_and_only_in_its_environment_on_
     }
     for cond in [
         "",
-        SIGNING_PUSH_IF,
         MAIN_REF_IF,
         "    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}\n",
         "    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && github.ref == 'refs/heads/main' }}\n",
