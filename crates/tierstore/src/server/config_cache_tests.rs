@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::config::{File, from_text, settings_from_text};
 use super::config_cache::{CacheSettings, Rate};
-use super::config_testing::{DEFAULTS, GOLDEN};
+use super::config_testing::{DEFAULTS, GOLDEN, MINIMAL};
 use super::local_cache::{FILL_CHUNK, WHOLE_FILL_LIMIT};
 
 /// A build node's file with every key given a value that is not the default.
@@ -37,6 +37,7 @@ critical   = 97
 free_floor = 15
 max_concurrent_fills = 6
 write_through = true
+whole_fill_limit = "128MiB"
 cache      = true
 scrub_rate = "50MiB/s"
 
@@ -56,8 +57,20 @@ prefix = "cas/d/"
 cache  = true
 
 [[policy]]
+prefix = "images/"
+cache  = true
+
+[[policy]]
 prefix = ""
 cache  = false
+
+[oci]
+listen              = "192.0.2.10:5000"
+tls_cert_file       = "/etc/tierstore-cache/oci.crt"
+tls_key_file        = "/etc/tierstore-cache/oci.key"
+prefix              = "images/"
+max_connections     = 16
+connection_lifetime = "30m"
 "#;
 
 /// The least a build node's file can say.
@@ -80,6 +93,26 @@ prefix = "cas/"
 cache  = true
 "#;
 
+/// `LEAST` with a policy that keeps the keys of the default `[oci]` prefix, `oci/`.
+const KEEPS_OCI: &str = r#"
+[server]
+listen          = "127.0.0.1:0"
+proxy_id        = "c1"
+bucket          = "tier-bucket"
+access_key_file = "key"
+
+[local_cache]
+path   = "/c"
+budget = 1000
+
+[cold_store]
+kind = "memory"
+
+[[policy]]
+prefix = "oci/"
+cache  = true
+"#;
+
 /// The settings of a build node's file.
 fn cache_of(text: &str) -> CacheSettings {
     settings_from_text(text, DEFAULTS)
@@ -91,6 +124,14 @@ fn cache_of(text: &str) -> CacheSettings {
 /// The message of the refusal of this file text.
 fn refusal(text: &str) -> String {
     settings_from_text(text, DEFAULTS).unwrap_err().to_string()
+}
+
+/// `message` without the leading `line N, column M: ` of a refusal of the syntax, if it has one.
+fn without_position(message: &str) -> &str {
+    match message.split_once(": ") {
+        Some((position, rest)) if position.starts_with("line ") => rest,
+        _ => message,
+    }
 }
 
 /// `CACHE` with the text `from` replaced by `to`, which must be in it.
@@ -141,13 +182,21 @@ fn a_build_node_file_makes_a_cache() {
         ),
         (85, 60, 97, 15)
     );
-    let policies = [("cas/b/", true), ("cas/d/", true), ("", false)];
+    let policies = [
+        ("cas/b/", true),
+        ("cas/d/", true),
+        ("images/", true),
+        ("", false),
+    ];
     let policies: Vec<(String, bool)> = policies
         .iter()
         .map(|(p, c)| ((*p).to_owned(), *c))
         .collect();
     assert_eq!(config.policies, policies);
-    assert_eq!((config.fill_chunk, config.whole_limit), (8 << 20, 64 << 20));
+    assert_eq!(
+        (config.fill_chunk, config.whole_limit),
+        (8 << 20, 128 << 20)
+    );
     assert_eq!((FILL_CHUNK, WHOLE_FILL_LIMIT), (8 << 20, 64 << 20));
     assert_eq!(config.max_concurrent_fills, 6);
     assert!(config.write_through);
@@ -189,6 +238,7 @@ fn a_build_node_file_has_the_defaults_of_the_flags_and_of_the_cache() {
         !config.write_through,
         "a file that leaves it out is a read cache"
     );
+    assert_eq!(config.whole_limit, WHOLE_FILL_LIMIT);
     assert_eq!(config.budget, 1000);
     assert_eq!(cache.front.region, "us-east-1");
     assert_eq!(cache.front.max_request_bytes, 256 << 20);
@@ -227,6 +277,11 @@ fn a_build_node_file_is_refused_when_it_cannot_be_run() {
     .replacen(
         "prefix = \"cas/d/\"\ncache  = true",
         "prefix = \"cas/d/\"\ncache  = false",
+        1,
+    )
+    .replacen(
+        "prefix = \"images/\"\ncache  = true",
+        "prefix = \"images/\"\ncache  = false",
         1,
     );
     let cases = [
@@ -347,6 +402,22 @@ fn a_build_node_file_is_refused_when_it_cannot_be_run() {
     assert!(!why.contains("fast"), "{why}");
 }
 
+/// Asserts that a `whole_fill_limit` that is not a size is refused naming its key and without the
+/// value, as a `budget` is: the key is one a refusal may name.
+#[test]
+fn a_whole_fill_limit_that_is_not_a_size_is_refused_naming_the_key_and_not_the_value() {
+    for bad in ["\"huge\"", "-5"] {
+        let text = LEAST.replacen(
+            "budget = 1000",
+            &format!("budget = 1000\nwhole_fill_limit = {bad}"),
+            1,
+        );
+        let why = refusal(&text);
+        assert!(why.contains("whole_fill_limit"), "{bad}: {why}");
+        assert!(!why.contains("huge"), "{bad}: {why}");
+    }
+}
+
 /// Asserts the edges of the water marks: a low water mark one under the high one, a high one
 /// equal to the critical one and a free floor of 99 are accepted; a low water mark equal to the
 /// high one, a high one over the critical one, a high or low water mark of 0 and a floor of 100
@@ -427,14 +498,82 @@ fn a_storage_node_refuses_a_list_of_endpoints_and_a_cache_policy() {
     assert!(why.contains("keeps no cache"), "{why}");
 }
 
-/// Asserts that a build node's file with an `[oci]` table is refused, with a message that names
-/// `oci`, whether or not the table has `listen`.
+/// Asserts that a build node's file takes the `[oci]` table with the keys of a storage node's,
+/// each to the field the `--oci-*` flag has, and that a file without the table has no front.
 #[test]
-fn a_build_node_refuses_an_oci_table() {
-    for table in ["listen = \"127.0.0.1:5000\"", "prefix = \"cas/\""] {
-        let why = refusal(&format!("{CACHE}\n[oci]\n{table}\n"));
-        assert!(why.contains("oci"), "{why}");
-        assert!(why.contains("build node"), "{why}");
+fn a_build_node_file_with_an_oci_table_makes_the_front() {
+    let oci = cache_of(CACHE).oci;
+    assert_eq!(oci.listen, Some("192.0.2.10:5000".parse().unwrap()));
+    assert_eq!(
+        oci.tls_cert.as_deref(),
+        Some(Path::new("/etc/tierstore-cache/oci.crt"))
+    );
+    assert_eq!(
+        oci.tls_key.as_deref(),
+        Some(Path::new("/etc/tierstore-cache/oci.key"))
+    );
+    assert_eq!(oci.prefix.as_deref(), Some("images/"));
+    assert_eq!(oci.max_connections, Some(16));
+    assert_eq!(oci.connection_lifetime, Some(Duration::from_secs(1800)));
+
+    let plain = format!("{KEEPS_OCI}\n[oci]\nlisten = \"127.0.0.1:5000\"\n");
+    let oci = cache_of(&plain).oci;
+    assert_eq!(oci.listen, Some("127.0.0.1:5000".parse().unwrap()));
+    assert_eq!((oci.tls_cert, oci.tls_key, oci.prefix), (None, None, None));
+    assert_eq!((oci.max_connections, oci.connection_lifetime), (None, None));
+
+    assert_eq!(cache_of(LEAST).oci.listen, None);
+}
+
+/// Asserts that a build node's `[oci]` table is refused exactly as a storage node's is: for each
+/// table below the build node's message equals the storage node's and names the key, so a
+/// certificate without a key, a key without a certificate, any key without `listen`, a count of
+/// zero and a key the table does not have are refused by the one set of rules.
+#[test]
+fn a_build_node_oci_table_is_refused_as_a_storage_nodes_is() {
+    let listen = "listen = \"127.0.0.1:5000\"\n";
+    let cases = [
+        (
+            format!("{listen}tls_cert_file = \"/c\""),
+            "oci.tls_key_file: it is needed with oci.tls_cert_file",
+        ),
+        (
+            format!("{listen}tls_key_file = \"/k\""),
+            "oci.tls_cert_file: it is needed with oci.tls_key_file",
+        ),
+        (
+            "tls_cert_file = \"/c\"\ntls_key_file = \"/k\"".to_owned(),
+            "oci.tls_cert_file: it needs oci.listen",
+        ),
+        (
+            "prefix = \"oci/\"".to_owned(),
+            "oci.prefix: it needs oci.listen",
+        ),
+        (
+            "max_connections = 4".to_owned(),
+            "oci.max_connections: it needs",
+        ),
+        (
+            "connection_lifetime = \"1h\"".to_owned(),
+            "oci.connection_lifetime: it needs",
+        ),
+        (String::new(), "oci.listen: it is needed"),
+        (
+            format!("{listen}max_connections = 0"),
+            "oci.max_connections",
+        ),
+        (format!("{listen}bogus = 1"), "bogus"),
+    ];
+    for (oci, want) in cases {
+        let build = refusal(&format!("{LEAST}\n[oci]\n{oci}\n"));
+        let storage = refusal(&format!("{MINIMAL}\n[oci]\n{oci}\n"));
+        assert!(build.contains(want), "{oci}: {build}");
+        // A refusal of the syntax says where it is, and the two files are not laid out alike.
+        assert_eq!(
+            without_position(&build),
+            without_position(&storage),
+            "{oci}"
+        );
     }
 }
 
@@ -465,8 +604,68 @@ fn a_build_node_file_written_back_makes_the_same_settings() {
     assert_eq!(format!("{again:?}"), format!("{:?}", cache_of(CACHE)));
 }
 
+/// Asserts that an `[oci]` front whose blobs no policy keeps is refused at load, with a message
+/// that names `oci.prefix` and says which policy decides: none covers the default prefix, the
+/// policy that covers it has `cache = false`, and a given prefix is checked, not the default. A
+/// policy that keeps the prefix (the default, and a given one) loads.
+#[test]
+fn an_oci_front_over_keys_the_cache_does_not_keep_is_refused() {
+    let front = "[oci]\nlisten = \"127.0.0.1:5000\"\n";
+    let none = refusal(&format!("{LEAST}\n{front}"));
+    assert!(none.contains("oci.prefix"), "{none}");
+    assert!(none.contains("no [[policy]] covers"), "{none}");
+    assert!(none.contains("\"oci/blobs/sha256/\""), "{none}");
+
+    let off = "[[policy]]\nprefix = \"\"\ncache = false\n";
+    let why = refusal(&format!("{LEAST}\n{off}\n{front}"));
+    assert!(why.contains("oci.prefix"), "{why}");
+    assert!(why.contains("cache = false"), "{why}");
+
+    let exact = "[[policy]]\nprefix = \"oci/\"\ncache = false\n";
+    let why = refusal(&format!("{LEAST}\n{exact}\n{front}"));
+    assert!(why.contains("oci.prefix"), "{why}");
+    assert!(why.contains("cache = false"), "{why}");
+
+    // A policy prefix must end in `/` and the blobs are flat under `blobs/sha256/`, so no policy
+    // can cover some of the blobs: the one that covers them all decides.
+    let rest = "[[policy]]\nprefix = \"\"\ncache = true\n";
+    let inside = "[[policy]]\nprefix = \"oci/blobs/sha256/0\"\ncache = false\n";
+    let why = refusal(&format!("{LEAST}\n{rest}\n{inside}\n{front}"));
+    assert!(why.contains("does not end in /"), "{why}");
+    let outside = "[[policy]]\nprefix = \"other/\"\ncache = false\n";
+    let loaded = cache_of(&format!("{LEAST}\n{rest}\n{outside}\n{front}"));
+    assert!(loaded.oci.listen.is_some());
+
+    let given = format!("{front}prefix = \"layers/\"\n");
+    let why = refusal(&format!("{KEEPS_OCI}\n{given}"));
+    assert!(why.contains("\"layers/blobs/sha256/\""), "{why}");
+    let layers = "[[policy]]\nprefix = \"layers/\"\ncache = true\n";
+    let kept = cache_of(&format!("{KEEPS_OCI}\n{layers}\n{given}"));
+    assert!(kept.oci.listen.is_some());
+    let default = cache_of(&format!("{KEEPS_OCI}\n{front}"));
+    assert!(default.oci.listen.is_some());
+    // No front, no check: a file whose policies keep nothing under `oci/` loads as before.
+    assert_eq!(cache_of(LEAST).oci.listen, None);
+}
+
+/// Asserts the `whole_fill_limit` key: a size that reaches `whole_limit`, and refused at zero and
+/// above the budget, naming the key.
+#[test]
+fn the_whole_fill_limit_is_a_size_between_one_byte_and_the_budget() {
+    let with = |limit: &str| {
+        let key = format!("budget = 1000\nwhole_fill_limit = {limit}");
+        LEAST.replacen("budget = 1000", &key, 1)
+    };
+    assert_eq!(cache_of(&with("1000")).cache.whole_limit, 1000);
+    assert_eq!(cache_of(&with("1")).cache.whole_limit, 1);
+    for bad in ["0", "1001"] {
+        let why = refusal(&with(bad));
+        assert!(why.contains("local_cache.whole_fill_limit"), "{bad}: {why}");
+    }
+}
+
 /// The keys of `[local_cache]`, which the README of the packaging must document each in a row.
-const LOCAL_CACHE_KEYS: [&str; 11] = [
+const LOCAL_CACHE_KEYS: [&str; 12] = [
     "path",
     "layout",
     "budget",
@@ -476,6 +675,7 @@ const LOCAL_CACHE_KEYS: [&str; 11] = [
     "free_floor",
     "max_concurrent_fills",
     "write_through",
+    "whole_fill_limit",
     "cache",
     "scrub_rate",
 ];

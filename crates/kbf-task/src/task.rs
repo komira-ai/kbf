@@ -20,7 +20,7 @@
 //! | 12 | pack: the outputs could not be collected, did not fit the run's packs and large objects (`output-too-large`), changed after they were hashed (`output-changed`), or made a manifest or pack the frontend would refuse (`invalid-manifest`, `invalid-pack`) |
 //! | 13 | put: a pack or large object could not be stored (refused, key already taken, still no room after the retries of a 503, unreachable), or a large object's bytes changed while it was sent (the stored object is an orphan) |
 //! | 14 | setup: `--lease` is not a build id, a credential or root certificate is unusable, a credential given as a flag value without `--insecure-argv-secrets`, or the runtime did not start |
-//! | 15 | no confine: the Command is to be denied the network and this system cannot deny it (not Linux, no platform confine built); nothing was run |
+//! | 15 | no confine: the Command is to be denied the network and this system cannot deny it (neither Linux nor macOS); nothing was run |
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -62,7 +62,7 @@ pub const EXIT_PACK: u8 = 12;
 pub const EXIT_PUT: u8 = 13;
 /// Exit code: a file a flag names is unusable, or the runtime did not start.
 pub const EXIT_SETUP: u8 = 14;
-/// Exit code: the Command is to be denied the network and this system has no confine that can.
+/// Exit code: the Command is to be denied the network and this system (neither Linux nor macOS) has no confine that can.
 pub const EXIT_NO_CONFINE: u8 = 15;
 
 /// `kbf-task`: runs one build action inside a job and stores its pack with one PUT.
@@ -252,6 +252,21 @@ impl Failure {
             Failure::Put(_) => EXIT_PUT,
         }
     }
+}
+
+/// The files this tool was given a credential or presigned URL in (`--grant-token-file`,
+/// `--pack-url-file`, `--put-urls-file`): the ones the Command must not read, as on macOS its
+/// sandbox profile denies. A credential given as a flag value is in no file.
+pub(crate) fn credential_files(cli: &Cli) -> Vec<PathBuf> {
+    [
+        &cli.grant_token_file,
+        &cli.pack_url_file,
+        &cli.put_urls_file,
+    ]
+    .into_iter()
+    .flatten()
+    .cloned()
+    .collect()
 }
 
 /// Where the finished packs and large objects go: one slot for each URL of the run's key set.
@@ -444,6 +459,7 @@ pub(crate) async fn execute_with(
     let stdout = cli.work_dir.join("stdout");
     let stderr = cli.work_dir.join("stderr");
     let private = cli.work_dir.join("private");
+    let unreadable = credential_files(cli);
     let ran = run(
         &command,
         &Run {
@@ -453,6 +469,7 @@ pub(crate) async fn execute_with(
             stderr: &stderr,
             deadline: deadline(&action, Duration::from_millis(cli.deadline_ms)),
             network,
+            unreadable: &unreadable,
         },
     )
     .await?;
@@ -793,6 +810,10 @@ fn start(runtime: std::io::Result<tokio::runtime::Runtime>, cli: &Cli) -> ExitCo
 #[cfg(test)]
 #[path = "task_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "credential_files_tests.rs"]
+mod credential_files_tests;
 
 #[cfg(test)]
 #[path = "plain_grant_tests.rs"]
