@@ -38,7 +38,12 @@ fn hand() -> (Hand, mpsc::Sender<()>, mpsc::UnboundedReceiver<()>) {
 
 /// Changes one byte of the data file of `key` in place, as rot does.
 fn rot(rig: &Rig, key: &str) {
-    let path = rig.file(key);
+    rot_path(&rig.file(key));
+}
+
+/// Changes one byte of the file at `path` in place.
+fn rot_path(path: &std::path::Path) {
+    let path = path.to_path_buf();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     let mut bytes = std::fs::read(&path).unwrap();
     bytes[0] ^= 0xff;
@@ -550,11 +555,12 @@ async fn a_scrub_does_not_touch_the_object_of_a_fill_that_a_forget_marked() {
     assert!(inner.is_invalidated(&hex));
 }
 
-/// Asserts that a write-through put of a key whose cache entry is stale (the object was deleted
-/// behind the cache's back) drops the entry, so a scrub finds nothing to drop and counts no
-/// mismatch, and the next read fills the new bytes, which the next scrub keeps.
+/// Asserts that a write-through put over a stale entry (the object was deleted behind the cache's
+/// back) leaves the new bytes kept on the node and the stale ones gone; that the scrub then
+/// checks the new copy, finds it whole and keeps it (scrubbed 1, its size, dropped 0); and that
+/// the next read serves it with no call to the upstream.
 #[tokio::test]
-async fn a_write_through_put_clears_a_stale_entry_so_the_scrub_has_nothing_to_drop() {
+async fn a_write_through_put_replaces_a_stale_entry_and_the_scrub_keeps_the_new_copy() {
     let rig = Rig::with("tscache-scrub-put", |config| config.write_through = true);
     rig.put("cas/b/obj", &pattern(100)).await;
     rig.get("cas/b/obj").await.unwrap();
@@ -565,11 +571,45 @@ async fn a_write_through_put_clears_a_stale_entry_so_the_scrub_has_nothing_to_dr
         .put("cas/b/obj", fresh.clone().into())
         .await
         .unwrap();
+    assert_eq!(std::fs::read(rig.file("cas/b/obj")).unwrap(), fresh);
+    assert_eq!(rig.cache.held(), (150, 1));
     let mut state = Scrubber::new(1 << 20);
-    assert_eq!(rig.cache.scrub_once(&mut state), ScrubPass::default());
+    let expected = ScrubPass {
+        scrubbed: 1,
+        bytes: 150,
+        dropped: 0,
+    };
+    assert_eq!(rig.cache.scrub_once(&mut state), expected);
+    assert_eq!(read(&rig.cache.counters().scrub_mismatches), 0);
+    let gets = rig.calls(Op::Get);
     assert_eq!(rig.get("cas/b/obj").await.unwrap(), fresh);
-    let pass = rig.cache.scrub_once(&mut state);
-    assert_eq!((pass.scrubbed, pass.dropped), (1, 0));
+    assert_eq!(rig.calls(Op::Get), gets);
+}
+
+/// Asserts that a kept object that is being published (its file linked, its flight held, just
+/// before the index insert) is not dropped by a scrub of its name, even if its bytes were wrong: the
+/// scrub leaves it, counts no mismatch, and the object is in the index when the put ends.
+#[tokio::test]
+async fn a_kept_object_published_during_a_scrub_is_not_dropped() {
+    let rig = Rig::with("tscache-scrub-keep-race", |config| {
+        config.write_through = true
+    });
+    let key = "cas/b/kept";
+    let hex = name_of(key).hex;
+    let inner = Arc::clone(&rig.cache.inner);
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let (hooked, noted) = (Arc::clone(&inner), Arc::clone(&seen));
+    let path = rig.file(key);
+    *super::locked(&inner.before_insert) = Some(Box::new(move || {
+        rot_path(&path);
+        let verdict = hooked.scrub_object_between(&hex, &Scrubber::new(1 << 20), || {});
+        *noted.lock().unwrap() = Some(verdict);
+    }));
+    rig.cache.put(key, pattern(120).into()).await.unwrap();
+    *super::locked(&inner.before_insert) = None;
+    assert_eq!(*seen.lock().unwrap(), Some(Verdict::Left));
+    assert!(rig.has_file(key));
+    assert_eq!(rig.cache.held(), (120, 1));
     assert_eq!(read(&rig.cache.counters().scrub_mismatches), 0);
 }
 
