@@ -30,10 +30,12 @@ pub mod live;
 pub mod mc;
 pub mod ops;
 pub mod paper;
+pub mod trusted;
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -194,7 +196,7 @@ pub(crate) fn heal_percent(host: &dyn Host, ops: &OpsFile) -> Result<Option<f64>
     let Some(path) = &ops.cold_heal_status_file else {
         return Ok(None);
     };
-    let text = read_text(host, path).map_err(|e| why(&e))?;
+    let text = host::read_status_text(host, path).map_err(|e| why(&e))?;
     let status: Status =
         serde_json::from_str(&text).map_err(|e| format!("heal status file: {e}"))?;
     Ok(Some(status.percent_done))
@@ -213,11 +215,78 @@ pub fn is_healing(info: Option<&serde_json::Value>, percent_done: Option<f64>) -
 /// The heal state in words: `none`, `healing N% done` or `healing, progress unknown`.
 #[must_use]
 pub fn heal_state(info: Option<&serde_json::Value>, percent_done: Option<f64>) -> String {
-    match (is_healing(info, percent_done), percent_done) {
+    heal_words(is_healing(info, percent_done), percent_done)
+}
+
+fn heal_words(healing: bool, percent_done: Option<f64>) -> String {
+    match (healing, percent_done) {
         (true, Some(p)) => format!("healing {p:.0}% done"),
         (true, None) => "healing, progress unknown".to_owned(),
         (false, _) => "none".to_owned(),
     }
+}
+
+/// How far in the future the stamp of a status file may be, milliseconds: the writer's clock
+/// and this one are not the same clock.
+const FUTURE_SKEW_MS: u64 = 5_000;
+
+/// The cold store's status file in file mode: what the writer on the node that can ask the store
+/// recorded, stamped with its own clock when it asked.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct HealFile {
+    /// When the writer read the store, milliseconds since the Unix epoch, by its clock.
+    pub read_unix_ms: u64,
+    /// Whether the writer saw the store healing.
+    pub healing: bool,
+    /// How far the heal is, percent, if the writer knows.
+    pub percent_done: Option<f64>,
+    /// The drives the writer saw, named as in a result.
+    pub drives: Vec<crate::result::DriveState>,
+    /// The store's version, if the writer recorded it.
+    pub version: Option<String>,
+}
+
+impl HealFile {
+    /// Healing if the file's flag, a drive or the percent says so.
+    pub(crate) fn is_healing(&self) -> bool {
+        self.healing
+            || self.drives.iter().any(|d| d.healing)
+            || self.percent_done.is_some_and(|p| p < 100.0)
+    }
+
+    /// The heal state in words, as [`heal_state`].
+    pub(crate) fn state_words(&self) -> String {
+        heal_words(self.is_healing(), self.percent_done)
+    }
+}
+
+/// The status file `path` (see [`OpsFile::cold_file_mode`]), read in file mode and refused unless its own stamp is at
+/// most `max_age` before `now_ms` and at most five seconds after it.
+pub(crate) fn read_heal_file(
+    host: &dyn Host,
+    path: &Path,
+    now_ms: u64,
+    max_age: Duration,
+) -> Result<HealFile, String> {
+    let text = host::read_status_text(host, path).map_err(|e| why(&e))?;
+    let file: HealFile =
+        serde_json::from_str(&text).map_err(|e| format!("heal status file: {e}"))?;
+    if file.read_unix_ms > now_ms.saturating_add(FUTURE_SKEW_MS) {
+        return Err(format!(
+            "heal status file is stamped {} s in the future",
+            (file.read_unix_ms - now_ms) / 1000
+        ));
+    }
+    let limit = u64::try_from(max_age.as_millis()).unwrap_or(u64::MAX);
+    let age = now_ms.saturating_sub(file.read_unix_ms);
+    if age > limit {
+        return Err(format!(
+            "heal status file is {} s old, over the limit of {} s",
+            age / 1000,
+            max_age.as_secs()
+        ));
+    }
+    Ok(file)
 }
 
 /// What of the test instance exists: its unit, its port and its directories, one text each.
@@ -246,18 +315,37 @@ pub fn instance_leftovers(
 }
 
 /// The checks that ask a store: its version, and for the cold store its heal state.
+///
+/// The cold role with no admin entry and a status file (file mode) is answered by the file
+/// alone, under its freshness rule, and `mc` is not run for it.
 fn store_checks(
     host: &dyn Host,
     config: &RunConfig,
     ops: &OpsFile,
+    now_ms: u64,
     versions: &mut BTreeMap<String, String>,
 ) -> Vec<Check> {
     let mut checks = Vec::new();
     let mut cold_info = None;
+    let path = ops
+        .cold_file_mode()
+        .filter(|_| config.stores.contains_key(&Role::Cold));
+    let file = path.map(|path| read_heal_file(host, path, now_ms, config.cold_state_max_age));
     for role in [Role::Cold, Role::Hot] {
         let Some(spec) = config.stores.get(&role) else {
             continue;
         };
+        if let (Role::Cold, Some(file)) = (role, &file) {
+            let version = file.clone().map(|f| {
+                f.version
+                    .inspect(|v| {
+                        versions.insert("cold-store".to_owned(), v.clone());
+                    })
+                    .unwrap_or_else(|| "version unknown (file mode)".to_owned())
+            });
+            checks.push(check("store-version:cold", version));
+            continue;
+        }
         let info = Mc::for_role(host, ops, role, spec, &config.result_dir)
             .and_then(|mc| mc.info())
             .map_err(|e| why(&e));
@@ -272,7 +360,13 @@ fn store_checks(
             cold_info = Some(info);
         }
     }
-    if let Some(info) = cold_info {
+    if let Some(file) = file {
+        let found = file.map(|f| f.state_words());
+        if let Ok(state) = &found {
+            versions.insert("cold-heal".to_owned(), state.clone());
+        }
+        checks.push(check("cold-heal-state", found));
+    } else if let Some(info) = cold_info {
         let percent = heal_percent(host, ops);
         let info = info.ok();
         let known = info.is_some() || matches!(percent, Ok(Some(_)));
@@ -458,6 +552,18 @@ fn paper_checks(host: &dyn Host, ops: &OpsFile) -> Vec<Check> {
 /// Runs every check against `host` and returns the report. Writes nothing.
 #[must_use]
 pub fn gather(host: &dyn Host, config: &RunConfig, ops: &OpsFile) -> PreflightReport {
+    gather_at(host, config, ops, crate::s3::unix_ms())
+}
+
+/// [`gather`], the time now being `now_ms` (milliseconds since the Unix epoch): the clock a
+/// status file's stamp is compared with.
+#[must_use]
+pub fn gather_at(
+    host: &dyn Host,
+    config: &RunConfig,
+    ops: &OpsFile,
+    now_ms: u64,
+) -> PreflightReport {
     let mut report = PreflightReport::default();
     let (binary, digest) = binary_checks(host, ops, &mut report.snapshot);
     report.binary_digest = digest;
@@ -468,7 +574,7 @@ pub fn gather(host: &dyn Host, config: &RunConfig, ops: &OpsFile) -> PreflightRe
     report
         .checks
         .extend(live_checks(host, ops, &mut report.snapshot));
-    let stores = store_checks(host, config, ops, &mut report.tool_versions);
+    let stores = store_checks(host, config, ops, now_ms, &mut report.tool_versions);
     report.checks.extend(stores);
     let node = node_checks(host, config, ops, &mut report.hardware);
     report.checks.extend(node);

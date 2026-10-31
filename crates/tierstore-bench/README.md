@@ -32,6 +32,41 @@ before it makes either: one that is on the store and not in `provision-state.jso
 directory is someone else's, and the verb stops before changing anything. The account's secret is
 given to `mc` on its standard input, never in its arguments.
 
+## Pre-made buckets: `provision --premade`
+
+MinIO cannot confine admin user, policy or quota actions to a name prefix: its policy engine
+ignores `Resource` for admin actions, so a key allowed to create a policy and attach it to a user
+can grant itself anything. So the admin work is split between two keys.
+
+| who | holds | does |
+|---|---|---|
+| the held script `admin_mint.sh --campaign ...`, run by a person with the store's root key | everything | per campaign: the bucket, its 30 GiB quota, the bucket-only policy `<test prefix>tierstore-bench-<role>`, the scoped account and the attachment; and, with `--remove`, the reverse |
+| the key this tool holds (the `admin` file of `ops.json`) | `admin:ServerInfo`, `admin:GetBucketQuota`; `s3:GetBucketLocation`, `s3:ListBucket`, `s3:ListBucketVersions`, `s3:DeleteBucket`, `s3:ForceDeleteBucket` on the campaign's buckets (`<prefix>*`); `s3:DeleteObject` and `s3:DeleteObjectVersion` on their objects (`<prefix>*/*`) | `preflight` (`mc admin info`), `provision --premade`, and the removal of a bucket's objects and the bucket itself |
+
+That key has no `admin:ListUsers`, `admin:CreatePolicy`, `admin:AttachUserOrGroupPolicy`,
+`admin:CreateUser`, `admin:SetBucketQuota` or `s3:CreateBucket`; every command `provision` runs
+without `--premade` needs at least one of them.
+
+`provision --premade` (with or without `--apply`) runs none of `mb`, `quota set`, `admin policy
+create`, `admin user add` and `admin policy attach`, and does not list accounts. For each role of
+the run (`hot`, `cold`) it:
+
+1. checks that the test bucket is there (`mc ls` of that bucket); if it is not, or may not be
+   listed, the verb stops and names the held script;
+2. checks the quota with `mc quota info`: no quota, or one over 30 GiB, stops the verb (a smaller
+   one passes);
+3. with every role's checks passed, runs the two probes: the scoped account (the key pair the run
+   file holds for the role) must list its own bucket, and must be refused a read of the live
+   bucket the ops file names;
+4. writes the bucket and the account to `provision-state.json` with `"premade": true`, so the
+   teardown's guard finds them. The record is written only after the probes pass; the key of a
+   run that made its own has no `premade` field, and a record without it reads as before.
+
+If the scoped account can read a live bucket the verb stops and does not remove it (it holds no
+right to): it says to run `admin_mint.sh --campaign ... --remove` now. The plan and the dry run
+say `premade` on every line, and `provision.json` has mode `apply-premade` or `dry-run-premade`.
+Without `--premade` nothing changes.
+
 ## Commands
 
 ```
@@ -89,6 +124,21 @@ A credentials file (`admin`, `verifier`) is JSON of `access_key_id` and `secret_
 `cold_heal_status_file` is JSON of `percent_done`, kept by the operator. `live_buckets`, `admin`,
 `verifier`, `mc`, `node`, `cold_heal_status_file` and `paper` are optional; `tierstore`, `live`
 (with `dirs`) and `test_instance` are not.
+
+`verify-teardown` reads the store with the `verifier` key. That key needs `s3:ListAllMyBuckets`
+(the bucket list) and read on the test bucket (`s3:GetObject`, `s3:ListBucket`,
+`s3:ListBucketMultipartUploads`, `s3:GetBucketLocation`). `test-bucket-removed` passes only when
+the bucket list, read with that key, does not name the test bucket and does name the role's
+live bucket (`live_buckets`). It fails if the bucket is listed and fails if the list cannot be
+read (`AccessDenied` included). The live-bucket condition closes a blind spot: a store lists a key
+without `s3:ListAllMyBuckets` only the buckets that key may use, so a mis-scoped verifier sees an
+empty list, and an empty list proves nothing. A list that does not name the live bucket fails with
+"the verifier's bucket list does not show the live bucket <name>: the key lacks
+s3:ListAllMyBuckets, so the list cannot prove removal", and a role with no `live_buckets` entry
+fails with a message that says so. An `AccessDenied` on the
+bucket itself is never read as removal; a `NoSuchBucket` on it is noted and does not decide
+alone. `no-multipart-uploads` reads the uploads of the bucket whenever `s3:ListBucketMultipartUploads`
+is granted, whether or not the other listings work.
 
 ### The live directories
 
@@ -180,11 +230,50 @@ The load gate sees this machine only. Two things look at the cold store itself.
 carry that reading. Before every pass of every arm `run` reads it again, through what preflight
 uses and read-only: `mc admin info` of the cold role (its drives and whether any reports healing)
 and the status file of the ops file (`cold_heal_status_file`, `percent_done`). It is healing if a
-drive says so or the status file is under 100. A reading that cannot be made (neither source
-answers, or the status file is not one) stops the run, and so does a reading that takes longer
+drive says so or the status file is under 100. A reading that cannot be made (`mc admin info`
+fails, or the status file is not one) stops the run, and so does a reading that takes longer
 than `--cold-state-timeout-secs` (30): the `mc admin info` that has not answered by then is
 killed (that command only) and the run stops with `cold state: unreadable`, the status file
 notwithstanding. A run with no `cold` role reads nothing.
+
+**File mode.** When the ops file has no `admin` entry for `cold` and names a
+`cold_heal_status_file`, `run` and `preflight` never run `mc` for the cold role: a writer on a host
+that holds the admin key keeps the file, and the file is the reading. (With an `admin` entry for
+`cold` nothing of this applies: `mc admin info` is read, and an admin key that fails is an error,
+never a fall back to the file.) The file is JSON:
+
+```json
+{"read_unix_ms": 1790000000000, "healing": true, "percent_done": 12.5,
+ "drives": [{"id": "d-1a2b3c4d", "state": "ok", "healing": true}],
+ "version": "RELEASE.<version>"}
+```
+
+`read_unix_ms` (integer, milliseconds since the Unix epoch), `healing` (bool) and `drives` (array of
+`id`, `state`, `healing`, named as in a result) are required; `percent_done` and `version` are
+optional; other fields are ignored. The reading is healing if `healing`, a drive or a
+`percent_done` under 100 says so. The file is refused (`cold state: unreadable` for `run`, which
+stops; a failed `store-version:cold` and `cold-heal-state` for `preflight`) if it is missing or not
+this JSON, if `read_unix_ms` is older than `--cold-state-max-age-secs` (default 30, at least 1) before
+now, or if it is more than 5 s in the future. The `cold_state` entry carries the file's
+`read_unix_ms`, not the time the tool read the file, and `"source": "file"` (`"mc"` when `mc` was
+asked). Preflight takes the store version from the file's `version`; without one the check
+passes as `version unknown (file mode)` and the report records no cold store version. Only the
+cold role has a file mode; a hot role still needs its `admin` entry.
+
+The writer's contract: stamp `read_unix_ms` with the clock of the host that asked the store, at the
+time of the ask; write the file only after `mc admin info` answered and was parsed; on any failure
+write nothing, so the file ages out and the run stops. The tool compares the writer's stamp with
+its own clock, so the two hosts' clocks must be in sync (NTP on both). A writer more than 5 s
+ahead of the reader is refused as stamped in the future; a writer behind the reader spends that
+difference from `--cold-state-max-age-secs`, so a file is refused sooner than its age alone says.
+
+The file is a trust input: it decides whether the cold store is quiet. It is written by the
+dev-box loop over ssh as the operator account, mode 0644, owned by that account (the user that
+runs the tool), and it is read as a secret file is: the tool refuses it (the reading is
+`cold state: unreadable` and `run` stops) if it is a symbolic link, is not a regular file (a FIFO
+or a directory), is owned by another user, is writable by its group or by others, or is over
+64 KiB. The same rule holds for the status file in `mc` mode.
+
 Each reading is stamped into the `cold_state` array of the result of the arm, one entry per pass:
 
 ```json

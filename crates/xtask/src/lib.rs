@@ -27,9 +27,6 @@
 //!   --project <dir> --nonce <text>` ([`prove_farm`]): after the deploy, build a small Buck2 project against the
 //!   farm, remote only, and exit 1 unless some action ran remotely and none locally. An empty `--address` prints a
 //!   notice and exits 0.
-//! - `frozen-paths --base <rev> --head <rev>` ([`frozen_paths`]): refused when the change touches a
-//!   path tierstore is moving to its own repository with (a rename out of one counts). Deleted with
-//!   its workflow, `tierstore-move-freeze.yml`, once the import has landed.
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
 //!   row the working tree's budget file has and `<rev>`'s does not is refused, unless
 //!   git sees the row's path renamed from a path `<rev>` has a row for. CI runs
@@ -150,7 +147,6 @@ pub mod deploy_farm;
 pub mod entitlements;
 pub mod fetch;
 pub mod fetch_attested;
-pub mod frozen_paths;
 pub mod installer_tarball;
 pub mod package;
 pub mod pipeline_rerun;
@@ -256,9 +252,6 @@ enum Verb {
         #[arg(long)]
         base: String,
     },
-    /// Refuse a change between `--base` and `--head` that touches a path tierstore is moving out
-    /// with (a rename out of one counts).
-    FrozenPaths(frozen_paths::Args),
     /// Append `SOURCE_DATE_EPOCH=<seconds>`, the committer time of `--commit`, to `--output`
     /// (on Actions, `GITHUB_ENV`), so a later step builds an image that carries the commit's
     /// time and no clock of the build's.
@@ -1167,7 +1160,6 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::PipelineWatch(args) => pipeline_watch::run(&args),
         Verb::PipelineRerun(args) => pipeline_rerun::run(&args),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
-        Verb::FrozenPaths(args) => Ok(vec![frozen_paths::run(&args, &root)?]),
         Verb::SourceDateEpoch { commit, output } => {
             source_date_epoch(&root, &commit, &output).map(|line| vec![line])
         }
