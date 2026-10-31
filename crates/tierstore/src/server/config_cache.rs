@@ -25,6 +25,9 @@
 //! endpoint         = "http://192.0.2.20:9300"
 //! credentials_file = "/etc/tierstore-cache/upstream-read.key"
 //!
+//! [oci]                         # optional: the registry front, served from the cache
+//! listen = "127.0.0.1:5000"
+//!
 //! [[policy]]
 //! prefix = "cas/b/"
 //! cache  = true
@@ -36,12 +39,14 @@
 //! multipart-conditional answers (see [`cache_cli`](super::cache_cli)). Left out or `false`, the
 //! node refuses every write with 403 and its upstream key may be a read-only one.
 //!
-//! The file is read into a [`CacheSettings`]. It has no flag form. What it refuses, besides what
+//! The file is read into a [`CacheSettings`]. It has no flag form. The `[oci]` table is the
+//! storage node's, with its rules (see [`config`](super::config)). What it refuses, besides what
 //! every file does: a `[hot_store]` along with `[local_cache]`, a layout that is not `digest-v1`,
 //! `cache = false`, marks out of order, no `[[policy]]` with `cache = true`, a list of more than
 //! one `endpoints` in `[cold_store]` (the cache reads from one upstream), and the keys of the
 //! storage node that do nothing here: `skip_checks`, the reconciler's keys and
-//! `backend_check_wait`.
+//! `backend_check_wait`. With an `[oci]` table it also refuses a front whose blobs (the keys under
+//! `<prefix>blobs/sha256/`) no `[[policy]]` with `cache = true` keeps.
 
 use std::fmt;
 use std::time::Duration;
@@ -49,9 +54,11 @@ use std::time::Duration;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use super::cli::DEFAULT_OCI_PREFIX;
 use super::config::{
-    ConfigError, Dur, PerRun, Policy, ServerTable, Size, TierParts, TierTable, check_policies,
-    duration, front_of, invalid, parse_size, refuse, refuse_hot_keys, require, tier, within,
+    ConfigError, Dur, OciFlags, OciTable, PerRun, Policy, ServerTable, Size, TierParts, TierTable,
+    check_policies, duration, front_of, invalid, oci as oci_of, parse_size, refuse,
+    refuse_hot_keys, require, tier, within,
 };
 use super::front::FrontSettings;
 use super::local_cache::{CacheConfig, SCRUB_MIN_ROUND, SCRUB_RATE};
@@ -128,6 +135,10 @@ pub(super) struct LocalCacheTable {
     /// Whether the node takes writes and sends them to the upstream (default `false`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_through: Option<bool>,
+    /// The most an object may be for a ranged read of it to fill the whole of it (1 byte up to
+    /// the budget, default 64 MiB). A larger object is passed through and kept nowhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whole_fill_limit: Option<Size>,
     /// Whether the cache is on: `true`, the default. `false` is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<bool>,
@@ -152,6 +163,8 @@ pub(super) struct CacheSettings {
     pub upstream: TierParts,
     /// The cache.
     pub cache: CacheConfig,
+    /// The OCI front, as `[oci]` and the `--oci-*` flags make it: `listen` is `None` for none.
+    pub oci: OciFlags,
     /// The rate of the scrub in bytes a second: the default if the file gave none; none if the
     /// file turned it off.
     pub scrub_rate: Option<u64>,
@@ -185,11 +198,45 @@ fn percent(key: &str, value: Option<u8>, default: u8, low: u8) -> Result<u8, Con
     within("local_cache", key, value.unwrap_or(default), low, 100)
 }
 
+/// Refuses an `[oci]` front whose blobs the cache would not keep: the keys it reads, under
+/// `<prefix>blobs/sha256/`, must be held by the longest `[[policy]]` prefix that covers them with
+/// `cache = true`. A front over a cache that keeps none of what it serves is every pull going to
+/// the upstream; a registry that is meant to pass through is a storage node's front, or no
+/// cache, so there is no use of this to keep.
+fn check_oci_is_kept(oci: &OciFlags, policy: &[Policy]) -> Result<(), ConfigError> {
+    if oci.listen.is_none() {
+        return Ok(());
+    }
+    let prefix = oci.prefix.as_deref().unwrap_or(DEFAULT_OCI_PREFIX);
+    let probe = format!("{prefix}blobs/sha256/");
+    let holding = policy
+        .iter()
+        .filter(|policy| probe.starts_with(policy.prefix.as_str()));
+    let longest = holding.max_by_key(|policy| policy.prefix.len());
+    match longest {
+        Some(policy) if policy.cache => Ok(()),
+        Some(policy) => {
+            let why = format!(
+                "the blobs under {probe:?} are covered by the [[policy]] with prefix {:?}, which has cache = false, so every pull would go to the upstream; give a [[policy]] with prefix = {prefix:?} and cache = true",
+                policy.prefix
+            );
+            Err(invalid("oci.prefix", why))
+        }
+        None => {
+            let why = format!(
+                "no [[policy]] covers the blobs under {probe:?}, so every pull would go to the upstream; give a [[policy]] with prefix = {prefix:?} and cache = true"
+            );
+            Err(invalid("oci.prefix", why))
+        }
+    }
+}
+
 impl CacheSettings {
     /// The settings of the tables of a build-node file.
     pub(super) fn new(
         server: ServerTable,
         tables: (LocalCacheTable, TierTable),
+        oci_table: Option<OciTable>,
         policy: &[Policy],
         per_run: PerRun,
     ) -> Result<Self, ConfigError> {
@@ -238,6 +285,7 @@ impl CacheSettings {
                 "must not be above critical",
             ));
         }
+        let oci = oci_of(oci_table)?;
         let shared = front_of(server, per_run)?;
         let policies = policy
             .iter()
@@ -258,12 +306,17 @@ impl CacheSettings {
             let why = "must be at least 1s (the scrub ticks once a second), or 0s for no minimum";
             return Err(invalid("local_cache.scrub_min_round", why));
         }
+        if let Some(limit) = table.whole_fill_limit {
+            cache.whole_limit = within("local_cache", "whole_fill_limit", limit.0, 1, budget)?;
+        }
+        check_oci_is_kept(&oci, policy)?;
         Ok(Self {
             front: shared.front,
             s3_request_timeout: shared.s3_request_timeout,
             upstream,
             cache,
             scrub_min_round,
+            oci,
             scrub_rate: Some(table.scrub_rate.map_or(SCRUB_RATE, |rate| rate.0)).filter(|n| *n > 0),
         })
     }

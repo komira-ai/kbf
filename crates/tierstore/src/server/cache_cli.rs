@@ -19,27 +19,35 @@
 //! them wrongly, a key that may not write included, is exit status 3; one that does not answer is
 //! exit status 1, after the one try that the check of the start gives it.
 //!
+//! With an `[oci]` table the registry front runs beside the S3 one, over the same cache: a blob
+//! or a manifest it reads is a hit on the disk or a fill from the upstream, as an S3 GET is. Its
+//! flags and files are checked as a storage node's are (see `oci_setup_of`), before the cache is
+//! opened, and it drains with the S3 front.
+//!
 //! On SIGTERM or SIGINT the process drains as a storage node does; the eviction pass is the only
 //! thing running beside the server, and it stops with it. Nothing is owed to the upstream: no
 //! journal, no lease, no copy in flight.
 
 use std::future::Future;
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 use crate::{Backend, Clock, Error as BackendError, SelfTestOptions, SystemClock, self_test};
 
-use super::cli::{Error, S3Flags, open_tier, probe_run_id, signals};
+use super::cli::{
+    Addresses, Error, S3Flags, bind_oci, oci_cut_note, oci_setup_of, open_tier, probe_run_id,
+    serve_oci, signals,
+};
 use super::config_cache::CacheSettings;
 use super::front::{InvalidFlags, server_config};
 use super::local_cache::{
     CacheConfig, Disk, Every, LocalCache, SCRUB_TICK, SystemDisk, check_local,
 };
+use super::oci::OciListener;
 use super::{Drained, Server};
 
 /// How often the eviction pass runs beside the server.
@@ -152,10 +160,13 @@ pub(super) async fn serve_cache(
     upstream: Arc<dyn Backend>,
     disk: Arc<dyn Disk>,
     stop: impl Future<Output = ()> + Send + 'static,
-    ready: impl FnOnce(SocketAddr),
+    ready: impl FnOnce(Addresses),
 ) -> Result<Drained, Error> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut config = server_config(&settings.front, Arc::clone(&clock))?;
+    // The front's flags and files are checked before the cache is opened, as the storage node's.
+    let oci = oci_setup_of(&settings.oci, &config, true)?;
+    config.oci_metrics = oci.as_ref().map(|setup| Arc::clone(&setup.metrics));
     let run = probe_run_id(&settings.front.proxy_id, clock.now(), std::process::id());
     let cache = open(&settings.cache, &upstream, &disk, &run).await?;
     reach(&*upstream, &run, &settings.upstream.spec).await?;
@@ -164,16 +175,28 @@ pub(super) async fn serve_cache(
         config.cache_writes = true;
     }
     config.cache = Some(cache.clone());
+    // The registry front reads what the S3 front reads: through the cache.
     let backend: Arc<dyn Backend> = Arc::new(cache.clone());
-    let server = Server::new(backend, config);
+    let server = Server::new(Arc::clone(&backend), config);
     let address = settings.front.listen;
     let bound = TcpListener::bind(address).await;
     let listener = bound.map_err(|why| format!("binding {address}: {why}"))?;
-    ready(listener.local_addr()?);
+    let oci = bind_oci(oci, backend).await?;
+    let oci_addr = oci.as_ref().map(OciListener::local_addr).transpose()?;
+    let oci_mode = oci.as_ref().map(OciListener::mode);
+    ready(Addresses {
+        s3: listener.local_addr()?,
+        oci: oci_addr,
+        oci_mode,
+    });
     let stopping = Arc::clone(&server);
+    let (oci_stop, oci_stopped) = watch::channel(false);
+    let lb_wait = settings.front.drain_lb_wait;
     let watcher = tokio::spawn(async move {
         stop.await;
         stopping.begin_drain();
+        tokio::time::sleep(lb_wait).await;
+        let _ = oci_stop.send(true);
     });
     // One Notify for each loop: `notify_one` wakes one waiter, and keeps the wake for a loop that
     // is not waiting just now.
@@ -193,8 +216,10 @@ pub(super) async fn serve_cache(
         Every::new(SCRUB_TICK),
         halt_scrub,
     );
-    let (drained, (), ()) = tokio::join!(serving, maintaining, scrubbing);
+    let (drained, (), (), oci_cut) =
+        tokio::join!(serving, maintaining, scrubbing, serve_oci(oci, oci_stopped));
     watcher.abort();
+    eprint!("{}", oci_cut_note(oci_cut));
     Ok(drained)
 }
 
@@ -206,7 +231,7 @@ pub(super) async fn serve_cache(
 pub(super) async fn run_cache(
     settings: &CacheSettings,
     stop: impl Future<Output = ()> + Send + 'static,
-    ready: impl FnOnce(SocketAddr),
+    ready: impl FnOnce(Addresses),
 ) -> Result<Drained, Error> {
     if settings.s3_request_timeout.is_zero() {
         return Err("--s3-request-timeout must be longer than zero".into());
@@ -231,7 +256,14 @@ pub(super) async fn serve_cache_until_signalled(settings: CacheSettings) -> Resu
     } else {
         "read-cache"
     };
-    let announce = |addr: SocketAddr| println!("tierstore {version} listen={addr} mode={mode}");
+    let announce = |bound: Addresses| {
+        let mut line = format!("tierstore {version} listen={} mode={mode}", bound.s3);
+        if let Some(oci) = bound.oci {
+            let how = bound.oci_mode.unwrap_or_default().as_str();
+            line.push_str(&format!(" oci-listen={oci} ({how})"));
+        }
+        println!("{line}");
+    };
     let drained = run_cache(&settings, stop, announce).await?;
     eprint!("{}", super::cli::cut_note(drained));
     Ok(())
