@@ -472,6 +472,30 @@ fn a_marked_node_that_cannot_be_read_is_not_given_back() {
     assert_eq!(marks(&rig.dir), 1);
 }
 
+/// A restart in the middle of a trial finds the marked node unreadable: the trial still
+/// finishes and B is kept, but the node is not given back, its mark stays, and the log says
+/// to uncordon it by hand.
+///
+/// Catches: a transient read failure at resume taken for "ours" (the node uncordoned unseen),
+/// and a node left drained with no word of how to get it back.
+#[test]
+fn a_resumed_trial_whose_node_cannot_be_read_keeps_b_and_leaves_the_node_drained() {
+    let rig = Rig::new("cordon-resume-unreadable");
+    cordon(&rig.node, &rig.dir)
+        .drain(&host(Role::Daemon), None)
+        .unwrap();
+    rig.pending();
+    *rig.node.read_error.lock().unwrap() = Some(PortError::other("503"));
+    assert_eq!(rig.run(VB, None), result(VB, Outcome::Succeeded));
+    assert!(!rig.node.is_serving(), "not given back");
+    assert_eq!(marks(&rig.dir), 1, "the mark stays");
+    let logs = rig.logs.lock().unwrap();
+    assert!(
+        logs.iter().any(|l| l.contains("uncordon it by hand")),
+        "{logs:?}"
+    );
+}
+
 /// `observe` (what the agent calls when it looks at its node outside an update) drops the mark
 /// of a node read serving, keeps that of one still cordoned, and does nothing with no mark.
 ///
