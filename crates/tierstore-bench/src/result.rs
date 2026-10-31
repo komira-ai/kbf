@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::cells::CellId;
+use crate::config::RateCaps;
 use crate::error::BenchError;
 use crate::role::Role;
 
@@ -247,6 +248,38 @@ pub struct PassResult {
     /// The cold store guard's trip that aborted the pass, if one did.
     #[serde(default)]
     pub cold_guard: Option<ColdTrip>,
+    /// Requests the fault proxy forwarded, by HTTP method, while the pass was driven and after
+    /// it; none when the arm has no proxy in its path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_requests: Option<ProxyRequests>,
+    /// The busy time of each whole disk of the machine that sends the requests over the pass,
+    /// by device name; empty when the machine could not be read for it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub disk_busy: BTreeMap<String, DiskBusy>,
+    /// The most requests that were in flight at the start of one request of the pass: what the
+    /// pass realised of the width it was asked for.
+    #[serde(default)]
+    pub peak_in_flight: u32,
+}
+
+/// What the fault proxy forwarded to the store around one pass, by HTTP method. A method with no
+/// request is absent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyRequests {
+    /// While the pass sent its requests.
+    pub during: BTreeMap<String, u64>,
+    /// From the end of the last request of the pass to the end of its cleanup: what the store
+    /// is still sent for the pass (a background copy) and what the cleanup deletes.
+    pub after: BTreeMap<String, u64>,
+}
+
+/// How busy one disk was over a pass.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DiskBusy {
+    /// Milliseconds the disk spent doing IO during the pass (`io_ticks` of `/proc/diskstats`).
+    pub busy_ms: u64,
+    /// `busy_ms` over the wall time of the pass, percent, at most 100.
+    pub util_pct: f64,
 }
 
 /// The result of one arm of one cell: the contents of one result JSON.
@@ -273,6 +306,11 @@ pub struct CellResult {
     /// had no cold store to read (or the result was written before the field existed).
     #[serde(default)]
     pub cold_state: Vec<PassColdState>,
+    /// The request-rate caps the run held every client to. A cell whose requests wait at a cap
+    /// measures the cap, so the caps are in every result. Absent in a result written before the
+    /// field existed.
+    #[serde(default)]
+    pub rate_caps: Option<RateCaps>,
 }
 
 impl CellResult {
@@ -437,6 +475,18 @@ mod tests {
                     requests: 40,
                     window_secs: 60,
                 }),
+                proxy_requests: Some(ProxyRequests {
+                    during: BTreeMap::from([("HEAD".to_owned(), 3)]),
+                    after: BTreeMap::from([("DELETE".to_owned(), 10)]),
+                }),
+                disk_busy: BTreeMap::from([(
+                    "sda".to_owned(),
+                    DiskBusy {
+                        busy_ms: 2_500,
+                        util_pct: 50.0,
+                    },
+                )]),
+                peak_in_flight: 7,
             }],
             notes: vec!["a note".to_owned()],
             cold_state: vec![PassColdState {
@@ -452,6 +502,11 @@ mod tests {
                     read_unix_ms: 1_500,
                 },
             }],
+            rate_caps: Some(RateCaps {
+                cold_rps: 20,
+                hot_rps: 50,
+                list_poll_rps: 2,
+            }),
         }
     }
 
@@ -482,18 +537,36 @@ mod tests {
         );
     }
 
-    /// Catches a result written before the cold state, the cold guard and the attempt were added
+    /// Catches a result written before the cold state, the cold guard, the attempt, the rate caps,
+    /// the proxy counts, the disk busy time and the peak in flight were added
     /// being refused, or read as something other than a first attempt with no readings.
     #[test]
     fn a_result_without_the_newer_fields_reads_with_their_defaults() {
         let mut v: serde_json::Value = serde_json::from_str(&result().to_json()).unwrap();
         v.as_object_mut().unwrap().remove("cold_state");
+        v.as_object_mut().unwrap().remove("rate_caps");
         v["provenance"].as_object_mut().unwrap().remove("attempt");
         for pass in v["passes"].as_array_mut().unwrap() {
-            pass.as_object_mut().unwrap().remove("cold_guard");
+            for field in [
+                "cold_guard",
+                "proxy_requests",
+                "disk_busy",
+                "peak_in_flight",
+            ] {
+                pass.as_object_mut().unwrap().remove(field);
+            }
         }
         let old = CellResult::from_json(&v.to_string()).unwrap();
         assert!(old.cold_state.is_empty());
+        assert_eq!(old.rate_caps, None);
+        assert_eq!(
+            (
+                old.passes[0].proxy_requests.is_none(),
+                old.passes[0].disk_busy.is_empty(),
+                old.passes[0].peak_in_flight
+            ),
+            (true, true, 0)
+        );
         assert_eq!(old.provenance.attempt, 1);
         assert_eq!(old.passes[0].cold_guard, None);
     }

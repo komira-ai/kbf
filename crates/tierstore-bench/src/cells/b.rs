@@ -211,6 +211,7 @@ fn arm(label: String, in_flight: u32, misses: &Arc<Misses>) -> Arm {
         })),
         faulted: false,
         notes,
+        proxy: None,
     }
 }
 
@@ -241,6 +242,8 @@ pub async fn run_with(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use bytes::Bytes;
     use objstore_s3::s3::fake::FakeS3;
 
@@ -341,6 +344,39 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("a lower bound on a real miss"))
         );
+    }
+
+    /// Catches the store being warmed by the harness before the read the paper calls a miss: for
+    /// every object the first read of the key is the instance's, then its second read, and the
+    /// direct read of the cold bucket comes last. A direct read first would leave the object in
+    /// the page cache of the cold store's disks, and the miss would be timed against a warm store.
+    #[tokio::test]
+    async fn the_first_read_of_an_object_is_the_instances_and_the_direct_read_is_last() {
+        let dir = temp("tb-b-order");
+        let (instance, cold) = (FakeS3::start().await, FakeS3::start().await);
+        let stores = [
+            (Role::Instance, instance.endpoint()),
+            (Role::Cold, cold.endpoint()),
+        ];
+        let ctx = testkit::ctx(dir.path(), &stores, Window::Busy);
+        mirror(&ctx, 4096, 2, 3).await;
+        run_with(&ctx, &plan(&[2], &[4096]), Script::calm(), Some(3))
+            .await
+            .unwrap();
+        let mut reads: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for record in testkit::requests(dir.path())
+            .into_iter()
+            .filter(|r| r.method == "GET" && !r.key.ends_with('/'))
+        {
+            reads
+                .entry(record.key.clone())
+                .or_default()
+                .push(record.role.to_string());
+        }
+        assert_eq!(reads.len(), 6, "{reads:?}");
+        for (key, roles) in &reads {
+            assert_eq!(roles, &["instance", "instance", "cold"], "{key}");
+        }
     }
 
     /// Catches a direct read that is not a failure when the instance keeps its cold objects

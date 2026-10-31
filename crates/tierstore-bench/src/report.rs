@@ -440,6 +440,9 @@ mod tests {
             }),
             gate_tripped: None,
             cold_guard: None,
+            proxy_requests: None,
+            disk_busy: BTreeMap::new(),
+            peak_in_flight: 0,
         }
     }
 
@@ -459,6 +462,7 @@ mod tests {
             passes,
             notes: notes.iter().map(|n| (*n).to_owned()).collect(),
             cold_state: vec![],
+            rate_caps: None,
         }
     }
 
@@ -876,5 +880,146 @@ mod tests {
         let other = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "tb-report-io2");
         std::fs::create_dir(other.path().join("x.json")).unwrap();
         assert!(matches!(render(other.path()), Err(BenchError::Io { .. })));
+    }
+
+    /// A pass of `arm` with the counts, disk figures and width given.
+    fn recorded(
+        index: u32,
+        requests: u64,
+        during: &[(&str, u64)],
+        after: &[(&str, u64)],
+    ) -> PassResult {
+        let counts = |pairs: &[(&str, u64)]| -> BTreeMap<String, u64> {
+            pairs.iter().map(|(m, n)| ((*m).to_owned(), *n)).collect()
+        };
+        PassResult {
+            proxy_requests: Some(crate::result::ProxyRequests {
+                during: counts(during),
+                after: counts(after),
+            }),
+            ..pass(index, Window::Quiet, requests, None)
+        }
+    }
+
+    /// Catches the instance's multipart put reported on its own, with nothing to read it
+    /// against: the report pairs `instance-<rest>` with `direct-mp-<rest>` (same size, width and
+    /// mode) and gives each path's p50 and p95 and the difference and ratio; the single PUT
+    /// (`direct-`) is not a partner, and an arm with no partner gets no comparison.
+    #[test]
+    fn an_instance_put_is_compared_with_the_multipart_put_to_the_store() {
+        let quiet = |arm: &str| {
+            result(
+                arm,
+                vec![
+                    pass(0, Window::Quiet, 3, None),
+                    pass(1, Window::Quiet, 3, None),
+                ],
+                &[],
+            )
+        };
+        let data = merged(vec![
+            rows("direct-mp-4kib-c1-healthy", 1, &[1000, 2000, 3000], "200"),
+            rows("instance-4kib-c1-healthy", 1, &[3000, 4000, 5000], "200"),
+            rows("direct-4kib-c1-healthy", 1, &[100, 200, 300], "200"),
+            rows("instance-1mib-c1-healthy", 1, &[9000], "200"),
+        ]);
+        let results = [
+            quiet("direct-mp-4kib-c1-healthy"),
+            quiet("instance-4kib-c1-healthy"),
+            quiet("direct-4kib-c1-healthy"),
+            quiet("instance-1mib-c1-healthy"),
+        ];
+        let text = format_report(&results, &data);
+        let (_, section) = text
+            .split_once("### cold-put: instance against direct-mp")
+            .expect("a comparison section");
+        let section = section.split("\n\n").nth(1).unwrap();
+        assert!(
+            section.contains("| 4kib-c1-healthy | quiet | 2.00 ms | 4.00 ms | +2.00 ms (2.00x) | 3.00 ms | 5.00 ms | +2.00 ms (1.67x) |"),
+            "{section}"
+        );
+        assert!(!section.contains("direct-4kib"), "{section}");
+        assert!(!section.contains("1mib"), "{section}");
+
+        let alone = format_report(&results[1..2], &data);
+        assert!(!alone.contains("instance against direct-mp"), "{alone}");
+    }
+
+    /// Catches the requests the proxy forwarded being left out of the report, summed over the
+    /// warm-up pass, or not divided by the requests of the arm: the measured passes' counts by
+    /// method, per request, those during the pass and those after it apart.
+    #[test]
+    fn the_proxy_requests_are_reported_per_request_by_method() {
+        let r = result(
+            "a",
+            vec![
+                recorded(0, 10, &[("PUT", 1000)], &[("DELETE", 1000)]),
+                recorded(1, 10, &[("HEAD", 20), ("PUT", 10)], &[("DELETE", 10)]),
+                recorded(2, 10, &[("HEAD", 20), ("PUT", 10)], &[("DELETE", 10)]),
+            ],
+            &[],
+        );
+        let none = result("b", vec![pass(1, Window::Quiet, 10, None)], &[]);
+        let text = format_report(&[r, none], &Rows::new());
+        assert!(
+            text.contains("- arm a: proxy requests per request, measured passes: during HEAD 2.00, PUT 1.00; after DELETE 1.00"),
+            "{text}"
+        );
+        assert!(!text.contains("- arm b: proxy requests"), "{text}");
+    }
+
+    /// Catches the disk figures and the width a pass reached being recorded and never shown, the
+    /// warm-up pass among them: the mean and the largest utilisation of each disk over the
+    /// measured passes and the most requests in flight in one.
+    #[test]
+    fn the_disk_and_the_width_of_the_measured_passes_are_reported() {
+        let with = |index: u32, util: f64, peak: u32| PassResult {
+            disk_busy: BTreeMap::from([(
+                "sda".to_owned(),
+                crate::result::DiskBusy {
+                    busy_ms: 1,
+                    util_pct: util,
+                },
+            )]),
+            peak_in_flight: peak,
+            ..pass(index, Window::Quiet, 10, None)
+        };
+        let r = result(
+            "x",
+            vec![with(0, 99.0, 9), with(1, 40.0, 3), with(2, 60.0, 2)],
+            &[],
+        );
+        let text = format_report(&[r], &Rows::new());
+        assert!(
+            text.contains("- arm x: disk busy, measured passes: sda mean 50.0%, max 60.0%"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- arm x: most requests in flight in a measured pass: 3"),
+            "{text}"
+        );
+    }
+
+    /// Catches a table of a cell that hides the rate cap its requests waited at: the caps of the
+    /// run are named under the table of every cell, and a result that predates them says so.
+    #[test]
+    fn the_rate_caps_of_the_run_are_named_under_each_table() {
+        let mut capped = result("a", vec![pass(1, Window::Quiet, 1, None)], &[]);
+        capped.rate_caps = Some(crate::config::RateCaps {
+            cold_rps: 20,
+            hot_rps: 50,
+            list_poll_rps: 2,
+        });
+        let text = format_report(&[capped], &Rows::new());
+        assert!(
+            text.contains("- request caps of the run: cold 20/s, hot 50/s, LIST poll 2/s"),
+            "{text}"
+        );
+        let old = result("a", vec![pass(1, Window::Quiet, 1, None)], &[]);
+        let text = format_report(&[old], &Rows::new());
+        assert!(
+            text.contains("- request caps of the run: not recorded"),
+            "{text}"
+        );
     }
 }

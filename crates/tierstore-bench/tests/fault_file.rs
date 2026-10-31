@@ -8,7 +8,7 @@ use kbf_testkit::dir::TestDir;
 use tierstore_bench::cells::engine::FaultSwitch;
 use tierstore_bench::error::BenchError;
 use tierstore_bench::faultfile::FileSwitch;
-use tierstore_bench::proxy::{FaultMode, ProxyConfig, spawn};
+use tierstore_bench::proxy::{COUNTERS_FILE, Counters, FaultMode, ProxyConfig, spawn};
 
 fn config(dir: &TestDir) -> ProxyConfig {
     ProxyConfig {
@@ -52,6 +52,29 @@ async fn the_request_count_is_the_proxys_counters() {
     silent.set_mode(FaultMode::Pass).unwrap();
     assert_eq!(silent.request_count(), 0);
     proxy.stop().await.unwrap();
+}
+
+/// Catches counts by method that are lost between the proxy's file and the switch: the switch
+/// reports the map of the counters file as written, and an empty one for counters it cannot read.
+#[test]
+fn the_method_counts_are_the_proxys_counters() {
+    let dir = TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        "tierstore-bench-faultfile-methods",
+    );
+    let switch = FileSwitch::new(dir.path().join("control"), dir.path());
+    assert!(switch.method_counts().is_empty());
+    let counters = Counters {
+        requests: 3,
+        requests_by_method: [("HEAD".to_owned(), 2), ("PUT".to_owned(), 1)].into(),
+        ..Counters::default()
+    };
+    std::fs::write(
+        dir.path().join(COUNTERS_FILE),
+        serde_json::to_vec(&counters).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(switch.method_counts(), counters.requests_by_method);
 }
 
 /// Catches a fault arm measured with no proxy listening to the file: with no proxy the call

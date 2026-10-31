@@ -104,6 +104,14 @@ pub trait LoadSource: Send + Sync {
     /// [`BenchError`] if the machine cannot be read; the run stops, since a gate that cannot see
     /// is not a gate.
     fn sample(&self) -> Result<LoadSample, BenchError>;
+    /// Milliseconds each whole disk of the machine has spent doing IO so far, by device name;
+    /// empty for a source that cannot say.
+    ///
+    /// # Errors
+    /// [`BenchError`] if the machine cannot be read.
+    fn disk_busy_ms(&self) -> Result<BTreeMap<String, u64>, BenchError> {
+        Ok(BTreeMap::new())
+    }
 }
 
 /// The machine this process runs on, through [`LoadSample::read`].
@@ -126,6 +134,10 @@ pub trait FaultSwitch: Send + Sync {
     fn set_mode(&self, mode: FaultMode) -> Result<(), BenchError>;
     /// Requests that went through the proxy so far.
     fn request_count(&self) -> u64;
+    /// The same requests by HTTP method, so far; empty for a switch that cannot say.
+    fn method_counts(&self) -> BTreeMap<String, u64> {
+        BTreeMap::new()
+    }
 }
 
 /// How an arm sends its requests.
@@ -263,6 +275,9 @@ pub struct Arm {
     pub faulted: bool,
     /// Prose of the cell's for every result of the arm.
     pub notes: Vec<String>,
+    /// The fault proxy in the path of the arm's cold requests, if there is one: its counts by
+    /// method around each pass go into the pass result.
+    pub proxy: Option<Arc<dyn FaultSwitch>>,
 }
 
 /// Which rate cap a client is held to.
@@ -708,6 +723,9 @@ fn pass_result(
         percentiles,
         gate_tripped: trip.map(|t| t.metric.to_owned()),
         cold_guard: cold_trip.cloned(),
+        proxy_requests: None,
+        disk_busy: BTreeMap::new(),
+        peak_in_flight: 0,
     }
 }
 
@@ -799,6 +817,7 @@ pub async fn run_cell(
             passes: got.passes,
             notes,
             cold_state: got.cold_state,
+            rate_caps: None,
         };
         write_new(&env.result_path(cell, &result.arm), &result.to_json())?;
         results.push(result);
@@ -1007,6 +1026,7 @@ mod tests {
             before: None,
             after: None,
             faulted: false,
+            proxy: None,
             notes: vec!["a note of the cell".to_owned()],
         }
     }

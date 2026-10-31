@@ -46,6 +46,7 @@
 //! `Instant`; the unit tests of the expiry give it instants of their own and read no clock.
 //! The verb `fault-proxy` is [`run`]: [`spawn`] and wait for SIGTERM.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -214,6 +215,10 @@ pub struct Counters {
     pub role: String,
     /// Requests sent on to the store, whatever came back.
     pub requests: u64,
+    /// The same requests by HTTP method (`GET`, `HEAD`, `PUT`, `POST`, `DELETE`, ...); the
+    /// counts add up to `requests`. A method that was not seen is absent.
+    #[serde(default)]
+    pub requests_by_method: BTreeMap<String, u64>,
     /// Bytes of request bodies read from the clients.
     pub request_bytes: u64,
     /// Bytes of answer bodies read from the store.
@@ -483,6 +488,7 @@ impl Shared {
             schema_version: COUNTERS_SCHEMA_VERSION,
             role: Role::Proxy.as_str().to_owned(),
             requests: load(&self.requests),
+            requests_by_method: BTreeMap::new(),
             request_bytes: load(&self.request_bytes),
             response_bytes: load(&self.response_bytes),
             refused: load(&self.refused),

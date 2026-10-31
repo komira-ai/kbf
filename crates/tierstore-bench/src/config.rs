@@ -12,7 +12,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cells::coldguard::ColdGuardLimits;
 use crate::gate::LoadGate;
@@ -193,7 +193,7 @@ pub struct ByteCaps {
 }
 
 /// Request-rate caps, per second, held by the harness whatever a cell asks for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateCaps {
     /// Requests to the cold store (token bucket, global).
     pub cold_rps: u32,

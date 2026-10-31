@@ -328,6 +328,7 @@ fn arm(
         .is_some_and(|(mode, _)| *mode != FaultMode::Pass);
     let (before_fault, after_fault) = (fault.clone(), fault.map(|(_, switch)| switch));
     let (before_seen, after_seen) = (seen.clone(), seen);
+    let proxy = after_fault.clone();
     Arm {
         label,
         pace: Pace::Closed,
@@ -376,6 +377,7 @@ fn arm(
         })),
         faulted,
         notes,
+        proxy,
     }
 }
 
