@@ -51,6 +51,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cli;
+pub mod compare;
 pub mod export;
 pub mod readonly;
 pub mod replay;
