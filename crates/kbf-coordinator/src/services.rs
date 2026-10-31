@@ -155,8 +155,11 @@ fn invalid<T>(why: String) -> Result<T, ServicesError> {
 }
 
 fn role_of(name: &str) -> Result<HostRole, ServicesError> {
+    // The loader names the four roles `kbf` knows and no others, however well formed.
     name.parse()
-        .or_else(|_| invalid(format!("{name} is not a host role")))
+        .ok()
+        .filter(|role| kbf_roles().contains(role))
+        .map_or_else(|| invalid(format!("{name} is not a host role")), Ok)
 }
 
 fn role_def(
