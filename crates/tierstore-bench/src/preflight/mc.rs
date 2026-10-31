@@ -179,8 +179,8 @@ impl<'a> Mc<'a> {
     }
 
     /// The hard quota of `bucket` in bytes (`mc quota info`, which needs `admin:GetBucketQuota`
-    /// and nothing that changes anything), or `None` if the answer carries no quota or a quota
-    /// of 0.
+    /// and nothing that changes anything), or `None` if the answer carries no quota, a quota
+    /// of 0, or a quota that is not of type `hard`.
     ///
     /// # Errors
     /// [`BenchError::Ops`] if the command fails or a line of its answer is not JSON.
@@ -188,7 +188,15 @@ impl<'a> Mc<'a> {
         let out = self.run("mc quota info", &["quota", "info", &Self::target(bucket)])?;
         Ok(json_lines("mc quota info", &out)?
             .iter()
-            .find_map(|line| line.get("quota").and_then(Value::as_u64))
+            .find_map(|line| {
+                // `mc quota info --json` prints `status`, `bucket`, `quota` (bytes, omitted
+                // when 0) and `type` (`hard`, omitted when empty): mc `cmd/quota-set.go:74-80`,
+                // filled at `cmd/quota-info.go:78-83`. A quota whose type is not `hard`, or
+                // whose type is not printed, is not the limit the run needs, so it fails closed.
+                let hard = line.get("type").and_then(Value::as_str) == Some("hard");
+                hard.then(|| line.get("quota").and_then(Value::as_u64))
+                    .flatten()
+            })
             .filter(|bytes| *bytes > 0))
     }
 
@@ -305,15 +313,14 @@ impl<'a> Mc<'a> {
     }
 }
 
-/// The lines of an `mc --json` answer, each parsed: `mc` prints one JSON object per line.
+/// The objects of an `mc --json` answer, each parsed. Most commands print one object per line;
+/// `mc quota info` prints an indented, multi-line object (`json.MarshalIndent`, mc
+/// `cmd/quota-set.go:96-97`), so the answer is read as a stream of objects, not line by line.
 fn json_lines(what: &str, out: &str) -> Result<Vec<Value>, BenchError> {
-    out.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            serde_json::from_str(line)
-                .map_err(|_| BenchError::Ops(format!("{what}: a line of the answer is not JSON")))
-        })
-        .collect()
+    serde_json::Deserializer::from_str(out)
+        .into_iter::<Value>()
+        .collect::<Result<_, _>>()
+        .map_err(|_| BenchError::Ops(format!("{what}: the answer is not JSON")))
 }
 
 /// The server version in an `mc admin info` answer: the first server's `version`.

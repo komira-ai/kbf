@@ -414,6 +414,25 @@ pub async fn run_with_supply(
         .map(|(role, spec)| prepare(host, config, ops, role, spec, supply))
         .collect::<Result<Vec<_>, _>>()?;
     let mut state = State::load(&config.result_dir, &config.test_prefix)?;
+    // One record says one thing: what a created run made, or what a held script made. A record
+    // of the other kind would be relabelled whole by this run, and the teardown, which trusts
+    // the label, would take a made account for the script's or the reverse. Dry runs refuse too.
+    let dir = config.result_dir.display();
+    match supply {
+        Supply::Premade if state.has_entries() && !state.is_premade() => {
+            return Err(BenchError::Ops(format!(
+                "{dir} holds a record of buckets or accounts this tool made; `--premade` would \
+                 relabel it. Use a fresh result directory, or tear the old one down first"
+            )));
+        }
+        Supply::Create if state.is_premade() => {
+            return Err(BenchError::Ops(format!(
+                "{dir} holds a record of pre-made buckets and accounts; a run that makes its own \
+                 would mix them in. Use a fresh result directory, or tear the old one down first"
+            )));
+        }
+        _ => {}
+    }
     if mode == Mode::Apply && supply == Supply::Create {
         // Everything that could be someone else's is looked for before anything is changed, so a
         // refusal leaves the store as it was.

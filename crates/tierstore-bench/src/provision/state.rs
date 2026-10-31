@@ -79,6 +79,12 @@ impl State {
         self.made.premade
     }
 
+    /// Whether the record names any bucket or account.
+    #[must_use]
+    pub fn has_entries(&self) -> bool {
+        !self.made.buckets.is_empty() || !self.made.accounts.is_empty()
+    }
+
     /// Whether this run made the bucket `name`.
     #[must_use]
     pub fn made_bucket(&self, name: &str) -> bool {
