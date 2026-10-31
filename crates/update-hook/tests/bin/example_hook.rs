@@ -86,7 +86,8 @@ impl Hook {
 
     /// How many times the harness has started this program, this time included.
     fn runs(&self) -> usize {
-        let file = self.faults.join("runs");
+        // Beside the sandboxes, so that it counts across them.
+        let file = self.faults.join("../../flaky-runs");
         let n = fs::read_to_string(&file).map_or(0, |t| t.len()) + 1;
         let _ = fs::write(&file, ".".repeat(n));
         n

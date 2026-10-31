@@ -376,16 +376,16 @@ impl<'a> Conformance<'a> {
         report: &Report,
     ) -> Result<(), Violation> {
         if report.reversible {
-            let moved = changes(start, &Self::world(sandbox)?);
-            if !moved.is_empty() {
-                return Err(Violation::RollbackClaimsReversible { changes: moved });
-            }
             let left = self.fake.residue(sandbox)?;
             if !left.is_empty() {
                 return Err(Violation::ResidueLeft {
                     step: Step::Rollback,
                     left,
                 });
+            }
+            let moved = changes(start, &Self::world(sandbox)?);
+            if !moved.is_empty() {
+                return Err(Violation::RollbackClaimsReversible { changes: moved });
             }
         }
         Ok(())

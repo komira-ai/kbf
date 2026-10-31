@@ -289,9 +289,6 @@ objstore-s3 = { path = "crates/objstore-s3" }
 # The hot/cold object store library; it depends on no kbf crate unless its `s3` feature is on
 # (kbf-integration-test keeps it so).
 tierstore = { path = "crates/tierstore" }
-# The hook contract and its conformance harness; depends on no workspace crate and is named
-# without `kbf` (kbf-integration-test keeps both true).
-update-hook = { path = "crates/update-hook" }
 # The CI verbs (`cargo xtask`); kbf-integration-test reads the interpreter budget with its parser.
 xtask = { path = "crates/xtask" }
 
