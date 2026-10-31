@@ -94,6 +94,8 @@ mod evict_tests;
 #[cfg(test)]
 mod fill_tests;
 #[cfg(test)]
+mod forget_tests;
+#[cfg(test)]
 mod front_tests;
 #[cfg(test)]
 mod hit_tests;
@@ -153,6 +155,10 @@ pub const FILL_CHUNK: u64 = 8 << 20;
 /// The fills that may run at once, unless the settings say otherwise.
 pub const MAX_CONCURRENT_FILLS: usize = 4;
 
+/// The keys a read-only cache remembers it deleted or replaced, unless the settings say
+/// otherwise: 65536 names of 64 bytes, about 4 MiB.
+pub const FORGET_LIMIT: usize = 65_536;
+
 /// The text of the refusal of a write at the Backend level (the front refuses it earlier).
 const READ_ONLY: &str = "this tierstore is a read cache";
 
@@ -185,6 +191,9 @@ pub struct CacheConfig {
     /// `Unsupported`. The binary sets the front's `cache_writes` from the same setting, so that
     /// the front does not refuse the writes either.
     pub write_through: bool,
+    /// The most keys a read-only cache remembers it deleted or replaced through the upstream
+    /// (see the module `hold`). Past it the cache is emptied when it takes the lock.
+    pub forget_limit: usize,
 }
 
 impl CacheConfig {
@@ -204,6 +213,7 @@ impl CacheConfig {
             whole_limit: WHOLE_FILL_LIMIT,
             max_concurrent_fills: MAX_CONCURRENT_FILLS,
             write_through: false,
+            forget_limit: FORGET_LIMIT,
         }
     }
 
