@@ -451,9 +451,11 @@ impl Inner {
 
     /// Removes the object from the index and, if this cache may write to its directory, from the
     /// disk. A read-only cache forgets the object and leaves its files: they are the holder's.
+    /// It notes the name, and removes the files when it takes the lock (see `hold`), so that the
+    /// object is not served from them then: it was deleted or replaced at the upstream.
     fn drop_entry(&self, hex: &str) {
         drop(locked(&self.index).remove(hex));
-        if !self.read_write() {
+        if !self.may_delete(hex) {
             return;
         }
         let root = &self.config.path;

@@ -12,6 +12,15 @@
 //! creates, changes and removes nothing in the directory. An object the holder publishes after
 //! the scan is not in the index of the read-only cache: it is a miss, answered from the upstream.
 //!
+//! A write-through delete or put sent to a read-only cache goes to the upstream, and the cache
+//! forgets the object in its index, so a read of it goes to the upstream too. The holder's files
+//! for it stay: the cache notes the name (at most `CacheConfig::forget_limit` names, 65536 by
+//! default; past that it notes only that there were too many). When it takes the lock it removes
+//! those files after the scan, before it is read-write, or, if there were too many, removes
+//! every object file and starts with an empty index. What remains: the holder itself still
+//! serves its cached copy of such an object, on the connections it is draining, until it exits.
+//! That window ends with its drain, and a read-only cache cannot shorten it.
+//!
 //! Taking the lock runs what a start of a lone cache runs: it empties `.stage/` (the fills of
 //! the one that held the lock are not kept), scans `obj/` again with deletes (a sidecar whose
 //! data file was never linked is the middle of a publish that did not finish), and replaces the
@@ -20,8 +29,9 @@
 //! else looks at, so the cache lets it go, is read-only again, and takes the new file when it
 //! can.
 
+use std::collections::HashSet;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -82,11 +92,41 @@ pub(super) enum Standing {
     Holding(LockFile),
 }
 
+/// The objects a read-only cache was told, by a write-through delete or put, are gone or
+/// replaced at the upstream, by the name of their files. The files are the holder's and stay
+/// where they are, so the cache must not trust them when it takes the lock.
+#[derive(Default)]
+struct Forgotten {
+    names: HashSet<String>,
+    /// More names than the limit were noted: the cache does not know which, so it trusts no
+    /// file.
+    overflowed: bool,
+}
+
+impl Forgotten {
+    /// Notes `hex`, or, if `limit` names are noted already, that there are too many to note.
+    fn note(&mut self, hex: &str, limit: usize) {
+        if self.overflowed {
+            return;
+        }
+        if self.names.len() >= limit {
+            self.overflowed = true;
+            self.names.clear();
+        } else {
+            let _ = self.names.insert(hex.to_owned());
+        }
+    }
+}
+
 /// The lock a cache holds, if any, and the mode that follows from it.
 pub(super) struct Hold {
     standing: Mutex<Standing>,
     /// Read on every request, so it is not behind the mutex that a scan holds for its length.
     read_write: AtomicBool,
+    /// Taken before `read_write` is read by whoever acts on it, and held by [`Inner::promote`]
+    /// until `read_write` is set: a delete is noted before the promotion looks at the notes, or
+    /// finds the cache read-write and removes the files itself.
+    forgotten: Mutex<Forgotten>,
 }
 
 impl Hold {
@@ -95,7 +135,16 @@ impl Hold {
         Self {
             standing: Mutex::new(standing),
             read_write: AtomicBool::new(read_write),
+            forgotten: Mutex::new(Forgotten::default()),
         }
+    }
+}
+
+/// Removes the file at `path`; one that is not there is removed already.
+fn remove_if_there(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(why) if why.kind() != io::ErrorKind::NotFound => Err(why),
+        _ => Ok(()),
     }
 }
 
@@ -131,19 +180,47 @@ impl Inner {
         // ready: the next tick tries again.
         self.promote()?;
         *standing = Standing::Holding(file);
-        self.hold.read_write.store(true, Ordering::SeqCst);
         Ok(Tick::Took)
     }
 
-    /// What taking the lock does to the directory and the index, before the cache is read-write.
+    /// Whether the files of `hex` may be removed now: the cache is read-write. A read-only cache
+    /// notes the name instead, for [`promote`](Self::promote), and removes nothing.
+    ///
+    /// The holder of the directory may go on serving its copy on the connections it is
+    /// draining, until it exits; that window ends with its drain, and nothing here can end it.
+    pub(super) fn may_delete(&self, hex: &str) -> bool {
+        let mut forgotten = locked(&self.hold.forgotten);
+        if self.read_write() {
+            return true;
+        }
+        forgotten.note(hex, self.config.forget_limit);
+        false
+    }
+
+    /// What taking the lock does to the directory and the index, and then makes the cache
+    /// read-write. After the scan it removes the files of the objects a delete or put through
+    /// this cache, while it was read-only, said are gone or replaced at the upstream, and drops
+    /// them from the index; if more were noted than the limit holds, it removes every object
+    /// and the index starts empty. Nothing is trusted that the holder left for a name that was
+    /// deleted.
     fn promote(&self) -> io::Result<()> {
         let removed = layout::clear_stage(&self.config.path)?;
         let scanned = layout::scan(&self.config.path)?;
+        let mut forgotten = locked(&self.hold.forgotten);
+        let distrust = |hex: &String| forgotten.overflowed || forgotten.names.contains(hex);
+        let (gone, kept): (Vec<_>, Vec<_>) =
+            scanned.found.into_iter().partition(|f| distrust(&f.hex));
+        for found in &gone {
+            remove_if_there(&layout::data_path(&self.config.path, &found.hex))?;
+            remove_if_there(&layout::meta_path(&self.config.path, &found.hex))?;
+        }
         add(
             &self.counters.discarded_at_start,
             scanned.discarded + removed,
         );
-        *locked(&self.index) = index_of(scanned.found);
+        *locked(&self.index) = index_of(kept);
+        *forgotten = Forgotten::default();
+        self.hold.read_write.store(true, Ordering::SeqCst);
         Ok(())
     }
 
