@@ -270,9 +270,14 @@ impl Desired {
         desired.checked(&def.require_min_up)?;
         desired.refuse_unnamed(services)?;
         let has = |role: &str| def.roles.contains_key(role);
-        desired.max_updating.retain(&LEGACY_ROLES, has);
-        desired.min_up.retain(&KBF_MIN_UP, has);
-        Ok((service, desired, Vec::new()))
+        let mut dropped = desired.max_updating.retain(&LEGACY_ROLES, has);
+        dropped.extend(desired.min_up.retain(&KBF_MIN_UP, has));
+        dropped.sort();
+        dropped.dedup();
+        if !dropped.is_empty() {
+            tracing::warn!(%service, roles = ?dropped, "dropped limits for roles the service does not have");
+        }
+        Ok((service, desired, dropped))
     }
 
     /// Refuses a limits key that is neither a legacy name nor a role of any service, so that a
