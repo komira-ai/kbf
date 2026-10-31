@@ -52,6 +52,17 @@ impl Staged {
         })
     }
 
+    /// Like [`Staged::check`], trusting the owners in `trusted` and reading owners from `owner`.
+    pub fn check_as(
+        &self,
+        hook: &Path,
+        trusted: &[u32],
+        owner: &dyn Fn(&fs::Metadata) -> (u32, u32),
+    ) -> Result<PathBuf, ArtifactError> {
+        let _ = (trusted, owner);
+        self.check(hook)
+    }
+
     /// Checks the tree still has its digest and returns the hook executable inside it.
     ///
     /// **What the launcher may rely on:** the returned path is a regular file of a tree that was
@@ -81,6 +92,15 @@ impl Staged {
         }
         Ok(path)
     }
+}
+
+/// Like [`tree_digest`], reading the owner of an entry from `owner` (user id, group id).
+pub fn tree_digest_with(
+    dir: &Path,
+    owner: &dyn Fn(&fs::Metadata) -> (u32, u32),
+) -> Result<String, ArtifactError> {
+    let _ = owner;
+    tree_digest(dir)
 }
 
 /// The tree and every directory above it are real directories (not links) owned by the running

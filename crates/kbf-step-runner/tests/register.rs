@@ -332,6 +332,31 @@ fn a_registration_that_cannot_be_kept_is_not_acknowledged() {
         "internal"
     );
     assert!(matches!(served.join().unwrap(), Err(RegistryError::Io(_))));
+    // The registration that could not be kept is not believed either.
+    assert_eq!(rig.registry.report("svc", None), Reported::Absent);
+}
+
+/// Catches a registration that was refused for being unwritable replacing the one that stood: the
+/// earlier registration is restored, and still reported as it was.
+#[test]
+fn a_registration_that_cannot_be_kept_leaves_the_earlier_one_standing() {
+    let rig = Rig::new("reg-restore", me());
+    let reg = |version: &str| -> Registration {
+        serde_json::from_str(registration(version, None).trim()).unwrap()
+    };
+    rig.registry
+        .register(me(), &reg("2.0.0"), &grant(me()))
+        .unwrap();
+    fs::remove_dir_all(rig.scratch.path().join("state")).unwrap();
+    let err = rig.registry.register(me(), &reg("2.0.1"), &grant(me()));
+    assert!(matches!(err, Err(RegistryError::Io(_))));
+    assert_eq!(rig.registry.report("svc", Some("2.0.0")), Reported::Healthy);
+    assert_eq!(
+        rig.registry.report("svc", Some("2.0.1")),
+        Reported::Unhealthy(Why::VersionMismatch {
+            running: "2.0.0".to_owned()
+        })
+    );
 }
 
 /// Catches a socket directory that others can enter, that another user owns, that is a link, or is
@@ -353,6 +378,14 @@ fn the_socket_directory_is_checked() {
     let err = bind(&open.join("s"), me()).err().unwrap();
     assert!(matches!(err, RegistryError::SocketDir(_)));
     assert!(err.to_string().contains("socket directory"));
+
+    let group_writable = scratch.path().join("gw");
+    fs::create_dir(&group_writable).unwrap();
+    fs::set_permissions(&group_writable, fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(matches!(
+        bind(&group_writable.join("s"), me()).err().unwrap(),
+        RegistryError::SocketDir(_)
+    ));
 
     let closed = scratch.path().join("closed");
     fs::create_dir(&closed).unwrap();
@@ -491,4 +524,106 @@ fn a_close_that_cannot_be_kept_is_an_error() {
     fs::remove_dir_all(rig.scratch.path().join("state")).unwrap();
     drop(client);
     assert!(matches!(served.join().unwrap(), Err(RegistryError::Io(_))));
+}
+
+fn serve_in_thread(rig: &Rig) -> (Arc<AtomicBool>, JoinHandle<std::io::Result<()>>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (server, flag) = (rig.server.clone(), stop.clone());
+    (stop, std::thread::spawn(move || server.serve(&flag)))
+}
+
+fn finish(rig: &Rig, stop: Arc<AtomicBool>, serving: JoinHandle<std::io::Result<()>>) {
+    stop.store(true, Ordering::Release);
+    drop(UnixStream::connect(&rig.sock).unwrap());
+    serving.join().unwrap().unwrap();
+}
+
+/// Catches one user using every slot: with a limit of one per user, a second connection of the
+/// same user is answered `busy` while the global limit is far off.
+#[test]
+fn one_user_cannot_hold_every_connection() {
+    let rig = Rig::new("reg-per-uid", me());
+    let server = Server::bind(
+        &rig.scratch.path().join("run").join("p"),
+        me(),
+        None,
+        rig.registry.clone(),
+        Arc::new(Table(Mutex::new(BTreeMap::from([(
+            "svc".to_owned(),
+            grant(me()),
+        )])))),
+    )
+    .unwrap()
+    .with_max_per_uid(1);
+    let path = rig.scratch.path().join("run").join("p");
+    let server = Arc::new(server);
+    let stop = Arc::new(AtomicBool::new(false));
+    let (s, flag) = (server.clone(), stop.clone());
+    let serving = std::thread::spawn(move || s.serve(&flag));
+    let first = UnixStream::connect(&path).unwrap();
+    assert_eq!(say(&first, &registration("2.0.0", None))["ok"], true);
+    let second = UnixStream::connect(&path).unwrap();
+    second.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(answer(&second)["error"], "busy");
+    stop.store(true, Ordering::Release);
+    drop(UnixStream::connect(&path).unwrap());
+    serving.join().unwrap().unwrap();
+    drop(first);
+}
+
+/// Catches a connection whose thread cannot be started being dropped silently: the peer is
+/// answered `busy`.
+#[test]
+fn a_connection_that_gets_no_thread_is_answered_busy() {
+    let mut rig = Rig::new("reg-no-thread", me());
+    let server = Arc::try_unwrap(rig.server)
+        .ok()
+        .unwrap()
+        .with_spawner(Box::new(|_job| Err(std::io::Error::other("no threads"))));
+    rig.server = Arc::new(server);
+    let (stop, serving) = serve_in_thread(&rig);
+    let client = UnixStream::connect(&rig.sock).unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(answer(&client)["error"], "busy");
+    finish(&rig, stop, serving);
+}
+
+/// Catches a line deadline that is only a per-read timeout: a registration line has a total time
+/// to arrive, and one that has none left is refused as malformed (a zero deadline, so that
+/// nothing waits).
+#[test]
+fn a_line_that_is_out_of_time_is_refused() {
+    let mut rig = Rig::new("reg-deadline", me());
+    let server = Arc::try_unwrap(rig.server)
+        .ok()
+        .unwrap()
+        .with_line_deadline(std::time::Duration::ZERO);
+    rig.server = Arc::new(server);
+    assert_eq!(refused(&rig, &registration("2.0.0", None)), "malformed");
+    assert_eq!(rig.registry.report("svc", None), Reported::Absent);
+}
+
+/// Catches an accept loop that ends on a passing error: running out of descriptors or an
+/// interrupted call is waited out and the loop goes on to serve the next connection; any other
+/// error ends it.
+#[test]
+fn transient_accept_errors_are_retried() {
+    use rustix::io::Errno;
+    let rig = Rig::new("reg-accept-retry", me());
+    let (client, served) = UnixStream::pair().unwrap();
+    let mut script: std::collections::VecDeque<std::io::Result<UnixStream>> =
+        std::collections::VecDeque::from([
+            Err(Errno::MFILE.into()),
+            Err(std::io::ErrorKind::Interrupted.into()),
+            Ok(served),
+            Err(std::io::ErrorKind::PermissionDenied.into()),
+        ]);
+    let stop = AtomicBool::new(false);
+    let ended = rig
+        .server
+        .serve_with(&mut || script.pop_front().unwrap(), &stop)
+        .unwrap_err();
+    assert_eq!(ended.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(say(&client, &registration("2.0.0", None))["ok"], true);
+    assert_eq!(rig.registry.report("svc", Some("2.0.0")), Reported::Healthy);
 }

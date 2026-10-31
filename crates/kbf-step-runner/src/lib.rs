@@ -24,7 +24,7 @@ pub mod register;
 pub mod runner;
 pub mod selfupdate;
 
-pub use artifact::{ArtifactError, Staged, tree_digest};
+pub use artifact::{ArtifactError, Staged, tree_digest, tree_digest_with};
 pub use clock::{Clock, Stamp, SystemClock};
 pub use deadman::{DeadMan, Watch};
 pub use launcher::{LaunchError, StepCall, StepExit, StepLauncher};

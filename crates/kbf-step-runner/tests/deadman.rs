@@ -179,3 +179,46 @@ fn a_step_past_its_own_bound_is_stopped() {
     );
     assert_eq!(rig.fake.stops(), ["updater-svc-cutover-1"]);
 }
+
+/// A launcher whose `stop` is slow: while it works, the next run of the same step is armed.
+struct RearmsDuringStop {
+    watch: Arc<Watch>,
+    next_deadline: u64,
+    stops: Mutex<Vec<String>>,
+}
+
+impl StepLauncher for RearmsDuringStop {
+    fn run(&self, _: &StepCall<'_>) -> Result<StepExit, LaunchError> {
+        unreachable!("the dead-man only stops")
+    }
+
+    fn stop(&self, unit: &str) -> Result<(), LaunchError> {
+        self.stops.lock().unwrap().push(unit.to_owned());
+        // The runner started the step again under the same unit name.
+        self.watch.arm(unit, self.next_deadline);
+        Ok(())
+    }
+}
+
+/// Catches a stop that is marked on the step armed after it: the unit name is the same for the
+/// next try of a step, so the mark is keyed on the arming. The new arm is still enforced when
+/// its own second comes.
+#[test]
+fn a_stop_does_not_disarm_the_step_armed_while_it_ran() {
+    let clock = FakeClock::new();
+    let watch = Watch::new();
+    let start = clock.mono_secs();
+    let launcher = Arc::new(RearmsDuringStop {
+        watch: watch.clone(),
+        next_deadline: start + 100,
+        stops: Mutex::new(Vec::new()),
+    });
+    let man = DeadMan::new(watch.clone(), launcher.clone(), clock.clone());
+    watch.arm("unit-r", start + 5);
+    clock.advance(5);
+    assert!(man.tick().unwrap());
+    assert!(!man.tick().unwrap());
+    clock.advance(100);
+    assert!(man.tick().unwrap());
+    assert_eq!(*launcher.stops.lock().unwrap(), ["unit-r", "unit-r"]);
+}

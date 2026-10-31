@@ -6,7 +6,7 @@ use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 
-use kbf_step_runner::{ArtifactError, Staged, tree_digest};
+use kbf_step_runner::{ArtifactError, Staged, tree_digest, tree_digest_with};
 use support::{Rig, Scratch};
 
 fn tree(name: &str) -> Scratch {
@@ -189,4 +189,122 @@ fn the_tree_and_its_parents_must_be_closed_and_unlinked() {
         ArtifactError::Untrusted(p) if p == link
     ));
     staged.check(hook).unwrap();
+}
+
+fn host_owner(meta: &fs::Metadata) -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.uid(), meta.gid())
+}
+
+fn me() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+/// Catches a hook path that leaves the tree through a linked directory in the middle of it: with
+/// `bin` linked to a directory inside or outside the tree, `bin/hook` is not a hook, though the
+/// last component is a regular file.
+#[test]
+fn a_hook_behind_a_linked_directory_is_not_a_hook() {
+    let s = Scratch::new("art-mid-link");
+    let outside = Scratch::new("art-mid-link-out");
+    fs::write(outside.path().join("hook"), "#!out\n").unwrap();
+    fs::create_dir_all(s.path().join("real")).unwrap();
+    fs::write(s.path().join("real/hook"), "#!in\n").unwrap();
+    symlink("real", s.path().join("inside")).unwrap();
+    symlink(outside.path(), s.path().join("outside")).unwrap();
+    let staged = Staged::seal(s.path()).unwrap();
+    staged.check(Path::new("real/hook")).unwrap();
+    for hook in ["inside/hook", "outside/hook"] {
+        let err = staged.check(Path::new(hook)).unwrap_err();
+        assert!(
+            matches!(err, ArtifactError::HookMissing(_)),
+            "{hook}: {err:?}"
+        );
+    }
+}
+
+/// Catches an owner that is not part of the digest: the same tree read with another user or
+/// group id has another digest, so a restore that chowns a file is a change.
+#[test]
+fn the_owner_of_every_entry_is_in_the_digest() {
+    let s = tree("art-owner-digest");
+    let p = s.path();
+    let same = tree_digest_with(p, &host_owner).unwrap();
+    assert_eq!(same, tree_digest(p).unwrap());
+    let a = tree_digest_with(p, &|_| (1, 2)).unwrap();
+    let b = tree_digest_with(p, &|_| (1, 3)).unwrap();
+    let c = tree_digest_with(p, &|_| (2, 2)).unwrap();
+    assert!(a != b && a != c && b != c && a != same);
+}
+
+/// Catches a foreign owner being trusted: with no trusted owner the tree is refused; an entry
+/// inside the tree owned by another user is refused too, though the directories are fine.
+#[test]
+fn only_the_trusted_owners_may_own_the_tree_and_what_is_in_it() {
+    let s = tree("art-foreign");
+    let staged = Staged::seal(s.path()).unwrap();
+    let hook = Path::new("bin/hook");
+    staged.check_as(hook, &[me(), 0], &host_owner).unwrap();
+    let err = staged.check_as(hook, &[], &host_owner).unwrap_err();
+    assert!(matches!(err, ArtifactError::Untrusted(_)));
+    let files_of_another = |meta: &fs::Metadata| {
+        let (uid, gid) = host_owner(meta);
+        (if meta.is_file() { 4242 } else { uid }, gid)
+    };
+    let sealed = Staged {
+        dir: s.path().to_path_buf(),
+        digest: tree_digest_with(s.path(), &files_of_another).unwrap(),
+    };
+    let err = sealed
+        .check_as(hook, &[me(), 0], &files_of_another)
+        .unwrap_err();
+    assert!(
+        matches!(&err, ArtifactError::Untrusted(p) if p.ends_with("VERSION") || p.ends_with("hook")),
+        "{err:?}"
+    );
+}
+
+/// Catches an entry a service could rewrite or that runs with more than its owner's rights: a
+/// setuid or setgid file, a file or directory writable by group or others, inside the tree.
+#[test]
+fn a_tree_with_setuid_or_writable_entries_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    for (name, mode, dir) in [
+        ("suid", 0o4755, false),
+        ("sgid", 0o2755, false),
+        ("gw", 0o664, false),
+        ("ow", 0o646, false),
+        ("dgw", 0o775, true),
+    ] {
+        let s = tree(&format!("art-entry-{name}"));
+        let target = if dir {
+            s.path().join("bin")
+        } else {
+            s.path().join("VERSION")
+        };
+        let staged = Staged::seal(s.path()).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(mode)).unwrap();
+        let err = staged.check(Path::new("bin/hook")).unwrap_err();
+        assert!(
+            matches!(&err, ArtifactError::Untrusted(_)),
+            "{name}: {err:?}"
+        );
+    }
+}
+
+/// Catches a staged directory that is relative or has `..`: the checks of its ancestors would
+/// then be made on something else than the tree that is run.
+#[test]
+fn the_staged_directory_must_be_absolute_and_plain() {
+    for dir in ["relative/tree", "/a/../b", ""] {
+        let staged = Staged {
+            dir: dir.into(),
+            digest: "0".repeat(64),
+        };
+        let err = staged.check(Path::new("hook")).unwrap_err();
+        assert!(
+            matches!(err, ArtifactError::Untrusted(_)),
+            "{dir:?}: {err:?}"
+        );
+    }
 }

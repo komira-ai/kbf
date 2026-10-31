@@ -331,5 +331,5 @@ impl Rig {
 }
 
 pub fn io_err() -> io::Error {
-    io::Error::other("planted")
+    io::Error::other("failure")
 }

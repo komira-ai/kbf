@@ -191,12 +191,12 @@ fn system_binary(name: &str) -> PathBuf {
         .expect("a system binary")
 }
 
-/// Catches a fallback that leaves the host with a broken updater: a planted binary that exits at
+/// Catches a fallback that leaves the host with a broken updater: a binary that exits at
 /// start fails `START_LIMIT_BURST` starts of the link the unit runs; the flip the fallback unit
 /// makes puts the previous binary back, and the next start succeeds.
 #[test]
-fn a_planted_binary_that_exits_at_start_is_replaced_by_the_previous() {
-    let s = Scratch::new("su-planted");
+fn a_binary_that_exits_at_start_is_replaced_by_the_previous() {
+    let s = Scratch::new("su-exits-at-start");
     let layout = Layout::new(&s.path().join("bin"));
     layout.stage("good", &system_binary("true")).unwrap();
     layout.switch("good").unwrap();

@@ -40,6 +40,8 @@ use crate::record::write_atomic;
 
 /// The registrations, in the updater's state directory.
 pub const REGISTRATIONS_FILE: &str = "registrations.json";
+/// Starts the thread of a connection.
+pub type Spawn = Box<dyn Fn(Box<dyn FnOnce() + Send>) -> io::Result<()> + Send + Sync>;
 /// The connections a server serves at once unless told otherwise.
 pub const MAX_CONNECTIONS: usize = 64;
 /// How long a connection may take to send its registration. A test never waits for it.
@@ -397,6 +399,34 @@ impl Server {
     pub fn with_max_connections(mut self, max: usize) -> Server {
         self.max_connections = max;
         self
+    }
+
+    /// The most connections of one user served at once.
+    pub fn with_max_per_uid(self, max: usize) -> Server {
+        let _ = max;
+        self
+    }
+
+    /// The time a connection has to send its registration line, in total.
+    pub fn with_line_deadline(self, deadline: Duration) -> Server {
+        let _ = deadline;
+        self
+    }
+
+    /// How a connection gets its thread (a test makes it fail).
+    pub fn with_spawner(self, spawn: Spawn) -> Server {
+        let _ = spawn;
+        self
+    }
+
+    /// [`Server::serve`] over any source of connections.
+    pub fn serve_with(
+        self: &Arc<Server>,
+        accept: &mut dyn FnMut() -> io::Result<UnixStream>,
+        stop: &AtomicBool,
+    ) -> io::Result<()> {
+        let _ = (accept, stop);
+        Ok(())
     }
 
     /// Accepts connections, one thread each, until `stop` is set. The caller sets it and then

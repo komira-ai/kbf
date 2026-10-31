@@ -33,6 +33,8 @@ pub const DEFAULT_RETRY_SECS: u64 = 60;
 pub const WATCH_POLL_SECS: u64 = 30;
 /// The reason of a `halt` for a staged release that no longer has its digest.
 pub const REASON_ARTIFACT_CHANGED: &str = "artifact_changed";
+/// The longest wait a hook can ask for between two runs of a step.
+pub const MAX_RETRY_SECS: u64 = 3600;
 /// The reason a cleared halt is recorded with.
 pub const REASON_HALT_CLEARED: &str = "halt_cleared";
 /// The reason of a `Deferred` for a hook that needs a newer updater.
@@ -294,6 +296,7 @@ impl StepRunner {
             service: order.service.clone(),
             target_version: order.target_version.clone(),
             artifact_digest: order.staged.digest.clone(),
+            tarball_digest: order.artifact_digest.clone(),
             previous_digest: order.previous.as_ref().map(|p| p.digest.clone()),
             generation,
             params: self.store.params_path(),

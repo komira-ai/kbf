@@ -80,6 +80,8 @@ pub struct Record {
     pub service: String,
     pub target_version: String,
     pub artifact_digest: String,
+    /// The sha256 of the artifact (tarball) the order names.
+    pub tarball_digest: String,
     pub previous_digest: Option<String>,
     /// The number of this update on this host; the unit names carry it.
     pub generation: u64,

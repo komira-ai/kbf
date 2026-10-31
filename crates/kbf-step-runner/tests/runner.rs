@@ -933,8 +933,8 @@ fn a_verify_resumed_after_its_window_is_not_started() {
     }
 }
 
-/// Catches a staged release in a place others can change being run: a tree or a parent that is
-/// writable by group or others, and a path through a link, halt the update with nothing run.
+/// Catches a staged release that others can change being run: a tree writable by group halts the
+/// update with nothing run (the parents and links are in the artifact tests).
 #[test]
 fn a_release_in_an_untrusted_place_never_runs() {
     use std::os::unix::fs::PermissionsExt;
@@ -1053,4 +1053,73 @@ fn an_artifact_digest_that_is_not_a_sha256_is_refused() {
         );
     }
     assert!(rig.fake.events().is_empty());
+}
+
+const HUGE_DEFER: Reply = Reply::Exit(75, Some(r#"{"retry_after_secs":1000000000}"#));
+const HUGE_PENDING: Reply = Reply::Exit(
+    0,
+    Some(r#"{"promotion_pending":true,"retry_after_secs":1000000000}"#),
+);
+
+/// Catches a hook parking the runner for years: a `retry_after_secs` of a billion is waited as
+/// the longest wait the runner allows, after a deferred `rollback`, a deferred `cleanup` and a
+/// pending promotion.
+#[test]
+fn a_huge_retry_after_is_clamped() {
+    let max = kbf_step_runner::runner::MAX_RETRY_SECS;
+    let rig = Rig::new("run-clamp-rollback");
+    rig.fake.say(Step::Prepare, &[FAIL]);
+    rig.fake.say(Step::Rollback, &[HUGE_DEFER, OK]);
+    run(&rig);
+    assert_eq!(rig.clock.slept(), [max]);
+
+    let rig = Rig::new("run-clamp-cleanup");
+    rig.fake.say(Step::Cleanup, &[HUGE_DEFER, OK]);
+    assert_eq!(run(&rig), ok());
+    assert_eq!(rig.clock.slept(), [max]);
+
+    let rig = Rig::new("run-clamp-watch");
+    rig.fake.say(Step::Verify, &[PENDING, HUGE_PENDING, OK]);
+    assert_eq!(run(&rig), ok());
+    assert_eq!(rig.clock.slept(), [max]);
+}
+
+/// Catches two tarballs with the same unpacked tree being one update: an order that names
+/// another artifact digest is not the unfinished update (`Busy`), and after a verdict it starts
+/// the next generation instead of getting the stored verdict.
+#[test]
+fn another_tarball_is_another_update_even_with_the_same_tree() {
+    let rig = Rig::new("run-tarball-busy");
+    rig.fake
+        .lose_run
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    let order = rig.order();
+    assert!(rig.runner().run(&order).is_err());
+    let mut other = rig.order();
+    other.artifact_digest = "cd".repeat(32);
+    assert!(matches!(
+        rig.runner().run(&other),
+        Err(RunError::Busy { .. })
+    ));
+    assert_eq!(rig.runner().run(&order).unwrap(), ok());
+    rig.fake.clear();
+    assert_eq!(rig.runner().run(&order).unwrap(), ok());
+    assert!(rig.fake.events().is_empty());
+    assert_eq!(rig.runner().run(&other).unwrap(), ok());
+    let support::Event::Run { unit, .. } = &rig.fake.runs()[0] else {
+        unreachable!()
+    };
+    assert_eq!(unit, "updater-svc-prepare-2");
+}
+
+/// Catches a params file left behind when the updater died between the verdict and the removal:
+/// the same order delivered again answers with the verdict and removes the file.
+#[test]
+fn a_redelivered_order_removes_a_params_file_left_behind() {
+    let rig = Rig::new("run-params-leftover");
+    let order = rig.order();
+    assert_eq!(rig.runner().run(&order).unwrap(), ok());
+    fs::write(rig.state.join("params.toml"), "left = 1\n").unwrap();
+    assert_eq!(rig.runner().run(&order).unwrap(), ok());
+    assert!(!rig.state.join("params.toml").exists());
 }
