@@ -22,6 +22,8 @@ mod exclusive;
 mod hot;
 mod learned;
 
+mod one_recorder;
+
 mod placement;
 
 mod views;
