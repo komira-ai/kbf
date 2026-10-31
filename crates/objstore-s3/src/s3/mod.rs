@@ -45,7 +45,7 @@ use std::fmt;
 use std::future::Future;
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use bytes::{Bytes, BytesMut};
@@ -53,6 +53,7 @@ use md5::Md5;
 use reqwest::header::{AUTHORIZATION, CONTENT_RANGE};
 use reqwest::{Method, Response, StatusCode, Url};
 use sha2::{Digest, Sha256};
+use tokio::time::Instant;
 
 use crate::types::Token;
 use crate::{
@@ -471,8 +472,9 @@ impl S3Store {
     /// answer counts, whatever its status: a running S3 service answers this unsigned
     /// `GET /` with an error such as 403. Only a request that fails to complete (refused,
     /// reset, timed out) is retried, every [`WAIT_RETRY`]. On the deadline it returns
-    /// the last attempt's error. For setup and tests, to wait for a store that is
-    /// starting; kbf itself never calls it.
+    /// the last attempt's error. The deadline is read on tokio's clock, so a test that
+    /// pauses it decides when it comes. For setup and tests, to wait for a store that
+    /// is starting; kbf itself never calls it.
     pub async fn wait_answering(&self, within: Duration) -> Result<(), ObjectStoreError> {
         let deadline = Instant::now() + within;
         loop {
@@ -814,7 +816,8 @@ mod tests {
     }
 
     /// Catches: the builder not applying the idle timeout it is given (the default is
-    /// 90 s, so a connection idle past the limit would be reused, not replaced).
+    /// 90 s, so a connection idle past the limit, here for a second of the pool's clock,
+    /// would be reused, not replaced).
     #[tokio::test]
     async fn idle_connection_is_dropped_after_the_timeout() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -852,13 +855,16 @@ mod tests {
             1,
             "a fresh connection is reused"
         );
-        // Expiry: a short idle timeout and a wait far above it replace the connection.
+        // Expiry: a short idle timeout and a jump of the clock far above it replace the
+        // connection. The jump is tokio's clock, which the pool reads; nothing waits.
         let dropping = client_builder(limit, Duration::from_millis(100))
             .build()
             .unwrap();
         dropping.get(&url).send().await.unwrap();
         assert_eq!(accepted.load(Ordering::SeqCst), 2);
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
         dropping.get(&url).send().await.unwrap();
         assert_eq!(
             accepted.load(Ordering::SeqCst),
@@ -881,18 +887,30 @@ mod tests {
     }
 
     /// A one-object store on loopback that answers every request as `script` says and
-    /// counts the requests it took. The timings only set up a slow or a stalled body.
-    async fn scripted(len: usize, script: Script) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    /// counts the requests it took; `served` is notified when it has read one, and has
+    /// started its script (written everything the script writes at once). The `every` of a
+    /// steady body is a time on tokio's clock, which the test that uses it pauses.
+    async fn scripted(
+        len: usize,
+        script: Script,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<tokio::sync::Notify>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = Arc::clone(&taken);
+        let served = Arc::new(tokio::sync::Notify::new());
+        let told = Arc::clone(&served);
         tokio::spawn(async move {
             loop {
                 let (mut sock, _) = listener.accept().await.unwrap();
                 tokio::spawn({
                     let count = Arc::clone(&count);
+                    let told = Arc::clone(&told);
                     async move {
                         let mut seen = Vec::new();
                         let mut buf = [0u8; 4096];
@@ -903,6 +921,7 @@ mod tests {
                             }
                         }
                         count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        told.notify_one();
                         let head = format!(
                             "HTTP/1.1 206 Partial Content\r\ncontent-length: {len}\r\n\
                              content-range: bytes 0-{}/{len}\r\n\r\n",
@@ -935,13 +954,37 @@ mod tests {
                 });
             }
         });
-        (endpoint, taken)
+        (endpoint, taken, served)
     }
 
+    /// A store whose limit is [`LIMIT`].
     fn short_limit_store(endpoint: &str) -> S3Store {
         let mut c = config(endpoint, "kbf-test");
-        c.request_timeout = Duration::from_millis(200);
+        c.request_timeout = LIMIT;
         S3Store::new(c).unwrap()
+    }
+
+    /// The `request_timeout` of the scripted reads. It passes on tokio's clock, paused by
+    /// [`read_once_served`] once the scripted store has the request, so it costs no time.
+    const LIMIT: Duration = Duration::from_secs(10);
+
+    /// Reads `len` bytes from the scripted store at `endpoint`, with tokio's clock paused
+    /// as soon as the store has the request and has written what its script writes at once.
+    /// From then on the client waits for nothing but timers (its limit, and the pieces of a
+    /// steady script), and the paused clock moves from one to the next by itself, so the
+    /// outcome is decided by what the store sends and never sends, not by how long anything
+    /// took. The clock is paused only now, because before it the client waits for the
+    /// socket and an idle runtime would move the clock on past its limit.
+    async fn read_once_served(
+        endpoint: &str,
+        served: &tokio::sync::Notify,
+        len: usize,
+    ) -> Result<Bytes, ObjectStoreError> {
+        let store = short_limit_store(endpoint);
+        let reading = tokio::spawn(async move { store.get_range(&key(), r(0, len as u64)).await });
+        served.notified().await;
+        tokio::time::pause();
+        reading.await.unwrap()
     }
 
     fn key() -> ObjectKey {
@@ -949,22 +992,20 @@ mod tests {
     }
 
     /// Catches: a read cut by a limit on the whole request: a body that arrives
-    /// steadily, for several times `request_timeout` in all, must come back whole.
+    /// steadily, for several times `request_timeout` in all (20 pieces, 4 s apart, against
+    /// a limit of 10 s), must come back whole.
     #[tokio::test]
     async fn a_ranged_read_that_keeps_progressing_outlasts_the_request_timeout() {
         let len = 1000;
-        let (endpoint, taken) = scripted(
+        let (endpoint, taken, served) = scripted(
             len,
             Script::Steady {
                 pieces: 20,
-                every: Duration::from_millis(50),
+                every: Duration::from_secs(4),
             },
         )
         .await;
-        let got = short_limit_store(&endpoint)
-            .get_range(&key(), r(0, len as u64))
-            .await
-            .unwrap();
+        let got = read_once_served(&endpoint, &served, len).await.unwrap();
         assert_eq!(got.as_ref(), vec![7u8; len].as_slice());
         assert_eq!(taken.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -973,9 +1014,8 @@ mod tests {
     /// transport failure and sent again: it fails as a timeout, after one request.
     #[tokio::test]
     async fn a_ranged_read_whose_body_stops_fails_as_a_timeout_and_is_not_resent() {
-        let (endpoint, taken) = scripted(1000, Script::StallsInBody).await;
-        let err = short_limit_store(&endpoint)
-            .get_range(&key(), r(0, 1000))
+        let (endpoint, taken, served) = scripted(1000, Script::StallsInBody).await;
+        let err = read_once_served(&endpoint, &served, 1000)
             .await
             .unwrap_err();
         assert!(!is_retryable(&err));
@@ -987,11 +1027,8 @@ mod tests {
     /// limit is gone.
     #[tokio::test]
     async fn a_ranged_read_with_no_answer_fails_as_a_timeout() {
-        let (endpoint, taken) = scripted(10, Script::Silent).await;
-        let err = short_limit_store(&endpoint)
-            .get_range(&key(), r(0, 10))
-            .await
-            .unwrap_err();
+        let (endpoint, taken, served) = scripted(10, Script::Silent).await;
+        let err = read_once_served(&endpoint, &served, 10).await.unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
         assert_eq!(taken.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -999,11 +1036,8 @@ mod tests {
     /// Catches: an error answer whose body never arrives holding the read forever.
     #[tokio::test]
     async fn an_error_body_that_stops_fails_as_a_timeout() {
-        let (endpoint, _) = scripted(10, Script::StallsInError).await;
-        let err = short_limit_store(&endpoint)
-            .get_range(&key(), r(0, 10))
-            .await
-            .unwrap_err();
+        let (endpoint, _, served) = scripted(10, Script::StallsInError).await;
+        let err = read_once_served(&endpoint, &served, 10).await.unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
     }
 
@@ -1057,21 +1091,22 @@ mod tests {
     /// refused connection taken for a timeout.
     // Linux drops a SYN when the accept queue is full; BSD and macOS may reset instead.
     #[cfg(target_os = "linux")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_connect_that_times_out_is_not_resent_but_a_refused_one_is() {
         // A listener whose accept queue is full drops the next SYN: the connect hangs.
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
         socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = socket.local_addr().unwrap();
         let _listener = socket.listen(1).unwrap();
-        let mut held = Vec::new();
+        // Four connects, each polled once: the poll sends the SYN, and the kernel has
+        // answered or dropped it before the poll returns. The connects are kept, finished
+        // or not, so no socket closes and the queue stays full.
+        let mut fillers = Vec::new();
         for _ in 0..4 {
             let filler = tokio::net::TcpSocket::new_v4().unwrap();
-            if let Ok(Ok(c)) =
-                tokio::time::timeout(Duration::from_millis(200), filler.connect(addr)).await
-            {
-                held.push(c);
-            }
+            let mut connecting = Box::pin(filler.connect(addr));
+            let _ = futures::poll!(connecting.as_mut());
+            fillers.push(connecting);
         }
         let client = client_builder(Duration::from_millis(100), POOL_IDLE_TIMEOUT)
             .build()
@@ -1101,7 +1136,7 @@ mod tests {
     /// Catches: every non-connect reqwest error sent again, including the client's own
     /// per-request limit, which ends a read against a store that accepts and never
     /// answers and would multiply the wait of a read that cannot succeed.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_request_that_exceeds_its_client_timeout_is_not_resent() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

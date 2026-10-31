@@ -43,6 +43,7 @@ use bytes::Bytes;
 use md5::{Digest, Md5};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 
 mod uploads;
 
@@ -289,6 +290,8 @@ struct State {
 pub struct FakeS3 {
     endpoint: String,
     state: Arc<Mutex<State>>,
+    /// Woken each time a request changed what the service holds ([`FakeS3::wait_for`]).
+    changed: Arc<Notify>,
 }
 
 impl FakeS3 {
@@ -303,14 +306,21 @@ impl FakeS3 {
         let endpoint = format!("http://{}", listener.local_addr().expect("address"));
         let state = Arc::new(Mutex::new(State::default()));
         let shared = Arc::clone(&state);
+        let changed = Arc::new(Notify::new());
+        let wake = Arc::clone(&changed);
         tokio::spawn(async move {
             loop {
                 let accepted = listener.accept().await;
-                let serving = accepted.map(|(sock, _)| serve(sock, Arc::clone(&shared)));
+                let serving =
+                    accepted.map(|(sock, _)| serve(sock, Arc::clone(&shared), Arc::clone(&wake)));
                 serving.map(tokio::spawn).ok();
             }
         });
-        Self { endpoint, state }
+        Self {
+            endpoint,
+            state,
+            changed,
+        }
     }
 
     /// `http://127.0.0.1:<port>`.
@@ -393,6 +403,23 @@ impl FakeS3 {
         self.lock().uploads.len()
     }
 
+    /// Waits until `ready` holds of this service, looking again each time a request has
+    /// changed what it holds. For a test that must see an effect of a request it did not
+    /// wait for (a part that reached the service, an upload aborted from a task of its
+    /// own) without sleeping and looking again: it returns when the effect is there, and
+    /// waits for ever if it never comes (a test runner's hang guard ends the test).
+    pub async fn wait_for(&self, ready: impl Fn(&FakeS3) -> bool) {
+        loop {
+            // Registered before `ready` looks, so a change between the two is not lost.
+            let mut changed = std::pin::pin!(self.changed.notified());
+            changed.as_mut().enable();
+            if ready(self) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     /// What the service took so far.
     #[must_use]
     pub fn stats(&self) -> FakeStats {
@@ -428,7 +455,7 @@ struct Request {
 }
 
 /// Serves one connection's requests, one after another, until it closes.
-async fn serve(mut sock: TcpStream, state: Arc<Mutex<State>>) -> Option<()> {
+async fn serve(mut sock: TcpStream, state: Arc<Mutex<State>>, changed: Arc<Notify>) -> Option<()> {
     let mut buf = Vec::new();
     let mut chunk = vec![0u8; RUN];
     loop {
@@ -462,16 +489,20 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<State>>) -> Option<()> {
             held
         };
         if held {
+            changed.notify_waiters();
             // Until the caller closes the connection; then the request is lost.
             let _ = tokio::io::copy(&mut sock, &mut tokio::io::sink()).await;
             let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
             state.held_aborts -= 1;
+            drop(state);
+            changed.notify_waiters();
             return None;
         }
         let answer = {
             let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
             handle(&mut state, &request)
         };
+        changed.notify_waiters();
         sock.write_all(&answer).await.ok()?;
     }
 }
