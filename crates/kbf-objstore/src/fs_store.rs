@@ -75,12 +75,10 @@ use kbf_threads::disk::{FreeSpace as _, Space, Statvfs, keep_free};
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
-use crate::body::{self, BodyStream};
 use crate::released::{Gate, Released};
-use crate::types::Token;
 use crate::{
-    ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectInfo, ObjectKey, ObjectStore,
-    ObjectStoreError, PageSize,
+    BodyStream, ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectInfo, ObjectKey,
+    ObjectStore, ObjectStoreError, PageSize,
 };
 
 /// The first bytes of every object file.
@@ -602,12 +600,9 @@ impl Inner {
         // starts after it.
         let next = (end < keys.len() || cut)
             .then(|| {
-                objects.last().map(|last| {
-                    ListToken(Token::Kept {
-                        listing: id,
-                        after: last.key.clone(),
-                    })
-                })
+                objects
+                    .last()
+                    .map(|last| ListToken::kept(id, last.key.clone()))
             })
             .flatten();
         if next.is_none() {
@@ -843,7 +838,7 @@ impl ObjectStore for FsStore {
                 let piece = piece?;
                 written += piece.len() as u64;
                 if written > len {
-                    return Err(body::too_long(len));
+                    return Err(objstore_s3::too_long(len));
                 }
                 let path = tmp.clone();
                 file = blocking(move || {
@@ -854,7 +849,7 @@ impl ObjectStore for FsStore {
                 .await?;
             }
             if written < len {
-                return Err(body::too_short(len, written));
+                return Err(objstore_s3::too_short(len, written));
             }
             Ok(file)
         }
