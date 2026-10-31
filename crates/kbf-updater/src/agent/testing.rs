@@ -324,6 +324,9 @@ pub struct ServingNode {
     pub seen_at_drain: Arc<Mutex<Option<bool>>>,
     /// The frontend knows no node here: reads say in placement, drain and undrain do nothing.
     pub absent: Arc<Mutex<bool>>,
+    /// Out of placement as a plain cordon (no drain), which only an operator makes: the
+    /// updater's own cordon is always a drain.
+    pub cordoned: Arc<Mutex<bool>>,
 }
 
 impl ServingNode {
@@ -337,6 +340,7 @@ impl ServingNode {
             watch: Arc::default(),
             seen_at_drain: Arc::default(),
             absent: Arc::default(),
+            cordoned: Arc::default(),
         }
     }
 
@@ -353,6 +357,14 @@ impl ServingNode {
     /// An operator cordons and drains it.
     pub fn operator_drains(&self) {
         *lock(&self.serving) = false;
+        *lock(&self.cordoned) = false;
+    }
+
+    /// An operator cordons it, with no drain: over the updater's drain or over a node
+    /// serving.
+    pub fn operator_cordons(&self) {
+        *lock(&self.serving) = false;
+        *lock(&self.cordoned) = true;
     }
 
     pub fn is_serving(&self) -> bool {
@@ -389,6 +401,7 @@ impl Drain for ServingNode {
             return Err(e);
         }
         *lock(&self.serving) = false;
+        *lock(&self.cordoned) = false;
         Ok(())
     }
 
@@ -404,6 +417,7 @@ impl Drain for ServingNode {
             return Err(e);
         }
         *lock(&self.serving) = true;
+        *lock(&self.cordoned) = false;
         Ok(())
     }
 }
