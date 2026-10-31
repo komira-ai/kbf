@@ -120,12 +120,21 @@ it once its leases end: a `WholeMachine` lease, an `owns_worker` action, or a
    the request's demand. For a whole-machine or owner-worker request the demand is the
    whole worker, so this is the latest lease end; for the #169 request it is the time the
    first leases free 24 cores, not the time the worker empties. The **tail** is the start
-   time minus now. One function (`start_time(worker, demand)`) serves every kind.
+   time minus now. One function (`start_time(worker, demand)`) serves every kind. For a
+   `Blocked::Load` head "holds the demand" is read against the same charge model as
+   `Servable::admitted` (`load_state.left` and the lease charges over minutes, the 1.1x
+   slack, curve charges), not against bookings: `Worker::has_room(request, by_load)`
+   zeroes the CPU check, so a worker can have free booked capacity and still refuse the
+   request. After step 1 the load predicate is the only admission. The start time is the
+   first minute at which `admitted` would accept, with held leases dropping out at their
+   remaining time (3.3). A worker that already admits it has tail zero and the request is
+   not blocked there.
 2. **Reserve** the worker with the least tail among those that could hold the request.
    The pick is made again every round with no stickiness: ties go to the lower name, so a
    steady state does not flap. A reservation moves when another worker's tail becomes the
    least, including when the reserved worker's tail grows. The reservation keeps its
-   original `made` time across moves, so the queue-age order of the caps does not reset.
+   original `made` time across moves, so the queue-age order of the caps does not reset
+   (`Drain::mark` drops `made` on a worker change today; it must carry it).
 3. **Backfill.** An operation *after the large request in queue order* is placed on the
    reserved worker only if its estimated end is no later than that worker's start time.
    Otherwise it goes elsewhere or waits. Operations *ahead* of the large request in queue
@@ -137,7 +146,7 @@ it once its leases end: a `WholeMachine` lease, an `owns_worker` action, or a
 ### 3.2 Owner
 
 **js owns the rule, once, in `Scheduler::place`.** kbf owns only the flag default, the
-both-core test, and closing the gap of step 0. No kbf scheduling code.
+both-core test, and the wiring of step 0 (passing the submission's `max_wall` to the js core). No kbf scheduling code.
 
 ### 3.3 Limits, accepted and tested
 
@@ -152,8 +161,9 @@ both-core test, and closing the gap of step 0. No kbf scheduling code.
 - **Overdue leases.** `drain_cost` reads a lease past its end as zero remaining
   (`saturating_sub`), so a still-busy worker would look empty, become the least-tail pick,
   and close backfill. A lease's **remaining time** is
-  `max(estimated end - now, margin)`, never more than its enforced `max_wall` end, with
-  `margin` a js setting (default one minute). A learned estimate that proves too short
+  `max(min(estimated end, enforced end) - now, margin)`: the cap at the enforced end never
+  takes it below `margin`, because a lease past its enforced end still holds the worker
+  until the next lease tick releases it. `margin` is a js setting (default one minute). A learned estimate that proves too short
   therefore keeps the worker from looking free.
 
 ### 3.4 Mapping onto the code that exists
@@ -167,15 +177,29 @@ both-core test, and closing the gap of step 0. No kbf scheduling code.
   `WholeMark`'s worker and `made`. What goes for this rule: `deadline`, the give-up count,
   `reserve_backoff_ms` and `drain_after_ms` as a wait before holding. For an ordinary
   large action the reservation stays in `head_holds`, **not** in `drain.marks` (below).
+- **Cap check on a re-pick.** `hold_whole` runs `may_reserve` only when the pick differs
+  from the kept worker, because the holder's own mark is already in `whole_counts`. With
+  `kept = None` the check would run every round against its own mark, and at
+  `max_draining = 1` the holder would lose its hold and flap. So: pick with
+  `kept = None`; skip the cap checks when the pick is the previous mark's worker; when
+  it moves, exclude the request's own mark from the counts. Red test: a request at the
+  cap keeps its hold across rounds.
+- **Three stores today, and what each keeps.** (1) `drain.marks`: `WholeMachine` with
+  whole-node settings; capped. (2) `self.reservations`, via `Servable::reserve`:
+  `owns_worker` actions, and `WholeMachine` without settings; uncapped, so four queued
+  owner-worker actions can each reserve a worker. (3) `head_holds`: `Blocked::Load`
+  heads; one per pool by `held_pools`. The rule changes the pick in all three and
+  merges none of them. For (2) the bound is one reserved worker per pool per round, the
+  same `held_pools` rule as (3), applied to owner-worker actions and to settings-less
+  `WholeMachine` (a small change in `place`; tested).
 - **Caps.** `whole_counts` counts every entry of `drain.marks` toward `max_whole_node` and
   `max_draining`, and `whole_round` drops the newest marks beyond `ceiling_excess` at the
   start of each round. An ordinary large action in `drain.marks` would be counted as a
   whole node and could be dropped silently by the ceiling; `last_capable` also assumes
   only whole marks take a worker from an ordinary request. So ordinary large actions
   keep `head_holds` (one per pool, decision 4.5) and are outside the whole-node caps;
-  the caps apply to `WholeMachine` requests as today. Two stores, on purpose: one
-  capped, for the rare whole-node class an operator limits; one uncapped by those
-  flags, for ordinary work. What bounds the ordinary one is `held_pools`: one held
+  the caps apply to `WholeMachine` requests as today. Different stores, on purpose: one
+  capped by the whole-node flags, the others not. What bounds the ordinary one is `held_pools`: one held
   worker per pool per round, so four queued 24-of-32 requests in one pool take one
   worker, never the pool. Several pools (platform and kind classes) can each hold one.
 - **Backfill.** In `place`, a later operation that `fit` would put on a reserved worker
@@ -196,35 +220,43 @@ how long the curve is charged, was not verified; step 2 reads it first and adds 
 duration per key only if it is not.
 
 - **Fallback [proposed, and it is a fallback]: the declared bound.** The estimate of a
-  lease is `min(declared max_wall, ceiling)`. `ceiling` is a new js setting, the longest
-  wall time the scheduler will believe (the scheduler has no pools of its own today, so
-  there is no "pool maximum" to read; one ceiling for all). A lease with no declared
-  bound has an *unknown* estimate: an `Option`, never `u64::MAX`. For the pick, unknown
-  counts as `ceiling`; for backfill, an unknown estimate is refused. Learned history
-  replaces the fallback per key once a key has enough clean runs (the threshold in
-  jobscheduler#245).
-- **With the fallback alone, backfill admits nothing.** A candidate's end is
-  `now + max_wall`, the reserved lease's end is `start + max_wall`, and `now >= start`.
-  So the reserved worker idles until its tail ends, up to one `max_wall`. That is the
-  whole js core today. The rule still helps there, because it picks the worker that
-  empties first, but it earns backfill only with learned estimates. A test pins this.
-- **What bounds an overrun is the overrunner's own enforced `max_wall`.** If a backfilled
-  job runs past its learned estimate, nothing in the scheduler stops it; the executor's
-  wall-time limit (the kbf action timeout) does. So the large job's delay from an
-  overrun is at most the overrunner's `max_wall`, and only if that limit is enforced.
-  Today, on the js core, the submission's `max_wall` is not used at all
-  (`crates/kbf-server/src/farm/js/hot.rs`, "Known gap", `submit`; only the legacy farm
-  calls `set_max_wall`), a client may send none, and I could not find a js-core path
-  that kills a lease at a wall time. So **step 0 closes that gap before any backfill**,
-  and backfill is allowed only for a job with an enforced bound.
+  lease is its declared `max_wall`. A bound above `ceiling` is **refused for backfill**
+  (treated as unknown; a clamped bound would not be enforced, and its overrun would run
+  to the real timeout), and a lease with no declared bound is unknown. For the pick,
+  unknown counts as `ceiling`; for backfill, unknown is refused. `ceiling` is the
+  existing js-lease `Settings::with_max_wall` value, which already refuses a wall above
+  it (`WallAboveCeiling`); the scheduler has no pools of its own, so one ceiling is
+  passed to it. One concept, not a second clamping one. Learned history replaces the
+  fallback per key once a key has enough clean runs (the threshold in jobscheduler#245).
+- **With the fallback alone, backfill admits only a job whose bound is shorter than the
+  remaining tail.** A candidate ends at `now + bound`; the reserved lease ends at
+  `start + its bound`. A 1 h lease 50 minutes in has a 10 minute tail, and a job declaring
+  5 minutes backfills. A job with a bound as long as the held leases' never does, so the
+  reserved worker idles up to the tail; on the kbf js core today, where no bound is
+  passed, nothing backfills until step 0. Learned estimates widen the set. A test uses
+  different bounds on the two sides.
+- **What bounds an overrun is an enforced `max_wall`, defined operationally:** a lease
+  past its wall is ended by something that runs without the scheduler's help. A
+  `set_max_wall` call proves a declared bound, not enforcement. In js-lease it exists:
+  `acquire` expires a lease at the earlier of its ttl and its wall, `renew` never
+  extends past it, and `tick` stops an expired one; this serves js-lease-server and
+  js-registry. In the embedded farm core (`js-server-core` and `js-sched`) there is none:
+  `max_wall` only feeds `set_max_wall`. On the kbf farm the enforcer would be the kbf
+  action timeout, which I did not verify. `js-server-core` already takes the wall
+  (`SubmitOptions::max_wall`, persisted as the `opwall/` row, applied with
+  `set_max_wall`); `crates/kbf-server/src/farm/js/hot.rs` says it cannot, and that
+  comment is stale. The gap is kbf only: it passes no `SubmitOptions`. So **step 0 is kbf
+  wiring**, plus a test that an action past its wall is ended; backfill is allowed only
+  for a job whose bound is enforced.
 
 ### 3.6 Steps, in order
 
-0. **kbf and js: enforce and carry `max_wall` on the js core.** `js-server-core` takes the
-   submission's `max_wall`; kbf passes it to `set_max_wall` as the legacy farm does; a
-   lease past it is terminated by the action timeout. Test (red today): a job whose
-   `max_wall` passes is ended and its worker's tail ends with it; the scheduler's
-   `set_max_wall` is called for a js-core submission. Nothing below is enabled before this.
+0. **kbf: carry and enforce `max_wall` on the js core.** kbf passes the submission's
+   `max_wall` in `SubmitOptions` (js-server-core already applies it), fixes the stale
+   `hot.rs` comment, and a lease past its wall is ended by the action timeout. Test (red
+   today): a js-core job whose `max_wall` passes is ended and its worker's tail ends with
+   it; the scheduler holds the declared bound for a js-core submission. Backfill is not
+   enabled before this.
 1. **kbf: make load placement the only mode, then observe.**
    - flip `--placement-load` to `on` (`crates/kbf-server/src/config.rs`);
    - add the both-core #169 test through `Farm` (`SchedulerCore::Legacy` and `Js`, default
@@ -253,9 +285,10 @@ duration per key only if it is not.
   shape: the start time is when 24 cores free up, not when the worker empties; the
   pick follows it. (c) Backfill: a job whose estimate ends inside the start time is
   placed on the reserved worker, one ending after it is not, and the large job starts at
-  the original start time. (d) The ceiling: a declared bound over `ceiling` is clamped,
-  an unknown estimate is refused for backfill, and the cases on each side of the ceiling
-  behave as stated; with fallback-only estimates no backfill happens. (e) Older same-QoS
+  the original start time. (d) The ceiling: a declared bound over `ceiling` is refused for
+  backfill, an unknown estimate is refused, and the cases on each side of the ceiling
+  behave as stated; with fallback-only estimates a job with a shorter bound than the
+  remaining tail backfills and one with an equal or longer bound does not. (e) Older same-QoS
   work ahead of the large request lands on the reserved worker, and the large job starts
   after it but before any later arrival. (f) A lower-QoS large request waits out a
   higher-QoS stream and starts when it stops. (g) Overdue: a worker whose lease is past
@@ -264,12 +297,16 @@ duration per key only if it is not.
   grows past another's, keeps its `made` time, and does not move on a tie. (i) An
   ordinary large action is not counted by `max_whole_node` and is not dropped by
   `ceiling_excess`. (j) At step 4 the deadline and give-up tests are removed with the code, and a
-  presented request is never given up. (k) Compatibility: the old flags are accepted
-  and inert, the hosts API golden for `drain_deadline_ms` is unchanged, and a D55 record
-  written before the change is read after it and one written after is read before it.
-  An unclaimed record is still dropped at its TTL. (l) Recording: a reservation ending by
-  start, cancel and move each emits one record with the estimated start, blocked-at and
-  backfilled core-seconds; a released lease reports its placement estimate.
+  presented request is never given up. (k) Compatibility (js-sched only; the registry is untouched, 4.12): the old flags are
+  accepted and inert, and nothing in js-sched expires by `deadline`; an unclaimed
+  registry record is still dropped by `regain_grace` as today. (l) Recording: a request
+  that starts and one that is cancelled each emit one record (a move only increments its
+  counter) with the estimated start, blocked-at and backfilled core-seconds; a released
+  lease reports its placement estimate. (m) A request at `max_draining = 1` keeps its
+  hold across rounds. (n) A `Blocked::Load` head whose booked capacity is free but is
+  refused by load: its start time follows `admitted`, not bookings; red first. (o) Four
+  queued owner-worker actions in one pool reserve one worker. (p) A lease past its
+  enforced end does not give tail zero.
 
 ### 3.8 What is recorded for section 5
 
@@ -303,7 +340,7 @@ unchanged beyond 4.11).
 5. **One hold per pool, first (recommended).** Several large requests take their tails in
    turn: slower, never stuck by each other. Allow more only if the #169 run shows the
    serial waits are unacceptable on a few nodes.
-6. **Cold start: the declared bound, clamped to a ceiling (recommended).** A fallback,
+6. **Cold start: the declared bound, refused above the ceiling (recommended).** A fallback,
    replaced per key by history. Unknown is refused for backfill, never infinite.
 7. **VM leases (recommended).** A VM refused for room is a large request: give it the same
    hold, so the VM reservation planned in `macos-vms.md` is not built. If that is not a
@@ -324,22 +361,25 @@ unchanged beyond 4.11).
 
 11. **Compatibility of the removal (recommended: keep every name, change the behaviour).**
     - The three `--whole-node-*` flags of the deadline, back-off and attempts stay
-      accepted, log a deprecation, and have no effect on a presented request, so old
-      unit files still start.
-    - The hosts API field `drain_deadline_ms` (`kbf-lease-client` `wire.rs` and its
-      golden) stays with its meaning "orphan reservation TTL"; the golden does not change.
-    - D55's persisted record keeps its `deadline` field, written and read as today, so an
-      upgrade and a rollback read the same file. Its only use after step 4 is the TTL
-      that frees a reservation whose request is never presented again (`regain_grace`
-      is the unclaimed case); that is the `reserve-node.md` section 4.3 purpose, kept.
-      A request presented again is bound to its record and the drain continues (W13
-      unchanged).
-    - Docs amended in the js change: D48 (re-queue after the deadline: now only the
-      orphan TTL), D55 and W6/W14 (the bound of a drain is the enforced `max_wall` of the
-      leases on the host, not a deadline; W13 unchanged), `whole-node.md` section 4,
-      `configuration.md` (`drain_deadline`), `reserve-node.md` section 4.3, and
-      `design.md` "Draining".
-12. **Metrics are recorded, not inferred (recommended).** 3.8.
+      accepted, log a deprecation, and have no effect, so old unit files still start.
+    - After step 4 `deadline` has no use in js-sched: it gave up a hold, and that is gone.
+      The orphan case (a reservation whose request never comes back) is `regain_grace` /
+      `claim_by` in the registry, which exists today and is independent of `deadline`;
+      nothing else expires by `deadline`.
+    - The registry keeps its `deadline` field in the D55 record, the hosts API
+      `drain_deadline_ms` (with its golden) and its own timer (4.12), so D55, the wire
+      and the golden do not change in this work.
+    - Docs amended with step 4: `whole-node.md` and `configuration.md` where they describe
+      the embedded scheduler's give-up; W6/W14 are about the registry and stay.
+12. **The registry keeps its sticky mark and timer in this change (recommended).**
+    `crates/js-registry/src/whole/reserve.rs` is a second implementation (its own marks,
+    `keep_or_move`, `drain_cost`, `reserve_deadline`, give-up and back-off, caps), and
+    D55 persistence, the hosts API field and the claim/regain handling live there. The
+    tail rule lands in js-sched, which the embedded kbf core uses; the registry takes it
+    in a separate issue, filed when the js-sched rule is green, because it carries a
+    persistence and wire change that this work should not. Until then the two differ and
+    the js-sched rule supersedes the registry's only inside js-sched.
+13. **Metrics are recorded, not inferred (recommended).** 3.8.
 
 ## 5. What it measures (for the paper)
 
@@ -348,8 +388,8 @@ unchanged beyond 4.11).
   started). Report p50 and p99.
 - **Backfill share:** the fraction of the reserved worker's core-seconds used by
   backfilled work during the wait (utilization of the reserved host while it drains).
-  With fallback-only estimates this is zero by construction (3.5); report it split by
-  fallback and learned.
+  With fallback-only estimates this is limited to jobs with a bound shorter than the remaining tail (3.5);
+  report it split by fallback and learned.
 - **Estimate miss:** actual start minus estimated start at reservation, and actual over
   estimated duration per backfilled job; fallback versus learned. Also the count of
   reservation moves and of overdue leases.
