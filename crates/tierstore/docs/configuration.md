@@ -125,6 +125,8 @@ How the cache behaves is in [operations](operations.md#a-build-node). The file i
 | `server.presign_key_files` | `--presign-key-file` | paths, none | presigning key files |
 | `server.gc_key_files` | `--gc-key-file` | paths, none | GC key files |
 | `server.scoped_key_files` | `--scoped-key-file` | paths, none | scoped key files |
+| `server.grant_key_files` | `--grant-key-file` | paths, none | grant key files |
+| `server.grant_max_lifetime` | `--grant-max-lifetime` | duration, `15m` | the longest a read grant may still have to live when it is checked: a grant that ends later is refused 403 |
 | `server.presign_max_expires` | `--presign-max-expires` | duration, `15m` | the longest expiry of any presigned URL |
 | `server.max_request_bytes` | `--max-request-bytes` | bytes, 268435456 (256 MiB) | the longest body of a request: the longest object and the longest part. A body over it is refused with 413 and nothing is stored |
 | `server.max_concurrent_puts` | `--max-concurrent-puts` | count, 32 | the most put bodies and parts taken at once; one more is 503 `SlowDown` with `Retry-After: 1` |

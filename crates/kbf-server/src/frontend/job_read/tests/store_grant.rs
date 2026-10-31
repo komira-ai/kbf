@@ -27,6 +27,8 @@ const BUCKET: &str = "tiers";
 
 fn key_file(dir: &Path, text: &str, mode: u32) -> std::path::PathBuf {
     let path = dir.join("grant.key");
+    // A file at mode 0400 cannot be written over.
+    let _ = std::fs::remove_file(&path);
     std::fs::write(&path, text).expect("key file");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("mode");
     path
@@ -121,7 +123,8 @@ async fn the_start_reads_the_grant_key_as_the_other_secret_files_are_read() {
         "{why}"
     );
     for bad in [
-        r#"{"access_key_id": "locate-grant", "secret_access_key": "", "x": "y"}"#.to_owned(),
+        r#"{"access_key_id": "locate-grant", "secret_access_key": "locate-grant-secret-0123456789", "x": "y"}"#.to_owned(),
+        r#"{"access_key_id": "locate-grant", "secret_access_key": ""}"#.to_owned(),
         r#"{"access_key_id": "", "secret_access_key": "locate-grant-secret-0123456789"}"#
             .to_owned(),
         r#"{"access_key_id": "locate-grant"}"#.to_owned(),

@@ -71,7 +71,6 @@ use crate::proxy::MAX_UNTRUSTED_BLOB_BYTES;
 mod idle;
 mod locate;
 mod source;
-#[expect(dead_code, reason = "locate hands the grants out in the next commit")]
 mod store_grants;
 mod walk;
 

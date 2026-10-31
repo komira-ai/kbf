@@ -546,7 +546,7 @@ async fn the_store_and_the_bucket_are_the_configured_ones() {
     };
     for (url, bucket) in [
         ("https://tier-a.farm.test", "alpha"),
-        ("http://10.0.0.7:9000", "beta-2"),
+        ("http://store-b.farm.test:9000", "beta-2"),
     ] {
         let source = Source::default();
         let a = many(&source, "a", 1);
