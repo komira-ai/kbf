@@ -38,9 +38,20 @@
 //! - `fetch --url <url> --sha256 <hex> --out <path> [--extract <format> [--member <path>]]`
 //!   ([`fetch`]): a pinned tool, downloaded over HTTPS and refused unless its SHA-256
 //!   matches, before anything is unpacked or written.
+//! - `fetch-attested-tool --url <url> --sha256 <hex> --archive <path> --member <path> --out <path> --gh
+//!   <program> --repo <owner/repo> --signer-workflow <path> --source-ref <ref> --source-digest <sha>`
+//!   ([`fetch_attested`]): a pinned release archive, refused unless its SHA-256 matches and `gh attestation
+//!   verify` accepts the file, and only then the member is taken out of that file.
 //! - `package --binary <path> --sbom <path> --platform <platform> --commit <sha> --out
 //!   <dir>` ([`package`]): one binary as a release asset, a tarball that is the same
 //!   bytes on every runner, and its SBOM, with their lines in `SHA256SUMS.<platform>`.
+//! - `stage-task-tree --binary <path> --out <dir>` ([`task_bundle::stage_tree`]): the signed `kbf-task` alone in
+//!   a new directory, the tree of the bundle.
+//! - `package-task-bundle --layout <dir> --sbom <path> --commit <sha> --out <dir>` ([`task_bundle`]):
+//!   the signed darwin `kbf-task`, packed by the pinned `js-bundle` into an OCI image layout, as
+//!   a tarball of that layout that is the same bytes on every runner, and the SBOM of the binary,
+//!   with their lines in `SHA256SUMS.darwin-arm64`. Refused unless the layout is one bundle of
+//!   `kbf-task` for darwin arm64.
 //! - `installer-tarball --binary <path> --platform <platform> --commit <sha> --units
 //!   <dir> --trust <dir> --sysusers <file> --tmpfiles <file> --needrestart <file> --out <dir>`
 //!   ([`installer_tarball`]): the files the Debian package ships, at the same paths and
@@ -135,6 +146,7 @@ pub mod darwin;
 pub mod deploy_farm;
 pub mod entitlements;
 pub mod fetch;
+pub mod fetch_attested;
 pub mod installer_tarball;
 pub mod package;
 pub mod pipeline_rerun;
@@ -160,6 +172,7 @@ pub mod runner_disk;
 pub mod static_elf;
 pub mod sudo_test;
 pub mod sums;
+pub mod task_bundle;
 pub mod version_facts;
 pub mod wait_artifacts;
 
@@ -269,6 +282,40 @@ enum Verb {
         #[arg(long)]
         member: Option<PathBuf>,
     },
+    /// Download a pinned release archive, check its SHA-256 and its build attestation (`gh attestation
+    /// verify`, with the pinned `gh`), and only then take `--member` out of the file that was checked.
+    FetchAttestedTool {
+        /// Where to download it from (HTTPS).
+        #[arg(long)]
+        url: String,
+        /// The SHA-256 of the download, 64 lowercase hex digits.
+        #[arg(long)]
+        sha256: fetch::Sha256,
+        /// Where the archive is written for `gh` to verify; must not exist.
+        #[arg(long)]
+        archive: PathBuf,
+        /// The regular file of the gzip tar to install: a relative path of plain names.
+        #[arg(long)]
+        member: PathBuf,
+        /// The file to install (mode 0755); its directory is created when missing.
+        #[arg(long)]
+        out: PathBuf,
+        /// The `gh` program.
+        #[arg(long)]
+        gh: PathBuf,
+        /// The repository the archive was built in, `<owner>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// The signer workflow, `<owner>/<repo>/<path>`.
+        #[arg(long)]
+        signer_workflow: String,
+        /// The ref it was built on, `refs/heads/<branch>`.
+        #[arg(long)]
+        source_ref: String,
+        /// The commit it was built from, a full SHA.
+        #[arg(long)]
+        source_digest: String,
+    },
     /// Package one binary and its SBOM as release assets in `--out`.
     Package {
         /// The binary; its file name is the asset's name.
@@ -280,6 +327,31 @@ enum Verb {
         /// The platform it was built for.
         #[arg(long, value_enum)]
         platform: package::Platform,
+        /// The commit it was built from (on Actions, `GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// The directory the assets go in; created when missing.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Copy the signed `kbf-task` into a new directory, the one tree `js-bundle pack` packs.
+    StageTaskTree {
+        /// The binary; its file name must be `kbf-task`.
+        #[arg(long)]
+        binary: PathBuf,
+        /// The directory to make (its parent is created when missing; it must not exist).
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Package the signed darwin `kbf-task` bundle (an OCI image layout `js-bundle pack` wrote) and
+    /// its SBOM as release assets in `--out`.
+    PackageTaskBundle {
+        /// The layout directory (`oci-layout`, `index.json`, `blobs/sha256/`).
+        #[arg(long)]
+        layout: PathBuf,
+        /// The CycloneDX SBOM of the `kbf-task` binary.
+        #[arg(long)]
+        sbom: PathBuf,
         /// The commit it was built from (on Actions, `GITHUB_SHA`).
         #[arg(long)]
         commit: String,
@@ -1108,6 +1180,32 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             let roots = fetch::host_roots();
             Ok(vec![fetch::fetch(&url, &sha256, &unpack, &out, &roots)?])
         }
+        Verb::FetchAttestedTool {
+            url,
+            sha256,
+            archive,
+            member,
+            out,
+            gh,
+            repo,
+            signer_workflow,
+            source_ref,
+            source_digest,
+        } => fetch_attested::fetch_attested_tool(
+            &fetch_attested::Request {
+                url: &url,
+                sha256,
+                archive,
+                member,
+                out,
+                repo: &repo,
+                signer_workflow: &signer_workflow,
+                source_ref: &source_ref,
+                source_digest: &source_digest,
+            },
+            &gh,
+        )
+        .map(|line| vec![line]),
         Verb::Package {
             binary,
             sbom,
@@ -1115,6 +1213,15 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             commit,
             out,
         } => package::package(&binary, &sbom, platform, &commit, &out),
+        Verb::StageTaskTree { binary, out } => {
+            task_bundle::stage_tree(&binary, &out).map(|line| vec![line])
+        }
+        Verb::PackageTaskBundle {
+            layout,
+            sbom,
+            commit,
+            out,
+        } => task_bundle::package_task_bundle(&layout, &sbom, &commit, &out),
         Verb::InstallerTarball {
             binary,
             platform,
