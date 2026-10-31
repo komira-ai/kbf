@@ -1,0 +1,44 @@
+# TEMPORARY. tierstore is moving to a repository of its own. From the commit the import copies from
+# until the import has landed there, no pull request may change the paths that move
+# (crates/tierstore/, crates/objstore-s3/, packaging/tierstore/ and the two tierstore-site workflows;
+# the list is FROZEN in crates/xtask/src/frozen_paths.rs). This workflow and that xtask verb are
+# deleted in the change that switches this repository over to the new one.
+#
+# The job is a required check, so it always runs and always reports: there is no `paths:` filter on the
+# triggers (a filtered required check that does not run stays pending forever), and a pull request that
+# touches no frozen path passes. The required check's name is the job's: `tierstore-move-freeze`.
+#
+# A pull request is checked out as the merge commit, so HEAD^1 is the base branch it merges into (as in
+# ci.yml); the same holds for a merge-queue commit. GitHub-hosted runner, commit-pinned actions, no token
+# rights beyond reading the checkout.
+name: tierstore-move-freeze
+
+on:
+  pull_request:
+  merge_group:
+
+permissions: {}
+
+concurrency:
+  group: tierstore-move-freeze-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  tierstore-move-freeze:
+    name: tierstore-move-freeze
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The merge commit and its first parent, the base branch.
+          fetch-depth: 2
+      - run: rustup toolchain install
+      - run: cargo xtask frozen-paths --base HEAD^1 --head HEAD
