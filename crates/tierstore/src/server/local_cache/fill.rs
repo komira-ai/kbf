@@ -67,9 +67,9 @@ impl From<Error> for Stop {
 }
 
 /// A file of the stage directory, removed when it is dropped, and counted while it exists.
-struct Staged {
+pub(super) struct Staged {
     inner: Arc<Inner>,
-    file: tokio::fs::File,
+    pub(super) file: tokio::fs::File,
     path: PathBuf,
     /// Where the sidecar is written before it is renamed into place.
     sidecar: PathBuf,
@@ -78,7 +78,7 @@ struct Staged {
 impl Staged {
     /// A new file, read-only for everyone once it is made (mode 0444: the descriptor that made
     /// it can still write).
-    async fn create(inner: &Arc<Inner>) -> io::Result<Self> {
+    pub(super) async fn create(inner: &Arc<Inner>) -> io::Result<Self> {
         let number = inner.staged.fetch_add(1, Ordering::Relaxed);
         let name = format!("{}-{number:016x}", inner.stage_prefix);
         let path = stage_dir(&inner.config.path).join(&name);
@@ -104,7 +104,7 @@ impl Staged {
 
     /// Writes the end of the file to the disk, so that a name linked to it is whole after a
     /// crash.
-    async fn finish(&mut self) -> io::Result<()> {
+    pub(super) async fn finish(&mut self) -> io::Result<()> {
         self.file.flush().await?;
         self.file.sync_data().await
     }
@@ -128,7 +128,7 @@ fn write_sidecar(path: &Path, text: &[u8]) -> io::Result<()> {
 
 /// What [`publish`] did.
 #[derive(Debug, PartialEq, Eq)]
-enum Published {
+pub(super) enum Published {
     /// The data file is new.
     New,
     /// The data file was there already.
@@ -186,9 +186,9 @@ impl Drop for Reserved {
 
 /// A fill's place in the table of the fills that run: taken out when it is dropped, whether the
 /// fill ended, panicked or was cancelled, so that no key stays marked as being filled.
-struct Flight {
-    inner: Arc<Inner>,
-    hex: String,
+pub(super) struct Flight {
+    pub(super) inner: Arc<Inner>,
+    pub(super) hex: String,
 }
 
 impl Drop for Flight {
@@ -470,21 +470,35 @@ impl Inner {
         sidecar: &Sidecar,
         generation: u64,
     ) -> io::Result<Published> {
+        let publishing = self.begin_commit(staged, name, sidecar, generation);
+        publishing.await.expect("a publish does not panic")
+    }
+
+    /// Starts the link of the staged file into the cache on a thread that may block, and gives
+    /// the handle of the job, which goes on when the handle is dropped. The job publishes only
+    /// while the cache still owns the directory as of `generation` (see `Inner::owns`): fills
+    /// and keeps both run it, and both give up when it says [`Published::Lost`].
+    pub(super) fn begin_commit(
+        self: &Arc<Self>,
+        staged: &Staged,
+        name: &Name,
+        sidecar: &Sidecar,
+        generation: u64,
+    ) -> JoinHandle<io::Result<Published>> {
         let disk = Arc::clone(&self.disk);
         let root = self.config.path.clone();
         let hex = name.hex.clone();
         let (from, temporary) = (staged.path.clone(), staged.sidecar.clone());
         let text = serde_json::to_vec(sidecar).unwrap_or_default();
         let inner = Arc::clone(self);
-        let publishing = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let owns = || inner.owns(generation);
             publish(&*disk, &root, &hex, (&from, &temporary), &text, &owns)
-        });
-        publishing.await.expect("a publish does not panic")
+        })
     }
 
     /// Runs a pass of the eviction if the cache is above its high water mark.
-    async fn relieve(self: &Arc<Self>) {
+    pub(super) async fn relieve(self: &Arc<Self>) {
         let held = locked(&self.index).bytes();
         if held > percent_of(self.config.budget, self.config.high_water) {
             let inner = Arc::clone(self);

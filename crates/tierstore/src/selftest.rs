@@ -22,9 +22,13 @@
 //! `_tiering/` prefix is reserved), and the caller gives a run id that is new for each start.
 //! The keys of a check are deleted after it, whether it passed or not (a delete that fails is
 //! noted). Keys under the prefix that are older than an hour, left by a start that was killed,
-//! are deleted when the test starts (at most the first thousand are looked at). Only keys that
+//! are deleted by [`sweep_probes`], which is not part of [`self_test`] so that a caller can run it
+//! when the start no longer waits for it. At most the first thousand keys are looked at, and a
+//! sweep is bounded by a [`SweepBudget`] (by default 100 deletes, and no new delete starts after
+//! 10 seconds on the clock it is given; a request already sent runs to the end of its own
+//! timeout); what it leaves waits for the next start, and its note says so. Only keys that
 //! start with the probe prefix and are not this run's are deleted, whatever a listing returns, and
-//! the age is judged by the clock of the store (the `Last-Modified` of a key the test writes for
+//! the age is judged by the clock of the store (the `Last-Modified` of a key the sweep writes for
 //! the purpose and deletes), not by the clock of the machine, which may be minutes from that of
 //! another machine over the same bucket.
 //!
@@ -45,7 +49,7 @@ use futures::StreamExt;
 use futures::stream;
 use tokio::time::Instant;
 
-use crate::{Backend, ByteRange, Error, Listed};
+use crate::{Backend, ByteRange, Clock, Error, Listed};
 
 /// The prefix of the probe keys.
 const PROBE_PREFIX: &str = "_tiering/selftest/";
@@ -227,6 +231,54 @@ pub struct SelfTestOptions<'a> {
 /// not deleted.
 pub type Note<'a> = &'a (dyn Fn(String) + Sync);
 
+/// How much one sweep of old probe keys may do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SweepBudget {
+    /// The most deletes sent.
+    pub keys: usize,
+    /// The longest the sweep runs, on the clock it is given.
+    pub time: Duration,
+}
+
+impl Default for SweepBudget {
+    fn default() -> Self {
+        Self {
+            keys: 100,
+            time: Duration::from_secs(10),
+        }
+    }
+}
+
+/// What a sweep did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Swept {
+    /// The deletes sent, one for each old probe key (a delete that failed is counted, and noted).
+    pub deleted: usize,
+    /// Whether a budget stopped the sweep with old keys left.
+    pub more_left: bool,
+}
+
+/// Deletes the probe keys that earlier starts left, within `budget` (see the module). The time of
+/// the budget is counted on `clock`. The run id and the name come from `options`; the checks do
+/// not run. One note says how many keys were deleted and how long it took, and that keys are left
+/// if a budget stopped the sweep.
+pub async fn sweep_probes(
+    backend: &dyn Backend,
+    options: &SelfTestOptions<'_>,
+    budget: SweepBudget,
+    clock: &dyn Clock,
+    note: Note<'_>,
+) -> Swept {
+    let probe = Probe {
+        backend,
+        prefix: format!("{PROBE_PREFIX}{}/", options.run_id),
+        options,
+        note,
+        started: Instant::now(),
+    };
+    probe.sweep(budget, clock).await
+}
+
 /// Runs the checks on `backend`. The first check that fails ends the test.
 ///
 /// # Errors
@@ -244,7 +296,6 @@ pub async fn self_test(
         note,
         started: Instant::now(),
     };
-    probe.sweep().await;
     for check in Check::ALL {
         let multipart_only = check == Check::MultipartConditional && !options.multipart;
         if options.skip.contains(&check) || multipart_only {
@@ -422,12 +473,21 @@ impl Probe<'_> {
     /// Deletes the probe keys that an earlier start left, more than an hour old by the clock of
     /// the store. Only keys under the probe prefix and not this run's are deleted, whatever the
     /// listing returns (a store that ignores the prefix lists the data too).
-    async fn sweep(&self) {
+    ///
+    /// At most `budget.keys` deletes are sent (one that fails counts), and none is sent once
+    /// `budget.time` has passed on `clock` since the sweep began; the keys left wait for the next
+    /// start.
+    async fn sweep(&self, budget: SweepBudget, clock: &dyn Clock) -> Swept {
+        let began = clock.now();
+        let nothing = Swept {
+            deleted: 0,
+            more_left: false,
+        };
         let now = match self.store_time().await {
             Ok(now) => now,
             Err(error) => {
                 self.note(format!("could not read the time of the store: {error}"));
-                return;
+                return nothing;
             }
         };
         let listed = self.backend.list_page(PROBE_PREFIX, None, SWEEP_LIMIT);
@@ -436,15 +496,31 @@ impl Probe<'_> {
             Err(error) => {
                 let why = format!("could not list the probe keys of earlier starts: {error}");
                 self.note(why);
-                return;
+                return nothing;
             }
         };
-        for object in found {
+        let stale = found.into_iter().filter(|object| {
             let ours = object.key.starts_with(&self.prefix);
             let probe = object.key.starts_with(PROBE_PREFIX);
-            if probe && !ours && object.modified.saturating_add(SWEEP_AGE_MS) < now {
-                self.delete(&object.key).await;
+            probe && !ours && object.modified.saturating_add(SWEEP_AGE_MS) < now
+        });
+        let limit = budget.time.as_millis();
+        let (mut sent, mut more_left) = (0, false);
+        for object in stale {
+            let spent = u128::from(clock.now().saturating_sub(began));
+            if sent >= budget.keys || spent >= limit {
+                more_left = true;
+                break;
             }
+            self.delete(&object.key).await;
+            sent += 1;
+        }
+        let took = clock.now().saturating_sub(began);
+        let more = if more_left { " (more left)" } else { "" };
+        self.note(format!("swept {sent} stale probe keys in {took} ms{more}"));
+        Swept {
+            deleted: sent,
+            more_left,
         }
     }
 

@@ -26,7 +26,7 @@ pub fn stem(name: &str, platform: &str) -> String {
 pub const SBOM_IMAGES: &[&str] = &["task"];
 
 /// The (binary name, platform) of every `cargo xtask package` line in the workflow's
-/// `run:` steps, in file order. An error names a package line it cannot read.
+/// `run:` steps, then of every `cargo xtask package-task-bundle` line, in file order. An error names a package line it cannot read.
 pub fn packaged(workflow: &str) -> Result<Vec<(String, String)>, String> {
     let mut found = Vec::new();
     for step in workflows::run_steps(workflow)? {
@@ -47,6 +47,26 @@ pub fn packaged(workflow: &str) -> Result<Vec<(String, String)>, String> {
             };
             let name = binary.rsplit_once('/').map_or(binary, |(_, n)| n);
             found.push((name.to_owned(), platform.to_owned()));
+        }
+    }
+    found.extend(packaged_task_bundles(workflow)?);
+    Ok(found)
+}
+
+/// The (name, platform) of every `cargo xtask package-task-bundle` line in the workflow's `run:`
+/// steps, in file order: the signed darwin `kbf-task` as a bundle in an OCI layout, which is a
+/// tarball with an SBOM like the binaries are, named `kbf-task-bundle-<commit>-darwin-arm64`
+/// (`xtask::task_bundle`). The verb takes no `--platform`: the bundle is for a Mac.
+pub fn packaged_task_bundles(workflow: &str) -> Result<Vec<(String, String)>, String> {
+    let mut found = Vec::new();
+    for step in workflows::run_steps(workflow)? {
+        for line in step.script.lines().map(str::trim_start) {
+            if line.starts_with("cargo xtask package-task-bundle ") {
+                found.push((
+                    xtask::task_bundle::NAME.to_owned(),
+                    xtask::task_bundle::PLATFORM.name().to_owned(),
+                ));
+            }
         }
     }
     Ok(found)
