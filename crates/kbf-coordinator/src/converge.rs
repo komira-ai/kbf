@@ -27,7 +27,7 @@ use kbf_updater::version::Version;
 use kbf_updater::wire::Outcome;
 use serde::Serialize;
 
-use crate::desired::{Desired, KBF};
+use crate::desired::{Desired, KBF, kbf_roles};
 use crate::fleet::{Fleet, Host};
 use crate::services::ServiceDef;
 
@@ -45,10 +45,10 @@ pub enum State {
 }
 
 /// The hosts of one role, by where they stand.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RoleCounts {
     /// The role (`frontend`, `storage`, `daemon`, `mac-daemon`).
-    pub role: &'static str,
+    pub role: String,
     /// Live and running the desired version.
     pub at_desired: usize,
     /// Live and updating.
@@ -87,7 +87,7 @@ fn failed_to_reach(host: &Host, desired: &Desired) -> bool {
 
 fn counts(
     service: &str,
-    role: HostRole,
+    role: &HostRole,
     desired: &Desired,
     fleet: &Fleet,
     now: Duration,
@@ -96,10 +96,10 @@ fn counts(
         fleet
             .hosts_of(service)
             .map(|(_, h)| h)
-            .filter(move |h| h.role == role)
+            .filter(|h| h.role == *role)
     };
     RoleCounts {
-        role: role.name(),
+        role: role.name().to_owned(),
         at_desired: mine()
             .filter(|h| h.is_live(now) && h.beat.version == desired.version)
             .count(),
@@ -125,9 +125,9 @@ pub fn role_counts(
     let Some(desired) = desired else {
         return Vec::new();
     };
-    HostRole::ALL
+    kbf_roles()
         .into_iter()
-        .map(|role| counts(service, role, desired, fleet, now))
+        .map(|role| counts(service, &role, desired, fleet, now))
         .filter(|c| c.at_desired + c.updating + c.failed + c.down > 0)
         .collect()
 }
@@ -151,7 +151,7 @@ pub fn converge_service(
     now: Duration,
 ) -> Convergence {
     converge_with(&def.name, desired, fleet, now, |d, role| {
-        def.roles.get(&role).map_or(0, |r| r.required_up(role, d))
+        def.roles.get(role).map_or(0, |r| r.required_up(role, d))
     })
 }
 
@@ -160,7 +160,7 @@ fn converge_with(
     desired: Option<&Desired>,
     fleet: &Fleet,
     now: Duration,
-    minimum: impl Fn(&Desired, HostRole) -> usize,
+    minimum: impl Fn(&Desired, &HostRole) -> usize,
 ) -> Convergence {
     let quiet = fleet.is_quiet(now);
     let Some(desired) = desired else {
@@ -179,10 +179,10 @@ fn converge_with(
         .count();
     let at_desired: usize = roles.iter().map(|c| c.at_desired).sum();
     let clear = roles.iter().all(|c| c.updating == 0 && c.failed == 0);
-    let up = |role| {
+    let up = |role: &HostRole| {
         fleet
             .hosts_of(service)
-            .filter(|(_, h)| h.role == role && h.is_up(now))
+            .filter(|(_, h)| h.role == *role && h.is_up(now))
             .count()
     };
     let state = if roles.iter().any(|c| c.failed > 0) {
@@ -191,9 +191,9 @@ fn converge_with(
         && live > 0
         && at_desired == live
         && clear
-        && HostRole::ALL
+        && kbf_roles()
             .into_iter()
-            .all(|role| up(role) >= minimum(desired, role))
+            .all(|role| up(&role) >= minimum(desired, &role))
     {
         State::Converged
     } else {

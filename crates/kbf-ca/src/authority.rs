@@ -55,7 +55,7 @@ pub struct UpdaterCert<'a> {
     /// The host: the certificate's one DNS name (and its subject, which nothing reads).
     pub node_id: &'a NodeId,
     /// What the host runs, which the coordinator limits and orders it by.
-    pub host_role: HostRole,
+    pub host_role: &'a HostRole,
     /// The updater's key, from a request that proved possession.
     pub key: &'a PublicKey,
 }

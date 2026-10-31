@@ -493,10 +493,10 @@ fn the_frontend_certificate_needs_good_names() {
 fn an_updater_certificate_names_the_updater_role_and_the_hosts_role() {
     let ca = authority();
     let golden = [
-        (HostRole::Frontend, "urn:kbf:host-role:frontend"),
-        (HostRole::Storage, "urn:kbf:host-role:storage"),
-        (HostRole::Daemon, "urn:kbf:host-role:daemon"),
-        (HostRole::MacDaemon, "urn:kbf:host-role:mac-daemon"),
+        (HostRole::FRONTEND, "urn:kbf:host-role:frontend"),
+        (HostRole::STORAGE, "urn:kbf:host-role:storage"),
+        (HostRole::DAEMON, "urn:kbf:host-role:daemon"),
+        (HostRole::MAC_DAEMON, "urn:kbf:host-role:mac-daemon"),
     ];
     for (host_role, uri) in golden {
         let key = key();
@@ -504,7 +504,7 @@ fn an_updater_certificate_names_the_updater_role_and_the_hosts_role() {
             .issue_updater(
                 &UpdaterCert {
                     node_id: &node("host-7"),
-                    host_role,
+                    host_role: &host_role,
                     key: &key,
                 },
                 NOW,

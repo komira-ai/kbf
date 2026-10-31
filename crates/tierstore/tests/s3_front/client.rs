@@ -7,8 +7,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream;
-use kbf_objstore::s3::{MULTIPART_THRESHOLD, S3Store};
-use kbf_objstore::{
+use objstore_s3::s3::{MULTIPART_THRESHOLD, S3Store};
+use objstore_s3::{
     BodyStream, ByteRange, Capabilities, KeyPrefix, ListToken, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };

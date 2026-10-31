@@ -77,7 +77,7 @@ pub struct HostStatus {
     /// The node id from its certificate.
     pub node_id: String,
     /// The host role from its certificate.
-    pub role: &'static str,
+    pub role: String,
     /// Heartbeated within the down limit.
     pub live: bool,
     /// Live, healthy and not updating.
@@ -199,7 +199,7 @@ impl Coordinator {
         let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         let announced = beat.services.clone().unwrap_or_default();
         let platform = beat.platform;
-        fleet.record(who.node_id.clone(), who.role, beat, now);
+        fleet.record(who.node_id.clone(), who.role.clone(), beat, now);
         for one in &announced {
             let runs_here = self
                 .services
@@ -209,7 +209,7 @@ impl Coordinator {
                 fleet.record_in(
                     &one.name,
                     who.node_id.clone(),
-                    who.role,
+                    who.role.clone(),
                     one.as_heartbeat(platform),
                     now,
                 );
@@ -289,7 +289,7 @@ impl Coordinator {
             .hosts()
             .map(|(id, host)| HostStatus {
                 node_id: id.to_string(),
-                role: host.role.name(),
+                role: host.role.name().to_owned(),
                 live: host.is_live(now),
                 up: fleet.is_up(KBF, id, host, now),
                 holds_slot: fleet.holds_slot(KBF, id, host, now),
