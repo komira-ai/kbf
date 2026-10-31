@@ -12,16 +12,19 @@
 //! cold store's state must not look like one that says it is quiet.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::config::StoreSpec;
 use crate::error::BenchError;
-use crate::preflight::host::Host;
+use crate::gate::LoadSample;
+use crate::preflight::host::{Cmd, CmdOutput, Host};
 use crate::preflight::mc::Mc;
 use crate::preflight::ops::OpsFile;
 use crate::preflight::{heal_percent, is_healing, live::sha256_hex};
@@ -62,6 +65,7 @@ impl ColdStateSource for NoColdState {
 
 /// The preflight's source, on a [`Host`]: `mc admin info` of the cold store and the heal status
 /// file of the ops file.
+#[derive(Clone)]
 pub struct OpsColdState {
     host: Arc<dyn Host>,
     ops: OpsFile,
@@ -81,11 +85,14 @@ impl OpsColdState {
             result_dir,
         }
     }
-}
 
-impl ColdStateSource for OpsColdState {
-    fn read(&self) -> Result<Option<ColdState>, BenchError> {
-        let host: &dyn Host = &*self.host;
+    /// One reading, its commands stopped (and killed) once `stop` is set.
+    fn read_until(&self, stop: &AtomicBool) -> Result<Option<ColdState>, BenchError> {
+        let bounded = Stoppable {
+            inner: &*self.host,
+            stop,
+        };
+        let host: &dyn Host = &bounded;
         let info = Mc::for_role(host, &self.ops, Role::Cold, &self.spec, &self.result_dir)
             .and_then(|mc| mc.info())
             .ok();
@@ -103,6 +110,68 @@ impl ColdStateSource for OpsColdState {
             drives: info.as_ref().map(drives_of).unwrap_or_default(),
             read_unix_ms: unix_ms(),
         }))
+    }
+}
+
+impl ColdStateSource for OpsColdState {
+    fn read(&self) -> Result<Option<ColdState>, BenchError> {
+        self.read_until(&AtomicBool::new(false))
+    }
+
+    /// Reads on a thread of the blocking pool; if `limit` passes first, the command that is
+    /// running is told to stop (its own child is killed, nothing else) and the reading is an
+    /// error, whatever the status file would have said: a store that does not answer is not a
+    /// store that is quiet.
+    fn read_within(&self, limit: Duration) -> ReadFuture<'_> {
+        Box::pin(async move {
+            let stop = Arc::new(AtomicBool::new(false));
+            let (this, flag) = (self.clone(), stop.clone());
+            let mut task = tokio::task::spawn_blocking(move || this.read_until(&flag));
+            if let Ok(done) = tokio::time::timeout(limit, &mut task).await {
+                return done.unwrap_or(Err(unreadable("the reading did not end")));
+            }
+            stop.store(true, Ordering::SeqCst);
+            task.await.ok();
+            Err(unreadable(&format!(
+                "no answer in {} s, the command was stopped",
+                limit.as_secs()
+            )))
+        })
+    }
+}
+
+fn unreadable(why: &str) -> BenchError {
+    BenchError::Ops(format!("cold state: unreadable: {why}"))
+}
+
+/// A [`Host`] whose commands end when `stop` is set, as a command that timed out (the cold
+/// store's admin tool is the one command a reading runs).
+struct Stoppable<'a> {
+    inner: &'a dyn Host,
+    stop: &'a AtomicBool,
+}
+
+impl Host for Stoppable<'_> {
+    fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
+        self.inner.read_file(path)
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        self.inner.exists(path)
+    }
+
+    fn run(&self, cmd: &Cmd) -> io::Result<CmdOutput> {
+        self.inner
+            .run_until(cmd, self.stop)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
+    }
+
+    fn port_open(&self, port: u16) -> bool {
+        self.inner.port_open(port)
+    }
+
+    fn load_sample(&self) -> Result<LoadSample, BenchError> {
+        self.inner.load_sample()
     }
 }
 
@@ -142,6 +211,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::preflight::host::SystemHost;
 
     /// Catches a drive set that names a host or path, one that loses a drive or its healing flag,
     /// and an order that depends on the order the store listed them in.
@@ -182,6 +252,30 @@ mod tests {
     fn an_answer_without_drives_gives_an_empty_set() {
         assert!(drives_of(&json!({})).is_empty());
         assert!(drives_of(&json!({"info": {"servers": [{"version": "v"}]}})).is_empty());
+    }
+
+    /// Catches a host that is told to stop answering for the whole machine, not for its commands:
+    /// files, ports and the load are the inner host's own; a command runs to its end while the
+    /// flag is down, and is an error of kind `TimedOut` once it is up and the command has not
+    /// ended.
+    #[test]
+    fn a_stoppable_host_passes_everything_on_and_stops_only_commands() {
+        let (down, up) = (AtomicBool::new(false), AtomicBool::new(true));
+        let host = Stoppable {
+            inner: &SystemHost,
+            stop: &down,
+        };
+        assert!(host.exists(Path::new("/")));
+        assert!(host.read_file(Path::new("/")).is_err());
+        assert!(!host.port_open(1));
+        let _ = host.load_sample();
+        assert_eq!(host.run(&Cmd::new("echo", &["a"])).unwrap().stdout, "a\n");
+        let stopped = Stoppable {
+            inner: &SystemHost,
+            stop: &up,
+        };
+        let err = stopped.run(&Cmd::new("sleep", &["3600"])).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 
     /// Catches a run with no cold store being asked anything.

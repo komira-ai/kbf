@@ -4,11 +4,12 @@
 //! [`Host`] they are the same code on the node and in a test, where a fake answers from a table
 //! and records the commands it was asked to run. [`SystemHost`] is the node itself.
 
-use std::io::{self, Write as _};
+use std::io::{self, Read, Write as _};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::AtomicBool;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::error::BenchError;
@@ -131,6 +132,43 @@ pub struct SystemHost;
 /// The longest a connection to a loopback port may take before the port counts as closed.
 const PORT_CONNECT: Duration = Duration::from_millis(500);
 
+/// How often a command run with `run_until` is looked at.
+const POLL: Duration = Duration::from_millis(20);
+
+/// Starts `cmd` with its pipes and writes its input.
+fn start(cmd: &Cmd) -> io::Result<Child> {
+    let mut child = Command::new(&cmd.program)
+        .args(&cmd.args)
+        .envs(cmd.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(if cmd.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(text) = &cmd.stdin {
+        // A write that fails (the child exited without reading) is not an error of its own:
+        // the exit status says what happened. Dropping the pipe closes the child's input.
+        child.stdin.take().into_iter().for_each(|mut pipe| {
+            pipe.write_all(text.as_bytes()).ok();
+        });
+    }
+    Ok(child)
+}
+
+/// The text a pipe gives until it closes, read on a thread of its own.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.into_iter().for_each(|mut pipe| {
+            pipe.read_to_end(&mut bytes).ok();
+        });
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
+}
+
 impl Host for SystemHost {
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
         std::fs::read(path)
@@ -141,31 +179,38 @@ impl Host for SystemHost {
     }
 
     fn run(&self, cmd: &Cmd) -> io::Result<CmdOutput> {
-        let mut child = Command::new(&cmd.program)
-            .args(&cmd.args)
-            .envs(cmd.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .stdin(if cmd.stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        if let Some(text) = &cmd.stdin {
-            // A write that fails (the child exited without reading) is not an error of its own:
-            // the exit status says what happened. Dropping the pipe closes the child's input.
-            child.stdin.take().into_iter().for_each(|mut pipe| {
-                pipe.write_all(text.as_bytes()).ok();
-            });
-        }
-        let out = child.wait_with_output()?;
+        let out = start(cmd)?.wait_with_output()?;
         Ok(CmdOutput {
             success: out.status.success(),
             code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
+    }
+
+    fn run_until(&self, cmd: &Cmd, stop: &AtomicBool) -> io::Result<Option<CmdOutput>> {
+        let mut child = start(cmd)?;
+        // Read on threads, so a command that fills a pipe is not a command that hangs.
+        let (out, err) = (drain(child.stdout.take()), drain(child.stderr.take()));
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if stop.load(Ordering::SeqCst) {
+                // This child only, by the handle that started it. The reader threads end with
+                // the pipes; they are not waited for, as a grandchild may hold them open.
+                child.kill().ok();
+                child.wait().ok();
+                return Ok(None);
+            }
+            std::thread::sleep(POLL);
+        };
+        Ok(Some(CmdOutput {
+            success: status.success(),
+            code: status.code(),
+            stdout: out.join().unwrap_or_default(),
+            stderr: err.join().unwrap_or_default(),
+        }))
     }
 
     fn port_open(&self, port: u16) -> bool {

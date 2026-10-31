@@ -171,7 +171,10 @@ carry that reading. Before every pass of every arm `run` reads it again, through
 uses and read-only: `mc admin info` of the cold role (its drives and whether any reports healing)
 and the status file of the ops file (`cold_heal_status_file`, `percent_done`). It is healing if a
 drive says so or the status file is under 100. A reading that cannot be made (neither source
-answers, or the status file is not one) stops the run. A run with no `cold` role reads nothing.
+answers, or the status file is not one) stops the run, and so does a reading that takes longer
+than `--cold-state-timeout-secs` (30): the `mc admin info` that has not answered by then is
+killed (that command only) and the run stops with `cold state: unreadable`, the status file
+notwithstanding. A run with no `cold` role reads nothing.
 Each reading is stamped into the `cold_state` array of the result of the arm, one entry per pass:
 
 ```json
@@ -197,11 +200,19 @@ so far are written), when either holds:
 | `--cold-abort-error-share` | 0.05 | the share of the window's requests that failed or timed out is above it (0 to 1) |
 | `--cold-abort-window-secs` | 60 | the length of the window, seconds |
 
-Equal to a limit is within it. A window of fewer than 20 requests is not judged. A failed request
-counts in the share and, with the time it took to fail, in the p99. Only requests the harness
-sent to the cold role are counted (steps of the `cold` role): requests to the instance are not,
-and neither are the arms that put the cold store in a fault on purpose (the arms through the fault
-proxy other than `proxy-pass`), whose requests are meant to be slow or to fail. The trip is in the
+Equal to a limit is within it. The window counts one entry per request (the `.ttfb` step of a
+streamed read is not a second one). A window of fewer than 20 requests is not judged; with 20 to
+99 requests in it the p99 is the slowest request, so one slow request can stop the run. That is
+deliberate: it protects the farm. A failed request counts in the share and, with the time it took
+to fail, in the p99. Only requests the harness sent to the cold role are counted (steps of the
+`cold` role), and not the arms that put the cold store in a fault on purpose (the arms through the
+fault proxy other than `proxy-pass`), whose requests are meant to be slow or to fail.
+
+The guard does not watch the instance arms: requests to the instance are not counted, and the
+instance's own copy traffic to the cold store is throttled only by the held `COPY_PARALLEL` site
+key.
+
+The trip is in the
 result, in the pass it cut (`cold_guard`: `metric` `p99_ms` or `error_share`, `value`, `limit`,
 `requests` in the window, `window_secs`), and `report` lists it under the table. The flags are
 accepted by every verb that takes the shared flags, like the load gate's.

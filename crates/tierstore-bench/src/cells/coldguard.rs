@@ -16,6 +16,10 @@
 //!   requests is not a share, and the p99 of a handful is the slowest of them.
 //! - A request that failed counts in the share and, with the time it took to fail, in the p99: a
 //!   store that hangs until the timeout is slow as well as failing.
+//! - The window counts one entry per request: the step of the whole request. The step that
+//!   carries a second quantity of a request (the `.ttfb` of a streamed read, which only a request
+//!   that succeeded has) is not an entry, or a read that succeeded would count twice and one that
+//!   failed once.
 //! - Only requests the harness sent to the cold role count; the arms that put the cold store in a
 //!   fault on purpose (through the fault proxy) are not shown to the guard.
 //! - The guard is pure: it is given the instant of every request and of every check, so a test

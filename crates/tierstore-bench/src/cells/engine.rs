@@ -429,8 +429,14 @@ impl Env {
 
     /// Shows the cold store guard the cold requests among `steps`, which finished now, and judges
     /// its window: the trip, if the cold store's health is over a limit.
+    ///
+    /// A request is one step, the one with no label; a step with a label (`.ttfb`) is a second
+    /// quantity of a request already shown, and a request that failed has none.
     fn watch_cold(&self, steps: &[Step]) -> Option<ColdTrip> {
-        let mut cold = steps.iter().filter(|s| s.role == Role::Cold).peekable();
+        let mut cold = steps
+            .iter()
+            .filter(|s| s.role == Role::Cold && s.label.is_empty())
+            .peekable();
         cold.peek()?;
         let now = Instant::now();
         let mut guard = self.guard.lock().unwrap_or_else(PoisonError::into_inner);
