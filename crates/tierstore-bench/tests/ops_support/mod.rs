@@ -428,6 +428,32 @@ pub fn info_json(version: &str, healing: bool) -> String {
     .to_string()
 }
 
+/// The time of the file-mode tests, milliseconds since the Unix epoch: their clock is fixed here.
+pub const NOW_MS: u64 = 1_790_000_000_000;
+
+/// A heal status file of the node's writer, stamped `read_unix_ms`: healing, 12.5 percent, two
+/// drives (one healing) and a store version.
+pub fn status_file(read_unix_ms: u64) -> String {
+    json!({
+        "read_unix_ms": read_unix_ms,
+        "healing": true,
+        "percent_done": 12.5,
+        "drives": [
+            {"id": "d-0123abcd", "state": "ok", "healing": true},
+            {"id": "d-89abcdef", "state": "ok", "healing": false}
+        ],
+        "version": "RELEASE.file-mark"
+    })
+    .to_string()
+}
+
+/// The ops file of `base` without a cold admin key: file mode for the cold role.
+pub fn file_mode(ops: &OpsFile) -> OpsFile {
+    let mut ops = ops.clone();
+    ops.admin.remove(&tierstore_bench::role::Role::Cold);
+    ops
+}
+
 pub const CPUINFO: &str = "processor\t: 0\nmodel name\t: x\n\nprocessor\t: 1\nmodel name\t: x\n";
 pub const MEMINFO: &str = "MemTotal:       16384000 kB\nMemFree:        1 kB\n";
 pub const OS_RELEASE: &str =
@@ -463,7 +489,7 @@ pub fn healthy_host() -> FakeHost {
         let args = cmd.args.join(" ");
         match program {
             "/private-mark/pinned/tierstore" => ok(HELP_HOT_REQUIRED),
-            "/private-mark/mc" => ok(&info_json("RELEASE.2025-mark", true)),
+            "/private-mark/mc" => ok(&info_json("RELEASE.mark", true)),
             _ if args.ends_with("--value") => ok("not-found\n"),
             _ => ok(&show_text(4242, "Thu 2026-10-29 10:00:00 UTC")),
         }

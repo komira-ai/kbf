@@ -126,6 +126,9 @@ pub struct Config {
     /// the executor may post a run whose grant url is `http://` (the bearer token then crosses
     /// the job network in clear).
     pub allow_plain_http_grant: bool,
+    /// Whether the task is told to read its inputs where `GET /locate` says they are kept
+    /// (`--locate`), and from the listener when that read fails.
+    pub locate: bool,
     /// The most bytes of a pack the frontend takes.
     pub max_pack_bytes: u64,
     /// The most bytes of one blob in a pack.
@@ -241,6 +244,7 @@ impl Config {
             work_dir: None,
             allow_plain_http_put: false,
             allow_plain_http_grant: false,
+            locate: false,
             max_pack_bytes: 128 << 20,
             max_blob_bytes: 64 << 20,
             presign_ceiling: PRESIGN_LIMIT,
