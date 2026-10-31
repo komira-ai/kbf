@@ -7,7 +7,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use hyper::{Request, StatusCode};
 
-use super::testing::Rig;
+use super::testing::{Rig, digest};
 use crate::server::auth::{sign, sign_as};
 use crate::server::ops_tests::completion;
 use crate::server::presign::presign_url;
@@ -233,6 +233,32 @@ async fn a_create_only_put_is_200_and_a_repeat_is_412() {
     assert_eq!(front.rig.calls(Op::Put), 3);
     assert_eq!(front.rig.calls(Op::PutIfMatch), 0);
     assert_eq!(front.rig.staged_files(), 0);
+}
+
+/// Asserts that a put of a key named by its content (`cas/l/<sha256>`) whose body hashes to
+/// another name is 400 `BadDigest` through the front and leaves nothing at the upstream or in
+/// the cache; and that the body that does hash to the name is 200 and is a hit afterwards.
+#[tokio::test]
+async fn a_body_that_does_not_hash_to_its_name_is_400_bad_digest() {
+    let front = Front::new("tscache-wfront-bad-digest", true);
+    let key = format!("cas/l/{}", digest(b"the right bytes"));
+    // The front hands the backend the length of the body only when the request says it, as a
+    // client of an S3 upstream must; without it the copy cannot be reserved for and is not kept.
+    let create = [("if-none-match", "*"), ("content-length", "15")];
+    let wrong = front.full("PUT", &key, &create, b"the wrong bytes").await;
+    assert_eq!(
+        denied(&wrong),
+        (400, "BadDigest".to_owned()),
+        "{}",
+        wrong.body
+    );
+    assert!(!front.upstream_holds(&key).await);
+    assert_eq!(front.rig.cache.held(), (0, 0));
+
+    let right = front.full("PUT", &key, &create, b"the right bytes").await;
+    assert_eq!(right.status, StatusCode::OK, "{}", right.body);
+    assert_eq!(front.rig.cache.held(), (15, 1));
+    assert_eq!(front.read(&key).await.body, "the right bytes");
 }
 
 /// Asserts that a put that replaces on a tag is not done: `If-Match` on an object that is there
