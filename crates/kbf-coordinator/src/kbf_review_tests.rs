@@ -172,6 +172,22 @@ fn a_services_file_must_be_owner_only() {
     ));
 }
 
+/// Behaviour: an owner-only services file that is not text, or is over a mebibyte, is refused
+/// with the reason, not read as an empty file.
+#[test]
+fn a_services_file_must_be_text_and_small() {
+    let dir = TestDir::under(std::env::temp_dir(), "services-file-shape");
+    let read = |name: &str, bytes: &[u8]| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).expect("written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        Services::from_file(&path).expect_err("refused").to_string()
+    };
+    assert!(read("binary.toml", &[0xff, 0xfe]).contains("not UTF-8"));
+    let big = vec![b'#'; (1 << 20) + 1];
+    assert!(read("big.toml", &big).contains("over 1048576 bytes"));
+}
+
 /// Pins: the strings the status gives for each hold are public: scripts match on them.
 /// The match has no wildcard, so a new variant fails to compile here until it is listed.
 #[test]

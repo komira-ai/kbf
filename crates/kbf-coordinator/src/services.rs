@@ -30,10 +30,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use kbf_types::HostRole;
+use kbf_updater::secret::read_secret;
 use kbf_updater::wire::{MAX_SERVICE_NAME, MAX_SERVICES, is_service_name};
 use serde::Deserialize;
 
 use crate::desired::{Desired, KBF, KBF_MIN_UP, LEGACY_ROLES, MAX_COUNT};
+
+/// The most bytes of a services file.
+const MAX_FILE_BYTES: u64 = 1 << 20;
 
 /// kbf's shipped definition, in the format of a services file.
 const KBF_SERVICES: &str = include_str!("kbf.services.toml");
@@ -257,10 +261,7 @@ fn service_def(
         ));
     }
     if defined.contains_key(&name) {
-        return invalid(format!(
-            "{name} is defined twice (kbf is defined first, by the shipped data or by the \
-             first entry of the file)"
-        ));
+        return invalid(format!("{name} is defined twice"));
     }
     if roles.is_empty() {
         return invalid(format!("{name} has no roles"));
@@ -323,9 +324,9 @@ impl Services {
     ///
     /// # Errors
     /// [`ServicesError`]: the text is not TOML of the shape, a name is bad or repeated (`kbf`
-    /// only as the first entry), a service has no roles, `kbf` has an `after`, there are more than [`MAX_SERVICES`] services, a role name or
-    /// count is unusable, or an `after` names what does not exist (or is defined later, which
-    /// also forbids a cycle).
+    /// only as the first entry, once), a service has no roles, `kbf` has an `after`, there
+    /// are more than [`MAX_SERVICES`] services, a role name or count is unusable, or an
+    /// `after` names what does not exist (or is defined later, which also forbids a cycle).
     pub fn parse(text: &str) -> Result<Self, ServicesError> {
         let file: RawFile =
             toml::from_str(text).map_err(|e| ServicesError::Parse(e.to_string()))?;
@@ -333,7 +334,9 @@ impl Services {
             return invalid(format!("more than {MAX_SERVICES} services"));
         }
         let mut entries = file.service.into_iter().peekable();
-        let kbf = match entries.next_if(|raw| raw.name == KBF) {
+        let replacement = entries.next_if(|raw| raw.name == KBF);
+        let replaced = replacement.is_some();
+        let kbf = match replacement {
             Some(raw) => kbf_def(raw)?,
             None => ServiceDef::kbf(),
         };
@@ -341,19 +344,38 @@ impl Services {
             defs: BTreeMap::from([(KBF.to_owned(), kbf)]),
         };
         for raw in entries {
+            if raw.name == KBF {
+                return invalid(if replaced {
+                    "kbf is defined twice".to_owned()
+                } else {
+                    "kbf must be the first entry of the file (it is defined after another service)"
+                        .to_owned()
+                });
+            }
             let def = service_def(raw, &services.defs)?;
             services.defs.insert(def.name.clone(), def);
         }
         Ok(services)
     }
 
-    /// The services in the file at `path`.
+    /// The services in the file at `path`. The file is read under the rule of the operator's
+    /// token file: a regular file, not a symlink, owned by this process's user, mode `0600`
+    /// or `0400`. Whoever can write it controls kbf's rollout limits (a replaced `kbf` can
+    /// drop every gate), so it is held to the same rule as a secret.
     ///
     /// # Errors
-    /// [`ServicesError`].
+    /// [`ServicesError`]: the file fails the rule, cannot be read, is over [`MAX_FILE_BYTES`],
+    /// or its text is refused by [`Self::parse`].
     pub fn from_file(path: &Path) -> Result<Self, ServicesError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| ServicesError::Read(format!("{}: {e}", path.display())))?;
+        let shown = path.display().to_string();
+        let bytes = read_secret(path, &shown, MAX_FILE_BYTES).map_err(ServicesError::Read)?;
+        if bytes.len() as u64 > MAX_FILE_BYTES {
+            return Err(ServicesError::Read(format!(
+                "{shown}: it is over {MAX_FILE_BYTES} bytes"
+            )));
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|_| ServicesError::Read(format!("{shown}: it is not UTF-8")))?;
         Self::parse(&text)
     }
 

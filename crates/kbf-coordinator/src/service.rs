@@ -12,7 +12,7 @@ use kbf_updater::wire::{Heartbeat, Reply, ServiceReply};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
-use crate::converge::{Convergence, RoleCounts, converge, converge_service, role_counts};
+use crate::converge::{Convergence, RoleCounts, converge_kbf, converge_service, role_counts};
 use crate::decide::{Decision, Hold, decide_in, decide_why};
 use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
 use crate::fleet::{Fleet, Host};
@@ -214,8 +214,8 @@ impl Coordinator {
     /// host's role (any other entry is ignored). The services are decided by priority, the
     /// highest first ([`crate::services::ServiceDef::priority`], 0 unless a definition sets
     /// it); services of one priority go `kbf` first, then in the order the host listed them.
-    /// The first order is the reply: one update per reply. A host that sent no `services` is answered about `kbf` alone, in the
-    /// shape it has always read.
+    /// The first order is the reply: one update per reply. A host that sent no `services` is
+    /// answered about `kbf` alone, in the shape it has always read.
     pub fn heartbeat(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
         let now = (self.clock)();
         let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
@@ -410,7 +410,7 @@ fn convergence_of(
     now: Duration,
 ) -> Convergence {
     if def.name == KBF {
-        converge(desired, fleet, now)
+        converge_kbf(def, desired, fleet, now)
     } else {
         converge_service(def, desired, fleet, now)
     }
