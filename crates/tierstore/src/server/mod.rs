@@ -577,7 +577,8 @@ impl Server {
         self.inflight.load(Ordering::SeqCst)
     }
 
-    /// The streamed bodies that may still be taken at once.
+    /// The streamed bodies that may still be taken at once. For tests and probes; not a stable API.
+    #[doc(hidden)]
     #[must_use]
     pub fn put_permits_free(&self) -> usize {
         self.puts.available_permits()
