@@ -90,9 +90,24 @@ pub const WRITE_ROOTS: [&str; 4] = ["/var/lib", "/var/cache", "/run", "/opt"];
 
 /// Whether a hook that runs as root may write `path` for `service`: at or below a directory of a
 /// write root whose name is the service's, or the service's followed by `-` and more
-/// (`/var/lib/svc`, `/opt/svc/data`, `/var/lib/svc-update`). Not yet.
-pub fn check_service_write(_path: &str, _service: &str) -> Result<(), Violation> {
-    Ok(())
+/// (`/var/lib/svc`, `/opt/svc/data`, `/var/lib/svc-update`).
+pub fn check_service_write(path: &str, service: &str) -> Result<(), Violation> {
+    let own = WRITE_ROOTS.iter().any(|root| {
+        path.strip_prefix(root)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|rest| {
+                let first = rest.split('/').next().unwrap_or_default();
+                (first == service)
+                    | first
+                        .strip_prefix(service)
+                        .is_some_and(|more| more.starts_with('-'))
+            })
+    });
+    if own {
+        Ok(())
+    } else {
+        Err(Violation::NotTheServices)
+    }
 }
 
 /// Whether `path` is `dir` or lies below it. Both are absolute and in the path grammar.

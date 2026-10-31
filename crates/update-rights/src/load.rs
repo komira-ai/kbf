@@ -103,7 +103,7 @@ pub fn check_state_dir(state_dir: &str, service: u32, service_gids: &[u32]) -> R
 }
 
 /// The reserved-path rules again, on what each entry points to when it exists.
-fn check_targets(declaration: &Declaration) -> Result<(), Refusal> {
+fn check_targets(declaration: &Declaration, root_hook: bool) -> Result<(), Refusal> {
     let hook = &declaration.hook;
     let entries = [(Kind::State, "state_dir", &declaration.state_dir)]
         .into_iter()
@@ -120,7 +120,17 @@ fn check_targets(declaration: &Declaration) -> Result<(), Refusal> {
     for (kind, field, entry) in entries {
         // A hook that runs as root follows links as root: nothing above a path it reads or writes may
         // be swapped by anyone else.
-        let guarded = (hook.user == "root") & (kind != Kind::State);
+        let guarded = root_hook & (kind != Kind::State);
+        let own = |path: &str| {
+            (root_hook & (kind == Kind::Write))
+                .then(|| reserved::check_service_write(path, &declaration.name).err())
+                .flatten()
+                .map(|why| Refusal::Reserved {
+                    field,
+                    path: path.to_owned(),
+                    why,
+                })
+        };
         let swappable = |path: &str| {
             guarded
                 .then(|| swappable_above(path))
@@ -131,7 +141,7 @@ fn check_targets(declaration: &Declaration) -> Result<(), Refusal> {
                     ancestor,
                 })
         };
-        if let Some(refusal) = swappable(entry) {
+        if let Some(refusal) = own(entry).or_else(|| swappable(entry)) {
             return Err(refusal);
         }
         if let Ok(target) = std::fs::canonicalize(entry) {
@@ -141,7 +151,7 @@ fn check_targets(declaration: &Declaration) -> Result<(), Refusal> {
                 path: format!("{entry} (which is {target})"),
                 why,
             })?;
-            if let Some(refusal) = swappable(&target) {
+            if let Some(refusal) = own(&target).or_else(|| swappable(&target)) {
                 return Err(refusal);
             }
         }
@@ -161,8 +171,8 @@ fn swappable_above(path: &str) -> Option<String> {
 
 /// The reserved-path rules on what each entry points to now, for the step runner to call before
 /// every launch: a link can be re-pointed after the load.
-pub fn recheck_targets(declaration: &Declaration, _root_hook: bool) -> Result<(), Refusal> {
-    check_targets(declaration)
+pub fn recheck_targets(declaration: &Declaration, root_hook: bool) -> Result<(), Refusal> {
+    check_targets(declaration, root_hook)
 }
 
 fn account_error(what: &str, name: &str) -> Refusal {
@@ -195,7 +205,15 @@ fn load_file(path: &Path, stem: &str, policy: &Policy<'_>) -> Result<Declared, R
                 .to_owned(),
         ));
     }
-    check_targets(&declaration)?;
+    let root_hook = hook_user.uid == 0;
+    // The text rule on strings is by name; an account of uid 0 under another name is held to it too.
+    if root_hook & declaration.hook.params.values().any(toml::Value::is_str) {
+        return Err(Refusal::Value {
+            field: "hook.params".to_owned(),
+            why: "a hook that runs as root takes numbers and booleans, not strings".to_owned(),
+        });
+    }
+    check_targets(&declaration, root_hook)?;
     let mut service_gids = accounts.member_of(&declaration.uid);
     service_gids.push(service.gid);
     check_state_dir(&declaration.state_dir, service.uid, &service_gids)?;

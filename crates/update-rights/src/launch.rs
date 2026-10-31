@@ -161,7 +161,6 @@ pub fn command(launch: &Launch<'_>) -> Result<SystemdRun, LaunchError> {
             .into_iter()
             .map(|property| OsString::from(format!("--property={property}"))),
     );
-    args.push("--setenv=HARNESS_SECRET".into());
     args.push("--".into());
     args.push(launch.release.join(&declaration.binary).into());
     args.extend(declaration.hook_args.iter().map(OsString::from));

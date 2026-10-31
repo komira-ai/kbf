@@ -149,19 +149,49 @@ pub fn is_env_name(name: &str) -> bool {
 /// The variable names that change what a program loads or how it resolves names: the dynamic
 /// loader's (`LD_*`), the character set and locale search paths, the allocator's (`MALLOC_*`) and
 /// the resolver's.
-pub const HIJACKING_ENV: [&str; 5] = [
+pub const HIJACKING_ENV: &[&str] = &[
     "GCONV_PATH",
     "LOCPATH",
     "NLSPATH",
     "HOSTALIASES",
     "RES_OPTIONS",
+    // What a shell, an interpreter or a runtime started by the hook would read before its script.
+    "BASH_ENV",
+    "ENV",
+    "IFS",
+    "CDPATH",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "PS4",
+    "PROMPT_COMMAND",
+    "PERL5LIB",
+    "PERL5OPT",
+    "PERLLIB",
+    "PERL5DB",
+    "RUBYLIB",
+    "RUBYOPT",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    "CLASSPATH",
+    "LUA_PATH",
+    "LUA_CPATH",
+    "TCLLIBPATH",
+    "PHPRC",
+    "PHP_INI_SCAN_DIR",
+    "GEM_PATH",
+    "GEM_HOME",
 ];
 
 /// Whether a hook may be given the variable `name` with `value`: not a name of [`HIJACKING_ENV`],
-/// not `LD_*` or `MALLOC_*`, and `PATH` only as a list of absolute directories.
+/// not `LD_*`, `MALLOC_*`, `PYTHON*` or `DYLD_*`, and `PATH` only as a list of absolute directories.
 pub fn env_allowed(name: &str, value: &str) -> bool {
-    let hijack =
-        name.starts_with("LD_") | name.starts_with("MALLOC_") | HIJACKING_ENV.contains(&name);
+    let hijack = ["LD_", "MALLOC_", "PYTHON", "DYLD_"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        | HIJACKING_ENV.contains(&name);
     let path_ok = (name != "PATH") | value.split(':').all(|dir| check_path(dir).is_ok());
     !hijack & path_ok
 }

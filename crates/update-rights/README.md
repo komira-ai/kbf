@@ -36,8 +36,8 @@ The crate names no product and depends on no crate of this workspace but the hoo
   that runs as root: the design allows a string only for a key a schema lists, and none exists,
   so a root hook is refused a string. A float parameter that is `nan` is never a lowered number.
 - **The targets are checked again.** `recheck_targets` repeats the reserved-path rules on what each
-  entry points to now; the step runner calls it before every launch, because a link can be
-  re-pointed after the load. `check_state_dir` is the same for the record directory.
+  entry points to now; `run_step` calls it before every launch and refuses the launch (`RunError::Recheck`)
+  when a target changed, because a link can be re-pointed after the load. `check_state_dir` is the same for the record directory.
 - **The deny list** also holds `/run/systemd/{transient,generator*,system.control}` and
   `/var/lib/polkit-1`; `/proc`, `/sys` and `/dev` may be read and never written.
 - **Hook accounts.** A hook may not run as another declared service's account, and two
@@ -54,9 +54,15 @@ The crate names no product and depends on no crate of this workspace but the hoo
 - **A root hook's paths cannot be swapped.** `ReadWritePaths=` follows links, so for a hook that
   runs as root every existing directory above a read or write path (and above what it resolves to)
   must be owned by root and closed to the group and others; `recheck_targets` repeats it before
-  each launch. The `root` of the rule is the name `root`.
-- **Environment names.** `LD_*`, `MALLOC_*`, `GCONV_PATH`, `LOCPATH`, `NLSPATH`, `HOSTALIASES` and
-  `RES_OPTIONS` are refused, and `PATH` only as a list of absolute directories.
+  each launch. "Root" is the account that resolves to uid 0 (`Launch::root_hook`), whatever its name.
+- **A root hook writes in its own directory.** For a hook that runs as root each write path is at or
+  below `<write root>/<service>` or a name beginning with the service's and a `-`
+  (`/var/lib/svc`, `/var/lib/svc-state`), so the one-component rule cannot hand it `/var/lib/sudo` or
+  `/run/udev`.
+- **Environment names.** `LD_*`, `MALLOC_*`, `PYTHON*`, `DYLD_*` and a list of loader, resolver, shell
+  and interpreter names (`GCONV_PATH`, `BASH_ENV`, `IFS`, `PERL5OPT`, `RUBYOPT`, `NODE_OPTIONS`, and the like;
+  `names::HIJACKING_ENV`) are refused for every hook, and `PATH` only as a list of absolute
+  directories.
 
 ## What polkit can and cannot scope
 
