@@ -77,6 +77,8 @@
 #![forbid(unsafe_code)]
 
 mod backend;
+#[cfg(test)]
+mod build_commit;
 mod cache;
 mod clock;
 mod dir;
@@ -84,8 +86,12 @@ mod error;
 mod faulty;
 mod journal;
 mod lease;
+#[cfg(test)]
+mod lease_tests;
 mod memory;
 mod metrics;
+#[cfg(test)]
+mod metrics_names_tests;
 mod reconciler;
 #[cfg(feature = "s3")]
 pub mod s3;

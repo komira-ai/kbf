@@ -32,6 +32,10 @@
 //! whatever eviction and fills do between. At least `min_round` ticks (an hour by default) lie
 //! between the starts of two rounds, so a small cache is not read over and over at the rate.
 //!
+//! A cache that is read-only (a second process over the directory, see the module `hold`) runs no
+//! pass: its ticks do nothing until it takes the lock, and a cache that loses the lock stops
+//! dropping at once.
+//!
 //! An object whose check panics is counted in `scrub_errors`, skipped for the round, and the walk
 //! goes on past it. A failure to read the identity of the open file is not counted: the object
 //! is then never dropped (its identity cannot be matched), only passed over.
@@ -241,6 +245,11 @@ impl Inner {
         // delete or a write that marks a running fill (see `forget`) finds the fill, which this
         // does not touch.
         let flights = locked(&self.flights);
+        // A cache that does not hold the lock of its directory deletes nothing in it, and one
+        // that lost the lock in the middle of a pass stops dropping.
+        if !self.read_write() {
+            return false;
+        }
         let now = std::fs::metadata(data_path(&self.config.path, hex))
             .ok()
             .map(|meta| identity(&meta));
@@ -326,6 +335,12 @@ impl Inner {
 
     /// One tick: scrubs objects while there is credit, and counts them.
     pub(super) fn scrub_tick(&self, state: &mut Scrubber) -> ScrubPass {
+        // A cache that is read-only (it does not hold the lock of its directory) leaves the files
+        // to the holder: no pass reads or drops anything. A tick still counts, and the pass
+        // starts when the cache takes the lock.
+        if !self.read_write() {
+            return ScrubPass::default();
+        }
         let per_tick = i128::from(state.per_tick);
         state.ticks += 1;
         state.credit = (state.credit + per_tick).min(per_tick);

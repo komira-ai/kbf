@@ -8,7 +8,7 @@ Start the unit by hand (see [install](install.md)). Before it opens the proxy or
 tierstore <version> listen=192.0.2.10:9000
 ```
 
-With the OCI front on, the line gets ` oci-listen=<address> (https)` or ` (http)` after the listen address. The self-test's progress and every other message go to stderr, and so to the journal.
+With the OCI front on, the line gets ` oci-listen=<address> (https)` or ` (http)` after the listen address. With more than one address of a kind (on main, not in v0.0.41) the value is every address, in the order given, separated by commas with no space: `listen=0.0.0.0:9000,[::]:9000`. The self-test's progress and every other message go to stderr, and so to the journal.
 
 ## Probes
 
@@ -22,6 +22,8 @@ Four paths of the S3 listener answer a GET or HEAD without a signature, so a buc
 | `/metricz` | 200 with the counters, in the Prometheus text format (see [Metrics](operations.md#metrics)) | scraping |
 
 `/readyz` does not look at the usage: one stopped reconciler would otherwise make every node unready. `/usagez` is for alerting, not for a load balancer.
+
+On main, not in v0.0.41, the 200 of a build node says which mode its cache is in: `ready read-write` or `ready read-only` (see [the cache lock](operations.md#the-cache-lock-and-read-only-mode)). The status is the same in both: a read-only node serves.
 
 ## Usage
 
@@ -56,14 +58,20 @@ If the cold tier is a full disk, puts that reach it fail. A tier that is full at
 
 On SIGTERM or SIGINT (what `systemctl stop` sends) the process drains:
 
-1. `/readyz` answers 503 at once, and for `--drain-lb-wait` (10s) the server goes on serving everything, so that a load balancer sees the 503;
-2. it stops accepting connections and answers new requests, but for the probes, with 503 `ServiceUnavailable` and `Connection: close`;
-3. it waits for requests in flight, at most `--drain-deadline` (15m) in all;
-4. it gives up the reconciler's lease and exits 0.
+1. `/readyz` answers 503 at once, and every answer from then on carries `Connection: close`, so that a client does not send its next request on a connection that is about to end;
+2. for `--drain-lb-wait` (10s), the settle, the server goes on accepting connections and serving everything, so that a load balancer sees the 503 and a connection that was routed here a moment ago is served, not reset;
+3. at the end of the settle it stops accepting connections and closes each connection that has no request on the wire with a lingering close: it shuts its end for writing, so that the client reads a clean end of stream, and goes on reading until the client closes its end, or for 60 seconds at most (the time an idle connection is let to wait for its next request, which has no flag), and then closes;
+4. a request that is on the wire at that moment (begun, and not answered in full) is served, with `Connection: close`, never answered 503, and its connection is closed in the same way once the answer is out;
+5. it waits for the requests in flight and for the connections to close, at most `--drain-deadline` (15m) in all;
+6. it gives up the reconciler's lease and exits 0.
+
+A request that arrives within one round trip of the end of the stream, on a connection that was idle since before the drain began, cannot be answered: the client sent it before it read the end of the stream. The server reads and drops it and counts the connection in `tierstore_drain_late_requests_total`. A client that follows `Connection: close` never meets this; a client that retries such a request must be sure the request is safe to repeat, which a create-only put is not. This drain, the lingering close and the metric are on main, not in v0.0.41; v0.0.41 and before answer every request on a connection that is open after the settle 503 `ServiceUnavailable` with `Connection: close`.
 
 A request cut at the deadline is counted on stderr: `tierstore: <N> requests were cut at the drain deadline`. Another process over the same tiers takes the reconciler's lease once it is given up or has expired (`--lease-ttl`). State is in the tiers, not the process, so a restart needs nothing but the same `--proxy-id`.
 
 To restart for a new binary or a new key file, replace the file, then `systemctl restart tierstore`; run more than one process, with ids of their own, if clients must not see the pause.
+
+On main, not in v0.0.41, `--lock-file` (`hot_store.lock_file`) says which of the processes over one node reconciles. A process that holds an exclusive lock on the file runs the reconciler and takes the lease. A process that finds the lock held serves reads and writes through its own proxy at once and does not touch the reconciler's state in the hot tier, the lease included, until it holds the lock; it tries every second. The system frees the lock when the holder exits or crashes, so a process started beside the one that is draining reconciles as soon as that one has exited and given its lease up. Give both processes the same file, on a local file system, in a directory that nothing removes: a directory under `/run` that systemd removes with the unit would let a third process make a new file and lock it beside the second. The holder looks before each pass at whether the path still leads to the file it locked; if the file was replaced, it gives its lease up and waits for the lock on the new file. A start whose lock file cannot be opened, is a link or is on a network file system exits 1. Without the flag the reconciler works as soon as the process starts, as before.
 
 ## The start-up self-test
 
@@ -85,10 +93,22 @@ Eviction keeps the cache under `local_cache.budget`: above `high_water` percent 
 
 At start the process makes the directory, removes what a fill left half done, reads the kept objects back (sizes only; an object whose sidecar does not say what the file holds is deleted), and asks the file system four questions with a probe object. A file system that answers one wrongly exits the process with status 3, naming the check. It then asks the upstream for a key that is not there: 404 or any object is an answer, and anything else exits 1. On SIGTERM it drains as a storage node does.
 
+### The cache lock and read-only mode
+
+On main, not in v0.0.41. Two processes may have one cache directory open at once, for example a new binary started beside the one that is draining. Only one of them writes to it. The directory has a lock file, `.lock`, and the process that holds an exclusive lock on it is read-write: it fills, keeps, evicts and records the use of objects. A process that finds the lock held is read-only. A lone process takes the lock before it binds the address, so it is read-write from its first answer; the system frees the lock when the holder exits or crashes.
+
+A read-only process serves what its scan of the directory found, from the disk, and sends every other read and every write to the upstream. It makes and removes nothing in the directory and stamps no file: it does not empty the staging directory or delete a half-published object at start, skips the start-up probe of the file system, deletes nothing when a read of a kept object fails (the read is answered from the upstream), and starts no fill, no keep of a put, no eviction pass and no write of file times. A create-only put that reaches it with `write_through` goes to the upstream and succeeds, with no copy made in the directory; it is counted as `read_only` in `tierstore_cache_write_keep_skipped_total`. An object the holder keeps after the scan is read from the upstream until the process takes the lock. The counters of fills and evictions (`fills_total`, `evictions_total`, `fill_failures_total`) stay at 0 in a read-only process; hits, misses and bytes count.
+
+With `write_through`, a delete or put sent to a read-only process goes to the upstream, and from then on the process reads that key from the upstream. The files the holder has for it stay on the disk, because the process may not remove them; the process notes the names, at most 65536 of them. When it takes the lock it removes those files after its scan and before it is read-write, so a deleted or replaced object is never served from the files the holder left. If more than 65536 keys were deleted or replaced, the process does not know which, and it removes every object file when it takes the lock and starts with an empty cache. One window is left: the holder itself still serves its own cached copy of such an object on the connections it is draining, until it exits. It ends with the holder's drain (`--drain-deadline` at most).
+
+A cache that loses its lock (the lock file was replaced, see below) stops writing at once: a fill or the copy of a put (a keep) that is running publishes nothing, and the put is counted as `read_only`, and neither touches the staging files of the process that holds the directory now, which are named with a prefix of their own. The loss is noticed by the one-second try, so for up to that second a fill or a keep still believes it owns the directory. A fill or keep that has linked its object into the directory when it finds the loss removes the data file and the sidecar it linked (they are its own: no other process makes those names), so the object is not left where the new holder does not index it. What is left of the window is a whole, valid object that is on the disk for the moments until that removal.
+
+The process tries the lock every second. When it takes it, it empties the staging directory, scans the directory again (deleting what is not a whole object) and only then is read-write; stderr says so, and the first line of the start says which mode it started in. `/readyz` says the mode in its body and `tierstore_cache_mode` in the metrics (see [metrics](metrics.md)); the status of `/readyz` does not depend on it. A holder looks at each try whether `.lock` still leads to the file it locked: a file that was removed or replaced is a lock that no other process looks at, so the holder lets it go, is read-only, and takes the new file when it can. A lock file that is a link, or on a network file system, stops the start (exit 1); a try that fails later is said on stderr and made again.
+
 ## Metrics
 
 `GET /metricz` on the S3 listener (unsigned) answers 200 in the Prometheus text format. On main it has the hit, miss, byte and cold-read counters of the hot and cold tiers, the counters of the OCI read front, such as `tierstore_oci_requests_total`, and the counters of the cache of a build node, all named `tierstore_` and a word; without `--oci-listen` it says the front is not enabled, and a node with no cache says so on a line of its own. The tier counters are on main and not in v0.0.40. The full list of metric names, their labels and queries to alert on is in [metrics](metrics.md).
 
 ## Not in a release yet
 
-- **Waiting for a put slot.** Today a put over `--max-concurrent-puts` is answered 503 `SlowDown` at once; the server will instead wait briefly for a slot first, and clients will retry a 503 with jittered waits.
+- **Waiting for a put slot** (on main, not in v0.0.41). A put over `--max-concurrent-puts` waits up to `--put-permit-wait` (15 s) for a slot before it is answered 503 `SlowDown`, and the kbf task client retries a 503 with jittered waits. In v0.0.41 it is answered 503 at once.

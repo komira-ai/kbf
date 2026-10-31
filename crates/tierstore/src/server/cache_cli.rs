@@ -27,16 +27,22 @@
 //! flags and files are checked as a storage node's are (see `oci_setup_of`), before the cache is
 //! opened, and it drains with the S3 front.
 //!
-//! On SIGTERM or SIGINT the process drains as a storage node does; the eviction pass is the only
-//! thing running beside the server, and it stops with it. Nothing is owed to the upstream: no
-//! journal, no lease, no copy in flight.
+//! The cache directory has a lock (`<path>/.lock`, see [`local_cache`](super::local_cache)). The
+//! process that holds it is read-write; one that starts while another holds it is read-only: it
+//! does not make the probe of the file system (the probe writes to the directory), `/readyz`
+//! says `ready read-only`, and a task tries the lock every second, so that it becomes
+//! read-write when the holder has exited. A start that is alone holds the lock before it binds
+//! the address, so it is read-write from its first answer.
+//!
+//! On SIGTERM or SIGINT the process drains as a storage node does; the eviction pass and the
+//! lock task are the only things running beside the server, and they stop with it. Nothing is
+//! owed to the upstream: no journal, no lease, no copy in flight.
 
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
 
 use crate::{
@@ -44,20 +50,25 @@ use crate::{
     SystemClock, self_test, sweep_probes,
 };
 
+use super::build_info::{COMMIT, VERSION};
 use super::cli::{
-    Addresses, Error, S3Flags, bind_oci, oci_cut_note, oci_setup_of, open_tier, probe_run_id,
-    serve_oci, signals,
+    Addresses, Error, S3Flags, bind_oci, bind_s3, oci_cut_note, oci_setup_of, open_tier,
+    probe_run_id, serve_oci, signals,
 };
 use super::config_cache::CacheSettings;
 use super::front::{InvalidFlags, server_config};
+use super::listen::{joined, local_addrs};
 use super::local_cache::{
-    CacheConfig, Disk, Every, LocalCache, SCRUB_TICK, SystemDisk, check_local,
+    CacheConfig, Disk, Every, LocalCache, Mode, SCRUB_TICK, SystemDisk, check_local,
 };
-use super::oci::OciListener;
 use super::{Drained, Server};
 
 /// How often the eviction pass runs beside the server.
 const PASS_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How often a cache that does not hold the lock of its directory tries it again, and one that
+/// holds it checks that the lock file is still the file at the path.
+const LOCK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Asks the upstream a HEAD of a key that is not there: any answer but 404 is a problem.
 async fn reach(upstream: &dyn Backend, run: &str, spec: &str) -> Result<(), Error> {
@@ -144,14 +155,23 @@ async fn open(
 ) -> Result<LocalCache, Error> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let (upstream, disk) = (Arc::clone(upstream), Arc::clone(disk));
-    let opened = LocalCache::open(config.clone(), upstream, Arc::clone(&disk), clock);
+    let opened = LocalCache::open_locked(config.clone(), upstream, Arc::clone(&disk), clock);
     let cache = opened.map_err(|why| {
         format!(
             "opening the local cache at {}: {why}",
             config.path.display()
         )
     })?;
-    check_local(&*disk, cache.path(), run)?;
+    // The probe writes under `.stage/` and `obj/`: only the process that holds the lock may. A
+    // read-only one is on the directory, and the file system, that the holder's check passed.
+    match cache.mode() {
+        Mode::ReadWrite => check_local(&*disk, cache.path(), run)?,
+        Mode::ReadOnly => eprintln!(
+            "tierstore: local cache at {}: another process holds the lock; read-only, and the \
+             file system check is left to it",
+            config.path.display()
+        ),
+    }
     // A file system whose size cannot be read is not judged: the start says so and goes on.
     match size_of_file_system(&*disk, cache.path()) {
         Ok(total) if config.budget > config.room(total) => {
@@ -170,9 +190,11 @@ async fn open(
     }
     let (bytes, objects) = cache.held();
     eprintln!(
-        "tierstore: local cache at {}: {objects} objects, {bytes} bytes, {} files removed at start",
+        "tierstore: local cache at {}: {objects} objects, {bytes} bytes, {} files removed at \
+         start, {}",
         config.path.display(),
-        cache.counters().discarded_at_start()
+        cache.counters().discarded_at_start(),
+        cache.mode().as_str()
     );
     Ok(cache)
 }
@@ -205,17 +227,9 @@ pub(super) async fn serve_cache(
     // The registry front reads what the S3 front reads: through the cache.
     let backend: Arc<dyn Backend> = Arc::new(cache.clone());
     let server = Server::new(Arc::clone(&backend), config);
-    let address = settings.front.listen;
-    let bound = TcpListener::bind(address).await;
-    let listener = bound.map_err(|why| format!("binding {address}: {why}"))?;
+    let listeners = bind_s3(&settings.front.listen)?;
     let oci = bind_oci(oci, backend).await?;
-    let oci_addr = oci.as_ref().map(OciListener::local_addr).transpose()?;
-    let oci_mode = oci.as_ref().map(OciListener::mode);
-    ready(Addresses {
-        s3: listener.local_addr()?,
-        oci: oci_addr,
-        oci_mode,
-    });
+    ready(Addresses::of(local_addrs(&listeners)?, oci.as_ref())?);
     // After the ready: the sweep is the one thing of the self-test that is not a gate.
     let sweeping = settings.cache.write_through.then(|| {
         let spec = settings.upstream.spec.clone();
@@ -232,15 +246,21 @@ pub(super) async fn serve_cache(
     });
     // One Notify for each loop: `notify_one` wakes one waiter, and keeps the wake for a loop that
     // is not waiting just now.
-    let (halt, halt_scrub) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
-    let halting = (Arc::clone(&halt), Arc::clone(&halt_scrub));
+    let halt = Arc::new(Notify::new());
+    let halting = Arc::clone(&halt);
+    let lock_halt = Arc::new(Notify::new());
+    let lock_halting = Arc::clone(&lock_halt);
+    let halt_scrub = Arc::new(Notify::new());
+    let scrub_halting = Arc::clone(&halt_scrub);
     let serving = async move {
-        let drained = server.serve(listener).await;
-        halting.0.notify_one();
-        halting.1.notify_one();
+        let drained = server.serve_all(listeners).await;
+        halting.notify_one();
+        lock_halting.notify_one();
+        scrub_halting.notify_one();
         drained
     };
     let maintaining = cache.maintain(PASS_INTERVAL, halt);
+    let holding = cache.hold(LOCK_INTERVAL, lock_halt);
     let min_round = settings.scrub_min_round.as_secs() / SCRUB_TICK.as_secs();
     let scrubbing = cache.scrub(
         settings.scrub_rate,
@@ -248,8 +268,13 @@ pub(super) async fn serve_cache(
         Every::new(SCRUB_TICK),
         halt_scrub,
     );
-    let (drained, (), (), oci_cut) =
-        tokio::join!(serving, maintaining, scrubbing, serve_oci(oci, oci_stopped));
+    let (drained, (), (), (), oci_cut) = tokio::join!(
+        serving,
+        maintaining,
+        holding,
+        scrubbing,
+        serve_oci(oci, oci_stopped)
+    );
     watcher.abort();
     if let Some(sweeping) = sweeping {
         sweeping.abort();
@@ -285,19 +310,19 @@ pub(super) async fn run_cache(
 /// Runs the cache until SIGTERM or SIGINT.
 pub(super) async fn serve_cache_until_signalled(settings: CacheSettings) -> Result<(), Error> {
     let stop = signals()?;
-    let version = env!("CARGO_PKG_VERSION");
     let mode = if settings.cache.write_through {
         "write-through-cache"
     } else {
         "read-cache"
     };
     let announce = |bound: Addresses| {
-        let mut line = format!("tierstore {version} listen={} mode={mode}", bound.s3);
-        if let Some(oci) = bound.oci {
+        let listen = joined(&bound.s3_all);
+        let mut line = format!("tierstore {VERSION} listen={listen} mode={mode}");
+        if bound.oci.is_some() {
             let how = bound.oci_mode.unwrap_or_default().as_str();
-            line.push_str(&format!(" oci-listen={oci} ({how})"));
+            line.push_str(&format!(" oci-listen={} ({how})", joined(&bound.oci_all)));
         }
-        println!("{line}");
+        println!("{line} commit={COMMIT}");
     };
     let drained = run_cache(&settings, stop, announce).await?;
     eprint!("{}", super::cli::cut_note(drained));

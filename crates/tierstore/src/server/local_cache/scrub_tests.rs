@@ -653,3 +653,37 @@ async fn a_walk_that_is_told_to_stop_reads_nothing() {
     assert_eq!(rig.cache.scrub_once(&mut state), ScrubPass::default());
     assert_eq!(read(&rig.cache.counters().scrubbed_objects), 0);
 }
+
+/// Asserts that a cache that does not hold the lock of its directory (read-only) runs no scrub
+/// pass: with a driven ticker its ticks read and drop nothing and count nothing, while the cache
+/// that holds the lock drops the same rotten object on its first tick.
+#[tokio::test]
+async fn a_read_only_cache_runs_no_scrub_pass() {
+    let rig = Rig::new("tscache-scrub-read-only");
+    let keys = fill(&rig, 1, 100).await;
+    rot(&rig, &keys[0]);
+    let holder = rig.locked();
+    let reader = rig.locked();
+    assert_eq!(reader.held(), (100, 1));
+
+    let (ticker, tick, mut asks) = hand();
+    let halt = Arc::new(Notify::new());
+    let reading = reader.clone();
+    let running = tokio::spawn(async move { reading.scrub(Some(1000), 0, ticker, halt).await });
+    asks.recv().await.unwrap();
+    for _ in 0..2 {
+        tick.send(()).await.unwrap();
+        asks.recv().await.unwrap();
+    }
+    drop(tick);
+    running.await.unwrap();
+    assert_eq!(read(&reader.counters().scrubbed_objects), 0);
+    assert_eq!(read(&reader.counters().scrub_mismatches), 0);
+    assert!(rig.has_file(&keys[0]));
+    assert_eq!(reader.held(), (100, 1));
+
+    let mut state = Scrubber::new(1 << 20);
+    let pass = holder.scrub_once(&mut state);
+    assert_eq!((pass.scrubbed, pass.dropped), (1, 1));
+    assert!(!rig.has_file(&keys[0]));
+}

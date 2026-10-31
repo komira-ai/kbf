@@ -105,7 +105,7 @@ use crate::{Backend, ByteRange, Error};
 pub use body::{BodyError, OciBody};
 pub use listener::{OciLimits, OciListener};
 pub use metrics::OciMetrics;
-pub use tls::{OciError, OciMode, acceptor, plain_warning};
+pub use tls::{OciError, OciMode, acceptor, acceptor_for, plain_warning};
 
 use body::BlobRead;
 use metrics::{Outcome, RouteKind};
