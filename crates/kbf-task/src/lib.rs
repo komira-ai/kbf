@@ -116,6 +116,9 @@ pub mod put_urls;
 pub mod run;
 pub mod task;
 
+#[cfg(test)]
+pub(crate) mod fake_http;
+
 // The feature that lets a denied Command run with the network where no confine exists is for tests:
 // a non-Linux build without debug assertions (a release build) that turns it on does not compile; on
 // Linux the feature does nothing, so it is allowed there (a workspace-wide `--all-features` build).

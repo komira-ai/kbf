@@ -174,6 +174,15 @@ pub struct Cli {
     /// request. Applies to `--fetch-batch` too.
     #[arg(long)]
     pub allow_plain_http_grant: bool,
+    /// Ask the listener's `GET /locate` once, before the inputs are fetched, and read each input
+    /// where it points: a byte range of a pack, or a whole large object, directly from the store
+    /// the answer names, with the read grants the answer carries. Every byte is checked against
+    /// its digest like any other, and a blob whose direct read fails (a refused or expired grant,
+    /// a short or wrong read, any error) is read from the listener. Without this flag `/locate` is
+    /// never called. An `http` store needs `--allow-plain-http-grant`, since the grants cross the
+    /// network in the clear; the grants are never written to a log.
+    #[arg(long)]
+    pub locate: bool,
     /// The lease id the frontend gave; it is copied into the manifest. It must be a build id, 1 to
     /// 128 bytes of `0-9A-Za-z_-`, the only lease the frontend accepts in a manifest; any other is
     /// refused at startup (exit 14), before anything is fetched.
@@ -430,6 +439,9 @@ pub(crate) async fn execute_with(
         usize::from(cli.fetch_concurrency),
     )?;
     let fetch_ms = millis(fetching.elapsed());
+    if let Some(report) = source.report() {
+        eprintln!("kbf-task: {report}");
+    }
 
     let stdout = cli.work_dir.join("stdout");
     let stderr = cli.work_dir.join("stderr");
@@ -714,12 +726,19 @@ fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
     Ok((source, sink))
 }
 
+/// [`connect`], and the source wrapped to read where `/locate` points when the flags give a
+/// store and a credential for it. Without `--store-url` the source is the listener's alone and
+/// `/locate` is never asked.
+fn connect_located(cli: &Cli) -> Result<(Box<dyn BlobSource>, HttpSink), Failure> {
+    let (source, sink) = connect(cli)?;
+    Ok((Box::new(source), sink))
+}
+
 /// Runs the task the flags describe against the real grant and the real presigned URL, and turns
 /// the outcome into the process exit code (see the module documentation). A failure is written to
 /// standard error; no message holds the token or the presigned URL's query.
 pub async fn main_with(cli: &Cli) -> ExitCode {
-    let connected = connect(cli).map(|(source, sink)| {
-        let source: Box<dyn BlobSource> = Box::new(source);
+    let connected = connect_located(cli).map(|(source, sink)| {
         let sink: Box<dyn PackSink> = Box::new(sink);
         (source, sink)
     });
@@ -786,6 +805,10 @@ mod tests;
 #[cfg(test)]
 #[path = "plain_grant_tests.rs"]
 mod plain_grant_tests;
+
+#[cfg(test)]
+#[path = "locate_flags_tests.rs"]
+mod locate_flags_tests;
 
 #[cfg(test)]
 #[path = "put_urls_flag_tests.rs"]
