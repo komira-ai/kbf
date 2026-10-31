@@ -1,6 +1,7 @@
 //! The coordinator: the fleet the heartbeats build, the desired state, and who may change
 //! or read either. No sockets here; [`crate::http`] maps requests onto these calls.
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -111,6 +112,18 @@ pub enum ConvergenceError {
     UnknownService,
 }
 
+/// What `POST /v1/desired` answers: the state as stored, and, only when there are any, the
+/// roles whose limits were dropped because the service does not have them.
+#[derive(Debug, Serialize)]
+pub struct Set {
+    /// The state as stored.
+    #[serde(flatten)]
+    pub desired: Desired,
+    /// The dropped roles, sorted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dropped_roles: Vec<String>,
+}
+
 /// What an operator reads.
 #[derive(Debug, Serialize)]
 pub struct Status {
@@ -190,9 +203,10 @@ impl Coordinator {
     ///
     /// The top-level fields are `kbf`. Each entry of `services` is noted as that service's
     /// heartbeat of the host, if the coordinator manages the service and runs it on the
-    /// host's role (any other entry is ignored). `kbf` is decided first, then the host's
-    /// services in the order it listed them, and the first order is the reply: one update
-    /// per reply. A host that sent no `services` is answered about `kbf` alone, in the
+    /// host's role (any other entry is ignored). The services are decided by priority, the
+    /// highest first ([`crate::services::ServiceDef::priority`], 0 unless a definition sets
+    /// it); services of one priority go `kbf` first, then in the order the host listed them.
+    /// The first order is the reply: one update per reply. A host that sent no `services` is answered about `kbf` alone, in the
     /// shape it has always read.
     pub fn heartbeat(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
         let now = (self.clock)();
@@ -216,7 +230,11 @@ impl Coordinator {
             }
         }
         let desired = self.desired.all();
-        let names = std::iter::once(KBF).chain(announced.iter().map(|one| one.name.as_str()));
+        let mut names: Vec<&str> = std::iter::once(KBF)
+            .chain(announced.iter().map(|one| one.name.as_str()))
+            .collect();
+        // Stable: services of one priority keep the order above.
+        names.sort_by_key(|name| Reverse(self.services.get(name).map_or(0, |def| def.priority)));
         for name in names {
             let reply = decide_in(&self.services, &desired, name, &fleet, &who.node_id, now);
             if let Reply::Update { version } = reply {
@@ -253,8 +271,25 @@ impl Coordinator {
         bearer: Option<&str>,
         body: &[u8],
     ) -> Result<Desired, SetError> {
+        self.set_desired_noting(bearer, body)
+            .await
+            .map(|set| set.desired)
+    }
+
+    /// [`Self::set_desired`], also naming the roles whose limits the body carried and the
+    /// service does not have: they are dropped, not refused, since one body serves every
+    /// service.
+    ///
+    /// # Errors
+    /// [`SetError`].
+    pub async fn set_desired_noting(
+        &self,
+        bearer: Option<&str>,
+        body: &[u8],
+    ) -> Result<Set, SetError> {
         let verified = self.ci(bearer).await?;
-        let (service, desired) = Desired::parse_request_for(body, &self.services)?;
+        let (service, desired, dropped_roles) =
+            Desired::parse_request_noting(body, &self.services)?;
         if !verified.services.contains(&service) {
             tracing::warn!(
                 workflow = %verified.job_workflow_ref,
@@ -270,7 +305,10 @@ impl Coordinator {
             %service,
             "desired state set by CI"
         );
-        Ok(desired)
+        Ok(Set {
+            desired,
+            dropped_roles,
+        })
     }
 
     /// The status, if `bearer` is the operator token.
