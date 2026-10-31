@@ -42,6 +42,8 @@
 //! Both exit with every problem printed, not the first.
 
 mod certs;
+#[cfg(test)]
+mod cold_key_file_tests;
 mod cpuset;
 mod credential;
 mod env;
