@@ -282,7 +282,7 @@ jobs:
       # The packer is a release of the jobscheduler repository, pinned by tag and by the archive's SHA-256 (JS_BUNDLE_*).
       # One command: the download must have the pinned digest and `gh attestation verify` must accept that same file
       # (this repository, the release workflow, main, the pinned commit) before the program is taken out of it.
-      - name: Fetch js-bundle: pinned digest, verified attestation, then the program out of that file
+      - name: Fetch js-bundle with the pinned digest and a verified attestation, then take the program out of that file
         env:
           GH_TOKEN: ${{ github.token }}
         run: cargo xtask fetch-attested-tool --url "https://github.com/komira-ai/jobscheduler/releases/download/v$JS_BUNDLE_VERSION/js-bundle-$JS_BUNDLE_VERSION-$TARGET.tar.gz" --sha256 "$JS_BUNDLE_SHA256_AARCH64_DARWIN" --archive "$RUNNER_TEMP/js-bundle-release/js-bundle-$JS_BUNDLE_VERSION-$TARGET.tar.gz" --member "js-bundle-$JS_BUNDLE_VERSION-$TARGET/js-bundle" --out "$RUNNER_TEMP/tools/js-bundle" --gh "$RUNNER_TEMP/tools/gh" --repo komira-ai/jobscheduler --signer-workflow komira-ai/jobscheduler/.github/workflows/release.yml --source-ref refs/heads/main --source-digest "$JS_BUNDLE_SOURCE_DIGEST"

@@ -8,8 +8,8 @@
 //! 1. refuses a `--member` that is empty, absolute, or has a `..` part, before anything is read;
 //! 2. downloads the archive over HTTPS ([`crate::fetch::download`]) and refuses it unless its SHA-256 is the
 //!    pinned one, before any byte is written;
-//! 3. writes it to `--archive` (a file that must not exist: the file `gh` verifies is the file the program
-//!    comes out of, never a second download);
+//! 3. writes it to `--archive`, creating its directory (a file that must not exist: the file `gh`
+//!    verifies is the file the program comes out of, never a second download);
 //! 4. runs `gh attestation verify <archive>` with `--repo`, `--signer-workflow`, `--cert-oidc-issuer`
 //!    (GitHub Actions), `--source-ref`, `--source-digest` and `--deny-self-hosted-runners`, and refuses the
 //!    archive unless it accepts it;
@@ -105,6 +105,10 @@ pub fn install_verified(
             actual,
         }
         .into());
+    }
+    if let Some(parent) = req.archive.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(Error::spawn(format!("create {}", parent.display())))?;
     }
     write_new(&req.archive, bytes)?;
     let (accepted, said) = gh.verify(&req.archive, &verify_args(req))?;
