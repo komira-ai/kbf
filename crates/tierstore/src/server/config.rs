@@ -47,7 +47,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::cli::{
     Cli, DEFAULT_MAX_CONCURRENT_PUTS, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_PUT_MIN_BYTES_PER_SEC,
-    DEFAULT_REGION, SkippedCheck, parse_duration, parse_skip,
+    DEFAULT_PUT_PERMIT_WAIT, DEFAULT_REGION, SkippedCheck, parse_duration, parse_skip,
 };
 use super::config_cache::{CacheSettings, LocalCacheTable};
 use super::front::FrontSettings;
@@ -58,6 +58,7 @@ pub(super) const PER_RUN: &[&str] = &[
     "config",
     "print-config",
     "check-config",
+    "capabilities",
     "drain-lb-wait",
     "drain-deadline",
 ];
@@ -103,6 +104,7 @@ pub(super) const KEYS: &[(&str, &[&str])] = &[
     ("usage-stale-after", &["hot_store.usage_stale_after"]),
     ("max-request-bytes", &["server.max_request_bytes"]),
     ("max-concurrent-puts", &["server.max_concurrent_puts"]),
+    ("put-permit-wait", &["server.put_permit_wait"]),
     ("put-min-bytes-per-sec", &["server.put_min_bytes_per_sec"]),
     ("put-rate-grace", &["server.put_rate_grace"]),
     ("body-idle-timeout", &["server.body_idle_timeout"]),
@@ -209,13 +211,26 @@ pub(super) struct Dur(pub Duration);
 
 impl<'de> Deserialize<'de> for Dur {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        match parse_duration(&text) {
+        deserializer.deserialize_str(DurVisitor)
+    }
+}
+
+struct DurVisitor;
+
+impl Visitor<'_> for DurVisitor {
+    type Value = Dur;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a duration such as \"15m\" (a number and ms, s, m or h)")
+    }
+
+    fn visit_str<E: de::Error>(self, text: &str) -> Result<Dur, E> {
+        match parse_duration(text) {
             Ok(duration) => Ok(Dur(duration)),
-            // Not the reason of the flag: it holds the text, which the file's messages never repeat.
-            Err(_) => Err(de::Error::custom(
-                "not a duration; use a number and ms, s, m or h, as in 15m",
-            )),
+            // An invalid value, not a custom message and not the reason of the flag (which holds
+            // the text): the refusal of a file names the key and the kind of value it takes and
+            // never shows what was written (see `syntax`).
+            Err(_) => Err(E::invalid_value(de::Unexpected::Str(text), &self)),
         }
     }
 }
@@ -349,6 +364,7 @@ pub(super) struct ServerTable {
     pub presign_max_expires: Option<Dur>,
     pub max_request_bytes: Option<u64>,
     pub max_concurrent_puts: Option<u32>,
+    pub put_permit_wait: Option<Dur>,
     pub put_min_bytes_per_sec: Option<u64>,
     pub put_rate_grace: Option<Dur>,
     pub body_idle_timeout: Option<Dur>,
@@ -554,6 +570,9 @@ const LOCAL_CACHE_KEYS: &[&str] = &[
     "path",
     "layout",
     "max_concurrent_fills",
+    "max_concurrent_keeps",
+    "keep_wait",
+    "keep_deadline",
     "write_through",
     "whole_fill_limit",
     "scrub_rate",
@@ -868,6 +887,7 @@ fn storage(
         config: None,
         print_config: false,
         check_config: false,
+        capabilities: false,
         listen: front.listen,
         proxy_id: front.proxy_id,
         hot: hot_parts.spec,
@@ -901,6 +921,7 @@ fn storage(
         usage_stale_after: duration(hot.usage_stale_after, Duration::from_secs(120)),
         max_request_bytes: front.max_request_bytes,
         max_concurrent_puts: front.max_concurrent_puts,
+        put_permit_wait: front.put_permit_wait,
         put_min_bytes_per_sec: front.put_min_bytes_per_sec,
         put_rate_grace: front.put_rate_grace,
         body_idle_timeout: front.body_idle_timeout,
@@ -958,6 +979,7 @@ pub(super) fn front_of(server: ServerTable, per_run: PerRun) -> Result<Shared, C
         presign_max_expires: duration(server.presign_max_expires, Duration::from_secs(15 * 60)),
         max_request_bytes,
         max_concurrent_puts,
+        put_permit_wait: duration(server.put_permit_wait, DEFAULT_PUT_PERMIT_WAIT),
         put_min_bytes_per_sec: server
             .put_min_bytes_per_sec
             .unwrap_or(DEFAULT_PUT_MIN_BYTES_PER_SEC),

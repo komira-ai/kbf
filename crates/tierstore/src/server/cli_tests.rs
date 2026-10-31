@@ -129,6 +129,7 @@ fn the_flags_have_their_defaults() {
     assert_eq!(cli.reconcile_interval, Duration::from_secs(5));
     assert_eq!(cli.max_request_bytes, 256 << 20);
     assert_eq!(cli.max_concurrent_puts, 32);
+    assert_eq!(cli.put_permit_wait, Duration::from_secs(15));
     assert_eq!(cli.put_min_bytes_per_sec, 1024);
     assert_eq!(cli.put_rate_grace, Duration::from_secs(30));
     assert_eq!(cli.body_idle_timeout, Duration::from_secs(30));
@@ -189,6 +190,7 @@ fn the_flags_can_all_be_given() {
         ("--reconcile-interval", "1s"),
         ("--max-request-bytes", "10"),
         ("--max-concurrent-puts", "3"),
+        ("--put-permit-wait", "4s"),
         ("--put-min-bytes-per-sec", "5"),
         ("--put-rate-grace", "2s"),
         ("--body-idle-timeout", "7s"),
@@ -215,6 +217,7 @@ fn the_flags_can_all_be_given() {
     assert_eq!(cli.reconcile_interval, Duration::from_secs(1));
     assert_eq!(cli.max_request_bytes, 10);
     assert_eq!(cli.max_concurrent_puts, 3);
+    assert_eq!(cli.put_permit_wait, Duration::from_secs(4));
     assert_eq!(cli.put_min_bytes_per_sec, 5);
     assert_eq!(cli.put_rate_grace, Duration::from_secs(2));
     assert_eq!(cli.body_idle_timeout, Duration::from_secs(7));
@@ -304,6 +307,29 @@ fn the_help_names_every_flag_and_the_version_the_package() {
     assert!(shown.contains(env!("CARGO_PKG_VERSION")), "{shown}");
 }
 
+/// Asserts that a storage node's file reaches the built server settings: the front of the file
+/// of `GOLDEN` (a `put_permit_wait` of 25 s, not the 15 s a `ServerConfig` has by itself), given
+/// a key file that exists, makes a server whose wait for a put permit is 25 s.
+#[test]
+fn the_put_permit_wait_of_a_file_reaches_the_built_server() {
+    let dir = TestDir::under(std::env::temp_dir(), "tierstore-permit-wait-file");
+    let from_file = crate::server::config::from_text(
+        crate::server::config_testing::GOLDEN,
+        crate::server::config_testing::DEFAULTS,
+    )
+    .unwrap();
+    let mut front = from_file.front();
+    assert_eq!(front.put_permit_wait, Duration::from_secs(25));
+    front.access_key_file = key_file(&dir, "key", "AKID\nsecret\n", 0o600);
+    front.read_only_key_file = Vec::new();
+    front.presign_key_file = Vec::new();
+    front.gc_key_file = Vec::new();
+    front.scoped_key_file = Vec::new();
+    let server = crate::server::front::server_config(&front, Arc::new(crate::SystemClock))
+        .expect("a server");
+    assert_eq!(server.put_permit_wait, Duration::from_secs(25));
+}
+
 /// Asserts that percents are shares of a whole.
 #[test]
 fn a_percent_is_a_share() {
@@ -324,6 +350,7 @@ fn the_settings_are_made_from_the_flags() {
     cli.region = "eu-west-1".to_owned();
     cli.drain_lb_wait = Duration::from_secs(7);
     cli.drain_deadline = Duration::from_secs(11);
+    cli.put_permit_wait = Duration::from_secs(4);
     let lines = key_file(&dir, "reader-lines", "READ1\nread-secret-1\n", 0o600);
     let json = key_file(&dir, "reader-json", JSON_KEY, 0o400);
     cli.read_only_key_file = vec![lines, json];
@@ -339,6 +366,7 @@ fn the_settings_are_made_from_the_flags() {
     assert_eq!(built.server.secret_access_key, "secret");
     assert_eq!(built.server.max_request_bytes, 256 << 20);
     assert_eq!(built.server.max_concurrent_puts, 32);
+    assert_eq!(built.server.put_permit_wait, Duration::from_secs(4));
     assert_eq!(built.server.put_min_bytes_per_sec, 1024);
     assert_eq!(built.server.put_rate_grace, Duration::from_secs(30));
     assert_eq!(built.server.body_idle_timeout, Duration::from_secs(30));

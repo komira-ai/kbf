@@ -116,15 +116,45 @@ async fn metricz_lists_every_series_with_its_labels() {
     }
 }
 
+/// Asserts that `/metricz` has the build gauge with the crate version and the commit the build
+/// embeds, with value 1, once, whatever else the server has. It would catch a gauge that is not
+/// exported, one that names another version or no commit, and one on only some shapes.
+#[tokio::test]
+async fn metricz_has_the_build_gauge_with_version_and_commit() {
+    use super::build_info::COMMIT;
+    let expected = format!(
+        "tierstore_build_info{{version=\"{}\",commit=\"{COMMIT}\"}} 1",
+        env!("CARGO_PKG_VERSION")
+    );
+    for rig in [
+        Rig::new(BUDGET).await,
+        Rig::with(BUDGET, |config| config.proxy = None).await,
+    ] {
+        let body = metricz(&rig).await.body;
+        let lines: Vec<&str> = body.lines().collect();
+        let found = lines.iter().filter(|l| **l == expected).count();
+        assert_eq!(found, 1, "{body}");
+        assert!(
+            body.contains("# TYPE tierstore_build_info gauge\n"),
+            "{body}"
+        );
+        assert!(!COMMIT.is_empty());
+    }
+}
+
 /// Asserts that a server with no proxy and no OCI front answers `/metricz` 200 with one comment
-/// line that names the sources and no series. It would catch a probe that fails or says nothing
-/// when there is nothing to count.
+/// line that names the sources and no series but the build gauge. It would catch a probe that
+/// fails or says nothing when there is nothing to count.
 #[tokio::test]
 async fn metricz_without_a_source_is_one_line_naming_them() {
     let rig = Rig::with(BUDGET, |config| config.proxy = None).await;
     let reply = metricz(&rig).await;
     assert_eq!(reply.status, StatusCode::OK);
-    let lines: Vec<&str> = reply.body.lines().collect();
+    let lines: Vec<&str> = reply
+        .body
+        .lines()
+        .filter(|line| !line.contains("tierstore_build_info"))
+        .collect();
     assert_eq!(lines.len(), 1, "{}", reply.body);
     for name in ["proxy", "OCI read front", "local cache"] {
         assert!(
@@ -428,7 +458,9 @@ async fn no_series_is_emitted_twice() {
         assert!(number.parse::<u64>().is_ok(), "{line}");
         assert!(seen.insert(name.to_owned()), "{name} twice in:\n{text}");
     }
-    assert_eq!(seen.len(), SERIES.len());
+    // Every series of SERIES, and the build gauge, whose labels name the build and so are not in
+    // the list.
+    assert_eq!(seen.len(), SERIES.len() + 1);
 }
 
 /// Asserts that a ranged GET of a cold object while the hot tier is above its critical mark

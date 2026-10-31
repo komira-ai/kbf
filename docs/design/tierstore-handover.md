@@ -187,10 +187,11 @@ create-only and skips a taken number (`Inner::write_batch`, `tiered.rs`).
   but **one proxy id for both is wrong**: two writers on one journal interleave, and the reconciler treats it as one
   stream (oldest first by journal order within a proxy). The unit already says to give each process its own id; the slot
   template gives `tierstore-9301` and `tierstore-9302`, stable across updates.
-- **One lease holder name is a small real bug**: `ReconcilerConfig::holder` is the proxy id and the body is
-  `holder\n<generation>` counting from 1 in each process (`Lease::body`); the content tag hashes the body. A restarted
-  process can write a body equal to an older one, and a stale renew with that old tag then succeeds. A start nonce in the
-  body removes it.
+- **One lease holder name is safe**: `ReconcilerConfig::holder` is the proxy id and the body is
+  `holder\n<nonce>\n<generation>` (`Lease::body`), the nonce 128 random bits as hex drawn in `Lease::new` and the
+  generation counting from 1 in each process; the content tag hashes the body. A restarted process with the same name
+  writes other bodies than the process before it, so a stale renew or release with the old tag fails. (Before the
+  nonce, the body was `holder\n<generation>` and the two could collide.)
 - **A `dir:` hot tier cannot have two holders**: `DirBackend::put_if_match` is atomic among the calls of one backend only
   (`dir.rs`). It keeps the plain restart (`mode=restart`).
 

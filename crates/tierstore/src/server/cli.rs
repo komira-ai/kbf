@@ -44,6 +44,7 @@
 //! flags without the other, and a certificate, key or prefix that cannot work, exit with status
 //! 2; a file that cannot be read
 //! with status 1. The start line gets ` oci-listen=<address> (http)` or ` (https)`.
+//! The start line ends with ` commit=<the commit the binary was built from>`.
 //!
 //! On SIGTERM or SIGINT the process drains (see the [`server`](super) docs): `/readyz` says 503,
 //! it serves for `--drain-lb-wait`, refuses new requests, waits for those in flight and for the
@@ -87,10 +88,12 @@ use tokio::sync::{Notify, watch};
 
 use crate::s3::{Capabilities, Credentials, S3Config};
 use crate::{
-    Backend, Check, Clock, DirBackend, MemoryBackend, Proxy, ProxyConfig, Reconciler,
-    ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SystemClock, self_test,
+    Backend, Check, Clock, DirBackend, MemoryBackend, MonotonicClock, Proxy, ProxyConfig,
+    Reconciler, ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SweepBudget,
+    SystemClock, self_test, sweep_probes,
 };
 
+use super::build_info::{CAPABILITIES, COMMIT, RELEASE_VERSION, VERSION, capabilities_text};
 use super::cache_cli::serve_cache_until_signalled;
 use super::config::{OciFlags, Settings, keys_for_flags};
 use super::config_print::render;
@@ -113,6 +116,10 @@ pub(super) const DEFAULT_MAX_REQUEST_BYTES: u64 = 256 << 20;
 /// The streamed bodies taken at once: 32 of them hold at most 32 x (16 MiB + a few pieces).
 pub(super) const DEFAULT_MAX_CONCURRENT_PUTS: u32 = 32;
 
+/// How long a put that finds all the slots taken waits for one before it is answered 503
+/// (`--put-permit-wait`'s default, `15s`).
+pub(super) const DEFAULT_PUT_PERMIT_WAIT: Duration = Duration::from_secs(15);
+
 /// The least average rate of a body, in bytes a second.
 pub(super) const DEFAULT_PUT_MIN_BYTES_PER_SEC: u64 = 1024;
 
@@ -132,7 +139,7 @@ const S3_MIN_BODY_RATE: Option<NonZeroU64> = NonZeroU64::new(1 << 20);
 /// read-only keys, writes new objects to the hot tier, copies them to the cold tier in the
 /// background, and frees the hot tier when it fills.
 #[derive(Clone, Debug, PartialEq, Parser)]
-#[command(name = "tierstore", version)]
+#[command(name = "tierstore", version = RELEASE_VERSION)]
 pub struct Cli {
     /// The configuration file: a TOML file with the tables `[server]`, `[hot_store]` and
     /// `[cold_store]` that holds what the flags below hold, except `--drain-lb-wait` and
@@ -151,6 +158,14 @@ pub struct Cli {
     /// error.
     #[arg(long)]
     pub check_config: bool,
+    /// Prints the capabilities of this build, one to a line, and exits with status 0 without
+    /// starting anything. It needs no other flag and is refused with any (status 2). A host
+    /// updater asks it of a release before it hands over to it.
+    // Never read: `main` finds the flag in the raw arguments before they are parsed, since a
+    // parse would demand `--listen`. The field is here so that `--help` and the docs checks
+    // know the flag.
+    #[arg(long)]
+    pub capabilities: bool,
     /// The address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on.
     #[arg(long)]
     pub listen: SocketAddr,
@@ -308,8 +323,9 @@ pub struct Cli {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub max_request_bytes: u64,
-    /// The most put bodies and upload parts taken at once. One more is answered 503 `SlowDown`
-    /// with `Retry-After: 1` and its body is not read. A body in flight holds a few pieces of
+    /// The most put bodies and upload parts taken at once. One more waits for a slot, at most
+    /// `--put-permit-wait`, and is then answered 503 `SlowDown` with `Retry-After: 1`; its body
+    /// is not read, while it waits or after. A body in flight holds a few pieces of
     /// at most the size the connection delivers (tens of KiB), and an S3 tier up to 16 MiB
     /// more, so 32 bodies hold about half a GiB at most, with S3 tiers, and a few MiB with
     /// directory tiers.
@@ -319,6 +335,13 @@ pub struct Cli {
         value_parser = clap::value_parser!(u32).range(1..)
     )]
     pub max_concurrent_puts: u32,
+    /// How long a put body or upload part that arrives when `--max-concurrent-puts` bodies are
+    /// already being taken waits for one of them to end: a number and `ms`, `s`, `m` or `h`. If a
+    /// slot is free in that time the body is taken; if not, it is answered 503 `SlowDown` with
+    /// `Retry-After: 1`. The request's body is not read while it waits, so a slow tier makes
+    /// clients queue here, up to this long, instead of retrying at once. 0 answers 503 at once.
+    #[arg(long, default_value = "15s", value_parser = parse_duration)]
+    pub put_permit_wait: Duration,
     /// The least average rate, in bytes a second, at which a request body may come in, counted
     /// over the time the server spends waiting for the client to send the next piece, once that
     /// time has passed `--put-rate-grace`. Time the server spends not waiting for the client (a
@@ -811,6 +834,10 @@ async fn probe_tiers(
         let took = started.elapsed().as_millis();
         eprintln!("tierstore: tested the {name} in {took} ms");
         outcome?;
+        // Bounded in the keys and in the time after which no delete starts, on a clock that
+        // setting the machine's clock does not move.
+        let budget = SweepBudget::default();
+        sweep_probes(backend, &options, budget, &MonotonicClock::new(), &note).await;
     }
     Ok(())
 }
@@ -966,14 +993,13 @@ pub(super) fn signals() -> std::io::Result<impl Future<Output = ()> + Send + 'st
 
 async fn serve_until_signalled(cli: Cli) -> Result<(), Error> {
     let stop = signals()?;
-    let version = env!("CARGO_PKG_VERSION");
     let announce = |bound: Addresses| {
-        let mut line = format!("tierstore {version} listen={}", bound.s3);
+        let mut line = format!("tierstore {VERSION} listen={}", bound.s3);
         if let Some(oci) = bound.oci {
             let mode = bound.oci_mode.unwrap_or_default().as_str();
             line.push_str(&format!(" oci-listen={oci} ({mode})"));
         }
-        println!("{line}");
+        println!("{line} commit={COMMIT}");
     };
     run_serving(&cli, stop, announce).await?;
     Ok(())
@@ -986,9 +1012,30 @@ fn blocking(start: impl Future<Output = Result<(), Error>>) -> Result<(), Error>
     runtime.block_on(start)
 }
 
+/// `--capabilities`: the capabilities of this build, one to a line, on stdout and status 0 (see
+/// [`CAPABILITIES`]); or, when `args` (the program name first) hold anything else, the first of
+/// it named on stderr and status 2, with nothing on stdout.
+fn capabilities(args: &[OsString]) -> ExitCode {
+    match args.iter().skip(1).find(|arg| *arg != "--capabilities") {
+        Some(other) => {
+            let other = other.to_string_lossy();
+            eprintln!("tierstore: --capabilities takes no other flag, got {other}");
+            ExitCode::from(2)
+        }
+        None => {
+            print!("{}", capabilities_text(CAPABILITIES));
+            ExitCode::SUCCESS
+        }
+    }
+}
+
 /// The binary: flags in, exit status out.
 #[must_use]
 pub fn main(args: Vec<OsString>) -> ExitCode {
+    // Before the flags are parsed: it needs none of the flags a start requires.
+    if args.iter().skip(1).any(|arg| arg == "--capabilities") {
+        return capabilities(&args);
+    }
     let launch = match resolve(args) {
         Ok(launch) => launch,
         Err(Refused::Usage(usage)) => {

@@ -64,7 +64,9 @@
 //! body whole otherwise) with 411 `MissingContentLength`; if its `Content-Length` is over
 //! [`ServerConfig::max_request_bytes`], with 413 `EntityTooLarge`, so that nothing is stored and
 //! no upload is begun; and if [`ServerConfig::max_concurrent_puts`] bodies are already being
-//! taken, with 503 `SlowDown` and `Retry-After`. A body that then comes in at an average rate
+//! taken, the request waits for one of them to end, at most [`ServerConfig::put_permit_wait`],
+//! without reading its body, and is answered 503 `SlowDown` and `Retry-After` only when no slot
+//! was free in that time. A body that then comes in at an average rate
 //! under [`ServerConfig::put_min_bytes_per_sec`], once [`ServerConfig::put_rate_grace`] has
 //! passed, is cut with 400 `RequestTimeout`, which ends the stream with an error, so nothing is
 //! stored and an upload at an S3 tier is aborted.
@@ -173,6 +175,7 @@
 //! the deadline cut: those still running, or still being sent.
 
 mod auth;
+pub mod build_info;
 mod cache_cli;
 pub mod cli;
 mod config;
@@ -325,11 +328,17 @@ pub struct ServerConfig {
     /// See the module docs.
     pub body_idle_timeout: Duration,
     /// The most streamed bodies (puts and parts of uploads) taken at once. A request over the
-    /// limit is answered 503 `SlowDown` with a `Retry-After` and its body is not read. Each
+    /// limit waits up to `put_permit_wait` for one to end, and is then answered 503 `SlowDown`
+    /// with a `Retry-After`; its body is not read either way. Each
     /// streamed body holds a few pieces (`PIECES_QUEUED`, of the size the connection delivers),
     /// and an S3 tier up to 16 MiB more, so the memory of the puts is bounded by this number
     /// times that.
     pub max_concurrent_puts: usize,
+    /// How long a streamed body that arrives with `max_concurrent_puts` bodies already being
+    /// taken waits for one of them to end, before it is answered 503 `SlowDown`. It is the
+    /// time of the runtime (`tokio::time`), and the body is not read while the request waits.
+    /// Zero answers 503 at once.
+    pub put_permit_wait: Duration,
     /// The least average rate, in bytes a second, at which a request body is taken, counted
     /// over the time the server spends waiting for the client to send the next piece once
     /// that time has passed `put_rate_grace`; a body that goes slower is refused with 400
@@ -406,6 +415,7 @@ impl ServerConfig {
             max_request_bytes: 256 << 20,
             body_idle_timeout: Duration::from_secs(30),
             max_concurrent_puts: 32,
+            put_permit_wait: Duration::from_secs(15),
             put_min_bytes_per_sec: 1024,
             put_rate_grace: Duration::from_secs(30),
             header_timeout: Duration::from_secs(60),
@@ -808,9 +818,10 @@ impl Server {
 
     /// The text of `/metricz`: the block of every source of counters the process has (the
     /// proxy's, the OCI front's, the local cache's), one after the other, each ending in a
-    /// newline, or one line that names them all when there is none. Every block that exists
-    /// renders, never one of them; a storage node has the proxy's, a cache node the cache's, and
-    /// either may have the OCI front's.
+    /// newline, or one line that names them all when there is none; then, always,
+    /// `tierstore_build_info` ([`build_info::gauge`]). Every block that exists renders, never one
+    /// of them; a storage node has the proxy's, a cache node the cache's, and either may have the
+    /// OCI front's.
     fn metrics_probe(&self) -> String {
         let blocks = [
             self.config.proxy.as_ref().map(|proxy| proxy.metrics()),
@@ -827,6 +838,7 @@ impl Server {
         if text.is_empty() {
             text = "# this server has no proxy, no OCI read front and no local cache\n".to_owned();
         }
+        text.push_str(&build_info::gauge(build_info::VERSION, build_info::COMMIT));
         text
     }
 

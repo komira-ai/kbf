@@ -127,7 +127,8 @@ How the cache behaves is in [operations](operations.md#a-build-node). The file i
 | `server.scoped_key_files` | `--scoped-key-file` | paths, none | scoped key files |
 | `server.presign_max_expires` | `--presign-max-expires` | duration, `15m` | the longest expiry of any presigned URL |
 | `server.max_request_bytes` | `--max-request-bytes` | bytes, 268435456 (256 MiB) | the longest body of a request: the longest object and the longest part. A body over it is refused with 413 and nothing is stored |
-| `server.max_concurrent_puts` | `--max-concurrent-puts` | count, 32 | the most put bodies and parts taken at once; one more is 503 `SlowDown` with `Retry-After: 1` |
+| `server.max_concurrent_puts` | `--max-concurrent-puts` | count, 32 | the most put bodies and parts taken at once; one more waits for one to end, up to `server.put_permit_wait` |
+| `server.put_permit_wait` | `--put-permit-wait` | duration, `15s` | on main, not in v0.0.41. How long a put that finds every put slot taken waits for one to end before it is answered 503 `SlowDown` with `Retry-After: 1`; `0s` answers at once. No byte of its body is read while it waits, and a waiter counts as in flight in a drain (never past `--drain-deadline`) |
 | `server.put_min_bytes_per_sec` | `--put-min-bytes-per-sec` | bytes a second, 1024 | the least average rate of a body, counted over the time spent waiting for the client; 0 turns it off |
 | `server.put_rate_grace` | `--put-rate-grace` | duration, `30s` | the time spent waiting for the client before that rate is held |
 | `server.body_idle_timeout` | `--body-idle-timeout` | duration, `30s` | how long a body or an answer may go without a byte; more than zero |
@@ -181,12 +182,15 @@ The read cache of a build node. A GET or HEAD of a key that a `[[policy]]` with 
 | `local_cache.critical` | percent, 95 | above this share a fill is skipped; not below `high_water` |
 | `local_cache.free_floor` | percent, 10 (0 to 99) | the share of the file system that is kept free: below it a pass evicts, even under the budget. The budget may not be above the size of the file system less this share |
 | `local_cache.max_concurrent_fills` | count, 4 (1 to 64) | the most fills that run at once; a miss that finds them all running is served from the upstream and kept nowhere |
+| `local_cache.max_concurrent_keeps` | count, 8 (1 to 64) | on main, not in v0.0.41. The most create-only puts copied into the cache at once, apart from the fills; a put that finds them all running succeeds and is not kept |
+| `local_cache.keep_wait` | duration, `5s` (above 0) | on main, not in v0.0.41. The longest a put waits, once the upstream has the object, for its copy to land in the cache; past it the put is answered and the copy finishes in the background |
+| `local_cache.keep_deadline` | duration, `60s` (above 0, not below `keep_wait`) | on main, not in v0.0.41. The longest a copy takes in all, from the upstream's acknowledgement; a copy not done by then is abandoned and its stage file removed |
 | `local_cache.write_through` | boolean, `false` | `false`: the node refuses every write with 403. `true`: it takes the writes its keys may do and sends each to the upstream, which must then be read with a key that may write; the start runs the self-test of a storage node against the upstream and exits 3 if it answers one wrongly |
 | `local_cache.whole_fill_limit` | size, 64 MiB (1 byte to `budget`) | on main, not in v0.0.41. the most an object may be for a ranged read of it to fill the whole of it; a larger object is passed through and kept nowhere. A fill reads 8 MiB at a time whatever the limit, so raising it does not raise the memory of the fills |
 | `local_cache.cache` | boolean, `true` | `false` is refused: leave `[local_cache]` out to run without a cache |
 | `local_cache.scrub_rate` | rate, none | a size and `/s`, such as `"50MiB/s"`: accepted, and not used by this release |
 
-The upstream is `[cold_store]`, with any `kind`. In place of `endpoint` it may have a list `endpoints` of exactly one entry. With `write_through = true` the node takes create-only puts, presigned puts, multipart uploads and deletes, and sends each to the upstream before it answers; the keys' roles apply as on a storage node, and a put that replaces (`If-Match`) and a copy are still refused. A build node leaves out `skip_checks` and the reconciler's keys and `server.backend_check_wait`. On main (not in v0.0.41) it may have an `[oci]` table: the registry front then reads through the cache, and the start refuses the file unless a `[[policy]]` with `cache = true` covers the blobs, the keys under `blobs/sha256/` below `oci.prefix`.
+The upstream is `[cold_store]`, with any `kind`. In place of `endpoint` it may have a list `endpoints` of exactly one entry. With `write_through = true` the node takes create-only puts, presigned puts, multipart uploads and deletes, and sends each to the upstream before it answers; the keys' roles apply as on a storage node, and a put that replaces (`If-Match`) and a copy are still refused. On main (not in v0.0.41) a create-only put under a `cache = true` prefix is also kept on the node before it is answered, so its next read is a local hit; a copy that cannot be kept never fails the put. A build node leaves out `skip_checks` and the reconciler's keys and `server.backend_check_wait`. On main (not in v0.0.41) it may have an `[oci]` table: the registry front then reads through the cache, and the start refuses the file unless a `[[policy]]` with `cache = true` covers the blobs, the keys under `blobs/sha256/` below `oci.prefix`.
 
 ## `[oci]`
 
@@ -226,12 +230,13 @@ These describe one run, not the data path, and have no key:
 | `--config` | none | the file |
 | `--print-config` | off | print the file for the flags given, and exit |
 | `--check-config` | off | with `--config`: load the file, read the key files it names, and for an `[oci]` table check the prefix, the connection lifetime and the TLS files; then exit 0 and print nothing, or print the refusal and exit 2. It binds nothing and asks no store. What it does not check is listed below. Without `--config` it is a usage error |
+| `--capabilities` | off | on main, not in v0.0.41. print what this build can do, one capability to a line, and exit 0 (a build with none prints nothing). It needs none of the flags a start requires, and with any other argument it prints nothing on stdout, says `--capabilities takes no other flag` on stderr and exits 2 |
 | `--drain-lb-wait` | `10s` | on SIGTERM, how long `/readyz` says 503 while the server goes on serving |
 | `--drain-deadline` | `15m` | then how long it waits for requests in flight |
 
 `--check-config` finds what the loader refuses (see "What the loader refuses"), a `bucket` that is a probe path name, a zero `body_idle_timeout`, a key file that is not owned by the user, is open to others or is a link, two keys with one id, and, in the file of a build node, a zero `s3_request_timeout`. It does not find what a start checks after that: the water marks out of order, `reconcile_interval` not below `lease_ttl`, `usage_stale_after` not above `lease_ttl`, or a zero `s3_request_timeout` in a storage node's file (a start exits 1 on each, and the unit tries again every 30 seconds); a tier that is down or answers the self-test wrongly; the cache directory and a `budget` over the size of its file system. A file that passes `--check-config` can still fail to start.
 
-`--help` and `--version` are the usual. A start that gives `--config` and any other flag but `--drain-lb-wait`, `--drain-deadline` and `--check-config` is refused with exit status 2.
+`--help` and `--version` are the usual; on main `--version` prints the version, `+` and the commit the binary was built from (`tierstore 0.2.0+0123456789ab`), and the start line ends with ` commit=<commit>`. The commit is twelve hex digits, or `unknown` for a build that had neither a git checkout nor a stamp. A start that gives `--config` and any other flag but `--drain-lb-wait`, `--drain-deadline` and `--check-config` is refused with exit status 2.
 
 ## What the loader refuses
 
