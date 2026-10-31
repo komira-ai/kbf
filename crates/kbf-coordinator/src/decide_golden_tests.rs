@@ -259,7 +259,7 @@ fn a_failed_host_is_not_ordered_again() {
         ]
     );
     let mut one = desired("2.0", 1, 1);
-    one.max_updating.daemon = 1;
+    one.max_updating.set("daemon", 1);
     assert_eq!(
         run(&mut f, &one, &hosts, NOW, false),
         ["d1: nothing", "d2: nothing", "d3: nothing", "d4: nothing"],
