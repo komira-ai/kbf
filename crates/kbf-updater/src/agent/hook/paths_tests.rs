@@ -183,7 +183,7 @@ fn a_taken_over_trial_on_an_unreadable_node_is_not_given_back() {
 
     let rig = Rig::new("hook-adopt-recorded");
     on_trial(&rig);
-    let store = super::record::Store::new(rig.record_dir(), Arc::new(|| {}));
+    let store = super::record::Store::new(rig.record_dir(), None);
     let mut record = super::record::Record::new(VB, super::testing::DIGEST);
     record.placement = Some(Was::In);
     store.save(&record).unwrap();
@@ -234,7 +234,7 @@ fn prepare_refuses_an_artifact_that_is_not_the_staged_release() {
     let mut args = rig.args(Step::Prepare);
     let at = args.iter().position(|a| a == "prepare").unwrap() + 1;
     args[at] = s("/somewhere/else");
-    let ran = rig.run_args(&args, Arc::new(|| {}));
+    let ran = rig.run_args(&args, None);
     assert_eq!(ran.outcome, Outcome::Failure);
     assert_eq!(ran.reason(), "artifact_mismatch");
     assert!(rig.calls().is_empty());
@@ -299,6 +299,43 @@ fn leases_that_cannot_be_read_fail_prepare_and_the_rollback_gives_the_node_back(
     );
     assert_eq!(rig.events.count("undrain"), 1);
     assert_eq!(rig.events.count("local:switch"), 0);
+}
+
+/// A `prepare` after the update was rolled back starts a new attempt, from the node's placement
+/// on; a record of another update (another release or another artifact) is not this attempt's
+/// and is replaced by it.
+///
+/// Catches: a retry of a deferred update that finds its old record and does nothing, or one that
+/// carries the old attempt's placement into the new.
+#[test]
+fn a_prepare_after_a_rollback_or_after_another_update_starts_afresh() {
+    let mut rig = Rig::new("hook-afresh");
+    rig.flags.extend([s("--drain-deadline-secs"), s("5")]);
+    *rig.drain.leases.lock().unwrap() = [1].into();
+    assert_eq!(rig.run(Step::Prepare).outcome, Outcome::Deferred);
+    assert_eq!(rig.run(Step::Rollback).outcome, Outcome::Success);
+    *rig.drain.leases.lock().unwrap() = [0].into();
+    assert_eq!(rig.run(Step::Prepare).outcome, Outcome::Success);
+    let record = rig.record().expect("a record");
+    assert!(record.prepared && !record.rolled_back);
+    assert_eq!(
+        rig.events.count("placed"),
+        2,
+        "the node is read again for the new attempt"
+    );
+
+    let rig = Rig::new("hook-other-record");
+    let store = super::record::Store::new(rig.record_dir(), None);
+    let mut other = super::record::Record::new(VA, super::testing::DIGEST);
+    other.prepared = true;
+    other.placement = Some(Was::Out);
+    store.save(&other).unwrap();
+    assert_eq!(rig.run(Step::Prepare).outcome, Outcome::Success);
+    let record = rig.record().expect("a record");
+    assert_eq!(
+        (record.target.as_str(), record.placement),
+        (VB, Some(Was::In))
+    );
 }
 
 // ---- the node is given back only if this update drained it ----
@@ -578,7 +615,7 @@ fn a_cutover_run_again_looks_at_the_helper_before_it_switches() {
     let marked = |name: &str| {
         let rig = Rig::new(name);
         upto(&rig, Step::Prepare);
-        let store = super::record::Store::new(rig.record_dir(), Arc::new(|| {}));
+        let store = super::record::Store::new(rig.record_dir(), None);
         let mut record = rig.record().expect("a record");
         record.switch_begun = true;
         store.save(&record).unwrap();
@@ -661,7 +698,7 @@ fn verify_names_why_the_release_is_not_healthy() {
 fn a_rollback_with_nothing_of_this_update_does_nothing() {
     let rig = Rig::new("hook-rollback-nothing");
     assert_eq!(rig.run(Step::Rollback).outcome, Outcome::Success);
-    let store = super::record::Store::new(rig.record_dir(), Arc::new(|| {}));
+    let store = super::record::Store::new(rig.record_dir(), None);
     let mut other = super::record::Record::new(VA, super::testing::DIGEST);
     other.switch_begun = true;
     store.save(&other).unwrap();
@@ -708,7 +745,7 @@ fn a_rollback_after_the_commit_says_it_cannot_and_changes_nothing() {
     let begun = |name: &str, confirmed_at_helper: bool| {
         let rig = Rig::new(name);
         upto(&rig, Step::Verify);
-        let store = super::record::Store::new(rig.record_dir(), Arc::new(|| {}));
+        let store = super::record::Store::new(rig.record_dir(), None);
         let mut record = rig.record().expect("a record");
         record.confirm_begun = true;
         store.save(&record).unwrap();
@@ -749,6 +786,12 @@ fn a_revert_that_fails_fails_the_rollback_and_it_can_be_tried_again() {
     );
     assert!(ran.logged("the revert failed"));
     assert!(!rig.record().expect("a record").rolled_back);
+    rig.local.world().revert = Err(LocalError::Refused(s("busy")));
+    let ran = rig.run(Step::Rollback);
+    assert_eq!(
+        (ran.outcome, ran.reason()),
+        (Outcome::Failure, "revert_failed")
+    );
     rig.local.world().revert = Ok(());
     assert_eq!(rig.run(Step::Rollback).outcome, Outcome::Success);
     assert!(rig.record().expect("a record").rolled_back);
@@ -787,6 +830,17 @@ fn a_node_is_not_given_back_onto_an_old_release_that_is_not_healthy() {
         .say("0.1.0+gaaaaaaaaaaaa", vec![Ok(Health::Healthy)]);
     assert_eq!(rig.run(Step::Rollback).outcome, Outcome::Success);
     assert!(rig.calls().contains(&s("health:held 0.1.0+gaaaaaaaaaaaa")));
+
+    // A host that names neither a version nor a commit.
+    let rig = Rig::new("hook-a-nameless");
+    upto(&rig, Step::Cutover);
+    rig.local.world().revert = Err(LocalError::Refused(s("nothing_pending")));
+    {
+        let mut world = rig.local.world();
+        world.state.version = None;
+        world.state.commit = None;
+    }
+    assert_eq!(rig.run(Step::Rollback).reason(), "a_unhealthy");
 
     let rig = Rig::new("hook-a-mute");
     upto(&rig, Step::Cutover);
@@ -897,7 +951,7 @@ fn a_cleanup_run_again_looks_at_the_helper_before_it_confirms() {
     let begun = |name: &str| {
         let rig = Rig::new(name);
         upto(&rig, Step::Verify);
-        let store = super::record::Store::new(rig.record_dir(), Arc::new(|| {}));
+        let store = super::record::Store::new(rig.record_dir(), None);
         let mut record = rig.record().expect("a record");
         record.confirm_begun = true;
         store.save(&record).unwrap();

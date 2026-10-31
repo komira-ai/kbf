@@ -15,7 +15,8 @@
 //! The directory is locked, exclusively, for the whole step ([`Store::lock`]): a second copy of
 //! a step refuses and changes nothing.
 
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -132,7 +133,7 @@ impl Record {
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// Another copy of a step holds the directory.
-    #[error("another copy of this step is running (the record directory is locked)")]
+    #[error("the record directory cannot be locked: another copy of this step is running")]
     Busy,
     #[error("{what} {path}: {source}")]
     Io {
@@ -146,44 +147,89 @@ pub enum StoreError {
     Newer { path: PathBuf, found: u32 },
 }
 
+/// What is called before every write of the record, in the hook's process, so that a test can
+/// stop the step at each change (`update_hook::conformance::gate::point`). There is none in a
+/// real run.
+pub type Gate = Arc<dyn Fn() + Send + Sync>;
+
 /// The record directory.
 pub struct Store {
     dir: PathBuf,
-    /// Called before every write, in the hook's process, so that a test can stop the step at
-    /// each change (`update_hook::conformance::gate::point`). Nothing in a real run.
-    before_write: Arc<dyn Fn() + Send + Sync>,
+    before_write: Option<Gate>,
 }
 
 impl Store {
-    pub fn new(dir: PathBuf, before_write: Arc<dyn Fn() + Send + Sync>) -> Store {
+    pub fn new(dir: PathBuf, before_write: Option<Gate>) -> Store {
         Store { dir, before_write }
+    }
+
+    fn io(&self, what: &'static str, source: std::io::Error) -> StoreError {
+        StoreError::Io {
+            what,
+            path: self.dir.clone(),
+            source,
+        }
     }
 
     /// Takes the exclusive lock on the directory for as long as the returned file lives.
     ///
     /// # Errors
-    /// Not written yet: always busy.
+    /// [`StoreError::Busy`] when the lock cannot be taken (another process holds it), or the
+    /// directory cannot be opened.
     pub fn lock(&self) -> Result<File, StoreError> {
-        let _ = &self.dir;
-        Err(StoreError::Busy)
+        let dir =
+            File::open(&self.dir).map_err(|e| self.io("cannot open the record directory", e))?;
+        // Any refusal of the lock is a refusal of the step: the record is never shared.
+        dir.try_lock().map(|()| dir).map_err(|_| StoreError::Busy)
     }
 
     /// The record, if there is one.
     ///
     /// # Errors
-    /// Not written yet: never.
+    /// The file cannot be read, is not a record, or is newer than this hook.
     pub fn load(&self) -> Result<Option<Record>, StoreError> {
-        let _ = &self.dir;
-        Ok(None)
+        let path = self.dir.join(FILE);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(self.io("cannot read the record in", e)),
+        };
+        let record: Record = serde_json::from_str(&text).map_err(|e| StoreError::Corrupt {
+            path: path.clone(),
+            why: e.to_string(),
+        })?;
+        if record.schema > SCHEMA {
+            return Err(StoreError::Newer {
+                path,
+                found: record.schema,
+            });
+        }
+        Ok(Some(record))
     }
 
-    /// Replaces the record.
+    /// Replaces the record: written beside, synced, renamed over, the directory synced.
     ///
     /// # Errors
-    /// Not written yet: never.
+    /// The write failed; the old record is then still the record.
     pub fn save(&self, record: &Record) -> Result<(), StoreError> {
-        (self.before_write)();
-        let _ = record;
-        Ok(())
+        if let Some(gate) = &self.before_write {
+            gate();
+        }
+        let path = self.dir.join(FILE);
+        let tmp = self.dir.join(format!("{FILE}.tmp"));
+        let written = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .and_then(|mut file| {
+                serde_json::to_writer_pretty(&mut file, record)
+                    .map_err(std::io::Error::from)
+                    .and_then(|()| file.write_all(b"\n"))
+                    .and_then(|()| file.sync_all())
+            })
+            .and_then(|()| fs::rename(&tmp, &path))
+            .and_then(|()| File::open(&self.dir).and_then(|dir| dir.sync_all()));
+        written.map_err(|e| self.io("cannot write the record in", e))
     }
 }

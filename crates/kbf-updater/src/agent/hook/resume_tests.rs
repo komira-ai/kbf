@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use update_hook::{Outcome, Step};
 
 use super::record::Record;
-use super::testing::{Rig, kill_at};
+use super::testing::{Ran, Rig, kill_at};
 use crate::agent::local::HostState;
 
 const SUCCESS: [Step; 4] = [Step::Prepare, Step::Cutover, Step::Verify, Step::Cleanup];
@@ -161,43 +161,133 @@ fn a_rollback_killed_at_any_write_and_run_again_reaches_the_same_state() {
     }
 }
 
-/// A write of the record that fails fails the step with `record_unwritable` (the environment's
-/// fault), at whichever write it is: nothing goes on past a mark that was not kept.
+/// Runs `before` on a rig `setup` has been applied to, then `last` with a gate that makes the
+/// `n`th write of the record fail: the temporary file's name is taken by a directory.
+fn run_with_failing_write(
+    setup: &dyn Fn(&Rig),
+    before: &[Step],
+    last: Step,
+    n: usize,
+) -> (Rig, Ran) {
+    let rig = Rig::new("hook-unwritable");
+    setup(&rig);
+    for step in before {
+        assert_eq!(rig.run(*step).outcome, Outcome::Success, "{step}");
+    }
+    let tmp = rig.record_dir().join("record.json.tmp");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gate: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if calls.fetch_add(1, Ordering::SeqCst) + 1 == n {
+            std::fs::create_dir(&tmp).expect("a directory in the way");
+        }
+    });
+    let ran = rig.run_gated(last, gate);
+    (rig, ran)
+}
+
+/// The writes of the record `last` makes, after `before` succeeded on a rig `setup` was applied to.
+fn writes_after(setup: &dyn Fn(&Rig), before: &[Step], last: Step) -> usize {
+    let rig = Rig::new("hook-writes");
+    setup(&rig);
+    for step in before {
+        assert_eq!(rig.run(*step).outcome, Outcome::Success, "{step}");
+    }
+    let (gate, count) = counting();
+    rig.run_gated(last, gate);
+    count.load(Ordering::SeqCst)
+}
+
+/// A write of the record that fails fails the step, at whichever write it is: nothing goes on
+/// past a mark that was not kept. On the road of a successful update, on the road back, and on
+/// the roads that end in a failure of their own (a drain the frontend refuses, a confirm the
+/// helper refuses, a trial taken over, a host that runs the release already).
 ///
 /// Catches: a step that carries on after its mark could not be written.
 #[test]
 fn a_record_that_cannot_be_written_fails_the_step() {
+    use crate::agent::local::{LocalError, Trial};
+    use crate::agent::testing::{COMMIT_B, VA, VB, version};
+    use crate::ports::PortError;
+
+    type Setup = fn(&Rig);
+    let nothing: Setup = |_| {};
+    let mut scenarios: Vec<(&str, Setup, Vec<Step>, Step)> = Vec::new();
     for path in [SUCCESS.as_slice(), ROLLBACK.as_slice()] {
-        for (index, count) in writes(path).into_iter().enumerate() {
-            for n in 1..=count {
-                let rig = Rig::new("hook-unwritable");
-                for step in &path[..index] {
-                    assert_eq!(rig.run(*step).outcome, Outcome::Success);
-                }
-                // The write cannot be made: the temporary file's name is taken by a directory.
-                let tmp = rig.record_dir().join("record.json.tmp");
-                let calls = Arc::new(AtomicUsize::new(0));
-                let seen = calls.clone();
-                let gate: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                    if seen.fetch_add(1, Ordering::SeqCst) + 1 == n {
-                        std::fs::create_dir(&tmp).expect("a directory in the way");
-                    }
-                });
-                let ran = rig.run_gated(path[index], gate);
-                assert_eq!(
-                    ran.outcome,
-                    Outcome::Failure,
-                    "{} at write {n}",
-                    path[index]
-                );
-                assert_eq!(
-                    ran.reason(),
-                    "record_unwritable",
-                    "{} at write {n}",
-                    path[index]
-                );
-                assert_eq!(ran.report.class, update_hook::Class::Environment);
-            }
+        for index in 0..path.len() {
+            scenarios.push(("the road", nothing, path[..index].to_vec(), path[index]));
+        }
+    }
+    scenarios.push(("not switched", nothing, vec![Step::Prepare], Step::Rollback));
+    scenarios.push((
+        "a drain refused",
+        |rig| {
+            *rig.drain.drain_error.lock().unwrap() = Some(PortError::other("404"));
+        },
+        vec![],
+        Step::Prepare,
+    ));
+    scenarios.push((
+        "a confirm refused",
+        |rig| {
+            rig.local.world().confirm = Err(LocalError::Failed("state_unavailable".to_owned()));
+        },
+        vec![Step::Prepare, Step::Cutover, Step::Verify],
+        Step::Cleanup,
+    ));
+    scenarios.push((
+        "a trial taken over",
+        |rig| {
+            let mut world = rig.local.world();
+            world.state.version = Some(version(VB));
+            world.state.commit = Some(COMMIT_B.to_owned());
+            world.state.pending = Some(Trial {
+                version: Some(version(VB)),
+                commit: COMMIT_B.to_owned(),
+                deadline_unix: Some(10_400),
+            });
+            world.before = Some(version(VA));
+        },
+        vec![],
+        Step::Prepare,
+    ));
+    scenarios.push((
+        "a release that runs",
+        |rig| {
+            rig.local.world().state.version = Some(version(VB));
+        },
+        vec![],
+        Step::Prepare,
+    ));
+    scenarios.push((
+        "a release that runs, verified",
+        |rig| {
+            rig.local.world().state.version = Some(version(VB));
+        },
+        vec![Step::Prepare],
+        Step::Verify,
+    ));
+    scenarios.push((
+        "a release staged as current",
+        |rig| {
+            rig.local.world().install = Ok(crate::agent::local::Staged {
+                commit: COMMIT_B.to_owned(),
+                current: true,
+            });
+        },
+        vec![],
+        Step::Prepare,
+    ));
+    for (name, setup, before, last) in scenarios {
+        let count = writes_after(&setup, &before, last);
+        assert!(count > 0, "{name}: {last} writes nothing");
+        for n in 1..=count {
+            let (_, ran) = run_with_failing_write(&setup, &before, last, n);
+            assert_eq!(ran.outcome, Outcome::Failure, "{name}: {last} at write {n}");
+            assert!(
+                ["record_unwritable", "confirm_refused"].contains(&ran.reason()),
+                "{name}: {last} at write {n}: {}",
+                ran.reason()
+            );
         }
     }
 }

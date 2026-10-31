@@ -565,6 +565,16 @@ The kbf daemon becomes a hook like the others: `kbf update-hook <step>` does wha
 
 Today the helper reverts by itself at the trial's deadline; in the hook shape that guarantee is the step record's `verify_deadline_secs`, enforced by the root part of the updater (3.5). A frontend that runs as a container and a host on the `kbf` package (`deb`, `rpm`) are variants of the same hook with another backend, as they are today (`local/mod.rs`: `frontend`, `package`, `linux`, `mac_backend`). The updater and its root part are updated as 3.5 says, never inside this hook.
 
+**As built (migration step 5).** `kbf update-hook [flags] <step> [<artifact>] [--params <file>]` is `crates/kbf-updater/src/agent/hook`; the flags are the declaration's `hook_args` and are the agent's own (`--channel`, `--helper-socket`, `--frontend` or `--operator-api` and `--token-file`, `--daemon-node`, `--cordon-dir`, `--drain-deadline-secs`, `--health-timeout-secs`, `--health-poll-secs`, `--retry-secs`), plus `--record-dir`, the declaration's `state_dir`, where the hook keeps `record.json` and which it locks for the whole of a step. The ports are the agent's (`Local`, `Drain`, `HealthCheck`, `Clock`), so the order of calls is today's, call for call (`agent/hook/steps_tests.rs` runs today's update and the steps side by side on the same fakes). What differs from `agent/update.rs`, and why:
+
+- *The record.* `prepare` reads the node's placement once, writes it to the record before its own drain, and never reads it again; `rollback` and `cleanup` give the node back only if the record says it was in placement and this update's drain was begun, so a node an operator drained is never uncordoned (komira-ai/kbf#2004). Marks (`drain_begun`, `switch_begun`, `confirm_begun`) are written before their acts, and a step run again looks at the helper before it acts a second time.
+- *`install` stays in `prepare`.* The helper fetches and verifies by version and channel (`Local::install`); the staged artifact directory of the contract is only checked to be `updater.staged_release`. The target version and the artifact digest come from the params, and the pair is the record's identity.
+- *The drain deadline* ends `prepare` with exit `75`, the reason `drain_bound` and `retry_after_secs` of `--retry-secs`, the node left drained; the updater's table then runs `rollback`, which gives back the cordon this update placed (3.6), where today's update keeps the node drained until its retry.
+- *The confirm is `cleanup`'s, and the commit.* A confirm the helper refuses is reverted by `cleanup` itself (confirm, revert, what runs, A's health, undrain: today's order) and the step exits `1`, because the table never runs `rollback` after `cleanup`.
+- *A trial on the helper that this update did not start* fails `prepare` (`foreign_trial`); a trial of this update's own version is taken over, as today's resume does.
+- *`rollback` that cannot put the old release back* (the revert fails, or A is not healthy and the node stays drained) exits `1`, which the table reads as `halt` before the commit.
+
+
 ## 5. The generic coordinator
 
 ### 5.1 Desired version per service; host sets; who should run a service

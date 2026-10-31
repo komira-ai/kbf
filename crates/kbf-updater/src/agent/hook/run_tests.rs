@@ -3,7 +3,6 @@
 //! of a step, a record that is not ours and a world that cannot be built end it the same way.
 
 use std::ffi::OsString;
-use std::sync::Arc;
 
 use update_hook::{Class, Outcome, Scalar, Step};
 
@@ -22,7 +21,7 @@ fn s(text: &str) -> String {
 #[test]
 fn a_command_line_or_params_that_are_wrong_stop_the_step_before_it_does_anything() {
     let reason = |rig: &Rig, args: &[String]| {
-        let ran = rig.run_args(args, Arc::new(|| {}));
+        let ran = rig.run_args(args, None);
         assert_eq!(ran.outcome, Outcome::Failure, "{args:?}");
         assert_eq!(ran.report.class, Class::Release);
         assert!(rig.calls().is_empty(), "{args:?}");
@@ -122,7 +121,7 @@ fn flags_in_either_form_run_the_step() {
     let mut args = rig.args(Step::Prepare);
     args[0] = format!("--record-dir={}", rig.record_dir().display());
     args.remove(1);
-    let ran = rig.run_args(&args, Arc::new(|| {}));
+    let ran = rig.run_args(&args, None);
     assert_eq!(ran.outcome, Outcome::Success);
 }
 
@@ -216,7 +215,7 @@ fn a_world_that_cannot_be_built_ends_the_step() {
     let world = |_: &super::flags::Flags| Err(s("no certificate"));
     let setup = Setup {
         world: &world,
-        before_write: Arc::new(|| {}),
+        before_write: None,
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let outcome = run(&rig.args(Step::Prepare), &setup, &mut out, &mut err);
@@ -230,7 +229,7 @@ fn a_world_that_cannot_be_built_ends_the_step() {
 
     let setup = Setup {
         world: &real::world,
-        before_write: Arc::new(|| {}),
+        before_write: None,
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
     assert_eq!(
@@ -244,29 +243,26 @@ fn a_world_that_cannot_be_built_ends_the_step() {
     );
 }
 
-/// The last line is written even when nobody reads standard output, and the exit code does not
-/// change.
+/// A standard output (and a log) that cannot be written to does not change the exit code.
 ///
-/// Catches: a hook that panics on a closed pipe.
+/// Catches: a hook that panics, or exits 1, on a closed pipe or a full disk after the work is
+/// done.
 #[test]
 fn a_standard_output_that_cannot_be_written_does_not_change_the_exit_code() {
-    struct Closed;
-    impl std::io::Write for Closed {
-        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::ErrorKind::BrokenPipe.into())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Err(std::io::ErrorKind::BrokenPipe.into())
-        }
-    }
+    let full = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full")
+    };
     let rig = Rig::new("hook-run-closed");
     let world = |_: &super::flags::Flags| Ok(rig.world());
     let setup = Setup {
         world: &world,
-        before_write: Arc::new(|| {}),
+        before_write: None,
     };
     assert_eq!(
-        run(&rig.args(Step::Prepare), &setup, &mut Closed, &mut Closed),
+        run(&rig.args(Step::Prepare), &setup, &mut full(), &mut full()),
         Outcome::Success
     );
 }

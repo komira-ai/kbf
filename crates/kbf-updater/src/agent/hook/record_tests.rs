@@ -10,7 +10,7 @@ use crate::testutil::scratch;
 
 fn store(name: &str) -> (Store, std::path::PathBuf) {
     let dir = scratch(name);
-    (Store::new(dir.clone(), Arc::new(|| {})), dir)
+    (Store::new(dir.clone(), None), dir)
 }
 
 /// A record written is read back as it was, with every mark, and no temporary file is left
@@ -112,9 +112,9 @@ fn the_gate_is_called_before_each_write() {
     let seen = count.clone();
     let store = Store::new(
         dir,
-        Arc::new(move || {
+        Some(Arc::new(move || {
             seen.fetch_add(1, Ordering::SeqCst);
-        }),
+        })),
     );
     store.load().unwrap();
     assert_eq!(count.load(Ordering::SeqCst), 0);
@@ -133,10 +133,14 @@ fn the_record_directory_is_locked_for_one_step_at_a_time() {
     let held = store.lock().unwrap();
     let error = store.lock().unwrap_err();
     assert!(matches!(error, StoreError::Busy), "{error}");
-    assert!(error.to_string().contains("another copy of this step"));
+    assert!(
+        error
+            .to_string()
+            .contains("another copy of this step is running")
+    );
     drop(held);
     drop(store.lock().unwrap());
-    let gone = Store::new(dir.join("absent"), Arc::new(|| {}));
+    let gone = Store::new(dir.join("absent"), None);
     let error = gone.lock().unwrap_err();
     assert!(
         error

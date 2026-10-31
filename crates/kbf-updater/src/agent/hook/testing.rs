@@ -9,7 +9,7 @@ use kbf_types::ReleasePlatform;
 use update_hook::{Context, Next, Outcome, Params, Report, Scalar, Step, Verdict, next};
 
 use super::flags::split;
-use super::record::{Record, Store};
+use super::record::{Gate, Record, Store};
 use super::{HookWorld, Setup, run};
 use crate::agent::flags::Timing;
 use crate::agent::status::{Shared, Status};
@@ -123,7 +123,7 @@ impl Rig {
 
     /// The record on disk, if there is one.
     pub fn record(&self) -> Option<Record> {
-        Store::new(self.record_dir(), Arc::new(|| {}))
+        Store::new(self.record_dir(), None)
             .load()
             .expect("a readable record")
     }
@@ -155,16 +155,16 @@ impl Rig {
 
     /// Runs `step` as a process would.
     pub fn run(&self, step: Step) -> Ran {
-        self.run_args(&self.args(step), Arc::new(|| {}))
+        self.run_args(&self.args(step), None)
     }
 
     /// Runs `step` with `before_write` called before each write of the record.
-    pub fn run_gated(&self, step: Step, before_write: Arc<dyn Fn() + Send + Sync>) -> Ran {
-        self.run_args(&self.args(step), before_write)
+    pub fn run_gated(&self, step: Step, before_write: Gate) -> Ran {
+        self.run_args(&self.args(step), Some(before_write))
     }
 
     /// Runs this command line.
-    pub fn run_args(&self, args: &[String], before_write: Arc<dyn Fn() + Send + Sync>) -> Ran {
+    pub fn run_args(&self, args: &[String], before_write: Option<Gate>) -> Ran {
         let world = |_: &super::flags::Flags| Ok(self.world());
         let setup = Setup {
             world: &world,
@@ -240,7 +240,7 @@ impl Rig {
 
 /// A kill: `before_write` that panics at its `n`th call (1 is the first), the way a process
 /// killed at that write would stop.
-pub fn kill_at(n: usize) -> Arc<dyn Fn() + Send + Sync> {
+pub fn kill_at(n: usize) -> Gate {
     let count = Mutex::new(0_usize);
     Arc::new(move || {
         let mut count = count

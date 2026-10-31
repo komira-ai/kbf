@@ -287,7 +287,7 @@ fn main() -> ExitCode {
     };
     let setup = Setup {
         world: &world,
-        before_write: Arc::new(gate::point),
+        before_write: Some(Arc::new(gate::point)),
     };
     let outcome = run(
         &args,

@@ -30,7 +30,7 @@ use std::sync::Arc;
 use update_hook::{Class, Invocation, Outcome, Params};
 
 use self::flags::Flags;
-use self::record::{Store, StoreError};
+use self::record::{Gate, Store, StoreError};
 use self::steps::{Done, Hook, Run};
 use super::local::Local;
 use crate::inventory::Host;
@@ -70,8 +70,8 @@ pub struct Setup<'a> {
     /// Builds the world the flags describe.
     pub world: &'a dyn Fn(&Flags) -> Result<HookWorld, String>,
     /// Called before every write of the record. A test stops the step here
-    /// (`update_hook::conformance::gate::point`); a real run does nothing.
-    pub before_write: Arc<dyn Fn() + Send + Sync>,
+    /// (`update_hook::conformance::gate::point`); a real run has none.
+    pub before_write: Option<Gate>,
 }
 
 /// One run of the hook: `args` are everything after `update-hook`. The last line of the step
@@ -166,7 +166,7 @@ pub fn main(args: Vec<OsString>) -> ExitCode {
     };
     let setup = Setup {
         world: &real::world,
-        before_write: Arc::new(|| {}),
+        before_write: None,
     };
     run(&args, &setup, &mut out, &mut err).into()
 }

@@ -102,6 +102,11 @@ fn a_frontend_host_drains_only_the_daemon_it_runs() {
         "the frontend is not reachable"
     );
 
+    // The node of a daemon it runs cannot be recorded: the same refusal as a daemon host's.
+    let mut unwritable = with_daemon.clone();
+    unwritable.access.cordon_dir = rig.dir.join("missing");
+    assert!(world(&unwritable).err().unwrap().contains("--cordon-dir"));
+
     for role in [HostRole::STORAGE, HostRole::DAEMON, HostRole::MAC_DAEMON] {
         let mut other = Rig::new("hook-real-flag", role.clone());
         other.flags.access.daemon_node = Some("d1".to_owned());
