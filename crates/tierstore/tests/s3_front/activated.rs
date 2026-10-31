@@ -230,7 +230,17 @@ impl Process {
 
     /// Sends SIGTERM and waits for the process to exit: its exit code.
     async fn stop(&mut self) -> Option<i32> {
+        self.term();
+        self.wait().await
+    }
+
+    /// Sends SIGTERM.
+    fn term(&self) {
         kill_process(self.pid, Signal::TERM).unwrap();
+    }
+
+    /// Waits for the process to exit: its exit code.
+    async fn wait(&mut self) -> Option<i32> {
         let mut child = self.child.take().expect("not stopped yet");
         let waiting = tokio::task::spawn_blocking(move || {
             let status = child.wait();
@@ -270,6 +280,18 @@ fn stamp() -> String {
 /// A signed request for the key of the key file, as bytes to write to a socket: one request on
 /// a connection that the server closes after the answer.
 fn signed(addr: SocketAddr, method: &str, key: &str, create: bool, body: &[u8]) -> Vec<u8> {
+    build(addr, method, key, create, body, true)
+}
+
+/// The same, on a connection that stays open after the answer unless `close`.
+fn build(
+    addr: SocketAddr,
+    method: &str,
+    key: &str,
+    create: bool,
+    body: &[u8],
+    close: bool,
+) -> Vec<u8> {
     let path = format!("/{BUCKET}/{key}");
     let host = addr.to_string();
     let headers: &[(&str, &str)] = if create {
@@ -290,8 +312,9 @@ fn signed(addr: SocketAddr, method: &str, key: &str, create: bool, body: &[u8]) 
     for (name, value) in sign(&request, BIN_KEY_ID, BIN_SECRET) {
         text.push_str(&format!("{name}: {value}\r\n"));
     }
+    let connection = if close { "connection: close\r\n" } else { "" };
     text.push_str(&format!(
-        "content-length: {}\r\nconnection: close\r\n\r\n",
+        "content-length: {}\r\n{connection}\r\n",
         body.len()
     ));
     let mut bytes = text.into_bytes();
@@ -304,6 +327,8 @@ fn signed(addr: SocketAddr, method: &str, key: &str, create: bool, body: &[u8]) 
 struct Answer {
     status: u16,
     id: u64,
+    /// Whether the answer says `Connection: close`.
+    close: bool,
     body: Vec<u8>,
 }
 
@@ -328,9 +353,13 @@ fn parse(bytes: &[u8]) -> Result<Answer, String> {
         })
         .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
         .ok_or_else(|| format!("no request id in {head:?}"))?;
+    let close = head
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case("connection: close"));
     Ok(Answer {
         status,
         id,
+        close,
         body: bytes[split + 4..].to_vec(),
     })
 }
@@ -872,4 +901,116 @@ fn the_flag_and_the_key_are_one_setting() {
     assert_eq!((code, out.as_str()), (2, ""));
     assert!(err.contains("server.listen_from_systemd"), "{err}");
     assert!(!err.contains("--listen-from-systemd"), "{err}");
+}
+
+/// What a keep-alive connection reads next.
+enum Next {
+    /// The server closed the connection (or reset it) without another answer.
+    Closed,
+    Answer(Answer),
+}
+
+/// Reads one answer from a connection that stays open: the head, then as many bytes of body as
+/// `content-length` says.
+async fn read_one(stream: &mut TcpStream) -> Next {
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let split = bytes.windows(4).position(|w| w == b"\r\n\r\n");
+        if let Some(split) = split {
+            let head = String::from_utf8_lossy(&bytes[..split]).to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: ").map(str::to_owned))
+                .map_or(0, |text| text.trim().parse::<usize>().unwrap());
+            if bytes.len() >= split + 4 + length {
+                return Next::Answer(parse(&bytes).unwrap());
+            }
+        }
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return Next::Closed,
+            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+/// Asserts that a drain held open by a request in flight does not leave keep-alive connections
+/// open or answer them 503, and that the next process serves what the first left.
+///
+/// - Process 1 has a connection `a` that has served one request and is idle (keep-alive), and a
+///   put `b` whose body has not all arrived, which holds the drain open. That `b` is being handled
+///   is known from the ids: the server numbers a request when it begins it, so a probe on a fresh
+///   connection that gets an id two past the last one means `b` took the one between.
+/// - SIGTERM. The test sends requests on `a` until the connection ends: an answer that says
+///   `Connection: close`, or the connection closed. Any answer on it that is 503 fails the test (a
+///   server that refuses the connection's requests for the drain answers 503 here, from the moment
+///   it stops accepting until `b` is done, however long that is).
+/// - `b` is completed and answered 200, process 1 exits 0, and process 2, started on the same
+///   socket, serves a fresh connection as its first request and has what `b` wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drain_held_open_by_a_request_ends_keep_alive_connections_without_a_503() {
+    let node = Node::new(Shape::Storage, "act-keepalive").await;
+    let (socket, addr) = bound();
+    let fds = [socket.as_raw_fd()];
+    let mut flags = node.flags(addr, None, true);
+    flags.extend(["--body-idle-timeout".to_owned(), "1h".to_owned()]);
+    let mut first = start(&flags, &Passing::named(&fds, "s3"));
+    let seed = call(addr, "PUT", "cas/seed", true, b"seed").await;
+    assert!(check(seed, 200, None).is_ok());
+
+    let mut a = TcpStream::connect(addr).await.unwrap();
+    let get = build(addr, "GET", "cas/seed", false, b"", false);
+    a.write_all(&get).await.unwrap();
+    let Next::Answer(served) = read_one(&mut a).await else {
+        panic!("the connection closed before its first answer");
+    };
+    assert_eq!((served.status, served.close), (200, false));
+
+    let held = vec![b'h'; 1000];
+    let put = build(addr, "PUT", "cas/held", true, &held, false);
+    let head = put.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let mut b = TcpStream::connect(addr).await.unwrap();
+    b.write_all(&put[..head + 10]).await.unwrap();
+    let mut last = served.id;
+    loop {
+        let probe = call(addr, "GET", "cas/seed", false, b"").await.unwrap();
+        if probe.id != last + 1 {
+            break;
+        }
+        last = probe.id;
+    }
+
+    first.term();
+    loop {
+        if a.write_all(&get).await.is_err() {
+            break;
+        }
+        match read_one(&mut a).await {
+            Next::Closed => break,
+            Next::Answer(answer) => {
+                let said = String::from_utf8_lossy(&answer.body).into_owned();
+                assert_eq!(
+                    answer.status, 200,
+                    "an answer to a keep-alive connection: {said}"
+                );
+                if answer.close {
+                    break;
+                }
+            }
+        }
+    }
+
+    b.write_all(&put[head + 10..]).await.unwrap();
+    let Next::Answer(done) = read_one(&mut b).await else {
+        panic!("the put in flight was cut");
+    };
+    assert_eq!(done.status, 200);
+    assert_eq!(first.wait().await, Some(0));
+
+    let mut second = start(&flags, &Passing::named(&fds, "s3"));
+    let seed = call(addr, "GET", "cas/seed", false, b"").await.unwrap();
+    assert_eq!((seed.status, seed.id), (200, 1));
+    let kept = call(addr, "GET", "cas/held", false, b"").await.unwrap();
+    assert_eq!((kept.status, kept.body), (200, held));
+    assert_eq!(second.stop().await, Some(0));
 }
