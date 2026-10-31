@@ -3,14 +3,15 @@
 //! as a fill does.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::stream;
 use futures::{FutureExt as _, StreamExt as _};
 
-use super::layout::{meta_path, name_of};
+use super::layout::{Sidecar, data_path, meta_path, name_of, object_dir};
 use super::metrics::{SkippedKeep, read};
-use super::testing::{Rig, never_expires, tree};
+use super::testing::{Rig, digest, never_expires, tree};
 use super::{Mode, Tick};
 use crate::{Backend, Error, PartBody};
 
@@ -73,6 +74,63 @@ async fn a_keep_published_just_before_the_lock_was_lost_is_removed() {
     assert_eq!(first.held(), (0, 0));
     assert_eq!(first.counters().keeps_skipped(SkippedKeep::ReadOnly), 1);
     assert_eq!(rig.staged_files(), 0);
+}
+
+/// Asserts that a keep that is abandoned at its deadline while its link is held on a thread, in a
+/// cache that then loses the lock and takes it again (the generation changed, the cache is
+/// read-write), leaves alone the object and the entry that the new ownership has for the same
+/// name: the keep linked nothing, so it has nothing of its own to undo. The link ends with an
+/// error (the take emptied the stage directory). It would catch a cleanup that removes the
+/// entry and the files of a name because the cache is read-write now, whoever made them.
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_keep_leaves_the_object_of_the_new_ownership_alone() {
+    let rig = Rig::with("tscache-lost-keep-deadline", |config| {
+        config.write_through = true;
+        config.keep_wait = Duration::from_secs(5);
+        config.keep_deadline = Duration::from_secs(60);
+    });
+    let first = rig.locked();
+    let key = "cas/b/linking";
+    let gate = rig.disk.hold_links();
+    let body = Bytes::from_static(b"linking");
+    assert_eq!(first.put(key, body).await, Ok(()));
+    while rig.disk.linked.lock().unwrap().is_empty() {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    while first.counters().keeps_skipped(SkippedKeep::Deadline) == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    // The lock is lost and taken again: this is another ownership of the directory, and it has
+    // an object of its own under the name.
+    std::fs::remove_file(rig.config.path.join(".lock")).unwrap();
+    assert_eq!(first.tick().unwrap(), Tick::Lost);
+    assert_eq!(first.tick().unwrap(), Tick::Took);
+    let hex = name_of(key).hex;
+    let root = &rig.config.path;
+    std::fs::create_dir_all(object_dir(root, &hex)).unwrap();
+    std::fs::write(data_path(root, &hex), b"the new one").unwrap();
+    let sidecar = Sidecar {
+        key: key.to_owned(),
+        size: 11,
+        sha256: digest(b"the new one"),
+        tag: "new".to_owned(),
+        modified: 0,
+    };
+    std::fs::write(meta_path(root, &hex), serde_json::to_vec(&sidecar).unwrap()).unwrap();
+    super::locked(&first.inner.index).insert(&hex, 11, "new".to_owned(), 0);
+
+    gate.open();
+    while read(&first.counters().staging_files) != 0 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(first.held(), (11, 1));
+    assert_eq!(
+        std::fs::read(data_path(root, &hex)).unwrap(),
+        b"the new one"
+    );
+    assert!(meta_path(root, &hex).is_file());
 }
 
 /// Asserts that a keep whose body is still arriving when the cache loses the lock (the test
