@@ -188,7 +188,7 @@ async fn a_machine_that_reports_no_disks_leaves_the_field_empty() {
 /// Catches counts by method that are the proxy's totals instead of the pass's share, that mix
 /// the requests of the pass with what came after it, that list a method with no request, or that
 /// are written for an arm with no proxy: before the pass the proxy had seen 1 GET; in the first
-/// pass it forwarded 4 HEAD and 2 PUT, and after it 3 DELETE; in the second 6 HEAD and, after it,
+/// pass it forwarded 4 HEAD and 2 PUT, and during its cleanup hook 3 DELETE; in the second 6 HEAD and, then,
 /// 2 DELETE and 1 GET.
 #[tokio::test(start_paused = true)]
 async fn a_pass_records_what_the_proxy_forwarded_by_method_during_it_and_after_it() {
@@ -211,10 +211,10 @@ async fn a_pass_records_what_the_proxy_forwarded_by_method_during_it_and_after_i
     let proxied = &by("proxied").passes;
     let first = proxied[0].proxy_requests.as_ref().expect("counts");
     assert_eq!(first.during, counts(&[("HEAD", 4), ("PUT", 2)]));
-    assert_eq!(first.after, counts(&[("DELETE", 3)]));
+    assert_eq!(first.cleanup, counts(&[("DELETE", 3)]));
     let second = proxied[1].proxy_requests.as_ref().expect("counts");
     assert_eq!(second.during, counts(&[("HEAD", 6)]));
-    assert_eq!(second.after, counts(&[("DELETE", 2), ("GET", 1)]));
+    assert_eq!(second.cleanup, counts(&[("DELETE", 2), ("GET", 1)]));
     assert!(
         by("direct")
             .passes

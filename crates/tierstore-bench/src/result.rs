@@ -248,8 +248,8 @@ pub struct PassResult {
     /// The cold store guard's trip that aborted the pass, if one did.
     #[serde(default)]
     pub cold_guard: Option<ColdTrip>,
-    /// Requests the fault proxy forwarded, by HTTP method, while the pass was driven and after
-    /// it; none when the arm has no proxy in its path.
+    /// Requests the fault proxy forwarded, by HTTP method, while the pass was driven and while
+    /// the arm's cleanup hook ran; none when the arm has no proxy in its path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_requests: Option<ProxyRequests>,
     /// The busy time of each whole disk of the machine that sends the requests over the pass,
@@ -263,14 +263,16 @@ pub struct PassResult {
 }
 
 /// What the fault proxy forwarded to the store around one pass, by HTTP method. A method with no
-/// request is absent.
+/// request is absent. Background traffic (a copy the instance makes later) is not separated.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxyRequests {
     /// While the pass sent its requests.
     pub during: BTreeMap<String, u64>,
-    /// From the end of the last request of the pass to the end of its cleanup: what the store
-    /// is still sent for the pass (a background copy) and what the cleanup deletes.
-    pub after: BTreeMap<String, u64>,
+    /// The requests made while the arm's cleanup hook ran: the bench's own cleanup, plus any
+    /// background traffic that happened to land then. Background traffic is not separated. An
+    /// arm with no cleanup hook has about none. Older result files call this field `after`.
+    #[serde(alias = "after")]
+    pub cleanup: BTreeMap<String, u64>,
 }
 
 /// How busy one disk was over a pass.
@@ -477,7 +479,7 @@ mod tests {
                 }),
                 proxy_requests: Some(ProxyRequests {
                     during: BTreeMap::from([("HEAD".to_owned(), 3)]),
-                    after: BTreeMap::from([("DELETE".to_owned(), 10)]),
+                    cleanup: BTreeMap::from([("DELETE".to_owned(), 10)]),
                 }),
                 disk_busy: BTreeMap::from([(
                     "sda".to_owned(),
@@ -535,6 +537,20 @@ mod tests {
                 .provenance
                 .open_loop
         );
+    }
+
+    /// Pins the name of the cleanup counts and that a result written under the old name `after`
+    /// still parses into it.
+    #[test]
+    fn the_cleanup_counts_are_named_cleanup_and_the_old_name_still_parses() {
+        let v: serde_json::Value = serde_json::from_str(&result().to_json()).unwrap();
+        let counts = &v["passes"][0]["proxy_requests"];
+        assert_eq!(counts["cleanup"]["DELETE"], 10);
+        assert!(counts.get("after").is_none());
+        let old = v.to_string().replace("\"cleanup\"", "\"after\"");
+        let parsed = CellResult::from_json(&old).unwrap();
+        let counts = parsed.passes[0].proxy_requests.as_ref().unwrap();
+        assert_eq!(counts.cleanup["DELETE"], 10);
     }
 
     /// Catches a result written before the cold state, the cold guard, the attempt, the rate caps,

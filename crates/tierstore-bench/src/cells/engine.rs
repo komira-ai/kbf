@@ -941,7 +941,7 @@ async fn run_pass(
     let proxy_requests = match (proxy_before, proxy_driven, &arm.proxy) {
         (Some(before), Some(sent), Some(proxy)) => Some(ProxyRequests {
             during: count_delta(&before, &sent),
-            after: count_delta(&sent, &proxy.method_counts()),
+            cleanup: count_delta(&sent, &proxy.method_counts()),
         }),
         _ => None,
     };

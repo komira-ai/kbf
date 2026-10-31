@@ -198,11 +198,15 @@ busy machine:
   width the pass realised (at 16 asked and a cap of 20 requests a second it is far below 16).
 - per pass, `disk_busy`: for each whole disk of the machine that sends the requests, the
   milliseconds it spent doing IO during the pass (`io_ticks` of `/proc/diskstats`) and that over the
-  pass's wall time. It is this machine's disks; a cold store on another host has to be read there.
+  pass's wall time, over the driven window only (the cleanup hook is not in it). It is this
+  machine's disks; a cold store on another host has to be read there. `dm-*` and `md*` devices
+  (LVM, RAID) are in `/sys/block`, so a stacked volume is listed beside its physical disk; busy time
+  is per device, so nothing is summed.
 - per pass of an arm that has the fault proxy in its path, `proxy_requests`: the requests the proxy
   forwarded by HTTP method (the proxy's own `requests_by_method` counter) while the pass sent its
-  requests (`during`) and from then to the end of the pass's cleanup (`after`: what the store is
-  still sent for the pass, such as a background copy, and the cleanup's deletes). The report gives
+  requests (`during`) and while the arm's cleanup hook ran (`cleanup`: the bench's own cleanup,
+  plus any background traffic that happened to land then; background traffic is not separated, and
+  an arm with no cleanup hook has about none). Old results call the field `after`. The report gives
   them per request.
 
 `report` also sets each `instance` put arm of `cold-put` beside the `direct-mp` arm of the same

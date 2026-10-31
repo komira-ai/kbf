@@ -415,18 +415,21 @@ fn recorded_lines(name: &str, result: &CellResult) -> Vec<String> {
         .collect();
     let requests: u64 = counted.iter().map(|(n, _)| n).sum();
     if requests > 0 {
-        let (mut during, mut after) = (BTreeMap::new(), BTreeMap::new());
+        let (mut during, mut cleanup) = (BTreeMap::new(), BTreeMap::new());
         for (_, counts) in &counted {
-            for (total, part) in [(&mut during, &counts.during), (&mut after, &counts.after)] {
+            for (total, part) in [
+                (&mut during, &counts.during),
+                (&mut cleanup, &counts.cleanup),
+            ] {
                 for (method, n) in part {
                     *total.entry(method.clone()).or_insert(0) += n;
                 }
             }
         }
         lines.push(format!(
-            "- arm {name}: proxy requests per request, measured passes: during {}; after {}",
+            "- arm {name}: proxy requests per request, measured passes: during {}; cleanup {}",
             per_request(&during, requests),
-            per_request(&after, requests)
+            per_request(&cleanup, requests)
         ));
     }
     let mut disks: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
@@ -1045,7 +1048,7 @@ mod tests {
         index: u32,
         requests: u64,
         during: &[(&str, u64)],
-        after: &[(&str, u64)],
+        cleanup: &[(&str, u64)],
     ) -> PassResult {
         let counts = |pairs: &[(&str, u64)]| -> BTreeMap<String, u64> {
             pairs.iter().map(|(m, n)| ((*m).to_owned(), *n)).collect()
@@ -1053,7 +1056,7 @@ mod tests {
         PassResult {
             proxy_requests: Some(crate::result::ProxyRequests {
                 during: counts(during),
-                after: counts(after),
+                cleanup: counts(cleanup),
             }),
             ..pass(index, Window::Quiet, requests, None)
         }
@@ -1105,7 +1108,7 @@ mod tests {
 
     /// Catches the requests the proxy forwarded being left out of the report, summed over the
     /// warm-up pass, or not divided by the requests of the arm: the measured passes' counts by
-    /// method, per request, those during the pass and those after it apart.
+    /// method, per request, those during the pass and those during its cleanup hook apart.
     #[test]
     fn the_proxy_requests_are_reported_per_request_by_method() {
         let r = result(
@@ -1120,7 +1123,7 @@ mod tests {
         let none = result("b", vec![pass(1, Window::Quiet, 10, None)], &[]);
         let text = format_report(&[r, none], &Rows::new());
         assert!(
-            text.contains("- arm a: proxy requests per request, measured passes: during HEAD 2.00, PUT 1.00; after DELETE 1.00"),
+            text.contains("- arm a: proxy requests per request, measured passes: during HEAD 2.00, PUT 1.00; cleanup DELETE 1.00"),
             "{text}"
         );
         assert!(!text.contains("- arm b: proxy requests"), "{text}");
