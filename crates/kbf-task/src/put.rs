@@ -145,9 +145,11 @@ fn transport_error(error: &ureq::Error, url: &str) -> PutError {
     use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
     let (url, reason) = (redact(url), scrub(&error.to_string(), url));
     match error {
+        // `|`, not `||`: the macOS codes are empty elsewhere, and a short circuit would leave a
+        // branch that no other system can take.
         ureq::Error::Io(e)
             if matches!(e.kind(), BrokenPipe | ConnectionAborted | ConnectionReset)
-                || is_macos_reset_symptom(e) =>
+                | is_macos_reset_symptom(e) =>
         {
             PutError::Interrupted { url, reason }
         }
@@ -155,14 +157,20 @@ fn transport_error(error: &ureq::Error, url: &str) -> PutError {
     }
 }
 
-/// Whether `e` is what macOS gives for an operation on a socket the peer has reset: `EINVAL`
-/// from `setsockopt`, `EPROTOTYPE` from a write. Always false on other systems.
+/// The OS errors macOS gives for an operation on a socket the peer has reset: `EINVAL` from
+/// `setsockopt`, `EPROTOTYPE` from a write.
+#[cfg(target_os = "macos")]
+const MACOS_RESET_CODES: &[i32] = &[libc::EINVAL, libc::EPROTOTYPE];
+
+/// None on other systems.
+#[cfg(not(target_os = "macos"))]
+const MACOS_RESET_CODES: &[i32] = &[];
+
+/// Whether `e` is what macOS gives for an operation on a socket the peer has reset. Always false
+/// on other systems.
 fn is_macos_reset_symptom(e: &std::io::Error) -> bool {
-    cfg!(target_os = "macos")
-        && matches!(
-            e.raw_os_error(),
-            Some(libc::EINVAL) | Some(libc::EPROTOTYPE)
-        )
+    e.raw_os_error()
+        .is_some_and(|code| MACOS_RESET_CODES.contains(&code))
 }
 
 /// The part of a 503's message that tells what the store asked for.
@@ -1023,7 +1031,10 @@ mod tests {
                 "os error {code}: {got:?}"
             );
             assert!(
-                interrupted || matches!(got, PutError::Transport { .. }),
+                matches!(
+                    got,
+                    PutError::Interrupted { .. } | PutError::Transport { .. }
+                ),
                 "os error {code}: {got:?}"
             );
         }
