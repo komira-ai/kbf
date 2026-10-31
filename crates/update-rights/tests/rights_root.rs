@@ -668,11 +668,12 @@ fn probe_2_mask_runtime_then_stop_an_active_instance_through_polkit() {
         stranger_stop.outcome,
         stranger_stop.report.detail
     );
+    let pkcheck = pkcheck_facts(&rig, &account.name, &stranger.name);
     let log = said(
         "/usr/bin/journalctl",
         &["--no-pager", "-u", "polkit.service", "--since", "-10min"],
     );
-    record("probe-2-facts", &format!("{facts}\n{log}"));
+    record("probe-2-facts", &format!("{facts}\n{pkcheck}\n{log}"));
     assert_eq!(refused_stop.outcome, Outcome::Failure, "{facts}");
     assert_eq!(b_state, "active", "{facts}");
     assert_eq!(stranger_stop.outcome, Outcome::Failure, "{facts}");
@@ -795,4 +796,54 @@ fn a_state_directory_the_service_can_write_is_refused_under_the_real_accounts() 
         ),
         other => panic!("{other:?}"),
     }
+}
+
+/// What polkit itself says about the actions of the probe for each account, asked with
+/// `pkcheck` about a process the account owns: 0 authorized, 1 not, 2 needs authentication.
+fn pkcheck_facts(rig: &Rig, listed: &str, stranger: &str) -> String {
+    use std::os::unix::process::CommandExt;
+    let accounts = EtcAccounts::system().unwrap();
+    let mut text = String::new();
+    for name in [listed, stranger] {
+        let ids = accounts.user(name).unwrap();
+        let mut child = Command::new(rig.path("release/probe"))
+            .args(["park", "--"])
+            .uid(ids.uid)
+            .gid(ids.gid)
+            .spawn()
+            .unwrap();
+        let pid = child.id().to_string();
+        for (action, unit) in [
+            (
+                "org.freedesktop.systemd1.manage-units",
+                Some("probe-polkit@a.service"),
+            ),
+            (
+                "org.freedesktop.systemd1.manage-units",
+                Some("probe-polkit@b.service"),
+            ),
+            (
+                "org.freedesktop.systemd1.manage-units",
+                Some("probe-polkit@c.service"),
+            ),
+            ("org.freedesktop.systemd1.manage-unit-files", None),
+        ] {
+            let mut args = vec!["--action-id", action, "--process", &pid];
+            if let Some(unit) = unit {
+                args.extend(["--detail", "unit", unit]);
+            }
+            let done = Command::new("/usr/bin/pkcheck")
+                .args(&args)
+                .output()
+                .unwrap();
+            text.push_str(&format!(
+                "pkcheck {name} {action} {unit:?}: {:?} {}\n",
+                done.status.code(),
+                String::from_utf8_lossy(&done.stderr).trim()
+            ));
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    text
 }
