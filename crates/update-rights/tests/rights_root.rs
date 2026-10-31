@@ -572,6 +572,7 @@ fn probe_2_mask_runtime_then_stop_an_active_instance_through_polkit() {
             "polkit.addRule(function(action, subject) {{\n\
              \x20 polkit.log(\"probe-polkit \" + action.id + \" unit=\" + action.lookup(\"unit\") + \" user=\" + subject.user);\n\
              \x20 if (subject.user != \"{user}\") return polkit.Result.NOT_HANDLED;\n\
+             \x20 return polkit.Result.NO;\n\
              \x20 if (action.id == \"org.freedesktop.systemd1.manage-unit-files\") return polkit.Result.YES;\n\
              \x20 if (action.id == \"org.freedesktop.systemd1.manage-units\" &&\n\
              \x20     action.lookup(\"unit\") == \"probe-polkit@a.service\") return polkit.Result.YES;\n\
