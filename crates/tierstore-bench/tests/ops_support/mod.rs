@@ -442,7 +442,7 @@ pub fn status_file(read_unix_ms: u64) -> String {
             {"id": "d-0123abcd", "state": "ok", "healing": true},
             {"id": "d-89abcdef", "state": "ok", "healing": false}
         ],
-        "version": "RELEASE.2025-file-mark"
+        "version": "RELEASE.file-mark"
     })
     .to_string()
 }
@@ -489,7 +489,7 @@ pub fn healthy_host() -> FakeHost {
         let args = cmd.args.join(" ");
         match program {
             "/private-mark/pinned/tierstore" => ok(HELP_HOT_REQUIRED),
-            "/private-mark/mc" => ok(&info_json("RELEASE.2025-mark", true)),
+            "/private-mark/mc" => ok(&info_json("RELEASE.mark", true)),
             _ if args.ends_with("--value") => ok("not-found\n"),
             _ => ok(&show_text(4242, "Thu 2026-10-29 10:00:00 UTC")),
         }

@@ -159,8 +159,8 @@ fn between<'a>(text: &'a str, open: &str, close: &str) -> Vec<&'a str> {
 /// only if it opens and closes `ListAllMyBucketsResult`: a cut-off body must not read as a list
 /// without the bucket.
 ///
-/// `spec`'s endpoint is one [`client`] has already accepted.
-async fn bucket_names(spec: &StoreSpec) -> Result<Vec<String>, String> {
+/// `spec`'s endpoint must be one [`client`] accepts (it is parsed here).
+pub async fn bucket_names(spec: &StoreSpec) -> Result<Vec<String>, String> {
     let url = reqwest::Url::parse(&spec.endpoint).expect("the client accepted the endpoint");
     let host = match url.port() {
         Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),

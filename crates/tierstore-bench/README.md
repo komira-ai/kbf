@@ -93,8 +93,14 @@ A credentials file (`admin`, `verifier`) is JSON of `access_key_id` and `secret_
 `verify-teardown` reads the store with the `verifier` key. That key needs `s3:ListAllMyBuckets`
 (the bucket list) and read on the test bucket (`s3:GetObject`, `s3:ListBucket`,
 `s3:ListBucketMultipartUploads`, `s3:GetBucketLocation`). `test-bucket-removed` passes only when
-the bucket list, read with that key, does not name the test bucket. It fails if the bucket is
-listed and fails if the list cannot be read (`AccessDenied` included). An `AccessDenied` on the
+the bucket list, read with that key, does not name the test bucket and does name the role's
+live bucket (`live_buckets`). It fails if the bucket is listed and fails if the list cannot be
+read (`AccessDenied` included). The live-bucket condition closes a blind spot: a store lists a key
+without `s3:ListAllMyBuckets` only the buckets that key may use, so a mis-scoped verifier sees an
+empty list, and an empty list proves nothing. A list that does not name the live bucket fails with
+"the verifier's bucket list does not show the live bucket <name>: the key lacks
+s3:ListAllMyBuckets, so the list cannot prove removal", and a role with no `live_buckets` entry
+fails with a message that says so. An `AccessDenied` on the
 bucket itself is never read as removal; a `NoSuchBucket` on it is noted and does not decide
 alone. `no-multipart-uploads` reads the uploads of the bucket whenever `s3:ListBucketMultipartUploads`
 is granted, whether or not the other listings work.
@@ -204,7 +210,7 @@ never a fall back to the file.) The file is JSON:
 ```json
 {"read_unix_ms": 1790000000000, "healing": true, "percent_done": 12.5,
  "drives": [{"id": "d-1a2b3c4d", "state": "ok", "healing": true}],
- "version": "RELEASE.2025-01-01T00-00-00Z"}
+ "version": "RELEASE.<version>"}
 ```
 
 `read_unix_ms` (integer, milliseconds since the Unix epoch), `healing` (bool) and `drives` (array of

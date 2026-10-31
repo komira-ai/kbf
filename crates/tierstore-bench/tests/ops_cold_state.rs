@@ -39,7 +39,7 @@ fn each_read_asks_the_store_again() {
     assert_eq!(first.drives.len(), 2);
     assert_eq!(first.drives.iter().filter(|d| d.healing).count(), 1);
 
-    host.answer(|_| ok(&info_json("RELEASE.2025-mark", false)));
+    host.answer(|_| ok(&info_json("RELEASE.mark", false)));
     host.file("/private-mark/heal.json", r#"{"percent_done": 100.0}"#);
     let second = source.read().unwrap().unwrap();
     assert!(!second.healing);

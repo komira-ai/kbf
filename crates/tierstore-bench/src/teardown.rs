@@ -7,7 +7,11 @@
 //! - `test-bucket-removed:<role>`: the verifier's key pair (the ops file's `verifier` entry) reads
 //!   the store's bucket list (`ListBuckets`) and the test bucket is not in it. A list that cannot
 //!   be read fails the check, and so does a refusal on the bucket itself; a `NoSuchBucket` on the
-//!   bucket is noted and never decides alone;
+//!   bucket is noted and never decides alone. A store lists a key without `s3:ListAllMyBuckets`
+//!   only the buckets that key may use, so a mis-scoped verifier sees an empty list and "the test
+//!   bucket is not named" would prove nothing. The list is therefore trusted only if it names
+//!   the role's live bucket (the ops file's `live_buckets`, which exists and is never removed):
+//!   a list that does not, or a role with no live bucket configured, fails the check;
 //! - `no-multipart-uploads:<role>`: no upload is open (a bucket the list does not name holds
 //!   none; an uploads listing that works counts whether or not the objects listing does);
 //! - `scoped-account-gone:<role>`: a request signed with the scoped account's key is refused as
@@ -93,24 +97,43 @@ fn log_check(config: &RunConfig) -> Result<String, String> {
     }
 }
 
-/// The state of the test bucket of `spec`, read with the verifier's key pair.
-async fn verifier_state(
+/// `spec` with the verifier's key pair.
+fn verifier_spec(
     host: &dyn Host,
     ops: &OpsFile,
     role: Role,
     spec: &StoreSpec,
-) -> Result<BucketState, String> {
+) -> Result<StoreSpec, String> {
     let file = ops
         .verifier
         .get(&role)
         .ok_or_else(|| "the ops file names no verifier key file".to_owned())?;
     let key = read_key_pair(host, file).map_err(|e| why(&e))?;
-    let reader = StoreSpec {
+    Ok(StoreSpec {
         access_key_id: key.access_key_id,
         secret_access_key: key.secret_access_key,
         ..spec.clone()
-    };
-    probe::bucket_state(&reader).await.map_err(|e| why(&e))
+    })
+}
+
+/// `Ok` if the verifier's bucket list names the role's live bucket, which exists: only then does
+/// a list that does not name the test bucket mean the bucket is gone, and not that the key was
+/// shown nothing. `reader` is the store's spec with the verifier's key pair.
+async fn list_shows_live(ops: &OpsFile, role: Role, reader: &StoreSpec) -> Result<(), String> {
+    let live = ops.live_buckets.get(&role).ok_or_else(|| {
+        format!(
+            "the ops file names no live bucket for {role}, so the bucket list cannot prove removal"
+        )
+    })?;
+    // A list that cannot be read now (it was read a moment ago) names nothing.
+    let names = probe::bucket_names(reader).await.unwrap_or_default();
+    if names.contains(live) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the verifier's bucket list does not show the live bucket {live}: the key lacks s3:ListAllMyBuckets, so the list cannot prove removal"
+        ))
+    }
 }
 
 /// What a reading says of the entries it counted: `3 objects`, or why it did not count.
@@ -157,8 +180,18 @@ fn uploads_closed(state: &BucketState) -> Result<String, String> {
 
 /// The three checks of one shared store's test bucket and account.
 async fn store_checks(host: &dyn Host, ops: &OpsFile, role: Role, spec: &StoreSpec) -> Vec<Check> {
-    let state = verifier_state(host, ops, role, spec).await;
-    let removed = state.clone().and_then(|state| removed(&state));
+    let reader = verifier_spec(host, ops, role, spec);
+    let state = match &reader {
+        Ok(reader) => probe::bucket_state(reader).await.map_err(|e| why(&e)),
+        Err(reason) => Err(reason.clone()),
+    };
+    let mut removed = state.clone().and_then(|state| removed(&state));
+    if let (Ok(_), Ok(reader)) = (&removed, &reader)
+        && let Err(reason) = list_shows_live(ops, role, reader).await
+    {
+        // "Not named" counts only from a list that names the live bucket.
+        removed = Err(reason);
+    }
     let uploads = state.and_then(|state| uploads_closed(&state));
     let account =
         probe::can_list(spec)

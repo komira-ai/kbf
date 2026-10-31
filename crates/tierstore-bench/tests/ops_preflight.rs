@@ -61,8 +61,8 @@ fn a_right_node_passes_every_check_and_the_report_carries_the_facts() {
 
     assert_eq!(report.binary_digest, hex_of(b"pinned binary"));
     assert_eq!(report.tool_versions["tierstore"], "0.0.37");
-    assert_eq!(report.tool_versions["cold-store"], "RELEASE.2025-mark");
-    assert_eq!(report.tool_versions["hot-store"], "RELEASE.2025-mark");
+    assert_eq!(report.tool_versions["cold-store"], "RELEASE.mark");
+    assert_eq!(report.tool_versions["hot-store"], "RELEASE.mark");
     assert_eq!(report.tool_versions["cold-heal"], "healing 6% done");
     let roles: Vec<String> = report.hardware.keys().map(ToString::to_string).collect();
     assert_eq!(roles, ["instance", "generator"]);
@@ -793,13 +793,13 @@ fn file_mode_takes_the_version_and_the_heal_state_from_a_fresh_file() {
     let version = find(&report, "store-version:cold");
     assert!(version.passed, "{}", version.detail);
     assert!(
-        version.detail.contains("RELEASE.2025-file-mark"),
+        version.detail.contains("RELEASE.file-mark"),
         "{}",
         version.detail
     );
     assert_eq!(
         report.tool_versions.get("cold-store").map(String::as_str),
-        Some("RELEASE.2025-file-mark")
+        Some("RELEASE.file-mark")
     );
     let heal = find(&report, "cold-heal-state");
     assert!(heal.passed);
@@ -858,8 +858,5 @@ fn with_an_admin_entry_the_preflight_is_unchanged() {
     host.file("/private-mark/heal.json", &status_file(1));
     let report = gather_at(&host, &only_cold, &ops, NOW_MS);
     assert!(find(&report, "store-version:cold").passed);
-    assert_eq!(
-        find(&report, "store-version:cold").detail,
-        "RELEASE.2025-mark"
-    );
+    assert_eq!(find(&report, "store-version:cold").detail, "RELEASE.mark");
 }
