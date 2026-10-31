@@ -20,25 +20,33 @@
 //! [`Registration`] holds it open, and when it is dropped or the process ends the updater reports
 //! the service stopped. A service that restarts registers again.
 //!
-//! [`register`] blocks until the updater has answered. The updater answers as soon as it has
-//! read the line, which this client sends at once.
+//! [`register`] blocks until the updater has answered, and gives up with [`Error::NoAnswer`] when
+//! [`ANSWER_DEADLINE_SECS`] have passed, so that a stalled updater cannot hold a service from
+//! starting. Connecting has no bound: a unix socket whose listener is not accepting and whose
+//! backlog is full blocks `connect`, and `std` has no connect timeout; a caller that cannot
+//! wait registers from a thread of its own.
 
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 /// The longest registration line the updater reads, newline included.
 pub const MAX_LINE: usize = 4096;
 
-/// How long `register` waits for the answer.
+/// How long `register` waits for the updater's answer, in all: the updater's own limit on a
+/// line, so an updater that answers at all does so within it.
 pub const ANSWER_DEADLINE_SECS: u64 = 10;
 
 /// The most of an answer that is read; an answer is one short line.
-const MAX_ANSWER: u64 = 512;
+const MAX_ANSWER: usize = 512;
+
+/// The smallest timeout a socket takes: a zero one is refused (`InvalidInput`) by `std`, and the
+/// system call reads it as no timeout at all. A deadline of zero, or one that has passed, is this.
+const SMALLEST_TIMEOUT: Duration = Duration::from_micros(1);
 
 /// Where a service's health answers: the updater issues a `GET` of `path` on `addr` and reads
 /// a 2xx as ready. The address must be loopback and its port one the declaration grants.
@@ -157,27 +165,36 @@ pub fn register(
     )
 }
 
+/// `register` over a connection made, with `deadline` for the whole answer (and for the write).
 fn register_on(
     stream: UnixStream,
     name: &str,
     version: &str,
     health: Option<&Health>,
-    _deadline: Duration,
+    deadline: Duration,
 ) -> Result<Registration, Error> {
     let line = encode(name, version, health);
     if line.len() > MAX_LINE {
         return Err(Error::TooLong { len: line.len() });
     }
+    let end = Instant::now() + deadline;
+    stream.set_write_timeout(Some(left(end)))?;
     // An updater that is full answers and closes without reading the line, so the write can
     // fail while the answer is waiting: the answer is read first and says why.
     let sent = (&stream).write_all(&line);
-    match (answer(&stream), sent) {
-        (Ok(()), _) => Ok(Registration {
+    match (answer(&stream, end), sent) {
+        (Ok(()), Ok(())) => Ok(Registration {
             _connection: stream,
         }),
-        (Err(Error::NoAnswer), Err(e)) => Err(Error::Io(e)),
+        (Ok(()), Err(e)) | (Err(Error::NoAnswer), Err(e)) => Err(Error::Io(e)),
         (Err(e), _) => Err(e),
     }
+}
+
+/// The time left until `end`, and never zero.
+fn left(end: Instant) -> Duration {
+    end.saturating_duration_since(Instant::now())
+        .max(SMALLEST_TIMEOUT)
 }
 
 /// The registration line: one JSON object and a newline.
@@ -188,18 +205,45 @@ fn encode(name: &str, version: &str, health: Option<&Health>) -> Vec<u8> {
     line.into_bytes()
 }
 
-/// Reads the updater's answer: `{"ok":true,"error":null}` or `{"ok":false,"error":"<token>"}`.
-fn answer(stream: &UnixStream) -> Result<(), Error> {
-    let mut text = String::new();
-    BufReader::new(stream.take(MAX_ANSWER)).read_line(&mut text)?;
+/// Reads the updater's answer, one line, until `end`: `{"ok":true,"error":null}` or
+/// `{"ok":false,"error":"<token>"}`.
+///
+/// Nothing at all is [`Error::NoAnswer`], and so is the deadline passing. Something that is not
+/// one whole line the client understands is [`Error::BadAnswer`], a line cut short before its
+/// newline included: the updater writes the newline with the rest, so a success that lacks it was
+/// cut by a connection that died, and is not believed. Each read waits only for what is left of
+/// the deadline, and an answer is read to at most `MAX_ANSWER` bytes, so the deadline holds for
+/// the whole answer to within one short read.
+fn answer(stream: &UnixStream, end: Instant) -> Result<(), Error> {
+    let mut text = Vec::new();
+    let mut chunk = [0u8; 128];
+    while !text.contains(&b'\n') && text.len() < MAX_ANSWER {
+        stream.set_read_timeout(Some(left(end)))?;
+        match (&*stream).read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => text.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(Error::NoAnswer);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
     if text.is_empty() {
         return Err(Error::NoAnswer);
     }
-    let reply: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-    match (reply["ok"].as_bool(), reply["error"].as_str()) {
-        (Some(true), None) => Ok(()),
-        (Some(false), Some(token)) => Err(Refusal::from_token(token).into()),
-        _ => Err(Error::BadAnswer(text)),
+    let whole = text.contains(&b'\n');
+    let reply: Value = serde_json::from_slice(&text).unwrap_or(Value::Null);
+    match (whole, reply["ok"].as_bool(), reply["error"].as_str()) {
+        (true, Some(true), None) => Ok(()),
+        (true, Some(false), Some(token)) => Err(Refusal::from_token(token).into()),
+        _ => Err(Error::BadAnswer(
+            String::from_utf8_lossy(&text).into_owned(),
+        )),
     }
 }
 

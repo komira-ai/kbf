@@ -176,9 +176,9 @@ fn an_answer_that_is_not_understood_is_not_success() {
 /// An answer longer than the limit with no end is not read to the end of memory.
 #[test]
 fn an_endless_answer_is_cut_off() {
-    let (client, _peer) = peer_that_said(&vec![b'x'; 2 * MAX_ANSWER as usize]);
+    let (client, _peer) = peer_that_said(&vec![b'x'; 2 * MAX_ANSWER]);
     match on(client, "svc", "1.0.0", None) {
-        Err(Error::BadAnswer(text)) => assert_eq!(text.len(), MAX_ANSWER as usize),
+        Err(Error::BadAnswer(text)) => assert_eq!(text.len(), MAX_ANSWER),
         other => panic!("{other:?}"),
     }
 }
