@@ -16,7 +16,6 @@ publish.workspace = true
 # migration step 3. Synchronous, threads and blocking sockets.
 [dependencies]
 update-hook = { path = "../update-hook" }
-libc.workspace = true
 # `SO_PEERCRED` (Linux) and the monotonic clock.
 rustix = { workspace = true, features = ["fs", "net", "process", "time"] }
 serde.workspace = true

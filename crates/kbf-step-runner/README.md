@@ -37,3 +37,16 @@ What is not here: the unprivileged agent that talks to the coordinator, the regi
 (step 4a), the declaration loader and approval, the transient-unit launcher (step 3), and wiring a
 binary. The root-only checks (a registration from another user, the real systemd restart limit) need
 the `cargo xtask sudo-test` job and are not part of this crate's fast tests.
+
+## Limits the caller should know
+
+- A host that reboots in a loop restarts the verify window at every boot (the monotonic clock
+  restarts, so the time spent before the reboot is unknown): such a host is not rolled back by the
+  window, and the dead-man bounds each boot's `verify` only.
+- `Layout` (the updater's own binary directory) must be given as a root-owned directory closed to
+  group and others, in root-owned parents; the type does not check it.
+- `UpdateOrder.artifact_digest` is passed through. The unpack step must hash the tarball bytes as it
+  reads them and unpack from that same stream; this crate does not bind the digest to the tree.
+- The staged tree is checked by path before every step; the guarantee that it cannot be swapped
+  between the check and the exec rests on the tree being root-owned and read-only in root-owned
+  parents.

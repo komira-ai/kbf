@@ -21,6 +21,8 @@ use crate::clock::Clock;
 use crate::launcher::{LaunchError, StepLauncher};
 
 struct Active {
+    /// Which arming this is: the unit name repeats for the next try of a step.
+    arm: u64,
     unit: String,
     deadline_secs: u64,
     stopped: bool,
@@ -28,6 +30,7 @@ struct Active {
 
 #[derive(Default)]
 struct WatchState {
+    armed: u64,
     active: Option<Active>,
     last_error: Option<String>,
 }
@@ -49,7 +52,11 @@ impl Watch {
 
     /// The step in `unit` must end by `deadline_secs` on the monotonic clock.
     pub fn arm(&self, unit: &str, deadline_secs: u64) {
-        self.state().active = Some(Active {
+        let mut state = self.state();
+        state.armed += 1;
+        let arm = state.armed;
+        state.active = Some(Active {
+            arm,
             unit: unit.to_owned(),
             deadline_secs,
             stopped: false,
@@ -92,15 +99,15 @@ impl DeadMan {
                 .active
                 .as_ref()
                 .filter(|a| !a.stopped && self.clock.mono_secs() >= a.deadline_secs)
-                .map(|a| a.unit.clone())
+                .map(|a| (a.unit.clone(), a.arm))
         };
-        let Some(unit) = due else {
+        let Some((unit, arm)) = due else {
             return Ok(false);
         };
         self.launcher.stop(&unit)?;
-        // Only the step that was stopped: another may have been armed meanwhile.
+        // Only the arming that was stopped: the next try of the step may be armed meanwhile.
         let mut state = self.watch.state();
-        let armed = state.active.iter_mut().filter(|a| a.unit == unit);
+        let armed = state.active.iter_mut().filter(|a| a.arm == arm);
         armed.for_each(|a| a.stopped = true);
         Ok(true)
     }

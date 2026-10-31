@@ -78,7 +78,12 @@ pub struct UpdateOrder {
     pub previous_version: Option<String>,
     /// The sha256 of the release artifact the updater verified (its attested tarball): 64
     /// lower-case hex digits, the value in the order and in the release's SHA256SUMS. It is
-    /// written to every step's params file as `updater.artifact_digest` = `sha256:<hex>`.
+    /// written to every step's params file as `updater.artifact_digest` = `sha256:<hex>`, and an
+    /// order with another artifact digest is another update even for the same tree.
+    ///
+    /// **This crate does not bind the digest to the unpacked bytes.** The step that unpacks the
+    /// tarball must hash the bytes as it reads them and unpack from that same stream, so that the
+    /// digest is of what was unpacked, then seal the tree with [`Staged::seal`].
     pub artifact_digest: String,
     /// The verified staged release (the unpacked tree of that artifact).
     pub staged: Staged,
@@ -238,6 +243,8 @@ impl StepRunner {
                     let ended =
                         matches!(verdict, Verdict::Succeeded { .. } | Verdict::Failed { .. });
                     if matches!(verdict, Verdict::Halt) || (ended && same_update(&rec, order)) {
+                        // The updater may have died between the verdict and the removal.
+                        self.store.remove_params()?;
                         return Ok(Finished {
                             verdict: verdict.clone(),
                             reason: reason.clone(),
@@ -473,7 +480,7 @@ impl StepRunner {
             }
             Next::Again { step, after_secs } => {
                 self.clock
-                    .sleep_secs(after_secs.unwrap_or(DEFAULT_RETRY_SECS));
+                    .sleep_secs(wait_secs(after_secs, DEFAULT_RETRY_SECS));
                 if step != Step::Verify {
                     rec.progress.retry += 1;
                 }
@@ -505,7 +512,7 @@ impl StepRunner {
         let Some(began) = &rec.progress.verify_started else {
             return false;
         };
-        let wait = report.retry_after_secs.unwrap_or(DEFAULT_RETRY_SECS);
+        let wait = wait_secs(report.retry_after_secs, DEFAULT_RETRY_SECS);
         began.elapsed_secs(&*self.clock).saturating_add(wait) >= order.bounds.verify_deadline_secs
     }
 
@@ -541,7 +548,7 @@ impl StepRunner {
             },
             Outcome::Success if !over => {
                 self.clock
-                    .sleep_secs(report.retry_after_secs.unwrap_or(WATCH_POLL_SECS));
+                    .sleep_secs(wait_secs(report.retry_after_secs, WATCH_POLL_SECS));
                 rec.attempt += 1;
                 rec.state = State::Pending;
                 return;
@@ -556,11 +563,17 @@ impl StepRunner {
     }
 }
 
+/// How long to wait: what the hook asked for, or `default`, never more than [`MAX_RETRY_SECS`].
+fn wait_secs(asked: Option<u64>, default: u64) -> u64 {
+    asked.unwrap_or(default).min(MAX_RETRY_SECS)
+}
+
 /// Whether `rec` is the update `order` asks for.
 fn same_update(rec: &Record, order: &UpdateOrder) -> bool {
     rec.service == order.service
         && rec.target_version == order.target_version
         && rec.artifact_digest == order.staged.digest
+        && rec.tarball_digest == order.artifact_digest
         && rec.previous_digest == order.previous.as_ref().map(|p| p.digest.clone())
 }
 

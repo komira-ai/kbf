@@ -33,6 +33,10 @@ use crate::runner::Finished;
 pub const START_LIMIT_BURST: u32 = 3;
 
 /// The updater's binary directory.
+///
+/// **The caller gives a directory that is root-owned and closed to group and others, in
+/// root-owned parents**: this type does not check it, and the fallback unit runs what `previous`
+/// points at as root.
 #[derive(Clone, Debug)]
 pub struct Layout {
     dir: PathBuf,

@@ -24,7 +24,7 @@ pub enum ArtifactError {
     #[error("the staged release changed after it was verified: it was {expected}, it is {found}")]
     Changed { expected: String, found: String },
     #[error(
-        "{0:?} is not a directory owned by the updater or root and closed to group and others, or is a link"
+        "{0:?} is not trusted: it must be an absolute plain path of real directories owned by the updater or root and closed to group and others, and nothing in the tree may be owned by another user, setuid, setgid or writable by group or others"
     )]
     Untrusted(PathBuf),
     #[error("the hook path {0:?} is not a relative path of plain names")]
@@ -52,17 +52,6 @@ impl Staged {
         })
     }
 
-    /// Like [`Staged::check`], trusting the owners in `trusted` and reading owners from `owner`.
-    pub fn check_as(
-        &self,
-        hook: &Path,
-        trusted: &[u32],
-        owner: &dyn Fn(&fs::Metadata) -> (u32, u32),
-    ) -> Result<PathBuf, ArtifactError> {
-        let _ = (trusted, owner);
-        self.check(hook)
-    }
-
     /// Checks the tree still has its digest and returns the hook executable inside it.
     ///
     /// **What the launcher may rely on:** the returned path is a regular file of a tree that was
@@ -73,10 +62,28 @@ impl Staged {
     /// exec. A launcher that runs the path must run it from here, not from a path it built.
     ///
     /// `hook` is the declaration's `binary`: relative, plain names only, a regular file of the
-    /// tree (not a link, so it cannot lead out of it).
+    /// tree reached without passing a link at any component, so it cannot lead out of the tree.
     pub fn check(&self, hook: &Path) -> Result<PathBuf, ArtifactError> {
-        check_place(&self.dir)?;
-        let found = tree_digest(&self.dir)?;
+        let trusted = [rustix::process::geteuid().as_raw(), 0];
+        self.check_as(hook, &trusted, &host_owner)
+    }
+
+    /// [`Staged::check`] with the trusted owners and the way an owner is read given, so that a
+    /// test can refuse a foreign owner without a second user.
+    ///
+    /// Besides the digest: the tree and every directory above it must be real directories owned
+    /// by a trusted user and not writable by group or others, and every entry inside the tree must
+    /// be owned by a trusted user, not setuid or setgid, and not writable by group or others. A
+    /// link inside the tree is allowed (it is hashed by its target) but never on the way to the
+    /// hook.
+    pub fn check_as(
+        &self,
+        hook: &Path,
+        trusted: &[u32],
+        owner: &dyn Fn(&fs::Metadata) -> (u32, u32),
+    ) -> Result<PathBuf, ArtifactError> {
+        check_place(&self.dir, trusted, owner)?;
+        let found = digest(&self.dir, owner, Some(trusted))?;
         if found != self.digest {
             return Err(ArtifactError::Changed {
                 expected: self.digest.clone(),
@@ -86,27 +93,34 @@ impl Staged {
         if hook.as_os_str().is_empty() || !hook.components().all(is_plain) {
             return Err(ArtifactError::BadHookPath(hook.to_path_buf()));
         }
-        let path = self.dir.join(hook);
-        if !fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+        // Every component under the tree, the last included, is looked at without following it.
+        let mut at = self.dir.clone();
+        let mut unlinked = true;
+        for part in hook.components() {
+            at.push(part);
+            unlinked &= fs::symlink_metadata(&at).is_ok_and(|meta| !meta.is_symlink());
+        }
+        if !unlinked || !fs::symlink_metadata(&at).is_ok_and(|meta| meta.is_file()) {
             return Err(ArtifactError::HookMissing(hook.to_path_buf()));
         }
-        Ok(path)
+        Ok(at)
     }
 }
 
-/// Like [`tree_digest`], reading the owner of an entry from `owner` (user id, group id).
-pub fn tree_digest_with(
-    dir: &Path,
-    owner: &dyn Fn(&fs::Metadata) -> (u32, u32),
-) -> Result<String, ArtifactError> {
-    let _ = owner;
-    tree_digest(dir)
+fn host_owner(meta: &fs::Metadata) -> (u32, u32) {
+    (meta.uid(), meta.gid())
 }
 
-/// The tree and every directory above it are real directories (not links) owned by the running
-/// user or root and not writable by group or others.
-fn check_place(dir: &Path) -> Result<(), ArtifactError> {
-    let me = rustix::process::geteuid().as_raw();
+/// The tree and every directory above it are real directories (not links) owned by a trusted
+/// user and not writable by group or others; the path is absolute and made of plain names.
+fn check_place(
+    dir: &Path,
+    trusted: &[u32],
+    owner: &dyn Fn(&fs::Metadata) -> (u32, u32),
+) -> Result<(), ArtifactError> {
+    if !dir.is_absolute() || !dir.components().skip(1).all(is_plain) {
+        return Err(ArtifactError::Untrusted(dir.to_path_buf()));
+    }
     let mut at = PathBuf::new();
     for part in dir.components() {
         at.push(part);
@@ -114,7 +128,7 @@ fn check_place(dir: &Path) -> Result<(), ArtifactError> {
         // One comparison; a link is not a directory here, so a linked component fails it.
         let sound = (
             meta.is_dir(),
-            [me, 0].contains(&meta.uid()),
+            trusted.contains(&owner(&meta).0),
             meta.mode() & 0o022 == 0,
         );
         if sound != (true, true, true) {
@@ -128,15 +142,38 @@ fn is_plain(component: Component<'_>) -> bool {
     matches!(component, Component::Normal(_))
 }
 
-/// The sha256 of a tree: every name, kind, mode and content below `dir`, in name order, links
-/// by their target and never followed. Lower-case hex.
+/// The sha256 of a tree: every name, kind, mode, owner and content below `dir`, in name order,
+/// links by their target and never followed. Lower-case hex.
 pub fn tree_digest(dir: &Path) -> Result<String, ArtifactError> {
+    tree_digest_with(dir, &host_owner)
+}
+
+/// Like [`tree_digest`], reading the owner of an entry (user id, group id) from `owner`.
+pub fn tree_digest_with(
+    dir: &Path,
+    owner: &dyn Fn(&fs::Metadata) -> (u32, u32),
+) -> Result<String, ArtifactError> {
+    digest(dir, owner, None)
+}
+
+/// The digest, and with `trusted` also the refusal of what a tree must not hold.
+fn digest(
+    dir: &Path,
+    owner: &dyn Fn(&fs::Metadata) -> (u32, u32),
+    trusted: Option<&[u32]>,
+) -> Result<String, ArtifactError> {
     let mut hasher = Sha256::new();
-    hash_dir(&mut hasher, dir, Path::new(""))?;
+    hash_dir(&mut hasher, dir, Path::new(""), owner, trusted)?;
     Ok(hex(&hasher.finalize()))
 }
 
-fn hash_dir(hasher: &mut Sha256, dir: &Path, rel: &Path) -> Result<(), ArtifactError> {
+fn hash_dir(
+    hasher: &mut Sha256,
+    dir: &Path,
+    rel: &Path,
+    owner: &dyn Fn(&fs::Metadata) -> (u32, u32),
+    trusted: Option<&[u32]>,
+) -> Result<(), ArtifactError> {
     let mut names = Vec::new();
     for entry in fs::read_dir(dir)? {
         names.push(entry?.file_name());
@@ -148,20 +185,40 @@ fn hash_dir(hasher: &mut Sha256, dir: &Path, rel: &Path) -> Result<(), ArtifactE
         let meta = fs::symlink_metadata(&path)?;
         let mode = meta.permissions().mode() & 0o7777;
         let kind = meta.file_type();
+        let (uid, gid) = owner(&meta);
+        if let Some(trusted) = trusted {
+            // One comparison; a link carries mode 0777 and is let through.
+            let sound = (
+                trusted.contains(&uid),
+                mode & 0o6000 == 0,
+                kind.is_symlink() || mode & 0o022 == 0,
+            );
+            if sound != (true, true, true) {
+                return Err(ArtifactError::Untrusted(rel));
+            }
+        }
         if kind.is_dir() {
-            put(hasher, format!("d\0{}\0{mode}\0", rel.display()).as_bytes());
-            hash_dir(hasher, &path, &rel)?;
+            put(
+                hasher,
+                format!("d\0{}\0{mode}\0{uid}\0{gid}\0", rel.display()).as_bytes(),
+            );
+            hash_dir(hasher, &path, &rel, owner, trusted)?;
         } else if kind.is_file() {
             put(
                 hasher,
-                format!("f\0{}\0{mode}\0{}\0", rel.display(), meta.size()).as_bytes(),
+                format!(
+                    "f\0{}\0{mode}\0{uid}\0{gid}\0{}\0",
+                    rel.display(),
+                    meta.size()
+                )
+                .as_bytes(),
             );
             hasher.update(fs::read(&path)?);
         } else if kind.is_symlink() {
             let target = fs::read_link(&path)?;
             put(
                 hasher,
-                format!("l\0{}\0{}\0", rel.display(), target.display()).as_bytes(),
+                format!("l\0{}\0{uid}\0{gid}\0{}\0", rel.display(), target.display()).as_bytes(),
             );
         } else {
             return Err(ArtifactError::Unsupported(rel));

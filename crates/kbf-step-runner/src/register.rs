@@ -24,14 +24,14 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -44,8 +44,12 @@ pub const REGISTRATIONS_FILE: &str = "registrations.json";
 pub type Spawn = Box<dyn Fn(Box<dyn FnOnce() + Send>) -> io::Result<()> + Send + Sync>;
 /// The connections a server serves at once unless told otherwise.
 pub const MAX_CONNECTIONS: usize = 64;
-/// How long a connection may take to send its registration. A test never waits for it.
-pub const READ_TIMEOUT_SECS: u64 = 10;
+/// The connections of one user served at once unless told otherwise.
+pub const MAX_PER_UID: usize = 8;
+/// The time a connection has, in total, to send its registration line. A test never waits for it.
+pub const LINE_DEADLINE_SECS: u64 = 10;
+/// The pause before accepting again after an error that passes (out of descriptors).
+pub const ACCEPT_RETRY_MS: u64 = 50;
 /// The longest line a registration may be.
 pub const MAX_LINE: usize = 4096;
 
@@ -247,7 +251,7 @@ impl Registry {
         let mut inner = self.inner();
         inner.next_conn += 1;
         let conn = inner.next_conn;
-        inner.entries.insert(
+        let before = inner.entries.insert(
             registration.name.clone(),
             Entry {
                 uid: grant.uid,
@@ -258,7 +262,14 @@ impl Registry {
                 conn,
             },
         );
-        self.persist(&inner)?;
+        if let Err(e) = self.persist(&inner) {
+            // Not kept, so not believed: the registration that stood is back, or none.
+            inner.entries.remove(&registration.name);
+            inner
+                .entries
+                .extend(before.map(|old| (registration.name.clone(), old)));
+            return Err(e);
+        }
         Ok(conn)
     }
 
@@ -352,7 +363,39 @@ pub struct Server {
     registry: Arc<Registry>,
     declared: Arc<dyn Declared>,
     max_connections: usize,
-    open: AtomicUsize,
+    max_per_uid: usize,
+    line_deadline: Duration,
+    spawner: Spawn,
+    slots: Mutex<Slots>,
+}
+
+/// The connections being served, in all and by user.
+#[derive(Default)]
+struct Slots {
+    total: usize,
+    by_uid: BTreeMap<u32, usize>,
+}
+
+/// A connection's place among the served ones, given back when it is dropped.
+struct Slot {
+    server: Arc<Server>,
+    uid: u32,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut slots = self
+            .server
+            .slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        slots.total -= 1;
+        let mine = slots.by_uid.entry(self.uid).or_default();
+        *mine -= 1;
+        if *mine == 0 {
+            slots.by_uid.remove(&self.uid);
+        }
+    }
 }
 
 impl Server {
@@ -371,7 +414,7 @@ impl Server {
     ) -> Result<Server, RegistryError> {
         let dir = path.parent().unwrap_or(Path::new("/"));
         let meta = fs::symlink_metadata(dir)?;
-        if !meta.is_dir() || meta.uid() != dir_owner || meta.mode() & 0o007 != 0 {
+        if !meta.is_dir() || meta.uid() != dir_owner || meta.mode() & 0o027 != 0 {
             return Err(RegistryError::SocketDir(dir.to_path_buf()));
         }
         match UnixStream::connect(path) {
@@ -391,7 +434,10 @@ impl Server {
             registry,
             declared,
             max_connections: MAX_CONNECTIONS,
-            open: AtomicUsize::new(0),
+            max_per_uid: MAX_PER_UID,
+            line_deadline: Duration::from_secs(LINE_DEADLINE_SECS),
+            spawner: Box::new(|job| std::thread::Builder::new().spawn(job).map(|_| ())),
+            slots: Mutex::default(),
         })
     }
 
@@ -402,51 +448,117 @@ impl Server {
     }
 
     /// The most connections of one user served at once.
-    pub fn with_max_per_uid(self, max: usize) -> Server {
-        let _ = max;
+    pub fn with_max_per_uid(mut self, max: usize) -> Server {
+        self.max_per_uid = max;
         self
     }
 
     /// The time a connection has to send its registration line, in total.
-    pub fn with_line_deadline(self, deadline: Duration) -> Server {
-        let _ = deadline;
+    pub fn with_line_deadline(mut self, deadline: Duration) -> Server {
+        self.line_deadline = deadline;
         self
     }
 
     /// How a connection gets its thread (a test makes it fail).
-    pub fn with_spawner(self, spawn: Spawn) -> Server {
-        let _ = spawn;
+    pub fn with_spawner(mut self, spawn: Spawn) -> Server {
+        self.spawner = spawn;
         self
-    }
-
-    /// [`Server::serve`] over any source of connections.
-    pub fn serve_with(
-        self: &Arc<Server>,
-        accept: &mut dyn FnMut() -> io::Result<UnixStream>,
-        stop: &AtomicBool,
-    ) -> io::Result<()> {
-        let _ = (accept, stop);
-        Ok(())
     }
 
     /// Accepts connections, one thread each, until `stop` is set. The caller sets it and then
     /// makes one connection, which wakes the accept.
     pub fn serve(self: &Arc<Server>, stop: &AtomicBool) -> io::Result<()> {
+        self.serve_with(
+            &mut || self.listener.accept().map(|(stream, _)| stream),
+            stop,
+        )
+    }
+
+    /// [`Server::serve`] over any source of connections. An error that passes (out of
+    /// descriptors, an interrupted call) is waited out and the loop goes on; any other ends it.
+    pub fn serve_with(
+        self: &Arc<Server>,
+        accept: &mut dyn FnMut() -> io::Result<UnixStream>,
+        stop: &AtomicBool,
+    ) -> io::Result<()> {
         loop {
-            let (stream, _) = self.listener.accept()?;
+            let stream = match accept() {
+                Ok(stream) => stream,
+                Err(e) if is_transient(&e) => {
+                    std::thread::sleep(Duration::from_millis(ACCEPT_RETRY_MS));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             if stop.load(Ordering::Acquire) {
                 return Ok(());
             }
-            if self.open.fetch_add(1, Ordering::SeqCst) >= self.max_connections {
-                self.open.fetch_sub(1, Ordering::SeqCst);
-                let _ = reply(&stream, Some(Refused::Busy.token()));
-                continue;
+            self.dispatch(stream);
+        }
+    }
+
+    /// Gives a connection its slot and its thread, or answers it `busy`.
+    fn dispatch(self: &Arc<Server>, stream: UnixStream) {
+        // A peer whose user cannot be read counts under no user in particular.
+        let uid = peer_uid(&stream).unwrap_or(u32::MAX);
+        let Some(slot) = self.admit(uid) else {
+            let _ = reply(&stream, Some(Refused::Busy.token()));
+            return;
+        };
+        let spare = stream.try_clone().ok();
+        let server = Arc::clone(self);
+        let job = Box::new(move || {
+            let _slot = slot;
+            let _ = server.serve_connection(stream);
+        });
+        if (self.spawner)(job).is_err() {
+            // The job, and with it the slot, is dropped; the peer is told.
+            let _ = spare
+                .as_ref()
+                .map(|s| reply(s, Some(Refused::Busy.token())));
+        }
+    }
+
+    fn admit(self: &Arc<Server>, uid: u32) -> Option<Slot> {
+        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        let mine = slots.by_uid.get(&uid).copied().unwrap_or(0);
+        if slots.total >= self.max_connections || mine >= self.max_per_uid {
+            return None;
+        }
+        slots.total += 1;
+        slots.by_uid.insert(uid, mine + 1);
+        Some(Slot {
+            server: Arc::clone(self),
+            uid,
+        })
+    }
+
+    /// The registration line: up to [`MAX_LINE`] bytes, ended by a newline or by the peer closing
+    /// its writing side, within the line deadline. `None` when it is too long or too slow.
+    fn read_line(&self, stream: &UnixStream) -> io::Result<Option<Vec<u8>>> {
+        let deadline = Instant::now() + self.line_deadline;
+        let mut line = Vec::new();
+        let mut chunk = [0u8; 512];
+        let mut from = stream;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(None);
             }
-            let server = Arc::clone(self);
-            std::thread::spawn(move || {
-                let _ = server.serve_connection(stream);
-                server.open.fetch_sub(1, Ordering::SeqCst);
-            });
+            stream.set_read_timeout(Some(left))?;
+            // A read that fails (the time ran out, the peer vanished) is the end of the line.
+            let n = from.read(&mut chunk).unwrap_or(0);
+            line.extend_from_slice(&chunk[..n]);
+            if line.len() > MAX_LINE {
+                return Ok(None);
+            }
+            if let Some(end) = line.iter().position(|b| *b == b'\n') {
+                line.truncate(end);
+                return Ok(Some(line));
+            }
+            if n == 0 {
+                return Ok(Some(line));
+            }
         }
     }
 
@@ -454,14 +566,10 @@ impl Server {
     /// until the peer closes.
     pub fn serve_connection(&self, stream: UnixStream) -> Result<(), RegistryError> {
         let peer = peer_uid(&stream)?;
-        stream.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)))?;
-        let mut reader = BufReader::new((&stream).take(MAX_LINE as u64 + 1));
-        let mut line = String::new();
-        let read = reader.read_line(&mut line);
-        let registration = match read {
-            Ok(n) if n <= MAX_LINE => serde_json::from_str::<Registration>(&line).ok(),
-            _ => None,
-        };
+        let registration = self
+            .read_line(&stream)?
+            .and_then(|line| String::from_utf8(line).ok())
+            .and_then(|text| serde_json::from_str::<Registration>(&text).ok());
         let outcome = match registration {
             None => Err(Refused::Malformed.into()),
             Some(registration) => self.accept(peer, registration),
@@ -515,6 +623,21 @@ fn reply(stream: &UnixStream, error: Option<&'static str>) -> Result<(), Registr
     line.push(b'\n');
     let mut out = stream;
     Ok(out.write_all(&line)?)
+}
+
+/// Whether an accept error is one that passes: an interrupted call, a connection that went away,
+/// or the host running out of descriptors or memory for a moment.
+fn is_transient(e: &io::Error) -> bool {
+    use rustix::io::Errno;
+    let passing = [Errno::MFILE, Errno::NFILE, Errno::NOBUFS, Errno::NOMEM];
+    let kinds = [
+        io::ErrorKind::Interrupted,
+        io::ErrorKind::ConnectionAborted,
+        io::ErrorKind::WouldBlock,
+    ];
+    kinds.contains(&e.kind())
+        || e.raw_os_error()
+            .is_some_and(|code| passing.iter().any(|p| p.raw_os_error() == code))
 }
 
 /// The user id of the process that made the connection, as the kernel recorded it
