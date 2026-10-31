@@ -175,6 +175,12 @@ pub trait BlobSource: Sync {
     fn verified(&self, digest: &Digest) -> Result<Vec<u8>, FetchError> {
         verified_bytes(digest, &mut |out| self.fetch_to(digest, out))
     }
+
+    /// One line saying how the inputs were read, when the source has more than one way to read
+    /// them; the default has nothing to say.
+    fn report(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The blob `digest` names, streamed through `fetch` into memory and checked: the default of
@@ -400,6 +406,31 @@ impl std::fmt::Debug for HttpBlobSource {
     }
 }
 
+/// The agent every read uses: rustls on the ring provider trusting only `roots`, no redirect, no
+/// proxy, a pool of idle connections for [`MAX_CONCURRENCY`] requests.
+fn http_agent(roots: &[Vec<u8>], https_only: bool) -> ureq::Agent {
+    let roots: Vec<ureq::tls::Certificate<'static>> = roots
+        .iter()
+        .map(|der| ureq::tls::Certificate::from_der(der).to_owned())
+        .collect();
+    let tls = ureq::tls::TlsConfig::builder()
+        .provider(ureq::tls::TlsProvider::Rustls)
+        .root_certs(ureq::tls::RootCerts::Specific(Arc::new(roots)))
+        .unversioned_rustls_crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .build();
+    ureq::Agent::config_builder()
+        .https_only(https_only)
+        .proxy(None)
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .max_idle_connections(MAX_CONCURRENCY)
+        .max_idle_connections_per_host(MAX_CONCURRENCY)
+        .tls_config(tls)
+        .build()
+        .into()
+}
+
 /// The host's trusted root certificates, DER encoded: what to pass to [`HttpBlobSource::new`]
 /// when the grant's server uses a public CA.
 #[must_use]
@@ -442,28 +473,8 @@ impl HttpBlobSource {
     }
 
     fn build(base: &str, token: &str, roots: &[Vec<u8>], https_only: bool) -> Self {
-        let roots: Vec<ureq::tls::Certificate<'static>> = roots
-            .iter()
-            .map(|der| ureq::tls::Certificate::from_der(der).to_owned())
-            .collect();
-        let tls = ureq::tls::TlsConfig::builder()
-            .provider(ureq::tls::TlsProvider::Rustls)
-            .root_certs(ureq::tls::RootCerts::Specific(Arc::new(roots)))
-            .unversioned_rustls_crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .build();
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .https_only(https_only)
-            .proxy(None)
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_connect(Some(CONNECT_TIMEOUT))
-            .max_idle_connections(MAX_CONCURRENCY)
-            .max_idle_connections_per_host(MAX_CONCURRENCY)
-            .tls_config(tls)
-            .build()
-            .into();
         Self {
-            agent,
+            agent: http_agent(roots, https_only),
             base: base.trim_end_matches('/').to_owned(),
             authorization: format!("Bearer {token}"),
             batch: false,
@@ -751,6 +762,13 @@ fn create_file(path: &Path, is_executable: bool) -> Result<std::fs::File, FetchE
 
 #[path = "batch.rs"]
 mod batch;
+
+#[path = "locate.rs"]
+mod locate;
+pub use locate::{
+    Counts, HELD_IN_MEMORY, HttpObjectStore, LocatedSource, MAX_LOCATE_BYTES, ObjectStore, Place,
+    StoreError, Table, Want,
+};
 
 #[cfg(test)]
 #[path = "fetch_tests.rs"]

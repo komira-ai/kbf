@@ -39,7 +39,7 @@ use kbf_types::Digest;
 
 use crate::digest;
 use crate::fetch::{
-    BlobSource, FetchError, HttpBlobSource, fetch_message, materialize, native_roots,
+    BlobSource, FetchError, HttpBlobSource, LocatedSource, fetch_message, materialize, native_roots,
 };
 use crate::network;
 use crate::outputs::{Blobs, OutputLimits, collect_outputs};
@@ -174,6 +174,15 @@ pub struct Cli {
     /// request. Applies to `--fetch-batch` too.
     #[arg(long)]
     pub allow_plain_http_grant: bool,
+    /// Ask the listener's `GET /locate` once, before the inputs are fetched, and read each input
+    /// where it points: a byte range of a pack, or a whole large object, directly from the store
+    /// the answer names, with the read grants the answer carries. Every byte is checked against
+    /// its digest like any other, and a blob whose direct read fails (a refused or expired grant,
+    /// a short or wrong read, any error) is read from the listener. Without this flag `/locate` is
+    /// never called. An `http` store needs `--allow-plain-http-grant`, since the grants cross the
+    /// network in the clear; the grants are never written to a log.
+    #[arg(long)]
+    pub locate: bool,
     /// The lease id the frontend gave; it is copied into the manifest. It must be a build id, 1 to
     /// 128 bytes of `0-9A-Za-z_-`, the only lease the frontend accepts in a manifest; any other is
     /// refused at startup (exit 14), before anything is fetched.
@@ -445,6 +454,9 @@ pub(crate) async fn execute_with(
         usize::from(cli.fetch_concurrency),
     )?;
     let fetch_ms = millis(fetching.elapsed());
+    if let Some(report) = source.report() {
+        eprintln!("kbf-task: {report}");
+    }
 
     let stdout = cli.work_dir.join("stdout");
     let stderr = cli.work_dir.join("stderr");
@@ -699,8 +711,25 @@ fn put_urls(cli: &Cli) -> Result<PutUrls, Failure> {
     }
 }
 
+/// The host's roots and the DER certificates `--root-der` names.
+fn trusted_roots(cli: &Cli) -> Result<Vec<Vec<u8>>, Failure> {
+    let mut roots = native_roots();
+    for path in &cli.root_der {
+        roots.push(
+            std::fs::read(path).map_err(|e| Failure::Setup(format!("{}: {e}", path.display())))?,
+        );
+    }
+    Ok(roots)
+}
+
 /// The trusted roots and the real source and sink the flags name.
+#[cfg(test)]
 fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
+    connect_with_roots(cli).map(|(source, sink, _)| (source, sink))
+}
+
+/// [`connect`], and the roots it read, for a caller that needs them too.
+fn connect_with_roots(cli: &Cli) -> Result<(HttpBlobSource, HttpSink, Vec<Vec<u8>>), Failure> {
     check_lease(cli)?;
     check_argv_secrets(cli)?;
     check_grant_scheme(cli)?;
@@ -709,12 +738,7 @@ fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
         cli.grant_token_file.as_deref(),
         cli.grant_token.as_deref(),
     )?;
-    let mut roots = native_roots();
-    for path in &cli.root_der {
-        roots.push(
-            std::fs::read(path).map_err(|e| Failure::Setup(format!("{}: {e}", path.display())))?,
-        );
-    }
+    let roots = trusted_roots(cli)?;
     let urls = put_urls(cli)?;
     let source =
         HttpBlobSource::new_with(&cli.grant_url, &token, &roots, cli.allow_plain_http_grant)?
@@ -728,15 +752,30 @@ fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
         urls,
         sleeper: Arc::new(ThreadSleeper),
     };
-    Ok((source, sink))
+    Ok((source, sink, roots))
+}
+
+/// [`connect`], and with `--locate` the source wrapped to read where the listener's `/locate`
+/// points. Without `--locate` the source is the listener's alone and `/locate` is never asked.
+fn connect_located(cli: &Cli) -> Result<(Box<dyn BlobSource>, HttpSink), Failure> {
+    let (source, sink, roots) = connect_with_roots(cli)?;
+    if !cli.locate {
+        return Ok((Box::new(source), sink));
+    }
+    let located = LocatedSource::open(
+        source,
+        &roots,
+        cli.allow_plain_http_grant,
+        cli.work_dir.clone(),
+    );
+    Ok((Box::new(located), sink))
 }
 
 /// Runs the task the flags describe against the real grant and the real presigned URL, and turns
 /// the outcome into the process exit code (see the module documentation). A failure is written to
 /// standard error; no message holds the token or the presigned URL's query.
 pub async fn main_with(cli: &Cli) -> ExitCode {
-    let connected = connect(cli).map(|(source, sink)| {
-        let source: Box<dyn BlobSource> = Box::new(source);
+    let connected = connect_located(cli).map(|(source, sink)| {
         let sink: Box<dyn PackSink> = Box::new(sink);
         (source, sink)
     });
@@ -807,6 +846,10 @@ mod credential_files_tests;
 #[cfg(test)]
 #[path = "plain_grant_tests.rs"]
 mod plain_grant_tests;
+
+#[cfg(test)]
+#[path = "locate_flags_tests.rs"]
+mod locate_flags_tests;
 
 #[cfg(test)]
 #[path = "put_urls_flag_tests.rs"]
