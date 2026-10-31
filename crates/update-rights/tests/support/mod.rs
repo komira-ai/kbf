@@ -90,6 +90,7 @@ impl Scratch {
     /// A file of this mode, whatever the umask.
     pub fn file(&self, name: &str, text: &str, mode: u32) -> PathBuf {
         let path = self.0.join(name);
+        let _ = fs::remove_file(&path);
         fs::write(&path, text).expect("write the file");
         fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("set the mode");
         path

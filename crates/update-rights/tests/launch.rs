@@ -201,8 +201,7 @@ fn the_record_directory_is_writable_once() {
 }
 
 /// Catches a read-only property for no paths (systemd reads an empty `ReadOnlyPaths=` as a
-/// reset), and the empty address family list being a reset (no restriction at all) instead of
-/// `none`.
+/// reset), and the empty address family list taking a value that would be read as a reset.
 #[test]
 fn empty_lists_are_not_resets() {
     let text = with(
@@ -216,7 +215,7 @@ fn empty_lists_are_not_resets() {
         all.iter().all(|p| !p.starts_with("ReadOnlyPaths")),
         "{all:?}"
     );
-    assert!(all.contains(&"RestrictAddressFamilies=none".to_owned()));
+    assert!(all.contains(&"RestrictAddressFamilies=".to_owned()));
 }
 
 /// Catches the environment being merged into one property systemd would split on white space,

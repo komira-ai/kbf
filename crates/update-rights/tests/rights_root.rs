@@ -621,18 +621,40 @@ fn probe_2_mask_runtime_then_stop_an_active_instance_through_polkit() {
         "inactive"
     );
 
-    // The scope: another instance of the same template is not the hook's to stop.
+    // The scope: another instance of the same template is not the hook's to stop, and an account
+    // with no rule at all is refused by the default, which shows that polkit is what decides.
     let refused_stop = systemctl(&["stop"], "probe-polkit@b.service");
-    assert_eq!(
+    let b_state = said(SYSTEMCTL, &["is-active", "probe-polkit@b.service"]);
+    let stranger = Account::new(&format!("urp2s{pid}"), &[]);
+    let mut stranger_spec = rig.spec();
+    stranger_spec.user = stranger.name.clone();
+    stranger_spec.group = stranger.name.clone();
+    let stranger_stop = rig.run(
+        &stranger_spec,
+        Step::Cutover,
+        &[
+            "run",
+            SYSTEMCTL,
+            "--no-ask-password",
+            "stop",
+            "probe-polkit@c.service",
+            "--",
+        ],
+    );
+    let c_state = said(SYSTEMCTL, &["is-active", "probe-polkit@c.service"]);
+    let facts = format!(
+        "listed account stopping the other instance: {:?} ({:?}), then it is {b_state}; \
+         an account with no rule stopping an instance: {:?} ({:?}), then it is {c_state}",
         refused_stop.outcome,
-        Outcome::Failure,
-        "{}",
-        said_by(&refused_stop)
+        refused_stop.report.detail,
+        stranger_stop.outcome,
+        stranger_stop.report.detail
     );
-    assert_eq!(
-        said(SYSTEMCTL, &["is-active", "probe-polkit@b.service"]),
-        "active"
-    );
+    record("probe-2-facts", &facts);
+    assert_eq!(refused_stop.outcome, Outcome::Failure, "{facts}");
+    assert_eq!(b_state, "active", "{facts}");
+    assert_eq!(stranger_stop.outcome, Outcome::Failure, "{facts}");
+    assert_eq!(c_state, "active", "{facts}");
     drop(guard);
     record(
         "probe-2",

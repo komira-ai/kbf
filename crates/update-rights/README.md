@@ -25,8 +25,9 @@ The crate names no product and depends on no crate of this workspace but the hoo
   exists, by owner, group (primary and listed) and others; a root service is not checked.
 - **`ReadOnlyPaths=` does not hide anything.** `ProtectSystem=strict` leaves the whole tree
   readable, so `read_paths` says what the hook is declared to read and confines nothing.
-- **An empty address family list is `RestrictAddressFamilies=none`**, never an empty value, which
-  systemd reads as "no restriction".
+- **An empty address family list is `RestrictAddressFamilies=` with an empty value.** Through
+  `systemd-run -p` that is an empty allow list (every family refused); the root test opens a unix
+  socket under it and must fail. `none` is refused by systemd as an unknown family.
 - **A reserved directory may hold a read-only entry**, but a write path or a record directory
   inside one is refused, except under `/var/lib/updater/hooks`, where the records live.
 - Account names come from `/etc/passwd` and `/etc/group` only, not from NSS.

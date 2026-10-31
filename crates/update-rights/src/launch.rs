@@ -10,7 +10,7 @@
 //! | `hook.user`, `hook.group` | `User=`, `Group=` |
 //! | the step's capabilities | `AmbientCapabilities=` and `CapabilityBoundingSet=`, exactly that list; `NoNewPrivileges=yes` |
 //! | `read_paths`, `write_paths`, `state_dir` | `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `ReadOnlyPaths=`, `ReadWritePaths=` (the writable paths and the record directory) |
-//! | `address_families` | `RestrictAddressFamilies=`, `none` for an empty list |
+//! | `address_families` | `RestrictAddressFamilies=`, an empty value for an empty list (through `systemd-run -p` that is an empty allow list; `none` is refused as an unknown family) |
 //! | `environment` | one `Environment=` per variable, and nothing inherited |
 //! | `timeout_secs.<step>` | `RuntimeMaxSec=` |
 //!
@@ -97,7 +97,7 @@ pub fn properties(declaration: &Declaration, step: Step) -> Vec<String> {
     let hook = &declaration.hook;
     let capabilities = words(hook.capabilities_for(step).iter());
     let families = if hook.address_families.is_empty() {
-        "none".to_owned()
+        String::new()
     } else {
         words(hook.address_families.iter())
     };
