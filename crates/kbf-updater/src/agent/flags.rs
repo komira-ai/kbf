@@ -236,7 +236,7 @@ pub(super) fn collect<'k>(
 }
 
 /// A number of seconds from 1 to a day.
-fn secs(flag: &str, text: &str) -> Result<Duration, String> {
+pub(super) fn secs(flag: &str, text: &str) -> Result<Duration, String> {
     text.parse::<u64>()
         .ok()
         .filter(|n| (1..=86_400).contains(n))
@@ -245,7 +245,7 @@ fn secs(flag: &str, text: &str) -> Result<Duration, String> {
 }
 
 /// A drain deadline: a number of seconds from 1 up, with no upper bound. Absent is no deadline.
-fn drain_secs(flag: &str, text: &str) -> Result<Duration, String> {
+pub(super) fn drain_secs(flag: &str, text: &str) -> Result<Duration, String> {
     text.parse::<u64>()
         .ok()
         .filter(|n| *n >= 1)
@@ -490,7 +490,10 @@ fn parse_ready_url(url: &str) -> Result<(SocketAddr, String), String> {
 
 /// The files of this host's TLS: those of `state_dir` (`kbf-updater enroll` made them), or the
 /// three an operator placed, and never a mixture.
-fn tls_files(state_dir: Option<&Path>, placed: [Option<String>; 3]) -> Result<TlsFiles, String> {
+pub(super) fn tls_files(
+    state_dir: Option<&Path>,
+    placed: [Option<String>; 3],
+) -> Result<TlsFiles, String> {
     match (state_dir, placed) {
         (Some(dir), [None, None, None]) => {
             let store = Store::unopened(dir);
@@ -514,7 +517,7 @@ fn tls_files(state_dir: Option<&Path>, placed: [Option<String>; 3]) -> Result<Tl
 }
 
 /// The grammar of a channel name, as the helper checks it (`[a-z0-9][a-z0-9-]{0,31}`).
-fn channel_ok(text: &str) -> bool {
+pub(super) fn channel_ok(text: &str) -> bool {
     let lower_or_digit = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
     let Some((first, rest)) = text.split_at_checked(1) else {
         return false;

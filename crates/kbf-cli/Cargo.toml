@@ -72,6 +72,9 @@ kbf-state = { workspace = true, features = ["postgres"] }
 # `[proxy]` table is `kbf-installer setup`'s to keep (tests/layering.rs in kbf-integration-test
 # checks the tree).
 kbf-setup.workspace = true
+# `kbf update-hook <step>` (src/lib.rs): the hook the generic updater runs for the kbf service,
+# today's update of a host split at the five steps of the hook contract.
+kbf-updater.workspace = true
 # The identity `kbf --version --json` prints (src/version.rs), and the bodies of
 # `kbf cluster` (src/cluster.rs).
 serde_json.workspace = true

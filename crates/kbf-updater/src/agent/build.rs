@@ -10,10 +10,10 @@ use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 
 use super::container_health::ContainerHealth;
-use super::coordinator::{HttpsCoordinator, TlsFiles};
+use super::coordinator::{Endpoint, HttpsCoordinator, TlsFiles};
 use super::cordon::OwnCordon;
 use super::enroll::frontend_url;
-use super::flags::{Config, ServiceConfig, ServiceDrain, ServiceHealth};
+use super::flags::{Config, NodeApi, ServiceConfig, ServiceDrain, ServiceHealth};
 use super::local::{Limits, LocalInstaller, SocketLocal};
 use super::renew::{FrontendRenewer, Renewer};
 use super::run::{Agent, ServicePorts, Stop, World};
@@ -99,6 +99,36 @@ impl Drain for NoCredential {
 /// The drain and the health of a host.
 type NodePorts = (Arc<dyn Drain>, Arc<dyn HealthCheck>);
 
+/// What a process needs to reach its node at the frontend: the settings of the agent (or of
+/// the update hook, which is given the same flags) that say how the drain and the health are
+/// asked.
+#[derive(Clone, Debug)]
+pub struct Access {
+    /// This host's updater certificate, its key and the farm CA.
+    pub files: TlsFiles,
+    /// The frontend's worker listener.
+    pub frontend: Option<Endpoint>,
+    /// The opt-in operator API and its token.
+    pub node_api: Option<NodeApi>,
+    /// Where the marks of the cordons made are kept.
+    pub cordon_dir: PathBuf,
+    /// The node id of the daemon a frontend host also runs.
+    pub daemon_node: Option<String>,
+}
+
+impl Access {
+    /// The access an agent's settings give.
+    pub fn of(cfg: &Config) -> Access {
+        Access {
+            files: cfg.files.clone(),
+            frontend: cfg.frontend.clone(),
+            node_api: cfg.node_api.clone(),
+            cordon_dir: cordon_dir(cfg),
+            daemon_node: cfg.daemon_node.clone(),
+        }
+    }
+}
+
 /// The drain and the health of the host `identity` names, by the way the agent was given to the
 /// frontend:
 ///
@@ -114,26 +144,37 @@ pub(super) fn node_ports(
     unit: &str,
     local: &Arc<SocketLocal>,
 ) -> Result<NodePorts, String> {
+    node_ports_for(&Access::of(cfg), identity, role, unit, local)
+}
+
+/// [`node_ports`], from the access alone.
+pub(super) fn node_ports_for(
+    access: &Access,
+    identity: &Identity,
+    role: Role,
+    unit: &str,
+    local: &Arc<SocketLocal>,
+) -> Result<NodePorts, String> {
     let installer = || Arc::new(LocalInstaller(local.clone()));
     // A drain that could not record its cordon would refuse every update: found out here.
     let own = |drain: Arc<dyn Drain>| -> Result<Arc<dyn Drain>, String> {
-        let own = OwnCordon::new(drain, cordon_dir(cfg), unit);
+        let own = OwnCordon::new(drain, access.cordon_dir.clone(), unit);
         own.check_writable()?;
         Ok(Arc::new(own))
     };
-    if let Some(api) = &cfg.node_api {
+    if let Some(api) = &access.node_api {
         let api = OperatorApi::new(api.addr, api.token_file.clone())?;
         let drain = own(drain_for(role, &api))?;
         let health = Arc::new(NodeHealth::with_api(api, installer()));
         return Ok((drain, health));
     }
-    let Some(frontend) = &cfg.frontend else {
+    let Some(frontend) = &access.frontend else {
         return Ok((
             Arc::new(NoCredential(NO_CREDENTIAL)),
             Arc::new(NoCredential(NO_CREDENTIAL)),
         ));
     };
-    let api = OperatorApi::as_updater(frontend.clone(), cfg.files.clone(), identity.clone());
+    let api = OperatorApi::as_updater(frontend.clone(), access.files.clone(), identity.clone());
     let drain = own(drain_for(role, &api))?;
     let health = Arc::new(NodeHealth::for_updater(api, installer()));
     Ok((drain, health))
@@ -221,8 +262,17 @@ pub(super) fn frontend_ports(
     identity: &Identity,
     local: &Arc<SocketLocal>,
 ) -> Result<NodePorts, String> {
-    let drain = match &cfg.daemon_node {
-        Some(_) => node_ports(cfg, identity, Role::Daemon, KBF_SERVICE, local)?.0,
+    frontend_ports_for(&Access::of(cfg), identity, local)
+}
+
+/// [`frontend_ports`], from the access alone.
+pub(super) fn frontend_ports_for(
+    access: &Access,
+    identity: &Identity,
+    local: &Arc<SocketLocal>,
+) -> Result<NodePorts, String> {
+    let drain = match &access.daemon_node {
+        Some(_) => node_ports_for(access, identity, Role::Daemon, KBF_SERVICE, local)?.0,
         None => no_drain(),
     };
     let health = Arc::new(ContainerHealth::new(Arc::new(LocalInstaller(
@@ -244,6 +294,31 @@ pub(super) fn kind_of(role: &HostRole) -> Result<Role, String> {
     }
 }
 
+/// The host a certificate names, as the frontend knows its node: `daemon_node` for a frontend host
+/// that also runs a daemon, else the certificate's own node id.
+///
+/// # Errors
+/// A role this updater has no duties for, or `daemon_node` for a host that is not a frontend's.
+pub(super) fn this_host(identity: &Identity, daemon_node: Option<&str>) -> Result<Host, String> {
+    let role = kind_of(&identity.role)?;
+    if daemon_node.is_some() && role != Role::Frontend {
+        return Err(
+            "--daemon-node is for the agent of a frontend host that also runs a \
+                    daemon: another host's node is its certificate's"
+                .to_owned(),
+        );
+    }
+    let node_id = daemon_node.map_or_else(|| identity.node_id.to_string(), str::to_owned);
+    Ok(Host {
+        alias: node_id.clone(),
+        address: "localhost".to_owned(),
+        role,
+        host_key: String::new(),
+        node_id: Some(node_id),
+        member: None,
+    })
+}
+
 /// The agent of this host, with the real ports.
 ///
 /// # Errors
@@ -253,29 +328,10 @@ pub(super) fn kind_of(role: &HostRole) -> Result<Role, String> {
 pub fn build(cfg: &Config) -> Result<Agent, String> {
     let platform = host_platform().ok_or("kbf has no release for this platform")?;
     let identity = identity_of_files(&cfg.files)?;
-    let role = kind_of(&identity.role)?;
-    if cfg.daemon_node.is_some() && role != Role::Frontend {
-        return Err(
-            "--daemon-node is for the agent of a frontend host that also runs a \
-                    daemon: another host's node is its certificate's"
-                .to_owned(),
-        );
-    }
+    let host = this_host(&identity, cfg.daemon_node.as_deref())?;
     super::coordinator::client_config(&cfg.files).map_err(|e| e.to_string())?;
-    let node_id = cfg
-        .daemon_node
-        .clone()
-        .unwrap_or_else(|| identity.node_id.to_string());
-    let host = Host {
-        alias: node_id.clone(),
-        address: "localhost".to_owned(),
-        role,
-        host_key: String::new(),
-        node_id: Some(node_id),
-        member: None,
-    };
     let local = Arc::new(SocketLocal::new(&cfg.helper_socket, Limits::default()));
-    let (drain, health) = if role == Role::Frontend {
+    let (drain, health) = if host.role == Role::Frontend {
         frontend_ports(cfg, &identity, &local)?
     } else {
         node_ports(cfg, &identity, host.role, KBF_SERVICE, &local)?
