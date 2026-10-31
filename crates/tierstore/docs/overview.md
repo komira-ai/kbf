@@ -4,7 +4,7 @@ tierstore is an S3-compatible object store server that puts a small, fast tier i
 
 This guide is for the person who installs and runs it. It describes what is on the main branch of the source today. A piece that is planned and not in the code is described only under a heading titled "Not in a release yet", so you can tell the two apart.
 
-> Which release first carries what: the configuration file (`--config`, `--print-config`) came with v0.0.39; the OCI read front (`--oci-listen`) and the build node (`[local_cache]`, the read cache) with v0.0.40. `--check-config`, `local_cache.write_through` and the hot and cold counters on `/metricz` are on main and not in v0.0.40. The command-line flags of every other setting work in every release. The pages say where a setting needs a build of main.
+> Which release first carries what: the configuration file (`--config`, `--print-config`) came with v0.0.39; the OCI read front (`--oci-listen`) and the build node (`[local_cache]`, the read cache) with v0.0.40. `--check-config`, `local_cache.write_through` and the hot and cold counters on `/metricz` are on main and not in v0.0.40; the drain's `Connection: close` and lingering close, and `tierstore_drain_late_requests_total`, are on main and not in v0.0.41. The command-line flags of every other setting work in every release. The pages say where a setting needs a build of main.
 
 ## The shape of a deployment
 

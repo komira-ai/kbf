@@ -149,7 +149,7 @@ fn cache_with(from: &str, to: &str) -> String {
 fn a_build_node_file_makes_a_cache() {
     let cache = cache_of(CACHE);
     let front = &cache.front;
-    assert_eq!(front.listen.to_string(), "192.0.2.10:9400");
+    assert_eq!(front.listen, vec!["192.0.2.10:9400".parse().unwrap()]);
     assert_eq!(front.proxy_id, "tierstore-cache-1");
     assert_eq!(
         (front.bucket.as_str(), front.region.as_str()),
@@ -549,7 +549,7 @@ fn a_storage_node_refuses_a_list_of_endpoints_and_a_cache_policy() {
 #[test]
 fn a_build_node_file_with_an_oci_table_makes_the_front() {
     let oci = cache_of(CACHE).oci;
-    assert_eq!(oci.listen, Some("192.0.2.10:5000".parse().unwrap()));
+    assert_eq!(oci.listen, vec!["192.0.2.10:5000".parse().unwrap()]);
     assert_eq!(
         oci.tls_cert.as_deref(),
         Some(Path::new("/etc/tierstore-cache/oci.crt"))
@@ -564,11 +564,34 @@ fn a_build_node_file_with_an_oci_table_makes_the_front() {
 
     let plain = format!("{KEEPS_OCI}\n[oci]\nlisten = \"127.0.0.1:5000\"\n");
     let oci = cache_of(&plain).oci;
-    assert_eq!(oci.listen, Some("127.0.0.1:5000".parse().unwrap()));
+    assert_eq!(oci.listen, vec!["127.0.0.1:5000".parse().unwrap()]);
     assert_eq!((oci.tls_cert, oci.tls_key, oci.prefix), (None, None, None));
     assert_eq!((oci.max_connections, oci.connection_lifetime), (None, None));
 
-    assert_eq!(cache_of(LEAST).oci.listen, None);
+    assert!(cache_of(LEAST).oci.listen.is_empty());
+}
+
+/// Asserts that a build node's `listen` keys take a list as a storage node's do, in the S3
+/// table and the `[oci]` table, and are refused with the same messages when an address is twice.
+#[test]
+fn a_build_node_takes_lists_of_addresses() {
+    let server = "[\"192.0.2.10:9400\", \"[::]:9400\"]";
+    let oci = "[\"192.0.2.10:5000\", \"[::]:5000\"]";
+    let text =
+        CACHE
+            .replacen("\"192.0.2.10:9400\"", server, 1)
+            .replacen("\"192.0.2.10:5000\"", oci, 1);
+    let cache = cache_of(&text);
+    let wanted = |first: &str, second: &str| vec![first.parse().unwrap(), second.parse().unwrap()];
+    assert_eq!(cache.front.listen, wanted("192.0.2.10:9400", "[::]:9400"));
+    assert_eq!(cache.oci.listen, wanted("192.0.2.10:5000", "[::]:5000"));
+
+    let twice = "[\"192.0.2.10:9400\", \"192.0.2.10:9400\"]";
+    let why = refusal(&CACHE.replacen("\"192.0.2.10:9400\"", twice, 1));
+    assert_eq!(why, "server.listen: the same address is listed twice");
+    let twice = "[\"192.0.2.10:5000\", \"192.0.2.10:5000\"]";
+    let why = refusal(&CACHE.replacen("\"192.0.2.10:5000\"", twice, 1));
+    assert_eq!(why, "oci.listen: the same address is listed twice");
 }
 
 /// Asserts that a build node's `[oci]` table is refused exactly as a storage node's is: for each
@@ -680,18 +703,18 @@ fn an_oci_front_over_keys_the_cache_does_not_keep_is_refused() {
     assert!(why.contains("does not end in /"), "{why}");
     let outside = "[[policy]]\nprefix = \"other/\"\ncache = false\n";
     let loaded = cache_of(&format!("{LEAST}\n{rest}\n{outside}\n{front}"));
-    assert!(loaded.oci.listen.is_some());
+    assert!(!loaded.oci.listen.is_empty());
 
     let given = format!("{front}prefix = \"layers/\"\n");
     let why = refusal(&format!("{KEEPS_OCI}\n{given}"));
     assert!(why.contains("\"layers/blobs/sha256/\""), "{why}");
     let layers = "[[policy]]\nprefix = \"layers/\"\ncache = true\n";
     let kept = cache_of(&format!("{KEEPS_OCI}\n{layers}\n{given}"));
-    assert!(kept.oci.listen.is_some());
+    assert!(!kept.oci.listen.is_empty());
     let default = cache_of(&format!("{KEEPS_OCI}\n{front}"));
-    assert!(default.oci.listen.is_some());
+    assert!(!default.oci.listen.is_empty());
     // No front, no check: a file whose policies keep nothing under `oci/` loads as before.
-    assert_eq!(cache_of(LEAST).oci.listen, None);
+    assert!(cache_of(LEAST).oci.listen.is_empty());
 }
 
 /// Asserts the `whole_fill_limit` key: a size that reaches `whole_limit`, and refused at zero and

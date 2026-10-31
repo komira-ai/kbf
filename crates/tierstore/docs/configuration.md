@@ -110,13 +110,14 @@ How the cache behaves is in [operations](operations.md#a-build-node). The file i
 - A duration is a string of a whole number and `ms`, `s`, `m` or `h`: `250ms`, `15m`.
 - A size is an integer of bytes, or a string of a whole number and `B`, `KiB`, `MiB`, `GiB` or `TiB`: `"500GiB"`.
 - A path is a string. A list of paths is an array, and the flag it stands for is given once for each element.
+- An address is a string, `"192.0.2.10:9000"` or `"[2001:db8::1]:9000"`. The two `listen` keys also take an array of addresses, and the flag is given once for each element; that is on main, not in v0.0.41, where a `listen` key is one string and a flag is given once. Only an address named twice is refused by the check of the file or the flags. A wildcard and a specific address on one port (`0.0.0.0:9000` and `192.0.2.10:9000`), or one address on both `--listen` and `--oci-listen`, are refused by the system at bind on Linux (the start fails, naming the address); on macOS and the BSDs `SO_REUSEADDR` can let such sockets share the port, so do not rely on the refusal there.
 - A number above 9223372036854775807 cannot go in a file; as a flag it is accepted.
 
 ## `[server]`
 
 | Key | Flag | Type, default | What |
 |---|---|---|---|
-| `server.listen` | `--listen` | address, required | where the S3 API, `/healthz`, `/readyz`, `/usagez` and `/metricz` are served |
+| `server.listen` | `--listen` | address or list of addresses, required | where the S3 API, `/healthz`, `/readyz`, `/usagez` and `/metricz` are served. On main, not in v0.0.41: a list (the flag given again for each address) is served on every address by one server, with one drain and one limit on connections, and a start that cannot bind every address is refused. To listen on the wildcard of both families give `0.0.0.0:<port>` and `[::]:<port>`: an IPv6 address is bound for IPv6 only, so the two do not clash. An address given twice is refused, naming the key |
 | `server.proxy_id` | `--proxy-id` | string, required | names this process's journal and lease in the hot tier; keep it across restarts and give each process over the same tiers its own |
 | `server.bucket` | `--bucket` | string, required | the one bucket clients see; not `healthz`, `readyz`, `usagez` or `metricz` |
 | `server.region` | `--region` | string, `us-east-1` | the region in the credential scope of a request's signature (not the tiers' regions) |
@@ -164,6 +165,7 @@ Only `[hot_store]` has these, since only a process with a hot tier has them:
 | `hot_store.copy_parallel` | `--copy-parallel` | count, 16 | the most objects the reconciler copies at once |
 | `hot_store.lease_ttl` | `--lease-ttl` | duration, `30s` | how long the reconciler's lease lasts without a renewal |
 | `hot_store.reconcile_interval` | `--reconcile-interval` | duration, `5s` | how often the reconciler works; shorter than the lease |
+| `hot_store.lock_file` | `--lock-file` | absolute path, none | on main, not in v0.0.41. the lock file of the node: the reconciler works only while this process holds an exclusive lock on it. A process that finds the lock held serves reads and writes through its own proxy and tries the lock again every second; the system frees it when the holder exits or crashes. If the file is replaced, the holder stops its reconciler and waits for the lock on the new file. Give every process of one node the same path, on a local file system, in a directory that nothing removes (`/var/lib/tierstore/`, not a directory under `/run`). The start refuses a path that is not absolute, one that names no file, and one that cannot be opened or is on a network file system. Without it the reconciler works as soon as the process starts |
 | `hot_store.usage_stale_after` | `--usage-stale-after` | duration, `2m` | how old the published usage may be before `/usagez` says 503; longer than the lease |
 
 The water marks are percents from 1 to 100. The start refuses `low_water` at or above `high_water`, `high_water` above `critical`, a `reconcile_interval` at or above `lease_ttl`, and a `usage_stale_after` at or below `lease_ttl`.
@@ -182,7 +184,7 @@ The read cache of a build node. A GET or HEAD of a key that a `[[policy]]` with 
 | `local_cache.critical` | percent, 95 | above this share a fill is skipped; not below `high_water` |
 | `local_cache.free_floor` | percent, 10 (0 to 99) | the share of the file system that is kept free: below it a pass evicts, even under the budget. The budget may not be above the size of the file system less this share |
 | `local_cache.max_concurrent_fills` | count, 4 (1 to 64) | the most fills that run at once; a miss that finds them all running is served from the upstream and kept nowhere |
-| `local_cache.max_concurrent_keeps` | count, 8 (1 to 64) | on main, not in v0.0.41. The most create-only puts copied into the cache at once, apart from the fills; a put that finds them all running succeeds and is not kept |
+| `local_cache.max_concurrent_keeps` | count, 8 (1 to 64) | on main, not in v0.0.41. The most create-only puts copied into the cache at once, apart from the fills; a put that finds them all running succeeds and is not kept. A process that does not hold the lock of the cache directory (see [operations](operations.md#the-cache-lock-and-read-only-mode)) keeps no put at all |
 | `local_cache.keep_wait` | duration, `5s` (above 0) | on main, not in v0.0.41. The longest a put waits, once the upstream has the object, for its copy to land in the cache; past it the put is answered and the copy finishes in the background |
 | `local_cache.keep_deadline` | duration, `60s` (above 0, not below `keep_wait`) | on main, not in v0.0.41. The longest a copy takes in all, from the upstream's acknowledgement; a copy not done by then is abandoned and its stage file removed |
 | `local_cache.write_through` | boolean, `false` | `false`: the node refuses every write with 403. `true`: it takes the writes its keys may do and sends each to the upstream, which must then be read with a key that may write; the start runs the self-test of a storage node against the upstream and exits 3 if it answers one wrongly |
@@ -208,12 +210,19 @@ connection_lifetime = "1h"
 
 | Key | Flag | Type, default | What |
 |---|---|---|---|
-| `oci.listen` | `--oci-listen` | address | where the front listens. With a certificate and key it is HTTPS; with neither it is plain HTTP, and off loopback the start prints one warning line |
-| `oci.tls_cert_file` | `--oci-tls-cert` | path | the certificate chain (PEM), leaf first. It must carry an IP subjectAltName for the listen address. Both this and the key, or neither |
+| `oci.listen` | `--oci-listen` | address or list of addresses | where the front listens. With a certificate and key it is HTTPS; with neither it is plain HTTP, and off loopback the start prints one warning line for each such address. On main, not in v0.0.41: a list (the flag given again for each address) is served on every address by the one front, with one limit on connections and one drain, as `server.listen` is; an address given twice is refused, naming the key |
+| `oci.tls_cert_file` | `--oci-tls-cert` | path | the certificate chain (PEM), leaf first. It must carry an IP subjectAltName for each listen address. Both this and the key, or neither |
 | `oci.tls_key_file` | `--oci-tls-key` | path | the private key (PEM); a file any user can read is refused |
 | `oci.prefix` | `--oci-prefix` | string, `oci/` | the key prefix, ending in `/`; not inside `_journal/` or `_tiering/` |
 | `oci.max_connections` | `--oci-max-connections` | count, 64 (at least 1) | connections open at once |
 | `oci.connection_lifetime` | `--oci-connection-lifetime` | duration, `1h` | the longest a connection lives |
+
+On main, not in v0.0.41, `listen` may be a list, here the wildcard of both families:
+
+```toml fragment
+[oci]
+listen = ["0.0.0.0:5000", "[::]:5000"]
+```
 
 The front reads objects at `<prefix>blobs/sha256/<hex>` and serves GET and HEAD of `/v2/`, of manifests by digest and of blobs by digest. It is anonymous: anyone who can connect can read any digest under the prefix, so the network decides who may. Tags are not served. The certificate and key are read once; a new certificate takes a restart.
 
@@ -231,8 +240,8 @@ These describe one run, not the data path, and have no key:
 | `--print-config` | off | print the file for the flags given, and exit |
 | `--check-config` | off | with `--config`: load the file, read the key files it names, and for an `[oci]` table check the prefix, the connection lifetime and the TLS files; then exit 0 and print nothing, or print the refusal and exit 2. It binds nothing and asks no store. What it does not check is listed below. Without `--config` it is a usage error |
 | `--capabilities` | off | on main, not in v0.0.41. print what this build can do, one capability to a line, and exit 0 (a build with none prints nothing). It needs none of the flags a start requires, and with any other argument it prints nothing on stdout, says `--capabilities takes no other flag` on stderr and exits 2 |
-| `--drain-lb-wait` | `10s` | on SIGTERM, how long `/readyz` says 503 while the server goes on serving |
-| `--drain-deadline` | `15m` | then how long it waits for requests in flight |
+| `--drain-lb-wait` | `10s` | on SIGTERM, the settle: how long `/readyz` says 503 while the server goes on accepting and serving |
+| `--drain-deadline` | `15m` | then how long it waits for requests in flight and for the connections it closes (on main, not in v0.0.41: a lingering close, see [operations](operations.md#drain-and-restart)) |
 
 `--check-config` finds what the loader refuses (see "What the loader refuses"), a `bucket` that is a probe path name, a zero `body_idle_timeout`, a key file that is not owned by the user, is open to others or is a link, two keys with one id, and, in the file of a build node, a zero `s3_request_timeout`. It does not find what a start checks after that: the water marks out of order, `reconcile_interval` not below `lease_ttl`, `usage_stale_after` not above `lease_ttl`, or a zero `s3_request_timeout` in a storage node's file (a start exits 1 on each, and the unit tries again every 30 seconds); a tier that is down or answers the self-test wrongly; the cache directory and a `budget` over the size of its file system. A file that passes `--check-config` can still fail to start.
 
@@ -249,6 +258,7 @@ Each of these exits with status 2 and names the file and the key (a syntax error
 - a key a tier's `kind` does not take, a `dir` tier without `path`, an `s3` tier without `bucket`, `endpoint` or `credentials_file`, and a key only one tier has in the other (`budget` and the reconciler's keys belong to `[hot_store]`, `skip_checks` to `[cold_store]`);
 - a water mark outside 1 to 100, and a budget, count or limit of zero;
 - an `[oci]` table without `listen`, with only one of the certificate and the key, or with `max_connections = 0`;
+- on main, not in v0.0.41: a `server.listen` or `oci.listen` that is an empty list or names one address twice;
 - a `[[policy]]` that breaks the rules above.
 
 ## Moving from flags to a file
