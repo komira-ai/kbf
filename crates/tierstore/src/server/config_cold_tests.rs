@@ -190,9 +190,21 @@ fn the_other_shapes_are_unchanged() {
     assert!(why.contains("no flag form"), "{why}");
 }
 
+/// Asserts that a pass-through file with an `[oci]` table is refused at load, with a message that
+/// names `oci` and the shape, whether or not the table has `listen`: the registry front is a
+/// storage node's. Catches the table being dropped without a word.
+#[test]
+fn a_pass_through_front_refuses_an_oci_table() {
+    for table in ["listen = \"127.0.0.1:5000\"", "prefix = \"cas/\""] {
+        let why = refusal(&cold_text("", &format!("[oci]\n{table}\n")));
+        assert!(why.contains("oci"), "{why}");
+        assert!(why.contains("pass-through front"), "{why}");
+    }
+}
+
 /// Asserts that the README of the packaging documents the pass-through shape: its example (the
-/// third TOML block, after the storage node's and the build node's) loads as a pass-through
-/// front, and both READMEs have a section for it.
+/// TOML block with a `[cold_store]` and neither `[hot_store]` nor `[local_cache]`) loads as a
+/// pass-through front, and both READMEs have a section for it.
 #[test]
 fn the_readme_documents_the_cold_store_alone_file() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -200,8 +212,17 @@ fn the_readme_documents_the_cold_store_alone_file() {
         std::fs::read_to_string(root.join("../../packaging/tierstore/README.md")).unwrap();
     let package = std::fs::read_to_string(root.join("README.md")).unwrap();
     let blocks: Vec<&str> = packaging.split("```toml\n").skip(1).collect();
-    let example = blocks[2].split_once("\n```").unwrap().0;
-    let settings = cold(example, DEFAULTS);
+    let examples: Vec<&str> = blocks
+        .iter()
+        .map(|block| block.split_once("\n```").unwrap().0)
+        .filter(|text| {
+            text.contains("[cold_store]")
+                && !text.contains("[hot_store]")
+                && !text.contains("[local_cache]")
+        })
+        .collect();
+    assert_eq!(examples.len(), 1, "{examples:?}");
+    let settings = cold(examples[0], DEFAULTS);
     assert_eq!(settings.cold.spec, "s3:tierstore");
     assert_eq!(settings.front.proxy_id, "tierstore-pass-1");
     assert!(packaging.contains("### A cold store alone"));

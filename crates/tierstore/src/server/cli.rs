@@ -1033,6 +1033,10 @@ pub(super) fn checked(settings: &Settings) -> Result<(), Error> {
             Err("--s3-request-timeout must be longer than zero".into())
         }
         Settings::Cache(cache) => server_config(&cache.front, clock).map(drop),
+        Settings::Cold(cold) if cold.s3_request_timeout.is_zero() => {
+            Err("--s3-request-timeout must be longer than zero".into())
+        }
+        Settings::Cold(cold) => server_config(&cold.front, clock).map(drop),
     }
 }
 

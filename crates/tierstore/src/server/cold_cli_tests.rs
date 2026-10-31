@@ -20,9 +20,9 @@ use kbf_objstore::{
 use kbf_testkit::dir::TestDir;
 use tokio::sync::oneshot;
 
-use super::cli::{Error, exit_status};
+use super::cli::{Error, checked, exit_status};
 use super::cold_cli::{run_cold, serve_cold};
-use super::config::{PerRun, settings_from_text};
+use super::config::{PerRun, Settings, settings_from_text};
 use super::config_cold::ColdSettings;
 use super::launch::{Refused, resolve};
 use super::presign::{PresignRequest, presign_put};
@@ -587,4 +587,28 @@ async fn run_cold_opens_the_cold_store_the_file_names() {
     };
     let (drained, ()) = tokio::join!(running, driving);
     assert_eq!(drained.unwrap(), Drained { abandoned: 0 });
+}
+
+/// Asserts what `--check-config` finds in the settings of a pass-through front: a whole file
+/// passes, a request timeout of zero is refused with the message of a start, and a key file that
+/// is not there is refused. Catches a front that `checked` lets through unread.
+#[test]
+fn check_config_of_a_pass_through_front_refuses_a_zero_timeout_and_a_missing_key_file() {
+    let node = Node::new("tscold-cli-check");
+    let whole = node.settings("", "");
+    assert!(checked(&Settings::Cold(Box::new(whole))).is_ok());
+
+    let zero = node.settings("s3_request_timeout = \"0s\"", "");
+    let why = checked(&Settings::Cold(Box::new(zero))).unwrap_err();
+    assert!(why.to_string().contains("--s3-request-timeout"), "{why}");
+
+    let text = node
+        .text("", "")
+        .replace(&node.file("key"), "/no/such/access.key");
+    let gone = settings_from_text(&text, QUICK)
+        .unwrap()
+        .into_cold()
+        .unwrap();
+    let why = checked(&Settings::Cold(Box::new(gone))).unwrap_err();
+    assert!(why.to_string().contains("/no/such/access.key"), "{why}");
 }

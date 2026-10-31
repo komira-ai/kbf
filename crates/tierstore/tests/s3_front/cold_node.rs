@@ -89,3 +89,31 @@ fn a_file_that_skips_a_check_of_the_cold_store_is_refused_with_status_2() {
     assert!(err.contains("pass.toml"), "{err}");
     assert!(!err.contains("ignores-if-none-match"), "{err}");
 }
+
+fn checking(config: &str) -> Vec<String> {
+    ["--config", config, "--check-config"]
+        .map(str::to_owned)
+        .to_vec()
+}
+
+/// Asserts that `--check-config` of a good pass-through file prints nothing and exits 0 without a
+/// call to the network (the endpoint is an address nothing answers on), and that a request timeout
+/// of zero is refused with status 2, nothing on stdout and the message of the start's refusal on stderr.
+#[test]
+fn check_config_of_a_pass_through_file_passes_silently_and_refuses_a_zero_timeout() {
+    let files = Files::new("bin-cold-check");
+    let cold_key = files.secret("cold.key", "COLDKEY\ncold-secret\n");
+    let config = node_file(&files, "http://192.0.2.1:9300", &cold_key, "");
+    assert_eq!(run(&checking(&config)), (0, String::new(), String::new()));
+
+    let text = std::fs::read_to_string(&config).unwrap();
+    let zero = text.replace(
+        "proxy_id        = \"bin-pass\"",
+        "proxy_id        = \"bin-pass\"\ns3_request_timeout = \"0s\"",
+    );
+    assert_ne!(zero, text);
+    let zero = files.secret("zero.toml", &zero).display().to_string();
+    let (code, out, said) = run(&checking(&zero));
+    assert_eq!((code, out.as_str()), (2, ""));
+    assert!(said.contains("must be longer than zero"), "{said}");
+}

@@ -451,8 +451,8 @@ so; the proxy's series are in "Metrics" in `crates/tierstore/README.md`.
 ### The registry front
 
 The registry front (see The OCI read front) is the optional `[oci]` table of a storage node's file,
-left out for a server with no front. A build node's file may not have it: the front is a storage
-node's, and the file is refused with a message that names `oci`. A key of the table that is left
+left out for a server with no front. The file of a build node or of a pass-through front may not
+have it: the front is a storage node's, and the file is refused with a message that names `oci`. A key of the table that is left
 out has the default of its flag:
 
 ```toml

@@ -819,6 +819,10 @@ fn settings(file: File, per_run: PerRun) -> Result<Settings, ConfigError> {
             Ok(Settings::Cache(Box::new(cache)))
         }
         (None, Some(cold), None) => {
+            if oci.is_some() {
+                let why = "is refused in the file of a pass-through front: the OCI front is a storage node's, and this node serves only the S3 front";
+                return Err(invalid("oci", why));
+            }
             let cold = ColdSettings::new(server, cold, &policy, per_run)?;
             Ok(Settings::Cold(Box::new(cold)))
         }
