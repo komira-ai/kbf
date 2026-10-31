@@ -424,7 +424,7 @@ fn plan_one(def: &ServiceDef, marks: &ServiceOps, fleet: &Fleet) -> Vec<Change> 
 /// or marked bad.
 #[test]
 fn last_good_is_recorded_only_when_converged_and_baked() {
-    let plain = def("");
+    let plain = def(AUTO);
     let none = ServiceOps::default();
     let record = vec![Change::LastGood(version("1.0"))];
     assert_eq!(plan_one(&plain, &none, &converged(&all_at_one())), record);
@@ -468,7 +468,7 @@ fn last_good_is_recorded_only_when_converged_and_baked() {
 /// not at the first.
 #[test]
 fn last_good_waits_for_the_bake() {
-    let baking = def("bake_beats = 2");
+    let baking = def(&format!("{AUTO}\nbake_beats = 2"));
     let mut fleet = Fleet::new(Duration::ZERO);
     for round in 1..=2_u64 {
         for (name, b) in all_at_one() {
@@ -932,4 +932,24 @@ async fn a_mark_that_cannot_be_written_stays_raised_and_the_rollback_waits() {
     assert_eq!(wanted(&rig), version("2.0"), "not rolled back on that beat");
     assert_eq!(heartbeat("d3", beat("1.0")), ServiceReply::Nothing);
     assert_eq!(wanted(&rig), version("1.0"), "the next beat finishes it");
+}
+
+/// A manual service uses none of this: nothing is recorded for it, so a farm that never asks
+/// for a rollback keeps its files as they were (no ops file, no `ops` in the status).
+#[tokio::test]
+async fn a_manual_service_records_nothing_and_creates_no_ops_file() {
+    let rig = rig("rb-manual-quiet", "", ONE).await;
+    round(&rig, 2_000, &[]);
+    assert_eq!(
+        plan(
+            &def(""),
+            &desired("1.0", 0, 0),
+            &ServiceOps::default(),
+            &converged(&all_at_one()),
+            secs(2_000)
+        ),
+        vec![]
+    );
+    assert!(status(&rig).ops.is_empty());
+    assert!(!rig.dir.path().join("desired.json.ops").exists());
 }
