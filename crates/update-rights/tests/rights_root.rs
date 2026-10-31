@@ -902,6 +902,9 @@ fn probe_2_scope_diagnosis() {
             user = account.name
         );
         fs::write(&rule, body).unwrap();
+        let _ = Command::new(SYSTEMCTL)
+            .args(["reset-failed", "polkit.service"])
+            .output();
         ok(SYSTEMCTL, &["restart", "polkit.service"]);
         for unit in ["a", "b", "c"] {
             let done = Command::new("/usr/bin/pkcheck")
