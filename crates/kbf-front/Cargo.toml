@@ -54,6 +54,8 @@ tower-layer.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The client side of `Server::handle`: a request body for the store a locate grant is verified by.
+http-body-util.workspace = true
 kbf-front = { workspace = true, features = ["testkit"] }
 # The loopback S3 service (`s3::fake`) the large-blob tests flush to.
 kbf-objstore = { workspace = true, features = ["testkit"] }
