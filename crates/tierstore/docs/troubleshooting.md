@@ -47,7 +47,8 @@ The configuration file:
 <key>: a storage node keeps no cache: it needs [local_cache] and no [hot_store]
 <key>: the file needs both [hot_store] and [cold_store] (the storage-node shape), or [local_cache] and [cold_store] without [hot_store] (the build-node shape)
 <key>: is refused with [hot_store]: the hot store is already local disk, and a disk cache in front of it would cache a disk with a disk
-<key>: is refused in the file of a build node: the OCI front is a storage node's, and this node serves only the S3 front
+<key>: no [[policy]] covers the blobs under <prefix>, so every pull would go to the upstream; give a [[policy]] with prefix = <prefix> and cache = true
+<key>: the blobs under <prefix> are covered by the [[policy]] with prefix <prefix>, which has cache = false, so every pull would go to the upstream; give a [[policy]] with prefix = <prefix> and cache = true
 ```
 
 Move the setting into the file as a path, or take the flag out of the command line; give the file one of the two shapes, a storage node's or a build node's, and leave `[local_cache]` out of a storage node's. A message of a syntax error reads `line <N>, column <M>: <key>: ...` and never repeats the value.
