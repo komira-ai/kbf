@@ -29,8 +29,9 @@ use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +40,10 @@ use crate::record::write_atomic;
 
 /// The registrations, in the updater's state directory.
 pub const REGISTRATIONS_FILE: &str = "registrations.json";
+/// The connections a server serves at once unless told otherwise.
+pub const MAX_CONNECTIONS: usize = 64;
+/// How long a connection may take to send its registration. A test never waits for it.
+pub const READ_TIMEOUT_SECS: u64 = 10;
 /// The longest line a registration may be.
 pub const MAX_LINE: usize = 4096;
 
@@ -165,6 +170,8 @@ struct Saved {
     version: String,
     health: Option<HealthAddr>,
     ttl_secs: u64,
+    #[serde(default)]
+    stopped: bool,
 }
 
 #[derive(Default)]
@@ -197,7 +204,11 @@ impl Registry {
                             version: s.version,
                             health: s.health,
                             ttl_secs: s.ttl_secs,
-                            presence: Presence::Unconfirmed { since },
+                            presence: if s.stopped {
+                                Presence::Stopped
+                            } else {
+                                Presence::Unconfirmed { since }
+                            },
                             conn: 0,
                         },
                     );
@@ -245,6 +256,12 @@ impl Registry {
                 conn,
             },
         );
+        self.persist(&inner)?;
+        Ok(conn)
+    }
+
+    /// Writes the registrations, durably; a service whose connection closed is written stopped.
+    fn persist(&self, inner: &Inner) -> Result<(), RegistryError> {
         let saved: Vec<Saved> = inner
             .entries
             .iter()
@@ -254,21 +271,25 @@ impl Registry {
                 version: e.version.clone(),
                 health: e.health.clone(),
                 ttl_secs: e.ttl_secs,
+                stopped: e.presence == Presence::Stopped,
             })
             .collect();
         let bytes =
             serde_json::to_vec(&saved).map_err(|e| RegistryError::Corrupt(e.to_string()))?;
-        write_atomic(&self.dir, REGISTRATIONS_FILE, &bytes)?;
-        Ok(conn)
+        Ok(write_atomic(&self.dir, REGISTRATIONS_FILE, &bytes)?)
     }
 
     /// The connection `conn` closed: its service is stopped, unless a later registration of
     /// the same name has replaced it.
-    pub fn closed(&self, name: &str, conn: u64) {
+    /// The stop is written, so a registration loaded after a restart is stopped too.
+    pub fn closed(&self, name: &str, conn: u64) -> Result<(), RegistryError> {
         let mut inner = self.inner();
-        if let Some(entry) = inner.entries.get_mut(name).filter(|e| e.conn == conn) {
-            entry.presence = Presence::Stopped;
-        }
+        let held = inner.entries.get_mut(name).filter(|e| e.conn == conn);
+        let Some(entry) = held else {
+            return Ok(());
+        };
+        entry.presence = Presence::Stopped;
+        self.persist(&inner)
     }
 
     /// What to report for `name`, whose staged version is `expected`.
@@ -328,6 +349,8 @@ pub struct Server {
     listener: UnixListener,
     registry: Arc<Registry>,
     declared: Arc<dyn Declared>,
+    max_connections: usize,
+    open: AtomicUsize,
 }
 
 impl Server {
@@ -365,12 +388,14 @@ impl Server {
             listener,
             registry,
             declared,
+            max_connections: MAX_CONNECTIONS,
+            open: AtomicUsize::new(0),
         })
     }
 
     /// The most connections served at once; more are answered `busy` and closed.
-    pub fn with_max_connections(self, max: usize) -> Server {
-        let _ = max;
+    pub fn with_max_connections(mut self, max: usize) -> Server {
+        self.max_connections = max;
         self
     }
 
@@ -382,9 +407,15 @@ impl Server {
             if stop.load(Ordering::Acquire) {
                 return Ok(());
             }
+            if self.open.fetch_add(1, Ordering::SeqCst) >= self.max_connections {
+                self.open.fetch_sub(1, Ordering::SeqCst);
+                let _ = reply(&stream, Some(Refused::Busy.token()));
+                continue;
+            }
             let server = Arc::clone(self);
             std::thread::spawn(move || {
                 let _ = server.serve_connection(stream);
+                server.open.fetch_sub(1, Ordering::SeqCst);
             });
         }
     }
@@ -393,6 +424,7 @@ impl Server {
     /// until the peer closes.
     pub fn serve_connection(&self, stream: UnixStream) -> Result<(), RegistryError> {
         let peer = peer_uid(&stream)?;
+        stream.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)))?;
         let mut reader = BufReader::new((&stream).take(MAX_LINE as u64 + 1));
         let mut line = String::new();
         let read = reader.read_line(&mut line);
@@ -415,12 +447,19 @@ impl Server {
             }
         };
         reply(&stream, None)?;
-        // The connection is the liveness: wait for the peer to close it.
+        // The connection is the liveness: wait for the peer to close it. What it sends meanwhile
+        // is read and dropped, up to one more line's worth; a peer that sends more is cut off.
+        stream.set_read_timeout(None)?;
         let mut sink = [0u8; 256];
         let mut rest = &stream;
-        while matches!(rest.read(&mut sink), Ok(n) if n > 0) {}
-        self.registry.closed(&name, conn);
-        Ok(())
+        let mut budget = MAX_LINE;
+        while budget > 0 {
+            match rest.read(&mut sink) {
+                Ok(n) if n > 0 => budget = budget.saturating_sub(n),
+                _ => break,
+            }
+        }
+        self.registry.closed(&name, conn)
     }
 
     fn accept(

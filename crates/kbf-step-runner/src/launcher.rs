@@ -16,8 +16,9 @@ pub struct StepCall<'a> {
     /// The step and its arguments, in the form `Invocation::to_args` prints: `prepare` carries
     /// the staged release as its `<artifact>`, every step carries `--params <file>`.
     pub invocation: Invocation,
-    /// The hook executable: a file of the verified release the runner checked, the previous
-    /// release's only for the `rollback` fallback.
+    /// The hook executable: a file of the verified release the runner checked with
+    /// `Staged::check` just before (see its guarantees), the previous release's only for the
+    /// `rollback` fallback. The launcher executes this path as it is.
     pub executable: &'a Path,
     /// The deterministic name of the transient unit: `updater-<service>-<step>-<generation>`.
     /// A launcher that runs the step as a unit uses it; it is stopped by name on resume.

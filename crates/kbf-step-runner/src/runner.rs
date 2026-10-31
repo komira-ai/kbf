@@ -32,6 +32,8 @@ pub const DEFAULT_RETRY_SECS: u64 = 60;
 pub const WATCH_POLL_SECS: u64 = 30;
 /// The reason of a `halt` for a staged release that no longer has its digest.
 pub const REASON_ARTIFACT_CHANGED: &str = "artifact_changed";
+/// The reason a cleared halt is recorded with.
+pub const REASON_HALT_CLEARED: &str = "halt_cleared";
 /// The reason of a `Deferred` for a hook that needs a newer updater.
 pub const REASON_UPDATER_OLD: &str = "updater_old";
 
@@ -144,7 +146,29 @@ impl StepRunner {
 
     /// Clears a `halt`: the next order runs. `false` when the record holds no halt.
     pub fn clear_halt(&self) -> Result<bool, RunError> {
-        Ok(false)
+        let mut rec = match self.store.load()? {
+            Loaded::Newer { schema } => return Err(RunError::RecordNewer(schema)),
+            Loaded::Absent => return Ok(false),
+            Loaded::Current(rec) => rec,
+        };
+        let halted = matches!(
+            rec.state,
+            State::Finished {
+                verdict: Verdict::Halt,
+                ..
+            }
+        );
+        if !halted {
+            return Ok(false);
+        }
+        rec.state = State::Finished {
+            verdict: Verdict::Deferred {
+                retry_after_secs: None,
+            },
+            reason: Some(REASON_HALT_CLEARED.to_owned()),
+        };
+        self.store.save(&rec)?;
+        Ok(true)
     }
 
     /// How the last update of this service ended, `None` when none has or one is under way.
@@ -196,6 +220,19 @@ impl StepRunner {
             Loaded::Newer { schema } => return Err(RunError::RecordNewer(schema)),
             Loaded::Absent => 1,
             Loaded::Current(rec) => {
+                // A verdict stands: the same order again is answered with it and runs nothing,
+                // and a halt holds the service for every order until `clear_halt`. A `Deferred`
+                // is run again, because the order comes back after its wait.
+                if let State::Finished { verdict, reason } = &rec.state {
+                    let ended =
+                        matches!(verdict, Verdict::Succeeded { .. } | Verdict::Failed { .. });
+                    if matches!(verdict, Verdict::Halt) || (ended && same_update(&rec, order)) {
+                        return Ok(Finished {
+                            verdict: verdict.clone(),
+                            reason: reason.clone(),
+                        });
+                    }
+                }
                 let unfinished = !matches!(rec.state, State::Finished { .. });
                 if unfinished && same_update(&rec, order) {
                     return self.advance(order, *rec);
@@ -329,6 +366,14 @@ impl StepRunner {
     ) -> Result<Ran, RunError> {
         let started = Stamp::now(&*self.clock);
         let timeout = self.timeout(order, rec);
+        // Nothing is left of the bound (the verify window has passed): the step is not started,
+        // and never with a bound of 0, which systemd reads as no limit. It ends as a failure.
+        if timeout == 0 {
+            return Ok(Ran::Exit(StepExit {
+                code: None,
+                last_line: None,
+            }));
+        }
         let deadline_secs = started.mono_secs.saturating_add(timeout);
         rec.state = State::Running {
             started,

@@ -54,9 +54,17 @@ impl Staged {
 
     /// Checks the tree still has its digest and returns the hook executable inside it.
     ///
+    /// **What the launcher may rely on:** the returned path is a regular file of a tree that was
+    /// not changed since it was sealed, and the tree and every directory above it were, at this
+    /// check, real directories (no link) owned by the running user or root and closed to group
+    /// and others. The updater's staged trees are root-owned, read-only and in root-owned
+    /// parents, so the digest and the place together mean the file cannot be swapped before the
+    /// exec. A launcher that runs the path must run it from here, not from a path it built.
+    ///
     /// `hook` is the declaration's `binary`: relative, plain names only, a regular file of the
     /// tree (not a link, so it cannot lead out of it).
     pub fn check(&self, hook: &Path) -> Result<PathBuf, ArtifactError> {
+        check_place(&self.dir)?;
         let found = tree_digest(&self.dir)?;
         if found != self.digest {
             return Err(ArtifactError::Changed {
@@ -73,6 +81,27 @@ impl Staged {
         }
         Ok(path)
     }
+}
+
+/// The tree and every directory above it are real directories (not links) owned by the running
+/// user or root and not writable by group or others.
+fn check_place(dir: &Path) -> Result<(), ArtifactError> {
+    let me = rustix::process::geteuid().as_raw();
+    let mut at = PathBuf::new();
+    for part in dir.components() {
+        at.push(part);
+        let meta = fs::symlink_metadata(&at)?;
+        // One comparison; a link is not a directory here, so a linked component fails it.
+        let sound = (
+            meta.is_dir(),
+            [me, 0].contains(&meta.uid()),
+            meta.mode() & 0o022 == 0,
+        );
+        if sound != (true, true, true) {
+            return Err(ArtifactError::Untrusted(at));
+        }
+    }
+    Ok(())
 }
 
 fn is_plain(component: Component<'_>) -> bool {
