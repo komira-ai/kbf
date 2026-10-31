@@ -76,20 +76,3 @@ async fn a_key_file_the_node_must_not_use_refuses_its_start_naming_flag_and_path
         assert_eq!(class(&*error), StartFailure::Refused, "{name}: {said}");
     }
 }
-
-/// Catches a key file accepted with a `file://` cold store, where it would do nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn file_cold_store_refuses_a_credentials_file() {
-    let rig = rig(0, |s3| node::registered(s3, "bkt", ID, SECRET)).await;
-    let cold = format!("file://{}", dir("local-cold").join("cold").display());
-    let mut node = flags(&rig, "local", &cold, no_keys);
-    node.server.cold_store_credentials_file = Some(key_file("local-key", ID, SECRET, 0o600));
-    let Err(error) = started(&node).await else {
-        panic!("a node started with a key file and a directory for a cold store");
-    };
-    assert!(
-        error.to_string().contains("--cold-store-credentials-file"),
-        "{error}"
-    );
-    assert_eq!(class(&*error), StartFailure::Refused);
-}

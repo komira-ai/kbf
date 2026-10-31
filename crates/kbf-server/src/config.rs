@@ -687,7 +687,7 @@ pub struct Args {
         long,
         value_name = "URI",
         value_parser = crate::state_store::StateStoreParser,
-        display_order = 5,
+        display_order = 6,
     )]
     pub state_store: Option<crate::state_store::StateStoreUri>,
     /// How long, in seconds, a storage node's membership row lives without a heartbeat
