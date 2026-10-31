@@ -129,7 +129,7 @@ fn an_oci_flag_with_a_file_conflicts_and_the_file_holds_the_front() {
     }
     let launch = resolve(words(&["tierstore", "--config", &path])).unwrap();
     let cli = launch.settings.into_storage().unwrap();
-    assert_eq!(cli.oci_listen, Some("192.0.2.10:5000".parse().unwrap()));
+    assert_eq!(cli.oci_listen, vec!["192.0.2.10:5000".parse().unwrap()]);
     assert_eq!(cli.oci_max_connections, Some(16));
 }
 

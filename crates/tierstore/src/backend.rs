@@ -14,6 +14,11 @@ use crate::Error;
 /// that error.
 pub type PartBody<'a> = BoxStream<'a, Result<Bytes, Error>>;
 
+/// The bytes of a read as the chunks they arrive in, so that a reader of an object of any size
+/// holds one chunk at a time. A chunk that is an error ends the body: the bytes before it were
+/// not the whole of what was asked, and a reader must not take the body for complete.
+pub type ReadBody = BoxStream<'static, Result<Bytes, Error>>;
+
 /// The error of a multipart call that a backend does not override.
 fn not_supported(call: &str) -> Error {
     let text = format!("{call}: this backend does not do multipart uploads");
@@ -246,6 +251,22 @@ pub trait Backend: Send + Sync {
     /// # Errors
     /// [`Error::NotFound`] if no object has the key.
     async fn get(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error>;
+
+    /// As [`Backend::get`], for a read that is given as the chunks of the bytes: the bytes of
+    /// `range` of the object, in order, ending with an error if they could not all be read. The
+    /// body is complete only if it ends without an error; a caller that has the length it asked
+    /// for (from a HEAD) must also count the bytes.
+    ///
+    /// The provided implementation reads the bytes whole with [`Backend::get`] and gives them as
+    /// one chunk, which serves a backend that holds its objects in memory anyway; a backend that
+    /// can do better (the local cache) overrides it.
+    ///
+    /// # Errors
+    /// As [`Backend::get`].
+    async fn get_stream(&self, key: &str, range: Option<ByteRange>) -> Result<ReadBody, Error> {
+        let whole = self.get(key, range).await?;
+        Ok(futures::stream::once(std::future::ready(Ok(whole))).boxed())
+    }
 
     /// The object's size, content tag and time of last write.
     ///

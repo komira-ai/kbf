@@ -10,9 +10,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::cells::coldguard::ColdGuardLimits;
 use crate::gate::LoadGate;
 use crate::result::Window;
 use crate::role::Role;
@@ -243,6 +245,21 @@ pub struct ConfigArgs {
     /// Load gate: highest utilisation of the busiest disk, percent.
     #[arg(long, default_value_t = 60.0)]
     pub max_disk_util_pct: f64,
+    /// Cold store guard: the run stops when the p99 latency of the harness's own requests to the
+    /// cold store over the window is above this, milliseconds.
+    #[arg(long, default_value_t = 2000, value_parser = clap::value_parser!(u64).range(1..))]
+    pub cold_abort_p99_ms: u64,
+    /// Cold store guard: the run stops when the share of the harness's own requests to the cold
+    /// store over the window that failed or timed out is above this (0 to 1).
+    #[arg(long, default_value_t = 0.05, value_parser = parse_share)]
+    pub cold_abort_error_share: f64,
+    /// Cold store guard: the length of the sliding window, seconds.
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
+    pub cold_abort_window_secs: u64,
+    /// The longest a reading of the cold store's state (`mc admin info`) may take, seconds; the
+    /// run stops, the reading being unreadable, if it takes longer.
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    pub cold_state_timeout_secs: u64,
     /// Cap on requests per second to the cold store.
     #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..))]
     pub cold_rps: u32,
@@ -261,6 +278,16 @@ pub struct ConfigArgs {
     /// Cap on all passes of a cell, GiB.
     #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..))]
     pub cell_cap_gib: u64,
+}
+
+/// A share: a number from 0 to 1.
+fn parse_share(s: &str) -> Result<f64, String> {
+    let share: f64 = s.parse().map_err(|_| format!("{s:?} is not a number"))?;
+    if (0.0..=1.0).contains(&share) {
+        Ok(share)
+    } else {
+        Err(format!("{s} is not between 0 and 1"))
+    }
 }
 
 /// `ROLE=VALUE`, split at the first `=`.
@@ -286,6 +313,10 @@ pub struct RunConfig {
     pub seed: u64,
     /// The load gate's limits.
     pub gate: LoadGate,
+    /// The cold store guard's limits.
+    pub cold_guard: ColdGuardLimits,
+    /// The longest one reading of the cold store's state may take.
+    pub cold_state_timeout: Duration,
     /// Request-rate caps.
     pub rates: RateCaps,
     /// Byte caps.
@@ -378,6 +409,12 @@ impl RunConfig {
                 max_psi_io_avg10: args.max_psi_io_avg10,
                 max_disk_util_pct: args.max_disk_util_pct,
             },
+            cold_guard: ColdGuardLimits {
+                window: Duration::from_secs(args.cold_abort_window_secs),
+                max_p99_ms: args.cold_abort_p99_ms,
+                max_error_share: args.cold_abort_error_share,
+            },
+            cold_state_timeout: Duration::from_secs(args.cold_state_timeout_secs),
             rates: RateCaps {
                 cold_rps: args.cold_rps,
                 hot_rps: args.hot_rps,
@@ -520,6 +557,50 @@ mod tests {
         assert_eq!(cfg.rates.list_poll_rps, 2);
         assert_eq!(cfg.window, Window::Busy);
         assert!(cfg.stores.is_empty());
+    }
+
+    /// Catches cold guard defaults other than 2,000 ms, 0.05 and 60 s, flags that do not reach the
+    /// configuration, and a share outside 0 to 1 or a limit of zero that the parser takes.
+    #[test]
+    fn the_cold_guard_flags_have_their_defaults_and_reach_the_configuration() {
+        let cfg = RunConfig::resolve(&args(&[]), None).unwrap();
+        assert_eq!(cfg.cold_guard, ColdGuardLimits::default());
+        assert_eq!(cfg.cold_guard.window, Duration::from_secs(60));
+        let set = args(&[
+            "--cold-abort-p99-ms",
+            "750",
+            "--cold-abort-error-share",
+            "0.2",
+            "--cold-abort-window-secs",
+            "15",
+        ]);
+        let cfg = RunConfig::resolve(&set, None).unwrap();
+        assert_eq!(cfg.cold_guard.max_p99_ms, 750);
+        assert!((cfg.cold_guard.max_error_share - 0.2).abs() < f64::EPSILON);
+        assert_eq!(cfg.cold_guard.window, Duration::from_secs(15));
+        for bad in [
+            ["--cold-abort-error-share", "1.5"],
+            ["--cold-abort-error-share", "-0.1"],
+            ["--cold-abort-error-share", "many"],
+            ["--cold-abort-p99-ms", "0"],
+            ["--cold-abort-window-secs", "0"],
+        ] {
+            let mut argv = vec!["t", "--result-dir", "out"];
+            argv.extend_from_slice(&bad);
+            assert!(Wrap::try_parse_from(argv).is_err(), "{bad:?}");
+        }
+    }
+
+    /// Catches a limit on the cold state reading other than 30 s, a flag that does not reach the
+    /// configuration, and a limit of zero that the parser takes.
+    #[test]
+    fn the_cold_state_timeout_has_its_default_and_reaches_the_configuration() {
+        let cfg = RunConfig::resolve(&args(&[]), None).unwrap();
+        assert_eq!(cfg.cold_state_timeout, Duration::from_secs(30));
+        let cfg = RunConfig::resolve(&args(&["--cold-state-timeout-secs", "5"]), None).unwrap();
+        assert_eq!(cfg.cold_state_timeout, Duration::from_secs(5));
+        let argv = ["t", "--result-dir", "out", "--cold-state-timeout-secs", "0"];
+        assert!(Wrap::try_parse_from(argv).is_err());
     }
 
     /// Catches a flag that does not override the run file, and a missing endpoint that is

@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use kbf_types::HostRole::{Daemon, Frontend, Storage};
+use kbf_types::HostRole;
 use kbf_updater::wire::{Outcome, Reply};
 
 use crate::decide::{Decision, Hold, decide_in, decide_why};
@@ -80,14 +80,14 @@ fn two(want: &Desired) -> (Services, BTreeMap<String, Desired>) {
 /// carries the desired version.
 #[test]
 fn a_host_that_passes_every_rule_is_ordered() {
-    let f = fleet(NOW, &[("d1", Daemon, beat("1.0"))]);
+    let f = fleet(NOW, &[("d1", HostRole::DAEMON, beat("1.0"))]);
     assert_eq!(kbf(&desired("2.0", 1, 1), &f, "d1", NOW), update("2.0"));
 }
 
 /// A service no definition names holds with `NoDefinition`, even with a desired state.
 #[test]
 fn a_service_without_a_definition_holds_as_no_definition() {
-    let f = fleet(NOW, &[("d1", Daemon, beat("1.0"))]);
+    let f = fleet(NOW, &[("d1", HostRole::DAEMON, beat("1.0"))]);
     let all = BTreeMap::from([("ghost".to_owned(), desired("2.0", 1, 1))]);
     let services = Services::default();
     assert_eq!(
@@ -99,7 +99,7 @@ fn a_service_without_a_definition_holds_as_no_definition() {
 /// A defined service with no desired state holds with `NoDesired`.
 #[test]
 fn a_service_without_a_desired_state_holds_as_no_desired() {
-    let f = fleet(NOW, &[("d1", Daemon, beat("1.0"))]);
+    let f = fleet(NOW, &[("d1", HostRole::DAEMON, beat("1.0"))]);
     let services = Services::default();
     assert_eq!(
         why(&services, &BTreeMap::new(), KBF, &f, "d1", NOW),
@@ -110,7 +110,7 @@ fn a_service_without_a_desired_state_holds_as_no_desired() {
 /// A host the coordinator has not heard from holds with `NotAMember`.
 #[test]
 fn a_host_that_has_not_heartbeated_holds_as_not_a_member() {
-    let f = fleet(NOW, &[("d1", Daemon, beat("1.0"))]);
+    let f = fleet(NOW, &[("d1", HostRole::DAEMON, beat("1.0"))]);
     assert_eq!(
         kbf(&desired("2.0", 1, 1), &f, "d2", NOW),
         held(Hold::NotAMember)
@@ -124,7 +124,7 @@ fn a_host_whose_role_the_service_does_not_run_on_holds_as_not_a_member() {
     let want = desired("2.0", 0, 0);
     let (services, all) = two(&want);
     let mut f = Fleet::new(Duration::ZERO);
-    f.record_in("server", id("s1"), Storage, beat("1.0"), NOW);
+    f.record_in("server", id("s1"), HostRole::STORAGE, beat("1.0"), NOW);
     assert_eq!(
         why(&services, &all, "server", &f, "s1", NOW),
         held(Hold::NotAMember)
@@ -137,7 +137,7 @@ fn a_host_whose_role_the_service_does_not_run_on_holds_as_not_a_member() {
 fn the_first_thirty_seconds_hold_as_quiet() {
     let d = desired("2.0", 1, 1);
     let mut f = Fleet::new(secs(1_000));
-    f.record(id("d1"), Daemon, beat("1.0"), secs(1_029));
+    f.record(id("d1"), HostRole::DAEMON, beat("1.0"), secs(1_029));
     assert_eq!(kbf(&d, &f, "d1", secs(1_000)), held(Hold::Quiet));
     assert_eq!(kbf(&d, &f, "d1", secs(1_029)), held(Hold::Quiet));
     assert_eq!(kbf(&d, &f, "d1", secs(1_030)), update("2.0"));
@@ -146,7 +146,10 @@ fn the_first_thirty_seconds_hold_as_quiet() {
 /// A host in the middle of an update holds with `Updating`.
 #[test]
 fn a_host_that_is_updating_holds_as_updating() {
-    let f = fleet(NOW, &[("d1", Daemon, updating(beat("1.0"), "2.0"))]);
+    let f = fleet(
+        NOW,
+        &[("d1", HostRole::DAEMON, updating(beat("1.0"), "2.0"))],
+    );
     assert_eq!(
         kbf(&desired("2.0", 1, 1), &f, "d1", NOW),
         held(Hold::Updating)
@@ -160,8 +163,8 @@ fn a_host_busy_with_another_service_holds_as_busy_elsewhere() {
     let want = desired("2.0", 0, 0);
     let (services, all) = two(&want);
     let mut f = Fleet::new(Duration::ZERO);
-    f.record_in("server", id("h"), Daemon, beat("1.0"), NOW);
-    f.record_in("agent", id("h"), Daemon, beat("1.0"), NOW);
+    f.record_in("server", id("h"), HostRole::DAEMON, beat("1.0"), NOW);
+    f.record_in("agent", id("h"), HostRole::DAEMON, beat("1.0"), NOW);
     f.order("server", id("h"), version("2.0"), NOW);
     assert_eq!(
         why(&services, &all, "agent", &f, "h", NOW),
@@ -173,7 +176,7 @@ fn a_host_busy_with_another_service_holds_as_busy_elsewhere() {
 /// A host that runs the desired version holds with `UpToDate`.
 #[test]
 fn a_host_at_the_desired_version_holds_as_up_to_date() {
-    let f = fleet(NOW, &[("d1", Daemon, beat("2.0"))]);
+    let f = fleet(NOW, &[("d1", HostRole::DAEMON, beat("2.0"))]);
     assert_eq!(
         kbf(&desired("2.0", 1, 1), &f, "d1", NOW),
         held(Hold::UpToDate)
@@ -186,7 +189,11 @@ fn a_host_at_the_desired_version_holds_as_up_to_date() {
 fn a_host_that_failed_this_version_holds_as_failed_here() {
     let f = fleet(
         NOW,
-        &[("d1", Daemon, last(beat("1.0"), "2.0", Outcome::Failed))],
+        &[(
+            "d1",
+            HostRole::DAEMON,
+            last(beat("1.0"), "2.0", Outcome::Failed),
+        )],
     );
     assert_eq!(
         kbf(&desired("2.0", 1, 1), &f, "d1", NOW),
@@ -201,8 +208,8 @@ fn a_role_with_no_free_slot_holds_as_no_slot() {
     let f = fleet(
         NOW,
         &[
-            ("s1", Storage, updating(beat("1.0"), "2.0")),
-            ("s2", Storage, beat("1.0")),
+            ("s1", HostRole::STORAGE, updating(beat("1.0"), "2.0")),
+            ("s2", HostRole::STORAGE, beat("1.0")),
         ],
     );
     assert_eq!(
@@ -217,9 +224,9 @@ fn a_role_that_waits_for_another_holds_as_waiting_for_role() {
     let f = fleet(
         NOW,
         &[
-            ("s1", Storage, beat("1.0")),
-            ("f1", Frontend, beat("1.0")),
-            ("f2", Frontend, beat("1.0")),
+            ("s1", HostRole::STORAGE, beat("1.0")),
+            ("f1", HostRole::FRONTEND, beat("1.0")),
+            ("f2", HostRole::FRONTEND, beat("1.0")),
         ],
     );
     assert_eq!(
@@ -235,20 +242,20 @@ fn a_service_that_waits_for_another_holds_as_waiting_for_service() {
     let want = desired("2.0", 0, 0);
     let (services, all) = two(&want);
     let mut f = Fleet::new(Duration::ZERO);
-    f.record_in("server", id("h"), Daemon, beat("1.0"), NOW);
-    f.record_in("agent", id("h"), Daemon, beat("1.0"), NOW);
+    f.record_in("server", id("h"), HostRole::DAEMON, beat("1.0"), NOW);
+    f.record_in("agent", id("h"), HostRole::DAEMON, beat("1.0"), NOW);
     assert_eq!(
         why(&services, &all, "agent", &f, "h", NOW),
         held(Hold::WaitingForService)
     );
-    f.record_in("server", id("h"), Daemon, beat("2.0"), NOW);
+    f.record_in("server", id("h"), HostRole::DAEMON, beat("2.0"), NOW);
     assert_eq!(why(&services, &all, "agent", &f, "h", NOW), update("2.0"));
 }
 
 /// The only storage host, with one storage host required up besides it, holds with `MinUp`.
 #[test]
 fn too_few_others_up_holds_as_min_up() {
-    let f = fleet(NOW, &[("s1", Storage, beat("1.0"))]);
+    let f = fleet(NOW, &[("s1", HostRole::STORAGE, beat("1.0"))]);
     assert_eq!(kbf(&desired("2.0", 1, 1), &f, "s1", NOW), held(Hold::MinUp));
     assert_eq!(kbf(&desired("2.0", 0, 1), &f, "s1", NOW), update("2.0"));
 }
@@ -260,13 +267,18 @@ fn the_first_failing_rule_is_the_one_named() {
     let f = fleet(
         NOW,
         &[
-            ("s1", Storage, updating(beat("1.0"), "2.0")),
-            ("s2", Storage, beat("2.0")),
+            ("s1", HostRole::STORAGE, updating(beat("1.0"), "2.0")),
+            ("s2", HostRole::STORAGE, beat("2.0")),
         ],
     );
     let d = desired("2.0", 0, 0);
     assert_eq!(kbf(&d, &f, "s2", NOW), held(Hold::UpToDate));
     let mut quiet = Fleet::new(secs(1_000));
-    quiet.record(id("s1"), Storage, updating(beat("1.0"), "2.0"), secs(1_000));
+    quiet.record(
+        id("s1"),
+        HostRole::STORAGE,
+        updating(beat("1.0"), "2.0"),
+        secs(1_000),
+    );
     assert_eq!(kbf(&d, &quiet, "s1", secs(1_000)), held(Hold::Quiet));
 }

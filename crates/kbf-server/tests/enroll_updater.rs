@@ -229,7 +229,7 @@ fn names_in(dir: &Path) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_host_enrolls_with_its_token_and_gets_its_own_updater_certificate() {
     let farm = start("enroll").await;
-    let token = farm.updater_token(0x77, "host-1", HostRole::MacDaemon);
+    let token = farm.updater_token(0x77, "host-1", HostRole::MAC_DAEMON);
     let host = host("enroll-host", &farm, "host-1", &token);
     let said = enroll(&host).await.expect("enrolled");
     assert!(
@@ -277,7 +277,7 @@ async fn a_host_enrolls_with_its_token_and_gets_its_own_updater_certificate() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_used_expired_wrong_node_or_wrong_role_token_makes_no_certificate() {
     let farm = start("refused").await;
-    let used = farm.updater_token(0x71, "host-1", HostRole::Daemon);
+    let used = farm.updater_token(0x71, "host-1", HostRole::DAEMON);
     let first = host("refused-first", &farm, "host-1", &used);
     enroll(&first).await.expect("the first use");
     let second = host("refused-second", &farm, "host-1", &used);
@@ -285,12 +285,12 @@ async fn a_used_expired_wrong_node_or_wrong_role_token_makes_no_certificate() {
         0x72,
         &[Role::Updater],
         Some("host-1"),
-        Some(HostRole::Daemon),
+        Some(HostRole::DAEMON),
         Some(Duration::from_secs(600)),
     );
     let late = host("refused-late", &farm, "host-1", &expired);
     farm.advance(601);
-    let other_node = farm.updater_token(0x73, "host-9", HostRole::Daemon);
+    let other_node = farm.updater_token(0x73, "host-9", HostRole::DAEMON);
     let wrong_node = host("refused-node", &farm, "host-1", &other_node);
     let for_nodes = farm.token(0x74, &[Role::Storage, Role::Daemon], None, None, None);
     let wrong_role = host("refused-role", &farm, "host-1", &for_nodes);
@@ -319,7 +319,7 @@ async fn a_used_expired_wrong_node_or_wrong_role_token_makes_no_certificate() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_agent_renews_the_certificate_at_half_its_life_with_the_same_key() {
     let farm = start("renew").await;
-    let token = farm.updater_token(0x78, "host-1", HostRole::Daemon);
+    let token = farm.updater_token(0x78, "host-1", HostRole::DAEMON);
     let host = host("renew-host", &farm, "host-1", &token);
     enroll(&host).await.expect("enrolled");
     let node = NodeStore::open(&host.flags.state_dir)

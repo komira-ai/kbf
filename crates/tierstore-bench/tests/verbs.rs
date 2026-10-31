@@ -101,8 +101,29 @@ async fn run_owned(args: &[String]) -> Result<(), BenchError> {
     run(&args).await
 }
 
-fn write_report(out: &std::path::Path, report: &PreflightReport) {
+/// The directory the ops file of `out` names as the live tierstore's, beside `out`.
+fn live_of(out: &std::path::Path) -> std::path::PathBuf {
+    out.with_file_name("live-state")
+}
+
+/// Writes the ops file `run` reads first, with `live` as the live tierstore's directories.
+fn write_ops_with(out: &std::path::Path, live: &[&std::path::Path]) {
     std::fs::create_dir_all(out).unwrap();
+    let ops = serde_json::json!({
+        "tierstore": {"binary": "/x/tierstore", "sha256": "00", "version": "0.0.37", "plan_flags": []},
+        "live": {"unit": "live.service", "binary": "/x/live", "port": 9300, "dirs": live},
+        "test_instance": {"unit": "test.service", "port": 9411, "dirs": ["/x/state"]}
+    });
+    std::fs::write(out.join("ops.json"), ops.to_string()).unwrap();
+}
+
+/// [`write_ops_with`] for a live directory beside `out`.
+fn write_ops(out: &std::path::Path) {
+    write_ops_with(out, &[live_of(out).as_path()]);
+}
+
+fn write_report(out: &std::path::Path, report: &PreflightReport) {
+    write_ops(out);
     std::fs::write(
         out.join(preflight::REPORT_FILE),
         serde_json::to_vec(report).unwrap(),
@@ -143,6 +164,7 @@ async fn the_run_makes_its_request_log_and_the_cell_says_what_it_needs() {
 async fn a_run_needs_a_passed_preflight() {
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-run-preflight");
     let out = dir.path().join("out");
+    write_ops(&out);
     let err = run_owned(&run_args(&out, &[])).await.unwrap_err();
     match err {
         BenchError::Io { path, .. } => assert!(path.ends_with(preflight::REPORT_FILE)),
@@ -174,9 +196,10 @@ async fn the_report_verb_renders_a_directory_and_stops_on_a_missing_one() {
     assert!(matches!(err, BenchError::Io { .. }), "{err}");
 }
 
-/// Catches a result directory that cannot be made being ignored.
+/// Catches a result directory that is no directory (a file in the way, so no ops file in it)
+/// being ignored.
 #[tokio::test]
-async fn a_result_directory_that_cannot_be_made_stops_the_run() {
+async fn a_result_directory_that_is_no_directory_stops_the_run() {
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-nodir");
     let file = dir.path().join("a-file");
     std::fs::write(&file, "x").unwrap();
@@ -388,6 +411,119 @@ fn the_run_flags_name_the_ledger_and_the_fault_time_to_live() {
         tierstore_bench::faultfile::DEFAULT_TTL
     );
     assert!(parsed_run(&["--campaign-ledger", "l", "--fault-ttl-secs", "0"]).is_err());
+}
+
+/// Catches an attempt number that is not 1 unless asked for, one of 0 (no attempt `a0`), and one
+/// that is not a number.
+#[test]
+fn the_attempt_flag_defaults_to_the_first_and_is_a_positive_number() {
+    assert_eq!(parsed_run(&["--campaign-ledger", "l"]).unwrap().attempt, 1);
+    let args = parsed_run(&["--campaign-ledger", "l", "--attempt", "3"]).unwrap();
+    assert_eq!(args.attempt, 3);
+    for bad in ["0", "-1", "two"] {
+        assert!(
+            parsed_run(&["--campaign-ledger", "l", "--attempt", bad]).is_err(),
+            "{bad}"
+        );
+    }
+}
+
+/// What `run` says when it is refused for `live` directories, and whether it made anything:
+/// the result directory `out` (made by the caller only as far as its ops file), the request log
+/// and the ledger must not exist.
+async fn refused_for_live(out: &std::path::Path, live: &[&std::path::Path]) -> String {
+    write_ops_with(out, live);
+    let err = run_owned(&run_args(out, &[])).await.unwrap_err();
+    assert!(matches!(err, BenchError::LiveDir(_)), "{err}");
+    assert!(
+        !out.join("requests.jsonl").exists(),
+        "the request log was made"
+    );
+    assert!(!ledger_of(out).exists(), "the ledger was made");
+    assert!(
+        !ledger_of(out).with_extension("json.lock").exists(),
+        "the lock was made"
+    );
+    err.to_string()
+}
+
+/// Catches a run that writes in or around the live tierstore's directories: a result directory
+/// that is, holds or lies inside one, a ledger inside one, a ledger lock that is one, the same
+/// through a link or a `..`, and an ops file that lists none. Each is refused before the request
+/// log, the ledger or its lock is made.
+#[tokio::test]
+async fn a_run_stays_clear_of_the_live_directories() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-live");
+    let root = dir.path();
+    let out = root.join("out");
+
+    let text = refused_for_live(&out, &[&out]).await;
+    assert!(
+        text.contains("result directory") && text.contains("is the live directory"),
+        "{text}"
+    );
+    let text = refused_for_live(&out, &[root]).await;
+    assert!(
+        text.contains("result directory") && text.contains("is inside"),
+        "{text}"
+    );
+    let text = refused_for_live(&out, &[&out.join("data")]).await;
+    assert!(
+        text.contains("result directory") && text.contains("contains"),
+        "{text}"
+    );
+
+    let in_live = root.join("live-ledgers");
+    std::fs::create_dir_all(&in_live).unwrap();
+    write_ops_with(&out, &[&in_live]);
+    let args = with_ledger(&run_args(&out, &[]), &in_live.join("l.json"));
+    let err = run_owned(&args).await.unwrap_err();
+    assert!(err.to_string().contains("campaign ledger"), "{err}");
+    assert!(matches!(err, BenchError::LiveDir(_)), "{err}");
+    assert!(!in_live.join("l.json").exists() && !out.join("requests.jsonl").exists());
+
+    let lock = ledger_of(&out).with_extension("json.lock");
+    let text = refused_for_live(&out, &[&lock]).await;
+    assert!(text.contains("campaign ledger lock"), "{text}");
+
+    let text = refused_for_live(&out, &[]).await;
+    assert!(text.contains("live.dirs"), "{text}");
+
+    let live = root.join("live-state");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::create_dir_all(root.join("work")).unwrap();
+    let dotted = root.join("work").join("..").join("live-state").join("out");
+    let text = refused_for_live(&dotted, &[&live]).await;
+    assert!(text.contains("is inside"), "{text}");
+
+    #[cfg(unix)]
+    {
+        let linked = root.join("linked-out");
+        std::os::unix::fs::symlink(&live, &linked).unwrap();
+        let text = refused_for_live(&linked, &[&live]).await;
+        assert!(
+            text.contains("result directory") && text.contains("is the live"),
+            "{text}"
+        );
+    }
+}
+
+/// Catches an ops file with no `live.dirs` being read as one that lists none: the field is
+/// required, and the run says the file is not an ops file.
+#[tokio::test]
+async fn an_ops_file_without_live_dirs_is_not_an_ops_file() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-nolivedirs");
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let ops = serde_json::json!({
+        "tierstore": {"binary": "/x/tierstore", "sha256": "00", "version": "0.0.37", "plan_flags": []},
+        "live": {"unit": "live.service", "binary": "/x/live", "port": 9300},
+        "test_instance": {"unit": "test.service", "port": 9411, "dirs": ["/x/state"]}
+    });
+    std::fs::write(out.join("ops.json"), ops.to_string()).unwrap();
+    let err = run_owned(&run_args(&out, &[])).await.unwrap_err();
+    assert!(matches!(err, BenchError::Ops(_)), "{err}");
+    assert!(err.to_string().contains("not an ops file"), "{err}");
 }
 
 /// Catches `plan` reaching a store or ignoring the prefix rule: it needs a test prefix, refuses a

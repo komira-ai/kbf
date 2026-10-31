@@ -53,7 +53,7 @@ async fn rig(test: &str, text: &str, names: &[&str]) -> Rig {
 fn offered(rig: &Rig, announced: &[&str]) -> Vec<String> {
     let who = Identity {
         node_id: id("d1"),
-        role: HostRole::Daemon,
+        role: HostRole::DAEMON,
     };
     let mut running: BTreeMap<String, Version> = BTreeMap::new();
     let mut told = Vec::new();

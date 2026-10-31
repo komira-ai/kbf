@@ -45,7 +45,10 @@ tokio = { workspace = true, features = ["rt", "fs", "process", "time", "io-util"
 [dev-dependencies]
 kbf-testkit.workspace = true
 prost-types.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `tests/put_back_pressure.rs`: the real PUT client against a real tierstore front whose put
+# slots are all taken. A dev-dependency only: no build of the tool has it.
+tierstore = { workspace = true, features = ["server"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync"] }
 
 [features]
 # TEST ONLY. Where no confine is built (a system that is neither Linux nor macOS) a Command denied the

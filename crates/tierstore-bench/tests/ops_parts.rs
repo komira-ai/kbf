@@ -5,6 +5,7 @@ mod ops_support;
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use tierstore_bench::error::BenchError;
 use tierstore_bench::preflight::facts::{
@@ -372,5 +373,49 @@ fn the_system_host_reads_files_runs_commands_and_tries_ports() {
     assert_eq!(
         sha256_hex(b""),
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+}
+
+/// Catches a command that cannot be stopped, or a stop that kills more than the command: with the
+/// flag down a command runs to its end as `run` does (output, input, status, a start that
+/// fails, one that takes a moment); with the flag up, one that would not end by itself is
+/// killed and the answer is `None`.
+#[test]
+fn the_system_host_stops_a_command_it_is_told_to_stop() {
+    let host = SystemHost;
+    let down = AtomicBool::new(false);
+    let said = host
+        .run_until(&Cmd::new("echo", &["hello"]), &down)
+        .unwrap()
+        .unwrap();
+    assert!(said.success);
+    assert_eq!((said.code, said.stdout.as_str()), (Some(0), "hello\n"));
+    let echoed = host
+        .run_until(
+            &Cmd::new("cat", &[]).with_stdin("line one\n".to_owned()),
+            &down,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(echoed.stdout, "line one\n");
+    let refused = host
+        .run_until(&Cmd::new("false", &[]), &down)
+        .unwrap()
+        .unwrap();
+    assert_eq!((refused.success, refused.code), (false, Some(1)));
+    let slow = host
+        .run_until(&Cmd::new("sleep", &["0.1"]), &down)
+        .unwrap()
+        .unwrap();
+    assert!(slow.success);
+    assert!(
+        host.run_until(&Cmd::new("/nonexistent-tb/none", &[]), &down)
+            .is_err()
+    );
+
+    let up = AtomicBool::new(true);
+    assert_eq!(
+        host.run_until(&Cmd::new("sleep", &["3600"]), &up).unwrap(),
+        None
     );
 }

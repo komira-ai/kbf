@@ -34,7 +34,7 @@ use kbf_updater::secret::read_secret;
 use kbf_updater::wire::{MAX_SERVICE_NAME, MAX_SERVICES, is_service_name};
 use serde::Deserialize;
 
-use crate::desired::{Desired, KBF, KBF_MIN_UP, LEGACY_ROLES, MAX_COUNT};
+use crate::desired::{Desired, KBF, KBF_MIN_UP, LEGACY_ROLES, MAX_COUNT, kbf_roles};
 
 /// The most bytes of a services file.
 const MAX_FILE_BYTES: u64 = 1 << 20;
@@ -206,9 +206,14 @@ fn invalid<T>(why: String) -> Result<T, ServicesError> {
 
 /// The one place that says which role names a services file may use.
 fn role_of(name: &str) -> Result<String, ServicesError> {
+    // The loader names the four roles `kbf` knows and no others, however well formed.
     name.parse::<HostRole>()
-        .map(|role| role.name().to_owned())
-        .or_else(|_| invalid(format!("{name} is not a host role")))
+        .ok()
+        .filter(|role| kbf_roles().contains(role))
+        .map_or_else(
+            || invalid(format!("{name} is not a host role")),
+            |role| Ok(role.name().to_owned()),
+        )
 }
 
 fn role_def(
@@ -319,6 +324,13 @@ impl Default for Services {
 }
 
 impl Services {
+    /// These services and `def`, for a test that needs a role the loader refuses.
+    #[cfg(test)]
+    pub(crate) fn with(mut self, def: ServiceDef) -> Self {
+        self.defs.insert(def.name.clone(), def);
+        self
+    }
+
     /// The services of the file text `text`, with `kbf` as shipped unless the first entry of
     /// the text defines it.
     ///

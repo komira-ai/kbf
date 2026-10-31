@@ -30,10 +30,10 @@ fn kbf_roles_in_convergence_keep_the_legacy_order() {
     let f = fleet(
         secs(990),
         &[
-            ("m1", HostRole::MacDaemon, beat("2.0")),
-            ("d1", HostRole::Daemon, beat("2.0")),
-            ("s1", HostRole::Storage, beat("2.0")),
-            ("f1", HostRole::Frontend, beat("2.0")),
+            ("m1", HostRole::MAC_DAEMON, beat("2.0")),
+            ("d1", HostRole::DAEMON, beat("2.0")),
+            ("s1", HostRole::STORAGE, beat("2.0")),
+            ("f1", HostRole::FRONTEND, beat("2.0")),
         ],
     );
     let c = converge(Some(&desired("2.0", 1, 1)), &f, NOW);
@@ -101,10 +101,10 @@ async fn status_lists_roles_in_the_legacy_order() {
         .await;
     rig.at(2_000);
     for (name, role) in [
-        ("m1", HostRole::MacDaemon),
-        ("d1", HostRole::Daemon),
-        ("s1", HostRole::Storage),
-        ("f1", HostRole::Frontend),
+        ("m1", HostRole::MAC_DAEMON),
+        ("d1", HostRole::DAEMON),
+        ("s1", HostRole::STORAGE),
+        ("f1", HostRole::FRONTEND),
     ] {
         let who = Identity {
             node_id: id(name),

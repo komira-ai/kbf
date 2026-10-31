@@ -6,7 +6,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -21,6 +21,7 @@ use tonic::Status;
 
 use super::metrics::PackMetrics;
 use super::room::{Budget, DEFAULT_INFLIGHT_BYTES, Room};
+use super::verifying::VerifyingKeys;
 use crate::large_backfill::LargeStore;
 
 /// The largest blob a frontend puts in a pack or serves from one by default: 64 MiB, the
@@ -155,6 +156,9 @@ impl<S: ObjectStore> PackStore for Over<S> {
     }
 }
 
+/// The clock that dates a task key's age.
+pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
+
 /// The frontend's packs. Cheap to clone; every clone is the same packs.
 #[derive(Clone)]
 pub struct Packs {
@@ -164,6 +168,8 @@ pub struct Packs {
     upload_idle_timeout: Duration,
     budget: Budget,
     pub(super) metrics: Arc<PackMetrics>,
+    pub(super) verifying: Arc<VerifyingKeys>,
+    clock: Clock,
 }
 
 impl fmt::Debug for Packs {
@@ -211,7 +217,29 @@ impl Packs {
             upload_idle_timeout: settings.upload_idle_timeout.min(MAX_UPLOAD_IDLE_TIMEOUT),
             budget: Budget::new(settings.inflight_bytes, Arc::clone(&metrics)),
             metrics,
+            verifying: Arc::default(),
+            clock: Arc::new(SystemTime::now),
         })
+    }
+
+    /// These packs judging the age of a task key by `clock` (the wall clock unless told).
+    #[must_use]
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The time these packs judge the age of a task key by.
+    #[must_use]
+    pub fn now(&self) -> SystemTime {
+        (self.clock)()
+    }
+
+    /// The task pack keys an ingest through these packs is verifying now: the janitor of
+    /// `cas/b/` never deletes one. Shared by every clone.
+    #[must_use]
+    pub fn verifying_keys(&self) -> Arc<VerifyingKeys> {
+        Arc::clone(&self.verifying)
     }
 
     /// The largest blob, in bytes, that is packed or served from a pack. A larger one is

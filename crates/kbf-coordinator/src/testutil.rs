@@ -65,7 +65,7 @@ pub fn desired(target: &str, storage: u32, frontend: u32) -> Desired {
 pub fn fleet(seen: Duration, hosts: &[(&str, HostRole, Heartbeat)]) -> Fleet {
     let mut fleet = Fleet::new(Duration::ZERO);
     for (name, role, b) in hosts {
-        fleet.record(id(name), *role, b.clone(), seen);
+        fleet.record(id(name), role.clone(), b.clone(), seen);
     }
     fleet
 }
