@@ -168,7 +168,7 @@ impl Fleet {
             }
         }
         let baking = (key.1.clone(), key.0.clone());
-        match Bake::after(self.bake.get(&baking), &beat) {
+        match Bake::after(self.bake.get(&baking), &beat, now) {
             Some(bake) => {
                 self.bake.insert(baking, bake);
             }

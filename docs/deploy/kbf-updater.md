@@ -557,6 +557,13 @@ will converge on it.
 
 `--services-file` is read once at start, under the rule of `--operator-token-file`: a regular file (not a symlink) owned by the coordinator's user with mode `0600` or `0400`, at most 1 MiB; a file that fails it stops the start. Treat it as secret-grade: a file whose first entry is named `kbf` replaces the shipped kbf definition, and can set `max_updating` up to 10000, `min_up = 0`, drop `never_last` and every `after`, so whoever controls the file controls kbf's rollout safety. A replaced kbf must be the first entry, wait for no service and have a role, and its desired state still names `min_up` for storage and frontend.
 
+A service entry may also set two rollout fields, both off by default (a coordinator before the change refuses a file that names them, so set them only after every coordinator runs the new build):
+
+- `bake_beats = N` (default 0, at most 100; a larger number is refused with `bake_beats is over 100`). A host at the desired version keeps the update slot it used until it has sent `N` healthy beats in a row at that version, not updating and not waiting for a promotion. An unhealthy or updating beat, a pending promotion, a different version, or a silence of 45 s or more between two beats starts the count again. The count is kept in the coordinator's memory only: a restart forgets it, and a host at the desired version bakes again. A host that is silent for 45 s or more stops holding the slot for baking. `GET /v1/convergence` is `in_progress`, not `converged`, while a live host is still baking.
+- `canary = { count = n }` (`n` from 1 to 10000; otherwise refused with `canary count is not 1 to 10000`). Until `n` hosts at the desired version have baked (`bake_beats` healthy beats, 0 meaning up at the version), the coordinator orders at most `n` hosts of the service: hosts that are updating, under an order, failed at the version, or at it all count as started, silent ones included. The hosts that go first are the live ones not yet started, hosts of roles that wait for no other role before the rest, then by node id. Every other host is held with `canary_wait`; a canary that cannot go yet (no free slot, too few hosts up, a role it waits for) holds them all, by design. A canary that fails leaves the service `blocked` and orders nobody else. The roles-and-labels form of the canary (`canary = { roles = [...], labels = {...} }`) is refused as an unknown field until host selectors land.
+
+A host whose heartbeat carries `promotion_pending` holds its update slot and does not count as up, whatever the definition says. The coordinator puts no bound of its own on a pending promotion: the service declaration's `promotion_ceiling_secs`, applied by the updater, turns an overdue one into a failed update (`after_commit`) while the agent keeps beating, and a host that dies mid-promotion holds its slot until it is fixed, as an updating host does.
+
 The coordinator keeps its desired state per service name, and `kbf` is the only service it accepts unless `--services-file` defines more ([the design](../design/updates.md)): `POST /v1/desired` takes an optional `service` (absent means `kbf`; a name no file defines is a 400), and `GET /v1/status` adds `services` beside the unchanged `desired`, `services_dropped`, the number of heartbeats whose `services` list was bad and was dropped (the host is answered as a `kbf`-only host), and `per_service` (below). While `kbf` is the only service, the `--state-file` holds the single state in the form earlier coordinators wrote, so a downgrade to one of them starts on the same file; a file in the map form (`{"services": {...}}`), which a coordinator with a second service writes, is refused by an earlier build, and the operator then restores the file from before or writes `kbf`'s state alone in it.
 
 `cargo xtask deploy-farm` (one `run:` line):
@@ -610,10 +617,10 @@ service, by node id: the fields of the top-level `hosts` entries, with `up` and 
 counted for this service (a host ordered to update `other` holds `other`'s slot and is not up for
 it, while it holds nothing under `kbf`), and `hold`: the rule that keeps the coordinator from
 ordering the host now (`quiet`, `updating`, `busy_elsewhere`, `up_to_date`, `failed_here`,
-`no_slot`, `waiting_for_role`, `waiting_for_service`, `min_up`, `not_a_member`, `no_desired`, `no_definition`; these spellings are public), or
+`no_slot`, `baking`, `canary_wait`, `waiting_for_role`, `waiting_for_service`, `min_up`, `not_a_member`, `no_desired`, `no_definition`; these spellings are public), or
 `null` when it would be ordered at its next heartbeat. `up` and `slots_held` count those hosts,
 and `convergence` is the answer of `GET /v1/convergence?service=NAME`. The top-level keys, and the
-top-level `hosts`, which are `kbf`'s, are unchanged.
+top-level `hosts`, which are `kbf`'s, are unchanged. Two holds are for the rollout fields above: `baking` means every slot of the host's role is held and at least one holder is a host at the desired version that has not finished baking, and `canary_wait` means the service's canary gate is closed and the host is not one of the canaries.
 
 `cargo xtask deploy-farm --service NAME` (default `kbf`) deploys another service the same way.
 For `kbf` the requests are the ones listed above. For another service the POST body also has
