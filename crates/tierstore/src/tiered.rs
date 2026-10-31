@@ -15,6 +15,7 @@ use crate::journal::{
     USAGE_KEY, Usage, encode_journal, is_reserved, journal_key, journal_prefix, load_checkpoint,
     proxy_key, seq_of,
 };
+use crate::metrics::{Counters, Read, Skipped, Tier};
 use crate::{
     Backend, ByteRange, Clock, Error, JournalEntry, JournalOp, Listed, Meta, OpenUpload, PartBody,
     UploadsAfter,
@@ -268,6 +269,7 @@ struct Inner {
     /// the objects are written one at a time, and a number is used again if its write failed.
     next_seq: AsyncMutex<u64>,
     capacity: Mutex<Capacity>,
+    counters: Counters,
 }
 
 impl Proxy {
@@ -307,6 +309,7 @@ impl Proxy {
             open: Mutex::new(None),
             next_seq: AsyncMutex::new(next),
             capacity: Mutex::new(Capacity::default()),
+            counters: Counters::default(),
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -322,6 +325,16 @@ impl Proxy {
     /// age that tells it, whatever it is.
     pub async fn usage_age(&self) -> Option<Duration> {
         self.inner.usage_age().await
+    }
+
+    /// What this proxy has counted of its reads since it started, in the Prometheus text
+    /// format: hits, misses and errors of each tier, the bytes each served and read, and the
+    /// copies into the hot tier that cold reads made. Every sample is a counter
+    /// whose labels have a few fixed values; the names and their meaning are in the README of
+    /// the crate.
+    #[must_use]
+    pub fn metrics(&self) -> String {
+        self.inner.counters.render()
     }
 }
 
@@ -616,10 +629,14 @@ impl Inner {
     /// the background.
     async fn copy_back(self: &Arc<Self>, key: &str, body: &Bytes) {
         if self.level().await >= Level::Critical {
+            self.counters.skipped(Skipped::Critical);
             return;
         }
         match self.hot.put(key, body.clone()).await {
             Ok(()) => {
+                // Counted when the hot tier has the object, before the journal entry below,
+                // which can fail.
+                self.counters.promoted(body.len());
                 let inner = Arc::clone(self);
                 let key = key.to_owned();
                 let size = body.len() as u64;
@@ -627,8 +644,31 @@ impl Inner {
                     let _ = inner.journal_put(&key, size).await;
                 }));
             }
-            Err(Error::Full(_)) => self.latch_full(),
-            Err(_) => {}
+            Err(Error::Full(_)) => {
+                self.latch_full();
+                self.counters.skipped(Skipped::Full);
+            }
+            Err(Error::AlreadyExists(_)) => self.counters.skipped(Skipped::Raced),
+            Err(_) => self.counters.skipped(Skipped::Failed),
+        }
+    }
+
+    /// A get of the cold tier, counted as a hit, a miss or an error of it.
+    async fn cold_get(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
+        match self.cold.get(key, range).await {
+            Ok(body) => {
+                self.counters.hit(Tier::Cold, Read::Get);
+                self.counters.bytes_read(Tier::Cold, body.len());
+                Ok(body)
+            }
+            Err(error @ Error::NotFound(_)) => {
+                self.counters.miss(Tier::Cold, Read::Get);
+                Err(error)
+            }
+            Err(error) => {
+                self.counters.error(Tier::Cold, Read::Get);
+                Err(error)
+            }
         }
     }
 
@@ -638,21 +678,63 @@ impl Inner {
         range: Option<ByteRange>,
     ) -> Result<Bytes, Error> {
         match self.hot.get(key, range).await {
-            Err(Error::NotFound(_)) => {}
-            found => return found,
+            Ok(body) => {
+                self.counters.hit(Tier::Hot, Read::Get);
+                self.counters.bytes_read(Tier::Hot, body.len());
+                self.counters.served(Tier::Hot, body.len());
+                return Ok(body);
+            }
+            Err(Error::NotFound(_)) => self.counters.miss(Tier::Hot, Read::Get),
+            Err(error) => {
+                self.counters.error(Tier::Hot, Read::Get);
+                return Err(error);
+            }
         }
-        let body = self.cold.get(key, None).await?;
+        if let Some(part) = range
+            && self.level().await >= Level::Critical
+        {
+            // A read of a part, with the hot tier too full to take a copy, asks the cold tier for
+            // that part alone: a whole read per chunk of a long blob would be quadratic.
+            self.counters.skipped(Skipped::Critical);
+            let body = self.cold_get(key, Some(part)).await?;
+            self.counters.served(Tier::Cold, body.len());
+            return Ok(body);
+        }
+        let body = self.cold_get(key, None).await?;
         self.copy_back(key, &body).await;
-        match range {
-            Some(range) => range.slice(&body),
-            None => Ok(body),
-        }
+        let served = match range {
+            Some(range) => range.slice(&body)?,
+            None => body,
+        };
+        self.counters.served(Tier::Cold, served.len());
+        Ok(served)
     }
 
     async fn head_object(&self, key: &str) -> Result<Meta, Error> {
         match self.hot.head(key).await {
-            Err(Error::NotFound(_)) => self.cold.head(key).await,
-            found => found,
+            Ok(meta) => {
+                self.counters.hit(Tier::Hot, Read::Head);
+                return Ok(meta);
+            }
+            Err(Error::NotFound(_)) => self.counters.miss(Tier::Hot, Read::Head),
+            Err(error) => {
+                self.counters.error(Tier::Hot, Read::Head);
+                return Err(error);
+            }
+        }
+        match self.cold.head(key).await {
+            Ok(meta) => {
+                self.counters.hit(Tier::Cold, Read::Head);
+                Ok(meta)
+            }
+            Err(error @ Error::NotFound(_)) => {
+                self.counters.miss(Tier::Cold, Read::Head);
+                Err(error)
+            }
+            Err(error) => {
+                self.counters.error(Tier::Cold, Read::Head);
+                Err(error)
+            }
         }
     }
 

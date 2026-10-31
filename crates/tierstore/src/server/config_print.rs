@@ -8,7 +8,7 @@ use std::path::Path;
 
 use super::cli::Cli;
 use super::config::{
-    ConfigError, Dur, File, Kind, PerRun, ServerTable, Size, TierTable, from_text,
+    ConfigError, Dur, File, Kind, OciTable, PerRun, ServerTable, Size, TierTable, from_text,
 };
 
 /// What the file starts with.
@@ -114,10 +114,20 @@ pub(super) fn render(cli: &Cli) -> Result<String, ConfigError> {
         listen_unix: None,
         listen_unix_group: None,
     };
+    // The flags that need `--oci-listen` cannot be given without it, so the table is the front.
+    let oci = cli.oci_listen.map(|listen| OciTable {
+        listen: Some(listen),
+        tls_cert_file: cli.oci_tls_cert.clone(),
+        tls_key_file: cli.oci_tls_key.clone(),
+        prefix: cli.oci_prefix.clone(),
+        max_connections: cli.oci_max_connections,
+        connection_lifetime: cli.oci_connection_lifetime.map(Dur),
+    });
     let file = File {
         server,
         hot_store: Some(hot),
         cold_store: Some(cold),
+        oci,
         local_cache: None,
         policy: Vec::new(),
     };

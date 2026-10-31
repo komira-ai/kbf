@@ -45,7 +45,8 @@ pub(super) struct Beside<'a> {
 /// A flag the executor cannot run without is missing (the packs, `--task-secret-file`,
 /// `--job-listen`), the longest run's wall time does not fit the presign ceiling, the tier
 /// store is `http://` and the executor was not told the plain write is accepted, the read url
-/// or the tier store is not an IP address, or the tier store's bucket is not the packs'.
+/// or the tier store is not an IP address, the read url's scheme is not the one the job
+/// listener serves, or the tier store's bucket is not the packs'.
 pub(super) fn check(js: &mut JsAgentFlags, beside: &Beside<'_>) -> Result<Vec<String>, String> {
     let refuse = |why: &str| format!("--executor js-agent: {why}");
     let needs = |what: &str| format!("--executor js-agent needs {what}");
@@ -59,11 +60,30 @@ pub(super) fn check(js: &mut JsAgentFlags, beside: &Beside<'_>) -> Result<Vec<St
              grant of each run are made from them",
         )
     })?;
-    if beside.job_read.is_none() {
+    let Some(job) = beside.job_read else {
         return Err(needs(
-            "--job-listen (and --job-tls-cert, --job-tls-key, --job-grant-secret-file): \
-             without the listener every read grant points at a port nobody serves",
+            "--job-listen (and --job-tls-cert and --job-tls-key, or --job-plain-http, and \
+             --job-grant-secret-file): without the listener every read grant points at a port \
+             nobody serves",
         ));
+    };
+    // The task dials the scheme of the read url, and the listener speaks the other one.
+    match (job.tls.is_some(), task.read_url.starts_with("http://")) {
+        (true, true) => {
+            return Err(refuse(
+                "--task-read-url is http:// but --job-listen serves TLS: a task would send \
+                 plain HTTP to a TLS port; use https://, or serve --job-listen with \
+                 --job-plain-http instead of --job-tls-cert",
+            ));
+        }
+        (false, false) => {
+            return Err(refuse(
+                "--task-read-url is https:// but --job-plain-http serves no TLS: a task would \
+                 start a handshake the listener cannot answer; use http:// (with \
+                 --executor-allow-plain-http-grant), or serve --job-listen over TLS",
+            ));
+        }
+        _ => {}
     }
     let mut warnings = Vec::new();
 
@@ -102,6 +122,13 @@ pub(super) fn check(js: &mut JsAgentFlags, beside: &Beside<'_>) -> Result<Vec<St
                 .to_owned(),
         ),
         _ => {}
+    }
+    if config.allow_plain_http_grant && task.read_url.starts_with("https://") {
+        warnings.push(
+            "--executor-allow-plain-http-grant is set and --task-read-url is https://: the \
+             flag is not needed"
+                .to_owned(),
+        );
     }
     for (flag, url) in [
         ("--task-read-url", &task.read_url),

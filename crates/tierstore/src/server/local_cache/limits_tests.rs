@@ -322,7 +322,7 @@ async fn readers_that_share_a_fill_with_the_wrong_hash_all_get_the_error() {
     assert_eq!(staged(&rig), 0);
     assert!(locked(&rig.cache.inner.flights).is_empty());
 
-    rig.put(key, &right).await;
+    rig.replace(key, &right).await;
     assert_eq!(rig.get(key).await.unwrap(), right);
     assert_eq!(read(&counters.fills), 1);
     assert!(rig.has_file(key));

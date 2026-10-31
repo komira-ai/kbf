@@ -8,6 +8,13 @@
 //!   advisories`, kept in one GitHub issue (opened, updated, or commented on and closed when
 //!   none remain) instead of failing a pull request. Exit 0 whatever it found; 1 when
 //!   cargo-deny or `gh` failed. `advisories.yml` runs it daily and on every push to `main`.
+//! - `wait-artifacts --repo <owner/repo> --run-id <id> --job-prefix <p> --artifact <name>...`
+//!   ([`wait_artifacts`]): the `test` job of the split coverage run waits until every named artifact
+//!   has been uploaded by the shards that run beside it (exit 1 when a shard failed, every shard
+//!   finished without one, or the looks ran out).
+//! - `profiles-complete --dir <dir> --prefix <p>...` ([`profiles_complete`]): exit 1 unless each
+//!   shard's prefix begins a non-empty `.profraw` file of the directory and no `.profraw` file
+//!   begins none of them.
 //! - `release farm-version --repo <owner/repo> --tag <tag> --commit <sha> [--output <file>]`
 //!   ([`release::farm_version`]): the version text the farm is told to converge on,
 //!   `<version>+g<12 hex digits of the commit>` as the hosts report it, read from the release's
@@ -56,6 +63,9 @@
 //!   release asset `kbf-<service>-image-<commit>-<platform>.oci.tar`, refused unless its program
 //!   is the attested `kbf` (frontend) or the built `kbf-coordinator` or `kbf-task`, it runs as a user that is
 //!   not root with the service's entrypoint, and it is built for the platform.
+//! - `pkg-image-sbom` ([`pkg_image_sbom`]): the CycloneDX SBOM of the task image, read from its
+//!   layers with the pinned syft, as the release asset `kbf-task-image-<commit>-<platform>.cdx.json`
+//!   beside the image; with the same bytes for the same image.
 //! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf` package
 //!   carries, in the one form a deb and an rpm put in the same order, and the most a package
 //!   that carries a kbf release may weigh. `pkg-config` and `pkg-kbf-asset` take them up with
@@ -91,6 +101,10 @@
 //!   ([`pipeline_watch`]): the fail-fast of the push pipeline: cancel the run as soon as one of its jobs
 //!   has failed, and stop when the job `--last-job` has completed. Exit 0 whatever it saw; 1 only when
 //!   GitHub refuses the cancel.
+//! - `pipeline-rerun --repo <owner/repo> --run-id <id>` ([`pipeline_rerun`]): after a pipeline run has
+//!   completed, rerun its failed jobs once (first attempt only) when every failed job builds or moves
+//!   artifacts; a failed test or lint job, or an unknown one, means nothing is rerun. Exit 1 only
+//!   when GitHub refuses the rerun.
 //! - `runner-disk --path <path> --min-free-gb <n>` ([`runner_disk`]): exit 1 naming the disk
 //!   when the disk of `<path>` has less free space than the coverage run needs.
 //! - `static-elf <binary>` ([`static_elf`]): exit 1 unless the ELF64 binary is statically
@@ -123,10 +137,12 @@ pub mod entitlements;
 pub mod fetch;
 pub mod installer_tarball;
 pub mod package;
+pub mod pipeline_rerun;
 pub mod pipeline_watch;
 pub mod pkg;
 pub mod pkg_asset;
 pub mod pkg_image_asset;
+pub mod pkg_image_sbom;
 pub mod pkg_install;
 pub mod pkg_kbf_asset;
 pub mod pkg_linux;
@@ -137,6 +153,7 @@ pub mod pkg_size;
 pub mod pkg_trust;
 pub mod pkg_upgrade;
 pub mod pkg_version;
+pub mod profiles_complete;
 pub mod prove_farm;
 pub mod release;
 pub mod runner_disk;
@@ -144,6 +161,7 @@ pub mod static_elf;
 pub mod sudo_test;
 pub mod sums;
 pub mod version_facts;
+pub mod wait_artifacts;
 
 /// Why a verb failed.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -197,6 +215,10 @@ enum Verb {
     BuildCommit(BuildCommit),
     /// Keep the advisories `cargo deny` reports in one GitHub issue.
     Advisories(advisories::Args),
+    /// Wait until the sibling jobs of a split job have uploaded their artifacts.
+    WaitArtifacts(wait_artifacts::Args),
+    /// Refuse a directory of raw coverage profiles in which a shard's profiles are missing.
+    ProfilesComplete(profiles_complete::Args),
     /// Set a published release as the farm's desired version on the update coordinator and
     /// wait for the farm to converge.
     DeployFarm(deploy_farm::Args),
@@ -209,6 +231,8 @@ enum Verb {
     StaticElf(static_elf::Args),
     /// Cancel the pipeline run when one of its jobs has failed, so its other jobs stop.
     PipelineWatch(pipeline_watch::Args),
+    /// Rerun the failed jobs of a completed pipeline run once, when all of them build or move artifacts.
+    PipelineRerun(pipeline_rerun::Args),
     /// Refuse a row the budget file gains against `--base`.
     BudgetDiff {
         /// The revision to compare with (on a pull request, the base branch).
@@ -427,6 +451,42 @@ enum Verb {
         )]
         out: Option<PathBuf>,
         /// Only check `--image`, which must be named as the asset; write nothing.
+        #[arg(long)]
+        verify_only: bool,
+    },
+    /// The CycloneDX SBOM of the task OCI image, read from its layers (the base's packages too), as
+    /// a release asset beside the image; or, with `--verify-only`, a check that the one beside the
+    /// signed image is the image's.
+    PkgImageSbom {
+        /// The image asset, `kbf-task-image-<commit>-<platform>.oci.tar`, in the directory its
+        /// SBOM and line of `SHA256SUMS.<platform>` go in.
+        #[arg(long)]
+        image: PathBuf,
+        /// The service the image runs (only the task image has an SBOM asset).
+        #[arg(long, value_enum)]
+        service: pkg_image_asset::Image,
+        /// The platform it was built for (`linux-x86_64`, `linux-arm64`).
+        #[arg(long, value_enum)]
+        platform: package::Platform,
+        /// The commit it was built from (`$GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// The pinned syft program that reads the image.
+        #[arg(
+            long,
+            required_unless_present = "verify_only",
+            conflicts_with = "verify_only"
+        )]
+        syft: Option<PathBuf>,
+        /// The time the SBOM carries, seconds since 1970: the commit's time
+        /// (`source-date-epoch`), so the same image has the same SBOM.
+        #[arg(
+            long,
+            required_unless_present = "verify_only",
+            conflicts_with = "verify_only"
+        )]
+        source_date_epoch: Option<u64>,
+        /// Only check the SBOM beside `--image`; run nothing and write nothing.
         #[arg(long)]
         verify_only: bool,
     },
@@ -709,9 +769,10 @@ enum ReleaseVerb {
         /// The commit the assets were built from, a full SHA.
         #[arg(long)]
         commit: String,
-        /// Do not require the version facts of each `kbf` tarball: for the release made
-        /// before the build jobs recorded them (the previous release, read by the first
-        /// release that has them). Facts without their tarball are still refused.
+        /// Do not require the version facts of each `kbf` tarball, nor the facts and the SBOM of
+        /// the task image: for the release made before the build jobs recorded them (the
+        /// previous release, read by the first release that has them). Facts and an SBOM without
+        /// their tarball or image are still refused.
         #[arg(long)]
         without_version_facts: bool,
     },
@@ -1024,11 +1085,14 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             root: &root,
         }),
         Verb::Advisories(args) => advisories::run(&args, &root, &cargo_program()),
+        Verb::WaitArtifacts(args) => wait_artifacts::run(&args, &root, &cargo_program()),
+        Verb::ProfilesComplete(args) => profiles_complete::run(&args),
         Verb::DeployFarm(args) => deploy_farm::run(&args),
         Verb::ProveFarm(args) => prove_farm::run(&args),
         Verb::RunnerDisk(args) => runner_disk::run(&args),
         Verb::StaticElf(args) => static_elf::run(&args),
         Verb::PipelineWatch(args) => pipeline_watch::run(&args),
+        Verb::PipelineRerun(args) => pipeline_rerun::run(&args),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
         Verb::SourceDateEpoch { commit, output } => {
             source_date_epoch(&root, &commit, &output).map(|line| vec![line])
@@ -1179,6 +1243,31 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 },
             )
         }
+        Verb::PkgImageSbom {
+            image,
+            service,
+            platform,
+            commit,
+            syft,
+            source_date_epoch,
+            verify_only,
+        } => match (&syft, source_date_epoch, verify_only) {
+            (Some(syft), Some(epoch), false) => {
+                // Under the build tree, named for this process: syft's home and cache.
+                let scratch = root
+                    .join("target")
+                    .join(format!("pkg-image-sbom-{}", std::process::id()));
+                pkg_image_sbom::make(
+                    &image,
+                    service,
+                    &commit,
+                    platform,
+                    epoch,
+                    &mut pkg_image_sbom::syft_process(syft, &scratch),
+                )
+            }
+            _ => pkg_image_sbom::verify(&image, service, &commit, platform),
+        },
         Verb::PkgMacosAsset {
             package,
             commit,
