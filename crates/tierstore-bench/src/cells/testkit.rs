@@ -117,23 +117,35 @@ impl ColdStateSource for ColdScript {
 /// A store address that gives no answer. Tests that need "a store that is not there" use this and
 /// not a port bound and then closed: a closed port is handed to the next listener any other test
 /// binds on this machine, and that test's fake store then answers the requests meant for the
-/// dead one (and counts them).
+/// dead one (and counts them). Here the address stays bound for as long as the value lives, and
+/// every connection made to it is closed at once, so a request to it ends without an answer.
 pub struct DeadStore {
     url: String,
+    accepting: tokio::task::JoinHandle<()>,
 }
 
 impl DeadStore {
-    /// An address of a store that is not there.
+    /// Binds a loopback address and holds it.
     pub async fn start() -> Self {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", closed.local_addr().unwrap());
-        drop(closed);
-        Self { url }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepting = tokio::spawn(async move {
+            loop {
+                drop(listener.accept().await.unwrap());
+            }
+        });
+        Self { url, accepting }
     }
 
     /// The endpoint, as a store spec names it.
     pub fn endpoint(&self) -> &str {
         &self.url
+    }
+}
+
+impl Drop for DeadStore {
+    fn drop(&mut self) {
+        self.accepting.abort();
     }
 }
 
