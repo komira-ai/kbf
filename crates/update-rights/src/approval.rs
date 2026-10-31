@@ -11,11 +11,14 @@
 //! one that is not is an error, never an empty record. A missing file is an empty record.
 
 use std::collections::BTreeSet;
-use std::io;
-use std::path::Path;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 
 use crate::digest::{BadDigest, Digest};
-use crate::trust::TrustError;
+use crate::names::is_service_name;
+use crate::trust::{TrustError, read_trusted};
 
 /// Where approvals are recorded.
 pub const APPROVALS_FILE: &str = "/etc/updater.d/approved";
@@ -52,17 +55,28 @@ pub enum Approved {
 
 impl Approvals {
     /// Reads the text of the file: a digest per line, then anything the reader may like.
-    pub fn parse(_text: &str) -> Result<Approvals, ApprovalError> {
-        Ok(Approvals::default())
+    pub fn parse(text: &str) -> Result<Approvals, ApprovalError> {
+        let mut digests = BTreeSet::new();
+        for (index, line) in text.lines().enumerate() {
+            let content = line.split('#').next().unwrap_or_default();
+            if let Some(word) = content.split_whitespace().next() {
+                let digest = Digest::parse(word).map_err(|why| ApprovalError::Line {
+                    line: index + 1,
+                    why,
+                })?;
+                digests.insert(digest);
+            }
+        }
+        Ok(Approvals(digests))
     }
 
     /// Reads the approval file. A file that is missing is an empty record.
-    pub fn read(_path: &Path, _trusted_uid: u32) -> Result<Approvals, ApprovalError> {
-        Ok(Approvals::default())
+    pub fn read(path: &Path, trusted_uid: u32) -> Result<Approvals, ApprovalError> {
+        Approvals::parse(&String::from_utf8_lossy(&read_bytes(path, trusted_uid)?))
     }
 
-    pub fn contains(&self, _digest: &Digest) -> bool {
-        false
+    pub fn contains(&self, digest: &Digest) -> bool {
+        self.0.contains(digest)
     }
 
     pub fn len(&self) -> usize {
@@ -74,13 +88,65 @@ impl Approvals {
     }
 }
 
+/// The bytes of the approval file, none if it is missing.
+fn read_bytes(path: &Path, trusted_uid: u32) -> Result<Vec<u8>, ApprovalError> {
+    match read_trusted(path, trusted_uid) {
+        Ok(bytes) => Ok(bytes),
+        Err(TrustError::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Records the approval of `digest`, the declaration of `service`.
+///
+/// This is a root act: the process must run as `trusted_uid`, the account that owns the
+/// approval file, because the file it writes is only as good as its owner. The existing file is
+/// read first under the same rules as everyone else reads it, so an untrusted file is never
+/// copied into a trusted one. The new file is written beside the old and renamed over it.
 pub fn approve(
-    _path: &Path,
-    _trusted_uid: u32,
-    _effective_uid: u32,
-    _service: &str,
-    _digest: &Digest,
+    path: &Path,
+    trusted_uid: u32,
+    effective_uid: u32,
+    service: &str,
+    digest: &Digest,
 ) -> Result<Approved, ApprovalError> {
+    if !is_service_name(service) {
+        return Err(ApprovalError::ServiceName(service.to_owned()));
+    }
+    if effective_uid != trusted_uid {
+        return Err(ApprovalError::NotTrustedAccount {
+            found: effective_uid,
+            wanted: trusted_uid,
+        });
+    }
+    let bytes = read_bytes(path, trusted_uid)?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if Approvals::parse(&text)?.contains(digest) {
+        return Ok(Approved::Already);
+    }
+    // The new line starts on a line of its own.
+    text.push_str(&"\n".repeat(usize::from(!text.is_empty() & !text.ends_with('\n'))));
+    text.push_str(&format!("{digest} {service}\n"));
+    replace(path, text.as_bytes())?;
     Ok(Approved::Recorded)
+}
+
+/// Writes `bytes` to a new file beside `path`, syncs it and renames it over `path`, then syncs
+/// the directory.
+fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".new");
+    let temporary = PathBuf::from(temporary);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, path)?;
+    let directory = path.parent().unwrap_or(Path::new("/"));
+    std::fs::File::open(directory)?.sync_all()
 }

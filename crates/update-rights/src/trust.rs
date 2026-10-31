@@ -1,6 +1,8 @@
 //! Reading a file the host trusts: owned by the trusted account, not writable by anyone else.
 
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Read};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 /// Why a file or directory is not trusted.
@@ -18,12 +20,46 @@ pub enum TrustError {
     Writable { mode: u32 },
 }
 
-/// Reads a regular file; not yet.
-pub fn read_trusted(_path: &Path, _trusted_uid: u32) -> Result<Vec<u8>, TrustError> {
-    Err(TrustError::NotRegular)
+fn judge(meta: &std::fs::Metadata, trusted_uid: u32) -> Result<(), TrustError> {
+    if meta.uid() != trusted_uid {
+        return Err(TrustError::Owner {
+            found: meta.uid(),
+            wanted: trusted_uid,
+        });
+    }
+    let mode = meta.mode();
+    if mode & 0o022 != 0 {
+        return Err(TrustError::Writable {
+            mode: mode & 0o7777,
+        });
+    }
+    Ok(())
 }
 
-/// Checks a directory; not yet.
-pub fn check_dir(_dir: &Path, _trusted_uid: u32) -> Result<(), TrustError> {
-    Ok(())
+/// Reads a regular file that `trusted_uid` owns and that only its owner can write. The file is
+/// opened without following a link or waiting on a pipe, and the checks are made on the open file, so the file that
+/// is checked is the file that is read.
+pub fn read_trusted(path: &Path, trusted_uid: u32) -> Result<Vec<u8>, TrustError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(TrustError::NotRegular);
+    }
+    judge(&meta, trusted_uid)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Checks that `dir` is a directory (not a link to one) that `trusted_uid` owns and only its
+/// owner can write.
+pub fn check_dir(dir: &Path, trusted_uid: u32) -> Result<(), TrustError> {
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(TrustError::NotDirectory);
+    }
+    judge(&meta, trusted_uid)
 }

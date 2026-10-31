@@ -10,10 +10,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
-use update_hook::Step;
+use update_hook::{Params, Step};
 
-use crate::names::{Capability, Family, PathError, UnitError};
-use crate::reserved;
+use crate::names::{
+    Capability, Family, PathError, UnitError, check_path, check_relative, check_unit,
+    is_account_name, is_env_name, is_env_value, is_service_name,
+};
+use crate::reserved::{self, Kind};
 
 /// The longest a step, a deadline or a registration may be given: one day.
 pub const MAX_SECS: u64 = 86_400;
@@ -204,6 +207,57 @@ pub enum Refusal {
     Conflict { what: &'static str, with: String },
 }
 
+fn value(field: &str, why: impl Into<String>) -> Refusal {
+    Refusal::Value {
+        field: field.to_owned(),
+        why: why.into(),
+    }
+}
+
+fn in_range(field: &str, number: u64, max: u64) -> Result<(), Refusal> {
+    if (1..=max).contains(&number) {
+        Ok(())
+    } else {
+        Err(value(field, format!("{number} is not within 1 to {max}")))
+    }
+}
+
+fn plain_word(field: &str, word: &str) -> Result<(), Refusal> {
+    let ok = (1..=64).contains(&word.len())
+        & word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._=:/@+-".contains(&b));
+    if ok {
+        Ok(())
+    } else {
+        Err(value(
+            field,
+            format!("{word:?} is not 1 to 64 letters, digits and `._=:/@+-`"),
+        ))
+    }
+}
+
+fn account(field: &str, name: &str) -> Result<(), Refusal> {
+    if is_account_name(name) {
+        Ok(())
+    } else {
+        Err(value(field, format!("{name:?} is not an account name")))
+    }
+}
+
+fn path(kind: Kind, field: &'static str, entry: &str) -> Result<(), Refusal> {
+    check_path(entry).map_err(|why| Refusal::Path {
+        field,
+        path: entry.to_owned(),
+        why,
+    })?;
+    reserved::check(kind, entry).map_err(|why| Refusal::Reserved {
+        field,
+        path: entry.to_owned(),
+        why,
+    })
+}
+
 impl Declaration {
     /// Reads the text of a declaration and applies every rule that needs nothing but the text.
     pub fn parse(text: &str) -> Result<Declaration, Refusal> {
@@ -215,6 +269,97 @@ impl Declaration {
 
     /// The rules of the text alone: grammars, bounds, the reserved paths, the deadline.
     pub fn check(&self) -> Result<(), Refusal> {
+        if !is_service_name(&self.name) {
+            return Err(value(
+                "name",
+                format!("{:?} is not a service name", self.name),
+            ));
+        }
+        check_relative(&self.binary).map_err(|why| value("binary", format!("{why}")))?;
+        if self.hook_args.len() > MAX_HOOK_ARGS {
+            return Err(value(
+                "hook_args",
+                format!("more than {MAX_HOOK_ARGS} arguments"),
+            ));
+        }
+        for arg in &self.hook_args {
+            plain_word("hook_args", arg)?;
+        }
+        plain_word("signer.repository", &self.signer.repository)?;
+        plain_word("signer.workflow", &self.signer.workflow)?;
+        account("uid", &self.uid)?;
+        account("hook.user", &self.hook.user)?;
+        account("hook.group", &self.hook.group)?;
+        in_range(
+            "registration_ttl_secs",
+            self.registration_ttl_secs,
+            MAX_SECS,
+        )?;
+        if self.health_ports.contains(&0) {
+            return Err(value("health_ports", "port 0 is not a port"));
+        }
+        if self.cleanup_retries > MAX_CLEANUP_RETRIES {
+            return Err(value(
+                "cleanup_retries",
+                format!(
+                    "{} is more than {MAX_CLEANUP_RETRIES}",
+                    self.cleanup_retries
+                ),
+            ));
+        }
+        for (field, number) in [
+            ("hook.timeout_secs.prepare", self.hook.timeout_secs.prepare),
+            ("hook.timeout_secs.cutover", self.hook.timeout_secs.cutover),
+            ("hook.timeout_secs.verify", self.hook.timeout_secs.verify),
+            (
+                "hook.timeout_secs.rollback",
+                self.hook.timeout_secs.rollback,
+            ),
+            ("hook.timeout_secs.cleanup", self.hook.timeout_secs.cleanup),
+            ("verify_deadline_secs", self.verify_deadline_secs),
+        ] {
+            in_range(field, number, MAX_SECS)?;
+        }
+        let needed = self.hook.timeout_secs.verify + self.hook.timeout_secs.rollback;
+        if self.verify_deadline_secs < needed {
+            return Err(Refusal::Deadline {
+                deadline: self.verify_deadline_secs,
+                needed,
+            });
+        }
+        self.promotion_ceiling_secs.iter().try_for_each(|ceiling| {
+            in_range("promotion_ceiling_secs", *ceiling, MAX_CEILING_SECS)
+        })?;
+        self.boot
+            .iter()
+            .try_for_each(|text| plain_word("boot", text))?;
+        self.min_version
+            .iter()
+            .try_for_each(|text| plain_word("min_version", text))?;
+        path(Kind::State, "state_dir", &self.state_dir)?;
+        for entry in &self.hook.read_paths {
+            path(Kind::Read, "hook.read_paths", entry)?;
+        }
+        for entry in &self.hook.write_paths {
+            path(Kind::Write, "hook.write_paths", entry)?;
+        }
+        for unit in &self.hook.units {
+            check_unit(&self.name, unit).map_err(|why| Refusal::Unit {
+                unit: unit.clone(),
+                why,
+            })?;
+        }
+        for (key, text) in &self.hook.environment {
+            if !(is_env_name(key) & is_env_value(text)) {
+                return Err(value(
+                    "hook.environment",
+                    format!("{key:?} is not a variable name with a plain value"),
+                ));
+            }
+        }
+        // The table is opaque, but it is scalars, and the `updater.` keys are the updater's.
+        Params::parse_declared(&self.hook.params.to_string())
+            .map_err(|e| value("hook.params", e.to_string()))?;
         Ok(())
     }
 }

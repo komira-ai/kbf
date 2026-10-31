@@ -58,11 +58,28 @@ pub enum Violation {
 }
 
 /// Whether `path` is `dir` or lies below it. Both are absolute and in the path grammar.
-pub fn is_within(_path: &str, _dir: &str) -> bool {
-    false
+pub fn is_within(path: &str, dir: &str) -> bool {
+    let below = dir.trim_end_matches('/');
+    (path == dir)
+        | path
+            .strip_prefix(below)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Checks one entry against the deny list. `path` is in the path grammar (`check_path`).
-pub fn check(_kind: Kind, _path: &str) -> Result<(), Violation> {
-    Ok(())
+pub fn check(kind: Kind, path: &str) -> Result<(), Violation> {
+    if let Some(reserved) = RESERVED.iter().find(|r| **r == path) {
+        return Err(Violation::Names(reserved));
+    }
+    if let Some(reserved) = RESERVED.iter().find(|r| is_within(r, path)) {
+        return Err(Violation::Contains(reserved));
+    }
+    let writes = kind != Kind::Read;
+    let in_hooks_root = path != HOOKS_ROOT && is_within(path, HOOKS_ROOT);
+    // `/` is every path's ancestor, which the rule on the inside is not about.
+    let inside = RESERVED.iter().skip(1).find(|r| is_within(path, r));
+    match inside {
+        Some(reserved) if writes && !in_hooks_root => Err(Violation::Inside(reserved)),
+        _ => Ok(()),
+    }
 }

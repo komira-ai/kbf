@@ -667,3 +667,37 @@ fn refusals_are_in_file_order() {
     let order: Vec<&str> = loaded.refused.iter().map(|r| r.service.as_str()).collect();
     assert_eq!(order, ["alpha", "mid", "zeta"]);
 }
+
+/// Catches the shared-account rule applying to root: several services run as root (the js-agent
+/// and kbf among them), so two declarations whose service account is root both load. Their units,
+/// ports and record directories still may not collide.
+#[test]
+fn two_declarations_of_services_that_run_as_root_both_load() {
+    let host = Host::new("two-roots");
+    for name in ["tierstore", "other"] {
+        let mut spec = Spec::new(name);
+        spec.uid = "root".to_owned();
+        host.put(&spec);
+    }
+    let loaded = host.load();
+    assert!(loaded.refused.is_empty(), "{:?}", loaded.refused);
+    assert_eq!(loaded.services.len(), 2);
+
+    // The rules that are not about the account still hold between them.
+    let host = Host::new("two-roots-clash");
+    for name in ["tierstore", "other"] {
+        let mut spec = Spec::new(name);
+        spec.uid = "root".to_owned();
+        spec.ports = vec![9301];
+        host.put(&spec);
+    }
+    let loaded = host.load();
+    assert_eq!(
+        conflict(&loaded, "tierstore"),
+        ("a health port", "other".to_owned())
+    );
+    assert_eq!(
+        conflict(&loaded, "other"),
+        ("a health port", "tierstore".to_owned())
+    );
+}

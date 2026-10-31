@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use sha2::{Digest as _, Sha256};
+
 /// A SHA-256 as 64 lowercase hex digits.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Digest(String);
@@ -13,13 +15,18 @@ pub struct BadDigest(String);
 
 impl Digest {
     /// The digest of `bytes`.
-    pub fn of(_bytes: &[u8]) -> Digest {
-        Digest(String::new())
+    pub fn of(bytes: &[u8]) -> Digest {
+        Digest(hex::encode(Sha256::digest(bytes)))
     }
 
     /// Reads the text `sha256sum` prints.
     pub fn parse(text: &str) -> Result<Digest, BadDigest> {
-        Ok(Digest(text.to_owned()))
+        let ok = (text.len() == 64) & text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if ok {
+            Ok(Digest(text.to_owned()))
+        } else {
+            Err(BadDigest(text.to_owned()))
+        }
     }
 
     pub fn as_str(&self) -> &str {

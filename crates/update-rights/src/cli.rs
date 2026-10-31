@@ -11,7 +11,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crate::approval::APPROVALS_FILE;
+use crate::approval::{APPROVALS_FILE, Approved, approve};
+use crate::digest::Digest;
 
 /// What the command runs against.
 pub struct Env {
@@ -33,10 +34,42 @@ impl Env {
     }
 }
 
+const USAGE: &str = "usage: approve <service> <sha256 of the declaration file>";
+
 /// Runs the command. `args` follow the word `approve`. Exit codes: 0 done, 1 refused or
 /// failed, 2 usage.
-pub fn run(_args: &[String], _env: &Env, _out: &mut dyn Write, _err: &mut dyn Write) -> u8 {
-    1
+pub fn run(args: &[String], env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    let [service, digest] = args else {
+        let _ = writeln!(err, "{USAGE}");
+        return 2;
+    };
+    let Ok(digest) = Digest::parse(digest) else {
+        let _ = writeln!(
+            err,
+            "{digest:?} is not a SHA-256: 64 lowercase hex digits\n{USAGE}"
+        );
+        return 2;
+    };
+    match approve(
+        &env.approvals,
+        env.trusted_uid,
+        env.effective_uid,
+        service,
+        &digest,
+    ) {
+        Ok(done) => {
+            let word = match done {
+                Approved::Recorded => "approved",
+                Approved::Already => "already approved",
+            };
+            let _ = writeln!(out, "{word} {service} {digest}");
+            0
+        }
+        Err(e) => {
+            let _ = writeln!(err, "not approved: {e}");
+            1
+        }
+    }
 }
 
 /// The command as the root part of the updater runs it.

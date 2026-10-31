@@ -12,6 +12,7 @@
 use crate::approval::Approvals;
 use crate::declaration::Declaration;
 use crate::digest::Digest;
+use crate::widening::widening;
 
 /// The reason an update is deferred for a declaration that asks for more.
 pub const RIGHTS_CHANGE: &str = "rights_change";
@@ -42,10 +43,21 @@ pub struct Deferral {
 
 /// Decides on `incoming` (whose file has the digest `digest`) against the `active` declaration.
 pub fn gate(
-    _active: Option<&Declaration>,
-    _incoming: &Declaration,
-    _digest: &Digest,
-    _approvals: &Approvals,
+    active: Option<&Declaration>,
+    incoming: &Declaration,
+    digest: &Digest,
+    approvals: &Approvals,
 ) -> Gate {
-    Gate::Install
+    let widened = active.map_or_else(
+        || vec![FIRST_INSTALL.to_owned()],
+        |active| widening(active, incoming),
+    );
+    if approvals.contains(digest) | widened.is_empty() {
+        return Gate::Install;
+    }
+    Gate::Deferred(Deferral {
+        reason: RIGHTS_CHANGE,
+        digest: digest.clone(),
+        widened,
+    })
 }

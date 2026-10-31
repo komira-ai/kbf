@@ -35,27 +35,67 @@ pub enum PathError {
 }
 
 /// Whether `name` is a service name: lowercase letters, digits and `-`, 1 to 64 bytes.
-pub fn is_service_name(_name: &str) -> bool {
-    true
+pub fn is_service_name(name: &str) -> bool {
+    (1..=MAX_SERVICE_NAME).contains(&name.len())
+        & name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Whether `name` is an account name: a lowercase letter or `_` first, then lowercase letters,
 /// digits, `_` and `-`, at most 32 bytes.
-pub fn is_account_name(_name: &str) -> bool {
-    true
+pub fn is_account_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let first = bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_lowercase() || b == b'_');
+    first
+        & (name.len() <= 32)
+        & bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+fn is_path_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | '@')
 }
 
 /// Checks the grammar of an absolute path: it starts with `/` (so with none of the systemd
 /// prefixes `-`, `+` and `!`), is at most [`MAX_PATH`] bytes, holds only letters, digits and
 /// `/ . _ - + @`, and has no empty, `.` or `..` component. `/` alone is a path.
-pub fn check_path(_path: &str) -> Result<(), PathError> {
+pub fn check_path(path: &str) -> Result<(), PathError> {
+    if let Some(prefix) = path.chars().next().filter(|c| matches!(c, '-' | '+' | '!')) {
+        return Err(PathError::SystemdPrefix(prefix));
+    }
+    if !path.starts_with('/') {
+        return Err(PathError::NotAbsolute);
+    }
+    if path.len() > MAX_PATH {
+        return Err(PathError::TooLong);
+    }
+    if let Some(c) = path.chars().find(|c| !is_path_char(*c)) {
+        return Err(PathError::BadChar(c));
+    }
+    let components = path.strip_prefix('/').unwrap_or_default();
+    // `/` alone has one empty component, which is the root and not a mistake.
+    if components.is_empty() {
+        return Ok(());
+    }
+    for component in components.split('/') {
+        match component {
+            "" => return Err(PathError::EmptyComponent),
+            "." | ".." => return Err(PathError::DotComponent),
+            _ => {}
+        }
+    }
     Ok(())
 }
 
 /// Checks the grammar of a path within a release: the same characters and components as an
 /// absolute path, written without the first `/`.
-pub fn check_relative(_path: &str) -> Result<(), PathError> {
-    Ok(())
+pub fn check_relative(path: &str) -> Result<(), PathError> {
+    if path.is_empty() {
+        return Err(PathError::Empty);
+    }
+    check_path(&format!("/{path}"))
 }
 
 /// Why a unit name was refused for a service.
@@ -73,24 +113,57 @@ pub enum UnitError {
 /// `-<more>` after the service name (`kbf-daemon.service` for the service `kbf`). A unit that
 /// does not begin with the service's own name could be a system unit, which a declaration may
 /// never claim.
-pub fn check_unit(_service: &str, _unit: &str) -> Result<(), UnitError> {
+pub fn check_unit(service: &str, unit: &str) -> Result<(), UnitError> {
+    let stem = unit.strip_suffix(".service").ok_or(UnitError::NotService)?;
+    let (base, instance) = match stem.split_once('@') {
+        Some((base, instance)) => (base, Some(instance)),
+        None => (stem, None),
+    };
+    let own = base == service
+        || base
+            .strip_prefix(service)
+            .is_some_and(|rest| rest.starts_with('-') & is_service_name(base));
+    if !own {
+        return Err(UnitError::NotTheServices);
+    }
+    let instance_ok = instance.is_none_or(|i| {
+        (1..=64).contains(&i.len())
+            & i.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+    });
+    if !instance_ok {
+        return Err(UnitError::BadInstance);
+    }
     Ok(())
 }
 
 /// Whether `name` can be an environment variable of a hook: `[A-Za-z_][A-Za-z0-9_]*`.
-pub fn is_env_name(_name: &str) -> bool {
-    true
+pub fn is_env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let first = bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_');
+    first & bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// Whether `value` can be an environment value: letters, digits and `. _ / : @ , + = -`, at
 /// most [`MAX_ENV_VALUE`] bytes. No white space, quote, `$`, `%` or `\`: systemd would read the
 /// property as several words or expand it.
-pub fn is_env_value(_value: &str) -> bool {
-    true
+pub fn is_env_value(value: &str) -> bool {
+    (value.len() <= MAX_ENV_VALUE)
+        & value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._/:@,+=-".contains(&b))
 }
 
-fn is_upper_name(_prefix: &str, _text: &str) -> bool {
-    true
+/// Whether `text` is `prefix` followed by one or more of `A-Z`, `0-9` and `_`.
+fn is_upper_name(prefix: &str, text: &str) -> bool {
+    text.strip_prefix(prefix).is_some_and(|rest| {
+        !rest.is_empty()
+            & rest
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    })
 }
 
 macro_rules! upper_name {

@@ -23,11 +23,14 @@
 //! for the unit, remove it even when it failed, carry the hook's standard output through and
 //! exit with the hook's exit status.
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::fmt::Display;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-use update_hook::{Outcome, Report, Step};
+use update_hook::{Invocation, Outcome, Report, Step};
 
 use crate::declaration::Declaration;
 
@@ -50,8 +53,8 @@ pub const FIXED_PROPERTIES: [&str; 10] = [
 
 /// The unit that runs `step` of `service` for one order. The generation counts the runs of the
 /// order, so a rerun after a crash has a name of its own and the old one can be found.
-pub fn unit_name(_service: &str, _step: Step, _generation: u64) -> String {
-    String::new()
+pub fn unit_name(service: &str, step: Step, generation: u64) -> String {
+    format!("updater-{service}-{step}-{generation}")
 }
 
 /// One run of one step.
@@ -82,14 +85,83 @@ pub struct SystemdRun {
     pub args: Vec<OsString>,
 }
 
+fn words(items: impl Iterator<Item = impl Display>) -> String {
+    items
+        .map(|item| item.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The `Name=value` properties of a step, in the order they are given.
-pub fn properties(_declaration: &Declaration, _step: Step) -> Vec<String> {
-    Vec::new()
+pub fn properties(declaration: &Declaration, step: Step) -> Vec<String> {
+    let hook = &declaration.hook;
+    let capabilities = words(hook.capabilities_for(step).iter());
+    let families = if hook.address_families.is_empty() {
+        "none".to_owned()
+    } else {
+        words(hook.address_families.iter())
+    };
+    let mut writable: BTreeSet<&str> = hook.write_paths.iter().map(String::as_str).collect();
+    writable.insert(&declaration.state_dir);
+    let read_only = (!hook.read_paths.is_empty())
+        .then(|| format!("ReadOnlyPaths={}", words(hook.read_paths.iter())));
+    let mut properties = vec![
+        format!("User={}", hook.user),
+        format!("Group={}", hook.group),
+        format!("AmbientCapabilities={capabilities}"),
+        format!("CapabilityBoundingSet={capabilities}"),
+        "NoNewPrivileges=yes".to_owned(),
+        "ProtectSystem=strict".to_owned(),
+        "ProtectHome=yes".to_owned(),
+        "PrivateTmp=yes".to_owned(),
+    ];
+    properties.extend(read_only);
+    properties.push(format!("ReadWritePaths={}", words(writable.iter())));
+    properties.push(format!("RestrictAddressFamilies={families}"));
+    properties.extend(
+        hook.environment
+            .iter()
+            .map(|(name, value)| format!("Environment={name}={value}")),
+    );
+    properties.push(format!("RuntimeMaxSec={}", hook.timeout_secs.get(step)));
+    properties.extend(
+        FIXED_PROPERTIES
+            .iter()
+            .map(|property| (*property).to_owned()),
+    );
+    properties
 }
 
 /// The `systemd-run` command that runs one step.
-pub fn command(_launch: &Launch<'_>) -> Result<SystemdRun, LaunchError> {
-    Ok(SystemdRun { args: Vec::new() })
+pub fn command(launch: &Launch<'_>) -> Result<SystemdRun, LaunchError> {
+    if !launch.release.is_absolute() {
+        return Err(LaunchError::RelativeRelease(launch.release.to_owned()));
+    }
+    if let Some(params) = launch.params.filter(|params| !params.is_absolute()) {
+        return Err(LaunchError::RelativeParams(params.to_owned()));
+    }
+    let declaration = launch.declaration;
+    let invocation = Invocation {
+        step: launch.step,
+        artifact: (launch.step == Step::Prepare).then(|| launch.release.to_owned()),
+        params: launch.params.map(Path::to_owned),
+    };
+    let unit = unit_name(&declaration.name, launch.step, launch.generation);
+    let mut args: Vec<OsString> = ["--system", "--quiet", "--wait", "--collect", "--pipe"]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    args.push(format!("--unit={unit}").into());
+    args.extend(
+        properties(declaration, launch.step)
+            .into_iter()
+            .map(|property| OsString::from(format!("--property={property}"))),
+    );
+    args.push("--".into());
+    args.push(launch.release.join(&declaration.binary).into());
+    args.extend(declaration.hook_args.iter().map(OsString::from));
+    args.extend(invocation.to_args());
+    Ok(SystemdRun { args })
 }
 
 /// What `systemd-run` did.
@@ -126,9 +198,17 @@ impl Systemd {
 }
 
 impl Spawner for Systemd {
-    fn run(&self, _command: &SystemdRun) -> io::Result<Finished> {
-        let _ = &self.program;
-        Err(io::ErrorKind::Unsupported.into())
+    fn run(&self, command: &SystemdRun) -> io::Result<Finished> {
+        let output = Command::new(&self.program)
+            .args(&command.args)
+            .env_clear()
+            .stdin(Stdio::null())
+            .output()?;
+        Ok(Finished {
+            code: output.status.code(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
     }
 }
 
@@ -155,6 +235,13 @@ pub enum RunError {
 /// Runs one step and reads how it ended: the exit status as an [`Outcome`] (a status of no
 /// contract, a signal and a timeout are failures) and the last line of standard output as a
 /// [`Report`] (a missing or malformed line is `{}`).
-pub fn run_step(_spawner: &dyn Spawner, _launch: &Launch<'_>) -> Result<StepRun, RunError> {
-    Err(RunError::Spawn(io::ErrorKind::Unsupported.into()))
+pub fn run_step(spawner: &dyn Spawner, launch: &Launch<'_>) -> Result<StepRun, RunError> {
+    let command = command(launch)?;
+    let finished = spawner.run(&command)?;
+    Ok(StepRun {
+        unit: unit_name(&launch.declaration.name, launch.step, launch.generation),
+        outcome: Outcome::from_exit(finished.code),
+        report: Report::read(&String::from_utf8_lossy(&finished.stdout)),
+        stderr: String::from_utf8_lossy(&finished.stderr).into_owned(),
+    })
 }

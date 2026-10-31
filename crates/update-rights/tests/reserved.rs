@@ -123,7 +123,7 @@ fn ordinary_paths_pass() {
         "/var/lib/tierstore",
         "/srv/x",
         "/opt/x/y",
-        "/home/x",
+        "/srv/y",
         "/tmp/x",
     ] {
         for kind in KINDS {
