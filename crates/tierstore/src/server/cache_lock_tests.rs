@@ -89,5 +89,16 @@ async fn a_lone_build_node_holds_the_lock_while_it_serves() {
     };
     let drained = serving(&settings, upstream, disk, work).await.unwrap();
     assert_eq!(drained, Drained { abandoned: 0 });
-    assert!(try_take(&node.cache_dir().join(".lock")).unwrap().is_some());
+    // The tasks of the drain that were cut drop their hold of the cache on the runtime's next
+    // turns, so the lock is free after a few yields; a node that never lets it go fails here.
+    let lock = node.cache_dir().join(".lock");
+    let mut freed = false;
+    for _ in 0..100_000 {
+        freed = try_take(&lock).unwrap().is_some();
+        if freed {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(freed, "the lock was still held after the node exited");
 }
