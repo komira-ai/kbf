@@ -56,6 +56,12 @@ impl Grants {
         )
     }
 
+    /// The time now, in unix seconds, by the clock grants are checked against.
+    #[must_use]
+    pub fn now(&self) -> u64 {
+        (self.clock)()
+    }
+
     /// The token that lets build `build` read the inputs of `action` before `not_after`.
     ///
     /// # Errors

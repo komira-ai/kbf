@@ -185,7 +185,7 @@ toml = { version = "1.1.8", default-features = false, features = ["display", "pa
 # RFC 3339 times in the MDM gate's signed messages. Already in the tree through
 # x509-parser.
 time = { version = "0.3.55", default-features = false, features = ["formatting", "macros", "parsing", "std"] }
-tokio = "1.53.2"
+tokio = "1.53.3"
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
 tonic = "0.14.6"
 tonic-prost = "0.14.6"
