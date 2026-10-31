@@ -26,6 +26,13 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 filter = 'package(tierstore) & binary(s3_front) & test(~drain::)'
 slow-timeout = { period = "30s", terminate-after = 2 }
 
+# The same for the tierstore tests that bind sockets and serve over them (the unit tests of
+# `server::listen`, and `tests/s3_front/listeners.rs`, which starts the binary too): a drain that
+# never ends or a listener that is never served fails the test after two minutes at most.
+[[profile.default.overrides]]
+filter = 'package(tierstore) & (test(~listen::tests::) | (binary(s3_front) & test(~listeners::)))'
+slow-timeout = { period = "60s", terminate-after = 2 }
+
 [[profile.default.overrides]]
 filter = 'package(xtask) & binary(install_sh)'
 test-group = 'install-sh-fixture'

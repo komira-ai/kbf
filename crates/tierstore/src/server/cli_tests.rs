@@ -111,7 +111,8 @@ fn a_duration_is_a_number_and_a_unit() {
 #[test]
 fn the_flags_have_their_defaults() {
     let cli = Cli::try_parse_from(flags("key", &[])).unwrap();
-    assert_eq!(cli.listen.to_string(), "127.0.0.1:0");
+    assert_eq!(cli.listen, vec!["127.0.0.1:0".parse().unwrap()]);
+    assert!(cli.oci_listen.is_empty());
     assert_eq!(cli.proxy_id, "p1");
     assert_eq!(cli.hot, "memory");
     assert_eq!(cli.cold, "memory");

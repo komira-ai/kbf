@@ -194,6 +194,7 @@ mod idle;
 mod keys;
 mod launch;
 mod linger;
+mod listen;
 pub mod local_cache;
 pub mod oci;
 mod ops;
@@ -295,6 +296,7 @@ pub use scoped::{Prefixes, ScopedKey};
 
 use idle::Watched;
 use linger::Lingering;
+use listen::Listeners;
 use reply::{Answer, S3Error, answer};
 use request::{BoxError, Check, Query, Reader, Target, resolve};
 
@@ -636,6 +638,13 @@ impl Server {
     /// docs): the drain begins when [`Server::begin_drain`] is called.
     pub async fn serve(self: &Arc<Self>, listener: TcpListener) -> Drained {
         self.serve_from(listener).await
+    }
+
+    /// [`Server::serve`] over several listeners: the one server, so one drain and one count of
+    /// the connections open, takes the connections of all of them, and the drain closes every
+    /// one of them.
+    pub async fn serve_all(self: &Arc<Self>, listeners: Vec<TcpListener>) -> Drained {
+        self.serve_from(Listeners::new(listeners)).await
     }
 
     /// [`Server::serve`] over any source of connections: the tests serve pipes.
