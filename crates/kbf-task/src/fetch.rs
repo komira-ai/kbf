@@ -766,7 +766,8 @@ mod batch;
 #[path = "locate.rs"]
 mod locate;
 pub use locate::{
-    Counts, HttpObjectStore, LocatedSource, MAX_LOCATE_BYTES, ObjectStore, Place, Table, Want,
+    Counts, HELD_IN_MEMORY, HttpObjectStore, LocatedSource, MAX_LOCATE_BYTES, ObjectStore, Place,
+    StoreError, Table, Want,
 };
 
 #[cfg(test)]

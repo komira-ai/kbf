@@ -12,7 +12,7 @@
 //!
 //! # The answer
 //!
-//! Lines of JSON, one object each. The first is the header, naming the store, its bucket and
+//! Lines of JSON, one object each. The first line, and only the first, is the header, naming the store, its bucket and
 //! the read grants (bearer tokens, each good for a few hundred exact keys and for a few minutes):
 //!
 //! ```text
@@ -40,7 +40,7 @@ use std::io::{Read as _, Seek as _, Write};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde_json::Value;
 
@@ -51,6 +51,10 @@ pub const MAX_LOCATE_BYTES: u64 = 256 << 20;
 
 /// The longest grant the task takes, which is the longest header the store takes.
 const MAX_GRANT_BYTES: usize = 64 * 1024;
+
+/// The most a blob may be to be read into memory; a larger one (a hostile answer can put any
+/// size on a pack line) waits in a spool file while it is checked.
+pub const HELD_IN_MEMORY: i64 = 256 << 10;
 
 /// The longest object key the task asks for.
 const MAX_KEY_BYTES: usize = 1024;
@@ -149,12 +153,12 @@ impl Table {
     pub fn parse(body: &[u8]) -> Table {
         let mut table = Table::default();
         let mut usable: Vec<bool> = Vec::new();
-        for line in body.split(|b| *b == b'\n') {
+        for (at, line) in body.split(|b| *b == b'\n').enumerate() {
             let Ok(value) = serde_json::from_slice::<Value>(line) else {
                 continue;
             };
             if value.get("digest").is_none() {
-                if table.store.is_none() {
+                if at == 0 {
                     table.header(&value, &mut usable);
                 }
                 continue;
@@ -242,6 +246,18 @@ pub enum Want {
     },
 }
 
+/// Why a read from the store failed.
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    /// The store could not be reached (connection refused, no route, timed out): the rest of the
+    /// run does not try it again.
+    #[error("{0}")]
+    Unreachable(String),
+    /// The store answered, or the read broke: refused, not found, short, broken.
+    #[error("{0}")]
+    Failed(String),
+}
+
 /// A store that objects can be read from with a grant.
 pub trait ObjectStore: Sync {
     /// Writes what `want` names of the object `key` into `out`, presenting `grant`, as it
@@ -250,7 +266,13 @@ pub trait ObjectStore: Sync {
     ///
     /// # Errors
     /// Why the object could not be read.
-    fn read(&self, key: &str, want: Want, grant: &str, out: &mut dyn Write) -> Result<(), String>;
+    fn read(
+        &self,
+        key: &str,
+        want: Want,
+        grant: &str,
+        out: &mut dyn Write,
+    ) -> Result<(), StoreError>;
 }
 
 /// The store over HTTP: `GET <endpoint>/<bucket>/<key>` with the grant in `x-tierstore-grant`
@@ -261,13 +283,21 @@ pub struct HttpObjectStore {
     base: String,
 }
 
-/// Whether `bucket` is a plain bucket name: lowercase letters, digits, `-` and `.`.
+/// Whether `bucket` is a plain bucket name: 1 to 63 lowercase letters, digits, `-` and `.`, not
+/// starting or ending with `.` (so never `.` or `..`, which a URL path would resolve).
 fn plain_bucket(bucket: &str) -> bool {
-    !bucket.is_empty()
-        && bucket.len() <= 63
-        && bucket
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'.'))
+    let chars = bucket
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() | b.is_ascii_digit() | matches!(b, b'-' | b'.'));
+    (1..=63).contains(&bucket.len()) & chars & !bucket.starts_with('.') & !bucket.ends_with('.')
+}
+
+/// Whether `endpoint` is only visible ASCII without `?`, `#`, `@` (user information) or `\`: the
+/// endpoint is a scheme, a host and perhaps a port, nothing a request could be steered with.
+fn plain_endpoint(endpoint: &str) -> bool {
+    endpoint
+        .bytes()
+        .all(|b| b.is_ascii_graphic() & !matches!(b, b'?' | b'#' | b'@' | b'\\'))
 }
 
 /// Whether `url` starts with `scheme` (which ends in `://`), in any case.
@@ -295,6 +325,9 @@ impl HttpObjectStore {
         if !plain_bucket(bucket) {
             return refuse("the bucket is not a plain name");
         }
+        if !plain_endpoint(endpoint) {
+            return refuse("the endpoint holds a character a store address does not");
+        }
         if !(has_scheme(endpoint, "https://")
             || (allow_plain_http && has_scheme(endpoint, "http://")))
         {
@@ -310,7 +343,13 @@ impl HttpObjectStore {
 }
 
 impl ObjectStore for HttpObjectStore {
-    fn read(&self, key: &str, want: Want, grant: &str, out: &mut dyn Write) -> Result<(), String> {
+    fn read(
+        &self,
+        key: &str,
+        want: Want,
+        grant: &str,
+        out: &mut dyn Write,
+    ) -> Result<(), StoreError> {
         let (range, size, expected) = match want {
             Want::Whole { size } => (None, size, 200),
             Want::Range { offset, length } => {
@@ -330,14 +369,29 @@ impl ObjectStore for HttpObjectStore {
         if let Some(range) = &range {
             request = request.header("Range", range);
         }
-        let mut response = request.call().map_err(|e| e.to_string())?;
+        let mut response = request.call().map_err(|e| {
+            let unreachable = matches!(
+                e,
+                ureq::Error::Io(_)
+                    | ureq::Error::Timeout(_)
+                    | ureq::Error::HostNotFound
+                    | ureq::Error::ConnectionFailed
+            );
+            if unreachable {
+                StoreError::Unreachable(e.to_string())
+            } else {
+                StoreError::Failed(e.to_string())
+            }
+        })?;
         let status = response.status().as_u16();
         if status != expected {
-            return Err(format!("the store answered {status}, not {expected}"));
+            return Err(StoreError::Failed(format!(
+                "the store answered {status}, not {expected}"
+            )));
         }
         std::io::copy(&mut response.body_mut().as_reader(), out)
             .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| StoreError::Failed(e.to_string()))
     }
 }
 
@@ -378,8 +432,10 @@ pub struct LocatedSource {
     counts: [AtomicU64; 4],
     /// Why `/locate` was not used, or the first direct read that failed.
     failure: Mutex<Option<String>>,
-    /// Where a large object is held while it is checked.
+    /// Where a large blob is held while it is checked.
     spool: PathBuf,
+    /// Set by the first read that could not reach the store: the rest go to the listener.
+    down: AtomicBool,
 }
 
 /// A blob read from the store and checked: held in memory, or in an unlinked spool file.
@@ -388,7 +444,7 @@ enum Ready {
     Spooled(std::fs::File),
 }
 
-/// Makes an unlinked file in `dir`: the checked bytes of a large object wait in it until they are
+/// Makes an unlinked file in `dir`: the checked bytes of a large blob wait in it until they are
 /// copied on, so a blob that fails its check never reaches the writer it was read for. The
 /// unlink cannot fail in a way that matters: a file left behind holds only input bytes.
 fn spool_file(dir: &Path) -> Result<std::fs::File, FetchError> {
@@ -410,21 +466,27 @@ fn spool_file(dir: &Path) -> Result<std::fs::File, FetchError> {
     Ok(file)
 }
 
-/// Reads from `store` into `out`, an error naming the digest. Not generic.
+/// Reads from `store` into `out`, an error naming the digest. A read that could not reach the
+/// store sets `down`, so that no other blob tries it. Not generic.
 fn read_store(
     store: &dyn ObjectStore,
+    down: &AtomicBool,
     key: &str,
     want: Want,
     grant: &str,
     digest: &Digest,
     out: &mut dyn Write,
 ) -> Result<(), FetchError> {
-    store
-        .read(key, want, grant, out)
-        .map_err(|why| FetchError::Source {
+    store.read(key, want, grant, out).map_err(|error| {
+        down.fetch_or(
+            matches!(error, StoreError::Unreachable(_)),
+            Ordering::SeqCst,
+        );
+        FetchError::Source {
             digest: label(digest),
-            why,
-        })
+            why: error.to_string(),
+        }
+    })
 }
 
 impl LocatedSource {
@@ -444,6 +506,7 @@ impl LocatedSource {
             counts: Default::default(),
             failure: Mutex::new(None),
             spool,
+            down: AtomicBool::new(false),
         }
     }
 
@@ -502,7 +565,8 @@ impl LocatedSource {
         Some((store, place, grant))
     }
 
-    /// Reads `digest` from the store, checked against it.
+    /// Reads `digest` from the store, checked against it: held in memory when it is small, in
+    /// the spool when it is not, whatever the answer says it is.
     fn read_located(
         &self,
         store: &dyn ObjectStore,
@@ -510,35 +574,39 @@ impl LocatedSource {
         grant: &str,
         digest: &Digest,
     ) -> Result<Ready, FetchError> {
-        match place {
+        let (key, want, counted) = match place {
             Place::Pack {
                 key,
                 offset,
                 length,
-            } => {
-                let want = Want::Range {
+            } => (
+                key,
+                Want::Range {
                     offset: *offset,
                     length: *length,
-                };
-                let bytes = verified_bytes(digest, &mut |out| {
-                    read_store(store, key, want, grant, digest, out)
-                })?;
-                self.count(RANGE, 1);
-                Ok(Ready::Bytes(bytes))
-            }
-            Place::Large { key } => {
-                let want = Want::Whole {
+                },
+                RANGE,
+            ),
+            Place::Large { key } => (
+                key,
+                Want::Whole {
                     size: digest.size_bytes.unsigned_abs(),
-                };
-                let mut spool = spool_file(&self.spool)?;
-                stream_checked(digest, &self.spool, &mut spool, &mut |out| {
-                    read_store(store, key, want, grant, digest, out)
-                })?;
-                spool.rewind().map_err(io(&self.spool))?;
-                self.count(LARGE, 1);
-                Ok(Ready::Spooled(spool))
-            }
-        }
+                },
+                LARGE,
+            ),
+        };
+        let mut read =
+            |out: &mut dyn Write| read_store(store, &self.down, key, want, grant, digest, out);
+        let ready = if digest.size_bytes <= HELD_IN_MEMORY {
+            Ready::Bytes(verified_bytes(digest, &mut read)?)
+        } else {
+            let mut spool = spool_file(&self.spool)?;
+            stream_checked(digest, &self.spool, &mut spool, &mut read)?;
+            spool.rewind().map_err(io(&self.spool))?;
+            Ready::Spooled(spool)
+        };
+        self.count(counted, 1);
+        Ok(ready)
     }
 }
 
@@ -569,6 +637,10 @@ impl BlobSource for LocatedSource {
             self.count(ABSENT, 1);
             return self.inner.fetch_to(digest, out);
         };
+        if self.down.load(Ordering::SeqCst) {
+            self.count(FALLBACK, 1);
+            return self.inner.fetch_to(digest, out);
+        }
         match self.read_located(store, place, grant, digest) {
             Ok(ready) => deliver(ready, digest, out),
             Err(error) => {

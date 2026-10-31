@@ -706,7 +706,13 @@ fn trusted_roots(cli: &Cli) -> Result<Vec<Vec<u8>>, Failure> {
 }
 
 /// The trusted roots and the real source and sink the flags name.
+#[cfg(test)]
 fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
+    connect_with_roots(cli).map(|(source, sink, _)| (source, sink))
+}
+
+/// [`connect`], and the roots it read, for a caller that needs them too.
+fn connect_with_roots(cli: &Cli) -> Result<(HttpBlobSource, HttpSink, Vec<Vec<u8>>), Failure> {
     check_lease(cli)?;
     check_argv_secrets(cli)?;
     check_grant_scheme(cli)?;
@@ -729,18 +735,16 @@ fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
         urls,
         sleeper: Arc::new(ThreadSleeper),
     };
-    Ok((source, sink))
+    Ok((source, sink, roots))
 }
 
-/// [`connect`], and the source wrapped to read where `/locate` points when the flags give a
-/// store and a credential for it. Without `--store-url` the source is the listener's alone and
-/// `/locate` is never asked.
+/// [`connect`], and with `--locate` the source wrapped to read where the listener's `/locate`
+/// points. Without `--locate` the source is the listener's alone and `/locate` is never asked.
 fn connect_located(cli: &Cli) -> Result<(Box<dyn BlobSource>, HttpSink), Failure> {
-    let (source, sink) = connect(cli)?;
+    let (source, sink, roots) = connect_with_roots(cli)?;
     if !cli.locate {
         return Ok((Box::new(source), sink));
     }
-    let roots = trusted_roots(cli)?;
     let located = LocatedSource::open(
         source,
         &roots,

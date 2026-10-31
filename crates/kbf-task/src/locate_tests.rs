@@ -44,7 +44,14 @@ impl FakeStore {
 struct SharedStore(Arc<FakeStore>);
 
 impl ObjectStore for SharedStore {
-    fn read(&self, key: &str, want: Want, grant: &str, out: &mut dyn Write) -> Result<(), String> {
+    fn read(
+        &self,
+        key: &str,
+        want: Want,
+        grant: &str,
+        out: &mut dyn Write,
+    ) -> Result<(), StoreError> {
+        let failed = |why: &str| StoreError::Failed(why.to_owned());
         let store = &self.0;
         store
             .reads
@@ -52,10 +59,10 @@ impl ObjectStore for SharedStore {
             .expect("reads")
             .push((key.to_owned(), want, grant.to_owned()));
         if store.refuse.lock().expect("refuse").contains(key) {
-            return Err("403".to_owned());
+            return Err(failed("403"));
         }
         let objects = store.objects.lock().expect("objects");
-        let object = objects.get(key).ok_or_else(|| "404".to_owned())?;
+        let object = objects.get(key).ok_or_else(|| failed("404"))?;
         let (start, end) = match want {
             Want::Whole { .. } => (0, object.len()),
             Want::Range { offset, length } => {
@@ -67,9 +74,9 @@ impl ObjectStore for SharedStore {
             }
         };
         out.write_all(&object[start..end])
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| failed(&e.to_string()))?;
         if store.overrun.lock().expect("overrun").contains(key) {
-            out.write_all(b"x").map_err(|e| e.to_string())?;
+            out.write_all(b"x").map_err(|e| failed(&e.to_string()))?;
         }
         Ok(())
     }
@@ -135,6 +142,9 @@ fn located(
         spool.to_owned(),
     )
 }
+
+/// A blob too big to be held in memory while it is checked.
+const BIG: usize = HELD_IN_MEMORY as usize + 1000;
 
 /// A writer that takes nothing.
 struct Refuses;
@@ -483,7 +493,7 @@ fn a_short_a_long_and_a_failed_read_fall_back() {
 /// spool leaves nothing in its directory.
 #[test]
 fn a_large_object_is_read_whole_and_checked() {
-    let big: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    let big: Vec<u8> = (0..BIG as u32).map(|i| (i % 251) as u8).collect();
     let (mem, root, digests) = listener_with(std::slice::from_ref(&big));
     let mem = Arc::new(mem);
     let store = Arc::new(FakeStore::default());
@@ -496,7 +506,7 @@ fn a_large_object_is_read_whole_and_checked() {
         store.reads(),
         vec![(
             format!("cas/l/{}", digests[0].hash),
-            Want::Whole { size: 50_000 },
+            Want::Whole { size: BIG as u64 },
             GRANT.to_owned()
         )]
     );
@@ -513,7 +523,7 @@ fn a_large_object_is_read_whole_and_checked() {
 /// the file are the listener's, and the corrupt bytes streamed from the store are not in it.
 #[test]
 fn a_large_object_that_is_corrupt_or_refused_falls_back_clean() {
-    let big: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    let big: Vec<u8> = (0..BIG as u32).map(|i| (i % 251) as u8).collect();
     let (mem, root, digests) = listener_with(std::slice::from_ref(&big));
     let mem = Arc::new(mem);
     let key = format!("cas/l/{}", digests[0].hash);
@@ -542,7 +552,7 @@ fn a_large_object_that_is_corrupt_or_refused_falls_back_clean() {
 /// object is read from the listener.
 #[test]
 fn a_large_object_with_no_spool_directory_is_read_from_the_listener() {
-    let big = vec![9u8; 4096];
+    let big = vec![9u8; BIG];
     let (mem, root, digests) = listener_with(std::slice::from_ref(&big));
     let mem = Arc::new(mem);
     let store = Arc::new(FakeStore::default());
@@ -744,6 +754,119 @@ fn a_digest_mismatch_on_the_fallback_is_still_exit_10() {
     let failure = crate::task::Failure::from(error);
     assert_eq!(failure.exit_code(), crate::task::EXIT_FETCH);
     assert_eq!(failure.exit_code(), 10);
+}
+
+/// Catches a span of any size being held in memory: a hostile answer can put a huge size on a pack
+/// line, so a span over the in-memory limit is checked in the spool. With no spool directory the
+/// read fails and the listener serves it, which shows the spool was the path; with one, the file
+/// is right and nothing is left in the directory.
+#[test]
+fn a_span_over_the_memory_limit_is_checked_in_the_spool() {
+    let big: Vec<u8> = (0..BIG as u32).map(|i| (i % 249) as u8).collect();
+    let (pack, offsets) = pack_of(std::slice::from_ref(&big));
+    let store = Arc::new(FakeStore::default());
+    store.put("cas/f/w/p0", pack);
+    let (mem, root, digests) = listener_with(std::slice::from_ref(&big));
+    let mem = Arc::new(mem);
+    let lines = vec![pack_line(&digests[0], "cas/f/w/p0", offsets[0])];
+    let dir = scratch("span-spooled");
+    let source = located(&mem, &store, &lines, &dir);
+    materialize(&source, &root, &dir.join("in"), 1).expect("materialize");
+    check_files(&dir.join("in"), std::slice::from_ref(&big));
+    assert_eq!((source.counts().range, source.counts().fallback), (1, 0));
+    assert_eq!(mem.reads(&digests[0]), 0);
+    let names: Vec<_> = std::fs::read_dir(&dir)
+        .expect("dir")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("in")]);
+
+    let dir = scratch("span-no-spool");
+    let source = located(&mem, &store, &lines, &dir.join("missing"));
+    materialize(&source, &root, &dir.join("in"), 1).expect("materialize");
+    check_files(&dir.join("in"), std::slice::from_ref(&big));
+    assert_eq!((source.counts().range, source.counts().fallback), (0, 1));
+}
+
+/// Catches a header taken from later in the answer: only the first line is the header, so a
+/// header-shaped line after a blank first line, or after an entry, sets no store.
+#[test]
+fn only_the_first_line_is_the_header() {
+    let header = header_line("http://store.test");
+    let d = digest_of(b"payload");
+    let entry = pack_line(&d, "cas/f/w/p0", 4);
+    assert!(Table::parse(format!("\n{header}\n{entry}\n").as_bytes()).is_empty());
+    assert_eq!(
+        Table::parse(format!("\n{header}\n").as_bytes()).store(),
+        None
+    );
+    let after = Table::parse(format!("{entry}\n{header}\n").as_bytes());
+    assert_eq!(after.store(), None);
+    assert!(after.is_empty());
+}
+
+/// Catches a store that is down costing every blob a connect: the first blob's read cannot
+/// connect, and the other blobs go to the listener without trying the store (the store is
+/// asked once; the port is closed, so no clock is involved).
+#[test]
+fn a_store_that_cannot_be_reached_is_tried_once() {
+    struct Counting {
+        store: HttpObjectStore,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+    impl ObjectStore for Counting {
+        fn read(
+            &self,
+            key: &str,
+            want: Want,
+            grant: &str,
+            out: &mut dyn Write,
+        ) -> Result<(), StoreError> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.store.read(key, want, grant, out)
+        }
+    }
+    let free = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base = format!("http://{}", free.local_addr().expect("addr"));
+    drop(free);
+    let blobs = bodies(3);
+    let (pack, offsets) = pack_of(&blobs);
+    drop(pack);
+    let (mem, root, digests) = listener_with(&blobs);
+    let mem = Arc::new(mem);
+    let counting = Arc::new(Counting {
+        store: HttpObjectStore::new(&base, "b", &[vec![1, 2, 3]], true).expect("store"),
+        asked: std::sync::atomic::AtomicUsize::new(0),
+    });
+    struct Shared2(Arc<Counting>);
+    impl ObjectStore for Shared2 {
+        fn read(
+            &self,
+            key: &str,
+            want: Want,
+            grant: &str,
+            out: &mut dyn Write,
+        ) -> Result<(), StoreError> {
+            self.0.read(key, want, grant, out)
+        }
+    }
+    let lines: Vec<String> = digests
+        .iter()
+        .zip(&offsets)
+        .map(|(d, o)| pack_line(d, "cas/f/w/p0", *o))
+        .collect();
+    let dir = scratch("store-down");
+    let source = LocatedSource::new(
+        Box::new(Shared(Arc::clone(&mem))),
+        Some(Box::new(Shared2(Arc::clone(&counting)))),
+        table(&lines),
+        dir.to_path_buf(),
+    );
+    materialize(&source, &root, &dir.join("in"), 1).expect("materialize");
+    check_files(&dir.join("in"), &blobs);
+    assert_eq!(counting.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(source.counts().fallback, 3);
+    assert!(digests.iter().all(|d| mem.reads(d) == 1));
 }
 
 #[path = "locate_http_tests.rs"]

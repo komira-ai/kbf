@@ -34,6 +34,8 @@ pub(crate) struct Answer {
     pub body: Vec<u8>,
     /// Whether the connection ends before the body does.
     pub cut: bool,
+    /// A `Location` header, for a redirect.
+    pub location: Option<String>,
 }
 
 impl Answer {
@@ -42,6 +44,15 @@ impl Answer {
             status,
             body: body.into(),
             cut: false,
+            location: None,
+        }
+    }
+
+    /// A redirect to `url`.
+    pub fn redirect(status: u16, url: &str) -> Self {
+        Self {
+            location: Some(url.to_owned()),
+            ..Self::new(status, "")
         }
     }
 
@@ -117,8 +128,13 @@ fn serve(mut stream: std::net::TcpStream, handler: &Handler, log: &Mutex<Vec<See
         };
         log.lock().expect("seen").push(seen.clone());
         let answer = handler(&seen);
+        let location = answer
+            .location
+            .as_ref()
+            .map(|url| format!("Location: {url}\r\n"))
+            .unwrap_or_default();
         let head = format!(
-            "HTTP/1.1 {} X\r\nContent-Length: {}\r\n\r\n",
+            "HTTP/1.1 {} X\r\n{location}Content-Length: {}\r\n\r\n",
             answer.status,
             answer.body.len() + if answer.cut { 8 } else { 0 }
         );

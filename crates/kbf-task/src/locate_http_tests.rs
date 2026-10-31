@@ -136,6 +136,12 @@ fn open_asks_locate_once_and_reads_where_it_points() {
     assert_eq!(seen[0].header("x-tierstore-grant"), Some("grant-2"));
     assert_eq!(seen[0].path, "/b/cas/f/w/p0");
     assert_eq!(source.counts().range, 1);
+    // The listener is never given a store grant.
+    assert!(
+        fake.requests()
+            .iter()
+            .all(|r| r.header("x-tierstore-grant").is_none())
+    );
 }
 
 /// Catches an unusable `/locate` stopping the run: a 503, a 404, a body that is no table and a
@@ -275,12 +281,14 @@ fn a_whole_read_wants_200_and_a_range_read_wants_206() {
             "g",
             &mut Vec::new(),
         )
-        .expect_err("200 for a range");
+        .expect_err("200 for a range")
+        .to_string();
     assert!(error.contains("200"), "{error}");
     let fake = Fake::start(|_| Answer::new(206, "part"));
     let error = store_at(&fake, "b")
         .read("cas/l/abc", Want::Whole { size: 4 }, "g", &mut Vec::new())
-        .expect_err("206 for whole");
+        .expect_err("206 for whole")
+        .to_string();
     assert!(error.contains("206"), "{error}");
 }
 
@@ -292,7 +300,8 @@ fn a_refusal_or_an_unreachable_store_is_an_error() {
         let fake = Fake::start(move |_| Answer::new(status, "AccessDenied"));
         let error = store_at(&fake, "b")
             .read("cas/l/abc", Want::Whole { size: 4 }, "g", &mut Vec::new())
-            .expect_err("refused");
+            .expect_err("refused")
+            .to_string();
         assert!(error.contains(&status.to_string()), "{error}");
         assert!(!error.contains("AccessDenied"), "{error}");
     }
@@ -324,7 +333,8 @@ fn a_writer_that_refuses_ends_the_store_read() {
     let fake = Fake::start(|_| Answer::new(200, "data"));
     let error = store_at(&fake, "b")
         .read("cas/l/abc", Want::Whole { size: 4 }, "g", &mut Refuses)
-        .expect_err("refused");
+        .expect_err("refused")
+        .to_string();
     assert!(error.contains("full"), "{error}");
 }
 
@@ -336,7 +346,18 @@ fn a_store_needs_roots_a_plain_bucket_name_and_a_scheme_it_may_use() {
     let roots = [vec![1, 2, 3]];
     assert!(HttpObjectStore::new("http://h:1", "b", &[], true).is_err());
     let long = "a".repeat(64);
-    for bucket in ["", "a/b", "Upper", "a b", "a?b", long.as_str()] {
+    for bucket in [
+        "",
+        "a/b",
+        "Upper",
+        "a b",
+        "a?b",
+        long.as_str(),
+        ".",
+        "..",
+        ".a",
+        "a.",
+    ] {
         assert!(
             HttpObjectStore::new("http://h:1", bucket, &roots, true).is_err(),
             "{bucket:?}"
@@ -346,6 +367,21 @@ fn a_store_needs_roots_a_plain_bucket_name_and_a_scheme_it_may_use() {
     assert!(HttpObjectStore::new("HTTPS://h:1", "b", &roots, false).is_ok());
     assert!(HttpObjectStore::new("http://h:1", "b", &roots, false).is_err());
     assert!(HttpObjectStore::new("ftp://h:1", "b", &roots, true).is_err());
+    for endpoint in [
+        "https://h:1?x=1",
+        "https://h:1#frag",
+        "https://user:pw@h:1",
+        "https://h:1 ",
+        "https://h:1\t",
+        "https://h:1\n",
+        "https://h:1\\x",
+        "https://h\u{e9}:1",
+    ] {
+        assert!(
+            HttpObjectStore::new(endpoint, "b", &roots, true).is_err(),
+            "{endpoint:?}"
+        );
+    }
     let fake = Fake::start(|_| Answer::new(200, "x"));
     let store = HttpObjectStore::new(&format!("{}/", fake.base), "b", &roots, true).expect("store");
     store
@@ -359,7 +395,7 @@ fn a_store_needs_roots_a_plain_bucket_name_and_a_scheme_it_may_use() {
 /// span and for a large object alike.
 #[test]
 fn a_writer_that_refuses_a_checked_blob_fails_without_a_fallback() {
-    let big = vec![5u8; 4096];
+    let big = vec![5u8; BIG];
     let small = b"a small blob".to_vec();
     let (pack, offsets) = pack_of(std::slice::from_ref(&small));
     let store = Arc::new(FakeStore::default());
@@ -367,7 +403,7 @@ fn a_writer_that_refuses_a_checked_blob_fails_without_a_fallback() {
     let (big_digest, small_digest) = (digest_of(&big), digest_of(&small));
     store.put(&format!("cas/l/{}", big_digest.hash), big);
     let mut mem = Memory::default();
-    mem.put(vec![5u8; 4096]);
+    mem.put(vec![5u8; BIG]);
     mem.put(small.clone());
     let mem = Arc::new(mem);
     let lines = vec![
@@ -391,4 +427,43 @@ fn a_locate_answer_cut_short_is_an_error() {
     let (_fake, source) = plain_listener(|_| Answer::cut(200, "the start of a table"));
     let error = source.locate().expect_err("cut").to_string();
     assert!(error.starts_with("/locate: "), "{error}");
+}
+
+/// Catches a redirect from the store being followed: the grant would go to whatever host the
+/// `Location` names. The store answers 302 to a second server; the read is an error and the
+/// second server sees no request, and through `open` the blob is read from the listener.
+#[test]
+fn a_redirect_from_the_store_is_an_error_and_is_not_followed() {
+    let elsewhere = Fake::start(|_| Answer::new(206, "stolen"));
+    let target = format!("{}/b/cas/f/w/p0", elsewhere.base);
+    let store = Fake::start(move |_| Answer::redirect(302, &target));
+    let error = store_at(&store, "b")
+        .read(
+            "cas/f/w/p0",
+            Want::Range {
+                offset: 0,
+                length: 6,
+            },
+            "the-grant",
+            &mut Vec::new(),
+        )
+        .expect_err("redirect")
+        .to_string();
+    assert!(error.contains("302"), "{error}");
+    assert!(elsewhere.requests().is_empty());
+
+    let blobs = bodies(1);
+    let (_, offsets) = pack_of(&blobs);
+    let d = digest_of(&blobs[0]);
+    let body = [
+        header_line(&store.base),
+        pack_line(&d, "cas/f/w/p0", offsets[0]),
+    ]
+    .join("\n");
+    let (_fake, listener) = listener_serving(&blobs, Answer::new(200, body));
+    let dir = scratch("store-redirect");
+    let source = open(listener, &dir);
+    assert!(source.get(&d).expect("get") == blobs[0]);
+    assert_eq!(source.counts().fallback, 1);
+    assert!(elsewhere.requests().is_empty());
 }
