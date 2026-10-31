@@ -65,3 +65,13 @@ ol.steps h3 { margin: 0 0 0.3rem; }
 .transcript .p { color: var(--accent); user-select: none; }
 .source-note { margin: 0.4rem 0 0; font-size: 0.8125rem; color: var(--fg-muted); }
 .compact { max-width: 46rem; }
+
+/* ---- the operator guide (generated from crates/tierstore/docs by tools/docs.ts) ---- */
+.docs-nav { margin: 0 0 1.5rem; padding: 0 0 0.9rem; border-bottom: 1px solid var(--border); }
+.docs-nav ul { display: flex; flex-wrap: wrap; gap: 0.4rem 1.2rem; list-style: none; margin: 0; padding: 0; }
+.docs-nav a[aria-current="page"] { color: var(--fg); font-weight: 700; text-decoration: none; }
+.docs-list { list-style: none; margin: 1.5rem 0; padding: 0; display: grid; gap: 1rem; }
+.docs-list li { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 18px; }
+.docs-list a { font: 700 1rem var(--mono); }
+.docs-list p { margin: 6px 0 0; color: var(--fg-2); font-size: 0.9375rem; }
+main.wrap h2 .tag { margin-left: 0.6rem; vertical-align: middle; }
