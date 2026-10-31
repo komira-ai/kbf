@@ -287,3 +287,317 @@ fn a_failing_rollback_halts_before_the_commit_and_fails_after_it() {
     assert_eq!(rollbacks, 3);
     assert_eq!(verdict, Verdict::Halt);
 }
+// --- planted bad hooks ---
+
+fn refused(name: &str, hook: HookCommand) -> Violation {
+    let scratch = Scratch::new(name);
+    let mut fake = ExampleFake::default();
+    check(&hook, &mut fake, scratch.path()).expect_err("the harness must refuse this hook")
+}
+
+fn refused_scenario(name: &str, hook: HookCommand, faults: &[(Step, Fault)]) -> Violation {
+    let scratch = Scratch::new(name);
+    let mut fake = ExampleFake::default();
+    Conformance::new(&hook, &mut fake, scratch.path())
+        .scenario(faults)
+        .expect_err("the harness must refuse this hook")
+}
+
+/// Catches a harness that lets a step change the world every time it runs.
+#[test]
+fn a_step_that_is_not_idempotent_is_refused() {
+    match refused("bad-idempotent", example_with("non-idempotent")) {
+        Violation::NotIdempotent { step, changes } => {
+            assert_eq!(step, Step::Cutover);
+            assert_eq!(changes, ["changed log"]);
+        }
+        other => panic!("{other}"),
+    }
+}
+
+/// Catches a harness that accepts a success with no JSON last line, or one that is not JSON.
+#[test]
+fn a_step_that_exits_zero_without_the_line_is_refused() {
+    match refused("bad-no-line", example_with("no-line-on-success")) {
+        Violation::Line { step, error, .. } => {
+            assert_eq!(step, Step::Verify);
+            assert_eq!(error, LineError::Missing);
+        }
+        other => panic!("{other}"),
+    }
+    match refused("bad-bad-line", example_with("bad-line")) {
+        Violation::Line { step, error, .. } => {
+            assert_eq!(step, Step::Verify);
+            assert!(matches!(error, LineError::Malformed(_)));
+        }
+        other => panic!("{other}"),
+    }
+}
+
+/// Catches a harness that lets a hook write the service's own data directory (the old state
+/// file location) or anywhere but its record.
+#[test]
+fn a_hook_that_writes_outside_its_record_is_refused() {
+    match refused("bad-outside", example_with("writes-outside")) {
+        Violation::WroteOutside { step, changes } => {
+            assert_eq!(step, Step::Prepare);
+            assert_eq!(changes, ["added outside/state.json"]);
+        }
+        other => panic!("{other}"),
+    }
+}
+
+/// Catches a rollback after the commit that claims it gave everything back when it did not.
+#[test]
+fn a_rollback_after_the_commit_that_claims_reversible_is_refused() {
+    let hook = example(&[
+        "update-hook",
+        "--irreversible-cutover",
+        "--defect=reversible-lie",
+    ]);
+    match refused("bad-reversible-lie", hook) {
+        Violation::RollbackClaimsReversible { changes } => {
+            assert_eq!(changes, ["added stopped"]);
+        }
+        other => panic!("{other}"),
+    }
+}
+
+/// Catches a hook that dies of a signal, exits with a code the contract does not define, or
+/// defers without saying when.
+#[test]
+fn a_step_that_ends_outside_the_contract_is_refused() {
+    assert!(matches!(
+        refused("bad-signal", example_with("signal")),
+        Violation::DiedBySignal { step: Step::Verify }
+    ));
+    assert!(matches!(
+        refused("bad-exit-2", example_with("exit-2")),
+        Violation::UnknownExit {
+            step: Step::Verify,
+            code: 2,
+            ..
+        }
+    ));
+    assert!(matches!(
+        refused_scenario(
+            "bad-defer",
+            example_with("defer-no-retry"),
+            &[(Step::Prepare, Fault::Defer)]
+        ),
+        Violation::DeferredWithoutRetryAfter {
+            step: Step::Prepare
+        }
+    ));
+}
+
+/// Catches a step that ends differently the second time.
+#[test]
+fn a_step_whose_second_run_fails_is_refused() {
+    assert!(matches!(
+        refused("bad-second-run", example_with("second-run-fails")),
+        Violation::RerunOutcomeChanged {
+            step: Step::Cleanup,
+            first: Outcome::Success,
+            second: Outcome::Failure
+        }
+    ));
+}
+
+/// Catches a hook that cannot resume after a crash in the middle of a step.
+#[test]
+fn a_hook_that_diverges_after_a_crash_is_refused() {
+    let scratch = Scratch::new("bad-crash");
+    let hook = example_with("resume-diverges");
+    let mut fake = ExampleFake::default();
+    match Conformance::new(&hook, &mut fake, scratch.path()).crash_resume() {
+        Err(Violation::CrashResumeDiverges {
+            step,
+            kill_at,
+            changes,
+        }) => {
+            assert_eq!(step, Step::Cutover);
+            assert_eq!(kill_at, 2);
+            assert_eq!(changes, ["changed marker"]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Catches a fake service with no kill points passing crash-resume, which would check nothing.
+#[test]
+fn a_hook_with_no_kill_points_is_refused() {
+    let scratch = Scratch::new("bad-ungated");
+    let hook = example_with("ungated");
+    let mut fake = ExampleFake::default();
+    assert!(matches!(
+        Conformance::new(&hook, &mut fake, scratch.path()).crash_resume(),
+        Err(Violation::NoKillPoints)
+    ));
+}
+
+/// Catches a kill point that was in the first run and not in the next.
+#[test]
+fn kill_points_that_come_and_go_are_refused() {
+    let scratch = Scratch::new("bad-flaky");
+    let hook = example_with("flaky-gates");
+    let mut fake = ExampleFake::default();
+    assert!(matches!(
+        Conformance::new(&hook, &mut fake, scratch.path()).crash_resume(),
+        Err(Violation::KillPointVanished {
+            step: Step::Prepare,
+            ..
+        })
+    ));
+}
+
+/// Catches a cleanup that finishes an update that was rolled back, and a rollback that leaves
+/// the cordon behind.
+#[test]
+fn a_cleanup_that_commits_after_a_rollback_and_a_rollback_that_leaves_residue_are_refused() {
+    assert!(matches!(
+        refused("bad-cleanup-commits", example_with("cleanup-commits")),
+        Violation::CleanupCommitted { .. }
+    ));
+    match refused("bad-residue", example_with("leaves-cordon")) {
+        Violation::ResidueLeft { step, left } => {
+            assert_eq!(step, Step::Rollback);
+            assert_eq!(left, ["cordon"]);
+        }
+        other => panic!("{other}"),
+    }
+}
+
+/// Catches a hook that ignores the record lock and runs a second copy of a step.
+#[test]
+fn a_hook_that_runs_while_the_record_is_locked_is_refused() {
+    let scratch = Scratch::new("bad-lock");
+    let hook = example_with("ignores-lock");
+    let mut fake = ExampleFake::default();
+    assert!(matches!(
+        Conformance::new(&hook, &mut fake, scratch.path()).exclusive_record(),
+        Err(Violation::RanWhileLocked {
+            step: Step::Prepare,
+            outcome: Outcome::Success,
+            ..
+        })
+    ));
+}
+
+/// Catches a fake whose injected fault the hook does not honour, and a deferral that leaves the
+/// world changed.
+#[test]
+fn a_hook_that_ignores_a_fault_or_keeps_state_after_a_deferral_is_refused() {
+    assert!(matches!(
+        refused_scenario(
+            "bad-ignores-faults",
+            example_with("ignores-faults"),
+            &[(Step::Cutover, Fault::Fail)]
+        ),
+        Violation::UnexpectedOutcome {
+            step: Step::Cutover,
+            wanted: Outcome::Failure,
+            got: Outcome::Success
+        }
+    ));
+    assert!(matches!(
+        refused_scenario(
+            "bad-defer-state",
+            example_with("rollback-says-irreversible"),
+            &[(Step::Prepare, Fault::Defer)]
+        ),
+        Violation::DeferredLeftState { .. }
+    ));
+}
+
+/// Catches a violation that prints nothing useful.
+#[test]
+fn every_violation_says_what_it_found() {
+    let steps = Step::Verify;
+    let all = vec![
+        Violation::Io(std::io::Error::other("x")),
+        Violation::DiedBySignal { step: steps },
+        Violation::UnknownExit {
+            step: steps,
+            code: 2,
+            stderr: "s".into(),
+        },
+        Violation::Line {
+            step: steps,
+            error: LineError::Missing,
+            stderr: "s".into(),
+        },
+        Violation::DeferredWithoutRetryAfter { step: steps },
+        Violation::WroteOutside {
+            step: steps,
+            changes: vec!["c".into()],
+        },
+        Violation::UnexpectedOutcome {
+            step: steps,
+            wanted: Outcome::Success,
+            got: Outcome::Halt,
+        },
+        Violation::RerunOutcomeChanged {
+            step: steps,
+            first: Outcome::Success,
+            second: Outcome::Halt,
+        },
+        Violation::NotIdempotent {
+            step: steps,
+            changes: vec!["c".into()],
+        },
+        Violation::RollbackClaimsReversible {
+            changes: vec!["c".into()],
+        },
+        Violation::ResidueLeft {
+            step: steps,
+            left: vec!["l".into()],
+        },
+        Violation::CleanupCommitted {
+            changes: vec!["c".into()],
+        },
+        Violation::NoKillPoints,
+        Violation::KillPointVanished {
+            step: steps,
+            kill_at: 3,
+        },
+        Violation::CrashResumeDiverges {
+            step: steps,
+            kill_at: 3,
+            changes: vec!["c".into()],
+        },
+        Violation::DeferredLeftState {
+            changes: vec!["c".into()],
+        },
+        Violation::RanWhileLocked {
+            step: steps,
+            outcome: Outcome::Success,
+            changes: vec![],
+        },
+    ];
+    for violation in all {
+        assert!(!violation.to_string().is_empty());
+    }
+}
+
+/// Catches the hook command's defaults: `update-hook` before the step, replaceable.
+#[test]
+fn hook_args_default_to_the_convention() {
+    let hook = HookCommand::new(std::path::Path::new("/x/hook"));
+    assert_eq!(hook.hook_args, [OsString::from("update-hook")]);
+    assert!(hook.with_hook_args(&[]).hook_args.is_empty());
+}
+
+/// Catches a sandbox whose world is not the one the fake set up.
+#[test]
+fn the_example_world_starts_at_v1() {
+    let scratch = Scratch::new("world-start");
+    let sandbox = Sandbox::create(scratch.path().join("run")).unwrap();
+    let mut fake = ExampleFake::default();
+    update_hook::conformance::FakeService::init(&mut fake, &sandbox).unwrap();
+    assert!(
+        snapshot(&sandbox.world())
+            .unwrap()
+            .contains_key(std::path::Path::new("current"))
+    );
+}
