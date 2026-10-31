@@ -51,7 +51,7 @@ use hyper_util::service::TowerToHyperService;
 use kbf_front::Packs;
 use kbf_front::grants::{GrantKey, Grants, KeyError};
 use kbf_front::job_read::{
-    BATCH_PATH, BlobSource, JobRead, Limits, MAX_BATCH_REQUEST_BYTES, Reply,
+    BATCH_PATH, BlobSource, JobRead, LOCATE_PATH, Limits, MAX_BATCH_REQUEST_BYTES, Reply,
 };
 use kbf_front::large_backfill::LargeBackfill;
 use kbf_tls::{Alpn, Conn, TlsError, TlsFiles, TlsSource};
@@ -529,7 +529,12 @@ async fn answer(
         .read
         .respond_with_body(&method, path, authorization, &bytes)
         .await;
-    response(reply, if path == BATCH_PATH { "POST" } else { "GET" })
+    let mut response = response(reply, if path == BATCH_PATH { "POST" } else { "GET" });
+    if path == LOCATE_PATH && response.status() == StatusCode::OK {
+        let kind = HeaderValue::from_static("application/x-ndjson");
+        response.headers_mut().insert(CONTENT_TYPE, kind);
+    }
+    response
 }
 
 /// The body of a batch request: at most [`MAX_BATCH_REQUEST_BYTES`], within `wait`; empty if it
