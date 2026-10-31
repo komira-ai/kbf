@@ -251,6 +251,9 @@ pub struct Answer {
     /// The supported features, only for an agent that announced `agent_features`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub features: Option<Vec<String>>,
+    /// Stub: not yet carried.
+    #[serde(skip)]
+    pub halts: BTreeMap<String, u64>,
 }
 
 impl Answer {
@@ -260,6 +263,7 @@ impl Answer {
         Self {
             reply,
             features: None,
+            halts: BTreeMap::new(),
         }
     }
 }
@@ -298,6 +302,7 @@ impl<'de> Deserialize<'de> for Answer {
         Ok(Self {
             reply,
             features: raw.features,
+            halts: BTreeMap::new(),
         })
     }
 }

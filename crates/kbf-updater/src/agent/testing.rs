@@ -478,6 +478,8 @@ pub struct FakeCoordinator {
     /// The `features` of the answer to a heartbeat that announces `agent_features`; none: a
     /// coordinator that predates them, whose reply has no such field.
     pub features: Arc<Mutex<Option<Vec<String>>>>,
+    /// The `halts` of every answer: the clear generation of each service cleared at least once.
+    pub halts: Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
 }
 
 impl FakeCoordinator {
@@ -502,6 +504,14 @@ impl FakeCoordinator {
     /// and supports none).
     pub fn advertise(&self, names: &[&str]) {
         *lock(&self.features) = Some(names.iter().map(|n| (*n).to_owned()).collect());
+    }
+
+    /// The generations the coordinator's answers carry from now on.
+    pub fn set_halts(&self, generations: &[(&str, u64)]) {
+        *lock(&self.halts) = generations
+            .iter()
+            .map(|(name, generation)| ((*name).to_owned(), *generation))
+            .collect();
     }
 
     /// The coordinator predates features: its replies carry none.
@@ -530,6 +540,7 @@ impl Coordinator for FakeCoordinator {
         Ok(Answer {
             reply,
             features: lock(&self.features).clone(),
+            halts: lock(&self.halts).clone(),
         })
     }
 }

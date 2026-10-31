@@ -12,7 +12,7 @@ use kbf_types::ReleasePlatform;
 
 use super::coordinator::CoordinatorError;
 use super::flags::Timing;
-use super::hold::{Deferral, MAX_RETRY_SECS, Features, Fit, Marks, fit};
+use super::hold::{Deferral, Features, Fit, MAX_RETRY_SECS, Marks, fit};
 use super::local::LocalError;
 use super::run::{Agent, World};
 use super::status::Status;
@@ -696,4 +696,132 @@ fn a_persisted_deadline_beyond_the_bound_is_read_at_the_bound() {
     rig.advance_unix(MAX_RETRY_SECS);
     rig.take_order(&agent);
     assert_eq!(rig.installs(), 1, "the bound has passed");
+}
+
+/// An agent that halted on a rollback it could not do, under the clear generation `seen` (the
+/// generation of `kbf` in the last reply before the halt; none: no `halts` at all).
+fn halted_under(rig: &Rig, seen: Option<u64>) -> Agent {
+    rig.coordinator.advertise(&["halt-v1"]);
+    if let Some(generation) = seen {
+        rig.coordinator.set_halts(&[("kbf", generation)]);
+    }
+    rig.cannot_go_back();
+    let agent = rig.announcing();
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 1);
+    agent
+}
+
+/// Catches: a reply that carries `halts` and is refused whole (the answer reader refuses a key
+/// it does not know), or a map that is lost, or a bad one that is taken.
+#[test]
+fn an_answer_with_halts_is_read() {
+    let text = r#"{"reply":"nothing","features":["halt-v1"],"halts":{"kbf":2,"db":1}}"#;
+    let answer: crate::wire::Answer = serde_json::from_str(text).expect("read");
+    assert_eq!(answer.halts.get("kbf"), Some(&2));
+    assert_eq!(answer.halts.get("db"), Some(&1));
+    for bad in [
+        r#"{"reply":"nothing","halts":{"Kbf":1}}"#,
+        r#"{"reply":"nothing","halts":{"kbf":-1}}"#,
+        r#"{"reply":"nothing","halts":["kbf"]}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<crate::wire::Answer>(bad).is_err(),
+            "{bad}"
+        );
+    }
+    let many: std::collections::BTreeMap<String, u64> =
+        (0..18).map(|n| (format!("s{n}"), 1)).collect();
+    let over = serde_json::json!({"reply": "nothing", "halts": many}).to_string();
+    assert!(serde_json::from_str::<crate::wire::Answer>(&over).is_err());
+}
+
+/// Catches: a hold lifted by a reply that carries `halts` and no newer generation: the
+/// generation is the one seen before the halt, or the service is not in the map.
+#[test]
+fn a_reply_with_halts_but_no_newer_generation_keeps_the_hold() {
+    let rig = Rig::new("hold-halts-same");
+    let agent = halted_under(&rig, Some(3));
+    agent.beat_once();
+    rig.take_order(&agent);
+    assert_eq!(
+        rig.installs(),
+        1,
+        "equal to the generation seen before the halt"
+    );
+    rig.coordinator.set_halts(&[("kbf", 2), ("db", 9)]);
+    rig.take_order(&agent);
+    assert_eq!(
+        rig.installs(),
+        1,
+        "older, and another service's is not ours"
+    );
+    rig.coordinator.set_halts(&[]);
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 1, "absent is 0");
+    assert!(rig.logged("held after a halt (rollback_failed)"));
+}
+
+/// Catches: a hold that is never lifted: a clear (a newer generation) after the halt lifts it,
+/// and the next order runs.
+#[test]
+fn a_newer_generation_lifts_the_hold() {
+    let rig = Rig::new("hold-halts-newer");
+    let agent = halted_under(&rig, Some(3));
+    rig.coordinator.set_halts(&[("kbf", 4)]);
+    agent.beat_once();
+    assert!(rig.logged("lifted"));
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 2, "the order runs");
+}
+
+/// Catches: the race of a halt under a stale generation: an agent that halted having seen no
+/// `halts` (generation 0) is not lifted by a reply that says 0, and is by 1.
+#[test]
+fn a_generation_equal_to_the_one_seen_before_the_halt_does_not_lift() {
+    let rig = Rig::new("hold-halts-equal");
+    let agent = halted_under(&rig, None);
+    rig.coordinator.set_halts(&[("kbf", 0)]);
+    agent.beat_once();
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 1);
+    rig.coordinator.set_halts(&[("kbf", 1)]);
+    agent.beat_once();
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 2);
+}
+
+/// Catches: `halts` changing an agent that never halted: its orders run, and nothing is
+/// lifted or logged as lifted.
+#[test]
+fn an_agent_that_never_halted_ignores_halts() {
+    let rig = Rig::new("hold-halts-never");
+    rig.coordinator.advertise(&["halt-v1"]);
+    rig.coordinator.set_halts(&[("kbf", 5)]);
+    *rig.drain.leases.lock().unwrap() = [0].into();
+    let agent = rig.announcing();
+    rig.take_order(&agent);
+    agent.beat_once();
+    assert_eq!(rig.installs(), 1);
+    assert_eq!(
+        rig.last_beat().last_update,
+        Some(UpdateResult::new(version(VB), Outcome::Succeeded))
+    );
+    assert!(!rig.logged("lifted"));
+    assert!(!rig.dir.join("halt-kbf").exists());
+}
+
+/// Catches: a hold, or the generation it was made under, lost in a restart: the restarted
+/// agent still holds, is not lifted by the generation it halted under, and is by a newer one.
+#[test]
+fn the_hold_survives_a_restart_with_its_generation() {
+    let rig = Rig::new("hold-halts-restart");
+    drop(halted_under(&rig, Some(3)));
+    let restarted = rig.announcing();
+    rig.take_order(&restarted);
+    assert_eq!(rig.installs(), 1, "still held");
+    rig.coordinator.set_halts(&[("kbf", 4)]);
+    restarted.beat_once();
+    rig.take_order(&restarted);
+    assert_eq!(rig.installs(), 2, "lifted by a clear after the halt");
 }
