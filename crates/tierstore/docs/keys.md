@@ -11,11 +11,10 @@ A client signs each request with an access key (SigV4, in the `Authorization` he
 | presigning | `--presign-key-file` | `server.presign_key_files` | sign presigned PUT URLs, each good for one object under the key's prefix, and nothing else |
 | GC | `--gc-key-file` | `server.gc_key_files` | list, head, delete and abort uploads under one prefix, and nothing else; it never reads a body |
 | scoped | `--scoped-key-file` | `server.scoped_key_files` | read, create and delete under the prefixes its file lists, and nothing else |
-| grant | `--grant-key-file` | `server.grant_key_files` | signs no request: its signature on a read grant (the `x-tierstore-grant` header) lets the bearer get and head the objects the grant lists, until the grant expires, and nothing else |
 | hot tier credential | `--hot-credentials-file` | `hot_store.credentials_file` | not a client key: what tierstore signs its own requests to an `s3` hot tier with |
 | cold tier credential | `--cold-credentials-file` | `cold_store.credentials_file` | not a client key: the same for an `s3` cold tier |
 
-Only the full key is required. The read-only, presigning, GC, scoped and grant flags may each be given once for each key. A tier that is a directory needs no credential file.
+Only the full key is required. The read-only, presigning, GC and scoped flags may each be given once for each key. A tier that is a directory needs no credential file.
 
 A role is not a prefix: a read-only key may read every object of the bucket. To limit a client to prefixes, use a scoped key (or a GC key, or a presigned URL). The key prefixes `_journal/` and `_tiering/` belong to tierstore: a client put or delete there is refused, and a listing leaves them out.
 
@@ -76,6 +75,6 @@ The server reads its key files once, at start. To rotate a key, write the new fi
 
 A change to the tier credentials takes the same restart.
 
-## Read grants
+## Not in a release yet
 
-A client that holds no key and must read a fixed set of objects for a short time presents a read grant: a token signed with a grant key, sent as one `x-tierstore-grant` header on `GET` and `HEAD`. It names one bucket, an expiry and the exact objects it lists, and allows nothing else. The server refuses a grant that ends more than `--grant-max-lifetime` (15 minutes by default) after its own clock. A grant is a bearer token: whoever holds it can use it until it expires, so use TLS where that matters. The token format is in the README, under Read grants.
+A read grant, a signed token that lets a bearer GET and HEAD the objects it lists, is planned and is not in the code on main. Today a client that needs to read must sign with a full, read-only or scoped key.
