@@ -6,12 +6,13 @@
 // code by a test of the crate (src/server/docs_tests.rs); this holds the site to the guide.
 
 import assert from 'node:assert/strict';
-import { cpSync, existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { test } from 'node:test';
 import { buildSite } from '../tools/build';
+import { listFiles } from '../tools/check-dist';
 import { loadDocs, renderMarkdown, slug } from '../tools/docs';
-import { buildReal, DOCS, REPO, scratch, SITE } from './support';
+import { buildReal, copyTree, DOCS, REPO, scratch, SITE } from './support';
 
 const stems = readdirSync(DOCS).filter((f) => f.endsWith('.md')).map((f) => f.replace(/\.md$/, '')).sort();
 const dist = buildReal('docs');
@@ -31,6 +32,13 @@ function copyDocs(name: string): string {
   return dir;
 }
 
+/** What is wrong with the files under docs/ of a built tree: exactly index.html and <stem>/index.html for each guide file. */
+function docsTreeProblems(tree: string): string[] {
+  const want = new Set(['docs/index.html', ...stems.map((s) => `docs/${s}/index.html`)]);
+  const have = new Set(listFiles(tree).filter((f) => f.startsWith('docs/')));
+  return [...[...want].filter((f) => !have.has(f)).map((f) => `missing ${f}`), ...[...have].filter((f) => !want.has(f)).map((f) => `unexpected ${f}`)];
+}
+
 test('every file of docs/ is a page of the site, under /docs/<name>/, and /docs/ lists them all', () => {
   assert.ok(stems.length >= 7, `the guide has ${stems.length} pages`);
   const index = built('/docs/');
@@ -38,6 +46,22 @@ test('every file of docs/ is a page of the site, under /docs/<name>/, and /docs/
     assert.ok(existsSync(join(dist, 'docs', stem, 'index.html')), `docs/${stem}.md has no page`);
     assert.ok(index.includes(`href="/docs/${stem}/"`), `/docs/ does not list ${stem}`);
   }
+  assert.deepEqual(docsTreeProblems(dist), [], 'the built docs/ is index.html and one <name>/index.html per guide file, nothing else');
+});
+
+test('an extra docs directory or a stray file under docs/ is refused (the check can fail)', () => {
+  const extraDir = copyTree(dist, 'docs-extra-dir');
+  mkdirSync(join(extraDir, 'docs', 'extra'));
+  writeFileSync(join(extraDir, 'docs', 'extra', 'index.html'), '<p>x</p>');
+  assert.deepEqual(docsTreeProblems(extraDir), ['unexpected docs/extra/index.html']);
+  for (const stray of ['x.js', join('overview', 'extra.json')]) {
+    const tree = copyTree(dist, 'docs-stray');
+    writeFileSync(join(tree, 'docs', stray), '{}');
+    assert.deepEqual(docsTreeProblems(tree), [`unexpected docs/${stray}`]);
+  }
+  const gone = copyTree(dist, 'docs-gone');
+  unlinkSync(join(gone, 'docs', 'keys', 'index.html'));
+  assert.deepEqual(docsTreeProblems(gone), ['missing docs/keys/index.html']);
 });
 
 test('the guide is read in its order, and a page the site has not heard of follows by name', () => {
