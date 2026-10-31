@@ -173,6 +173,7 @@
 //! the deadline cut: those still running, or still being sent.
 
 mod auth;
+pub mod build_info;
 mod cache_cli;
 pub mod cli;
 mod config;
