@@ -87,7 +87,7 @@ At start the process makes the directory, removes what a fill left half done, re
 
 ## Metrics
 
-`GET /metricz` on the S3 listener (unsigned) answers 200 in the Prometheus text format. On main it has the hit, miss, byte and cold-read counters of the hot and cold tiers, the counters of the OCI read front, such as `tierstore_oci_requests_total`, and the counters of the cache of a build node, all named `tierstore_` and a word; without `--oci-listen` it says the front is not enabled, and a node with no cache says so on a line of its own. The tier counters are on main and not in v0.0.40. The full list of metric names, their labels and queries to alert on is in [metrics](metrics-x.md).
+`GET /metricz` on the S3 listener (unsigned) answers 200 in the Prometheus text format. On main it has the hit, miss, byte and cold-read counters of the hot and cold tiers, the counters of the OCI read front, such as `tierstore_oci_requests_total`, and the counters of the cache of a build node, all named `tierstore_` and a word; without `--oci-listen` it says the front is not enabled, and a node with no cache says so on a line of its own. The tier counters are on main and not in v0.0.40. The full list of metric names, their labels and queries to alert on is in [metrics](metrics.md).
 
 ## Not in a release yet
 
