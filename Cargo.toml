@@ -95,8 +95,8 @@ js-whole = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c
 # tierstore and objstore-s3 moved to the tierstore repository (https://github.com/komira-ai/tierstore).
 # Both are taken from it at this one revision. The revision is raised by a pull request of
 # its own that runs the whole CI, never along with other changes.
-objstore-s3 = { git = "https://github.com/komira-ai/tierstore", rev = "19083d0c8bd2fb1ce549ac00d2aa692cef0fb793" } # v0.3.0
-tierstore = { git = "https://github.com/komira-ai/tierstore", rev = "19083d0c8bd2fb1ce549ac00d2aa692cef0fb793" } # v0.3.0
+objstore-s3 = { git = "https://github.com/komira-ai/tierstore", rev = "eb6cfae075b720f2203cd957cffd1ba3b586c999" } # v0.3.0
+tierstore = { git = "https://github.com/komira-ai/tierstore", rev = "eb6cfae075b720f2203cd957cffd1ba3b586c999" } # v0.3.0
 md-5 = "0.11.0"
 # macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
 objc2 = "0.6.5"
