@@ -73,11 +73,16 @@ fn offered(rig: &Rig, announced: &[&str]) -> Vec<String> {
                         health: b.health,
                         last_update: None,
                         updating: None,
+                        step: None,
+                        commit: None,
+                        step_secs: Default::default(),
+                        promotion_pending: false,
+                        deferred: None,
                     }
                 })
                 .collect(),
         );
-        match rig.coordinator.heartbeat(who.clone(), heartbeat) {
+        match rig.coordinator.heartbeat(who.clone(), heartbeat).reply {
             ServiceReply::Nothing => return told,
             ServiceReply::Update { service, version } => {
                 let name = service.unwrap_or_else(|| "kbf".to_owned());
