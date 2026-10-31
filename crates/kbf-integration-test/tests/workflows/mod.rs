@@ -89,9 +89,9 @@ mod yaml;
 
 mod jobs;
 pub use jobs::{
-    concurrency, job_env, job_environment, job_has_key, job_needs, job_outputs,
-    job_permission_levels, job_uses, job_with, push_filters, top_defaults_shell, top_env,
-    trigger_filters,
+    concurrency, job_env, job_environment, job_has_key, job_matrix, job_name, job_needs,
+    job_outputs, job_permission_levels, job_uses, job_with, push_filters, top_defaults_shell,
+    top_env, trigger_filters,
 };
 
 use yaml::{Node, Value};

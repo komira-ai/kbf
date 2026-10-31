@@ -30,7 +30,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_kbf-server");
 /// `--cold-store` and `--meta-dir` flags over fresh directories named for `name`, under the
 /// target directory: every start of the binary needs both.
 /// The directory is removed when it drops, so the caller keeps it as long as the server.
-fn stores(name: &str) -> (kbf_testkit::dir::TestDir, [String; 4]) {
+fn stores(name: &str) -> (kbf_testkit::dir::TestDir, [String; 5]) {
     let base = kbf_testkit::dir::TestDir::under(
         env!("CARGO_TARGET_TMPDIR"),
         &format!("kbf-server-stores-{name}"),
@@ -38,6 +38,7 @@ fn stores(name: &str) -> (kbf_testkit::dir::TestDir, [String; 4]) {
     let flags = [
         "--cold-store".to_owned(),
         format!("file://{}", base.join("cold").display()),
+        "--cold-store-floor-bytes=1".to_owned(),
         "--meta-dir".to_owned(),
         base.join("meta").display().to_string(),
     ];

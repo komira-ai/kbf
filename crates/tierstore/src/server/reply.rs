@@ -123,6 +123,13 @@ impl S3Error {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, "SlowDown", text).with("retry-after", "1")
     }
 
+    /// A write to a server that is a read cache.
+    pub(crate) fn read_cache() -> Self {
+        let text = "This tierstore is a read cache: it does not accept writes; send them to the \
+                    storage endpoint it reads from.";
+        Self::new(StatusCode::FORBIDDEN, "AccessDenied", text)
+    }
+
     /// Whether this is the answer to a request that stalled.
     pub(crate) fn is_timeout(&self) -> bool {
         self.code == "RequestTimeout"
