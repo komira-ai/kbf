@@ -4,12 +4,21 @@
 //! that reading in every result. The run asks [`ColdStateSource`] before every pass of every arm
 //! instead, and the answer is stamped into the result (`cold_state`, one entry per pass).
 //!
-//! The source is the one preflight uses, read-only: `mc admin info` of the cold role (its
-//! drives and whether any reports healing) and the operator's heal status file
-//! (`cold_heal_status_file` of the ops file, `percent_done`). [`OpsColdState`] does that through
-//! the [`Host`] seam; a test gives [`ColdStateSource`] its own readings. A reading that cannot be
-//! made stops the run, as a load gate that cannot see does: a result that says nothing of the
-//! cold store's state must not look like one that says it is quiet.
+//! The source is the one preflight uses, read-only, in one of two modes. With a cold admin key in
+//! the ops file it is `mc admin info` of the cold role (its drives and whether any reports
+//! healing), with the heal status file's `percent_done` beside it (`source` `mc`). Without one,
+//! and with a `cold_heal_status_file`, it is that file alone (`source` `file`) and `mc` is never
+//! run: the file is the record of a writer on a host that can ask the store, stamped by that
+//! writer, and a file older than the limit, or stamped more than 5 s after the reader's clock,
+//! is unreadable. The writer's stamp is compared with the reader's clock, so both clocks must be
+//! in sync (NTP): a writer ahead by more than 5 s is refused, and a writer behind uses up the
+//! limit. The file is a trust input and is read only if it is a regular file of the running
+//! user, not a link, not writable by group or others, and at most 64 KiB
+//! ([`crate::preflight::trusted`]). The stamp recorded in the result is the file's. [`OpsColdState`] does that through the [`Host`] seam; a
+//! test gives [`ColdStateSource`] its own readings. A reading that cannot be made stops the run,
+//! as a load gate that cannot see does: a result that says nothing of the cold store's state must
+//! not look like one that says it is quiet. An admin key that fails is that error too; nothing
+//! falls back to the file.
 
 use std::future::Future;
 use std::io;
@@ -27,8 +36,8 @@ use crate::gate::LoadSample;
 use crate::preflight::host::{Cmd, CmdOutput, Host};
 use crate::preflight::mc::Mc;
 use crate::preflight::ops::OpsFile;
-use crate::preflight::{heal_percent, is_healing, live::sha256_hex};
-use crate::result::{ColdState, DriveState};
+use crate::preflight::{heal_percent, is_healing, live::sha256_hex, read_heal_file, why};
+use crate::result::{ColdSource, ColdState, DriveState};
 use crate::role::Role;
 use crate::s3::unix_ms;
 
@@ -63,15 +72,20 @@ impl ColdStateSource for NoColdState {
     }
 }
 
-/// The preflight's source, on a [`Host`]: `mc admin info` of the cold store and the heal status
-/// file of the ops file.
+/// The preflight's source, on a [`Host`]: `mc admin info` of the cold store (with the heal status
+/// file's percent), or, with no cold admin key, the heal status file alone.
 #[derive(Clone)]
 pub struct OpsColdState {
     host: Arc<dyn Host>,
     ops: OpsFile,
     spec: StoreSpec,
     result_dir: PathBuf,
+    max_age: Duration,
+    now_ms: NowMs,
 }
+
+/// The clock of file mode: milliseconds since the Unix epoch now.
+pub type NowMs = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 impl OpsColdState {
     /// A source for the cold store `spec`, asked with the cold admin key the ops file names;
@@ -83,7 +97,23 @@ impl OpsColdState {
             ops,
             spec,
             result_dir,
+            max_age: Duration::from_secs(30),
+            now_ms: Arc::new(unix_ms),
         }
+    }
+
+    /// The oldest a status file's stamp may be in file mode (30 s unless set).
+    #[must_use]
+    pub fn with_max_age(mut self, max_age: Duration) -> Self {
+        self.max_age = max_age;
+        self
+    }
+
+    /// The clock the status file's stamp is compared with (the system clock unless set).
+    #[must_use]
+    pub fn with_clock(mut self, now_ms: NowMs) -> Self {
+        self.now_ms = now_ms;
+        self
     }
 
     /// One reading, its commands stopped (and killed) once `stop` is set.
@@ -93,22 +123,28 @@ impl OpsColdState {
             stop,
         };
         let host: &dyn Host = &bounded;
+        if let Some(path) = self.ops.cold_file_mode() {
+            let now = (self.now_ms)();
+            let file = read_heal_file(host, path, now, self.max_age).map_err(|e| unreadable(&e))?;
+            return Ok(Some(ColdState {
+                healing: file.is_healing(),
+                percent_done: file.percent_done,
+                drives: file.drives,
+                read_unix_ms: file.read_unix_ms,
+                source: Some(ColdSource::File),
+            }));
+        }
         let info = Mc::for_role(host, &self.ops, Role::Cold, &self.spec, &self.result_dir)
             .and_then(|mc| mc.info())
-            .ok();
+            .map_err(|e| BenchError::Ops(format!("cold state: {}", why(&e))))?;
         let percent = heal_percent(host, &self.ops)
             .map_err(|e| BenchError::Ops(format!("cold state: {e}")))?;
-        if info.is_none() && percent.is_none() {
-            return Err(BenchError::Ops(
-                "cold state: neither the admin info nor a status file gives the heal state"
-                    .to_owned(),
-            ));
-        }
         Ok(Some(ColdState {
-            healing: is_healing(info.as_ref(), percent),
+            healing: is_healing(Some(&info), percent),
             percent_done: percent,
-            drives: info.as_ref().map(drives_of).unwrap_or_default(),
+            drives: drives_of(&info),
             read_unix_ms: unix_ms(),
+            source: Some(ColdSource::Mc),
         }))
     }
 }
@@ -154,6 +190,10 @@ struct Stoppable<'a> {
 impl Host for Stoppable<'_> {
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
         self.inner.read_file(path)
+    }
+
+    fn read_status_file(&self, path: &Path) -> io::Result<Vec<u8>> {
+        self.inner.read_status_file(path)
     }
 
     fn exists(&self, path: &Path) -> bool {

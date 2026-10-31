@@ -359,6 +359,12 @@ pub struct ConfigArgs {
     /// run stops, the reading being unreadable, if it takes longer.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     pub cold_state_timeout_secs: u64,
+    /// File mode only (the ops file has no cold admin key and names a heal status file): the
+    /// oldest a status file's own `read_unix_ms` may be, seconds, when a reading is taken. An
+    /// older file stops the run and fails the preflight; so does one stamped more than 5 s in
+    /// the future.
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    pub cold_state_max_age_secs: u64,
     /// Cap on requests per second to the cold store: a positive number, never `unlimited` (the
     /// cold store is shared). Recorded in the provenance of every result.
     #[arg(long, default_value = "100", value_name = "N", value_parser = parse_cold_rate)]
@@ -419,6 +425,8 @@ pub struct RunConfig {
     pub cold_guard: ColdGuardLimits,
     /// The longest one reading of the cold store's state may take.
     pub cold_state_timeout: Duration,
+    /// See [`ConfigArgs::cold_state_max_age_secs`].
+    pub cold_state_max_age: Duration,
     /// Request-rate caps.
     pub rates: RateCaps,
     /// Byte caps.
@@ -517,6 +525,7 @@ impl RunConfig {
                 max_error_share: args.cold_abort_error_share,
             },
             cold_state_timeout: Duration::from_secs(args.cold_state_timeout_secs),
+            cold_state_max_age: Duration::from_secs(args.cold_state_max_age_secs),
             rates: RateCaps {
                 cold_rps: args.cold_rps,
                 hot_rps: args.hot_rps,
@@ -702,6 +711,18 @@ mod tests {
         let cfg = RunConfig::resolve(&args(&["--cold-state-timeout-secs", "5"]), None).unwrap();
         assert_eq!(cfg.cold_state_timeout, Duration::from_secs(5));
         let argv = ["t", "--result-dir", "out", "--cold-state-timeout-secs", "0"];
+        assert!(Wrap::try_parse_from(argv).is_err());
+    }
+
+    /// Catches a freshness limit on the cold status file other than 30 s, a flag that does not
+    /// reach the configuration, and a limit of zero that the parser takes.
+    #[test]
+    fn the_cold_state_max_age_has_its_default_and_reaches_the_configuration() {
+        let cfg = RunConfig::resolve(&args(&[]), None).unwrap();
+        assert_eq!(cfg.cold_state_max_age, Duration::from_secs(30));
+        let cfg = RunConfig::resolve(&args(&["--cold-state-max-age-secs", "5"]), None).unwrap();
+        assert_eq!(cfg.cold_state_max_age, Duration::from_secs(5));
+        let argv = ["t", "--result-dir", "out", "--cold-state-max-age-secs", "0"];
         assert!(Wrap::try_parse_from(argv).is_err());
     }
 

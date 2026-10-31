@@ -14,8 +14,7 @@
 //! - a trigger on a workflow with a row that no stage of that workflow's jobs allows
 //!   under `events`, `pull_request` included;
 //! - `id-token` or `attestations` set to `write` (or `write-all`) in any job of any
-//!   workflow that is not a row marked `signing: true` (but for [`SITE_DEPLOY`], the one
-//!   job of the site's own workflow that has no row), and a signing row whose job
+//!   workflow that is not a row marked `signing: true`, and a signing row whose job
 //!   holds neither scope.
 //!
 //! It does not check that a job runs only for its own stage's events (the triggers are
@@ -39,12 +38,6 @@ const JOB_KEYS: &[&str] = &["job", "stage", "signing"];
 const RUNS: &[&str] = &["actions", "operator"];
 /// The token scopes only a signing job may write.
 const SIGNING_SCOPES: &[&str] = &["id-token", "attestations"];
-
-/// The `(workflow file, job)` pairs that may write `id-token` without being a signing row: the deploy of tierstore.dev,
-/// which signs nothing and belongs to no release stage. Its OIDC token goes to AWS, in the one environment the site's
-/// role trusts, and `mod.rs` allows the scope only under that environment and `SITE_DEPLOY_IF`; this list is the file
-/// and job it applies to, so the same job written in another workflow is still refused.
-const SITE_DEPLOY: &[(&str, &str)] = &[("tierstore-site-publish.yml", "deploy")];
 
 struct Stage {
     name: String,
@@ -118,7 +111,6 @@ pub fn check(stage_text: &str, workflows: &[(String, String)]) -> Vec<String> {
         for (name, node) in &jobs {
             let signing = listed(name).is_some_and(|r| r.signing);
             match (signs(node), signing) {
-                (true, false) if SITE_DEPLOY.contains(&(file.as_str(), name.as_str())) => {}
                 (true, false) => out.push(at(format!(
                     "line {}: job `{name}` can write `id-token` or `attestations` but is not a \
                      `signing: true` row of {STAGE_FILE}",

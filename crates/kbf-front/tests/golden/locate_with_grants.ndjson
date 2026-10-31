@@ -1,0 +1,9 @@
+{"bucket":"tiers","grants":["dGllcnN0b3JlLWdyYW50LXYxCmxvY2F0ZS1ncmFudAp0aWVycwo3MDAKY2FzL2Yvdy8xCmNhcy9sL2QyOGZlMDVhMjdlZTk0NDkzZDk3MzU0ZTkyYmQ3NGYxY2U4NDY0OGFkMGJmYjhmNzQ0YjAzOGM0MGRiNGY1YjY.Det36g7nAkq1r4b6x856rKRtuna1ieQ2kokAlajVOOo"],"store":"http://store.farm.test:9000"}
+{"absent":true,"digest":"4f4a9410ffcdf895c4adb880659e9b5c0dd1f23a30790684340b3eaacb045398/5"}
+{"absent":true,"digest":"73479d05b122d39a2af4e9fdde243e1e1a9dde2b5327041f043031b1983c4f86/78"}
+{"digest":"8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8/5","g":0,"pack":{"key":"cas/f/w/1","length":5,"offset":0}}
+{"absent":true,"digest":"9e2f663853504636ad900273275e0e07e8b98ea7cd7ae876d730cec3641bb5ea/141"}
+{"digest":"d28fe05a27ee94493d97354e92bd74f1ce84648ad0bfb8f744b038c40db4f5b6/2000","g":0,"large":{"key":"cas/l/d28fe05a27ee94493d97354e92bd74f1ce84648ad0bfb8f744b038c40db4f5b6","size":2000}}
+{"absent":true,"digest":"eac8f1acf7b8422e0461772df97d8bcb81f4a4b0f8bfad283cce5ab672e791f1/309"}
+{"absent":true,"digest":"edc894d092e81f67eb918a556b0b0c1199c83b553b70877fd4a252f7e90eaf45/12"}
+{"absent":true,"digest":"f3ad8dc3d1f2ed280b86da19464a9e7375367b47a73a773e0ff79e16ec4b924e/14"}
