@@ -34,8 +34,11 @@ pub const PREVIOUS_RELEASE_KEY: &str = "updater.previous_release";
 pub const TARGET_VERSION_KEY: &str = "updater.target_version";
 /// The version it replaces; absent on a first install.
 pub const PREVIOUS_VERSION_KEY: &str = "updater.previous_version";
+/// The digest of the artifact the updater verified, `sha256:<64 lowercase hex>`.
+pub const ARTIFACT_DIGEST_KEY: &str = "updater.artifact_digest";
 /// The reserved keys whose value is text.
-const TEXT_KEYS: [&str; 4] = [
+const TEXT_KEYS: [&str; 5] = [
+    ARTIFACT_DIGEST_KEY,
     STAGED_RELEASE_KEY,
     PREVIOUS_RELEASE_KEY,
     TARGET_VERSION_KEY,
@@ -71,6 +74,8 @@ pub enum ParamsError {
         "updater.previous_release and updater.previous_version go together: a first install has neither, an update both"
     )]
     PreviousPair,
+    #[error("updater.artifact_digest must be sha256: and 64 lowercase hex digits, not {0:?}")]
+    BadDigest(String),
     #[error("params key {0:?} must be an absolute path")]
     NotAbsolute(String),
     #[error("params key {0:?} is in the namespace `updater.`, which only the updater writes")]
@@ -215,5 +220,12 @@ impl Params {
     /// The version it replaces; `None` on a first install.
     pub fn previous_version(&self) -> Option<&str> {
         self.text(PREVIOUS_VERSION_KEY)
+    }
+
+    /// The identity of the verified artifact, `sha256:<64 lowercase hex>`, which a hook keys its
+    /// record on (it is not for verifying the artifact again). `Ok(None)` when absent; any
+    /// other shape is refused.
+    pub fn artifact_digest(&self) -> Result<Option<&str>, ParamsError> {
+        Ok(None)
     }
 }

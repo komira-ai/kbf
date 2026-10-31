@@ -74,6 +74,12 @@ fn every_step_gets_the_same_params_and_prepare_gets_the_staged_release() {
         Some(scratch.path().join("run-1/artifact"))
     );
     assert_eq!(params.target_version(), Some("2.0.0"));
+    // The artifact's identity, on every step: one file, so the same value everywhere.
+    let digest = params
+        .artifact_digest()
+        .unwrap()
+        .expect("the harness writes the digest");
+    assert!(digest.starts_with("sha256:") && digest.len() == 71);
     assert_eq!(params.previous_version(), Some("1.0.0"));
     assert_eq!(
         params.previous_release(),
