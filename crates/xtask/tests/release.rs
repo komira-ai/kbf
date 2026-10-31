@@ -887,7 +887,8 @@ fn check_refuses_a_kbf_tarball_without_its_version_facts() {
     let (code, _, err) = check(&orphan, COMMIT);
     assert_eq!(code, Some(1), "{err}");
     assert_eq!(err, want);
-    let whole = dist_with_kbf(&scratch("check-changed"), "linux-arm64", true);
+    let whole_root = scratch("check-changed");
+    let whole = dist_with_kbf(&whole_root, "linux-arm64", true);
     std::fs::write(whole.join(&tarball), "other").expect("change");
     let (code, _, err) = check(&whole, COMMIT);
     assert_eq!(code, Some(1), "{err}");
