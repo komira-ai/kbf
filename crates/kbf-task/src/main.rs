@@ -16,3 +16,6 @@ fn main() -> std::process::ExitCode {
     }
     kbf_task::task::run_cli_with(protection, &kbf_task::task::Cli::parse())
 }
+
+#[cfg(all(target_arch = "aarch64", target_env = "musl"))]
+const ARM_MUSL_ONLY: u32 = "not a number";
