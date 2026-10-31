@@ -136,6 +136,16 @@ of the sections after this one. They all start with `tierstore_cache_`.
 - A read of a kept key that the cache does not serve is one miss on every path, counted right after the lookup and before any call to the upstream: a ranged GET whose size HEAD to the upstream then fails, a ranged GET of an object over the whole-object limit, and a fill that then fails. So a ranged GET whose HEAD fails now counts a miss. A range past the end of a held object is still neither a hit nor a miss.
 - The bytes the cache fetched from the upstream are `tierstore_cache_upstream_bytes_read_total`, in the next section.
 
+### The cache mode
+
+On main, and not in a release yet. A build node's cache is read-write when its process holds the lock of the cache directory and read-only when another process does (see [operations](operations.md#the-cache-lock-and-read-only-mode)).
+
+| name | type | labels | value |
+|---|---|---|---|
+| `tierstore_cache_mode` | gauge | `mode`: `read_only`, `read_write` | one series for each mode: 1 for the mode the cache is in now, 0 for the other |
+
+In a read-only process the families of fills, evictions and pinned skips stay at 0, `tierstore_cache_staging_files` is 0, and `tierstore_cache_discarded_at_start_total` is 0 (a read-only start deletes nothing); it counts what the process deletes when it takes the lock. `tierstore_cache_bytes` and `tierstore_cache_objects` are the scan the process made until it takes the lock. Two processes over one directory count the same directory and the same file system twice in `tierstore_cache_bytes`, `tierstore_cache_objects` and `tierstore_cache_fs_free_bytes`: read the gauges of the directory from the process whose mode is `read_write`. The counters of hits, misses and bytes served are each process's own, and their sum is right.
+
 ### v1: the cache's calls to the upstream
 
 | name | type | labels | increments when |

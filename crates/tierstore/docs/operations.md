@@ -23,6 +23,8 @@ Four paths of the S3 listener answer a GET or HEAD without a signature, so a buc
 
 `/readyz` does not look at the usage: one stopped reconciler would otherwise make every node unready. `/usagez` is for alerting, not for a load balancer.
 
+On main, not in v0.0.41, the 200 of a build node says which mode its cache is in: `ready read-write` or `ready read-only` (see [the cache lock](operations.md#the-cache-lock-and-read-only-mode)). The status is the same in both: a read-only node serves.
+
 ## Usage
 
 The reconciler publishes the hot tier's usage every pass. `/usagez` says:
@@ -65,6 +67,8 @@ A request cut at the deadline is counted on stderr: `tierstore: <N> requests wer
 
 To restart for a new binary or a new key file, replace the file, then `systemctl restart tierstore`; run more than one process, with ids of their own, if clients must not see the pause.
 
+On main, not in v0.0.41, `--lock-file` (`hot_store.lock_file`) says which of the processes over one node reconciles. A process that holds an exclusive lock on the file runs the reconciler and takes the lease. A process that finds the lock held serves reads and writes through its own proxy at once and does not touch the reconciler's state in the hot tier, the lease included, until it holds the lock; it tries every second. The system frees the lock when the holder exits or crashes, so a process started beside the one that is draining reconciles as soon as that one has exited and given its lease up. Give both processes the same file, on a local file system, in a directory that nothing removes: a directory under `/run` that systemd removes with the unit would let a third process make a new file and lock it beside the second. The holder looks before each pass at whether the path still leads to the file it locked; if the file was replaced, it gives its lease up and waits for the lock on the new file. A start whose lock file cannot be opened, is a link or is on a network file system exits 1. Without the flag the reconciler works as soon as the process starts, as before.
+
 ## The start-up self-test
 
 Before it serves, the process asks each tier, under a probe key in `_tiering/selftest/` that is new for each start and deleted afterwards, the questions its guarantees rest on: a create-only put refuses a key that exists, an `If-Match` put replaces only on the right content tag, a range read gives the range, a head has `Last-Modified`, a listing honors `start-after`, and on the cold tier a multipart completion is create-only. A tier that answers one wrongly exits the process with status 3, naming the tier, the check and the answer. A tier that cannot be reached is asked again, with pauses from one second doubling to thirty, for `--backend-check-wait` (5m), and then the start exits 1.
@@ -82,6 +86,14 @@ Memory is bounded for the fills: at most `local_cache.max_concurrent_fills` chun
 Eviction keeps the cache under `local_cache.budget`: above `high_water` percent of it, or when the free space of the file system is under `free_floor` percent, a pass (every 10 seconds) removes the least recently used objects down to `low_water` percent and until the free space is back at the floor. The free-space floor only triggers a pass; it does not stop a fill. An object that another tree has linked is skipped, counted and stays charged to the budget. A fill is skipped when the object is larger than the budget or would take the cache above `critical`.
 
 At start the process makes the directory, removes what a fill left half done, reads the kept objects back (sizes only; an object whose sidecar does not say what the file holds is deleted), and asks the file system four questions with a probe object. A file system that answers one wrongly exits the process with status 3, naming the check. It then asks the upstream for a key that is not there: 404 or any object is an answer, and anything else exits 1. On SIGTERM it drains as a storage node does.
+
+### The cache lock and read-only mode
+
+On main, not in v0.0.41. Two processes may have one cache directory open at once, for example a new binary started beside the one that is draining. Only one of them writes to it. The directory has a lock file, `.lock`, and the process that holds an exclusive lock on it is read-write: it fills, keeps, evicts and records the use of objects. A process that finds the lock held is read-only. A lone process takes the lock before it binds the address, so it is read-write from its first answer; the system frees the lock when the holder exits or crashes.
+
+A read-only process serves what its scan of the directory found, from the disk, and sends every other read and every write to the upstream. It makes and removes nothing in the directory and stamps no file: it does not empty the staging directory or delete a half-published object at start, skips the start-up probe of the file system, deletes nothing when a read of a kept object fails (the read is answered from the upstream), and starts no fill, no eviction pass and no write of file times. An object the holder keeps after the scan is read from the upstream until the process takes the lock. The counters of fills and evictions (`fills_total`, `evictions_total`, `fill_failures_total`) stay at 0 in a read-only process; hits, misses and bytes count.
+
+The process tries the lock every second. When it takes it, it empties the staging directory, scans the directory again (deleting what is not a whole object) and only then is read-write; stderr says so, and the first line of the start says which mode it started in. `/readyz` says the mode in its body and `tierstore_cache_mode` in the metrics (see [metrics](metrics.md)); the status of `/readyz` does not depend on it. A holder looks at each try whether `.lock` still leads to the file it locked: a file that was removed or replaced is a lock that no other process looks at, so the holder lets it go, is read-only, and takes the new file when it can. A lock file that is a link, or on a network file system, stops the start (exit 1); a try that fails later is said on stderr and made again.
 
 ## Metrics
 
