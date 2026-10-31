@@ -153,6 +153,12 @@ const PURE_GIT_CRATES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Edges `cargo metadata` reports only because it unifies features across the whole
+/// workspace, not because the pure crates compile them: `ssh-key` (kbf-mdm, kbf-deploy)
+/// turns on `crypto-common/rand_core`, so every `sha2` user would otherwise appear to
+/// reach `rand_core`. `cargo tree -p kbf-segments -e features` shows no such edge.
+const FEATURE_UNIFIED_EDGES: &[(&str, &str)] = &[("crypto-common", "rand_core")];
+
 struct Graph {
     /// Package id to package name.
     names: BTreeMap<String, String>,
@@ -214,10 +220,15 @@ fn load_graph() -> Graph {
 
     let mut normal = BTreeMap::new();
     for node in meta["resolve"]["nodes"].as_array().expect("resolve.nodes") {
+        let from = names[node["id"].as_str().expect("node id")].as_str();
         let deps = node["deps"]
             .as_array()
             .expect("deps")
             .iter()
+            .filter(|d| {
+                let to = names[d["pkg"].as_str().expect("dep pkg")].as_str();
+                !FEATURE_UNIFIED_EDGES.contains(&(from, to))
+            })
             .filter(|d| {
                 // A null kind is a normal dependency; "dev" and "build" are not linked
                 // into the crate's library.
