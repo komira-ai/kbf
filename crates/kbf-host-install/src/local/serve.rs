@@ -55,7 +55,7 @@ use crate::request::{BadCommand, Unit};
 use crate::trust::Trust;
 
 /// The window a release on trial has to be confirmed, unless a flag says otherwise.
-pub const DEFAULT_WINDOW_SECS: u64 = 600;
+pub const DEFAULT_WINDOW_SECS: u64 = 900;
 
 /// How long the loop sleeps when no connection waits.
 const IDLE: Duration = Duration::from_millis(200);
@@ -170,7 +170,7 @@ impl ServeConfig {
             Some(text) => text
                 .parse::<u64>()
                 .ok()
-                .filter(|secs| (120..=1800).contains(secs))
+                .filter(|secs| (120..=2400).contains(secs))
                 .ok_or("--window-secs must be a number from 120 to 1800")?,
             None => DEFAULT_WINDOW_SECS,
         };

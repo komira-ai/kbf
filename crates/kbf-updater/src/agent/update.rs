@@ -98,6 +98,7 @@ impl Update<'_> {
             Ok(state) => state,
             Err(e) => return failed(&e),
         };
+        let _ = self.ports.local.query();
         // A restart in the middle of an A/B: the helper has B on trial. Finish that trial.
         if let Some(trial) = state.pending {
             return self.resume(target, &trial);
@@ -251,10 +252,10 @@ impl Update<'_> {
     /// drains the node again and waits again. What comes back is whether the node was in
     /// placement before this drain: a node the updater drained on an earlier attempt is.
     fn drain(&self) -> Result<Placed, PortError> {
-        let placed = self.ports.drain.placed(self.host)?;
         self.ports
             .drain
             .drain(self.host, self.timing.drain_deadline)?;
+        let placed = self.ports.drain.placed(self.host)?;
         let start = self.ports.clock.now();
         loop {
             let leases = match self.ports.drain.leases(self.host) {

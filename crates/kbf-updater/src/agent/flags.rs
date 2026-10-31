@@ -128,11 +128,11 @@ pub struct Timing {
 
 impl Timing {
     pub const DEFAULT: Self = Self {
-        heartbeat: Duration::from_secs(15),
+        heartbeat: Duration::from_secs(10),
         drain_deadline: None,
         drain_poll: Duration::from_secs(5),
         health_timeout: Duration::from_secs(300),
-        health_poll: Duration::from_secs(5),
+        health_poll: Duration::from_secs(10),
         retry: Duration::from_secs(900),
         margin: Duration::from_secs(10),
     };

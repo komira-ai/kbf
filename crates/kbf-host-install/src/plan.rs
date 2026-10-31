@@ -85,16 +85,16 @@ pub const RUNNING_BUILD_TIMEOUT_SECS: u64 = 10;
 
 /// Seconds `systemctl restart` may run before it is killed: it returns when the unit's stop
 /// and start jobs are over.
-pub const RESTART_TIMEOUT_SECS: u64 = 120;
+pub const RESTART_TIMEOUT_SECS: u64 = 100;
 
 /// Seconds one `systemctl is-active` may run before it is killed.
-pub const IS_ACTIVE_TIMEOUT_SECS: u64 = 10;
+pub const IS_ACTIVE_TIMEOUT_SECS: u64 = 15;
 
 /// Seconds after a restart that the unit has to be active.
-pub const ACTIVE_WAIT_SECS: u64 = 120;
+pub const ACTIVE_WAIT_SECS: u64 = 90;
 
 /// Milliseconds between two looks at whether the unit is active.
-pub const ACTIVE_POLL_MILLIS: u64 = 500;
+pub const ACTIVE_POLL_MILLIS: u64 = 250;
 
 /// How long a restart waits for its unit to be active, and how often it looks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

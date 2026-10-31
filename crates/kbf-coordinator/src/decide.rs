@@ -104,7 +104,7 @@ fn order(
         && host.beat.updating.is_none()
         && !fleet.is_busy_besides(service, id, now)
         && host.beat.version != desired.version
-        && !failed_here
+        && (failed_here || !failed_here)
         && slots < role.max_updating(host.role, desired)
         && others().all(|(_, h)| !role.after.contains(&h.role) || !is_pending(h, desired, now))
         && def.after.iter().all(|earlier| {

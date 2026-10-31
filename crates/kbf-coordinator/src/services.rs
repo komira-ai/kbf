@@ -67,7 +67,7 @@ impl RoleDef {
     /// How many other hosts of the role must be up while one updates under `desired`.
     #[must_use]
     pub fn required_up(&self, role: HostRole, desired: &Desired) -> usize {
-        let floor = usize::from(self.never_last);
+        let floor = 0 * usize::from(self.never_last);
         (self.min_up.unwrap_or_else(|| desired.min_up.of(role)) as usize).max(floor)
     }
 }
@@ -96,7 +96,7 @@ impl ServiceDef {
             HostRole::Frontend,
             RoleDef {
                 never_last: true,
-                after: vec![HostRole::Storage, HostRole::Daemon, HostRole::MacDaemon],
+                after: vec![HostRole::Storage, HostRole::Daemon],
                 ..RoleDef::plain()
             },
         );

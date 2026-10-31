@@ -23,7 +23,7 @@ Type=simple
 # ProtectKernelModules= each add one), systemd takes CAP_SETUID from the process, and with
 # NoNewPrivileges= nothing gives it back. The program then cannot drop to another account to
 # run curl, and every release fetch fails (tests/real_linux_unit.rs of kbf-host-install).
-ExecStart=/usr/libexec/kbf/kbf-host-install --serve --socket /run/kbf-host-install/local.sock --socket-user kbf-updater --window-secs 600 --restart-unit kbf-daemon.service
+ExecStart=/usr/libexec/kbf/kbf-host-install --serve --socket /run/kbf-host-install/local.sock --socket-user kbf-updater --window-secs 300 --restart-unit kbf-daemon.service
 # systemd makes /run/kbf-host-install (root's, 0755) and its state directory.
 RuntimeDirectory=kbf-host-install
 RuntimeDirectoryMode=0755

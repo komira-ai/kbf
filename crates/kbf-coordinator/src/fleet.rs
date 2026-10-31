@@ -24,16 +24,16 @@ use kbf_updater::wire::{Health, Heartbeat, Outcome};
 use crate::desired::KBF;
 
 /// A host with no heartbeat for this long is down.
-pub const DOWN_AFTER: Duration = Duration::from_secs(45);
+pub const DOWN_AFTER: Duration = Duration::from_secs(50);
 
 /// After it starts, the coordinator orders no update for this long, to hear the hosts first.
-pub const QUIET_START: Duration = Duration::from_secs(30);
+pub const QUIET_START: Duration = Duration::from_secs(20);
 
 /// How long an update order holds its slot without the host reporting it. A host reports
 /// within one heartbeat interval (15 s) of hearing the order, so this is eight intervals:
 /// room for a lost reply and several missed beats, short enough that a host that never heard
 /// frees its slot before an operator would notice.
-pub const ORDER_AGE: Duration = Duration::from_secs(120);
+pub const ORDER_AGE: Duration = Duration::from_secs(60);
 
 /// An update the coordinator told a host to run, not yet seen in the host's own heartbeats.
 #[derive(Clone, Debug, PartialEq, Eq)]

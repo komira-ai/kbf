@@ -61,8 +61,8 @@ impl Default for MaxUpdating {
         Self {
             frontend: one(),
             storage: one(),
-            daemon: two(),
-            mac_daemon: two(),
+            daemon: 3,
+            mac_daemon: 3,
         }
     }
 }
