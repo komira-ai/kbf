@@ -566,6 +566,7 @@ The coordinator keeps its desired state per service name, and `kbf` is the only 
 - `{"action":"exclude","service":"<name>","node_id":"<id>","reason":"<text>"}`: takes a host out of a service. The service must be one the coordinator manages; the reason is 1 to 256 bytes with no control character; a second exclusion of the same host and service replaces the first.
 - `{"action":"include","service":"<name>","node_id":"<id>"}`: removes the exclusion (no error when there is none).
 - `{"action":"set_labels","node_id":"<id>","labels":{"<key>":"<value>"}}`: replaces the host's labels; at most 8, each key and value 1 to 32 bytes of `[a-z0-9-]`; an empty object removes them. Only this call sets labels: a heartbeat that carries them changes nothing.
+- `{"action":"clear_halt","service":"<name>","reason":"<text>"}`: lifts the halt of a service. A host whose last update failed in the `halt` phase halts its service: nothing is ordered for any host of it, a new desired version does not lift it, `GET /v1/convergence` says `halted` and names the host, the check and the version (`halt`), `deploy-farm` fails on it, and the coordinator logs it at error with `alert="halt"`. The clear is written to the ops file before it takes effect, acknowledges the report that raised the halt (the host keeps reporting it until it updates again) and adds one to the service's clear generation, which an agent that announced `halt-v1` is told as `halts` in every answer. A service that is not halted is refused with 400.
 
 Each accepted action is written to the file before it takes effect (a failed write is a 500 and the old state stands), numbered, appended to the ring, and logged at info on the target `kbf_coordinator::audit` with `by`, `action`, `service`, `node_id` and `reason`; the answer is that entry. A bad body is a 400. In this release the coordinator records these changes and shows them in the status; nothing yet reads them when it decides what a host is told.
 
@@ -596,7 +597,7 @@ Each accepted action is written to the file before it takes effect (a failed wri
    is reported and tried again, and counts as no change.
 
 `GET /v1/convergence` answers `{"desired", "quiet", "state", "roles": [{"role", "at_desired",
-"updating", "failed", "down"}]}`, where `state` is `converged`, `blocked` or `in_progress`. It
+"updating", "failed", "down"}]}`, where `state` is `converged`, `blocked`, `halted` or `in_progress` (`halted` adds `halt`: `{"node_id","check","target"}`). It
 takes CI's OIDC token and refuses the operator token (the operator's read is `GET /v1/status`).
 It is computed from the heartbeats and the desired state, and stores nothing. `converged` needs
 the coordinator to be past its 30 second quiet start, at least one live host, every live host at
