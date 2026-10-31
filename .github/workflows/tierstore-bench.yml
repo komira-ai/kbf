@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Branch, tag or commit to build (empty: the ref this workflow is dispatched on)
+        description: "Branch, tag or commit to build (empty means the ref this workflow is dispatched on)"
         required: false
         default: ""
         type: string
