@@ -118,7 +118,8 @@ Where the frontend runs the actions it places is `--executor` (the `[executor]` 
 as always: the frontend builds no executor and contacts no lease server, whatever the other
 `--executor-*` flags say, so a unit or `kbf.toml` that names a lease server keeps its settings
 when the executor is switched back, `--executor-insecure-argv-secrets` too (it is ignored, with a
-warning, so the rollback is the one flag: `executor = "kbf-daemon"`). Stopping the frontend
+warning, so the rollback is the one flag: `executor = "kbf-daemon"`, except `--executor-locate`,
+which is refused with `kbf-daemon` and must be removed in the same edit). Stopping the frontend
 releases its leases; a frontend that is killed (a stop timeout, SIGKILL) leaves them, and the
 hosts stay held until their ttl ends (`--executor-lease-ttl-secs`, an hour by default) unless a
 later `js-agent` start releases them. `js-agent` leases hosts from the job scheduler's lease server
@@ -181,7 +182,9 @@ private home, on top of the bytes of its inputs and a fixed 1 GiB margin),
 plain-http flags are off by default), and `--executor-locate` (off by default: the task is given
 `--locate`, asks the listener's `GET /locate` once and reads each input straight from the store the
 answer names, from the listener when that read fails; with no grants in the answer it reads from the
-listener as before; refused with `--executor kbf-daemon`). A setting that breaks a rule
+listener as before; refused with `--executor kbf-daemon`; the task image must carry kbf-task
+v0.0.44 or later, the first release that knows `--locate`: an older one refuses the flag and every
+run fails). A setting that breaks a rule
 the executor's safety rests on (the fence time against the scheduler's grace, the lease ttl
 against the longest run) is refused at start, exit status 2.
 
