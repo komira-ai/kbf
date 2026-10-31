@@ -11,6 +11,7 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use tokio::sync::Semaphore;
 
+use super::fill::{Filled, Pending};
 use super::layout::name_of;
 use super::locked;
 use super::metrics::{FailedFill, read};
@@ -655,4 +656,22 @@ async fn an_upstream_without_content_tags_is_refused_where_a_version_is_needed()
     let (chunks, error) = drain(stream).await;
     assert_eq!(error, None);
     assert_eq!(joined(&chunks), &body[10..60]);
+}
+
+/// Asserts that a read that finds the place of a keep in the table of the fills that run (a fill
+/// that is over already, with no object) does not wait and starts no fill: it is answered from the
+/// upstream, from its first byte to the last, and nothing is kept.
+#[tokio::test]
+async fn a_read_that_finds_the_place_of_a_keep_is_answered_from_the_upstream() {
+    let rig = rig("tsstream-keep-place");
+    let body = pattern(SIZE);
+    rig.put("cas/b/obj", &body).await;
+    let hex = name_of("cas/b/obj").hex;
+    drop(locked(&rig.cache.inner.flights).insert(hex, Pending::finished(Filled::Skipped)));
+    let stream = rig.cache.get_stream("cas/b/obj", None).await.unwrap();
+    let (chunks, error) = drain(stream).await;
+    assert_eq!(error, None);
+    assert_eq!(joined(&chunks), body);
+    assert_eq!(read(&rig.cache.counters().fills), 0);
+    assert_eq!(rig.cache.held(), (0, 0));
 }
