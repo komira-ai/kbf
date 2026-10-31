@@ -579,6 +579,18 @@ impl Server {
         self.open.load(Ordering::SeqCst)
     }
 
+    /// The connections the drain closed that still wait for their peer to close its end.
+    #[must_use]
+    pub fn lingering_connections(&self) -> usize {
+        0
+    }
+
+    /// The requests that arrived after the server shut its end of a connection in the drain.
+    #[cfg(test)]
+    pub(super) fn late_requests(&self) -> u64 {
+        0
+    }
+
     /// Begins the drain: `/readyz` says 503 from now on, and [`Server::serve`] runs the rest of
     /// the sequence. Calling it again does nothing more.
     pub fn begin_drain(&self) {

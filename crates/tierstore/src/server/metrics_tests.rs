@@ -12,7 +12,7 @@ use super::testing::{Reply, Rig};
 pub(super) const BUDGET: u64 = 1 << 20;
 
 /// Every series of `/metricz` with its labels, as the text names it.
-const SERIES: [&str; 26] = [
+const SERIES: [&str; 27] = [
     "tierstore_hits_total{tier=\"hot\",op=\"get\"}",
     "tierstore_hits_total{tier=\"hot\",op=\"head\"}",
     "tierstore_hits_total{tier=\"cold\",op=\"get\"}",
@@ -39,6 +39,7 @@ const SERIES: [&str; 26] = [
     "tierstore_promotions_skipped_total{reason=\"full\"}",
     "tierstore_promotions_skipped_total{reason=\"raced\"}",
     "tierstore_promotions_skipped_total{reason=\"failed\"}",
+    "tierstore_drain_late_requests_total",
 ];
 
 async fn metricz(rig: &Rig) -> Reply {
@@ -117,15 +118,16 @@ async fn metricz_lists_every_series_with_its_labels() {
 }
 
 /// Asserts that a server with no proxy and no OCI front answers `/metricz` 200 with one comment
-/// line that names the sources and no series. It would catch a probe that fails or says nothing
-/// when there is nothing to count.
+/// line that names the sources, and then the server's own series, the late requests of the drain,
+/// at zero, and nothing else. It would catch a probe that fails or says nothing when there is
+/// nothing to count, and a server whose own series is shown only with a source.
 #[tokio::test]
-async fn metricz_without_a_source_is_one_line_naming_them() {
+async fn metricz_without_a_source_is_the_line_naming_them_and_the_servers_own_series() {
     let rig = Rig::with(BUDGET, |config| config.proxy = None).await;
     let reply = metricz(&rig).await;
     assert_eq!(reply.status, StatusCode::OK);
     let lines: Vec<&str> = reply.body.lines().collect();
-    assert_eq!(lines.len(), 1, "{}", reply.body);
+    assert_eq!(lines.len(), 3, "{}", reply.body);
     for name in ["proxy", "OCI read front", "local cache"] {
         assert!(
             lines[0].starts_with('#') && lines[0].contains(name),
@@ -133,6 +135,11 @@ async fn metricz_without_a_source_is_one_line_naming_them() {
             reply.body
         );
     }
+    assert_eq!(
+        lines[1],
+        "# TYPE tierstore_drain_late_requests_total counter"
+    );
+    assert_eq!(lines[2], "tierstore_drain_late_requests_total 0");
 }
 
 /// Asserts that a server with a proxy and an OCI front shows both blocks, the proxy's first, each
