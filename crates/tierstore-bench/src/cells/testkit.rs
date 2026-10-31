@@ -179,6 +179,7 @@ pub fn ctx_with_log(
             max_disk_util_pct: 60.0,
         },
         cold_guard: crate::cells::coldguard::ColdGuardLimits::default(),
+        cold_state_timeout: std::time::Duration::from_secs(30),
         rates: RateCaps {
             cold_rps: 100_000,
             hot_rps: 100_000,

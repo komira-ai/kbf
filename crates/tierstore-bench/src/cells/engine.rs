@@ -848,7 +848,10 @@ async fn run_pass(
     }
     // Read again before every pass, not once at preflight: a heal can start or end in a campaign
     // of hours. The read is one short command of this process; nothing else runs meanwhile.
-    let cold_state = env.cold_state.read()?;
+    let cold_state = env
+        .cold_state
+        .read_within(env.config.cold_state_timeout)
+        .await?;
     // The pass's planned bytes are counted before anything is sent, so a run that dies in the
     // middle of a pass, or a ledger read by another run meanwhile, never sees fewer bytes than
     // may have landed. After the pass the count becomes what was written (a failed put counts).

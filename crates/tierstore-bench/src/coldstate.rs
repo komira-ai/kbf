@@ -11,8 +11,11 @@
 //! made stops the run, as a load gate that cannot see does: a result that says nothing of the
 //! cold store's state must not look like one that says it is quiet.
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -33,7 +36,20 @@ pub trait ColdStateSource: Send + Sync {
     /// # Errors
     /// [`BenchError`] if the store cannot be asked and no status file answers: the run stops.
     fn read(&self) -> Result<Option<ColdState>, BenchError>;
+
+    /// [`ColdStateSource::read`], given up after `limit`: a source that can wait on a command
+    /// answers with an error then, having stopped the command. The default reads at once.
+    ///
+    /// # Errors
+    /// As `read`; and [`BenchError`] if the reading took longer than `limit`.
+    fn read_within(&self, _limit: Duration) -> ReadFuture<'_> {
+        Box::pin(std::future::ready(self.read()))
+    }
 }
+
+/// What [`ColdStateSource::read_within`] gives: a reading, in time.
+pub type ReadFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<ColdState>, BenchError>> + Send + 'a>>;
 
 /// A run with no cold role: nothing to read.
 pub struct NoColdState;

@@ -256,6 +256,10 @@ pub struct ConfigArgs {
     /// Cold store guard: the length of the sliding window, seconds.
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
     pub cold_abort_window_secs: u64,
+    /// The longest a reading of the cold store's state (`mc admin info`) may take, seconds; the
+    /// run stops, the reading being unreadable, if it takes longer.
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    pub cold_state_timeout_secs: u64,
     /// Cap on requests per second to the cold store.
     #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..))]
     pub cold_rps: u32,
@@ -311,6 +315,8 @@ pub struct RunConfig {
     pub gate: LoadGate,
     /// The cold store guard's limits.
     pub cold_guard: ColdGuardLimits,
+    /// The longest one reading of the cold store's state may take.
+    pub cold_state_timeout: Duration,
     /// Request-rate caps.
     pub rates: RateCaps,
     /// Byte caps.
@@ -408,6 +414,7 @@ impl RunConfig {
                 max_p99_ms: args.cold_abort_p99_ms,
                 max_error_share: args.cold_abort_error_share,
             },
+            cold_state_timeout: Duration::from_secs(args.cold_state_timeout_secs),
             rates: RateCaps {
                 cold_rps: args.cold_rps,
                 hot_rps: args.hot_rps,
@@ -582,6 +589,18 @@ mod tests {
             argv.extend_from_slice(&bad);
             assert!(Wrap::try_parse_from(argv).is_err(), "{bad:?}");
         }
+    }
+
+    /// Catches a limit on the cold state reading other than 30 s, a flag that does not reach the
+    /// configuration, and a limit of zero that the parser takes.
+    #[test]
+    fn the_cold_state_timeout_has_its_default_and_reaches_the_configuration() {
+        let cfg = RunConfig::resolve(&args(&[]), None).unwrap();
+        assert_eq!(cfg.cold_state_timeout, Duration::from_secs(30));
+        let cfg = RunConfig::resolve(&args(&["--cold-state-timeout-secs", "5"]), None).unwrap();
+        assert_eq!(cfg.cold_state_timeout, Duration::from_secs(5));
+        let argv = ["t", "--result-dir", "out", "--cold-state-timeout-secs", "0"];
+        assert!(Wrap::try_parse_from(argv).is_err());
     }
 
     /// Catches a flag that does not override the run file, and a missing endpoint that is

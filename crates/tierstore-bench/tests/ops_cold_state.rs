@@ -5,6 +5,8 @@
 mod ops_support;
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use tierstore_bench::coldstate::{ColdStateSource, OpsColdState};
 use tierstore_bench::error::BenchError;
@@ -98,4 +100,50 @@ fn a_store_that_cannot_be_asked_and_no_status_file_is_an_error() {
             .contains("neither the admin info nor a status file"),
         "{err}"
     );
+}
+
+/// Catches a reading that is waited for for ever: `mc admin info` never ends, and the read gives
+/// up after its limit with an error (the run stops, as for any reading that cannot be made), the
+/// command having been told to stop, and the status file that would have answered is not used.
+/// The clock is paused, so the limit passes at once and nothing here waits for it.
+#[tokio::test(start_paused = true)]
+async fn a_reading_that_never_answers_is_stopped_and_is_unreadable() {
+    let (dir, host, config, ops) = base("tb-cold-state-hangs");
+    host.hang.store(true, Ordering::SeqCst);
+    let host = Arc::new(host);
+    let spec = config
+        .store(tierstore_bench::role::Role::Cold)
+        .unwrap()
+        .clone();
+    let source = OpsColdState::new(host.clone(), ops, spec, dir.path().to_owned());
+    let err = source
+        .read_within(Duration::from_secs(30))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BenchError::Ops(_)), "{err}");
+    assert!(
+        err.to_string().starts_with("cold state: unreadable"),
+        "{err}"
+    );
+    assert!(
+        host.stopped.load(Ordering::SeqCst),
+        "the command was told to stop"
+    );
+    assert_eq!(host.ran().len(), 1, "only the admin info was started");
+}
+
+/// Catches a bounded read that gives a different answer from the plain one when the store
+/// answers: same reading, the store asked once.
+#[tokio::test]
+async fn a_reading_that_answers_in_time_is_the_plain_reading() {
+    let (_dir, host, source) = source("tb-cold-state-in-time");
+    let read = source
+        .read_within(Duration::from_secs(600))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(read.healing);
+    assert_eq!(read.percent_done, Some(6.4));
+    assert_eq!(read.drives.len(), 2);
+    assert_eq!(host.ran().len(), 1);
 }

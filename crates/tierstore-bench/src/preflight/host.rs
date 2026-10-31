@@ -8,6 +8,7 @@ use std::io::{self, Write as _};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::error::BenchError;
@@ -101,6 +102,17 @@ pub trait Host: Send + Sync {
     /// # Errors
     /// The command could not be started.
     fn run(&self, cmd: &Cmd) -> io::Result<CmdOutput>;
+
+    /// Runs a command until it ends or `stop` is set; if `stop` is set first, the command is
+    /// killed and the answer is `None`. Only the child this call started is killed.
+    ///
+    /// The default runs the command to its end and ignores `stop`.
+    ///
+    /// # Errors
+    /// The command could not be started.
+    fn run_until(&self, cmd: &Cmd, _stop: &AtomicBool) -> io::Result<Option<CmdOutput>> {
+        self.run(cmd).map(Some)
+    }
 
     /// Whether something accepts connections on loopback `port`.
     fn port_open(&self, port: u16) -> bool;

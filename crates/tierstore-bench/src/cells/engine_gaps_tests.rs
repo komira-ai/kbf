@@ -510,3 +510,135 @@ async fn a_healthy_cold_store_finishes_and_the_same_slow_one_does_not() {
     .unwrap_err();
     assert!(matches!(err, BenchError::ColdGuard(_)), "{err}");
 }
+
+/// A streamed cold read as the cold-read cell reports it: a read that succeeded is two steps,
+/// the whole request and the same request's time to the first byte (`.ttfb`); a read that
+/// failed is the whole request alone. `shape` says, of request `index`, whether it succeeded
+/// and how long it took.
+fn streamed_reads(
+    label: &str,
+    requests: u64,
+    shape: impl Fn(u64) -> (bool, u64) + Send + Sync + 'static,
+) -> Arm {
+    let mut arm = arm(label, requests, &Arc::new(AtomicU64::new(0)));
+    arm.work = work(move |unit| {
+        let (ok, latency_us) = shape(unit.index);
+        async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut steps = vec![step(Role::Cold, latency_us, ok)];
+            if ok {
+                steps.push(Step {
+                    label: ".ttfb",
+                    ..step(Role::Cold, 1_000, true)
+                });
+            }
+            Ok(steps)
+        }
+    });
+    arm
+}
+
+/// Catches a guard that counts a streamed read twice when it succeeded and once when it failed
+/// (its `.ttfb` step counted as a request): 54 good reads and then failures, the third failure
+/// is 3 of 57 requests, over 5%, and the guard says so; counting the pairs it would be 3 of 111
+/// and trip only at the sixth failure, 6 of 114 entries.
+#[tokio::test(start_paused = true)]
+async fn a_streamed_read_counts_once_for_the_error_share() {
+    let dir = temp("tb-gaps-guard-streamed-share");
+    let err = run_cell(
+        &env(dir.path(), 1, no_cold()),
+        CellId::ColdRead,
+        vec![streamed_reads("a", 60, |i| (i < 54, 20_000))],
+        3,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, BenchError::ColdGuard(_)), "{err}");
+    let result = written(dir.path(), CellId::ColdRead, "a", 1);
+    let trip = result.passes[0].cold_guard.clone().unwrap();
+    assert_eq!(trip.metric, "error_share");
+    assert_eq!(trip.requests, 57);
+    assert!((trip.value - 3.0 / 57.0).abs() < 1e-9, "{trip}");
+}
+
+/// Catches reads judged before the window has enough of them: 15 slow successful reads are 15
+/// requests, fewer than the 20 the guard needs to judge, though they are 30 steps; counted by
+/// step, their p99 of 3 s would stop the run.
+#[tokio::test(start_paused = true)]
+async fn successful_streamed_reads_are_not_counted_twice_toward_the_minimum() {
+    let dir = temp("tb-gaps-guard-streamed-min");
+    let results = run_cell(
+        &env(dir.path(), 1, no_cold()),
+        CellId::ColdRead,
+        vec![streamed_reads("a", 15, |_| (true, 3_000_000))],
+        1,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(results[0].passes.len(), 1);
+    assert!(results[0].passes[0].cold_guard.is_none());
+}
+
+/// Catches a p99 that takes the time to the first byte as a request: 50 reads, the last of them
+/// slow. The p99 of their 50 whole-request latencies is that slowest one and trips; with the 50
+/// first-byte times in the window as well, the slow one would be the 100th of 100 and the p99
+/// the one before it.
+#[tokio::test(start_paused = true)]
+async fn the_p99_is_taken_over_whole_requests_only() {
+    let dir = temp("tb-gaps-guard-streamed-p99");
+    let err = run_cell(
+        &env(dir.path(), 1, no_cold()),
+        CellId::ColdRead,
+        vec![streamed_reads("a", 50, |i| {
+            (true, if i == 49 { 3_000_000 } else { 20_000 })
+        })],
+        3,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, BenchError::ColdGuard(_)), "{err}");
+    let result = written(dir.path(), CellId::ColdRead, "a", 1);
+    let trip = result.passes[0].cold_guard.clone().unwrap();
+    assert_eq!(trip.metric, "p99_ms");
+    assert_eq!(trip.requests, 50);
+    assert!((trip.value - 3_000.0).abs() < 1e-9, "{trip}");
+}
+
+/// A cold state source that notes the limit it was given, and answers at once.
+struct Noting(std::sync::Mutex<Vec<Duration>>);
+
+impl ColdStateSource for Noting {
+    fn read(&self) -> Result<Option<crate::result::ColdState>, BenchError> {
+        Ok(None)
+    }
+
+    fn read_within(&self, limit: Duration) -> crate::coldstate::ReadFuture<'_> {
+        self.0.lock().unwrap().push(limit);
+        Box::pin(std::future::ready(self.read()))
+    }
+}
+
+/// Catches a run that reads the cold state with no limit, or with another than the one it was
+/// configured with (`--cold-state-timeout-secs`): every pass of every arm asks with it.
+#[tokio::test(start_paused = true)]
+async fn every_cold_state_reading_is_asked_with_the_configured_limit() {
+    let dir = temp("tb-gaps-cold-state-limit");
+    let noting = Arc::new(Noting(std::sync::Mutex::default()));
+    let mut ctx = testkit::ctx(dir.path(), &[], Window::Quiet);
+    ctx.cold_state = noting.clone();
+    ctx.config.cold_state_timeout = Duration::from_secs(7);
+    let env = Env::new(&ctx, Script::calm()).unwrap();
+    run_cell(
+        &env,
+        CellId::G,
+        vec![arm("a", 2, &Arc::new(AtomicU64::new(0)))],
+        3,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(*noting.0.lock().unwrap(), vec![Duration::from_secs(7); 3]);
+}
