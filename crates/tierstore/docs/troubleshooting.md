@@ -77,12 +77,16 @@ A tier that answers a self-test question wrongly exits 3 and names the tier, the
 | 413 `EntityTooLarge` | a body longer than `--max-request-bytes` (or the presigning key's ceiling) |
 | 400 `RequestTimeout` | a body that stalled for `--body-idle-timeout` or came slower than `--put-min-bytes-per-sec`; nothing is stored |
 | 503 `SlowDown` | more than `--max-concurrent-puts` bodies at once, or a put that met a full tier; retry |
-| 503 `ServiceUnavailable` | the server is draining, or a tier could not be reached |
+| 503 `ServiceUnavailable` | a tier could not be reached; in v0.0.41 and before also a request on a connection that was open when the drain's settle ended. On main a drain answers no request 503 (see "A connection ends during a restart") |
 | 501 `NotImplemented` | an `aws-chunked` or trailing-checksum body, CRC-64/NVMe, or `encoding-type=url` on a listing; set the SDK's checksum calculation to "when required" |
 
 ## The hot tier keeps filling
 
 Check `/usagez` first. A 503 there means the reconciler is not publishing: look at its process (`journalctl`), at the cold tier's reachability and at the lease. If usage is fresh and still high, the cold tier is taking copies slower than clients write: raise `--copy-parallel` if the cold store has room for more at once, or give the hot tier a larger `--hot-bytes`. See [operations](operations.md) for what a full hot tier does.
+
+## A connection ends during a restart
+
+On main, not in v0.0.41. From the moment a stop begins every answer carries `Connection: close`, and at the end of the settle (`--drain-lb-wait`) the server closes each idle connection by shutting its end for writing: a client reads the end of the stream, not a reset, and opens a new connection. A client that sent a request in the one round trip before it read that end gets no answer: the server read the request, dropped it and counted it in `tierstore_drain_late_requests_total`. Do not retry such a request unless it is safe to repeat: a retried create-only put answers 412 whether its first try was stored or another writer stored the key. Only a connection that was idle for the whole settle can meet this, and the server cannot remove it; a count that is large after every restart means clients that send on a connection without looking at `Connection: close`.
 
 ## At drain deadline
 

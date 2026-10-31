@@ -169,6 +169,25 @@ async fn an_idle_connection_at_the_end_of_the_settle_is_shut_and_held_until_the_
     assert_eq!(drained(serving.served).await, Drained { abandoned: 0 });
 }
 
+/// Asserts that a lingering close is finite: a client that never closes its end does not hold
+/// the drain open for ever; the server closes the connection when the bound has passed, the drain
+/// ends with nothing cut, and the client's next write finds the connection gone. The bound is
+/// `header_timeout`, which the test leaves as it is; the test waits for the end of the drain and
+/// asserts nothing about how long it takes.
+#[tokio::test(start_paused = true)]
+async fn a_lingering_close_ends_when_the_client_never_closes() {
+    let serving = Serving::start(patient).await;
+    let rig = &serving.rig;
+    let mut client = kept_idle(&serving).await;
+    rig.server.begin_drain();
+    assert_shut(&mut client).await;
+    assert_eq!(rig.server.lingering_connections(), 1);
+
+    assert_eq!(drained(serving.served).await, Drained { abandoned: 0 });
+    assert_eq!(rig.server.lingering_connections(), 0);
+    assert!(client.write_all(b"x").await.is_err());
+}
+
 /// Asserts that a request written after the server's end was shut is read, not served, and
 /// counted: the object it would create does not exist, the late counter is 1 and `/metricz` says
 /// so. It would catch a drain that serves what it can no longer answer cleanly, one that closes

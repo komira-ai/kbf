@@ -83,13 +83,6 @@ impl S3Error {
         Self::new(StatusCode::NOT_IMPLEMENTED, "NotImplemented", message)
     }
 
-    /// A request after the drain began: refused, and the connection is closed.
-    pub(crate) fn draining() -> Self {
-        let text = "The server is shutting down; send the request to another endpoint.";
-        Self::new(StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable", text)
-            .with("connection", "close")
-    }
-
     /// A request whose body took no byte for the idle timeout: the connection is closed.
     pub(crate) fn request_timeout(idle: Duration) -> Self {
         let text = format!("No byte of the request body arrived within {idle:?}.");

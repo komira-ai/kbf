@@ -635,7 +635,7 @@ The unit's `ExecStart=` is a complete command line. The flags to edit:
 | `--hot`, `--cold` | the tiers: `s3:<bucket>` for a bucket of an S3-compatible store (also `dir:<path>` and `memory`; a `dir:` path must also be writable under `ProtectSystem=strict`, so add it to `ReadWritePaths=`) |
 | `--hot-endpoint`, `--cold-endpoint` | where the tier's store is, `http://host[:port]` (TLS is not built yet); `--hot-region` and `--cold-region` set the signing region of a tier, `us-east-1` if not given |
 | `--hot-bytes` | the bytes the hot tier is meant to hold; the water marks are shares of it (`--high-water`, `--low-water`, `--critical`) |
-| `--drain-lb-wait`, `--drain-deadline` | the drain on SIGTERM: how long `/readyz` says 503 while the server goes on serving, and how long it then waits for requests in flight |
+| `--drain-lb-wait`, `--drain-deadline` | the drain on SIGTERM: how long `/readyz` says 503 while the server goes on accepting and serving (the settle), and how long it then waits for requests in flight and for the connections it closes (see "Stopping it") |
 | `--usage-stale-after` | how old the usage that the reconciler publishes may be (2m by default, longer than `--lease-ttl`) before `/usagez` says 503 with the reason (200 and the age while fresh). Puts ignore a usage older than 30 s, so a stopped reconciler means a hot tier that is never taken to be full; puts are not refused. A load balancer probes `/readyz`, which does not look at the usage (one stopped reconciler would otherwise take every node out); alerting probes `/usagez` |
 | `--oci-listen`, `--oci-tls-cert`, `--oci-tls-key`, `--oci-prefix` | the read-only registry front, off unless `--oci-listen` is given; see The OCI read front |
 
@@ -901,9 +901,16 @@ the operator's choice, and the shipped file does not make it.
 
 ## Stopping it
 
-systemd sends SIGTERM. The process answers `/readyz` 503, serves for `--drain-lb-wait` so that a
-load balancer sees it, refuses new requests, waits for those in flight for at most
-`--drain-deadline`, gives up the reconciler's lease and exits 0. `TimeoutStopSec=` is set above
+systemd sends SIGTERM. The process answers `/readyz` 503 and puts `Connection: close` on every
+answer from then on, serves for `--drain-lb-wait` (the settle) so that a load balancer sees it,
+stops accepting, and closes each idle connection with a lingering close (it shuts its end for
+writing, so that the client reads a clean end of stream, and reads until the client closes, for 60
+seconds at most). A request already on the wire is served, with `Connection: close`, never
+answered 503; one that arrives within a round trip of the end of the stream cannot be answered
+and is counted in `tierstore_drain_late_requests_total`. It waits for the requests in flight and
+the connections for at most `--drain-deadline`, gives up the reconciler's lease and exits 0. This
+is on main, not in v0.0.41, which answers a request on a connection that is open after the settle
+503 `ServiceUnavailable`. `TimeoutStopSec=` is set above
 the sum of the two flags and the lease's wait, so that systemd does not send SIGKILL to a drain
 in progress; if `--drain-deadline` is raised, raise it too. A start that fails is tried again
 after 30 seconds; exit status 2 (a command line the argument parser refused: an unknown flag, a
