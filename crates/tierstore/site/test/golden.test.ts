@@ -33,3 +33,18 @@ test('the manifest sees a one byte change in a page and a missing file (the chec
   unlinkSync(join(missing, '404.html'));
   assert.notEqual(manifestOf(missing), clean);
 });
+
+test('the manifest ignores the guide pages and sees every hand-made page', () => {
+  const dist = buildReal('golden-g');
+  const clean = manifestOf(dist);
+  const guide = copyTree(dist, 'golden-h');
+  plant(guide, join('docs', 'overview', 'index.html'), '<h1', '<h2');
+  plant(guide, join('docs', 'index.html'), '<h1', '<h2');
+  assert.equal(manifestOf(guide), clean, 'a change to a docs page must not change the manifest (docs.test.ts holds those pages)');
+  for (const page of ['index.html', 'why/index.html', 'install/index.html', 'demo/index.html', '404.html']) {
+    const changed = copyTree(dist, 'golden-i');
+    plant(changed, page, /<(h1|main)/, '<$1 data-planted');
+    assert.notEqual(manifestOf(changed), clean, `a change to ${page} must change the manifest`);
+  }
+  assert.ok(!golden.includes('  docs/'), 'the committed manifest lists a docs page');
+});
