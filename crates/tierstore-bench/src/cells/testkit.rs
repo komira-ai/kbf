@@ -81,6 +81,7 @@ pub fn cold_state(healing: bool, read_unix_ms: u64) -> ColdState {
             healing,
         }],
         read_unix_ms,
+        source: Some(crate::result::ColdSource::Mc),
     }
 }
 
@@ -180,6 +181,7 @@ pub fn ctx_with_log(
         },
         cold_guard: crate::cells::coldguard::ColdGuardLimits::default(),
         cold_state_timeout: std::time::Duration::from_secs(30),
+        cold_state_max_age: std::time::Duration::from_secs(30),
         rates: RateCaps {
             cold_rps: 100_000,
             hot_rps: 100_000,
