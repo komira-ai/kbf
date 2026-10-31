@@ -32,6 +32,21 @@ fn a_host_silent_past_the_down_limit_restarts_its_bake() {
     }
 }
 
+/// The gap that restarts a bake is the liveness limit itself: a beat 44 s after the last one
+/// keeps the count, one 45 s after it starts the count again.
+#[test]
+fn a_gap_of_the_down_limit_restarts_the_bake_and_one_second_less_does_not() {
+    let s = services("bake_beats = 2", 1, 0);
+    for (gap, expect) in [(44, go()), (45, held(Hold::Baking))] {
+        let mut f = Fleet::new(Duration::ZERO);
+        beats(&mut f, "a", &beat("2.0"), 100);
+        let at = 100 + gap;
+        beats(&mut f, "a", &beat("2.0"), at);
+        beats(&mut f, "b", &beat("1.0"), at);
+        assert_eq!(why(&s, &f, "b", at), expect, "gap {gap}");
+    }
+}
+
 /// An unhealthy host at the desired version holds the slot as a baking host: it is no longer
 /// counted up, but it has not baked, and the next host waits on it.
 #[test]
@@ -82,7 +97,7 @@ fn a_canary_count_over_the_cap_is_refused() {
     let err = Services::parse(&definition("canary = { count = 10001 }", 1, 0))
         .expect_err("refused")
         .to_string();
-    assert!(err.contains("canary count"), "{err}");
+    assert!(err.contains("canary count is not 1 to 10000"), "{err}");
 }
 
 const FRONTENDS_AFTER_STORAGE: &str = "[[service]]\nname = \"kbf\"\ncanary = { count = 2 }\n\
