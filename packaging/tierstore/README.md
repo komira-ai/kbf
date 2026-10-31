@@ -294,7 +294,9 @@ the body is read. The key files of `[server]` are those of the front, as for a s
 
 With `write_through = true` in `[local_cache]` (default `false`) the node takes the writes its keys
 may do and sends each to the upstream; the answer is given only after the upstream has the object,
-and the cache keeps nothing of what is written (the first read of an object fills it). Create-only
+and a create-only put under a `cache = true` policy is also kept on the node, so the next read of
+it is a hit (a multipart upload is not kept: the first read fills it; see "What a put keeps"
+below). Create-only
 puts (with or without `If-None-Match: *`), presigned PUTs, multipart uploads (start, part,
 completion, abort) and deletes go to the upstream; the roles of the full, read-only, scoped,
 presigning and GC keys apply as on a storage node, and a put that replaces (`If-Match`) and a copy
@@ -312,6 +314,35 @@ before the address is bound; one that cannot be reached is status 1. The upstrea
 a store that takes writes under `_tiering/` (an S3 bucket, not the front of a storage node). The
 upstream's key is also the cache's: only the front's roles keep one client from another's objects.
 The start line then says `mode=write-through-cache`.
+
+What a put keeps. The body of a create-only put under a `cache = true` policy is copied into
+`.stage/` as it streams to the upstream. When the upstream has acknowledged the object, the node
+asks it for the object's tag and time (one HEAD, so the tag in the cache is the one the upstream
+gave, which for a large body is not an MD5), puts the copy in the cache, and then answers 200. The
+copy is best effort and never fails the put: if every keep slot is busy (`max_concurrent_keeps`),
+the object does not fit the budget, the stage directory cannot be written, the HEAD fails, the disk
+falls behind the body, or the object was deleted meanwhile, the copy is dropped, the put is still
+200 with the object at the upstream, and the skip is counted. The body is written to the stage file
+by a task of its own through a queue of at most 16 chunks and 4 MiB (the bytes bound the memory,
+whatever the size of the chunks; at most `max_concurrent_keeps` times 4 MiB in all), so a slow or
+hung disk never makes the upload wait: the copy is dropped instead. Once the upstream has
+acknowledged the object, the rest of the keep runs on its own task, so a client that goes away at
+that point does not leave a half-made copy. The put waits for that task for `keep_wait` and is then
+answered; the task ends within `keep_deadline` with the object kept or abandoned. A read of a key
+whose copy is still being made never waits for it: it is answered from the upstream. The eviction
+pass that a kept object may call for runs on its own task, and the put does not wait for it. A link
+that is under way when a copy is abandoned cannot be called back and is undone when it ends; if its
+thread never returns (a disk that hangs for good) the staged file and a reference to the cache stay
+until the process ends, and the undoing may remove the entry of a fill of the same key made after
+the abandonment, which costs one more trip to the upstream and never serves stale data.
+A key named by its content (`cas/l/<sha256>`) is hashed as the body streams, copied or not;
+a body that does not hash to the name is answered 400 `BadDigest`, the upstream stores nothing, and
+nothing is kept. A body that is cut leaves nothing at the upstream or in the cache.
+`/metricz` has `tierstore_cache_writes_through_total` (puts the upstream took),
+`tierstore_cache_write_exists_total` (puts answered 412) and
+`tierstore_cache_write_keep_skipped_total{reason}` with the reasons `budget` (also a body of no
+declared length), `io`, `busy`, `head`, `deleted`, `slow` (the disk did not keep up), `deadline` (the copy was abandoned) and `read_only` (on main, not in v0.0.41: the cache does not hold the lock of its directory, so it copies nothing);
+`tierstore_cache_keeps_expired_total` counts the puts answered before their copy was done.
 
 ```toml
 [server]
@@ -365,9 +396,9 @@ costs the upstream a HEAD and a GET. A node that serves container layers through
 (see The registry front) should raise the limit to its largest layer: a layer over it is never kept. A fill that fails (a short body, an object written over
 while it was read, an upstream error, a directory that cannot be written) never fails the reader for
 the cache's reasons: the reader is answered from the upstream. A kept object is never checked
-against the upstream again, and a hit is not hashed again: put `cache = true` only on prefixes whose
-objects are never rewritten (the content-addressed ones), and note that the start reads the sizes of
-the files, not their bytes. Anyone who may read through the front may read everything the upstream's
+against the upstream again, and a hit is not hashed again (the scrub below does that, later): put
+`cache = true` only on prefixes whose objects are never rewritten (the content-addressed ones), and
+note that the start reads the sizes of the files, not their bytes. Anyone who may read through the front may read everything the upstream's
 read key can read, so give build clients scoped keys. The directories the cache makes are mode 0755
 whatever the umask.
 
@@ -385,9 +416,23 @@ pass-through, whether or not the object is kept, and a whole GET of a miss holds
 the fill has kept it. A fill that panics or is cancelled frees its slot and its key, and the
 readers that waited for it get a 503 (`fill_failures_total{reason="aborted"}`).
 
-No scrub. A hit is not hashed again, and the sidecar's `sha256` is written but not checked after
-the fill: an object that rots on the disk is served as it is now until it is evicted. A restart
-checks sizes only.
+Scrub. A hit is not hashed again, so a background scrub reads the objects at `scrub_rate` (16 MiB a
+second by default) and hashes each against the digest it must have: the name for a key
+`cas/l/<sha256>`, and for any other key the `sha256` that the sidecar recorded at the fill (every
+sidecar has it, so every object is checked). An object whose bytes do not match, or whose sidecar
+can no longer be read, is removed from the index and the disk, counted in
+`scrub_mismatches_total` and named on stderr; the next read of its key fills it again from the
+upstream. The scrub walks the objects in name order, takes the names at the start of a round, and
+starts over when it is done; it reads an object to its end, so one object larger than the rate is read
+in one go and the next reads wait until the rate has paid for it. It never drops an object whose
+fill is still ending, and never one whose file was replaced after it was read. A file or a sidecar that
+cannot be read (a failing disk, out of descriptors) is left alone and counted in
+`scrub_errors_total`; a sidecar that is missing or does not parse drops the object. The bytes are
+hashed in chunks of 1 MiB and a shutdown ends the pass at the next chunk; inside one object the
+read is not paced. A round (every object once) starts at most once in `scrub_min_round`. An
+object whose check panics is counted in `scrub_errors_total` and skipped for the round. `scrub_rate = "off"`
+turns it off; a restart still checks sizes only. A hard link that a job holds to a dropped object
+keeps the old bytes for that job: the scrub removes the cache's name only.
 
 Eviction keeps the cache under `budget` bytes: above `high_water` percent of it, and when the free
 space of the file system (`statvfs`) is under `free_floor` percent, a pass removes the least
@@ -401,8 +446,9 @@ stop a fill, so on a disk that the jobs fill, the cache may fill the file system
 until the next pass (every 10 seconds) frees it. The start refuses (exit status 2) a `budget` larger
 than the size of the file system less `free_floor` percent of it; a file system whose size cannot be
 read, or that reports 0 bytes, is not judged: the start warns on stderr and goes on. The files of
-`.stage/` are never evicted and are removed at start. `scrub_rate` is accepted; this release does not
-scrub.
+`.stage/` are never evicted and are removed at start. `put_permit_wait`, like `max_concurrent_puts` and `put_min_bytes_per_sec`, is accepted in
+`[server]` of a build node and does nothing there without write-through, since the node answers every
+put 403.
 
 | key | what |
 |---|---|
@@ -414,10 +460,14 @@ scrub.
 | `local_cache.critical` | percent of the budget above which a fill is skipped (default 95, not below `high_water`) |
 | `local_cache.free_floor` | percent of the file system that is kept free (0 to 99, default 10): below it a pass evicts, even under the budget; it does not stop a fill, and `budget` may not be above the file system's size less the floor (exit status 2), unless its size cannot be read or is 0, which the start warns of and does not judge |
 | `local_cache.max_concurrent_fills` | the most fills that run at once (1 to 64, default 4); a miss that finds them all running is served from the upstream and kept nowhere |
+| `local_cache.max_concurrent_keeps` | the most create-only puts that are copied into the cache at once (1 to 64, default 8), apart from the fills; a put that finds them all running succeeds and is not kept |
+| `local_cache.keep_wait` | the longest a put waits, once the upstream has the object, for its copy to be put in the cache (default `5s`, above 0). Past it the put is answered 200 and the copy is finished in the background; counted in `tierstore_cache_keeps_expired_total`. Safe because the upstream already holds the object: a read of it that misses costs only the trip, so read-your-write on the node is best effort past this wait |
+| `local_cache.keep_deadline` | the longest a copy takes in all, from the upstream's acknowledgement (default `60s`, above 0 and not below `keep_wait`); a copy that is not done by then (a hung disk or upstream) is abandoned: its stage file is removed, its slot and room are given back, and it is counted as `deadline` |
 | `local_cache.write_through` | `false` by default: a read cache that refuses every write with 403 before the role of the key is looked at. `true`: the node takes the writes its keys may do and sends each to the upstream, which must be written with a key that may write; the start runs the upstream's self-test (create-only and multipart-conditional included) and exits with status 3 if the upstream answers one wrongly |
 | `local_cache.whole_fill_limit` | the most an object may be for a ranged read of it to fill the whole of it: a number or a size such as `"512MiB"`, from 1 byte to the `budget` (default 64 MiB); a larger object is passed through and kept nowhere. A fill reads 8 MiB at a time whatever the limit, so raising it does not raise the memory of the fills |
 | `local_cache.cache` | `true`, the default; `false` is refused (leave `[local_cache]` out to run without a cache) |
-| `local_cache.scrub_rate` | a size and `/s`, such as `"50MiB/s"`: accepted, and not used by this release |
+| `local_cache.scrub_min_round` | the least time between the starts of two rounds of the scrub (default `"1h"`; at least `"1s"`, or `"0s"`: a round starts as soon as the last is done): a small cache is not read again and again at the rate |
+| `local_cache.scrub_rate` | the bytes a second the scrub reads, a size and `/s` such as `"50MiB/s"` (default `"16MiB/s"`); `"off"` turns the scrub off |
 | `cold_store.endpoints` | a list of exactly one endpoint, in place of `endpoint`: several are refused as not supported yet, since the cache reads from one upstream |
 
 `[cold_store]` is the upstream: any `kind` (an `s3` bucket, with `endpoint` and a `credentials_file`
@@ -443,7 +493,7 @@ text format, `tierstore_cache_<name>`, with: `hits_total`, `misses_total`, `byte
 fill included, so the byte hit ratio is the first over the sum of the two), `fills_total`,
 `fills_skipped_total`, `fills_skipped_busy_total` (those of the skipped fills that found every fill
 slot taken), `fill_failures_total{reason}` (`hash_mismatch`, `upstream_error`,
-`short_body`, `local_io`, `changed`, `aborted`), `evictions_total{reason}` (`budget`, `floor`), `pinned_skips_total`,
+`short_body`, `local_io`, `changed`, `aborted`), `evictions_total{reason}` (`budget`, `floor`), `pinned_skips_total`, `scrubbed_objects_total`, `scrubbed_bytes_total`, `scrub_mismatches_total`, `scrub_errors_total`,
 `discarded_at_start_total`, and the gauges `bytes`, `objects`, `fs_free_bytes` and `staging_files`.
 A storage node has the proxy's counters instead, the same path on a node with the OCI front (a
 storage node, or a build node with an `[oci]` table) also has the OCI counters (see Counters), and
@@ -504,7 +554,7 @@ the flags of the binary against this table, so a flag added without a key fails 
 
 | flag | key | what |
 |---|---|---|
-| `--listen` | `server.listen` | the address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on |
+| `--listen` | `server.listen` | the address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on. On main, not in v0.0.41: the flag may be given again, and the key may be a list of addresses, served by one server (see Filling in the flags) |
 | `--proxy-id` | `server.proxy_id` | names the journal and the lease of this process |
 | `--hot` | `hot_store.kind`, `hot_store.path`, `hot_store.bucket` | the hot tier: `kind` is `memory`, `dir` (with `path`) or `s3` (with `bucket`, `endpoint` and `credentials_file`); in a flag, `memory`, `dir:<path>` or `s3:<bucket>` |
 | `--cold` | `cold_store.kind`, `cold_store.path`, `cold_store.bucket` | the cold tier, in the same three kinds |
@@ -532,15 +582,17 @@ the flags of the binary against this table, so a flag added without a key fails 
 | `--copy-parallel` | `hot_store.copy_parallel` | the most objects the reconciler copies at once |
 | `--lease-ttl` | `hot_store.lease_ttl` | how long the reconciler's lease lasts without a renewal |
 | `--reconcile-interval` | `hot_store.reconcile_interval` | how often the reconciler works |
+| `--lock-file` | `hot_store.lock_file` | the lock file the reconciler works under: only the process that holds it reconciles (on main, not in v0.0.41) |
 | `--usage-stale-after` | `hot_store.usage_stale_after` | how old the published usage may be before `/usagez` says 503 |
 | `--max-request-bytes` | `server.max_request_bytes` | the longest body of a request |
 | `--max-concurrent-puts` | `server.max_concurrent_puts` | the most put bodies and parts taken at once |
+| `--put-permit-wait` | `server.put_permit_wait` | how long a put that arrives with all of those taken waits for one to end (15s by default; 0 answers 503 at once). No byte of its body is read while it waits. If none ends in that time it is answered 503 `SlowDown` with `Retry-After: 1`. A waiter holds a connection and no permit or body memory, is not bounded except by the connections, counts as in flight in a drain (so a drain may take up to this much longer, never past `--drain-deadline`), and does not notice its client leaving until its body is first read |
 | `--put-min-bytes-per-sec` | `server.put_min_bytes_per_sec` | the least average rate of a body (0 turns it off) |
 | `--put-rate-grace` | `server.put_rate_grace` | the time waiting for the client before that rate is held |
 | `--body-idle-timeout` | `server.body_idle_timeout` | how long a body or an answer may go without a byte |
 | `--skip-backend-check` | `cold_store.skip_checks` | a list of `CHECK=REASON` texts: the start-up check that is left out, with its reason (only `multipart-conditional`; it runs on the cold tier) |
 | `--backend-check-wait` | `server.backend_check_wait` | how long the start-up self-test asks again of a tier that does not answer |
-| `--oci-listen` | `oci.listen` | where the registry front listens; the front is off without the `[oci]` table |
+| `--oci-listen` | `oci.listen` | where the registry front listens; the front is off without the `[oci]` table. On main, not in v0.0.41: the flag may be given again, and the key may be a list of addresses |
 | `--oci-tls-cert` | `oci.tls_cert_file` | the certificate chain (PEM) of the front; with `oci.tls_key_file`, or neither |
 | `--oci-tls-key` | `oci.tls_key_file` | the private key (PEM) of the front |
 | `--oci-prefix` | `oci.prefix` | the key prefix the front reads, ending in `/` (`oci/` if left out) |
@@ -548,11 +600,22 @@ the flags of the binary against this table, so a flag added without a key fails 
 | `--oci-connection-lifetime` | `oci.connection_lifetime` | the longest a connection of the front lives (`1h` if left out) |
 
 These stay flags, since they describe one run and not the data path: `--config`,
-`--print-config`, `--check-config`, `--drain-lb-wait` and `--drain-deadline`. A start that gives
-`--config` and any other flag is refused with status 2 and a message that names the flags
-(`--drain-lb-wait`, `--drain-deadline` and `--check-config` may go with it). A refusal that the
-checks of the start make (water marks out of order, a key file others can read) names the keys of
-the file where the flag-mode message names the flags.
+`--print-config`, `--check-config`, `--capabilities`, `--drain-lb-wait` and `--drain-deadline`. A
+start that gives `--config` and any other flag is refused with status 2 and a message that names
+the flags (`--drain-lb-wait`, `--drain-deadline` and `--check-config` may go with it). A refusal
+that the checks of the start make (water marks out of order, a key file others can read) names the
+keys of the file where the flag-mode message names the flags.
+
+`tierstore --capabilities` (on main, not in v0.0.41) prints what this build can do, one
+capability to a line, and exits with status 0; a build with none prints nothing. It takes no other
+flag and needs none of those a start requires: with any other argument it prints nothing on stdout,
+says on stderr `tierstore: --capabilities takes no other flag, got <argument>`, and exits with
+status 2. A host updater reads it from a release before it hands over to it. `tierstore --version`
+prints `tierstore <version>+<commit>`, the end of the start line is ` commit=<commit>`, and
+`/metricz` has `tierstore_build_info{version="<version>",commit="<commit>"} 1`. The commit is the
+one the binary was built from, twelve hex digits: git's, or the value of
+`TIERSTORE_BUILD_COMMIT_OVERRIDE` at build time for a build without a `.git` (a build refuses a
+value that is not twelve lowercase hex digits), or `unknown` where there is neither.
 
 `tierstore --config <path> --check-config` loads the file as a start does (the same loader and the
 same refusals, the build-node checks and `write_through` included) and reads the key files it
@@ -625,7 +688,7 @@ The unit's `ExecStart=` is a complete command line. The flags to edit:
 
 | flag | what |
 |---|---|
-| `--listen` | the address the S3 API, `/healthz` and `/readyz` are served on |
+| `--listen` | the address the S3 API, `/healthz` and `/readyz` are served on. On main, not in v0.0.41: give it again for each further address (for the wildcard of both families, `0.0.0.0:<port>` and `[::]:<port>`; an IPv6 address is bound for IPv6 only, so they do not clash); one server, one drain and one limit on connections serve them all, an address given twice is refused (exit 2), and the start line shows them as `listen=<a>,<b>`. A wildcard and a specific address on one port, or one address on both `--listen` and `--oci-listen`, are refused by the system at bind on Linux (exit 1, naming the address); on macOS and the BSDs `SO_REUSEADDR` can let them share the port |
 | `--proxy-id` | names this process's journal and its lease in the hot tier; keep it across restarts, and give each process over the same tiers one of its own |
 | `--bucket` | the name of the one bucket clients see |
 | `--access-key-file`, `--read-only-key-file` | the full key, and (given once for each) the read-only keys; see above |
@@ -635,7 +698,7 @@ The unit's `ExecStart=` is a complete command line. The flags to edit:
 | `--hot`, `--cold` | the tiers: `s3:<bucket>` for a bucket of an S3-compatible store (also `dir:<path>` and `memory`; a `dir:` path must also be writable under `ProtectSystem=strict`, so add it to `ReadWritePaths=`) |
 | `--hot-endpoint`, `--cold-endpoint` | where the tier's store is, `http://host[:port]` (TLS is not built yet); `--hot-region` and `--cold-region` set the signing region of a tier, `us-east-1` if not given |
 | `--hot-bytes` | the bytes the hot tier is meant to hold; the water marks are shares of it (`--high-water`, `--low-water`, `--critical`) |
-| `--drain-lb-wait`, `--drain-deadline` | the drain on SIGTERM: how long `/readyz` says 503 while the server goes on serving, and how long it then waits for requests in flight |
+| `--drain-lb-wait`, `--drain-deadline` | the drain on SIGTERM: how long `/readyz` says 503 while the server goes on accepting and serving (the settle), and how long it then waits for requests in flight and for the connections it closes (see "Stopping it") |
 | `--usage-stale-after` | how old the usage that the reconciler publishes may be (2m by default, longer than `--lease-ttl`) before `/usagez` says 503 with the reason (200 and the age while fresh). Puts ignore a usage older than 30 s, so a stopped reconciler means a hot tier that is never taken to be full; puts are not refused. A load balancer probes `/readyz`, which does not look at the usage (one stopped reconciler would otherwise take every node out); alerting probes `/usagez` |
 | `--oci-listen`, `--oci-tls-cert`, `--oci-tls-key`, `--oci-prefix` | the read-only registry front, off unless `--oci-listen` is given; see The OCI read front |
 
@@ -747,8 +810,8 @@ the front then reads through the node's local cache, not a proxy (see The regist
 
 | flag | what |
 |---|---|
-| `--oci-listen ADDR` | where the registry front listens. With `--oci-tls-cert` and `--oci-tls-key` it is HTTPS; with neither it is plain HTTP, at any address; off loopback (127/8 and `::1` are loopback; `0.0.0.0` and `::` are not) the start prints one warning line, and a certificate and key are advised |
-| `--oci-tls-cert PATH`, `--oci-tls-key PATH` | both or neither (one without the other is refused at start, exit 2). The certificate chain (leaf first) and the private key, PEM. Clients dial an IP address, so the leaf must carry an IP subjectAltName for `--oci-listen` (any IP subjectAltName, if the address is `0.0.0.0` or `::`); a certificate without one, one that is expired or not yet valid, a key file any user can read (the "other" mode bits; a group may), or an unreadable file, is refused at start. The files are read once: a new certificate takes a restart, so renew it before it expires |
+| `--oci-listen ADDR` | where the registry front listens. With `--oci-tls-cert` and `--oci-tls-key` it is HTTPS; with neither it is plain HTTP, at any address; off loopback (127/8 and `::1` are loopback; `0.0.0.0` and `::` are not) the start prints one warning line, and a certificate and key are advised. On main, not in v0.0.41: give the flag again for each further address; one front, one limit on connections and one drain serve them all, and an address given twice is refused (exit 2); the start line shows them as `oci-listen=<a>,<b> (https)` or `(http)`, and a plain front prints one warning line for each address off loopback |
+| `--oci-tls-cert PATH`, `--oci-tls-key PATH` | both or neither (one without the other is refused at start, exit 2). The certificate chain (leaf first) and the private key, PEM. Clients dial an IP address, so the leaf must carry an IP subjectAltName for `--oci-listen` (for each of them, when it is given more than once; any IP subjectAltName, if the address is `0.0.0.0` or `::`); a certificate without one, one that is expired or not yet valid, a key file any user can read (the "other" mode bits; a group may), or an unreadable file, is refused at start. The files are read once: a new certificate takes a restart, so renew it before it expires |
 | `--oci-prefix PREFIX` | the key prefix, ending in `/`, `oci/` if not given. A prefix inside `_journal/` or `_tiering/`, or one that is not plain path segments, is refused at start (exit 2) |
 | `--oci-max-connections N` | connections open at once, 64 if not given; the others wait in the kernel's backlog. Memory is bounded by connections times the buffer a connection holds (up to 4 MiB), about 256 MiB at the default |
 | `--oci-connection-lifetime D` | the longest a connection lives, 1h if not given; a request being answered is finished first |
@@ -901,9 +964,16 @@ the operator's choice, and the shipped file does not make it.
 
 ## Stopping it
 
-systemd sends SIGTERM. The process answers `/readyz` 503, serves for `--drain-lb-wait` so that a
-load balancer sees it, refuses new requests, waits for those in flight for at most
-`--drain-deadline`, gives up the reconciler's lease and exits 0. `TimeoutStopSec=` is set above
+systemd sends SIGTERM. The process answers `/readyz` 503 and puts `Connection: close` on every
+answer from then on, serves for `--drain-lb-wait` (the settle) so that a load balancer sees it,
+stops accepting, and closes each idle connection with a lingering close (it shuts its end for
+writing, so that the client reads a clean end of stream, and reads until the client closes, for 60
+seconds at most). A request already on the wire is served, with `Connection: close`, never
+answered 503; one that arrives within a round trip of the end of the stream cannot be answered
+and is counted in `tierstore_drain_late_requests_total`. It waits for the requests in flight and
+the connections for at most `--drain-deadline`, gives up the reconciler's lease and exits 0. This
+is on main, not in v0.0.41, which answers a request on a connection that is open after the settle
+503 `ServiceUnavailable`. `TimeoutStopSec=` is set above
 the sum of the two flags and the lease's wait, so that systemd does not send SIGKILL to a drain
 in progress; if `--drain-deadline` is raised, raise it too. A start that fails is tried again
 after 30 seconds; exit status 2 (a command line the argument parser refused: an unknown flag, a

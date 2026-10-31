@@ -4,7 +4,7 @@ tierstore is an S3-compatible object store server that puts a small, fast tier i
 
 This guide is for the person who installs and runs it. It describes what is on the main branch of the source today. A piece that is planned and not in the code is described only under a heading titled "Not in a release yet", so you can tell the two apart.
 
-> Which release first carries what: the configuration file (`--config`, `--print-config`) came with v0.0.39; the OCI read front (`--oci-listen`) and the build node (`[local_cache]`, the read cache) with v0.0.40. `--check-config`, `local_cache.write_through` and the hot and cold counters on `/metricz` are on main and not in v0.0.40. The command-line flags of every other setting work in every release. The pages say where a setting needs a build of main.
+> Which release first carries what: the configuration file (`--config`, `--print-config`) came with v0.0.39; the OCI read front (`--oci-listen`) and the build node (`[local_cache]`, the read cache) with v0.0.40. `--check-config`, `local_cache.write_through` and the hot and cold counters on `/metricz` are on main and not in v0.0.40; the drain's `Connection: close` and lingering close, and `tierstore_drain_late_requests_total`, are on main and not in v0.0.41. The command-line flags of every other setting work in every release. The pages say where a setting needs a build of main.
 
 ## The shape of a deployment
 
@@ -30,7 +30,7 @@ A write goes to the hot tier and is acknowledged once a journal entry for it is 
 - A put is create-only: a key that exists in either tier is refused with 412 `PreconditionFailed`. Objects are immutable.
 - A put is acknowledged only after its journal entry is durable in the hot tier. Losing the hot tier loses objects that were not yet copied to the cold tier.
 - It asks each tier the questions these guarantees rest on before it starts (see "The start-up self-test" in [operations](operations.md)) and refuses to start on a store that answers one wrongly.
-- It does not scrub: nothing re-reads stored bytes to find rot. See [limits](limits.md).
+- It does not scrub a storage node's objects: nothing re-reads stored bytes to find rot. See [limits](limits.md).
 
 ## Where to go next
 

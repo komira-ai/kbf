@@ -17,6 +17,9 @@
 //! critical   = 95
 //! free_floor = 10
 //! max_concurrent_fills = 4
+//! max_concurrent_keeps = 8
+//! keep_wait            = "5s"
+//! keep_deadline        = "60s"
 //! write_through        = false  # true: take writes and send them to the upstream
 //!
 //! [cold_store]                  # the upstream: an S3 endpoint
@@ -35,7 +38,8 @@
 //!
 //! `write_through = true` makes the node take the writes its keys may do (create-only puts,
 //! multipart uploads, presigned puts, deletes) and send each to the upstream, which must then be
-//! written with a key that may write: the start tests the upstream's create-only and
+//! written with a key that may write, and keeps under a `cache = true` policy the objects it
+//! puts (`max_concurrent_keeps` of them copied at once): the start tests the upstream's create-only and
 //! multipart-conditional answers (see [`cache_cli`](super::cache_cli)). Left out or `false`, the
 //! node refuses every write with 403 and its upstream key may be a read-only one.
 //!
@@ -56,23 +60,26 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::cli::DEFAULT_OCI_PREFIX;
 use super::config::{
-    ConfigError, OciFlags, OciTable, PerRun, Policy, ServerTable, Size, TierParts, TierTable,
-    check_policies, front_of, invalid, oci as oci_of, parse_size, refuse, refuse_hot_keys, require,
-    tier, within,
+    ConfigError, Dur, OciFlags, OciTable, PerRun, Policy, ServerTable, Size, TierParts, TierTable,
+    check_policies, duration, front_of, invalid, oci as oci_of, parse_size, refuse,
+    refuse_hot_keys, require, tier, within,
 };
 use super::front::FrontSettings;
-use super::local_cache::CacheConfig;
+use super::local_cache::{CacheConfig, SCRUB_MIN_ROUND, SCRUB_RATE};
 
 /// The only layout of the cache directory.
 const LAYOUT: &str = "digest-v1";
 
-/// A rate in the file: a size and `/s`, such as `50MiB/s`.
+/// A rate in the file: a size and `/s`, such as `50MiB/s`, or `off` (which is 0 bytes a second).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Rate(pub u64);
 
 impl Serialize for Rate {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&format!("{}B/s", self.0))
+        match self.0 {
+            0 => serializer.serialize_str("off"),
+            bytes => serializer.serialize_str(&format!("{bytes}B/s")),
+        }
     }
 }
 
@@ -88,10 +95,13 @@ impl Visitor<'_> for RateVisitor {
     type Value = Rate;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a rate such as \"50MiB/s\"")
+        f.write_str("a rate such as \"50MiB/s\", or \"off\"")
     }
 
     fn visit_str<E: de::Error>(self, text: &str) -> Result<Rate, E> {
+        if text == "off" {
+            return Ok(Rate(0));
+        }
         let size = text.strip_suffix("/s").map(parse_size);
         match size {
             Some(Ok(bytes)) => Ok(Rate(bytes)),
@@ -126,6 +136,18 @@ pub(super) struct LocalCacheTable {
     /// The most fills that run at once (1 to 64, default 4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_fills: Option<u8>,
+    /// The most create-only puts that are copied into the cache at once (1 to 64, default 8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_keeps: Option<u8>,
+    /// The longest a put waits for its copy to be put in the cache once the upstream has the
+    /// object, such as `5s` (default `5s`, above 0). Past it the put is answered and the copy is
+    /// finished in the background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_wait: Option<Dur>,
+    /// The longest a keep runs in all before it is abandoned, such as `60s` (default `60s`,
+    /// above 0 and not below `keep_wait`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_deadline: Option<Dur>,
     /// Whether the node takes writes and sends them to the upstream (default `false`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_through: Option<bool>,
@@ -136,10 +158,14 @@ pub(super) struct LocalCacheTable {
     /// Whether the cache is on: `true`, the default. `false` is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<bool>,
-    /// The rate at which a scrubber would re-read the objects. Accepted; this release does not
-    /// scrub.
+    /// The rate at which the scrub re-reads the objects (`SCRUB_RATE`, 16 MiB/s, if not given);
+    /// `"off"` (or `"0B/s"`) turns the scrub off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrub_rate: Option<Rate>,
+    /// The least time between the starts of two rounds of the scrub (`SCRUB_MIN_ROUND`, one hour,
+    /// if not given); `"0s"` lets a round start as soon as the last is done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_min_round: Option<Dur>,
 }
 
 /// What a build-node file stands for.
@@ -153,10 +179,13 @@ pub(super) struct CacheSettings {
     pub upstream: TierParts,
     /// The cache.
     pub cache: CacheConfig,
-    /// The OCI front, as `[oci]` and the `--oci-*` flags make it: `listen` is `None` for none.
+    /// The OCI front, as `[oci]` and the `--oci-*` flags make it: `listen` is empty for none.
     pub oci: OciFlags,
-    /// The rate at which a scrubber would run, in bytes a second, if the file gave one.
+    /// The rate of the scrub in bytes a second: the default if the file gave none; none if the
+    /// file turned it off.
     pub scrub_rate: Option<u64>,
+    /// The least time between the starts of two rounds of the scrub.
+    pub scrub_min_round: Duration,
 }
 
 /// The `endpoint` of the upstream: `endpoint`, or the one entry of `endpoints`.
@@ -191,7 +220,7 @@ fn percent(key: &str, value: Option<u8>, default: u8, low: u8) -> Result<u8, Con
 /// the upstream; a registry that is meant to pass through is a storage node's front, or no
 /// cache, so there is no use of this to keep.
 fn check_oci_is_kept(oci: &OciFlags, policy: &[Policy]) -> Result<(), ConfigError> {
-    if oci.listen.is_none() {
+    if oci.listen.is_empty() {
         return Ok(());
     }
     let prefix = oci.prefix.as_deref().unwrap_or(DEFAULT_OCI_PREFIX);
@@ -287,7 +316,34 @@ impl CacheSettings {
             let fills = within("local_cache", "max_concurrent_fills", fills, 1, 64)?;
             cache.max_concurrent_fills = usize::from(fills);
         }
+        if let Some(keeps) = table.max_concurrent_keeps {
+            let keeps = within("local_cache", "max_concurrent_keeps", keeps, 1, 64)?;
+            cache.max_concurrent_keeps = usize::from(keeps);
+        }
+        if let Some(wait) = table.keep_wait {
+            if wait.0.is_zero() {
+                let why =
+                    "must be above 0; a short wait, such as 100ms, keeps the put from waiting";
+                return Err(invalid("local_cache.keep_wait", why));
+            }
+            cache.keep_wait = wait.0;
+        }
+        if let Some(deadline) = table.keep_deadline {
+            if deadline.0.is_zero() {
+                return Err(invalid("local_cache.keep_deadline", "must be above 0"));
+            }
+            cache.keep_deadline = deadline.0;
+        }
+        if cache.keep_deadline < cache.keep_wait {
+            let why = "must not be below keep_wait (the default is 60s: set both)";
+            return Err(invalid("local_cache.keep_deadline", why));
+        }
         cache.write_through = table.write_through.unwrap_or(false);
+        let scrub_min_round = duration(table.scrub_min_round, SCRUB_MIN_ROUND);
+        if !scrub_min_round.is_zero() && scrub_min_round < Duration::from_secs(1) {
+            let why = "must be at least 1s (the scrub ticks once a second), or 0s for no minimum";
+            return Err(invalid("local_cache.scrub_min_round", why));
+        }
         if let Some(limit) = table.whole_fill_limit {
             cache.whole_limit = within("local_cache", "whole_fill_limit", limit.0, 1, budget)?;
         }
@@ -297,8 +353,9 @@ impl CacheSettings {
             s3_request_timeout: shared.s3_request_timeout,
             upstream,
             cache,
+            scrub_min_round,
             oci,
-            scrub_rate: table.scrub_rate.map(|rate| rate.0),
+            scrub_rate: Some(table.scrub_rate.map_or(SCRUB_RATE, |rate| rate.0)).filter(|n| *n > 0),
         })
     }
 }
