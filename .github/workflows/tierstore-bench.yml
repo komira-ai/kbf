@@ -1,0 +1,72 @@
+# The tierstore-bench binary for Linux x86_64, built from a commit, as a workflow artifact to
+# download and run on a benchmark host (`gh run download`, then check the SHA-256 sums in the
+# job summary against the SHA256SUMS file inside).
+#
+# It runs by hand (`ref` names the branch, tag or commit to build; empty builds the ref the
+# workflow was dispatched on) and on a pull request that changes this file, so the pull
+# request proves the workflow builds. Nothing is attested here, as in vmm-probe.yml: the
+# artifact is a build of the commit, not a signed release asset.
+name: tierstore-bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit to build (empty means the ref this workflow is dispatched on)"
+        required: false
+        default: ""
+        type: string
+  pull_request:
+    paths:
+      - .github/workflows/tierstore-bench.yml
+
+permissions: {}
+
+concurrency:
+  group: tierstore-bench-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+      - run: rustup toolchain install
+      - run: cargo build --locked --release -p tierstore-bench
+      - name: The binary starts
+        run: target/release/tierstore-bench --help
+      # The commit built (a pull request builds its merge commit, a dispatch the commit `ref` names).
+      - name: Name the artifact after the commit
+        run: echo "NAME=tierstore-bench-${{ steps.checkout.outputs.commit }}-linux-x86_64" >> "$GITHUB_ENV"
+      - run: mkdir "dist"
+      - run: cp target/release/tierstore-bench dist/tierstore-bench
+      - name: Tar the binary (a tar keeps the executable bit)
+        run: tar -C dist -czf "dist/$NAME.tar.gz" tierstore-bench
+      - name: Sum the binary and the tarball
+        working-directory: dist
+        run: sha256sum tierstore-bench "$NAME.tar.gz" > SHA256SUMS
+      - name: Print the sums in the job log
+        run: cat dist/SHA256SUMS
+      - name: Print the sums in the job summary
+        run: cat dist/SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.NAME }}
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error

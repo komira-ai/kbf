@@ -5,7 +5,6 @@ use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::future::Future;
 use std::io;
-use std::os::unix::fs::FileExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -13,11 +12,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
-use bytes::Bytes;
 use futures::FutureExt as _;
 use futures::future::{BoxFuture, OptionFuture, Shared};
 use sha2::{Digest, Sha256};
 use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -82,6 +81,17 @@ pub(super) struct Pending {
     pub(super) live: watch::Receiver<Live>,
 }
 
+impl Pending {
+    /// A fill that is over already, with no object and no progress: what a keep leaves in the table
+    /// of the fills that run (see `keep.rs`). A reader that finds it is answered from the upstream.
+    pub(super) fn finished(filled: Filled) -> Self {
+        let done = futures::future::ready(Ok(filled)).boxed().shared();
+        // The sender is dropped at once: nothing is ever written.
+        let (_, live) = watch::channel(Live::Starting);
+        Self { done, live }
+    }
+}
+
 impl Future for Pending {
     type Output = Result<Filled, Error>;
 
@@ -124,13 +134,9 @@ impl From<Error> for Stop {
 }
 
 /// A file of the stage directory, removed when it is dropped, and counted while it exists.
-struct Staged {
+pub(super) struct Staged {
     inner: Arc<Inner>,
-    /// The one descriptor of the file: the fill writes it at an offset and the readers read it at
-    /// an offset, so a fill needs no second descriptor however many readers it has.
-    file: Arc<File>,
-    /// The bytes written.
-    written: u64,
+    pub(super) file: tokio::fs::File,
     path: PathBuf,
     /// Where the sidecar is written before it is renamed into place.
     sidecar: PathBuf,
@@ -139,13 +145,12 @@ struct Staged {
 impl Staged {
     /// A new file, read-only for everyone once it is made (mode 0444: the descriptor that made
     /// it can still write).
-    async fn create(inner: &Arc<Inner>) -> io::Result<Self> {
+    pub(super) async fn create(inner: &Arc<Inner>) -> io::Result<Self> {
         let number = inner.staged.fetch_add(1, Ordering::Relaxed);
         let path = stage_dir(&inner.config.path).join(format!("{number:016x}"));
         let sidecar = stage_dir(&inner.config.path).join(format!("{number:016x}.meta"));
         let mut options = OpenOptions::new();
         let file = options
-            .read(true)
             .write(true)
             .create_new(true)
             .mode(0o444)
@@ -154,34 +159,20 @@ impl Staged {
         // The mode given to `open` is cut by the umask: set it, so that it is 0444 for any.
         file.set_permissions(std::fs::Permissions::from_mode(0o444))
             .await?;
-        let file = Arc::new(file.into_std().await);
         let _ = inner.counters.staging_files.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             inner: Arc::clone(inner),
             file,
-            written: 0,
             path,
             sidecar,
         })
     }
 
-    /// Appends `chunk`, on a thread that may block. The bytes are in the file for a reader of it
-    /// (a write at an offset, seen by a read at an offset) once this returns.
-    async fn append(&mut self, chunk: Bytes) -> io::Result<()> {
-        let (file, at) = (Arc::clone(&self.file), self.written);
-        let len = chunk.len() as u64;
-        let writing = tokio::task::spawn_blocking(move || file.write_all_at(&chunk, at));
-        writing.await.expect("a write does not panic")?;
-        self.written += len;
-        Ok(())
-    }
-
     /// Writes the end of the file to the disk, so that a name linked to it is whole after a
     /// crash.
-    async fn finish(&mut self) -> io::Result<()> {
-        let file = Arc::clone(&self.file);
-        let syncing = tokio::task::spawn_blocking(move || file.sync_data());
-        syncing.await.expect("a sync does not panic")
+    pub(super) async fn finish(&mut self) -> io::Result<()> {
+        self.file.flush().await?;
+        self.file.sync_data().await
     }
 }
 
@@ -243,9 +234,9 @@ impl Drop for Reserved {
 
 /// A fill's place in the table of the fills that run: taken out when it is dropped, whether the
 /// fill ended, panicked or was cancelled, so that no key stays marked as being filled.
-struct Flight {
-    inner: Arc<Inner>,
-    hex: String,
+pub(super) struct Flight {
+    pub(super) inner: Arc<Inner>,
+    pub(super) hex: String,
 }
 
 impl Drop for Flight {
@@ -440,7 +431,10 @@ impl Inner {
         let mut staged = Staged::create(self).await?;
         let mut hasher = Sha256::new();
         let mut offset = 0;
-        let (about, file) = (meta.clone(), Arc::clone(&staged.file));
+        // The readers read the staged file through a descriptor of its own, opened for the fills only
+        // (a keep has no readers).
+        let reader = Arc::new(tokio::fs::File::open(&staged.path).await?.into_std().await);
+        let (about, file) = (meta.clone(), reader);
         let progress = |written| Live::Staging {
             meta: about.clone(),
             file: Arc::clone(&file),
@@ -455,7 +449,9 @@ impl Inner {
                 return Err(Stop::Short);
             }
             hasher.update(&chunk);
-            staged.append(chunk).await?;
+            staged.file.write_all(&chunk).await?;
+            // The bytes are in the file for a reader of it once they are flushed.
+            staged.file.flush().await?;
             offset += want;
             let _ = live.send_replace(progress(offset));
         }
@@ -504,19 +500,30 @@ impl Inner {
         name: &Name,
         sidecar: &Sidecar,
     ) -> io::Result<bool> {
+        let publishing = self.begin_commit(staged, name, sidecar);
+        publishing.await.expect("a publish does not panic")
+    }
+
+    /// Starts the link of the staged file into the cache on a thread that may block, and gives
+    /// the handle of the job, which goes on when the handle is dropped.
+    pub(super) fn begin_commit(
+        self: &Arc<Self>,
+        staged: &Staged,
+        name: &Name,
+        sidecar: &Sidecar,
+    ) -> JoinHandle<io::Result<bool>> {
         let disk = Arc::clone(&self.disk);
         let root = self.config.path.clone();
         let hex = name.hex.clone();
         let (from, temporary) = (staged.path.clone(), staged.sidecar.clone());
         let text = serde_json::to_vec(sidecar).unwrap_or_default();
-        let publishing = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             publish(&*disk, &root, &hex, (&from, &temporary), &text)
-        });
-        publishing.await.expect("a publish does not panic")
+        })
     }
 
     /// Runs a pass of the eviction if the cache is above its high water mark.
-    async fn relieve(self: &Arc<Self>) {
+    pub(super) async fn relieve(self: &Arc<Self>) {
         let held = locked(&self.index).bytes();
         if held > percent_of(self.config.budget, self.config.high_water) {
             let inner = Arc::clone(self);

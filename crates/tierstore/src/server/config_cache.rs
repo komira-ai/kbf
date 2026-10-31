@@ -17,6 +17,9 @@
 //! critical   = 95
 //! free_floor = 10
 //! max_concurrent_fills = 4
+//! max_concurrent_keeps = 8
+//! keep_wait            = "5s"
+//! keep_deadline        = "60s"
 //! write_through        = false  # true: take writes and send them to the upstream
 //!
 //! [cold_store]                  # the upstream: an S3 endpoint
@@ -25,6 +28,9 @@
 //! endpoint         = "http://192.0.2.20:9300"
 //! credentials_file = "/etc/tierstore-cache/upstream-read.key"
 //!
+//! [oci]                         # optional: the registry front, served from the cache
+//! listen = "127.0.0.1:5000"
+//!
 //! [[policy]]
 //! prefix = "cas/b/"
 //! cache  = true
@@ -32,16 +38,19 @@
 //!
 //! `write_through = true` makes the node take the writes its keys may do (create-only puts,
 //! multipart uploads, presigned puts, deletes) and send each to the upstream, which must then be
-//! written with a key that may write: the start tests the upstream's create-only and
+//! written with a key that may write, and keeps under a `cache = true` policy the objects it
+//! puts (`max_concurrent_keeps` of them copied at once): the start tests the upstream's create-only and
 //! multipart-conditional answers (see [`cache_cli`](super::cache_cli)). Left out or `false`, the
 //! node refuses every write with 403 and its upstream key may be a read-only one.
 //!
-//! The file is read into a [`CacheSettings`]. It has no flag form. What it refuses, besides what
+//! The file is read into a [`CacheSettings`]. It has no flag form. The `[oci]` table is the
+//! storage node's, with its rules (see [`config`](super::config)). What it refuses, besides what
 //! every file does: a `[hot_store]` along with `[local_cache]`, a layout that is not `digest-v1`,
 //! `cache = false`, marks out of order, no `[[policy]]` with `cache = true`, a list of more than
 //! one `endpoints` in `[cold_store]` (the cache reads from one upstream), and the keys of the
 //! storage node that do nothing here: `skip_checks`, the reconciler's keys and
-//! `backend_check_wait`.
+//! `backend_check_wait`. With an `[oci]` table it also refuses a front whose blobs (the keys under
+//! `<prefix>blobs/sha256/`) no `[[policy]]` with `cache = true` keeps.
 
 use std::fmt;
 use std::time::Duration;
@@ -49,9 +58,11 @@ use std::time::Duration;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use super::cli::DEFAULT_OCI_PREFIX;
 use super::config::{
-    ConfigError, PerRun, Policy, ServerTable, Size, TierParts, TierTable, check_policies, front_of,
-    invalid, parse_size, refuse, refuse_hot_keys, require, tier, within,
+    ConfigError, Dur, OciFlags, OciTable, PerRun, Policy, ServerTable, Size, TierParts, TierTable,
+    check_policies, front_of, invalid, oci as oci_of, parse_size, refuse, refuse_hot_keys, require,
+    tier, within,
 };
 use super::front::FrontSettings;
 use super::local_cache::CacheConfig;
@@ -119,9 +130,25 @@ pub(super) struct LocalCacheTable {
     /// The most fills that run at once (1 to 64, default 4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_fills: Option<u8>,
+    /// The most create-only puts that are copied into the cache at once (1 to 64, default 8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_keeps: Option<u8>,
+    /// The longest a put waits for its copy to be put in the cache once the upstream has the
+    /// object, such as `5s` (default `5s`, above 0). Past it the put is answered and the copy is
+    /// finished in the background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_wait: Option<Dur>,
+    /// The longest a keep runs in all before it is abandoned, such as `60s` (default `60s`,
+    /// above 0 and not below `keep_wait`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_deadline: Option<Dur>,
     /// Whether the node takes writes and sends them to the upstream (default `false`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_through: Option<bool>,
+    /// The most an object may be for a ranged read of it to fill the whole of it (1 byte up to
+    /// the budget, default 64 MiB). A larger object is passed through and kept nowhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whole_fill_limit: Option<Size>,
     /// Whether the cache is on: `true`, the default. `false` is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<bool>,
@@ -142,6 +169,8 @@ pub(super) struct CacheSettings {
     pub upstream: TierParts,
     /// The cache.
     pub cache: CacheConfig,
+    /// The OCI front, as `[oci]` and the `--oci-*` flags make it: `listen` is `None` for none.
+    pub oci: OciFlags,
     /// The rate at which a scrubber would run, in bytes a second, if the file gave one.
     pub scrub_rate: Option<u64>,
 }
@@ -172,11 +201,45 @@ fn percent(key: &str, value: Option<u8>, default: u8, low: u8) -> Result<u8, Con
     within("local_cache", key, value.unwrap_or(default), low, 100)
 }
 
+/// Refuses an `[oci]` front whose blobs the cache would not keep: the keys it reads, under
+/// `<prefix>blobs/sha256/`, must be held by the longest `[[policy]]` prefix that covers them with
+/// `cache = true`. A front over a cache that keeps none of what it serves is every pull going to
+/// the upstream; a registry that is meant to pass through is a storage node's front, or no
+/// cache, so there is no use of this to keep.
+fn check_oci_is_kept(oci: &OciFlags, policy: &[Policy]) -> Result<(), ConfigError> {
+    if oci.listen.is_none() {
+        return Ok(());
+    }
+    let prefix = oci.prefix.as_deref().unwrap_or(DEFAULT_OCI_PREFIX);
+    let probe = format!("{prefix}blobs/sha256/");
+    let holding = policy
+        .iter()
+        .filter(|policy| probe.starts_with(policy.prefix.as_str()));
+    let longest = holding.max_by_key(|policy| policy.prefix.len());
+    match longest {
+        Some(policy) if policy.cache => Ok(()),
+        Some(policy) => {
+            let why = format!(
+                "the blobs under {probe:?} are covered by the [[policy]] with prefix {:?}, which has cache = false, so every pull would go to the upstream; give a [[policy]] with prefix = {prefix:?} and cache = true",
+                policy.prefix
+            );
+            Err(invalid("oci.prefix", why))
+        }
+        None => {
+            let why = format!(
+                "no [[policy]] covers the blobs under {probe:?}, so every pull would go to the upstream; give a [[policy]] with prefix = {prefix:?} and cache = true"
+            );
+            Err(invalid("oci.prefix", why))
+        }
+    }
+}
+
 impl CacheSettings {
     /// The settings of the tables of a build-node file.
     pub(super) fn new(
         server: ServerTable,
         tables: (LocalCacheTable, TierTable),
+        oci_table: Option<OciTable>,
         policy: &[Policy],
         per_run: PerRun,
     ) -> Result<Self, ConfigError> {
@@ -225,6 +288,7 @@ impl CacheSettings {
                 "must not be above critical",
             ));
         }
+        let oci = oci_of(oci_table)?;
         let shared = front_of(server, per_run)?;
         let policies = policy
             .iter()
@@ -239,12 +303,39 @@ impl CacheSettings {
             let fills = within("local_cache", "max_concurrent_fills", fills, 1, 64)?;
             cache.max_concurrent_fills = usize::from(fills);
         }
+        if let Some(keeps) = table.max_concurrent_keeps {
+            let keeps = within("local_cache", "max_concurrent_keeps", keeps, 1, 64)?;
+            cache.max_concurrent_keeps = usize::from(keeps);
+        }
+        if let Some(wait) = table.keep_wait {
+            if wait.0.is_zero() {
+                let why =
+                    "must be above 0; a short wait, such as 100ms, keeps the put from waiting";
+                return Err(invalid("local_cache.keep_wait", why));
+            }
+            cache.keep_wait = wait.0;
+        }
+        if let Some(deadline) = table.keep_deadline {
+            if deadline.0.is_zero() {
+                return Err(invalid("local_cache.keep_deadline", "must be above 0"));
+            }
+            cache.keep_deadline = deadline.0;
+        }
+        if cache.keep_deadline < cache.keep_wait {
+            let why = "must not be below keep_wait (the default is 60s: set both)";
+            return Err(invalid("local_cache.keep_deadline", why));
+        }
         cache.write_through = table.write_through.unwrap_or(false);
+        if let Some(limit) = table.whole_fill_limit {
+            cache.whole_limit = within("local_cache", "whole_fill_limit", limit.0, 1, budget)?;
+        }
+        check_oci_is_kept(&oci, policy)?;
         Ok(Self {
             front: shared.front,
             s3_request_timeout: shared.s3_request_timeout,
             upstream,
             cache,
+            oci,
             scrub_rate: table.scrub_rate.map(|rate| rate.0),
         })
     }

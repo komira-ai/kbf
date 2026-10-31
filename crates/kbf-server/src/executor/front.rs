@@ -197,6 +197,11 @@ impl Front {
     /// As [`Front::new`], reading the time from `now`.
     #[must_use]
     pub fn with_clock(parts: FrontParts, now: fn() -> SystemTime) -> Self {
+        // The ingest judges the age of a key by the clock the keys are minted by.
+        let parts = FrontParts {
+            packs: parts.packs.with_clock(Arc::new(now)),
+            ..parts
+        };
         Self {
             parts,
             now,
@@ -331,6 +336,8 @@ fn reason(why: kbf_front::RejectReason) -> RejectReason {
         Front::HashMismatch => RejectReason::HashMismatch,
         Front::BadManifest => RejectReason::BadManifest,
         Front::Incomplete => RejectReason::Incomplete,
+        Front::Expired => RejectReason::Expired,
+        Front::Claimed => RejectReason::Claimed,
     }
 }
 

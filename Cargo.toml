@@ -67,6 +67,9 @@ http-body = "1.1.0"
 # The registry client of kbf-image reads response bodies frame by frame. Already in the tree
 # through axum and tonic.
 http-body-util = "0.1.5"
+# HTTP-date text of `Date` and `Last-Modified` (tierstore-bench's fault proxy). Already in the
+# tree through hyper.
+httpdate = "1.0.3"
 # `wait4` and `kill` for a measured child process (kbf-daemon's `usage` module); the
 # standard library reaps children without returning their resource usage.
 libc = "0.2.190"
@@ -256,6 +259,7 @@ kbf-proxy = { path = "crates/kbf-proxy" }
 kbf-raft = { path = "crates/kbf-raft" }
 kbf-route = { path = "crates/kbf-route" }
 kbf-sched = { path = "crates/kbf-sched" }
+kbf-seatbelt = { path = "crates/kbf-seatbelt" }
 kbf-segments = { path = "crates/kbf-segments" }
 kbf-server = { path = "crates/kbf-server" }
 kbf-setup = { path = "crates/kbf-setup" }
@@ -279,6 +283,9 @@ kbf-unitfile = { path = "crates/kbf-unitfile" }
 kbf-update = { path = "crates/kbf-update" }
 kbf-updater = { path = "crates/kbf-updater" }
 kbf-usage = { path = "crates/kbf-usage" }
+# The object store trait and the S3 client, with no dependency on another workspace crate
+# (kbf-integration-test keeps it so); kbf-objstore re-exports it.
+objstore-s3 = { path = "crates/objstore-s3" }
 # The hot/cold object store library; it depends on no kbf crate unless its `s3` feature is on
 # (kbf-integration-test keeps it so).
 tierstore = { path = "crates/tierstore" }

@@ -149,7 +149,7 @@ them if none is, as after a crash. Nothing asks for a host meanwhile. A restart 
 stopping it stops the runs and releases the leases. The executor prepares each run with the
 frontend's **task runs** (below) and its job-facing read listener (`--job-listen`), so
 `--executor js-agent` is refused when the flags are read unless `--task-secret-file` (with the
-four flags it needs), `--job-listen` (with its three) and `--pack-store-endpoint` are given, and
+four flags it needs), `--job-listen` (with its companions) and `--pack-store-endpoint` are given, and
 unless they agree with it: the tier store and the read url must be IP addresses (the job network
 has no DNS); `--task-put-bucket` must be `--pack-store-bucket`, the bucket the pack is read
 from; an `http://` `--task-put-endpoint` needs `--executor-allow-plain-http-put` (with an
@@ -249,6 +249,42 @@ and readable by it alone; the pack-key mint and the grant key are made from it, 
 job-facing listener must verify grants with the same secret. No secret is a flag. Left out, no
 secret file is read and the frontend serves exactly as before.
 
+**The `cas/b/` janitor** (off by default; the `[task-runs]` table of `kbf.toml`). The packs and
+large objects tasks write under `cas/b/` are not all kept: a refused run, a run that failed after
+its write, the unused keys of a key set, and a large object the ingest has already copied into the
+CAS leave keys nothing refers to. With `--task-janitor-key-file` the leader (the server that holds
+the scheduler role) lists `cas/b/` every `--task-janitor-interval-secs` (default 900) and deletes
+a key that is older than `--task-janitor-grace-secs` (default 21600, which is also the least: the
+18000 seconds at which an ingest refuses a key, the 4 hours a presigned write is good for and an
+hour for the ingest, and an hour more as a margin between frontends), is not one an ingest is verifying
+right now, and is not recorded in the pack index (asked again for that key just before the
+delete; a pack the ingest recorded stays where it lies and is never deleted). The age is the
+minute in the key's own name, for a pack (`-<k>`) and a large object (`-L<i>`) alike; a key under
+`cas/b/` whose name does not parse is kept and counted. It never lists or deletes under `cas/l/`
+(content-bound large objects), `cas/f/<writer>/` (frontend packs) or `cas/d/` (daemon packs). The
+key file is the JSON of the tier store's GC key (`--gc-key-file` there), whose prefix must be
+exactly `cas/b/`, owned by the server's user, mode 0600 or 0400; it signs the janitor's requests to
+the store of `--pack-store-endpoint` (same endpoint, bucket and region), which the janitor needs,
+as it needs `--task-secret-file` and `--pack-index`. A sweep lists `--task-janitor-page-size`
+(default 500) keys at a time and waits `--task-janitor-page-pause-ms` (default 1000) after each
+page, which bounds how fast it lists and deletes. `--task-janitor-dry-run` counts and logs what a
+sweep would delete and deletes nothing. A key the janitor is about to delete is claimed in the
+registry the ingests hold their keys in, after the pack index's last answer and through the delete,
+and a claim and a hold on one key exclude each other: an ingest that has begun makes the janitor
+keep the key, and one that begins after the claim is refused (`claimed`) before it reads anything.
+An ingest also refuses a key 18000 s old (`expired`), so a key seen as ended only after a long
+outage is never committed. Holds and claims are per process: across frontends (clocks that differ,
+or a fenced old leader still ingesting while the new leader sweeps) a key is safe by the age rule
+alone, and its margin is the grace less 18000 s, an hour at least. The leadership is asked before each page and each delete,
+and a sweep that finds it lost stops (`..._abandoned_total`). A 401 or 403 on a delete ends the
+sweep at that key, and so do 5 deletes failing in a row; each is one `..._sweep_errors_total` and one log
+line. `GET /metrics` has `kbf_cas_b_janitor_listed_total`,
+`..._reaped_total`, `..._kept_young_total`, `..._kept_verifying_total`,
+`..._kept_referenced_total`, `..._kept_unparsed_total`, `..._kept_outside_total`,
+`..._would_reap_total`, `..._reap_errors_total` (deletes the store refused, retried by the next
+sweep), `..._sweeps_total` and `..._sweep_errors_total` (sweeps the listing or the pack index
+stopped).
+
 A daemon writes its outputs into packs with `--pack-write` (off by default; the `[packs]`
 table of `kbf.toml`), which needs `--pack-read` and `--pack-store-write-credentials-file`, a
 key pair file of the same form as `--pack-store-credentials-file` but of a key that may
@@ -300,10 +336,10 @@ that runs an action on a worker fetches the action's input files from the fronte
 grant (a token the frontend gives the run, valid until its expiry, for one Action: it reads that
 Action, its Command and its input tree, and no other blob). The task is untrusted code that holds
 no client certificate, so the REAPI listener is not open to it; `--job-listen <addr>` opens
-another, over HTTPS, that serves `GET /<hex>/<size>` and `POST /batch` (below) with
+another, over HTTPS (or plain HTTP, below), that serves `GET /<hex>/<size>` and `POST /batch` (below) with
 `Authorization: Bearer <read grant>` and nothing else (any other path is 404, any other method
-405). It needs three more flags, all four
-given together, and takes two more that have defaults:
+405). It needs the secret and a transport (a certificate and key, or `--job-plain-http`), and takes
+two more flags that have defaults:
 
 - `--job-tls-cert` and `--job-tls-key`: the certificate chain and key of the listener (PEM), issued
   by the farm CA that the task is told to trust. The TLS is the server's alone: no client
@@ -315,6 +351,18 @@ given together, and takes two more that have defaults:
   certificate does not name it; on `0.0.0.0` or `::` it needs some IP name. The files are read
   again every `--tls-reload-interval-secs` like the other listeners' (the names are checked at
   start only).
+- `--job-plain-http`, in place of the two: serves the same listener in plain HTTP, with no TLS,
+  for a farm on its own network: TLS is optional on a trusted job network, and a read grant is a
+  bearer token, so whoever can read that network can use a grant until it expires. It serves the same
+  routes and the same bounds, and every request still needs a valid read grant, checked as over
+  TLS; what changes is that the grant and the blobs cross the network unencrypted. Given with `--job-tls-cert` or
+  `--job-tls-key` it is refused when the flags are read (which of the two to serve is not a
+  guess to make); there are no IP-name checks and no TLS reload series in this mode. The
+  executor must agree, and `--executor js-agent` refuses at the flags when it does not:
+  `--task-read-url` is `http://host:port` with `--executor-allow-plain-http-grant` (the
+  executor then gives the task tool its `--allow-plain-http-grant`), and an `https://` read url
+  goes with a TLS listener. The other two pairs, `http://` against TLS and `https://` against
+  plain, are refused, since every read would fail.
 - `--job-grant-secret-file`: the farm secret the grants are signed with (at least 32 bytes, mode
   0600 or 0400, owned by the server's user; surrounding whitespace is dropped). Every frontend
   of the farm, and whatever issues the grants, reads the same secret, so a grant is verified by

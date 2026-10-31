@@ -1002,3 +1002,39 @@ mod multipack;
 
 #[path = "http_sink_tests.rs"]
 mod http_sink;
+
+/// A source that says how it read.
+struct Reporting {
+    mem: Mem,
+    reported: std::sync::atomic::AtomicBool,
+}
+
+impl BlobSource for Reporting {
+    fn get(&self, digest: &Digest) -> Result<Vec<u8>, FetchError> {
+        self.mem.get(digest)
+    }
+
+    fn report(&self) -> Option<String> {
+        self.reported
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Some("inputs read: test".to_owned())
+    }
+}
+
+/// Catches a source's report being dropped: once the inputs are fetched the task asks the source
+/// how it read, and the run goes on to succeed.
+#[tokio::test]
+async fn a_sources_report_is_asked_for_once_the_inputs_are_fetched() {
+    let mut mem = Mem::default();
+    let digest = action(&mut mem, COPY, &["out"]);
+    let source = Reporting {
+        mem,
+        reported: std::sync::atomic::AtomicBool::new(false),
+    };
+    let dir = scratch("report");
+    let cli = cli(&dir, digest);
+    execute(&cli, &source, &Fake::new(false))
+        .await
+        .expect("task");
+    assert!(source.reported.load(std::sync::atomic::Ordering::SeqCst));
+}
