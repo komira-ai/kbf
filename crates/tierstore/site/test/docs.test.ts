@@ -44,9 +44,9 @@ test('the guide is read in its order, and a page the site has not heard of follo
   const order = loadDocs(DOCS).map((d) => d.stem);
   assert.deepEqual(order.slice(0, 3), ['overview', 'install', 'keys']);
   const dir = copyDocs('docs-order');
-  writeFileSync(join(dir, 'aaa.md'), '# A page\n\nText.\n');
+  writeFileSync(join(dir, 'zzz.md'), '# A page\n\nText.\n');
   const after = loadDocs(dir).map((d) => d.stem);
-  assert.equal(after[after.length - 1], 'aaa');
+  assert.equal(after[after.length - 1], 'zzz');
 });
 
 test('a page added to docs/ is built, and a change to the guide changes its page', () => {
