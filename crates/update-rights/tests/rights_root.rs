@@ -673,7 +673,11 @@ fn probe_2_mask_runtime_then_stop_an_active_instance_through_polkit() {
         "/usr/bin/journalctl",
         &["--no-pager", "-u", "polkit.service", "--since", "-10min"],
     );
-    record("probe-2-facts", &format!("{facts}\n{pkcheck}\n{log}"));
+    let rule_text = fs::read_to_string(&rule).unwrap_or_default();
+    record(
+        "probe-2-facts",
+        &format!("{facts}\n{pkcheck}\nrule:\n{rule_text}\n{log}"),
+    );
     assert_eq!(refused_stop.outcome, Outcome::Failure, "{facts}");
     assert_eq!(b_state, "active", "{facts}");
     assert_eq!(stranger_stop.outcome, Outcome::Failure, "{facts}");
