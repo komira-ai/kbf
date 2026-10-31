@@ -649,6 +649,59 @@ fn kbfs_former_name_is_accepted_for_kbfs_channel_only() {
     assert_eq!(flag_value(&spawn_args(&rig, 0), "--repo"), OTHER_REPO);
 }
 
+/// The `tierstore` asset of a channel for komira-ai/tierstore is attested against tierstore's
+/// artifacts workflow, then kbf's two (a rollback to the last release kbf shipped), each named
+/// whole in one `gh` call; a channel for another asset of the same repository is asked for its
+/// own pair only.
+#[test]
+fn the_tierstore_asset_is_attested_by_tierstore_then_kbf_and_no_other_asset_is() {
+    const TIERSTORE: &str = "komira-ai/tierstore";
+    const WORKFLOW: &str = "komira-ai/tierstore/.github/workflows/artifacts.yml";
+    for (prefix, expected) in [
+        (
+            "tierstore",
+            vec![
+                (TIERSTORE, WORKFLOW),
+                (
+                    "komira-ai/kbf",
+                    "komira-ai/kbf/.github/workflows/artifacts.yml",
+                ),
+                (
+                    "komira-ai/komira-build-farm",
+                    "komira-ai/komira-build-farm/.github/workflows/artifacts.yml",
+                ),
+            ],
+        ),
+        ("kbf", vec![(TIERSTORE, WORKFLOW)]),
+    ] {
+        let rig = Rig::new("tierstore-signers");
+        put(
+            &rig.dir.join("releases.toml"),
+            format!(
+                "trusted_workflows = [\"{WORKFLOW}\"]\n[channels.stable]\nsource = \"github\"\nrepository = \"{TIERSTORE}\"\nsigner_workflow = \"{WORKFLOW}\"\nartifact_prefix = \"{prefix}\"\n"
+            ),
+        );
+        rig.offer_as(prefix, COMMIT, &tar_gz(&[file("kbf", &binary("b"))]));
+        *rig.gh_exit.borrow_mut() = 1;
+        let fault = rig.stage().unwrap_err();
+        assert!(refused(Code::VerifyFailed)(&fault), "{prefix}: {fault:?}");
+        let asked: Vec<(String, String)> = (0..rig.installer.borrow().len())
+            .map(|i| {
+                let args = spawn_args(&rig, i);
+                (
+                    flag_value(&args, "--repo"),
+                    flag_value(&args, "--signer-workflow"),
+                )
+            })
+            .collect();
+        let expected: Vec<(String, String)> = expected
+            .into_iter()
+            .map(|(r, w)| (r.to_owned(), w.to_owned()))
+            .collect();
+        assert_eq!(asked, expected, "{prefix}");
+    }
+}
+
 /// A repository or workflow that is not safe is refused as `config_invalid` before anything
 /// runs, and so is a prefix on a channel whose file names are fixed.
 #[test]
