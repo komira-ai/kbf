@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use update_hook::{
-    Context, Invocation, Next, Outcome, PREVIOUS_RELEASE_KEY, PREVIOUS_VERSION_KEY, Params, Phase,
+    ARTIFACT_DIGEST_KEY, Context, Invocation, Next, Outcome, PREVIOUS_RELEASE_KEY, PREVIOUS_VERSION_KEY, Params, Phase,
     Report, STAGED_RELEASE_KEY, Scalar, Step, TARGET_VERSION_KEY, Verdict, next,
 };
 
@@ -269,6 +269,10 @@ impl StepRunner {
         let text = |s: &str| Scalar::Text(s.to_owned());
         params.insert(STAGED_RELEASE_KEY, text(staged));
         params.insert(TARGET_VERSION_KEY, text(&order.target_version));
+        params.insert(
+            ARTIFACT_DIGEST_KEY,
+            text(&format!("sha256:{}", order.staged.digest)),
+        );
         if let Some(previous) = previous {
             params.insert(PREVIOUS_RELEASE_KEY, text(previous));
         }

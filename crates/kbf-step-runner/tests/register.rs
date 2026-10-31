@@ -276,8 +276,7 @@ fn a_registration_is_kept_across_a_restart_until_its_ttl() {
         &client,
         &registration("2.0.0", Some(("127.0.0.1:9301", "/ready"))),
     );
-    drop(client);
-    served.join().unwrap().unwrap();
+    // The service is connected while the updater restarts.
 
     let state = rig.scratch.path().join("state");
     let after = Arc::new(Registry::load(&state, rig.clock.clone()).unwrap());
@@ -301,6 +300,8 @@ fn a_registration_is_kept_across_a_restart_until_its_ttl() {
         )
         .unwrap();
     assert_eq!(after.report("svc", Some("2.0.0")), Reported::Healthy);
+    drop(client);
+    served.join().unwrap().unwrap();
 }
 
 /// Catches a registry file that is read as empty when it is damaged or unreadable.

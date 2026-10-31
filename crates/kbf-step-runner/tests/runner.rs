@@ -1025,11 +1025,8 @@ fn every_steps_params_file_names_the_verified_artifact() {
         };
         let params = Params::parse(&params).unwrap();
         assert_eq!(
-            params.get("updater.artifact_digest"),
-            Some(&update_hook::Scalar::Text(format!(
-                "sha256:{}",
-                order.staged.digest
-            )))
+            params.artifact_digest().unwrap(),
+            Some(format!("sha256:{}", order.staged.digest).as_str())
         );
     }
 }
