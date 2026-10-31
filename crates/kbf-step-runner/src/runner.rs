@@ -209,6 +209,10 @@ impl StepRunner {
         {
             return Err(RunError::BadOrder("the service name"));
         }
+        let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+        if order.artifact_digest.len() != 64 || !order.artifact_digest.bytes().all(hex) {
+            return Err(RunError::BadOrder("the artifact digest"));
+        }
         if order
             .min_updater_protocol
             .is_some_and(|needed| needed > UPDATER_PROTOCOL)
@@ -276,7 +280,7 @@ impl StepRunner {
         params.insert(TARGET_VERSION_KEY, text(&order.target_version));
         params.insert(
             ARTIFACT_DIGEST_KEY,
-            text(&format!("sha256:{}", order.staged.digest)),
+            text(&format!("sha256:{}", order.artifact_digest)),
         );
         if let Some(previous) = previous {
             params.insert(PREVIOUS_RELEASE_KEY, text(previous));
