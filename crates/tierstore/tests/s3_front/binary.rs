@@ -205,11 +205,8 @@ fn the_flags_are_parsed_and_refused_as_the_usage_says() {
     }
     let (code, out, _) = run(&["--version".to_owned()]);
     assert_eq!(code, 0);
-    let version = format!(
-        "tierstore {} (commit {})",
-        env!("CARGO_PKG_VERSION"),
-        COMMIT
-    );
+    // The form the release check reads: the name, the package version, `+`, the commit.
+    let version = format!("tierstore {}+{COMMIT}", env!("CARGO_PKG_VERSION"));
     assert_eq!(out.trim_end(), version);
     let (code, _, err) = run(&[]);
     assert_eq!(code, 2);
@@ -258,6 +255,30 @@ fn capabilities_with_another_flag_is_refused_naming_it() {
         );
         assert!(err.contains(other[0]), "{other:?}: {err}");
     }
+}
+
+/// Asserts that the refusal does not depend on where `--capabilities` stands, that a repeated
+/// `--capabilities` is the one flag given twice and not another flag, and that
+/// `--capabilities=x` is not `--capabilities`: the parser refuses it, as a flag that takes no
+/// value. Catches: a refusal that looks only at the argument after the flag, a repeat taken for
+/// another flag, and a prefix match that takes `--capabilities=x` for the flag.
+#[test]
+fn capabilities_is_found_wherever_it_stands() {
+    let flags = |list: &[&str]| -> Vec<String> { list.iter().map(|s| (*s).to_owned()).collect() };
+    let (code, out, err) = run(&flags(&["--listen", "127.0.0.1:0", "--capabilities"]));
+    assert_eq!((code, out.as_str()), (2, ""));
+    assert!(
+        err.starts_with("tierstore: --capabilities takes no other flag, got --listen"),
+        "{err}"
+    );
+    let (once, once_out, _) = run(&flags(&["--capabilities"]));
+    let (twice, twice_out, twice_err) = run(&flags(&["--capabilities", "--capabilities"]));
+    assert_eq!((twice, twice_err.as_str()), (once, ""));
+    assert_eq!(twice_out, once_out);
+    let (code, out, err) = run(&flags(&["--capabilities=x"]));
+    assert_eq!((code, out.as_str()), (2, ""));
+    assert!(!err.contains("takes no other flag"), "{err}");
+    assert!(err.contains("--capabilities"), "{err}");
 }
 
 /// Asserts that the start line ends with `commit=` and the commit the build embeds, and that the

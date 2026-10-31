@@ -77,6 +77,8 @@
 #![forbid(unsafe_code)]
 
 mod backend;
+#[cfg(test)]
+mod build_commit;
 mod cache;
 mod clock;
 mod dir;

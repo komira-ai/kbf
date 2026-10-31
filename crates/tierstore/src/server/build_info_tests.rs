@@ -1,6 +1,6 @@
 //! The text of `--capabilities` and of the build gauge, and the shape of what the build embeds.
 
-use super::{CAPABILITIES, COMMIT, VERSION, capabilities_text, gauge};
+use super::{CAPABILITIES, COMMIT, RELEASE_VERSION, VERSION, capabilities_text, gauge};
 
 /// A commit as the build embeds it: twelve lowercase hex digits, or `unknown` where git gave
 /// nothing.
@@ -52,11 +52,14 @@ fn the_gauge_is_one_sample_with_version_and_commit() {
     );
 }
 
-/// Asserts that the commit the build embeds has the shape of a commit, and the version is the
-/// crate's. Catches: an empty value (the build script's variable not read) and a placeholder
-/// that is not a commit.
+/// Asserts that the commit the build embeds is twelve lowercase hex digits or `unknown`, and that
+/// the version `--version` prints is the crate's version, `+`, and that commit: the form the
+/// release check reads. Catches: an empty value (the build script's variable not read), a
+/// placeholder that is not a commit, and a version string that leaves the commit out or joins
+/// it another way.
 #[test]
-fn the_build_embeds_a_commit() {
+fn the_build_embeds_a_commit_and_the_version_names_it() {
     assert!(is_commit(COMMIT), "{COMMIT:?}");
     assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+    assert_eq!(RELEASE_VERSION, format!("{VERSION}+{COMMIT}"));
 }

@@ -8,6 +8,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// git checkout. `build.rs` embeds it.
 pub const COMMIT: &str = env!("TIERSTORE_BUILD_COMMIT");
 
+/// What `--version` prints after the program's name.
+pub const RELEASE_VERSION: &str = VERSION;
+
 /// The capabilities `tierstore --capabilities` prints, one to a line, in this order. A name is
 /// lowercase letters, digits and `-`.
 ///
