@@ -242,5 +242,7 @@ fn the_socket_unit_and_the_service_agree_on_names() {
     // One socket, one name: the unit passes exactly the sockets the command line asks for (no
     // `--oci-listen`), so the process is not refused for a socket it has no use for.
     assert_eq!(values(&socket, "ListenStream").len(), 1);
+    // No load balancer to tell: the old process stops accepting and closes at once.
+    assert_eq!(cli.drain_lb_wait, Duration::ZERO);
     assert!(cli.oci_listen.is_none());
 }

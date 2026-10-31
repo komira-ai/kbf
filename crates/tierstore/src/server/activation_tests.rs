@@ -246,8 +246,8 @@ fn sources(dir: &std::path::Path, found: &mut Vec<(std::path::PathBuf, String)>)
 
 /// Asserts that `unsafe` is allowed in exactly one place in the crate, the function of
 /// `activation.rs` that adopts a descriptor, and used nowhere else; and that no file of the crate
-/// starts a child process, which is why the variables of the hand-over need not be removed from
-/// the environment.
+/// names `Command::new` in `src` (a tripwire on that spelling, not a proof that no child is
+/// started), which is why the variables of the hand-over are not removed from the environment.
 #[test]
 fn unsafe_is_allowed_once_and_no_child_process_is_started() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -279,5 +279,8 @@ fn unsafe_is_allowed_once_and_no_child_process_is_started() {
         .find(|(p, _)| p.ends_with("activation.rs"))
         .unwrap();
     assert_eq!(text.1.matches(&allow).count(), 1);
+    // The two operations of `take`: the borrow that asks the system what the descriptor is, and
+    // the owner made of it once it is a listening socket.
+    assert_eq!(text.1.matches(&block).count(), 2);
     assert!(!text.1.contains(&function));
 }

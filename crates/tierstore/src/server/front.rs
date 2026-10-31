@@ -120,6 +120,7 @@ pub(super) fn server_config(
     server.max_concurrent_puts = front.max_concurrent_puts as usize;
     server.put_min_bytes_per_sec = front.put_min_bytes_per_sec;
     server.put_rate_grace = front.put_rate_grace;
+    server.activated = front.listen_from_systemd;
     server.drain_lb_wait = front.drain_lb_wait;
     server.drain_deadline = front.drain_deadline;
     Ok(server)

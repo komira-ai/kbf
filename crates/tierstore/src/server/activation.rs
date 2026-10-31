@@ -102,6 +102,7 @@ impl Sockets {
         if TAKEN.swap(true, Ordering::SeqCst) {
             return Err(refuse("the sockets were already taken by this process".to_owned()).into());
         }
+        supported().map_err(refuse)?;
         let passed = Passed::from_env();
         let me = std::process::id();
         Ok(Self::from_passed(&passed, me, FIRST_FD, s3, oci)?)
@@ -237,7 +238,8 @@ pub(super) fn take(fd: RawFd, name: &str, expected: SocketAddr) -> Result<TcpLis
     if bound != expected {
         return Err(format!(
             "the socket {name:?} (descriptor {fd}) is bound to {bound} but this start serves \
-             {expected}: ListenStream= and the address of the flag must be one address"
+             {expected}: ListenStream= and the address of the flag must be one address \
+             (ListenStream=9000 binds [::]:9000: give --listen [::]:9000, or ListenStream=0.0.0.0:9000)"
         ));
     }
     // SAFETY: `fd` is open and is a listening TCP socket (`check`). It comes from the service
@@ -259,11 +261,24 @@ fn listening(fd: BorrowedFd<'_>) -> bool {
     rustix::net::sockopt::socket_acceptconn(fd).unwrap_or(false)
 }
 
-/// Apple platforms declare `SO_ACCEPTCONN` and do not implement it. tierstore is released for
-/// Linux only; this keeps the crate building elsewhere and asks nothing.
+/// Apple platforms declare `SO_ACCEPTCONN` and do not implement it; `supported` refuses the flag
+/// there, so this is not reached.
 #[cfg(target_vendor = "apple")]
 fn listening(_: BorrowedFd<'_>) -> bool {
-    true
+    false
+}
+
+/// Whether this platform can tell a listening socket from another.
+#[cfg(not(target_vendor = "apple"))]
+fn supported() -> Result<(), String> {
+    Ok(())
+}
+
+/// `--listen-from-systemd` is refused on Apple platforms, where `SO_ACCEPTCONN` is not implemented
+/// and a socket that listens could not be told from one that does not.
+#[cfg(target_vendor = "apple")]
+fn supported() -> Result<(), String> {
+    Err("not supported on this platform".to_owned())
 }
 
 /// The address `fd` is bound to, if it is a listening TCP stream socket.

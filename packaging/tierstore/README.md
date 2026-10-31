@@ -927,23 +927,38 @@ The service asks for this with `--listen-from-systemd` (or `listen_from_systemd 
   unit does not restart a start that exits 2.
 - The address is in two places, `ListenStream=` and the flag, and the process checks that they
   are one.
-- On SIGTERM the process drains as it always has (see Stopping it). When it stops accepting it
-  closes its own descriptor of the socket and nothing else: it never calls `shutdown` on it, so
-  the socket is left listening in systemd and the connections queued on it are neither refused
-  nor reset.
+- On SIGTERM the process stops accepting and drops its own descriptor of the socket, and nothing
+  else: it never calls `shutdown` on it, so the socket stays listening in systemd and the
+  connections queued on it are neither refused nor reset. With the flag the drain differs from
+  the plain one in three ways, because the manager and not a load balancer is in front: every
+  answer from the moment the drain begins carries `Connection: close`; the process tells all its
+  connections to close the moment it stops accepting, so an idle connection ends then, and a
+  connection that is answering finishes the answer and ends (the plain drain does this only after
+  every request in flight is done); and a request that was already on the wire then is served, not
+  answered 503. The unit ships `--drain-lb-wait 0s`, so that the process stops accepting at once;
+  a longer wait keeps it accepting, and serving, for that long first.
+- `systemctl stop tierstore` leaves the socket in place, and the next connection starts the
+  service again. To stop it for good, stop `tierstore.socket` too.
 
 The registry front is a second socket unit, because a socket unit has one name. For
 `--oci-listen 192.0.2.10:5000`, a `tierstore-oci.socket` with `ListenStream=192.0.2.10:5000` and
 `FileDescriptorName=oci`, and `Sockets=tierstore.socket tierstore-oci.socket` in the service's
 `[Service]` section, with `Requires=` and `After=` of the second socket as for the first.
 
-What a restart does not do. The old process answers the requests it has in flight, for at most
-`--drain-deadline` (`TimeoutStopSec=` is set above it); the new process starts after the old one
-has exited, so a request that takes longer than that is cut, and the new process is not serving
-before it has passed the start-up checks of its tiers, while the connections wait. A connection
-that the old process had accepted and that sent its first request after the end of
-`--drain-lb-wait` is answered 503 `ServiceUnavailable` with `Connection: close`, which the
-clients of kbf retry.
+What a restart does not do:
+
+- The old process answers the requests it has in flight for at most `--drain-deadline`
+  (`TimeoutStopSec=` is set above it); a request that takes longer is cut. The new process starts
+  after the old one has exited. So a request longer than the stop timeout is lost, and every new
+  connection waits in the socket's queue (it is not refused) for the whole drain, plus the new
+  process's start-up checks of its tiers, before anything accepts it. A restart that waits on one
+  long transfer is slow for everyone, not only for that transfer.
+- A client whose request is on the wire at the instant the old process stops accepting may see its
+  connection closed before the answer, as with any server that closes a connection; clients retry
+  that on a reused connection, and a request that was already read is answered.
+- A request that arrives on a connection after the old process told it to close is served, not
+  refused; the connection then ends. The wait for the drain counts the connections that have not
+  ended by `--drain-deadline` as cut.
 
 ## Stopping it
 
