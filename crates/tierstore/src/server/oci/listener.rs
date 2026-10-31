@@ -14,13 +14,14 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 use super::{OciError, OciFront, OciMode};
 use crate::server::idle::Watched;
+use crate::server::listen::{self, Listeners};
 use crate::server::{ACCEPT_PAUSE, Incoming};
 
 /// A connection's byte stream, whichever way it is carried: one code path serves HTTP over it.
@@ -50,9 +51,10 @@ pub struct OciLimits {
     pub drain_deadline: Duration,
 }
 
-/// A bound socket, ready to serve the front over TLS, or over plain HTTP.
+/// The bound sockets of the front, ready to serve it over TLS, or over plain HTTP. They share
+/// one limit on connections and one stop.
 pub struct OciListener {
-    listener: TcpListener,
+    listeners: Listeners,
     /// `None` serves plain HTTP.
     acceptor: Option<TlsAcceptor>,
     front: Arc<OciFront>,
@@ -92,10 +94,25 @@ impl OciListener {
         front: Arc<OciFront>,
         limits: OciLimits,
     ) -> Result<Self, OciError> {
-        let bound = TcpListener::bind(addr).await;
-        let listener = bound.map_err(|source| OciError::Bind { addr, source })?;
+        Self::bind_all(&[addr], acceptor, front, limits).await
+    }
+
+    /// Binds a socket for each of `addrs`, to serve HTTPS with `acceptor`, or plain HTTP
+    /// without one: one front, one limit on connections and one stop for all of them. An
+    /// IPv6 address is bound for IPv6 only, so that `0.0.0.0:P` and `[::]:P` can both be.
+    ///
+    /// # Errors
+    /// [`OciError::Bind`] for the first address that cannot be bound.
+    pub async fn bind_all(
+        addrs: &[SocketAddr],
+        acceptor: Option<TlsAcceptor>,
+        front: Arc<OciFront>,
+        limits: OciLimits,
+    ) -> Result<Self, OciError> {
+        let bound = listen::bind_all(addrs);
+        let bound = bound.map_err(|(addr, source)| OciError::Bind { addr, source })?;
         Ok(Self {
-            listener,
+            listeners: Listeners::new(bound),
             acceptor,
             front,
             limits,
@@ -112,12 +129,21 @@ impl OciListener {
         }
     }
 
-    /// The address the socket is bound to.
+    /// The address of the first socket, the one the front was first asked to bind.
     ///
     /// # Errors
-    /// The socket's address cannot be read.
+    /// The socket's address cannot be read, or the front has no socket.
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.listener.local_addr()
+        let first = self.local_addrs()?.into_iter().next();
+        first.ok_or_else(|| std::io::Error::other("the front has no socket"))
+    }
+
+    /// The address each socket is bound to, in the order they were asked for.
+    ///
+    /// # Errors
+    /// A socket's address cannot be read.
+    pub fn local_addrs(&self) -> std::io::Result<Vec<SocketAddr>> {
+        self.listeners.local_addrs()
     }
 
     /// Serves connections until `stop` turns true: then it takes no more, lets the connections
@@ -125,12 +151,12 @@ impl OciListener {
     /// [`OciLimits::drain_deadline`], and cuts those that are left. Returns how many were cut.
     pub async fn serve(self, stop: watch::Receiver<bool>) -> usize {
         let Self {
-            listener,
+            listeners,
             acceptor,
             front,
             limits,
         } = self;
-        accept_loop(listener, acceptor, front, limits, stop).await
+        accept_loop(listeners, acceptor, front, limits, stop).await
     }
 }
 

@@ -7,6 +7,17 @@
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// The full name of each family, written out in the source; a test holds `docs/metrics.md` to them.
+pub(crate) const HITS_TOTAL: &str = "tierstore_hits_total";
+pub(crate) const MISSES_TOTAL: &str = "tierstore_misses_total";
+pub(crate) const READ_ERRORS_TOTAL: &str = "tierstore_read_errors_total";
+pub(crate) const READS_TOTAL: &str = "tierstore_reads_total";
+pub(crate) const BYTES_SERVED_TOTAL: &str = "tierstore_bytes_served_total";
+pub(crate) const BYTES_READ_TOTAL: &str = "tierstore_bytes_read_total";
+pub(crate) const PROMOTIONS_TOTAL: &str = "tierstore_promotions_total";
+pub(crate) const PROMOTED_BYTES_TOTAL: &str = "tierstore_promoted_bytes_total";
+pub(crate) const PROMOTIONS_SKIPPED_TOTAL: &str = "tierstore_promotions_skipped_total";
+
 /// The tier that answered, or was asked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Tier {
@@ -128,54 +139,44 @@ impl Counters {
                 let hits = read(&self.hits[tier][kind]);
                 let misses = read(&self.misses[tier][kind]);
                 let failed = read(&self.errors[tier][kind]);
-                sample(&mut text, "hits_total", &labels, hits);
-                sample(&mut text, "misses_total", &labels, misses);
-                sample(&mut text, "read_errors_total", &labels, failed);
+                sample(&mut text, HITS_TOTAL, &labels, hits);
+                sample(&mut text, MISSES_TOTAL, &labels, misses);
+                sample(&mut text, READ_ERRORS_TOTAL, &labels, failed);
                 let reads = hits + misses + failed;
-                sample(&mut text, "reads_total", &labels, reads);
+                sample(&mut text, READS_TOTAL, &labels, reads);
             }
         }
         for (tier, label) in tiers {
             let labels = [("tier", label)];
             sample(
                 &mut text,
-                "bytes_served_total",
+                BYTES_SERVED_TOTAL,
                 &labels,
                 read(&self.served[tier]),
             );
-            sample(
-                &mut text,
-                "bytes_read_total",
-                &labels,
-                read(&self.read[tier]),
-            );
+            sample(&mut text, BYTES_READ_TOTAL, &labels, read(&self.read[tier]));
         }
-        sample(&mut text, "promotions_total", &[], read(&self.promotions));
+        sample(&mut text, PROMOTIONS_TOTAL, &[], read(&self.promotions));
         sample(
             &mut text,
-            "promoted_bytes_total",
+            PROMOTED_BYTES_TOTAL,
             &[],
             read(&self.promoted_bytes),
         );
         for (why, counter) in SKIPPED.into_iter().zip(&self.skipped) {
             let labels = [("reason", why)];
-            sample(
-                &mut text,
-                "promotions_skipped_total",
-                &labels,
-                read(counter),
-            );
+            sample(&mut text, PROMOTIONS_SKIPPED_TOTAL, &labels, read(counter));
         }
         text
     }
 }
 
-/// The line of `tierstore_<name>` with `labels`.
+/// The line of the family `name` (one of the constants above) with `labels`.
 fn sample(text: &mut String, name: &str, labels: &[(&str, &str)], value: u64) {
     let pairs: Vec<String> = labels.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect();
     if pairs.is_empty() {
-        let _ = writeln!(text, "tierstore_{name} {value}");
+        let _ = writeln!(text, "{name} {value}");
     } else {
-        let _ = writeln!(text, "tierstore_{name}{{{}}} {value}", pairs.join(","));
+        let _ = writeln!(text, "{name}{{{}}} {value}", pairs.join(","));
     }
 }

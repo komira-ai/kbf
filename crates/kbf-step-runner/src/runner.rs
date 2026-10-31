@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use update_hook::{
-    ARTIFACT_DIGEST_KEY, Context, Invocation, Next, Outcome, PREVIOUS_RELEASE_KEY, PREVIOUS_VERSION_KEY, Params, Phase,
-    Report, STAGED_RELEASE_KEY, Scalar, Step, TARGET_VERSION_KEY, Verdict, next,
+    ARTIFACT_DIGEST_KEY, Context, Invocation, Next, Outcome, PREVIOUS_RELEASE_KEY,
+    PREVIOUS_VERSION_KEY, Params, Phase, Report, STAGED_RELEASE_KEY, Scalar, Step,
+    TARGET_VERSION_KEY, Verdict, next,
 };
 
 use crate::artifact::{ArtifactError, Staged};

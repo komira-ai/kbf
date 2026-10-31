@@ -113,14 +113,15 @@ async fn with_write_through_every_write_but_a_replace_reaches_the_upstream() {
     assert_eq!(rig.calls(Op::Delete), 1);
 }
 
-/// Asserts a create-only put: it makes the object at the upstream with one HEAD and one put (the
-/// HEAD before the body), under a prefix the cache keeps and under one it does not; the same key
-/// again is `AlreadyExists` and the upstream gets no second put; the stage directory is empty
-/// throughout, since nothing is kept.
+/// Asserts a create-only put: it makes the object at the upstream with one put and a HEAD before
+/// the body, and under a prefix the cache keeps one more HEAD after it (for the tag of the kept
+/// copy), under one it does not keep none; the same key again is `AlreadyExists` after one HEAD
+/// and the upstream gets no second put; the stage directory is empty throughout, and only the
+/// kept key has an entry.
 #[tokio::test]
-async fn a_create_only_put_heads_once_and_puts_once() {
+async fn a_create_only_put_heads_before_the_body_and_puts_once() {
     let rig = Rig::writing("tscache-write-create");
-    for key in ["cas/b/new", "other/new"] {
+    for (key, heading) in [("cas/b/new", 2), ("other/new", 1)] {
         let chunks: [&'static [u8]; 3] = [b"one ", b"two ", b"three"];
         let polled = Arc::new(AtomicUsize::new(0));
         let (heads, puts) = (rig.calls(Op::Head), rig.calls(Op::Put));
@@ -128,7 +129,7 @@ async fn a_create_only_put_heads_once_and_puts_once() {
             .cache
             .put_stream(key, Some(13), counted(&chunks, &polled));
         assert_eq!(made.await, Ok(()));
-        assert_eq!(rig.calls(Op::Head), heads + 1, "{key}");
+        assert_eq!(rig.calls(Op::Head), heads + heading, "{key}");
         assert_eq!(rig.calls(Op::Put), puts + 1, "{key}");
         let stored = rig.tamper.memory.get(key, None).await.unwrap();
         assert_eq!(stored, Bytes::from_static(b"one two three"));
@@ -140,7 +141,8 @@ async fn a_create_only_put_heads_once_and_puts_once() {
         assert_eq!(stored, Bytes::from_static(b"one two three"));
     }
     assert_eq!(rig.staged_files(), 0);
-    assert_eq!(rig.cache.held(), (0, 0));
+    assert_eq!(rig.cache.held(), (13, 1));
+    assert!(rig.has_file("cas/b/new"));
 }
 
 /// Asserts that a create-only put of a key that exists is refused before the body is read: no
@@ -278,8 +280,9 @@ async fn a_multipart_upload_passes_through_to_the_upstream() {
 /// Asserts that a write that makes an object drops the cache's own entry for the key, when the
 /// cache has one: the entry is of an object that was deleted at the upstream behind the cache's
 /// back (a create-only write only succeeds where nothing is), and the next read is of the new
-/// object. It covers the completion of an upload and the streamed put; a cache that kept the
-/// entry would serve the old bytes.
+/// object. It covers the completion of an upload (the entry is dropped and the first read
+/// fills) and the streamed put (the entry is replaced by the kept copy of the new bytes); a
+/// cache that kept the old entry would serve the old bytes.
 #[tokio::test]
 async fn a_write_that_makes_an_object_drops_the_entry_for_the_key() {
     let rig = Rig::writing("tscache-write-stale");
@@ -313,8 +316,8 @@ async fn a_write_that_makes_an_object_drops_the_entry_for_the_key() {
         .put_stream("cas/b/put", Some(7), body(b"new put"))
         .await;
     assert_eq!(made, Ok(()));
-    assert!(!rig.has_file("cas/b/put"));
-    assert_eq!(rig.cache.held(), (6, 1));
+    assert!(rig.has_file("cas/b/put"));
+    assert_eq!(rig.cache.held(), (7 + 6, 2));
     assert_eq!(
         rig.get("cas/b/put").await.unwrap(),
         Bytes::from_static(b"new put")

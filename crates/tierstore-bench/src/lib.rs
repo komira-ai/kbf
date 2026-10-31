@@ -17,10 +17,12 @@
 pub mod atomic;
 pub mod cells;
 pub mod cli;
+pub mod coldstate;
 pub mod config;
 pub mod error;
 pub mod faultfile;
 pub mod gate;
+pub mod livedir;
 pub mod preflight;
 pub mod procload;
 pub mod provision;

@@ -24,7 +24,13 @@
 //!   (`ctx.config.rates`) holds whatever a cell asks for.
 //! - p99 is filled in only from the pooled samples of quiet passes, 1,000 requests at least.
 //! - Samples (one row per counted request) are appended to `<result_dir>/samples.csv`
-//!   ([`crate::result::Sample`]) and the results go to `<result_dir>/<cell>-<arm>.json`.
+//!   ([`crate::result::Sample`]) and the results go to `<result_dir>/<cell>-<arm>-a<N>.json`, `N`
+//!   being the run's attempt (`run --attempt`, 1 unless set). A run never writes over a result
+//!   file: it stops, before it sends anything, if one is there.
+//! - The cold store's state (healing or not, its drives, when it was read) is read again before
+//!   every pass and stamped into the results; and the cold store guard ([`coldguard`]) stops the
+//!   run, as the load gate does, when the p99 latency or the error share of the harness's own
+//!   cold requests over a sliding window is over its limit.
 //! - What a cell wrote to a store, it deletes after the pass or at the end, also when the run
 //!   stops early.
 //!
@@ -40,6 +46,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cells::budget::Campaign;
 use crate::cells::engine::{FaultSwitch, ProcLoad};
+use crate::coldstate::ColdStateSource;
 use crate::config::RunConfig;
 use crate::error::BenchError;
 use crate::requestlog::RequestLog;
@@ -51,8 +58,11 @@ pub mod budget;
 pub mod c;
 pub mod cold_put;
 pub mod cold_read;
+pub mod coldguard;
 pub mod content;
 pub mod engine;
+#[cfg(test)]
+mod engine_gaps_tests;
 pub mod fileserver;
 pub mod g;
 pub mod modes;
@@ -127,6 +137,8 @@ pub struct CellContext {
     pub provenance: Provenance,
     /// The campaign the run belongs to: its ledger of bytes written to the cold store.
     pub campaign: Campaign,
+    /// Where the cold store's state is read from, before every pass.
+    pub cold_state: Arc<dyn ColdStateSource>,
 }
 
 /// What the `run` verb asks of a cell; a cell reads the parts it has.
@@ -138,6 +150,9 @@ pub struct CellPlan {
     pub in_flight: Vec<u32>,
     /// Object sizes in bytes, one arm per value (cell G reads a tree and ignores them).
     pub object_bytes: Vec<u64>,
+    /// Whether the put cells add their open-loop arms (`run --open-loop`). The other cells have
+    /// none and ignore it.
+    pub open_loop: bool,
 }
 
 /// Runs one cell.
@@ -219,6 +234,7 @@ mod tests {
             passes: 2,
             in_flight: vec![1],
             object_bytes: vec![],
+            open_loop: true,
         };
         let bare = testkit::ctx(dir.path(), &[], Window::Busy);
         for (id, name) in [

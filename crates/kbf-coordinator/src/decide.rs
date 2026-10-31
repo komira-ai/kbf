@@ -88,7 +88,7 @@ fn order(
     let Some(host) = fleet.get_in(service, id) else {
         return false;
     };
-    let Some(role) = def.roles.get(&host.role) else {
+    let Some(role) = def.roles.get(host.role_name()) else {
         return false;
     };
     let others = || fleet.hosts_of(service).filter(|(other, _)| *other != id);
@@ -98,15 +98,17 @@ fn order(
         .as_ref()
         .is_some_and(|r| r.outcome == Outcome::Failed && r.target == desired.version);
     let slots = others()
-        .filter(|(o, h)| h.role == host.role && fleet.holds_slot(service, o, h, now))
+        .filter(|(o, h)| h.role_name() == host.role_name() && fleet.holds_slot(service, o, h, now))
         .count();
     !fleet.is_quiet(now)
         && host.beat.updating.is_none()
         && !fleet.is_busy_besides(service, id, now)
         && host.beat.version != desired.version
         && !failed_here
-        && slots < role.max_updating(host.role, desired)
-        && others().all(|(_, h)| !role.after.contains(&h.role) || !is_pending(h, desired, now))
+        && slots < role.max_updating(host.role_name(), desired)
+        && others().all(|(_, h)| {
+            !role.after.iter().any(|r| r == h.role_name()) || !is_pending(h, desired, now)
+        })
         && def.after.iter().all(|earlier| {
             all.get(earlier).is_none_or(|want| {
                 fleet
@@ -115,9 +117,9 @@ fn order(
             })
         })
         && others()
-            .filter(|(o, h)| h.role == host.role && fleet.is_up(service, o, h, now))
+            .filter(|(o, h)| h.role_name() == host.role_name() && fleet.is_up(service, o, h, now))
             .count()
-            >= role.required_up(host.role, desired)
+            >= role.required_up(host.role_name(), desired)
 }
 
 /// Whether `h` is live and not yet at `desired`, or still updating: what a later role or

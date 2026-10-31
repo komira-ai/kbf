@@ -59,7 +59,7 @@ use crate::proxy::{IssuedPackKey, MintError, PackKeyMint};
 /// The longest a presigned write and a read grant are good for: 4 hours, the ceiling of the
 /// presigning key (`max_expires_secs` of its `--presign-key-file`, and the tier store's
 /// `--presign-max-expires`, must be at least this).
-pub const MAX_EXPIRY: Duration = Duration::from_secs(4 * 60 * 60);
+pub const MAX_EXPIRY: Duration = kbf_pack::MAX_KEY_LIFE;
 
 /// Why a run wall and a slack cannot give an expiry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]

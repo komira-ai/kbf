@@ -3248,6 +3248,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
+ "tierstore",
  "tokio",
  "ureq",
 ]
@@ -5226,9 +5227,9 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "kbf-objstore",
  "kbf-testkit",
  "md-5 0.11.0",
+ "objstore-s3",
  "percent-encoding",
  "rcgen",
  "reqwest",

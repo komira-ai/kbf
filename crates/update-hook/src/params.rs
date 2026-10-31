@@ -7,7 +7,9 @@
 //!
 //! The updater writes more reserved keys, all in the namespace `updater.`, which a hook only
 //! reads: [`STAGED_RELEASE_KEY`], [`PREVIOUS_RELEASE_KEY`] (absent on a first install),
-//! [`TARGET_VERSION_KEY`] and [`PREVIOUS_VERSION_KEY`] (absent on a first install). The staged
+//! [`TARGET_VERSION_KEY`], [`PREVIOUS_VERSION_KEY`] (absent on a first install) and
+//! [`ARTIFACT_DIGEST_KEY`], the `sha256:<64 lowercase hex>` identity of the verified artifact: a
+//! hook keys its record on it and does not use it to verify the artifact again. The staged
 //! release equals the argument of `prepare`. A declaration's own `[hook.params]` may not set any
 //! `updater.*` key: [`Params::parse_declared`] refuses it. **A hook still validates every one of
 //! these values against its own record directory and its declaration**: they come from a file,
@@ -34,8 +36,11 @@ pub const PREVIOUS_RELEASE_KEY: &str = "updater.previous_release";
 pub const TARGET_VERSION_KEY: &str = "updater.target_version";
 /// The version it replaces; absent on a first install.
 pub const PREVIOUS_VERSION_KEY: &str = "updater.previous_version";
+/// The digest of the artifact the updater verified, `sha256:<64 lowercase hex>`.
+pub const ARTIFACT_DIGEST_KEY: &str = "updater.artifact_digest";
 /// The reserved keys whose value is text.
-const TEXT_KEYS: [&str; 4] = [
+const TEXT_KEYS: [&str; 5] = [
+    ARTIFACT_DIGEST_KEY,
     STAGED_RELEASE_KEY,
     PREVIOUS_RELEASE_KEY,
     TARGET_VERSION_KEY,
@@ -71,6 +76,8 @@ pub enum ParamsError {
         "updater.previous_release and updater.previous_version go together: a first install has neither, an update both"
     )]
     PreviousPair,
+    #[error("updater.artifact_digest must be sha256: and 64 lowercase hex digits, not {0:?}")]
+    BadDigest(String),
     #[error("params key {0:?} must be an absolute path")]
     NotAbsolute(String),
     #[error("params key {0:?} is in the namespace `updater.`, which only the updater writes")]
@@ -135,6 +142,7 @@ impl Params {
         if self.get(PREVIOUS_RELEASE_KEY).is_some() != self.get(PREVIOUS_VERSION_KEY).is_some() {
             return Err(ParamsError::PreviousPair);
         }
+        self.artifact_digest()?;
         for key in [STAGED_RELEASE_KEY, PREVIOUS_RELEASE_KEY] {
             if self
                 .text(key)
@@ -215,5 +223,21 @@ impl Params {
     /// The version it replaces; `None` on a first install.
     pub fn previous_version(&self) -> Option<&str> {
         self.text(PREVIOUS_VERSION_KEY)
+    }
+
+    /// The identity of the verified artifact, `sha256:<64 lowercase hex>`, which a hook keys its
+    /// record on (it is not for verifying the artifact again). `Ok(None)` when absent; any
+    /// other shape is refused.
+    pub fn artifact_digest(&self) -> Result<Option<&str>, ParamsError> {
+        let Some(digest) = self.text(ARTIFACT_DIGEST_KEY) else {
+            return Ok(None);
+        };
+        let hex = digest.strip_prefix("sha256:").unwrap_or("");
+        let shaped = hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if shaped {
+            Ok(Some(digest))
+        } else {
+            Err(ParamsError::BadDigest(digest.to_owned()))
+        }
     }
 }

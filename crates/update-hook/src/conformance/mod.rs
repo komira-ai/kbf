@@ -49,8 +49,9 @@ use std::path::{Path, PathBuf};
 pub use sandbox::{Entry, Sandbox, Tree, changes, snapshot};
 
 use crate::{
-    Context, Invocation, LineError, Next, Outcome, PREVIOUS_RELEASE_KEY, PREVIOUS_VERSION_KEY,
-    Params, Report, STAGED_RELEASE_KEY, Scalar, Step, TARGET_VERSION_KEY, Verdict, next,
+    ARTIFACT_DIGEST_KEY, Context, Invocation, LineError, Next, Outcome, PREVIOUS_RELEASE_KEY,
+    PREVIOUS_VERSION_KEY, Params, Report, STAGED_RELEASE_KEY, Scalar, Step, TARGET_VERSION_KEY,
+    Verdict, next,
 };
 use run::{Run, run_step};
 
@@ -67,6 +68,11 @@ const RETRIES: u32 = 2;
 
 /// A reserved key the harness invents, to see that a hook ignores what it does not know.
 const PROBE_KEY: &str = "updater.conformance_probe";
+
+/// The artifact digest the harness puts in the params file: a fixed identity of the right shape
+/// (the harness stages no real tree to hash).
+const ARTIFACT_DIGEST: &str =
+    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// The versions the harness puts in the params file.
 const TARGET_VERSION: &str = "2.0.0";
@@ -330,6 +336,10 @@ impl<'a> Conformance<'a> {
             Scalar::Text(sandbox.artifact().to_string_lossy().into_owned()),
         );
         params.insert(TARGET_VERSION_KEY, Scalar::Text(TARGET_VERSION.to_owned()));
+        params.insert(
+            ARTIFACT_DIGEST_KEY,
+            Scalar::Text(ARTIFACT_DIGEST.to_owned()),
+        );
         if !self.first_install {
             // An update has both, and the previous release is a real tree.
             fs::write(sandbox.previous().join("VERSION"), PREVIOUS_VERSION)?;

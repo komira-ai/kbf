@@ -25,7 +25,7 @@ pub use exit::{EXIT_DEFERRED, EXIT_FAILURE, EXIT_HALT, EXIT_OK, Outcome};
 pub use line::{Class, LineError, MAX_REASON_LEN, Report, is_reason_token};
 pub use next::{Context, Next, Phase, Verdict, next};
 pub use params::{
-    PREVIOUS_RELEASE_KEY, PREVIOUS_VERSION_KEY, PROMOTION_CEILING_KEY, Params, ParamsError,
-    STAGED_RELEASE_KEY, Scalar, TARGET_VERSION_KEY,
+    ARTIFACT_DIGEST_KEY, PREVIOUS_RELEASE_KEY, PREVIOUS_VERSION_KEY, PROMOTION_CEILING_KEY, Params,
+    ParamsError, STAGED_RELEASE_KEY, Scalar, TARGET_VERSION_KEY,
 };
 pub use step::{ArgsError, Invocation, Step};

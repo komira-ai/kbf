@@ -64,7 +64,9 @@
 //! body whole otherwise) with 411 `MissingContentLength`; if its `Content-Length` is over
 //! [`ServerConfig::max_request_bytes`], with 413 `EntityTooLarge`, so that nothing is stored and
 //! no upload is begun; and if [`ServerConfig::max_concurrent_puts`] bodies are already being
-//! taken, with 503 `SlowDown` and `Retry-After`. A body that then comes in at an average rate
+//! taken, the request waits for one of them to end, at most [`ServerConfig::put_permit_wait`],
+//! without reading its body, and is answered 503 `SlowDown` and `Retry-After` only when no slot
+//! was free in that time. A body that then comes in at an average rate
 //! under [`ServerConfig::put_min_bytes_per_sec`], once [`ServerConfig::put_rate_grace`] has
 //! passed, is cut with 400 `RequestTimeout`, which ends the stream with an error, so nothing is
 //! stored and an upload at an S3 tier is aborted.
@@ -136,7 +138,9 @@
 //! longer than that timeout.
 //!
 //! `GET /healthz` is 200 while the process runs. `GET /readyz` is 200 until the drain begins and
-//! 503 after. Neither is signed, so a bucket cannot have either name.
+//! 503 after. Neither is signed, so a bucket cannot have either name. The body of the 200 is
+//! `ready`, and for a build node `ready read-write` or `ready read-only`, the mode its cache is
+//! in ([`local_cache::Mode`]); a read-only node serves, so the status does not change with it.
 //!
 //! `GET /usagez`, for alerting and not for a load balancer, is 200 with the age of the usage
 //! object that the reconciler publishes (`_tiering/usage`), and 503 with the reason once that
@@ -162,17 +166,24 @@
 //! # Drain
 //!
 //! [`Server::begin_drain`], which the binary calls on SIGTERM or SIGINT, starts a sequence that
-//! [`Server::serve`] runs: `/readyz` answers 503 at once; for [`ServerConfig::drain_lb_wait`]
-//! the server goes on serving everything, so that a load balancer or a client that has not seen
-//! the 503 yet is not refused; then it stops accepting connections and answers every new
-//! request, but for the `GET` and `HEAD` probes `/healthz` and `/readyz`, 503
-//! `ServiceUnavailable` with `Connection: close`; then it waits until the requests in flight
-//! are finished; then it closes the connections that are open, after the answers they are still
-//! sending, and waits until they are closed. Both waits together take
-//! [`ServerConfig::drain_deadline`] at most. `serve` returns, with the number of requests that
-//! the deadline cut: those still running, or still being sent.
+//! [`Server::serve`] runs: `/readyz` answers 503 at once, and from then on every answer carries
+//! `Connection: close`, so that a client does not send its next request on a connection that is
+//! about to end. For [`ServerConfig::drain_lb_wait`], the settle, the server goes on accepting
+//! and serving everything, so that a load balancer or a client that has not seen the 503 yet is
+//! not refused. At the end of the settle it stops accepting connections and closes each
+//! connection that has no request on the wire with a lingering close: it shuts its end for
+//! writing, so that the client reads a clean end of stream, and goes on reading, and dropping
+//! what it reads, until the client closes its end or [`ServerConfig::header_timeout`] has
+//! passed. A request that is on the wire (begun, and not answered in full) is served, with
+//! `Connection: close`, and its connection is closed in the same way when the answer is out.
+//! The bytes that arrive after the server shut its end, a request that came within one round trip
+//! of the end of the stream, cannot be answered; they are counted once for each connection in
+//! `tierstore_drain_late_requests_total`. The drain waits until every connection is closed, and
+//! every lingering close is over, for [`ServerConfig::drain_deadline`] at most. `serve` returns,
+//! with the number of requests that the deadline cut: those still running, or still being sent.
 
 mod auth;
+pub mod build_info;
 mod cache_cli;
 pub mod cli;
 mod config;
@@ -184,7 +195,10 @@ mod handover;
 mod idle;
 mod keys;
 mod launch;
+mod linger;
+mod listen;
 pub mod local_cache;
+mod lock;
 pub mod oci;
 mod ops;
 pub mod presign;
@@ -200,6 +214,8 @@ mod auth_tests;
 mod body_stall_tests;
 #[cfg(test)]
 mod cache_cli_tests;
+#[cfg(test)]
+mod cache_lock_tests;
 #[cfg(test)]
 mod completion_tests;
 #[cfg(test)]
@@ -217,6 +233,8 @@ mod gc_tests;
 #[cfg(test)]
 mod idle_tests;
 #[cfg(test)]
+mod lock_tests;
+#[cfg(test)]
 mod metrics_race_tests;
 #[cfg(test)]
 mod metrics_tests;
@@ -228,6 +246,8 @@ mod pipes;
 mod presign_server_tests;
 #[cfg(test)]
 mod ready_tests;
+#[cfg(test)]
+mod reconcile_lock_tests;
 #[cfg(test)]
 mod reply_tests;
 #[cfg(test)]
@@ -244,6 +264,8 @@ mod server_tests;
 mod slow_reader_tests;
 #[cfg(test)]
 mod stream_put_tests;
+#[cfg(test)]
+mod stream_wire_tests;
 #[cfg(test)]
 mod testing;
 #[cfg(test)]
@@ -263,8 +285,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::Full;
-use hyper::header::{HeaderName, HeaderValue};
+use hyper::header::{CONNECTION, HeaderName, HeaderValue};
 use hyper::http::request::Parts;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -284,6 +305,9 @@ pub use presign::{Grant, PresignKey, PresignRequest, presign_put};
 pub use scoped::{Prefixes, ScopedKey};
 
 use idle::Watched;
+use linger::Lingering;
+use listen::Listeners;
+pub use reply::AnswerBody;
 use reply::{Answer, S3Error, answer};
 use request::{BoxError, Check, Query, Reader, Target, resolve};
 
@@ -325,11 +349,17 @@ pub struct ServerConfig {
     /// See the module docs.
     pub body_idle_timeout: Duration,
     /// The most streamed bodies (puts and parts of uploads) taken at once. A request over the
-    /// limit is answered 503 `SlowDown` with a `Retry-After` and its body is not read. Each
+    /// limit waits up to `put_permit_wait` for one to end, and is then answered 503 `SlowDown`
+    /// with a `Retry-After`; its body is not read either way. Each
     /// streamed body holds a few pieces (`PIECES_QUEUED`, of the size the connection delivers),
     /// and an S3 tier up to 16 MiB more, so the memory of the puts is bounded by this number
     /// times that.
     pub max_concurrent_puts: usize,
+    /// How long a streamed body that arrives with `max_concurrent_puts` bodies already being
+    /// taken waits for one of them to end, before it is answered 503 `SlowDown`. It is the
+    /// time of the runtime (`tokio::time`), and the body is not read while the request waits.
+    /// Zero answers 503 at once.
+    pub put_permit_wait: Duration,
     /// The least average rate, in bytes a second, at which a request body is taken, counted
     /// over the time the server spends waiting for the client to send the next piece once
     /// that time has passed `put_rate_grace`; a body that goes slower is refused with 400
@@ -344,12 +374,14 @@ pub struct ServerConfig {
     pub put_rate_grace: Duration,
     /// How long a client has to send the head of a request. It also bounds how long a
     /// connection may wait, idle, for its next request, so keep it above the time a client
-    /// keeps an idle connection in its pool.
+    /// keeps an idle connection in its pool, and how long the drain waits for a client to close
+    /// a connection that the server has shut for writing.
     pub header_timeout: Duration,
-    /// How long the server goes on serving after the drain began and `/readyz` said 503.
+    /// The settle: how long the server goes on accepting and serving after the drain began and
+    /// `/readyz` said 503.
     pub drain_lb_wait: Duration,
-    /// How long the server waits for requests in flight, and for the answers it is sending, after
-    /// it began refusing new requests.
+    /// How long the server waits for requests in flight, for the answers it is sending, and for
+    /// the connections it closes to be closed by their clients, after the settle.
     pub drain_deadline: Duration,
     /// The proxy whose usage object `/usagez` judges: none by default, and then `/usagez` says
     /// the usage is not watched. The binary sets the proxy it serves.
@@ -406,6 +438,7 @@ impl ServerConfig {
             max_request_bytes: 256 << 20,
             body_idle_timeout: Duration::from_secs(30),
             max_concurrent_puts: 32,
+            put_permit_wait: Duration::from_secs(15),
             put_min_bytes_per_sec: 1024,
             put_rate_grace: Duration::from_secs(30),
             header_timeout: Duration::from_secs(60),
@@ -432,10 +465,10 @@ pub struct Drained {
 
 /// The server is serving.
 const SERVING: u8 = 0;
-/// The drain began: `/readyz` says 503.
+/// The drain began: `/readyz` says 503, and every answer says `Connection: close`.
 const NOT_READY: u8 = 1;
-/// The server refuses new requests.
-const REFUSING: u8 = 2;
+/// The settle is over: the server takes no new connection and closes the idle ones.
+const SETTLED: u8 = 2;
 
 /// How long [`Server::serve`] waits after a failed accept before the next.
 const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
@@ -485,11 +518,18 @@ pub struct Server {
     inflight: AtomicUsize,
     /// The connections that are open.
     open: AtomicUsize,
-    /// Notified whenever a request begins or ends or a connection opens or closes.
+    /// The connections with a request on the wire: read, and not answered in full.
+    unanswered: AtomicUsize,
+    /// The connections the drain has shut for writing that are waiting for their peer to close.
+    lingering: AtomicUsize,
+    /// The connections whose peer wrote after the server shut its end, in the drain.
+    late: AtomicU64,
+    /// Notified whenever a request begins or ends or a connection opens or closes, and when a
+    /// lingering close ends or counts a late request.
     idle: Notify,
-    /// Set once, when the drain has waited for the requests in flight: the connections finish
-    /// the answers they are sending and close.
-    closing: watch::Sender<bool>,
+    /// Set once, when the settle is over: a connection with no request on the wire closes, and
+    /// one with a request on the wire closes when it is answered.
+    settled: watch::Sender<bool>,
     next_request: AtomicU64,
     /// One permit for each streamed body that may be taken at once.
     puts: Arc<Semaphore>,
@@ -545,8 +585,11 @@ impl Server {
             drain_requested: Notify::new(),
             inflight: AtomicUsize::new(0),
             open: AtomicUsize::new(0),
+            unanswered: AtomicUsize::new(0),
+            lingering: AtomicUsize::new(0),
+            late: AtomicU64::new(0),
             idle: Notify::new(),
-            closing: watch::channel(false).0,
+            settled: watch::channel(false).0,
             next_request: AtomicU64::new(1),
         })
     }
@@ -567,9 +610,10 @@ impl Server {
         self.inflight.load(Ordering::SeqCst)
     }
 
-    /// The streamed bodies that may still be taken at once.
-    #[cfg(test)]
-    pub(super) fn put_permits_free(&self) -> usize {
+    /// The streamed bodies that may still be taken at once. For tests and probes; not a stable API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn put_permits_free(&self) -> usize {
         self.puts.available_permits()
     }
 
@@ -577,6 +621,20 @@ impl Server {
     #[must_use]
     pub fn open_connections(&self) -> usize {
         self.open.load(Ordering::SeqCst)
+    }
+
+    /// The connections the drain closed that still wait for their peer to close its end: the
+    /// server has shut its end for writing and is reading what the peer still sends.
+    #[must_use]
+    pub fn lingering_connections(&self) -> usize {
+        self.lingering.load(Ordering::SeqCst)
+    }
+
+    /// The connections whose peer wrote after the server shut its end, in the drain: the
+    /// requests that came too late to be answered.
+    #[cfg(test)]
+    pub(super) fn late_requests(&self) -> u64 {
+        self.late.load(Ordering::SeqCst)
     }
 
     /// Begins the drain: `/readyz` says 503 from now on, and [`Server::serve`] runs the rest of
@@ -592,6 +650,13 @@ impl Server {
     /// docs): the drain begins when [`Server::begin_drain`] is called.
     pub async fn serve(self: &Arc<Self>, listener: TcpListener) -> Drained {
         self.serve_from(listener).await
+    }
+
+    /// [`Server::serve`] over several listeners: the one server, so one drain and one count of
+    /// the connections open, takes the connections of all of them, and the drain closes every
+    /// one of them.
+    pub async fn serve_all(self: &Arc<Self>, listeners: Vec<TcpListener>) -> Drained {
+        self.serve_from(Listeners::new(listeners)).await
     }
 
     /// [`Server::serve`] over any source of connections: the tests serve pipes.
@@ -613,8 +678,9 @@ impl Server {
                 () = &mut wait => break,
             }
         }
-        self.phase.store(REFUSING, Ordering::SeqCst);
+        self.phase.store(SETTLED, Ordering::SeqCst);
         drop(incoming);
+        let _ = self.settled.send_replace(true);
         self.finish_by_deadline().await
     }
 
@@ -640,19 +706,19 @@ impl Server {
         }
     }
 
-    /// Waits until no request is in flight, then has the connections finish the answers they
-    /// are sending and close, and waits until they have. A process that ends before that cuts
-    /// the answers that were not sent in full.
+    /// Waits until no request is in flight, then until every connection has closed after the
+    /// answer it was sending, and until every lingering close has ended. A process that ends
+    /// before that cuts the answers that were not sent in full, and resets a connection whose
+    /// client has not yet read the end of the stream.
     async fn finish(&self) {
         self.wait_idle().await;
-        let _ = self.closing.send_replace(true);
         self.wait_for_zero(&self.open).await;
+        self.wait_for_zero(&self.lingering).await;
     }
 
-    /// The connections that were told to close and have not: each is still sending an answer.
+    /// The requests that were read and whose answer was not written in full.
     fn unsent(&self) -> usize {
-        let closing = usize::from(*self.closing.borrow());
-        closing * self.open.load(Ordering::SeqCst)
+        self.unanswered.load(Ordering::SeqCst)
     }
 
     /// Resolves when no request is in flight.
@@ -680,34 +746,56 @@ impl Server {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let server = Arc::clone(self);
-        let service = service_fn(move |request| {
-            let server = Arc::clone(&server);
-            async move { Ok::<_, Infallible>(server.handle(request).await) }
-        });
         let watched = Watched::new(stream, self.config.body_idle_timeout, peer);
+        let (stream, wire) = Lingering::new(watched, self);
+        let on_wire = Arc::clone(&wire);
+        let service = service_fn(move |request| {
+            let (server, wire) = (Arc::clone(&server), Arc::clone(&on_wire));
+            async move { Ok::<_, Infallible>(server.handle_on(request, Some(&wire)).await) }
+        });
         let serving = http1::Builder::new()
             .timer(TokioTimer::new())
             .header_read_timeout(self.config.header_timeout)
-            .serve_connection(TokioIo::new(watched), service);
+            .serve_connection(TokioIo::new(stream), service);
         let connected = Connected::enter(self);
-        let mut closing = self.closing.subscribe();
+        let mut settled = self.settled.subscribe();
         drop(tokio::spawn(async move {
             let _connected = connected;
             tokio::pin!(serving);
             tokio::select! {
                 // A connection that ends badly has nothing to tell the other side.
                 _ = serving.as_mut() => return,
-                _ = closing.changed() => {}
+                _ = settled.wait_for(|settled| *settled) => {}
             }
-            // The drain waits for this connection: the answer that is being sent is sent in
-            // full, and then the connection closes.
+            // The settle is over. A connection with a request on the wire is closed once that
+            // request is answered in full; one without is closed now, and the stream lingers.
+            tokio::select! {
+                _ = serving.as_mut() => return,
+                () = wire.wait_clear() => {}
+            }
             serving.as_mut().graceful_shutdown();
             let _ = serving.await;
         }));
     }
 
     /// Answers one request.
-    pub async fn handle<B>(&self, request: Request<B>) -> Response<Full<Bytes>>
+    pub async fn handle<B>(&self, request: Request<B>) -> Response<AnswerBody>
+    where
+        B: hyper::body::Body + Send,
+        B::Data: Send,
+        B::Error: Into<BoxError>,
+    {
+        self.handle_on(request, None).await
+    }
+
+    /// [`Server::handle`] for a request that came on a connection with this `wire`: a streamed
+    /// answer holds the wire until its body is over, so that the drain does not close the
+    /// connection in the middle of it.
+    async fn handle_on<B>(
+        &self,
+        request: Request<B>,
+        wire: Option<&Arc<linger::Wire>>,
+    ) -> Response<AnswerBody>
     where
         B: hyper::body::Body + Send,
         B::Data: Send,
@@ -729,6 +817,13 @@ impl Server {
         response
             .headers_mut()
             .insert(name, HeaderValue::from_str(&id).expect("hex digits"));
+        if !self.is_ready() {
+            let close = HeaderValue::from_static("close");
+            response.headers_mut().insert(CONNECTION, close);
+        }
+        if let Some(wire) = wire {
+            response.body_mut().hold_wire(wire);
+        }
         response
     }
 
@@ -746,9 +841,6 @@ impl Server {
     {
         if let Some(answer) = self.probe(parts).await {
             return Ok(answer);
-        }
-        if self.phase() == REFUSING {
-            return Err(S3Error::draining());
         }
         let signed = auth::verify(&self.config, parts)?;
         let reads = matches!(parts.method, Method::GET | Method::HEAD);
@@ -796,7 +888,7 @@ impl Server {
         let read = matches!(parts.method, Method::GET | Method::HEAD);
         let (status, text) = match (read, parts.uri.path(), self.is_ready()) {
             (true, "/healthz", _) => (StatusCode::OK, "ok".to_owned()),
-            (true, "/readyz", true) => (StatusCode::OK, "ready".to_owned()),
+            (true, "/readyz", true) => (StatusCode::OK, self.ready_text()),
             (true, "/readyz", false) => (StatusCode::SERVICE_UNAVAILABLE, "draining".to_owned()),
             (true, "/usagez", _) => self.usage_probe().await,
             (true, "/metricz", _) => (StatusCode::OK, self.metrics_probe()),
@@ -806,11 +898,22 @@ impl Server {
         Some(answer(status, &headers, Bytes::from(text)))
     }
 
+    /// The body of a 200 from `/readyz`: `ready`, and for a build node the mode of its cache,
+    /// `ready read-only` or `ready read-write` (see [`local_cache::Mode`]). The status does not
+    /// depend on the mode: a read-only node serves.
+    fn ready_text(&self) -> String {
+        match &self.config.cache {
+            Some(cache) => format!("ready {}", cache.mode().as_str()),
+            None => "ready".to_owned(),
+        }
+    }
+
     /// The text of `/metricz`: the block of every source of counters the process has (the
     /// proxy's, the OCI front's, the local cache's), one after the other, each ending in a
-    /// newline, or one line that names them all when there is none. Every block that exists
-    /// renders, never one of them; a storage node has the proxy's, a cache node the cache's, and
-    /// either may have the OCI front's.
+    /// newline, or one line that names them all when there is none; then, always,
+    /// `tierstore_build_info` ([`build_info::gauge`]). Every block that exists renders, never one
+    /// of them; a storage node has the proxy's, a cache node the cache's, and either may have the
+    /// OCI front's.
     fn metrics_probe(&self) -> String {
         let blocks = [
             self.config.proxy.as_ref().map(|proxy| proxy.metrics()),
@@ -827,6 +930,10 @@ impl Server {
         if text.is_empty() {
             text = "# this server has no proxy, no OCI read front and no local cache\n".to_owned();
         }
+        let late = self.late.load(Ordering::SeqCst);
+        text.push_str("# TYPE tierstore_drain_late_requests_total counter\n");
+        text.push_str(&format!("tierstore_drain_late_requests_total {late}\n"));
+        text.push_str(&build_info::gauge(build_info::VERSION, build_info::COMMIT));
         text
     }
 
