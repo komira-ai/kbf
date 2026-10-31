@@ -209,6 +209,7 @@ pub const ALLOWED: &[&str] = &[
     "exclusive_actions",
     "placement_load",
     "placement_predictions",
+    "usage_profiles",
     "whole_node_max",
     "whole_node_max_draining",
     "whole_node_keep_for_ordinary",
