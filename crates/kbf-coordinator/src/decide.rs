@@ -97,6 +97,8 @@ pub enum Hold {
     UpToDate,
     /// The host failed an update to the desired version.
     FailedHere,
+    /// The host declined an update to the desired version and its wait is not over.
+    Deferred,
     /// Every slot of the host's role is held.
     NoSlot,
     /// A role of the service that this one waits for has hosts behind or updating.

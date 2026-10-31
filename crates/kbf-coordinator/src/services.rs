@@ -34,6 +34,7 @@ use kbf_updater::secret::read_secret;
 use kbf_updater::wire::{MAX_SERVICE_NAME, MAX_SERVICES, is_service_name};
 use serde::Deserialize;
 
+use crate::defer::DeferBackoff;
 use crate::desired::{Desired, KBF, KBF_MIN_UP, LEGACY_ROLES, MAX_COUNT, kbf_roles};
 
 /// The most bytes of a services file.
@@ -107,6 +108,8 @@ pub struct ServiceDef {
     /// [`crate::service::Coordinator::heartbeat`]. It orders offers only: a service that
     /// must wait (`after`, its slots) yields to the next one whatever its priority.
     pub priority: i32,
+    /// How long a host that deferred an update is left alone ([`crate::defer`]).
+    pub defer_backoff: DeferBackoff,
 }
 
 impl ServiceDef {
@@ -122,6 +125,7 @@ impl ServiceDef {
             after: Vec::new(),
             require_min_up: Vec::new(),
             priority: 0,
+            defer_backoff: DeferBackoff::default(),
         }
     }
 
@@ -293,6 +297,7 @@ fn service_def(
         after,
         require_min_up: Vec::new(),
         priority,
+        defer_backoff: DeferBackoff::default(),
     })
 }
 

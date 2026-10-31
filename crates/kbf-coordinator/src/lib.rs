@@ -23,6 +23,7 @@ pub const BUILD_COMMIT: &str = env!("KBF_BUILD_COMMIT");
 pub mod config;
 pub mod converge;
 pub mod decide;
+pub mod defer;
 pub mod desired;
 pub mod fleet;
 pub mod http;
@@ -43,6 +44,8 @@ mod decide_role_tests;
 mod decide_tests;
 #[cfg(test)]
 mod decide_why_tests;
+#[cfg(test)]
+mod defer_tests;
 #[cfg(test)]
 mod desired_dropped_tests;
 #[cfg(test)]
