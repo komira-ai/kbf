@@ -331,9 +331,12 @@ impl Server {
     /// Lets a streamed body in, before any byte of it is read: refuses a body of unknown length
     /// where the backend needs the length (411), one that says it is longer than the limit
     /// (413, so that nothing is stored and no upload is begun), and one that comes when the
-    /// server is taking as many as it may (503 `SlowDown`, with `Retry-After`). Gives the
-    /// permit that is held until the body is stored or refused.
-    fn admit(
+    /// server is taking as many as it may and none ends within
+    /// [`put_permit_wait`](super::ServerConfig::put_permit_wait) (503 `SlowDown`, with
+    /// `Retry-After`). The checks of the head come first, so a request that is refused for them
+    /// does not wait; the wait is on the permit alone and no byte of the body is read during it.
+    /// Gives the permit that is held until the body is stored or refused.
+    async fn admit(
         &self,
         len: Option<u64>,
         presign: Option<&Grant>,
@@ -346,9 +349,17 @@ impl Server {
             Some(declared) if declared > limit as u64 => return Err(S3Error::too_large(limit)),
             _ => {}
         }
-        Arc::clone(&self.puts)
-            .try_acquire_owned()
-            .map_err(|_| S3Error::busy())
+        if let Ok(permit) = Arc::clone(&self.puts).try_acquire_owned() {
+            return Ok(permit);
+        }
+        let wait = self.config.put_permit_wait;
+        if wait.is_zero() {
+            return Err(S3Error::busy());
+        }
+        match tokio::time::timeout(wait, Arc::clone(&self.puts).acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            _ => Err(S3Error::busy()),
+        }
     }
 
     /// Creates the object from the body of the request as it arrives, create-only. The body is
@@ -377,7 +388,7 @@ impl Server {
         B::Error: Into<BoxError>,
     {
         refuse_reserved(key)?;
-        let permit = self.admit(len, presign)?;
+        let permit = self.admit(len, presign).await?;
         let hot_only = presign.is_some();
         let refused = Refused::default();
         let (carry, body) = hand_over(pieces(reader, check, refused.clone()));
@@ -515,7 +526,7 @@ impl Server {
         if !(1..=PART_LIMIT).contains(&number) {
             return Err(S3Error::invalid("a part number is from 1 to 10000"));
         }
-        let _permit = self.admit(len, None)?;
+        let _permit = self.admit(len, None).await?;
         let refused = Refused::default();
         let body = pieces(reader, check, refused.clone());
         let backend = &self.backend;

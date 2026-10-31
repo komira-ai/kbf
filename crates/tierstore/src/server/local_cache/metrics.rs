@@ -50,11 +50,21 @@ pub(super) enum SkippedKeep {
     Slow,
     /// The keep did not end within `keep_deadline` (a hung upstream or disk) and was abandoned.
     Deadline,
+    /// The cache is read-only, or lost the lock of its directory while the keep ran: it writes
+    /// nothing to a directory that another process holds.
+    ReadOnly,
 }
 
 /// The label of each [`SkippedKeep`], in the order of the enum.
-const SKIPPED_KEEP: [&str; 7] = [
-    "budget", "io", "busy", "head", "deleted", "slow", "deadline",
+const SKIPPED_KEEP: [&str; 8] = [
+    "budget",
+    "io",
+    "busy",
+    "head",
+    "deleted",
+    "slow",
+    "deadline",
+    "read_only",
 ];
 
 /// Why an object was evicted.
@@ -158,6 +168,7 @@ impl Counters {
         cache_bytes: u64,
         cache_objects: u64,
         fs_free_bytes: u64,
+        read_write: bool,
     ) -> String {
         let mut text = String::new();
         let plain = [
@@ -204,6 +215,11 @@ impl Counters {
                 text,
                 "tierstore_cache_evictions_total{{reason=\"{label}\"}} {value}"
             );
+        }
+        // One series for each mode: 1 for the one the cache is in, 0 for the other.
+        for (label, now) in [("read_only", !read_write), ("read_write", read_write)] {
+            let value = u8::from(now);
+            let _ = writeln!(text, "tierstore_cache_mode{{mode=\"{label}\"}} {value}");
         }
         text
     }

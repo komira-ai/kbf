@@ -126,6 +126,18 @@ const KEY_FLAG: &str = "--oci-tls-key";
 /// does not name the address or is not valid now, a key file any user can read, or a key that is
 /// not the leaf's.
 pub fn acceptor(cert: &Path, key: &Path, listen: SocketAddr) -> Result<TlsAcceptor, OciError> {
+    acceptor_for(cert, key, &[listen])
+}
+
+/// [`acceptor`] for a front that listens at several addresses: the leaf must name each of them.
+///
+/// # Errors
+/// As [`acceptor`], for any of the addresses.
+pub fn acceptor_for(
+    cert: &Path,
+    key: &Path,
+    listen: &[SocketAddr],
+) -> Result<TlsAcceptor, OciError> {
     let read = |flag, path: &Path| {
         std::fs::read(path).map_err(|source| OciError::Read {
             flag,
@@ -147,8 +159,10 @@ pub fn acceptor(cert: &Path, key: &Path, listen: SocketAddr) -> Result<TlsAccept
         return Err(pem_error(CERT_FLAG, cert, "no certificate".to_owned()));
     };
     let facts = Facts::of(leaf).map_err(|why| pem_error(CERT_FLAG, cert, why))?;
-    if let Some(why) = unnamed(&facts.ips, listen) {
-        return Err(pem_error(CERT_FLAG, cert, why));
+    for addr in listen {
+        if let Some(why) = unnamed(&facts.ips, *addr) {
+            return Err(pem_error(CERT_FLAG, cert, why));
+        }
     }
     if let Some(why) = facts.not_valid_now() {
         return Err(pem_error(CERT_FLAG, cert, why));

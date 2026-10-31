@@ -16,6 +16,7 @@ use kbf_task_pack::ManifestError;
 use super::recording_sink::Fake;
 use super::*;
 use crate::fetch::label;
+use crate::put::FixedJitter;
 
 /// The REAPI digest of `bytes`.
 fn reapi_of(bytes: &[u8]) -> Digest {
@@ -829,6 +830,7 @@ fn the_http_sink_puts_the_pack_to_the_url() {
             large: Vec::new(),
         },
         sleeper: Arc::new(ThreadSleeper),
+        jitter: Arc::new(RandomJitter),
     };
     sink.store_pack(0, b"ok").expect("stored");
     let request = server.join().expect("server");
@@ -952,6 +954,7 @@ fn recording_sink(url: String, waits: &Arc<Waits>) -> HttpSink {
             large: Vec::new(),
         },
         sleeper: Arc::new(Arc::clone(waits)),
+        jitter: Arc::new(FixedJitter(0.5)),
     }
 }
 
@@ -995,6 +998,24 @@ fn the_http_sink_does_not_retry_a_412() {
     assert_eq!(server.join().expect("server"), 1);
     assert!(waits.0.lock().unwrap().is_empty());
     assert!(matches!(err, PutError::Exists { .. }), "{err:?}");
+}
+
+/// Catches the two 412s sharing a line or an exit code: both are a put failure with exit 13, and
+/// the line a 412 after an interrupted attempt writes names it (greppable), while a plain 412
+/// writes the old line.
+#[test]
+fn a_412_after_an_interrupted_attempt_has_its_own_line_and_the_same_exit_code() {
+    let plain = Failure::from(PutError::Exists { url: "u".into() });
+    let after = Failure::from(PutError::ExistsAfterInterrupt { url: "u".into() });
+    assert_eq!(plain.exit_code(), EXIT_PUT);
+    assert_eq!(after.exit_code(), EXIT_PUT);
+    assert_eq!(plain.to_string(), "put: the object already exists at u");
+    assert!(
+        after
+            .to_string()
+            .starts_with("put: 412 after an interrupted attempt of this put; "),
+        "{after}"
+    );
 }
 
 #[path = "multipack_tests.rs"]

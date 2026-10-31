@@ -341,7 +341,7 @@ nothing is kept. A body that is cut leaves nothing at the upstream or in the cac
 `/metricz` has `tierstore_cache_writes_through_total` (puts the upstream took),
 `tierstore_cache_write_exists_total` (puts answered 412) and
 `tierstore_cache_write_keep_skipped_total{reason}` with the reasons `budget` (also a body of no
-declared length), `io`, `busy`, `head`, `deleted`, `slow` (the disk did not keep up) and `deadline` (the copy was abandoned);
+declared length), `io`, `busy`, `head`, `deleted`, `slow` (the disk did not keep up), `deadline` (the copy was abandoned) and `read_only` (on main, not in v0.0.41: the cache does not hold the lock of its directory, so it copies nothing);
 `tierstore_cache_keeps_expired_total` counts the puts answered before their copy was done.
 
 ```toml
@@ -433,7 +433,9 @@ until the next pass (every 10 seconds) frees it. The start refuses (exit status 
 than the size of the file system less `free_floor` percent of it; a file system whose size cannot be
 read, or that reports 0 bytes, is not judged: the start warns on stderr and goes on. The files of
 `.stage/` are never evicted and are removed at start. `scrub_rate` is accepted; this release does not
-scrub.
+scrub. `put_permit_wait`, like `max_concurrent_puts` and `put_min_bytes_per_sec`, is accepted in
+`[server]` of a build node and does nothing there without write-through, since the node answers every
+put 403.
 
 | key | what |
 |---|---|
@@ -538,7 +540,7 @@ the flags of the binary against this table, so a flag added without a key fails 
 
 | flag | key | what |
 |---|---|---|
-| `--listen` | `server.listen` | the address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on |
+| `--listen` | `server.listen` | the address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on. On main, not in v0.0.41: the flag may be given again, and the key may be a list of addresses, served by one server (see Filling in the flags) |
 | `--proxy-id` | `server.proxy_id` | names the journal and the lease of this process |
 | `--hot` | `hot_store.kind`, `hot_store.path`, `hot_store.bucket` | the hot tier: `kind` is `memory`, `dir` (with `path`) or `s3` (with `bucket`, `endpoint` and `credentials_file`); in a flag, `memory`, `dir:<path>` or `s3:<bucket>` |
 | `--cold` | `cold_store.kind`, `cold_store.path`, `cold_store.bucket` | the cold tier, in the same three kinds |
@@ -566,15 +568,17 @@ the flags of the binary against this table, so a flag added without a key fails 
 | `--copy-parallel` | `hot_store.copy_parallel` | the most objects the reconciler copies at once |
 | `--lease-ttl` | `hot_store.lease_ttl` | how long the reconciler's lease lasts without a renewal |
 | `--reconcile-interval` | `hot_store.reconcile_interval` | how often the reconciler works |
+| `--lock-file` | `hot_store.lock_file` | the lock file the reconciler works under: only the process that holds it reconciles (on main, not in v0.0.41) |
 | `--usage-stale-after` | `hot_store.usage_stale_after` | how old the published usage may be before `/usagez` says 503 |
 | `--max-request-bytes` | `server.max_request_bytes` | the longest body of a request |
 | `--max-concurrent-puts` | `server.max_concurrent_puts` | the most put bodies and parts taken at once |
+| `--put-permit-wait` | `server.put_permit_wait` | how long a put that arrives with all of those taken waits for one to end (15s by default; 0 answers 503 at once). No byte of its body is read while it waits. If none ends in that time it is answered 503 `SlowDown` with `Retry-After: 1`. A waiter holds a connection and no permit or body memory, is not bounded except by the connections, counts as in flight in a drain (so a drain may take up to this much longer, never past `--drain-deadline`), and does not notice its client leaving until its body is first read |
 | `--put-min-bytes-per-sec` | `server.put_min_bytes_per_sec` | the least average rate of a body (0 turns it off) |
 | `--put-rate-grace` | `server.put_rate_grace` | the time waiting for the client before that rate is held |
 | `--body-idle-timeout` | `server.body_idle_timeout` | how long a body or an answer may go without a byte |
 | `--skip-backend-check` | `cold_store.skip_checks` | a list of `CHECK=REASON` texts: the start-up check that is left out, with its reason (only `multipart-conditional`; it runs on the cold tier) |
 | `--backend-check-wait` | `server.backend_check_wait` | how long the start-up self-test asks again of a tier that does not answer |
-| `--oci-listen` | `oci.listen` | where the registry front listens; the front is off without the `[oci]` table |
+| `--oci-listen` | `oci.listen` | where the registry front listens; the front is off without the `[oci]` table. On main, not in v0.0.41: the flag may be given again, and the key may be a list of addresses |
 | `--oci-tls-cert` | `oci.tls_cert_file` | the certificate chain (PEM) of the front; with `oci.tls_key_file`, or neither |
 | `--oci-tls-key` | `oci.tls_key_file` | the private key (PEM) of the front |
 | `--oci-prefix` | `oci.prefix` | the key prefix the front reads, ending in `/` (`oci/` if left out) |
@@ -582,11 +586,22 @@ the flags of the binary against this table, so a flag added without a key fails 
 | `--oci-connection-lifetime` | `oci.connection_lifetime` | the longest a connection of the front lives (`1h` if left out) |
 
 These stay flags, since they describe one run and not the data path: `--config`,
-`--print-config`, `--check-config`, `--drain-lb-wait` and `--drain-deadline`. A start that gives
-`--config` and any other flag is refused with status 2 and a message that names the flags
-(`--drain-lb-wait`, `--drain-deadline` and `--check-config` may go with it). A refusal that the
-checks of the start make (water marks out of order, a key file others can read) names the keys of
-the file where the flag-mode message names the flags.
+`--print-config`, `--check-config`, `--capabilities`, `--drain-lb-wait` and `--drain-deadline`. A
+start that gives `--config` and any other flag is refused with status 2 and a message that names
+the flags (`--drain-lb-wait`, `--drain-deadline` and `--check-config` may go with it). A refusal
+that the checks of the start make (water marks out of order, a key file others can read) names the
+keys of the file where the flag-mode message names the flags.
+
+`tierstore --capabilities` (on main, not in v0.0.41) prints what this build can do, one
+capability to a line, and exits with status 0; a build with none prints nothing. It takes no other
+flag and needs none of those a start requires: with any other argument it prints nothing on stdout,
+says on stderr `tierstore: --capabilities takes no other flag, got <argument>`, and exits with
+status 2. A host updater reads it from a release before it hands over to it. `tierstore --version`
+prints `tierstore <version>+<commit>`, the end of the start line is ` commit=<commit>`, and
+`/metricz` has `tierstore_build_info{version="<version>",commit="<commit>"} 1`. The commit is the
+one the binary was built from, twelve hex digits: git's, or the value of
+`TIERSTORE_BUILD_COMMIT_OVERRIDE` at build time for a build without a `.git` (a build refuses a
+value that is not twelve lowercase hex digits), or `unknown` where there is neither.
 
 `tierstore --config <path> --check-config` loads the file as a start does (the same loader and the
 same refusals, the build-node checks and `write_through` included) and reads the key files it
@@ -659,7 +674,7 @@ The unit's `ExecStart=` is a complete command line. The flags to edit:
 
 | flag | what |
 |---|---|
-| `--listen` | the address the S3 API, `/healthz` and `/readyz` are served on |
+| `--listen` | the address the S3 API, `/healthz` and `/readyz` are served on. On main, not in v0.0.41: give it again for each further address (for the wildcard of both families, `0.0.0.0:<port>` and `[::]:<port>`; an IPv6 address is bound for IPv6 only, so they do not clash); one server, one drain and one limit on connections serve them all, an address given twice is refused (exit 2), and the start line shows them as `listen=<a>,<b>`. A wildcard and a specific address on one port, or one address on both `--listen` and `--oci-listen`, are refused by the system at bind on Linux (exit 1, naming the address); on macOS and the BSDs `SO_REUSEADDR` can let them share the port |
 | `--proxy-id` | names this process's journal and its lease in the hot tier; keep it across restarts, and give each process over the same tiers one of its own |
 | `--bucket` | the name of the one bucket clients see |
 | `--access-key-file`, `--read-only-key-file` | the full key, and (given once for each) the read-only keys; see above |
@@ -669,7 +684,7 @@ The unit's `ExecStart=` is a complete command line. The flags to edit:
 | `--hot`, `--cold` | the tiers: `s3:<bucket>` for a bucket of an S3-compatible store (also `dir:<path>` and `memory`; a `dir:` path must also be writable under `ProtectSystem=strict`, so add it to `ReadWritePaths=`) |
 | `--hot-endpoint`, `--cold-endpoint` | where the tier's store is, `http://host[:port]` (TLS is not built yet); `--hot-region` and `--cold-region` set the signing region of a tier, `us-east-1` if not given |
 | `--hot-bytes` | the bytes the hot tier is meant to hold; the water marks are shares of it (`--high-water`, `--low-water`, `--critical`) |
-| `--drain-lb-wait`, `--drain-deadline` | the drain on SIGTERM: how long `/readyz` says 503 while the server goes on serving, and how long it then waits for requests in flight |
+| `--drain-lb-wait`, `--drain-deadline` | the drain on SIGTERM: how long `/readyz` says 503 while the server goes on accepting and serving (the settle), and how long it then waits for requests in flight and for the connections it closes (see "Stopping it") |
 | `--usage-stale-after` | how old the usage that the reconciler publishes may be (2m by default, longer than `--lease-ttl`) before `/usagez` says 503 with the reason (200 and the age while fresh). Puts ignore a usage older than 30 s, so a stopped reconciler means a hot tier that is never taken to be full; puts are not refused. A load balancer probes `/readyz`, which does not look at the usage (one stopped reconciler would otherwise take every node out); alerting probes `/usagez` |
 | `--oci-listen`, `--oci-tls-cert`, `--oci-tls-key`, `--oci-prefix` | the read-only registry front, off unless `--oci-listen` is given; see The OCI read front |
 
@@ -781,8 +796,8 @@ the front then reads through the node's local cache, not a proxy (see The regist
 
 | flag | what |
 |---|---|
-| `--oci-listen ADDR` | where the registry front listens. With `--oci-tls-cert` and `--oci-tls-key` it is HTTPS; with neither it is plain HTTP, at any address; off loopback (127/8 and `::1` are loopback; `0.0.0.0` and `::` are not) the start prints one warning line, and a certificate and key are advised |
-| `--oci-tls-cert PATH`, `--oci-tls-key PATH` | both or neither (one without the other is refused at start, exit 2). The certificate chain (leaf first) and the private key, PEM. Clients dial an IP address, so the leaf must carry an IP subjectAltName for `--oci-listen` (any IP subjectAltName, if the address is `0.0.0.0` or `::`); a certificate without one, one that is expired or not yet valid, a key file any user can read (the "other" mode bits; a group may), or an unreadable file, is refused at start. The files are read once: a new certificate takes a restart, so renew it before it expires |
+| `--oci-listen ADDR` | where the registry front listens. With `--oci-tls-cert` and `--oci-tls-key` it is HTTPS; with neither it is plain HTTP, at any address; off loopback (127/8 and `::1` are loopback; `0.0.0.0` and `::` are not) the start prints one warning line, and a certificate and key are advised. On main, not in v0.0.41: give the flag again for each further address; one front, one limit on connections and one drain serve them all, and an address given twice is refused (exit 2); the start line shows them as `oci-listen=<a>,<b> (https)` or `(http)`, and a plain front prints one warning line for each address off loopback |
+| `--oci-tls-cert PATH`, `--oci-tls-key PATH` | both or neither (one without the other is refused at start, exit 2). The certificate chain (leaf first) and the private key, PEM. Clients dial an IP address, so the leaf must carry an IP subjectAltName for `--oci-listen` (for each of them, when it is given more than once; any IP subjectAltName, if the address is `0.0.0.0` or `::`); a certificate without one, one that is expired or not yet valid, a key file any user can read (the "other" mode bits; a group may), or an unreadable file, is refused at start. The files are read once: a new certificate takes a restart, so renew it before it expires |
 | `--oci-prefix PREFIX` | the key prefix, ending in `/`, `oci/` if not given. A prefix inside `_journal/` or `_tiering/`, or one that is not plain path segments, is refused at start (exit 2) |
 | `--oci-max-connections N` | connections open at once, 64 if not given; the others wait in the kernel's backlog. Memory is bounded by connections times the buffer a connection holds (up to 4 MiB), about 256 MiB at the default |
 | `--oci-connection-lifetime D` | the longest a connection lives, 1h if not given; a request being answered is finished first |
@@ -935,9 +950,16 @@ the operator's choice, and the shipped file does not make it.
 
 ## Stopping it
 
-systemd sends SIGTERM. The process answers `/readyz` 503, serves for `--drain-lb-wait` so that a
-load balancer sees it, refuses new requests, waits for those in flight for at most
-`--drain-deadline`, gives up the reconciler's lease and exits 0. `TimeoutStopSec=` is set above
+systemd sends SIGTERM. The process answers `/readyz` 503 and puts `Connection: close` on every
+answer from then on, serves for `--drain-lb-wait` (the settle) so that a load balancer sees it,
+stops accepting, and closes each idle connection with a lingering close (it shuts its end for
+writing, so that the client reads a clean end of stream, and reads until the client closes, for 60
+seconds at most). A request already on the wire is served, with `Connection: close`, never
+answered 503; one that arrives within a round trip of the end of the stream cannot be answered
+and is counted in `tierstore_drain_late_requests_total`. It waits for the requests in flight and
+the connections for at most `--drain-deadline`, gives up the reconciler's lease and exits 0. This
+is on main, not in v0.0.41, which answers a request on a connection that is open after the settle
+503 `ServiceUnavailable`. `TimeoutStopSec=` is set above
 the sum of the two flags and the lease's wait, so that systemd does not send SIGKILL to a drain
 in progress; if `--drain-deadline` is raised, raise it too. A start that fails is tried again
 after 30 seconds; exit status 2 (a command line the argument parser refused: an unknown flag, a
