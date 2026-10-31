@@ -59,7 +59,6 @@ use super::config_cache::CacheSettings;
 use super::front::{InvalidFlags, server_config};
 use super::listen::{joined, local_addrs};
 use super::local_cache::{CacheConfig, Disk, LocalCache, Mode, SystemDisk, check_local};
-use super::oci::OciListener;
 use super::{Drained, Server};
 
 /// How often the eviction pass runs beside the server.
