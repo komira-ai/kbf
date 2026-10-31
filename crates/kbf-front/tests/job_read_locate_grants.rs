@@ -457,6 +457,23 @@ async fn keys_tierstore_refuses_are_never_listed() {
     assert!(answer.lines.iter().all(|line| line["absent"] == true));
 }
 
+/// Catches: a header that is left out when nothing in the answer is located: with a key
+/// configured the header is the first line whatever the lines say, with no grants, and every line
+/// is `absent`.
+#[tokio::test]
+async fn an_answer_with_nothing_located_still_has_its_header() {
+    let source = Source::default();
+    let a = build(&source, "a", &[b"alpha".to_vec()]);
+    let rig = rig_granting(source, small(), Some(grants()));
+    let answer = Answer::of(&rig.locate(&rig.token(a.action)).await);
+    assert_eq!(
+        answer.header,
+        json!({"store": STORE, "bucket": BUCKET, "grants": []})
+    );
+    assert_eq!(answer.lines.len(), a.scope().len());
+    assert!(answer.lines.iter().all(|line| line["absent"] == true));
+}
+
 /// A writer that keeps what the logs say.
 #[derive(Clone, Default)]
 struct Log(Arc<Mutex<Vec<u8>>>);

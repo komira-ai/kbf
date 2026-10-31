@@ -25,7 +25,7 @@ const SECRET: &str = "locate-grant-secret-0123456789";
 const URL: &str = "https://store.farm.test:9000";
 const BUCKET: &str = "tiers";
 
-fn key_file(dir: &Path, text: &str, mode: u32) -> std::path::PathBuf {
+fn key_file(dir: &Path, text: impl AsRef<[u8]>, mode: u32) -> std::path::PathBuf {
     let path = dir.join("grant.key");
     // A file at mode 0400 cannot be written over.
     let _ = std::fs::remove_file(&path);
@@ -136,8 +136,16 @@ async fn the_start_reads_the_grant_key_as_the_other_secret_files_are_read() {
         assert!(why.contains("--job-store-grant-key-file"), "{why}");
         assert!(!why.contains(SECRET), "{why}");
     }
+    let not_text = key_file(dir.path(), [0xff, 0xfe, 0x00], 0o600);
+    let why = refusal(&with_store(
+        flags(&files, "127.0.0.1:0"),
+        &not_text,
+        URL,
+        BUCKET,
+    ));
+    assert!(why.contains("--job-store-grant-key-file"), "{why}");
     let bucket = {
-        let key = key_file(dir.path(), &json_key(), 0o600);
+        let key = key_file(dir.path(), json_key(), 0o600);
         refusal(&with_store(
             flags(&files, "127.0.0.1:0"),
             &key,
@@ -165,7 +173,7 @@ async fn the_start_refuses_a_store_url_a_task_cannot_use() {
     let dir = scratch_dir("job-read-store-url");
     let farm = ca("farm CA");
     let files = files(dir.path(), &farm, vec![ip("127.0.0.1")]);
-    let key = key_file(dir.path(), &json_key(), 0o600);
+    let key = key_file(dir.path(), json_key(), 0o600);
     for bad in [
         "ftp://store:9000",
         "store:9000",
@@ -174,6 +182,7 @@ async fn the_start_refuses_a_store_url_a_task_cannot_use() {
         "http://store:9000?x=1",
         "http://store:9000#top",
         "http://sto re:9000",
+        "http://sto\u{7}re:9000",
         "",
     ] {
         let why = refusal(&with_store(flags(&files, "127.0.0.1:0"), &key, bad, BUCKET));
@@ -269,7 +278,7 @@ async fn a_listener_with_a_grant_key_sends_grants_with_its_table_and_one_without
     let farm = ca("farm CA");
     let files = files(dir.path(), &farm, vec![ip("127.0.0.1")]);
     let world = world();
-    let key = key_file(dir.path(), &json_key(), 0o600);
+    let key = key_file(dir.path(), json_key(), 0o600);
 
     let granting = with_store(flags(&files, "127.0.0.1:0"), &key, URL, BUCKET);
     let lines = locate_lines(&farm, &world, &granting).await;

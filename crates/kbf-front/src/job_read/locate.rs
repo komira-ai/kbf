@@ -66,9 +66,9 @@ use serde_json::json;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
-use super::store_grants::GRANT_LIFETIME;
+use super::store_grants::{GRANT_LIFETIME, Minted};
 use super::walk::ScopeError;
-use super::{Hold, JobRead, LOCATE_OUTCOMES, Limits, Outcome, Reply, Tally};
+use super::{Hold, JobRead, LOCATE_OUTCOMES, Limits, Outcome, Reply, StoreGrants, Tally};
 use crate::cache::is_empty_blob;
 use crate::metrics::{Counter, Families};
 
@@ -248,8 +248,10 @@ impl JobRead {
         // The table is held until it is sent: the most it can be is charged before any of it is
         // built (a place first, as a GET takes them, so that the two never wait on each other).
         let place = Arc::clone(&self.reads).acquire_owned().await;
-        let charge =
-            LOCATE_CHARGE_BYTES + self.store_grants.as_ref().map_or(0, |_| GRANT_CHARGE_BYTES);
+        let mut charge = LOCATE_CHARGE_BYTES;
+        if self.store_grants.is_some() {
+            charge += GRANT_CHARGE_BYTES;
+        }
         let room = self.budget.take(scope.most_digests() as u64 * charge).await;
         let digests = scope.digests();
         let entries = self.entries_of(&digests).await;
@@ -258,33 +260,27 @@ impl JobRead {
             return self.refuse_locate(Outcome::Unavailable, "store_unavailable");
         };
         // The grants cover the keys of the lines to be sent, and those only.
-        let granted = self.store_grants.as_ref().map(|store| {
-            let keys: BTreeSet<String> = digests
-                .iter()
-                .zip(&entries)
-                .filter_map(|(digest, entry)| key_of(digest, entry))
-                .collect();
-            let end = GRANT_LIFETIME.as_secs();
-            let expires = claims.not_after.min(self.grants.now().saturating_add(end));
-            (store, store.mint(&keys, expires))
-        });
+        let granted = self.grants_for(claims.not_after, &digests, &entries);
         let mut body = String::new();
         if let Some((store, minted)) = &granted {
-            body.push_str(&format!("{}\n", store.header(minted)));
+            body.push_str(&store.header(minted).to_string());
+            body.push('\n');
         }
         for (at, (digest, entry)) in digests.iter().zip(&entries).enumerate() {
             if at % LINES_PER_YIELD == LINES_PER_YIELD - 1 {
                 tokio::task::yield_now().await;
             }
             // With grants a line is located only if a grant lists its key.
-            let grant = granted
-                .as_ref()
-                .and_then(|(_, minted)| minted.grant_of(&key_of(digest, entry)?));
-            let entry = if granted.is_some() && grant.is_none() {
-                &Entry::Absent
-            } else {
-                entry
-            };
+            let mut grant = None;
+            let mut entry = entry;
+            if let Some((_, minted)) = &granted {
+                if let Some(key) = key_of(digest, entry) {
+                    grant = minted.grant_of(&key);
+                }
+                if grant.is_none() {
+                    entry = &Entry::Absent;
+                }
+            }
             let (kind, mut line) = match entry {
                 Entry::Pack(at) => (
                     0,
@@ -311,6 +307,27 @@ impl JobRead {
             idle: self.limits.held_idle,
         });
         reply
+    }
+
+    /// The store grants for the keys of `entries` (those of `digests`, in order), ending at the
+    /// earlier of `not_after` (the job's read grant) and [`GRANT_LIFETIME`] from now; none
+    /// without a grant key.
+    fn grants_for(
+        &self,
+        not_after: u64,
+        digests: &[Digest],
+        entries: &[Entry],
+    ) -> Option<(&StoreGrants, Minted)> {
+        let store = self.store_grants.as_ref()?;
+        let mut keys = BTreeSet::new();
+        for (digest, entry) in digests.iter().zip(entries) {
+            if let Some(key) = key_of(digest, entry) {
+                keys.insert(key);
+            }
+        }
+        let end = GRANT_LIFETIME.as_secs();
+        let expires = not_after.min(self.grants.now().saturating_add(end));
+        Some((store, store.mint(&keys, expires)))
     }
 
     fn refuse_locate(&self, outcome: Outcome, reason: &'static str) -> Reply {
