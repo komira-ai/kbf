@@ -572,7 +572,6 @@ fn probe_2_mask_runtime_then_stop_an_active_instance_through_polkit() {
             "polkit.addRule(function(action, subject) {{\n\
              \x20 polkit.log(\"probe-polkit \" + action.id + \" unit=\" + action.lookup(\"unit\") + \" user=\" + subject.user);\n\
              \x20 if (subject.user != \"{user}\") return polkit.Result.NOT_HANDLED;\n\
-             \x20 return polkit.Result.NO;\n\
              \x20 if (action.id == \"org.freedesktop.systemd1.manage-unit-files\") return polkit.Result.YES;\n\
              \x20 if (action.id == \"org.freedesktop.systemd1.manage-units\" &&\n\
              \x20     action.lookup(\"unit\") == \"probe-polkit@a.service\") return polkit.Result.YES;\n\
@@ -851,4 +850,74 @@ fn pkcheck_facts(rig: &Rig, listed: &str, stranger: &str) -> String {
         child.wait().unwrap();
     }
     text
+}
+
+/// What polkit says about three units under three spellings of a rule that names one of them.
+/// Not an assertion: it records what `pkcheck` answers, so the scope of the probe's rule is
+/// known from facts.
+#[test]
+#[ignore = "needs root and systemd; run by cargo xtask sudo-test"]
+fn probe_2_scope_diagnosis() {
+    use std::os::unix::process::CommandExt;
+    let rig = Rig::new("pkdiag");
+    if !["/usr/lib/polkit-1/polkitd", "/usr/libexec/polkitd"]
+        .iter()
+        .any(|p| Path::new(p).exists())
+    {
+        refused(2, "polkitd is not installed");
+    }
+    let account = Account::new(&format!("urp2d{}", std::process::id()), &[]);
+    let rule = "/etc/polkit-1/rules.d/48-probe-pkdiag.rules".to_owned();
+    let _guard = PolkitProbe {
+        units: Vec::new(),
+        files: vec![rule.clone()],
+    };
+    let ids = EtcAccounts::system().unwrap().user(&account.name).unwrap();
+    let mut child = Command::new(rig.path("release/probe"))
+        .args(["park", "--"])
+        .uid(ids.uid)
+        .gid(ids.gid)
+        .spawn()
+        .unwrap();
+    let pid = child.id().to_string();
+    let mut text = String::new();
+    let scenarios = [
+        (
+            "loose ==",
+            "action.lookup(\"unit\") == \"probe-polkit@a.service\"",
+        ),
+        (
+            "strict ===",
+            "String(action.lookup(\"unit\")) === \"probe-polkit@a.service\"",
+        ),
+        (
+            "indexOf",
+            "String(action.lookup(\"unit\")).indexOf(\"@a.\") >= 0",
+        ),
+        ("always false", "false"),
+    ];
+    for (name, condition) in scenarios {
+        let body = format!(
+            "polkit.addRule(function(action, subject) {{\n  if (subject.user != \"{user}\") return polkit.Result.NOT_HANDLED;\n  if (action.id == \"org.freedesktop.systemd1.manage-units\" && {condition}) return polkit.Result.YES;\n  return polkit.Result.NOT_HANDLED;\n}});\n",
+            user = account.name
+        );
+        fs::write(&rule, body).unwrap();
+        ok(SYSTEMCTL, &["restart", "polkit.service"]);
+        for unit in ["a", "b", "c"] {
+            let done = Command::new("/usr/bin/pkcheck")
+                .args([
+                    "--action-id",
+                    "org.freedesktop.systemd1.manage-units",
+                    "--process",
+                    &pid,
+                ])
+                .args(["--detail", "unit", &format!("probe-polkit@{unit}.service")])
+                .output()
+                .unwrap();
+            text.push_str(&format!("{name}: unit {unit}: {:?}\n", done.status.code()));
+        }
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    record("probe-2-scope", &text);
 }
