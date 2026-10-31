@@ -179,6 +179,18 @@ impl Agent {
         self
     }
 
+    /// Not yet: the agent announces nothing and keeps nothing.
+    #[must_use]
+    pub fn with_host_updates(self, _dir: std::path::PathBuf) -> Self {
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn with_beat_limit(self, _max: usize) -> Self {
+        self
+    }
+
     /// The status of `kbf` the heartbeats say.
     pub fn status(&self) -> Status {
         self.slots[0].status.get()
@@ -296,32 +308,40 @@ impl Agent {
     /// one with services lists them, and reads a reply that may name one.
     fn heartbeats(&self, stop: &Stop, orders: &std::sync::mpsc::Sender<Order>) {
         while !stop.stopped() {
-            let mut beat = self.slots[0].status.get().heartbeat();
-            let reply = if self.slots.len() == 1 {
-                self.world
-                    .coordinator
-                    .heartbeat(&beat)
-                    .map(ServiceReply::from)
-            } else {
-                beat.services = Some(
-                    self.slots[1..]
-                        .iter()
-                        .filter_map(|slot| {
-                            Some(slot.status.get().service_beat(slot.service.as_deref()?))
-                        })
-                        .collect(),
-                );
-                self.world.coordinator.heartbeat_services(&beat)
-            };
-            match reply {
-                Ok(ServiceReply::Update { service, version }) => {
-                    let service = service.filter(|name| name != KBF_SERVICE);
-                    let _ = orders.send((service, version));
-                }
-                Ok(ServiceReply::Nothing) => {}
-                Err(e) => self.log(&format!("heartbeat: {e}")),
+            if let Some(order) = self.beat_once() {
+                let _ = orders.send(order);
             }
             sleep(self.timing.heartbeat, stop);
+        }
+    }
+
+    pub(super) fn beat_once(&self) -> Option<Order> {
+        let mut beat = self.slots[0].status.get().heartbeat();
+        let reply = if self.slots.len() == 1 {
+            self.world
+                .coordinator
+                .heartbeat(&beat)
+                .map(ServiceReply::from)
+        } else {
+            beat.services = Some(
+                self.slots[1..]
+                    .iter()
+                    .filter_map(|slot| {
+                        Some(slot.status.get().service_beat(slot.service.as_deref()?))
+                    })
+                    .collect(),
+            );
+            self.world.coordinator.heartbeat_services(&beat)
+        };
+        match reply {
+            Ok(ServiceReply::Update { service, version }) => {
+                Some((service.filter(|name| name != KBF_SERVICE), version))
+            }
+            Ok(ServiceReply::Nothing) => None,
+            Err(e) => {
+                self.log(&format!("heartbeat: {e}"));
+                None
+            }
         }
     }
 
@@ -362,7 +382,7 @@ impl Agent {
 
     /// An order for `target` of `service` (`None`: `kbf`): run it, unless the same target
     /// failed a moment ago.
-    fn order(&self, service: Option<&str>, target: &Version) {
+    pub(super) fn order(&self, service: Option<&str>, target: &Version) {
         let Some(slot) = self.slots.iter().find(|s| s.service.as_deref() == service) else {
             self.log(&format!(
                 "an order for {}, which this agent does not run",

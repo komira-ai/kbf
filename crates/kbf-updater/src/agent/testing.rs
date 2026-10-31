@@ -12,7 +12,7 @@ use super::local::{Ended, HostState, Local, LocalError, Staged, Trial};
 use crate::inventory::{Host, Role};
 use crate::ports::{Clock, Drain, Health, HealthCheck, Placed, PortError};
 use crate::version::Version;
-use crate::wire::{self, Heartbeat, Reply, ServiceReply};
+use crate::wire::{self, Answer, Heartbeat, Reply, ServiceReply};
 
 pub const COMMIT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub const COMMIT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -475,6 +475,9 @@ pub struct FakeCoordinator {
     pub service_script: Arc<Mutex<VecDeque<ServiceReply>>>,
     /// How many replies of the script were handed out.
     pub delivered: Arc<AtomicUsize>,
+    /// The `features` of the answer to a heartbeat that announces `agent_features`; none: a
+    /// coordinator that predates them, whose reply has no such field.
+    pub features: Arc<Mutex<Option<Vec<String>>>>,
 }
 
 impl FakeCoordinator {
@@ -494,6 +497,17 @@ impl FakeCoordinator {
     pub fn reply(&self, reply: Result<Reply, CoordinatorError>) {
         *lock(&self.answer) = Some(reply);
     }
+
+    /// The coordinator advertises `names` to an agent that announces (`[]`: it knows the field
+    /// and supports none).
+    pub fn advertise(&self, names: &[&str]) {
+        *lock(&self.features) = Some(names.iter().map(|n| (*n).to_owned()).collect());
+    }
+
+    /// The coordinator predates features: its replies carry none.
+    pub fn advertise_nothing_at_all(&self) {
+        *lock(&self.features) = None;
+    }
 }
 
 impl Coordinator for FakeCoordinator {
@@ -505,6 +519,18 @@ impl Coordinator for FakeCoordinator {
     fn heartbeat_services(&self, beat: &Heartbeat) -> Result<ServiceReply, CoordinatorError> {
         lock(&self.beats).push(beat.clone());
         Ok(self.next_service_reply())
+    }
+
+    fn heartbeat_answer(&self, beat: &Heartbeat) -> Result<Answer, CoordinatorError> {
+        lock(&self.beats).push(beat.clone());
+        let reply = lock(&self.answer)
+            .clone()
+            .unwrap_or(Ok(Reply::Nothing))?
+            .into();
+        Ok(Answer {
+            reply,
+            features: lock(&self.features).clone(),
+        })
     }
 }
 
