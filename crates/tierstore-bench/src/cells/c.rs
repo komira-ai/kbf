@@ -502,10 +502,8 @@ mod tests {
             let two_polls = Duration::from_secs(1) / rps * 2;
             // The timer wheel rounds a sleep up to the millisecond, so allow that and no more.
             let seen = lag[0].unwrap();
-            assert!(
-                seen >= two_polls && seen < two_polls + Duration::from_millis(5),
-                "{rps} a second: {seen:?}"
-            );
+            let allowed = two_polls..two_polls + Duration::from_millis(5);
+            assert!(allowed.contains(&seen), "{rps} a second: {seen:?}");
             assert_eq!(lag[1], None);
             assert_eq!(backlog, [1, 1, 0]);
             assert!(drained.is_some());

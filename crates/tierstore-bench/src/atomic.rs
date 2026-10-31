@@ -47,9 +47,9 @@ pub fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
     // The directory's own entry: best effort, since not every file system lets a directory be
     // opened for this.
-    if let Some(dir) = path.parent() {
+    path.parent().into_iter().for_each(|dir| {
         File::open(dir).and_then(|d| d.sync_all()).ok();
-    }
+    });
     Ok(())
 }
 

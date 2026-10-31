@@ -698,11 +698,10 @@ mod tests {
             "hot=farm-hot",
         ]);
         let err = RunConfig::resolve(&a, Some(file(FILE))).unwrap_err();
-        assert!(
-            matches!(&err, ConfigError::OutsidePrefix { role: Role::Hot, what: "bucket", value, .. } if value == "farm-hot"),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "role hot: the bucket \"farm-hot\" does not start with the test prefix \"t-\""
         );
-        assert!(err.to_string().contains("farm-hot"));
 
         let live = FILE.replace("t-cold-id", "live-cold-id");
         let a = args(&[
@@ -712,9 +711,9 @@ mod tests {
             "cold=t-c",
         ]);
         let err = RunConfig::resolve(&a, Some(file(&live))).unwrap_err();
-        assert!(
-            matches!(&err, ConfigError::OutsidePrefix { role: Role::Cold, what: "account id", value, .. } if value == "live-cold-id"),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "role cold: the account id \"live-cold-id\" does not start with the test prefix \"t-\""
         );
 
         let instance = r#"{"stores": {"instance": {"endpoint": "http://i.example:1",
