@@ -2,8 +2,6 @@
 //! in [`Counted`], so every request the node's cache makes to the cold store, on the
 //! store its flags name or the one its registration gives, is in `kbf_cold_store_*`.
 
-#![allow(dead_code)]
-
 use std::error::Error;
 use std::sync::Arc;
 

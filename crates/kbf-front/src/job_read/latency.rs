@@ -6,8 +6,6 @@
 //! answered `POST /batch`. A blob streamed over the size where reads stream is answered when
 //! its stream starts, not when its last byte is sent.
 
-#![allow(dead_code)]
-
 use std::future::Future;
 
 use tonic::codegen::http::Method;
@@ -69,8 +67,14 @@ impl Latency {
         (method, path): (&Method, &str),
         answer: impl Future<Output = T>,
     ) -> T {
-        let _ = (method, path);
-        answer.await
+        let kind = ReadKind::of(method, path);
+        let began = (self.clock)();
+        let reply = answer.await;
+        if let Some(kind) = kind {
+            let elapsed = (self.clock)().saturating_sub(began);
+            self.seconds[kind as usize].observe_duration(elapsed);
+        }
+        reply
     }
 
     pub(super) fn render(&self, families: &mut Families) {

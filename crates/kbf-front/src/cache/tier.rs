@@ -324,6 +324,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     pub fn render_metrics(&self) -> String {
         let mut out = self.writer.metrics.render();
         self.render_ram(&mut out);
+        self.cold_store.render(&mut out);
         if let Some(reads) = &self.legacy_reads {
             reads.render(&mut out);
         }

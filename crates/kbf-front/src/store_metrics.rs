@@ -17,8 +17,6 @@
 //!
 //! Recording is a few relaxed atomic adds and takes no lock.
 
-#![allow(dead_code)]
-
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -295,7 +293,13 @@ impl<S: ObjectStore> ObjectStore for Counted<S> {
         body: Bytes,
         retain_until: Option<SystemTime>,
     ) -> Result<(), ObjectStoreError> {
-        self.inner.put_new(key, body, retain_until).await
+        let call = self.call(Op::Put);
+        let len = body.len() as u64;
+        let answer = call.end(self.inner.put_new(key, body, retain_until).await);
+        if answer.is_ok() {
+            self.metrics.write_bytes.add(len);
+        }
+        answer
     }
 
     async fn put_stream(
@@ -304,7 +308,12 @@ impl<S: ObjectStore> ObjectStore for Counted<S> {
         len: u64,
         body: BodyStream,
     ) -> Result<(), ObjectStoreError> {
-        self.inner.put_stream(key, len, body).await
+        let call = self.call(Op::Put);
+        let answer = call.end(self.inner.put_stream(key, len, body).await);
+        if answer.is_ok() {
+            self.metrics.write_bytes.add(len);
+        }
+        answer
     }
 
     async fn get_range(
@@ -312,7 +321,12 @@ impl<S: ObjectStore> ObjectStore for Counted<S> {
         key: &ObjectKey,
         range: ByteRange,
     ) -> Result<Bytes, ObjectStoreError> {
-        self.inner.get_range(key, range).await
+        let call = self.call(Op::Get);
+        let answer = call.end(self.inner.get_range(key, range).await);
+        if let Ok(bytes) = &answer {
+            self.metrics.read_bytes.add(bytes.len() as u64);
+        }
+        answer
     }
 
     async fn may_hold(&self, key: &ObjectKey) -> Result<bool, ObjectStoreError> {
@@ -320,11 +334,13 @@ impl<S: ObjectStore> ObjectStore for Counted<S> {
     }
 
     async fn len(&self, key: &ObjectKey) -> Result<Option<u64>, ObjectStoreError> {
-        self.inner.len(key).await
+        let call = self.call(Op::Head);
+        call.end(self.inner.len(key).await)
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
-        self.inner.delete(key).await
+        let call = self.call(Op::Delete);
+        call.end(self.inner.delete(key).await)
     }
 
     async fn list(
@@ -333,6 +349,7 @@ impl<S: ObjectStore> ObjectStore for Counted<S> {
         after: Option<&ListToken>,
         max_keys: PageSize,
     ) -> Result<ListPage, ObjectStoreError> {
-        self.inner.list(prefix, after, max_keys).await
+        let call = self.call(Op::List);
+        call.end(self.inner.list(prefix, after, max_keys).await)
     }
 }

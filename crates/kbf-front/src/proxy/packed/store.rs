@@ -169,7 +169,6 @@ pub struct Packs {
     budget: Budget,
     pub(super) metrics: Arc<PackMetrics>,
     /// What the packs' object store has been asked ([`Packs::with_store_metrics`]).
-    #[allow(dead_code)]
     store_metrics: Arc<crate::store_metrics::StoreMetrics>,
     pub(super) verifying: Arc<VerifyingKeys>,
     clock: Clock,
@@ -295,6 +294,7 @@ impl Packs {
     /// Appends the pack families to `out` in the Prometheus text format.
     pub fn render_metrics(&self, out: &mut String) {
         self.metrics.render(out);
+        self.store_metrics.render(out);
     }
 
     /// Appends the pack families of `packs`, if a frontend has them, to `out`; without packs

@@ -224,7 +224,6 @@ pub struct Cache<M, O> {
     legacy_reads: Option<Arc<kbf_storage::legacy::LegacyReads>>,
     /// What the cold store has been asked, which the scrape renders
     /// ([`Cache::with_cold_store_metrics`]); zeros for a cache whose store is not counted.
-    #[allow(dead_code)]
     cold_store: Arc<crate::store_metrics::StoreMetrics>,
     /// How many waits for held blobs have parked, for a test to wait on.
     #[cfg(feature = "testkit")]
