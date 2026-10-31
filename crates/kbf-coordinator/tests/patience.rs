@@ -75,7 +75,7 @@ async fn a_client_that_never_handshakes_is_dropped() {
 #[tokio::test(start_paused = true)]
 async fn a_client_that_sends_no_request_is_dropped() {
     let farm = Farm::start("patience-request").await;
-    let who = farm.pki.updater("d1", HostRole::Daemon);
+    let who = farm.pki.updater("d1", HostRole::DAEMON);
     let config = client_config(&farm.pki, Some(&who));
     let name = rustls::pki_types::ServerName::try_from("localhost").expect("a name");
     let mut tls = tokio_rustls::TlsConnector::from(config)
@@ -126,7 +126,7 @@ async fn a_listener_serves_no_more_connections_than_its_cap() {
         );
         tokio::task::yield_now().await;
     }
-    let who = farm.pki.updater("d1", HostRole::Daemon);
+    let who = farm.pki.updater("d1", HostRole::DAEMON);
     let config = client_config(&farm.pki, Some(&who));
     let name = rustls::pki_types::ServerName::try_from("localhost").expect("a name");
     let tcp = TcpStream::connect(addr)
