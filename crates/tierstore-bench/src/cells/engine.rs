@@ -1447,8 +1447,8 @@ mod tests {
     /// Catches the caps a result names not being the caps the run held: the provenance of the
     /// environment (and so of every result a cell writes) is stamped from the configuration even
     /// when the context's own provenance has none, and the cold cap is the cold role's and the
-    /// hot cap the hot role's: with the cold cap off and the hot one at 1 a second, a hundred cold
-    /// requests take no time and three hot ones two seconds.
+    /// hot cap the hot role's: with the cold cap at 1000 a second and the hot one at 1, a hundred
+    /// cold requests take 99 ms and three hot ones two seconds.
     #[tokio::test(start_paused = true)]
     async fn the_environment_stamps_the_caps_it_holds_and_holds_each_role_to_its_own() {
         use crate::config::{RateCap, RateCaps};
@@ -1456,7 +1456,7 @@ mod tests {
         let mut ctx = testkit::ctx(dir.path(), &[], Window::Busy);
         assert_eq!(ctx.provenance.rate_caps, None);
         ctx.config.rates = RateCaps {
-            cold_rps: std::num::NonZeroU32::new(1_000_000).unwrap(),
+            cold_rps: std::num::NonZeroU32::new(1000).unwrap(),
             hot_rps: RateCap::per_sec(1).unwrap(),
             list_poll_rps: 5,
         };
@@ -1466,11 +1466,12 @@ mod tests {
         for _ in 0..100 {
             env.cap(Cap::Cold).acquire().await;
         }
-        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_eq!(start.elapsed(), Duration::from_millis(99));
+        let hot_start = tokio::time::Instant::now();
         for _ in 0..3 {
             env.cap(Cap::Hot).acquire().await;
         }
-        assert_eq!(start.elapsed(), Duration::from_secs(2));
+        assert_eq!(hot_start.elapsed(), Duration::from_secs(2));
         let seen = Arc::new(Mutex::new(vec![]));
         let results = run_cell(&env, CellId::ColdPut, vec![arm("a", 1, 1, &seen)], 2, None)
             .await
