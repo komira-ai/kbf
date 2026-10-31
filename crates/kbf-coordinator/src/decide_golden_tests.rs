@@ -219,22 +219,27 @@ fn the_minimums_hold_whatever_the_limits_say() {
     );
 }
 
-/// A host that failed the desired version is not ordered it again, healthy or not, and holds its
-/// slot while it is unhealthy; a host that failed another version is not held back; a new desired
-/// version lifts the block.
+/// A host that failed the desired version is not ordered it again, healthy or not; a host that
+/// failed another version is not held back; a new desired version lifts the block. With a
+/// daemon limit of 1 the failed host that is unhealthy (d2) holds the only slot, so nobody else
+/// goes until it heartbeats healthy; the host that failed and is healthy (d1) holds none.
 #[test]
 fn a_failed_host_is_not_ordered_again() {
     let failed = |b: Heartbeat, target: &str| last(b, target, Outcome::Failed);
-    let mut f = fleet(
-        NOW,
-        &[
-            ("d1", Daemon, failed(beat("1.0"), "2.0")),
-            ("d2", Daemon, unhealthy(failed(beat("1.0"), "2.0"))),
-            ("d3", Daemon, beat("1.0")),
-            ("d4", Daemon, failed(beat("1.0"), "1.5")),
-        ],
-    );
     let hosts = ["d1", "d2", "d3", "d4"];
+    let with = |d2_healthy: bool| {
+        let d2 = failed(beat("1.0"), "2.0");
+        fleet(
+            NOW,
+            &[
+                ("d1", Daemon, failed(beat("1.0"), "2.0")),
+                ("d2", Daemon, if d2_healthy { d2 } else { unhealthy(d2) }),
+                ("d3", Daemon, beat("1.0")),
+                ("d4", Daemon, failed(beat("1.0"), "1.5")),
+            ],
+        )
+    };
+    let mut f = with(false);
     assert_eq!(
         run(&mut f, &desired("2.0", 1, 1), &hosts, NOW, false),
         [
@@ -253,6 +258,58 @@ fn a_failed_host_is_not_ordered_again() {
             "d4: update 3.0"
         ]
     );
+    let mut one = desired("2.0", 1, 1);
+    one.max_updating.daemon = 1;
+    assert_eq!(
+        run(&mut f, &one, &hosts, NOW, false),
+        ["d1: nothing", "d2: nothing", "d3: nothing", "d4: nothing"],
+        "the unhealthy failed host holds the only slot"
+    );
+    let mut f = with(true);
+    assert_eq!(
+        run(&mut f, &one, &hosts, NOW, false),
+        [
+            "d1: nothing",
+            "d2: nothing",
+            "d3: update 2.0",
+            "d4: update 2.0"
+        ],
+        "healthy again, it holds none"
+    );
+}
+
+/// Each of storage, daemons and Macs, alone behind, keeps both frontends waiting; the host
+/// that is behind goes. (Macs are the role the frontend wait names last.)
+#[test]
+fn one_role_behind_keeps_the_frontends_waiting() {
+    for (role, host) in [(Storage, "s1"), (Daemon, "d1"), (MacDaemon, "m1")] {
+        let mut f = fleet(
+            NOW,
+            &[
+                ("s1", Storage, beat("2.0")),
+                ("d1", Daemon, beat("2.0")),
+                ("m1", MacDaemon, beat("2.0")),
+                ("f1", Frontend, beat("1.0")),
+                ("f2", Frontend, beat("1.0")),
+            ],
+        );
+        f.record(id(host), role, beat("1.0"), NOW);
+        assert_eq!(
+            run(
+                &mut f,
+                &desired("2.0", 0, 1),
+                &[host, "f1", "f2"],
+                NOW,
+                false
+            ),
+            [
+                format!("{host}: update 2.0"),
+                "f1: nothing".to_owned(),
+                "f2: nothing".to_owned()
+            ],
+            "{role}"
+        );
+    }
 }
 
 /// An order holds its slot for 120 s without the host reporting it: the host that asks again is
