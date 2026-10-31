@@ -294,7 +294,9 @@ the body is read. The key files of `[server]` are those of the front, as for a s
 
 With `write_through = true` in `[local_cache]` (default `false`) the node takes the writes its keys
 may do and sends each to the upstream; the answer is given only after the upstream has the object,
-and the cache keeps nothing of what is written (the first read of an object fills it). Create-only
+and a create-only put under a `cache = true` policy is also kept on the node, so the next read of
+it is a hit (a multipart upload is not kept: the first read fills it; see "What a put keeps"
+below). Create-only
 puts (with or without `If-None-Match: *`), presigned PUTs, multipart uploads (start, part,
 completion, abort) and deletes go to the upstream; the roles of the full, read-only, scoped,
 presigning and GC keys apply as on a storage node, and a put that replaces (`If-Match`) and a copy
@@ -312,6 +314,35 @@ before the address is bound; one that cannot be reached is status 1. The upstrea
 a store that takes writes under `_tiering/` (an S3 bucket, not the front of a storage node). The
 upstream's key is also the cache's: only the front's roles keep one client from another's objects.
 The start line then says `mode=write-through-cache`.
+
+What a put keeps. The body of a create-only put under a `cache = true` policy is copied into
+`.stage/` as it streams to the upstream. When the upstream has acknowledged the object, the node
+asks it for the object's tag and time (one HEAD, so the tag in the cache is the one the upstream
+gave, which for a large body is not an MD5), puts the copy in the cache, and then answers 200. The
+copy is best effort and never fails the put: if every keep slot is busy (`max_concurrent_keeps`),
+the object does not fit the budget, the stage directory cannot be written, the HEAD fails, the disk
+falls behind the body, or the object was deleted meanwhile, the copy is dropped, the put is still
+200 with the object at the upstream, and the skip is counted. The body is written to the stage file
+by a task of its own through a queue of at most 16 chunks and 4 MiB (the bytes bound the memory,
+whatever the size of the chunks; at most `max_concurrent_keeps` times 4 MiB in all), so a slow or
+hung disk never makes the upload wait: the copy is dropped instead. Once the upstream has
+acknowledged the object, the rest of the keep runs on its own task, so a client that goes away at
+that point does not leave a half-made copy. The put waits for that task for `keep_wait` and is then
+answered; the task ends within `keep_deadline` with the object kept or abandoned. A read of a key
+whose copy is still being made never waits for it: it is answered from the upstream. The eviction
+pass that a kept object may call for runs on its own task, and the put does not wait for it. A link
+that is under way when a copy is abandoned cannot be called back and is undone when it ends; if its
+thread never returns (a disk that hangs for good) the staged file and a reference to the cache stay
+until the process ends, and the undoing may remove the entry of a fill of the same key made after
+the abandonment, which costs one more trip to the upstream and never serves stale data.
+A key named by its content (`cas/l/<sha256>`) is hashed as the body streams, copied or not;
+a body that does not hash to the name is answered 400 `BadDigest`, the upstream stores nothing, and
+nothing is kept. A body that is cut leaves nothing at the upstream or in the cache.
+`/metricz` has `tierstore_cache_writes_through_total` (puts the upstream took),
+`tierstore_cache_write_exists_total` (puts answered 412) and
+`tierstore_cache_write_keep_skipped_total{reason}` with the reasons `budget` (also a body of no
+declared length), `io`, `busy`, `head`, `deleted`, `slow` (the disk did not keep up) and `deadline` (the copy was abandoned);
+`tierstore_cache_keeps_expired_total` counts the puts answered before their copy was done.
 
 ```toml
 [server]
@@ -416,6 +447,9 @@ put 403.
 | `local_cache.critical` | percent of the budget above which a fill is skipped (default 95, not below `high_water`) |
 | `local_cache.free_floor` | percent of the file system that is kept free (0 to 99, default 10): below it a pass evicts, even under the budget; it does not stop a fill, and `budget` may not be above the file system's size less the floor (exit status 2), unless its size cannot be read or is 0, which the start warns of and does not judge |
 | `local_cache.max_concurrent_fills` | the most fills that run at once (1 to 64, default 4); a miss that finds them all running is served from the upstream and kept nowhere |
+| `local_cache.max_concurrent_keeps` | the most create-only puts that are copied into the cache at once (1 to 64, default 8), apart from the fills; a put that finds them all running succeeds and is not kept |
+| `local_cache.keep_wait` | the longest a put waits, once the upstream has the object, for its copy to be put in the cache (default `5s`, above 0). Past it the put is answered 200 and the copy is finished in the background; counted in `tierstore_cache_keeps_expired_total`. Safe because the upstream already holds the object: a read of it that misses costs only the trip, so read-your-write on the node is best effort past this wait |
+| `local_cache.keep_deadline` | the longest a copy takes in all, from the upstream's acknowledgement (default `60s`, above 0 and not below `keep_wait`); a copy that is not done by then (a hung disk or upstream) is abandoned: its stage file is removed, its slot and room are given back, and it is counted as `deadline` |
 | `local_cache.write_through` | `false` by default: a read cache that refuses every write with 403 before the role of the key is looked at. `true`: the node takes the writes its keys may do and sends each to the upstream, which must be written with a key that may write; the start runs the upstream's self-test (create-only and multipart-conditional included) and exits with status 3 if the upstream answers one wrongly |
 | `local_cache.whole_fill_limit` | the most an object may be for a ranged read of it to fill the whole of it: a number or a size such as `"512MiB"`, from 1 byte to the `budget` (default 64 MiB); a larger object is passed through and kept nowhere. A fill reads 8 MiB at a time whatever the limit, so raising it does not raise the memory of the fills |
 | `local_cache.cache` | `true`, the default; `false` is refused (leave `[local_cache]` out to run without a cache) |

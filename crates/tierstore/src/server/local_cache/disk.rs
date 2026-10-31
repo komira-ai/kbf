@@ -1,12 +1,14 @@
 //! The calls the local cache makes on the file system that a test must be able to replace: the
 //! free space (so that a test sets how full the disk is), the create-only link, the link count
-//! and the time of a file. Everything else the cache does with `std::fs` on a directory of its
-//! own.
+//! and the time of a file, and the write of a chunk of a put to its stage file. Everything else
+//! the cache does with `std::fs` on a directory of its own.
 
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+use futures::FutureExt as _;
+use futures::future::BoxFuture;
 use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, statvfs, utimensat};
 
 /// The size of a file system and what is left of it for a process that is not root.
@@ -45,6 +47,16 @@ pub trait Disk: Send + Sync {
     /// # Errors
     /// What the system said.
     fn touch(&self, path: &Path, millis: u64) -> io::Result<()>;
+
+    /// Appends `bytes` to the stage file `file`, which the copy of a put is written to. The
+    /// default writes it; it is a call of the disk so that a test can make a write wait or fail.
+    fn write_stage<'a>(
+        &'a self,
+        file: &'a mut tokio::fs::File,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, io::Result<()>> {
+        async move { tokio::io::AsyncWriteExt::write_all(file, bytes).await }.boxed()
+    }
 }
 
 /// The file system of the machine.
