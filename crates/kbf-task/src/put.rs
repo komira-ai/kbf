@@ -139,7 +139,8 @@ pub enum PutError {
 /// whose OS error is `EINVAL` or `EPROTOTYPE` is `Interrupted` as well: a socket the peer has
 /// reset refuses `setsockopt` (ureq sets the write and read timeout between the chunks of a
 /// body) with `EINVAL`, and a write to it can fail with `EPROTOTYPE`, where Linux reports a
-/// reset or a broken pipe. Other systems do not widen it.
+/// reset or a broken pipe. A genuine `EINVAL` on macOS is therefore retried to the bound of
+/// [`put_retrying`] too, and then reported as `Interrupted`. Other systems do not widen it.
 fn transport_error(error: &ureq::Error, url: &str) -> PutError {
     use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
     let (url, reason) = (redact(url), scrub(&error.to_string(), url));
