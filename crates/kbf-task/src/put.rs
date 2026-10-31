@@ -135,18 +135,33 @@ pub enum PutError {
 /// kind reset, abort or broken pipe, [`PutError::Transport`] for any other (a store not reached,
 /// a bad URL, a timeout, a protocol error, a clean close before any answer). The classification
 /// is by the kind of the error alone, so a reset while the connection was being made is
-/// `Interrupted` too; retrying that is harmless, since nothing was sent.
+/// `Interrupted` too; retrying that is harmless, since nothing was sent. On macOS, an I/O error
+/// whose OS error is `EINVAL` or `EPROTOTYPE` is `Interrupted` as well: a socket the peer has
+/// reset refuses `setsockopt` (ureq sets the write and read timeout between the chunks of a
+/// body) with `EINVAL`, and a write to it can fail with `EPROTOTYPE`, where Linux reports a
+/// reset or a broken pipe. Other systems do not widen it.
 fn transport_error(error: &ureq::Error, url: &str) -> PutError {
     use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
     let (url, reason) = (redact(url), scrub(&error.to_string(), url));
     match error {
         ureq::Error::Io(e)
-            if matches!(e.kind(), BrokenPipe | ConnectionAborted | ConnectionReset) =>
+            if matches!(e.kind(), BrokenPipe | ConnectionAborted | ConnectionReset)
+                || is_macos_reset_symptom(e) =>
         {
             PutError::Interrupted { url, reason }
         }
         _ => PutError::Transport { url, reason },
     }
+}
+
+/// Whether `e` is what macOS gives for an operation on a socket the peer has reset: `EINVAL`
+/// from `setsockopt`, `EPROTOTYPE` from a write. Always false on other systems.
+fn is_macos_reset_symptom(e: &std::io::Error) -> bool {
+    cfg!(target_os = "macos")
+        && matches!(
+            e.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::EPROTOTYPE)
+        )
 }
 
 /// The part of a 503's message that tells what the store asked for.
@@ -996,6 +1011,20 @@ mod tests {
                 "{kind:?}: {got:?}"
             );
             assert!(!got.to_string().contains("secret"), "{got}");
+        }
+        // What macOS gives for a reset socket: interrupted there, final everywhere else.
+        for code in [libc::EINVAL, libc::EPROTOTYPE] {
+            let got = transport_error(&ureq::Error::Io(Error::from_raw_os_error(code)), url);
+            let interrupted = matches!(got, PutError::Interrupted { .. });
+            assert_eq!(
+                interrupted,
+                cfg!(target_os = "macos"),
+                "os error {code}: {got:?}"
+            );
+            assert!(
+                interrupted || matches!(got, PutError::Transport { .. }),
+                "os error {code}: {got:?}"
+            );
         }
         for error in [
             ureq::Error::Io(Error::from(ErrorKind::ConnectionRefused)),
