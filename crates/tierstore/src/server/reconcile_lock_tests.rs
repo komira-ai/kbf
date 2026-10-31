@@ -101,6 +101,7 @@ async fn a_reconciler_under_a_held_lock_file_does_nothing_until_it_takes_the_loc
         drop(holder);
         tiers.lease(true, Duration::from_secs(1)).await;
         while tiers.cold_mem.get("k", None).await.is_err() {
+            tokio::time::advance(Duration::from_secs(1)).await;
             tokio::task::yield_now().await;
         }
         halt.notify_one();

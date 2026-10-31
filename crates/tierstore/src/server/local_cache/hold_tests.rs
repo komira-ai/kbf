@@ -167,8 +167,10 @@ async fn the_loop_takes_the_lock_at_a_tick_after_it_is_free_and_ends_when_halted
     tokio::time::advance(Duration::from_secs(1)).await;
     assert_eq!(second.mode(), Mode::ReadOnly);
     drop(first);
-    tokio::time::advance(Duration::from_secs(1)).await;
+    // A try may be running when the clock moves, and the loop then waits for the next interval
+    // from a later time: the clock moves once for each turn of the wait.
     while second.mode() == Mode::ReadOnly {
+        tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
     }
     assert_eq!(second.mode(), Mode::ReadWrite);
