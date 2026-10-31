@@ -3,10 +3,6 @@
 //! own driver keeps them in the worker's link; here they sit beside the adapter's
 //! connections, written by the hot path and read by the node views.
 
-// The hot path of the farm on the js core calls the setters; until that is built in, only
-// tests do.
-#![allow(dead_code)]
-
 use kbf_caps::NodeCaps;
 use kbf_types::WorkerId;
 
@@ -62,10 +58,11 @@ impl KbfAdapter {
         }
     }
 
-    /// Forgets `worker`'s facts: its stream is gone for good. The farm's own driver keeps a
-    /// worker's link for as long as the farm runs, so a caller that mirrors it does not
-    /// call this where that driver would keep the link: the node views would lose the
-    /// worker's `os`, `arch` and protocol.
+    /// Forgets `worker`'s facts: its stream is gone for good. Only tests call this: the farm's
+    /// own driver keeps a worker's link for as long as the farm runs, so the hot path on the
+    /// js core keeps its facts too, and the node views never lose a worker's `os`, `arch` and
+    /// protocol.
+    #[cfg(test)]
     pub(crate) fn forget_worker(&mut self, worker: &WorkerId) {
         self.facts.remove(worker);
     }

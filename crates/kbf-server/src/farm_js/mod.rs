@@ -17,10 +17,13 @@
 //!   the core's calls with it; [`record`]: the events it tells the invocation recorder;
 //!   [`open`]: the core's configuration, storage, metrics and admission.
 //!
-//! Nothing here is wired into the running server: the farm writes its rows through its own
-//! store layer and drives its own scheduler. The tests run the scenario of the store layer's
-//! golden files through `js-store` and require the same rows, and the scripted sessions of
-//! `tests/farm_core_trace` through the core and require the same text.
+//! `--scheduler-core js` runs the farm on these ([`crate::farm`] dispatches on the core, and
+//! `crate::farm::js` is the hot path over them): the rows go to the state store through
+//! `js-store`, and the scheduler is driven by `js-server-core`. The legacy core still writes
+//! its rows through its own store layer and drives its own scheduler. The tests run the
+//! scenario of the store layer's golden files through `js-store` and require the same rows,
+//! and the scripted sessions of `tests/farm_core_trace` through the core and require the
+//! same text.
 
 pub(crate) mod ablation;
 pub mod adapter;
