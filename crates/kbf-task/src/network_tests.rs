@@ -1,5 +1,6 @@
 use kbf_proto::reapi::{Platform, platform::Property};
 
+#[cfg(target_os = "linux")]
 use super::seccomp::filter;
 use super::*;
 
@@ -312,6 +313,10 @@ fn every_layer_has_a_line() {
         (Layers::Open, "open (kbf-network=allow)"),
         (Layers::Unavailable, "none (this system has no filter)"),
         (Layers::SeccompAndNetns, "netns (loopback only) + seccomp"),
+        (
+            Layers::Seatbelt,
+            "sandbox-exec profile (no network but loopback and unix sockets)",
+        ),
     ] {
         assert_eq!(layers.to_string(), text);
     }
@@ -651,4 +656,211 @@ mod forked {
             strict.as_slice()
         ));
     }
+}
+
+/// Where no confine is built, a Command denied the network is refused with `NoConfine`, and nothing
+/// is printed or run for it.
+#[test]
+fn without_a_confine_a_denied_command_is_refused() {
+    let error = without_confine(Network::Denied, false).expect_err("refused");
+    assert!(matches!(error, RunError::NoConfine), "{error}");
+}
+
+/// A Command that is allowed the network needs no confine, with the test feature or without it,
+/// and no warning is made for it.
+#[test]
+fn without_a_confine_an_allowed_command_is_unaffected() {
+    assert_eq!(without_confine(Network::Allowed, false).unwrap(), None);
+    assert_eq!(without_confine(Network::Allowed, true).unwrap(), None);
+}
+
+/// With the test-only feature a denied Command is let through with the warning line, which says
+/// the Command has the network and names the feature.
+#[test]
+fn the_test_feature_warns_and_lets_a_denied_command_run() {
+    let line = without_confine(Network::Denied, true)
+        .unwrap()
+        .expect("a warning");
+    assert_eq!(line, UNCONFINED_WARNING);
+    assert!(line.contains("runs with it"), "{line}");
+    assert!(line.contains("unconfined-for-tests"), "{line}");
+}
+
+/// The system's own `confine` where neither Linux nor macOS has one: refused without the feature,
+/// run with it.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn confine_refuses_a_denied_command_unless_the_test_feature_is_on() {
+    let mut process = Process::new("true");
+    let result = confine(&mut process, Network::Denied);
+    if cfg!(feature = "unconfined-for-tests") {
+        assert_eq!(result.expect("tolerated").layers(), Layers::Unavailable);
+    } else {
+        assert!(matches!(result, Err(RunError::NoConfine)));
+    }
+    let mut process = Process::new("true");
+    let allowed = confine(&mut process, Network::Allowed).expect("allowed");
+    assert_eq!(allowed.layers(), Layers::Open);
+}
+
+fn paths(list: &[&str]) -> Vec<PathBuf> {
+    list.iter().map(PathBuf::from).collect()
+}
+
+/// Catches the profile of a denied Command lacking the network denial, and that of an allowed one
+/// having it: the two Commands differ in nothing else.
+#[test]
+fn the_seatbelt_profile_denies_the_network_only_to_a_denied_command() {
+    let denied = seatbelt_profile(Network::Denied, &[]).expect("denied");
+    let allowed = seatbelt_profile(Network::Allowed, &[]).expect("allowed");
+    assert!(denied.contains("(deny network*)"), "{denied}");
+    assert!(
+        !allowed.contains("(deny network*)") && !allowed.contains("localhost"),
+        "{allowed}"
+    );
+    assert_eq!(
+        denied.replace(kbf_seatbelt::DENY_NETWORK_RULES, ""),
+        allowed
+    );
+}
+
+/// Catches a credential file left readable: one read deny per file, for a denied Command and for
+/// an allowed one.
+#[test]
+fn the_seatbelt_profile_denies_reading_each_credential_file() {
+    for network in [Network::Denied, Network::Allowed] {
+        let text = seatbelt_profile(network, &paths(&["/w/grant", "/w/put urls"])).expect("ok");
+        let denies: Vec<&str> = text.lines().filter(|l| l.contains("file-read*")).collect();
+        assert_eq!(
+            denies,
+            [
+                "(deny file-read* (literal \"/w/grant\"))",
+                "(deny file-read* (literal \"/w/put urls\"))"
+            ]
+        );
+    }
+}
+
+/// Catches a path that would end the profile string, and a relative one, reaching the sandbox: the
+/// run is refused with `Confine`, which fails the run (exit 11), not the Command.
+#[test]
+fn the_seatbelt_profile_refuses_a_path_it_cannot_carry() {
+    for bad in [
+        "/w/a\"b",
+        "/w/a\\b",
+        "/w/a\")(allow default)(\"",
+        "relative",
+    ] {
+        let error = seatbelt_profile(Network::Denied, &paths(&[bad])).expect_err(bad);
+        assert!(matches!(error, RunError::Confine(_)), "{bad}: {error}");
+        assert!(error.to_string().starts_with("cannot confine the Command"));
+    }
+}
+
+/// Catches `launch` changing a Command that is not wrapped (any system but macOS).
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn off_macos_the_command_is_started_as_it_is() {
+    let launch = launch(
+        Path::new("/bin/echo"),
+        &["a".to_owned(), "b c".to_owned()],
+        Network::Denied,
+        &paths(&["/w/grant"]),
+    )
+    .expect("launch");
+    assert_eq!(launch.program, Path::new("/bin/echo"));
+    assert_eq!(launch.args, ["a", "b c"]);
+}
+
+/// Catches a macOS Command started without `sandbox-exec`, and one whose arguments are altered:
+/// the program is `sandbox-exec`, then `-p`, the profile, the Command's program and its arguments
+/// in order.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_macos_the_command_is_started_under_sandbox_exec() {
+    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-task-launch");
+    let grant = dir.join("grant");
+    std::fs::write(&grant, "x").expect("grant");
+    let launch = launch(
+        Path::new("/bin/echo"),
+        &["a".to_owned(), "b c".to_owned()],
+        Network::Denied,
+        std::slice::from_ref(&grant),
+    )
+    .expect("launch");
+    assert_eq!(launch.program, Path::new("/usr/bin/sandbox-exec"));
+    assert_eq!(launch.args[0], "-p");
+    let profile = launch.args[1].to_str().expect("profile text");
+    assert!(profile.contains("(deny network*)"), "{profile}");
+    // The file is named by its real path: a link in the temporary directory is resolved.
+    let real = std::fs::canonicalize(&grant).expect("real path");
+    assert!(
+        profile.contains(&format!("(literal \"{}\")", real.display())),
+        "{profile}"
+    );
+    assert_eq!(launch.args[2..], ["/bin/echo", "a", "b c"]);
+}
+
+/// Catches a credential file that is not there being dropped from the denies, or refusing the run:
+/// it holds nothing to read, and is named as given.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_macos_a_credential_file_that_does_not_exist_is_still_named() {
+    let launch = launch(
+        Path::new("/bin/echo"),
+        &[],
+        Network::Denied,
+        &paths(&["/no/such/grant"]),
+    )
+    .expect("launch");
+    let profile = launch.args[1].to_str().expect("profile text");
+    assert!(
+        profile.contains("(deny file-read* (literal \"/no/such/grant\"))"),
+        "{profile}"
+    );
+}
+
+/// Catches `confine` accepting a denied Command whose process was not made by `launch`, which
+/// would run it with the network on macOS; a process that is `sandbox-exec` passes, and layers say so.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_macos_confine_refuses_a_denied_command_that_is_not_under_sandbox_exec() {
+    let mut plain = Process::new("/bin/echo");
+    assert!(matches!(
+        confine(&mut plain, Network::Denied),
+        Err(RunError::NoConfine)
+    ));
+    let mut wrapped = Process::new("/usr/bin/sandbox-exec");
+    assert_eq!(
+        confine(&mut wrapped, Network::Denied)
+            .expect("wrapped")
+            .layers(),
+        Layers::Seatbelt
+    );
+    let mut allowed = Process::new("/bin/echo");
+    assert_eq!(
+        confine(&mut allowed, Network::Allowed)
+            .expect("allowed")
+            .layers(),
+        Layers::Open
+    );
+}
+
+/// Catches an error that names only the wrapper, or only the Command's program: a Command started
+/// as it is has one name, one started through another program has both.
+#[test]
+fn a_launch_names_the_program_it_runs_and_the_one_it_runs_through() {
+    let own = Launch {
+        program: PathBuf::from("/bin/echo"),
+        args: Vec::new(),
+    };
+    assert_eq!(own.name(Path::new("/bin/echo")), Path::new("/bin/echo"));
+    let wrapped = Launch {
+        program: PathBuf::from("/usr/bin/sandbox-exec"),
+        args: Vec::new(),
+    };
+    assert_eq!(
+        wrapped.name(Path::new("/bin/echo")),
+        Path::new("/usr/bin/sandbox-exec for /bin/echo")
+    );
 }

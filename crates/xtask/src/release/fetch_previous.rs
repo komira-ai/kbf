@@ -60,7 +60,6 @@ use crate::Error;
 use crate::build_commit::{full_commit, write_executable};
 use crate::darwin::packaged_binary;
 use crate::package::{Platform, read};
-use crate::version_facts::Pairing;
 
 /// The arguments of `release fetch-previous`.
 #[derive(clap::Args)]
@@ -205,9 +204,9 @@ fn unpack(a: &FetchPreviousArgs, tag: &str, commit: &str, scratch: &Path) -> Res
             "release", "download", tag, "--repo", &a.repo, "--dir", &download,
         ],
     )?;
-    // The release before may predate the version facts, as `release check previous` allows;
-    // its tarballs are still attested below.
-    super::check(&assets, commit, Pairing::Waived)?;
+    // The release before holds the version facts of its `kbf` and the facts and SBOM of its
+    // task image, as every release since v0.0.41 does; its files are attested below.
+    super::check(&assets, commit)?;
     let attester = Gh {
         repo: &a.repo,
         trusted_root: a.trusted_root.as_deref(),

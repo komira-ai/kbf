@@ -99,17 +99,11 @@ impl Rig {
 }
 
 fn succeeded(target: &str) -> UpdateResult {
-    UpdateResult {
-        target: version(target),
-        outcome: Outcome::Succeeded,
-    }
+    UpdateResult::new(version(target), Outcome::Succeeded)
 }
 
 fn failed(target: &str) -> UpdateResult {
-    UpdateResult {
-        target: version(target),
-        outcome: Outcome::Failed,
-    }
+    UpdateResult::new(version(target), Outcome::Failed)
 }
 
 /// "Update to X" runs fetch and verify, drain, switch, health, confirm and undrain, in that
@@ -575,5 +569,615 @@ fn the_wire_health_is_two_words() {
     assert_eq!(
         serde_json::to_string(&WireHealth::Unhealthy).unwrap(),
         "\"unhealthy\""
+    );
+}
+
+const LEFT_OUT: &str = "node was out of placement before the roll; left out";
+
+/// A node an operator took out of placement before the roll is drained and waited for as any
+/// other (a restart cuts no lease off), and after the confirm it is not uncordoned: the update
+/// succeeds, `undrain` is never called, the node ends out of placement, and the log says it was
+/// left out. The node is read before it is drained.
+#[test]
+fn a_node_out_of_placement_before_the_roll_is_not_given_back_after_the_confirm() {
+    let rig = Rig::new();
+    rig.drain.out_of_placement();
+    *rig.drain.leases.lock().unwrap() = [2, 0].into();
+    assert_eq!(rig.run(VB), succeeded(VB));
+    assert_eq!(
+        rig.steps(),
+        [
+            &format!("local:install {VB} stable"),
+            "drain n1 none",
+            &format!("local:switch {VB}"),
+            &format!("local:confirm {VB}"),
+        ]
+    );
+    assert_eq!(rig.events.count("leases"), 2, "its leases are waited for");
+    let all = rig.events.all();
+    let at = |needle: &str| all.iter().position(|e| e.starts_with(needle)).unwrap();
+    assert!(at("placed") < at("drain"), "{all:?}");
+    assert_eq!(rig.events.count("undrain"), 0);
+    assert!(rig.drain.is_drained());
+    assert!(rig.logged(LEFT_OUT));
+}
+
+/// ... and on every path that used to give the node back, a node that was out stays out: B
+/// unhealthy with A healthy, a switch the helper could not do, a confirm the helper refused,
+/// and a node whose leases could not be read.
+#[test]
+fn a_node_out_of_placement_before_the_roll_is_not_given_back_on_any_revert_path() {
+    // B never shows healthy; A does.
+    let rig = Rig::new();
+    rig.drain.out_of_placement();
+    rig.health
+        .say(VB, vec![Ok(Health::Abandoned("wrong build".to_owned()))]);
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(rig.events.count("local:revert"), 1);
+    assert_eq!(rig.events.count("undrain"), 0, "back on A");
+    assert!(rig.drain.is_drained());
+    assert!(rig.logged(LEFT_OUT));
+
+    // The switch fails and the helper has nothing to revert; A is healthy.
+    let rig = Rig::new();
+    rig.drain.out_of_placement();
+    rig.local.world().switch = Err(LocalError::Failed("switch_failed".to_owned()));
+    rig.local.world().revert = Err(LocalError::Refused("nothing_pending".to_owned()));
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(rig.events.count("undrain"), 0, "switch failed");
+    assert!(rig.drain.is_drained());
+    assert!(rig.logged(LEFT_OUT));
+
+    // The confirm is refused, so B is reverted.
+    let rig = Rig::new();
+    rig.drain.out_of_placement();
+    rig.local.world().confirm = Err(LocalError::Failed("state_unavailable".to_owned()));
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(rig.events.count("local:revert"), 1);
+    assert_eq!(rig.events.count("undrain"), 0, "confirm refused");
+    assert!(rig.drain.is_drained());
+    assert!(rig.logged(LEFT_OUT));
+
+    // The leases cannot be read: nothing is switched, and the node is not uncordoned.
+    let rig = Rig::new();
+    rig.drain.out_of_placement();
+    *rig.drain.leases_error.lock().unwrap() = Some(PortError::other("serving again"));
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(rig.events.count("local:switch"), 0);
+    assert_eq!(rig.events.count("undrain"), 0, "leases unreadable");
+    assert!(rig.drain.is_drained());
+    assert!(rig.logged(LEFT_OUT));
+}
+
+/// A node in placement before the roll is given back as ever: after the confirm, and after a
+/// revert to a healthy A; and the log does not say it was left out.
+#[test]
+fn a_node_in_placement_before_the_roll_is_given_back() {
+    let rig = Rig::new();
+    assert_eq!(rig.run(VB), succeeded(VB));
+    assert_eq!(rig.events.count("placed"), 1);
+    assert_eq!(rig.events.count("undrain"), 1);
+    assert!(!rig.drain.is_drained());
+    assert!(!rig.logged(LEFT_OUT));
+
+    let rig = Rig::new();
+    rig.health
+        .say(VB, vec![Ok(Health::Abandoned("wrong build".to_owned()))]);
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(rig.events.count("undrain"), 1);
+    assert!(!rig.drain.is_drained());
+    assert!(!rig.logged(LEFT_OUT));
+}
+
+/// A node that cannot be read is not guessed at: the update fails before the drain, and
+/// nothing is drained, switched or given back.
+#[test]
+fn a_node_that_cannot_be_read_stops_the_update_before_the_drain() {
+    let rig = Rig::new();
+    *rig.drain.placed_error.lock().unwrap() = Some(PortError::unreachable("the operator API"));
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(
+        rig.steps(),
+        [format!("local:install {VB} stable")],
+        "no drain, no switch, no undrain"
+    );
+    assert!(rig.logged("could not be drained"));
+}
+
+/// A restart with B on trial reads the node as the first run does: one an operator drained is
+/// finished the same way and left out, with the log saying so; one in placement is given back.
+///
+/// Catches: a resume that takes every node for the updater's own and uncordons an operator's.
+#[test]
+fn a_restart_in_the_middle_does_not_give_back_a_node_an_operator_drained() {
+    for (out, undrains) in [(true, 0), (false, 1)] {
+        let rig = Rig::new();
+        {
+            let mut world = rig.local.world();
+            world.state.version = Some(version(VB));
+            world.state.commit = Some(COMMIT_B.to_owned());
+            world.state.pending = Some(Trial {
+                version: Some(version(VB)),
+                commit: COMMIT_B.to_owned(),
+                deadline_unix: Some(NOW + 400),
+            });
+            world.before = Some(version(VA));
+        }
+        if out {
+            rig.drain.out_of_placement();
+        } else {
+            *rig.drain.drained.lock().unwrap() = true;
+        }
+        assert_eq!(rig.run(VB), succeeded(VB));
+        assert_eq!(rig.events.count("undrain"), undrains, "out: {out}");
+        assert_eq!(rig.events.count("drain "), 0, "out: {out}");
+        assert_eq!(rig.logged(LEFT_OUT), out, "out: {out}");
+    }
+}
+
+// ---- goldens of the call order (docs/design/host-updates.md, section 8, step 1) ----------
+//
+// Each test below writes out every call the update makes on the fake helper, drain and health
+// check, in order, for one path. Runs of the same call are written once with a count; the
+// counts come from the fake clock and the default polls (5 s), never from real time. The
+// kbf hook (migration step 5) must make the same calls in the same order.
+
+/// Every call, in order, one per line; a run of the same call is `call (xN)`.
+fn calls(rig: &Rig) -> Vec<String> {
+    let mut out: Vec<(String, usize)> = Vec::new();
+    for event in rig.events.all() {
+        match out.last_mut() {
+            Some((last, n)) if *last == event => *n += 1,
+            _ => out.push((event, 1)),
+        }
+    }
+    out.into_iter()
+        .map(|(event, n)| {
+            if n > 1 {
+                format!("{event} (x{n})")
+            } else {
+                event
+            }
+        })
+        .collect()
+}
+
+/// The defaults the update runs on when a flag does not say otherwise.
+#[test]
+fn the_default_timing_is_that_of_today() {
+    let t = Timing::DEFAULT;
+    assert_eq!(
+        format!(
+            "heartbeat={:?} drain_deadline={:?} drain_poll={:?} health_timeout={:?} \
+             health_poll={:?} retry={:?} margin={:?}",
+            t.heartbeat,
+            t.drain_deadline,
+            t.drain_poll,
+            t.health_timeout,
+            t.health_poll,
+            t.retry,
+            t.margin
+        ),
+        "heartbeat=15s drain_deadline=None drain_poll=5s health_timeout=300s \
+         health_poll=5s retry=900s margin=10s"
+    );
+}
+
+/// A normal update: the helper is asked what runs, the release is fetched and verified, the
+/// node's placement is read, it is drained and its leases looked at once, the helper switches,
+/// B's health is asked once, B is confirmed, and the node is given back.
+#[test]
+fn golden_call_order_of_a_normal_update() {
+    let rig = Rig::new();
+    assert_eq!(rig.run(VB), succeeded(VB));
+    assert_eq!(
+        calls(&rig),
+        [
+            "local:query",
+            &format!("local:install {VB} stable"),
+            "placed",
+            "drain n1 none",
+            "leases",
+            &format!("local:switch {VB}"),
+            &format!("health:held {VB}"),
+            &format!("local:confirm {VB}"),
+            "undrain",
+        ]
+    );
+}
+
+/// A normal update on a node that holds leases: the leases are looked at again after each 5 s
+/// poll until none is left, and only then is the helper asked to switch.
+#[test]
+fn golden_call_order_when_leases_drain_away() {
+    let rig = Rig::new();
+    *rig.drain.leases.lock().unwrap() = [3, 1, 0].into();
+    assert_eq!(rig.run(VB), succeeded(VB));
+    assert_eq!(
+        calls(&rig),
+        [
+            "local:query",
+            &format!("local:install {VB} stable"),
+            "placed",
+            "drain n1 none",
+            "leases (x3)",
+            &format!("local:switch {VB}"),
+            &format!("health:held {VB}"),
+            &format!("local:confirm {VB}"),
+            "undrain",
+        ]
+    );
+}
+
+/// B never shows healthy: it is looked at 61 times over the 300 s the timeout allows (every 5 s,
+/// the first at 0 and the last at 300), the helper is asked to revert, asked what runs, A's
+/// health is asked once, and the node is given back.
+#[test]
+fn golden_call_order_of_a_failed_verify_that_reverts() {
+    let rig = Rig::new();
+    rig.health
+        .say(VB, vec![Ok(Health::Waiting("not connected".to_owned()))]);
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(
+        calls(&rig),
+        [
+            "local:query",
+            &format!("local:install {VB} stable"),
+            "placed",
+            "drain n1 none",
+            "leases",
+            &format!("local:switch {VB}"),
+            &format!("health:held {VB} (x61)"),
+            "local:revert",
+            "local:query",
+            &format!("health:held {VA}"),
+            "undrain",
+        ]
+    );
+}
+
+/// B is abandoned at its first look and A does not come back either: A is looked at 61 times,
+/// and the node is never given back.
+#[test]
+fn golden_call_order_of_a_revert_onto_an_unhealthy_a() {
+    let rig = Rig::new();
+    rig.health
+        .say(VB, vec![Ok(Health::Abandoned("wrong build".to_owned()))]);
+    rig.health
+        .say(VA, vec![Ok(Health::Waiting("not connected".to_owned()))]);
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(
+        calls(&rig),
+        [
+            "local:query",
+            &format!("local:install {VB} stable"),
+            "placed",
+            "drain n1 none",
+            "leases",
+            &format!("local:switch {VB}"),
+            &format!("health:held {VB}"),
+            "local:revert",
+            "local:query",
+            &format!("health:held {VA} (x61)"),
+        ]
+    );
+}
+
+/// A healthy B whose confirm the helper refuses is reverted like any other release that did
+/// not work.
+#[test]
+fn golden_call_order_of_a_refused_confirm() {
+    let rig = Rig::new();
+    rig.local.world().confirm = Err(LocalError::Failed("state_unavailable".to_owned()));
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(
+        calls(&rig),
+        [
+            "local:query",
+            &format!("local:install {VB} stable"),
+            "placed",
+            "drain n1 none",
+            "leases",
+            &format!("local:switch {VB}"),
+            &format!("health:held {VB}"),
+            &format!("local:confirm {VB}"),
+            "local:revert",
+            "local:query",
+            &format!("health:held {VA}"),
+            "undrain",
+        ]
+    );
+}
+
+/// A switch the helper cannot do: the helper is asked to revert and says nothing is on trial,
+/// A's health is asked, and the node is given back.
+#[test]
+fn golden_call_order_of_a_failed_switch() {
+    let rig = Rig::new();
+    rig.local.world().switch = Err(LocalError::Failed("switch_failed".to_owned()));
+    rig.local.world().revert = Err(LocalError::Refused("nothing_pending".to_owned()));
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(
+        calls(&rig),
+        [
+            "local:query",
+            &format!("local:install {VB} stable"),
+            "placed",
+            "drain n1 none",
+            "leases",
+            &format!("local:switch {VB}"),
+            "local:revert",
+            "local:query",
+            &format!("health:held {VA}"),
+            "undrain",
+        ]
+    );
+}
+
+/// A drain deadline of 60 s with a lease still held: the leases are looked at every 5 s, 13
+/// times from 0 to 60 s, and then the update stops. Nothing is switched, reverted or given back.
+#[test]
+fn golden_call_order_of_a_drain_deadline() {
+    let mut rig = Rig::new();
+    rig.timing.drain_deadline = Some(Duration::from_secs(60));
+    *rig.drain.leases.lock().unwrap() = [2].into();
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(
+        calls(&rig),
+        [
+            "local:query",
+            &format!("local:install {VB} stable"),
+            "placed",
+            "drain n1 60",
+            "leases (x13)",
+        ]
+    );
+}
+
+/// An updater restarted with B on trial: it reads the helper's state, reads the node's
+/// placement, and finishes from the health step. Nothing is fetched, drained or switched.
+#[test]
+fn golden_call_order_of_a_resumed_trial() {
+    let rig = Rig::new();
+    {
+        let mut world = rig.local.world();
+        world.state.version = Some(version(VB));
+        world.state.commit = Some(COMMIT_B.to_owned());
+        world.state.pending = Some(Trial {
+            version: Some(version(VB)),
+            commit: COMMIT_B.to_owned(),
+            deadline_unix: Some(NOW + 400),
+        });
+        world.before = Some(version(VA));
+    }
+    *rig.drain.drained.lock().unwrap() = true;
+    assert_eq!(rig.run(VB), succeeded(VB));
+    assert_eq!(
+        calls(&rig),
+        [
+            "local:query",
+            "placed",
+            &format!("health:held {VB}"),
+            &format!("local:confirm {VB}"),
+            "undrain",
+        ]
+    );
+}
+
+/// A node an operator had drained is waited for like any other but never given back: the
+/// calls are those of a normal update without the `undrain`.
+#[test]
+fn golden_call_order_on_a_node_that_was_out_of_placement() {
+    let rig = Rig::new();
+    rig.drain.out_of_placement();
+    assert_eq!(rig.run(VB), succeeded(VB));
+    assert_eq!(
+        calls(&rig),
+        [
+            "local:query",
+            &format!("local:install {VB} stable"),
+            "placed",
+            "drain n1 none",
+            "leases",
+            &format!("local:switch {VB}"),
+            &format!("health:held {VB}"),
+            &format!("local:confirm {VB}"),
+        ]
+    );
+}
+
+// ---- goldens of the failure paths (docs/design/host-updates.md, section 8, step 1) ---------
+
+/// What the first four calls of an update leave behind, up to the one that fails.
+fn head(upto: usize) -> Vec<String> {
+    [
+        "local:query".to_owned(),
+        format!("local:install {VB} stable"),
+        "placed".to_owned(),
+        "drain n1 none".to_owned(),
+    ]
+    .into_iter()
+    .take(upto)
+    .collect()
+}
+
+/// A fetch the helper cannot do, or a release it refuses to verify (attestation, the digest,
+/// an unknown build), or an install that fails: the helper is asked what runs and to install,
+/// and nothing else is called. The node is never read, drained or switched.
+#[test]
+fn golden_call_order_of_a_failed_fetch_or_verify() {
+    for error in [
+        LocalError::Refused("fetch_failed".to_owned()),
+        LocalError::Refused("verify_failed".to_owned()),
+        LocalError::Refused("sha256_mismatch".to_owned()),
+        LocalError::Failed("install_failed".to_owned()),
+        LocalError::Unreachable("socket".to_owned()),
+    ] {
+        let rig = Rig::new();
+        rig.local.world().install = Err(error.clone());
+        assert_eq!(rig.run(VB), failed(VB), "{error:?}");
+        assert_eq!(calls(&rig), head(2), "{error:?}");
+    }
+}
+
+/// A helper that cannot say what runs: that is the only call.
+#[test]
+fn golden_call_order_of_a_failed_query() {
+    let rig = Rig::new();
+    rig.local.world().query = Err(LocalError::Unreachable("no socket".to_owned()));
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(calls(&rig), head(1));
+}
+
+/// A placement that cannot be read stops the update after the install, before the drain.
+#[test]
+fn golden_call_order_of_a_failed_placement_read() {
+    let rig = Rig::new();
+    *rig.drain.placed_error.lock().unwrap() = Some(PortError::other("503"));
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(calls(&rig), head(3));
+}
+
+/// A drain that fails: nothing is looked at, switched or given back.
+#[test]
+fn golden_call_order_of_a_failed_drain() {
+    let rig = Rig::new();
+    *rig.drain.drain_error.lock().unwrap() = Some(PortError::other("404"));
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(calls(&rig), head(4));
+}
+
+/// Leases that cannot be read after the drain: the node is given back, nothing is switched.
+#[test]
+fn golden_call_order_of_a_failed_lease_read() {
+    let rig = Rig::new();
+    *rig.drain.leases_error.lock().unwrap() = Some(PortError::other("serving again"));
+    assert_eq!(rig.run(VB), failed(VB));
+    let mut want = head(4);
+    want.extend(["leases".to_owned(), "undrain".to_owned()]);
+    assert_eq!(calls(&rig), want);
+}
+
+/// A switch the helper refuses (not a failure of the switch itself) whose revert then succeeds
+/// and has A back: the same road as any release that did not work.
+#[test]
+fn golden_call_order_of_a_refused_switch_and_a_revert_that_works() {
+    let rig = Rig::new();
+    rig.local.world().switch = Err(LocalError::Refused("busy".to_owned()));
+    rig.local.world().before = Some(version(VA));
+    assert_eq!(rig.run(VB), failed(VB));
+    let mut want = head(4);
+    want.extend([
+        "leases".to_owned(),
+        format!("local:switch {VB}"),
+        "local:revert".to_owned(),
+        "local:query".to_owned(),
+        format!("health:held {VA}"),
+        "undrain".to_owned(),
+    ]);
+    assert_eq!(calls(&rig), want);
+}
+
+/// A revert that itself fails: the helper still says B runs, B is looked at again (it is
+/// abandoned), and the node stays drained.
+#[test]
+fn golden_call_order_of_a_revert_that_fails() {
+    let rig = Rig::new();
+    rig.health
+        .say(VB, vec![Ok(Health::Abandoned("wrong build".to_owned()))]);
+    rig.local.world().revert = Err(LocalError::Failed("revert_failed".to_owned()));
+    assert_eq!(rig.run(VB), failed(VB));
+    let mut want = head(4);
+    want.extend([
+        "leases".to_owned(),
+        format!("local:switch {VB}"),
+        format!("health:held {VB}"),
+        "local:revert".to_owned(),
+        "local:query".to_owned(),
+        format!("health:held {VB}"),
+    ]);
+    assert_eq!(calls(&rig), want);
+    assert!(rig.drain.is_drained());
+}
+
+/// When the heartbeat's `updating` is set and cleared: set before the first port call, held
+/// through the install, the switch and the confirm, and cleared only when the result is
+/// written, with the result in the same step. A trial found on the helper replaces the asked
+/// version as the one reported. Read from the status at each hook.
+#[test]
+fn golden_updating_in_the_status_through_an_update() {
+    fn seen(status: &Shared) -> String {
+        let s = status.get();
+        format!(
+            "updating={} last={}",
+            s.updating.map_or("none".to_owned(), |v| v.to_string()),
+            s.last_update.map_or("none".to_owned(), |r| format!(
+                "{} {:?}",
+                r.target, r.outcome
+            )),
+        )
+    }
+    let watch = |rig: &Rig| {
+        let log: Arc<Mutex<Vec<String>>> = Arc::default();
+        let mut guard = rig.local.world();
+        let world = &mut *guard;
+        for (tag, slot) in [
+            ("install", &mut world.on_install),
+            ("switch", &mut world.on_switch),
+            ("confirm", &mut world.on_confirm),
+        ] {
+            let (status, log) = (rig.status.clone(), Arc::clone(&log));
+            *slot = Some(Arc::new(move || {
+                log.lock()
+                    .unwrap()
+                    .push(format!("{tag}: {}", seen(&status)));
+            }));
+        }
+        log
+    };
+
+    let rig = Rig::new();
+    let log = watch(&rig);
+    assert_eq!(seen(&rig.status), "updating=none last=none");
+    assert_eq!(rig.run(VB), succeeded(VB));
+    assert_eq!(
+        *log.lock().unwrap(),
+        [
+            format!("install: updating={VB} last=none"),
+            format!("switch: updating={VB} last=none"),
+            format!("confirm: updating={VB} last=none"),
+        ]
+    );
+    assert_eq!(
+        seen(&rig.status),
+        format!("updating=none last={VB} Succeeded")
+    );
+
+    let rig = Rig::new();
+    let log = watch(&rig);
+    rig.local.world().install = Err(LocalError::Refused("verify_failed".to_owned()));
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(
+        *log.lock().unwrap(),
+        [format!("install: updating={VB} last=none")]
+    );
+    assert_eq!(seen(&rig.status), format!("updating=none last={VB} Failed"));
+
+    let rig = Rig::new();
+    let log = watch(&rig);
+    rig.local.world().state.pending = Some(Trial {
+        version: Some(version(VB)),
+        commit: COMMIT_B.to_owned(),
+        deadline_unix: Some(NOW + 400),
+    });
+    assert_eq!(rig.run("0.1.9+gdddddddddddd-5"), succeeded(VB));
+    assert_eq!(
+        *log.lock().unwrap(),
+        [format!("confirm: updating={VB} last=none")],
+        "the trial's version, not the asked one"
+    );
+    assert_eq!(
+        seen(&rig.status),
+        format!("updating=none last={VB} Succeeded")
     );
 }

@@ -1,4 +1,4 @@
-# infra/site: AWS infrastructure for the kbf website and release downloads
+# infra/site: AWS infrastructure for the kbf websites and release downloads
 
 CDK (TypeScript, us-east-1) for a static site and its release downloads: a private S3 bucket behind CloudFront (origin
 access control), a Route 53 zone, a certificate, and an IAM role that the publish workflow assumes through GitHub OIDC.
@@ -23,7 +23,62 @@ The held steps are one small CLI, `held/main.ts`, run as `npm run held -- <comma
 repository allows no shell scripts). It calls `aws`, `gh` and `cdk` with argument arrays, and its tests drive it with a
 fake so they can see which commands a dry run does and does not run.
 
+## Several sites in one account
+
+One account and one GitHub repository can host several sites. Every name is derived from a **site id**, chosen by the domain
+(`--domain`) or given with `--site`:
+
+| domain | site id |
+|---|---|
+| `kbf.dev` (the default) | `kbf` |
+| `tierstore.dev` | `tierstore` |
+
+A domain that is not in that table (`SITES` in `lib/config.ts`) must pass `--site <id>`: it is never silently given another
+site's names. `--site` may not contradict a known domain, nor reuse another listed site's id (two unlisted domains with the
+same id cannot be detected), and an id on an unlisted domain is refused if any name derived from it (stack, bucket, role,
+GitHub environment, workflow, variable) equals a name of a listed site: `--site site` would take kbf.dev's `prod-site`. An id is lower-case letters and digits,
+starting with a letter, at most 16.
+
+| name | kbf.dev (`kbf`) | tierstore.dev (`tierstore`) |
+|---|---|---|
+| zone stack | `kbf-dns-zone` | `tierstore-dns-zone` |
+| site stack | `kbf-prod-site` | `tierstore-prod-site` |
+| bucket | `kbf-prod-site-<account>` | `tierstore-prod-site-<account>` |
+| headers policy | `kbf-prod-site-headers` | `tierstore-prod-site-headers` |
+| router function | `kbf-prod-site-router` | `tierstore-prod-site-router` |
+| publish role | `kbf-prod-publish` | `tierstore-prod-publish` |
+| approval environment | `prod` | `prod-tierstore` |
+| site environment (the role trusts it) | `prod-site` | `prod-site-tierstore` |
+| publish workflow the role trusts | `.github/workflows/site-publish.yml` | `.github/workflows/tierstore-site-publish.yml` (komira-ai/tierstore; the role's trust in `lib/config.ts` still names this repository until it is moved, below) |
+| GitHub variables | `KBF_SITE_BUCKET`, `KBF_SITE_DISTRIBUTION_ID`, `KBF_SITE_PUBLISH_ROLE_ARN` | `TIERSTORE_SITE_BUCKET`, `TIERSTORE_SITE_DISTRIBUTION_ID`, `TIERSTORE_SITE_PUBLISH_ROLE_ARN` |
+
+**kbf.dev's names are the ones it was first deployed with and must never change**: CloudFormation replaces a resource whose
+logical id or physical name changes. Logical ids are the same in every site's stack (they are scoped by the stack), so only the
+physical names above differ. `test/kbf-names.test.ts` pins every kbf.dev name and compares the synthesized zone and site
+templates (domain and no-domain mode) byte for byte with `test/golden/*.json`, which were made from the code before names
+were parameterized; if that test fails, a kbf.dev resource would be replaced. `test/site-names.test.ts` requires the two
+sites to share no name. Regenerate a golden only for a change you intend to deploy to kbf.dev.
+
+Everything else is shared by all sites on purpose: the Content-Security-Policy and the other response headers, the router,
+cache and error behavior, the role's permissions, the OIDC provider (one per account, imported by ARN) and the
+`prod`-style policies (approval: `main` branch and `v*` tag; site: `v*` tag only). A site that needs a different policy
+changes `lib/site-stack.ts` for that site deliberately. `site/test/csp.test.ts` reads the CSP from `lib/site-stack.ts`.
+
+`.github/workflows/tierstore-site-publish.yml` (now in komira-ai/tierstore, no longer in this repository) is the workflow tierstore's publish role is to trust. The role's trust is not moved yet: `lib/config.ts` still builds it for this repository's workflow path, so a publish from komira-ai/tierstore is refused at `AssumeRoleWithWebIdentity` until a maintainer redeploys the stack with the trust set to komira-ai/tierstore (its repository id and workflow path), the one-time setup of that repository's step 6. It publishes on a push to `main`
+that changes the site (and on a manual run of `main`), so its job runs in the environment `prod-site-tierstore` from the `main`
+branch: that environment's deployment rule is the branch `main`, where kbf.dev's `prod-site` admits `v*` tags only. The held
+`github` step creates the tag rule for every site, so for tierstore.dev the rule is changed by hand once, and a later `github`
+dry run reports the difference. The held `upload` step is the manual fallback.
+
+Each site has its own GitHub environments and variables, so two sites in one repository share no reviewer rule or variable.
+Every step is per site: pass `--domain` (or `--site`) to `github`, `dns`, `site`, `vars` and `upload`. `oidc-provider`
+is per account, not per site. For a second site: `github --domain tierstore.dev`, `dns --domain tierstore.dev`, the registrar,
+`site --domain tierstore.dev`, `vars --domain tierstore.dev`, `upload --domain tierstore.dev`. A step run for one site never
+reads or changes another's stacks, environments or variables.
+
 ## One approval per release: two environments
+
+The table names are kbf.dev's; another site has its own pair (see above).
 
 A release asks the reviewer once. Two GitHub environments split the work:
 
@@ -59,12 +114,14 @@ stand there.
 | `--reviewer` | `github` | GitHub login of the person who approves a `prod` deployment (the only reviewer; `prod-site` has none) (a value you pass, never stored in a file) |
 | `--repo` / `-c githubRepo` | `github`, `site`, `vars` | `<owner>/<name>` of the repository that hosts the publish workflow |
 | `-c githubRepoId`, `-c githubOwnerId` | `cdk` (set by `site`) | immutable numeric ids; `site` reads them with read-only `gh api repos/<repo>` |
-| `--domain` / `-c domain` | `dns`, `site` | site name; default `kbf.dev` |
+| `--domain` / `-c domain` | `github`, `dns`, `site`, `vars`, `upload` | site name; default `kbf.dev`; selects the site id (see "Several sites") |
+| `--site` / `-c site` | `github`, `dns`, `site`, `vars`, `upload` | site id; only for a domain that is not a known site; passed to `cdk` only when given |
 | `--no-domain` / `-c noDomain=true` | `site` | no certificate, alias or zone; serve on the `*.cloudfront.net` name (see "Before DNS") |
 | `--oidc-provider-arn` / `-c oidcProviderArn` | `site` | the account's existing GitHub OIDC provider; default `arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com` |
 
-Names are fixed: bucket `kbf-prod-site-<account>`, headers policy `kbf-prod-site-headers`, function
-`kbf-prod-site-router`, role `kbf-prod-publish`, stacks `kbf-dns-zone` and `kbf-prod-site`.
+Names are derived from the site id (see "Several sites"). For kbf.dev: bucket `kbf-prod-site-<account>`, headers policy
+`kbf-prod-site-headers`, function `kbf-prod-site-router`, role `kbf-prod-publish`, stacks `kbf-dns-zone` and `kbf-prod-site`.
+The rest of this file uses kbf.dev's names; substitute the site's for another.
 
 ## Stacks
 
@@ -284,6 +341,10 @@ before any `--apply`, and the held CLI runs it for `dns` and `site`).
   deny, the write-once deny and its `latest.json` carve-out, the router run over its vectors, the region and
   provider-ARN guards, the zone stack, and the context parameters (the ids come only from context; bad values refused).
   The tests use the documentation account `123456789012` and fake ids.
+- `test/kbf-names.test.ts`: every kbf.dev name pinned to its deployed value, and the zone and site templates byte-equal to
+  `test/golden/`. `test/site-names.test.ts`: site-id resolution (a known domain, an explicit id, refusals), kbf and
+  tierstore names share no string, their synthesized templates share no physical name and tierstore's contain no `kbf`,
+  and the held CLI selects the right stacks, environments and variables per `--domain`. No test depends on timing.
 - `test/held.test.ts`: flag parsing (`--force` refused), the account guard stops each AWS step after one call, dry runs
   run no write and no `cdk deploy`, `github` writes, for `prod`, the reviewer, `prevent_self_review=false`, `can_admins_bypass=false` and the
   two policies, and for `prod-site` an empty reviewer list and the single `v*` tag policy, each exactly once and nothing when present, `oidc-provider` creates only when absent, `--apply` runs the tests before `cdk`, `site` passes the ids read from `gh api` as

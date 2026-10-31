@@ -1,5 +1,5 @@
 //! The S3 client the cells use: [`BenchS3`], one bucket of one store role, over the SigV4 client
-//! of `kbf-objstore` (path-style, plain HTTP, which is what the tierstore front and the stores
+//! of `objstore-s3` (path-style, plain HTTP, which is what the tierstore front and the stores
 //! behind it speak).
 //!
 //! Every call is timed, and every call is written to the [`RequestLog`] before it returns. A
@@ -18,12 +18,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use kbf_objstore::s3::{Credentials, S3Config, S3Store};
-use kbf_objstore::{
-    ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectKey, ObjectStore as _,
-    ObjectStoreError, PageSize,
+use futures::StreamExt as _;
+use objstore_s3::s3::{Credentials, PART_BYTES, S3Config, S3Store};
+use objstore_s3::{
+    BodyStream, ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectKey,
+    ObjectStore as _, ObjectStoreError, PageSize,
 };
 
+use crate::cells::budget::Throttle;
 use crate::config::StoreSpec;
 use crate::error::BenchError;
 use crate::requestlog::{RequestLog, RequestRecord};
@@ -35,7 +37,7 @@ use crate::role::Role;
 pub struct Timeouts {
     /// Limit on opening a connection.
     pub connect: Duration,
-    /// Limit on a request, see `kbf_objstore::s3::S3Config::request_timeout`.
+    /// Limit on a request, see `objstore_s3::s3::S3Config::request_timeout`.
     pub request: Duration,
 }
 
@@ -119,6 +121,7 @@ pub struct BenchS3 {
     bucket: String,
     store: S3Store,
     log: Arc<RequestLog>,
+    cap: Option<Arc<Throttle>>,
 }
 
 impl BenchS3 {
@@ -155,7 +158,16 @@ impl BenchS3 {
             bucket: spec.bucket.clone(),
             store,
             log,
+            cap: None,
         })
+    }
+
+    /// The same client, with every request held to `cap` (a request waits for its turn before it
+    /// is sent, and the wait is not part of its latency).
+    #[must_use]
+    pub fn with_cap(mut self, cap: Arc<Throttle>) -> Self {
+        self.cap = Some(cap);
+        self
     }
 
     /// The role this client reaches.
@@ -173,6 +185,9 @@ impl BenchS3 {
         success_status: impl FnOnce(&T) -> u16,
         request: impl Future<Output = Result<T, ObjectStoreError>>,
     ) -> Result<Outcome<T>, BenchError> {
+        if let Some(cap) = &self.cap {
+            cap.acquire().await;
+        }
         let started_unix_ms = unix_ms();
         let clock = Instant::now();
         let result = request.await;
@@ -269,6 +284,166 @@ impl BenchS3 {
         let object = ObjectKey::new(key)?;
         self.timed("DELETE", key, 0, |()| 204, self.store.delete(&object))
             .await
+    }
+
+    /// A create-only put of `body` as a multipart upload of parts of [`PART_BYTES`], sent one
+    /// after the other: CreateMultipartUpload, UploadPart for each part, CompleteMultipartUpload.
+    /// Each request is timed and logged on its own; the [`Outcome`] returned is of the whole put:
+    /// its latency is the sum of its requests' (the waits of a rate cap between them are not in
+    /// it) and its status is that of the last request sent. After a failure the upload is aborted
+    /// (the abort is logged, its answer is not looked at).
+    ///
+    /// The multipart path is the one a tierstore front sends straight to its cold tier, so a
+    /// put made this way measures the cold tier and not the hot one.
+    ///
+    /// # Errors
+    /// [`BenchError`] if the key is malformed, the body is empty or the log cannot be written.
+    pub async fn put_multipart(&self, key: &str, body: Bytes) -> Result<Outcome<()>, BenchError> {
+        let object = ObjectKey::new(key)?;
+        if body.is_empty() {
+            return Err(BenchError::Request("a multipart put needs a body"));
+        }
+        let started_unix_ms = unix_ms();
+        let create = self
+            .timed(
+                "POST",
+                key,
+                0,
+                |_| 200,
+                self.store.create_multipart(&object),
+            )
+            .await?;
+        let mut latency = create.latency;
+        let (status, result) = match create.result {
+            Err(error) => (create.status, Err(error)),
+            Ok(upload_id) => {
+                let sent = self
+                    .send_parts(&object, key, &upload_id, &body, &mut latency)
+                    .await?;
+                if sent.1.is_err() {
+                    self.timed(
+                        "DELETE",
+                        key,
+                        0,
+                        |()| 204,
+                        self.store.abort_multipart(&object, &upload_id),
+                    )
+                    .await?;
+                }
+                sent
+            }
+        };
+        Ok(Outcome {
+            started_unix_ms,
+            latency,
+            status,
+            result,
+        })
+    }
+
+    /// The parts of `body` and the completion of the upload; stops at the first failure and
+    /// gives its status and error. `latency` gets the time of each request.
+    async fn send_parts(
+        &self,
+        object: &ObjectKey,
+        key: &str,
+        upload_id: &str,
+        body: &Bytes,
+        latency: &mut Duration,
+    ) -> Result<(Option<u16>, Result<(), ObjectStoreError>), BenchError> {
+        let size = usize::try_from(PART_BYTES).expect("a part fits in memory");
+        let mut parts = Vec::new();
+        for (index, start) in (0..body.len()).step_by(size).enumerate() {
+            let piece = body.slice(start..body.len().min(start + size));
+            let len = piece.len() as u64;
+            let number = u32::try_from(index + 1).expect("a part number");
+            let stream: BodyStream = futures::stream::once(async move { Ok(piece) }).boxed();
+            let sent = self
+                .timed(
+                    "PUT",
+                    key,
+                    len,
+                    |_| 200,
+                    self.store
+                        .upload_part_stream(object, upload_id, number, len, stream),
+                )
+                .await?;
+            *latency += sent.latency;
+            match sent.result {
+                Ok(etag) => parts.push((number, etag)),
+                Err(error) => return Ok((sent.status, Err(error))),
+            }
+        }
+        let done = self
+            .timed(
+                "POST",
+                key,
+                0,
+                |_| 200,
+                self.store.complete_multipart(object, upload_id, &parts),
+            )
+            .await?;
+        *latency += done.latency;
+        Ok((done.status, done.result.map(|_| ())))
+    }
+
+    /// Aborts every multipart upload under `prefix` that is neither completed nor aborted
+    /// (what a put that failed or was cut off leaves on the store, and holds disk until a rule
+    /// of the bucket removes it). Gives how many were found. An upload the store will not abort
+    /// is left and logged.
+    ///
+    /// # Errors
+    /// [`BenchError`] if the prefix is malformed or the log cannot be written; a failed listing
+    /// ends the sweep with what was found so far.
+    pub async fn abort_uploads(&self, prefix: &str) -> Result<u64, BenchError> {
+        self.abort_uploads_in_pages(prefix, PageSize::MAX).await
+    }
+
+    /// [`BenchS3::abort_uploads`] listing `page_size` uploads at a time.
+    ///
+    /// # Errors
+    /// As [`BenchS3::abort_uploads`].
+    pub async fn abort_uploads_in_pages(
+        &self,
+        prefix: &str,
+        page_size: PageSize,
+    ) -> Result<u64, BenchError> {
+        let prefix = KeyPrefix::new(prefix)?;
+        let mut found = 0;
+        let mut after: Option<(ObjectKey, String)> = None;
+        loop {
+            let page = self
+                .timed(
+                    "GET",
+                    prefix.as_str(),
+                    0,
+                    |_| 200,
+                    self.store.list_multipart_uploads(
+                        &prefix,
+                        after.as_ref().map(|(k, id)| (k, Some(id.as_str()))),
+                        page_size,
+                    ),
+                )
+                .await?;
+            let Ok(page) = page.result else {
+                return Ok(found);
+            };
+            for upload in &page.uploads {
+                found += 1;
+                self.timed(
+                    "DELETE",
+                    upload.key.as_str(),
+                    0,
+                    |()| 204,
+                    self.store.abort_multipart(&upload.key, &upload.upload_id),
+                )
+                .await?;
+            }
+            match page.next {
+                Some(next) => after = Some(next),
+                None => return Ok(found),
+            }
+        }
     }
 
     /// One page of up to `max_keys` keys under `prefix`, starting after `after`.

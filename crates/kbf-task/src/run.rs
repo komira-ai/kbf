@@ -50,6 +50,16 @@ pub enum RunError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// The Command is to be denied the network and this system has no way to deny it (neither
+    /// Linux nor macOS): it is refused, not run with the network.
+    #[error(
+        "this system cannot deny the Command the network (a confine is built for Linux and macOS only), so the Command is not run; only a Command allowed the network (kbf-network=allow) runs here"
+    )]
+    NoConfine,
+    /// A file this tool holds a credential in cannot be hidden from the Command (macOS): its path
+    /// cannot be written into the sandbox profile. Nothing was run.
+    #[error("cannot confine the Command: {0}")]
+    Confine(String),
     /// The program could not be started.
     #[error("cannot start {program}: {source}")]
     Spawn {
@@ -92,6 +102,10 @@ pub struct Run<'a> {
     /// Whether the program may use the network; [`Network::Denied`] unless the action asked
     /// ([`network::from_platform`]).
     pub network: Network,
+    /// Files holding a credential or a presigned URL this tool was given (the grant token file,
+    /// the PUT URL files). On macOS the Command's sandbox profile denies reading each; on Linux
+    /// the Command's own filesystem does not hold them and the list is not used.
+    pub unreadable: &'a [PathBuf],
 }
 
 /// Runs `command` under `run.root`.
@@ -128,9 +142,15 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
     } else {
         PathBuf::from(program)
     };
-    let mut process = Process::new(&program);
+    let launch = network::launch(
+        &program,
+        &command.arguments[1..],
+        run.network,
+        run.unreadable,
+    )?;
+    let mut process = Process::new(&launch.program);
     process
-        .args(&command.arguments[1..])
+        .args(&launch.args)
         .current_dir(&work_dir)
         .env_clear()
         .envs(private)
@@ -149,8 +169,9 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
 
     let cpu_before = children_usage().cpu_us;
     let started = Instant::now();
+    let started_as = launch.name(&program);
     let spawn_error = |source| RunError::Spawn {
-        program: program.clone(),
+        program: started_as.clone(),
         source,
     };
     let mut child = process.spawn().map_err(spawn_error)?;
@@ -309,11 +330,16 @@ fn children_usage() -> ChildrenUsage {
     // SAFETY: the pointer is to a live local of the right type, which `getrusage` writes and
     // does not keep. On failure the zeroes stay, which reads as "no usage".
     unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &raw mut usage) };
-    let micros = |t: libc::timeval| u64::try_from(t.tv_sec * 1_000_000 + t.tv_usec).unwrap_or(0);
+    // `tv_usec` is an `i32` on macOS and an `i64` on Linux.
+    #[allow(clippy::useless_conversion)]
+    let micros = |t: libc::timeval| {
+        u64::try_from(i64::from(t.tv_sec) * 1_000_000 + i64::from(t.tv_usec)).unwrap_or(0)
+    };
     ChildrenUsage {
         cpu_us: micros(usage.ru_utime) + micros(usage.ru_stime),
-        // Linux reports the peak resident set in KiB.
-        peak_rss_bytes: u64::try_from(usage.ru_maxrss).unwrap_or(0) * 1024,
+        // Linux reports the peak resident set in KiB, macOS in bytes.
+        peak_rss_bytes: u64::try_from(usage.ru_maxrss).unwrap_or(0)
+            * if cfg!(target_os = "macos") { 1 } else { 1024 },
     }
 }
 
@@ -364,6 +390,7 @@ mod tests {
                     stderr: &self.stderr,
                     deadline,
                     network: NETWORK,
+                    unreadable: &[],
                 },
             )
             .await
@@ -428,8 +455,8 @@ mod tests {
         // `env` exits 127 when it cannot find the program it was asked to run. Each run gets its
         // own work directory: a run refuses a `private` directory an earlier one left.
         for (argv, code) in [
-            (vec!["/bin/true"], 0),
-            (vec!["/bin/false"], 1),
+            (vec!["/usr/bin/true"], 0),
+            (vec!["/usr/bin/false"], 1),
             (vec!["/usr/bin/env", "./no-such-program"], 127),
         ] {
             let rig = Rig::new(&format!("exit-{code}"));
@@ -544,7 +571,7 @@ mod tests {
         std::fs::create_dir(rig.private()).expect("private");
         std::fs::write(rig.private().join("stale"), b"old").expect("stale");
         let error = rig
-            .run(&program(&["/bin/true"]), LONG)
+            .run(&program(&["/usr/bin/true"]), LONG)
             .await
             .expect_err("refused");
         assert!(matches!(error, RunError::Io { .. }), "{error}");
@@ -565,7 +592,7 @@ mod tests {
         let target = TestDir::under(std::env::temp_dir(), "kbf-task-run-symlink-target");
         std::os::unix::fs::symlink(&*target, rig.private()).expect("link");
         let error = rig
-            .run(&program(&["/bin/true"]), LONG)
+            .run(&program(&["/usr/bin/true"]), LONG)
             .await
             .expect_err("refused");
         assert!(matches!(error, RunError::Io { .. }), "{error}");
@@ -578,7 +605,7 @@ mod tests {
     #[tokio::test]
     async fn an_output_path_out_of_the_root_is_refused_before_the_command_runs() {
         let rig = Rig::new("escape");
-        let mut command = program(&["/bin/true"]);
+        let mut command = program(&["/usr/bin/true"]);
         command.output_paths = vec!["../private/tmp/x".into()];
         let error = rig.run(&command, LONG).await.expect_err("refused");
         assert!(matches!(error, RunError::Invalid(_)), "{error}");
@@ -592,7 +619,7 @@ mod tests {
         let rig = Rig::new("blocked");
         std::fs::write(rig.private(), b"in the way").expect("file");
         let error = rig
-            .run(&program(&["/bin/true"]), LONG)
+            .run(&program(&["/usr/bin/true"]), LONG)
             .await
             .expect_err("refused");
         assert!(matches!(error, RunError::Io { .. }), "{error}");
@@ -636,7 +663,7 @@ mod tests {
     #[tokio::test]
     async fn the_parent_directories_of_outputs_are_made_under_the_working_directory() {
         let rig = Rig::new("parents");
-        let mut command = program(&["/bin/true"]);
+        let mut command = program(&["/usr/bin/true"]);
         command.working_directory = "w".into();
         command.output_paths = vec!["out/deep/file".into(), "top".into()];
         rig.run(&command, LONG).await.expect("ran");
@@ -649,7 +676,7 @@ mod tests {
     #[allow(deprecated)]
     async fn the_older_output_lists_make_their_parents_too() {
         let rig = Rig::new("legacy");
-        let mut command = program(&["/bin/true"]);
+        let mut command = program(&["/usr/bin/true"]);
         command.output_files = vec!["f/g/file".into()];
         command.output_directories = vec!["d/e".into()];
         rig.run(&command, LONG).await.expect("ran");
@@ -709,7 +736,7 @@ mod tests {
             ("", "../x"),
             ("", ""),
         ] {
-            let mut command = program(&["/bin/true"]);
+            let mut command = program(&["/usr/bin/true"]);
             command.working_directory = work.into();
             command.output_paths = vec![output.into()];
             let error = rig.run(&command, LONG).await.expect_err("refused");
@@ -726,13 +753,13 @@ mod tests {
         std::os::unix::fs::symlink("/", rig.root().join("link")).expect("link");
         std::fs::write(rig.root().join("file"), b"x").expect("file");
         for work in ["link", "link/x", "file/x"] {
-            let mut command = program(&["/bin/true"]);
+            let mut command = program(&["/usr/bin/true"]);
             command.working_directory = work.into();
             let error = rig.run(&command, LONG).await.expect_err("refused");
             assert!(matches!(error, RunError::Invalid(_)), "{work}: {error}");
         }
         // The same for a directory an output needs.
-        let mut command = program(&["/bin/true"]);
+        let mut command = program(&["/usr/bin/true"]);
         command.output_paths = vec!["link/out".into()];
         let error = rig.run(&command, LONG).await.expect_err("refused");
         assert!(matches!(error, RunError::Invalid(_)), "{error}");
@@ -754,7 +781,7 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o500),
         )
         .expect("chmod");
-        let mut command = program(&["/bin/true"]);
+        let mut command = program(&["/usr/bin/true"]);
         command.working_directory = "new".into();
         let result = rig.run(&command, LONG).await;
         std::fs::set_permissions(
@@ -776,7 +803,7 @@ mod tests {
         let root = rig.root();
         let missing = rig.dir.join("none/stdout");
         let error = run(
-            &program(&["/bin/true"]),
+            &program(&["/usr/bin/true"]),
             &Run {
                 root: &root,
                 private: &rig.private(),
@@ -784,6 +811,7 @@ mod tests {
                 stderr: &rig.stderr,
                 deadline: LONG,
                 network: NETWORK,
+                unreadable: &[],
             },
         )
         .await
@@ -791,14 +819,24 @@ mod tests {
         assert!(matches!(error, RunError::Io { .. }), "{error}");
     }
 
+    /// Catches a Command whose program is missing being reported as a run. Where the program is
+    /// started directly, that is a spawn error. On macOS `sandbox-exec` starts it and is what
+    /// fails, so the run ends with a nonzero exit and the message in the Command's stderr.
     #[tokio::test]
-    async fn a_program_that_does_not_exist_is_a_spawn_error() {
+    async fn a_program_that_does_not_exist_is_not_run() {
         let rig = Rig::new("spawn");
         let command = Command {
             arguments: vec!["./no-such-program".into()],
             ..Command::default()
         };
-        let error = rig.run(&command, LONG).await.expect_err("refused");
-        assert!(matches!(error, RunError::Spawn { .. }), "{error}");
+        let result = rig.run(&command, LONG).await;
+        if cfg!(target_os = "macos") {
+            let ran = result.expect("sandbox-exec ran");
+            assert_ne!(ran.exit_code, 0);
+            assert!(rig.err().contains("no-such-program"), "{}", rig.err());
+        } else {
+            let error = result.expect_err("refused");
+            assert!(matches!(error, RunError::Spawn { .. }), "{error}");
+        }
     }
 }

@@ -1,0 +1,649 @@
+//! The rules of [`super`], on planted workflows: each way the split stops being whole, and the
+//! shape `ci.yml` has, which passes.
+
+use super::*;
+
+const LINT_JOB: &str = "  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n";
+
+const LEGACY_ARGS: &str = "--workspace";
+const JS_ARGS: &str = "-p kbf-server --features kbf-server/farm-core-js";
+
+fn entry(core: &str, part: usize, parts: usize, args: &str) -> String {
+    let gb = if core == "js" { 55 } else { 75 };
+    entry_with_disk(core, part, parts, args, &gb.to_string())
+}
+
+fn entry_with_disk(core: &str, part: usize, parts: usize, args: &str, gb: &str) -> String {
+    format!(
+        "          - core: {core}\n            part: {part}\n            parts: {parts}\n            min_free_gb: {gb}\n            args: {args}\n"
+    )
+}
+
+fn matrix(entries: &str) -> String {
+    format!("    strategy:\n      matrix:\n        include:\n{entries}")
+}
+
+fn good_matrix() -> String {
+    matrix(&format!(
+        "{}{}{}",
+        entry("legacy", 1, 2, LEGACY_ARGS),
+        entry("legacy", 2, 2, LEGACY_ARGS),
+        entry("js", 1, 1, JS_ARGS)
+    ))
+}
+
+const SHARD_ENV: &str = "    env:\n      PART: ${{ matrix.part }}\n      PARTS: ${{ matrix.parts }}\n      ARGS: ${{ matrix.args }}\n      MIN_FREE_GB: ${{ matrix.min_free_gb }}\n      LLVM_PROFILE_FILE_NAME: kbf-${{ matrix.core }}-${{ matrix.part }}-%p-%4m.profraw\n";
+const SHARD_STEPS: &str = "    steps:\n      - run: cargo xtask runner-disk --path . --min-free-gb \"$MIN_FREE_GB\"\n      - run: cargo llvm-cov nextest $ARGS --locked --branch --no-report --no-fail-fast --profile pr \"--partition=count:$PART/$PARTS\"\n      - if: ${{ always() }}\n        run: df -h /\n      - uses: actions/upload-artifact@abc # v7\n        with:\n          name: profraw-${{ matrix.core }}-${{ matrix.part }}\n          path: target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-*.profraw\n          if-no-files-found: error\n          overwrite: true\n";
+
+fn shard_job(matrix: &str) -> String {
+    format!(
+        "  test-shard:\n    name: test-shard (${{{{ matrix.core }}}}-${{{{ matrix.part }}}}-of-${{{{ matrix.parts }}}})\n    runs-on: ubuntu-latest\n{matrix}{SHARD_ENV}{SHARD_STEPS}"
+    )
+}
+
+const GATE_HEAD: &str = "  test:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      actions: read\n    steps:\n";
+const BUILD_LEGACY: &str = "      - run: cargo llvm-cov nextest --workspace --locked --branch --no-report --profile pr -E 'none()' --no-tests=pass\n";
+const BUILD_JS: &str = "      - run: cargo llvm-cov nextest -p kbf-server --features kbf-server/farm-core-js --locked --branch --no-report --profile pr -E 'none()' --no-tests=pass\n";
+const CLEAN: &str = "      - run: cargo llvm-cov clean --profraw-only\n";
+const WAIT: &str = "      - run: cargo xtask wait-artifacts --repo r --run-id 1 --job-prefix test-shard --artifact \"profraw-legacy-1=(legacy-1-of-2)\" --artifact \"profraw-legacy-2=(legacy-2-of-2)\" --artifact \"profraw-js-1=(js-1-of-1)\"\n";
+const DOWNLOAD: &str = "      - uses: actions/download-artifact@abc # v8\n        with:\n          pattern: profraw-*\n          path: target/llvm-cov-target\n          merge-multiple: true\n";
+const COMPLETE: &str = "      - run: cargo xtask profiles-complete --dir target/llvm-cov-target --prefix kbf-legacy-1- --prefix kbf-legacy-2- --prefix kbf-js-1-\n";
+const REPORT: &str = "      - run: cargo llvm-cov report --branch --lcov\n";
+const GATE_STEP: &str = "      - run: cargo run -p kbf-coverage --locked -- --lcov l\n";
+
+fn gate_job(steps: &[&str]) -> String {
+    format!("{GATE_HEAD}{}", steps.concat())
+}
+
+fn good_steps() -> Vec<&'static str> {
+    vec![
+        BUILD_LEGACY,
+        BUILD_JS,
+        CLEAN,
+        WAIT,
+        DOWNLOAD,
+        COMPLETE,
+        REPORT,
+        GATE_STEP,
+    ]
+}
+
+fn workflow(shard: &str, gate: &str) -> String {
+    format!("on: push\npermissions: {{}}\njobs:\n{LINT_JOB}{shard}{gate}")
+}
+
+fn good() -> String {
+    workflow(&shard_job(&good_matrix()), &gate_job(&good_steps()))
+}
+
+#[test]
+fn the_shape_ci_uses_passes() {
+    let w = good();
+    assert_eq!(shard_wiring(&w), Ok(()));
+    assert_eq!(gate_wiring(&w), Ok(()));
+    assert_eq!(check_names(&w), Ok(()));
+}
+
+/// A workflow with `from` replaced by `to` in the good one (which must hold `from`).
+fn changed(from: &str, to: &str) -> String {
+    let g = good();
+    assert!(g.contains(from), "{from}");
+    g.replacen(from, to, 1)
+}
+
+#[test]
+fn each_drift_of_the_partition_is_refused() {
+    // Catches: each way the matrix stops running every test of every core exactly once.
+    let legacy_only =
+        |entries: &str| workflow(&shard_job(&matrix(entries)), &gate_job(&good_steps()));
+    let js = entry("js", 1, 1, JS_ARGS);
+    let l1 = entry("legacy", 1, 2, LEGACY_ARGS);
+    let l2 = entry("legacy", 2, 2, LEGACY_ARGS);
+    let cases = [
+        (
+            legacy_only(&format!("{l1}{l2}")),
+            "the matrix of `test-shard` has no `js` entry, so that core's tests would not run",
+        ),
+        (
+            legacy_only(&js),
+            "the matrix of `test-shard` has no `legacy` entry, so that core's tests would not run",
+        ),
+        (
+            legacy_only(&format!("{l1}{js}")),
+            "the `legacy` entries are parts [1] of 2, not each of 1 to 2 once, so some tests would run twice or not at all",
+        ),
+        (
+            legacy_only(&format!("{l1}{l1}{l2}{js}")),
+            "the `legacy` entries are parts [1, 1, 2] of 2, not each of 1 to 2 once, so some tests would run twice or not at all",
+        ),
+        (
+            legacy_only(&format!("{l1}{}{js}", entry("legacy", 3, 2, LEGACY_ARGS))),
+            "the `legacy` entries are parts [1, 3] of 2, not each of 1 to 2 once, so some tests would run twice or not at all",
+        ),
+        (
+            legacy_only(&format!("{l1}{}{js}", entry("legacy", 2, 3, LEGACY_ARGS))),
+            "the `legacy` entries do not all say `parts: 2`, so their parts are of different splits",
+        ),
+        (
+            legacy_only(&format!(
+                "{l1}{}{js}",
+                entry("legacy", 2, 2, "--workspace --exclude kbf-front")
+            )),
+            "the `legacy` entries do not run the same packages (`args`), so the parts are not parts of one set of tests",
+        ),
+        (
+            legacy_only(&format!(
+                "{}{}{js}",
+                entry("legacy", 1, 2, "-p kbf-front"),
+                entry("legacy", 2, 2, "-p kbf-front")
+            )),
+            "the `args` of the `legacy` entries do not contain `--workspace`",
+        ),
+        (
+            legacy_only(&format!("{l1}{l2}{}", entry("js", 1, 1, "-p kbf-server"))),
+            "the `args` of the `js` entries do not contain `--features kbf-server/farm-core-js`",
+        ),
+        (
+            legacy_only(&format!(
+                "{l1}{l2}{js}{}",
+                entry("arm", 1, 1, "--workspace")
+            )),
+            "a matrix entry names the core Some(\"arm\"), which is neither `legacy` nor `js`",
+        ),
+        (
+            legacy_only(&format!(
+                "{l1}{l2}{}",
+                js.replace("parts: 1", "parts: many")
+            )),
+            "a `js` entry has no numeric `parts`",
+        ),
+        (
+            legacy_only(&format!("{l1}{l2}{}", js.replace("part: 1", "part: first"))),
+            "a `js` entry has no numeric `part`",
+        ),
+    ];
+    for (w, want) in cases {
+        assert_eq!(shard_wiring(&w), Err(want.to_owned()), "{w}");
+    }
+}
+
+#[test]
+fn each_drift_of_a_shard_is_refused() {
+    // Catches: each way a shard stops running its own part of its own core, or stops being
+    // red when it fails, or leaves profiles that could be another shard's.
+    let cases = [
+        (
+            changed("      PART: ${{ matrix.part }}\n", "      PART: 1\n"),
+            "the job `test-shard` does not set `PART: ${{ matrix.part }}`",
+        ),
+        (
+            changed("      PARTS: ${{ matrix.parts }}\n", ""),
+            "the job `test-shard` does not set `PARTS: ${{ matrix.parts }}`",
+        ),
+        (
+            changed(
+                "      ARGS: ${{ matrix.args }}\n",
+                "      ARGS: --workspace\n",
+            ),
+            "the job `test-shard` does not set `ARGS: ${{ matrix.args }}`",
+        ),
+        (
+            changed(
+                "kbf-${{ matrix.core }}-${{ matrix.part }}-%p",
+                "kbf-${{ matrix.core }}-%p",
+            ),
+            "LLVM_PROFILE_FILE_NAME is `kbf-${{ matrix.core }}-%p-%4m.profraw`, which does not begin `kbf-${{ matrix.core }}-${{ matrix.part }}-` (the core and the part) and end `.profraw`, so the shards' profiles could overwrite one another",
+        ),
+        (
+            changed("-%p-%4m.profraw", "-%p-%4m.prof"),
+            "LLVM_PROFILE_FILE_NAME is `kbf-${{ matrix.core }}-${{ matrix.part }}-%p-%4m.prof`, which",
+        ),
+        (
+            changed(
+                "      - run: cargo llvm-cov nextest $ARGS",
+                "      - run: cargo test $ARGS",
+            ),
+            "the job `test-shard` has no step running `llvm-cov nextest`",
+        ),
+        (
+            changed(" \"--partition=count:$PART/$PARTS\"", ""),
+            "the test step of `test-shard` lacks `--partition=count:$PART/$PARTS`",
+        ),
+        (
+            changed(
+                " \"--partition=count:$PART/$PARTS\"",
+                " --partition=count:1/$PARTS",
+            ),
+            "the test step of `test-shard` lacks `--partition=count:$PART/$PARTS`",
+        ),
+        (
+            changed("nextest $ARGS", "nextest --workspace"),
+            "the test step of `test-shard` lacks `$ARGS`",
+        ),
+        (
+            changed(" --branch", ""),
+            "the test step of `test-shard` lacks `--branch`",
+        ),
+        (
+            changed(" --no-report", ""),
+            "the test step of `test-shard` lacks `--no-report`",
+        ),
+        (
+            changed(" --no-fail-fast", ""),
+            "the test step of `test-shard` lacks `--no-fail-fast`",
+        ),
+        (
+            changed("--profile pr", "--profile ci"),
+            "the test step of `test-shard` does not run `--profile pr`",
+        ),
+        (
+            changed(" --profile pr", ""),
+            "the test step of `test-shard` does not run `--profile pr`",
+        ),
+        (
+            changed("--profile pr \"", "--profile pr -E 'package(a)' \""),
+            "the test step of `test-shard` filters the tests, which would leave some out of every part",
+        ),
+        (
+            changed("--profile pr \"", "--profile pr --filterset=all() \""),
+            "the test step of `test-shard` filters the tests, which would leave some out of every part",
+        ),
+        (
+            changed(
+                "      - run: cargo llvm-cov nextest $ARGS",
+                "      - if: ${{ github.event_name == 'push' }}\n        run: cargo llvm-cov nextest $ARGS",
+            ),
+            "the test step of `test-shard` has an `if:` or `continue-on-error`, so a shard could pass without running its tests",
+        ),
+        (
+            changed(
+                "      - uses: actions/upload-artifact@abc # v7\n",
+                "      - uses: actions/upload-artifact@abc # v7\n        if: ${{ always() }}\n",
+            ),
+            "the last step of `test-shard` must be the upload of its raw profiles with no `if:`, so that a shard has succeeded exactly when its profiles are up",
+        ),
+        (
+            changed(
+                "          overwrite: true\n",
+                "          overwrite: true\n      - run: echo done\n",
+            ),
+            "the last step of `test-shard` must be the upload of its raw profiles with no `if:`, so that a shard has succeeded exactly when its profiles are up",
+        ),
+        (
+            changed(
+                "name: profraw-${{ matrix.core }}-${{ matrix.part }}",
+                "name: profraw-${{ matrix.core }}",
+            ),
+            "the upload step's `name` is not `profraw-${{ matrix.core }}-${{ matrix.part }}`",
+        ),
+        (
+            changed(
+                "path: target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-*.profraw",
+                "path: target/llvm-cov-target/*.profraw",
+            ),
+            "the upload step's `path` is not the shard's own profiles, `target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-*.profraw`",
+        ),
+        (
+            changed("          overwrite: true\n", ""),
+            "the upload step lacks `overwrite: true`, so a re-run of the run fails on the names its first run uploaded",
+        ),
+        (
+            changed("          if-no-files-found: error\n", ""),
+            "the upload step lacks `if-no-files-found: error`, so a shard with no profile would pass",
+        ),
+        // A shard with an empty part passes under `--no-tests=pass`.
+        (
+            changed(" --no-fail-fast", " --no-fail-fast --no-tests=pass"),
+            "the test step of `test-shard` passes when no test runs (`--no-tests`)",
+        ),
+        (
+            changed(" --no-fail-fast", " --no-tests=pass --no-fail-fast"),
+            "the test step of `test-shard` passes when no test runs (`--no-tests`)",
+        ),
+        (
+            changed(" --no-fail-fast", " --no-fail-fast --no-tests pass"),
+            "the test step of `test-shard` passes when no test runs (`--no-tests`)",
+        ),
+        (
+            changed(" --no-fail-fast", " --no-fail-fast --no-tests=warn"),
+            "the test step of `test-shard` passes when no test runs (`--no-tests`)",
+        ),
+        (
+            changed(
+                " --no-fail-fast",
+                " --no-fail-fast --no-tests=fail --no-tests=pass",
+            ),
+            "the test step of `test-shard` passes when no test runs (`--no-tests`)",
+        ),
+        // The job's name is what `test` finds it by.
+        (
+            changed(
+                "    name: test-shard (${{ matrix.core }}-${{ matrix.part }}-of-${{ matrix.parts }})\n",
+                "",
+            ),
+            "the job `test-shard` is not named `test-shard (${{ matrix.core }}-${{ matrix.part }}-of-${{ matrix.parts }})`",
+        ),
+        (
+            changed(
+                "(${{ matrix.core }}-${{ matrix.part }}-of-${{ matrix.parts }})\n    runs-on",
+                "(${{ matrix.core }} ${{ matrix.part }}/${{ matrix.parts }})\n    runs-on",
+            ),
+            "the job `test-shard` is not named",
+        ),
+        // The early disk check uses the matrix's number.
+        (
+            changed("      MIN_FREE_GB: ${{ matrix.min_free_gb }}\n", ""),
+            "the job `test-shard` does not set `MIN_FREE_GB: ${{ matrix.min_free_gb }}`",
+        ),
+        (
+            changed(
+                "      - run: cargo xtask runner-disk --path . --min-free-gb \"$MIN_FREE_GB\"\n",
+                "",
+            ),
+            "the job `test-shard` has no unconditional step `xtask runner-disk",
+        ),
+        (
+            changed("--min-free-gb \"$MIN_FREE_GB\"", "--min-free-gb 10"),
+            "the job `test-shard` has no unconditional step `xtask runner-disk",
+        ),
+        (
+            changed(
+                "      - run: cargo xtask runner-disk",
+                "      - if: ${{ github.event_name == 'push' }}\n        run: cargo xtask runner-disk",
+            ),
+            "the job `test-shard` has no unconditional step `xtask runner-disk",
+        ),
+    ];
+    for (w, want) in cases {
+        let got = shard_wiring(&w);
+        assert!(
+            got.as_ref().is_err_and(|e| e.starts_with(want)),
+            "want `{want}`, got {got:?}:\n{w}"
+        );
+    }
+}
+
+#[test]
+fn a_shard_with_too_little_disk_is_refused() {
+    // Catches: an early disk check set below what the core's build and tests measured (legacy
+    // about 67 GB, js about 50), which passes a runner that then fails tests for want of room;
+    // a number that is missing or is not one.
+    let l2 = entry("legacy", 2, 2, LEGACY_ARGS);
+    let js = entry("js", 1, 1, JS_ARGS);
+    let with = |l1: String, js: String| {
+        workflow(
+            &shard_job(&matrix(&format!("{l1}{l2}{js}"))),
+            &gate_job(&good_steps()),
+        )
+    };
+    let l1 = |gb: &str| entry_with_disk("legacy", 1, 2, LEGACY_ARGS, gb);
+    let js_gb = |gb: &str| entry_with_disk("js", 1, 1, JS_ARGS, gb);
+    let cases = [
+        (
+            with(l1("74"), js.clone()),
+            "a `legacy` entry says `min_free_gb: 74`, under the 75",
+        ),
+        (
+            with(l1("60"), js.clone()),
+            "a `legacy` entry says `min_free_gb: 60`, under the 75",
+        ),
+        (
+            with(l1("75"), js_gb("54")),
+            "a `js` entry says `min_free_gb: 54`, under the 55",
+        ),
+        (
+            with(l1("75"), js_gb("40")),
+            "a `js` entry says `min_free_gb: 40`, under the 55",
+        ),
+        (
+            with(l1("lots"), js.clone()),
+            "a `legacy` entry has no numeric `min_free_gb`",
+        ),
+        (
+            with(
+                l1("75").replace("            min_free_gb: 75\n", ""),
+                js.clone(),
+            ),
+            "a `legacy` entry has no numeric `min_free_gb`",
+        ),
+    ];
+    for (w, want) in cases {
+        let got = shard_wiring(&w);
+        assert!(
+            got.as_ref().is_err_and(|e| e.starts_with(want)),
+            "want `{want}`, got {got:?}"
+        );
+    }
+    // The measured numbers and more pass.
+    assert_eq!(shard_wiring(&with(l1("75"), js_gb("55"))), Ok(()));
+    assert_eq!(shard_wiring(&with(l1("120"), js_gb("90"))), Ok(()));
+}
+
+#[test]
+fn a_shard_may_say_no_tests_fail() {
+    // `--no-tests=fail` is nextest's own default: it is allowed, not required.
+    let w = changed(" --no-fail-fast", " --no-fail-fast --no-tests=fail");
+    assert_eq!(shard_wiring(&w), Ok(()));
+}
+
+#[test]
+fn each_drift_of_the_gate_is_refused() {
+    // Catches: each way `test` stops reading every shard's profiles, in the order that makes
+    // one whole report, with the binaries of both cores.
+    let without = |i: usize| {
+        let mut steps = good_steps();
+        steps.remove(i);
+        workflow(&shard_job(&good_matrix()), &gate_job(&steps))
+    };
+    let order = |a: usize, b: usize| {
+        let mut steps = good_steps();
+        steps.swap(a, b);
+        workflow(&shard_job(&good_matrix()), &gate_job(&steps))
+    };
+    let conditioned = |step: &str| {
+        let with = step.replacen(
+            "      - ",
+            "      - if: ${{ github.event_name == 'push' }}\n        ",
+            1,
+        );
+        changed(step, &with)
+    };
+    let cases = [
+        (
+            without(0),
+            "the job `test` has no step that builds the instrumented tests of the `legacy` core (`llvm-cov nextest --workspace ... --no-tests=pass`)",
+        ),
+        (
+            without(1),
+            "the job `test` has no step that builds the instrumented tests of the `js` core (`llvm-cov nextest -p kbf-server --features kbf-server/farm-core-js ... --no-tests=pass`)",
+        ),
+        (
+            changed(
+                " --no-tests=pass\n      - run: cargo llvm-cov nextest -p",
+                "\n      - run: cargo llvm-cov nextest -p",
+            ),
+            "the job `test` has no step that builds the instrumented tests of the `legacy` core",
+        ),
+        (
+            without(2),
+            "the job `test` has no step that drops the profiles the builds' test listing wrote (`llvm-cov clean --profraw-only`), which would be merged into the report",
+        ),
+        (
+            without(3),
+            "the job `test` has no step running `cargo xtask wait-artifacts`",
+        ),
+        (
+            without(4),
+            "the job `test` has no step that downloads the shards' raw profiles",
+        ),
+        (
+            without(5),
+            "the job `test` has no step running `cargo xtask profiles-complete`",
+        ),
+        (
+            without(6),
+            "the job `test` has no step running `llvm-cov report`",
+        ),
+        (
+            without(7),
+            "the job `test` has no step running the gate (`-p kbf-coverage`)",
+        ),
+        (
+            order(2, 4),
+            "the steps of `test` are not in the order build, drop listing profiles (before the download), wait, download, check the profiles, report, gate",
+        ),
+        (order(3, 4), "the steps of `test` are not in the order"),
+        (order(4, 5), "the steps of `test` are not in the order"),
+        (order(5, 6), "the steps of `test` are not in the order"),
+        (order(6, 7), "the steps of `test` are not in the order"),
+        (order(1, 2), "the steps of `test` are not in the order"),
+        (
+            conditioned(BUILD_JS),
+            "the build step of `test` has an `if:` or `continue-on-error`, so the gate could pass without it",
+        ),
+        (
+            conditioned(CLEAN),
+            "the profile-dropping step of `test` has an `if:` or `continue-on-error`, so the gate could pass without it",
+        ),
+        (
+            conditioned(WAIT),
+            "the wait step of `test` has an `if:` or `continue-on-error`, so the gate could pass without it",
+        ),
+        (
+            conditioned(DOWNLOAD),
+            "the download step of `test` has an `if:` or `continue-on-error`, so the gate could pass without it",
+        ),
+        (
+            conditioned(COMPLETE),
+            "the profiles-complete step of `test` has an `if:` or `continue-on-error`, so the gate could pass without it",
+        ),
+        (
+            conditioned(REPORT),
+            "the report step of `test` has an `if:` or `continue-on-error`, so the gate could pass without it",
+        ),
+        (
+            changed(" --job-prefix test-shard", ""),
+            "the wait step does not pass `--job-prefix test-shard`, so a failed shard would not end it",
+        ),
+        (
+            changed(" --artifact \"profraw-js-1=(js-1-of-1)\"", ""),
+            "the wait step's `--artifact` names are not the shards' artifacts",
+        ),
+        (
+            changed(
+                " --artifact \"profraw-js-1=(js-1-of-1)\"",
+                " --artifact \"profraw-js-1=(js-1-of-1)\" --artifact \"profraw-js-2=(js-2-of-1)\"",
+            ),
+            "the wait step's `--artifact` names are not the shards' artifacts",
+        ),
+        (
+            changed(
+                " --artifact \"profraw-js-1=(js-1-of-1)\"",
+                " --artifact \"profraw-js-1=(js-1-of-1)\" --artifact \"profraw-js-1=(js-1-of-1)\"",
+            ),
+            "the wait step's `--artifact` names are not the shards' artifacts",
+        ),
+        // An artifact asked for by its name alone would count whatever attempt made it.
+        (
+            changed("\"profraw-js-1=(js-1-of-1)\"", "profraw-js-1"),
+            "the wait step's `--artifact` names are not the shards' artifacts",
+        ),
+        // Or for the wrong shard's job: the key must be that of the artifact's own shard.
+        (
+            changed(
+                "\"profraw-js-1=(js-1-of-1)\"",
+                "\"profraw-js-1=(legacy-1-of-2)\"",
+            ),
+            "the wait step's `--artifact` names are not the shards' artifacts",
+        ),
+        (
+            changed("pattern: profraw-*", "pattern: other-*"),
+            "the download step's `pattern` is not `profraw-*`",
+        ),
+        (
+            changed(
+                "path: target/llvm-cov-target\n          merge",
+                "path: elsewhere\n          merge",
+            ),
+            "the download step must put the profiles flat in `target/llvm-cov-target` (`merge-multiple: true`)",
+        ),
+        (
+            changed("merge-multiple: true", "merge-multiple: false"),
+            "the download step must put the profiles flat in `target/llvm-cov-target` (`merge-multiple: true`)",
+        ),
+        (
+            changed(
+                "profiles-complete --dir target/llvm-cov-target",
+                "profiles-complete --dir elsewhere",
+            ),
+            "the profiles-complete step does not check `--dir target/llvm-cov-target`",
+        ),
+        (
+            changed(" --prefix kbf-js-1-", ""),
+            "the profiles-complete step's `--prefix` values are not the shards' file prefixes",
+        ),
+        (
+            changed(" --prefix kbf-js-1-", " --prefix kbf-js-2-"),
+            "the profiles-complete step's `--prefix` values are not the shards' file prefixes",
+        ),
+    ];
+    for (w, want) in cases {
+        let got = gate_wiring(&w);
+        assert!(
+            got.as_ref().is_err_and(|e| e.starts_with(want)),
+            "want `{want}`, got {got:?}:\n{w}"
+        );
+    }
+    // A workflow whose matrix has no entry for a core has nothing to build for it.
+    let no_args = workflow(
+        &shard_job(&matrix(&entry("legacy", 1, 1, LEGACY_ARGS))),
+        &gate_job(&good_steps()),
+    );
+    assert_eq!(
+        gate_wiring(&no_args),
+        Err("the matrix has no `args` for the `js` core".to_owned())
+    );
+}
+
+#[test]
+fn each_drift_of_the_check_names_is_refused() {
+    // Catches: the required checks renamed, missing or skippable, and `test` without the scope
+    // that lets it wait for the shards.
+    let cases = [
+        (
+            good().replace("  lint:\n", "  lints:\n"),
+            "the workflow has no job `lint`, a required check",
+        ),
+        (
+            good().replace("  test:\n", "  tests:\n"),
+            "the workflow has no job `test`, a required check",
+        ),
+        (
+            good().replace("  lint:\n", "  lint:\n    name: format\n"),
+            "the job `lint` has a `name:`, so its check is no longer called `lint`",
+        ),
+        (
+            good().replace("  test:\n", "  test:\n    name: coverage\n"),
+            "the job `test` has a `name:`, so its check is no longer called `test`",
+        ),
+        (
+            good().replace("  test:\n", "  test:\n    if: ${{ !cancelled() }}\n"),
+            "the job `test` has an `if:`, so it can be skipped, and a skipped required check passes",
+        ),
+        (
+            good().replace("      actions: read\n", ""),
+            "the job `test` lacks `actions: read`",
+        ),
+        (
+            good().replace("      actions: read\n", "      actions: none\n"),
+            "the job `test` lacks `actions: read`",
+        ),
+    ];
+    for (w, want) in cases {
+        let got = check_names(&w);
+        assert!(
+            got.as_ref().is_err_and(|e| e.starts_with(want)),
+            "want `{want}`, got {got:?}"
+        );
+    }
+}

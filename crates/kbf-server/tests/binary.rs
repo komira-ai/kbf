@@ -120,8 +120,13 @@ fn server(args: &[&str]) -> Cmd {
     );
     let cold = format!("file://{}", base.join("cold").display());
     let mut c = bare(args);
-    c.args(["--cold-store", &cold, "--meta-dir"])
-        .arg(base.join("meta"));
+    c.args([
+        "--cold-store",
+        &cold,
+        "--cold-store-floor-bytes=1",
+        "--meta-dir",
+    ])
+    .arg(base.join("meta"));
     c.dir = Some(base);
     c
 }

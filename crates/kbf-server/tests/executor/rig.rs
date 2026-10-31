@@ -20,6 +20,8 @@ use kbf_types::{ActionKey, LeaseKind, Qos, Resources};
 use tokio::sync::watch;
 
 pub const GIB: u64 = 1 << 30;
+/// The input bytes the fake grant reports: not a whole GiB, so a sum that drops it shows.
+pub const INPUT_BYTES: u64 = 3 * GIB + 4_096;
 pub const IMAGE: &str = "docker://registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -46,6 +48,7 @@ impl FakeInputs {
             grant: Mutex::new(Ok(ReadGrant {
                 url: "https://grant.test:9400".to_owned(),
                 token: Secret::new("read-token-0001"),
+                input_bytes: Some(INPUT_BYTES),
             })),
             looked_up: Mutex::new(Vec::new()),
             hold: std::sync::atomic::AtomicBool::new(false),

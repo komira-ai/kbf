@@ -45,8 +45,8 @@ struct Order {
 /// A host, as its last heartbeat and certificate left it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Host {
-    /// What the host runs, from its certificate.
-    pub role: HostRole,
+    /// What the host runs, from its certificate, by name. Read it with [`Host::role_name`].
+    role: String,
     /// What it last said.
     pub beat: Heartbeat,
     /// When it said it.
@@ -54,6 +54,12 @@ pub struct Host {
 }
 
 impl Host {
+    /// The host's role, by name: how coordinator logic reads a role.
+    #[must_use]
+    pub fn role_name(&self) -> &str {
+        &self.role
+    }
+
     /// Whether the host has heartbeated within [`DOWN_AFTER`] of `now`.
     #[must_use]
     pub fn is_live(&self, now: Duration) -> bool {
@@ -128,6 +134,19 @@ impl Fleet {
         beat: Heartbeat,
         now: Duration,
     ) {
+        self.record_named_in(service, id, role.name(), beat, now);
+    }
+
+    /// [`Self::record_in`] for a host whose role is named `role`: the one place a role enters
+    /// the fleet.
+    pub(crate) fn record_named_in(
+        &mut self,
+        service: &str,
+        id: NodeId,
+        role: &str,
+        beat: Heartbeat,
+        now: Duration,
+    ) {
         let key = (id, service.to_owned());
         if let Some(order) = self.orders.get(&key) {
             let failed = beat
@@ -141,7 +160,7 @@ impl Fleet {
         self.hosts.entry(key.1).or_default().insert(
             key.0,
             Host {
-                role,
+                role: role.to_owned(),
                 beat,
                 seen: now,
             },

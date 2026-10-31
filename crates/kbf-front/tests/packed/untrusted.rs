@@ -608,6 +608,32 @@ async fn a_store_that_fails_makes_the_commit_unavailable() {
     assert!(recorded.expect("recorded").created);
 }
 
+/// Asserts that a store that fails while a record is read, after the trailer and the footer were
+/// read, is not the commit's fault either: the commit is unavailable, nothing is recorded and the
+/// refusal counter does not move. Catches a store failure on a record reported as a mismatch of
+/// the pack.
+#[tokio::test]
+async fn a_store_that_fails_on_a_record_makes_the_commit_unavailable() {
+    let (bytes, manifest) = segment_of(&[FIRST]);
+    let rig = Rig::new().await;
+    rig.store.seed(KEY, &bytes).await;
+    rig.store.reject_read_after(2);
+
+    let failed = commit(&rig, manifest.clone()).await;
+
+    let failed = failed.expect_err("the store fails on the record");
+    assert!(matches!(failed, CommitError::Unavailable(_)), "{failed:?}");
+    assert_eq!(
+        rig.store.ranges().len(),
+        3,
+        "the trailer, the footer, the record"
+    );
+    assert!(rig.index.pack(KEY).expect("asked").is_none());
+    assert_eq!(rig.packs.metrics().commit_rejects.get(), 0);
+    let recorded = commit(&rig, manifest).await;
+    assert!(recorded.expect("recorded").created);
+}
+
 /// A manifest of a pack of `size` bytes that lists `blobs` as they are (digest and offset), sorted
 /// into the order a manifest must list them.
 fn raw(blobs: Vec<PackBlob>, size: u64) -> NewPack {

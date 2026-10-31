@@ -1,9 +1,10 @@
 use std::fs;
 
 use kbf_testkit::dir::TestDir;
-use kbf_types::HostRole;
 
-use crate::desired::{Desired, DesiredError, DesiredStore, KBF, MAX_COUNT, StoreError, dir_of};
+use crate::desired::{
+    Desired, DesiredError, DesiredStore, KBF, MAX_COUNT, StoreError, dir_of, kbf_roles,
+};
 
 const FULL: &str = r#"{"version":"0.1.9+gabcdefabcdef-2",
     "max_updating":{"frontend":1,"storage":2,"daemon":3,"mac-daemon":4},
@@ -19,22 +20,35 @@ fn dir(name: &str) -> TestDir {
 #[test]
 fn a_desired_state_reads_every_limit_and_defaults_the_rest() {
     let d = Desired::parse(FULL.as_bytes()).expect("parsed");
-    let got = HostRole::ALL.map(|r| d.max_updating.of(r));
+    let got = kbf_roles().map(|r| d.max_updating.max_updating_of(r.name()));
     assert_eq!(got, [1, 2, 3, 4]);
-    assert_eq!((d.min_up.storage, d.min_up.frontend), (3, 2));
+    assert_eq!(
+        (
+            d.min_up.min_up_of("storage"),
+            d.min_up.min_up_of("frontend")
+        ),
+        (3, 2)
+    );
     assert_eq!(d.version.as_str(), "0.1.9+gabcdefabcdef-2");
     let short = r#"{"version":"1.0","min_up":{"storage":1,"frontend":1}}"#;
     let d = Desired::parse(short.as_bytes()).expect("parsed");
-    assert_eq!(HostRole::ALL.map(|r| d.max_updating.of(r)), [1, 1, 2, 2]);
+    assert_eq!(
+        kbf_roles().map(|r| d.max_updating.max_updating_of(r.name())),
+        [1, 1, 2, 2]
+    );
     let partial =
         r#"{"version":"1.0","max_updating":{"daemon":7},"min_up":{"storage":1,"frontend":1}}"#;
     let d = Desired::parse(partial.as_bytes()).expect("parsed");
-    assert_eq!(HostRole::ALL.map(|r| d.max_updating.of(r)), [1, 1, 7, 2]);
+    assert_eq!(
+        kbf_roles().map(|r| d.max_updating.max_updating_of(r.name())),
+        [1, 1, 7, 2]
+    );
 }
 
 /// Catches: a desired state accepted that the host-side rule or the schema refuses: a
 /// version with a shell word or an option, a missing minimum, an unknown field (a URL for the
-/// release, say), a count over the cap, a negative count, and text that is no JSON.
+/// release, say), a count over the cap, a negative count, and text that is no JSON. A limit
+/// key that is no role name is refused in `desired_role_tests`.
 #[test]
 fn a_desired_state_that_is_not_one_is_refused() {
     let over = format!(
@@ -59,7 +73,6 @@ fn a_desired_state_that_is_not_one_is_refused() {
         r#"{"min_up":{"storage":1,"frontend":1}}"#,
         r#"{"version":"1.0","min_up":{"storage":1}}"#,
         r#"{"version":"1.0","min_up":{"storage":1,"frontend":1},"url":"https://x.example"}"#,
-        r#"{"version":"1.0","max_updating":{"other":1},"min_up":{"storage":1,"frontend":1}}"#,
         r#"{"version":"1.0","min_up":{"storage":-1,"frontend":1}}"#,
         "not json",
         "",
@@ -341,4 +354,13 @@ fn a_map_file_that_is_not_a_map_of_states_refuses_to_start() {
         let why = DesiredStore::open(&file).expect_err("refused");
         assert!(matches!(why, StoreError::Invalid { .. }), "{bad}");
     }
+}
+
+/// Catches: the spelling of the legacy role names drifting from the four roles `kbf` names:
+/// every list in the coordinator's output follows this order. (That a role no definition
+/// names is never ordered is `decide_role_tests`.)
+#[test]
+fn the_legacy_role_names_are_the_four_roles_kbf_names() {
+    let named = kbf_roles().map(|r| r.name().to_owned());
+    assert_eq!(named, crate::desired::LEGACY_ROLES);
 }

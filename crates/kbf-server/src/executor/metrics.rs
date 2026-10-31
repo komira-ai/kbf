@@ -106,7 +106,7 @@ impl IngestEnd {
 }
 
 /// Every reason a pack is refused, with its label.
-const REASONS: [(RejectReason, &str); 7] = [
+const REASONS: [(RejectReason, &str); 9] = [
     (RejectReason::Missing, "rejected_missing"),
     (RejectReason::WrongKey, "rejected_wrong_key"),
     (RejectReason::TooLarge, "rejected_too_large"),
@@ -114,6 +114,8 @@ const REASONS: [(RejectReason, &str); 7] = [
     (RejectReason::HashMismatch, "rejected_hash_mismatch"),
     (RejectReason::BadManifest, "rejected_bad_manifest"),
     (RejectReason::Incomplete, "rejected_incomplete"),
+    (RejectReason::Expired, "rejected_expired"),
+    (RejectReason::Claimed, "rejected_claimed"),
 ];
 
 /// The executor's counters.
@@ -121,7 +123,7 @@ const REASONS: [(RejectReason, &str); 7] = [
 pub struct Metrics {
     held: AtomicU64,
     runs: [AtomicU64; 6],
-    ingests: [AtomicU64; 10],
+    ingests: [AtomicU64; 12],
     late_starts: AtomicU64,
     strays_released: AtomicU64,
 }

@@ -18,6 +18,19 @@ fn job_of<'a>(root: &'a Node, job: &str) -> Result<&'a [(Node, Node)], String> {
     }
 }
 
+/// The job `job`'s `name:` (what its check is called); `None` without one. An error when it is
+/// not a string.
+pub fn job_name(text: &str, job: &str) -> Result<Option<String>, String> {
+    let root = yaml::load(text)?;
+    match get(job_of(&root, job)?, "name") {
+        None => Ok(None),
+        Some(n) => n
+            .as_str()
+            .map(|n| Some(n.to_owned()))
+            .ok_or_else(|| format!("the `name` of job `{job}` is not a string")),
+    }
+}
+
 /// The environment the job `job` runs in: `None` without `environment:`; the name when
 /// it is a string or a mapping with a string `name:`. An error for any other shape.
 pub fn job_environment(text: &str, job: &str) -> Result<Option<String>, String> {
@@ -152,6 +165,49 @@ pub fn job_env(text: &str, job: &str) -> Result<Vec<(String, String)>, String> {
             .collect(),
         Some(_) => Err(format!("the `env` of job `{job}` is not a mapping")),
     }
+}
+
+/// The entries of the matrix of the job `job`, each as its `(name, value)` pairs in file order,
+/// the matrix being a list under `strategy.matrix.include` and nothing else (a matrix with axes
+/// of its own expands to a product this reader does not compute). An error for any other shape,
+/// an entry that is not a mapping of scalars, or no entry at all.
+pub fn job_matrix(text: &str, job: &str) -> Result<Vec<Vec<(String, String)>>, String> {
+    let root = yaml::load(text)?;
+    let found = job_of(&root, job)?;
+    let Some(Value::Map(strategy)) = get(found, "strategy").map(|s| &s.value) else {
+        return Err(format!("the job `{job}` has no `strategy` mapping"));
+    };
+    let Some(Value::Map(matrix)) = get(strategy, "matrix").map(|m| &m.value) else {
+        return Err(format!(
+            "the `strategy` of job `{job}` has no `matrix` mapping"
+        ));
+    };
+    if matrix.iter().any(|(k, _)| k.as_str() != Some("include")) {
+        return Err(format!(
+            "the matrix of job `{job}` has a key besides `include`, which this reader does not expand"
+        ));
+    }
+    let Some(Value::Seq(entries)) = get(matrix, "include").map(|i| &i.value) else {
+        return Err(format!("the matrix of job `{job}` has no `include` list"));
+    };
+    if entries.is_empty() {
+        return Err(format!("the matrix of job `{job}` has no entry"));
+    }
+    entries
+        .iter()
+        .map(|entry| match &entry.value {
+            Value::Map(pairs) => pairs
+                .iter()
+                .map(|(k, v)| match (k.as_str(), v.as_str()) {
+                    (Some(k), Some(v)) => Ok((k.to_owned(), v.to_owned())),
+                    _ => Err(format!(
+                        "a matrix entry of job `{job}` has a value that is not a scalar"
+                    )),
+                })
+                .collect(),
+            _ => Err(format!("a matrix entry of job `{job}` is not a mapping")),
+        })
+        .collect()
 }
 
 /// The reusable workflow the job `job` calls (`uses:`), `None` for a job with steps. An error

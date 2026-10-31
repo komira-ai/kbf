@@ -42,7 +42,8 @@
 //!   holds that rule), started by the success of a run of this one.
 //! - **Least privilege.** Every job has `contents: read` and nothing else but the signing
 //!   scopes of the two calls of `artifacts.yml` (the build call has them only because a called
-//!   workflow is checked against its caller's grant statically; its signing jobs are skipped) and
+//!   workflow is checked against its caller's grant statically; its signing jobs are skipped),
+//!   the `actions: read` of `ci` (its `test` job waits for the coverage shards' artifacts) and
 //!   the `actions: write` of `watch`; a called workflow gets at most
 //!   what its caller job grants.
 
@@ -307,6 +308,8 @@ fn permissions(text: &str, out: &mut Vec<String>) -> Result<(), String> {
                 ("attestations", "write"),
             ],
             "beta" => vec![("contents", "read"), ("attestations", "read")],
+            // The `test` job of ci.yml lists the run's jobs and artifacts, to wait for the shards.
+            "ci" => vec![("contents", "read"), ("actions", "read")],
             WATCH => vec![("contents", "read"), ("actions", "write")],
             _ => vec![("contents", "read")],
         };

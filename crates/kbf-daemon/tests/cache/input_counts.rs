@@ -3,7 +3,9 @@
 
 use std::sync::Arc;
 
-use crate::support::cache_kit::{CountingCas, FakeClock, Gates, config, file, key, lease, stop};
+use crate::support::cache_kit::{
+    CountingCas, FakeClock, Gates, config, file, key, lease, stop, wait_for_fill_waits,
+};
 use crate::support::scratch;
 use kbf_daemon::cache::{Cache, Point};
 
@@ -125,9 +127,8 @@ async fn two_leases_for_one_missing_entry_count_one_fill_and_one_hit() {
         .await
         .expect("held");
     let second = spawn("second");
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+    // The second lease waits on the slot the first one holds (its read is held).
+    wait_for_fill_waits(&cache, 1).await;
     gates.release(held);
     first.await.expect("joined").expect("first");
     second.await.expect("joined").expect("second");

@@ -176,11 +176,13 @@ fn js_agent_settings_become_the_executors_config() {
         "--executor-arch=arm64",
         "--executor-work-dir=/scratch",
         "--executor-allow-plain-http-put",
+        "--executor-allow-plain-http-grant",
         "--executor-run-margin-secs=120",
         "--executor-lease-ttl-secs=7200",
         "--executor-max-run-secs=1800",
         "--executor-default-timeout-secs=900",
         "--executor-call-timeout-secs=3",
+        "--executor-output-disk-bytes=4294967296",
     ])
     .expect("flags");
     let js = flags.executor.js.expect("js-agent");
@@ -200,12 +202,35 @@ fn js_agent_settings_become_the_executors_config() {
     assert_eq!(config.arch, "arm64");
     assert_eq!(config.work_dir.as_deref(), Some("/scratch"));
     assert!(config.allow_plain_http_put);
+    assert!(config.allow_plain_http_grant);
     assert!(config.insecure_argv_secrets);
     assert_eq!(config.run_margin, Duration::from_secs(120));
     assert_eq!(config.lease_ttl, Duration::from_secs(7200));
     assert_eq!(config.max_run, Duration::from_secs(1800));
     assert_eq!(config.default_timeout, Duration::from_secs(900));
     assert_eq!(config.call_timeout, Duration::from_secs(3));
+    assert_eq!(config.output_disk_bytes, 4 << 30);
+}
+
+/// Catches `--executor-locate` not becoming the executor's setting, or being on by default: it
+/// is off unless given, and given with `--executor js-agent` it is the config's `locate`.
+#[test]
+fn executor_locate_is_off_unless_given_and_becomes_the_config() {
+    let off = js_with(&[]).expect("flags");
+    assert!(!off.executor.js.expect("js-agent").config.locate);
+    let on = js_with(&["--executor-locate"]).expect("flags");
+    assert!(on.executor.js.expect("js-agent").config.locate);
+}
+
+/// Catches `--executor-locate` accepted where nothing reads it: daemons build no task command
+/// line, so with `--executor kbf-daemon` (the default) it would do nothing and is refused when
+/// the flags are read, naming both flags.
+#[test]
+fn locate_with_kbf_daemon_is_refused_at_start() {
+    let why = parsed(argv(&["--executor-locate"])).expect_err("refused");
+    assert!(why.contains("--executor-locate"), "{why}");
+    assert!(why.contains("--executor js-agent"), "{why}");
+    parsed(argv(&[])).expect("daemons without the flag still parse");
 }
 
 /// Catches a flag default that has drifted from the executor's own: the defaults are written
@@ -225,11 +250,14 @@ fn the_defaults_are_the_executors_own() {
     assert_eq!(config.arch, own.arch);
     assert_eq!(config.work_dir, own.work_dir);
     assert_eq!(config.allow_plain_http_put, own.allow_plain_http_put);
+    assert_eq!(config.allow_plain_http_grant, own.allow_plain_http_grant);
+    assert!(!config.allow_plain_http_grant, "off by default");
     assert_eq!(config.run_margin, own.run_margin);
     assert_eq!(config.lease_ttl, own.lease_ttl);
     assert_eq!(config.max_run, own.max_run);
     assert_eq!(config.default_timeout, own.default_timeout);
     assert_eq!(config.call_timeout, own.call_timeout);
+    assert_eq!(config.output_disk_bytes, own.output_disk_bytes);
     assert_eq!(own.delivery, config.delivery);
 }
 
@@ -302,7 +330,7 @@ fn the_flags_of_the_host_preloaded_tool_are_gone() {
 /// each is refused at the flags, naming the flag.
 #[test]
 fn settings_that_are_not_what_they_name_are_refused_naming_the_flag() {
-    let cases: [(&[&str], &str); 5] = [
+    let cases: [(&[&str], &str); 6] = [
         (&["--executor-lease-url=ftp://x"], "--executor-lease-url"),
         (
             &["--executor-lease-url=http://lease.example:80"],
@@ -317,6 +345,10 @@ fn settings_that_are_not_what_they_name_are_refused_naming_the_flag() {
             "--executor-lease-ca-file",
         ),
         (&["--executor-work-dir=scratch"], "--executor-work-dir"),
+        (
+            &["--executor-output-disk-bytes=0"],
+            "--executor-output-disk-bytes",
+        ),
     ];
     for (more, flag) in cases {
         let why = refused(more);

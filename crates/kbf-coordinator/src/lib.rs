@@ -32,16 +32,36 @@ pub mod service;
 pub mod services;
 
 #[cfg(test)]
+mod converge_role_tests;
+#[cfg(test)]
 mod converge_tests;
 #[cfg(test)]
+mod decide_golden_tests;
+#[cfg(test)]
+mod decide_role_tests;
+#[cfg(test)]
 mod decide_tests;
+#[cfg(test)]
+mod decide_why_tests;
+#[cfg(test)]
+mod desired_dropped_tests;
+#[cfg(test)]
+mod desired_role_tests;
 #[cfg(test)]
 mod desired_tests;
 #[cfg(test)]
 mod http_tests;
 #[cfg(test)]
+mod kbf_definition_tests;
+#[cfg(test)]
+mod kbf_review_tests;
+#[cfg(test)]
+mod priority_tests;
+#[cfg(test)]
 mod service_tests;
 #[cfg(test)]
 mod services_tests;
+#[cfg(test)]
+mod status_service_tests;
 #[cfg(test)]
 mod testutil;

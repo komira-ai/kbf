@@ -88,7 +88,13 @@ fn node(dir: &Path) -> Proc {
     std::fs::create_dir_all(dir).expect("directory");
     let cold = format!("--cold-store=file://{}", dir.join("cold").display());
     let meta = format!("--meta-dir={}", dir.join("meta").display());
-    Proc::start(&["storage", "--storage-listen=127.0.0.1:0", &cold, &meta])
+    Proc::start(&[
+        "storage",
+        "--storage-listen=127.0.0.1:0",
+        &cold,
+        "--cold-store-floor-bytes=1",
+        &meta,
+    ])
 }
 
 /// A `kbf frontend` in front of the node at `storage`, on free loopback ports with the

@@ -70,6 +70,8 @@ jobs:
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
+      # The `test` job of ci lists the run's jobs and artifacts to wait for the coverage shards.
+      actions: read
 
   # Tests the commit's source, beside ci: every job of beta.yml builds what it runs.
   beta:

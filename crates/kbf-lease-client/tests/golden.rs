@@ -61,11 +61,13 @@ fn what_the_client_sends_is_what_the_server_reads() {
         memory_bytes: 8 << 30,
         pids: None,
         wall_ms: None,
+        disk_bytes: None,
     };
     assert_eq!(RunSpec::new(support::IMAGE, limits), minimal);
     let full: RunSpec = round_trip("run_request_full");
     assert_eq!(full.isolation, Isolation::Host);
     assert_eq!(full.limits.wall_ms, Some(1_800_000));
+    assert_eq!(full.limits.disk_bytes, Some(10 << 30));
     assert_eq!(
         full.mounts,
         [Mount {
@@ -74,6 +76,24 @@ fn what_the_client_sends_is_what_the_server_reads() {
             ro: true
         }]
     );
+}
+
+/// Asserts that a run's disk is optional on the wire in both directions: a body without
+/// `disk_bytes` (the minimal golden, what an older client sends) reads as no disk and is
+/// written back without the field, and the full golden carries it as the number the server
+/// reads. It catches a client that sends `"disk_bytes": null` to a server that does not take
+/// it, and one that drops the field from a body that has it.
+#[test]
+fn a_runs_disk_is_optional_on_the_wire() {
+    let without: RunSpec = round_trip("run_request_minimal");
+    assert_eq!(without.limits.disk_bytes, None);
+    assert!(
+        !serde_json::to_string(&without)
+            .unwrap()
+            .contains("disk_bytes")
+    );
+    let with: RunSpec = round_trip("run_request_full");
+    assert_eq!(with.limits.disk_bytes, Some(10_737_418_240));
 }
 
 /// Asserts that the server's request bodies refuse an unknown field and so do the client's

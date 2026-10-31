@@ -363,8 +363,9 @@ impl HostWorker {
             return Err(Settled::Infra("the pack url is not https".to_owned()));
         }
         let grant = ctx.deps.inputs.read_grant(lease, action, wall).await?;
-        // The bearer token goes into the arguments: not over a scheme that sends it in clear.
-        if !grant.url.starts_with("https://") {
+        // The bearer token goes into the arguments: not over a scheme that sends it in clear,
+        // unless the operator said the job network is trusted for it.
+        if !ctx.cfg.allow_plain_http_grant && !grant.url.starts_with("https://") {
             return Err(Settled::Infra(
                 "the read grant is not served over https".to_owned(),
             ));
@@ -378,13 +379,23 @@ impl HostWorker {
             deadline: timeout,
             work_dir: ctx.cfg.work_dir.as_deref(),
             allow_plain_http_put: ctx.cfg.allow_plain_http_put,
+            allow_plain_http_grant: ctx.cfg.allow_plain_http_grant,
+            locate: ctx.cfg.locate,
         };
         let limits = RunLimits {
             cpu_millis: w.millicpus.max(1),
             memory_bytes: Config::hard_memory(w.memory_bytes),
             pids: None,
             wall_ms: Some(u64::try_from(wall.as_millis()).unwrap_or(u64::MAX)),
+            disk_bytes: Some(ctx.cfg.disk_bytes(grant.input_bytes)),
         };
+        if grant.input_bytes.is_none() {
+            tracing::warn!(
+                worker = %self.id,
+                %lease,
+                "the size of the inputs is not known; the run books the allowance and the margin only"
+            );
+        }
         let mut spec = RunSpec::new(image, limits);
         spec.args = args.argv(ctx.cfg.delivery);
         // The labels are listed back with every run and are not secret-safe: the nonce only.
@@ -432,6 +443,22 @@ impl HostWorker {
             }
             Some(ErrorCode::NotHeld | ErrorCode::UnknownLease | ErrorCode::Expired) => {
                 Queued::Retire(Retire::Gone)
+            }
+            // Every host holds the pool's shape, so a run over it fits no host and rerunning
+            // the action never helps: the action's limits are the caller's to fix.
+            Some(ErrorCode::LimitsExceedShape) => {
+                let limits = &prepared.spec.limits;
+                let disk = limits
+                    .disk_bytes
+                    .map_or_else(|| "none".to_owned(), |bytes| format!("{bytes} bytes"));
+                Queued::Settled(Settled::Invalid(format!(
+                    "the run's limits (cpu {} millis, memory {} bytes, disk {disk}) exceed the \
+                     pool's shape (cpu {} millis, memory {} bytes), which every host shares",
+                    limits.cpu_millis,
+                    limits.memory_bytes,
+                    ctx.cfg.cpu_millis,
+                    ctx.cfg.memory_bytes,
+                )))
             }
             Some(other) => Queued::Settled(Settled::Infra(format!(
                 "the lease server refused the run: {other}"

@@ -1,6 +1,5 @@
 use std::cell::Cell;
 use std::ffi::OsString;
-use std::time::Instant;
 
 use clap::Parser;
 
@@ -43,9 +42,15 @@ fn cli(
     let pilot = parse(args).expect("valid flags");
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let pauses = Cell::new(0);
-    let code = run(pilot, exec, env, &mut out, &mut err, &|| {
-        pauses.set(pauses.get() + 1)
-    });
+    let code = run(
+        pilot,
+        exec,
+        env,
+        SystemTime::UNIX_EPOCH,
+        &mut out,
+        &mut err,
+        &|| pauses.set(pauses.get() + 1),
+    );
     let text = |b: Vec<u8>| String::from_utf8(b).expect("utf-8");
     let code = if code == ExitCode::SUCCESS {
         0
@@ -330,14 +335,4 @@ fn buckconfig_writes_removes_and_fails_through_the_command_line() {
         (code, err.as_str()),
         (2, "REFUSED: KBF_SERVER_HOST is not set (config file)\n")
     );
-}
-
-/// Catches the host's pause not pausing (the wait for kbf-server's start line would
-/// be over in no time) or pausing far longer than a second.
-#[test]
-fn the_host_pause_is_a_second() {
-    let start = Instant::now();
-    sleep_a_second();
-    let took = start.elapsed();
-    assert!(took >= PAUSE && took < PAUSE * 5, "{took:?}");
 }

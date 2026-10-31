@@ -31,7 +31,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-use super::{JobReadFlags, Prepared, Serving, Timeouts};
+use super::{JobReadFlags, JobTls, Prepared, Serving, Timeouts};
 use crate::frontend::pack_tests::{flags_of, index, pack_flags, scrape, started, upload};
 use crate::frontend::{command, parse};
 use crate::listen::Binder;
@@ -97,12 +97,27 @@ fn files(dir: &Path, ca: &Ca, sans: Vec<SanType>) -> Files {
 fn flags(files: &Files, listen: &str) -> JobReadFlags {
     JobReadFlags {
         listen: listen.parse().expect("an address"),
-        tls_cert: files.cert.clone(),
-        tls_key: files.key.clone(),
+        tls: Some(JobTls {
+            cert: files.cert.clone(),
+            key: files.key.clone(),
+        }),
         grant_secret_file: files.secret.clone(),
         max_blob_bytes: Limits::default().max_blob_bytes,
         reads_in_flight: 32,
+        read_budget_bytes: Limits::default().read_budget_bytes,
+        read_idle_secs: Limits::default().held_idle.as_secs(),
+        store: None,
     }
+}
+
+/// The TLS flags of `files`, changed by `change`.
+fn tls_of(files: &Files, change: impl FnOnce(&mut JobTls)) -> Option<JobTls> {
+    let mut tls = JobTls {
+        cert: files.cert.clone(),
+        key: files.key.clone(),
+    };
+    change(&mut tls);
+    Some(tls)
 }
 
 fn prepare(flags: &JobReadFlags) -> Result<Prepared, super::JobReadError> {
@@ -277,6 +292,20 @@ async fn send(
     let tcp = TcpStream::connect(addr).await?;
     let name = ServerName::IpAddress(addr.ip().into());
     let mut tls = client(trust).connect(name, tcp).await?;
+    exchange(&mut tls, addr, method, path, token, extra, body).await
+}
+
+/// One request and its answer over `io`, a connection to `addr` that is already secured, or
+/// plain.
+async fn exchange<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    tls: &mut S,
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    extra: &str,
+    body: &[u8],
+) -> std::io::Result<Got> {
     let auth = token
         .map(|token| format!("Authorization: Bearer {token}\r\n"))
         .unwrap_or_default();
@@ -516,13 +545,13 @@ async fn the_start_refuses_a_certificate_that_does_not_name_the_address() {
     assert!(why.contains("no IP subjectAltName for 0.0.0.0"), "{why}");
 
     let mut broken = flags(&right_ip, listen);
-    broken.tls_cert = dir.path().join("absent.pem");
+    broken.tls = tls_of(&right_ip, |tls| tls.cert = dir.path().join("absent.pem"));
     assert!(refusal(&broken).contains("absent.pem"));
     std::fs::write(dir.path().join("junk.pem"), "not a certificate").expect("junk");
-    broken.tls_cert = dir.path().join("junk.pem");
+    broken.tls = tls_of(&right_ip, |tls| tls.cert = dir.path().join("junk.pem"));
     assert!(refusal(&broken).contains("no PEM certificate"));
     let mut mismatched = flags(&right_ip, listen);
-    mismatched.tls_key = wrong_ip.key.clone();
+    mismatched.tls = tls_of(&right_ip, |tls| tls.key = wrong_ip.key.clone());
     assert!(refusal(&mismatched).contains("--job-tls-key"));
 }
 
@@ -581,8 +610,9 @@ fn the_flags_come_together_and_are_off_by_default() {
     let flags = with(&all).expect("matches").expect("flags");
     let job = flags.job_read.expect("the flags are read");
     assert_eq!(job.listen, "127.0.0.1:8990".parse().expect("address"));
-    assert_eq!(job.tls_cert, Path::new("/etc/kbf/job.pem"));
-    assert_eq!(job.tls_key, Path::new("/etc/kbf/job.key"));
+    let tls = job.tls.expect("TLS");
+    assert_eq!(tls.cert, Path::new("/etc/kbf/job.pem"));
+    assert_eq!(tls.key, Path::new("/etc/kbf/job.key"));
     assert_eq!(job.grant_secret_file, Path::new("/etc/kbf/grant.secret"));
     for (i, left_out) in all.iter().enumerate() {
         let rest: Vec<&str> = all.iter().filter(|f| f != &left_out).copied().collect();
@@ -662,4 +692,8 @@ async fn a_frontend_without_the_job_flags_has_no_job_listener() {
 }
 
 mod batch;
+mod held;
+mod locate;
+mod plain;
+mod store_grant;
 mod stream;

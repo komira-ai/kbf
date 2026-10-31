@@ -317,16 +317,14 @@ jobs:
         if: ${{ steps.previous.outputs.previous != '' }}
         working-directory: previous
         run: sha256sum --check --strict SHA256SUMS
-      # The release before the build jobs recorded version facts has none, and the same for the
-      # facts of the task image (`kbf-task-image-<commit>-<platform>.facts.json`): the flag waives
-      # both kinds, and this is the only check that waives them: the release being made
-      # (`release check dist`) never does. Remove the flag once the release before this one was
-      # made with both kinds of facts.
+      # The previous release is held to the same rules as this one: the version facts of its `kbf`,
+      # and the facts and the CycloneDX SBOM of its task image, are all listed. No flag waives them
+      # (the workflow lint refuses one on either `release check`).
       - name: Every one is an asset of the previous release's commit, with its bundle
         if: ${{ steps.previous.outputs.previous != '' }}
         env:
           PREVIOUS_COMMIT: ${{ steps.previous.outputs.previous-commit }}
-        run: cargo xtask release check previous --commit "$PREVIOUS_COMMIT" --without-version-facts
+        run: cargo xtask release check previous --commit "$PREVIOUS_COMMIT"
       - name: Verify the previous release's attestations as these were
         if: ${{ steps.previous.outputs.previous != '' }}
         env:

@@ -276,6 +276,9 @@ pub struct CacheStats {
     pub evictions: u64,
     /// Entries that failed their lazy re-hash or their stat check.
     pub verify_failures: u64,
+    /// Times a lease found a key's slot held and waited for it, all leases together
+    /// (the sum of their `InputStats::fill_waits`).
+    pub fill_waits: u64,
     /// Free-space rounds that ran out of entries no lease links.
     pub floor_unreachable: u64,
     pub adopted_entries: u64,
@@ -302,6 +305,7 @@ struct Counters {
     hits: AtomicU64,
     hit_bytes: AtomicU64,
     verify_failures: AtomicU64,
+    fill_waits: AtomicU64,
     floor_unreachable: AtomicU64,
     adopted: AtomicU64,
     dropped: AtomicU64,
@@ -496,6 +500,7 @@ impl Cache {
             entries,
             evictions: get(&c.evictions),
             verify_failures: get(&c.verify_failures),
+            fill_waits: get(&c.fill_waits),
             floor_unreachable: get(&c.floor_unreachable),
             adopted_entries: get(&c.adopted),
             dropped_entries: get(&c.dropped),

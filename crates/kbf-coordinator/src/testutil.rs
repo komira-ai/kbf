@@ -6,7 +6,7 @@ use kbf_types::{HostRole, NodeId, ReleasePlatform};
 use kbf_updater::version::Version;
 use kbf_updater::wire::{Health, Heartbeat, Outcome, UpdateResult};
 
-use crate::desired::{Desired, MaxUpdating, MinUp};
+use crate::desired::{Desired, RoleLimits};
 use crate::fleet::Fleet;
 
 pub fn version(text: &str) -> Version {
@@ -30,6 +30,12 @@ pub fn beat(running: &str) -> Heartbeat {
         last_update: None,
         updating: None,
         services: None,
+        agent_features: Vec::new(),
+        step: None,
+        commit: None,
+        step_secs: Default::default(),
+        promotion_pending: false,
+        deferred: None,
     }
 }
 
@@ -44,10 +50,7 @@ pub fn updating(mut b: Heartbeat, target: &str) -> Heartbeat {
 }
 
 pub fn last(mut b: Heartbeat, target: &str, outcome: Outcome) -> Heartbeat {
-    b.last_update = Some(UpdateResult {
-        target: version(target),
-        outcome,
-    });
+    b.last_update = Some(UpdateResult::new(version(target), outcome));
     b
 }
 
@@ -56,8 +59,8 @@ pub fn last(mut b: Heartbeat, target: &str, outcome: Outcome) -> Heartbeat {
 pub fn desired(target: &str, storage: u32, frontend: u32) -> Desired {
     Desired {
         version: version(target),
-        max_updating: MaxUpdating::default(),
-        min_up: MinUp { storage, frontend },
+        max_updating: RoleLimits::max_updating_default(),
+        min_up: RoleLimits::from([("storage", storage), ("frontend", frontend)]),
     }
 }
 
@@ -65,7 +68,7 @@ pub fn desired(target: &str, storage: u32, frontend: u32) -> Desired {
 pub fn fleet(seen: Duration, hosts: &[(&str, HostRole, Heartbeat)]) -> Fleet {
     let mut fleet = Fleet::new(Duration::ZERO);
     for (name, role, b) in hosts {
-        fleet.record(id(name), *role, b.clone(), seen);
+        fleet.record(id(name), role.clone(), b.clone(), seen);
     }
     fleet
 }

@@ -180,7 +180,7 @@ impl Pki {
             let node_id = NODE.parse().unwrap();
             let cert = UpdaterCert {
                 node_id: &node_id,
-                host_role: HostRole::Storage,
+                host_role: &HostRole::STORAGE,
                 key,
             };
             self.ca

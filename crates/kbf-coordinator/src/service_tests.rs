@@ -47,7 +47,7 @@ async fn with_no_desired_state_every_host_is_told_nothing_and_is_noted() {
     rig.at(2_000);
     let reply = rig
         .coordinator
-        .heartbeat(who("d1", HostRole::Daemon), beat("1.0"));
+        .heartbeat(who("d1", HostRole::DAEMON), beat("1.0"));
     assert_eq!(reply, Reply::Nothing);
     let status = rig.coordinator.status(Some(OPERATOR)).expect("status");
     assert!(status.desired.is_none());
@@ -70,7 +70,7 @@ async fn a_valid_ci_token_sets_the_state_hosts_are_told_about() {
     assert_eq!(set.expect("set").version.as_str(), "2.0");
     let reply = rig
         .coordinator
-        .heartbeat(who("d1", HostRole::Daemon), beat("1.0"));
+        .heartbeat(who("d1", HostRole::DAEMON), beat("1.0"));
     assert_eq!(reply, update("2.0"));
 }
 
@@ -208,7 +208,7 @@ fn the_status_is_for_the_operator_token_only() {
     }
     rig.at(1_010);
     rig.coordinator
-        .heartbeat(who("d1", HostRole::Daemon), updating(beat("1.0"), "2.0"));
+        .heartbeat(who("d1", HostRole::DAEMON), updating(beat("1.0"), "2.0"));
     rig.at(1_020);
     let status = rig.coordinator.status(Some(OPERATOR)).expect("status");
     assert!(
@@ -241,7 +241,7 @@ async fn after_a_restart_a_host_that_was_updating_is_still_counted() {
     rig.set(STATE).await;
     assert_eq!(
         rig.coordinator
-            .heartbeat(who("d1", HostRole::Daemon), beat("1.0")),
+            .heartbeat(who("d1", HostRole::DAEMON), beat("1.0")),
         update("2.0")
     );
     rig.at(3_000);
@@ -249,24 +249,24 @@ async fn after_a_restart_a_host_that_was_updating_is_still_counted() {
     let busy = updating(beat("1.0"), "2.0");
     let early = rig
         .coordinator
-        .heartbeat(who("d1", HostRole::Daemon), busy.clone());
+        .heartbeat(who("d1", HostRole::DAEMON), busy.clone());
     assert_eq!(early, Reply::Nothing);
     rig.at(3_029);
-    let d2 = || who("d2", HostRole::Daemon);
+    let d2 = || who("d2", HostRole::DAEMON);
     assert_eq!(
         rig.coordinator.heartbeat(d2(), beat("1.0")),
         Reply::Nothing,
         "quiet"
     );
     rig.at(3_030);
-    rig.coordinator.heartbeat(who("d1", HostRole::Daemon), busy);
+    rig.coordinator.heartbeat(who("d1", HostRole::DAEMON), busy);
     assert_eq!(
         rig.coordinator.heartbeat(d2(), beat("1.0")),
         Reply::Nothing,
         "d1 holds the only daemon slot"
     );
     rig.coordinator
-        .heartbeat(who("d1", HostRole::Daemon), beat("2.0"));
+        .heartbeat(who("d1", HostRole::DAEMON), beat("2.0"));
     assert_eq!(rig.coordinator.heartbeat(d2(), beat("1.0")), update("2.0"));
 }
 
@@ -338,7 +338,7 @@ async fn the_convergence_follows_the_heartbeats() {
     let none = none.expect("read");
     assert_eq!((none.desired, none.state), (None, State::InProgress));
     rig.set(STATE).await;
-    let d1 = || who("d1", HostRole::Daemon);
+    let d1 = || who("d1", HostRole::DAEMON);
     rig.coordinator.heartbeat(d1(), beat("1.0"));
     let behind = rig.coordinator.convergence(Some(&ci_token()), KBF).await;
     assert_eq!(behind.expect("read").state, State::InProgress);
@@ -349,7 +349,7 @@ async fn the_convergence_follows_the_heartbeats() {
         State::InProgress,
         "STATE keeps one storage host and one frontend up, and none has been heard from"
     );
-    for (name, role) in [("st1", HostRole::Storage), ("fe1", HostRole::Frontend)] {
+    for (name, role) in [("st1", HostRole::STORAGE), ("fe1", HostRole::FRONTEND)] {
         rig.coordinator.heartbeat(who(name, role), beat("2.0"));
     }
     let done = rig.coordinator.convergence(Some(&ci_token()), KBF).await;
@@ -373,7 +373,7 @@ const TWO_STORAGE: &str = r#"{"version":"2.0","max_updating":{"storage":2},
     "min_up":{"storage":1,"frontend":1}}"#;
 
 fn storage(name: &str) -> Identity {
-    who(name, HostRole::Storage)
+    who(name, HostRole::STORAGE)
 }
 
 /// A rig past the quiet start with `state` set.
@@ -394,7 +394,7 @@ async fn hosts_that_beat_before_the_ordered_one_reports_are_not_ordered() {
     let c = &rig.coordinator;
     let replies: Vec<kbf_updater::wire::ServiceReply> = ["s1", "s2", "s3"]
         .iter()
-        .map(|h| c.heartbeat(storage(h), beat("1.0")))
+        .map(|h| c.heartbeat(storage(h), beat("1.0")).reply)
         .collect();
     assert_eq!(
         replies,
@@ -630,7 +630,7 @@ async fn ci_sets_a_defined_service_and_kbf_is_unchanged() {
     rig.at(2_000);
     let reply = rig
         .coordinator
-        .heartbeat(who("d1", HostRole::Daemon), beat("1.0"));
+        .heartbeat(who("d1", HostRole::DAEMON), beat("1.0"));
     assert_eq!(reply, update("2.0"));
     let unknown = OTHER.replace("other", "unknown");
     let set = rig
@@ -675,6 +675,11 @@ fn service_beat(running: &str) -> kbf_updater::wire::ServiceBeat {
         health: b.health,
         last_update: None,
         updating: None,
+        step: None,
+        commit: None,
+        step_secs: Default::default(),
+        promotion_pending: false,
+        deferred: None,
     }
 }
 
@@ -707,19 +712,19 @@ async fn a_new_updater_is_ordered_a_service_and_its_beat_is_recorded() {
     let rig = services_rig("svc-wire-order").await;
     let c = &rig.coordinator;
     assert_eq!(
-        c.heartbeat(who("d1", HostRole::Daemon), new_beat("2.0", "1.0")),
+        c.heartbeat(who("d1", HostRole::DAEMON), new_beat("2.0", "1.0")),
         update_of("other", "3.0")
     );
     let mut busy = new_beat("2.0", "1.0");
     busy.services.as_mut().expect("services")[0].updating = Some(version("3.0"));
-    c.heartbeat(who("d1", HostRole::Daemon), busy);
+    c.heartbeat(who("d1", HostRole::DAEMON), busy);
     assert_eq!(
-        c.heartbeat(who("d2", HostRole::Daemon), new_beat("2.0", "1.0")),
+        c.heartbeat(who("d2", HostRole::DAEMON), new_beat("2.0", "1.0")),
         kbf_updater::wire::ServiceReply::Nothing
     );
-    c.heartbeat(who("d1", HostRole::Daemon), new_beat("2.0", "3.0"));
+    c.heartbeat(who("d1", HostRole::DAEMON), new_beat("2.0", "3.0"));
     assert_eq!(
-        c.heartbeat(who("d2", HostRole::Daemon), new_beat("2.0", "1.0")),
+        c.heartbeat(who("d2", HostRole::DAEMON), new_beat("2.0", "1.0")),
         update_of("other", "3.0")
     );
 }
@@ -731,7 +736,7 @@ async fn a_new_updater_is_ordered_a_service_and_its_beat_is_recorded() {
 async fn kbf_is_ordered_before_a_service_and_one_order_per_reply() {
     let rig = services_rig("svc-wire-first").await;
     let c = &rig.coordinator;
-    let host = || who("d1", HostRole::Daemon);
+    let host = || who("d1", HostRole::DAEMON);
     assert_eq!(c.heartbeat(host(), new_beat("1.0", "1.0")), update("2.0"));
     assert_eq!(
         c.heartbeat(host(), new_beat("1.0", "1.0")),
@@ -752,13 +757,13 @@ async fn kbf_is_ordered_before_a_service_and_one_order_per_reply() {
 async fn only_an_updater_that_announced_a_service_is_ordered_it() {
     let rig = services_rig("svc-wire-old").await;
     let c = &rig.coordinator;
-    let host = || who("d1", HostRole::Daemon);
+    let host = || who("d1", HostRole::DAEMON);
     assert_eq!(
         c.heartbeat(host(), new_beat("2.0", "1.0")),
         update_of("other", "3.0")
     );
     assert_eq!(
-        c.heartbeat(who("d3", HostRole::Daemon), beat("2.0")),
+        c.heartbeat(who("d3", HostRole::DAEMON), beat("2.0")),
         kbf_updater::wire::ServiceReply::Nothing,
         "an old updater is a kbf-only host"
     );
@@ -770,11 +775,11 @@ async fn only_an_updater_that_announced_a_service_is_ordered_it() {
     let mut stray = new_beat("2.0", "1.0");
     stray.services.as_mut().expect("services")[0].name = "unheard-of".to_owned();
     assert_eq!(
-        c.heartbeat(who("d4", HostRole::Daemon), stray),
+        c.heartbeat(who("d4", HostRole::DAEMON), stray),
         kbf_updater::wire::ServiceReply::Nothing
     );
     assert_eq!(
-        c.heartbeat(who("s1", HostRole::Storage), new_beat("2.0", "1.0")),
+        c.heartbeat(who("s1", HostRole::STORAGE), new_beat("2.0", "1.0")),
         kbf_updater::wire::ServiceReply::Nothing,
         "other does not run on storage hosts"
     );
@@ -879,8 +884,8 @@ async fn a_second_services_convergence_and_status_come_from_its_own_hosts() {
             .await
             .expect("read")
     };
-    c.heartbeat(who("d1", HostRole::Daemon), new_beat("2.0", "3.0"));
-    c.heartbeat(who("d2", HostRole::Daemon), new_beat("2.0", "1.0"));
+    c.heartbeat(who("d1", HostRole::DAEMON), new_beat("2.0", "3.0"));
+    c.heartbeat(who("d2", HostRole::DAEMON), new_beat("2.0", "1.0"));
     let kbf = read("kbf").await;
     assert_eq!(kbf.state, State::Converged);
     assert_eq!(kbf.roles[0].at_desired, 2);
@@ -888,7 +893,7 @@ async fn a_second_services_convergence_and_status_come_from_its_own_hosts() {
     assert_eq!(other.state, State::InProgress);
     assert_eq!(other.desired.expect("desired").as_str(), "3.0");
     assert_eq!(other.roles[0].at_desired, 1);
-    c.heartbeat(who("d2", HostRole::Daemon), new_beat("2.0", "3.0"));
+    c.heartbeat(who("d2", HostRole::DAEMON), new_beat("2.0", "3.0"));
     assert_eq!(read("other").await.state, State::Converged);
 
     let status = c.status(Some(OPERATOR)).expect("status");

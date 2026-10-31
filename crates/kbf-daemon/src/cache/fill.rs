@@ -245,6 +245,7 @@ impl Cache {
                 }
                 Step::Wait(mut done) => {
                     bump(&counts.fill_waits);
+                    bump(&inner.counters.fill_waits);
                     let failed = done
                         .wait_for(Option::is_some)
                         .await

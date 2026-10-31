@@ -79,13 +79,41 @@
 //! the property named twice, is refused ([`from_platform`]). The property is part of the
 //! action's digest, so the action with the network is a different action.
 //!
+//! # macOS
+//!
+//! There is no seccomp or namespace on macOS. The Command alone runs under `sandbox-exec`
+//! ([`launch`]): this tool runs outside any sandbox (a sandbox cannot be nested on macOS) and starts
+//! `/usr/bin/sandbox-exec -p <profile> <program> <args...>`. The profile ([`seatbelt_profile`],
+//! written by `kbf-seatbelt`, the code the Mac daemon's driver also uses) allows everything, then:
+//!
+//! - for a Command denied the network, denies every network operation but to loopback and to Unix
+//!   sockets; for one allowed it, adds no network clause;
+//! - denies reading and writing each file this tool was given a credential or presigned URL in
+//!   (`--grant-token-file`, `--pack-url-file`, `--put-urls-file`), and renaming or removing each
+//!   directory above it, for either kind of Command: a rename, unlink, hard link or directory rename
+//!   cannot give the file a path the read deny does not name.
+//!
+//! What it does not do, as the driver's own profile does not: any Unix socket stays allowed (the
+//! system resolver, `mDNSResponder`, is reached through one, so a DNS lookup still leaves the node
+//! and a name the Command looks up can carry data out), and a connect to the node's own
+//! non-loopback address was allowed under the denial on the macOS runner. Writes are not limited by
+//! this profile, except to those files and directories. `mach-lookup` of helper daemons and other
+//! services on the node stay open, and the Command (the same user) can see this tool's argv and process
+//! (`protect_this_process` does nothing on macOS). A credential given as a flag value (`--insecure-argv-secrets`) is in this tool's
+//! argv, which the profile does not hide. Egress of the pool user is limited by the host's packet
+//! filter, not by this tool.
+//!
+//! The line the tool writes names the layer: `network: sandbox-exec profile (...)`.
+//!
 //! # Other systems
 //!
-//! The filter exists on Linux only, and this tool runs in Linux containers (the release is a
-//! static Linux build). Built for another system, which only developers' machines and the
-//! test suites do, the Command runs with the network and a line on standard error says so
-//! for each run: refusing instead would stop the tool's tests from running there, and the
-//! warning keeps anyone from taking such a build for a sandbox.
+//! A system that is neither Linux nor macOS has no confine, and a Command denied the network is
+//! refused there ([`RunError::NoConfine`], exit 15). The test-only feature `unconfined-for-tests`
+//! turns the refusal into a warning line and a run with the network, so a developer's machine can
+//! run the suite; it is refused in a release build ([`crate`] documents the compile error).
+
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 use kbf_proto::reapi::{Action, Command};
 use kbf_types::Digest;
@@ -154,8 +182,11 @@ pub fn allowed_notice(action: &Digest) -> String {
 pub enum Layers {
     /// The action asked for the network ([`PROPERTY`]): neither layer.
     Open,
-    /// This system has neither layer (not Linux).
+    /// This system has neither layer (neither Linux nor macOS); only the test feature gets here.
     Unavailable,
+    /// macOS: the Command runs under a `sandbox-exec` profile that denies every network operation
+    /// but to loopback and Unix sockets ([`seatbelt_profile`]).
+    Seatbelt,
     /// The strict filter alone, because the Command runs as root: a namespace with a map of one
     /// id would make `chown`, `setuid` and `setgroups` fail for it (`tar`, `dpkg`), so none is made.
     SeccompOnlyForRoot,
@@ -179,6 +210,10 @@ impl std::fmt::Display for Layers {
         match self {
             Layers::Open => write!(f, "open ({PROPERTY}={ALLOW})"),
             Layers::Unavailable => write!(f, "none (this system has no filter)"),
+            Layers::Seatbelt => write!(
+                f,
+                "sandbox-exec profile (no network but loopback and unix sockets)"
+            ),
             Layers::Unreported => write!(f, "unknown (no report from the child)"),
             Layers::SeccompOnlyForRoot => {
                 write!(f, "seccomp only, no inet (netns: skipped for uid 0)")
@@ -234,14 +269,15 @@ impl Confinement {
         self.report.map_or(Layers::Open, netns::Report::read)
     }
 
-    /// The layers that confine the process that was started (none, on this system).
+    /// The layers that confine the process that was started: the `sandbox-exec` profile on macOS
+    /// for a denied Command, none on another system.
     #[must_use]
     #[cfg(not(target_os = "linux"))]
     pub fn layers(self) -> Layers {
-        if self.denied {
-            Layers::Unavailable
-        } else {
-            Layers::Open
+        match (self.denied, cfg!(target_os = "macos")) {
+            (false, _) => Layers::Open,
+            (true, true) => Layers::Seatbelt,
+            (true, false) => Layers::Unavailable,
         }
     }
 }
@@ -271,19 +307,160 @@ fn confine_with(
     }
 }
 
-/// Applies `network` to the process about to be started. Only the seccomp filter and the
-/// namespace exist on Linux: elsewhere the Command runs with the network and a line says so.
+/// What the system's `confine` does where there is no seccomp filter. On macOS the confine is the
+/// `sandbox-exec` launch ([`launch`]), which the caller has already used to make `process`: this
+/// checks that it did (the program is `sandbox-exec`), and refuses a process that is not, so a
+/// caller that forgot [`launch`] cannot run a denied Command with the network. Elsewhere no
+/// confine is compiled in: a denied Command is refused ([`RunError::NoConfine`], exit 15), and the
+/// test-only feature `unconfined-for-tests` turns the refusal into a warning line and a run with
+/// the network, so a developer's machine can run the suite.
 ///
 /// # Errors
-/// None on this system.
+/// [`RunError::NoConfine`] for [`Network::Denied`], on macOS when `process` is not `sandbox-exec`,
+/// elsewhere unless the feature is on.
 #[cfg(not(target_os = "linux"))]
-pub fn confine(_process: &mut Process, network: Network) -> Result<Confinement, RunError> {
+pub fn confine(process: &mut Process, network: Network) -> Result<Confinement, RunError> {
     let denied = network == Network::Denied;
-    if denied {
-        eprintln!("kbf-task: this system cannot deny the Command the network; it runs with it");
+    if cfg!(target_os = "macos") {
+        let sandboxed = process.as_std().get_program() == kbf_seatbelt::SANDBOX_EXEC;
+        return if sandboxed || !denied {
+            Ok(Confinement { denied })
+        } else {
+            Err(RunError::NoConfine)
+        };
+    }
+    if let Some(warning) = without_confine(network, cfg!(feature = "unconfined-for-tests"))? {
+        eprintln!("{warning}");
     }
     Ok(Confinement { denied })
 }
+
+/// The program and arguments to start for a Command: the Command itself, or on macOS `sandbox-exec`
+/// with the profile of [`seatbelt_profile`] and then the Command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Launch {
+    pub program: PathBuf,
+    pub args: Vec<OsString>,
+}
+
+impl Launch {
+    /// How an error names what was started: `program` itself, or, where it is started through
+    /// another program (`sandbox-exec`), both.
+    #[must_use]
+    pub fn name(&self, program: &Path) -> PathBuf {
+        if self.program == program {
+            program.to_owned()
+        } else {
+            PathBuf::from(format!(
+                "{} for {}",
+                self.program.display(),
+                program.display()
+            ))
+        }
+    }
+}
+
+/// What to start for `program` with `args`. On macOS: `sandbox-exec -p <profile> <program> <args>`,
+/// where the profile denies the network to a [`Network::Denied`] Command and, for any Command,
+/// reading each of `unreadable` (the files holding a credential or a presigned URL; each is
+/// resolved to its real path first, which is how the sandbox names a file; one that does not exist
+/// is named as given). On another system:
+/// `program` and `args` unchanged ([`confine`] decides there).
+///
+/// # Errors
+/// [`RunError::Io`] for an `unreadable` path that cannot be resolved for a reason but its absence,
+/// [`RunError::Confine`] for a path the profile cannot carry.
+#[cfg(target_os = "macos")]
+pub fn launch(
+    program: &Path,
+    args: &[String],
+    network: Network,
+    unreadable: &[PathBuf],
+) -> Result<Launch, RunError> {
+    let mut real = Vec::with_capacity(unreadable.len());
+    for path in unreadable {
+        real.push(match std::fs::canonicalize(path) {
+            Ok(real) => real,
+            // A file that is not there holds nothing to read: it is named as given, made absolute.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::path::absolute(path)
+                .map_err(|source| RunError::Io {
+                    path: path.clone(),
+                    source,
+                })?,
+            Err(source) => {
+                return Err(RunError::Io {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        });
+    }
+    let profile = seatbelt_profile(network, &real)?;
+    let mut all: Vec<OsString> = vec!["-p".into(), profile.into(), program.into()];
+    all.extend(args.iter().map(OsString::from));
+    Ok(Launch {
+        program: PathBuf::from(kbf_seatbelt::SANDBOX_EXEC),
+        args: all,
+    })
+}
+
+/// What to start for `program` with `args`: unchanged, on a system where the Command is not
+/// wrapped.
+///
+/// # Errors
+/// None here.
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)] // The macOS form can fail.
+pub fn launch(
+    program: &Path,
+    args: &[String],
+    _network: Network,
+    _unreadable: &[PathBuf],
+) -> Result<Launch, RunError> {
+    Ok(Launch {
+        program: program.to_owned(),
+        args: args.iter().map(OsString::from).collect(),
+    })
+}
+
+/// The `sandbox-exec` profile of a Command: everything allowed, [`Network::Denied`] limited to
+/// loopback and Unix sockets, and one read deny for each of `unreadable` (absolute paths). Not tied
+/// to the system, so Linux runs its tests.
+///
+/// # Errors
+/// [`RunError::Confine`] for a path that is not absolute or holds a quote, a backslash, a control
+/// character or bytes that are not UTF-8.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn seatbelt_profile(network: Network, unreadable: &[PathBuf]) -> Result<String, RunError> {
+    kbf_seatbelt::Profile {
+        deny_network: network == Network::Denied,
+        deny_read: unreadable.to_vec(),
+    }
+    .render()
+    .map_err(|e| RunError::Confine(e.to_string()))
+}
+
+/// What a system with no confine does with `network`: nothing for [`Network::Allowed`]; for
+/// [`Network::Denied`] the refusal, or, when `unconfined_for_tests`, the line to print before the
+/// Command runs with the network. Not tied to the system, so Linux runs its tests.
+///
+/// # Errors
+/// [`RunError::NoConfine`] for a denied Command when `unconfined_for_tests` is false.
+#[cfg_attr(any(target_os = "linux", target_os = "macos"), allow(dead_code))]
+pub(crate) fn without_confine(
+    network: Network,
+    unconfined_for_tests: bool,
+) -> Result<Option<&'static str>, RunError> {
+    match (network, unconfined_for_tests) {
+        (Network::Allowed, _) => Ok(None),
+        (Network::Denied, true) => Ok(Some(UNCONFINED_WARNING)),
+        (Network::Denied, false) => Err(RunError::NoConfine),
+    }
+}
+
+/// The line printed when the feature `unconfined-for-tests` lets a denied Command run with the network.
+#[cfg_attr(any(target_os = "linux", target_os = "macos"), allow(dead_code))]
+pub(crate) const UNCONFINED_WARNING: &str = "kbf-task: this system cannot deny the Command the network; it runs with it (unconfined-for-tests)";
 
 /// The filter that lets `AF_INET` through is for a Command that is certainly in a namespace of
 /// its own: every step must have succeeded. Any other outcome, a skip for root included, gets

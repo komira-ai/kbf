@@ -33,7 +33,7 @@ use clap::{Arg, ArgMatches};
 use kbf_front::grants::{GrantKey, KeyError};
 use kbf_front::prepare_run::{
     AccessKey, ClosureLimits, ConfigError, LargeTarget, PutTarget, RunPrep, RunPrepConfig,
-    check_read_url,
+    check_read_url_allowing,
 };
 use kbf_front::{Backend, MintError, PackKeyMint};
 use zeroize::Zeroizing;
@@ -173,8 +173,11 @@ pub(super) fn args() -> [Arg; 14] {
             .default_value("600")
             .help(
                 "The time past the run wall, in seconds, that a task's presigned write and read \
-                 grant stay good: the time a task takes to start and to put its pack. The wall \
-                 and the slack together must not pass 14400, the ceiling of a presigned write, \
+                 grant stay good: the time a task takes to start and to put its pack, which \
+                 includes the retries of a put the store refuses with 503: about 165 seconds \
+                 from the first attempt to the last by default (up to 60 s of the task's own \
+                 waits, and up to 15 s at the store before each refusal). The wall and the \
+                 slack together must not pass 14400, the ceiling of a presigned write, \
                  or the frontend does not start. Used only with `--task-secret-file`",
             ),
         Arg::new(MAX_DIGESTS)
@@ -265,6 +268,9 @@ pub struct TaskFlags {
     pub put_credentials_file: PathBuf,
     /// `--task-read-url`.
     pub read_url: String,
+    /// `--executor-allow-plain-http-grant` with `--executor js-agent`: the read url may be
+    /// `http://`.
+    pub allow_plain_http_grant: bool,
     /// `--task-run-wall-secs`.
     pub run_wall: Duration,
     /// `--task-url-slack-secs`.
@@ -295,7 +301,19 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<Option<TaskFlags>, String> 
     let text = |id: &str| m.get_one::<String>(id).cloned().unwrap_or_default();
     let secs = |id: &str| Duration::from_secs(m.get_one::<u64>(id).copied().unwrap_or_default());
     let read_url = text(READ_URL);
-    check_read_url(&read_url).map_err(|error| format!("--task-read-url: {error}"))?;
+    let plain = super::executor_flags::plain_http_grant(m);
+    check_read_url_allowing(&read_url, plain).map_err(|error| {
+        let hint = if !read_url.starts_with("http://") {
+            ""
+        } else if super::job_read::serves_tls(m) {
+            // The flag alone would pass this check and fail the next, on the listener's scheme.
+            " (--job-listen serves TLS: use an https:// url, or serve it with --job-plain-http \
+             and give --executor-allow-plain-http-grant)"
+        } else {
+            " (--executor-allow-plain-http-grant with --executor js-agent accepts it)"
+        };
+        format!("--task-read-url: {error}{hint}")
+    })?;
     let digests = m.get_one::<u32>(MAX_DIGESTS).copied().unwrap_or_default();
     Ok(Some(TaskFlags {
         secret_file: secret_file.clone(),
@@ -307,6 +325,7 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<Option<TaskFlags>, String> 
             .cloned()
             .unwrap_or_default(),
         read_url,
+        allow_plain_http_grant: plain,
         run_wall: secs(RUN_WALL),
         url_slack: secs(URL_SLACK),
         max_digests: usize::try_from(digests).unwrap_or(usize::MAX),
@@ -383,6 +402,7 @@ impl TaskFlags {
             max_packs: self.max_packs,
             large,
             read_url: self.read_url.clone(),
+            allow_plain_read_url: self.allow_plain_http_grant,
             run_wall: self.run_wall,
             slack: self.url_slack,
             limits: ClosureLimits {

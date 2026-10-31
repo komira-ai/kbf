@@ -1189,27 +1189,25 @@ fn a_binary_runs_only_after_its_files_are_attested() {
 }
 
 #[test]
-fn only_the_previous_releases_check_waives_the_version_facts() {
-    // Catches: the first release with version facts failing on the release before it (which
-    // has none) so that nothing is published, and the other way round: a waiver on the check
-    // of the release being made, so a set without the facts of its kbf goes out.
-    // Catches: the flag dropped from `previous`; the flag added to `dist`.
-    red(
-        &plant(
-            "notes",
-            "release check previous --commit \"$PREVIOUS_COMMIT\" --without-version-facts",
+fn no_release_check_is_given_a_waiver() {
+    // Catches: a waiver left on the check of the previous release (a previous release without
+    // the version facts of its kbf, or the facts and the SBOM of its task image, would pass and
+    // be read for its identity), and one added to the check of the release being made (a set
+    // without them would go out). The real workflow is the control: `the_real_release_workflow_meets_every_rule`
+    // holds it clean.
+    for (verb, plain) in [
+        (
             "release check previous --commit \"$PREVIOUS_COMMIT\"",
+            "previous",
         ),
-        "`release check previous` is not given `--without-version-facts`",
-    );
-    red(
-        &plant(
-            "notes",
-            "release check dist --commit \"$COMMIT\"",
-            "release check dist --commit \"$COMMIT\" --without-version-facts",
-        ),
-        "`release check dist` is given `--without-version-facts`",
-    );
+        ("release check dist --commit \"$COMMIT\"", "dist"),
+    ] {
+        let planted = format!("{verb} --without-version-facts");
+        red(
+            &plant("notes", verb, &planted),
+            &format!("`release check {plain}` is given `--without-version-facts`"),
+        );
+    }
 }
 
 #[test]

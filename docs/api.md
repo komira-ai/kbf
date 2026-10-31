@@ -1707,6 +1707,7 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_pack_ingest_unavailable_total` | counter | ingests the object store, the pack index or the action cache could not answer; the pack is not judged and the lease is run again |
 | `kbf_pack_ingest_packs_total` | counter | packs of the runs `ingest` turned into an action result (a run of one pack counts 1): divided by `kbf_pack_ingests_total`, the packs per run |
 | `kbf_pack_ingest_large_bytes_total` | counter | bytes of large objects (raw objects over the record cap that a task wrote under `L<i>` keys) that `ingest` streamed into the CAS, for the runs it turned into an action result |
+| `kbf_pack_ingest_large_writethrough_total` | counter | large objects that `ingest` also put to `cas/l/<sha256 hex>` in the pack object store, labelled `result`: `ok`; `exists` (the key was already held at the digest's length, so nothing was uploaded, or the store refused a second write of it: the key names the bytes); `failed` (the store failed the write, or holds an object of another length under the key, which is not trusted or replaced); `aborted` (the ingest gave the write up before its end: the CAS write stopped, the bytes were not the blob, a retry started the pass over, or the store did not take a window in 30 s; nothing is kept under the key). Best effort: no result fails the ingest |
 | `kbf_executor_leases_held` | gauge | host leases the executor holds now (only with `--executor js-agent`; the `kbf_executor_*` families are absent otherwise) |
 | `kbf_executor_runs_total` | counter | runs the executor ended, labelled `outcome` by what the farm was told: `ran` (the frontend rebuilt the action's result), `infra` (an ending the farm runs again), `timeout` (the action's own), `out_of_memory`, `lost` (the host or the lease server) or `invalid` (an action that cannot run here) |
 | `kbf_executor_ingests_total` | counter | what the ingest of a task's pack came to, labelled `result`: `ok`, `unavailable`, `stopped` (the ingest panicked or was cancelled) or `rejected_<reason>` for each reason of `kbf_pack_ingest_rejects_total` |
@@ -1735,7 +1736,8 @@ any more.
 
 **Job-facing read.** On a frontend given `--job-listen` ([kbf-modes.md](deploy/kbf-modes.md)) the
 listener a task fetches its action's inputs from counts requests and bytes; without the flag these
-are absent. The same scrape has a `listener="job"` series in the `kbf_tls_reloads_total` family.
+are absent. The same scrape has a `listener="job"` series in the `kbf_tls_reloads_total` family, except
+under `--job-plain-http`, where the listener has no TLS files.
 
 | Family | Type | What it measures |
 |---|---|---|

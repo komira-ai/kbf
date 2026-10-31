@@ -67,13 +67,6 @@
 //! - the pack adoption tool (`kbf-pack-adopt`) depending, directly or through another crate, on
 //!   a crate of `PACK_MUST_NOT_REACH`, so that the operator binary never links the frontend, the
 //!   server or the daemon; and a walk that cannot see `kbf-pack` beneath it;
-//! - the hot/cold object store library (`tierstore`) depending, directly or through another
-//!   crate, on any other crate of this workspace, which would stop it from moving to a
-//!   repository of its own (its `s3` feature, off by default, adds the S3 client of
-//!   `kbf-objstore`, and so does its `server` feature, which the `tierstore` binary needs;
-//!   the check reads the tree of the crate built alone, so the features that its own tests
-//!   turn on do not count); and a walk that cannot see its dependencies, which would make
-//!   that check pass vacuously;
 //! - the state store (`kbf-state`, a re-export of `js-state`) depending on any other crate of
 //!   this workspace (with its test-database feature too, which brings `js-testkit` and not
 //!   `kbf-testkit`), which would stop it from being extracted, and the pack index (`kbf-pack-index`) depending on any but the state store;
@@ -718,55 +711,6 @@ fn pack_adopt_reaches_neither_the_frontend_nor_the_daemon() {
     );
 }
 
-/// Asserts that the normal dependencies of the object store library (`tierstore`), direct
-/// and through other crates, include no other crate of this workspace, and that the walk
-/// sees its dependencies (it reaches `tokio`), so the check does not pass on an empty walk.
-/// The tree is that of `cargo build -p tierstore`, with the features the crate has by default:
-/// its `s3` feature, which adds `kbf-objstore`, is off in it, and so is `server`, which turns
-/// `s3` on for the `tierstore` binary. It is not the graph of `cargo metadata`, which has the
-/// features of the whole workspace, where the tests of `tierstore` turn `server` on.
-#[test]
-fn tierstore_reaches_no_other_workspace_crate() {
-    let g = load_graph();
-    let (_, root) = g
-        .members
-        .get("tierstore")
-        .expect("tierstore is a workspace member");
-    assert!(root.is_some(), "tierstore must have a library target");
-    let linked = linked_by("tierstore");
-    assert!(
-        linked.contains("tokio"),
-        "tierstore's tree must hold tokio, or this walk proves nothing: {linked:?}"
-    );
-    let violations: Vec<&str> = g
-        .members
-        .keys()
-        .map(String::as_str)
-        .filter(|name| *name != "tierstore")
-        .filter(|name| linked.contains(*name))
-        .collect();
-    assert!(
-        violations.is_empty(),
-        "tierstore links another crate of this workspace: {violations:?}"
-    );
-}
-
-/// Asserts that the tree of `cargo build -p tierstore --features s3` holds `kbf-objstore` (the
-/// S3 client that `S3Backend` adapts) and that of `--features server` holds it too, so that the
-/// check above sees the edge it guards, and that `server` turns `s3` on.
-#[test]
-fn tierstore_links_the_s3_client_only_with_its_s3_or_server_feature() {
-    let bare = linked_by("tierstore");
-    assert!(
-        !bare.contains("kbf-objstore"),
-        "without a feature: {bare:?}"
-    );
-    for features in ["s3", "server"] {
-        let linked = linked_with("tierstore", features);
-        assert!(linked.contains("kbf-objstore"), "{features}: {linked:?}");
-    }
-}
-
 /// The workspace crates among `linked`, other than those in `allowed`.
 fn workspace_crates_beyond<'a>(
     g: &'a Graph,
@@ -786,8 +730,7 @@ fn workspace_crates_beyond<'a>(
 /// and that the walk sees its dependencies (it reaches `postgres`), so the check does not
 /// pass on an empty walk. The store is generic: what is specific to a kbf
 /// build (the pack index, `kbf-pack-index`) depends on it and never the other way, which is
-/// what lets the store be extracted. Like the `tierstore` check, it reads the tree of the
-/// crate built alone.
+/// what lets the store be extracted. It reads the tree of the crate built alone.
 #[test]
 fn the_state_store_links_no_build_specific_crate() {
     let g = load_graph();

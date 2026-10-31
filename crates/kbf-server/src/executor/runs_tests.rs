@@ -82,6 +82,7 @@ mod worker {
                 memory_bytes: 2 * GIB,
                 pids: None,
                 wall_ms: Some(60_000),
+                disk_bytes: None,
             },
         );
         spec.labels = BTreeMap::from([(super::super::RUN_LABEL.to_owned(), label.to_owned())]);

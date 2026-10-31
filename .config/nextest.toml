@@ -12,6 +12,7 @@ install-sh-fixture = { max-threads = 1 }
 # name share a directory (crates/kbf-mac-provision/tests/support/mod.rs).
 mac-provision-scratch = { max-threads = 1 }
 
+# Named overrides go before any override that matches more.
 [[profile.default.overrides]]
 filter = 'package(xtask) & binary(install_sh)'
 test-group = 'install-sh-fixture'
@@ -32,12 +33,48 @@ test-group = 'mac-provision-scratch'
 filter = 'binary_id(=kbf-front::large_blobs)'
 slow-timeout = { period = "450s", terminate-after = 4 }
 
+# The backfill tests wait on the put's own signal, with no deadline of their own, so a put that
+# never ends hangs the test: nextest kills it after 30 s x 4 (the whole test takes milliseconds).
+[[profile.default.overrides]]
+filter = 'package(kbf-front) & (binary(large_backfill) | test(/^large_backfill::tests::/))'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# A hang guard, not a bound: this test waits for a run that ends once the daemon has
+# killed it; a daemon that loses the kill leaves it waiting for ever.
+[[profile.default.overrides]]
+filter = 'binary_id(=kbf-daemon) & test(=lease::tests::a_cancel_during_the_first_poll_of_the_run_still_ends_it)'
+slow-timeout = { period = "30s", terminate-after = 1 }
+
 # A fetch test that waits for ever (a rendezvous that never gets its requests together, a pooled
 # connection that is never closed) is killed after two minutes and fails, where it would hang the
 # run. The tests hold no timeout of their own. The filter covers the keep-alive tests too, a child
-# module of `fetch::tests`.
+# module of `fetch::tests`, and the `--locate` flag tests, which open sockets to fake servers.
 [[profile.default.overrides]]
-filter = 'package(kbf-task) & test(/^fetch::tests::/)'
+filter = 'package(kbf-task) & (test(/^fetch::tests::/) | test(/^task::locate_flags_tests::/))'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# The kbf-task PUT tests against a real tierstore front and a raw stub (tests/put_back_pressure.rs)
+# hold no timeout of their own: a client that waits for ever on a socket is killed after two
+# minutes and fails.
+[[profile.default.overrides]]
+filter = 'package(kbf-task) & binary(put_back_pressure)'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# The kbf-daemon cache tests wait on the cache's own counters (tests/support/cache_kit.rs,
+# wait_for_fill_waits), never on a deadline in the test: a cache that never makes two leases
+# meet would hang, and this guard ends such a test (2 minutes) instead. Applies to every
+# profile, the pull-request one included. Keep it above any catch-all override: the first
+# matching override wins.
+[[profile.default.overrides]]
+filter = 'package(kbf-daemon) & binary(cache)'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# The janitor tests wait on the janitor's own counters, never on a deadline in the test: the loop
+# test on its paused clock until the third sweep, the frontend test on `GET /metrics` until the
+# orphans are counted as deleted. A janitor that never sweeps would leave one waiting for ever, and
+# this guard (2 minutes) ends it instead. Above the general budget: the first match wins.
+[[profile.default.overrides]]
+filter = 'package(kbf-server) & test(/^frontend::janitor::tests::/)'
 slow-timeout = { period = "30s", terminate-after = 4 }
 
 # The general budget: every other test, of every package, is ended after eight minutes

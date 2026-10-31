@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::support::cache_kit::{
     CountingCas, FakeClock, Gates, config, digest, entries, entry_path, file, key, lease,
-    on_disk_sum, stop, toolchain,
+    on_disk_sum, stop, toolchain, wait_for_fill_waits,
 };
 use crate::support::scratch;
 use kbf_daemon::cache::{Cache, CacheConfig, Discarded, FIXED_MTIME, Key, Point};
@@ -266,10 +266,8 @@ async fn a_lease_during_the_drain_waits_on_the_slot_it_holds() {
         );
         tokio::spawn(async move { lease(&cas, &cache, &root, &dir, "during").await })
     };
-    while run2.reads_of(&digest(&blobs[2])) == 0 {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The "during" lease waits on the slot the drain holds.
+    wait_for_fill_waits(&cache, 1).await;
     assert_eq!(
         run2.reads_of(&digest(&blobs[0])),
         0,

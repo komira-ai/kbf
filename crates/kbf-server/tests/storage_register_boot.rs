@@ -93,6 +93,7 @@ fn flags(dir: &Path, cold: &str, worker: SocketAddr) -> StorageFlags {
         "storage".to_owned(),
         "--storage-listen=127.0.0.1:0".to_owned(),
         format!("--cold-store=file://{}", dir.join(cold).display()),
+        "--cold-store-floor-bytes=1".to_owned(),
         format!("--meta-dir={}", dir.join("meta").display()),
         format!("--frontend=http://{worker}"),
     ];

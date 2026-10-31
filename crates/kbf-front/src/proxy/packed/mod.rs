@@ -59,6 +59,7 @@ mod hit;
 mod metrics;
 mod room;
 mod store;
+mod verifying;
 
 pub(in crate::proxy) use self::bytestream::{applies, read as read_stream, write as write_stream};
 pub(in crate::proxy) use self::cas::{Served, find_missing, read_blob, read_many, store_batch};
@@ -69,9 +70,10 @@ pub use self::commit::{
     UntrustedLimits, ingest, ingest_set,
 };
 pub(in crate::proxy) use self::hit::held;
-pub use self::metrics::PackMetrics;
+pub use self::metrics::{LargeWriteThrough, PackMetrics};
 pub use self::room::DEFAULT_INFLIGHT_BYTES;
 pub use self::store::{
-    DEFAULT_UPLOAD_IDLE_TIMEOUT, MAX_PACKED_BLOB_BYTES, MAX_UPLOAD_IDLE_TIMEOUT, PackSettings,
-    PackStore, Packs,
+    Clock, DEFAULT_UPLOAD_IDLE_TIMEOUT, MAX_PACKED_BLOB_BYTES, MAX_UPLOAD_IDLE_TIMEOUT,
+    PackSettings, PackStore, Packs,
 };
+pub use self::verifying::{Claim, Claimed, Held, VerifyingKeys};

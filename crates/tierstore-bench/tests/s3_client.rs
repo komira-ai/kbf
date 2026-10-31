@@ -5,8 +5,10 @@ use std::fs;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use kbf_objstore::s3::fake::FakeS3;
 use kbf_testkit::dir::TestDir;
+use objstore_s3::PageSize;
+use objstore_s3::s3::PART_BYTES;
+use objstore_s3::s3::fake::{Failure, FakeS3};
 use tierstore_bench::config::{Secret, StoreSpec};
 use tierstore_bench::error::BenchError;
 use tierstore_bench::requestlog::{RequestLog, RequestRecord};
@@ -180,4 +182,222 @@ fn a_bad_endpoint_or_bucket_is_refused_when_the_client_is_made() {
             "{endpoint} {bucket}"
         );
     }
+}
+
+/// A writer that refuses everything, as a full disk does.
+struct FullDisk;
+
+impl std::io::Write for FullDisk {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("disk full"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Catches a request whose record could not be written being reported as a success: a
+/// harness-side log with a gap proves nothing, so the call is an error.
+#[tokio::test]
+async fn a_call_whose_record_cannot_be_written_is_an_error() {
+    let log = Arc::new(RequestLog::to_writer(FullDisk));
+    let fake = FakeS3::start().await;
+    let s3 = BenchS3::new(
+        Role::Instance,
+        &spec(fake.endpoint()),
+        Timeouts::default(),
+        log.clone(),
+    )
+    .unwrap();
+    let err = s3
+        .put("bench/a", Bytes::from_static(b"x"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BenchError::Log(_)));
+    assert_eq!(log.count(), 0);
+}
+
+/// A writer that takes `n` writes and then refuses, as a disk that fills up does.
+struct FailAfter(usize);
+
+impl std::io::Write for FailAfter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.0 == 0 {
+            return Err(std::io::Error::other("disk full"));
+        }
+        self.0 -= 1;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn multipart_body() -> Bytes {
+    // One part and a bit more: two parts, the first of the 16 MiB the client sends.
+    Bytes::from(vec![3u8; (PART_BYTES as usize) + 1000])
+}
+
+fn client(endpoint: &str, log: Arc<RequestLog>) -> BenchS3 {
+    BenchS3::new(Role::Instance, &spec(endpoint), Timeouts::default(), log).unwrap()
+}
+
+/// Catches a multipart put that is logged as one request (the cold path's cost is in its parts),
+/// timed short of its parts, or that stores other than what it was given: four records (create,
+/// two parts, complete), a latency that is at least the sum of theirs, and the object whole.
+#[tokio::test]
+async fn a_multipart_put_logs_each_request_and_is_timed_as_the_whole() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-s3-mp");
+    let log_path = dir.path().join("requests.jsonl");
+    let log = Arc::new(RequestLog::create(&log_path).unwrap());
+    let fake = FakeS3::start().await;
+    let s3 = client(fake.endpoint(), log);
+    let put = s3.put_multipart("mp/a", multipart_body()).await.unwrap();
+    assert!(put.is_ok());
+    assert_eq!(put.status, Some(200));
+    let seen = records(&log_path);
+    let methods: Vec<&str> = seen.iter().map(|r| r.method.as_str()).collect();
+    assert_eq!(methods, ["POST", "PUT", "PUT", "POST"]);
+    assert_eq!(seen[1].bytes, PART_BYTES);
+    assert_eq!(seen[2].bytes, 1000);
+    let sum: u64 = seen.iter().map(|r| r.latency_us).sum();
+    assert!(put.latency_us() >= sum, "{} < {sum}", put.latency_us());
+    let stats = fake.stats();
+    assert_eq!((stats.parts, stats.completed, stats.aborted), (2, 1, 0));
+    let key = objstore_s3::ObjectKey::new("mp/a").unwrap();
+    assert_eq!(fake.object_len(&key), Some(PART_BYTES + 1000));
+    assert_eq!(
+        s3.head("mp/a").await.unwrap().result.unwrap(),
+        Some(PART_BYTES + 1000)
+    );
+}
+
+/// Catches a failure of a multipart put that is not a failure (a store error is a measurement,
+/// with its status), an upload left open after a part or the completion failed, and one aborted
+/// when the creation failed: three failures, each as the store made it.
+#[tokio::test]
+async fn a_failed_multipart_put_is_a_measurement_and_aborts_what_it_began() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-s3-mp-fail");
+    let log_path = dir.path().join("requests.jsonl");
+    let log = Arc::new(RequestLog::create(&log_path).unwrap());
+    let fake = FakeS3::start().await;
+    let s3 = client(fake.endpoint(), log);
+
+    fake.fail(Failure::Create);
+    let created = s3.put_multipart("mp/c", multipart_body()).await.unwrap();
+    assert_eq!(created.status, Some(500));
+    assert!(!created.is_ok());
+    assert_eq!(records(&log_path).len(), 1);
+
+    fake.fail(Failure::Part(2));
+    let part = s3.put_multipart("mp/p", multipart_body()).await.unwrap();
+    assert_eq!(part.status, Some(500));
+    assert!(!part.is_ok());
+
+    fake.fail(Failure::Complete);
+    let complete = s3.put_multipart("mp/q", multipart_body()).await.unwrap();
+    assert_eq!(complete.status, Some(500));
+
+    let stats = fake.stats();
+    assert_eq!((stats.aborted, stats.completed), (2, 0));
+    assert_eq!(fake.incomplete_uploads(), 0);
+    assert!(fake.keys().is_empty());
+    let seen = records(&log_path);
+    let aborts = seen.iter().filter(|r| r.method == "DELETE").count();
+    assert_eq!(aborts, 2);
+}
+
+/// Catches a malformed key or an empty body reaching the wire, and a put whose record cannot be
+/// written being reported as a put: the call is an error at each request it makes (creation, a
+/// part, completion, abort).
+#[tokio::test]
+async fn a_multipart_put_refuses_bad_input_and_stops_when_its_log_does() {
+    let fake = FakeS3::start().await;
+    let log = Arc::new(RequestLog::to_writer(std::io::sink()));
+    let s3 = client(fake.endpoint(), log.clone());
+    assert!(matches!(
+        s3.put_multipart("a b", multipart_body()).await,
+        Err(BenchError::Key(_))
+    ));
+    assert!(matches!(
+        s3.put_multipart("mp/e", Bytes::new()).await,
+        Err(BenchError::Request(_))
+    ));
+    assert_eq!(log.count(), 0);
+
+    for taken in 0..4 {
+        let log = Arc::new(RequestLog::to_writer(FailAfter(taken)));
+        let s3 = client(fake.endpoint(), log);
+        let key = format!("mp/log{taken}");
+        let result = s3.put_multipart(&key, multipart_body()).await;
+        assert!(matches!(result, Err(BenchError::Log(_))), "{taken}");
+    }
+    fake.fail(Failure::Complete);
+    let log = Arc::new(RequestLog::to_writer(FailAfter(4)));
+    let s3 = client(fake.endpoint(), log);
+    let result = s3.put_multipart("mp/log-abort", multipart_body()).await;
+    assert!(matches!(result, Err(BenchError::Log(_))));
+}
+
+/// Catches unfinished uploads left under a prefix, uploads outside it touched, a listing that
+/// stops at its first page, and a count that is not what was found: three open uploads, one
+/// outside, swept in pages of one.
+#[tokio::test]
+async fn unfinished_uploads_under_a_prefix_are_aborted_page_by_page() {
+    let fake = FakeS3::start().await;
+    let log = Arc::new(RequestLog::to_writer(std::io::sink()));
+    let s3 = client(fake.endpoint(), log);
+    for key in ["sweep/a", "sweep/b", "sweep/c", "keep/d"] {
+        fake.fail(Failure::Complete);
+        fake.fail(Failure::Abort);
+        let put = s3.put_multipart(key, multipart_body()).await.unwrap();
+        assert!(!put.is_ok());
+    }
+    assert_eq!(fake.incomplete_uploads(), 4);
+    let found = s3
+        .abort_uploads_in_pages("sweep/", PageSize::new(1).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(found, 3);
+    assert_eq!(fake.incomplete_uploads(), 1);
+    assert_eq!(s3.abort_uploads("keep/").await.unwrap(), 1);
+    assert_eq!(s3.abort_uploads("keep/").await.unwrap(), 0);
+    assert_eq!(fake.incomplete_uploads(), 0);
+    assert!(matches!(
+        s3.abort_uploads("a b/").await,
+        Err(BenchError::Key(_))
+    ));
+}
+
+/// Catches a sweep that goes on when its log cannot be written: at the listing, and at an abort.
+#[tokio::test]
+async fn a_sweep_stops_when_its_log_does() {
+    let fake = FakeS3::start().await;
+    let quiet = Arc::new(RequestLog::to_writer(std::io::sink()));
+    let s3 = client(fake.endpoint(), quiet);
+    fake.fail(Failure::Complete);
+    fake.fail(Failure::Abort);
+    s3.put_multipart("sweep/a", multipart_body()).await.unwrap();
+    for taken in 0..2 {
+        let log = Arc::new(RequestLog::to_writer(FailAfter(taken)));
+        let sweeper = client(fake.endpoint(), log);
+        let result = sweeper.abort_uploads("sweep/").await;
+        assert!(matches!(result, Err(BenchError::Log(_))), "{taken}");
+    }
+    // The second sweep sent its abort before its record could not be written.
+    assert_eq!(fake.incomplete_uploads(), 0);
+}
+
+/// Catches a sweep of a store that cannot be listed being an error of the run: it ends with
+/// what it found, nothing.
+#[tokio::test]
+async fn a_sweep_of_a_dead_store_finds_nothing() {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let log = Arc::new(RequestLog::to_writer(std::io::sink()));
+    let s3 = client(&endpoint, log);
+    assert_eq!(s3.abort_uploads("sweep/").await.unwrap(), 0);
 }

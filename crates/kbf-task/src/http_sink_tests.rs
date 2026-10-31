@@ -6,6 +6,7 @@ use kbf_outputs::CHUNK_BYTES;
 
 use super::*;
 use crate::outputs::collect_outputs;
+use crate::put::FixedJitter;
 
 /// What one request carried.
 struct Seen {
@@ -56,6 +57,7 @@ fn sink(url: String, waits: &Arc<Waits>) -> HttpSink {
             large: vec![url],
         },
         sleeper: Arc::new(Arc::clone(waits)),
+        jitter: Arc::new(FixedJitter(0.5)),
     }
 }
 

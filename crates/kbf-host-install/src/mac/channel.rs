@@ -44,7 +44,12 @@
 //!   file without them means what it always meant. Any signer workflow but kbf's own
 //!   (`komira-ai/kbf`'s `artifacts.yml`) is parsed and refused when the channel is used,
 //!   unless the top-level `trusted_workflows` of the same root-owned file names that exact
-//!   workflow ([`ChannelError::UntrustedSigner`]); it is empty by default.
+//!   workflow ([`ChannelError::UntrustedSigner`]); it is empty by default. That check is of
+//!   the channel's own pair. The attestation itself is also accepted, with no entry, from
+//!   the built-in pairs: kbf's own and its former name's (`artifacts.yml` of
+//!   `komira-ai/komira-build-farm`) and, for the `tierstore` prefix of a channel that names
+//!   kbf's, its former name's or `komira-ai/tierstore`'s repository, `komira-ai/tierstore`'s
+//!   `artifacts.yml`. Any other signer needs a `trusted_workflows` entry.
 
 use std::collections::BTreeMap;
 use std::fmt;

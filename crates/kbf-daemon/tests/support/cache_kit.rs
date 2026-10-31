@@ -397,6 +397,16 @@ pub async fn lease(
     Ok((lease, stats))
 }
 
+/// Returns once leases have waited on a held slot `at_least` times in all, as the cache
+/// counts them: the moment a wait begins, not a guess at how long one takes. A cache that
+/// never makes two leases meet would never return; the hang guard for that is the nextest
+/// profile's slow-timeout for this binary (.config/nextest.toml), not a deadline here.
+pub async fn wait_for_fill_waits(cache: &Cache, at_least: u64) {
+    while cache.stats().fill_waits < at_least {
+        tokio::task::yield_now().await;
+    }
+}
+
 /// The bytes of every file under `v1/blobs` of the cache in `dir/cache`: the on-disk sum.
 pub fn on_disk_sum(dir: &Path) -> u64 {
     entries(dir).values().map(|(size, _)| size).sum()

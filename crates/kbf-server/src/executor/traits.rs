@@ -41,6 +41,11 @@ pub enum RejectReason {
     BadManifest,
     /// An output the manifest names is not in the pack.
     Incomplete,
+    /// A key is as old as the longest it can be in use, or the janitor of `cas/b/` has claimed
+    /// it for its delete: the pack is not read.
+    Expired,
+    /// The janitor of `cas/b/` has claimed a key of the run for its delete: the pack is not read.
+    Claimed,
 }
 
 impl fmt::Display for RejectReason {
@@ -53,6 +58,8 @@ impl fmt::Display for RejectReason {
             Self::HashMismatch => "a record does not hash to its digest",
             Self::BadManifest => "bad manifest",
             Self::Incomplete => "an output is missing",
+            Self::Expired => "the key is too old to be ingested",
+            Self::Claimed => "the key is claimed for deletion",
         })
     }
 }
@@ -159,6 +166,9 @@ pub struct ReadGrant {
     pub url: String,
     /// The bearer token.
     pub token: Secret,
+    /// The bytes of the input closure the grant reads (the blobs the task fetches into its
+    /// scratch); `None` when the preparation did not say.
+    pub input_bytes: Option<u64>,
 }
 
 /// Why the inputs of an action could not be had.

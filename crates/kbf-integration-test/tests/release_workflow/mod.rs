@@ -1412,24 +1412,22 @@ fn notes_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// The flag that holds a `release check` to no version facts of its `kbf` tarballs.
+/// The flag a `release check` once took to go without version facts, image facts and image
+/// SBOMs. It no longer exists.
 const WITHOUT_FACTS: &str = "--without-version-facts";
 
-/// The release being made is checked with the version facts of its `kbf` (`release check
-/// dist` has no waiver), and the previous release, made before the build jobs recorded
-/// them, is checked without (`release check previous` has it): else the first release
-/// with facts would fail on the one before it, or a set without them would go out.
+/// Neither `release check` is given a waiver: the release being made and the release before it
+/// both hold the version facts of their `kbf` and the facts and SBOM of their task image. The
+/// release before this one is v0.0.41 or later, which has all three, so a waiver would only
+/// let a set without them go out unnoticed.
 fn version_facts(steps: &[workflows::Step], out: &mut Vec<String>) {
-    for (dir, waived) in [(DIST, false), (PREVIOUS_DIR, true)] {
+    for dir in [DIST, PREVIOUS_DIR] {
         let prefix = format!("cargo xtask release check {dir} ");
         let Some((_, _, words)) = command(steps, &prefix) else {
             continue;
         };
-        if waived && !words.contains(&WITHOUT_FACTS) {
-            out.push(format!("`release check {dir}` is not given `{WITHOUT_FACTS}`: the release before the version facts were recorded has none, so the first release with them would fail on it"));
-        }
-        if !waived && words.contains(&WITHOUT_FACTS) {
-            out.push(format!("`release check {dir}` is given `{WITHOUT_FACTS}`: the release being made must hold the version facts of its kbf"));
+        if words.contains(&WITHOUT_FACTS) {
+            out.push(format!("`release check {dir}` is given `{WITHOUT_FACTS}`: no release check waives the version facts, the image facts or the image SBOM"));
         }
     }
 }

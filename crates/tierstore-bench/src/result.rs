@@ -4,7 +4,7 @@
 //! free-text field a request error could be copied into except `notes`, which a cell owner fills
 //! with prose of its own. The JSON is versioned ([`SCHEMA_VERSION`]); a reader refuses another
 //! version rather than guess. The CSV has one row per request, each row carrying the run id,
-//! the git SHA and the binary digest, the pass index and whether the pass was quiet or busy; the
+//! the git SHA and the binary digest, the pass index, the attempt and whether the pass was quiet or busy; the
 //! tool versions and the hardware facts by role are in the JSON of the same run (`run_id` joins
 //! them).
 
@@ -115,6 +115,25 @@ pub struct Provenance {
     pub tool_versions: BTreeMap<String, String>,
     /// Hardware facts by role.
     pub hardware: BTreeMap<Role, Hardware>,
+    /// Which try of the run this is (`run --attempt`, from 1): a retry of a cell and arm keeps
+    /// the first try's result file, and the file name and the CSV rows carry the number. A
+    /// result written before the field existed was the first try.
+    #[serde(default = "first_attempt")]
+    pub attempt: u32,
+    /// Whether the run added the open-loop arms of the put cells (`run --open-loop`, on unless
+    /// set off). A result written before the field existed was a run with them on.
+    #[serde(default = "open_loop_on")]
+    pub open_loop: bool,
+}
+
+/// The open-loop setting of a result that does not name one.
+const fn open_loop_on() -> bool {
+    true
+}
+
+/// The attempt number of a result that does not name one.
+const fn first_attempt() -> u32 {
+    1
 }
 
 impl Provenance {
@@ -128,8 +147,80 @@ impl Provenance {
             binary_digest: String::new(),
             tool_versions: BTreeMap::new(),
             hardware: BTreeMap::new(),
+            attempt: first_attempt(),
+            open_loop: open_loop_on(),
         }
     }
+}
+
+/// One drive of the cold store as the admin info listed it. The drive is named by a short hash
+/// of its endpoint, so a result can tell that the set of drives changed between two passes
+/// without carrying a host or a path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriveState {
+    /// `d-` and the first eight hex digits of the SHA-256 of the drive's endpoint.
+    pub id: String,
+    /// The state the store reports (`ok`, `offline`, ...); empty if it reports none.
+    pub state: String,
+    /// Whether the drive reports that it is healing.
+    pub healing: bool,
+}
+
+/// What the cold store was doing when it was read: whether it was healing, its drives, and when
+/// the reading was made.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ColdState {
+    /// True if a drive reports healing, or the operator's heal status is under 100%.
+    pub healing: bool,
+    /// The operator's heal status, percent, if the ops file names a status file.
+    pub percent_done: Option<f64>,
+    /// The drives the admin info listed, sorted by id.
+    pub drives: Vec<DriveState>,
+    /// When it was read, milliseconds since the Unix epoch: by this tool for `mc`, by the
+    /// writer of the status file (its own stamp) for `file`.
+    pub read_unix_ms: u64,
+    /// Where the reading came from; absent in results written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ColdSource>,
+}
+
+/// Where a [`ColdState`] came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColdSource {
+    /// The operator's heal status file, stamped by its writer.
+    File,
+    /// `mc admin info` of the cold role.
+    Mc,
+}
+
+/// The reading taken before one pass of an arm.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PassColdState {
+    /// The pass it was taken before.
+    pub pass: u32,
+    /// What was read.
+    #[serde(flatten)]
+    pub state: ColdState,
+}
+
+/// The cold store's health guard tripping, see [`crate::cells::coldguard`]: which measure of the
+/// harness's own cold requests went over its limit.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, thiserror::Error)]
+#[error(
+    "cold store guard: {metric} is {value}, over the limit {limit} (over {requests} requests of the last {window_secs} s)"
+)]
+pub struct ColdTrip {
+    /// `p99_ms` or `error_share`.
+    pub metric: String,
+    /// What the window said.
+    pub value: f64,
+    /// The limit it exceeded.
+    pub limit: f64,
+    /// Cold requests in the window when it tripped.
+    pub requests: u64,
+    /// The length of the window, seconds.
+    pub window_secs: u64,
 }
 
 /// Latency percentiles of one pass, in microseconds (nearest rank).
@@ -167,6 +258,9 @@ pub struct PassResult {
     pub percentiles: Option<Percentiles>,
     /// The load gate's measure that aborted the pass, if one did.
     pub gate_tripped: Option<String>,
+    /// The cold store guard's trip that aborted the pass, if one did.
+    #[serde(default)]
+    pub cold_guard: Option<ColdTrip>,
 }
 
 /// The result of one arm of one cell: the contents of one result JSON.
@@ -189,6 +283,10 @@ pub struct CellResult {
     pub passes: Vec<PassResult>,
     /// Prose of the cell owner's: caveats a reader needs. No hosts, buckets or keys.
     pub notes: Vec<String>,
+    /// What the cold store was doing before each pass, read again every time: empty if the run
+    /// had no cold store to read (or the result was written before the field existed).
+    #[serde(default)]
+    pub cold_state: Vec<PassColdState>,
 }
 
 impl CellResult {
@@ -262,13 +360,13 @@ pub struct Sample {
 
 impl Sample {
     /// The header row, without a newline.
-    pub const CSV_HEADER: &'static str = "run_id,git_sha,binary_digest,cell,arm,pass,window,role,op,bytes,in_flight,started_unix_ms,latency_us,status";
+    pub const CSV_HEADER: &'static str = "run_id,git_sha,binary_digest,cell,arm,pass,window,role,op,bytes,in_flight,started_unix_ms,latency_us,status,attempt";
 
     /// The row for this sample, without a newline, in the order of [`Sample::CSV_HEADER`].
     #[must_use]
     pub fn csv_row(&self, provenance: &Provenance) -> String {
         let status = self.status.map_or_else(String::new, |s| s.to_string());
-        let fields: [Cow<'_, str>; 14] = [
+        let fields: [Cow<'_, str>; 15] = [
             csv_field(&provenance.run_id),
             csv_field(&provenance.git_sha),
             csv_field(&provenance.binary_digest),
@@ -283,6 +381,7 @@ impl Sample {
             Cow::Owned(self.started_unix_ms.to_string()),
             Cow::Owned(self.latency_us.to_string()),
             Cow::Owned(status),
+            Cow::Owned(provenance.attempt.to_string()),
         ];
         fields.join(",")
     }
@@ -317,6 +416,8 @@ mod tests {
                     link_mbps: Some(10_000),
                 },
             )]),
+            attempt: 2,
+            open_loop: true,
         }
     }
 
@@ -343,8 +444,29 @@ mod tests {
                     max_us: 300,
                 }),
                 gate_tripped: Some("loadavg_1m".to_owned()),
+                cold_guard: Some(ColdTrip {
+                    metric: "p99_ms".to_owned(),
+                    value: 2500.0,
+                    limit: 2000.0,
+                    requests: 40,
+                    window_secs: 60,
+                }),
             }],
             notes: vec!["a note".to_owned()],
+            cold_state: vec![PassColdState {
+                pass: 0,
+                state: ColdState {
+                    healing: true,
+                    percent_done: Some(12.5),
+                    drives: vec![DriveState {
+                        id: "d-0123abcd".to_owned(),
+                        state: "ok".to_owned(),
+                        healing: true,
+                    }],
+                    read_unix_ms: 1_500,
+                    source: Some(ColdSource::File),
+                },
+            }],
         }
     }
 
@@ -355,6 +477,52 @@ mod tests {
         let text = r.to_json();
         assert!(text.ends_with("}\n"));
         assert_eq!(CellResult::from_json(&text).unwrap(), r);
+    }
+
+    /// Catches the open-loop setting of a run not being kept in the provenance of its results,
+    /// and a result written before the field existed being read as a run without the arms.
+    #[test]
+    fn the_open_loop_setting_is_in_the_provenance_and_an_old_result_reads_as_on() {
+        let mut r = result();
+        r.provenance.open_loop = false;
+        let mut v: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
+        assert_eq!(v["provenance"]["open_loop"], false);
+        assert_eq!(CellResult::from_json(&v.to_string()).unwrap(), r);
+        v["provenance"].as_object_mut().unwrap().remove("open_loop");
+        assert!(
+            CellResult::from_json(&v.to_string())
+                .unwrap()
+                .provenance
+                .open_loop
+        );
+    }
+
+    /// Catches a result written before the cold state, the cold guard and the attempt were added
+    /// being refused, or read as something other than a first attempt with no readings.
+    #[test]
+    fn a_result_without_the_newer_fields_reads_with_their_defaults() {
+        let mut v: serde_json::Value = serde_json::from_str(&result().to_json()).unwrap();
+        v.as_object_mut().unwrap().remove("cold_state");
+        v["provenance"].as_object_mut().unwrap().remove("attempt");
+        for pass in v["passes"].as_array_mut().unwrap() {
+            pass.as_object_mut().unwrap().remove("cold_guard");
+        }
+        let old = CellResult::from_json(&v.to_string()).unwrap();
+        assert!(old.cold_state.is_empty());
+        assert_eq!(old.provenance.attempt, 1);
+        assert_eq!(old.passes[0].cold_guard, None);
+    }
+
+    /// Catches a cold reading whose fields are not flat beside the pass (the shape the report and
+    /// the paper scripts read) or that carries a name of the store.
+    #[test]
+    fn a_cold_reading_is_flat_and_names_no_host() {
+        let v: serde_json::Value = serde_json::from_str(&result().to_json()).unwrap();
+        let reading = &v["cold_state"][0];
+        assert_eq!(reading["pass"], 0);
+        assert_eq!(reading["healing"], true);
+        assert_eq!(reading["read_unix_ms"], 1_500);
+        assert_eq!(reading["drives"][0]["id"], "d-0123abcd");
     }
 
     /// Catches a reader that accepts another schema version, or no version, and reads it as
@@ -385,7 +553,8 @@ mod tests {
         assert!(!text.contains("://"));
         let dotted_quad = text
             .split(|c: char| !(c.is_ascii_digit() || c == '.'))
-            .any(|w| w.split('.').count() == 4 && w.split('.').all(|p| p.parse::<u8>().is_ok()));
+            .filter(|w| w.split('.').count() == 4)
+            .any(|w| w.split('.').all(|p| p.parse::<u8>().is_ok()));
         assert!(!dotted_quad);
     }
 
@@ -408,12 +577,12 @@ mod tests {
         let row = s.csv_row(&provenance());
         assert_eq!(
             row,
-            "run-1,0123abc,ff00,b,\"a,\"\"b\"\"\",2,busy,cold,get-range,4096,16,99,1234,"
+            "run-1,0123abc,ff00,b,\"a,\"\"b\"\"\",2,busy,cold,get-range,4096,16,99,1234,,2"
         );
-        assert_eq!(Sample::CSV_HEADER.split(',').count(), 14);
+        assert_eq!(Sample::CSV_HEADER.split(',').count(), 15);
         s.arm = "plain".to_owned();
         s.status = Some(206);
-        assert!(s.csv_row(&provenance()).ends_with(",1234,206"));
+        assert!(s.csv_row(&provenance()).ends_with(",1234,206,2"));
         assert_eq!(csv_field("a\nb"), "\"a\nb\"");
     }
 

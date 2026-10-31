@@ -11,7 +11,7 @@
 //!   [`ASSETS`] (binary and platform): `kbf`, `kbf-host-install` and `kbf-updater` for the
 //!   three platforms (a Mac runs the host agent), `kbf-installer` and `kbf-mac-provision` for macOS only (its Linux
 //!   package is the `kbf` package's now; a Mac is provisioned by `kbf-mac-provision`), `kbf-daemon`, `kbf-server`, `kbf-deploy`,
-//!   `kbf-signer`, `tierstore` and `kbf-task` (a static musl build) for Linux, `kbf-deploy` for macOS (a Mac runs
+//!   `kbf-signer` and `kbf-task` (a static musl build) for Linux, `kbf-deploy` for macOS (a Mac runs
 //!   `kbf daemon`; there is no darwin `kbf-daemon`). Each one's SBOM attestation is
 //!   [`crate::attested_assets`]' business, and its provenance bundle
 //!   [`crate::attested_bundles`]'.
@@ -68,6 +68,10 @@
 //!   install test runs before the asset; its downloads are pinned. The verify job then
 //!   runs `pkg-macos-asset --verify-only` on the signed `.pkg` with `--expect-ref
 //!   "$GITHUB_REF"`.
+//! - **The darwin `kbf-task` bundle.** The darwin job builds `kbf-task` with the macOS confine, signs it,
+//!   packs it with the pinned `js-bundle` into an OCI image layout and makes that layout an asset
+//!   (`cargo xtask package-task-bundle`, [`ASSETS`]'s `kbf-task-bundle`), a tarball with an SBOM like the
+//!   binaries'. Its steps, pin and docs are held to one shape by `task_bundle`.
 //! - **macOS.** Every binary the darwin job packages is signed by `cargo xtask
 //!   sign-darwin` before it is packaged and checked by `cargo xtask darwin-asset` on
 //!   the tarball after, each in a step that cannot be skipped.
@@ -83,6 +87,7 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-host-install", "darwin-arm64"),
     ("kbf-updater", "darwin-arm64"),
     ("kbf-mac-provision", "darwin-arm64"),
+    ("kbf-task-bundle", "darwin-arm64"),
     ("kbf", "linux-x86_64"),
     ("kbf-daemon", "linux-x86_64"),
     ("kbf-server", "linux-x86_64"),
@@ -90,7 +95,6 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-host-install", "linux-x86_64"),
     ("kbf-updater", "linux-x86_64"),
     ("kbf-signer", "linux-x86_64"),
-    ("tierstore", "linux-x86_64"),
     ("kbf-task", "linux-x86_64"),
     ("kbf", "linux-arm64"),
     ("kbf-daemon", "linux-arm64"),
@@ -99,7 +103,6 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-host-install", "linux-arm64"),
     ("kbf-updater", "linux-arm64"),
     ("kbf-signer", "linux-arm64"),
-    ("tierstore", "linux-arm64"),
     ("kbf-task", "linux-arm64"),
 ];
 
@@ -188,6 +191,7 @@ pub fn problems(workflow: &str) -> Result<Vec<String>, String> {
     facts::rules(workflow, &mut out)?;
     kbf_package::rules(workflow, &mut out)?;
     images::rules(workflow, &mut out)?;
+    image_sbom::rules(workflow, &mut out)?;
     mac_package(workflow, &mut out)?;
     darwin(workflow, &mut out)?;
     pull_request_gate(workflow, &mut out)?;
@@ -718,6 +722,8 @@ fn the_docs_describe_the_release_set() {
             format!("`kbf-frontend-image-<commit>-{platform}.oci.tar`"),
             format!("`kbf-coordinator-image-<commit>-{platform}.oci.tar`"),
             format!("`kbf-task-image-<commit>-{platform}.oci.tar`"),
+            format!("`kbf-task-image-<commit>-{platform}.facts.json`"),
+            format!("`kbf-task-image-<commit>-{platform}.cdx.json`"),
         ] {
             if !doc.contains(&file) {
                 missing.push(format!("docs/artifacts.md does not list {file}"));
@@ -858,6 +864,33 @@ mod rules {
         )
     }
 
+    /// The step that fetches syft for `platform` (pinned by version and SHA-256, like every tool
+    /// the jobs fetch), as the Linux jobs have it.
+    fn syft_fetch_step(platform: &str) -> String {
+        let (arch, sha) = match platform {
+            "linux-arm64" => ("arm64", "SYFT_SHA256_AARCH64_LINUX"),
+            _ => ("amd64", "SYFT_SHA256_X86_64_LINUX"),
+        };
+        format!(
+            "      - name: Fetch syft\n        run: cargo xtask fetch --url \"https://github.com/anchore/syft/releases/download/v$SYFT_VERSION/syft_${{SYFT_VERSION}}_linux_{arch}.tar.gz\" --sha256 \"${sha}\" --out \"$RUNNER_TEMP/tools/syft\" --extract tar.gz --member syft\n"
+        )
+    }
+
+    /// The step that makes the CycloneDX SBOM of the task image of `platform` an asset, after the
+    /// image is one.
+    fn task_sbom_step(platform: &str) -> String {
+        format!(
+            "      - name: Task SBOM\n        run: cargo xtask pkg-image-sbom --service task --image \"dist/kbf-task-image-$GITHUB_SHA-{platform}.oci.tar\" --platform {platform} --commit \"$GITHUB_SHA\" --syft \"$RUNNER_TEMP/tools/syft\" --source-date-epoch \"$SOURCE_DATE_EPOCH\"\n"
+        )
+    }
+
+    /// The verify job's check of the SBOM beside the signed task image of `platform`.
+    fn verify_task_sbom_step(platform: &str) -> String {
+        format!(
+            "      - name: Task SBOM {platform}\n        run: cargo xtask pkg-image-sbom --verify-only --service task --image \"dist/kbf-task-image-$GITHUB_SHA-{platform}.oci.tar\" --platform {platform} --commit \"$GITHUB_SHA\"\n"
+        )
+    }
+
     /// The steps that make the Mac `.pkg` an asset, as the darwin job has them (after the
     /// tarball's identity and signature checks, which `good()` writes before).
     fn mac_package_steps() -> String {
@@ -890,7 +923,7 @@ mod rules {
     /// A workflow of the shape the rules read, meeting every one.
     fn good() -> String {
         let mut w = String::from(
-            "on:\n  pull_request:\n  merge_group:\n  workflow_call:\npermissions: {}\nenv:\n  GH_SHA256_AARCH64_DARWIN: abababababababababababababababababababababababababababababababab\njobs:\n",
+            "on:\n  pull_request:\n  merge_group:\n  workflow_call:\npermissions: {}\nenv:\n  GH_SHA256_AARCH64_DARWIN: abababababababababababababababababababababababababababababababab\n  SYFT_SHA256_X86_64_LINUX: cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\n  SYFT_SHA256_AARCH64_LINUX: efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef\njobs:\n",
         );
         for job in BUILD_JOBS {
             w.push_str(&format!(
@@ -920,7 +953,7 @@ mod rules {
                 }
             }
             for name in &mine {
-                if platform == "darwin-arm64" {
+                if platform == "darwin-arm64" && *name != xtask::task_bundle::NAME {
                     w.push_str(&format!(
                         "      - name: Sign {name}\n        run: cargo xtask sign-darwin \"target/$TARGET/release/{name}\" --minos 14.0\n"
                     ));
@@ -934,6 +967,11 @@ mod rules {
             }
             w.push_str(&facts_step(platform));
             for name in &mine {
+                if *name == xtask::task_bundle::NAME {
+                    // Not a binary: the darwin kbf-task bundle has its own verb, and its own rules (`task_bundle`).
+                    w.push_str("      - name: Package the bundle\n        run: cargo xtask package-task-bundle --layout l --sbom s.json --commit \"$GITHUB_SHA\" --out dist\n");
+                    continue;
+                }
                 w.push_str(&format!(
                     "      - name: Package {name}\n        run: cargo xtask package --binary \"target/$TARGET/release/{name}\" --sbom s.json --platform {platform} --commit \"$GITHUB_SHA\" --out dist\n"
                 ));
@@ -953,6 +991,8 @@ mod rules {
                 w.push_str(&image_steps(platform));
                 w.push_str(&coordinator_steps(platform));
                 w.push_str(&task_steps(platform));
+                w.push_str(&syft_fetch_step(platform));
+                w.push_str(&task_sbom_step(platform));
             }
             if *job == MAC_PACKAGE {
                 w.push_str(&mac_package_steps());
@@ -973,6 +1013,7 @@ mod rules {
                     w.push_str(&verify_image_step(p));
                     w.push_str(&verify_coordinator_step(p));
                     w.push_str(&verify_task_step(p));
+                    w.push_str(&verify_task_sbom_step(p));
                 }
             } else {
                 w.push_str(&verify_mac_package_step());
@@ -1865,12 +1906,15 @@ mod rules {
         }
     }
 
+    mod image_sbom_tests;
     mod images_tests;
     mod kbf_package_tests;
 }
 
 mod facts;
+mod image_sbom;
 mod images;
 #[cfg(test)]
 mod installer;
 mod kbf_package;
+mod task_bundle;

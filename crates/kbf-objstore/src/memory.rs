@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn a_continuation_token_from_another_store_is_refused() {
         let store = MemoryStore::new(Capabilities::default());
-        let token = ListToken(crate::types::Token::Continue("a".into()));
+        let token = ListToken::continuation("a");
         let listed = futures::executor::block_on(store.list(
             &KeyPrefix::default(),
             Some(&token),

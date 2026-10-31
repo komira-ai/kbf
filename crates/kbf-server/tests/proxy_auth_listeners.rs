@@ -874,6 +874,7 @@ fn binary(name: &str, extra: &[&str]) -> (kbf_testkit::dir::TestDir, std::proces
         .args(["--listen", "127.0.0.1:0", "--worker-listen", "127.0.0.1:0"])
         .arg("--cold-store")
         .arg(format!("file://{}", base.join("cold").display()))
+        .arg("--cold-store-floor-bytes=1")
         .arg("--meta-dir")
         .arg(base.join("meta"))
         .args(extra)

@@ -118,7 +118,8 @@ Where the frontend runs the actions it places is `--executor` (the `[executor]` 
 as always: the frontend builds no executor and contacts no lease server, whatever the other
 `--executor-*` flags say, so a unit or `kbf.toml` that names a lease server keeps its settings
 when the executor is switched back, `--executor-insecure-argv-secrets` too (it is ignored, with a
-warning, so the rollback is the one flag: `executor = "kbf-daemon"`). Stopping the frontend
+warning, so the rollback is the one flag: `executor = "kbf-daemon"`, except `--executor-locate`,
+which is refused with `kbf-daemon` and must be removed in the same edit). Stopping the frontend
 releases its leases; a frontend that is killed (a stop timeout, SIGKILL) leaves them, and the
 hosts stay held until their ttl ends (`--executor-lease-ttl-secs`, an hour by default) unless a
 later `js-agent` start releases them. `js-agent` leases hosts from the job scheduler's lease server
@@ -149,11 +150,13 @@ them if none is, as after a crash. Nothing asks for a host meanwhile. A restart 
 stopping it stops the runs and releases the leases. The executor prepares each run with the
 frontend's **task runs** (below) and its job-facing read listener (`--job-listen`), so
 `--executor js-agent` is refused when the flags are read unless `--task-secret-file` (with the
-four flags it needs), `--job-listen` (with its three) and `--pack-store-endpoint` are given, and
+four flags it needs), `--job-listen` (with its companions) and `--pack-store-endpoint` are given, and
 unless they agree with it: the tier store and the read url must be IP addresses (the job network
 has no DNS); `--task-put-bucket` must be `--pack-store-bucket`, the bucket the pack is read
 from; an `http://` `--task-put-endpoint` needs `--executor-allow-plain-http-put` (with an
-`https://` one the flag is only warned about); and the longest run (`--executor-max-run-secs`
+`https://` one the flag is only warned about); an `http://` `--task-read-url` needs
+`--executor-allow-plain-http-grant` (the same, with the read grant: the task tool is then
+given `--allow-plain-http-grant`, and the read token crosses the job network in clear); and the longest run (`--executor-max-run-secs`
 plus `--executor-run-margin-secs`) must fit 14400 s less `--task-url-slack-secs`, the longest a
 presigned write may be good for once the slack is added. A lease ttl over 3600 s is warned
 about: the lease server grants at most its `--max-ttl` (3600 s unless started with another) and
@@ -171,8 +174,17 @@ presigned write and the read token are never part of an error, a log line or a m
 `--executor-run-margin-secs` (300; what a run's wall time adds to the action's timeout),
 `--executor-lease-ttl-secs` (3600), `--executor-max-run-secs` and
 `--executor-default-timeout-secs` (3000), `--executor-call-timeout-secs` (5),
-`--executor-work-dir` (for the task tool), and
-`--executor-allow-plain-http-put` (until the store serves TLS). A setting that breaks a rule
+`--executor-work-dir` (for the task tool),
+`--executor-output-disk-bytes` (8 GiB; the scratch disk a run books for its outputs, the pack and its
+private home, on top of the bytes of its inputs and a fixed 1 GiB margin),
+`--executor-allow-plain-http-put` (until the store serves TLS), and
+`--executor-allow-plain-http-grant` (a read listener without TLS, on a farm's own network; both
+plain-http flags are off by default), and `--executor-locate` (off by default: the task is given
+`--locate`, asks the listener's `GET /locate` once and reads each input straight from the store the
+answer names, from the listener when that read fails; with no grants in the answer it reads from the
+listener as before; refused with `--executor kbf-daemon`; the task image must carry kbf-task
+v0.0.44 or later, the first release that knows `--locate`: an older one refuses the flag and every
+run fails). A setting that breaks a rule
 the executor's safety rests on (the fence time against the scheduler's grace, the lease ttl
 against the longest run) is refused at start, exit status 2.
 
@@ -238,10 +250,46 @@ under it is refused at parse time. Every URL of a run has the same expiry. The s
 `--task-put-credentials-file` (JSON `{"access_key_id": "...", "secret_access_key": "..."}` of
 the presign-only key, owned by the server's user, mode 0600 or 0400) and `--task-read-url`
 (`https://host:port`, no path: an `http://` URL is refused at start, as the token is a bearer
-secret). The secret file holds one secret of at least 32 bytes, owned by the server's user
+secret, unless `--executor-allow-plain-http-grant` is given with `--executor js-agent`). The secret file holds one secret of at least 32 bytes, owned by the server's user
 and readable by it alone; the pack-key mint and the grant key are made from it, and the
 job-facing listener must verify grants with the same secret. No secret is a flag. Left out, no
 secret file is read and the frontend serves exactly as before.
+
+**The `cas/b/` janitor** (off by default; the `[task-runs]` table of `kbf.toml`). The packs and
+large objects tasks write under `cas/b/` are not all kept: a refused run, a run that failed after
+its write, the unused keys of a key set, and a large object the ingest has already copied into the
+CAS leave keys nothing refers to. With `--task-janitor-key-file` the leader (the server that holds
+the scheduler role) lists `cas/b/` every `--task-janitor-interval-secs` (default 900) and deletes
+a key that is older than `--task-janitor-grace-secs` (default 21600, which is also the least: the
+18000 seconds at which an ingest refuses a key, the 4 hours a presigned write is good for and an
+hour for the ingest, and an hour more as a margin between frontends), is not one an ingest is verifying
+right now, and is not recorded in the pack index (asked again for that key just before the
+delete; a pack the ingest recorded stays where it lies and is never deleted). The age is the
+minute in the key's own name, for a pack (`-<k>`) and a large object (`-L<i>`) alike; a key under
+`cas/b/` whose name does not parse is kept and counted. It never lists or deletes under `cas/l/`
+(content-bound large objects), `cas/f/<writer>/` (frontend packs) or `cas/d/` (daemon packs). The
+key file is the JSON of the tier store's GC key (`--gc-key-file` there), whose prefix must be
+exactly `cas/b/`, owned by the server's user, mode 0600 or 0400; it signs the janitor's requests to
+the store of `--pack-store-endpoint` (same endpoint, bucket and region), which the janitor needs,
+as it needs `--task-secret-file` and `--pack-index`. A sweep lists `--task-janitor-page-size`
+(default 500) keys at a time and waits `--task-janitor-page-pause-ms` (default 1000) after each
+page, which bounds how fast it lists and deletes. `--task-janitor-dry-run` counts and logs what a
+sweep would delete and deletes nothing. A key the janitor is about to delete is claimed in the
+registry the ingests hold their keys in, after the pack index's last answer and through the delete,
+and a claim and a hold on one key exclude each other: an ingest that has begun makes the janitor
+keep the key, and one that begins after the claim is refused (`claimed`) before it reads anything.
+An ingest also refuses a key 18000 s old (`expired`), so a key seen as ended only after a long
+outage is never committed. Holds and claims are per process: across frontends (clocks that differ,
+or a fenced old leader still ingesting while the new leader sweeps) a key is safe by the age rule
+alone, and its margin is the grace less 18000 s, an hour at least. The leadership is asked before each page and each delete,
+and a sweep that finds it lost stops (`..._abandoned_total`). A 401 or 403 on a delete ends the
+sweep at that key, and so do 5 deletes failing in a row; each is one `..._sweep_errors_total` and one log
+line. `GET /metrics` has `kbf_cas_b_janitor_listed_total`,
+`..._reaped_total`, `..._kept_young_total`, `..._kept_verifying_total`,
+`..._kept_referenced_total`, `..._kept_unparsed_total`, `..._kept_outside_total`,
+`..._would_reap_total`, `..._reap_errors_total` (deletes the store refused, retried by the next
+sweep), `..._sweeps_total` and `..._sweep_errors_total` (sweeps the listing or the pack index
+stopped).
 
 A daemon writes its outputs into packs with `--pack-write` (off by default; the `[packs]`
 table of `kbf.toml`), which needs `--pack-read` and `--pack-store-write-credentials-file`, a
@@ -294,10 +342,10 @@ that runs an action on a worker fetches the action's input files from the fronte
 grant (a token the frontend gives the run, valid until its expiry, for one Action: it reads that
 Action, its Command and its input tree, and no other blob). The task is untrusted code that holds
 no client certificate, so the REAPI listener is not open to it; `--job-listen <addr>` opens
-another, over HTTPS, that serves `GET /<hex>/<size>` and `POST /batch` (below) with
+another, over HTTPS (or plain HTTP, below), that serves `GET /<hex>/<size>` and `POST /batch` (below) with
 `Authorization: Bearer <read grant>` and nothing else (any other path is 404, any other method
-405). It needs three more flags, all four
-given together, and takes two more that have defaults:
+405). It needs the secret and a transport (a certificate and key, or `--job-plain-http`), and takes
+two more flags that have defaults:
 
 - `--job-tls-cert` and `--job-tls-key`: the certificate chain and key of the listener (PEM), issued
   by the farm CA that the task is told to trust. The TLS is the server's alone: no client
@@ -309,29 +357,89 @@ given together, and takes two more that have defaults:
   certificate does not name it; on `0.0.0.0` or `::` it needs some IP name. The files are read
   again every `--tls-reload-interval-secs` like the other listeners' (the names are checked at
   start only).
+- `--job-plain-http`, in place of the two: serves the same listener in plain HTTP, with no TLS,
+  for a farm on its own network: TLS is optional on a trusted job network, and a read grant is a
+  bearer token, so whoever can read that network can use a grant until it expires. It serves the same
+  routes and the same bounds, and every request still needs a valid read grant, checked as over
+  TLS; what changes is that the grant and the blobs cross the network unencrypted. Given with `--job-tls-cert` or
+  `--job-tls-key` it is refused when the flags are read (which of the two to serve is not a
+  guess to make); there are no IP-name checks and no TLS reload series in this mode. The
+  executor must agree, and `--executor js-agent` refuses at the flags when it does not:
+  `--task-read-url` is `http://host:port` with `--executor-allow-plain-http-grant` (the
+  executor then gives the task tool its `--allow-plain-http-grant`), and an `https://` read url
+  goes with a TLS listener. The other two pairs, `http://` against TLS and `https://` against
+  plain, are refused, since every read would fail.
 - `--job-grant-secret-file`: the farm secret the grants are signed with (at least 32 bytes, mode
   0600 or 0400, owned by the server's user; surrounding whitespace is dropped). Every frontend
   of the farm, and whatever issues the grants, reads the same secret, so a grant is verified by
   any frontend. It is never a flag.
 - `--job-max-blob-bytes` (default 536870912, 512 MiB): the largest blob a response carries.
 - `--job-reads-in-flight` (default 32): the blob reads open at once.
+- `--job-read-budget-bytes` (default 1073741824, 1 GiB): the bytes of blob reads open at once. A
+  read takes its blob's size first (a streamed blob a bounded window of 16 MiB, a batch the sizes
+  of its blobs together, and the reads of the scope walk their own sizes); one over the budget
+  waits for room and never fails, and a blob larger than the whole budget is read alone. The room
+  stays taken until the response has been sent (or the connection dropped), so that clients that
+  are slow to read do not hold more than the budget; a batch also pays 64 KiB for each gap
+  between its blobs, and takes at most half of `--job-reads-in-flight` while it reads. An Action
+  or Directory blob over 4 MiB gives its Action no scope (it is not read).
+- `--job-read-idle-secs` (default 60): a response that holds budget and whose client takes no
+  chunk for this long is dropped, its budget given back and its response ended (the client sees a
+  broken response). A client that reads is not cut off however long its response takes in all; one
+  that opens a response and never reads it holds budget for this long and no longer. The scope
+  of an Action is worked out once however many tasks ask for it at the same time.
+- `--job-store-grant-key-file`, `--job-store-url` and `--job-store-bucket` (the three come
+  together, and are off unless the key file is given): tell `GET /locate` to hand out read grants
+  of the tier store. The file is the grant key the store's own `--grant-key-file` holds (JSON of
+  `access_key_id` and `secret_access_key`, or the id and the secret on two lines; mode 0600 or
+  0400, owned by the server's user, never a flag; the secret is at least 32 bytes); the store
+  must be started with the same key.
+  `--job-store-url` is the base URL a task reads the store at (`http://` or `https://`, a host
+  and a port, no path: the task dials it from its worker, so it must be an address the workers
+  reach) and `--job-store-bucket` is the store's `--bucket`. Both come from these flags and from
+  nothing in a request. A file the server cannot read, a key or bucket tierstore would refuse, or
+  a URL that is not a store's is refused at start, exit status 2, and the refusal never holds the
+  secret. Without the flags `GET /locate` answers as it did: no header line and no `g`, and a
+  task reads every blob from this listener.
+
+  With them, the first line of a `GET /locate` answer is
+  `{"store":"<url>","bucket":"<bucket>","grants":["<token>",...]}` and each `pack` and `large`
+  line carries `"g":<n>`, the index in `grants` of the grant that lists its key (all the spans of
+  one pack share one). The grants list the keys of the lines of that answer, which come from the
+  grant's scope walk, and no others; each lists at most 600 keys (so a large scope has several
+  grants), and a key tierstore refuses to list (`_journal/`, `_tiering/`) is not listed and its
+  line is `absent`. A grant ends at the earlier of the job's read grant and ten minutes after it
+  is made, never later: the store refuses a grant that ends more than its
+  `--grant-max-lifetime` (900 seconds by default) after its own clock, so ten minutes leave five
+  for this host's clock to run ahead of the store's, and a store given a shorter
+  `--grant-max-lifetime` than ten minutes refuses them (the task then reads from the listener).
+  A grant is a bearer token: it is in the answer's body only, never in a log, a metric or a
+  `Debug`, and on plain HTTP (the listener's or the store's) anyone on the path can read it.
+  A grant lists whole pack keys, and the store serves any byte range of a key a grant lists, so a
+  task holding the grant for one blob of a pack can read every blob in that pack, including blobs
+  outside its Action's inputs. Turn these flags on only where that is acceptable: a farm whose
+  builds all belong to one tenant, or whose pack contents are not secret from one another.
+- The tee that copies a large blob to tierstore while it is streamed buffers up to 32 MiB for each
+  live put (64 MiB in all at the default concurrency of two). That buffer is outside
+  `--job-read-budget-bytes`, which counts what a read and its reply hold.
 
 The answers are 200 with the blob and its `Content-Length`; 401 for a missing, malformed, forged,
 expired or revoked grant (with `WWW-Authenticate: Bearer`); 403 for a digest outside the grant's
 scope, or a grant whose Action has no readable inputs in the store; 404 for a blob that is not
 held, an unknown path, and 405 (with `Allow: GET`) for another method; 413 for a blob over
-`--job-max-blob-bytes`, without reading it; and 503 when the store cannot answer. A body carries a reason code
-(`missing_token`, `invalid_token`, `expired`, `revoked`, `out_of_scope`, `no_scope`, `too_large`,
-`not_found`, `method_not_allowed`, `store_unavailable`) and nothing else. A blob is read as the
-REAPI listener's reads are (the pack index first, then the storage nodes, checked against its
-digest). A blob of at most 64 MiB is read whole and sent whole. A larger one is streamed from the
-storage nodes through SHA-256, one chunk at a time with the last held back until the whole has
-hashed to its digest, so a response never holds more than a few MiB of it; a blob whose bytes are
-not its digest's ends its response short of its `Content-Length` (the client sees a broken
-response and refuses it) and is counted in `kbf_job_read_stream_ended_early_total`. At most
-`--job-reads-in-flight` reads are open at once (a streamed one until its response ends), at most 256 connections are open, a client has 10 seconds to send a request's headers, and a
-connection lives at most 10 minutes. The listener's socket is closed the moment a drain begins; the
-connections open finish their request. `GET /metrics` of the operator API gains
+`--job-max-blob-bytes`, without reading it; and 503 when the store cannot answer. A body carries a
+reason code (`missing_token`, `invalid_token`, `expired`, `revoked`, `out_of_scope`, `no_scope`,
+`too_large`, `not_found`, `method_not_allowed`, `store_unavailable`) and nothing else. A blob is
+read as the REAPI listener's reads are (the pack index first, then the storage nodes, checked
+against its digest). A blob of at most 64 MiB is read whole and sent whole. A larger one is
+streamed from the storage nodes through SHA-256, one chunk at a time with the last held back until
+the whole has hashed to its digest, so a response never holds more than a few MiB of it; a blob
+whose bytes are not its digest's ends its response short of its `Content-Length` (the client sees
+a broken response and refuses it) and is counted in `kbf_job_read_stream_ended_early_total`. At
+most `--job-reads-in-flight` reads are open at once (a streamed one until its response ends), at
+most 256 connections are open, a client has 10 seconds to send a request's headers, and a
+connection lives at most 10 minutes. The listener's socket is closed the moment a drain begins;
+the connections open finish their request. `GET /metrics` of the operator API gains
 `kbf_job_read_requests_total` (by `outcome`), `kbf_job_read_bytes_total` and
 `kbf_job_read_stream_ended_early_total` (by `reason`: `digest_mismatch` or `store_error`), and
 `kbf_tls_reloads_total` a `listener="job"` series. Where the jobs run must be allowed to reach
@@ -349,8 +457,11 @@ over 4194304 bytes is not added, it is answered `too_large` below). Otherwise it
 `application/octet-stream` with one frame per digest in request order: a status byte (0 ok, 1
 not_found, 2 out_of_scope, 3 too_large (use GET), 4 store_unavailable), the length as 8 bytes
 big-endian (the blob's size when ok, else 0), and the bytes. Each digest is checked against the
-grant's scope, each read counts against `--job-reads-in-flight`, and the frontend hashes every ok
-blob against its digest. A GET of `/batch` is 405 with `Allow: POST`. The golden request and
+grant's scope, the batch's read takes one reservation of `--job-reads-in-flight` places (at most
+half of them, however many blobs it reads; a GET takes one), and the frontend hashes every ok
+blob against its digest. The blobs of a batch are read together: with packs, those in a pack are
+read with few ranged reads of the object store (one for blobs that lie close together), and only
+the others from the storage nodes. A GET of `/batch` is 405 with `Allow: POST`. The golden request and
 response bytes are `crates/kbf-front/tests/data/job_read_batch.golden`. `/metrics` gains
 `kbf_job_batch_requests_total` (by `outcome`) and `kbf_job_batch_blobs_total` (by `status`).
 

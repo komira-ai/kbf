@@ -119,15 +119,25 @@ mod tests {
         }
     }
 
-    struct Refusing;
+    /// A writer that fails at the stage it is told to.
+    struct Refusing {
+        write: bool,
+        flush: bool,
+    }
 
     impl Write for Refusing {
-        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-            Err(io::Error::other("disk full"))
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.write {
+                Err(io::Error::other("disk full"))
+            } else {
+                Ok(buf.len())
+            }
         }
 
         fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+            self.flush
+                .then(|| io::Error::other("flush"))
+                .map_or(Ok(()), Err)
         }
     }
 
@@ -163,13 +173,25 @@ mod tests {
         assert_eq!(lines, [record("a"), record("b")]);
     }
 
-    /// Catches a failed write being swallowed: a log with a gap must stop the run, and the
-    /// failed record is not counted.
+    /// Catches a failed write or flush being swallowed: a log with a gap must stop the run, and
+    /// the failed record is not counted.
     #[test]
     fn a_failed_write_is_an_error_and_is_not_counted() {
-        let log = RequestLog::to_writer(Refusing);
-        let err = log.record(&record("a")).unwrap_err();
-        assert!(matches!(err, BenchError::Log(_)));
-        assert_eq!(log.count(), 0);
+        for (write, flush) in [(true, false), (false, true)] {
+            let log = RequestLog::to_writer(Refusing { write, flush });
+            let err = log.record(&record("a")).unwrap_err();
+            assert!(matches!(err, BenchError::Log(_)), "{write} {flush}");
+            assert_eq!(log.count(), 0);
+        }
+    }
+
+    /// Catches a log file that cannot be opened being reported without its path.
+    #[test]
+    fn a_log_that_cannot_be_opened_names_its_path() {
+        let path = Path::new("/nonexistent-dir-for-test/requests.jsonl");
+        match RequestLog::create(path) {
+            Err(BenchError::Io { path: p, .. }) => assert_eq!(p, path),
+            other => panic!("expected Io, got {:?}", other.err()),
+        }
     }
 }

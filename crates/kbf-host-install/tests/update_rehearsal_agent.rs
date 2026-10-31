@@ -18,8 +18,9 @@
 //!   passes, so a form the hosts never report fails here;
 //! - release N's `kbf-updater agent` (its own binary, from release N's tarball) as the packaged
 //!   unit `packaging/host-agent/linux/kbf-updater-agent.service` runs it, as `kbf-updater`, with
-//!   its certificate placed (`--client-cert`, `--client-key`, `--ca`), the simplest of the
-//!   supported ways: enrolling needs a token and the frontend's enroll listener for a result that
+//!   its certificate placed (`--client-cert`, `--client-key`, `--ca`; `--cordon-dir` is the unit's
+//!   state directory, as the packaged unit's comment says for placed certificates), the
+//!   simplest of the supported ways: enrolling needs a token and the frontend's enroll listener for a result that
 //!   is the same files;
 //! - release N's helper and `kbf` on the host, as in the first rehearsal;
 //! - a real frontend of release N (`kbf --mode=frontend`, a SQLite state store, the farm CA, the
@@ -100,6 +101,26 @@ fn agent_unit(host_agent: &Path, exec: &str) -> String {
     let mut out: Vec<String> = lines.iter().map(|l| (*l).to_owned()).collect();
     out[at[0]] = format!("ExecStart={exec}");
     out.join("\n") + "\n"
+}
+
+/// The agent's `StateDirectory` in the packaged unit: the one place it may write under
+/// `ProtectSystem=strict`, where it keeps the marks of its cordons.
+const AGENT_STATE_DIR: &str = "/var/lib/kbf-updater";
+
+/// The command line of the agent the rehearsal runs, with its certificate placed in
+/// `updater_files` (read-only for the unit) and its cordon marks in the unit's state directory.
+fn agent_exec(updater_files: &Path) -> String {
+    let path = |p: &Path| p.display().to_string();
+    format!(
+        "{AGENT_BINARY} agent --coordinator localhost:{} --frontend localhost:{} \
+         --client-cert {} --client-key {} --ca {} --cordon-dir {AGENT_STATE_DIR} \
+         --channel {CHANNEL} --heartbeat-secs 5 --health-poll-secs 2",
+        farm::HEARTBEAT.rsplit(':').next().unwrap(),
+        farm::FRONTEND_WORKER.rsplit(':').next().unwrap(),
+        path(&updater_files.join("updater.pem")),
+        path(&updater_files.join("updater.key")),
+        path(&updater_files.join("ca.pem")),
+    )
 }
 
 /// The storage members of the frontend, once every one is `active` on `commit`.
@@ -208,16 +229,7 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
             .arg(updater_dir.join("kbf-updater"))
             .arg(AGENT_BINARY),
     );
-    let agent_exec = format!(
-        "{AGENT_BINARY} agent --coordinator localhost:{} --frontend localhost:{} \
-         --client-cert {} --client-key {} --ca {} --channel {CHANNEL} \
-         --heartbeat-secs 5 --health-poll-secs 2",
-        farm::HEARTBEAT.rsplit(':').next().unwrap(),
-        farm::FRONTEND_WORKER.rsplit(':').next().unwrap(),
-        path(&updater_files.join("updater.pem")),
-        path(&updater_files.join("updater.key")),
-        path(&updater_files.join("ca.pem")),
-    );
+    let agent_exec = agent_exec(&updater_files);
     install_file(
         &agent_unit(&host_agent, &agent_exec),
         &format!("{}/{AGENT_UNIT}", rehearsal::UNIT_DIR),
@@ -410,4 +422,55 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
         "the agent ran through the update"
     );
     println!("{}", journal(&[HELPER_UNIT, AGENT_UNIT]));
+}
+
+/// The values a unit gives `key`, one per line, split on white space.
+fn unit_words(unit: &str, key: &str) -> Vec<String> {
+    unit.lines()
+        .filter_map(|l| l.strip_prefix(&format!("{key}=")))
+        .flat_map(|v| v.split_whitespace().map(str::to_owned))
+        .collect()
+}
+
+/// The value of `flag` in the words of a command line.
+fn flag_value<'a>(words: &'a [String], flag: &str) -> Option<&'a str> {
+    let at = words.iter().position(|w| w == flag)?;
+    words.get(at + 1).map(String::as_str)
+}
+
+/// The agent refuses to start with a cordon directory it cannot write, and the packaged unit
+/// runs it under `ProtectSystem=strict`: the directory the rehearsal's command line leaves it
+/// (`--cordon-dir`, else `--state-dir`, else the directory of `--client-key`) must be inside
+/// the unit's `StateDirectory` or `ReadWritePaths`, or the agent never starts in the rehearsal.
+#[test]
+fn the_rehearsals_agent_can_write_the_directory_of_its_cordons() {
+    let host_agent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/host-agent/linux");
+    let files = Path::new(rehearsal::WORK).join("farm/updater");
+    let exec = agent_exec(&files);
+    let unit = agent_unit(&host_agent, &exec);
+    assert_eq!(unit_words(&unit, "ProtectSystem"), ["strict"]);
+    let words: Vec<String> = exec.split_whitespace().map(str::to_owned).collect();
+    let cordons = flag_value(&words, "--cordon-dir")
+        .or_else(|| flag_value(&words, "--state-dir"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(flag_value(&words, "--client-key").expect("--client-key"))
+                .parent()
+                .unwrap()
+                .to_path_buf()
+        });
+    let mut writable: Vec<PathBuf> = unit_words(&unit, "StateDirectory")
+        .iter()
+        .map(|d| Path::new("/var/lib").join(d))
+        .collect();
+    writable.extend(
+        unit_words(&unit, "ReadWritePaths")
+            .iter()
+            .map(|p| PathBuf::from(p.trim_start_matches(['-', '+']))),
+    );
+    assert!(
+        writable.iter().any(|w| cordons.starts_with(w)),
+        "{} is not inside the unit's StateDirectory or ReadWritePaths ({writable:?})",
+        cordons.display()
+    );
 }

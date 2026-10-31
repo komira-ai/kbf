@@ -32,6 +32,12 @@ fn beat() -> Heartbeat {
         last_update: None,
         updating: None,
         services: None,
+        agent_features: Vec::new(),
+        step: None,
+        commit: None,
+        step_secs: Default::default(),
+        promotion_pending: false,
+        deferred: None,
     }
 }
 
@@ -203,7 +209,7 @@ impl Rig {
     fn new(name: &str) -> Self {
         let pki = Pki::new();
         let dir = TestDir::under(std::env::temp_dir(), name);
-        let updater = pki.updater("n1", HostRole::Daemon);
+        let updater = pki.updater("n1", HostRole::DAEMON);
         let files = write_files(&dir, &pki, &updater);
         Self {
             pki,
@@ -259,7 +265,7 @@ fn a_heartbeat_is_a_post_of_the_heartbeat_over_mutual_tls() {
     let who = identity_of(&seen.client.expect("the client presented a certificate")).unwrap();
     assert_eq!(
         (who.node_id.to_string(), who.role),
-        ("n1".to_owned(), HostRole::Daemon)
+        ("n1".to_owned(), HostRole::DAEMON)
     );
 }
 
@@ -283,7 +289,7 @@ fn a_renewed_certificate_is_used_from_the_next_heartbeat() {
     ]);
     let client = rig.client(addr);
     client.heartbeat(&beat()).unwrap();
-    let renewed = rig.pki.updater("n1", HostRole::Daemon);
+    let renewed = rig.pki.updater("n1", HostRole::DAEMON);
     write_files(&rig.dir, &rig.pki, &renewed);
     client.heartbeat(&beat()).unwrap();
     let seen = server.join().unwrap();
@@ -425,7 +431,7 @@ fn a_coordinator_that_is_not_there_or_does_not_answer_is_unreachable() {
 fn a_certificate_from_another_ca_is_not_accepted_by_the_coordinator() {
     let rig = Rig::new("co-badclient");
     let strangers = Pki::new();
-    let mine = strangers.updater("n1", HostRole::Daemon);
+    let mine = strangers.updater("n1", HostRole::DAEMON);
     let files = TlsFiles {
         cert: rig.dir.join("stranger.pem"),
         key: rig.dir.join("stranger.key"),
@@ -531,7 +537,7 @@ fn files_that_do_not_make_a_configuration_are_named() {
         assert!(got.contains(why), "{name}: {got}");
     }
     // A key that is not the certificate's.
-    let other = Pki::new().updater("n1", HostRole::Daemon);
+    let other = Pki::new().updater("n1", HostRole::DAEMON);
     std::fs::write(&rig.files.key, other.key_pem()).unwrap();
     assert!(
         matches!(client_config(&rig.files), Err(CoordinatorError::Files(why)) if why.contains("not a TLS configuration"))
@@ -672,8 +678,8 @@ fn a_certificate_that_now_names_another_node_is_not_used() {
     assert!(bound.heartbeat(&beat()).is_ok(), "the pair it started with");
     server.join().unwrap();
 
-    for (node, role) in [("n2", HostRole::Daemon), ("n1", HostRole::MacDaemon)] {
-        let other = rig.pki.updater(node, role);
+    for (node, role) in [("n2", HostRole::DAEMON), ("n1", HostRole::MAC_DAEMON)] {
+        let other = rig.pki.updater(node, role.clone());
         std::fs::write(&rig.files.cert, other.cert_pem()).unwrap();
         std::fs::write(&rig.files.key, other.key_pem()).unwrap();
         // Nothing listens at this address: the refusal comes before any connection.
@@ -708,6 +714,11 @@ fn a_heartbeat_with_services_reads_a_reply_that_names_one() {
         health: Health::Healthy,
         last_update: None,
         updating: None,
+        step: None,
+        commit: None,
+        step_secs: Default::default(),
+        promotion_pending: false,
+        deferred: None,
     }]);
     let named = r#"{"reply":"update","service":"db","version":"0.1.7+gbbbbbbbbbbbb-3"}"#;
     let (addr, server) = rig.coordinator(vec![

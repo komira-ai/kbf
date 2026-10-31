@@ -518,7 +518,7 @@ fn actions_write_needs_a_job_that_runs_only_for_a_push_to_main() {
         assert_eq!(
             scan(&workflow(&body)),
             vec![format!(
-                "line {}: `actions: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}`",
+                "line {}: `actions: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}` or exactly `{RERUN_ONLY}`",
                 if cond.is_empty() { 7 } else { 8 }
             )],
             "{body}"
@@ -978,4 +978,132 @@ fn unreadable_bytes_are_refused_and_a_bom_is_dropped() {
         .chain(w.encode_utf16().flat_map(u16::to_le_bytes))
         .collect();
     assert!(decode(&utf16).is_err());
+}
+
+/// A job `a` with the given `strategy:` lines under it.
+fn with_strategy(strategy: &str) -> String {
+    workflow(&format!(
+        "    runs-on: ubuntu-latest\n    strategy:\n{strategy}    steps:\n      - run: echo\n"
+    ))
+}
+
+#[test]
+fn a_matrix_of_include_entries_is_read_in_order() {
+    // Catches: a reader that drops an entry, reorders keys or reads a number as no value.
+    let text = with_strategy(
+        "      fail-fast: false\n      matrix:\n        include:\n          - core: legacy\n            part: 1\n            args: -p a --features x/y\n          - { core: js, part: 2 }\n",
+    );
+    let got = job_matrix(&text, "a").expect("matrix");
+    let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+    assert_eq!(
+        got,
+        vec![
+            vec![
+                pair("core", "legacy"),
+                pair("part", "1"),
+                pair("args", "-p a --features x/y")
+            ],
+            vec![pair("core", "js"), pair("part", "2")],
+        ]
+    );
+}
+
+#[test]
+fn a_matrix_of_another_shape_is_an_error_not_an_empty_answer() {
+    // Catches: a rewritten matrix (axes, no list, an empty list, a nested value) that the
+    // reader would take for no entries, so a lint over it passed by reading nothing.
+    let cases = [
+        (
+            "    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n",
+            "the job `a` has no `strategy` mapping",
+        ),
+        (
+            "      fail-fast: false\n",
+            "the `strategy` of job `a` has no `matrix` mapping",
+        ),
+        (
+            "      matrix:\n        core: [legacy, js]\n        include:\n          - core: x\n",
+            "the matrix of job `a` has a key besides `include`",
+        ),
+        (
+            "      matrix:\n        include: x\n",
+            "the matrix of job `a` has no `include` list",
+        ),
+        (
+            "      matrix:\n        include: []\n",
+            "the matrix of job `a` has no entry",
+        ),
+        (
+            "      matrix:\n        include:\n          - [a, b]\n",
+            "a matrix entry of job `a` is not a mapping",
+        ),
+        (
+            "      matrix:\n        include:\n          - core: [a]\n",
+            "a matrix entry of job `a` has a value that is not a scalar",
+        ),
+    ];
+    for (strategy, want) in cases {
+        let text = if want.contains("no `strategy`") {
+            workflow(strategy)
+        } else {
+            with_strategy(strategy)
+        };
+        let e = job_matrix(&text, "a").expect_err(want);
+        assert!(e.contains(want), "want `{want}`, got `{e}`");
+    }
+    assert!(
+        job_matrix(
+            &with_strategy("      matrix:\n        include:\n          - a: 1\n"),
+            "b"
+        )
+        .is_err()
+    );
+}
+
+/// The `if:` line under which a job may rerun the failed jobs of a pipeline run (`pipeline-rerun.yml`).
+const RERUN_IF: &str = "    if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}\n";
+
+#[test]
+fn actions_write_is_also_allowed_for_the_first_attempt_of_a_failed_pipeline_run_and_nothing_wider()
+{
+    // Catches: the rerun workflow's `actions: write` refused; the exception loosened so that it
+    // runs for any attempt (a rerun loop), a run that was not a push to main, another branch or
+    // repository, or a green run; and the exception taken for any other write scope.
+    assert_eq!(format!("    if: {RERUN_ONLY}\n"), RERUN_IF);
+    clean(&workflow(&format!(
+        "    runs-on: ubuntu-latest\n{RERUN_IF}    permissions: {{contents: read, actions: write}}\n"
+    )));
+    for cond in [
+        "if: ${{ github.event.workflow_run.conclusion == 'failure' }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 2 && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion != 'success') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 }}",
+        "if: ${{ github.ref == 'refs/heads/main' }}",
+    ] {
+        let body = format!(
+            "    runs-on: ubuntu-latest\n    {cond}\n    permissions: {{actions: write}}\n"
+        );
+        let found = scan(&workflow(&body));
+        assert!(
+            found
+                .iter()
+                .any(|m| m
+                    .contains("`actions: write` is allowed only in a job whose `if:` is exactly")),
+            "{body}\n-> {found:?}"
+        );
+    }
+    for scope in ["contents", "id-token", "attestations", "issues"] {
+        let body =
+            format!("    runs-on: ubuntu-latest\n{RERUN_IF}    permissions: {{{scope}: write}}\n");
+        let found = scan(&workflow(&body));
+        assert!(
+            found
+                .iter()
+                .any(|m| m.contains(&format!("`{scope}: write` is allowed only"))),
+            "{body}\n-> {found:?}"
+        );
+    }
 }

@@ -876,3 +876,6 @@ mod failure;
 
 #[path = "fetch_keep_alive_tests.rs"]
 mod keep_alive;
+
+#[path = "locate_tests.rs"]
+mod locate;

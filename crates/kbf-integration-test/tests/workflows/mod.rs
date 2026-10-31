@@ -5,7 +5,7 @@
 //! YAML parser (`saphyr-parser`, through [`yaml`]) and evaluates the document. It
 //! refuses a workflow if:
 //! - `on` names the `pull_request_target` trigger, or the `workflow_run` trigger in any shape
-//!   but the one `release.yml` uses ([`workflow_run`]); both run with the base repository's
+//!   but the one `release.yml` and `pipeline-rerun.yml` use ([`workflow_run`]); both run with the base repository's
 //!   secrets and token. Any form (a string, a list or a mapping, block or flow) is read;
 //! - a job's `runs-on` is not exactly one GitHub-hosted runner label from
 //!   [`HOSTED_LABELS`], written out literally: a string, a one-entry list, or a
@@ -14,8 +14,8 @@
 //!   label, such as `ubuntu-gpu`) or a second label could select a non-hosted runner,
 //!   so each is refused because the lint cannot tell where it lands;
 //! - a job's `permissions` grants anything but `read` or `none`, except `actions` ([`ACTIONS_SCOPES`]: the
-//!   pipeline's watch job cancels its own run), which may be `write` only in a job whose `if:` is exactly
-//!   [`SIGNING_PUSH_ONLY`], and the two scopes
+//!   pipeline's watch job cancels its own run, and the rerun of its failed jobs), which may be `write` only in a job whose `if:` is exactly
+//!   [`SIGNING_PUSH_ONLY`] or exactly [`RERUN_ONLY`], and the two scopes
 //!   that sign build provenance ([`SIGNING_SCOPES`]: `id-token` and `attestations`),
 //!   which may be `write` only in a job whose `if:` is exactly [`SIGNING_PUSH_ONLY`] or exactly
 //!   [`SIGNING_STAGE_ONLY`] (the same push to main, and the called artifacts workflow's `sign`
@@ -89,9 +89,9 @@ mod yaml;
 
 mod jobs;
 pub use jobs::{
-    concurrency, job_env, job_environment, job_has_key, job_needs, job_outputs,
-    job_permission_levels, job_uses, job_with, push_filters, top_defaults_shell, top_env,
-    trigger_filters,
+    concurrency, job_env, job_environment, job_has_key, job_matrix, job_name, job_needs,
+    job_outputs, job_permission_levels, job_uses, job_with, push_filters, top_defaults_shell,
+    top_env, trigger_filters,
 };
 
 use yaml::{Node, Value};
@@ -190,6 +190,12 @@ const ISSUE_SCOPES: &[&str] = &["issues"];
 /// Token scopes a job may set to `write` when it runs only for a push to `main`: the Actions API,
 /// which the pipeline's watch job uses to cancel its own run when another job has failed.
 const ACTIONS_SCOPES: &[&str] = &["actions"];
+
+/// The second `if:` spelling under which a job may hold [`ACTIONS_SCOPES`] for writing (and only
+/// those): the completed pipeline run of a push to `main` of this repository that failed or was
+/// cancelled (the watch cancels a run for a failed job), in its first attempt. `pipeline-rerun.yml`
+/// reruns the failed jobs of that run once; the attempt test is what stops it looping.
+const RERUN_ONLY: &str = "${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}";
 
 /// The one `if:` spelling under which a job may hold [`ISSUE_SCOPES`] for writing: a run
 /// whose ref is `main` (a scheduled run, a push to `main`, a manual run of `main`). A pull
@@ -665,7 +671,7 @@ impl Lint<'_> {
     /// A job may narrow its token to `read` or `none` scopes; it may not widen it, but
     /// for [`SIGNING_SCOPES`] set to `write` in a job whose `if:` (`condition`) is
     /// exactly [`SIGNING_PUSH_ONLY`], [`RELEASE_SCOPES`] set to `write` in one whose
-    /// `if:` is exactly [`RELEASE_PUSH_ONLY`], and [`ISSUE_SCOPES`] in one whose `if:`
+    /// `if:` is exactly [`RELEASE_PUSH_ONLY`], [`ISSUE_SCOPES`] in one whose `if:`
     /// is exactly [`ISSUES_MAIN_ONLY`]. Scope names and levels are compared
     /// exactly, so another spelling is refused (the safe side).
     fn job_permissions(&mut self, p: &Node, condition: Option<&str>) {
@@ -690,7 +696,7 @@ impl Lint<'_> {
             } else if RELEASE_SCOPES.contains(&name) {
                 &[RELEASE_PUSH_ONLY]
             } else if ACTIONS_SCOPES.contains(&name) {
-                &[SIGNING_PUSH_ONLY]
+                &[SIGNING_PUSH_ONLY, RERUN_ONLY]
             } else if ISSUE_SCOPES.contains(&name) {
                 &[ISSUES_MAIN_ONLY]
             } else {

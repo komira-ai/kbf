@@ -16,6 +16,7 @@ use kbf_task_pack::ManifestError;
 use super::recording_sink::Fake;
 use super::*;
 use crate::fetch::label;
+use crate::put::FixedJitter;
 
 /// The REAPI digest of `bytes`.
 fn reapi_of(bytes: &[u8]) -> Digest {
@@ -426,6 +427,21 @@ fn each_failure_class_has_its_own_exit_code() {
     assert_eq!(codes, [14, 10, 11, 12, 12, 12, 13]);
 }
 
+/// A Command refused for want of a confine has an exit code of its own, so the farm can tell
+/// "this system cannot confine" from a Command that could not be started.
+#[test]
+fn a_run_refused_for_want_of_a_confine_has_its_own_exit_code() {
+    let failure = Failure::Run(RunError::NoConfine);
+    assert_eq!(failure.exit_code(), EXIT_NO_CONFINE);
+    assert_eq!(EXIT_NO_CONFINE, 15);
+    assert_ne!(EXIT_NO_CONFINE, EXIT_RUN);
+    assert!(
+        failure
+            .to_string()
+            .contains("cannot deny the Command the network")
+    );
+}
+
 #[test]
 fn a_result_digest_that_is_absent_or_malformed_is_refused() {
     let good = reapi_of(b"x");
@@ -814,6 +830,7 @@ fn the_http_sink_puts_the_pack_to_the_url() {
             large: Vec::new(),
         },
         sleeper: Arc::new(ThreadSleeper),
+        jitter: Arc::new(RandomJitter),
     };
     sink.store_pack(0, b"ok").expect("stored");
     let request = server.join().expect("server");
@@ -937,6 +954,7 @@ fn recording_sink(url: String, waits: &Arc<Waits>) -> HttpSink {
             large: Vec::new(),
         },
         sleeper: Arc::new(Arc::clone(waits)),
+        jitter: Arc::new(FixedJitter(0.5)),
     }
 }
 
@@ -982,8 +1000,62 @@ fn the_http_sink_does_not_retry_a_412() {
     assert!(matches!(err, PutError::Exists { .. }), "{err:?}");
 }
 
+/// Catches the two 412s sharing a line or an exit code: both are a put failure with exit 13, and
+/// the line a 412 after an interrupted attempt writes names it (greppable), while a plain 412
+/// writes the old line.
+#[test]
+fn a_412_after_an_interrupted_attempt_has_its_own_line_and_the_same_exit_code() {
+    let plain = Failure::from(PutError::Exists { url: "u".into() });
+    let after = Failure::from(PutError::ExistsAfterInterrupt { url: "u".into() });
+    assert_eq!(plain.exit_code(), EXIT_PUT);
+    assert_eq!(after.exit_code(), EXIT_PUT);
+    assert_eq!(plain.to_string(), "put: the object already exists at u");
+    assert!(
+        after
+            .to_string()
+            .starts_with("put: 412 after an interrupted attempt of this put; "),
+        "{after}"
+    );
+}
+
 #[path = "multipack_tests.rs"]
 mod multipack;
 
 #[path = "http_sink_tests.rs"]
 mod http_sink;
+
+/// A source that says how it read.
+struct Reporting {
+    mem: Mem,
+    reported: std::sync::atomic::AtomicBool,
+}
+
+impl BlobSource for Reporting {
+    fn get(&self, digest: &Digest) -> Result<Vec<u8>, FetchError> {
+        self.mem.get(digest)
+    }
+
+    fn report(&self) -> Option<String> {
+        self.reported
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Some("inputs read: test".to_owned())
+    }
+}
+
+/// Catches a source's report being dropped: once the inputs are fetched the task asks the source
+/// how it read, and the run goes on to succeed.
+#[tokio::test]
+async fn a_sources_report_is_asked_for_once_the_inputs_are_fetched() {
+    let mut mem = Mem::default();
+    let digest = action(&mut mem, COPY, &["out"]);
+    let source = Reporting {
+        mem,
+        reported: std::sync::atomic::AtomicBool::new(false),
+    };
+    let dir = scratch("report");
+    let cli = cli(&dir, digest);
+    execute(&cli, &source, &Fake::new(false))
+        .await
+        .expect("task");
+    assert!(source.reported.load(std::sync::atomic::Ordering::SeqCst));
+}

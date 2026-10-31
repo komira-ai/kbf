@@ -9,24 +9,46 @@ publish.workspace = true
 
 # A measurement tool for tierstore, an S3 client of its front and of the two stores behind it.
 # It depends on no tierstore code (it talks to the binary over HTTP, as any client does) and on
-# `kbf-objstore` only for the SigV4 client; crates/kbf-integration-test/tests/layering.rs does not
-# constrain it.
+# `objstore-s3` only for the SigV4 client.
 
 [dependencies]
 bytes.workspace = true
 clap.workspace = true
+# The fault proxy's `Date` and `Last-Modified` rewrite (`skew=SECS`): HTTP-date text to a time and
+# back. Already in the tree through hyper.
+httpdate.workspace = true
+# The fault proxy (`proxy`): an HTTP/1.1 server for the clients, an HTTP/1.1 client for the store,
+# frames passed on one at a time.
+hyper = { workspace = true, features = ["client", "http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 # The S3 client (`s3`): SigV4, multipart, ranged reads, listings.
-kbf-objstore.workspace = true
+objstore-s3.workspace = true
+# The status file is opened without following a link and its owner is compared with the running
+# user (`preflight::trusted`), and the tests make a FIFO.
+rustix = { workspace = true, features = ["fs", "process"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+# Streams of a body for a multipart part (`BodyStream`), and `join_all` of the cells.
+futures.workspace = true
+# The signed streaming GET (`cells::streamget`): the time to the first byte of a read, which the
+# S3 client of objstore-s3 does not give (it returns a body whole).
+hex.workspace = true
+hmac.workspace = true
+reqwest.workspace = true
+# The digests of the synthetic tree (`cells::tree`) and of the signing key.
+sha2.workspace = true
 
 [dev-dependencies]
 # `FakeS3`, a loopback S3 service, for the tests of the client wrapper.
-kbf-objstore = { workspace = true, features = ["testkit"] }
+objstore-s3 = { workspace = true, features = ["testkit"] }
 # Scratch directories of the tests.
 kbf-testkit.workspace = true
+# Raw sockets for the proxy tests and the loopback S3 stub of the operations tests
+# (`tests/ops_support`): requests as text, upstreams that answer by hand. A paused clock for the
+# throttle and the open-loop pacing tests.
+tokio = { workspace = true, features = ["io-util", "net", "test-util"] }
 
 [lints]
 workspace = true

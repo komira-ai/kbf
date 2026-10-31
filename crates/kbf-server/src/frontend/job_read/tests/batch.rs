@@ -7,7 +7,7 @@ use std::time::Duration;
 use super::{Timeouts, ca, files, ip, listening, path_of, send, world};
 use crate::test_dir::scratch_dir;
 
-fn digests(of: &[&kbf_types::Digest]) -> String {
+pub(super) fn digests(of: &[&kbf_types::Digest]) -> String {
     let quoted: Vec<String> = of.iter().map(|d| format!("\"{d}\"")).collect();
     format!("{{\"digests\":[{}]}}", quoted.join(","))
 }
@@ -21,7 +21,7 @@ fn frame(status: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 /// The header lines of a JSON POST of `body`.
-fn json_headers(body: &str) -> String {
+pub(super) fn json_headers(body: &str) -> String {
     format!(
         "Content-Type: application/json\r\nContent-Length: {}\r\n",
         body.len()

@@ -20,7 +20,12 @@
 //! 5. **Confirm** B if it is healthy. If it is not, **revert**: the helper owns that, and does
 //!    it by itself at the deadline whatever this process is doing; here it is asked at once.
 //! 6. **Undrain** only if the node is healthy: on B after a confirm, or on A after a revert. A
-//!    node that is not healthy stays drained.
+//!    node that is not healthy stays drained. A node that was out of placement before step 2
+//!    (an operator drained or cordoned it) is drained and waited for as any other but is never
+//!    undrained: it is left out, and the log says so. "Before step 2" means before the
+//!    updater's own drain: a node this updater drained on an earlier attempt (the drain
+//!    deadline passed, an undrain failed, the agent restarted) is still the updater's, and a
+//!    retry or a resume gives it back (`cordon`: the drain leaves a mark on disk).
 //!
 //! The result is [`UpdateResult`]: the target and whether it succeeded. It goes into the next
 //! heartbeat.
@@ -34,7 +39,7 @@ use super::flags::Timing;
 use super::local::{Local, LocalError, Trial};
 use super::status::{Shared, version_of_commit};
 use crate::inventory::Host;
-use crate::ports::{Clock, Drain, Health, HealthCheck, PortError};
+use crate::ports::{Clock, Drain, Health, HealthCheck, Placed, PortError};
 use crate::version::Version;
 use crate::wire::{Outcome, UpdateResult};
 
@@ -59,10 +64,7 @@ pub struct Update<'a> {
 }
 
 fn result(target: &Version, outcome: Outcome) -> UpdateResult {
-    UpdateResult {
-        target: target.clone(),
-        outcome,
-    }
+    UpdateResult::new(target.clone(), outcome)
 }
 
 impl Update<'_> {
@@ -110,19 +112,20 @@ impl Update<'_> {
             return result(target, Outcome::Succeeded);
         }
         // 2. Drain.
-        if let Err(e) = self.drain() {
-            return failed(&format!("the node could not be drained: {e}"));
-        }
+        let placed = match self.drain() {
+            Ok(placed) => placed,
+            Err(e) => return failed(&format!("the node could not be drained: {e}")),
+        };
         // 3. Switch.
         let deadline = match self.ports.local.switch(target) {
             Ok(deadline) => deadline,
             Err(e) => {
                 self.log(&format!("update to {target}: the switch failed: {e}"));
-                return self.back_on_a(target);
+                return self.back_on_a(target, placed);
             }
         };
         // 4 to 6.
-        self.trial(target, deadline)
+        self.trial(target, deadline, placed)
     }
 
     /// The helper has `trial` on trial: finish it from the health step.
@@ -133,18 +136,27 @@ impl Update<'_> {
                 "update to {asked}: the helper has {} on trial, which was not staged by it; reverting",
                 trial.commit
             ));
-            return self.back_on_a(asked);
+            return self.back_on_a(asked, Placed::In);
         };
         self.log(&format!(
             "update to {target}: resuming the trial the helper has"
         ));
         self.status.update(|s| s.updating = Some(target.clone()));
         let deadline = trial.deadline_unix.unwrap_or(0);
-        self.trial(&target, deadline)
+        // The drain was made by the process that began this A/B, perhaps this one before it
+        // restarted. The node reads as in placement if the updater cordoned it (its mark is on
+        // disk), and as out if an operator did. If it cannot be read, nothing says it is ours.
+        let placed = self.ports.drain.placed(self.host).unwrap_or_else(|e| {
+            self.log(&format!(
+                "update to {target}: the node could not be read, so it is not given back: {e}"
+            ));
+            Placed::Out
+        });
+        self.trial(&target, deadline, placed)
     }
 
     /// Steps 4 to 6 for `target` on trial until `deadline` (Unix seconds).
-    fn trial(&self, target: &Version, deadline: u64) -> UpdateResult {
+    fn trial(&self, target: &Version, deadline: u64, placed: Placed) -> UpdateResult {
         let left = Duration::from_secs(deadline.saturating_sub((self.ports.unix_now)()));
         let bound = self
             .timing
@@ -152,7 +164,7 @@ impl Update<'_> {
             .min(left.saturating_sub(self.timing.margin));
         match self.wait_healthy(target, bound) {
             Health::Healthy => match self.ports.local.confirm(target) {
-                Ok(()) => return self.keep(target),
+                Ok(()) => return self.keep(target, placed),
                 Err(e) => self.log(&format!("update to {target}: the confirm failed: {e}")),
             },
             Health::Waiting(why) => self.log(&format!(
@@ -162,12 +174,24 @@ impl Update<'_> {
                 self.log(&format!("update to {target}: it will not get there: {why}"));
             }
         }
-        self.back_on_a(target)
+        self.back_on_a(target, placed)
     }
 
-    /// B is confirmed: the node goes back into placement.
-    fn keep(&self, target: &Version) -> UpdateResult {
-        match self.ports.drain.undrain(self.host) {
+    /// Give the node back, unless it was out of placement before the roll: that one is left
+    /// as it was found, and the log says so.
+    fn give_back(&self, placed: Placed) -> Result<(), PortError> {
+        match placed {
+            Placed::In => self.ports.drain.undrain(self.host),
+            Placed::Out => {
+                self.log("node was out of placement before the roll; left out");
+                Ok(())
+            }
+        }
+    }
+
+    /// B is confirmed: the node goes back into placement, if it was in it.
+    fn keep(&self, target: &Version, placed: Placed) -> UpdateResult {
+        match self.give_back(placed) {
             Ok(()) => result(target, Outcome::Succeeded),
             Err(e) => {
                 // On B and healthy, and not given back: the update is not done.
@@ -181,7 +205,7 @@ impl Update<'_> {
 
     /// B did not work: the helper puts A back, and the node is given back only if A is
     /// healthy.
-    fn back_on_a(&self, target: &Version) -> UpdateResult {
+    fn back_on_a(&self, target: &Version, placed: Placed) -> UpdateResult {
         match self.ports.local.revert() {
             Ok(()) => {}
             // Nothing on trial: the helper went back by itself, or the switch never held.
@@ -204,7 +228,7 @@ impl Update<'_> {
             None => false,
         };
         if healthy {
-            if let Err(e) = self.ports.drain.undrain(self.host) {
+            if let Err(e) = self.give_back(placed) {
                 self.log(&format!(
                     "update to {target}: back on A, and the node stays drained: {e}"
                 ));
@@ -217,11 +241,14 @@ impl Update<'_> {
         result(target, Outcome::Failed)
     }
 
-    /// Drain the node and wait until it holds no lease, however long that takes, or until the
-    /// drain deadline, if the operator set one, is out. At that deadline the host is not
-    /// switched: the update fails with the node left drained (its leases run on), and the same
-    /// order is tried again after the retry time, which drains the node again and waits again.
-    fn drain(&self) -> Result<(), PortError> {
+    /// Read whether the node is in placement, then drain it and wait until it holds no lease,
+    /// however long that takes, or until the drain deadline, if the operator set one, is out.
+    /// At that deadline the host is not switched: the update fails with the node left drained
+    /// (its leases run on), and the same order is tried again after the retry time, which
+    /// drains the node again and waits again. What comes back is whether the node was in
+    /// placement before this drain: a node the updater drained on an earlier attempt is.
+    fn drain(&self) -> Result<Placed, PortError> {
+        let placed = self.ports.drain.placed(self.host)?;
         self.ports
             .drain
             .drain(self.host, self.timing.drain_deadline)?;
@@ -231,13 +258,13 @@ impl Update<'_> {
                 Ok(leases) => leases,
                 Err(e) => {
                     // The node is drained by us and is not going to be switched.
-                    let _ = self.ports.drain.undrain(self.host);
+                    let _ = self.give_back(placed);
                     return Err(e);
                 }
             };
             let waited = self.ports.clock.now().saturating_sub(start);
             if leases == 0 {
-                return Ok(());
+                return Ok(placed);
             }
             if let Some(deadline) = self.timing.drain_deadline.filter(|d| waited >= *d) {
                 return Err(PortError::other(format!(

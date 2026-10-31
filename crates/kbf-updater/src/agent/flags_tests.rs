@@ -71,6 +71,18 @@ fn the_required_flags_make_a_config_with_the_defaults() {
     assert_eq!(parse_flags(&inline).unwrap(), config);
 }
 
+/// `--cordon-dir` is read as a path and is absent unless given.
+#[test]
+fn the_cordon_directory_is_read() {
+    assert_eq!(parse_flags(&with(&NODE_API)).unwrap().cordon_dir, None);
+    let mut words = with(&NODE_API);
+    words.extend(args(&["--cordon-dir", "/var/lib/kbf-updater/cordons"]));
+    assert_eq!(
+        parse_flags(&words).unwrap().cordon_dir,
+        Some(PathBuf::from("/var/lib/kbf-updater/cordons"))
+    );
+}
+
 /// Every optional flag is read: the helper's socket and each of the times.
 #[test]
 fn the_optional_flags_are_read() {

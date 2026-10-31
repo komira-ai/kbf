@@ -41,7 +41,9 @@ enroll-rate-per-minute = 60
 [executor]
 # Where the farm runs the actions it places. `kbf-daemon`, the default, is the daemon of each node, over the worker listener: no executor is built and no lease server is contacted, whatever the other `--executor-*` flags say. `js-agent` runs them on hosts leased from the job scheduler's lease server, in the kbf image (`--executor-kbf-image`, built from `--executor-base-image`), whose task tool runs the action inside it; it needs the lease server's flags (`--executor-lease-url`, `--executor-lease-token-file`, and `--executor-lease-ca-file` for https), the pool's (`--executor-class`, `--executor-hosts`, `--executor-host-cpus`, `--executor-host-memory-gib`), `--executor-frontend-id`, the packs (`--pack-store-endpoint`) and `--executor-insecure-argv-secrets`. The executor runs on exactly one frontend: a second frontend that holds hosts on the same lease server stops. A restart of the frontend fails the builds in flight. Switching back to `kbf-daemon` releases the leases when the frontend is stopped, not when it is killed: a killed frontend's leases stay held until their ttl ends (`--executor-lease-ttl-secs`), unless a later `js-agent` start releases them. `--executor-insecure-argv-secrets` is ignored with `kbf-daemon`
 executor = "kbf-daemon"
-# Lets the task write its pack to an `http://` url, until the store serves TLS. The reads stay https. Used only with `--executor js-agent`
+# Lets the task read its inputs through a read grant served over `http://`: an `http://` `--task-read-url` is accepted, and the task tool is given `--allow-plain-http-grant`. The read token then crosses the job network in clear, so this is for a farm on its own network. Off by default, and an `http://` read url is refused without it. Used only with `--executor js-agent`
+executor-allow-plain-http-grant = false
+# Lets the task write its pack to an `http://` url, until the store serves TLS. The reads stay https unless `--executor-allow-plain-http-grant` says otherwise. Used only with `--executor js-agent`
 executor-allow-plain-http-put = false
 # The CPU architecture of the hosts. Every lease asks for a host of `os=linux` and this `arch`, and the hosts report them to the farm. Used only with `--executor js-agent`
 executor-arch = "x86_64"
@@ -75,8 +77,12 @@ executor-insecure-argv-secrets = false
 executor-lease-ttl-secs = 3600
 # The lease server, as `https://host[:port]`, or `http://` to a loopback host. Used only with `--executor js-agent`
 # executor-lease-url = "URL"
+# Has the task tool ask the read listener where each input is kept (`GET /locate`) and read it straight from that store, with the read grants the answer carries, and from the listener any input whose direct read fails; every byte is still checked against its digest. Off by default: the task reads every input through the listener. With no grants in the answer it reads from the listener as without the flag. An `http://` store needs `--executor-allow-plain-http-grant`. Used only with `--executor js-agent`, and refused with `--executor kbf-daemon`
+executor-locate = false
 # The longest action timeout the executor runs, in seconds; an action that asks for more is refused. Used only with `--executor js-agent`
 executor-max-run-secs = 3000
+# The scratch disk a run books for what it writes, in bytes: its outputs, the pack and the private home, tmp and cache. A run books this, the bytes of its inputs and a fixed 1 GiB margin against the host's scratch, and the lease server refuses a run the host's disk cannot hold. Used only with `--executor js-agent`
+executor-output-disk-bytes = 8589934592
 # What a run's wall time adds to the action's timeout, in seconds: the fetch of the inputs and the upload of the pack. An action that fetches or uploads for longer than this ends at the wall time and is answered to the caller as a timeout. Used only with `--executor js-agent`
 executor-run-margin-secs = 300
 # Where the task tool works in the container, if not in its own default: the kbf image must have a writable directory there. Used only with `--executor js-agent`
@@ -128,12 +134,24 @@ invocation-memory = 268435456
 [job-read]
 # A file with the farm secret that read grants are signed with, at least 32 bytes (surrounding whitespace is dropped), readable by its owner alone (mode 0600 or 0400). The frontends of a farm and whatever issues the grants must read the same secret. The secret is never a flag: a command line is world-readable
 # job-grant-secret-file = "PATH"
-# Serves the inputs of an action to the task that runs it, over HTTPS at this address: `GET /<hex>/<size>` and `POST /batch` (many small blobs in one request) with `Authorization: Bearer <read grant>`, and nothing else (any other path is 404 and any other method 405). A read grant is the token a run is given; until it expires it reads the Action it was issued for, its Command and its input tree, and no other blob. The TLS is the server's alone and no client certificate is asked for. The task dials an IP address, so give the address the jobs dial, and a `--job-tls-cert` that names it as an IP subjectAltName. Needs `--job-tls-cert`, `--job-tls-key` and `--job-grant-secret-file`. Left out, no such listener is opened
+# Serves the inputs of an action to the task that runs it, over HTTPS (or, with `--job-plain-http`, plain HTTP) at this address: `GET /<hex>/<size>` and `POST /batch` (many small blobs in one request) with `Authorization: Bearer <read grant>`, and nothing else (any other path is 404 and any other method 405). A read grant is the token a run is given; until it expires it reads the Action it was issued for, its Command and its input tree, and no other blob. The TLS is the server's alone and no client certificate is asked for. The task dials an IP address, so give the address the jobs dial, and a `--job-tls-cert` that names it as an IP subjectAltName. Needs `--job-tls-cert` and `--job-tls-key` or `--job-plain-http`, and `--job-grant-secret-file`. Left out, no such listener is opened
 # job-listen = "ADDR"
 # The most bytes of one blob the listener serves, at least 1: a blob of more is refused 413 `too_large` before anything is read. A blob of more than 67108864 bytes is streamed from the store through SHA-256 and never held whole; one whose bytes are not its digest's ends its response early, and is counted. Needs `--job-listen`
 job-max-blob-bytes = 536870912
+# Serves `--job-listen` in plain HTTP, with no TLS, in place of `--job-tls-cert` and `--job-tls-key` (given with either it is refused): the same routes and the same grants, each request still needs a valid read grant, but the grant and the blobs cross the network unencrypted. For a farm on its own network; the executor's `--task-read-url` must then be `http://` with `--executor-allow-plain-http-grant`, and the other way round. Needs `--job-listen` and `--job-grant-secret-file`
+job-plain-http = false
+# The bytes of blob reads this listener has open at once, at least 1: a read takes its blob's size (a streamed blob a bounded window of it, and the scope walk's reads their own sizes) and a request over the budget waits for room, it never fails; a blob larger than the whole budget is read alone. Needs `--job-listen`
+job-read-budget-bytes = 1073741824
+# How long, in seconds, a response that holds read budget may go with no chunk taken by its client before it is dropped, its budget given back and its response ended, at least 1: a client that does not read does not hold the budget for ever, and one that reads is not cut off however long its response takes. Needs `--job-listen`
+job-read-idle-secs = 60
 # The blob reads this listener has open at once, at least 1: a streamed blob holds its place until its response ends, and a request over the bound waits for one to end. Needs `--job-listen`
 job-reads-in-flight = 32
+# The bucket of the tier store that read grants are made for, the store's `--bucket`. Needs `--job-store-grant-key-file`
+# job-store-bucket = "BUCKET"
+# A file with the grant key of the tier store, `{"access_key_id": "...", "secret_access_key": "..."}` (or the id on the first line and the secret on the second), owned by this user and readable by it alone (mode 0600 or 0400): the key the store's `--grant-key-file` holds. With it, `GET /locate` signs read grants for the packs and large objects its table names, each good for the Action's job and at most ten minutes, and the task reads them from the store directly with `--locate`; the store must know the same key. Without it, `GET /locate` carries no grant and the task reads every blob from this listener. The secret is never a flag. Needs `--job-store-url`, `--job-store-bucket` and `--job-listen`
+# job-store-grant-key-file = "PATH"
+# The base URL of the tier store that a task is told to read from with a grant, `http://host:port` or `https://host:port` with no path (the task dials it from its worker, so give an address the workers reach). Needs `--job-store-grant-key-file`
+# job-store-url = "URL"
 # The certificate chain (PEM) of `--job-listen`, issued by the farm CA that the jobs trust. It must carry an IP subjectAltName for each address a job dials the frontend at: the start is refused if it has none, or if `--job-listen` is on one address and the certificate does not name it, since a client that dials an IP address accepts only a certificate that names it. Read again every `--tls-reload-interval-secs`, as the other listeners' are; the names are checked at start only
 # job-tls-cert = "PATH"
 # The private key (PEM) of `--job-tls-cert`
@@ -292,6 +310,18 @@ member-ttl-secs = 15
 task-closure-max-bytes = 34359738368
 # The most distinct digests (directories and files) the input tree of a run may have: a run whose tree has more is refused, never run on a part of its inputs. Used only with `--task-secret-file`
 task-closure-max-digests = 500000
+# Log and count the keys the janitor would delete, and delete none. Used only with `--task-janitor-key-file`
+task-janitor-dry-run = false
+# How old a key must be, in seconds, before the janitor may delete it, by the minute its name says it was minted in. At least 21600 (the 18000 seconds at which an ingest refuses a key, and an hour more as a margin for hosts with different clocks and for an old leader still ingesting) and at most 604800. Used only with `--task-janitor-key-file`
+task-janitor-grace-secs = 21600
+# How often, in seconds, the janitor starts a sweep of `cas/b/`, at least 1 and at most 86400. Used only with `--task-janitor-key-file`
+task-janitor-interval-secs = 900
+# Turns on the janitor of `cas/b/`: it deletes the task packs and large objects nothing recorded (a refused run, an unused key, a large object already copied into the CAS) once they are older than `--task-janitor-grace-secs`, are not under verification and are not in the pack index. The file is the tier store's GC key, `{"access_key_id": "...", "secret_access_key": "...", "prefix": "cas/b/"}` (the prefix must be exactly `cas/b/`), owned by this user and readable by it alone (mode 0600 or 0400); it is used against `--pack-store-endpoint`'s store, which this needs. The janitor never lists or deletes under `cas/l/`, `cas/f/` or `cas/d/`. Runs on the leader only. Needs `--task-secret-file` and `--pack-store-endpoint`. Left out, nothing is deleted
+# task-janitor-key-file = "PATH"
+# How long, in milliseconds, the janitor waits after each page before it lists the next, at most 60000: with `--task-janitor-page-size`, the most keys a second it lists and deletes. Used only with `--task-janitor-key-file`
+task-janitor-page-pause-ms = 1000
+# The keys of `cas/b/` the janitor lists at a time, 1 to 1000, and so the keys it checks against the pack index in one question. Used only with `--task-janitor-key-file`
+task-janitor-page-size = 500
 # A file with the presign-only key that signs a task's writes of large objects, of the same form and with the same owner and mode rules as `--task-put-credentials-file`: a key of the tier store whose prefix allows objects up to `--task-large-max-bytes`, with a ceiling of at least 14400 seconds. Left out, no run gets a large-object key and an output over 64 MiB fails its task
 # task-large-credentials-file = "PATH"
 # The most bytes of one large object, above 67108864 (64 MiB, the most a pack record holds): the cap a task and the ingest of its run hold an object to. Used only with `--task-large-credentials-file`
@@ -314,7 +344,7 @@ task-put-region = "us-east-1"
 task-run-wall-secs = 7200
 # Turns on the preparation of the runs of a host executor: for each run the frontend makes the keys the task may write, a presigned write of each to the tier store, and a read grant for the task's inputs. The file holds one secret of at least 32 bytes (surrounding white space is dropped), owned by this user and readable by it alone (mode 0600 or 0400): the pack-key mint and the read-grant key are made from it, and it is the secret the job-facing listener verifies grants with. The secret is never a flag: a command line is world-readable. Needs `--task-put-endpoint`, `--task-put-bucket`, `--task-put-credentials-file` and `--task-read-url`. Left out, no run is prepared
 # task-secret-file = "PATH"
-# The time past the run wall, in seconds, that a task's presigned write and read grant stay good: the time a task takes to start and to put its pack. The wall and the slack together must not pass 14400, the ceiling of a presigned write, or the frontend does not start. Used only with `--task-secret-file`
+# The time past the run wall, in seconds, that a task's presigned write and read grant stay good: the time a task takes to start and to put its pack, which includes the retries of a put the store refuses with 503: about 165 seconds from the first attempt to the last by default (up to 60 s of the task's own waits, and up to 15 s at the store before each refusal). The wall and the slack together must not pass 14400, the ceiling of a presigned write, or the frontend does not start. Used only with `--task-secret-file`
 task-url-slack-secs = 600
 
 [tls]

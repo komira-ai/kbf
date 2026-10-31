@@ -34,13 +34,16 @@
 //! asks again while its own order is outstanding is told the same again: its own order never
 //! counts against it, and the others' slots have not changed.
 //!
-//! The reply carries the desired version and nothing else.
+//! The reply carries the desired version and nothing else. [`decide_why`] is the same
+//! decision that also says which rule held ([`Hold`]); [`decide_in`] drops the reason.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use kbf_types::NodeId;
+use kbf_updater::version::Version;
 use kbf_updater::wire::{Outcome, Reply};
+use serde::Serialize;
 
 use crate::desired::{Desired, KBF};
 use crate::fleet::{Fleet, Host};
@@ -54,7 +57,8 @@ pub fn decide(desired: &Desired, fleet: &Fleet, id: &NodeId, now: Duration) -> R
 }
 
 /// What to tell the host `id` about `service` at `now`, given every service's `desired`
-/// state. A service with no definition or no desired state is told nothing.
+/// state. A service with no definition or no desired state is told nothing. This is
+/// [`decide_why`] without the reason.
 #[must_use]
 pub fn decide_in(
     services: &Services,
@@ -64,32 +68,97 @@ pub fn decide_in(
     id: &NodeId,
     now: Duration,
 ) -> Reply {
-    let (Some(def), Some(want)) = (services.get(service), desired.get(service)) else {
-        return Reply::Nothing;
-    };
-    if order(def, want, desired, fleet, id, now) {
-        Reply::Update {
-            version: want.version.clone(),
-        }
-    } else {
-        Reply::Nothing
+    match decide_why(services, desired, service, fleet, id, now) {
+        Decision::Update { version } => Reply::Update { version },
+        Decision::Hold(_) => Reply::Nothing,
     }
 }
 
-fn order(
+/// Which rule held an order back: the first that failed, in the order the module lists them
+/// (the lookups before them come first: the definition, the desired state, the host). The
+/// status says it in snake case (`no_slot`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Hold {
+    /// The service has no definition.
+    NoDefinition,
+    /// The service has no desired state.
+    NoDesired,
+    /// The coordinator has not heard from the host for the service, or the service does not
+    /// run on the host's role.
+    NotAMember,
+    /// The coordinator started less than [`crate::fleet::QUIET_START`] ago.
+    Quiet,
+    /// The host is updating this service.
+    Updating,
+    /// The host is updating another service or has an order outstanding for one.
+    BusyElsewhere,
+    /// The host runs the desired version.
+    UpToDate,
+    /// The host failed an update to the desired version.
+    FailedHere,
+    /// Every slot of the host's role is held.
+    NoSlot,
+    /// A role of the service that this one waits for has hosts behind or updating.
+    WaitingForRole,
+    /// A service that this one waits for has hosts behind or updating.
+    WaitingForService,
+    /// Fewer hosts of the role would stay up than the role requires.
+    MinUp,
+}
+
+/// What [`decide_why`] found for one host and service.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// Tell the host to update to `version`.
+    Update {
+        /// The desired version.
+        version: Version,
+    },
+    /// Tell it nothing, for this reason.
+    Hold(Hold),
+}
+
+/// The decision for the host `id` about `service` at `now`, with the rule that held when it
+/// is not an order. The only implementation of the rules; [`decide_in`] drops the reason.
+#[must_use]
+pub fn decide_why(
+    services: &Services,
+    desired: &BTreeMap<String, Desired>,
+    service: &str,
+    fleet: &Fleet,
+    id: &NodeId,
+    now: Duration,
+) -> Decision {
+    let Some(def) = services.get(service) else {
+        return Decision::Hold(Hold::NoDefinition);
+    };
+    let Some(want) = desired.get(service) else {
+        return Decision::Hold(Hold::NoDesired);
+    };
+    match first_hold(def, want, desired, fleet, id, now) {
+        Some(why) => Decision::Hold(why),
+        None => Decision::Update {
+            version: want.version.clone(),
+        },
+    }
+}
+
+/// The first rule that fails for the host `id`, or `None` when every rule holds.
+fn first_hold(
     def: &ServiceDef,
     desired: &Desired,
     all: &BTreeMap<String, Desired>,
     fleet: &Fleet,
     id: &NodeId,
     now: Duration,
-) -> bool {
+) -> Option<Hold> {
     let service = def.name.as_str();
-    let Some(host) = fleet.get_in(service, id) else {
-        return false;
-    };
-    let Some(role) = def.roles.get(&host.role) else {
-        return false;
+    let member = fleet
+        .get_in(service, id)
+        .and_then(|h| def.roles.get(h.role_name()).map(|role| (h, role)));
+    let Some((host, role)) = member else {
+        return Some(Hold::NotAMember);
     };
     let others = || fleet.hosts_of(service).filter(|(other, _)| *other != id);
     let failed_here = host
@@ -98,26 +167,47 @@ fn order(
         .as_ref()
         .is_some_and(|r| r.outcome == Outcome::Failed && r.target == desired.version);
     let slots = others()
-        .filter(|(o, h)| h.role == host.role && fleet.holds_slot(service, o, h, now))
+        .filter(|(o, h)| h.role_name() == host.role_name() && fleet.holds_slot(service, o, h, now))
         .count();
-    !fleet.is_quiet(now)
-        && host.beat.updating.is_none()
-        && !fleet.is_busy_besides(service, id, now)
-        && host.beat.version != desired.version
-        && !failed_here
-        && slots < role.max_updating(host.role, desired)
-        && others().all(|(_, h)| !role.after.contains(&h.role) || !is_pending(h, desired, now))
-        && def.after.iter().all(|earlier| {
-            all.get(earlier).is_none_or(|want| {
-                fleet
-                    .hosts_of(earlier)
-                    .all(|(_, h)| !is_pending(h, want, now))
-            })
-        })
-        && others()
-            .filter(|(o, h)| h.role == host.role && fleet.is_up(service, o, h, now))
-            .count()
-            >= role.required_up(host.role, desired)
+    let rules = [
+        (fleet.is_quiet(now), Hold::Quiet),
+        (host.beat.updating.is_some(), Hold::Updating),
+        (fleet.is_busy_besides(service, id, now), Hold::BusyElsewhere),
+        (host.beat.version == desired.version, Hold::UpToDate),
+        (failed_here, Hold::FailedHere),
+        (
+            slots >= role.max_updating(host.role_name(), desired),
+            Hold::NoSlot,
+        ),
+        (
+            others().any(|(_, h)| {
+                role.after.iter().any(|r| r == h.role_name()) && is_pending(h, desired, now)
+            }),
+            Hold::WaitingForRole,
+        ),
+        (
+            !def.after.iter().all(|earlier| {
+                all.get(earlier).is_none_or(|want| {
+                    fleet
+                        .hosts_of(earlier)
+                        .all(|(_, h)| !is_pending(h, want, now))
+                })
+            }),
+            Hold::WaitingForService,
+        ),
+        (
+            others()
+                .filter(|(o, h)| {
+                    h.role_name() == host.role_name() && fleet.is_up(service, o, h, now)
+                })
+                .count()
+                < role.required_up(host.role_name(), desired),
+            Hold::MinUp,
+        ),
+    ];
+    rules
+        .into_iter()
+        .find_map(|(holds, why)| holds.then_some(why))
 }
 
 /// Whether `h` is live and not yet at `desired`, or still updating: what a later role or

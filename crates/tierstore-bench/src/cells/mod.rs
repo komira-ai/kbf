@@ -1,31 +1,52 @@
-//! The cells: each module measures one quantity and returns one [`CellResult`] per
-//! arm.
+//! The cells: each module measures one quantity and returns one [`CellResult`] per arm.
 //!
-//! A cell owner fills `run` in its module, keeping its signature:
+//! Every cell is `pub async fn run(ctx: &CellContext, plan: &CellPlan) -> Result<Vec<CellResult>,
+//! BenchError>`, a thin call of `run_with` (the same with the machine, the fault proxy and a
+//! limit on requests given, for tests) that builds [`engine::Arm`]s and hands them to
+//! [`engine::run_cell`]. The pieces:
+//! - [`engine`]: passes, arms, the load gate, the ledger, the samples and the result files;
+//! - [`putcell`] (`cold-put`, `a1`), [`cold_read`] (with [`streamget`]), [`g`] (with [`tree`] and
+//!   [`fileserver`]), [`b`], [`c`]: the arms of each cell;
+//! - [`modes`]: the faults an arm is run under; [`budget`]: the rate cap and the byte ledger;
+//!   [`stats`] and [`content`]: percentiles and seeded bytes.
 //!
-//! ```text
-//! pub async fn run(ctx: &CellContext, plan: &CellPlan) -> Result<Vec<CellResult>, BenchError>
-//! ```
-//!
-//! Rules every cell keeps :
-//! - Every request goes through [`crate::s3::BenchS3`], so it is timed and logged.
+//! Rules every cell keeps:
+//! - Every request goes through [`crate::s3::BenchS3`] or [`streamget::StreamGet`], so it is
+//!   timed, logged and held to the rate cap.
 //! - Pass 0 of each arm is a warm-up: it is run, reported with `discarded: true`, and left out of
 //!   every figure. Arms are interleaved across passes and the order is recorded in `notes`.
-//! - Before each pass and every few seconds in it the cell reads a [`crate::gate::LoadSample`]
-//!   and checks it against `ctx.config.gate`; a trip aborts the pass (`gate_tripped`) and its
-//!   samples are `Window::Busy` whatever the run's window.
-//! - Bytes written to the cold store are counted against `ctx.config.bytes`; a cell refuses to
-//!   start when what is left is less than its own cost, and a request-rate cap
+//! - The cell reads a [`crate::gate::LoadSample`] before each pass and every few completions in
+//!   it, and checks it against `ctx.config.gate`; a trip ends the pass (`gate_tripped`), marks its
+//!   samples `Window::Busy` whatever the run's window, and ends the run. The cell `c` reads it
+//!   before a burst only.
+//! - Bytes written to the cold store are counted against `ctx.config.bytes`; a cell is refused
+//!   before it sends anything when its cost is more than what is left, and a request-rate cap
 //!   (`ctx.config.rates`) holds whatever a cell asks for.
 //! - p99 is filled in only from the pooled samples of quiet passes, 1,000 requests at least.
-//! - Samples are appended to `<result_dir>/samples.csv` ([`crate::result::Sample`]) and the
-//!   results to `<result_dir>/<cell>-<arm>.json`.
+//! - Samples (one row per counted request) are appended to `<result_dir>/samples.csv`
+//!   ([`crate::result::Sample`]) and the results go to `<result_dir>/<cell>-<arm>-a<N>.json`, `N`
+//!   being the run's attempt (`run --attempt`, 1 unless set). A run never writes over a result
+//!   file: it stops, before it sends anything, if one is there.
+//! - The cold store's state (healing or not, its drives, when it was read) is read again before
+//!   every pass and stamped into the results; and the cold store guard ([`coldguard`]) stops the
+//!   run, as the load gate does, when the p99 latency or the error share of the harness's own
+//!   cold requests over a sliding window is over its limit.
+//! - What a cell wrote to a store, it deletes after the pass or at the end, also when the run
+//!   stops early.
+//!
+//! The fault proxy is a process of its own: a cell takes it as a [`engine::FaultSwitch`]
+//! ([`run_with_faults`]), which [`crate::faultfile::FileSwitch`] implements over the proxy's
+//! control and counters files (`run --fault-control`). Without one only the healthy arms are
+//! run.
 
 use std::sync::Arc;
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
+use crate::cells::budget::Campaign;
+use crate::cells::engine::{FaultSwitch, ProcLoad};
+use crate::coldstate::ColdStateSource;
 use crate::config::RunConfig;
 use crate::error::BenchError;
 use crate::requestlog::RequestLog;
@@ -33,13 +54,27 @@ use crate::result::{CellResult, Provenance};
 
 pub mod a1;
 pub mod b;
+pub mod budget;
 pub mod c;
 pub mod cold_put;
 pub mod cold_read;
+pub mod coldguard;
+pub mod content;
+pub mod engine;
+#[cfg(test)]
+mod engine_gaps_tests;
+pub mod fileserver;
 pub mod g;
+pub mod modes;
+pub mod putcell;
+pub mod stats;
+pub mod streamget;
+#[cfg(test)]
+pub(crate) mod testkit;
+pub mod tree;
 
-/// The cells. `ColdPut`, `ColdRead` and `G` are the first stage (the instance with the cold
-/// tier on the measured path); `A1`, `B` and `C` need a hot tier and are the second.
+/// The cells. `ColdPut`, `ColdRead` and `G` are the first stage (the cold tier on the measured
+/// path); `A1`, `B` and `C` need a hot tier and are the second.
 ///
 /// Whether the instance can run with a cold tier only: at the pinned tag (v0.0.37) it cannot.
 /// `--hot` is a required flag (`memory`, `dir:<path>` or `s3:<bucket>`), and there is no
@@ -100,6 +135,10 @@ pub struct CellContext {
     pub log: Arc<RequestLog>,
     /// Where this run's numbers come from; copied into every result.
     pub provenance: Provenance,
+    /// The campaign the run belongs to: its ledger of bytes written to the cold store.
+    pub campaign: Campaign,
+    /// Where the cold store's state is read from, before every pass.
+    pub cold_state: Arc<dyn ColdStateSource>,
 }
 
 /// What the `run` verb asks of a cell; a cell reads the parts it has.
@@ -111,6 +150,9 @@ pub struct CellPlan {
     pub in_flight: Vec<u32>,
     /// Object sizes in bytes, one arm per value (cell G reads a tree and ignores them).
     pub object_bytes: Vec<u64>,
+    /// Whether the put cells add their open-loop arms (`run --open-loop`). The other cells have
+    /// none and ignore it.
+    pub open_loop: bool,
 }
 
 /// Runs one cell.
@@ -122,19 +164,46 @@ pub async fn run(
     ctx: &CellContext,
     plan: &CellPlan,
 ) -> Result<Vec<CellResult>, BenchError> {
+    run_with_faults(id, ctx, plan, None).await
+}
+
+/// Runs one cell with a fault proxy to drive. `cold-put`, `cold-read`, `a1` and `c` run their
+/// fault arms through it (the cold store they reach must be behind the proxy); `b` and `g` have
+/// no fault arms and ignore it. Without one only the healthy arms run.
+///
+/// # Errors
+/// What the cell's own `run_with` returns, and what the switch returns.
+pub async fn run_with_faults(
+    id: CellId,
+    ctx: &CellContext,
+    plan: &CellPlan,
+    faults: Option<Arc<dyn FaultSwitch>>,
+) -> Result<Vec<CellResult>, BenchError> {
+    let load = || Arc::new(ProcLoad);
     match id {
-        CellId::ColdPut => cold_put::run(ctx, plan).await,
-        CellId::ColdRead => cold_read::run(ctx, plan).await,
-        CellId::A1 => a1::run(ctx, plan).await,
-        CellId::B => b::run(ctx, plan).await,
-        CellId::C => c::run(ctx, plan).await,
-        CellId::G => g::run(ctx, plan).await,
+        CellId::ColdPut => cold_put::run_with(ctx, plan, load(), faults, None).await,
+        CellId::ColdRead => cold_read::run_with(ctx, plan, load(), faults, None).await,
+        CellId::A1 => a1::run_with(ctx, plan, load(), faults, None).await,
+        CellId::B => b::run_with(ctx, plan, load(), None).await,
+        CellId::C => {
+            c::run_with(
+                ctx,
+                plan,
+                load(),
+                faults,
+                c::polling(ctx.config.rates.list_poll_rps),
+                None,
+            )
+            .await
+        }
+        CellId::G => g::run_with(ctx, plan, load(), None).await,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cells::testkit;
 
     /// Catches a cell whose result-file name, flag name and JSON name differ, or two cells with
     /// one name.
@@ -149,5 +218,63 @@ mod tests {
             assert_eq!(flag.get_name(), name);
         }
         assert_eq!(seen.len(), 6);
+    }
+
+    /// Catches a cell id that runs another cell's module: each of the six, with a run that
+    /// lacks what it needs, says its own name or its own missing thing, and `g` (which would
+    /// build a tree of 344 MB if it got further) stops at the result directory.
+    #[tokio::test]
+    async fn each_cell_id_reaches_its_own_module() {
+        use crate::config::ConfigError;
+        use crate::result::Window;
+        use crate::role::Role;
+
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "tb-cells-dispatch");
+        let plan = CellPlan {
+            passes: 2,
+            in_flight: vec![1],
+            object_bytes: vec![],
+            open_loop: true,
+        };
+        let bare = testkit::ctx(dir.path(), &[], Window::Busy);
+        for (id, name) in [
+            (CellId::ColdPut, "cold-put"),
+            (CellId::ColdRead, "cold-read"),
+            (CellId::A1, "a1"),
+        ] {
+            let err = run(id, &bare, &plan).await.unwrap_err();
+            assert!(matches!(err, BenchError::Setup(_)), "{name}: {err}");
+            assert!(err.to_string().starts_with(name), "{name}: {err}");
+        }
+        let err = run(CellId::B, &bare, &plan).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BenchError::Config(ConfigError::Missing {
+                    role: Role::Instance,
+                    ..
+                })
+            ),
+            "{err}"
+        );
+        let instance = [(Role::Instance, "http://127.0.0.1:9")];
+        let only_instance = testkit::ctx(dir.path(), &instance, Window::Busy);
+        let err = run(CellId::C, &only_instance, &plan).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BenchError::Config(ConfigError::Missing {
+                    role: Role::Cold,
+                    ..
+                })
+            ),
+            "{err}"
+        );
+        let mut blocked = testkit::ctx(dir.path(), &[], Window::Busy);
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        blocked.config.result_dir = file.join("out");
+        let err = run(CellId::G, &blocked, &plan).await.unwrap_err();
+        assert!(matches!(err, BenchError::Io { .. }), "{err}");
     }
 }

@@ -60,6 +60,7 @@ async fn probe_run(name: &str, network: Network, args: &[&str]) -> (Ran, String)
             stderr: &dir.join("stderr"),
             deadline: Duration::from_secs(60),
             network,
+            unreadable: &[],
         },
     )
     .await

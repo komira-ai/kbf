@@ -337,6 +337,7 @@ fn config() -> RunPrepConfig {
         max_packs: 1,
         large: None,
         read_url: READ_URL.to_owned(),
+        allow_plain_read_url: false,
         run_wall: WALL,
         slack: SLACK,
         limits: ClosureLimits::DEFAULT,
