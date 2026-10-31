@@ -129,7 +129,7 @@ fn a_services_file_that_cannot_work_is_refused() {
         );
     }
     let kbf_later = format!("{}{}", svc("a", "", role), svc("kbf", "", role));
-    assert!(refusal(&kbf_later).contains("twice"));
+    assert!(refusal(&kbf_later).contains("first entry"));
     let twice = format!("{}{}", svc("a", "", role), svc("a", "", role));
     assert!(refusal(&twice).contains("twice"));
     assert!(refusal(&svc("a", "", "")).contains("no roles"));

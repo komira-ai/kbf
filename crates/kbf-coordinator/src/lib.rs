@@ -52,6 +52,8 @@ mod http_tests;
 #[cfg(test)]
 mod kbf_definition_tests;
 #[cfg(test)]
+mod kbf_review_tests;
+#[cfg(test)]
 mod priority_tests;
 #[cfg(test)]
 mod service_tests;

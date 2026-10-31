@@ -91,20 +91,6 @@ fn a_services_file_may_replace_kbf_as_its_first_entry() {
     );
 }
 
-/// Behaviour: kbf may be defined only as the first entry of the file, once. Catches a
-/// second definition of kbf after another service (it would replace the one the others'
-/// `after` were checked against) and a repeated kbf entry.
-#[test]
-fn a_kbf_entry_after_the_first_is_refused() {
-    let daemon = "[service.roles.daemon]\n";
-    let after_other =
-        format!("[[service]]\nname = \"a\"\n{daemon}[[service]]\nname = \"kbf\"\n{daemon}");
-    assert!(refusal(&after_other).contains("twice"));
-    let repeated =
-        format!("[[service]]\nname = \"kbf\"\n{daemon}[[service]]\nname = \"kbf\"\n{daemon}");
-    assert!(refusal(&repeated).contains("twice"));
-}
-
 /// Behaviour: a replaced kbf needs a role and may not wait for a service, as the shipped
 /// one has none. Catches a roleless kbf (it would order nothing, silently) and one that
 /// waits for itself or for a service defined later.
