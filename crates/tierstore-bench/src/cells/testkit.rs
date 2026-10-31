@@ -114,6 +114,52 @@ impl ColdStateSource for ColdScript {
     }
 }
 
+/// A store address that gives no answer. Tests that need "a store that is not there" use this and
+/// not a port bound and then closed: a closed port is handed to the next listener any other test
+/// binds on this machine, and that test's fake store then answers the requests meant for the
+/// dead one (and counts them).
+pub struct DeadStore {
+    url: String,
+}
+
+impl DeadStore {
+    /// An address of a store that is not there.
+    pub async fn start() -> Self {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        Self { url }
+    }
+
+    /// The endpoint, as a store spec names it.
+    pub fn endpoint(&self) -> &str {
+        &self.url
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeadStore;
+
+    /// Catches a dead store whose port is free to be taken by another test's listener, which then
+    /// answers for it: the next listener is asked for the very address.
+    #[tokio::test]
+    async fn the_address_of_a_dead_store_cannot_be_taken_by_another_listener() {
+        let dead = DeadStore::start().await;
+        let addr = dead.endpoint().trim_start_matches("http://").to_owned();
+        let intruder = tokio::net::TcpListener::bind(&addr).await;
+        assert!(intruder.is_err(), "another listener took {addr}");
+    }
+
+    /// Catches a dead store that answers: a request to it gets no HTTP answer.
+    #[tokio::test]
+    async fn a_dead_store_gives_no_answer() {
+        let dead = DeadStore::start().await;
+        let got = reqwest::Client::new().get(dead.endpoint()).send().await;
+        assert!(got.is_err());
+    }
+}
+
 /// A store spec for a loopback service.
 pub fn spec(endpoint: &str) -> StoreSpec {
     StoreSpec {
