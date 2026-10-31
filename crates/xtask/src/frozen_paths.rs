@@ -57,7 +57,8 @@ pub fn touched<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<String> {
             frozen(path).map(|entry| {
                 format!(
                     "{path}: under `{entry}`, which is frozen until the tierstore import has \
-                     landed in its new repository"
+                     landed in its new repository; open the change in komira-ai/tierstore after \
+                     the import instead"
                 )
             })
         })

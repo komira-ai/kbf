@@ -2,14 +2,16 @@
 # until the import has landed there, no pull request may change the paths that move
 # (crates/tierstore/, crates/objstore-s3/, packaging/tierstore/ and the two tierstore-site workflows;
 # the list is FROZEN in crates/xtask/src/frozen_paths.rs). This workflow and that xtask verb are
-# deleted in the change that switches this repository over to the new one.
+# deleted in the change that switches this repository over to the new one. ORDER: a maintainer unmarks
+# "tierstore-move-freeze" as a required check BEFORE that switch change, which deletes this workflow (on
+# its own pull request the check would never run and stay pending).
 #
 # The job is a required check, so it always runs and always reports: there is no `paths:` filter on the
 # triggers (a filtered required check that does not run stays pending forever), and a pull request that
 # touches no frozen path passes. The required check's name is the job's: `tierstore-move-freeze`.
 #
 # A pull request is checked out as the merge commit, so HEAD^1 is the base branch it merges into (as in
-# ci.yml); the same holds for a merge-queue commit. GitHub-hosted runner, commit-pinned actions, no token
+# ci.yml); a merge-queue group is checked over its own base_sha..head_sha. GitHub-hosted runner, commit-pinned actions, no token
 # rights beyond reading the checkout.
 name: tierstore-move-freeze
 
@@ -38,7 +40,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # The merge commit and its first parent, the base branch.
-          fetch-depth: 2
+          # The whole history: a merge-queue group can hold several commits since its base.
+          fetch-depth: 0
       - run: rustup toolchain install
-      - run: cargo xtask frozen-paths --base HEAD^1 --head HEAD
+      - env:
+          # A merge-queue group: its own range, whatever the merge method. A pull request: the merge
+          # commit and its first parent, the base branch.
+          FREEZE_BASE: ${{ github.event.merge_group.base_sha || 'HEAD^1' }}
+          FREEZE_HEAD: ${{ github.event.merge_group.head_sha || 'HEAD' }}
+        run: cargo xtask frozen-paths --base "$FREEZE_BASE" --head "$FREEZE_HEAD"
