@@ -616,7 +616,7 @@ mod tests {
         assert!(instance.keys().is_empty());
         assert!(cold.keys().is_empty());
         let samples = std::fs::read_to_string(dir.path().join("samples.csv")).unwrap();
-        assert!(samples.lines().skip(1).all(|l| l.ends_with(',')));
+        assert!(samples.lines().skip(1).all(|l| l.ends_with(",,1")));
     }
 
     /// Catches a cold store that cannot be listed ending the run in error: the objects are

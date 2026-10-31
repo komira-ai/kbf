@@ -141,12 +141,17 @@ mod tests {
         max_error_share: 0.05,
     };
 
-    /// The clock of these tests: `s` seconds after a fixed start.
+    /// The clock of these tests, moved by hand: `at` is `s` seconds after a fixed start, `tick`
+    /// is `n` tenths of a second.
     struct Clock(Instant);
 
     impl Clock {
         fn at(&self, s: u64) -> Instant {
             self.0 + Duration::from_secs(s)
+        }
+
+        fn tick(&self, n: u64) -> Instant {
+            self.0 + Duration::from_millis(100 * n)
         }
     }
 
@@ -154,10 +159,10 @@ mod tests {
         Clock(Instant::now())
     }
 
-    /// `n` healthy requests, one a second from `from`.
+    /// `n` healthy requests, one every tenth of a second from tick `from`.
     fn healthy(guard: &mut ColdGuard, clock: &Clock, from: u64, n: u64) {
         for i in 0..n {
-            guard.record(clock.at(from + i), 50_000, false);
+            guard.record(clock.tick(from + i), 50_000, false);
         }
     }
 
@@ -168,22 +173,22 @@ mod tests {
         let mut guard = ColdGuard::new(LIMITS);
         healthy(&mut guard, &clock, 0, 98);
         // Nearest rank: the p99 of 100 is the 99th smallest, here exactly the limit.
-        guard.record(clock.at(98), 2_000_000, false);
-        guard.record(clock.at(99), 2_000_000, false);
-        assert_eq!(guard.check(clock.at(100)), Ok(()));
+        guard.record(clock.tick(98), 2_000_000, false);
+        guard.record(clock.tick(99), 2_000_000, false);
+        assert_eq!(guard.check(clock.tick(100)), Ok(()));
         // One microsecond more is over it.
         let mut over = ColdGuard::new(LIMITS);
         healthy(&mut over, &clock, 0, 98);
-        over.record(clock.at(98), 2_000_001, false);
-        over.record(clock.at(99), 2_000_001, false);
-        assert_eq!(over.check(clock.at(100)).unwrap_err().metric, "p99_ms");
+        over.record(clock.tick(98), 2_000_001, false);
+        over.record(clock.tick(99), 2_000_001, false);
+        assert_eq!(over.check(clock.tick(100)).unwrap_err().metric, "p99_ms");
         // 5 of 100 failed is the limit itself.
         let mut at_share = ColdGuard::new(LIMITS);
         healthy(&mut at_share, &clock, 0, 95);
         for i in 0..5 {
-            at_share.record(clock.at(95 + i), 1_000, true);
+            at_share.record(clock.tick(95 + i), 1_000, true);
         }
-        assert_eq!(at_share.check(clock.at(100)), Ok(()));
+        assert_eq!(at_share.check(clock.tick(100)), Ok(()));
     }
 
     /// Catches an error share that is not looked at, or looked at with the wrong sign: one more
@@ -194,9 +199,9 @@ mod tests {
         let mut guard = ColdGuard::new(LIMITS);
         healthy(&mut guard, &clock, 0, 94);
         for i in 0..6 {
-            guard.record(clock.at(94 + i), 1_000, true);
+            guard.record(clock.tick(94 + i), 1_000, true);
         }
-        let trip = guard.check(clock.at(100)).unwrap_err();
+        let trip = guard.check(clock.tick(100)).unwrap_err();
         assert_eq!(trip.metric, "error_share");
         assert!((trip.value - 0.06).abs() < 1e-9, "{trip}");
         assert!((trip.limit - 0.05).abs() < 1e-9);
@@ -211,9 +216,9 @@ mod tests {
         let clock = clock();
         let mut guard = ColdGuard::new(LIMITS);
         healthy(&mut guard, &clock, 0, 98);
-        guard.record(clock.at(98), 2_500_000, false);
-        guard.record(clock.at(99), 2_500_000, false);
-        let trip = guard.check(clock.at(100)).unwrap_err();
+        guard.record(clock.tick(98), 2_500_000, false);
+        guard.record(clock.tick(99), 2_500_000, false);
+        let trip = guard.check(clock.tick(100)).unwrap_err();
         assert_eq!(trip.metric, "p99_ms");
         assert!((trip.value - 2_500.0).abs() < 1e-9, "{trip}");
         assert!((trip.limit - 2_000.0).abs() < 1e-9);
@@ -230,7 +235,9 @@ mod tests {
         }
         assert!(guard.check(clock.at(30)).is_err());
         // 61 s after the last of them, all are out of the window.
-        healthy(&mut guard, &clock, 91, 25);
+        for i in 0..25 {
+            guard.record(clock.at(91 + i), 50_000, false);
+        }
         assert_eq!(guard.check(clock.at(116)), Ok(()));
         assert_eq!(guard.window.len(), 25);
         // The edge: a request exactly one window old is still in it.
