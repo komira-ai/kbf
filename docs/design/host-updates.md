@@ -406,7 +406,7 @@ The forward was chosen because the swap is one atomic, reversible, observable st
 
 Written by the js-agent owner as `js-agent update-hook <step>` under the rules of 3.2 (contract, commit point), 3.6 (cordons, drains) and 3.8 (outcomes). Facts are from the jobscheduler repository: **[F]** is merged code on its main (a path or PR is given), **[F-open]** an open pull request (jobscheduler#509 the farm unit, #493 the image pull and the store lock, #516 the `crun` runtime wiring, #507 the keeper), **[new]** work this design adds, **[D]** a design choice, **[V]** to verify before building on it.
 
-**The shape [D].** The hook cordons the host, waits for it to hold no lease, and only then stops the agent, links the staged release and starts it, and waits to see it join the lease server again. **The commit point is the success of `cutover`** (3.2). Today's text put it at the SIGTERM; the two differ only in that a `cutover` which fails between the stop and the start has already done the irreversible part (misfit 1 at the end of this section). Everything before `cutover` can be aborted: a drain bound that passes with a lease still running exits `75` and the agent is never signalled.
+**The shape [D].** The hook cordons the host, waits for it to hold no lease, and only then stops the agent, links the staged release and starts it, and waits to see it join the lease server again. **The commit point is the success of `cutover`** (3.2). Today's text put it at the SIGTERM; the two differ only in that a `cutover` which fails between the stop and the start has already done the irreversible part. The updater then runs `rollback` (3.2), and the hook decides from its record (below) that the agent was stopped and reports `"reversible": false`. Everything before `cutover` can be aborted: a drain bound that passes with a lease still running exits `75` and the agent is never signalled.
 
 The agent is never killed first. Nothing inside the agent ties `crun run` to the agent's life until the keeper exists: only a graceful exit kills it, and there is no parent-death signal (`PR_SET_PDEATHSIG`), so after a crash (SIGKILL, abort) `crun run` and its container keep running. What ends them is the unit: lease cgroups sit under the unit's delegated cgroup (`<unit>/actions/<lease>`), and when the main process dies systemd stops the unit and `KillMode=mixed` kills everything left in it before any restart **[F-open]** (the unit and the test that asserts it are jobscheduler#509; the in-code comments that still say otherwise are corrected by jobscheduler#536). This holds **only for an agent run under that unit**. The start sweep then clears the stale lease state **[F]** (jobscheduler#508). No lease is handed over: a job finishes before the stop or the update does not pass `prepare`; the lease server reruns a job from its rerun budget only when the agent or the host dies on its own.
 
@@ -422,17 +422,21 @@ The agent is never killed first. Nothing inside the agent ties `crun run` to the
 
 **Cordon: a prerequisite, not a choice.** The hook cordons and uncordons through the own-host route of the lease server (`POST /v1/hosts/{id}:cordon`, `:uncordon`, `GET /v1/hosts/{id}`, for the host in the credential the hook presents) **[new]**; without it a busy host never reaches zero leases (migration step 9 `needs` it, 8; Question 17). Per 3.6 the cordon is a renewable lease, and the hook records it (see `cordon_placed`) where every step can find it. The agent's SIGTERM `draining` heartbeat is not a substitute: it is sent only at the stop.
 
+**The hook record [D].** Every step decides from it (3.2), not from the order it was called in. It lives under `/var/lib/js-agent-update` (see the declaration) and holds: the target and previous release; `cordon_placed` and the cordon's current expiry; `stop_begun` (written and fsynced **before** `cutover` signals the unit, so a `cutover` killed or crashed at any later point leaves it set); `link_moved` and `start_issued` (each written after the act); and `verify_ok` (written by the first successful `verify`). `stop_begun` is what tells `rollback` that the agent was stopped and that its runs are gone: with it set, a failed or killed `cutover`, and every `rollback` after it, reports `"reversible": false`. With it unset (a `cutover` that failed before the signal) `rollback` has nothing to repair beyond the cordon and reports `true`.
+
 **The steps.**
 
 | step | what it does | exit codes |
 |---|---|---|
-| `prepare <artifact>` | Refuse (exit `1`, nothing changed) if the staged release is not an agent of this service, if its unit's flags or cgroup layout (`supervisor`, `actions`) differ from the running one's **[new]**, or if `<staged> --version` does not report the runtimes the declaration requires (`runtimes: docker crun`, jobscheduler#516). Refuse with `76` if the host is tainted or an `owed-*` record exists (no version can repair it, and the old agent would refuse its next start). Write the hook record (intent), cordon through the own-host route, and wait up to `drain_wait` for `GET /v1/hosts/{id}` to show no lease. | `0`; `75` if the bound passes with a lease still running: the hook lifts the cordon it placed, nothing is stopped, `retry_after_secs` is the service's backoff; `76`; `1` |
-| `cutover` | Stop the unit (SIGTERM; the agent's own drain, at most `drain_wait + stop_grace`, inside `TimeoutStopSec`; only then does `KillMode=mixed` kill what is left), link the staged release, start the unit and wait for it to be active. **The irreversible stop is here:** the JSON line says `"reversible": false`, and so does every later `rollback`. Each of the three is a no-op when already done, so a rerun after a crash goes forward from whatever the unit and the link show. | `0`; `1` |
+| `prepare <artifact>` | Refuse (exit `1`, nothing changed) if the staged release is not an agent of this service, if its unit's flags or cgroup layout (`supervisor`, `actions`) differ from the running one's **[new]**, or if `<staged> --version` does not report the runtimes the declaration requires (`runtimes: docker crun`, jobscheduler#516). Refuse with `76` if the host is tainted or an `owed-*` record exists (no version can repair it, and the old agent would refuse its next start). Write the hook record (intent), cordon through the own-host route, and wait up to `drain_wait` for `GET /v1/hosts/{id}` to show no lease. | `0`; `75` if the bound passes with a lease still running: the hook lifts the cordon it placed, nothing is stopped, `retry_after_secs` is the service's backoff (the updater then runs `rollback`, which finds nothing left to lift); `76`; `1` (the updater runs `rollback`, which lifts a cordon placed) |
+| `cutover` | Record `stop_begun`, stop the unit (SIGTERM; the agent's own drain, at most `drain_wait + stop_grace`, inside `TimeoutStopSec`; only then does `KillMode=mixed` kill what is left), link the staged release, start the unit and wait for it to be active. **The irreversible stop is here:** the JSON line says `"reversible": false`, on failure as well as on success, and so does every later `rollback`. It does not repair before it exits `1`: the updater runs `rollback`, also after a timeout or a kill. Each of the three acts is a no-op when already done, so a rerun after a crash goes forward from whatever the unit and the link show. | `0`; `1` |
 | `verify` | All of: a hello after the start carrying the staged `agent_version` and `runtime=crun`; the sweep ran clean (no foreign or malformed sidecar, no lease kept; `SweepReport` is not reported outside the log today **[new]**); no taint and no `owed-*` record; the host `ready` in `GET /v1/hosts/{id}` for `bake_polls` consecutive polls. May be run again and again. Classed below. | `0`; `1` with `class`; `76` on a taint or an `owed-*` record |
-| `rollback` | Link the previous release back and start it. **A repair, not a restore:** runs stopped at the cutover are not brought back, which is why `"reversible": false`. Leaves the cordon (`cleanup` lifts it). | `0`; `1` (the updater then halts, 3.2) |
-| `cleanup` | Uncordon, **only if this update placed the cordon** (`cordon_placed` in the hook record); delete the hook record. A cordon that was there before is left. | `0` |
+| `rollback` | Run after a failed, timed-out, killed or deferred `prepare` or `cutover` and after a `verify` that failed or passed its deadline. If `link_moved`, link the previous release back; if the unit is not active, start it and wait for it to be active. **A repair, not a restore:** runs stopped at the cutover are not brought back, which is why `"reversible": false` once `stop_begun` is set. Then uncordon, only if `cordon_placed`, and delete the hook record (no `cleanup` follows a rollback). | `0`; `1` (the updater then halts, 3.2) |
+| `cleanup` | Run only after `verify` succeeded; refuses (exit `1`, changes nothing) if the record lacks `verify_ok`. Uncordon, **only if this update placed the cordon** (`cordon_placed`); delete the hook record. A cordon that was there before is left. | `0` |
 
-**Where the old commit point went.** The old text committed at the SIGTERM and had `prepare` abortable until then; the new contract has the same abort window (it ends when `cutover` is entered, not when the signal is sent) and `rollback` after `cutover` is the old `restore_previous`. The old `plan`, `stage`, `abort` and `recover` verbs are gone: `plan` and `stage` are `prepare` and the updater's fetch (3.1 step 2), `abort` is `cleanup` after a pre-commit failure, and `recover` is the step record (3.5).
+**Where the old commit point went.** The old text committed at the SIGTERM and had `prepare` abortable until then; the new contract has the same abort window (it ends when `cutover` is entered, not when the signal is sent) and `rollback` after `cutover` is the old `restore_previous`. The old `plan`, `stage`, `abort` and `recover` verbs are gone: `plan` and `stage` are `prepare` and the updater's fetch (3.1 step 2), `abort` is `rollback` after a pre-commit failure, and `recover` is the step record (3.5).
+
+**A halt runs nothing further** (3.2), so a `76` leaves the cordon in place; the cordon is a renewable lease (3.6) and expires in `cordon_lease_secs`, which 3.2 states is harmless for a halt (a tainted agent refuses to start, so no work is lost to it).
 
 **Classifying `verify` (3.8).** Only `release` counts toward rollback of the fleet.
 - `environment`: the lease server is unreachable (no hello or host listing can be read). Reported and alerted; it never rolls a healthy release back.
@@ -443,13 +447,15 @@ The agent is never killed first. Nothing inside the agent ties `crun run` to the
 
 **Crash cases.** Step resume and the dead-man are the updater's (3.5); the hook is idempotent by the table above. What is js-agent's: an *agent crash mid-drain or a host reboot* is restarted by systemd (`Restart=always`); the new process sweeps the previous run's leases (lost and rerun) and starts clean. A crash inside a job's cleanup window leaves an `owed-*` record, so the start is tainted: the next `verify` (or `prepare`) exits `76`, and nothing clears it **[F]**. *The hook killed during the wait in `prepare`* has changed only the cordon, which the rerun finds in the hook record.
 
-**The declaration** (`/etc/updater.d/js-agent.toml`, 2.4). The hook manages a root-owned unit and no unit-scoped polkit rule is assumed **[V]** (3.4), so `user = "root"`, accepted only with the approval of 3.3, with every other restriction kept. Paths below are those of the package **[V]**.
+**The declaration** (`/etc/updater.d/js-agent.toml`, 2.4). The hook manages a root-owned unit and no unit-scoped polkit rule is assumed **[V]** (3.4), so `user = "root"`, with every other restriction kept. The first install of this declaration is `Deferred` as `rights_change` until approved, once per host (`updater approve`) or by a fleet approval file (3.3); the first hook-bearing release is itself installed through the interim workflow (3.3, 7). Paths below are those of the package **[V]**.
 
 ```toml
 name   = "js-agent"
 binary = "js-agent"                     # the hook is `js-agent update-hook <step>`
 uid    = "<the unit's User=>"           # [V]
-# no health_ports: the agent has no listener (misfit 4 below)
+registration_ttl_secs = 300             # the agent is stopped for the length of a cutover; the registration outlives a restart
+# no health_ports: the agent has no listener; it registers without `health` (2.1) and its health is the hook's `verify`
+verify_deadline_secs = 5000
 
 [hook]
 user  = "root"
@@ -461,6 +467,10 @@ units        = ["js-agent-crun.service"]
 address_families = ["AF_UNIX", "AF_INET", "AF_INET6"]   # dbus; the lease server
 environment  = { }
 
+[hook.params]                           # opaque to the updater; passed to the hook as `--params <file>` (2.4)
+cordon_lease_secs = 300                 # renewed at every poll and at every step
+cordon_max_secs   = 13500
+
 # the unit's flags the staged unit must match (prepare refuses a difference), [D]:
 #   --scratch-root /var/lib/js-agent/scratch/runs   (scratch mount /var/lib/js-agent/scratch)
 
@@ -470,35 +480,25 @@ cutover  = 4320
 verify   = 615
 rollback = 4320
 cleanup  = 120
-
-verify_deadline_secs = 5000
-cordon_lease_secs    = 300              # renewed at every poll and at every step
-cordon_max_secs      = 13500
 ```
+
+`verify_deadline_secs` is a top-level key of the declaration (placed before the tables above, since a key after a table header belongs to that table). The cordon lease and cap are the hook's own values in `[hook.params]`; the updater does not read them.
 
 Derivations (each margin is 300 s, Question 16; `drain_wait` 3600 s, stop grace 120 s and `TimeoutStopSec` 3900 s are the unit's values, 3900 = 3600 + 120 + a 180 s margin):
 - `prepare` 3900 = `drain_wait` 3600 + 300. The version check, the cordon calls and the unit comparison take seconds.
 - `cutover` 4320 = stop 3900 (the unit's own limit) + start to active 120 + 300. The link is a rename.
 - `verify` 615 = hello wait 300 + `bake_polls` 3 x 5 s poll + 300.
 - `rollback` 4320 = the same shape as `cutover`: the new agent normally stops in seconds (the cordon is still held, so no lease), but the unit's limit is the honest bound.
-- `cleanup` 120: an HTTP call and a file delete.
+- `cleanup` 120: an HTTP call and a file delete. It runs only after `verify` succeeded; `rollback` also ends with an uncordon, so it is bounded as above.
 - `verify_deadline_secs` 5000 >= `verify` + `rollback` = 4935 (the rule of 2.4). Per 3.2 it runs from the success of `cutover`, so the stop is inside `cutover`'s own bound and not in this one.
-- `cordon_max_secs` 13500 = 3900 + 4320 + 615 + 4320 + 300: every step including a rollback. The lease expires in 300 s without renewals, so a dead updater costs minutes; the cap only bounds a live one that stalls. The hook renews from a thread while it waits inside a step, since `prepare` and `cutover` each run for up to an hour.
+- `cordon_max_secs` (`[hook.params]`) 13500 = 3900 + 4320 + 615 + 4320 + 300: every step including a rollback. The lease expires in 300 s without renewals, so a dead updater costs minutes; the cap only bounds a live one that stalls. The hook renews from a thread while it waits inside a step, since `prepare` and `cutover` each run for up to an hour.
 - The unit's `TimeoutStopSec` (3900) must stay above `drain_wait + stop_grace` (3720): `prepare` refuses a staged unit whose flags differ from these or whose timeout is lower **[new]**.
 
 **Open points.** (a) *The keeper* (jobscheduler#507, in review): until it lands, a stop that reaches `TimeoutStopSec` or a cgroup kill is the only way a container leaves; the hook never kills the agent first. (b) *Lease hand-off:* none, by design; a job that cannot rerun must not be on a host that is updated, since an agent that dies on its own still reruns it. (c) *Cgroup layout across versions:* `supervisor` and `actions` are names two versions must agree on; a release that changes them cannot be swept by the old one, so `prepare` compares and refuses a change **[new]**.
 
-**Where rev 4's generic rules do not fit js-agent** (each needs a decision by the owner of the generic sections; numbers are referred to above):
-1. *A `cutover` that fails after the stop.* 3.2 runs `cleanup` and reports `before_commit` ("nothing visible is left"); for js-agent the agent is stopped. *Recommend:* the updater runs `rollback` when a failed `cutover` says `"reversible": false`. Until then the hook repairs inside `cutover` (old link, start old) before it exits `1`.
-2. *Timeout of `cutover`* (killed mid-stop) is a plain failure with the same result; the same recommendation covers it.
-3. *`verify_deadline_secs` from the success of `cutover`* leaves the one-hour stop unguarded by the dead-man; only `cutover`'s own bound covers it. Acceptable (a crash reruns `cutover`), stated so it is not read as a gap.
-4. *Registration (misfit 4).* A declared service that never registers is `absent`, not counted toward `min_up` and not ordered (2.2), and the agent has no registration client or loopback listener **[F]**. *Recommend:* the agent gets a registration client (name, version) and the `health` field of 2.1 becomes optional, health then being the held connection plus the checks of `verify`; the alternative is a synthetic registration by the updater, which makes it know a service.
-5. *The first hook-bearing release* has no previous hook, so the fall-back of 3.3 (previous version's hook on a new binary that cannot run) does not exist for that one update; it goes through the interim workflow (7).
-6. *A `76` after the commit* skips `cleanup`, so the cordon is only expired, not lifted; with a tainted agent that refuses to start no lease can arrive, and the lease expiry (300 s) ends it.
-7. *The cordon cap and lease* are declaration values here; 2.4 has no field for them. *Recommend* fields under `[hook]`.
-8. *`user = "root"`* means the first install of this declaration is `Deferred` as `rights_change` until approved (3.3).
+**Where rev 4.1 still does not fit js-agent.** One point, stated so it is not read as a gap: *`verify_deadline_secs` runs from the success of `cutover`*, so the up-to-one-hour stop inside `cutover` is guarded by `cutover`'s own bound and not by the dead-man's deadline. Acceptable (a crash reruns `cutover`, and a `cutover` that passes its bound is killed and followed by `rollback`). The earlier misfits are answered by the generic text: a failed or killed `cutover` runs `rollback` (3.2); a `halt` runs nothing and the cordon expires (3.2, 3.6); `health` is optional (2.1) and the registration client is step 4a of 8; the first hook-bearing release goes through the interim workflow (3.3, 7); the hook's values are in `[hook.params]` (2.4); `user = "root"` is approved once (3.3).
 
-**New work [new].** (1) The `update-hook` subcommand of `js-agent` (jobscheduler), with the steps above; **it must pass the conformance suite (9) in jobscheduler's CI**. (2) The own-host cordon, uncordon and GET route with a requester-set, renewable expiry on the lease server (Question 17). (3) The runtime in the hello (`contract.rs`), after jobscheduler#516. (4) The sweep result reported outside the log. (5) The registration client (point 4). (6) `prepare`'s comparison of the staged unit's flags and cgroup layout. (7) The declaration above in the package.
+**New work [new].** (1) The `update-hook` subcommand of `js-agent` (jobscheduler), with the steps above; **it must pass the conformance suite (9) in jobscheduler's CI**. (2) The own-host cordon, uncordon and GET route with a requester-set, renewable expiry on the lease server (Question 17). (3) The runtime in the hello (`contract.rs`), after jobscheduler#516. (4) The sweep result reported outside the log. (5) The registration client: the agent links the tiny crate of migration step 4a (name and version, no `health`) and registers on start. (6) `prepare`'s comparison of the staged unit's flags and cgroup layout. (7) The declaration above in the package.
 
 ### 4.3 kbf-daemon: the kbf hook (today's behaviour)
 
