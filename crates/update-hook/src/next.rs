@@ -12,10 +12,13 @@
 //! The function holds no clock and no counter: the updater says whether the verify deadline has
 //! passed and whether a retry is left ([`Context`]), and does the waiting itself.
 
+use serde::{Deserialize, Serialize};
+
 use crate::{Class, Outcome, Report, Step};
 
 /// Where in the life of a failure it happened, assigned by the updater and never by the hook.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Phase {
     /// Nothing irreversible had been reported.
     BeforeCommit,
@@ -30,7 +33,7 @@ pub enum Phase {
 }
 
 /// What the updater reports for the update when it is over.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {
     Succeeded {
         promotion_pending: bool,

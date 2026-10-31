@@ -10,9 +10,12 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
+
 /// One of the five steps, in the order a successful update runs them (`Rollback` runs instead of
 /// the rest after a failure).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Step {
     Prepare,
     Cutover,
