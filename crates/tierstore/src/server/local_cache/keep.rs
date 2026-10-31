@@ -296,6 +296,9 @@ pub(super) fn tee<'a>(key: &'a str, body: PartBody<'a>, keeping: &'a mut Keeping
             },
         }
     })
+    // `unfold` panics if it is polled after its end; a backend that polls a body again after
+    // the end must get the end again, not a panic in the task of a request.
+    .fuse()
     .boxed()
 }
 
