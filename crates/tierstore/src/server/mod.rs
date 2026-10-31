@@ -809,8 +809,9 @@ impl Server {
 
     /// The text of `/metricz`: the block of every source of counters the process has (the
     /// proxy's, the OCI front's, the local cache's), one after the other, each ending in a
-    /// newline, or one line that names them all when there is none. Every block that exists
-    /// renders, never one of them; a storage node has the proxy's, a cache node the cache's, and
+    /// newline, or one line that names them all when there is none, and then
+    /// `tierstore_build_info` ([`build_info::gauge`]), which every process has. Every block that
+    /// exists renders, never one of them; a storage node has the proxy's, a cache node the cache's, and
     /// either may have the OCI front's.
     fn metrics_probe(&self) -> String {
         let blocks = [
@@ -828,6 +829,7 @@ impl Server {
         if text.is_empty() {
             text = "# this server has no proxy, no OCI read front and no local cache\n".to_owned();
         }
+        text.push_str(&build_info::gauge(build_info::VERSION, build_info::COMMIT));
         text
     }
 

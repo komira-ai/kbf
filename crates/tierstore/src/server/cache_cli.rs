@@ -240,19 +240,19 @@ pub(super) async fn run_cache(
 /// Runs the cache until SIGTERM or SIGINT.
 pub(super) async fn serve_cache_until_signalled(settings: CacheSettings) -> Result<(), Error> {
     let stop = signals()?;
-    let version = env!("CARGO_PKG_VERSION");
+    use super::build_info::{COMMIT, VERSION};
     let mode = if settings.cache.write_through {
         "write-through-cache"
     } else {
         "read-cache"
     };
     let announce = |bound: Addresses| {
-        let mut line = format!("tierstore {version} listen={} mode={mode}", bound.s3);
+        let mut line = format!("tierstore {VERSION} listen={} mode={mode}", bound.s3);
         if let Some(oci) = bound.oci {
             let how = bound.oci_mode.unwrap_or_default().as_str();
             line.push_str(&format!(" oci-listen={oci} ({how})"));
         }
-        println!("{line}");
+        println!("{line} commit={COMMIT}");
     };
     let drained = run_cache(&settings, stop, announce).await?;
     eprint!("{}", super::cli::cut_note(drained));

@@ -58,6 +58,7 @@ pub(super) const PER_RUN: &[&str] = &[
     "config",
     "print-config",
     "check-config",
+    "capabilities",
     "drain-lb-wait",
     "drain-deadline",
 ];
@@ -868,6 +869,7 @@ fn storage(
         config: None,
         print_config: false,
         check_config: false,
+        capabilities: false,
         listen: front.listen,
         proxy_id: front.proxy_id,
         hot: hot_parts.spec,

@@ -44,6 +44,7 @@
 //! flags without the other, and a certificate, key or prefix that cannot work, exit with status
 //! 2; a file that cannot be read
 //! with status 1. The start line gets ` oci-listen=<address> (http)` or ` (https)`.
+//! The start line ends with ` commit=<the commit the binary was built from>`.
 //!
 //! On SIGTERM or SIGINT the process drains (see the [`server`](super) docs): `/readyz` says 503,
 //! it serves for `--drain-lb-wait`, refuses new requests, waits for those in flight and for the
@@ -91,6 +92,7 @@ use crate::{
     ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SystemClock, self_test,
 };
 
+use super::build_info::{CAPABILITIES, COMMIT, VERSION, capabilities_text};
 use super::cache_cli::serve_cache_until_signalled;
 use super::config::{OciFlags, Settings, keys_for_flags};
 use super::config_print::render;
@@ -132,7 +134,15 @@ const S3_MIN_BODY_RATE: Option<NonZeroU64> = NonZeroU64::new(1 << 20);
 /// read-only keys, writes new objects to the hot tier, copies them to the cold tier in the
 /// background, and frees the hot tier when it fills.
 #[derive(Clone, Debug, PartialEq, Parser)]
-#[command(name = "tierstore", version)]
+#[command(
+    name = "tierstore",
+    version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (commit ",
+        env!("TIERSTORE_BUILD_COMMIT"),
+        ")"
+    )
+)]
 pub struct Cli {
     /// The configuration file: a TOML file with the tables `[server]`, `[hot_store]` and
     /// `[cold_store]` that holds what the flags below hold, except `--drain-lb-wait` and
@@ -151,6 +161,11 @@ pub struct Cli {
     /// error.
     #[arg(long)]
     pub check_config: bool,
+    /// Prints the capabilities of this build, one to a line, and exits with status 0 without
+    /// starting anything. It needs no other flag and is refused with any (status 2). A host
+    /// updater asks it of a release before it hands over to it.
+    #[arg(long)]
+    pub capabilities: bool,
     /// The address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on.
     #[arg(long)]
     pub listen: SocketAddr,
@@ -966,14 +981,13 @@ pub(super) fn signals() -> std::io::Result<impl Future<Output = ()> + Send + 'st
 
 async fn serve_until_signalled(cli: Cli) -> Result<(), Error> {
     let stop = signals()?;
-    let version = env!("CARGO_PKG_VERSION");
     let announce = |bound: Addresses| {
-        let mut line = format!("tierstore {version} listen={}", bound.s3);
+        let mut line = format!("tierstore {VERSION} listen={}", bound.s3);
         if let Some(oci) = bound.oci {
             let mode = bound.oci_mode.unwrap_or_default().as_str();
             line.push_str(&format!(" oci-listen={oci} ({mode})"));
         }
-        println!("{line}");
+        println!("{line} commit={COMMIT}");
     };
     run_serving(&cli, stop, announce).await?;
     Ok(())
@@ -986,9 +1000,30 @@ fn blocking(start: impl Future<Output = Result<(), Error>>) -> Result<(), Error>
     runtime.block_on(start)
 }
 
+/// `--capabilities`: the capabilities of this build, one to a line, on stdout and status 0 (see
+/// [`CAPABILITIES`]); or, when `args` (the program name first) hold anything else, the first of
+/// it named on stderr and status 2, with nothing on stdout.
+fn capabilities(args: &[OsString]) -> ExitCode {
+    match args.iter().skip(1).find(|arg| *arg != "--capabilities") {
+        Some(other) => {
+            let other = other.to_string_lossy();
+            eprintln!("tierstore: --capabilities takes no other flag, got {other}");
+            ExitCode::from(2)
+        }
+        None => {
+            print!("{}", capabilities_text(CAPABILITIES));
+            ExitCode::SUCCESS
+        }
+    }
+}
+
 /// The binary: flags in, exit status out.
 #[must_use]
 pub fn main(args: Vec<OsString>) -> ExitCode {
+    // Before the flags are parsed: it needs none of the flags a start requires.
+    if args.iter().skip(1).any(|arg| arg == "--capabilities") {
+        return capabilities(&args);
+    }
     let launch = match resolve(args) {
         Ok(launch) => launch,
         Err(Refused::Usage(usage)) => {

@@ -548,11 +548,20 @@ the flags of the binary against this table, so a flag added without a key fails 
 | `--oci-connection-lifetime` | `oci.connection_lifetime` | the longest a connection of the front lives (`1h` if left out) |
 
 These stay flags, since they describe one run and not the data path: `--config`,
-`--print-config`, `--check-config`, `--drain-lb-wait` and `--drain-deadline`. A start that gives
-`--config` and any other flag is refused with status 2 and a message that names the flags
-(`--drain-lb-wait`, `--drain-deadline` and `--check-config` may go with it). A refusal that the
-checks of the start make (water marks out of order, a key file others can read) names the keys of
-the file where the flag-mode message names the flags.
+`--print-config`, `--check-config`, `--capabilities`, `--drain-lb-wait` and `--drain-deadline`. A
+start that gives `--config` and any other flag is refused with status 2 and a message that names
+the flags (`--drain-lb-wait`, `--drain-deadline` and `--check-config` may go with it). A refusal
+that the checks of the start make (water marks out of order, a key file others can read) names the
+keys of the file where the flag-mode message names the flags.
+
+`tierstore --capabilities` (on main, not in v0.0.41) prints what this build can do, one
+capability to a line, and exits with status 0; a build with none prints nothing. It takes no other
+flag and needs none of those a start requires: with any other argument it prints nothing on stdout,
+says on stderr `tierstore: --capabilities takes no other flag, got <argument>`, and exits with
+status 2. A host updater reads it from a release before it hands over to it. `tierstore --version`
+and the end of the start line (` commit=<commit>`) name the commit the binary was built from, twelve
+hex digits, or `unknown` for a build outside a git checkout, and `/metricz` has
+`tierstore_build_info{version="<version>",commit="<commit>"} 1`.
 
 `tierstore --config <path> --check-config` loads the file as a start does (the same loader and the
 same refusals, the build-node checks and `write_through` included) and reads the key files it

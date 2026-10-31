@@ -118,6 +118,12 @@ cache has one more comment line, "this tierstore has no local cache".
 | `tierstore_oci_digest_mismatches_total` | counter | none | objects whose bytes were not the digest they are named by |
 | `tierstore_oci_front_info` | gauge | `mode`: `https`, `http` | always 1; the label is the mode the front runs in |
 
+Every `/metricz`, with or without the front, ends with one more series, on main and not in v0.0.41:
+
+| name | type | labels | what it says |
+|---|---|---|---|
+| `tierstore_build_info` | gauge | `version`: the crate version; `commit`: the commit the binary was built from, twelve hex digits, or `unknown` outside a git checkout | always 1; says which build answered |
+
 ## Not in a release yet
 
 Everything below describes series that are being added and are not in a released tierstore. The
