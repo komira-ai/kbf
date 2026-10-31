@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use super::{
     ACTIVE_WAIT, APT_GET, DPKG_QUERY, KBF, RUNNING_BUILD_TIMEOUT_SECS, SYSTEMCTL, SYSTEMD_RUN,
-    UNIT_ENV, Wait, apt_install, apt_update, installed_version, restart_unit, running_build,
-    unit_active, unit_install, unit_name, units_running,
+    UNIT_ENV, Wait, apt_install, apt_update, daemon_reload, installed_version, restart_unit,
+    restart_unit_no_block, running_build, unit_active, unit_install, unit_name, units_running,
 };
 use crate::config::ChannelSource;
 use crate::request::{Channel, Unit, Version};
@@ -53,6 +53,8 @@ fn every_command() -> Vec<Cmd> {
         restart_unit(&frontend("a1")),
         unit_active(&frontend("-")),
         unit_active(&frontend("a1")),
+        daemon_reload(),
+        restart_unit_no_block(&frontend("a1")),
     ]
 }
 
@@ -74,6 +76,30 @@ fn the_restart_argv() {
             }
         );
     }
+}
+
+/// Asserts that a restart that does not wait is `systemctl restart --no-block -- <unit>` with a
+/// short time limit (it only queues a job), and that a reload is `systemctl daemon-reload`.
+#[test]
+fn the_no_block_restart_and_reload_argv() {
+    assert_eq!(
+        restart_unit_no_block(&Unit::service("kbf-updater-agent.service").unwrap()),
+        Cmd {
+            program: SYSTEMCTL.into(),
+            args: strings(&["restart", "--no-block", "--", "kbf-updater-agent.service"]),
+            timeout: Some(Duration::from_secs(10)),
+            ..Cmd::default()
+        }
+    );
+    assert_eq!(
+        daemon_reload(),
+        Cmd {
+            program: SYSTEMCTL.into(),
+            args: strings(&["daemon-reload"]),
+            timeout: Some(Duration::from_secs(120)),
+            ..Cmd::default()
+        }
+    );
 }
 
 /// Asserts that the look at whether a unit is active is `systemctl is-active -- <unit>` with

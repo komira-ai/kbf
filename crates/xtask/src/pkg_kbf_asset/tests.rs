@@ -75,8 +75,10 @@ fn in_units(unit: &str) -> String {
 struct Fix {
     kbf: Vec<u8>,
     kbf_mode: u32,
-    /// The mode of every file but the binary and `gh`.
+    /// The mode of every file but the binaries, `gh` and the host agent's programs.
     unit_mode: u32,
+    /// The mode of the host agent's two programs.
+    program_mode: u32,
     gh: Vec<u8>,
     conf: String,
     package: &'static str,
@@ -98,6 +100,7 @@ impl Fix {
             kbf: b"\x7fELF the kbf built for the commit".to_vec(),
             kbf_mode: 0o755,
             unit_mode: 0o644,
+            program_mode: 0o755,
             gh: b"\x7fELF the pinned gh".to_vec(),
             conf: format!("SOURCE_REFS={MAIN}\n"),
             package: "kbf",
@@ -138,10 +141,17 @@ impl Fix {
         let control_tgz = tgz(&[("control", 0o644, control.as_bytes())]);
         let binary = "usr/bin/kbf".to_owned();
         let mut files = vec![(binary, self.kbf_mode, self.kbf.as_slice())];
-        for unit in KBF_UNITS.into_iter().chain([SLICE]) {
+        for unit in KBF_UNITS.into_iter().chain([SLICE]).chain(HOST_AGENT_UNITS) {
             files.push((in_units(unit), self.unit_mode, unit.as_bytes()));
         }
+        for path in [
+            "usr/libexec/kbf/kbf-host-install",
+            "usr/libexec/kbf/kbf-updater",
+        ] {
+            files.push((path.to_owned(), self.program_mode, path.as_bytes()));
+        }
         for (path, text) in [
+            ("usr/lib/sysusers.d/kbf-updater.conf", "u kbf-updater"),
             ("usr/lib/sysusers.d/kbf.conf", "u kbf"),
             ("usr/lib/tmpfiles.d/kbf.conf", "d /x"),
             ("etc/needrestart/conf.d/kbf.conf", "# n"),
@@ -278,9 +288,11 @@ fn the_kbf_must_be_executable_and_the_other_files_plain() {
     let mut want: Vec<String> = KBF_UNITS
         .into_iter()
         .chain([SLICE])
+        .chain(HOST_AGENT_UNITS)
         .map(in_units)
         .chain(
             [
+                "usr/lib/sysusers.d/kbf-updater.conf",
                 "usr/lib/sysusers.d/kbf.conf",
                 "usr/lib/tmpfiles.d/kbf.conf",
                 "etc/needrestart/conf.d/kbf.conf",
@@ -293,6 +305,17 @@ fn the_kbf_must_be_executable_and_the_other_files_plain() {
     let mut got = got;
     got.sort();
     assert_eq!(got, want);
+    let mut fix = Fix::new();
+    fix.program_mode = 0o644;
+    let mut got = found("program-mode", &fix);
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            "usr/libexec/kbf/kbf-host-install has mode 0644, not 0755",
+            "usr/libexec/kbf/kbf-updater has mode 0644, not 0755",
+        ]
+    );
 }
 
 /// Asserts that a package missing `usr/bin/kbf`, the unit of any one mode, the slice, the
@@ -301,10 +324,13 @@ fn the_kbf_must_be_executable_and_the_other_files_plain() {
 #[test]
 fn a_package_without_any_file_it_ships_is_refused() {
     let mut paths = vec!["usr/bin/kbf".to_owned()];
-    for unit in KBF_UNITS.into_iter().chain([SLICE]) {
+    for unit in KBF_UNITS.into_iter().chain([SLICE]).chain(HOST_AGENT_UNITS) {
         paths.push(in_units(unit));
     }
     for path in [
+        "usr/libexec/kbf/kbf-host-install",
+        "usr/libexec/kbf/kbf-updater",
+        "usr/lib/sysusers.d/kbf-updater.conf",
         "usr/lib/sysusers.d/kbf.conf",
         "usr/lib/tmpfiles.d/kbf.conf",
         "etc/needrestart/conf.d/kbf.conf",

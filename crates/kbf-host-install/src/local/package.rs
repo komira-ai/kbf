@@ -63,6 +63,12 @@ use crate::plan::Wait;
 use crate::request::{Channel, Unit, Version};
 use crate::runner::{Identity, Runner};
 
+/// The update agent's unit, which the package ships (`packaging/host-agent/linux`).
+pub(crate) const AGENT_UNIT: &str = "kbf-updater-agent.service";
+/// This program's own unit on a host that runs the package: `--layout deb` and `--layout rpm`
+/// are refused with `--frontend-container`, so the other variant of the unit never applies.
+pub(crate) const HELPER_UNIT: &str = "kbf-host-local.service";
+
 /// A Linux host that runs the `kbf` package, as the backend of an update.
 pub struct PackageHost {
     pub(crate) format: Format,
@@ -610,6 +616,31 @@ impl Backend for PackageHost {
 
     fn revert(&self, _pending: &Pending) -> Result<(), Fault> {
         self.put_back()
+    }
+
+    /// The package carries this program, the agent and their units, so the confirmed release
+    /// has new ones on disk while the old ones run: systemd reads the unit files again, then is
+    /// asked, without waiting, to restart the agent and then this program. Only here: during a
+    /// trial the running program's revert is the safety net, and a revert installs the older
+    /// files and restarts only the units of the release.
+    fn confirmed(&self) {
+        let queue = |what: &str, cmd: crate::runner::Cmd| match self.runner.run(&cmd) {
+            Ok(exec) if exec.success() => {}
+            Ok(exec) => super::production::log(&format!(
+                "{what}: exit status {:?}: {}",
+                exec.code,
+                exec.stderr_text().trim()
+            )),
+            Err(e) => super::production::log(&format!("{what}: {e}")),
+        };
+        queue("systemctl daemon-reload", crate::plan::daemon_reload());
+        for name in [AGENT_UNIT, HELPER_UNIT] {
+            let unit = Unit::service(name).expect("a fixed unit name is one the grammar takes");
+            queue(
+                &format!("systemctl restart --no-block {name}"),
+                crate::plan::restart_unit_no_block(&unit),
+            );
+        }
     }
 }
 

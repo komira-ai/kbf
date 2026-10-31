@@ -382,6 +382,7 @@ impl<B: Backend> Ab<B> {
         });
         saved.staged = None;
         self.save(&saved)?;
+        self.backend.confirmed();
         Ok(confirmed)
     }
 

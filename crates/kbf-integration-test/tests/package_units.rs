@@ -1507,6 +1507,9 @@ fn setup_enables_only_units_the_kbf_deb_ships() {
     let plan = xtask::pkg_linux::kbf_plan(&xtask::pkg_linux::Inputs {
         kbf: &at("units/kbf-daemon.service"),
         units: &at("units"),
+        host_install: &at("units/kbf-daemon.service"),
+        updater: &at("units/kbf-daemon.service"),
+        host_agent: &root.join("../host-agent/linux"),
         trust: &at("testdata/trust"),
         sysusers: &at("sysusers.d/kbf-installer.conf"),
         tmpfiles: &at("tmpfiles.d/kbf-installer.conf"),

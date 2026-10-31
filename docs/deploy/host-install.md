@@ -15,8 +15,11 @@ the same run as every other asset ([../artifacts.md](../artifacts.md)):
 | Linux, arm64 | `kbf-host-install-<commit>-linux-arm64.tar.gz` |
 | macOS, Apple silicon | `kbf-host-install-<commit>-darwin-arm64.tar.gz` (ad hoc signed with the hardened runtime) |
 
-No package ships it: neither the `kbf` nor the `kbf-installer` deb installs it, so a Linux
-host gets it from the tarball too. Each tarball holds one member, `kbf-host-install`. Its
+The `kbf` deb also ships it (and `kbf-updater`) on Linux, at `/usr/libexec/kbf/kbf-host-install`,
+so a host that runs the package has it from the package and updates it with the package
+([On a Linux daemon host that runs the package](#on-a-linux-daemon-host-that-runs-the-package));
+a hand-placed Linux host and a Mac get it from the tarball. Each tarball holds one member,
+`kbf-host-install`. Its
 `<commit>` is the commit of the release the host is on or going to. The updater,
 `kbf-updater`, is the same kind of asset for the operator's Linux box and for a Mac's host agent
 (`kbf-updater-<commit>-linux-<arch>.tar.gz` and `kbf-updater-<commit>-darwin-arm64.tar.gz`, one
@@ -727,9 +730,25 @@ directory (`/var/lib/kbf-host-install`: `package.json` and `packages/`, root's, 
 |---|---|
 | `install` | fetches the release's `kbf-<commit>-linux-<cpu>.deb` (or `.rpm`), its `.sigstore.json` bundle and the release's `SHA256SUMS` as the installer's unprivileged user, copies them once as root, and checks the copy, offline, before it keeps anything: the sha256 `SHA256SUMS` lists for the file; `gh attestation verify` (this repository's `artifacts.yml`, or the channel's own signer, on a hosted runner, for the full commit, on the channel's branch, with the pinned `gh` and trusted root); and the package manager's own reading of the file (`dpkg-deb --field`, `rpm --query --package`): the package `kbf`, for this CPU, at the version asked for. Nothing is installed, restarted or recorded |
 | `switch` | checks the kept file's sha256 again; reads the installed version from the package database; keeps a verified copy of the package that runs (the one kept already, or the release of that version fetched and checked the same way); writes the trial, with its deadline, naming that copy; then installs the new file (`dpkg --force-confold --install`, or `rpm --upgrade --oldpackage --replacepkgs`: one file, no repository, no dependency resolution) and restarts each `--restart-unit` and waits for it. A package that fails to install, or a unit that does not come up, puts the previous package back at once |
-| `confirm` | ends the trial and forgets every kept file but the new package and the one before it |
+| `confirm` | ends the trial and forgets every kept file but the new package and the one before it. Then, once the confirm is kept and recorded, it asks systemd to read the unit files again (`systemctl daemon-reload`) and to restart, without waiting, `kbf-updater-agent.service` and then `kbf-host-local.service` (`systemctl restart --no-block`), so the new `kbf-host-install`, `kbf-updater` and units take effect. A request that fails is written to the journal and does not undo the confirm. A confirm asked again after it was answered asks for nothing more |
 | `revert` | and the deadline: installs the kept copy of the package that ran (fetching and checking it again if the file is gone or changed), ends the trial, restarts the units |
 | `query` | as above; `commit` is the commit of the package this host kept, else the 12 digits of the installed version, else the version text |
+
+The package carries the host's update agent with the runtime: `/usr/libexec/kbf/kbf-host-install`
+and `/usr/libexec/kbf/kbf-updater` (0755), the units `kbf-host-local.service`,
+`kbf-host-local-frontend.service` and `kbf-updater-agent.service` in `/usr/lib/systemd/system`
+(byte for byte the files of [`packaging/host-agent/linux`](../../packaging/host-agent/README.md)),
+and the sysusers entry of the `kbf-updater` account. Like every unit of the package they are not
+enabled or started by it: the operator enables the one this host needs, and gives
+`kbf-host-local.service` its `--layout deb` and `--restart-unit` flags in a drop-in
+(`systemctl edit`), which an upgrade of the package leaves alone. The package has no maintainer
+script, so installing it never restarts the helper or the agent: a `dpkg` run inside a switch cannot
+kill the program that is running the trial, whose revert is the safety net. The restart happens
+once, at the confirm (the table above), never during a trial and never on a revert. The restart
+of this program is of `kbf-host-local.service`: `--frontend-container` is not given with
+`--layout deb` or `rpm`, so the frontend variant of the unit is not a package host's. A host set up
+from the tarballs (the hand-placed layout, a Mac) keeps its helper and agent as it places them;
+this restart is only the package layout's.
 
 A rollback is an installation of an older version and is never refused: `dpkg` downgrades by itself
 and `rpm` is told `--oldpackage`. The deadline is on disk before the package manager is asked for

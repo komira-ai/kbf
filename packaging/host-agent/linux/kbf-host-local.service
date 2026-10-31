@@ -5,11 +5,13 @@
 # the new one by its deadline. The ssh forced command of the same program is not this unit and
 # is unchanged.
 #
-# Not part of a package yet: an operator places it with the binaries (host-install.md, "Getting
-# the binary") and edits the --restart-unit lines to the units this host runs from
-# /var/lib/kbf-installer/releases/current (one --restart-unit each). The unit is named so
-# that it is not one of the transient `kbf-host-install-<version>.service` units the ssh path
-# lists.
+# The kbf package carries this unit (not enabled), with kbf-host-install at the path below.
+# The operator enables the one this host needs and gives it the --restart-unit lines of the
+# units this host runs (one --restart-unit each), and on a host that runs the package adds
+# `--layout deb` (or `rpm`) to the --serve line; a drop-in (`systemctl edit`) does that and
+# survives an upgrade of the package. A hand-placed host (host-install.md, "Getting the
+# binary") places the binary itself. The unit is named so that it is not one of the transient
+# `kbf-host-install-<version>.service` units the ssh path lists.
 [Unit]
 Description=kbf-host-install, the local socket of this host's update agent
 Documentation=https://github.com/komira-ai/kbf/blob/main/docs/deploy/host-install.md

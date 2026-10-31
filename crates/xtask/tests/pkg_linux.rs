@@ -40,7 +40,16 @@ fn copy_inputs(dir: &Path) {
     ] {
         std::fs::copy(packaging.join(file), dir.join(file.replace('/', "-"))).expect("copy");
     }
-    std::fs::copy(STUB, dir.join("kbf")).expect("stub");
+    let agent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/host-agent/linux");
+    let to = dir.join("host-agent");
+    std::fs::create_dir_all(&to).expect("dir");
+    for entry in std::fs::read_dir(agent).expect("read") {
+        let entry = entry.expect("entry");
+        std::fs::copy(entry.path(), to.join(entry.file_name())).expect("copy");
+    }
+    for name in ["kbf", "kbf-host-install", "kbf-updater"] {
+        std::fs::copy(STUB, dir.join(name)).expect("stub");
+    }
 }
 
 fn s(p: &Path) -> &str {
@@ -65,6 +74,12 @@ fn config_args(dir: &Path, out: &Path) -> Vec<String> {
         &at("kbf"),
         "--units",
         &at("testdata/units"),
+        "--host-install",
+        &at("kbf-host-install"),
+        "--updater",
+        &at("kbf-updater"),
+        "--host-agent",
+        &at("host-agent"),
         "--trust",
         &at("testdata/trust"),
         "--sysusers",
@@ -110,7 +125,9 @@ fn the_stub_prints_its_arguments_and_exits_zero() {
 
 /// Asserts that `pkg-config` writes the configuration and the listing of the `kbf` package in
 /// the output directory: the binary, the five mode units, the slice, the sysusers and tmpfiles
-/// files, the needrestart drop-in and the three trust files, the recommendations of the deb
+/// files, the needrestart drop-in and the three trust files, the host agent (the helper and the
+/// agent under `/usr/libexec/kbf`, their three units and the agent account's sysusers file, and
+/// not the example configuration beside them), the recommendations of the deb
 /// and the rpm (no dependency), the replacement of `kbf-installer` in the deb only (no break), and none of the
 /// retired installer's files.
 #[test]
@@ -151,12 +168,20 @@ fn pkg_config_writes_the_kbf_package() {
         " 0755 /usr/share/kbf/trust/gh ",
         " 0644 /usr/share/kbf/trust/installer.conf ",
         " 0644 /usr/share/kbf/trust/trusted_root.jsonl ",
+        " 0755 /usr/libexec/kbf/kbf-host-install ",
+        " 0755 /usr/libexec/kbf/kbf-updater ",
+        " 0755 /usr/libexec/kbf ",
+        " 0644 /usr/lib/systemd/system/kbf-host-local.service ",
+        " 0644 /usr/lib/systemd/system/kbf-host-local-frontend.service ",
+        " 0644 /usr/lib/systemd/system/kbf-updater-agent.service ",
+        " 0644 /usr/lib/sysusers.d/kbf-updater.conf ",
     ] {
         assert!(listing.contains(path), "{path} in {listing}");
     }
     assert!(!listing.contains("kbf-installer"), "{listing}");
     assert!(!listing.contains("kbf-node.service"), "{listing}");
-    assert_eq!(listing.lines().count(), 15, "{listing}");
+    assert!(!listing.contains("host-install-frontend.toml"), "{listing}");
+    assert_eq!(listing.lines().count(), 22, "{listing}");
 }
 
 /// Asserts that `pkg-config` without `--kbf` is a usage error and writes nothing, and that
@@ -440,7 +465,7 @@ const KBF_CONTROL: &[u8] = b"Package: kbf\nVersion: 0.1.0\nArchitecture: amd64\n
                              Replaces: kbf-installer (<< 0.1.1)\n";
 
 /// A deb as nfpm writes the `kbf` package, holding `kbf`, the unit of every mode, the slice, the
-/// sysusers, tmpfiles and needrestart files, and `gh` and the trust files for `source_ref`.
+/// host agent's programs and units, the sysusers, tmpfiles and needrestart files, and `gh` and the trust files for `source_ref`.
 fn kbf_deb_of(kbf: &[u8], source_ref: &str) -> Vec<u8> {
     let control = tgz(&[("control", 0o644, KBF_CONTROL)]);
     let conf = format!("SOURCE_REFS={source_ref}\n");
@@ -451,12 +476,22 @@ fn kbf_deb_of(kbf: &[u8], source_ref: &str) -> Vec<u8> {
         "usr/lib/systemd/system/kbf-frontend.service",
         "usr/lib/systemd/system/kbf-storage-and-daemon.service",
         "usr/lib/systemd/system/kbf-storage.service",
+        "usr/lib/systemd/system/kbf-host-local-frontend.service",
+        "usr/lib/systemd/system/kbf-host-local.service",
+        "usr/lib/systemd/system/kbf-updater-agent.service",
         "usr/lib/systemd/system/kbf.slice",
+        "usr/lib/sysusers.d/kbf-updater.conf",
         "usr/lib/sysusers.d/kbf.conf",
         "usr/lib/tmpfiles.d/kbf.conf",
         "etc/needrestart/conf.d/kbf.conf",
     ] {
         files.push((unit, 0o644, b"[Unit]\n"));
+    }
+    for program in [
+        "usr/libexec/kbf/kbf-host-install",
+        "usr/libexec/kbf/kbf-updater",
+    ] {
+        files.push((program, 0o755, b"a program"));
     }
     files.push(("usr/share/kbf/trust/gh", 0o755, b"the pinned gh"));
     files.push(("usr/share/kbf/trust/installer.conf", 0o644, conf.as_bytes()));

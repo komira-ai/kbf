@@ -134,6 +134,10 @@ pub(crate) struct Net {
     pub(crate) restart_never: BTreeSet<String>,
     /// How many times `systemctl daemon-reload` fails before it works.
     pub(crate) reload_fails: usize,
+    /// Units whose `systemctl restart --no-block` exits with a failure.
+    pub(crate) no_block_fails: BTreeSet<String>,
+    /// Units whose `systemctl restart --no-block` cannot be started at all.
+    pub(crate) no_block_errors: BTreeSet<String>,
     /// What `systemctl show --property=MainPID --value` prints.
     pub(crate) main_pid: String,
     /// The commit `/usr/bin/kbf --version --json` prints, when it prints one.
@@ -246,6 +250,16 @@ impl Runner for Sim {
                 }
             }
             "systemctl" => match cmd.args[0].as_str() {
+                "restart" if cmd.args.iter().any(|a| a == "--no-block") => {
+                    net.events.push(format!("restart-no-block:{last}"));
+                    if net.no_block_errors.contains(&last) {
+                        Err(io::Error::other("cannot start systemctl"))
+                    } else if net.no_block_fails.contains(&last) {
+                        exec(5, "", "refused")
+                    } else {
+                        exec(0, "", "")
+                    }
+                }
                 "restart" => {
                     net.events.push(format!("restart:{last}"));
                     if let Some(dir) = &net.watch_dir {
@@ -460,6 +474,9 @@ impl Backend for Borrowed<'_> {
     fn revert(&self, pending: &Pending) -> Result<(), Fault> {
         self.0.revert(pending)
     }
+    fn confirmed(&self) {
+        self.0.confirmed();
+    }
 }
 
 /// A host that runs package A, with a channel `stable` that offers whatever a test offers.
@@ -516,6 +533,8 @@ impl Rig {
             install_fails: 0,
             restart_never: BTreeSet::new(),
             reload_fails: 0,
+            no_block_fails: BTreeSet::new(),
+            no_block_errors: BTreeSet::new(),
             main_pid: "4242\n".to_owned(),
             kbf_commit: None,
             watch: None,

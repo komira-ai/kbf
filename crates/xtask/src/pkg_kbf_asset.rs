@@ -20,6 +20,10 @@
 //! - it holds the unit of every mode ([`crate::pkg_linux::KBF_UNITS`]) and `kbf.slice` in
 //!   `usr/lib/systemd/system`, the sysusers.d and tmpfiles.d files and the needrestart
 //!   drop-in, all mode 0644;
+//! - it holds the host agent: `usr/libexec/kbf/kbf-host-install` and `usr/libexec/kbf/kbf-updater`
+//!   (mode 0755), the units of [`crate::pkg_linux::HOST_AGENT_UNITS`] in
+//!   `usr/lib/systemd/system` and the agent account's sysusers.d file (mode 0644). Those two
+//!   programs are checked to be present and executable, not against their release tarballs;
 //! - its trust directory `usr/share/kbf/trust` holds the pinned `gh` (mode 0755, and byte for
 //!   byte `--gh`, the program the job downloaded and checked by SHA-256, when given), the
 //!   Sigstore trusted root and an `installer.conf` that is exactly `SOURCE_REFS=` and
@@ -39,8 +43,9 @@ use crate::Error;
 use crate::package::Platform;
 use crate::pkg_asset::{self, Mode};
 use crate::pkg_linux::{
-    DEB_RECOMMENDS, DEB_SUGGESTS, KBF_DEB_REPLACES, KBF_NAME, KBF_PATH, KBF_UNITS,
-    NEEDRESTART_PATH, SLICE, SYSUSERS_PATH, TMPFILES_PATH, TRUST_DIR, TRUST_FILES, UNIT_DIR,
+    AGENT_SYSUSERS_PATH, DEB_RECOMMENDS, DEB_SUGGESTS, HOST_AGENT_UNITS, HOST_INSTALL_PATH,
+    KBF_DEB_REPLACES, KBF_NAME, KBF_PATH, KBF_UNITS, NEEDRESTART_PATH, SLICE, SYSUSERS_PATH,
+    TMPFILES_PATH, TRUST_DIR, TRUST_FILES, UNIT_DIR, UPDATER_PATH,
 };
 
 /// The file name of the asset.
@@ -88,13 +93,20 @@ fn trust_paths() -> Vec<String> {
 
 /// The regular files of the package other than `usr/bin/kbf` and the trust files (which
 /// [`pkg_asset::trust_problems`] holds to their modes and contents), as a data tarball names
-/// them, each with the mode it has: the units, the slice, and the sysusers, tmpfiles and
-/// needrestart files.
+/// them, each with the mode it has: the units, the slice, the host agent's units, the sysusers,
+/// tmpfiles and needrestart files (0644), and the host agent's two programs (0755).
 fn other_files() -> Vec<(String, u32)> {
-    let units = KBF_UNITS.into_iter().chain([SLICE]);
+    let units = KBF_UNITS.into_iter().chain([SLICE]).chain(HOST_AGENT_UNITS);
     let units = units.map(|u| (member_path(&format!("{UNIT_DIR}/{u}")), 0o644));
-    let single = [SYSUSERS_PATH, TMPFILES_PATH, NEEDRESTART_PATH].map(|p| (member_path(p), 0o644));
-    units.chain(single).collect()
+    let single = [
+        SYSUSERS_PATH,
+        TMPFILES_PATH,
+        NEEDRESTART_PATH,
+        AGENT_SYSUSERS_PATH,
+    ]
+    .map(|p| (member_path(p), 0o644));
+    let programs = [HOST_INSTALL_PATH, UPDATER_PATH].map(|p| (member_path(p), 0o755));
+    units.chain(single).chain(programs).collect()
 }
 
 /// What is wrong with `deb` (the bytes of the package) as the `kbf` package for `c`: one
