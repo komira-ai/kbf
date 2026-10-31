@@ -113,9 +113,9 @@ pub struct Config {
     /// How the secrets reach the task.
     pub delivery: Delivery,
     /// Whether the operator has said the secrets may travel as arguments, where the action
-    /// can read them (`/proc/1/cmdline`) and the engine's inspect shows them: the only
-    /// delivery there is until the lease server's job takes a secret field. False by
-    /// default, and [`Config::validate`] refuses a config that leaves it so.
+    /// can read them (`/proc/1/cmdline`) and the engine's inspect shows them. False by
+    /// default, and [`Config::validate`] refuses a config that leaves it so unless the
+    /// delivery is [`Delivery::Files`].
     pub insecure_argv_secrets: bool,
     /// Where the task tool works in the container, if not in the tool's own default: the
     /// kbf image must have a writable directory there.
@@ -337,7 +337,10 @@ impl Config {
                     && !self.pass_budget.is_zero(),
                 ConfigError::Bounds,
             ),
-            (self.insecure_argv_secrets, ConfigError::InsecureArgv),
+            (
+                self.delivery == Delivery::Files || self.insecure_argv_secrets,
+                ConfigError::InsecureArgv,
+            ),
             (
                 self.max_wall > self.drain_before_end && self.drain_before_end > longest,
                 ConfigError::Drain,
@@ -351,11 +354,14 @@ impl Config {
     }
 
     /// What a lease must ask of its host: the system and the architecture, the same as the
-    /// worker's node report says.
+    /// worker's node report says, and under [`Delivery::Files`] `run-files`, so that a host
+    /// that cannot mount files is never leased.
     #[must_use]
     pub fn host_capabilities(&self) -> std::collections::BTreeMap<String, String> {
+        let files = (self.delivery == Delivery::Files).then_some(("run-files", "true"));
         [("os", "linux"), ("arch", self.arch.as_str())]
             .into_iter()
+            .chain(files)
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect()
     }

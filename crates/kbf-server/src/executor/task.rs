@@ -1,10 +1,12 @@
 //! What one run is told: the pack key it may write, and the command line of the task tool.
 //!
-//! A job of the lease server has no secret field yet, so the pack url and the read token
-//! travel in the arguments, where the action can read them (`/proc/1/cmdline`) and the
-//! engine's inspect shows them. That is [`Delivery::InsecureArgv`], and the executor
-//! refuses to run without being told to use it: [`Config::validate`] fails unless
-//! `insecure_argv_secrets` is set. Nothing here prints a secret: [`Secret`] formats as
+//! The pack url and the read token reach the task one of two ways. [`Delivery::Files`] puts
+//! each in a file of the run (the lease server mounts them read-only at `/run/js-files`) and
+//! gives the tool the paths: no argument holds a secret. [`Delivery::InsecureArgv`], the
+//! default, puts them in the arguments, where the action can read them (`/proc/1/cmdline`)
+//! and the engine's inspect shows them, and the executor refuses to run with it unless told to:
+//! [`Config::validate`] fails unless `insecure_argv_secrets` is set. There is no fall back from
+//! the first to the second. Nothing here prints a secret: [`Secret`] formats as
 //! `<redacted>`, and so does a [`TaskArgs`].
 //!
 //! [`Config::validate`]: crate::executor::Config::validate
@@ -108,12 +110,17 @@ impl fmt::Display for PackKey {
     }
 }
 
+/// Where the lease server mounts the files of a run, read-only.
+const FILES_DIR: &str = "/run/js-files";
+const PACK_URL_FILE: &str = "pack-url";
+const GRANT_TOKEN_FILE: &str = "grant-token";
+
 /// How the secrets reach the task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Delivery {
-    /// As arguments, behind the tool's `--insecure-argv-secrets`. Until the lease server's
-    /// job takes a secret field; an `Env` arm follows it.
+    /// As arguments, behind the tool's `--insecure-argv-secrets`: the default, for a lease
+    /// server whose agents do not report `run-files`.
     InsecureArgv,
     /// As files of the run, which the lease server mounts read-only at `/run/js-files`; the
     /// tool is given the paths.
@@ -148,7 +155,6 @@ impl TaskArgs<'_> {
     /// `ENTRYPOINT`, which the lease server prepends the arguments to: no path comes first.
     #[must_use]
     pub fn argv(&self, delivery: Delivery) -> Vec<String> {
-        let _ = delivery;
         let mut argv = vec![
             "--action".to_owned(),
             format!("{}/{}", self.action.hash, self.action.size_bytes),
@@ -158,12 +164,22 @@ impl TaskArgs<'_> {
             self.grant_url.to_owned(),
             "--deadline-ms".to_owned(),
             self.deadline.as_millis().to_string(),
-            "--insecure-argv-secrets".to_owned(),
-            "--pack-url".to_owned(),
-            self.pack_url.expose().to_owned(),
-            "--grant-token".to_owned(),
-            self.grant_token.expose().to_owned(),
         ];
+        match delivery {
+            Delivery::InsecureArgv => argv.extend([
+                "--insecure-argv-secrets".to_owned(),
+                "--pack-url".to_owned(),
+                self.pack_url.expose().to_owned(),
+                "--grant-token".to_owned(),
+                self.grant_token.expose().to_owned(),
+            ]),
+            Delivery::Files => argv.extend([
+                "--pack-url-file".to_owned(),
+                format!("{FILES_DIR}/{PACK_URL_FILE}"),
+                "--grant-token-file".to_owned(),
+                format!("{FILES_DIR}/{GRANT_TOKEN_FILE}"),
+            ]),
+        }
         if let Some(dir) = self.work_dir {
             argv.extend(["--work-dir".to_owned(), dir.to_owned()]);
         }
@@ -178,11 +194,24 @@ impl TaskArgs<'_> {
 }
 
 impl TaskArgs<'_> {
-    /// The files of the run for `delivery`.
+    /// The files of the run for `delivery`: none for [`Delivery::InsecureArgv`], and for
+    /// [`Delivery::Files`] the presigned url and the read token, each alone in a file the
+    /// arguments of [`TaskArgs::argv`] name.
     #[must_use]
     pub fn files(&self, delivery: Delivery) -> Vec<RunFile> {
-        let _ = delivery;
-        Vec::new()
+        match delivery {
+            Delivery::InsecureArgv => Vec::new(),
+            Delivery::Files => vec![
+                RunFile {
+                    name: PACK_URL_FILE.to_owned(),
+                    contents: self.pack_url.expose().to_owned(),
+                },
+                RunFile {
+                    name: GRANT_TOKEN_FILE.to_owned(),
+                    contents: self.grant_token.expose().to_owned(),
+                },
+            ],
+        }
     }
 }
 

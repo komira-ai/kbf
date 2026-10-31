@@ -30,7 +30,7 @@ use kbf_types::ImageRef;
 
 use crate::Farm;
 use crate::executor::{
-    Clock, Config, Deps, Executor, ExecutorKind, Front, FrontParts, Metrics, RunSource,
+    Clock, Config, Delivery, Deps, Executor, ExecutorKind, Front, FrontParts, Metrics, RunSource,
 };
 
 const KIND: &str = "executor";
@@ -48,6 +48,7 @@ const WORK_DIR: &str = "executor_work_dir";
 const PLAIN_PUT: &str = "executor_allow_plain_http_put";
 const PLAIN_GRANT: &str = "executor_allow_plain_http_grant";
 const INSECURE: &str = "executor_insecure_argv_secrets";
+const DELIVERY: &str = "executor_secret_delivery";
 const BASE_IMAGE: &str = "executor_base_image";
 const KBF_IMAGE: &str = "executor_kbf_image";
 const MARGIN: &str = "executor_run_margin_secs";
@@ -120,14 +121,16 @@ pub(super) fn args() -> Vec<Arg> {
                  server's flags (`--executor-lease-url`, `--executor-lease-token-file`, and \
                  `--executor-lease-ca-file` for https), the pool's (`--executor-class`, \
                  `--executor-hosts`, `--executor-host-cpus`, `--executor-host-memory-gib`), \
-                 `--executor-frontend-id`, the packs (`--pack-store-endpoint`) and \
-                 `--executor-insecure-argv-secrets`. The executor runs on exactly one \
+                 `--executor-frontend-id`, the packs (`--pack-store-endpoint`) and the secret \
+                 delivery (`--executor-secret-delivery`, with \
+                 `--executor-insecure-argv-secrets` for its default `argv`). The executor runs on exactly one \
                  frontend: a second frontend that holds hosts on the same lease server stops. \
                  A restart of the frontend fails the builds in flight. Switching back to \
                  `kbf-daemon` releases the leases when the frontend is stopped, not when it is \
                  killed: a killed frontend's leases stay held until their ttl ends \
                  (`--executor-lease-ttl-secs`), unless a later `js-agent` start releases them. \
-                 `--executor-insecure-argv-secrets` is ignored with `kbf-daemon`",
+                 `--executor-insecure-argv-secrets` and `--executor-secret-delivery` are ignored \
+                 with `kbf-daemon`",
             ),
         text(
             FRONTEND,
@@ -239,10 +242,23 @@ pub(super) fn args() -> Vec<Arg> {
             "executor-insecure-argv-secrets",
             "Says the secrets of a task (the presigned write url, the read token) may travel as \
              arguments of the run, where the action can read them from `/proc` and the engine's \
-             inspect shows them. The lease server's job has no secret field yet, so `--executor \
-             js-agent` cannot run without it; it is refused with `--executor kbf-daemon`. Off \
-             by default",
+             inspect shows them. It is what the default `--executor-secret-delivery argv` needs, \
+             and `--executor-secret-delivery files` refuses it. Off by default",
         ),
+        Arg::new(DELIVERY)
+            .long("executor-secret-delivery")
+            .value_name("MODE")
+            .value_parser(["argv", "files"])
+            .default_value("argv")
+            .help(
+                "How the secrets of a task (the presigned write url, the read token) reach it. \
+                 `argv`, the default, passes them as arguments of the run and needs \
+                 `--executor-insecure-argv-secrets`. `files` passes each as a file of the run, \
+                 which the lease server mounts read-only at `/run/js-files`: no argument holds \
+                 a secret, `--executor-insecure-argv-secrets` is refused with it, and only hosts \
+                 that report `run-files` are leased; a pool of none holds no host and no run is \
+                 sent. Used only with `--executor js-agent`",
+            ),
         text(
             BASE_IMAGE,
             "executor-base-image",
@@ -374,6 +390,11 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
                 "--executor-insecure-argv-secrets is ignored: it is for --executor js-agent, and this frontend runs placed actions on daemons"
             );
         }
+        if delivery(m) == Delivery::Files {
+            tracing::warn!(
+                "--executor-secret-delivery files is ignored: it is for --executor js-agent, and this frontend runs placed actions on daemons"
+            );
+        }
         return Ok(ExecutorFlags::default());
     }
     let missing: Vec<&str> = REQUIRED
@@ -384,11 +405,19 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
     if !missing.is_empty() {
         return Err(format!("--executor js-agent needs {}", missing.join(", ")));
     }
-    if !m.get_flag(INSECURE) {
+    let files = m.get_one::<String>(DELIVERY).is_some_and(|d| d == "files");
+    if files && m.get_flag(INSECURE) {
         return Err(
-            "--executor js-agent needs --executor-insecure-argv-secrets: the lease \
-                    server's job has no secret field yet, so the secrets of a task travel as \
-                    arguments, where the action can read them"
+            "--executor-secret-delivery files sends no secret in arguments: drop \
+             --executor-insecure-argv-secrets"
+                .to_owned(),
+        );
+    }
+    if !files && !m.get_flag(INSECURE) {
+        return Err(
+            "--executor js-agent needs --executor-insecure-argv-secrets, which \
+                    lets the secrets of a task travel as arguments where the action can read \
+                    them, or --executor-secret-delivery files"
                 .to_owned(),
         );
     }
@@ -447,6 +476,7 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     config.allow_plain_http_put = m.get_flag(PLAIN_PUT);
     config.allow_plain_http_grant = m.get_flag(PLAIN_GRANT);
     config.insecure_argv_secrets = m.get_flag(INSECURE);
+    config.delivery = delivery(m);
     config.run_margin = secs(MARGIN);
     config.lease_ttl = secs(TTL);
     config.max_run = secs(MAX_RUN);
@@ -464,6 +494,14 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
         base_image,
         kbf_image,
     })
+}
+
+/// The delivery `--executor-secret-delivery` names.
+fn delivery(m: &ArgMatches) -> Delivery {
+    match m.get_one::<String>(DELIVERY).map(String::as_str) {
+        Some("files") => Delivery::Files,
+        _ => Delivery::InsecureArgv,
+    }
 }
 
 /// The image the flag `long` (argument `id`) names: by digest, with or without the `docker://`

@@ -397,6 +397,7 @@ impl HostWorker {
         }
         let mut spec = RunSpec::new(image, limits);
         spec.args = args.argv(ctx.cfg.delivery);
+        spec.files = args.files(ctx.cfg.delivery);
         // The labels are listed back with every run and are not secret-safe: the nonce only.
         spec.labels = BTreeMap::from([(RUN_LABEL.to_owned(), nonce.to_string())]);
         Ok(Prepared {
@@ -433,6 +434,19 @@ impl HostWorker {
                 self.begin_drain(ctx, Drain::Tainted);
                 Queued::Settled(Settled::Infra("the host is tainted".to_owned()))
             }
+            // The host said it could mount files and now cannot (its files root is gone): it
+            // is taken out of service and the farm runs the action again elsewhere.
+            Some(ErrorCode::FilesUnsupported) => {
+                self.begin_drain(ctx, Drain::Tainted);
+                Queued::Settled(Settled::Infra(
+                    "the host cannot deliver the files of a run".to_owned(),
+                ))
+            }
+            // A file the lease server refuses is ours to fix, and no host takes it: the
+            // message repeats nothing of the file.
+            Some(ErrorCode::InvalidFile) => Queued::Settled(Settled::Invalid(
+                "the lease server refused a file of the run".to_owned(),
+            )),
             Some(ErrorCode::QuotaUnavailable) => {
                 self.quota_unavailable(ctx, ctx.clock.now());
                 Queued::Settled(Settled::Lost(Lost::Fenced))
