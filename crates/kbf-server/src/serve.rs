@@ -108,6 +108,8 @@ pub struct Listeners {
     /// Whether the scheduler is given the estimator's prediction of a new operation's cost
     /// (`--placement-predictions`).
     pub placement_predictions: crate::PlacementPredictions,
+    /// Whether the farm learns what its leases use (`--usage-profiles`).
+    pub usage_profiles: crate::UsageProfiles,
     /// The whole-node settings of the scheduler, if on (`--whole-node-max`).
     pub whole_node: Option<kbf_sched::WholeNodeConfig>,
     /// How long a finished operation is kept after its callers are answered, in which
@@ -567,6 +569,7 @@ pub(crate) fn sweeping(members: Option<Arc<Members>>) -> Pin<Box<dyn Future<Outp
 /// and the frontend both use.
 pub(crate) fn log_core(farm: &Farm) {
     tracing::info!("{}", farm.scheduler_core().start_line());
+    tracing::info!("{}", farm.usage_profiles().start_line());
     tracing::info!(
         "memory climb: {}",
         if farm.memory_climb() { "on" } else { "off" }

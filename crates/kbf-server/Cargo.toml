@@ -74,6 +74,8 @@ kbf-tls.workspace = true
 kbf-types.workspace = true
 # The pages mounted under /ui (src/ui_mount.rs).
 kbf-ui.workspace = true
+# The `--usage-profiles` mode (src/usage_profiles.rs).
+kbf-usage.workspace = true
 percent-encoding.workspace = true
 prost.workspace = true
 prost-types.workspace = true
