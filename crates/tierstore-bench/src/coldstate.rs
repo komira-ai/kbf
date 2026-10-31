@@ -9,8 +9,12 @@
 //! healing), with the heal status file's `percent_done` beside it (`source` `mc`). Without one,
 //! and with a `cold_heal_status_file`, it is that file alone (`source` `file`) and `mc` is never
 //! run: the file is the record of a writer on a host that can ask the store, stamped by that
-//! writer, and a file older than the limit (or stamped in the future) is unreadable. The stamp
-//! recorded in the result is the file's. [`OpsColdState`] does that through the [`Host`] seam; a
+//! writer, and a file older than the limit, or stamped more than 5 s after the reader's clock,
+//! is unreadable. The writer's stamp is compared with the reader's clock, so both clocks must be
+//! in sync (NTP): a writer ahead by more than 5 s is refused, and a writer behind uses up the
+//! limit. The file is a trust input and is read only if it is a regular file of the running
+//! user, not a link, not writable by group or others, and at most 64 KiB
+//! ([`crate::preflight::trusted`]). The stamp recorded in the result is the file's. [`OpsColdState`] does that through the [`Host`] seam; a
 //! test gives [`ColdStateSource`] its own readings. A reading that cannot be made stops the run,
 //! as a load gate that cannot see does: a result that says nothing of the cold store's state must
 //! not look like one that says it is quiet. An admin key that fails is that error too; nothing
@@ -186,6 +190,10 @@ struct Stoppable<'a> {
 impl Host for Stoppable<'_> {
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
         self.inner.read_file(path)
+    }
+
+    fn read_status_file(&self, path: &Path) -> io::Result<Vec<u8>> {
+        self.inner.read_status_file(path)
     }
 
     fn exists(&self, path: &Path) -> bool {

@@ -118,16 +118,21 @@ fn verifier_spec(
 
 /// `Ok` if the verifier's bucket list names the role's live bucket, which exists: only then does
 /// a list that does not name the test bucket mean the bucket is gone, and not that the key was
-/// shown nothing. `reader` is the store's spec with the verifier's key pair.
-async fn list_shows_live(ops: &OpsFile, role: Role, reader: &StoreSpec) -> Result<(), String> {
+/// shown nothing.
+///
+/// `names` is the list that decided "not named" (it is not asked for again: a second list could
+/// differ from the first).
+fn list_shows_live(
+    ops: &OpsFile,
+    role: Role,
+    names: &Result<Vec<String>, String>,
+) -> Result<(), String> {
     let live = ops.live_buckets.get(&role).ok_or_else(|| {
         format!(
             "the ops file names no live bucket for {role}, so the bucket list cannot prove removal"
         )
     })?;
-    // A list that cannot be read now (it was read a moment ago) names nothing.
-    let names = probe::bucket_names(reader).await.unwrap_or_default();
-    if names.contains(live) {
+    if names.as_ref().is_ok_and(|names| names.contains(live)) {
         Ok(())
     } else {
         Err(format!(
@@ -158,6 +163,10 @@ fn removed(state: &BucketState) -> Result<String, String> {
             counted(&state.objects, "objects"),
             counted(&state.uploads, "uploads")
         )),
+        Ok(false) if matches!(state.objects, Reading::Count(n) if n > 0) => Err(format!(
+            "the bucket is not listed but answers with objects: {}",
+            counted(&state.objects, "objects")
+        )),
         Ok(false) if state.objects == Reading::NoSuchBucket => Ok(
             "the store's bucket list does not name it (the bucket itself answers NoSuchBucket)"
                 .to_owned(),
@@ -181,13 +190,16 @@ fn uploads_closed(state: &BucketState) -> Result<String, String> {
 /// The three checks of one shared store's test bucket and account.
 async fn store_checks(host: &dyn Host, ops: &OpsFile, role: Role, spec: &StoreSpec) -> Vec<Check> {
     let reader = verifier_spec(host, ops, role, spec);
-    let state = match &reader {
-        Ok(reader) => probe::bucket_state(reader).await.map_err(|e| why(&e)),
-        Err(reason) => Err(reason.clone()),
+    let (state, names) = match &reader {
+        Ok(reader) => match probe::bucket_state_and_names(reader).await {
+            Ok((state, names)) => (Ok(state), names),
+            Err(e) => (Err(why(&e)), Err(why(&e))),
+        },
+        Err(reason) => (Err(reason.clone()), Err(reason.clone())),
     };
     let mut removed = state.clone().and_then(|state| removed(&state));
-    if let (Ok(_), Ok(reader)) = (&removed, &reader)
-        && let Err(reason) = list_shows_live(ops, role, reader).await
+    if removed.is_ok()
+        && let Err(reason) = list_shows_live(ops, role, &names)
     {
         // "Not named" counts only from a list that names the live bucket.
         removed = Err(reason);

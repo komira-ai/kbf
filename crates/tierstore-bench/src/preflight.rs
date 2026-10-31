@@ -196,7 +196,7 @@ pub(crate) fn heal_percent(host: &dyn Host, ops: &OpsFile) -> Result<Option<f64>
     let Some(path) = &ops.cold_heal_status_file else {
         return Ok(None);
     };
-    let text = read_text(host, path).map_err(|e| why(&e))?;
+    let text = host::read_status_text(host, path).map_err(|e| why(&e))?;
     let status: Status =
         serde_json::from_str(&text).map_err(|e| format!("heal status file: {e}"))?;
     Ok(Some(status.percent_done))
@@ -268,7 +268,7 @@ pub(crate) fn read_heal_file(
     now_ms: u64,
     max_age: Duration,
 ) -> Result<HealFile, String> {
-    let text = read_text(host, path).map_err(|e| why(&e))?;
+    let text = host::read_status_text(host, path).map_err(|e| why(&e))?;
     let file: HealFile =
         serde_json::from_str(&text).map_err(|e| format!("heal status file: {e}"))?;
     if file.read_unix_ms > now_ms.saturating_add(FUTURE_SKEW_MS) {

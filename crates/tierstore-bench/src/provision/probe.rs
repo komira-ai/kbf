@@ -230,11 +230,21 @@ fn reading(outcome: Result<usize, ObjectStoreError>) -> Reading {
 /// # Errors
 /// [`BenchError::Store`] if the endpoint or the bucket name is not accepted.
 pub async fn bucket_state(spec: &StoreSpec) -> Result<BucketState, BenchError> {
+    bucket_state_and_names(spec).await.map(|(state, _)| state)
+}
+
+/// [`bucket_state`], and the account listing it decided from, so that a caller that needs to
+/// ask more of that list does not ask for a second one.
+///
+/// # Errors
+/// [`BenchError::Store`] if the endpoint or the bucket name is not accepted.
+pub async fn bucket_state_and_names(
+    spec: &StoreSpec,
+) -> Result<(BucketState, Result<Vec<String>, String>), BenchError> {
     let store = client(spec)?;
     let prefix = KeyPrefix::default();
-    let listed = bucket_names(spec)
-        .await
-        .map(|names| names.contains(&spec.bucket));
+    let names = bucket_names(spec).await;
+    let listed = names.clone().map(|names| names.contains(&spec.bucket));
     let objects = reading(
         store
             .list(&prefix, None, PageSize::MAX)
@@ -247,9 +257,12 @@ pub async fn bucket_state(spec: &StoreSpec) -> Result<BucketState, BenchError> {
             .await
             .map(|open| open.uploads.len()),
     );
-    Ok(BucketState {
-        listed,
-        objects,
-        uploads,
-    })
+    Ok((
+        BucketState {
+            listed,
+            objects,
+            uploads,
+        },
+        names,
+    ))
 }

@@ -261,9 +261,18 @@ passes as `version unknown (file mode)` and the report records no cold store ver
 cold role has a file mode; a hot role still needs its `admin` entry.
 
 The writer's contract: stamp `read_unix_ms` with the clock of the host that asked the store, at the
-time of the ask, so that no clock skew between hosts matters; write the file only after `mc admin
-info` answered and was parsed; on any failure write nothing, so the file ages out and the run
-stops.
+time of the ask; write the file only after `mc admin info` answered and was parsed; on any failure
+write nothing, so the file ages out and the run stops. The tool compares the writer's stamp with
+its own clock, so the two hosts' clocks must be in sync (NTP on both). A writer more than 5 s
+ahead of the reader is refused as stamped in the future; a writer behind the reader spends that
+difference from `--cold-state-max-age-secs`, so a file is refused sooner than its age alone says.
+
+The file is a trust input: it decides whether the cold store is quiet. It is written by the
+dev-box loop over ssh as the operator account, mode 0644, owned by that account (the user that
+runs the tool), and it is read as a secret file is: the tool refuses it (the reading is
+`cold state: unreadable` and `run` stops) if it is a symbolic link, is not a regular file (a FIFO
+or a directory), is owned by another user, is writable by its group or by others, or is over
+64 KiB. The same rule holds for the status file in `mc` mode.
 
 Each reading is stamped into the `cold_state` array of the result of the arm, one entry per pass:
 
