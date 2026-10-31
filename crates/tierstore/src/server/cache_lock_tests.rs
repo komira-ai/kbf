@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use kbf_objstore::{ByteRange, ObjectKey, ObjectStore};
+use objstore_s3::{ByteRange, ObjectKey, ObjectStore};
 
 use super::Drained;
 use super::cache_cli_tests::{Node, client, probe, serving};
