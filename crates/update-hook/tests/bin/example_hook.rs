@@ -140,6 +140,9 @@ impl Hook {
         if !self.defect("ignores-lock") {
             let record = File::open(&self.record)?;
             if record.try_lock().is_err() {
+                if self.defect("writes-when-locked") {
+                    fs::write(self.world.join("intruder"), "1")?;
+                }
                 report.detail = Some("another copy of this step is running".to_owned());
                 return Ok((Outcome::Failure, report));
             }
@@ -226,7 +229,9 @@ impl Hook {
                 let previous = self.rec_get("previous").unwrap_or_else(|| "v1".to_owned());
                 self.world_set("retired", &previous)?;
                 self.take(&self.world, "next")?;
-                self.take(&self.world, "cordon")?;
+                if !self.defect("cleanup-leaves-cordon") {
+                    self.take(&self.world, "cordon")?;
+                }
                 report.reversible = false;
             }
         }
@@ -281,7 +286,10 @@ fn main() -> ExitCode {
     if inv.step == Step::Verify {
         match hook.defect.as_str() {
             "no-line-on-success" => return ExitCode::SUCCESS,
-            "exit-2" => return ExitCode::from(2),
+            "exit-2" => {
+                eprintln!("update-hook-example: giving up with 2");
+                return ExitCode::from(2);
+            }
             "bad-line" => {
                 println!("{{\"class\":");
                 return outcome.into();

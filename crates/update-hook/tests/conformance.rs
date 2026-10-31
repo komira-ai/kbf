@@ -484,6 +484,30 @@ fn a_hook_that_runs_while_the_record_is_locked_is_refused() {
     ));
 }
 
+/// Catches a hook that refuses while the record is locked but changes the world anyway, and
+/// one whose cleanup leaves the cordon behind.
+#[test]
+fn a_refusal_that_changes_the_world_and_a_cleanup_that_leaves_residue_are_refused() {
+    let scratch = Scratch::new("bad-lock-writes");
+    let hook = example_with("writes-when-locked");
+    let mut fake = ExampleFake::default();
+    assert!(matches!(
+        Conformance::new(&hook, &mut fake, scratch.path()).exclusive_record(),
+        Err(Violation::RanWhileLocked {
+            step: Step::Prepare,
+            outcome: Outcome::Failure,
+            ..
+        })
+    ));
+    match refused("bad-cleanup-residue", example_with("cleanup-leaves-cordon")) {
+        Violation::ResidueLeft { step, left } => {
+            assert_eq!(step, Step::Cleanup);
+            assert_eq!(left, ["cordon"]);
+        }
+        other => panic!("{other}"),
+    }
+}
+
 /// Catches a fake whose injected fault the hook does not honour, and a deferral that leaves the
 /// world changed.
 #[test]

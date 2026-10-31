@@ -83,7 +83,11 @@ impl Params {
 
     /// Reads a declaration's own `[hook.params]` table, which may not set any `updater.*` key.
     pub fn parse_declared(text: &str) -> Result<Params, ParamsError> {
-        Params::parse(text)
+        let params = Params::parse(text)?;
+        match params.0.keys().find(|key| key.starts_with(RESERVED_PREFIX)) {
+            Some(key) => Err(ParamsError::ReservedKey(key.clone())),
+            None => Ok(params),
+        }
     }
 
     /// Reads the text of a params file, as the updater wrote it.
@@ -171,21 +175,21 @@ impl Params {
 
     /// The verified staged release tree: the argument of `prepare`.
     pub fn staged_release(&self) -> Option<PathBuf> {
-        None
+        self.text(STAGED_RELEASE_KEY).map(PathBuf::from)
     }
 
     /// The previous release; `None` on a first install.
     pub fn previous_release(&self) -> Option<PathBuf> {
-        None
+        self.text(PREVIOUS_RELEASE_KEY).map(PathBuf::from)
     }
 
     /// The version being installed.
     pub fn target_version(&self) -> Option<&str> {
-        None
+        self.text(TARGET_VERSION_KEY)
     }
 
     /// The version it replaces; `None` on a first install.
     pub fn previous_version(&self) -> Option<&str> {
-        None
+        self.text(PREVIOUS_VERSION_KEY)
     }
 }

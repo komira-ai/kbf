@@ -25,7 +25,14 @@ keeps both true.
 Every step may be followed by `--params <file>`: a TOML table of scalars, the declaration's
 `[hook.params]`, opaque to the updater. It also carries the reserved key
 `"updater.promotion_ceiling_secs"` (quoted: it is one key with a dot in it), the ceiling the updater
-applies to a pending promotion and the hook must not fail for.
+applies to a pending promotion and the hook must not fail for. The updater writes four more
+reserved keys, all in the namespace `updater.`, which a hook only reads: `updater.staged_release`
+(the absolute path of the verified staged release tree; equal to the argument of `prepare`),
+`updater.previous_release` (absent on a first install), `updater.target_version` and
+`updater.previous_version` (absent on a first install). A declaration's own `[hook.params]` may not
+set any `updater.*` key (`Params::parse_declared` refuses it). **A hook still validates every value
+it reads from this file against its own record directory and its declaration**: a value read from a
+file is untrusted input.
 
 **Exit codes.** `0` success; `1` failure; `75` deferred (the host is busy, nothing irreversible
 happened, try later); `76` halt (no version can repair this). Any other code, a timeout and a signal
