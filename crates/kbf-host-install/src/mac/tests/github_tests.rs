@@ -1017,6 +1017,44 @@ fn the_token_goes_to_the_listing_by_stdin_and_the_download_only() {
     }
 }
 
+/// GitHub's workflow tokens are a prefix, an app id and a signed token of about 520 bytes in
+/// base64url with dots. A channel's token file takes one, so a hosted runner's rehearsal can
+/// list releases under the run's own quota; a token that is not one line of those bytes, or
+/// is past 1024 bytes, is still refused.
+#[test]
+fn a_workflow_token_of_the_new_long_format_is_taken() {
+    let long = format!(
+        "ghs_123456_{}.{}.{}",
+        "aB3-_".repeat(30),
+        "xY9".repeat(60),
+        "z_".repeat(60)
+    );
+    assert!(long.len() > 255 && long.len() <= 1024, "{}", long.len());
+    let fx = Fx::new("mac-gh-token-long");
+    let sim = github(&fx);
+    let (channel, _) = token_channel(&fx, &format!("{long}\n"));
+    run(&fx, &sim, &channel, NEW_VERSION).unwrap();
+    for list in curl_calls(&fx, &sim) {
+        assert_eq!(
+            String::from_utf8(list.stdin.clone()).unwrap(),
+            format!("header = \"Authorization: Bearer {long}\"\n")
+        );
+    }
+
+    for bad in ["a".repeat(1025), "ghs_a/b".to_owned(), "ghs_a=b".to_owned()] {
+        let fx = Fx::new("mac-gh-token-long-bad");
+        let sim = github(&fx);
+        let (channel, _) = token_channel(&fx, &bad);
+        assert_eq!(
+            refusal(run(&fx, &sim, &channel, NEW_VERSION)),
+            Refusal::ConfigInvalid,
+            "{} bytes",
+            bad.len()
+        );
+        assert!(sim.calls.borrow().is_empty());
+    }
+}
+
 // ---- the allowlist ----
 
 fn allowlist(fx: &Fx, body: &str) -> Result<MacAllowlist, Refusal> {
