@@ -5,9 +5,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use kbf_objstore::s3::fake::FakeS3;
-use kbf_objstore::s3::{ObjectHead, StampedPage};
-use kbf_objstore::{
+use objstore_s3::s3::fake::FakeS3;
+use objstore_s3::s3::{ObjectHead, StampedPage};
+use objstore_s3::{
     Capabilities, KeyPrefix, ListToken, ObjectKey, ObjectStore, ObjectStoreError, PageSize,
 };
 

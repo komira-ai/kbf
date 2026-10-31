@@ -138,7 +138,7 @@ where
             let _ = stopped.await;
         },
         move |bound| {
-            let _ = told.send(bound);
+            let _ = told.send(bound.s3);
         },
     );
     let driving = async {
@@ -216,7 +216,7 @@ async fn run_cache_opens_the_upstream_the_file_names() {
             let _ = stopped.await;
         },
         move |bound| {
-            let _ = told.send(bound);
+            let _ = told.send(bound.s3);
         },
     );
     let driving = async {
@@ -636,4 +636,89 @@ kind = "memory"
     let lone = format!("listen = \"127.0.0.1:0\"\ntls_cert_file = \"{key}\"");
     let why = load(&lone).unwrap_err();
     assert!(why.to_string().contains("tls_key_file"), "{why}");
+}
+
+/// Asserts what `--check-config` finds in the `[oci]` table of a build node, as for a storage
+/// node: a plain listener off loopback passes without the warning of a start; a certificate file
+/// that is not there is refused with the reason and status 2; a certificate without its key does
+/// not load; and a prefix outside every keeping policy does not load, naming `oci.prefix`.
+#[test]
+fn check_config_of_a_build_node_checks_its_oci_table() {
+    let node = Node::new("tscache-cli-check-oci-cache");
+    let load = |oci: &str| {
+        let text = format!("{}\n[oci]\n{oci}\n", node.text("", ""));
+        settings_from_text(&text, QUICK)
+    };
+    let plain = load("listen = \"0.0.0.0:0\"\nprefix = \"cas/\"").unwrap();
+    assert!(checked(&plain).is_ok());
+
+    let key = node.key.display();
+    let no_cert = format!(
+        "listen = \"127.0.0.1:0\"\nprefix = \"cas/\"\ntls_cert_file = \"/no/such/cert.pem\"\ntls_key_file = \"{key}\""
+    );
+    let why = checked(&load(&no_cert).unwrap()).unwrap_err();
+    assert!(why.to_string().contains("/no/such/cert.pem"), "{why}");
+    // A start exits 1 for a file it cannot read (a restart may mend that); `--check-config` exits
+    // 2 for any refusal, which the binary test checks.
+    assert_eq!(exit_status(&why), 1);
+
+    let lone = format!("listen = \"127.0.0.1:0\"\nprefix = \"cas/\"\ntls_cert_file = \"{key}\"");
+    let why = load(&lone).unwrap_err();
+    assert!(why.to_string().contains("tls_key_file"), "{why}");
+
+    let unkept = load("listen = \"127.0.0.1:0\"\nprefix = \"_journal/x/\"").unwrap_err();
+    assert!(unkept.to_string().contains("oci.prefix"), "{unkept}");
+}
+
+/// Asserts that a build node whose `[oci]` certificate is not a certificate is refused at start
+/// with exit status 2, before the cache directory is made, as a storage node's front is.
+#[tokio::test]
+async fn a_build_node_with_a_bad_oci_certificate_is_refused_before_the_cache_opens() {
+    let node = Node::new("tscache-cli-oci-cert");
+    let key = node.key.display();
+    let text = format!(
+        "{}\n[oci]\nlisten = \"127.0.0.1:0\"\nprefix = \"cas/\"\ntls_cert_file = \"{key}\"\ntls_key_file = \"{key}\"\n",
+        node.text("", "")
+    );
+    let settings = settings_from_text(&text, QUICK)
+        .unwrap()
+        .into_cache()
+        .unwrap();
+    let upstream: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let disk: Arc<dyn Disk> = Arc::new(SystemDisk);
+    let nothing = |_addr: SocketAddr| async {};
+    let why = serving(&settings, upstream, disk, nothing)
+        .await
+        .unwrap_err();
+    assert_eq!(exit_status(&why), 2, "{why}");
+    assert!(!node.cache_dir().exists());
+}
+
+/// Asserts that an OCI address that is taken stops the start of a build node with an error that
+/// a restart may mend (exit status 1), and that the S3 listener, which was bound first, is
+/// closed again: its address can be bound by someone else as soon as the start has returned.
+#[tokio::test]
+async fn a_taken_oci_address_stops_the_start_and_closes_the_s3_listener() {
+    let node = Node::new("tscache-cli-oci-taken");
+    let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let s3 = free.local_addr().unwrap();
+    drop(free);
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let busy = taken.local_addr().unwrap();
+    let text = node.text("", "").replace("127.0.0.1:0", &s3.to_string());
+    let text = format!("{text}\n[oci]\nlisten = \"{busy}\"\nprefix = \"cas/\"\n");
+    let settings = settings_from_text(&text, QUICK)
+        .unwrap()
+        .into_cache()
+        .unwrap();
+    let upstream: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let disk: Arc<dyn Disk> = Arc::new(SystemDisk);
+    let nothing = |_addr: SocketAddr| async {};
+    let why = serving(&settings, upstream, disk, nothing)
+        .await
+        .unwrap_err();
+    assert!(why.to_string().contains(&busy.to_string()), "{why}");
+    assert_eq!(exit_status(&why), 1, "{why}");
+    let again = std::net::TcpListener::bind(s3);
+    assert!(again.is_ok(), "the S3 address is still held");
 }

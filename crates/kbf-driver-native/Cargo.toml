@@ -13,6 +13,7 @@ kbf-daemon.workspace = true
 kbf-mac-session.workspace = true
 kbf-outputs.workspace = true
 kbf-proto.workspace = true
+kbf-seatbelt.workspace = true
 kbf-types.workspace = true
 libc.workspace = true
 # `hdiutil info -plist`, read by the clean and the assertion of a lease-user pool slot
