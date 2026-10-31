@@ -92,7 +92,7 @@ use crate::{
     ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SystemClock, self_test,
 };
 
-use super::build_info::{CAPABILITIES, COMMIT, VERSION, capabilities_text};
+use super::build_info::{CAPABILITIES, COMMIT, RELEASE_VERSION, VERSION, capabilities_text};
 use super::cache_cli::serve_cache_until_signalled;
 use super::config::{OciFlags, Settings, keys_for_flags};
 use super::config_print::render;
@@ -134,15 +134,7 @@ const S3_MIN_BODY_RATE: Option<NonZeroU64> = NonZeroU64::new(1 << 20);
 /// read-only keys, writes new objects to the hot tier, copies them to the cold tier in the
 /// background, and frees the hot tier when it fills.
 #[derive(Clone, Debug, PartialEq, Parser)]
-#[command(
-    name = "tierstore",
-    version = concat!(
-        env!("CARGO_PKG_VERSION"),
-        " (commit ",
-        env!("TIERSTORE_BUILD_COMMIT"),
-        ")"
-    )
-)]
+#[command(name = "tierstore", version = RELEASE_VERSION)]
 pub struct Cli {
     /// The configuration file: a TOML file with the tables `[server]`, `[hot_store]` and
     /// `[cold_store]` that holds what the flags below hold, except `--drain-lb-wait` and
@@ -164,6 +156,9 @@ pub struct Cli {
     /// Prints the capabilities of this build, one to a line, and exits with status 0 without
     /// starting anything. It needs no other flag and is refused with any (status 2). A host
     /// updater asks it of a release before it hands over to it.
+    // Never read: `main` finds the flag in the raw arguments before they are parsed, since a
+    // parse would demand `--listen`. The field is here so that `--help` and the docs checks
+    // know the flag.
     #[arg(long)]
     pub capabilities: bool,
     /// The address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on.

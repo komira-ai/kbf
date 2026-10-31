@@ -8,8 +8,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// git checkout. `build.rs` embeds it.
 pub const COMMIT: &str = env!("TIERSTORE_BUILD_COMMIT");
 
-/// What `--version` prints after the program's name.
-pub const RELEASE_VERSION: &str = VERSION;
+/// What `--version` prints after the program's name: the crate version, `+`, and the commit, the
+/// form `cargo xtask build-commit check` reads (`unknown` after the `+` for a build that has no
+/// commit).
+pub const RELEASE_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "+",
+    env!("TIERSTORE_BUILD_COMMIT")
+);
 
 /// The capabilities `tierstore --capabilities` prints, one to a line, in this order. A name is
 /// lowercase letters, digits and `-`.

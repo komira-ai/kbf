@@ -38,6 +38,7 @@ use tokio::sync::{Notify, watch};
 
 use crate::{Backend, Clock, Error as BackendError, SelfTestOptions, SystemClock, self_test};
 
+use super::build_info::{COMMIT, VERSION};
 use super::cli::{
     Addresses, Error, S3Flags, bind_oci, oci_cut_note, oci_setup_of, open_tier, probe_run_id,
     serve_oci, signals,
@@ -240,7 +241,6 @@ pub(super) async fn run_cache(
 /// Runs the cache until SIGTERM or SIGINT.
 pub(super) async fn serve_cache_until_signalled(settings: CacheSettings) -> Result<(), Error> {
     let stop = signals()?;
-    use super::build_info::{COMMIT, VERSION};
     let mode = if settings.cache.write_through {
         "write-through-cache"
     } else {

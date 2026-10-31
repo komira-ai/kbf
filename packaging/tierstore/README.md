@@ -559,9 +559,11 @@ capability to a line, and exits with status 0; a build with none prints nothing.
 flag and needs none of those a start requires: with any other argument it prints nothing on stdout,
 says on stderr `tierstore: --capabilities takes no other flag, got <argument>`, and exits with
 status 2. A host updater reads it from a release before it hands over to it. `tierstore --version`
-and the end of the start line (` commit=<commit>`) name the commit the binary was built from, twelve
-hex digits, or `unknown` for a build outside a git checkout, and `/metricz` has
-`tierstore_build_info{version="<version>",commit="<commit>"} 1`.
+prints `tierstore <version>+<commit>`, the end of the start line is ` commit=<commit>`, and
+`/metricz` has `tierstore_build_info{version="<version>",commit="<commit>"} 1`. The commit is the
+one the binary was built from, twelve hex digits: git's, or the value of
+`TIERSTORE_BUILD_COMMIT_OVERRIDE` at build time for a build without a `.git` (a build refuses a
+value that is not twelve lowercase hex digits), or `unknown` where there is neither.
 
 `tierstore --config <path> --check-config` loads the file as a start does (the same loader and the
 same refusals, the build-node checks and `write_through` included) and reads the key files it

@@ -20,12 +20,25 @@ pub const OVERRIDE: &str = "TIERSTORE_BUILD_COMMIT_OVERRIDE";
 /// value is refused too: a script whose variable expanded to nothing must fail, not quietly
 /// build from the checkout's commit.
 pub fn choose(
-    _override_value: Option<&std::ffi::OsStr>,
+    override_value: Option<&std::ffi::OsStr>,
     git_head: Option<String>,
 ) -> Result<String, String> {
-    Ok(git_head
-        .filter(|c| !c.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned()))
+    match override_value {
+        Some(value) => {
+            let text = value.to_str().unwrap_or_default();
+            let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+            if text.len() == 12 && text.bytes().all(hex) {
+                Ok(text.to_owned())
+            } else {
+                Err(format!(
+                    "{OVERRIDE}={value:?}: expected exactly 12 lowercase hex digits"
+                ))
+            }
+        }
+        None => Ok(git_head
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| "unknown".to_owned())),
+    }
 }
 
 #[cfg(test)]

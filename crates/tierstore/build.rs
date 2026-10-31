@@ -1,13 +1,18 @@
 //! Embeds the commit the binary is built from as `TIERSTORE_BUILD_COMMIT`, which `--version`, the
 //! start line and `tierstore_build_info` name (`src/server/build_info.rs`).
 //!
-//! The commit is `git rev-parse --short=12 HEAD` in the checkout being built, or `unknown` where
-//! that fails (a source archive, no `git`): a build never fails for want of a commit.
-//! Uncommitted changes are not marked. Cargo runs this again when `HEAD` moves or the branch it
-//! names gets a new commit.
+//! The commit is `TIERSTORE_BUILD_COMMIT_OVERRIDE` when set (12 lowercase hex digits, for a build
+//! without a `.git` that knows its commit; anything else, an empty value included, fails the
+//! build), else `git rev-parse --short=12 HEAD` in the checkout being built, or `unknown` where
+//! that fails (a source archive, no `git`): a build never fails for want of a commit. The rule
+//! is in `src/build_commit.rs`. Uncommitted changes are not marked. Cargo runs this again when
+//! the override changes, `HEAD` moves or the branch it names gets a new commit.
 
 use std::path::PathBuf;
 use std::process::Command;
+
+#[path = "src/build_commit.rs"]
+mod build_commit;
 
 /// `git` with `args` in this crate's directory: its trimmed stdout, if it succeeded.
 fn git(args: &[&str]) -> Option<String> {
@@ -23,9 +28,13 @@ fn git_path(name: &str) -> Option<PathBuf> {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    let commit = git(&["rev-parse", "--short=12", "HEAD"])
-        .filter(|c| !c.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned());
+    println!("cargo:rerun-if-env-changed={}", build_commit::OVERRIDE);
+    let given = std::env::var_os(build_commit::OVERRIDE);
+    let head = git(&["rev-parse", "--short=12", "HEAD"]);
+    let commit = match build_commit::choose(given.as_deref(), head) {
+        Ok(commit) => commit,
+        Err(e) => panic!("{e}"),
+    };
     println!("cargo:rustc-env=TIERSTORE_BUILD_COMMIT={commit}");
     // Watched: HEAD (a checkout), the ref it names (a commit), and packed-refs (where that ref
     // lives once packed).
