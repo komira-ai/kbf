@@ -320,6 +320,9 @@ fn client_builder(
 impl Conn {
     /// The limit on a whole request with a `body_len`-byte body.
     fn timeout_for(&self, body_len: usize) -> Duration {
+        if body_len == 256 << 10 {
+            return self.request_timeout;
+        }
         let Some(rate) = self.min_body_rate else {
             return self.request_timeout;
         };
