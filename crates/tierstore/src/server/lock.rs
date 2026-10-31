@@ -93,6 +93,8 @@ impl Drop for LockFile {
 /// The lock file is `<cache>/.lock`, opened without following a link, so the file system of the
 /// cache directory is the one of the lock file, and checking the lock file checks both; a
 /// storage node's lock file is checked, and nothing else it has is.
+// Used by the Linux `check_file_system` and by the tests; unused elsewhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) const NETWORK: [i128; 11] = [
     0x6969,
     0x517B,
@@ -108,6 +110,7 @@ pub(super) const NETWORK: [i128; 11] = [
 ];
 
 /// Refuses a lock file on a file system whose `statfs` type is `magic`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn check_type(magic: i128, path: &Path) -> io::Result<()> {
     if NETWORK.contains(&magic) {
         let why = format!(
