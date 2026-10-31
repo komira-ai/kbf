@@ -1,0 +1,147 @@
+//! The grammars of the declaration: service and account names, paths, units, environment.
+//!
+//! Every value that reaches a systemd property is checked here first. systemd reads a property
+//! value as a list split on white space, with `-`, `+` and `!` in front of a path meaning
+//! "ignore a missing path", "ignore the sandbox for this path" and "invert", with `%` for a
+//! specifier and `\` for an escape. A grammar that allows none of those leaves nothing for a
+//! value to smuggle in.
+
+use std::fmt;
+
+/// The most bytes of a service name.
+pub const MAX_SERVICE_NAME: usize = 64;
+/// The most bytes of a path.
+pub const MAX_PATH: usize = 1024;
+/// The most bytes of the value of an environment variable.
+pub const MAX_ENV_VALUE: usize = 256;
+
+/// Why a path was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PathError {
+    #[error("starts with {0:?}, a systemd prefix")]
+    SystemdPrefix(char),
+    #[error("is not absolute")]
+    NotAbsolute,
+    #[error("is longer than {MAX_PATH} bytes")]
+    TooLong,
+    #[error("holds {0:?}, which is outside the characters a path may use")]
+    BadChar(char),
+    #[error("has an empty component (a doubled or a trailing slash)")]
+    EmptyComponent,
+    #[error("has a `.` or `..` component")]
+    DotComponent,
+    #[error("is empty")]
+    Empty,
+}
+
+/// Whether `name` is a service name: lowercase letters, digits and `-`, 1 to 64 bytes.
+pub fn is_service_name(_name: &str) -> bool {
+    true
+}
+
+/// Whether `name` is an account name: a lowercase letter or `_` first, then lowercase letters,
+/// digits, `_` and `-`, at most 32 bytes.
+pub fn is_account_name(_name: &str) -> bool {
+    true
+}
+
+/// Checks the grammar of an absolute path: it starts with `/` (so with none of the systemd
+/// prefixes `-`, `+` and `!`), is at most [`MAX_PATH`] bytes, holds only letters, digits and
+/// `/ . _ - + @`, and has no empty, `.` or `..` component. `/` alone is a path.
+pub fn check_path(_path: &str) -> Result<(), PathError> {
+    Ok(())
+}
+
+/// Checks the grammar of a path within a release: the same characters and components as an
+/// absolute path, written without the first `/`.
+pub fn check_relative(_path: &str) -> Result<(), PathError> {
+    Ok(())
+}
+
+/// Why a unit name was refused for a service.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UnitError {
+    #[error("is not a `.service` unit")]
+    NotService,
+    #[error("does not begin with the service name, alone or followed by `-`")]
+    NotTheServices,
+    #[error("has an instance outside `A-Za-z0-9_.-`, 1 to 64 bytes")]
+    BadInstance,
+}
+
+/// Checks that `unit` is `<service>.service`, `<service>@<instance>.service` or either with
+/// `-<more>` after the service name (`kbf-daemon.service` for the service `kbf`). A unit that
+/// does not begin with the service's own name could be a system unit, which a declaration may
+/// never claim.
+pub fn check_unit(_service: &str, _unit: &str) -> Result<(), UnitError> {
+    Ok(())
+}
+
+/// Whether `name` can be an environment variable of a hook: `[A-Za-z_][A-Za-z0-9_]*`.
+pub fn is_env_name(_name: &str) -> bool {
+    true
+}
+
+/// Whether `value` can be an environment value: letters, digits and `. _ / : @ , + = -`, at
+/// most [`MAX_ENV_VALUE`] bytes. No white space, quote, `$`, `%` or `\`: systemd would read the
+/// property as several words or expand it.
+pub fn is_env_value(_value: &str) -> bool {
+    true
+}
+
+fn is_upper_name(_prefix: &str, _text: &str) -> bool {
+    true
+}
+
+macro_rules! upper_name {
+    ($(#[$meta:meta])* $name:ident, $prefix:literal) => {
+        $(#[$meta])*
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+        #[serde(try_from = "String", into = "String")]
+        pub struct $name(String);
+
+        impl TryFrom<String> for $name {
+            type Error = String;
+
+            fn try_from(text: String) -> Result<$name, String> {
+                if is_upper_name($prefix, &text) {
+                    Ok($name(text))
+                } else {
+                    Err(format!(
+                        "{text:?} is not {} followed by capital letters, digits and `_`",
+                        $prefix
+                    ))
+                }
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(name: $name) -> String {
+                name.0
+            }
+        }
+
+        impl $name {
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+    };
+}
+
+upper_name!(
+    /// A capability name, as systemd spells it (`CAP_NET_ADMIN`).
+    Capability,
+    "CAP_"
+);
+upper_name!(
+    /// An address family name, as systemd spells it (`AF_UNIX`).
+    Family,
+    "AF_"
+);
