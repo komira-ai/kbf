@@ -303,6 +303,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "executor-lease-token-file",
             "executor-lease-ttl-secs",
             "executor-lease-url",
+            "executor-locate",
             "executor-max-run-secs",
             "executor-output-disk-bytes",
             "executor-run-margin-secs",
