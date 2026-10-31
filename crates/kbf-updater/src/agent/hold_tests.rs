@@ -12,7 +12,7 @@ use kbf_types::ReleasePlatform;
 
 use super::coordinator::CoordinatorError;
 use super::flags::Timing;
-use super::hold::{Deferral, Features, Fit, Marks, fit};
+use super::hold::{Deferral, MAX_RETRY_SECS, Features, Fit, Marks, fit};
 use super::local::LocalError;
 use super::run::{Agent, World};
 use super::status::Status;
@@ -633,4 +633,67 @@ fn features_are_the_known_names_advertised() {
             halt: true
         }
     );
+}
+
+/// Catches: a clamp that drifts from the step runner's 3600 s bound.
+#[test]
+fn the_retry_bound_is_the_step_runners() {
+    assert_eq!(MAX_RETRY_SECS, 3600);
+}
+
+/// Catches: a retry hint above the bound that freezes a host. An agent whose retry is two
+/// hours reports and persists one hour.
+#[test]
+fn a_retry_above_the_bound_is_reported_and_persisted_at_the_bound() {
+    let rig = Rig::new("hold-clamp-new");
+    rig.coordinator.advertise(&["deferred-v1"]);
+    let agent = Agent::new(
+        host(Role::Daemon),
+        "stable".to_owned(),
+        Timing {
+            retry: Duration::from_secs(2 * MAX_RETRY_SECS),
+            ..Rig::timing()
+        },
+        rig.world(),
+        Status::unknown(ReleasePlatform::LinuxX86_64, version("0")),
+    )
+    .with_host_updates(rig.dir.clone());
+    agent.refresh();
+    rig.take_order(&agent);
+    agent.beat_once();
+    assert_eq!(
+        rig.last_beat().deferred.unwrap().retry_after_secs,
+        MAX_RETRY_SECS
+    );
+    let kept = Marks::new(&rig.dir).load("kbf").unwrap().unwrap();
+    assert_eq!(kept.retry_after_unix, T0 + MAX_RETRY_SECS);
+}
+
+/// Catches: an older agent's file with a far deadline that keeps a host frozen. It is read as
+/// at most now + 3600: reported so, declining until then, and the order runs after.
+#[test]
+fn a_persisted_deadline_beyond_the_bound_is_read_at_the_bound() {
+    let rig = Rig::new("hold-clamp-old");
+    rig.coordinator.advertise(&["deferred-v1"]);
+    Marks::new(&rig.dir)
+        .save(
+            "kbf",
+            &Deferral {
+                target: version(VB),
+                reason: token("drain_bound"),
+                retry_after_unix: T0 + 100 * MAX_RETRY_SECS,
+            },
+        )
+        .unwrap();
+    let agent = rig.announcing();
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 0, "declined");
+    agent.beat_once();
+    assert_eq!(
+        rig.last_beat().deferred.unwrap().retry_after_secs,
+        MAX_RETRY_SECS
+    );
+    rig.advance_unix(MAX_RETRY_SECS);
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 1, "the bound has passed");
 }

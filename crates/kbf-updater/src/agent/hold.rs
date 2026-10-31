@@ -40,6 +40,12 @@ pub const DRAIN_BOUND: &str = "drain_bound";
 /// healthy.
 pub const ROLLBACK_FAILED: &str = "rollback_failed";
 
+/// The longest a deferral lasts, in seconds, however long the retry hint or an older agent's
+/// file says. It is the step runner's `MAX_RETRY_SECS` (kbf-step-runner) and the coordinator's
+/// backoff cap: a bad or huge hint must not freeze a host. The crates do not depend on each
+/// other, so a test pins the value.
+pub const MAX_RETRY_SECS: u64 = 3600;
+
 /// The most bytes of a deferral file that are read.
 const MARK_MAX: u64 = 4096;
 
