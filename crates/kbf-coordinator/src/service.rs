@@ -17,6 +17,7 @@ use crate::decide::{Decision, Hold, decide_in, decide_why};
 use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
 use crate::fleet::{Fleet, Host};
 use crate::identity::Identity;
+use crate::ops::{self, AuditEntry, OPERATOR, OperateError, OpsState, OpsStore};
 use crate::services::{ServiceDef, Services};
 
 /// The time since the coordinator started.
@@ -161,6 +162,10 @@ pub struct Status {
     /// Every service the coordinator manages, `kbf` included, by name: its desired state, the
     /// counts of its hosts per role, its hosts, and its convergence.
     pub per_service: BTreeMap<String, ServiceStatus>,
+    /// What operators changed ([`crate::ops`]): exclusions, labels, the audit ring. Left out
+    /// until the first change, so a farm that never uses it reads the status it always did.
+    #[serde(skip_serializing_if = "OpsState::is_empty")]
+    pub ops: OpsState,
     /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]).
     pub commit: &'static str,
 }
@@ -170,6 +175,7 @@ pub struct Coordinator {
     fleet: Mutex<Fleet>,
     desired: DesiredStore,
     services: Services,
+    ops: OpsStore,
     verifier: Arc<Verifier>,
     operator_token: String,
     clock: Clock,
@@ -197,6 +203,7 @@ impl Coordinator {
             fleet: Mutex::new(Fleet::new(started)),
             desired,
             services: Services::default(),
+            ops: OpsStore::volatile(),
             verifier,
             operator_token,
             clock,
@@ -208,6 +215,13 @@ impl Coordinator {
     #[must_use]
     pub fn with_services(mut self, services: Services) -> Self {
         self.services = services;
+        self
+    }
+
+    /// The same coordinator over `ops` instead of a store that keeps nothing.
+    #[must_use]
+    pub fn with_ops(mut self, ops: OpsStore) -> Self {
+        self.ops = ops;
         self
     }
 
@@ -331,15 +345,34 @@ impl Coordinator {
         })
     }
 
+    /// Whether `bearer` is the operator token, compared in constant time. CI's token is no
+    /// operator token and the operator token is no CI token.
+    fn operator(&self, bearer: Option<&str>) -> Result<(), Unauthorized> {
+        let presented = bearer.ok_or(Unauthorized)?.as_bytes();
+        if bool::from(presented.ct_eq(self.operator_token.as_bytes())) {
+            Ok(())
+        } else {
+            Err(Unauthorized)
+        }
+    }
+
+    /// Does the operator action in `body` (`docs/design/host-updates.md`, section 5), if
+    /// `bearer` is the operator token, and answers the audit entry it made. The token is
+    /// checked before the body is looked at.
+    ///
+    /// # Errors
+    /// [`OperateError`].
+    pub fn operate(&self, bearer: Option<&str>, body: &[u8]) -> Result<AuditEntry, OperateError> {
+        self.operator(bearer)?;
+        ops::operate(&self.ops, &self.services, OPERATOR, body)
+    }
+
     /// The status, if `bearer` is the operator token.
     ///
     /// # Errors
     /// [`Unauthorized`].
     pub fn status(&self, bearer: Option<&str>) -> Result<Status, Unauthorized> {
-        let presented = bearer.ok_or(Unauthorized)?.as_bytes();
-        if !bool::from(presented.ct_eq(self.operator_token.as_bytes())) {
-            return Err(Unauthorized);
-        }
+        self.operator(bearer)?;
         let now = (self.clock)();
         let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         let hosts = fleet
@@ -379,6 +412,7 @@ impl Coordinator {
             .collect();
         Ok(Status {
             per_service,
+            ops: self.ops.state(),
             desired: self.desired.get(KBF),
             services: self.desired.all(),
             quiet: fleet.is_quiet(now),
