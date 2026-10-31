@@ -496,8 +496,8 @@ async fn the_loop_waits_out_the_minimum_between_rounds() {
     let halt = Arc::new(Notify::new());
     let running = tokio::spawn(async move { cache.scrub(Some(1000), 2, ticker, halt).await });
     let mut seen = Vec::new();
+    asks.recv().await.unwrap();
     for _ in 0..3 {
-        asks.recv().await.unwrap();
         tick.send(()).await.unwrap();
         asks.recv().await.unwrap();
         seen.push(read(&rig.cache.counters().scrubbed_objects));
