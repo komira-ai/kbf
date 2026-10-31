@@ -5,10 +5,12 @@
 //!  "promotion_pending":false,"detail":"..."}
 //! ```
 //!
-//! The updater reads the last line leniently ([`Report::read`]): a missing or malformed line is
-//! `{}`, which is a `release` failure class, a step that can still be undone and nothing pending.
-//! The conformance harness reads it strictly ([`Report::from_stdout`]) and refuses a hook that
-//! leaves it out.
+//! The updater reads the last line leniently ([`Report::read`]), field by field: a missing line,
+//! or one that is not a JSON object, is `{}` (a `release` failure class, a step that can still be
+//! undone, nothing pending); in an object, each invalid field takes its default and is reported
+//! as a warning, except a `reversible` that is present and not a boolean, which reads as `false`.
+//! The strict read ([`Report::from_stdout`]) refuses any invalid field, and the conformance
+//! harness uses it: it refuses a hook that leaves the line out or writes it badly.
 
 use std::io::{self, Write};
 
@@ -101,6 +103,39 @@ struct Wire {
     detail: Option<String>,
 }
 
+/// A text field: `None` when absent, or (with a warning) when not text.
+fn text_field(
+    object: &Map<String, Value>,
+    name: &str,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    match object.get(name) {
+        None => None,
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(_) => {
+            warnings.push(format!("{name} is not text: ignored"));
+            None
+        }
+    }
+}
+
+/// A boolean field: `absent` when missing; `false`, with a warning, when not a boolean.
+fn bool_field(
+    object: &Map<String, Value>,
+    name: &str,
+    absent: bool,
+    warnings: &mut Vec<String>,
+) -> bool {
+    match object.get(name) {
+        None => absent,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => {
+            warnings.push(format!("{name} is not a boolean: read as false"));
+            false
+        }
+    }
+}
+
 /// The last line of `stdout` that is not blank.
 fn last_line(stdout: &str) -> Option<&str> {
     stdout.lines().rev().find(|line| !line.trim().is_empty())
@@ -133,14 +168,60 @@ impl Report {
         Report::parse_line(line)
     }
 
-    /// Reads the last line the way the updater does: a missing or malformed line is `{}`.
+    /// Reads the last line the way the updater does (see [`Report::read_with_warnings`]).
     pub fn read(stdout: &str) -> Report {
-        Report::from_stdout(stdout).unwrap_or_default()
+        Report::read_with_warnings(stdout).0
     }
 
-    /// As [`Report::read`], with a warning for each field or line that was not used.
+    /// The updater's lenient read: a missing line, or one that is not a JSON object, is `{}`;
+    /// otherwise each field is read on its own, and one that is invalid (not a token, the wrong
+    /// type, an unknown class) takes its default and is reported in the warnings. A `reversible`
+    /// that is present and not a boolean reads as `false`: a step that might have committed is
+    /// treated as committed.
     pub fn read_with_warnings(stdout: &str) -> (Report, Vec<String>) {
-        (Report::read(stdout), Vec::new())
+        let Some(line) = last_line(stdout) else {
+            return (Report::default(), Vec::new());
+        };
+        let Ok(Value::Object(object)) = serde_json::from_str::<Value>(line) else {
+            let warning = format!("the last line is not a JSON object: {line}");
+            return (Report::default(), vec![warning]);
+        };
+        let mut warnings = Vec::new();
+        let class = match object.get("class") {
+            None => Class::Release,
+            Some(Value::String(word)) if word == "release" => Class::Release,
+            Some(Value::String(word)) if word == "environment" => Class::Environment,
+            Some(_) => {
+                warnings.push("class is not release or environment: ignored".to_owned());
+                Class::Release
+            }
+        };
+        let reason = match text_field(&object, "reason", &mut warnings) {
+            Some(reason) if !is_reason_token(&reason) => {
+                warnings.push("reason is not a token of [a-z0-9_]: ignored".to_owned());
+                None
+            }
+            other => other,
+        };
+        let retry_after_secs = match object.get("retry_after_secs") {
+            None => None,
+            Some(value) => {
+                let secs = value.as_u64();
+                if secs.is_none() {
+                    warnings.push("retry_after_secs is not a whole number: ignored".to_owned());
+                }
+                secs
+            }
+        };
+        let report = Report {
+            class,
+            reason,
+            retry_after_secs,
+            reversible: bool_field(&object, "reversible", true, &mut warnings),
+            promotion_pending: bool_field(&object, "promotion_pending", false, &mut warnings),
+            detail: text_field(&object, "detail", &mut warnings),
+        };
+        (report, warnings)
     }
 
     /// The line to print: one JSON object, no newline.

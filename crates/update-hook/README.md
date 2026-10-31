@@ -34,6 +34,12 @@ set any `updater.*` key (`Params::parse_declared` refuses it). **A hook still va
 it reads from this file against its own record directory and its declaration**: a value read from a
 file is untrusted input.
 
+`updater.previous_release` and `updater.previous_version` go together: a first install has neither,
+an update has both (`Params::parse` and `Params::validate` refuse one without the other). The
+release paths are absolute (a relative path is refused). A hook MAY refuse an unknown key of its own
+`[hook.params]`, but it MUST ignore an `updater.*` key it does not know, so the updater can add
+reserved keys without breaking an older hook.
+
 The updater writes **one params file per update** and passes that same file, with the same
 values, to every step (`prepare`, `cutover`, `verify`, `rollback`, `cleanup`), so
 `updater.staged_release` and `updater.target_version` are present on every step. The argument of
@@ -57,7 +63,12 @@ are failures.
   says `false` is the commit.
 - `promotion_pending`: set by `verify` when the service serves but is not yet fully its own.
 
-The updater reads a missing or malformed line as `{}`; the harness refuses a hook that leaves it out.
+The updater reads the line field by field. A missing line, or one that is not a JSON object, is
+`{}`. In an object, each invalid field (a `reason` that is not a token, a wrongly typed value, an
+unknown `class`) takes its default and is reported as a warning, and the valid fields are kept; a
+`reversible` that is present but not a boolean reads as `false`, because a step that might have
+committed is treated as committed. The strict reader and the harness refuse any invalid field and
+a missing line.
 
 **Every step is safe to run twice**, acts on the hook's own durable record rather than on the order it
 was called in, and takes an exclusive `flock` on its record directory for the whole step (a second
@@ -81,6 +92,11 @@ the hook as the updater would and checks:
   and each step run again after it finished, reaches the world an uninterrupted run reaches;
 - the updater's table driven through success and through a failure, a deferral and a halt at each
   step;
+- the record is compared as well as the world, in reruns and after a resume; a killed `rollback`
+  resumes like the other steps; a step that changes things with no kill point is refused;
+- the params file and the sandbox root are guarded like the staged release;
+- the same checks run as an update (previous release and version present, the release a real tree)
+  and as a first install (neither); a params file with an unknown `updater.*` key is accepted;
 - with the record directory locked, every step refuses.
 
 Nothing waits for a time. A kill point announces itself on standard error and the harness kills the

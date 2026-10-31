@@ -24,7 +24,9 @@
 //!    success, and through a failure, a deferral and a halt at each step, with faults the fake
 //!    service injects: the hook ends each step as injected, and a deferral leaves the world as
 //!    it was.
-//! 7. **One at a time.** With an exclusive lock held on the record directory, every step
+//! 7. **Unknown reserved keys.** A params file with an `updater.*` key the hook does not know
+//!    is no reason to refuse (a hook may refuse an unknown key of its own `[hook.params]`).
+//! 8. **One at a time.** With an exclusive lock held on the record directory, every step
 //!    refuses (exit `1`) and changes nothing.
 //!
 //! The params file is written once per sandbox and given to every step: the staged release
@@ -47,18 +49,24 @@ use std::path::{Path, PathBuf};
 pub use sandbox::{Entry, Sandbox, Tree, changes, snapshot};
 
 use crate::{
-    Context, Invocation, LineError, Next, Outcome, PREVIOUS_VERSION_KEY, Params, Report,
-    STAGED_RELEASE_KEY, Scalar, Step, TARGET_VERSION_KEY, Verdict, next,
+    Context, Invocation, LineError, Next, Outcome, PREVIOUS_RELEASE_KEY, PREVIOUS_VERSION_KEY,
+    Params, Report, STAGED_RELEASE_KEY, Scalar, Step, TARGET_VERSION_KEY, Verdict, next,
 };
 use run::{Run, run_step};
 
 /// The steps of a successful update, in order.
 const SUCCESS_PATH: [Step; 4] = [Step::Prepare, Step::Cutover, Step::Verify, Step::Cleanup];
 
+/// The steps before a `rollback` of the same update.
+const ROLLBACK_PATH: [Step; 2] = [Step::Prepare, Step::Cutover];
+
 /// How many times the harness lets `verify` be deferred, and `cleanup` and `rollback` be
 /// retried, before it says the deadline has passed or the retries are used up. Counts, not
 /// times.
 const RETRIES: u32 = 2;
+
+/// A reserved key the harness invents, to see that a hook ignores what it does not know.
+const PROBE_KEY: &str = "updater.conformance_probe";
 
 /// The versions the harness puts in the params file.
 const TARGET_VERSION: &str = "2.0.0";
@@ -250,6 +258,7 @@ pub struct Conformance<'a> {
     fake: &'a mut dyn FakeService,
     base: &'a Path,
     sandboxes: u32,
+    first_install: bool,
 }
 
 /// Runs every check on `hook` against `fake`, in sandboxes made under `base` (a directory of
@@ -273,12 +282,14 @@ impl<'a> Conformance<'a> {
             fake,
             base,
             sandboxes: 0,
+            first_install: false,
         }
     }
 
     /// Runs the checks as a first install: the params file has neither previous release nor
     /// previous version. The default is an update, which has both.
-    pub fn with_first_install(self) -> Conformance<'a> {
+    pub fn with_first_install(mut self) -> Conformance<'a> {
+        self.first_install = true;
         self
     }
 
@@ -289,6 +300,11 @@ impl<'a> Conformance<'a> {
         let (scenarios, skipped) = self.scenarios()?;
         self.tolerates_unknown_updater_keys()?;
         self.exclusive_record()?;
+        // The same update as a first install: no previous release or version in the params.
+        self.first_install = true;
+        let first = self.idempotence();
+        self.first_install = false;
+        first?;
         Ok(Summary {
             kill_points,
             scenarios,
@@ -301,23 +317,51 @@ impl<'a> Conformance<'a> {
         self.sandboxes += 1;
         let sandbox = Sandbox::create(self.base.join(format!("run-{}", self.sandboxes)))?;
         self.fake.init(&sandbox)?;
-        // One file for the whole update, the same for every step, as the updater writes it.
+        self.write_params(&sandbox, false)?;
+        Ok(sandbox)
+    }
+
+    /// One file for the whole update, the same for every step, as the updater writes it. With
+    /// `probe`, one `updater.*` key no hook knows.
+    fn write_params(&self, sandbox: &Sandbox, probe: bool) -> Result<(), Violation> {
         let mut params = self.fake.params().with_promotion_ceiling_secs(CEILING_SECS);
         params.insert(
             STAGED_RELEASE_KEY,
             Scalar::Text(sandbox.artifact().to_string_lossy().into_owned()),
         );
         params.insert(TARGET_VERSION_KEY, Scalar::Text(TARGET_VERSION.to_owned()));
-        params.insert(
-            PREVIOUS_VERSION_KEY,
-            Scalar::Text(PREVIOUS_VERSION.to_owned()),
-        );
+        if !self.first_install {
+            // An update has both, and the previous release is a real tree.
+            fs::write(sandbox.previous().join("VERSION"), PREVIOUS_VERSION)?;
+            params.insert(
+                PREVIOUS_RELEASE_KEY,
+                Scalar::Text(sandbox.previous().to_string_lossy().into_owned()),
+            );
+            params.insert(
+                PREVIOUS_VERSION_KEY,
+                Scalar::Text(PREVIOUS_VERSION.to_owned()),
+            );
+        }
+        if probe {
+            params.insert(PROBE_KEY, Scalar::Text("x".to_owned()));
+        }
         fs::write(sandbox.control().join("params.toml"), params.to_toml())?;
-        Ok(sandbox)
+        Ok(())
     }
 
     fn world(sandbox: &Sandbox) -> Result<Tree, Violation> {
         Ok(snapshot(&sandbox.world())?)
+    }
+
+    /// The world, and the hook's record under `record/`: what a rerun must leave as it was and
+    /// a resume must reach. The whole record is compared, so a record that grows on every run
+    /// is a violation; a hook keeps its record idempotent like everything else.
+    fn state(sandbox: &Sandbox) -> Result<Tree, Violation> {
+        let mut tree = Self::world(sandbox)?;
+        for (path, entry) in snapshot(&sandbox.record())? {
+            tree.insert(Path::new("record").join(path), entry);
+        }
+        Ok(tree)
     }
 
     /// Runs `step` once and checks only that it left the artifact and `outside/` alone;
@@ -374,7 +418,7 @@ impl<'a> Conformance<'a> {
     /// Runs `step` twice in a row and requires the second to be a no-op. Returns the first.
     fn twice(&self, sandbox: &Sandbox, step: Step) -> Result<Done, Violation> {
         let first = self.exec_ok(sandbox, step)?;
-        let before = Self::world(sandbox)?;
+        let before = Self::state(sandbox)?;
         let second = self.exec(sandbox, step)?;
         if second.outcome != first.outcome {
             return Err(Violation::RerunOutcomeChanged {
@@ -383,7 +427,14 @@ impl<'a> Conformance<'a> {
                 second: second.outcome,
             });
         }
-        let moved = changes(&before, &Self::world(sandbox)?);
+        if second.report.reversible != first.report.reversible {
+            return Err(Violation::RerunReversibleChanged {
+                step,
+                first: first.report.reversible,
+                second: second.report.reversible,
+            });
+        }
+        let moved = changes(&before, &Self::state(sandbox)?);
         if !moved.is_empty() {
             return Err(Violation::NotIdempotent {
                 step,
@@ -461,40 +512,73 @@ impl<'a> Conformance<'a> {
         let sandbox = self.fresh()?;
         let mut points = Vec::new();
         for step in SUCCESS_PATH {
-            points.push(self.exec_ok(&sandbox, step)?.run.gates);
+            points.push((step, self.measured(&sandbox, step)?));
         }
         self.finished(&sandbox)?;
-        let want = Self::world(&sandbox)?;
-        let total: u64 = points.iter().sum();
+        let want = Self::state(&sandbox)?;
+        // The rollback path of the same update.
+        let rolled = self.fresh()?;
+        for step in ROLLBACK_PATH {
+            self.exec_ok(&rolled, step)?;
+        }
+        points.push((Step::Rollback, self.measured(&rolled, Step::Rollback)?));
+        let rollback_want = Self::state(&rolled)?;
+
+        let total: u64 = points.iter().map(|(_, (gates, _))| gates).sum();
         if total == 0 {
             return Err(Violation::NoKillPoints);
         }
-        for (index, gates) in points.into_iter().enumerate() {
+        // A step that changed things and reached no kill point, even when others did.
+        if let Some((step, _)) = points
+            .iter()
+            .find(|(_, (gates, changed))| *gates == 0 && *changed)
+        {
+            return Err(Violation::StepWithoutKillPoints { step: *step });
+        }
+        let (_, (rollback_gates, _)) = points.remove(SUCCESS_PATH.len());
+        for (index, (_, (gates, _))) in points.into_iter().enumerate() {
             for kill_at in 0..=gates {
-                self.resume_from(index, kill_at, &want)?;
+                let (before, rest) = SUCCESS_PATH.split_at(index);
+                self.resume(before, rest, kill_at, &want)?;
             }
+        }
+        for kill_at in 0..=rollback_gates {
+            self.resume(&ROLLBACK_PATH, &[Step::Rollback], kill_at, &rollback_want)?;
         }
         Ok(total)
     }
 
-    /// Runs the steps before `SUCCESS_PATH[index]`, then that step stopped at kill point
-    /// `kill_at` (or, for `0`, to its end), then it and the rest again; the world must be
-    /// `want`.
-    fn resume_from(&mut self, index: usize, kill_at: u64, want: &Tree) -> Result<(), Violation> {
+    /// Runs `step`, requires success, and returns its kill points and whether it changed the
+    /// world or the record.
+    fn measured(&self, sandbox: &Sandbox, step: Step) -> Result<(u64, bool), Violation> {
+        let before = Self::state(sandbox)?;
+        let gates = self.exec_ok(sandbox, step)?.run.gates;
+        Ok((gates, before != Self::state(sandbox)?))
+    }
+
+    /// Runs `before`, then the first of `rest` stopped at kill point `kill_at` (or, for `0`, to
+    /// its end), then all of `rest`; the state must be `want`.
+    fn resume(
+        &mut self,
+        before: &[Step],
+        rest: &[Step],
+        kill_at: u64,
+        want: &Tree,
+    ) -> Result<(), Violation> {
         let sandbox = self.fresh()?;
-        for step in &SUCCESS_PATH[..index] {
+        for step in before {
             self.exec_ok(&sandbox, *step)?;
         }
-        let step = SUCCESS_PATH[index];
+        let step = rest[0];
         if kill_at == 0 {
             self.exec_ok(&sandbox, step)?;
         } else if !self.exec_at(&sandbox, step, kill_at)?.parked {
             return Err(Violation::KillPointVanished { step, kill_at });
         }
-        for step in &SUCCESS_PATH[index..] {
+        for step in rest {
             self.exec_ok(&sandbox, *step)?;
         }
-        let moved = changes(want, &Self::world(&sandbox)?);
+        let moved = changes(want, &Self::state(&sandbox)?);
         if !moved.is_empty() {
             return Err(Violation::CrashResumeDiverges {
                 step,
@@ -600,6 +684,15 @@ impl<'a> Conformance<'a> {
     /// A params file with one more `updater.*` key than the hook knows is no reason to refuse:
     /// the updater may add reserved keys without breaking an older hook.
     pub fn tolerates_unknown_updater_keys(&mut self) -> Result<(), Violation> {
+        let sandbox = self.fresh()?;
+        self.write_params(&sandbox, true)?;
+        let done = self.exec(&sandbox, Step::Prepare)?;
+        if done.outcome != Outcome::Success {
+            return Err(Violation::RefusedUpdaterKey {
+                step: Step::Prepare,
+                outcome: done.outcome,
+            });
+        }
         Ok(())
     }
 
