@@ -737,7 +737,7 @@ toolchain bundle. The `darwin-arm64` job makes that bundle, and no other job doe
 
 Both are in the macOS `SHA256SUMS`, the tarball is attested like every tarball (build provenance, an SBOM
 attestation and its own `.sigstore.json` bundle; [above](#provenance-bundles-verifying-a-tarball-offline)),
-and the tarball is one of the 25. It is not a binary tarball: it holds no member named `kbf-task`, the layout
+and the tarball is one of the 23. It is not a binary tarball: it holds no member named `kbf-task`, the layout
 holds it in a layer.
 
 The steps, in order, each unconditional (`crates/kbf-integration-test/tests/release_artifacts` pins them):
