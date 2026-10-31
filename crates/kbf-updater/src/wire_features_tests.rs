@@ -450,12 +450,7 @@ fn an_answer_equals_the_reply_it_carries() {
 fn the_new_facts_at_their_bounds_stay_inside_the_budget() {
     let token = "r".repeat(64);
     let step_secs: serde_json::Map<String, Value> = (0..8)
-        .map(|i| {
-            (
-                format!("{:_<16}", format!("s{i}")),
-                json!(4_294_967_295_u64),
-            )
-        })
+        .map(|i| (format!("{:_<16}", format!("s{i}")), json!(u64::MAX)))
         .collect();
     let facts = json!({
         "step": {"name": "n".repeat(16), "attempt": 4_294_967_295_u64},

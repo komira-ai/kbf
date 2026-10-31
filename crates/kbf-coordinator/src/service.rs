@@ -229,8 +229,10 @@ impl Coordinator {
 
     /// Logs a heartbeat from `who` of which an optional fact was bad and was dropped (`why`
     /// is the reader's reason): the heartbeat is still answered, without that fact.
-    pub fn note_extras_dropped(&self, who: &Identity, why: &str) {
+    pub fn note_extras_dropped(&self, who: &Identity, why: &str, facts: &[&'static str]) -> bool {
+        let _ = facts;
         tracing::warn!(node_id = %who.node_id, why, "dropped optional fields of a heartbeat");
+        true
     }
 
     /// Counts and logs a heartbeat from `who` whose `services` list was bad and was dropped

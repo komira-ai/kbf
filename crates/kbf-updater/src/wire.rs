@@ -278,6 +278,10 @@ pub struct HeartbeatRead {
     /// Why one of the optional facts (`agent_features`, `step`, `commit`, `step_secs`,
     /// `promotion_pending`, `deferred`) was dropped, if one was.
     pub extras_dropped: Option<String>,
+    /// The names of the facts `extras_dropped` is about, sorted, each once: `step`, `commit`,
+    /// `step_secs`, `promotion_pending`, `deferred` or `agent_features`, whether the bad one
+    /// was at the top level or in a service entry.
+    pub extras_dropped_facts: Vec<&'static str>,
 }
 
 /// Reads a heartbeat, keeping a host whose `services` list, or one of its optional facts, is
@@ -297,6 +301,7 @@ pub fn read_heartbeat(bytes: &[u8]) -> Result<HeartbeatRead, serde_json::Error> 
             beat,
             services_dropped: None,
             extras_dropped: None,
+            extras_dropped_facts: Vec::new(),
         }),
         Err(why) => {
             let Some(read) = without_droppable(bytes) else {
@@ -431,6 +436,7 @@ fn without_droppable(bytes: &[u8]) -> Option<HeartbeatRead> {
         beat,
         services_dropped: (!services_why.is_empty()).then(|| services_why.join("; ")),
         extras_dropped: (!extras.is_empty()).then(|| extras.join("; ")),
+        extras_dropped_facts: Vec::new(),
     })
 }
 
