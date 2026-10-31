@@ -106,6 +106,8 @@ mod limits_tests;
 #[cfg(test)]
 mod listing_tests;
 #[cfg(test)]
+mod lost_tests;
+#[cfg(test)]
 mod read_only_tests;
 #[cfg(test)]
 mod selfcheck_tests;
@@ -455,6 +457,8 @@ impl Inner {
     /// object is not served from them then: it was deleted or replaced at the upstream.
     fn drop_entry(&self, hex: &str) {
         drop(locked(&self.index).remove(hex));
+        #[cfg(test)]
+        self.trace_before_delete();
         if !self.may_delete(hex) {
             return;
         }

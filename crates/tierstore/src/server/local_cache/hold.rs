@@ -127,6 +127,24 @@ pub(super) struct Hold {
     /// until `read_write` is set: a delete is noted before the promotion looks at the notes, or
     /// finds the cache read-write and removes the files itself.
     forgotten: Mutex<Forgotten>,
+    /// Calls a test makes at fixed points of the take and of a delete, to order them.
+    #[cfg(test)]
+    pub(super) trace: Mutex<Trace>,
+}
+
+/// A call a test asks to be made at a point.
+#[cfg(test)]
+pub(super) type Hook = Arc<dyn Fn() + Send + Sync>;
+
+/// The points of [`Trace`].
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct Trace {
+    /// In `promote`, after the notes were taken into account for the scan and before the index
+    /// is replaced.
+    pub(super) promote: Option<Hook>,
+    /// In `drop_entry`, just before it asks whether the files may be removed.
+    pub(super) before_delete: Option<Hook>,
 }
 
 impl Hold {
@@ -136,6 +154,8 @@ impl Hold {
             standing: Mutex::new(standing),
             read_write: AtomicBool::new(read_write),
             forgotten: Mutex::new(Forgotten::default()),
+            #[cfg(test)]
+            trace: Mutex::new(Trace::default()),
         }
     }
 }
@@ -214,6 +234,8 @@ impl Inner {
             remove_if_there(&layout::data_path(&self.config.path, &found.hex))?;
             remove_if_there(&layout::meta_path(&self.config.path, &found.hex))?;
         }
+        #[cfg(test)]
+        self.trace_promote();
         add(
             &self.counters.discarded_at_start,
             scanned.discarded + removed,
@@ -222,6 +244,30 @@ impl Inner {
         *forgotten = Forgotten::default();
         self.hold.read_write.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Sets the calls a test makes at the points of [`Trace`].
+    #[cfg(test)]
+    pub(super) fn set_trace(&self, trace: Trace) {
+        *locked(&self.hold.trace) = trace;
+    }
+
+    /// Makes the call a test set for the take, if there is one.
+    #[cfg(test)]
+    fn trace_promote(&self) {
+        let hook = locked(&self.hold.trace).promote.clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Makes the call a test set for a delete, if there is one.
+    #[cfg(test)]
+    pub(super) fn trace_before_delete(&self) {
+        let hook = locked(&self.hold.trace).before_delete.clone();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// The line the process says on stderr of a tick, if the tick changed anything.

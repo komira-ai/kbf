@@ -3,8 +3,13 @@
 //!
 //! `Rig::cache` stands for the process that holds the directory and filled it.
 
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+
 use bytes::Bytes;
 
+use super::hold::Trace;
+use super::layout::name_of;
 use super::metrics::read;
 use super::testing::{Rig, pattern, tree};
 use super::{Mode, Tick};
@@ -100,4 +105,48 @@ async fn more_deletes_than_the_cache_remembers_empty_it_when_it_takes_the_lock()
     }
     assert_eq!(reader.get("cas/b/kept", None).await.unwrap(), pattern(30));
     assert_eq!(read(&reader.counters().fills), 1);
+}
+
+/// Asserts that a delete that reaches a read-only cache while it is taking the lock leaves no
+/// entry in the index: the take has decided which files to trust, the delete arrives and is
+/// ordered after the decision (the take is held, by the test, between the two), and when both are
+/// done the index has no entry and the files are gone. It would catch a delete that removes the
+/// index entry first and then waits for the take, which puts the entry back for an object that
+/// is deleted, to be answered by HEAD for good.
+#[tokio::test]
+async fn a_delete_that_arrives_during_the_take_leaves_no_index_entry() {
+    let rig = Rig::writing("tscache-forget-during");
+    rig.put("cas/b/obj", &pattern(30)).await;
+    let _ = rig.cache.get("cas/b/obj", None).await.unwrap();
+    let holder = rig.locked();
+    let reader = rig.locked();
+    assert_eq!(reader.held(), (30, 1));
+    drop(holder);
+
+    let (started_tx, started_rx) = mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = mpsc::channel::<()>();
+    let (arrived_tx, arrived_rx) = mpsc::channel::<()>();
+    let (started_tx, resume_rx) = (Mutex::new(started_tx), Mutex::new(resume_rx));
+    let arrived_tx = Mutex::new(arrived_tx);
+    reader.inner.set_trace(Trace {
+        promote: Some(Arc::new(move || {
+            started_tx.lock().unwrap().send(()).unwrap();
+            resume_rx.lock().unwrap().recv().unwrap();
+        })),
+        before_delete: Some(Arc::new(move || {
+            arrived_tx.lock().unwrap().send(()).unwrap();
+        })),
+    });
+    let taking = reader.clone();
+    let take = std::thread::spawn(move || taking.tick().unwrap());
+    started_rx.recv().unwrap();
+    let hex = name_of("cas/b/obj").hex;
+    let deleting = reader.clone();
+    let delete = std::thread::spawn(move || deleting.inner.drop_entry(&hex));
+    arrived_rx.recv().unwrap();
+    resume_tx.send(()).unwrap();
+    assert_eq!(take.join().unwrap(), Tick::Took);
+    delete.join().unwrap();
+    assert_eq!(reader.held(), (0, 0));
+    assert!(!rig.has_file("cas/b/obj"));
 }
