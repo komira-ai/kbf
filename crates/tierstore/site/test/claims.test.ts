@@ -69,7 +69,7 @@ test('the code still matches those statements', () => {
 test('the check can fail: a second metrics exporter, a CachedStore use and a dropped build-node shape are each reported with the page to change', () => {
   const real = binarySource();
   const with_ = (name: string, f: (s: string) => string): Map<string, string> => new Map([...real].map(([k, v]) => [k, k === name ? f(v) : v]));
-  assert.match(staleClaims(with_('server/mod.rs', (s) => s + '\n# TYPE x counter')).join('\n'), /exports metrics.*docs\/operations\.md/);
+  assert.match(staleClaims(with_('server/cli.rs', (s) => s + '\n# TYPE x counter')).join('\n'), /exports metrics.*docs\/operations\.md/);
   assert.match(staleClaims(with_('main.rs', (s) => s + '\nuse tierstore::CachedStore;')).join('\n'), /uses CachedStore.*content\/why\.html/);
   assert.match(staleClaims(with_('server/config.rs', (s) => s.replace('build-node shape', 'ok'))).join('\n'), /no longer reads a build node.*docs\/configuration\.md/);
   assert.match(staleClaims(with_('server/mod.rs', (s) => s.replace('"/usagez"', '"/usagez2"'))).join('\n'), /probe routes/);
