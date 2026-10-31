@@ -400,6 +400,14 @@ pub(super) struct TierTable {
     /// `endpoint`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoints: Option<Vec<String>>,
+    /// Only the `[cold_store]` of a build node: how long an endpoint that failed is skipped
+    /// (default 5s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unready_backoff: Option<Dur>,
+    /// Only the `[cold_store]` of a build node: the time between two polls of every endpoint's
+    /// `/readyz` (default 2s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readyz_interval: Option<Dur>,
 }
 
 /// `[oci]`: the read-only OCI front. The table is the front: `listen` is needed in it, and the
@@ -834,6 +842,14 @@ fn storage(
         why,
         &[("endpoints", cold.endpoints.is_some())],
     )?;
+    let why = "only the [cold_store] of a build node has it: it is about a list of endpoints";
+    for (table, tier) in [("hot_store", &hot), ("cold_store", &cold)] {
+        let failover = [
+            ("unready_backoff", tier.unready_backoff.is_some()),
+            ("readyz_interval", tier.readyz_interval.is_some()),
+        ];
+        refuse(table, why, &failover)?;
+    }
     let skipping = [("skip_checks", hot.skip_checks.is_some())];
     refuse(
         "hot_store",

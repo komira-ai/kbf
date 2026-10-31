@@ -15,11 +15,14 @@ use kbf_testkit::dir::TestDir;
 use tokio::sync::oneshot;
 
 use super::Drained;
-use super::cache_cli::{run_cache, serve_cache, size_of_file_system, unjudged_warning};
+use super::cache_cli::{
+    run_cache, serve_cache, serve_cache_over, size_of_file_system, unjudged_warning,
+};
 use super::cli::Error;
 use super::cli::{checked, exit_status};
 use super::config::{PerRun, Settings, settings_from_text};
 use super::config_cache::CacheSettings;
+use super::endpoints::testing::Fleet;
 use super::local_cache::testing::{FakeDisk, Quirk, digest, pattern};
 use super::local_cache::{Disk, SystemDisk};
 use crate::selftest_tests::{Flaw, Flawed};
@@ -200,6 +203,105 @@ async fn a_build_node_serves_the_upstream_through_its_cache() {
         .join(&name[2..4])
         .join(&name);
     assert_eq!(std::fs::read(file).unwrap(), pattern(1000));
+}
+
+/// Asserts that a build node over a list of endpoints serves what they hold, answers `/readyz`
+/// 200 while one is ready and 503 once the poll says none is, shows their counters on `/metricz`,
+/// and stops with the poll beside it (the drain waits for the poll to end, so a poll that
+/// ignored the stop would hang the test).
+#[tokio::test]
+async fn a_build_node_over_endpoints_follows_their_readiness() {
+    let node = Node::new("tscache-cli-endpoints");
+    let settings = node.settings("", "");
+    let fleet = Fleet::new(2);
+    fleet.put("cas/obj", &pattern(1000)).await;
+    let upstream: Arc<dyn Backend> = fleet.endpoints.clone();
+    let disk: Arc<dyn Disk> = Arc::new(SystemDisk);
+    let (stop, stopped) = oneshot::channel::<()>();
+    let (told, addr) = oneshot::channel::<SocketAddr>();
+    let running = serve_cache_over(
+        &settings,
+        upstream,
+        Some(fleet.endpoints.clone()),
+        disk,
+        async move {
+            let _ = stopped.await;
+        },
+        move |bound| {
+            let _ = told.send(bound);
+        },
+    );
+    let driving = async {
+        let addr = addr.await.unwrap();
+        let store = client(addr);
+        let key = ObjectKey::new("cas/obj").unwrap();
+        let all = ByteRange::new(0, 1000).unwrap();
+        assert_eq!(store.get_range(&key, all).await.unwrap(), pattern(1000));
+        let (status, text) = probe(addr, "/readyz").await;
+        assert_eq!((status, text.as_str()), (200, "ready"));
+        for name in &fleet.names {
+            fleet.probe.set(name, false);
+        }
+        fleet.endpoints.poll().await;
+        let (status, text) = probe(addr, "/readyz").await;
+        assert_eq!(
+            (status, text.as_str()),
+            (503, "no upstream endpoint is ready")
+        );
+        let (_, text) = probe(addr, "/metricz").await;
+        let gauge = format!("endpoint_ready{{endpoint=\"{}\"}} 0\n", fleet.names[0]);
+        assert!(text.contains(&gauge), "{text}");
+        stop.send(()).unwrap();
+    };
+    let (drained, ()) = tokio::join!(running, driving);
+    assert_eq!(drained.unwrap(), Drained { abandoned: 0 });
+}
+
+/// Asserts that an upstream that is a directory tier (no endpoints) and cannot be opened (its
+/// path is under a file) is refused by `run_cache`, naming the tier, with exit status 1.
+#[tokio::test]
+async fn a_cold_directory_that_cannot_be_opened_is_refused() {
+    let node = Node::new("tscache-cli-colddir");
+    let file = node.dir.path().join("cold-in-the-way");
+    std::fs::write(&file, b"a file").unwrap();
+    let path = file.join("below");
+    let dir = format!("kind = \"dir\"\npath = \"{}\"", path.display());
+    let text = node.text("", "").replace("kind = \"memory\"", &dir);
+    let settings = settings_from_text(&text, QUICK)
+        .unwrap()
+        .into_cache()
+        .unwrap();
+    let why = run_cache(&settings, std::future::ready(()), |_| {})
+        .await
+        .unwrap_err();
+    assert!(why.to_string().contains("--cold"), "{why}");
+    assert_eq!(exit_status(&why), 1);
+}
+
+/// Asserts that a list of endpoints one of which cannot be opened (the key file of the upstream
+/// is not there) is refused by `run_cache`, naming the key file, with exit status 1, and that
+/// nothing is served: the address is never told.
+#[tokio::test]
+async fn a_list_of_endpoints_that_cannot_be_opened_is_refused() {
+    let node = Node::new("tscache-cli-listrefused");
+    let missing = node.dir.path().join("no-such-credentials");
+    let s3 = format!(
+        "kind = \"s3\"\nbucket = \"b\"\nendpoints = [\"http://127.0.0.1:1\", \"http://127.0.0.1:2\"]\ncredentials_file = \"{}\"",
+        missing.display()
+    );
+    let text = node.text("", "").replace("kind = \"memory\"", &s3);
+    let settings = settings_from_text(&text, QUICK)
+        .unwrap()
+        .into_cache()
+        .unwrap();
+    assert_eq!(settings.endpoints.len(), 2);
+    let why = run_cache(&settings, std::future::ready(()), |_| {
+        panic!("a start that is refused tells no address")
+    })
+    .await
+    .unwrap_err();
+    assert!(why.to_string().contains("credentials"), "{why}");
+    assert_eq!(exit_status(&why), 1);
 }
 
 /// Asserts that `run_cache` makes the upstream of the file (a memory tier here, empty) and

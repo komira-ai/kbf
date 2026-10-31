@@ -19,6 +19,11 @@
 //! them wrongly, a key that may not write included, is exit status 3; one that does not answer is
 //! exit status 1, after the one try that the check of the start gives it.
 //!
+//! An S3 upstream is a list of one or more endpoints (see [`endpoints`](super::endpoints)), all
+//! taken to be ready at the start (the HEAD above is the start's check), and a poll of every
+//! endpoint's `/readyz` runs beside the server, the first one after one interval, until it
+//! stops. The cache's own `/readyz` is 503 while no endpoint is usable.
+//!
 //! On SIGTERM or SIGINT the process drains as a storage node does; the eviction pass is the only
 //! thing running beside the server, and it stops with it. Nothing is owed to the upstream: no
 //! journal, no lease, no copy in flight.
@@ -36,12 +41,16 @@ use crate::{Backend, Clock, Error as BackendError, SelfTestOptions, SystemClock,
 
 use super::cli::{Error, S3Flags, open_tier, probe_run_id, signals};
 use super::config_cache::CacheSettings;
+use super::endpoints::{Endpoints, HttpProbe};
 use super::front::{InvalidFlags, server_config};
 use super::local_cache::{CacheConfig, Disk, LocalCache, SystemDisk, check_local};
 use super::{Drained, Server};
 
 /// How often the eviction pass runs beside the server.
 const PASS_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long a poll of an endpoint's `/readyz` may take, connect included.
+const READYZ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Asks the upstream a HEAD of a key that is not there: any answer but 404 is a problem.
 async fn reach(upstream: &dyn Backend, run: &str, spec: &str) -> Result<(), Error> {
@@ -152,6 +161,23 @@ pub(super) async fn serve_cache(
     stop: impl Future<Output = ()> + Send + 'static,
     ready: impl FnOnce(SocketAddr),
 ) -> Result<Drained, Error> {
+    serve_cache_over(settings, upstream, None, disk, stop, ready).await
+}
+
+/// [`serve_cache`] over an upstream that may be a list of endpoints: `upstream` is read through
+/// and `endpoints`, if given, is the same list as `upstream`, whose `/readyz` poll runs beside the
+/// server and which the front shows on `/readyz` and `/metricz`.
+///
+/// # Errors
+/// As [`serve_cache`].
+pub(super) async fn serve_cache_over(
+    settings: &CacheSettings,
+    upstream: Arc<dyn Backend>,
+    endpoints: Option<Arc<Endpoints>>,
+    disk: Arc<dyn Disk>,
+    stop: impl Future<Output = ()> + Send + 'static,
+    ready: impl FnOnce(SocketAddr),
+) -> Result<Drained, Error> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut config = server_config(&settings.front, Arc::clone(&clock))?;
     let run = probe_run_id(&settings.front.proxy_id, clock.now(), std::process::id());
@@ -165,6 +191,7 @@ pub(super) async fn serve_cache(
         eprintln!("tierstore: scrub_rate {rate} B/s is accepted; this release does not scrub");
     }
     config.cache = Some(cache.clone());
+    config.upstream.clone_from(&endpoints);
     let backend: Arc<dyn Backend> = Arc::new(cache.clone());
     let server = Server::new(backend, config);
     let address = settings.front.listen;
@@ -178,13 +205,22 @@ pub(super) async fn serve_cache(
     });
     let halt = Arc::new(Notify::new());
     let halting = Arc::clone(&halt);
+    let polled = Arc::new(Notify::new());
+    let unpolled = Arc::clone(&polled);
     let serving = async move {
         let drained = server.serve(listener).await;
         halting.notify_one();
+        unpolled.notify_one();
         drained
     };
     let maintaining = cache.maintain(PASS_INTERVAL, halt);
-    let (drained, ()) = tokio::join!(serving, maintaining);
+    let polling = async {
+        match &endpoints {
+            Some(endpoints) => endpoints.watch(polled).await,
+            None => drop(polled),
+        }
+    };
+    let (drained, (), ()) = tokio::join!(serving, maintaining, polling);
     watcher.abort();
     Ok(drained)
 }
@@ -203,14 +239,28 @@ pub(super) async fn run_cache(
         return Err("--s3-request-timeout must be longer than zero".into());
     }
     let tier = &settings.upstream;
-    let s3 = S3Flags {
-        endpoint: tier.endpoint.as_deref(),
-        region: tier.region.as_deref(),
-        credentials: tier.credentials_file.as_deref(),
+    let open = |endpoint: Option<&str>| {
+        let s3 = S3Flags {
+            endpoint,
+            region: tier.region.as_deref(),
+            credentials: tier.credentials_file.as_deref(),
+        };
+        open_tier("--cold", &tier.spec, &s3, settings.s3_request_timeout)
     };
-    let upstream = open_tier("--cold", &tier.spec, &s3, settings.s3_request_timeout)?;
     let disk: Arc<dyn Disk> = Arc::new(SystemDisk);
-    serve_cache(settings, upstream, disk, stop, ready).await
+    if settings.endpoints.is_empty() {
+        let upstream = open(tier.endpoint.as_deref())?;
+        return serve_cache(settings, upstream, disk, stop, ready).await;
+    }
+    let mut members = Vec::new();
+    for url in &settings.endpoints {
+        members.push((url.clone(), open(Some(url))?));
+    }
+    let probe = Arc::new(HttpProbe::new(READYZ_TIMEOUT));
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let endpoints = Arc::new(Endpoints::new(members, settings.failover, clock, probe));
+    let upstream: Arc<dyn Backend> = endpoints.clone();
+    serve_cache_over(settings, upstream, Some(endpoints), disk, stop, ready).await
 }
 
 /// Runs the cache until SIGTERM or SIGINT.
