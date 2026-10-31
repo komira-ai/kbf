@@ -293,24 +293,26 @@ fn specifiers(src: &str) -> Vec<String> {
     };
     let mut out = Vec::new();
     for line in src.lines() {
-        let t = line.trim_start();
-        if t.starts_with("//") || t.starts_with('*') || t.starts_with("/*") {
-            continue;
-        }
-        let from = t
-            .find(" from ")
-            .filter(|_| t.starts_with("import ") || t.starts_with("export ") || t.starts_with('}'));
-        match from {
-            Some(at) => out.extend(quoted(&t[at..])),
-            None if t.starts_with("} from ") => out.extend(quoted(t)),
-            None if t.starts_with("import ") && !t.contains('(') => out.extend(quoted(t)),
-            None => {}
-        }
-        for call in ["require(", "import("] {
-            let mut rest = t;
-            while let Some(i) = rest.find(call) {
-                rest = &rest[i + call.len()..];
-                out.extend(quoted(rest));
+        // Statements, not lines: `import a from 'node:fs'; import b from 'b';` is two imports.
+        for statement in line.split(';') {
+            let t = statement.trim_start();
+            if t.starts_with("//") || t.starts_with('*') || t.starts_with("/*") {
+                break;
+            }
+            let from = t.find(" from ").filter(|_| {
+                t.starts_with("import ") || t.starts_with("export ") || t.starts_with('}')
+            });
+            match from {
+                Some(at) => out.extend(quoted(&t[at..])),
+                None if t.starts_with("import ") && !t.contains('(') => out.extend(quoted(t)),
+                None => {}
+            }
+            for call in ["require(", "import("] {
+                let mut rest = t;
+                while let Some(i) = rest.find(call) {
+                    rest = &rest[i + call.len()..];
+                    out.extend(quoted(rest));
+                }
             }
         }
     }

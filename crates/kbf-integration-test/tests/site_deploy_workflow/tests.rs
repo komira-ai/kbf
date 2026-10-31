@@ -106,19 +106,25 @@ fn the_deploy_job_runs_in_its_environment_on_main_only() {
 fn only_the_deploy_job_holds_the_token_and_it_holds_nothing_else() {
     // Catches: `id-token: write` in the job that runs the repository's code, the deploy job gaining
     // a repository or other right, and the build job losing its read-only grant.
-    let build = "    permissions:\n      contents: read\n";
+    let build = "    permissions:\n      contents: read\n    defaults:\n";
     refused(
         &plant(
             build,
-            "    permissions:\n      contents: read\n      id-token: write\n",
+            "    permissions:\n      contents: read\n      id-token: write\n    defaults:\n",
         ),
         "the build job's permissions",
     );
     refused(
-        &plant(build, "    permissions:\n      contents: write\n"),
+        &plant(
+            build,
+            "    permissions:\n      contents: write\n    defaults:\n",
+        ),
         "the build job's permissions",
     );
-    refused(&plant(build, ""), "the build job's permissions");
+    refused(
+        &plant(build, "    defaults:\n"),
+        "the build job's permissions",
+    );
     let deploy = "    permissions:\n      contents: read\n      id-token: write\n";
     refused(
         &plant(
