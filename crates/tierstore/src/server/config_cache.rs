@@ -50,11 +50,11 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::config::{
-    ConfigError, PerRun, Policy, ServerTable, Size, TierParts, TierTable, check_policies, front_of,
-    invalid, parse_size, refuse, refuse_hot_keys, require, tier, within,
+    ConfigError, Dur, PerRun, Policy, ServerTable, Size, TierParts, TierTable, check_policies,
+    duration, front_of, invalid, parse_size, refuse, refuse_hot_keys, require, tier, within,
 };
 use super::front::FrontSettings;
-use super::local_cache::{CacheConfig, SCRUB_RATE};
+use super::local_cache::{CacheConfig, SCRUB_MIN_ROUND, SCRUB_RATE};
 
 /// The only layout of the cache directory.
 const LAYOUT: &str = "digest-v1";
@@ -135,6 +135,10 @@ pub(super) struct LocalCacheTable {
     /// `"off"` (or `"0B/s"`) turns the scrub off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrub_rate: Option<Rate>,
+    /// The least time between the starts of two rounds of the scrub (`SCRUB_MIN_ROUND`, one hour,
+    /// if not given); `"0s"` lets a round start as soon as the last is done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_min_round: Option<Dur>,
 }
 
 /// What a build-node file stands for.
@@ -151,6 +155,8 @@ pub(super) struct CacheSettings {
     /// The rate of the scrub in bytes a second: the default if the file gave none; none if the
     /// file turned it off.
     pub scrub_rate: Option<u64>,
+    /// The least time between the starts of two rounds of the scrub.
+    pub scrub_min_round: Duration,
 }
 
 /// The `endpoint` of the upstream: `endpoint`, or the one entry of `endpoints`.
@@ -252,6 +258,7 @@ impl CacheSettings {
             s3_request_timeout: shared.s3_request_timeout,
             upstream,
             cache,
+            scrub_min_round: duration(table.scrub_min_round, SCRUB_MIN_ROUND),
             scrub_rate: Some(table.scrub_rate.map_or(SCRUB_RATE, |rate| rate.0)).filter(|n| *n > 0),
         })
     }

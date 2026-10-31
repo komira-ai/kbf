@@ -27,8 +27,14 @@
 //! anything else is read. The average is therefore `per_tick` bytes a tick and the largest burst
 //! is one object: inside one object the read is not paced (it runs at the speed of the disk), in
 //! chunks of 1 MiB, and the stop flag is looked at before each chunk, so a halt ends it at the
-//! next chunk and shutdown does not wait out a big object. The walk takes the names in the index at its start, in order, and starts over
-//! when it is done, so each object is visited once a round whatever eviction and fills do between.
+//! next chunk and shutdown does not wait out a big object. The walk takes the names in the index
+//! at its start, in order, and starts over when it is done, so each object is visited once a round
+//! whatever eviction and fills do between. At least `min_round` ticks (an hour by default) lie
+//! between the starts of two rounds, so a small cache is not read over and over at the rate.
+//!
+//! An object whose check panics is counted in `scrub_errors`, skipped for the round, and the walk
+//! goes on past it. A failure to read the identity of the open file is not counted: the object
+//! is then never dropped (its identity cannot be matched), only passed over.
 //!
 //! # Races
 //!
@@ -39,9 +45,9 @@
 //! the path still names the file that was hashed. Whatever puts a file at `data_path` (a fill, and
 //! so a write that a fill follows) does it inside a flight, which the scrub leaves alone; a
 //! delete or a write-through put that marks a running fill ([`Inner::forget`]) finds that flight
-//! still in the table, because the scrub never takes one out. A reader therefore sees the object whole (before the drop) or absent (after it), a
-//! file linked by a fill that ran between the hash and the drop is never removed for the old
-//! file's bytes, and an object whose fill is still ending is left for the next round.
+//! still in the table, because the scrub never takes one out. A reader therefore sees the object
+//! whole (before the drop) or absent (after it), a file linked by a fill that ran between the hash
+//! and the drop is never removed for the old file's bytes, and an object whose fill is still ending is left for the next round.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -62,6 +68,10 @@ use super::{Inner, LocalCache, locked};
 
 /// The bytes a second the binary scrubs at unless the settings say otherwise.
 pub const SCRUB_RATE: u64 = 16 << 20;
+
+/// The rounds of the binary's scrub start at least this far apart, unless the settings say
+/// otherwise.
+pub const SCRUB_MIN_ROUND: Duration = Duration::from_secs(3600);
 
 /// The time between two ticks of the binary's scrub.
 pub const SCRUB_TICK: Duration = Duration::from_secs(1);
@@ -116,6 +126,11 @@ pub struct Scrubber {
     /// The bytes that may be read now; negative while an object bigger than a tick's worth is paid
     /// for.
     credit: i128,
+    /// The ticks seen, and the tick at which the round that is running (or ran last) started.
+    ticks: u64,
+    round_at: Option<u64>,
+    /// The fewest ticks between the starts of two rounds.
+    min_round: u64,
     /// Set to end the walk: looked at before each chunk of an object and each object.
     pub(super) stop: Arc<AtomicBool>,
     /// Runs after each chunk of an object is hashed.
@@ -131,21 +146,27 @@ impl Scrubber {
             per_tick: per_tick.max(1),
             queue: VecDeque::new(),
             credit: 0,
+            ticks: 0,
+            round_at: None,
+            min_round: 0,
             stop: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             on_chunk: None,
         }
     }
 
-    /// The same walk after a tick that panicked: the position is lost, the stop flag is kept.
-    fn restarted(&self) -> Self {
-        let mut fresh = Self::new(self.per_tick);
-        fresh.stop = Arc::clone(&self.stop);
-        #[cfg(test)]
-        {
-            fresh.on_chunk = self.on_chunk.clone();
-        }
-        fresh
+    /// At least `ticks` ticks between the starts of two rounds: a cache that is small is not read
+    /// again at once, whatever the rate allows. The first round starts at the first tick.
+    #[must_use]
+    pub fn with_min_round(mut self, ticks: u64) -> Self {
+        self.min_round = ticks;
+        self
+    }
+
+    /// Whether a new round may start now.
+    fn may_start_round(&self) -> bool {
+        self.round_at
+            .is_none_or(|at| self.ticks - at >= self.min_round)
     }
 }
 
@@ -306,20 +327,29 @@ impl Inner {
     /// One tick: scrubs objects while there is credit, and counts them.
     pub(super) fn scrub_tick(&self, state: &mut Scrubber) -> ScrubPass {
         let per_tick = i128::from(state.per_tick);
+        state.ticks += 1;
         state.credit = (state.credit + per_tick).min(per_tick);
         let mut pass = ScrubPass::default();
         let mut started = false;
         while state.credit > 0 && !state.stop.load(Ordering::SeqCst) {
             let Some(hex) = state.queue.pop_front() else {
                 // One new round at most for a tick: an empty or all-skipped cache must end it.
-                if started {
+                if started || !state.may_start_round() {
                     break;
                 }
                 started = true;
-                state.queue = locked(&self.index).names().into();
+                state.round_at = Some(state.ticks);
+                let mut names = locked(&self.index).names();
+                names.sort();
+                state.queue = names.into();
                 continue;
             };
-            let (bytes, dropped) = match self.scrub_object(&hex, state) {
+            // An object whose check panics is counted and skipped for this round, and the walk
+            // goes on past it.
+            let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.scrub_object(&hex, state)
+            }));
+            let (bytes, dropped) = match checked.unwrap_or_else(|_| self.scrub_error()) {
                 Verdict::Intact(bytes) => (bytes, false),
                 Verdict::Dropped(bytes) => (bytes, true),
                 Verdict::Left => continue,
@@ -351,11 +381,18 @@ impl LocalCache {
     /// ticker for anything. A halt ends the pass that is running at the next chunk. A tick that
     /// panics is reported on the standard error stream and the walk starts over: the scrub never
     /// takes the cache down with it.
-    pub async fn scrub(&self, per_tick: Option<u64>, ticker: impl Ticker, halt: Arc<Notify>) {
+    pub async fn scrub(
+        &self,
+        per_tick: Option<u64>,
+        min_round: u64,
+        ticker: impl Ticker,
+        halt: Arc<Notify>,
+    ) {
         let Some(per_tick) = per_tick else {
             return;
         };
-        self.scrub_with(Scrubber::new(per_tick), ticker, halt).await;
+        let state = Scrubber::new(per_tick).with_min_round(min_round);
+        self.scrub_with(state, ticker, halt).await;
     }
 
     /// [`scrub`](Self::scrub) from a walk that is already made.
@@ -375,7 +412,8 @@ impl LocalCache {
                 break;
             }
             let inner = Arc::clone(&self.inner);
-            let fresh = state.restarted();
+            let stop = Arc::clone(&state.stop);
+            let (per_tick, min_round) = (state.per_tick, state.min_round);
             let mut running = tokio::task::spawn_blocking(move || {
                 let pass = inner.scrub_tick(&mut state);
                 (state, pass)
@@ -386,17 +424,20 @@ impl LocalCache {
                 done = &mut running => Some(done),
             };
             let Some(done) = finished else {
-                fresh.stop.store(true, Ordering::SeqCst);
+                stop.store(true, Ordering::SeqCst);
                 let _ = running.await;
                 break;
             };
-            state = match done {
-                Ok((state, _)) => state,
-                Err(error) => {
+            // A tick that fails outside an object's check starts the walk over: it is reported and
+            // does not take the cache down.
+            state = done.map_or_else(
+                |error| {
                     eprintln!("tierstore: a scrub tick failed, the walk starts over: {error}");
-                    fresh
-                }
-            };
+                    let fresh = Scrubber::new(per_tick).with_min_round(min_round);
+                    Scrubber { stop, ..fresh }
+                },
+                |(state, _)| state,
+            );
         }
     }
 }

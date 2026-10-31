@@ -397,7 +397,8 @@ fill is still ending, and never one whose file was replaced after it was read. A
 cannot be read (a failing disk, out of descriptors) is left alone and counted in
 `scrub_errors_total`; a sidecar that is missing or does not parse drops the object. The bytes are
 hashed in chunks of 1 MiB and a shutdown ends the pass at the next chunk; inside one object the
-read is not paced. `scrub_rate = "off"`
+read is not paced. A round (every object once) starts at most once in `scrub_min_round`. An
+object whose check panics is counted in `scrub_errors_total` and skipped for the round. `scrub_rate = "off"`
 turns it off; a restart still checks sizes only. A hard link that a job holds to a dropped object
 keeps the old bytes for that job: the scrub removes the cache's name only.
 
@@ -427,6 +428,7 @@ read, or that reports 0 bytes, is not judged: the start warns on stderr and goes
 | `local_cache.max_concurrent_fills` | the most fills that run at once (1 to 64, default 4); a miss that finds them all running is served from the upstream and kept nowhere |
 | `local_cache.write_through` | `false` by default: a read cache that refuses every write with 403 before the role of the key is looked at. `true`: the node takes the writes its keys may do and sends each to the upstream, which must be written with a key that may write; the start runs the upstream's self-test (create-only and multipart-conditional included) and exits with status 3 if the upstream answers one wrongly |
 | `local_cache.cache` | `true`, the default; `false` is refused (leave `[local_cache]` out to run without a cache) |
+| `local_cache.scrub_min_round` | the least time between the starts of two rounds of the scrub (default `"1h"`; `"0s"`: a round starts as soon as the last is done): a small cache is not read again and again at the rate |
 | `local_cache.scrub_rate` | the bytes a second the scrub reads, a size and `/s` such as `"50MiB/s"` (default `"16MiB/s"`); `"off"` turns the scrub off |
 | `cold_store.endpoints` | a list of exactly one endpoint, in place of `endpoint`: several are refused as not supported yet, since the cache reads from one upstream |
 

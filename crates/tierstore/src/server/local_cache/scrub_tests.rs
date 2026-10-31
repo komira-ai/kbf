@@ -356,7 +356,7 @@ async fn the_loop_scrubs_once_for_each_tick() {
     let (ticker, tick, mut asks) = hand();
     let cache = rig.cache.clone();
     let halt = Arc::new(Notify::new());
-    let running = tokio::spawn(async move { cache.scrub(Some(100), ticker, halt).await });
+    let running = tokio::spawn(async move { cache.scrub(Some(100), 0, ticker, halt).await });
     asks.recv().await.unwrap();
     assert_eq!(read(&rig.cache.counters().scrubbed_objects), 0);
     tick.send(()).await.unwrap();
@@ -377,7 +377,7 @@ async fn the_loop_ends_when_it_is_halted() {
     let cache = rig.cache.clone();
     let halt = Arc::new(Notify::new());
     let halting = Arc::clone(&halt);
-    let running = tokio::spawn(async move { cache.scrub(Some(100), ticker, halting).await });
+    let running = tokio::spawn(async move { cache.scrub(Some(100), 0, ticker, halting).await });
     asks.recv().await.unwrap();
     halt.notify_one();
     running.await.unwrap();
@@ -392,7 +392,9 @@ async fn a_scrub_that_is_off_runs_no_pass() {
     rot(&rig, "cas/b/0");
     let (ticker, tick, mut asks) = hand();
     tick.send(()).await.unwrap();
-    rig.cache.scrub(None, ticker, Arc::new(Notify::new())).await;
+    rig.cache
+        .scrub(None, 0, ticker, Arc::new(Notify::new()))
+        .await;
     assert!(asks.recv().await.is_none(), "the ticker was never asked");
     assert_eq!(read(&rig.cache.counters().scrubbed_objects), 0);
     assert!(rig.has_file("cas/b/0"));
@@ -421,6 +423,7 @@ async fn a_halt_in_the_middle_of_a_big_object_ends_the_pass_at_the_next_chunk() 
     let chunks = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let counting = Arc::clone(&chunks);
     let mut state = Scrubber::new(1 << 30);
+    let stop = Arc::clone(&state.stop);
     state.on_chunk = Some(Arc::new(move || {
         counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         reached.send(()).unwrap();
@@ -435,8 +438,10 @@ async fn a_halt_in_the_middle_of_a_big_object_ends_the_pass_at_the_next_chunk() 
     tick.send(()).await.unwrap();
     reaches.recv().await.unwrap();
     halt.notify_one();
-    tokio::task::yield_now().await;
-    tokio::task::yield_now().await;
+    // The loop sets the stop flag when it sees the halt; the gate is not opened before.
+    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
     release.send(()).unwrap();
     running.await.unwrap();
     assert_eq!(chunks.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -445,31 +450,59 @@ async fn a_halt_in_the_middle_of_a_big_object_ends_the_pass_at_the_next_chunk() 
     assert_eq!(rig.cache.held().1, 1);
 }
 
-/// Asserts that a tick that panics does not end the scrub or the cache: the loop reports it, starts
-/// the walk over, and the next tick scrubs.
+/// Asserts that an object whose check panics is counted as a scrub error and skipped, and that
+/// the objects after it are still scrubbed in the same tick.
 #[tokio::test]
-async fn a_tick_that_panics_does_not_end_the_scrub() {
+async fn an_object_whose_check_panics_is_counted_and_the_walk_goes_on_past_it() {
     let rig = Rig::new("tscache-scrub-panic");
-    fill(&rig, 1, 100).await;
+    fill(&rig, 3, 100).await;
     let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let mut state = Scrubber::new(1 << 20);
     state.on_chunk = Some(Arc::new(move || {
         assert!(
             !first.swap(false, std::sync::atomic::Ordering::SeqCst),
-            "the first chunk panics"
+            "the first object's check panics"
         );
     }));
+    let pass = rig.cache.scrub_once(&mut state);
+    assert_eq!((pass.scrubbed, pass.dropped), (2, 0));
+    let counters = rig.cache.counters();
+    assert_eq!(read(&counters.scrub_errors), 1);
+    assert_eq!(read(&counters.scrubbed_objects), 2);
+    assert_eq!(rig.cache.held(), (300, 3));
+}
+
+/// Asserts the minimum between rounds: with two objects and a minimum of three ticks, the ticks
+/// scrub 2, 0, 0, 2 (a round starts at the first tick, and the next only three ticks later).
+#[tokio::test]
+async fn a_round_does_not_start_again_before_the_minimum_between_rounds() {
+    let rig = Rig::new("tscache-scrub-min-round");
+    fill(&rig, 2, 100).await;
+    let mut state = Scrubber::new(1000).with_min_round(3);
+    let counts: Vec<usize> = (0..4)
+        .map(|_| rig.cache.scrub_once(&mut state).scrubbed)
+        .collect();
+    assert_eq!(counts, [2, 0, 0, 2]);
+}
+
+/// Asserts the same through the loop with a driven ticker: one pass per tick, and no object is read
+/// on the ticks between rounds.
+#[tokio::test]
+async fn the_loop_waits_out_the_minimum_between_rounds() {
+    let rig = Rig::new("tscache-scrub-min-loop");
+    fill(&rig, 1, 100).await;
     let (ticker, tick, mut asks) = hand();
     let cache = rig.cache.clone();
     let halt = Arc::new(Notify::new());
-    let running = tokio::spawn(async move { cache.scrub_with(state, ticker, halt).await });
-    asks.recv().await.unwrap();
-    tick.send(()).await.unwrap();
-    asks.recv().await.unwrap();
-    assert_eq!(read(&rig.cache.counters().scrubbed_objects), 0);
-    tick.send(()).await.unwrap();
-    asks.recv().await.unwrap();
-    assert_eq!(read(&rig.cache.counters().scrubbed_objects), 1);
+    let running = tokio::spawn(async move { cache.scrub(Some(1000), 2, ticker, halt).await });
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        asks.recv().await.unwrap();
+        tick.send(()).await.unwrap();
+        asks.recv().await.unwrap();
+        seen.push(read(&rig.cache.counters().scrubbed_objects));
+    }
+    assert_eq!(seen, [1, 1, 2]);
     drop(tick);
     running.await.unwrap();
 }
@@ -521,7 +554,7 @@ async fn a_scrub_does_not_touch_the_object_of_a_fill_that_a_forget_marked() {
 /// behind the cache's back) drops the entry, so a scrub finds nothing to drop and counts no
 /// mismatch, and the next read fills the new bytes, which the next scrub keeps.
 #[tokio::test]
-async fn a_write_through_put_is_never_dropped_by_the_scrub() {
+async fn a_write_through_put_clears_a_stale_entry_so_the_scrub_has_nothing_to_drop() {
     let rig = Rig::with("tscache-scrub-put", |config| config.write_through = true);
     rig.put("cas/b/obj", &pattern(100)).await;
     rig.get("cas/b/obj").await.unwrap();

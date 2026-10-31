@@ -92,11 +92,10 @@ impl Index {
         Some(entry.size)
     }
 
-    /// The names of the objects, in order.
+    /// The names of the objects, in no order (the caller sorts, outside the lock the index is
+    /// behind).
     pub(super) fn names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.entries.keys().cloned().collect();
-        names.sort();
-        names
+        self.entries.keys().cloned().collect()
     }
 
     /// The names and sizes of the objects, the least recently used first.

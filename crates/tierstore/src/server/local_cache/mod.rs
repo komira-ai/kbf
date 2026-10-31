@@ -127,7 +127,7 @@ use crate::{Backend, ByteRange, Clock, Error, Listed, Meta, OpenUpload, PartBody
 
 pub use disk::{Disk, Space, SystemDisk};
 pub use metrics::Counters;
-pub use scrub::{Every, SCRUB_RATE, SCRUB_TICK, ScrubPass, Scrubber, Ticker};
+pub use scrub::{Every, SCRUB_MIN_ROUND, SCRUB_RATE, SCRUB_TICK, ScrubPass, Scrubber, Ticker};
 pub use selfcheck::{LocalTierFailure, check_local};
 
 use fill::Pending;

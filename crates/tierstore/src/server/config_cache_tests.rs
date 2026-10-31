@@ -7,7 +7,7 @@ use std::time::Duration;
 use super::config::{File, from_text, settings_from_text};
 use super::config_cache::{CacheSettings, Rate};
 use super::config_testing::{DEFAULTS, GOLDEN};
-use super::local_cache::{FILL_CHUNK, SCRUB_RATE, WHOLE_FILL_LIMIT};
+use super::local_cache::{FILL_CHUNK, SCRUB_MIN_ROUND, SCRUB_RATE, WHOLE_FILL_LIMIT};
 
 /// A build node's file with every key given a value that is not the default.
 const CACHE: &str = r#"
@@ -38,6 +38,7 @@ max_concurrent_fills = 6
 write_through = true
 cache      = true
 scrub_rate = "50MiB/s"
+scrub_min_round = "30m"
 
 [cold_store]
 kind             = "s3"
@@ -158,6 +159,7 @@ fn a_build_node_file_makes_a_cache() {
         Some(Path::new("/etc/tierstore-cache/upstream-read.key"))
     );
     assert_eq!(cache.scrub_rate, Some(50 << 20));
+    assert_eq!(cache.scrub_min_round, Duration::from_secs(30 * 60));
 
     let why = from_text(CACHE, DEFAULTS).unwrap_err().to_string();
     assert!(why.contains("no flag form"), "{why}");
@@ -193,6 +195,8 @@ fn a_build_node_file_has_the_defaults_of_the_flags_and_of_the_cache() {
     assert_eq!(cache.front.max_concurrent_puts, 32);
     assert_eq!(cache.s3_request_timeout, Duration::from_secs(60));
     assert_eq!(cache.scrub_rate, Some(SCRUB_RATE));
+    assert_eq!(cache.scrub_min_round, SCRUB_MIN_ROUND);
+    assert_eq!(SCRUB_MIN_ROUND, Duration::from_secs(3600));
     assert_eq!(SCRUB_RATE, 16 << 20);
     assert_eq!(cache.upstream.spec, "memory");
 }
@@ -477,7 +481,7 @@ fn a_build_node_file_written_back_makes_the_same_settings() {
 }
 
 /// The keys of `[local_cache]`, which the README of the packaging must document each in a row.
-const LOCAL_CACHE_KEYS: [&str; 11] = [
+const LOCAL_CACHE_KEYS: [&str; 12] = [
     "path",
     "layout",
     "budget",
@@ -489,6 +493,7 @@ const LOCAL_CACHE_KEYS: [&str; 11] = [
     "write_through",
     "cache",
     "scrub_rate",
+    "scrub_min_round",
 ];
 
 /// Asserts that the README of the packaging documents the build-node shape: its example loads,

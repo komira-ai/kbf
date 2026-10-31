@@ -186,7 +186,13 @@ pub(super) async fn serve_cache(
         drained
     };
     let maintaining = cache.maintain(PASS_INTERVAL, halt);
-    let scrubbing = cache.scrub(settings.scrub_rate, Every::new(SCRUB_TICK), halt_scrub);
+    let min_round = settings.scrub_min_round.as_secs() / SCRUB_TICK.as_secs();
+    let scrubbing = cache.scrub(
+        settings.scrub_rate,
+        min_round,
+        Every::new(SCRUB_TICK),
+        halt_scrub,
+    );
     let (drained, (), ()) = tokio::join!(serving, maintaining, scrubbing);
     watcher.abort();
     Ok(drained)
