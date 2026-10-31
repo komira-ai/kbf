@@ -61,7 +61,16 @@ opening the proxy: <why>
 binding <address>: <why>
 ```
 
-`tier unreachable` is a store that did not answer for `--backend-check-wait`: check the endpoint, the network and the store. The process asks again with growing pauses before it gives up, so a store that is slow to come up after a reboot does not fail a start. `binding` is an address in use, or one that is not on this host.
+`tier unreachable` is a store that did not answer for `--backend-check-wait`: check the endpoint, the network and the store. The process asks again with growing pauses before it gives up, so a store that is slow to come up after a reboot does not fail a start. `binding` is an address in use, or one that is not on this host. On main, not in v0.0.41, a server given several `--listen` or `--oci-listen` addresses starts only if it can bind every one: the message names the first that failed, and nothing is served.
+
+An address given twice (on main, not in v0.0.41) exits 2 before anything is bound; the message names the flag or the key and never the address:
+
+```message
+--listen is given the same address twice
+--oci-listen is given the same address twice
+<key>: the same address is listed twice
+<key>: it needs at least one address
+```
 
 A tier that answers a self-test question wrongly exits 3 and names the tier, the check and what it answered: the store overwrites on a create-only put, ignores `If-Match`, answers a range with the whole object, or completes a multipart upload over an existing object. Use a store that does these properly. `--skip-backend-check multipart-conditional=<reason>` is for the last only.
 

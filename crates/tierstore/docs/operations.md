@@ -8,7 +8,7 @@ Start the unit by hand (see [install](install.md)). Before it opens the proxy or
 tierstore <version> listen=192.0.2.10:9000
 ```
 
-With the OCI front on, the line gets ` oci-listen=<address> (https)` or ` (http)` after the listen address. The self-test's progress and every other message go to stderr, and so to the journal.
+With the OCI front on, the line gets ` oci-listen=<address> (https)` or ` (http)` after the listen address. With more than one address of a kind (on main, not in v0.0.41) the value is every address, in the order given, separated by commas with no space: `listen=0.0.0.0:9000,[::]:9000`. The self-test's progress and every other message go to stderr, and so to the journal.
 
 ## Probes
 

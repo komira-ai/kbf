@@ -110,13 +110,14 @@ How the cache behaves is in [operations](operations.md#a-build-node). The file i
 - A duration is a string of a whole number and `ms`, `s`, `m` or `h`: `250ms`, `15m`.
 - A size is an integer of bytes, or a string of a whole number and `B`, `KiB`, `MiB`, `GiB` or `TiB`: `"500GiB"`.
 - A path is a string. A list of paths is an array, and the flag it stands for is given once for each element.
+- An address is a string, `"192.0.2.10:9000"` or `"[2001:db8::1]:9000"`. The two `listen` keys also take an array of addresses, and the flag is given once for each element; that is on main, not in v0.0.41, where a `listen` key is one string and a flag is given once.
 - A number above 9223372036854775807 cannot go in a file; as a flag it is accepted.
 
 ## `[server]`
 
 | Key | Flag | Type, default | What |
 |---|---|---|---|
-| `server.listen` | `--listen` | address, required | where the S3 API, `/healthz`, `/readyz`, `/usagez` and `/metricz` are served |
+| `server.listen` | `--listen` | address or list of addresses, required | where the S3 API, `/healthz`, `/readyz`, `/usagez` and `/metricz` are served. On main, not in v0.0.41: a list (the flag given again for each address) is served on every address by one server, with one drain and one limit on connections, and a start that cannot bind every address is refused. To listen on the wildcard of both families give `0.0.0.0:<port>` and `[::]:<port>`: an IPv6 address is bound for IPv6 only, so the two do not clash. An address given twice is refused, naming the key |
 | `server.proxy_id` | `--proxy-id` | string, required | names this process's journal and lease in the hot tier; keep it across restarts and give each process over the same tiers its own |
 | `server.bucket` | `--bucket` | string, required | the one bucket clients see; not `healthz`, `readyz`, `usagez` or `metricz` |
 | `server.region` | `--region` | string, `us-east-1` | the region in the credential scope of a request's signature (not the tiers' regions) |
@@ -204,12 +205,19 @@ connection_lifetime = "1h"
 
 | Key | Flag | Type, default | What |
 |---|---|---|---|
-| `oci.listen` | `--oci-listen` | address | where the front listens. With a certificate and key it is HTTPS; with neither it is plain HTTP, and off loopback the start prints one warning line |
-| `oci.tls_cert_file` | `--oci-tls-cert` | path | the certificate chain (PEM), leaf first. It must carry an IP subjectAltName for the listen address. Both this and the key, or neither |
+| `oci.listen` | `--oci-listen` | address or list of addresses | where the front listens. With a certificate and key it is HTTPS; with neither it is plain HTTP, and off loopback the start prints one warning line for each such address. On main, not in v0.0.41: a list (the flag given again for each address) is served on every address by the one front, with one limit on connections and one drain, as `server.listen` is; an address given twice is refused, naming the key |
+| `oci.tls_cert_file` | `--oci-tls-cert` | path | the certificate chain (PEM), leaf first. It must carry an IP subjectAltName for each listen address. Both this and the key, or neither |
 | `oci.tls_key_file` | `--oci-tls-key` | path | the private key (PEM); a file any user can read is refused |
 | `oci.prefix` | `--oci-prefix` | string, `oci/` | the key prefix, ending in `/`; not inside `_journal/` or `_tiering/` |
 | `oci.max_connections` | `--oci-max-connections` | count, 64 (at least 1) | connections open at once |
 | `oci.connection_lifetime` | `--oci-connection-lifetime` | duration, `1h` | the longest a connection lives |
+
+On main, not in v0.0.41, `listen` may be a list, here the wildcard of both families:
+
+```toml fragment
+[oci]
+listen = ["0.0.0.0:5000", "[::]:5000"]
+```
 
 The front reads objects at `<prefix>blobs/sha256/<hex>` and serves GET and HEAD of `/v2/`, of manifests by digest and of blobs by digest. It is anonymous: anyone who can connect can read any digest under the prefix, so the network decides who may. Tags are not served. The certificate and key are read once; a new certificate takes a restart.
 
@@ -244,6 +252,7 @@ Each of these exits with status 2 and names the file and the key (a syntax error
 - a key a tier's `kind` does not take, a `dir` tier without `path`, an `s3` tier without `bucket`, `endpoint` or `credentials_file`, and a key only one tier has in the other (`budget` and the reconciler's keys belong to `[hot_store]`, `skip_checks` to `[cold_store]`);
 - a water mark outside 1 to 100, and a budget, count or limit of zero;
 - an `[oci]` table without `listen`, with only one of the certificate and the key, or with `max_connections = 0`;
+- on main, not in v0.0.41: a `server.listen` or `oci.listen` that is an empty list or names one address twice;
 - a `[[policy]]` that breaks the rules above.
 
 ## Moving from flags to a file

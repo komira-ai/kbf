@@ -45,6 +45,12 @@
 //! 2; a file that cannot be read
 //! with status 1. The start line gets ` oci-listen=<address> (http)` or ` (https)`.
 //!
+//! `--listen` and `--oci-listen` may each be given more than once (the file's `listen` keys take a
+//! string or a list): a socket is bound for each address, an IPv6 one for IPv6 only (see
+//! [`listen`](super::listen)), and one server, one drain and one limit on connections serve them
+//! all. An address given twice is refused with status 2, and a start that cannot bind every address
+//! is refused with status 1. The start line names every address, separated by commas.
+//!
 //! On SIGTERM or SIGINT the process drains (see the [`server`](super) docs): `/readyz` says 503,
 //! it serves for `--drain-lb-wait`, refuses new requests, waits for those in flight and for the
 //! answers it is sending for at most `--drain-deadline`, gives the reconciler's lease up and

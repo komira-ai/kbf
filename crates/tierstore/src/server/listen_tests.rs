@@ -131,6 +131,19 @@ async fn a_v6_wildcard_and_a_v4_wildcard_bind_on_one_port() {
     assert!(accepted.expect("accepted").1.is_ipv6());
 }
 
+/// Asserts that an address that cannot be bound fails the whole set and is the one the error
+/// names, and that the reuse of an address (`SO_REUSEADDR`) does not let a second listener take
+/// the address of a first.
+#[tokio::test]
+async fn an_address_that_cannot_be_bound_is_named_and_fails_the_set() {
+    let held = bind(addr("127.0.0.1:0")).expect("a first listener");
+    let busy = held.local_addr().expect("an address");
+    let failed = bind_all(&[addr("0.0.0.0:0"), busy]).err();
+    let (at, why) = failed.expect("the set is refused");
+    assert_eq!(at, busy);
+    assert_eq!(why.kind(), std::io::ErrorKind::AddrInUse);
+}
+
 /// Asserts what is the same address: the whole socket address, so the same IP on another port,
 /// and another IP on the same port, are not.
 #[test]

@@ -159,7 +159,7 @@ pub fn acceptor_for(
         return Err(pem_error(CERT_FLAG, cert, "no certificate".to_owned()));
     };
     let facts = Facts::of(leaf).map_err(|why| pem_error(CERT_FLAG, cert, why))?;
-    for addr in listen.iter().take(1) {
+    for addr in listen {
         if let Some(why) = unnamed(&facts.ips, *addr) {
             return Err(pem_error(CERT_FLAG, cert, why));
         }

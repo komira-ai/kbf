@@ -14,6 +14,9 @@ use std::io;
 use std::net::SocketAddr;
 use std::task::{Context, Poll};
 
+use rustix::net::{
+    AddressFamily, SocketFlags, SocketType, bind as bind_socket, listen, socket_with, sockopt,
+};
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::net::{TcpListener, TcpStream};
@@ -27,9 +30,9 @@ pub(super) struct Addrs(pub Vec<SocketAddr>);
 
 impl Serialize for Addrs {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self.0.first() {
-            Some(first) => first.serialize(serializer),
-            None => self.0.serialize(serializer),
+        match self.0.as_slice() {
+            [only] => only.serialize(serializer),
+            several => several.serialize(serializer),
         }
     }
 }
@@ -42,15 +45,19 @@ impl<'de> Deserialize<'de> for Addrs {
             type Value = Addrs;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a socket address")
+                formatter.write_str("a socket address, or a list of them")
             }
 
             fn visit_str<E: de::Error>(self, text: &str) -> Result<Addrs, E> {
                 Ok(Addrs(vec![address(text)?]))
             }
 
-            fn visit_seq<A: SeqAccess<'de>>(self, _: A) -> Result<Addrs, A::Error> {
-                Err(de::Error::invalid_type(de::Unexpected::Seq, &self))
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Addrs, A::Error> {
+                let mut addrs = Vec::new();
+                while let Some(text) = seq.next_element::<String>()? {
+                    addrs.push(address(&text)?);
+                }
+                Ok(Addrs(addrs))
             }
         }
 
@@ -65,18 +72,38 @@ fn address<E: de::Error>(text: &str) -> Result<SocketAddr, E> {
 }
 
 /// Whether the same address is in `addrs` twice.
-pub(super) fn has_duplicate(_addrs: &[SocketAddr]) -> bool {
-    false
+pub(super) fn has_duplicate(addrs: &[SocketAddr]) -> bool {
+    addrs
+        .iter()
+        .enumerate()
+        .any(|(at, addr)| addrs[..at].contains(addr))
 }
 
-/// A listener on `addr`, which must be made inside the runtime.
+/// The length of the queue of connections the system keeps for a socket that is not yet
+/// accepted from.
+const BACKLOG: i32 = 1024;
+
+/// A listener on `addr`, which must be made inside the runtime. An IPv6 address is bound for
+/// IPv6 only (`IPV6_V6ONLY`, set explicitly: the system's default is not the same everywhere),
+/// so that `[::]:P` leaves `0.0.0.0:P` to a socket of its own.
 ///
 /// # Errors
 /// The address cannot be bound.
 pub(crate) fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
-    let listener = std::net::TcpListener::bind(addr)?;
-    listener.set_nonblocking(true)?;
-    TcpListener::from_std(listener)
+    let family = match addr {
+        SocketAddr::V4(_) => AddressFamily::INET,
+        SocketAddr::V6(_) => AddressFamily::INET6,
+    };
+    let flags = SocketFlags::CLOEXEC | SocketFlags::NONBLOCK;
+    let socket = socket_with(family, SocketType::STREAM, flags, None)?;
+    // As `std` does for a listener: a restart does not wait for the connections of the last run.
+    sockopt::set_socket_reuseaddr(&socket, true)?;
+    if addr.is_ipv6() {
+        sockopt::set_ipv6_v6only(&socket, true)?;
+    }
+    bind_socket(&socket, &addr)?;
+    listen(&socket, BACKLOG)?;
+    TcpListener::from_std(std::net::TcpListener::from(socket))
 }
 
 /// A listener on each of `addrs`, in the order given, or the first that cannot be bound with
@@ -86,7 +113,7 @@ pub(crate) fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
 /// The address that cannot be bound, and why.
 pub(crate) fn bind_all(addrs: &[SocketAddr]) -> Result<Vec<TcpListener>, (SocketAddr, io::Error)> {
     let mut bound = Vec::new();
-    for addr in addrs.iter().take(1) {
+    for addr in addrs {
         bound.push(bind(*addr).map_err(|why| (*addr, why))?);
     }
     Ok(bound)
@@ -110,13 +137,14 @@ pub(crate) fn joined(addrs: &[SocketAddr]) -> String {
 /// The sockets of a front, taken as one source of connections.
 pub(crate) struct Listeners {
     listeners: Vec<TcpListener>,
+    /// The socket the next ask begins at.
+    next: usize,
 }
 
 impl Listeners {
     /// The source of the connections of `listeners`.
-    pub(crate) fn new(mut listeners: Vec<TcpListener>) -> Self {
-        listeners.truncate(1);
-        Self { listeners }
+    pub(crate) fn new(listeners: Vec<TcpListener>) -> Self {
+        Self { listeners, next: 0 }
     }
 
     /// The address of each socket, in the order they were given.
@@ -128,11 +156,19 @@ impl Listeners {
 impl Incoming for Listeners {
     type Stream = TcpStream;
 
+    /// Takes the next connection of any of the sockets. The ask begins at the socket after the
+    /// one that was last taken from, so that a busy socket does not leave another unserved; a
+    /// socket that has none registers the waker, which any of them wakes.
     fn poll_incoming(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
-        match self.listeners.first() {
-            Some(first) => first.poll_accept(cx),
-            None => Poll::Pending,
+        let count = self.listeners.len();
+        for step in 0..count {
+            let at = (self.next + step) % count;
+            if let Poll::Ready(accepted) = self.listeners[at].poll_accept(cx) {
+                self.next = (at + 1) % count;
+                return Poll::Ready(accepted);
+            }
         }
+        Poll::Pending
     }
 }
 
