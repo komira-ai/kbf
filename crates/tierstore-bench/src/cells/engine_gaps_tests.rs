@@ -39,6 +39,7 @@ fn no_cold() -> Arc<dyn ColdStateSource> {
 fn step(role: Role, latency_us: u64, ok: bool) -> Step {
     Step {
         label: "",
+        second_quantity: false,
         role,
         op: Op::Put,
         bytes: 10,
@@ -529,6 +530,7 @@ fn streamed_reads(
             if ok {
                 steps.push(Step {
                     label: ".ttfb",
+                    second_quantity: true,
                     ..step(Role::Cold, 1_000, true)
                 });
             }
@@ -627,6 +629,7 @@ fn cell_b_reads(label: &str, requests: u64, from_index: u64, turn: Turn) -> Arm 
             },
             Step {
                 label: ".ttfb",
+                second_quantity: true,
                 ..step(Role::Instance, 1_000, true)
             },
             step(Role::Instance, 20_000, true),
@@ -700,6 +703,7 @@ async fn direct_reads_with_a_first_byte_pair_still_count_once() {
             },
             Step {
                 label: ".ttfb",
+                second_quantity: true,
                 ..step(Role::Cold, 1_000, true)
             },
         ])

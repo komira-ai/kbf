@@ -148,6 +148,10 @@ pub struct Step {
     /// `""` for the arm itself; else a suffix (`.ttfb`) naming a second quantity of the same
     /// requests, which gets an arm and a result file of its own.
     pub label: &'static str,
+    /// Whether this step is a second measurement of a request another step already stands for
+    /// (the time to the first byte of a read, `.ttfb`), not a request of its own. A label alone
+    /// does not say so: `.cold-direct` and `.second` are whole requests.
+    pub second_quantity: bool,
     /// The store the request went to.
     pub role: Role,
     /// What it did.
@@ -175,6 +179,7 @@ impl Step {
     pub fn of<T>(role: Role, op: Op, bytes: u64, outcome: &Outcome<T>) -> Self {
         Self {
             label: "",
+            second_quantity: false,
             role,
             op,
             bytes,
@@ -193,6 +198,7 @@ impl Step {
     pub fn streamed(role: Role, op: Op, expected: u64, read: &Streamed) -> Self {
         Self {
             label: "",
+            second_quantity: false,
             role,
             op,
             bytes: read.bytes,
@@ -212,10 +218,19 @@ impl Step {
         self
     }
 
-    /// The same step as a second quantity, under `label`.
+    /// The same step under `label`, a result of its own. It is still a request.
     #[must_use]
     pub fn labelled(mut self, label: &'static str) -> Self {
         self.label = label;
+        self
+    }
+
+    /// The same step as a second measurement of a request shown by another step, under `label`:
+    /// the cold store guard does not count it.
+    #[must_use]
+    pub fn second_quantity_of_request(mut self, label: &'static str) -> Self {
+        self.label = label;
+        self.second_quantity = true;
         self
     }
 }
@@ -430,12 +445,13 @@ impl Env {
     /// Shows the cold store guard the cold requests among `steps`, which finished now, and judges
     /// its window: the trip, if the cold store's health is over a limit.
     ///
-    /// A request is one step, the one with no label; a step with a label (`.ttfb`) is a second
-    /// quantity of a request already shown, and a request that failed has none.
+    /// A request is one cold step, whatever its label, except a second quantity of a request
+    /// already shown (`.ttfb`, the time to the first byte of a read, which only a read that
+    /// succeeded has).
     fn watch_cold(&self, steps: &[Step]) -> Option<ColdTrip> {
         let mut cold = steps
             .iter()
-            .filter(|s| s.role == Role::Cold && s.label.is_empty())
+            .filter(|s| s.role == Role::Cold && !s.second_quantity)
             .peekable();
         cold.peek()?;
         let now = Instant::now();
@@ -949,6 +965,7 @@ mod tests {
     fn step(latency_us: u64, cold_write: u64) -> Step {
         Step {
             label: "",
+            second_quantity: false,
             role: Role::Cold,
             op: Op::Put,
             bytes: 10,

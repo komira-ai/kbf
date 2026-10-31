@@ -171,7 +171,7 @@ impl Reader {
             latency_us: read.ttfb.map_or(0, crate::cells::engine::micros),
             ..full.clone()
         }
-        .labelled(".ttfb");
+        .second_quantity_of_request(".ttfb");
         Ok(if read.ttfb.is_some() && full.ok {
             vec![full, first]
         } else {

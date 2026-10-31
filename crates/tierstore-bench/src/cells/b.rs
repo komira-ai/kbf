@@ -123,7 +123,7 @@ impl Misses {
                 latency_us: crate::cells::engine::micros(t),
                 ..full.clone()
             }
-            .labelled(".ttfb")
+            .second_quantity_of_request(".ttfb")
         }));
         steps.push(full);
         let second = self.read_instance.get(&key, None).await?;

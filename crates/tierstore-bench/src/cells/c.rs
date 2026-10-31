@@ -219,6 +219,7 @@ impl Burst {
             .zip(&lag)
             .map(|((_, at, ok), lag)| Step {
                 label: "",
+                second_quantity: false,
                 role: Role::Cold,
                 op: Op::Put,
                 bytes: self.size,

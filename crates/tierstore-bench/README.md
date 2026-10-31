@@ -200,8 +200,10 @@ so far are written), when either holds:
 | `--cold-abort-error-share` | 0.05 | the share of the window's requests that failed or timed out is above it (0 to 1) |
 | `--cold-abort-window-secs` | 60 | the length of the window, seconds |
 
-Equal to a limit is within it. The window counts one entry per request (the `.ttfb` step of a
-streamed read is not a second one). A window of fewer than 20 requests is not judged; with 20 to
+Equal to a limit is within it. The window counts one entry per request to the cold role: every
+step of the `cold` role is one, whatever its label (cell B's `.cold-direct` reads of the cold
+bucket are counted), except the `.ttfb` step of a streamed read, which is the time to the first
+byte of a request already counted and is not a second one. A window of fewer than 20 requests is not judged; with 20 to
 99 requests in it the p99 is the slowest request, so one slow request can stop the run. That is
 deliberate: it protects the farm. A failed request counts in the share and, with the time it took
 to fail, in the p99. Only requests the harness sent to the cold role are counted (steps of the

@@ -135,6 +135,7 @@ fn step_of(role: Role, file: &TreeFile, digest: Option<&str>, fetched: &Fetched)
     };
     Step {
         label: "",
+        second_quantity: false,
         role,
         op: Op::Get,
         bytes: fetched.body.as_ref().map_or(0, |b| b.len() as u64),
