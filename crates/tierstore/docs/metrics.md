@@ -258,6 +258,21 @@ Everything below describes series that are being added and are not in a released
 names and labels are those of the changes under review and can still change; this page is
 updated when they land. Do not build alerts on them until they are in a release.
 
+### The drain
+
+On main, not in v0.0.41. One series of the server itself, with a `# TYPE` line, shown on every
+node whatever sources it has (it comes after the blocks of the proxy, the OCI front and the
+cache):
+
+| name | type | labels | increments when |
+|---|---|---|---|
+| `tierstore_drain_late_requests_total` | counter | none | in a drain, the server had shut its end of a connection for writing and its peer wrote after that: counted once for each such connection, not for each read |
+
+It is 0 until a drain. After a restart it is the number of connections whose client sent a
+request within one round trip of the end of the stream: the request was read, dropped and not
+answered (see "Drain and restart" in [operations](operations.md)). A request that was on the wire
+before the server shut its end is served and is not counted.
+
 ### v1: changes in the next release
 
 The series of "The build-node cache (v1)" above change as follows, and the cache gains the series

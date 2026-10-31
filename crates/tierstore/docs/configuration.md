@@ -231,8 +231,8 @@ These describe one run, not the data path, and have no key:
 | `--print-config` | off | print the file for the flags given, and exit |
 | `--check-config` | off | with `--config`: load the file, read the key files it names, and for an `[oci]` table check the prefix, the connection lifetime and the TLS files; then exit 0 and print nothing, or print the refusal and exit 2. It binds nothing and asks no store. What it does not check is listed below. Without `--config` it is a usage error |
 | `--capabilities` | off | on main, not in v0.0.41. print what this build can do, one capability to a line, and exit 0 (a build with none prints nothing). It needs none of the flags a start requires, and with any other argument it prints nothing on stdout, says `--capabilities takes no other flag` on stderr and exits 2 |
-| `--drain-lb-wait` | `10s` | on SIGTERM, how long `/readyz` says 503 while the server goes on serving |
-| `--drain-deadline` | `15m` | then how long it waits for requests in flight |
+| `--drain-lb-wait` | `10s` | on SIGTERM, the settle: how long `/readyz` says 503 while the server goes on accepting and serving |
+| `--drain-deadline` | `15m` | then how long it waits for requests in flight and for the connections it closes (on main, not in v0.0.41: a lingering close, see [operations](operations.md#drain-and-restart)) |
 
 `--check-config` finds what the loader refuses (see "What the loader refuses"), a `bucket` that is a probe path name, a zero `body_idle_timeout`, a key file that is not owned by the user, is open to others or is a link, two keys with one id, and, in the file of a build node, a zero `s3_request_timeout`. It does not find what a start checks after that: the water marks out of order, `reconcile_interval` not below `lease_ttl`, `usage_stale_after` not above `lease_ttl`, or a zero `s3_request_timeout` in a storage node's file (a start exits 1 on each, and the unit tries again every 30 seconds); a tier that is down or answers the self-test wrongly; the cache directory and a `budget` over the size of its file system. A file that passes `--check-config` can still fail to start.
 

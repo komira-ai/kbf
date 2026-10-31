@@ -56,10 +56,14 @@ If the cold tier is a full disk, puts that reach it fail. A tier that is full at
 
 On SIGTERM or SIGINT (what `systemctl stop` sends) the process drains:
 
-1. `/readyz` answers 503 at once, and for `--drain-lb-wait` (10s) the server goes on serving everything, so that a load balancer sees the 503;
-2. it stops accepting connections and answers new requests, but for the probes, with 503 `ServiceUnavailable` and `Connection: close`;
-3. it waits for requests in flight, at most `--drain-deadline` (15m) in all;
-4. it gives up the reconciler's lease and exits 0.
+1. `/readyz` answers 503 at once, and every answer from then on carries `Connection: close`, so that a client does not send its next request on a connection that is about to end;
+2. for `--drain-lb-wait` (10s), the settle, the server goes on accepting connections and serving everything, so that a load balancer sees the 503 and a connection that was routed here a moment ago is served, not reset;
+3. at the end of the settle it stops accepting connections and closes each connection that has no request on the wire with a lingering close: it shuts its end for writing, so that the client reads a clean end of stream, and goes on reading until the client closes its end, or for 60 seconds at most (the time an idle connection is let to wait for its next request, which has no flag), and then closes;
+4. a request that is on the wire at that moment (begun, and not answered in full) is served, with `Connection: close`, never answered 503, and its connection is closed in the same way once the answer is out;
+5. it waits for the requests in flight and for the connections to close, at most `--drain-deadline` (15m) in all;
+6. it gives up the reconciler's lease and exits 0.
+
+A request that arrives within one round trip of the end of the stream, on a connection that was idle since before the drain began, cannot be answered: the client sent it before it read the end of the stream. The server reads and drops it and counts the connection in `tierstore_drain_late_requests_total`. A client that follows `Connection: close` never meets this; a client that retries such a request must be sure the request is safe to repeat, which a create-only put is not. This drain, the lingering close and the metric are on main, not in v0.0.41; v0.0.41 and before answer every request on a connection that is open after the settle 503 `ServiceUnavailable` with `Connection: close`.
 
 A request cut at the deadline is counted on stderr: `tierstore: <N> requests were cut at the drain deadline`. Another process over the same tiers takes the reconciler's lease once it is given up or has expired (`--lease-ttl`). State is in the tiers, not the process, so a restart needs nothing but the same `--proxy-id`.
 
