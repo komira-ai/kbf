@@ -406,8 +406,8 @@ fn a_file_with_a_probe_path_as_the_bucket_is_refused() {
 /// Asserts that flags that do not fit together are refused with a message that names them: the
 /// water marks out of order, a reconcile interval that is not shorter than the lease, a bucket
 /// called like a probe path, an idle timeout of zero, a request timeout of zero for the S3
-/// tiers, a tier that cannot be opened, and a key file, of the full key or of a read-only one,
-/// that cannot be used. None of them is `InvalidFlags`, the refusal that exits with status 2.
+/// tiers, a tier that cannot be opened, a lock file that is not an absolute path to a file, and a
+/// key file, of the full key or of a read-only one, that cannot be used. None of them is `InvalidFlags`, the refusal that exits with status 2.
 #[test]
 fn flags_that_do_not_fit_together_are_refused() {
     let dir = TestDir::under(std::env::temp_dir(), "tierstore-refused");
@@ -436,6 +436,12 @@ fn flags_that_do_not_fit_together_are_refused() {
     assert!(hot.contains("--hot"), "{hot}");
     let cold = refused(&|cli| cli.cold = "/var/cold".to_owned());
     assert!(cold.contains("--cold"), "{cold}");
+    let relative = refused(&|cli| cli.lock_file = Some(PathBuf::from("instance.lock")));
+    assert!(relative.contains("--lock-file"), "{relative}");
+    assert!(relative.contains("must be an absolute path"), "{relative}");
+    let folder = refused(&|cli| cli.lock_file = Some(PathBuf::from("/")));
+    assert!(folder.contains("--lock-file"), "{folder}");
+    assert!(folder.contains("must name a file"), "{folder}");
     let missing = dir.path().join("missing");
     let key = refused(&|cli| cli.access_key_file = missing.clone());
     assert!(key.contains("--access-key-file"), "{key}");

@@ -138,7 +138,9 @@
 //! longer than that timeout.
 //!
 //! `GET /healthz` is 200 while the process runs. `GET /readyz` is 200 until the drain begins and
-//! 503 after. Neither is signed, so a bucket cannot have either name.
+//! 503 after. Neither is signed, so a bucket cannot have either name. The body of the 200 is
+//! `ready`, and for a build node `ready read-write` or `ready read-only`, the mode its cache is
+//! in ([`local_cache::Mode`]); a read-only node serves, so the status does not change with it.
 //!
 //! `GET /usagez`, for alerting and not for a load balancer, is 200 with the age of the usage
 //! object that the reconciler publishes (`_tiering/usage`), and 503 with the reason once that
@@ -196,6 +198,7 @@ mod launch;
 mod linger;
 mod listen;
 pub mod local_cache;
+mod lock;
 pub mod oci;
 mod ops;
 pub mod presign;
@@ -211,6 +214,8 @@ mod auth_tests;
 mod body_stall_tests;
 #[cfg(test)]
 mod cache_cli_tests;
+#[cfg(test)]
+mod cache_lock_tests;
 #[cfg(test)]
 mod completion_tests;
 #[cfg(test)]
@@ -228,6 +233,8 @@ mod gc_tests;
 #[cfg(test)]
 mod idle_tests;
 #[cfg(test)]
+mod lock_tests;
+#[cfg(test)]
 mod metrics_race_tests;
 #[cfg(test)]
 mod metrics_tests;
@@ -239,6 +246,8 @@ mod pipes;
 mod presign_server_tests;
 #[cfg(test)]
 mod ready_tests;
+#[cfg(test)]
+mod reconcile_lock_tests;
 #[cfg(test)]
 mod reply_tests;
 #[cfg(test)]
@@ -856,7 +865,7 @@ impl Server {
         let read = matches!(parts.method, Method::GET | Method::HEAD);
         let (status, text) = match (read, parts.uri.path(), self.is_ready()) {
             (true, "/healthz", _) => (StatusCode::OK, "ok".to_owned()),
-            (true, "/readyz", true) => (StatusCode::OK, "ready".to_owned()),
+            (true, "/readyz", true) => (StatusCode::OK, self.ready_text()),
             (true, "/readyz", false) => (StatusCode::SERVICE_UNAVAILABLE, "draining".to_owned()),
             (true, "/usagez", _) => self.usage_probe().await,
             (true, "/metricz", _) => (StatusCode::OK, self.metrics_probe()),
@@ -864,6 +873,16 @@ impl Server {
         };
         let headers = [("content-type", "text/plain".to_owned())];
         Some(answer(status, &headers, Bytes::from(text)))
+    }
+
+    /// The body of a 200 from `/readyz`: `ready`, and for a build node the mode of its cache,
+    /// `ready read-only` or `ready read-write` (see [`local_cache::Mode`]). The status does not
+    /// depend on the mode: a read-only node serves.
+    fn ready_text(&self) -> String {
+        match &self.config.cache {
+            Some(cache) => format!("ready {}", cache.mode().as_str()),
+            None => "ready".to_owned(),
+        }
     }
 
     /// The text of `/metricz`: the block of every source of counters the process has (the

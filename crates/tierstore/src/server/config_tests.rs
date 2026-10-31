@@ -370,6 +370,7 @@ fn the_keys_only_one_tier_has_are_refused_in_the_other() {
         "critical = 1",
         "copy_parallel = 1",
         "reconcile_interval = \"1s\"",
+        "lock_file = \"/var/lib/tierstore/instance.lock\"",
         "usage_stale_after = \"1s\"",
         "journal_linger = \"1s\"",
         "journal_retention = \"1s\"",
@@ -434,6 +435,23 @@ fn a_value_out_of_range_is_refused_with_its_key() {
             "budget = 1000",
             "budget = 1000\nlease_ttl = \"soon\"",
             "lease_ttl: not a value this key takes (it is not shown); expected a duration such as",
+        ),
+        // A lock file is an absolute path that names a file: two processes of one node must
+        // lock one file, whatever their working directories are.
+        (
+            "budget = 1000",
+            "budget = 1000\nlock_file = \"instance.lock\"",
+            "hot_store.lock_file: \"instance.lock\" must be an absolute path",
+        ),
+        (
+            "budget = 1000",
+            "budget = 1000\nlock_file = \"\"",
+            "hot_store.lock_file: \"\" must be an absolute path",
+        ),
+        (
+            "budget = 1000",
+            "budget = 1000\nlock_file = \"/\"",
+            "hot_store.lock_file: \"/\" must name a file",
         ),
         (
             "\"tier-bucket\"",
