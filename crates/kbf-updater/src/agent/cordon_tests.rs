@@ -36,10 +36,7 @@ fn marks(dir: &Path) -> usize {
 }
 
 fn result(target: &str, outcome: Outcome) -> UpdateResult {
-    UpdateResult {
-        target: version(target),
-        outcome,
-    }
+    UpdateResult::new(version(target), outcome)
 }
 
 /// A node the updater cordoned reads as in placement afterwards, to this process and to one
