@@ -58,7 +58,9 @@ use super::cli::{
 use super::config_cache::CacheSettings;
 use super::front::{InvalidFlags, server_config};
 use super::listen::{joined, local_addrs};
-use super::local_cache::{CacheConfig, Disk, LocalCache, Mode, SystemDisk, check_local};
+use super::local_cache::{
+    CacheConfig, Disk, Every, LocalCache, Mode, SCRUB_TICK, SystemDisk, check_local,
+};
 use super::{Drained, Server};
 
 /// How often the eviction pass runs beside the server.
@@ -221,9 +223,6 @@ pub(super) async fn serve_cache(
         test_upstream(&*upstream, &run, &settings.upstream.spec).await?;
         config.cache_writes = true;
     }
-    if let Some(rate) = settings.scrub_rate {
-        eprintln!("tierstore: scrub_rate {rate} B/s is accepted; this release does not scrub");
-    }
     config.cache = Some(cache.clone());
     // The registry front reads what the S3 front reads: through the cache.
     let backend: Arc<dyn Backend> = Arc::new(cache.clone());
@@ -245,20 +244,37 @@ pub(super) async fn serve_cache(
         tokio::time::sleep(lb_wait).await;
         let _ = oci_stop.send(true);
     });
+    // One Notify for each loop: `notify_one` wakes one waiter, and keeps the wake for a loop that
+    // is not waiting just now.
     let halt = Arc::new(Notify::new());
     let halting = Arc::clone(&halt);
     let lock_halt = Arc::new(Notify::new());
     let lock_halting = Arc::clone(&lock_halt);
+    let halt_scrub = Arc::new(Notify::new());
+    let scrub_halting = Arc::clone(&halt_scrub);
     let serving = async move {
         let drained = server.serve_all(listeners).await;
         halting.notify_one();
         lock_halting.notify_one();
+        scrub_halting.notify_one();
         drained
     };
     let maintaining = cache.maintain(PASS_INTERVAL, halt);
     let holding = cache.hold(LOCK_INTERVAL, lock_halt);
-    let (drained, (), (), oci_cut) =
-        tokio::join!(serving, maintaining, holding, serve_oci(oci, oci_stopped));
+    let min_round = settings.scrub_min_round.as_secs() / SCRUB_TICK.as_secs();
+    let scrubbing = cache.scrub(
+        settings.scrub_rate,
+        min_round,
+        Every::new(SCRUB_TICK),
+        halt_scrub,
+    );
+    let (drained, (), (), (), oci_cut) = tokio::join!(
+        serving,
+        maintaining,
+        holding,
+        scrubbing,
+        serve_oci(oci, oci_stopped)
+    );
     watcher.abort();
     if let Some(sweeping) = sweeping {
         sweeping.abort();

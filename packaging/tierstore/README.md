@@ -396,9 +396,9 @@ costs the upstream a HEAD and a GET. A node that serves container layers through
 (see The registry front) should raise the limit to its largest layer: a layer over it is never kept. A fill that fails (a short body, an object written over
 while it was read, an upstream error, a directory that cannot be written) never fails the reader for
 the cache's reasons: the reader is answered from the upstream. A kept object is never checked
-against the upstream again, and a hit is not hashed again: put `cache = true` only on prefixes whose
-objects are never rewritten (the content-addressed ones), and note that the start reads the sizes of
-the files, not their bytes. Anyone who may read through the front may read everything the upstream's
+against the upstream again, and a hit is not hashed again (the scrub below does that, later): put
+`cache = true` only on prefixes whose objects are never rewritten (the content-addressed ones), and
+note that the start reads the sizes of the files, not their bytes. Anyone who may read through the front may read everything the upstream's
 read key can read, so give build clients scoped keys. The directories the cache makes are mode 0755
 whatever the umask.
 
@@ -430,9 +430,23 @@ until the connection's idle time ends it; those blocks are outside the budget. T
 still holds the bytes of a GET whole. A fill that panics or is cancelled frees its slot and its
 key, and the readers that waited for it get a 503 (`fill_failures_total{reason="aborted"}`).
 
-No scrub. A hit is not hashed again, and the sidecar's `sha256` is written but not checked after
-the fill: an object that rots on the disk is served as it is now until it is evicted. A restart
-checks sizes only.
+Scrub. A hit is not hashed again, so a background scrub reads the objects at `scrub_rate` (16 MiB a
+second by default) and hashes each against the digest it must have: the name for a key
+`cas/l/<sha256>`, and for any other key the `sha256` that the sidecar recorded at the fill (every
+sidecar has it, so every object is checked). An object whose bytes do not match, or whose sidecar
+can no longer be read, is removed from the index and the disk, counted in
+`scrub_mismatches_total` and named on stderr; the next read of its key fills it again from the
+upstream. The scrub walks the objects in name order, takes the names at the start of a round, and
+starts over when it is done; it reads an object to its end, so one object larger than the rate is read
+in one go and the next reads wait until the rate has paid for it. It never drops an object whose
+fill is still ending, and never one whose file was replaced after it was read. A file or a sidecar that
+cannot be read (a failing disk, out of descriptors) is left alone and counted in
+`scrub_errors_total`; a sidecar that is missing or does not parse drops the object. The bytes are
+hashed in chunks of 1 MiB and a shutdown ends the pass at the next chunk; inside one object the
+read is not paced. A round (every object once) starts at most once in `scrub_min_round`. An
+object whose check panics is counted in `scrub_errors_total` and skipped for the round. `scrub_rate = "off"`
+turns it off; a restart still checks sizes only. A hard link that a job holds to a dropped object
+keeps the old bytes for that job: the scrub removes the cache's name only.
 
 Eviction keeps the cache under `budget` bytes: above `high_water` percent of it, and when the free
 space of the file system (`statvfs`) is under `free_floor` percent, a pass removes the least
@@ -446,8 +460,7 @@ stop a fill, so on a disk that the jobs fill, the cache may fill the file system
 until the next pass (every 10 seconds) frees it. The start refuses (exit status 2) a `budget` larger
 than the size of the file system less `free_floor` percent of it; a file system whose size cannot be
 read, or that reports 0 bytes, is not judged: the start warns on stderr and goes on. The files of
-`.stage/` are never evicted and are removed at start. `scrub_rate` is accepted; this release does not
-scrub. `put_permit_wait`, like `max_concurrent_puts` and `put_min_bytes_per_sec`, is accepted in
+`.stage/` are never evicted and are removed at start. `put_permit_wait`, like `max_concurrent_puts` and `put_min_bytes_per_sec`, is accepted in
 `[server]` of a build node and does nothing there without write-through, since the node answers every
 put 403.
 
@@ -467,7 +480,8 @@ put 403.
 | `local_cache.write_through` | `false` by default: a read cache that refuses every write with 403 before the role of the key is looked at. `true`: the node takes the writes its keys may do and sends each to the upstream, which must be written with a key that may write; the start runs the upstream's self-test (create-only and multipart-conditional included) and exits with status 3 if the upstream answers one wrongly |
 | `local_cache.whole_fill_limit` | the most an object may be for a ranged read of it to fill the whole of it: a number or a size such as `"512MiB"`, from 1 byte to the `budget` (default 64 MiB); a larger object is passed through and kept nowhere. A fill reads 8 MiB at a time whatever the limit, so raising it does not raise the memory of the fills |
 | `local_cache.cache` | `true`, the default; `false` is refused (leave `[local_cache]` out to run without a cache) |
-| `local_cache.scrub_rate` | a size and `/s`, such as `"50MiB/s"`: accepted, and not used by this release |
+| `local_cache.scrub_min_round` | the least time between the starts of two rounds of the scrub (default `"1h"`; at least `"1s"`, or `"0s"`: a round starts as soon as the last is done): a small cache is not read again and again at the rate |
+| `local_cache.scrub_rate` | the bytes a second the scrub reads, a size and `/s` such as `"50MiB/s"` (default `"16MiB/s"`); `"off"` turns the scrub off |
 | `cold_store.endpoints` | a list of exactly one endpoint, in place of `endpoint`: several are refused as not supported yet, since the cache reads from one upstream |
 
 `[cold_store]` is the upstream: any `kind` (an `s3` bucket, with `endpoint` and a `credentials_file`
@@ -493,7 +507,7 @@ text format, `tierstore_cache_<name>`, with: `hits_total`, `misses_total`, `byte
 fill included, so the byte hit ratio is the first over the sum of the two), `fills_total`,
 `fills_skipped_total`, `fills_skipped_busy_total` (those of the skipped fills that found every fill
 slot taken), `fill_failures_total{reason}` (`hash_mismatch`, `upstream_error`,
-`short_body`, `local_io`, `changed`, `aborted`), `evictions_total{reason}` (`budget`, `floor`), `pinned_skips_total`,
+`short_body`, `local_io`, `changed`, `aborted`), `evictions_total{reason}` (`budget`, `floor`), `pinned_skips_total`, `scrubbed_objects_total`, `scrubbed_bytes_total`, `scrub_mismatches_total`, `scrub_errors_total`,
 `discarded_at_start_total`, and the gauges `bytes`, `objects`, `fs_free_bytes` and `staging_files`.
 A storage node has the proxy's counters instead, the same path on a node with the OCI front (a
 storage node, or a build node with an `[oci]` table) also has the OCI counters (see Counters), and

@@ -92,6 +92,12 @@ impl Index {
         Some(entry.size)
     }
 
+    /// The names of the objects, in no order (the caller sorts, outside the lock the index is
+    /// behind).
+    pub(super) fn names(&self) -> Vec<String> {
+        self.entries.keys().cloned().collect()
+    }
+
     /// The names and sizes of the objects, the least recently used first.
     pub(super) fn oldest_first(&self) -> Vec<(String, u64)> {
         let size = |hex: &String| self.entries.get(hex).map_or(0, |entry| entry.size);

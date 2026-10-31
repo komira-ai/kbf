@@ -91,6 +91,7 @@ impl PreflightReport {
             binary_digest: self.binary_digest.clone(),
             tool_versions: self.tool_versions.clone(),
             hardware: self.hardware.clone(),
+            attempt: 1,
         }
     }
 }
@@ -184,7 +185,7 @@ fn is_pinned(found: &str, pinned: &str) -> Result<String, String> {
 
 /// The percent of the cold store's heal done, from the operator's status file. `None` if the
 /// ops file names no such file.
-fn heal_percent(host: &dyn Host, ops: &OpsFile) -> Result<Option<f64>, String> {
+pub(crate) fn heal_percent(host: &dyn Host, ops: &OpsFile) -> Result<Option<f64>, String> {
     #[derive(Deserialize)]
     struct Status {
         percent_done: f64,
@@ -198,13 +199,20 @@ fn heal_percent(host: &dyn Host, ops: &OpsFile) -> Result<Option<f64>, String> {
     Ok(Some(status.percent_done))
 }
 
-/// The heal state in words: `none`, `healing N% done` or `healing, progress unknown`. A drive
-/// that says it heals, or a status file under 100%, means healing.
+/// Whether the cold store is healing: a drive that says it heals, or a status file under 100%.
+/// One rule for the preflight's words ([`heal_state`]) and for the readings the run takes before
+/// every pass ([`crate::coldstate`]).
 #[must_use]
-pub fn heal_state(info: Option<&serde_json::Value>, percent_done: Option<f64>) -> String {
+pub fn is_healing(info: Option<&serde_json::Value>, percent_done: Option<f64>) -> bool {
     let drives = info.is_some_and(mc::any_drive_healing);
     let file = percent_done.is_some_and(|p| p < 100.0);
-    match (drives || file, percent_done) {
+    drives || file
+}
+
+/// The heal state in words: `none`, `healing N% done` or `healing, progress unknown`.
+#[must_use]
+pub fn heal_state(info: Option<&serde_json::Value>, percent_done: Option<f64>) -> String {
+    match (is_healing(info, percent_done), percent_done) {
         (true, Some(p)) => format!("healing {p:.0}% done"),
         (true, None) => "healing, progress unknown".to_owned(),
         (false, _) => "none".to_owned(),

@@ -4,8 +4,8 @@
 //! binary: any S3 store, such as a bucket of MinIO or a storage node's tierstore). By default the S3 front serves it as a read cache and
 //! refuses every write before it gets here (see `ServerConfig::cache`), so a cache has no
 //! journal, no lease and no reconciler, and nothing to recover but a directory of files it can
-//! delete. The only things that run on their own are the fills a miss starts and the eviction
-//! pass ([`LocalCache::maintain`]).
+//! delete. The only things that run on their own are the fills a miss starts, the eviction
+//! pass ([`LocalCache::maintain`]) and the scrub ([`LocalCache::scrub`]).
 //!
 //! # Writes
 //!
@@ -73,7 +73,8 @@
 //! the upstream. A key that is not named by its content is read twice by HEAD, before the first
 //! chunk and after the last: if the size or the tag changed, the object was written over during
 //! the fill and is not kept, and the readers get an error. A key named by its content whose bytes
-//! do not hash to the name is the reader's error, not passed through. A hit is not hashed again.
+//! do not hash to the name is the reader's error, not passed through. A hit is not hashed again:
+//! the scrub does that.
 //!
 //! At most `max_concurrent_fills` fills run at once, each holding one chunk (`fill_chunk`, 8 MiB)
 //! in memory at a time, so the fills hold at most that many chunks. A miss of a key that has no
@@ -103,6 +104,11 @@
 //! at open, no probe, no fill, no eviction, no file time, no deletion on a read error). When the
 //! lock is free, [`LocalCache::tick`] takes it, cleans up, scans again and makes the cache
 //! read-write. The module `hold` has the rules.
+//!
+//! # Scrub
+//!
+//! A background walk hashes each object again at a bounded rate and drops the ones whose bytes
+//! changed on the disk; see [`scrub`].
 
 mod disk;
 mod evict;
@@ -113,6 +119,7 @@ mod keep;
 pub(super) mod layout;
 mod listing;
 mod metrics;
+mod scrub;
 mod selfcheck;
 mod stream;
 mod write;
@@ -143,6 +150,8 @@ mod listing_tests;
 mod lost_tests;
 #[cfg(test)]
 mod read_only_tests;
+#[cfg(test)]
+mod scrub_tests;
 #[cfg(test)]
 mod selfcheck_tests;
 #[cfg(test)]
@@ -179,6 +188,7 @@ use crate::{
 pub use disk::{Disk, Space, SystemDisk};
 pub use hold::{Mode, Tick};
 pub use metrics::Counters;
+pub use scrub::{Every, SCRUB_MIN_ROUND, SCRUB_RATE, SCRUB_TICK, ScrubPass, Scrubber, Ticker};
 pub use selfcheck::{LocalTierFailure, check_local};
 
 use fill::Pending;

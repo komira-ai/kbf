@@ -82,6 +82,15 @@ pub(super) struct Pending {
 }
 
 impl Pending {
+    /// A fill that never ends, for the tests that need a key to be in the table of the fills that
+    /// run.
+    #[cfg(test)]
+    pub(super) fn never() -> Self {
+        let done = futures::future::pending().boxed().shared();
+        let (_, live) = watch::channel(Live::Starting);
+        Self { done, live }
+    }
+
     /// A fill that is over already, with no object and no progress: what a keep leaves in the table
     /// of the fills that run (see `keep.rs`). A reader that finds it is answered from the upstream.
     pub(super) fn finished(filled: Filled) -> Self {

@@ -52,6 +52,7 @@ impl Jitter for Middle {
 struct Front {
     addr: SocketAddr,
     backend: Arc<MemoryBackend>,
+    server: Arc<Server>,
 }
 
 impl Front {
@@ -72,8 +73,13 @@ impl Front {
         let server = Server::new(held, config);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bound");
         let addr = listener.local_addr().expect("an address");
-        tokio::spawn(async move { server.serve(listener).await });
-        Self { addr, backend }
+        let serving = Arc::clone(&server);
+        tokio::spawn(async move { serving.serve(listener).await });
+        Self {
+            addr,
+            backend,
+            server,
+        }
     }
 
     /// A presigned PUT URL for `name` under the prefix of the presigning key.
@@ -188,21 +194,18 @@ async fn a_large_put_refused_at_the_cap_is_stored_by_its_retry_once_a_slot_frees
     });
     started_rx.await.expect("the holder started");
 
-    // The holder has sent its head; the front may not yet have taken its slot, so a small put
-    // asks until the front refuses one. Each small put that is let in stores an object of its
-    // own and frees the slot again.
-    let mut probes = 0_usize;
-    loop {
-        let url = front.url(&format!("probe-{probes}"));
-        probes += 1;
-        let answer = tokio::task::spawn_blocking(move || put(&agent(None), &url, b"probe"))
-            .await
-            .expect("the probe");
-        match answer {
-            Ok(()) => tokio::task::yield_now().await,
-            Err(PutError::Unavailable { .. } | PutError::Interrupted { .. }) => break,
-            Err(other) => panic!("the probe was neither stored nor refused: {other:?}"),
-        }
+    // The holder has sent its head, but the front takes its slot a moment later, on its own
+    // task. The front says when it has: its free put slots go to zero. Nothing is sent to the
+    // front meanwhile, so no connection is spent on asking; the loop yields to the front's tasks
+    // and is bounded, so a slot that is never taken fails the test with a message.
+    let mut tries = 0_u32;
+    while front.server.put_permits_free() != 0 {
+        tries += 1;
+        assert!(
+            tries <= 1_000_000,
+            "the front never took the holder's put slot"
+        );
+        tokio::task::yield_now().await;
     }
 
     let url = front.url("big");

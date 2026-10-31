@@ -7,7 +7,7 @@ use std::time::Duration;
 use super::config::{File, from_text, settings_from_text};
 use super::config_cache::{CacheSettings, Rate};
 use super::config_testing::{DEFAULTS, GOLDEN, MINIMAL};
-use super::local_cache::{FILL_CHUNK, WHOLE_FILL_LIMIT};
+use super::local_cache::{FILL_CHUNK, SCRUB_MIN_ROUND, SCRUB_RATE, WHOLE_FILL_LIMIT};
 
 /// A build node's file with every key given a value that is not the default.
 const CACHE: &str = r#"
@@ -43,6 +43,7 @@ write_through = true
 whole_fill_limit = "128MiB"
 cache      = true
 scrub_rate = "50MiB/s"
+scrub_min_round = "30m"
 
 [cold_store]
 kind             = "s3"
@@ -215,6 +216,7 @@ fn a_build_node_file_makes_a_cache() {
         Some(Path::new("/etc/tierstore-cache/upstream-read.key"))
     );
     assert_eq!(cache.scrub_rate, Some(50 << 20));
+    assert_eq!(cache.scrub_min_round, Duration::from_secs(30 * 60));
 
     let why = from_text(CACHE, DEFAULTS).unwrap_err().to_string();
     assert!(why.contains("no flag form"), "{why}");
@@ -225,7 +227,7 @@ fn a_build_node_file_makes_a_cache() {
 }
 
 /// Asserts the defaults of a build node's file: marks at 90, 75 and 95 percent, a floor of 10
-/// percent, the region of the flags, no scrub, and the limits of the flags.
+/// percent, the region of the flags, the scrub at its default rate, and the limits of the flags.
 #[test]
 fn a_build_node_file_has_the_defaults_of_the_flags_and_of_the_cache() {
     let cache = cache_of(LEAST);
@@ -254,8 +256,24 @@ fn a_build_node_file_has_the_defaults_of_the_flags_and_of_the_cache() {
     assert_eq!(cache.front.max_concurrent_puts, 32);
     assert_eq!(cache.front.put_permit_wait, Duration::from_secs(15));
     assert_eq!(cache.s3_request_timeout, Duration::from_secs(60));
-    assert_eq!(cache.scrub_rate, None);
+    assert_eq!(cache.scrub_rate, Some(SCRUB_RATE));
+    assert_eq!(cache.scrub_min_round, SCRUB_MIN_ROUND);
+    assert_eq!(SCRUB_MIN_ROUND, Duration::from_secs(3600));
+    assert_eq!(SCRUB_RATE, 16 << 20);
     assert_eq!(cache.upstream.spec, "memory");
+}
+
+/// Asserts that `scrub_rate` of `"off"` or of zero bytes turns the scrub off, and that a rate is
+/// written back by `--print-config`'s form: `off` for none, bytes a second otherwise.
+#[test]
+fn a_scrub_rate_of_off_or_zero_turns_the_scrub_off() {
+    for off in ["\"off\"", "\"0B/s\""] {
+        let text = cache_with("\"50MiB/s\"", off);
+        assert_eq!(cache_of(&text).scrub_rate, None, "{off}");
+    }
+    assert_eq!(serde_json::to_string(&Rate(0)).unwrap(), "\"off\"");
+    assert_eq!(serde_json::to_string(&Rate(7)).unwrap(), "\"7B/s\"");
+    assert_eq!(serde_json::from_str::<Rate>("\"off\"").unwrap(), Rate(0));
 }
 
 /// Asserts that a single `endpoints` entry is the upstream, as `endpoint` is.
@@ -409,6 +427,31 @@ fn a_build_node_file_is_refused_when_it_cannot_be_run() {
     let why = refusal(&cache_with("\"50MiB/s\"", "\"fast\""));
     assert!(why.contains("scrub_rate"), "{why}");
     assert!(!why.contains("fast"), "{why}");
+    // The same for a minimum between rounds that is not a duration.
+    let text = cache_with("scrub_min_round = \"30m\"", "scrub_min_round = \"soon\"");
+    let why = refusal(&text);
+    assert!(why.contains("scrub_min_round"), "{why}");
+    assert!(!why.contains("soon"), "{why}");
+}
+
+/// Asserts that a minimum between rounds under one second is refused naming its key (it would
+/// round down to no minimum), and that exactly `0s` and one second are accepted.
+#[test]
+fn a_scrub_min_round_under_a_second_is_refused_except_zero() {
+    let with = |value: &str| {
+        cache_with(
+            "scrub_min_round = \"30m\"",
+            &format!("scrub_min_round = \"{value}\""),
+        )
+    };
+    let why = refusal(&with("500ms"));
+    assert!(why.contains("local_cache.scrub_min_round"), "{why}");
+    assert!(why.contains("at least 1s"), "{why}");
+    assert_eq!(cache_of(&with("0s")).scrub_min_round, Duration::ZERO);
+    assert_eq!(
+        cache_of(&with("1s")).scrub_min_round,
+        Duration::from_secs(1)
+    );
 }
 
 /// Asserts that a `whole_fill_limit` that is not a size is refused naming its key and without the
@@ -734,7 +777,7 @@ fn the_whole_fill_limit_is_a_size_between_one_byte_and_the_budget() {
 }
 
 /// The keys of `[local_cache]`, which the README of the packaging must document each in a row.
-const LOCAL_CACHE_KEYS: [&str; 15] = [
+const LOCAL_CACHE_KEYS: [&str; 16] = [
     "path",
     "layout",
     "budget",
@@ -750,6 +793,7 @@ const LOCAL_CACHE_KEYS: [&str; 15] = [
     "whole_fill_limit",
     "cache",
     "scrub_rate",
+    "scrub_min_round",
 ];
 
 /// Asserts that the README of the packaging documents the build-node shape: its example loads,
