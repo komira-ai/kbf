@@ -6,6 +6,8 @@
 //! the start line ([`UsageProfiles::start_line`]) and the gauge `kbf_usage_profiles_mode{mode}`
 //! ([`render`]). The mode itself is [`kbf_usage::UsageMode`]; this type is its flag spelling.
 
+use std::fmt::Write as _;
+
 use clap::ValueEnum;
 use kbf_usage::UsageMode;
 
@@ -43,7 +45,7 @@ impl UsageProfiles {
     /// The line a start logs: the mode it runs.
     #[must_use]
     pub fn start_line(self) -> String {
-        String::new()
+        format!("usage profiles: {}", self.name())
     }
 }
 
@@ -83,19 +85,42 @@ impl Args {
     /// [`UsageProfilesError`]: `record` or `on` without the js core or without a state
     /// store; `on` without `--placement-load on` or without `--placement-predictions on`.
     pub(crate) fn usage_profiles_fit(&self) -> Result<(), UsageProfilesError> {
-        let _ = (
-            self.usage_profiles,
-            SchedulerCore::Js,
-            PlacementLoad::On,
-            PlacementPredictions::On,
-        );
+        let mode = self.usage_profiles;
+        if mode == UsageProfiles::Off {
+            return Ok(());
+        }
+        if self.scheduler_core != SchedulerCore::Js {
+            return Err(UsageProfilesError::NeedsJsCore(mode.name()));
+        }
+        if self.state_store.is_none() {
+            return Err(UsageProfilesError::NeedsStateStore(mode.name()));
+        }
+        if mode == UsageProfiles::On {
+            if self.placement_load != PlacementLoad::On {
+                return Err(UsageProfilesError::OnNeedsPlacementLoad);
+            }
+            if self.placement_predictions != PlacementPredictions::On {
+                return Err(UsageProfilesError::OnNeedsPredictions);
+            }
+        }
         Ok(())
     }
 }
 
 /// Appends the gauge `kbf_usage_profiles_mode{mode}` to `out`: 1 for `running`, 0 for each
 /// other mode.
-pub(crate) fn render(_out: &mut String, _running: UsageProfiles) {}
+pub(crate) fn render(out: &mut String, running: UsageProfiles) {
+    let name = "kbf_usage_profiles_mode";
+    let _ = writeln!(
+        out,
+        "# HELP {name} The usage profiles mode the server runs: 1 for it, 0 for the others\n\
+         # TYPE {name} gauge"
+    );
+    for mode in UsageProfiles::value_variants() {
+        let value = u8::from(*mode == running);
+        let _ = writeln!(out, "{name}{{mode=\"{}\"}} {value}", mode.name());
+    }
+}
 
 #[cfg(test)]
 mod tests;
