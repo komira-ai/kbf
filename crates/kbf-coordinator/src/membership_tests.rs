@@ -15,6 +15,9 @@ const V2: &str = "heartbeat-v2";
 const DAEMONS: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n\
     [service.selector]\nroles = [\"daemon\"]\n";
 
+const DAEMONS_OF_TWO_ROLES: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n\
+    [service.roles.storage]\nmin_up = 0\n[service.selector]\nroles = [\"daemon\"]\n";
+
 const NO_SELECTOR: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n";
 
 const ZONE_A: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n\
@@ -58,6 +61,13 @@ fn who(name: &str) -> Identity {
     Identity {
         node_id: id(name),
         role: HostRole::DAEMON,
+    }
+}
+
+fn storage(name: &str) -> Identity {
+    Identity {
+        node_id: id(name),
+        role: HostRole::STORAGE,
     }
 }
 
@@ -288,6 +298,21 @@ async fn an_absent_host_is_not_up_and_is_ordered_only_with_install_when_absent()
     );
     assert_eq!(service_status(&rig, "other")["hosts"][0]["hold"], "absent");
     send(&rig, "d1", true, &[OTHER]);
+    let c = convergence(&rig, "other");
+    assert_eq!(c["hosts"], counts(0, 0, 0, 0));
+    assert_eq!(c["state"], "converged");
+}
+
+/// Catches: a selector that names roles selecting every role of the service: a host of a role
+/// the selector leaves out is not counted, not missing and not ordered, even when the service
+/// runs on its role.
+#[tokio::test]
+async fn a_selector_leaves_out_the_roles_it_does_not_name() {
+    let rig = rig("mem-roles", DAEMONS_OF_TWO_ROLES, &["other"]).await;
+    send(&rig, "d1", true, &[OTHER]);
+    let behind = beat_of(true, &[("other", "1.0", "healthy")]);
+    let reply = rig.coordinator.heartbeat(storage("s1"), behind).reply;
+    assert_eq!(reply, ServiceReply::Nothing);
     let c = convergence(&rig, "other");
     assert_eq!(c["hosts"], counts(0, 0, 0, 0));
     assert_eq!(c["state"], "converged");
