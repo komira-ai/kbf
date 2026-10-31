@@ -140,7 +140,7 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server}
 
 pub use self::executor_flags::{ExecutorFlags, JsAgentFlags};
 pub use self::janitor::{Janitor, JanitorFlagError, JanitorFlags, JanitorMetrics};
-pub use self::job_read::{JobReadError, JobReadFlags, JobTls};
+pub use self::job_read::{JobReadError, JobReadFlags, JobTls, StoreGrantFlags};
 pub use self::pack_flags::{PackFlagError, PackFlags};
 pub use self::task_flags::{TaskFlagError, TaskFlags};
 use crate::drain::Drain;

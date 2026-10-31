@@ -73,6 +73,7 @@ async fn a_run_mounts_nothing_and_holds_no_secret_outside_its_flags() {
     for flag in [
         "--allow-plain-http-put",
         "--allow-plain-http-grant",
+        "--locate",
         "--root-der",
         "--work-dir",
     ] {
@@ -143,6 +144,20 @@ async fn a_plain_http_grant_is_posted_only_when_allowed_and_the_task_is_told() {
             .count();
         assert_eq!(given, 1, "{:?}", run.args.len());
     }
+}
+
+/// Catches the config's `locate` not reaching the task, or reaching it twice: with it set the
+/// task tool is given exactly one `--locate` (the default config's runs have none, which the
+/// leak test above pins), and the grant and the other flags are those of a run without it.
+#[tokio::test(start_paused = true)]
+async fn executor_posts_run_with_locate_flag() {
+    let mut rig = Rig::start(&["node1"], 1, |cfg| cfg.locate = true).await;
+    let run = posted(&mut rig).await;
+    let given = run.args.iter().filter(|a| *a == "--locate").count();
+    assert_eq!(given, 1, "{:?}", run.args.len());
+    assert_eq!(run.args.last().map(String::as_str), Some("--locate"));
+    assert_eq!(run.args[0], "--action");
+    assert!(run.arg("--grant-url").is_some());
 }
 
 /// Catches a write url sent in clear without the operator's word: a pack url that is not

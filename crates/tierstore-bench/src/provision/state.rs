@@ -7,6 +7,10 @@
 //! bucket and account are found again and kept, and a failed live-bucket probe removes only the
 //! accounts listed here.
 //!
+//! A `--premade` run (see [`crate::provision::Supply`]) makes nothing, but writes down the
+//! pre-made bucket and account once the probes have passed, with a `premade` marker, so the
+//! teardown's guard finds them as it finds the ones a run made.
+//!
 //! The file names buckets and account ids, so it is private like `ops.json`; nothing prints it.
 
 use std::collections::BTreeSet;
@@ -27,6 +31,14 @@ pub const STATE_FILE: &str = "provision-state.json";
 struct Made {
     buckets: BTreeSet<String>,
     accounts: BTreeSet<String>,
+    /// Set when a `--premade` run wrote the record: the bucket and account were made by a held
+    /// script. A record of a run that made its own carries no such key.
+    #[serde(default, skip_serializing_if = "is_false")]
+    premade: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// The record of one run's provisioning.
@@ -59,6 +71,18 @@ impl State {
             prefix: prefix.to_owned(),
             made,
         })
+    }
+
+    /// Whether the record was written by a `--premade` run.
+    #[must_use]
+    pub fn is_premade(&self) -> bool {
+        self.made.premade
+    }
+
+    /// Whether the record names any bucket or account.
+    #[must_use]
+    pub fn has_entries(&self) -> bool {
+        !self.made.buckets.is_empty() || !self.made.accounts.is_empty()
     }
 
     /// Whether this run made the bucket `name`.
@@ -99,6 +123,18 @@ impl State {
     /// # Errors
     /// [`BenchError::Io`] if the record cannot be saved.
     pub fn record_account(&mut self, id: &str) -> Result<(), BenchError> {
+        self.made.accounts.insert(id.to_owned());
+        self.save()
+    }
+
+    /// Records the pre-made bucket and account of one role, marks the record `premade`, and
+    /// saves. Called once the probes have passed, so the held teardown finds what to remove.
+    ///
+    /// # Errors
+    /// [`BenchError::Io`] if the record cannot be saved.
+    pub fn record_premade(&mut self, bucket: &str, id: &str) -> Result<(), BenchError> {
+        self.made.premade = true;
+        self.made.buckets.insert(bucket.to_owned());
         self.made.accounts.insert(id.to_owned());
         self.save()
     }
