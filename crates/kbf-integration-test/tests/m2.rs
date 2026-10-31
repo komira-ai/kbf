@@ -267,7 +267,12 @@ mod fake {
         std::thread::sleep(sleep);
         // The container ends and the lease is cleaned, unless a defect leaves them.
         if !defect("container-left") {
-            let _ = std::fs::remove_dir_all(lease.join("crun"));
+            // Out of the harness's sight whole, then removed: unlinking the containers
+            // one by one would show a poll one of two for a moment.
+            let gone = lease.join("crun-gone");
+            if std::fs::rename(lease.join("crun"), &gone).is_ok() {
+                let _ = std::fs::remove_dir_all(&gone);
+            }
         }
         if !defect("container-left") & !defect("lease-left") {
             let _ = std::fs::remove_dir_all(&lease);
