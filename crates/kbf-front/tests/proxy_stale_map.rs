@@ -120,8 +120,11 @@ async fn a_held_upload_is_sent_to_the_owner_of_the_newer_map() {
         .await
         .expect("the newer map's owner takes the upload");
 
-    let second = after.write_owners(&digest_of(kind, size))[0].0 as usize;
-    assert_ne!(second, first);
+    // The down member is still among the blob's owners, and is passed over.
+    let second = (after.write_owners(&digest_of(kind, size)).into_iter())
+        .map(|id| id.0 as usize)
+        .find(|id| *id != first)
+        .expect("another owner");
     let mut want = vec![0, 0, 0];
     want[first - 1] = 1;
     want[second - 1] = 1;
