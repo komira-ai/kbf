@@ -148,6 +148,9 @@ pub struct TaskArgs<'a> {
     /// Whether the read grant may be served over plain http: the tool is told with
     /// `--allow-plain-http-grant`.
     pub allow_plain_http_grant: bool,
+    /// Whether the task asks the listener where its inputs are kept and reads them from there:
+    /// the tool is told with `--locate`.
+    pub locate: bool,
 }
 
 impl TaskArgs<'_> {
@@ -188,6 +191,9 @@ impl TaskArgs<'_> {
         }
         if self.allow_plain_http_grant {
             argv.push("--allow-plain-http-grant".to_owned());
+        }
+        if self.locate {
+            argv.push("--locate".to_owned());
         }
         argv
     }

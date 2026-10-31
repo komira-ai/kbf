@@ -31,6 +31,11 @@ fn announcing(mut top: Heartbeat, services: &[(&str, &str)]) -> Heartbeat {
                 health: Health::Healthy,
                 last_update: None,
                 updating: None,
+                step: None,
+                commit: None,
+                step_secs: Default::default(),
+                promotion_pending: false,
+                deferred: None,
             })
             .collect(),
     );

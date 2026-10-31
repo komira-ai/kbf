@@ -212,6 +212,27 @@ fn js_agent_settings_become_the_executors_config() {
     assert_eq!(config.output_disk_bytes, 4 << 30);
 }
 
+/// Catches `--executor-locate` not becoming the executor's setting, or being on by default: it
+/// is off unless given, and given with `--executor js-agent` it is the config's `locate`.
+#[test]
+fn executor_locate_is_off_unless_given_and_becomes_the_config() {
+    let off = js_with(&[]).expect("flags");
+    assert!(!off.executor.js.expect("js-agent").config.locate);
+    let on = js_with(&["--executor-locate"]).expect("flags");
+    assert!(on.executor.js.expect("js-agent").config.locate);
+}
+
+/// Catches `--executor-locate` accepted where nothing reads it: daemons build no task command
+/// line, so with `--executor kbf-daemon` (the default) it would do nothing and is refused when
+/// the flags are read, naming both flags.
+#[test]
+fn locate_with_kbf_daemon_is_refused_at_start() {
+    let why = parsed(argv(&["--executor-locate"])).expect_err("refused");
+    assert!(why.contains("--executor-locate"), "{why}");
+    assert!(why.contains("--executor js-agent"), "{why}");
+    parsed(argv(&[])).expect("daemons without the flag still parse");
+}
+
 /// Catches a flag default that has drifted from the executor's own: the defaults are written
 /// as text in the flags and are the config's.
 #[test]
@@ -472,13 +493,13 @@ fn an_unknown_delivery_is_refused() {
     assert!(why.contains("--executor-secret-delivery"), "{why}");
 }
 
-/// Catches the rollback tripping on the new setting: with `--executor kbf-daemon` the delivery
-/// may stay in the unit and nothing reads it.
+/// Catches a delivery that would do nothing being accepted: with `--executor kbf-daemon` no
+/// task command line is built, so `files` is refused, naming the flag; the default `argv`
+/// stays accepted (it is what every unit that names nothing has).
 #[test]
-fn the_daemon_executor_ignores_the_delivery() {
-    let _logged =
-        tracing::subscriber::set_default(tracing_subscriber::fmt().with_test_writer().finish());
-    let flags = parsed(argv(&["--executor-secret-delivery=files"])).expect("flags");
+fn the_daemon_executor_refuses_the_files_delivery() {
+    let why = parsed(argv(&["--executor-secret-delivery=files"])).expect_err("refused");
+    assert!(why.contains("--executor-secret-delivery"), "{why}");
+    let flags = parsed(argv(&["--executor-secret-delivery=argv"])).expect("flags");
     assert_eq!(flags.executor.kind, ExecutorKind::KbfDaemon);
-    assert!(flags.executor.js.is_none());
 }

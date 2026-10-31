@@ -118,7 +118,8 @@ Where the frontend runs the actions it places is `--executor` (the `[executor]` 
 as always: the frontend builds no executor and contacts no lease server, whatever the other
 `--executor-*` flags say, so a unit or `kbf.toml` that names a lease server keeps its settings
 when the executor is switched back, `--executor-insecure-argv-secrets` too (it is ignored, with a
-warning, so the rollback is the one flag: `executor = "kbf-daemon"`). Stopping the frontend
+warning, so the rollback is the one flag: `executor = "kbf-daemon"`, except `--executor-locate`,
+which is refused with `kbf-daemon` and must be removed in the same edit). Stopping the frontend
 releases its leases; a frontend that is killed (a stop timeout, SIGKILL) leaves them, and the
 hosts stay held until their ttl ends (`--executor-lease-ttl-secs`, an hour by default) unless a
 later `js-agent` start releases them. `js-agent` leases hosts from the job scheduler's lease server
@@ -146,7 +147,8 @@ the paths (`--pack-url-file`, `--grant-token-file`): no argument holds a secret,
 `run-files=true`. There is no fall back to arguments: a pool whose agents do not report
 `run-files` holds no host, and no run is sent. A start the lease server refuses with
 `files-unsupported` drains that host and the action is rerun elsewhere; `invalid-file` ends the
-action as invalid. The executor runs on exactly one frontend: it looks for another frontend's leases on
+action as invalid. `files` is refused with `--executor kbf-daemon`, which builds no command
+line. The executor runs on exactly one frontend: it looks for another frontend's leases on
 the lease server before its first pass and every minute after, and a frontend that finds one
 older than its own (or finds one before it has any) stops with an error naming it. Each lease
 also carries the process that made it: a frontend that starts and finds leases of another
@@ -185,7 +187,12 @@ presigned write and the read token are never part of an error, a log line or a m
 private home, on top of the bytes of its inputs and a fixed 1 GiB margin),
 `--executor-allow-plain-http-put` (until the store serves TLS), and
 `--executor-allow-plain-http-grant` (a read listener without TLS, on a farm's own network; both
-plain-http flags are off by default). A setting that breaks a rule
+plain-http flags are off by default), and `--executor-locate` (off by default: the task is given
+`--locate`, asks the listener's `GET /locate` once and reads each input straight from the store the
+answer names, from the listener when that read fails; with no grants in the answer it reads from the
+listener as before; refused with `--executor kbf-daemon`; the task image must carry kbf-task
+v0.0.44 or later, the first release that knows `--locate`: an older one refuses the flag and every
+run fails). A setting that breaks a rule
 the executor's safety rests on (the fence time against the scheduler's grace, the lease ttl
 against the longest run) is refused at start, exit status 2.
 
@@ -389,6 +396,37 @@ two more flags that have defaults:
   broken response). A client that reads is not cut off however long its response takes in all; one
   that opens a response and never reads it holds budget for this long and no longer. The scope
   of an Action is worked out once however many tasks ask for it at the same time.
+- `--job-store-grant-key-file`, `--job-store-url` and `--job-store-bucket` (the three come
+  together, and are off unless the key file is given): tell `GET /locate` to hand out read grants
+  of the tier store. The file is the grant key the store's own `--grant-key-file` holds (JSON of
+  `access_key_id` and `secret_access_key`, or the id and the secret on two lines; mode 0600 or
+  0400, owned by the server's user, never a flag; the secret is at least 32 bytes); the store
+  must be started with the same key.
+  `--job-store-url` is the base URL a task reads the store at (`http://` or `https://`, a host
+  and a port, no path: the task dials it from its worker, so it must be an address the workers
+  reach) and `--job-store-bucket` is the store's `--bucket`. Both come from these flags and from
+  nothing in a request. A file the server cannot read, a key or bucket tierstore would refuse, or
+  a URL that is not a store's is refused at start, exit status 2, and the refusal never holds the
+  secret. Without the flags `GET /locate` answers as it did: no header line and no `g`, and a
+  task reads every blob from this listener.
+
+  With them, the first line of a `GET /locate` answer is
+  `{"store":"<url>","bucket":"<bucket>","grants":["<token>",...]}` and each `pack` and `large`
+  line carries `"g":<n>`, the index in `grants` of the grant that lists its key (all the spans of
+  one pack share one). The grants list the keys of the lines of that answer, which come from the
+  grant's scope walk, and no others; each lists at most 600 keys (so a large scope has several
+  grants), and a key tierstore refuses to list (`_journal/`, `_tiering/`) is not listed and its
+  line is `absent`. A grant ends at the earlier of the job's read grant and ten minutes after it
+  is made, never later: the store refuses a grant that ends more than its
+  `--grant-max-lifetime` (900 seconds by default) after its own clock, so ten minutes leave five
+  for this host's clock to run ahead of the store's, and a store given a shorter
+  `--grant-max-lifetime` than ten minutes refuses them (the task then reads from the listener).
+  A grant is a bearer token: it is in the answer's body only, never in a log, a metric or a
+  `Debug`, and on plain HTTP (the listener's or the store's) anyone on the path can read it.
+  A grant lists whole pack keys, and the store serves any byte range of a key a grant lists, so a
+  task holding the grant for one blob of a pack can read every blob in that pack, including blobs
+  outside its Action's inputs. Turn these flags on only where that is acceptable: a farm whose
+  builds all belong to one tenant, or whose pack contents are not secret from one another.
 - The tee that copies a large blob to tierstore while it is streamed buffers up to 32 MiB for each
   live put (64 MiB in all at the default concurrency of two). That buffer is outside
   `--job-read-budget-bytes`, which counts what a read and its reply hold.
