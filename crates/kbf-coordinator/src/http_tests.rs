@@ -17,6 +17,7 @@ use crate::http::{
 use crate::testutil::{OPERATOR, Rig, ci_token};
 
 mod features;
+mod halt;
 mod operator;
 mod services;
 mod status;

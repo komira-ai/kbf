@@ -276,7 +276,11 @@ impl Coordinator {
                 .cloned()
                 .collect()
         });
-        Answer { reply, features }
+        Answer {
+            reply,
+            features,
+            halts: BTreeMap::new(),
+        }
     }
 
     fn reply_to(&self, who: Identity, beat: Heartbeat) -> ServiceReply {

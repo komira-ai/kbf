@@ -130,7 +130,7 @@ async fn an_agent_that_announced_features_gets_the_supported_subset() {
 /// `features: []`, which tells the agent this coordinator knows the field and supports none.
 #[tokio::test]
 async fn a_coordinator_that_advertises_nothing_answers_an_announcing_agent_with_an_empty_list() {
-    let rig = rig("http-features-empty", FEATURES).await;
+    let rig = rig("http-features-empty", &[]).await;
     let announcing = beat("2.0", r#","agent_features":["deferred-v1","halt-v1"]"#);
     assert_eq!(
         beat_text(&rig, "d1", "daemon", &announcing).await,
@@ -180,10 +180,10 @@ async fn a_heartbeat_with_every_new_fact_is_accepted_and_ordered_as_without_them
 }
 
 /// Catches: the unit test of the advertised set going vacuous: every name the coordinator
-/// advertises must be handled, and a name is added in the change that handles it. No name is
-/// handled yet.
+/// advertises must be handled, and a name is added in the change that handles it. `halt-v1`
+/// is handled by `http_tests/halt.rs`.
 #[test]
 fn advertised_features_equal_the_handled_set() {
-    let handled: &[&str] = &[];
+    let handled: &[&str] = &["halt-v1"];
     assert_eq!(FEATURES, handled);
 }
