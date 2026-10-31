@@ -314,7 +314,7 @@ fn client_builder(
 ) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(connect_timeout)
-        .pool_idle_timeout(None::<Duration>)
+        .pool_idle_timeout(pool_idle_timeout.max(Duration::from_secs(90)))
 }
 
 impl Conn {
