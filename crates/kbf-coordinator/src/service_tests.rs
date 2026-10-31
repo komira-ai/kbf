@@ -394,7 +394,7 @@ async fn hosts_that_beat_before_the_ordered_one_reports_are_not_ordered() {
     let c = &rig.coordinator;
     let replies: Vec<kbf_updater::wire::ServiceReply> = ["s1", "s2", "s3"]
         .iter()
-        .map(|h| c.heartbeat(storage(h), beat("1.0")))
+        .map(|h| c.heartbeat(storage(h), beat("1.0")).reply)
         .collect();
     assert_eq!(
         replies,
@@ -675,6 +675,11 @@ fn service_beat(running: &str) -> kbf_updater::wire::ServiceBeat {
         health: b.health,
         last_update: None,
         updating: None,
+        step: None,
+        commit: None,
+        step_secs: Default::default(),
+        promotion_pending: false,
+        deferred: None,
     }
 }
 
