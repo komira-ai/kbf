@@ -499,7 +499,7 @@ impl S3Store {
                 Ok(_) => return Ok(()),
                 Err(e) => {
                     let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
+                    if left.is_zero() && within.is_zero() {
                         return Err(transport(e));
                     }
                     tokio::time::sleep(left.min(WAIT_RETRY)).await;
