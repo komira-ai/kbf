@@ -18,8 +18,8 @@
 //!   marked node and finds it serving (in [`Drain::placed`], and in [`Drain::observe`], which
 //!   the agent calls for every unit at start and at each idle heartbeat), the cordon was given
 //!   back by hand and every mark of the node is removed. A frontend that cannot be asked
-//!   leaves the marks. The frontend's node read carries nothing that names one cordon (no
-//!   generation, no time), so a cordon given back and made again by an operator between two
+//!   leaves the marks and fails the read. The frontend's node read carries nothing that names
+//!   one cordon (no generation, no time), so a cordon given back and made again by an operator between two
 //!   looks is not told from the updater's.
 //! - **Only a drain is ours.** The updater drains; it never makes a plain cordon. A marked node
 //!   the frontend reads as cordoned (not draining, drained or paused) was cordoned by an
@@ -165,16 +165,19 @@ impl OwnCordon {
 
 impl Drain for OwnCordon {
     /// A marked node reads as in placement: the cordon on it is ours, unless the frontend says
-    /// it serves, which means the cordon was given back and every mark of it is removed. A
-    /// frontend that cannot be asked leaves the marks, and the node ours.
+    /// it serves (given back: its marks are removed) or cordoned (an operator's: marks removed,
+    /// node out). A frontend that cannot be asked fails the read and leaves the marks.
     fn placed(&self, host: &Host) -> Result<Placed, PortError> {
         let marks = self.marks(host)?;
         if marks.is_empty() {
             return self.inner.placed(host);
         }
         match self.inner.seen_if_known(host) {
-            // Still in a drain, or the frontend cannot say: the cordon is ours.
-            Ok(Some(Seen::Draining)) | Err(_) => Ok(Placed::In),
+            // Still in a drain: the cordon is ours.
+            Ok(Some(Seen::Draining)) => Ok(Placed::In),
+            // The frontend cannot say, so nothing says the cordon is still ours: the marks stay
+            // and the caller fails, leaving the node drained.
+            Err(e) => Err(e),
             // The updater only drains. A plain cordon was put there by an operator, over our
             // drain or after it was given back: the node is theirs.
             Ok(Some(Seen::Cordoned)) => {

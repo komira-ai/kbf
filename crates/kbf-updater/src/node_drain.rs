@@ -119,8 +119,18 @@ impl Drain for NodeDrain {
         let read: Node = Self::read(&reply, node)?;
         Ok(Some(match read.placement.state.as_str() {
             "serving" => Seen::Serving,
-            "cordoned" => Seen::Cordoned,
-            _ => Seen::Draining,
+            "draining" | "drained" | "drain_paused" => Seen::Draining,
+            // "cordoned", and a state this build does not know: not the updater's drain, so
+            // the node is left out rather than lifted at give-back.
+            other => {
+                if other != "cordoned" {
+                    eprintln!(
+                        "kbf-updater: node {node} is in the placement state {other:?}, which this \
+                         build does not know; treating it as an operator's cordon"
+                    );
+                }
+                Seen::Cordoned
+            }
         }))
     }
 
