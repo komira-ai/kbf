@@ -17,27 +17,27 @@ use crate::identity::Identity;
 use crate::services::Services;
 use crate::testutil::{Rig, beat, desired, id, last, unhealthy, updating, version};
 
-fn secs(n: u64) -> Duration {
+pub(crate) fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
 }
 
 /// `kbf` replaced by a service of daemons (`max_updating` and `min_up` as given) with the
 /// definition lines `extra` (`bake_beats`, `canary`) in its table.
-fn definition(extra: &str, max_updating: u32, min_up: u32) -> String {
+pub(crate) fn definition(extra: &str, max_updating: u32, min_up: u32) -> String {
     format!(
         "[[service]]\nname = \"kbf\"\n{extra}\n[service.roles.daemon]\nmax_updating = {max_updating}\nmin_up = {min_up}\n"
     )
 }
 
-fn services(extra: &str, max_updating: u32, min_up: u32) -> Services {
+pub(crate) fn services(extra: &str, max_updating: u32, min_up: u32) -> Services {
     Services::parse(&definition(extra, max_updating, min_up)).expect("services")
 }
 
-fn all(want: &Desired) -> BTreeMap<String, Desired> {
+pub(crate) fn all(want: &Desired) -> BTreeMap<String, Desired> {
     BTreeMap::from([(KBF.to_owned(), want.clone())])
 }
 
-fn why(s: &Services, f: &Fleet, host: &str, now: u64) -> Decision {
+pub(crate) fn why(s: &Services, f: &Fleet, host: &str, now: u64) -> Decision {
     let want = desired("2.0", 0, 0);
     let decision = decide_why(s, &all(&want), KBF, f, &id(host), secs(now));
     let reply = decide_in(s, &all(&want), KBF, f, &id(host), secs(now));
@@ -53,17 +53,17 @@ fn why(s: &Services, f: &Fleet, host: &str, now: u64) -> Decision {
     decision
 }
 
-fn go() -> Decision {
+pub(crate) fn go() -> Decision {
     Decision::Update {
         version: version("2.0"),
     }
 }
 
-fn held(why: Hold) -> Decision {
+pub(crate) fn held(why: Hold) -> Decision {
     Decision::Hold(why)
 }
 
-fn beats(f: &mut Fleet, host: &str, b: &kbf_updater::wire::Heartbeat, at: u64) {
+pub(crate) fn beats(f: &mut Fleet, host: &str, b: &kbf_updater::wire::Heartbeat, at: u64) {
     f.record(id(host), HostRole::DAEMON, b.clone(), secs(at));
 }
 
@@ -193,7 +193,7 @@ fn a_pending_or_baking_host_keeps_the_service_in_progress() {
     assert_eq!(state(&f, 130), State::InProgress, "pending");
 }
 
-fn started(f: &mut Fleet, at: u64) {
+pub(crate) fn started(f: &mut Fleet, at: u64) {
     for host in ["a", "b", "c"] {
         beats(f, host, &beat("1.0"), at);
     }
@@ -229,7 +229,7 @@ fn with_a_canary_of_one_nobody_else_is_ordered_until_it_has_baked() {
     assert_eq!(why(&s, &f, "c", 145), go(), "baked");
 }
 
-fn started_others(f: &mut Fleet, at: u64) {
+pub(crate) fn started_others(f: &mut Fleet, at: u64) {
     for host in ["b", "c"] {
         beats(f, host, &beat("1.0"), at);
     }
