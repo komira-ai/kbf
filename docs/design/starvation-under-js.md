@@ -127,7 +127,13 @@ it once its leases end: a `WholeMachine` lease, an `owns_worker` action, or a
    zeroes the CPU check, so a worker can have free booked capacity and still refuse the
    request. After step 1 the load predicate is the only admission. The start time is the
    first minute at which `admitted` would accept, with held leases dropping out at their
-   remaining time (3.3). A worker that already admits it has tail zero and the request is
+   remaining time (3.3). `admitted` also reads the node's reported (measured) load and the
+   cold-start cap, which are not functions of the held leases. Recommendation: hold the
+   measured part constant at its latest reading and let only the charged part decay with
+   the leases; a measured load that is the binding term then gives a long tail (the
+   request waits for the load to fall, and the pick prefers a worker where it does not
+   bind), and the cold-start cap is projected to lift at its own end. Decaying measured
+   load by the lease charge would promise a start the node's real load does not support. A worker that already admits it has tail zero and the request is
    not blocked there.
 2. **Reserve** the worker with the least tail among those that could hold the request.
    The pick is made again every round with no stickiness: ties go to the lower name, so a
@@ -163,7 +169,9 @@ both-core test, and the wiring of step 0 (passing the submission's `max_wall` to
   and close backfill. A lease's **remaining time** is
   `max(min(estimated end, enforced end) - now, margin)`: the cap at the enforced end never
   takes it below `margin`, because a lease past its enforced end still holds the worker
-  until the next lease tick releases it. `margin` is a js setting (default one minute). A learned estimate that proves too short
+  until the next lease tick releases it. `margin` is a js setting (default one minute). Per core: js-lease releases a lease
+  past its wall at its next tick; the embedded core has no tick, and there the floor
+  holds until the kbf action timeout ends the lease. A learned estimate that proves too short
   therefore keeps the worker from looking free.
 
 ### 3.4 Mapping onto the code that exists
@@ -191,7 +199,17 @@ both-core test, and the wiring of step 0 (passing the submission's `max_wall` to
   heads; one per pool by `held_pools`. The rule changes the pick in all three and
   merges none of them. For (2) the bound is one reserved worker per pool per round, the
   same `held_pools` rule as (3), applied to owner-worker actions and to settings-less
-  `WholeMachine` (a small change in `place`; tested).
+  `WholeMachine`. **This changes shipped behaviour, deliberately:** settings-less
+  `WholeMachine` is the kbf default (`--whole-node-max` unset) and holds today with no
+  per-pool bound, so a second queued request in the same pool will no longer hold a
+  worker in the same round. I read the tests by name: `whole_node_{caps,drain,order,
+  quiet,view}.rs` run with whole-node settings, use store (1), and are unaffected;
+  `whole_worker.rs` holds one request at a time, and the one beside a whole-node pool
+  (`a_whole_worker_request_holds_a_worker_beside_a_whole_node_pool`) is a single hold.
+  I found none that asserts two concurrent settings-less holds; if the red run finds
+  one, it is changed to assert the new one-per-pool order, not kept. An owner-worker
+  action and a `Blocked::Load` head share the pool key (same `needs` and kind); the one
+  earlier in queue order takes the pool's hold. Test (q).
 - **Caps.** `whole_counts` counts every entry of `drain.marks` toward `max_whole_node` and
   `max_draining`, and `whole_round` drops the newest marks beyond `ceiling_excess` at the
   start of each round. An ordinary large action in `drain.marks` would be counted as a
@@ -223,10 +241,12 @@ duration per key only if it is not.
   lease is its declared `max_wall`. A bound above `ceiling` is **refused for backfill**
   (treated as unknown; a clamped bound would not be enforced, and its overrun would run
   to the real timeout), and a lease with no declared bound is unknown. For the pick,
-  unknown counts as `ceiling`; for backfill, unknown is refused. `ceiling` is the
-  existing js-lease `Settings::with_max_wall` value, which already refuses a wall above
-  it (`WallAboveCeiling`); the scheduler has no pools of its own, so one ceiling is
-  passed to it. One concept, not a second clamping one. Learned history replaces the
+  unknown counts as `ceiling`; for backfill, unknown is refused. `ceiling` is **new
+  configuration in js-sched**, fed by kbf (js-sched does not depend on js-lease, and
+  the embedded farm has no lease table). It should carry the same value as the wall
+  ceiling js-lease refuses above (`Settings::with_max_wall`, `WallAboveCeiling`), so one
+  concept has one value; it refuses, it does not clamp. The scheduler has no pools of
+  its own, so one ceiling is passed to it. Learned history replaces the
   fallback per key once a key has enough clean runs (the threshold in jobscheduler#245).
 - **With the fallback alone, backfill admits only a job whose bound is shorter than the
   remaining tail.** A candidate ends at `now + bound`; the reserved lease ends at
@@ -237,7 +257,11 @@ duration per key only if it is not.
   different bounds on the two sides.
 - **What bounds an overrun is an enforced `max_wall`, defined operationally:** a lease
   past its wall is ended by something that runs without the scheduler's help. A
-  `set_max_wall` call proves a declared bound, not enforcement. In js-lease it exists:
+  `set_max_wall` call proves a declared bound, not enforcement. The scheduler learns
+  which it has from **one per-core setting**, `bounds_enforced`, which kbf sets once
+  step 0 is green (recommended over a per-operation bit: enforcement is a property of the
+  executor, not of a job, and a bit per job can be set by a client that is not enforced).
+  Without it every bound is treated as unknown for backfill. In js-lease it exists:
   `acquire` expires a lease at the earlier of its ttl and its wall, `renew` never
   extends past it, and `tick` stops an expired one; this serves js-lease-server and
   js-registry. In the embedded farm core (`js-server-core` and `js-sched`) there is none:
@@ -302,11 +326,18 @@ duration per key only if it is not.
   registry record is still dropped by `regain_grace` as today. (l) Recording: a request
   that starts and one that is cancelled each emit one record (a move only increments its
   counter) with the estimated start, blocked-at and backfilled core-seconds; a released
-  lease reports its placement estimate. (m) A request at `max_draining = 1` keeps its
+  lease reports its placement estimate. The sink is an event the scheduler emits to
+  its existing observer path (the js change names it), so (l) asserts on that event, not
+  on a scrape. (m) A request at `max_draining = 1` keeps its
   hold across rounds. (n) A `Blocked::Load` head whose booked capacity is free but is
   refused by load: its start time follows `admitted`, not bookings; red first. (o) Four
   queued owner-worker actions in one pool reserve one worker. (p) A lease past its
-  enforced end does not give tail zero.
+  enforced end does not give tail zero. (q) An owner-worker action and a `Blocked::Load`
+  head in one pool: the earlier in queue order holds, the other does not. (r) A
+  `Blocked::Load` head where measured load, not lease charge, is the binding term: its
+  start time stays at the measured reading and follows only the charged part. (s) With
+  `bounds_enforced` unset, no backfill; set, backfill as in (c). (t) The hosts view and
+  kbf's whole-mark metric still read `deadline` (4.11).
 
 ### 3.8 What is recorded for section 5
 
@@ -369,6 +400,10 @@ unchanged beyond 4.11).
     - The registry keeps its `deadline` field in the D55 record, the hosts API
       `drain_deadline_ms` (with its golden) and its own timer (4.12), so D55, the wire
       and the golden do not change in this work.
+    - `WholeMark.deadline` is a public field and a view column (`whole_view.rs`, read by
+      kbf's `whole_mark` metric and `docs/api.md`). It is kept, always absent after step
+      4, so the view and the metric do not break; removing it is a later, separate
+      change.
     - Docs amended with step 4: `whole-node.md` and `configuration.md` where they describe
       the embedded scheduler's give-up; W6/W14 are about the registry and stay.
 12. **The registry keeps its sticky mark and timer in this change (recommended).**
@@ -377,8 +412,9 @@ unchanged beyond 4.11).
     D55 persistence, the hosts API field and the claim/regain handling live there. The
     tail rule lands in js-sched, which the embedded kbf core uses; the registry takes it
     in a separate issue, filed when the js-sched rule is green, because it carries a
-    persistence and wire change that this work should not. Until then the two differ and
-    the js-sched rule supersedes the registry's only inside js-sched.
+    persistence and wire change that this work should not. This is a deployment split: js-registry does
+    not depend on js-sched, js-lease-server builds no `Scheduler`, and kbf embeds js-sched
+    only. In a shipped deployment one rule decides, by deployment.
 13. **Metrics are recorded, not inferred (recommended).** 3.8.
 
 ## 5. What it measures (for the paper)
