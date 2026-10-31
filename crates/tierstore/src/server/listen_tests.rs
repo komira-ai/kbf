@@ -131,6 +131,22 @@ async fn a_v6_wildcard_and_a_v4_wildcard_bind_on_one_port() {
     assert!(accepted.expect("accepted").1.is_ipv6());
 }
 
+/// Asserts that the sockets bound before a failed bind of the same set are released: the set
+/// `[free, busy]` fails on `busy`, and then the `free` address (a port found by binding one and
+/// giving it up) can be bound again.
+#[tokio::test]
+async fn the_sockets_bound_before_a_failed_bind_are_released() {
+    let held = bind(addr("127.0.0.1:0")).expect("a first listener");
+    let busy = held.local_addr().expect("an address");
+    let probe = bind(addr("127.0.0.1:0")).expect("a probe");
+    let free = probe.local_addr().expect("an address");
+    drop(probe);
+    let failed = bind_all(&[free, busy]).err();
+    assert_eq!(failed.expect("the set is refused").0, busy);
+    let again = bind(free).expect("the first address of the failed set is free again");
+    assert_eq!(again.local_addr().expect("an address"), free);
+}
+
 /// Asserts that an address that cannot be bound fails the whole set and is the one the error
 /// names, and that the reuse of an address (`SO_REUSEADDR`) does not let a second listener take
 /// the address of a first.

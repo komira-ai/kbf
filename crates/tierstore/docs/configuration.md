@@ -110,7 +110,7 @@ How the cache behaves is in [operations](operations.md#a-build-node). The file i
 - A duration is a string of a whole number and `ms`, `s`, `m` or `h`: `250ms`, `15m`.
 - A size is an integer of bytes, or a string of a whole number and `B`, `KiB`, `MiB`, `GiB` or `TiB`: `"500GiB"`.
 - A path is a string. A list of paths is an array, and the flag it stands for is given once for each element.
-- An address is a string, `"192.0.2.10:9000"` or `"[2001:db8::1]:9000"`. The two `listen` keys also take an array of addresses, and the flag is given once for each element; that is on main, not in v0.0.41, where a `listen` key is one string and a flag is given once.
+- An address is a string, `"192.0.2.10:9000"` or `"[2001:db8::1]:9000"`. The two `listen` keys also take an array of addresses, and the flag is given once for each element; that is on main, not in v0.0.41, where a `listen` key is one string and a flag is given once. Only an address named twice is refused by the check of the file or the flags. A wildcard and a specific address on one port (`0.0.0.0:9000` and `192.0.2.10:9000`), or one address on both `--listen` and `--oci-listen`, are refused by the system at bind on Linux (the start fails, naming the address); on macOS and the BSDs `SO_REUSEADDR` can let such sockets share the port, so do not rely on the refusal there.
 - A number above 9223372036854775807 cannot go in a file; as a flag it is accepted.
 
 ## `[server]`
