@@ -32,6 +32,41 @@ before it makes either: one that is on the store and not in `provision-state.jso
 directory is someone else's, and the verb stops before changing anything. The account's secret is
 given to `mc` on its standard input, never in its arguments.
 
+## Pre-made buckets: `provision --premade`
+
+MinIO cannot confine admin user, policy or quota actions to a name prefix: its policy engine
+ignores `Resource` for admin actions, so a key allowed to create a policy and attach it to a user
+can grant itself anything. So the admin work is split between two keys.
+
+| who | holds | does |
+|---|---|---|
+| the held script `admin_mint.sh --campaign ...`, run by a person with the store's root key | everything | per campaign: the bucket, its 30 GiB quota, the bucket-only policy `<test prefix>tierstore-bench-<role>`, the scoped account and the attachment; and, with `--remove`, the reverse |
+| the key this tool holds (the `admin` file of `ops.json`) | `admin:ServerInfo`, `admin:GetBucketQuota`; `s3:GetBucketLocation`, `s3:ListBucket`, `s3:ListBucketVersions`, `s3:DeleteBucket`, `s3:ForceDeleteBucket` on the campaign's buckets (`<prefix>*`); `s3:DeleteObject` and `s3:DeleteObjectVersion` on their objects (`<prefix>*/*`) | `preflight` (`mc admin info`), `provision --premade`, and the removal of a bucket's objects and the bucket itself |
+
+That key has no `admin:ListUsers`, `admin:CreatePolicy`, `admin:AttachUserOrGroupPolicy`,
+`admin:CreateUser`, `admin:SetBucketQuota` or `s3:CreateBucket`; every command `provision` runs
+without `--premade` needs at least one of them.
+
+`provision --premade` (with or without `--apply`) runs none of `mb`, `quota set`, `admin policy
+create`, `admin user add` and `admin policy attach`, and does not list accounts. For each role of
+the run (`hot`, `cold`) it:
+
+1. checks that the test bucket is there (`mc ls` of that bucket); if it is not, or may not be
+   listed, the verb stops and names the held script;
+2. checks the quota with `mc quota info`: no quota, or one over 30 GiB, stops the verb (a smaller
+   one passes);
+3. with every role's checks passed, runs the two probes: the scoped account (the key pair the run
+   file holds for the role) must list its own bucket, and must be refused a read of the live
+   bucket the ops file names;
+4. writes the bucket and the account to `provision-state.json` with `"premade": true`, so the
+   teardown's guard finds them. The record is written only after the probes pass; the key of a
+   run that made its own has no `premade` field, and a record without it reads as before.
+
+If the scoped account can read a live bucket the verb stops and does not remove it (it holds no
+right to): it says to run `admin_mint.sh --campaign ... --remove` now. The plan and the dry run
+say `premade` on every line, and `provision.json` has mode `apply-premade` or `dry-run-premade`.
+Without `--premade` nothing changes.
+
 ## Commands
 
 ```
