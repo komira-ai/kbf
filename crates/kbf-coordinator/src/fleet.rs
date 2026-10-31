@@ -148,6 +148,19 @@ impl Fleet {
         );
     }
 
+    /// Notes a heartbeat of `service` from a host whose role is named `role`.
+    #[cfg(test)]
+    pub(crate) fn record_named_in(
+        &mut self,
+        _service: &str,
+        _id: NodeId,
+        _role: &str,
+        _beat: Heartbeat,
+        _now: Duration,
+    ) {
+        todo!("record a host by role name")
+    }
+
     /// Notes that the host `id` was told at `now` to update `service` to `target`. An order
     /// for the same target that has not aged out stays as it was, so a host that asks again
     /// before it reports is told again without its slot being held longer.

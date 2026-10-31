@@ -84,6 +84,12 @@ pub struct ServiceDef {
 }
 
 impl ServiceDef {
+    /// A service named `name` with the roles `roles`, each by name.
+    #[cfg(test)]
+    pub(crate) fn new(_name: &str, _roles: &[(&str, RoleDef)]) -> Self {
+        todo!("a definition keyed by role name")
+    }
+
     /// `kbf`: all four roles, limits from the desired state, and frontends that wait for
     /// every other role and are never the last one up.
     #[must_use]
@@ -244,6 +250,12 @@ impl Default for Services {
 }
 
 impl Services {
+    /// The services `defs` and nothing else (not even `kbf`).
+    #[cfg(test)]
+    pub(crate) fn from_defs(_defs: Vec<ServiceDef>) -> Self {
+        todo!("services from definitions")
+    }
+
     /// The services of the file text `text`, with `kbf` built in.
     ///
     /// # Errors
