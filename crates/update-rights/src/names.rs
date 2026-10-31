@@ -146,6 +146,26 @@ pub fn is_env_name(name: &str) -> bool {
     first & bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// The variable names that change what a program loads or how it resolves names: the dynamic
+/// loader's (`LD_*`), the character set and locale search paths, the allocator's (`MALLOC_*`) and
+/// the resolver's.
+pub const HIJACKING_ENV: [&str; 5] = [
+    "GCONV_PATH",
+    "LOCPATH",
+    "NLSPATH",
+    "HOSTALIASES",
+    "RES_OPTIONS",
+];
+
+/// Whether a hook may be given the variable `name` with `value`: not a name of [`HIJACKING_ENV`],
+/// not `LD_*` or `MALLOC_*`, and `PATH` only as a list of absolute directories.
+pub fn env_allowed(name: &str, value: &str) -> bool {
+    let hijack =
+        name.starts_with("LD_") | name.starts_with("MALLOC_") | HIJACKING_ENV.contains(&name);
+    let path_ok = (name != "PATH") | value.split(':').all(|dir| check_path(dir).is_ok());
+    !hijack & path_ok
+}
+
 /// Whether `value` can be an environment value: letters, digits and `. _ / : @ , + = -`, at
 /// most [`MAX_ENV_VALUE`] bytes. No white space, quote, `$`, `%` or `\`: systemd would read the
 /// property as several words or expand it.

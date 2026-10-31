@@ -623,7 +623,7 @@ fn refusals_read_as_sentences() {
 #[test]
 fn a_write_path_outside_the_write_roots_is_refused() {
     let at = |path: &str| with("write_paths = []", &format!("write_paths = [\"{path}\"]"));
-    for path in ["/srv/x", "/home/x", "/var/log/x", "/opt"] {
+    for path in ["/srv/x", "/mnt/x", "/var/log/x", "/opt"] {
         match refusal(&at(path)) {
             Refusal::Reserved { field, why, .. } => {
                 assert_eq!(

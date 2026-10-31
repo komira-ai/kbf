@@ -118,6 +118,22 @@ fn check_targets(declaration: &Declaration) -> Result<(), Refusal> {
                 .map(|p| (Kind::Write, "hook.write_paths", p)),
         );
     for (kind, field, entry) in entries {
+        // A hook that runs as root follows links as root: nothing above a path it reads or writes may
+        // be swapped by anyone else.
+        let guarded = (hook.user == "root") & (kind != Kind::State);
+        let swappable = |path: &str| {
+            guarded
+                .then(|| swappable_above(path))
+                .flatten()
+                .map(|ancestor| Refusal::Ancestor {
+                    field,
+                    path: path.to_owned(),
+                    ancestor,
+                })
+        };
+        if let Some(refusal) = swappable(entry) {
+            return Err(refusal);
+        }
         if let Ok(target) = std::fs::canonicalize(entry) {
             let target = target.to_string_lossy().into_owned();
             reserved::check(kind, &target).map_err(|why| Refusal::Reserved {
@@ -125,9 +141,22 @@ fn check_targets(declaration: &Declaration) -> Result<(), Refusal> {
                 path: format!("{entry} (which is {target})"),
                 why,
             })?;
+            if let Some(refusal) = swappable(&target) {
+                return Err(refusal);
+            }
         }
     }
     Ok(())
+}
+
+/// The nearest directory above `path` that an account other than root owns or can write (the
+/// group or others): the one that could replace `path` with a link. Directories that do not
+/// exist yet are skipped.
+fn swappable_above(path: &str) -> Option<String> {
+    Path::new(path).ancestors().skip(1).find_map(|above| {
+        let meta = std::fs::metadata(above).ok()?;
+        ((meta.uid() != 0) | (meta.mode() & 0o022 != 0)).then(|| above.display().to_string())
+    })
 }
 
 /// The reserved-path rules on what each entry points to now, for the step runner to call before

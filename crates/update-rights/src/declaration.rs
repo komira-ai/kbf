@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use update_hook::{Params, Step};
 
 use crate::names::{
-    Capability, Family, PathError, UnitError, check_path, check_relative, check_unit,
+    Capability, Family, PathError, UnitError, check_path, check_relative, check_unit, env_allowed,
     is_account_name, is_env_name, is_env_value, is_service_name,
 };
 use crate::reserved::{self, Kind};
@@ -358,7 +358,7 @@ impl Declaration {
             })?;
         }
         for (key, text) in &self.hook.environment {
-            if !(is_env_name(key) & is_env_value(text)) {
+            if !(is_env_name(key) & is_env_value(text) & env_allowed(key, text)) {
                 return Err(value(
                     "hook.environment",
                     format!("{key:?} is not a variable name with a plain value"),

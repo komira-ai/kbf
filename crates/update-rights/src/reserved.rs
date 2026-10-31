@@ -11,6 +11,8 @@
 //!   one): `/etc` names, `/` and `/var/lib` contain;
 //! - a `write_paths` or `state_dir` entry is not **inside** a reserved directory either, except
 //!   under [`HOOKS_ROOT`], where the updater keeps the record directories of the hooks;
+//! - a `write_paths` entry must also be below one of [`WRITE_ROOTS`]: an allow-list, with the
+//!   deny list catching the reserved names inside the roots (the package database, the apt cache);
 //! - a `read_paths` entry may be inside a reserved directory: a single file such as the one
 //!   declaration under `/etc/updater.d`, or a directory such as `/etc/service`, is read-only
 //!   and harmless.
@@ -18,13 +20,16 @@
 /// The directories no entry may name or contain.
 pub const RESERVED: &[&str] = &[
     "/",
+    "/bin",
     "/boot",
     "/etc",
     "/etc/polkit-1",
     "/etc/sudoers.d",
     "/etc/systemd/system",
     "/etc/updater.d",
+    "/lib",
     "/lib/systemd/system",
+    "/lib64",
     "/root",
     "/run/systemd/generator",
     "/run/systemd/generator.early",
@@ -33,11 +38,15 @@ pub const RESERVED: &[&str] = &[
     "/run/systemd/system.control",
     "/run/systemd/transient",
     "/run/updater",
+    "/sbin",
     "/usr",
     "/usr/lib/systemd/system",
     "/usr/share/polkit-1",
+    "/var/cache/apt",
+    "/var/lib/dpkg",
     "/var/lib/polkit-1",
     "/var/lib/updater",
+    "/var/spool/cron",
 ];
 
 /// The trees where nothing is written: a declaration may read them (a hook reads `/proc`) and
@@ -100,6 +109,14 @@ pub fn check(kind: Kind, path: &str) -> Result<(), Violation> {
     match (inside, forbidden) {
         (Some(reserved), _) if writes && !in_hooks_root => Err(Violation::Inside(reserved)),
         (_, Some(dir)) if writes => Err(Violation::Inside(dir)),
+        // A write path is an allow-list: one component under a write root, and anything below.
+        _ if kind == Kind::Write
+            && !WRITE_ROOTS
+                .iter()
+                .any(|root| (path != *root) & is_within(path, root)) =>
+        {
+            Err(Violation::NotAllowed)
+        }
         _ => Ok(()),
     }
 }

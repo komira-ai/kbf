@@ -273,7 +273,7 @@ fn a_write_path_must_be_below_one_of_the_write_roots() {
         "/run",
         "/opt",
         "/srv/x",
-        "/home/x",
+        "/mnt/x",
         "/tmp/x",
         "/var/log/x",
         "/var/spool/x",
@@ -288,7 +288,7 @@ fn a_write_path_must_be_below_one_of_the_write_roots() {
             "{path}"
         );
     }
-    for path in ["/srv/x", "/home/x", "/tmp/x", "/var/log/x"] {
+    for path in ["/srv/x", "/mnt/x", "/tmp/x", "/var/log/x"] {
         assert_eq!(check(Kind::State, path), Ok(()), "{path}");
         assert_eq!(check(Kind::Read, path), Ok(()), "{path}");
     }

@@ -46,6 +46,18 @@ The crate names no product and depends on no crate of this workspace but the hoo
 - **Approving takes a lock** (`approved.lock` beside the record, flock) so two approvals at once
   do not lose one, and the directory of the record must be the trusted account's and closed.
 
+- **Write paths are an allow-list.** A `write_paths` entry must lie one component under `/var/lib`,
+  `/var/cache`, `/run` or `/opt` (and anything below); the deny list still catches the reserved
+  names inside those roots (`/var/lib/dpkg`, `/var/lib/polkit-1`, `/var/cache/apt`, `/var/spool/cron`),
+  and `/bin`, `/sbin`, `/lib`, `/lib64` are named for the hosts without a merged `/usr`. `state_dir`
+  and `read_paths` are not held to the list.
+- **A root hook's paths cannot be swapped.** `ReadWritePaths=` follows links, so for a hook that
+  runs as root every existing directory above a read or write path (and above what it resolves to)
+  must be owned by root and closed to the group and others; `recheck_targets` repeats it before
+  each launch. The `root` of the rule is the name `root`.
+- **Environment names.** `LD_*`, `MALLOC_*`, `GCONV_PATH`, `LOCPATH`, `NLSPATH`, `HOSTALIASES` and
+  `RES_OPTIONS` are refused, and `PATH` only as a list of absolute directories.
+
 ## What polkit can and cannot scope
 
 A rule for the `manage-units` action limits an account to the units it lists. But `systemctl mask`
