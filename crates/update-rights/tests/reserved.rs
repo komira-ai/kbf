@@ -1,7 +1,7 @@
 //! The reserved-path deny list: what no declaration may read, write or keep its record in.
 
 use update_rights::reserved::{
-    HOOKS_ROOT, Kind, RESERVED, Violation, WRITE_FORBIDDEN, check, is_within,
+    HOOKS_ROOT, Kind, RESERVED, Violation, WRITE_FORBIDDEN, WRITE_ROOTS, check, is_within,
 };
 
 const KINDS: [Kind; 3] = [Kind::Read, Kind::Write, Kind::State];
@@ -46,12 +46,11 @@ fn no_entry_names_a_reserved_directory() {
 #[test]
 fn no_entry_contains_a_reserved_directory() {
     for (path, holds) in [
-        ("/var", "/var/lib/polkit-1"),
-        ("/var/lib", "/var/lib/polkit-1"),
+        ("/var", "/var/cache/apt"),
+        ("/var/lib", "/var/lib/dpkg"),
         ("/etc/systemd", "/etc/systemd/system"),
         ("/run", "/run/systemd/generator"),
         ("/run/systemd", "/run/systemd/generator"),
-        ("/lib", "/lib/systemd/system"),
         ("/usr/share", "/usr/share/polkit-1"),
     ] {
         for kind in KINDS {
@@ -128,9 +127,17 @@ fn ordinary_paths_pass() {
         "/srv/y",
         "/tmp/x",
     ] {
-        for kind in KINDS {
+        for kind in [Kind::Read, Kind::State] {
             assert_eq!(check(kind, path), Ok(()), "{path}");
         }
+    }
+    for path in [
+        "/var/lib/tierstore",
+        "/var/cache/x",
+        "/run/x/y",
+        "/opt/x/y/z",
+    ] {
+        assert_eq!(check(Kind::Write, path), Ok(()), "{path}");
     }
 }
 
@@ -155,13 +162,16 @@ fn the_list_is_exactly_this() {
         RESERVED,
         [
             "/",
+            "/bin",
             "/boot",
             "/etc",
             "/etc/polkit-1",
             "/etc/sudoers.d",
             "/etc/systemd/system",
             "/etc/updater.d",
+            "/lib",
             "/lib/systemd/system",
+            "/lib64",
             "/root",
             "/run/systemd/generator",
             "/run/systemd/generator.early",
@@ -170,14 +180,19 @@ fn the_list_is_exactly_this() {
             "/run/systemd/system.control",
             "/run/systemd/transient",
             "/run/updater",
+            "/sbin",
             "/usr",
             "/usr/lib/systemd/system",
             "/usr/share/polkit-1",
+            "/var/cache/apt",
+            "/var/lib/dpkg",
             "/var/lib/polkit-1",
             "/var/lib/updater",
+            "/var/spool/cron",
         ]
     );
     assert_eq!(WRITE_FORBIDDEN, ["/dev", "/proc", "/sys"]);
+    assert_eq!(WRITE_ROOTS, ["/var/lib", "/var/cache", "/run", "/opt"]);
 }
 
 /// Catches the unit directories that systemd reads at run time (transient units, generators,
@@ -230,5 +245,91 @@ fn the_kernel_and_device_trees_are_never_written() {
     }
     for near in ["/devices", "/processes", "/system", "/dev-x", "/sysfs"] {
         assert_eq!(check(Kind::Write, near), Ok(()), "{near}");
+    }
+}
+
+/// Catches a write path outside the places a hook is given to write: only one component under
+/// `/var/lib`, `/var/cache`, `/run` or `/opt`, and anything below that, may be named; the roots
+/// themselves, `/srv`, `/home`, `/tmp`, `/var/log`, `/var/spool` and the like may not. State
+/// and read entries are not held to the list.
+#[test]
+fn a_write_path_must_be_below_one_of_the_write_roots() {
+    for path in [
+        "/var/lib/x",
+        "/var/lib/x/a/b",
+        "/var/cache/x",
+        "/var/cache/x/y",
+        "/run/x",
+        "/run/x/y",
+        "/opt/x",
+        "/opt/x/y/z",
+        "/var/lib/updater/hooks/x",
+    ] {
+        assert_eq!(check(Kind::Write, path), Ok(()), "{path}");
+    }
+    for path in [
+        "/var/lib",
+        "/var/cache",
+        "/run",
+        "/opt",
+        "/srv/x",
+        "/home/x",
+        "/tmp/x",
+        "/var/log/x",
+        "/var/spool/x",
+        "/var/mail/x",
+        "/varx/lib/y",
+        "/opt2/x",
+        "/run2/x",
+    ] {
+        assert_eq!(
+            check(Kind::Write, path),
+            Err(Violation::NotAllowed),
+            "{path}"
+        );
+    }
+    for path in ["/srv/x", "/home/x", "/tmp/x", "/var/log/x"] {
+        assert_eq!(check(Kind::State, path), Ok(()), "{path}");
+        assert_eq!(check(Kind::Read, path), Ok(()), "{path}");
+    }
+}
+
+/// Catches the names the allow-list does not cover: the package database, the apt cache and the
+/// cron spool sit inside or beside the allowed roots and are refused by the deny list; the system
+/// directories of a host without a merged `/usr` are named and refused for every kind.
+#[test]
+fn the_deny_list_still_catches_names_inside_the_write_roots() {
+    for (path, inside) in [
+        ("/var/lib/dpkg/info/x", "/var/lib/dpkg"),
+        ("/var/lib/polkit-1/x", "/var/lib/polkit-1"),
+        ("/var/cache/apt/archives/x", "/var/cache/apt"),
+        ("/var/spool/cron/crontabs/x", "/var/spool/cron"),
+        ("/bin/x", "/bin"),
+        ("/sbin/x", "/sbin"),
+        ("/lib/x", "/lib"),
+        ("/lib64/x", "/lib64"),
+    ] {
+        assert_eq!(
+            check(Kind::Write, path),
+            Err(Violation::Inside(inside)),
+            "{path}"
+        );
+        assert_eq!(check(Kind::Read, path), Ok(()), "{path}");
+    }
+    for dir in [
+        "/var/lib/dpkg",
+        "/var/cache/apt",
+        "/var/spool/cron",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+    ] {
+        for kind in KINDS {
+            assert!(
+                matches!(check(kind, dir), Err(Violation::Names(_))),
+                "{dir}"
+            );
+        }
     }
 }

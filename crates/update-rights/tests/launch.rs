@@ -191,12 +191,12 @@ fn a_step_with_no_entry_holds_the_hook_wide_grant() {
 fn the_record_directory_is_writable_once() {
     let d = Declaration::parse(&with(
         "write_paths = []",
-        "write_paths = [\"/srv/b\", \"/srv/a\", \"/var/lib/updater/hooks/tierstore\"]",
+        "write_paths = [\"/opt/b\", \"/opt/a\", \"/var/lib/updater/hooks/tierstore\"]",
     ))
     .unwrap();
     let all = properties(&d, Step::Cleanup);
     assert!(
-        all.contains(&"ReadWritePaths=/srv/a /srv/b /var/lib/updater/hooks/tierstore".to_owned())
+        all.contains(&"ReadWritePaths=/opt/a /opt/b /var/lib/updater/hooks/tierstore".to_owned())
     );
 }
 

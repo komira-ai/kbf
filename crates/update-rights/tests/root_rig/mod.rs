@@ -171,10 +171,10 @@ pub struct Rig {
 }
 
 impl Rig {
-    /// `/srv/updater-rights-<pid>-<tag>`: not under `/tmp` (the hook has a private one) and not
+    /// `/opt/updater-rights-<pid>-<tag>`: not under `/tmp` (the hook has a private one) and not
     /// under a home (it has none).
     pub fn new(tag: &str) -> Rig {
-        let dir = PathBuf::from(format!("/srv/updater-rights-{}-{tag}", std::process::id()));
+        let dir = PathBuf::from(format!("/opt/updater-rights-{}-{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         make_dir(&dir, 0o755);
         for sub in ["release", "w", "ro", "state"] {

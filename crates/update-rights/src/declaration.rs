@@ -203,6 +203,14 @@ pub enum Refusal {
     Account(String),
     #[error("the state directory {path:?} can be written by the service's account")]
     StateDirWritable { path: String },
+    #[error(
+        "{field}: path {path:?} is below {ancestor:?}, which an account other than root owns or can write, so it can be swapped for a link"
+    )]
+    Ancestor {
+        field: &'static str,
+        path: String,
+        ancestor: String,
+    },
     #[error("conflicts with {with} over {what}")]
     Conflict { what: &'static str, with: String },
 }

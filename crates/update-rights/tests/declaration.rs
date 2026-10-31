@@ -431,7 +431,7 @@ fn reserved_paths_are_refused_everywhere() {
             "\"/var/lib/updater/hooks/tierstore\"",
             "\"/var/lib\"",
             "state_dir",
-            Violation::Contains("/var/lib/polkit-1"),
+            Violation::Contains("/var/lib/dpkg"),
         ),
         (
             "\"/var/lib/updater/hooks/tierstore\"",
@@ -615,5 +615,78 @@ fn refusals_read_as_sentences() {
         },
     ] {
         assert!(!refusal.to_string().is_empty());
+    }
+}
+
+/// Catches a write path outside the allowed roots getting through the text rules: `/srv`, `/home`
+/// and `/var/log` are refused with the reason; one component under `/opt` is not.
+#[test]
+fn a_write_path_outside_the_write_roots_is_refused() {
+    let at = |path: &str| with("write_paths = []", &format!("write_paths = [\"{path}\"]"));
+    for path in ["/srv/x", "/home/x", "/var/log/x", "/opt"] {
+        match refusal(&at(path)) {
+            Refusal::Reserved { field, why, .. } => {
+                assert_eq!(
+                    (field, why),
+                    ("hook.write_paths", Violation::NotAllowed),
+                    "{path}"
+                );
+            }
+            other => panic!("{path}: {other:?}"),
+        }
+    }
+    for path in ["/opt/x", "/var/lib/x/y", "/var/cache/x", "/run/x"] {
+        assert!(Declaration::parse(&at(path)).is_ok(), "{path}");
+    }
+    // The state directory and the read paths are not held to the list.
+    assert!(Declaration::parse(&with("\"/etc/tierstore\"", "\"/srv/x\"")).is_ok());
+}
+
+/// Catches an environment variable that changes what a program loads or resolves: the loader's
+/// (`LD_*`), the character conversion and locale search paths, the allocator's (`MALLOC_*`), the
+/// resolver's, and a `PATH` that is not absolute directories only. Harmless names stay.
+#[test]
+fn the_environment_cannot_hijack_the_runtime() {
+    let at = |env: &str| with("environment = { }", &format!("environment = {env}"));
+    for name in [
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "LD_DEBUG",
+        "LD_BIND_NOW",
+        "GCONV_PATH",
+        "LOCPATH",
+        "NLSPATH",
+        "MALLOC_CONF",
+        "MALLOC_ARENA_MAX",
+        "MALLOC_PERTURB_",
+        "HOSTALIASES",
+        "RES_OPTIONS",
+    ] {
+        let text = at(&format!("{{ {name} = \"/x\" }}"));
+        assert_eq!(field_of(&refusal(&text)), "hook.environment", "{name}");
+    }
+    for path in [
+        "bin",
+        "/usr/bin:bin",
+        "",
+        ":/usr/bin",
+        "/usr/bin:",
+        "/usr/bin:.",
+        "/usr/../bin",
+        "/",
+    ] {
+        let text = at(&format!("{{ PATH = \"{path}\" }}"));
+        let expected = path == "/";
+        // `/` alone is an absolute directory.
+        assert_eq!(Declaration::parse(&text).is_ok(), expected, "PATH={path:?}");
+    }
+    for ok in [
+        "{ PATH = \"/usr/bin:/usr/sbin\" }",
+        "{ PATH = \"/opt/x/bin\" }",
+        "{ TMPDIR = \"/run/x\", LANG = \"C\", TZ = \"UTC\" }",
+        "{ LDX = \"1\", LDAP_URI = \"x\", MALLOCX = \"1\" }",
+    ] {
+        assert!(Declaration::parse(&at(ok)).is_ok(), "{ok}");
     }
 }

@@ -397,16 +397,21 @@ fn a_link_to_a_reserved_place_is_refused_in_each_kind() {
     let host = Host::new("links");
     let etc = host.scratch.path().join("etc-link");
     symlink("/etc", &etc).unwrap();
+    // A write path cannot be tried here: it must lie under `/var/lib`, `/var/cache`, `/run` or
+    // `/opt`, where a test without root cannot make a link (the root job does).
     let usr = host.scratch.path().join("usr-link");
     symlink("/usr/lib", &usr).unwrap();
     for (field, read, write, state) in [
         ("hook.read_paths", Some(&etc), None, None),
-        ("hook.write_paths", None, Some(&usr), None),
+        ("hook.read_paths", Some(&usr), None, None),
         ("state_dir", None, None, Some(&etc)),
     ] {
         let mut spec = Spec::new("tierstore");
         spec.read = read.map(|p| p.display().to_string()).into_iter().collect();
-        spec.write = write.map(|p| p.display().to_string()).into_iter().collect();
+        spec.write = write
+            .map(|p: &std::path::PathBuf| p.display().to_string())
+            .into_iter()
+            .collect();
         spec.state_dir = state.map_or(spec.state_dir.clone(), |p| p.display().to_string());
         host.put(&spec);
         let loaded = host.load();
@@ -713,28 +718,22 @@ fn two_declarations_of_services_that_run_as_root_both_load() {
 fn a_target_pointed_at_a_reserved_place_after_the_load_is_refused_by_the_recheck() {
     let host = Host::new("recheck");
     let real = host.scratch.dir("real", 0o755);
-    let (read, write, state) = (
+    let (read, state) = (
         host.scratch.path().join("read-link"),
-        host.scratch.path().join("write-link"),
         host.scratch.path().join("state-link"),
     );
-    for link in [&read, &write, &state] {
+    for link in [&read, &state] {
         symlink(&real, link).unwrap();
     }
     let mut spec = Spec::new("tierstore");
     spec.read = vec![read.display().to_string()];
-    spec.write = vec![write.display().to_string()];
     spec.state_dir = state.display().to_string();
     host.put(&spec);
     let loaded = host.load();
     assert!(loaded.refused.is_empty(), "{:?}", loaded.refused);
     let declaration = &loaded.services["tierstore"].declaration;
     assert_eq!(recheck_targets(declaration), Ok(()));
-    for (link, field) in [
-        (&read, "hook.read_paths"),
-        (&write, "hook.write_paths"),
-        (&state, "state_dir"),
-    ] {
+    for (link, field) in [(&read, "hook.read_paths"), (&state, "state_dir")] {
         fs::remove_file(link).unwrap();
         symlink("/etc", link).unwrap();
         match recheck_targets(declaration) {
@@ -798,6 +797,60 @@ fn a_hook_account_may_not_be_another_services_account_or_shared() {
         spec.hook_user = "root".to_owned();
         host.put(&spec);
     }
+    let loaded = host.load();
+    assert!(loaded.refused.is_empty(), "{:?}", loaded.refused);
+}
+
+/// Catches the race a root hook is open to: `ReadWritePaths=` follows links, so a path whose
+/// parent a non-root account can write can be swapped for a link to `/etc` after the check and
+/// before the unit starts. For a hook that runs as root every directory above a read or write
+/// path must be root's and closed to the group and others. Here the test's own account owns
+/// the directories above a path in the scratch directory, and `/tmp` is open to everyone.
+#[test]
+fn a_root_hook_path_below_a_directory_a_non_root_account_controls_is_refused() {
+    let host = Host::new("ancestors");
+    let owned = host.scratch.path().join("data").display().to_string();
+    for (path, ancestor) in [
+        (owned.as_str(), host.scratch.path().display().to_string()),
+        ("/tmp/updater-ancestor-probe", "/tmp".to_owned()),
+    ] {
+        let mut spec = Spec::new("tierstore");
+        spec.hook_user = "root".to_owned();
+        spec.read = vec![path.to_owned()];
+        host.put(&spec);
+        let loaded = host.load();
+        match refused(&loaded, "tierstore") {
+            Refusal::Ancestor {
+                field,
+                path: found,
+                ancestor: above,
+            } => {
+                assert_eq!(
+                    (field, found.as_str(), above),
+                    ("hook.read_paths", path, ancestor)
+                );
+            }
+            other => panic!("{path}: {other:?}"),
+        }
+    }
+}
+
+/// Catches the rule being applied where it does not belong or refusing what is safe: a hook that
+/// is not root is not held to it, and a root hook with paths below root's closed directories
+/// loads (a read path in `/usr/sbin`, a write path below `/opt` that does not exist yet).
+#[test]
+fn the_ancestor_rule_is_for_root_hooks_and_passes_root_owned_directories() {
+    let host = Host::new("ancestors-ok");
+    let mut elsewhere = Spec::new("tierstore");
+    elsewhere.read = vec![host.scratch.path().join("data").display().to_string()];
+    host.put(&elsewhere);
+    assert!(host.load().refused.is_empty());
+
+    let mut root = Spec::new("tierstore");
+    root.hook_user = "root".to_owned();
+    root.read = vec!["/usr/sbin/nft".to_owned()];
+    root.write = vec!["/opt/updater-ancestor-probe/work".to_owned()];
+    host.put(&root);
     let loaded = host.load();
     assert!(loaded.refused.is_empty(), "{:?}", loaded.refused);
 }

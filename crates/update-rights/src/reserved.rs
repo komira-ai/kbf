@@ -65,7 +65,15 @@ pub enum Violation {
     Contains(&'static str),
     #[error("is inside the reserved directory {0}, where nothing may be written")]
     Inside(&'static str),
+    #[error(
+        "is not below a directory a hook may write in (one component under /var/lib, /var/cache, /run or /opt)"
+    )]
+    NotAllowed,
 }
+
+/// The directories a hook may write below, one component down and anything under that: a
+/// `write_paths` entry outside them is refused, whatever the deny list says.
+pub const WRITE_ROOTS: [&str; 4] = ["/var/lib", "/var/cache", "/run", "/opt"];
 
 /// Whether `path` is `dir` or lies below it. Both are absolute and in the path grammar.
 pub fn is_within(path: &str, dir: &str) -> bool {

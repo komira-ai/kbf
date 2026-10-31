@@ -1017,3 +1017,75 @@ fn a_hook_has_a_private_tmp() {
     let run = rig.run(&rig.spec(), Step::Verify, &["read", &path, "--"]);
     assert_eq!(run.outcome, Outcome::Failure, "{}", said_by(&run));
 }
+
+/// Catches a write path swapped for a link after the load: the link points somewhere allowed
+/// when the file is read and at `/etc` when a step is about to run, and the recheck refuses it
+/// under its own field. Put back, it passes.
+#[test]
+#[ignore = "needs root and systemd; run by cargo xtask sudo-test"]
+fn a_write_path_pointed_at_etc_after_the_load_is_refused_by_the_recheck() {
+    let rig = Rig::new("swap");
+    let real = rig.dir.join("real");
+    make_dir(&real, 0o755);
+    let link = rig.dir.join("swap");
+    symlink(&real, &link).unwrap();
+    let mut spec = rig.spec();
+    spec.write = vec![link.display().to_string()];
+    let declaration = rig.declaration(&spec, &["ok", "--"]);
+    assert_eq!(update_rights::recheck_targets(&declaration), Ok(()));
+    fs::remove_file(&link).unwrap();
+    symlink("/etc", &link).unwrap();
+    match update_rights::recheck_targets(&declaration) {
+        Err(Refusal::Reserved { field, .. }) => assert_eq!(field, "hook.write_paths"),
+        other => panic!("{other:?}"),
+    }
+    fs::remove_file(&link).unwrap();
+    symlink("/var/log", &link).unwrap();
+    match update_rights::recheck_targets(&declaration) {
+        Err(Refusal::Reserved { field, why, .. }) => {
+            assert_eq!(field, "hook.write_paths");
+            assert_eq!(why, update_rights::reserved::Violation::NotAllowed);
+        }
+        other => panic!("a link to somewhere outside the write roots: {other:?}"),
+    }
+}
+
+/// Catches the ancestor rule for a root hook under the real root: below a directory root owns and
+/// closes, a write path passes; below one anyone can write, one the group can write, or one an
+/// ordinary account owns, it is refused, and the ancestor is named.
+#[test]
+#[ignore = "needs root and systemd; run by cargo xtask sudo-test"]
+fn a_root_hook_path_below_a_directory_others_control_is_refused() {
+    let rig = Rig::new("above");
+    let closed = rig.dir.join("closed");
+    make_dir(&closed, 0o755);
+    let mut spec = rig.spec();
+    spec.user = "root".to_owned();
+    spec.group = "root".to_owned();
+    spec.write = vec![closed.join("work").display().to_string()];
+    let declaration = rig.declaration(&spec, &["ok", "--"]);
+    assert_eq!(
+        update_rights::recheck_targets(&declaration),
+        Ok(()),
+        "below a closed root directory"
+    );
+    for (name, mode, owned_by_nobody) in [
+        ("everyone", 0o777, false),
+        ("group", 0o775, false),
+        ("theirs", 0o755, true),
+    ] {
+        let dir = rig.dir.join(name);
+        make_dir(&dir, mode);
+        if owned_by_nobody {
+            give_to_nobody(&dir);
+        }
+        spec.write = vec![dir.join("work").display().to_string()];
+        let declaration = rig.declaration(&spec, &["ok", "--"]);
+        match update_rights::recheck_targets(&declaration) {
+            Err(Refusal::Ancestor { ancestor, .. }) => {
+                assert_eq!(ancestor, dir.display().to_string(), "{name}")
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+}
