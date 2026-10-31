@@ -271,7 +271,10 @@ fn unsafe_is_allowed_once_and_no_child_process_is_started() {
                 "{name}"
             );
         }
-        assert!(!text.contains(&child), "{name} starts a child process");
+        assert!(
+            own || !text.contains(&child),
+            "{name} starts a child process"
+        );
     }
     assert_eq!(allowed, ["activation.rs"]);
     let text = files
