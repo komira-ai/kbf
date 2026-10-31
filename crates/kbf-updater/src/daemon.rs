@@ -66,6 +66,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
+use crate::agent::cordon::OwnCordon;
 use crate::api::RollState;
 use crate::frontend_http::HttpFrontend;
 use crate::inventory::Inventory;
@@ -375,7 +376,13 @@ pub fn build_ports_with_exec(cfg: &Config, exec: Arc<dyn Exec>) -> Result<Ports,
     Ok(Ports {
         safe: Box::new(HttpSafeToStop::from_api(api.clone())),
         installer: Box::new(Arc::clone(&installer)),
-        drain: Box::new(NodeDrain::with_api(api.clone())),
+        // The roll's own cordons are marked in the state directory, beside `roll.json`, so that
+        // a node an operator drained is left out when the roll ends (see `OwnCordon`).
+        drain: Box::new(OwnCordon::new(
+            Arc::new(NodeDrain::with_api(api.clone())),
+            &cfg.state_dir,
+            "roll",
+        )),
         health: Box::new(NodeHealth::with_api(api.clone(), installer)),
         clock: Box::new(SystemClock::new()),
         frontend: Box::new(HttpFrontend::with_api(api)),
