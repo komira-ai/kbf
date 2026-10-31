@@ -42,7 +42,9 @@
 //! the writer of the newer one, by the router's rule ([`kbf_route::Router::newer_map`]): it
 //! stops, UNAVAILABLE, when a fetch brings no newer map or after
 //! [`kbf_route::MAX_MAP_REFETCHES`]. A Write past its first frames cannot be sent again, so
-//! it ends UNAVAILABLE and the client starts it again, routed by the newer map. A Read and a
+//! it ends UNAVAILABLE and the client starts it again, routed by the newer map; a large blob
+//! past the held frames therefore costs the client a full resend, which is why only a held
+//! body is retried here. A Read and a
 //! QueryWriteStatus pass the answer to the client as it is, with no refetch and no second
 //! try (the whole-blob calls, which go through the router, do both); the frontend's map is
 //! refreshed by its own timer, so the client's next call is routed by the newer map. Only
@@ -262,7 +264,7 @@ impl RawByteStream {
             if let Some(refusal) = refusal {
                 return Err(refusal);
             }
-            // A node that holds a newer map refused the upload before it read any of it.
+            // A node that holds a newer map refused it.
             let stale = match (&answer, self.owners.map_router()) {
                 (Ok(response), Some(router)) => Status::from_header_map(response.headers())
                     .as_ref()
