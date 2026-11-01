@@ -894,3 +894,26 @@ fn a_lift_whose_file_cannot_be_removed_is_logged_and_lifts() {
     rig.take_order(&agent);
     assert_eq!(rig.installs(), 2);
 }
+
+/// Catches: a halt lost to a bad file. A corrupt `halt-<unit>` at start keeps the unit held (a
+/// halt is a safety stop), the log says the record is unreadable, and only a generation newer
+/// than 0 lifts it.
+#[test]
+fn a_corrupt_halt_file_keeps_the_hold_until_a_newer_generation() {
+    let rig = Rig::new("hold-halt-corrupt");
+    rig.coordinator.advertise(&["halt-v1"]);
+    std::fs::write(rig.dir.join("halt-kbf"), "not json").unwrap();
+    *rig.drain.leases.lock().unwrap() = [0].into();
+    let agent = rig.announcing();
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 0, "held");
+    assert!(rig.logged("halt record unreadable"));
+    rig.coordinator.set_halts(&[("kbf", 0)]);
+    agent.beat_once();
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 0, "generation 0 is not newer than 0");
+    rig.coordinator.set_halts(&[("kbf", 1)]);
+    agent.beat_once();
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 1, "a clear lifts it");
+}
