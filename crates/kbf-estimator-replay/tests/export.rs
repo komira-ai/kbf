@@ -105,6 +105,8 @@ fn a_window_becomes_its_attempts_in_queue_order() {
             operation: None,
             booked_millicpus: None,
             node_cpu_pressure_centi: None,
+            invocation_id: None,
+            correlated_invocations_id: None,
         }
     );
 

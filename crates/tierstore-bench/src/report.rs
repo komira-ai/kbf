@@ -332,6 +332,9 @@ fn fmt_against(value: u64, base: u64) -> String {
 /// instance. The single PUT (`direct`) is not a partner. `None` if no arm has a partner.
 fn put_comparison(of_cell: &[&CellResult], rows: &Rows) -> Option<String> {
     let mut table = String::new();
+    // The pairs whose two arms are of different runs: the names, and the runs of each side.
+    let (mut crossed, mut floor_runs, mut instance_runs) =
+        (Vec::new(), BTreeSet::new(), BTreeSet::new());
     for instance in of_cell {
         let Some(rest) = instance.arm.strip_prefix("instance-") else {
             continue;
@@ -343,6 +346,11 @@ fn put_comparison(of_cell: &[&CellResult], rows: &Rows) -> Option<String> {
         else {
             continue;
         };
+        if floor.provenance.run_id != instance.provenance.run_id {
+            crossed.push(rest.to_owned());
+            floor_runs.insert(floor.provenance.run_id.as_str());
+            instance_runs.insert(instance.provenance.run_id.as_str());
+        }
         let name = if instance.provenance.attempt == 1 {
             rest.to_owned()
         } else {
@@ -374,9 +382,20 @@ fn put_comparison(of_cell: &[&CellResult], rows: &Rows) -> Option<String> {
             .expect("a string takes text");
         }
     }
+    let note = if crossed.is_empty() {
+        String::new()
+    } else {
+        let runs = |set: &BTreeSet<&str>| set.iter().copied().collect::<Vec<_>>().join(", ");
+        format!(
+            "- the arms of {} came from two runs ({} and {}), not interleaved pass by pass: the direct-mp arm of one run is set beside the instance arm of another of the same attempt, so a drift of the cold store between the runs is not controlled for\n\n",
+            crossed.join(", "),
+            runs(&floor_runs),
+            runs(&instance_runs)
+        )
+    };
     (!table.is_empty()).then(|| {
         format!(
-            "### cold-put: instance against direct-mp\n\n| arm | window | direct-mp p50 | instance p50 | instance against direct-mp | direct-mp p95 | instance p95 | instance against direct-mp |\n|---|---|---|---|---|---|---|---|\n{table}\n"
+            "### cold-put: instance against direct-mp\n\n| arm | window | direct-mp p50 | instance p50 | instance against direct-mp | direct-mp p95 | instance p95 | instance against direct-mp |\n|---|---|---|---|---|---|---|---|\n{table}\n{note}"
         )
     })
 }
@@ -523,6 +542,16 @@ fn format_report(results: &[CellResult], rows: &Rows) -> String {
             out.push_str(&table);
         }
         writeln!(out, "{}", caps_line(&of_cell)).expect("a string takes text");
+        let filters: BTreeSet<(&str, String)> = of_cell
+            .iter()
+            .filter_map(|r| {
+                let filter = r.provenance.arms_filter.as_ref()?;
+                Some((r.provenance.run_id.as_str(), filter.join(", ")))
+            })
+            .collect();
+        for (run, filter) in filters {
+            writeln!(out, "- run {run} ran only the arms: {filter}").expect("a string takes text");
+        }
         let mut said = BTreeSet::new();
         for result in &of_cell {
             for note in &result.notes {
@@ -562,6 +591,23 @@ fn format_report(results: &[CellResult], rows: &Rows) -> String {
                         out,
                         "- arm {name}: pass {} was cut by the cold store guard ({trip})",
                         pass.pass
+                    )
+                    .expect("a string takes text");
+                }
+            }
+            for pass in result.passes.iter() {
+                if let Some(w) = &pass.cold_window {
+                    writeln!(
+                        out,
+                        "- arm {name}: pass {} cold window: store counted {} S3 requests, this tool sent {}, {} from elsewhere (judged: {}); drives {}, not ok {}; healing: {}",
+                        pass.pass,
+                        w.minio_requests,
+                        w.own_requests,
+                        w.foreign_requests,
+                        w.judged,
+                        w.drives,
+                        w.drives_not_ok,
+                        w.healing
                     )
                     .expect("a string takes text");
                 }
@@ -613,6 +659,7 @@ mod tests {
             }),
             gate_tripped: None,
             cold_guard: None,
+            cold_window: None,
             proxy_requests: None,
             disk_busy: BTreeMap::new(),
             peak_in_flight: 0,
@@ -637,6 +684,7 @@ mod tests {
             notes: notes.iter().map(|n| (*n).to_owned()).collect(),
             cold_state: vec![],
             rate_caps: None,
+            objects_per_pass: None,
         }
     }
 
@@ -985,10 +1033,34 @@ mod tests {
             limit: 0.05,
             requests: 32,
             window_secs: 60,
+            detail: None,
         });
         let text = format_report(&[result("a", vec![cut], &[])], &Rows::new());
         assert!(
             text.contains("- arm a: pass 1 was cut by the cold store guard (cold store guard: error_share is 0.0625, over the limit 0.05 (over 32 requests of the last 60 s))"),
+            "{text}"
+        );
+    }
+
+    /// Catches a window the guard read going unsaid: the report lists, for every pass that has
+    /// one, the store's counter growth, the bench's own count, what is left, the judging and the
+    /// drives and healing, so the paper can show the window was quiet.
+    #[test]
+    fn the_cold_window_of_a_pass_is_listed() {
+        let mut quiet = pass(1, Window::Quiet, 40, None);
+        quiet.cold_window = Some(crate::result::ColdWindow {
+            minio_requests: 120,
+            own_requests: 118,
+            foreign_requests: 2,
+            judged: true,
+            drives: 12,
+            drives_not_ok: 0,
+            healing: false,
+            unjudged_reason: None,
+        });
+        let text = format_report(&[result("a", vec![quiet], &[])], &Rows::new());
+        assert!(
+            text.contains("- arm a: pass 1 cold window: store counted 120 S3 requests, this tool sent 118, 2 from elsewhere (judged: true); drives 12, not ok 0; healing: false"),
             "{text}"
         );
     }
@@ -1118,6 +1190,98 @@ mod tests {
 
         let alone = format_report(&results[1..2], &data);
         assert!(!alone.contains("instance against direct-mp"), "{alone}");
+    }
+
+    /// The cold-put results of `instance-4kib-c1-healthy` and `direct-mp-4kib-c1-healthy`, each
+    /// of the run and attempt given, with samples.
+    fn two_arms(instance: (&str, u32), floor: (&str, u32)) -> String {
+        let quiet = |arm: &str, (run, attempt): (&str, u32)| {
+            let mut r = result(
+                arm,
+                vec![
+                    pass(0, Window::Quiet, 3, None),
+                    pass(1, Window::Quiet, 3, None),
+                ],
+                &[],
+            );
+            r.provenance.run_id = run.to_owned();
+            r.provenance.attempt = attempt;
+            r
+        };
+        let on = |rows: Rows, attempt: u32| -> Rows {
+            rows.into_iter()
+                .map(|((c, a, _, p), v)| ((c, a, attempt, p), v))
+                .collect()
+        };
+        let data = merged(vec![
+            on(
+                rows("direct-mp-4kib-c1-healthy", 1, &[1000, 2000, 3000], "200"),
+                floor.1,
+            ),
+            on(
+                rows("instance-4kib-c1-healthy", 1, &[3000, 4000, 5000], "200"),
+                instance.1,
+            ),
+        ]);
+        let results = [
+            quiet("direct-mp-4kib-c1-healthy", floor),
+            quiet("instance-4kib-c1-healthy", instance),
+        ];
+        format_report(&results, &data)
+    }
+
+    /// Catches an instance arm and a direct-mp arm of two runs (the direct arms run alone with
+    /// `--arms`) going unpaired, or paired without saying so: the same attempt pairs them across
+    /// result files and the report says the arms came from two runs, not interleaved; arms of
+    /// one run carry no such note.
+    #[test]
+    fn arms_of_two_runs_with_one_attempt_are_paired_and_the_report_says_so() {
+        let text = two_arms(("run-I", 1), ("run-D", 1));
+        assert!(
+            text.contains("### cold-put: instance against direct-mp"),
+            "{text}"
+        );
+        assert!(
+            text.contains("came from two runs (run-D and run-I), not interleaved"),
+            "{text}"
+        );
+        let one = two_arms(("run-I", 1), ("run-I", 1));
+        assert!(
+            one.contains("### cold-put: instance against direct-mp"),
+            "{one}"
+        );
+        assert!(!one.contains("two runs"), "{one}");
+    }
+
+    /// Catches arms of two attempts being paired: a different attempt is not a partner, and no
+    /// comparison and no note are made.
+    #[test]
+    fn arms_of_two_attempts_are_not_paired() {
+        let text = two_arms(("run-I", 2), ("run-D", 1));
+        assert!(!text.contains("instance against direct-mp"), "{text}");
+        assert!(!text.contains("two runs"), "{text}");
+    }
+
+    /// Catches a filtered run going unsaid: the report names the families a run was restricted
+    /// to, once per run.
+    #[test]
+    fn the_arms_filter_of_a_run_is_printed() {
+        let mut r = result(
+            "direct-4kib-c1-healthy",
+            vec![pass(1, Window::Quiet, 3, None)],
+            &[],
+        );
+        r.provenance.arms_filter = Some(vec!["direct".to_owned(), "direct-mp".to_owned()]);
+        let text = format_report(&[r], &Rows::new());
+        assert!(
+            text.contains("- run run-7 ran only the arms: direct, direct-mp"),
+            "{text}"
+        );
+        let all = format_report(
+            &[result("a", vec![pass(1, Window::Quiet, 3, None)], &[])],
+            &Rows::new(),
+        );
+        assert!(!all.contains("ran only"), "{all}");
     }
 
     /// Catches the requests the proxy forwarded being left out of the report, summed over the

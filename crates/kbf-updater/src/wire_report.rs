@@ -17,7 +17,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::version::Version;
-use crate::wire::ServiceReply;
+use crate::wire::{MAX_SERVICES, ServiceReply, is_service_name};
 
 /// The most bytes of a [`Token`].
 pub const MAX_TOKEN: usize = 64;
@@ -251,6 +251,10 @@ pub struct Answer {
     /// The supported features, only for an agent that announced `agent_features`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub features: Option<Vec<String>>,
+    /// The clear generation of each service cleared at least once (absent: 0), only for an
+    /// agent that announced `halt-v1` while the coordinator advertises it.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub halts: BTreeMap<String, u64>,
 }
 
 impl Answer {
@@ -260,6 +264,7 @@ impl Answer {
         Self {
             reply,
             features: None,
+            halts: BTreeMap::new(),
         }
     }
 }
@@ -284,7 +289,12 @@ struct RawAnswer {
     service: Option<String>,
     version: Option<Version>,
     features: Option<Vec<String>>,
+    #[serde(default)]
+    halts: BTreeMap<String, u64>,
 }
+
+/// The most entries of `halts`: a service per entry, the services of a host and `kbf`.
+const MAX_HALTS: usize = MAX_SERVICES + 1;
 
 impl<'de> Deserialize<'de> for Answer {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -293,11 +303,18 @@ impl<'de> Deserialize<'de> for Answer {
         if let Some(names) = &raw.features {
             check_features(names).map_err(D::Error::custom)?;
         }
+        if raw.halts.len() > MAX_HALTS {
+            return Err(D::Error::custom("too many halts"));
+        }
+        if raw.halts.keys().any(|name| !is_service_name(name)) {
+            return Err(D::Error::custom("a halt names no service"));
+        }
         let reply = ServiceReply::from_parts(raw.reply, raw.service, raw.version)
             .map_err(D::Error::custom)?;
         Ok(Self {
             reply,
             features: raw.features,
+            halts: raw.halts,
         })
     }
 }

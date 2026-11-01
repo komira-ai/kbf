@@ -105,6 +105,10 @@ mod updater_restart_tests;
 #[cfg(test)]
 mod updater_tests;
 #[cfg(test)]
+mod version_line_tests;
+#[cfg(test)]
+mod wire_absent_tests;
+#[cfg(test)]
 mod wire_dropped_facts_tests;
 #[cfg(test)]
 mod wire_features_tests;
@@ -115,9 +119,17 @@ mod wire_size_tests;
 #[cfg(test)]
 mod wire_tests;
 
-/// The program's text for `--version`.
+/// The program's text for `--version`: the package version and the commit the build was
+/// stamped with (`KBF_BUILD_COMMIT`, set by the artifacts workflow), or `unknown`.
 pub fn version_line() -> String {
-    format!("kbf-updater {}", env!("CARGO_PKG_VERSION"))
+    version_text(env!("CARGO_PKG_VERSION"), option_env!("KBF_BUILD_COMMIT"))
+}
+
+/// The text of [`version_line`] for a package version and the commit the build was stamped
+/// with (`None`: it was not).
+pub(crate) fn version_text(version: &str, commit: Option<&str>) -> String {
+    let commit = commit.filter(|c| !c.is_empty()).unwrap_or("unknown");
+    format!("kbf-updater {version}+{commit}")
 }
 
 /// The binary, as a function so that it is tested: the argument list in, the exit code and the

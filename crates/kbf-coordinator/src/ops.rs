@@ -25,8 +25,11 @@
 //! The caps on the counts (`MAX_HOSTS`, `MAX_EXCLUDED`) are checked under the same lock as the
 //! write ([`OpsStore::try_change`]), on the state the change is applied to.
 //!
-//! The operator actions ([`operate`]) are the only writers in this PR; nothing reads the
-//! store when it decides what a host is told.
+//! The writers are the operator actions ([`operate`]) and [`crate::reconcile`], which records
+//! the last good version and marks a version bad (a raise, so in memory first) and clears the
+//! mark when CI sets that version by hand. The decision reads the bad versions
+//! ([`crate::decide::decide_marked`]); nothing reads the rest when it decides what a host is
+//! told.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -36,6 +39,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use kbf_types::NodeId;
 use kbf_updater::version::Version;
+use kbf_updater::wire::UpdateResult;
 use serde::{Deserialize, Serialize};
 
 use crate::desired::{StoreError, io_at, write_whole};
@@ -109,6 +113,17 @@ pub struct HaltAck {
     pub target: Version,
 }
 
+/// A failure report an operator override acknowledged: the host and the whole report it made,
+/// so that a different report of the same host is not hidden by it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailureAck {
+    /// The host.
+    pub node_id: String,
+    /// The `last_update` it reported.
+    pub report: UpdateResult,
+}
+
 /// The marks of one service.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -119,12 +134,17 @@ pub struct ServiceOps {
     /// The halt reports an operator cleared.
     #[serde(default)]
     pub halt_acked: Vec<HaltAck>,
-    /// The newest version that converged and baked.
+    /// The newest version that converged and baked, as the coordinator recorded it; the
+    /// version an automatic rollback goes back to.
     #[serde(default)]
     pub last_good: Option<Version>,
-    /// The versions never to order again.
+    /// The versions never to order again, until CI sets one by hand.
     #[serde(default)]
     pub bad: Vec<Version>,
+    /// The failure reports standing when CI set a bad version by hand: one per host. A report
+    /// that is acked, whole, does not count towards an automatic rollback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_acked: Vec<FailureAck>,
 }
 
 /// One change, as the ring and the log say it.
@@ -135,7 +155,8 @@ pub struct AuditEntry {
     pub seq: u64,
     /// Who made it.
     pub by: String,
-    /// What it was (`exclude`, `include`, `set_labels`).
+    /// What it was (`exclude`, `include`, `set_labels`; the coordinator's own: `last_good`,
+    /// `clear_last_good`, `mark_bad`; CI's: `unmark_bad`).
     pub action: String,
     /// The service it concerned, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -334,6 +355,16 @@ impl OpsStore {
         self.lock().clone()
     }
 
+    /// The marks of `service` now: none if it has none.
+    #[must_use]
+    pub fn marks(&self, service: &str) -> ServiceOps {
+        self.lock()
+            .services
+            .get(service)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn lock(&self) -> MutexGuard<'_, OpsState> {
         self.current.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -506,7 +537,7 @@ fn reason(text: &str) -> Result<String, OperateError> {
     Ok(text.to_owned())
 }
 
-fn label(text: &str) -> bool {
+pub(crate) fn label(text: &str) -> bool {
     (1..=MAX_LABEL_BYTES).contains(&text.len())
         && text
             .bytes()

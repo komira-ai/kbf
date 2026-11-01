@@ -37,6 +37,7 @@ mod learning;
 pub mod load;
 pub mod open;
 mod report_hooks;
+pub(crate) mod usage;
 
 pub use adapter::{KbfAdapter, Outbound, Wall};
 pub use host::{Caller, Connection};
@@ -72,3 +73,5 @@ mod prediction_tests;
 mod report_hooks_tests;
 #[cfg(test)]
 mod testing;
+#[cfg(test)]
+mod usage_tests;
