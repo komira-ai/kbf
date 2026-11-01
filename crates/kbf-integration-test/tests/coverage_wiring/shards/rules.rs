@@ -429,7 +429,7 @@ fn a_shard_with_too_little_disk_is_refused() {
             "a `js` entry says `min_free_gb: 34`, under the 35",
         ),
         (
-            with(l1("20"), js_gb("40")),
+            with(l1("40"), js_gb("20")),
             "a `js` entry says `min_free_gb: 20`, under the 35",
         ),
         (
