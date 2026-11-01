@@ -293,6 +293,7 @@ async fn passes_the_bench_cannot_attribute_are_recorded_and_not_judged() {
             (500, false),
             "{name}"
         );
+        assert!(window.unjudged_reason.is_some(), "{name}");
     }
 }
 

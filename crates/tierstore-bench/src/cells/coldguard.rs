@@ -96,6 +96,18 @@ struct Seen {
     failed: bool,
 }
 
+/// Whose traffic the requests of a pass were, as far as the harness can tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Traffic {
+    /// Every request to the cold store was the harness's own.
+    Own,
+    /// The pass went through the fault proxy.
+    Faulted,
+    /// The pass sent requests to the instance (or another role), which copies to the cold store
+    /// on its own, for a time the harness does not read.
+    Instance,
+}
+
 /// What was read at one end of a window.
 #[derive(Clone, Copy)]
 struct Mark {
@@ -213,7 +225,7 @@ impl ColdGuard {
 
     /// Ends the window that began at the last reading and begins the next at this one.
     /// `own_requests` is the harness's count of requests to the cold role at the reading;
-    /// `judgeable` is whether the traffic of the window was the harness's alone.
+    /// `traffic` is whose requests the pass sent.
     ///
     /// Gives what the window read (none if it could not be worked out) and the trip, if the store
     /// is not healthy or the requests from elsewhere are over the limit.
@@ -221,8 +233,9 @@ impl ColdGuard {
         &mut self,
         reading: Result<ColdReading, String>,
         own_requests: u64,
-        judgeable: bool,
+        traffic: Traffic,
     ) -> (Option<ColdWindow>, Option<ColdTrip>) {
+        let judgeable = traffic == Traffic::Own;
         let reading = match reading {
             Ok(reading) => reading,
             Err(why) => return (None, Some(self.unreadable(&why))),
@@ -257,6 +270,7 @@ impl ColdGuard {
             drives_not_ok: u32::try_from(drives.iter().filter(|d| d.state != "ok").count())
                 .unwrap_or(u32::MAX),
             healing: reading.state.healing,
+            unjudged_reason: None,
         };
         let limit = self.limits.max_foreign_requests;
         let trip = self.unhealthy(&reading.state).or_else(|| {
@@ -513,7 +527,7 @@ mod tests {
         guard.record(clock.tick(98), 2_500_000, false);
         guard.record(clock.tick(99), 2_500_000, false);
         assert_eq!(guard.check(clock.tick(100)), Ok(()));
-        let (window, trip) = guard.close(read(1_100), 600, true);
+        let (window, trip) = guard.close(read(1_100), 600, Traffic::Own);
         assert_eq!(trip, None);
         let window = window.unwrap();
         assert_eq!((window.minio_requests, window.own_requests), (100, 100));
@@ -546,7 +560,7 @@ mod tests {
     #[test]
     fn foreign_requests_over_the_limit_trip_and_the_message_names_them() {
         let mut guard = opened(ColdGuardLimits::default());
-        let (window, trip) = guard.close(read(1_071), 560, true);
+        let (window, trip) = guard.close(read(1_071), 560, Traffic::Own);
         let trip = trip.unwrap();
         assert_eq!(trip.metric, "foreign_requests");
         assert!((trip.value - 11.0).abs() < 1e-9, "{trip}");
@@ -572,7 +586,7 @@ mod tests {
     #[test]
     fn foreign_requests_at_the_limit_do_not_trip() {
         let mut guard = opened(ColdGuardLimits::default());
-        let (window, trip) = guard.close(read(1_070), 560, true);
+        let (window, trip) = guard.close(read(1_070), 560, Traffic::Own);
         assert_eq!(trip, None);
         assert_eq!(window.unwrap().foreign_requests, 10);
         // A limit of 0 is "no request from elsewhere at all".
@@ -581,9 +595,13 @@ mod tests {
             ..ColdGuardLimits::default()
         };
         let mut guard = opened(strict);
-        assert_eq!(guard.close(read(1_060), 560, true).1, None);
+        assert_eq!(guard.close(read(1_060), 560, Traffic::Own).1, None);
         assert_eq!(
-            guard.close(read(1_061 + 60), 620, true).1.unwrap().metric,
+            guard
+                .close(read(1_061 + 60), 620, Traffic::Own)
+                .1
+                .unwrap()
+                .metric,
             "foreign_requests"
         );
     }
@@ -594,7 +612,7 @@ mod tests {
     #[test]
     fn fewer_requests_at_the_store_than_sent_is_no_foreign_load() {
         let mut guard = opened(ColdGuardLimits::default());
-        let (window, trip) = guard.close(read(1_005), 509, true);
+        let (window, trip) = guard.close(read(1_005), 509, Traffic::Own);
         assert_eq!(trip, None);
         let window = window.unwrap();
         assert_eq!(
@@ -613,9 +631,9 @@ mod tests {
     fn each_window_begins_where_the_last_ended() {
         let mut guard = opened(ColdGuardLimits::default());
         assert!(guard.has_baseline());
-        let (first, _) = guard.close(read(1_050), 550, true);
+        let (first, _) = guard.close(read(1_050), 550, Traffic::Own);
         assert_eq!(first.unwrap().minio_requests, 50);
-        let (second, trip) = guard.close(read(1_080), 580, true);
+        let (second, trip) = guard.close(read(1_080), 580, Traffic::Own);
         assert_eq!(trip, None);
         assert_eq!(second.unwrap().minio_requests, 30);
     }
@@ -627,13 +645,13 @@ mod tests {
     fn a_window_closed_before_any_reading_begins_the_chain() {
         let mut guard = ColdGuard::new(ColdGuardLimits::default());
         assert!(!guard.has_baseline());
-        assert_eq!(guard.close(read(1_000), 500, true), (None, None));
+        assert_eq!(guard.close(read(1_000), 500, Traffic::Own), (None, None));
         assert!(guard.has_baseline());
-        let (window, _) = guard.close(read(1_020), 520, true);
+        let (window, _) = guard.close(read(1_020), 520, Traffic::Own);
         assert_eq!(window.unwrap().minio_requests, 20);
         let mut sick = ColdGuard::new(ColdGuardLimits::default());
         let offline = state(&["ok", "offline"], false);
-        let (window, trip) = sick.close(read_in(1_000, offline), 500, true);
+        let (window, trip) = sick.close(read_in(1_000, offline), 500, Traffic::Own);
         assert_eq!((window, trip.unwrap().metric.as_str()), (None, "drives"));
     }
 
@@ -644,7 +662,7 @@ mod tests {
         let mut offline = vec!["ok"; 12];
         offline[3] = "offline";
         let mut guard = opened(ColdGuardLimits::default());
-        let (window, trip) = guard.close(read_in(1_000, state(&offline, false)), 500, true);
+        let (window, trip) = guard.close(read_in(1_000, state(&offline, false)), 500, Traffic::Own);
         let trip = trip.unwrap();
         assert_eq!(trip.metric, "drives");
         assert!((trip.value - 1.0).abs() < 1e-9, "{trip}");
@@ -669,7 +687,7 @@ mod tests {
     fn a_store_that_is_healing_trips() {
         let mut guard = opened(ColdGuardLimits::default());
         let healing = state(&["ok"; 12], true);
-        let (window, trip) = guard.close(read_in(1_000, healing.clone()), 500, true);
+        let (window, trip) = guard.close(read_in(1_000, healing.clone()), 500, Traffic::Own);
         let trip = trip.unwrap();
         assert_eq!(trip.metric, "healing");
         assert!((trip.value - 1.0).abs() < 1e-9, "{trip}");
@@ -688,7 +706,7 @@ mod tests {
     fn a_drive_fault_is_named_before_foreign_load() {
         let mut guard = opened(ColdGuardLimits::default());
         let offline = state(&["ok", "offline"], false);
-        let (_, trip) = guard.close(read_in(1_500, offline), 500, true);
+        let (_, trip) = guard.close(read_in(1_500, offline), 500, Traffic::Own);
         assert_eq!(trip.unwrap().metric, "drives");
     }
 
@@ -698,7 +716,7 @@ mod tests {
     #[test]
     fn a_counter_that_cannot_be_read_trips_and_is_not_zero_load() {
         let mut guard = opened(ColdGuardLimits::default());
-        let (window, trip) = guard.close(Err("no series".to_owned()), 600, true);
+        let (window, trip) = guard.close(Err("no series".to_owned()), 600, Traffic::Own);
         assert_eq!(window, None);
         let trip = trip.unwrap();
         assert_eq!(trip.metric, "unreadable");
@@ -717,34 +735,86 @@ mod tests {
     #[test]
     fn a_counter_that_goes_backwards_trips_and_the_same_value_is_a_quiet_window() {
         let mut guard = opened(ColdGuardLimits::default());
-        let (window, trip) = guard.close(read(3), 520, true);
+        let (window, trip) = guard.close(read(3), 520, Traffic::Own);
         assert_eq!(window, None);
         let trip = trip.unwrap();
         assert_eq!(trip.metric, "counter");
         let text = trip.to_string();
         assert!(text.contains("from 1000 to 3"), "{text}");
         let mut same = opened(ColdGuardLimits::default());
-        let (window, trip) = same.close(read(1_000), 500, true);
+        let (window, trip) = same.close(read(1_000), 500, Traffic::Own);
         assert_eq!(trip, None);
         let window = window.unwrap();
         assert_eq!((window.minio_requests, window.foreign_requests), (0, 0));
     }
 
-    /// Catches foreign load judged where the harness cannot tell it from the instance's own
-    /// copy traffic: the window is recorded with `judged` false and trips nothing, and so is the
-    /// window after it (the copy goes on); the next one is judged again.
+    /// Catches foreign load judged in a fault-proxy pass, or in the window after one: the window
+    /// is recorded with `judged` false and a reason and trips nothing, and so is the window
+    /// after it; the next one is judged again.
     #[test]
-    fn a_window_that_is_not_judgeable_is_recorded_and_not_judged() {
+    fn a_faulted_window_and_the_next_are_recorded_and_not_judged() {
         let mut guard = opened(ColdGuardLimits::default());
-        let (first, trip) = guard.close(read(1_500), 500, false);
+        let (first, trip) = guard.close(read(1_500), 500, Traffic::Faulted);
         assert_eq!(trip, None);
         let first = first.unwrap();
         assert_eq!((first.foreign_requests, first.judged), (500, false));
-        let (second, trip) = guard.close(read(2_000), 500, true);
+        let reason = first.unjudged_reason.unwrap();
+        assert!(reason.contains("fault proxy"), "{reason}");
+        let (second, trip) = guard.close(read(2_000), 500, Traffic::Own);
         assert_eq!(trip, None);
-        assert!(!second.unwrap().judged);
-        let (third, trip) = guard.close(read(2_500), 500, true);
-        assert!(third.unwrap().judged);
+        let second = second.unwrap();
+        assert!(!second.judged);
+        assert!(second.unjudged_reason.is_some());
+        let (third, trip) = guard.close(read(2_500), 500, Traffic::Own);
+        let third = third.unwrap();
+        assert_eq!((third.judged, third.unjudged_reason), (true, None));
         assert_eq!(trip.unwrap().metric, "foreign_requests");
+    }
+
+    /// Catches an instance's late copies tripping a later direct pass: its copies to the cold
+    /// store go on for minutes and the harness reads no signal of when they end, so after an
+    /// instance pass every window of the run is recorded, with the reason, and not judged, however
+    /// many direct passes come between and however much the store counts.
+    #[test]
+    fn after_an_instance_pass_no_window_of_the_run_is_judged() {
+        let mut guard = opened(ColdGuardLimits::default());
+        let (instance, trip) = guard.close(read(1_500), 500, Traffic::Instance);
+        assert_eq!(trip, None);
+        let instance = instance.unwrap();
+        assert!(!instance.judged);
+        for n in 1..=5 {
+            let (window, trip) = guard.close(read(1_500 + 500 * n), 500, Traffic::Own);
+            assert_eq!(trip, None, "window {n}");
+            let window = window.unwrap();
+            assert_eq!(
+                (window.foreign_requests, window.judged),
+                (500, false),
+                "{n}"
+            );
+            let reason = window.unjudged_reason.unwrap();
+            assert!(
+                reason.contains("instance copies may be pending"),
+                "{reason}"
+            );
+        }
+        assert!(
+            instance
+                .unjudged_reason
+                .unwrap()
+                .contains("instance copies may be pending")
+        );
+    }
+
+    /// Catches the instance rule leaking into a run that has no instance pass: its direct
+    /// passes are all judged, and a window that is judged has no reason.
+    #[test]
+    fn a_run_without_an_instance_pass_is_judged_throughout() {
+        let mut guard = opened(ColdGuardLimits::default());
+        for n in 1..=3 {
+            let (window, trip) = guard.close(read(1_000 + 5 * n), 500 + 5 * n, Traffic::Own);
+            assert_eq!(trip, None);
+            let window = window.unwrap();
+            assert_eq!((window.judged, window.unjudged_reason), (true, None));
+        }
     }
 }

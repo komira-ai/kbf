@@ -38,7 +38,7 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::cells::budget::{Ledger, Throttle};
-use crate::cells::coldguard::ColdGuard;
+use crate::cells::coldguard::{ColdGuard, Traffic};
 use crate::cells::stats;
 use crate::cells::streamget::{StreamGet, Streamed};
 use crate::cells::{CellContext, CellId};
@@ -458,10 +458,10 @@ impl Env {
     }
 
     /// Ends the window of the pass that just ended: what it read and the trip, if any.
-    async fn close_window(&self, judgeable: bool) -> (Option<ColdWindow>, Option<ColdTrip>) {
+    async fn close_window(&self, traffic: Traffic) -> (Option<ColdWindow>, Option<ColdTrip>) {
         match self.read_meter().await {
             None => (None, None),
-            Some((reading, own)) => self.guard().close(reading, own, judgeable),
+            Some((reading, own)) => self.guard().close(reading, own, traffic),
         }
     }
 
@@ -990,9 +990,15 @@ async fn run_pass(
     // has its trip and the run ends with it. The foreign requests are judged only where every
     // request of the pass was the bench's to the cold role: an instance's own copies to the cold
     // store, and the requests of an arm through the fault proxy, are not told apart from others.
-    let judgeable = !arm.faulted && driven.steps.iter().all(|s| s.role == Role::Cold);
+    let traffic = if !driven.steps.iter().all(|s| s.role == Role::Cold) {
+        Traffic::Instance
+    } else if arm.faulted {
+        Traffic::Faulted
+    } else {
+        Traffic::Own
+    };
     let (cold_window, window_trip) = if driven.trip.is_none() && driven.cold_trip.is_none() {
-        env.close_window(judgeable).await
+        env.close_window(traffic).await
     } else {
         (None, None)
     };

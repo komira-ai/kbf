@@ -1013,6 +1013,7 @@ mod tests {
             drives: 12,
             drives_not_ok: 0,
             healing: false,
+            unjudged_reason: None,
         });
         let text = format_report(&[result("a", vec![quiet], &[])], &Rows::new());
         assert!(

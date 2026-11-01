@@ -269,6 +269,10 @@ pub struct ColdWindow {
     pub drives_not_ok: u32,
     /// Whether the store was healing at the end of the window.
     pub healing: bool,
+    /// Why the window was not judged, when `judged` is false; absent in a result written before
+    /// the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unjudged_reason: Option<String>,
 }
 
 /// Latency percentiles of one pass, in microseconds (nearest rank).
@@ -551,6 +555,7 @@ mod tests {
                     drives: 12,
                     drives_not_ok: 0,
                     healing: false,
+                    unjudged_reason: None,
                 }),
                 proxy_requests: Some(ProxyRequests {
                     during: BTreeMap::from([("HEAD".to_owned(), 3)]),
