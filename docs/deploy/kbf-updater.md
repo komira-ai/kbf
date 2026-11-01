@@ -384,6 +384,73 @@ is left alone for `--retry-secs` per service: a failure of one does not hold bac
 agent's log lines for a service are led by its name. A restart in the middle of a service's trial
 finishes that trial first, as for `kbf`.
 
+### tierstore as a service
+
+The coordinator rolls tierstore, as it rolls kbf, from a definition in its services file
+(`--services-file`). The definition is shipped as data, `crates/kbf-coordinator/src/tierstore.services.toml`,
+and is in force only when the services file holds it. Append it to the file as it is (after kbf's own
+entry if the file replaces kbf's), keep the file `0600`, and restart the coordinator, which reads the
+file once at start:
+
+```toml
+# tierstore as a service of the coordinator (docs/deploy/kbf-updater.md, "tierstore as a
+# service"). An entry of a services file: appended to the file named by --services-file
+# (after kbf's own entry if the file replaces it), it makes tierstore a service the
+# coordinator rolls to the hosts of the storage role.
+#
+# Six storage hosts is the farm this is written for: one updates at a time, and the other
+# five must be up. The first host goes alone, and no other starts until it has beaten
+# healthy three times at the new version. A release that fails after its commit on two
+# hosts is rolled back by the coordinator to the last version that converged and baked.
+
+[[service]]
+name = "tierstore"
+bake_beats = 3
+canary = { count = 1 }
+rollback = "automatic"
+rollback_after_failed = { percent = 25, min_hosts = 2 }
+install_when_absent = false
+
+[service.selector]
+roles = ["storage"]
+
+[service.roles.storage]
+max_updating = 1
+min_up = 5
+```
+
+What each value is for, for a farm of six storage hosts:
+
+- `[service.roles.storage]` and `roles = ["storage"]`: tierstore is ordered to hosts of the storage
+  role and to no other. A host of another role that lists tierstore is not counted and is never
+  ordered it.
+- `max_updating = 1` and `min_up = 5`: one storage host updates at a time and the other five must be
+  up while it does. A storage host that is down, or excluded, therefore holds the roll until it is back or
+  `min_up` is lowered in the file; a farm of fewer than six storage hosts needs a smaller `min_up`.
+- `canary = { count = 1 }` and `bake_beats = 3`: one host goes alone, and no other starts until it has
+  sent three healthy beats at the new version; each host
+  after it holds its slot for the same three beats, so the next host starts only once the last one has
+  served healthy for that long.
+- `rollback = "automatic"` and `rollback_after_failed = { percent = 25, min_hosts = 2 }`: when a
+  release fails after its commit or at the release gate on the larger of 25% of the live hosts and
+  two (two of six), the coordinator marks the version bad and sets the desired version back to the last
+  one that converged and baked. It needs a last good version: the first version set is never rolled
+  back, only held.
+- `install_when_absent = false`: a host on which tierstore was declared and never registered is not
+  ordered it.
+
+The release workflow's CI token needs an allow-list entry with `services = ["tierstore"]` (the
+default is kbf alone). To roll a version, after it is published:
+
+```text
+cargo xtask deploy-farm --url <coordinator> --service tierstore --version <tierstore's version text>
+```
+
+It posts `{"version": ..., "service": "tierstore"}` (no `min_up`: the minimums are the definition's),
+reads `GET /v1/convergence?service=tierstore` until it says `converged`, and does not compare the
+coordinator's commit with the version, which is not a kbf commit. The convergence counts the hosts the
+selector names. kbf's own deploy is unchanged.
+
 ### Enrolling a host
 
 A host gets its updater certificate from the farm CA with a one-time token, with `kbf-updater enroll`:
@@ -654,7 +721,8 @@ Each accepted action is written to the file before it takes effect (a failed wri
    again like the POST. A coordinator that has just restarted (the table says so) may not have
    heard from every host yet; a host it hears from later counts as one that joined;
 2. posts `{"version": <the version text above>, "min_up": {...}}` to `/v1/desired` (the per-role
-   limits are the coordinator's defaults), with an OIDC token for the audience that is the URL as
+   limits are the coordinator's defaults; for a service other than kbf the body is the version and
+   `"service"` only, see "tierstore as a service"), with an OIDC token for the audience that is the URL as
    written in the variable (the audience keeps a trailing `/` the variable has, which the URL
    the calls go to does not, so write the variable and the allow-list's `audience` alike). A 503
    on the POST is tried again, up to four times;
