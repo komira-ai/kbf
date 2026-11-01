@@ -302,6 +302,7 @@ pub fn attempt(digest: &str, queued_s: u64, run_s: u64, outcome: &str, peak: Opt
         fetch_us: None,
         execution_us: None,
         pack_us: None,
+        lease: None,
     }
 }
 

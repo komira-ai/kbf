@@ -111,6 +111,7 @@ fn a_window_becomes_its_attempts_in_queue_order() {
             fetch_us: None,
             execution_us: None,
             pack_us: None,
+            lease: None,
         }
     );
 

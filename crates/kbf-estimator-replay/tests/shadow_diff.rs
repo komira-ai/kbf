@@ -69,6 +69,7 @@ impl Rec {
             fetch_us: None,
             execution_us: None,
             pack_us: None,
+            lease: None,
         }
     }
 

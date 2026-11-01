@@ -312,6 +312,7 @@ fn row_of(v: &Value, nodes: &BTreeMap<String, Node>) -> Result<Row, String> {
         fetch_us: spans[0],
         execution_us: spans[1],
         pack_us: spans[2],
+        lease: None,
     })
 }
 

@@ -253,31 +253,63 @@ fn an_arm_with_no_ids_has_null_build_numbers_and_the_full_gap_list() {
     assert_eq!(json["not_recorded"].as_array().unwrap().len(), 5);
 }
 
-/// Documents (and pins) today's counting: one operation joined by two invocations is
-/// exported as two rows, one per waiter, each with its own run id. Per invocation that is
-/// right, as each build waited on it; the arm-level attempt count, the queue time total of
-/// the CI-job view and the kill rates count the operation once per waiter until the export
-/// carries the operation and they count it once (komira-ai/kbf#2207). When that lands this
-/// test changes with it.
+/// One joined operation is exported as one row per waiting invocation, each with its own run
+/// id and the same (operation, lease). Per invocation each build did wait on it, so each
+/// counts it; the arm-level attempt count, the queue time total and kill rate of the arm and
+/// the CI-job view count the attempt once.
+fn waiters(inv: &[&str]) -> Vec<Row> {
+    inv.iter()
+        .enumerate()
+        .map(|(i, inv)| Row {
+            operation: Some("op-1".into()),
+            lease: Some("1.1".into()),
+            memory_kill: "own_limit".into(),
+            ..row(&format!("c{i}"), inv, Some("job"), (0, 2, 12))
+        })
+        .collect()
+}
+
+/// Catches: a joined operation counted once per waiter at arm level (two attempts, two
+/// kills) or in the CI-job view (queue time total 4 s, two attempts), and the per-invocation
+/// numbers deduplicated too (each invocation's build did wait, so it keeps its copy).
 #[test]
-fn a_joined_operation_is_counted_once_per_waiter_until_the_export_names_it() {
-    let copy = |id: &str, inv: &str| Row {
-        operation: Some("op-1".into()),
-        ..row(id, inv, Some("job"), (0, 2, 12))
-    };
-    let rows = [copy("c1", "i1"), copy("c2", "i2")];
+fn a_joined_operation_counts_once_per_arm_and_job_and_once_per_invocation() {
+    let rows = waiters(&["i1", "i2"]);
     let arm = analyze(&rows);
-    assert_eq!(arm.attempts, 2, "one attempt, counted for each waiter");
-    assert_eq!(arm.builds.runs.len(), 2);
+    assert_eq!(arm.attempts, 1, "one attempt");
+    assert_eq!(arm.kills.own_limit, 1);
+    assert_eq!(arm.queue_wait_samples, 1);
+    assert_eq!(arm.builds.runs.len(), 2, "each invocation did wait");
     assert!(arm.builds.runs.iter().all(|r| r.attempts == 1));
     let job = analyze_grouped(&rows, GroupBy::Correlated);
+    assert_eq!(job.attempts, 1);
     assert_eq!(job.builds.runs.len(), 1);
-    assert_eq!(job.builds.runs[0].attempts, 2);
-    assert_eq!(
-        job.builds.runs[0].queue_time_total_us,
-        Some(4 * S),
-        "2 s of queueing, counted twice"
-    );
+    assert_eq!(job.builds.runs[0].attempts, 1);
+    assert_eq!(job.builds.runs[0].queue_time_total_us, Some(2 * S));
+}
+
+/// Catches: attempts merged that are not one attempt: the same operation under another lease
+/// (a retry), another operation under the same lease number, and rows that name no operation
+/// or no lease (an old export), which keep the old counting (one per row).
+#[test]
+fn only_rows_with_the_same_operation_and_lease_are_one_attempt() {
+    let mut rows = waiters(&["i1", "i2"]);
+    rows[1].lease = Some("1.2".into());
+    assert_eq!(analyze(&rows).attempts, 2, "another lease: a retry");
+    let mut rows = waiters(&["i1", "i2"]);
+    rows[1].operation = Some("op-2".into());
+    assert_eq!(analyze(&rows).attempts, 2, "another operation");
+    for strip in [
+        (|r: &mut Row| r.operation = None) as fn(&mut Row),
+        |r: &mut Row| r.lease = None,
+    ] {
+        let mut rows = waiters(&["i1", "i2"]);
+        rows.iter_mut().for_each(strip);
+        let arm = analyze(&rows);
+        assert_eq!(arm.attempts, 2, "an old export keeps one count per row");
+        let job = analyze_grouped(&rows, GroupBy::Correlated);
+        assert_eq!(job.builds.runs[0].attempts, 2);
+    }
 }
 
 /// Catches: the table printing build numbers without saying what the span leaves out.

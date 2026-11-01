@@ -130,6 +130,11 @@ pub struct Row {
     /// `output_upload_completed - output_upload_start`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack_us: Option<u64>,
+    /// The lease the attempt ran under, `<epoch>.<seq>`, when the server says. With the
+    /// operation it names one attempt, which a joined operation exports once per waiting
+    /// invocation (each copy with its own run id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<String>,
 }
 
 impl Row {
