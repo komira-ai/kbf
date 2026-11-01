@@ -117,9 +117,9 @@ fn stored(result: &ActionResult) -> kbf_types::Digest {
 /// Catches each seam of section 3.4 not wired, or wired out of order:
 /// - a GetActionResult hit with no row, or its listing not the stored result's
 ///   (plant "no listing on a hit": the hit row's outputs go red);
-/// - the Execute call sent after its request is queued (plant: `record_submit` after
+/// - the Execute call sent after its request is queued (plant: `Recording::submit` after
 ///   `Event::Submit`), so the lease events reach no row: the run's attempts go red;
-/// - a requeue not sent from the drain (plant: no `record_requeue`): the requeued
+/// - a requeue not sent from the drain (plant: no `Recording::requeued`): the requeued
 ///   action has one attempt, or its first has no end;
 /// - the daemon's INFRA reason dropped (plant `Detail::Infra` with an empty text): the
 ///   failed attempt's reason goes red, while the client still sees only the farm's
@@ -479,7 +479,7 @@ async fn timeouts_and_refusals_are_recorded() {
 }
 
 /// Catches farm events sent for operations no recorded call waits on (plant: no
-/// `recorded` check in `State::record_*`, or `record_submit` noting an operation
+/// `recorded` check in `Recording`, or `Recording::submit` noting an operation
 /// for a call without an id): an id-less action that is granted, requeued, run and
 /// finished, and one that is refused, send nothing, so the farm builds no listing
 /// for them under its lock. A call with an id is sent.

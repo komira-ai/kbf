@@ -12,9 +12,10 @@
 //!   it. It stays so until the host is fixed or another version is set (the coordinator
 //!   does not tell it again, `decide`).
 //! - `converged`: past the quiet start, at least one live host, every live host at the
-//!   desired version and none updating or failed, and at least `min_up` hosts of the
-//!   storage and of the frontend role up. The last two keep a coordinator that has just
-//!   restarted, and has heard from few hosts, from reporting a farm converged.
+//!   desired version, none updating or failed or still baking or waiting for a promotion,
+//!   and at least `min_up` hosts of the storage and of the frontend role up. The last two
+//!   keep a coordinator that has just restarted, and has heard from few hosts, from
+//!   reporting a farm converged.
 //! - `in_progress`: everything else.
 //!
 //! How long a farm has gone without progress is the caller's to judge: it needs the time of
@@ -200,6 +201,13 @@ fn converge_with(
         .count();
     let at_desired: usize = roles.iter().map(|c| c.at_desired).sum();
     let clear = roles.iter().all(|c| c.updating == 0 && c.failed == 0);
+    // A host still baking, or waiting for its promotion, is not yet a host that took the
+    // version.
+    let settled = fleet.hosts_of(service).all(|(id, h)| {
+        !h.is_live(now)
+            || !(h.beat.promotion_pending
+                || fleet.is_baking(service, id, h, &desired.version, def.bake_beats, now))
+    });
     let up = |role: &str| {
         fleet
             .hosts_of(service)
@@ -212,6 +220,7 @@ fn converge_with(
         && live > 0
         && at_desired == live
         && clear
+        && settled
         && def
             .role_names()
             .into_iter()

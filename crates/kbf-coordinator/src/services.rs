@@ -23,6 +23,8 @@
 //! [service.selector]             # optional; absent: a host belongs if it announces the service
 //! roles = ["daemon"]             # default: every role of the service
 //! labels = { zone = "a" }        # operator-set labels the host must carry
+//! bake_beats = 0                 # default 0, at most 100: healthy beats before a slot frees
+//! canary = { count = 1 }         # optional: only this many hosts go until they have baked
 //! defer_backoff = { initial_secs = 300, factor = 2, max_secs = 3600 }   # the defaults
 //!
 //! [service.roles.daemon]
@@ -40,6 +42,8 @@ use kbf_updater::secret::read_secret;
 use kbf_updater::wire::{MAX_SERVICE_NAME, MAX_SERVICES, is_service_name};
 use serde::Deserialize;
 
+use crate::bake::MAX_BAKE_BEATS;
+use crate::canary::Canary;
 use crate::defer::DeferBackoff;
 use crate::desired::{Desired, KBF, KBF_MIN_UP, LEGACY_ROLES, MAX_COUNT, kbf_roles};
 use crate::membership::{RawSelector, Selector};
@@ -119,6 +123,11 @@ pub struct ServiceDef {
     pub selector: Option<Selector>,
     /// Whether a host on which the service is declared and has never registered is ordered.
     pub install_when_absent: bool,
+    /// How many healthy beats a host at the desired version must send before it frees the
+    /// slot it held while updating (default 0: it frees it at once).
+    pub bake_beats: u32,
+    /// The hosts that go alone first, if the service has a canary.
+    pub canary: Option<Canary>,
     /// How long a host that deferred an update is left alone ([`crate::defer`]).
     pub defer_backoff: DeferBackoff,
 }
@@ -138,6 +147,8 @@ impl ServiceDef {
             priority: 0,
             selector: None,
             install_when_absent: false,
+            bake_beats: 0,
+            canary: None,
             defer_backoff: DeferBackoff::default(),
         }
     }
@@ -208,7 +219,18 @@ struct RawService {
     #[serde(default)]
     install_when_absent: bool,
     #[serde(default)]
+    bake_beats: u32,
+    canary: Option<RawCanary>,
+    #[serde(default)]
     defer_backoff: DeferBackoff,
+}
+
+/// The count form of the canary. The roles and labels form is refused as an unknown field
+/// until it is implemented.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCanary {
+    count: u32,
 }
 
 #[derive(Deserialize)]
@@ -283,6 +305,8 @@ fn service_def(
         priority,
         selector,
         install_when_absent,
+        bake_beats,
+        canary,
         defer_backoff,
     } = raw;
     if !is_service_name(&name) {
@@ -307,6 +331,15 @@ fn service_def(
             "{name}: after names {unknown}, which is not kbf or defined earlier in the file"
         ));
     }
+    if bake_beats > MAX_BAKE_BEATS {
+        return invalid(format!("{name}: bake_beats is over {MAX_BAKE_BEATS}"));
+    }
+    if canary
+        .as_ref()
+        .is_some_and(|c| c.count == 0 || c.count > MAX_COUNT)
+    {
+        return invalid(format!("{name}: canary count is not 1 to {MAX_COUNT}"));
+    }
     let names = roles
         .keys()
         .map(|r| role_of(r))
@@ -327,6 +360,8 @@ fn service_def(
         priority,
         selector,
         install_when_absent,
+        bake_beats,
+        canary: canary.map(|c| Canary { count: c.count }),
         defer_backoff,
     })
 }

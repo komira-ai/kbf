@@ -48,6 +48,8 @@ fn the_shipped_kbf_definition_equals_the_frozen_built_in() {
         priority: 0,
         selector: None,
         install_when_absent: false,
+        bake_beats: 0,
+        canary: None,
         defer_backoff: crate::defer::DeferBackoff::default(),
     };
     assert_eq!(ServiceDef::kbf(), frozen);

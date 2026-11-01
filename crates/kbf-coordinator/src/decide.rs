@@ -17,19 +17,22 @@
 //! 5. the host did not decline an update to this version within its wait
 //!    ([`crate::defer`]; a deferral is not a failure, holds no slot, and a new desired
 //!    version lifts it);
-//! 6. the service runs on the host's role, and the role has room: fewer hosts of the role
+//! 6. the service's canary gate, if it has one, is open to the host ([`crate::canary`]; a
+//!    host that is deferring is not chosen as a canary);
+//! 7. the service runs on the host's role, and the role has room: fewer hosts of the role
 //!    hold a slot than `max_updating` allows (a
-//!    host holds a slot while updating, after a failed update until it heartbeats healthy,
-//!    and from the order the coordinator gave it until the host reports it or the order
-//!    ages out, [`crate::fleet::ORDER_AGE`]);
-//! 7. the role waits for the roles its definition names (`kbf`: a frontend waits for every
+//!    host holds a slot while updating, while its promotion is pending, after a failed update
+//!    until it heartbeats healthy, from the order the coordinator gave it until the host
+//!    reports it or the order ages out, [`crate::fleet::ORDER_AGE`], and, at the desired
+//!    version, until it has beaten healthy `bake_beats` times, [`crate::bake`]);
+//! 8. the role waits for the roles its definition names (`kbf`: a frontend waits for every
 //!    live storage, daemon and Mac host) and the service for the services in its `after`: each
 //!    live host of those runs that service's desired version and is done updating;
-//! 8. the hosts that would still be up without this one number at least the minimum: the
+//! 9. the hosts that would still be up without this one number at least the minimum: the
 //!    role's `min_up` (`kbf`: `min_up.storage` for a storage host, `min_up.frontend` for a
 //!    frontend), and at least one if the role is never the last (`kbf`: frontends), whatever
 //!    the setting says. A host is up when it is live, healthy, not
-//!    updating and not under an outstanding order, so a host that has not heartbeated since
+//!    updating, not waiting for its promotion and not under an outstanding order, so a host that has not heartbeated since
 //!    a restart counts as missing.
 //!
 //! A host that reports the service `absent` (declared, never registered) is held back before
@@ -51,6 +54,7 @@ use kbf_updater::version::Version;
 use kbf_updater::wire::{Health, Outcome, Reply};
 use serde::Serialize;
 
+use crate::canary;
 use crate::desired::{Desired, KBF};
 use crate::fleet::{Fleet, Host};
 use crate::services::{ServiceDef, Services};
@@ -116,6 +120,11 @@ pub enum Hold {
     WaitingForService,
     /// Fewer hosts of the role would stay up than the role requires.
     MinUp,
+    /// Every slot of the host's role is held, at least one of them by a host that runs the
+    /// desired version and has not yet baked.
+    Baking,
+    /// The service's canary gate is closed and the host is not one of the canaries.
+    CanaryWait,
 }
 
 /// What [`decide_why`] found for one host and service.
@@ -177,8 +186,15 @@ fn first_hold(
         .last_update
         .as_ref()
         .is_some_and(|r| r.outcome == Outcome::Failed && r.target == desired.version);
-    let slots = others()
-        .filter(|(o, h)| h.role_name() == host.role_name() && fleet.holds_slot(service, o, h, now))
+    let in_role = || others().filter(|(_, h)| h.role_name() == host.role_name());
+    let slots = in_role()
+        .filter(|(o, h)| fleet.holds_slot(service, o, h, now))
+        .count();
+    let baking = in_role()
+        .filter(|(o, h)| {
+            !fleet.holds_slot(service, o, h, now)
+                && fleet.is_baking(service, o, h, &desired.version, def.bake_beats, now)
+        })
         .count();
     let rules = [
         (fleet.is_quiet(now), Hold::Quiet),
@@ -197,8 +213,16 @@ fn first_hold(
             Hold::Deferred,
         ),
         (
+            canary::closed_to(def, desired, fleet, id, host, now),
+            Hold::CanaryWait,
+        ),
+        (
             slots >= role.max_updating(host.role_name(), desired),
             Hold::NoSlot,
+        ),
+        (
+            slots + baking >= role.max_updating(host.role_name(), desired),
+            Hold::Baking,
         ),
         (
             others().any(|(_, h)| {

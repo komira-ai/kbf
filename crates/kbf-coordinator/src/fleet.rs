@@ -21,6 +21,7 @@ use kbf_types::{HostRole, NodeId};
 use kbf_updater::version::Version;
 use kbf_updater::wire::{Health, Heartbeat, Outcome};
 
+use crate::bake::Bake;
 use crate::defer::{DeferBackoff, Defers};
 use crate::desired::KBF;
 
@@ -67,14 +68,18 @@ impl Host {
         now.saturating_sub(self.seen) < DOWN_AFTER
     }
 
-    /// Whether the host counts as up: live, healthy, and not in the middle of an update.
+    /// Whether the host counts as up: live, healthy, not in the middle of an update and not
+    /// waiting for its promotion.
     #[must_use]
     pub fn is_up(&self, now: Duration) -> bool {
-        self.is_live(now) && self.beat.health == Health::Healthy && self.beat.updating.is_none()
+        self.is_live(now)
+            && self.beat.health == Health::Healthy
+            && self.beat.updating.is_none()
+            && !self.beat.promotion_pending
     }
 
-    /// Whether the host holds one of its role's update slots: it is updating, or its last
-    /// update failed and it has not yet heartbeated healthy.
+    /// Whether the host holds one of its role's update slots: it is updating, its promotion
+    /// is pending, or its last update failed and it has not yet heartbeated healthy.
     #[must_use]
     pub fn holds_slot(&self) -> bool {
         let failed = self
@@ -82,7 +87,9 @@ impl Host {
             .last_update
             .as_ref()
             .is_some_and(|r| r.outcome == Outcome::Failed);
-        self.beat.updating.is_some() || (failed && self.beat.health != Health::Healthy)
+        self.beat.updating.is_some()
+            || self.beat.promotion_pending
+            || (failed && self.beat.health != Health::Healthy)
     }
 }
 
@@ -116,6 +123,8 @@ pub struct Fleet {
     nodes: BTreeMap<NodeId, Node>,
     hosts: BTreeMap<String, BTreeMap<NodeId, Host>>,
     orders: BTreeMap<(NodeId, String), Order>,
+    /// Healthy beats in a row at one version, per service and host ([`Bake`]).
+    bake: BTreeMap<(String, NodeId), Bake>,
     defers: Defers,
 }
 
@@ -128,6 +137,7 @@ impl Fleet {
             nodes: BTreeMap::new(),
             hosts: BTreeMap::new(),
             orders: BTreeMap::new(),
+            bake: BTreeMap::new(),
             defers: Defers::default(),
         }
     }
@@ -216,6 +226,15 @@ impl Fleet {
                 self.orders.remove(&key);
             }
         }
+        let baking = (key.1.clone(), key.0.clone());
+        match Bake::after(self.bake.get(&baking), &beat, now) {
+            Some(bake) => {
+                self.bake.insert(baking, bake);
+            }
+            None => {
+                self.bake.remove(&baking);
+            }
+        }
         self.defers.observe(&key, &beat, deferred_order, now);
         self.hosts.entry(key.1).or_default().insert(
             key.0,
@@ -285,6 +304,32 @@ impl Fleet {
     #[must_use]
     pub fn holds_slot(&self, service: &str, id: &NodeId, host: &Host, now: Duration) -> bool {
         host.holds_slot() || self.is_ordered(service, id, now)
+    }
+
+    /// How many healthy beats in a row the host `id` has sent `service` at `version`.
+    #[must_use]
+    pub fn bake_beats(&self, service: &str, id: &NodeId, version: &Version) -> u32 {
+        self.bake
+            .get(&(service.to_owned(), id.clone()))
+            .filter(|b| b.target == *version)
+            .map_or(0, |b| b.beats)
+    }
+
+    /// Whether the host `id` is still baking: live, at `version`, and has beaten healthy
+    /// fewer than `need` times in a row.
+    #[must_use]
+    pub fn is_baking(
+        &self,
+        service: &str,
+        id: &NodeId,
+        host: &Host,
+        version: &Version,
+        need: u32,
+        now: Duration,
+    ) -> bool {
+        host.is_live(now)
+            && host.beat.version == *version
+            && self.bake_beats(service, id, version) < need
     }
 
     /// Whether the host `id` counts as up for `service`: [`Host::is_up`] and no order
