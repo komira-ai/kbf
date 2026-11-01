@@ -445,3 +445,15 @@ fn files_mode_needs_no_insecure_flag_and_argv_mode_still_does() {
     };
     assert_eq!(argv.validate(), Err(ConfigError::InsecureArgv));
 }
+
+/// Catches the parser being the only guard against the contradiction: a config that says the
+/// secrets travel as files and also that they may travel as arguments is refused by name.
+#[test]
+fn files_delivery_refuses_the_insecure_opt_in() {
+    let both = Config {
+        delivery: Delivery::Files,
+        insecure_argv_secrets: true,
+        ..base()
+    };
+    assert_eq!(both.validate(), Err(ConfigError::InsecureWithFiles));
+}

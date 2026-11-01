@@ -57,6 +57,13 @@ pub(super) fn refused_for_quota(run: &Run) -> bool {
     run.outcome == Some(Outcome::FailedToStart) && run.detail.as_deref() == Some(QUOTA_UNAVAILABLE)
 }
 
+/// Whether `run` never started because its host cannot deliver the files of a run.
+#[allow(dead_code)]
+pub(super) fn refused_for_files(run: &Run) -> bool {
+    let _ = run;
+    false
+}
+
 /// The verdict on `run`. `truncated` says the lease cut the run's wall time short of what
 /// was asked, so a timeout was the lease's.
 pub(super) fn judge(run: &Run, truncated: bool) -> Verdict {

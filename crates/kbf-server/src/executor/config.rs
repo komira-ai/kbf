@@ -198,6 +198,9 @@ pub enum ConfigError {
     /// Secrets as arguments, which the operator has not allowed.
     #[error("the secrets travel as arguments: set insecure_argv_secrets to say so")]
     InsecureArgv,
+    /// Secrets as files, and the opt-in for secrets as arguments: a contradiction.
+    #[error("the secrets travel as files: insecure_argv_secrets must not be set")]
+    InsecureWithFiles,
     /// A presign ceiling or a run longer than a url may be good for.
     #[error("the presign ceiling and the longest run's wall time must be at most 4 hours")]
     PresignLimit,

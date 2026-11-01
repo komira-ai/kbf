@@ -7,7 +7,7 @@ use kbf_lease_client::fake::Pool;
 use kbf_server::executor::{Config, Delivery};
 use tonic::Code;
 
-use crate::rig::{Rig, count_tail};
+use crate::rig::{Rig, count, count_tail};
 
 const TOKEN: &str = "read-token-0001";
 
@@ -95,6 +95,8 @@ async fn a_files_unsupported_refusal_drains_the_host_and_reruns_the_action() {
     assert!(rig.exec.hosts()[0].draining);
     assert!(rig.runs().await.is_empty());
     assert!(caller.finished().is_none(), "{:?}", caller.finished());
+    assert!(ended_any(&rig, "infra"), "{}", rig.counted());
+    assert!(!ended_any(&rig, "lost"), "{}", rig.counted());
 }
 
 /// Catches a refused file being rerun for ever or blamed on the host: `invalid-file` is a fault
@@ -119,4 +121,84 @@ async fn an_invalid_file_refusal_ends_the_action_invalid() {
     assert!(!status.message.contains("s3cr3t"), "{}", status.message);
     assert!(!rig.exec.hosts()[0].draining);
     assert!(rig.runs().await.is_empty());
+}
+
+fn ended_any(rig: &Rig, outcome: &str) -> bool {
+    let row = format!("kbf_executor_runs_total{{outcome=\"{outcome}\"}} ");
+    rig.counted().lines().any(|l| {
+        l.strip_prefix(&row)
+            .is_some_and(|n| n.parse::<u32>().is_ok_and(|n| n > 0))
+    })
+}
+
+/// Catches a host that cannot deliver files being handed back and re-leased at once, without
+/// bound: it is held out like a host with a sick quota, so its lease stays booked and idle
+/// (no release, no new lease asked for) while the hold lasts. The action ends as the
+/// infrastructure failure the farm reruns, not as a loss to the host.
+#[tokio::test(start_paused = true)]
+async fn a_files_unsupported_host_is_not_leased_again_within_the_hold() {
+    let mut rig = rig().await;
+    rig.pump().await;
+    let lease = rig.exec.hosts()[0].lease;
+    let leases = count(&rig.requests(), "POST /v1/leases");
+    assert!(rig.fake.refuse_posts("node1", Some("files-unsupported")));
+    let _caller = rig.submit(3);
+    rig.elapse(15).await;
+    assert!(ended_any(&rig, "infra"), "{}", rig.counted());
+    assert!(!ended_any(&rig, "lost"), "{}", rig.counted());
+    let held = rig.exec.hosts();
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert!(held[0].draining);
+    let delete = format!("DELETE /v1/leases/{lease}");
+    assert_eq!(count(&rig.requests(), &delete), 0);
+    assert_eq!(count(&rig.requests(), "POST /v1/leases"), leases);
+}
+
+/// Catches the agent's own refusal (a run that ended without starting, detail
+/// `files-unsupported`) leaving the host in use: it is held out as the 409 is, and the action
+/// is the infrastructure failure the farm reruns.
+#[tokio::test(start_paused = true)]
+async fn an_agent_that_refused_the_files_is_held_out() {
+    let mut rig = rig().await;
+    rig.pump().await;
+    let lease = rig.exec.hosts()[0].lease;
+    let _caller = rig.submit(3);
+    rig.pump().await;
+    let first = rig.runs_of(3).await.remove(0);
+    rig.host_finishes_with(
+        &first.run,
+        Outcome::FailedToStart,
+        None,
+        "files-unsupported",
+    );
+    rig.elapse(15).await;
+    assert!(ended_any(&rig, "infra"), "{}", rig.counted());
+    let held = rig.exec.hosts();
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert!(held[0].draining);
+    let delete = format!("DELETE /v1/leases/{lease}");
+    assert_eq!(count(&rig.requests(), &delete), 0);
+}
+
+/// Catches the agent's `invalid-file` being rerun: the action ends InvalidArgument, the host
+/// stays in service, and the message holds neither secret.
+#[tokio::test(start_paused = true)]
+async fn an_agent_that_refused_a_file_ends_the_action_invalid() {
+    let mut rig = rig().await;
+    rig.pump().await;
+    let caller = rig.submit(3);
+    rig.pump().await;
+    let first = rig.runs_of(3).await.remove(0);
+    rig.host_finishes_with(&first.run, Outcome::FailedToStart, None, "invalid-file");
+    let finished = rig.until_done(&caller, 4).await;
+    let Finished::Failed(status) = &finished else {
+        panic!("not a failure: {finished:?}");
+    };
+    assert_eq!(
+        Code::from_i32(status.code),
+        Code::InvalidArgument,
+        "{status:?}"
+    );
+    assert!(!status.message.contains(TOKEN), "{}", status.message);
+    assert!(!rig.exec.hosts()[0].draining);
 }
