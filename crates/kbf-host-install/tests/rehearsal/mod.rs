@@ -87,7 +87,11 @@ pub fn run_explaining(name: &str, cmd: &mut Command, units: &[&str]) -> String {
     if !out.status.success()
         && let Some(note) = rate_limit_note(&journal(units))
     {
-        panic!("{name} failed: {note}");
+        panic!(
+            "{name} failed ({:?}): {}",
+            out.status.code(),
+            explained(name, &note, &String::from_utf8_lossy(&out.stderr))
+        );
     }
     check(name, &out)
 }
@@ -177,18 +181,30 @@ pub fn download(token: &str, tag: &str, dir: &Path, names: &[String]) {
 /// What the helper's journal says when GitHub refuses its release listing.
 pub const RATE_LIMITED: &str = "rate limited by GitHub";
 
-/// The plain words for a failure whose cause is GitHub's quota for the runner's address, when
-/// `journal` shows the helper was refused for it; `None` for any other failure.
+/// How many of the last lines of a command's stderr go after the note.
+const STDERR_LINES: usize = 40;
+
+/// The plain words for a failure whose journal shows GitHub refused the helper for its quota;
+/// `None` for any other journal.
 ///
-/// A helper without the token mark asks GitHub anonymously, and the hosted runners of a
-/// region share a small anonymous quota, so the refusal says nothing of the release.
+/// The wording is of what the journal says, not of whether the channel had a token: GitHub's
+/// API quota for this request, whichever address or token it was counted against.
 pub fn rate_limit_note(journal: &str) -> Option<String> {
     journal.contains(RATE_LIMITED).then(|| {
-        "GitHub refused the helper's release listing: the helper of release N takes no Actions \
-         token, so it asks GitHub anonymously, and the quota of this hosted runner's address is \
-         over. This says nothing of the release. Re-run the job."
+        "GitHub's API quota refused the helper's release listing (counted against the runner's \
+         address when the channel had no token, against the run's token when it had one). \
+         This says nothing of the release. Re-run the job."
             .to_owned()
     })
+}
+
+/// The failure message of a command whose journal showed the quota refusal: the note, then
+/// the last [`STDERR_LINES`] lines of the command's `stderr`, so that an earlier refusal in
+/// the journal cannot hide a different cause the command itself reports.
+pub fn explained(name: &str, note: &str, stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().collect();
+    let tail = lines[lines.len().saturating_sub(STDERR_LINES)..].join("\n");
+    format!("{name} failed: {note}\n---- last lines of {name}'s stderr\n{tail}")
 }
 
 /// The units' journal so far.
@@ -540,12 +556,29 @@ mod tests {
         let refused = "kbf-host-install: stage: fetch_failed: rate limited by GitHub, retry after \
                        2026-11-01T05:45:24Z or set token_file\n";
         let note = rate_limit_note(refused).expect("a note for a rate-limited helper");
-        assert!(note.contains("anonymous"), "{note}");
+        assert!(!note.contains("takes no"), "{note}");
         assert!(note.contains("Re-run the job"), "{note}");
         assert_eq!(
             rate_limit_note("kbf-host-install: stage: verify_failed\n"),
             None
         );
         assert_eq!(rate_limit_note(""), None);
+    }
+
+    /// Catches the note replacing the command's own report: a different real cause must stay
+    /// in the message, and a long stderr is cut to its last lines.
+    #[test]
+    fn the_explanation_keeps_the_end_of_the_commands_stderr() {
+        let stderr: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let text = explained("deploy_farm", "NOTE", &stderr);
+        assert!(text.contains("NOTE"), "{text}");
+        assert!(text.contains("line 99"), "{text}");
+        assert!(text.contains("line 60"), "{text}");
+        assert!(
+            !text.contains("line 59\n") && !text.ends_with("line 59"),
+            "{text}"
+        );
+        assert!(!text.contains("line 0\n"), "{text}");
+        assert!(explained("x", "N", "").contains("N"));
     }
 }
