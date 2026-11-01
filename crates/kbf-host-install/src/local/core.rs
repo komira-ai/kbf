@@ -42,6 +42,11 @@ const KEEP_VERSIONS: usize = 16;
 /// agent reads 16 KiB).
 pub const MAX_LISTED: usize = 64;
 
+/// The most bytes the listing's JSON array takes in a `query` line: with the rest of the line
+/// (whose versions are bounded by the request grammar) it stays well inside the 16 KiB the agent
+/// reads.
+pub const LISTED_BYTES: usize = 10 * 1024;
+
 /// How an update ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -133,31 +138,10 @@ impl Saved {
     }
 }
 
-/// At most `max` of the releases `kept` (newest first), and how many are left out. Past the
-/// limit the ones that must stay come first: what runs, what is on trial, the one before and
-/// the last good, then the pinned ones, then the newest others; the listing stays newest first.
+/// At most `max` of the releases `kept` that fit in [`LISTED_BYTES`], the ones that must stay
+/// first, and how many are left out ([`kbf_retain::cut`]).
 fn cut(kept: Vec<Kept>, max: usize) -> (Vec<Kept>, usize) {
-    let rank = |k: &Kept| {
-        if k.why.iter().any(|w| *w != "pinned") {
-            0
-        } else if k.why.is_empty() {
-            2
-        } else {
-            1
-        }
-    };
-    let mut order: Vec<usize> = (0..kept.len()).collect();
-    order.sort_by_key(|&i| (rank(&kept[i]), i));
-    let mut chosen: Vec<usize> = order.into_iter().take(max).collect();
-    chosen.sort_unstable();
-    let omitted = kept.len() - chosen.len();
-    let mut chosen = chosen.into_iter().peekable();
-    let listed = kept
-        .into_iter()
-        .enumerate()
-        .filter_map(|(i, k)| chosen.next_if_eq(&i).map(|_| k))
-        .collect();
-    (listed, omitted)
+    kbf_retain::cut(kept, max, LISTED_BYTES)
 }
 
 /// The update, over a backend.
@@ -453,8 +437,16 @@ impl<B: Backend> Ab<B> {
         }
         // The last good is recorded while the release is still on trial, when no collection of
         // any program removes a release: one that runs between the confirm and this record
-        // would not know the release it names.
-        let recorded = self.record(last_good);
+        // would not know the release it names. A last good that cannot be recorded keeps the
+        // trial: the confirm fails, every collection still removes nothing, and the confirm
+        // asked again (once the file can be written) records it and keeps the release.
+        if let Err(why) = self.record(last_good) {
+            (self.note)(&format!("retain: {why}; the release stays on trial"));
+            return Err(Fault::failed(
+                Code::StateUnavailable,
+                format!("the last good cannot be recorded: {why}"),
+            ));
+        }
         self.backend.confirm(&pending)?;
         saved.last = Some(Last {
             target: version.as_str().to_owned(),
@@ -463,7 +455,7 @@ impl<B: Backend> Ab<B> {
         });
         saved.staged = None;
         self.save(&saved)?;
-        self.retain(recorded, &mut saved);
+        self.retain(&mut saved);
         Ok(confirmed)
     }
 
@@ -478,16 +470,10 @@ impl<B: Backend> Ab<B> {
     }
 
     /// After a confirm: remove the releases the host no longer keeps, and forget their
-    /// versions. `recorded` is whether the confirm's last good was recorded. The confirm stands
-    /// whatever this does: a failure is told to the log, and the next confirm tries again.
-    fn retain(&self, recorded: Result<(), String>, saved: &mut Saved) {
+    /// versions. The confirm stands whatever this does: a failure is told to the log, and the
+    /// next confirm tries again.
+    fn retain(&self, saved: &mut Saved) {
         if self.backend.retain_file().is_none() {
-            return;
-        }
-        // A last good that cannot be recorded is not pruned around: the release it names may be
-        // the one an automatic rollback needs, so nothing is removed until a confirm records it.
-        if let Err(why) = recorded {
-            (self.note)(&format!("retain: {why}; removing nothing"));
             return;
         }
         match self.backend.prune(self.keep) {

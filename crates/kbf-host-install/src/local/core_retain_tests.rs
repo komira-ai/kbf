@@ -37,6 +37,7 @@ fn held(commit: &str, version: Option<&str>) -> Kept {
         commit: CommitId::new(commit).unwrap(),
         version: version.map(str::to_owned),
         why: Vec::new(),
+        version_left_out: false,
     }
 }
 
@@ -207,23 +208,33 @@ fn a_confirm_without_a_last_good_leaves_the_recorded_one() {
     assert_eq!(retained(&fx).last_good, Some(commit(A)));
 }
 
-/// A retain file that cannot be parsed is told to the log, and the confirm still answers
-/// confirmed; the last good it names cannot be recorded, so no prune is asked for.
+/// A confirm whose last good cannot be recorded (the retain file cannot be parsed) fails and
+/// keeps the release on trial, so no collection removes anything; the log says why, and the
+/// file is left as it was.
 ///
-/// Catches: a retain file that cannot be parsed passed over in silence; a prune after a last
-/// good that was not recorded.
+/// Catches: a retain file that cannot be parsed passed over in silence; a confirm that ends the
+/// trial with its last good unrecorded, after which any collection may remove that release.
 #[test]
-fn an_unparseable_retain_file_is_told_and_the_confirm_stands() {
+fn a_last_good_that_cannot_be_recorded_fails_the_confirm_and_keeps_the_trial() {
     let (fx, notes) = host("ab-retain-bad", 4);
     fs::write(fx.dir.join("retain.json"), "{ not json").unwrap();
     on_trial(&fx);
     let answer = fx.ask(&format!("confirm kbf={VB} last_good={VA}"));
-    assert_eq!(answer, Answer::Confirmed { version: VB.into() });
+    assert!(
+        matches!(&answer, Answer::Failed(Code::StateUnavailable, why) if why.contains("cannot be parsed")),
+        "{answer:?}"
+    );
+    assert!(
+        fx.world.borrow().pending.is_some(),
+        "the release stays on trial"
+    );
     let told = notes.borrow().clone();
     assert_eq!(told.len(), 1, "{told:?}");
     assert!(told[0].starts_with("retain: "), "{told:?}");
-    assert!(told[0].contains("cannot be parsed"), "{told:?}");
-    assert!(told[0].ends_with("; removing nothing"), "{told:?}");
+    assert!(
+        told[0].ends_with("; the release stays on trial"),
+        "{told:?}"
+    );
     assert!(prunes(&fx).is_empty());
     assert_eq!(
         fs::read_to_string(fx.dir.join("retain.json")).unwrap(),
@@ -446,11 +457,12 @@ fn a_backend_that_keeps_no_release_directories_keeps_nothing() {
     assert_eq!(Bare.prune(4).unwrap(), "");
 }
 
-/// A confirm that names a last good while the listing cannot be read leaves the recorded one as
-/// it is, tells why, and still answers confirmed.
+/// A confirm that names a last good while the listing cannot be read fails and keeps the
+/// release on trial; the recorded last good is left as it is. Once the listing reads, the same
+/// confirm records it and keeps the release.
 ///
 /// Catches: a listing that cannot be read taken for one that does not hold the last good, which
-/// clears the recorded one and lets the next prune remove it.
+/// clears the recorded one; a confirm asked again that does not record what the first could not.
 #[test]
 fn a_last_good_is_left_as_recorded_when_the_listing_cannot_be_read() {
     let (fx, notes) = host("ab-lg-blind", 4);
@@ -461,19 +473,28 @@ fn a_last_good_is_left_as_recorded_when_the_listing_cannot_be_read() {
     file.write(&fx.dir.join("retain.json")).unwrap();
     on_trial(&fx);
     fx.world.borrow_mut().kept_fault = true;
-    let answer = fx.ask(&format!("confirm kbf={VB} last_good={VA}"));
-    assert_eq!(
-        answer,
-        Answer::Confirmed {
-            version: VB.to_owned()
-        }
+    let line = format!("confirm kbf={VB} last_good={VA}");
+    let answer = fx.ask(&line);
+    assert!(
+        matches!(answer, Answer::Failed(Code::StateUnavailable, _)),
+        "{answer:?}"
+    );
+    assert!(
+        fx.world.borrow().pending.is_some(),
+        "the release stays on trial"
     );
     assert_eq!(retained(&fx).last_good, Some(commit(C)));
-    assert_eq!(*notes.borrow(), ["retain: listing; removing nothing"]);
-    assert!(
-        prunes(&fx).is_empty(),
-        "a last good not recorded is not pruned around"
+    assert_eq!(
+        *notes.borrow(),
+        ["retain: listing; the release stays on trial"]
     );
+    assert!(prunes(&fx).is_empty());
+
+    fx.world.borrow_mut().kept_fault = false;
+    assert_eq!(fx.ask(&line), Answer::Confirmed { version: VB.into() });
+    assert_eq!(retained(&fx).last_good, Some(commit(A)));
+    assert!(fx.world.borrow().pending.is_none());
+    assert_eq!(prunes(&fx), ["prune 4"]);
 }
 
 /// Past the limit of the listing, a release that must stay is listed however old it is: the
@@ -546,12 +567,13 @@ fn a_listing_past_the_limit_names_what_runs_first_and_counts_what_it_leaves_out(
     assert!(!line.contains("releases_omitted"), "{line}");
 }
 
-/// A last good whose 12 digits name two releases the host holds records neither: the one recorded
-/// before stays, nothing is pruned, and the log names both.
+/// A last good whose 12 digits name two releases the host holds records neither: the confirm
+/// fails and keeps the release on trial, the one recorded before stays, nothing is pruned, and
+/// the log names both.
 ///
 /// Catches: the first of two matching releases taken for the last good, by the order of age.
 #[test]
-fn a_last_good_that_names_two_held_releases_records_neither_and_removes_nothing() {
+fn a_last_good_that_names_two_held_releases_records_neither_and_keeps_the_trial() {
     let (fx, notes) = host("ab-lg-ambiguous", 4);
     let twin = format!("{}{}", &A[..12], "b".repeat(28));
     fx.world.borrow_mut().kept = vec![held(B, None), held(A, None), held(&twin, None)];
@@ -562,14 +584,18 @@ fn a_last_good_that_names_two_held_releases_records_neither_and_removes_nothing(
     file.write(&fx.dir.join("retain.json")).unwrap();
     on_trial(&fx);
     let answer = fx.ask(&format!("confirm kbf={VB} last_good={VA}"));
-    assert_eq!(answer, Answer::Confirmed { version: VB.into() });
+    assert!(
+        matches!(answer, Answer::Failed(Code::StateUnavailable, _)),
+        "{answer:?}"
+    );
+    assert!(fx.world.borrow().pending.is_some());
     assert_eq!(retained(&fx).last_good, Some(commit(C)));
     assert!(prunes(&fx).is_empty());
     let told = notes.borrow();
     assert_eq!(told.len(), 1, "{told:?}");
     assert!(
         told[0].contains(&format!("names 2 releases: {A} {twin}"))
-            && told[0].ends_with("; removing nothing"),
+            && told[0].ends_with("; the release stays on trial"),
         "{told:?}"
     );
 }

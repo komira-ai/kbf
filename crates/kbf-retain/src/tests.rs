@@ -432,16 +432,19 @@ fn the_lines_are_a_count_then_a_line_per_release() {
             commit: c(A),
             version: Some("v1".to_owned()),
             why: vec!["current", "pinned"],
+            version_left_out: false,
         },
         Kept {
             commit: c(B),
             version: None,
             why: vec!["previous"],
+            version_left_out: false,
         },
         Kept {
             commit: c(C),
             version: None,
             why: vec![],
+            version_left_out: false,
         },
     ];
     assert_eq!(
@@ -462,6 +465,7 @@ fn a_kept_release_serializes_without_an_empty_reason_list() {
         commit: c(A),
         version: None,
         why: vec![],
+        version_left_out: false,
     };
     assert_eq!(
         serde_json::to_value(&none).expect("json"),
@@ -471,6 +475,7 @@ fn a_kept_release_serializes_without_an_empty_reason_list() {
         commit: c(B),
         version: Some("v".to_owned()),
         why: vec!["current"],
+        version_left_out: false,
     };
     assert_eq!(
         serde_json::to_value(&some).expect("json"),
@@ -523,16 +528,12 @@ fn a_change_made_while_another_holds_the_file_waits_and_both_changes_stay() {
         .expect("pin");
         finished.store(true, Ordering::SeqCst);
     });
-    // The pin's progress, as the kernel tells it: waiting for the lock, or (wrongly) done.
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    // The pin's progress, as the kernel tells it: waiting for the lock, or (wrongly) done. No
+    // clock is asserted on; a pin that never asks for the lock is the harness's to time out.
     while !a_waiter_on(inode) {
         assert!(
             !done.load(Ordering::SeqCst),
             "the pin was written without waiting for the lock"
-        );
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the pin never asked for the lock"
         );
         std::thread::yield_now();
     }
@@ -607,4 +608,72 @@ fn a_lock_file_that_cannot_be_opened_stops_every_change() {
     let err = Retained::update(&path, |r| r.pinned.clear()).expect_err("no change");
     assert!(matches!(err, RetainError::Lock { .. }), "{err:?}");
     assert_eq!(Retained::read(&path).expect("read"), before);
+}
+
+fn entry(n: u32, why: &[&'static str], version: Option<String>) -> Kept {
+    Kept {
+        commit: c(&format!("{n:040x}")),
+        version,
+        why: why.to_vec(),
+        version_left_out: false,
+    }
+}
+
+/// Catches a cut that counts entries and not bytes: past the budget no entry is added, the ones
+/// that must stay are listed first, the listing stays newest first, the count of what is left
+/// out is exact, and the array of what is listed fits the budget.
+#[test]
+fn a_cut_fits_its_budget_with_the_releases_that_must_stay_first() {
+    let mut kept: Vec<Kept> = (0..40)
+        .map(|n| entry(n, &[], Some(format!("0.1.{n}+g{n:012x}-1"))))
+        .collect();
+    kept.push(entry(90, &["pinned"], Some("v-pin".to_owned())));
+    kept.push(entry(91, &["current"], Some("v-cur".to_owned())));
+    let budget = 1024;
+    let (listed, omitted) = cut(kept.clone(), 64, budget);
+    let text = serde_json::to_string(&listed).expect("json");
+    assert!(text.len() <= budget, "{} bytes", text.len());
+    assert_eq!(listed.len() + omitted, kept.len());
+    assert!(omitted > 0);
+    let names: Vec<String> = listed.iter().map(|k| k.commit.to_string()).collect();
+    assert_eq!(
+        names[names.len() - 2..],
+        [format!("{:040x}", 90), format!("{:040x}", 91)]
+    );
+    let others = listed.len() - 2;
+    assert_eq!(
+        names[..others],
+        (0..others as u32)
+            .map(|n| format!("{n:040x}"))
+            .collect::<Vec<_>>()[..]
+    );
+    let (all, none) = cut(kept.clone(), 64, usize::MAX);
+    assert_eq!((all.len(), none), (kept.len(), 0));
+    let (few, rest) = cut(kept.clone(), 3, usize::MAX);
+    assert_eq!((few.len(), rest), (3, kept.len() - 3));
+}
+
+/// Catches a long version text making an entry, and so the line, as long as the binary
+/// declared it: past [`MAX_LISTED_VERSION`] the text is left out of its entry, which says so,
+/// and the release is still listed; a budget too small for even one entry lists none and counts
+/// them all.
+#[test]
+fn a_version_too_long_to_list_is_left_out_of_its_entry_and_said_so() {
+    let long = "9".repeat(MAX_LISTED_VERSION + 1);
+    let fits = "8".repeat(MAX_LISTED_VERSION);
+    let kept = vec![
+        entry(1, &["current"], Some(long)),
+        entry(2, &[], Some(fits.clone())),
+    ];
+    let (listed, omitted) = cut(kept.clone(), 64, usize::MAX);
+    assert_eq!(omitted, 0);
+    assert_eq!(listed[0].version, None);
+    assert!(listed[0].version_left_out);
+    assert_eq!(listed[1].version.as_deref(), Some(fits.as_str()));
+    assert!(!listed[1].version_left_out);
+    let json = serde_json::to_value(&listed).expect("json");
+    assert_eq!(json[0]["version_left_out"], true);
+    assert!(json[1].get("version_left_out").is_none());
+    let (none, all) = cut(kept, 64, 10);
+    assert_eq!((none.len(), all), (0, 2));
 }

@@ -416,13 +416,15 @@ fn an_upgraded_host_has_the_versions_of_its_releases_in_the_status_and_the_query
 }
 
 /// A confirm whose last good cannot be recorded (the retain file reads, but nothing can be
-/// written beside it) removes nothing: the release it names is older than every kept one, and it
-/// and every surplus release are still there after the confirm, which stands.
+/// written beside it) fails and keeps the release on trial: an operator's gc run then removes
+/// nothing, the named release older than every kept one included. Once the file can be written,
+/// the same confirm records the last good, keeps the release, and the prune keeps that release.
 ///
-/// Catches: a prune that goes on with the last good recorded before, which removes the release
-/// the coordinator now names as the one to go back to.
+/// Catches: a confirm that ends the trial with its last good unrecorded, after which another
+/// program's collection removes the release the coordinator names as the one to go back to; a
+/// confirm asked again that does not record what the first could not.
 #[test]
-fn a_last_good_that_cannot_be_written_removes_nothing() {
+fn a_last_good_that_cannot_be_written_keeps_the_trial_until_it_can() {
     let rig = Rig::new("retain-lg-unwritable");
     for n in 20..28 {
         seed(&rig, &commit_n(n), u64::from(n));
@@ -433,22 +435,58 @@ fn a_last_good_that_cannot_be_written_removes_nothing() {
     fs::write(&file, "{}\n").unwrap();
     stage_and_switch(&rig, &ab, 30);
     // What is written beside the file cannot be made: the file reads, and cannot be replaced.
-    fs::create_dir(file.with_extension("json.new")).unwrap();
+    let aside = file.with_extension("json.new");
+    fs::create_dir(&aside).unwrap();
     let before = dirs(&rig);
     let line = format!("confirm kbf={} last_good={}", version_n(30), version_n(1));
+    let answer = ask(&ab, &line);
+    assert!(
+        matches!(&answer, Answer::Failed(Code::StateUnavailable, why) if why.contains("cannot write")),
+        "{answer:?}"
+    );
+    assert!(
+        rig.state().pending_confirm.is_some(),
+        "the release stays on trial"
+    );
+    let mut out = Vec::new();
+    kbf_installer::release::gc(
+        &mut *rig.backend.exec.borrow_mut(),
+        &rig.layout,
+        2,
+        &std::collections::BTreeSet::new(),
+        kbf_host::plan::Mode::Apply,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(
+        dirs(&rig),
+        before,
+        "an operator's gc on trial removes nothing"
+    );
+    assert!(
+        notes
+            .borrow()
+            .iter()
+            .any(|t| t.ends_with("; the release stays on trial")),
+        "{:?}",
+        notes.borrow()
+    );
+
+    fs::remove_dir(&aside).unwrap();
     assert_eq!(
         ask(&ab, &line),
         Answer::Confirmed {
             version: version_n(30)
         }
     );
-    assert_eq!(dirs(&rig), before, "notes: {:?}", notes.borrow());
-    assert!(dirs(&rig).contains(&commit_n(1)));
-    let told = notes.borrow();
+    assert!(rig.state().pending_confirm.is_none());
+    let recorded = Retained::read(&file).unwrap();
+    assert_eq!(recorded.last_good, Some(id(&commit_n(1))));
+    assert!(dirs(&rig).contains(&commit_n(1)), "{:?}", dirs(&rig));
     assert!(
-        told.iter()
-            .any(|t| t.starts_with("retain: cannot write") && t.ends_with("; removing nothing")),
-        "{told:?}"
+        !dirs(&rig).contains(&commit_n(20)),
+        "the prune ran: {:?}",
+        dirs(&rig)
     );
 }
 

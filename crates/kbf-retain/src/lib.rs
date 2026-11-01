@@ -331,6 +331,61 @@ pub struct Kept {
     /// Why it must stay, if it must: `current`, `previous`, `on_trial`, `pinned`, `last_good`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub why: Vec<&'static str>,
+    /// The version text is longer than a listing carries ([`MAX_LISTED_VERSION`]) and is left
+    /// out: `version` is none for that, not because the host does not know it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub version_left_out: bool,
+}
+
+/// The longest version text a cut listing carries ([`cut`]); a longer one is left out of its
+/// entry, which says so.
+pub const MAX_LISTED_VERSION: usize = 128;
+
+/// At most `max` of the releases `kept` (newest first) whose JSON array fits in `budget` bytes,
+/// and how many are left out. The ones that must stay come first: what runs, what is on trial,
+/// the one before and the last good, then the pinned ones, then the newest others; the listing
+/// stays newest first. A version text longer than [`MAX_LISTED_VERSION`] is left out of its
+/// entry (`version_left_out`), so every entry is small and the budget holds a known number.
+#[must_use]
+pub fn cut(kept: Vec<Kept>, max: usize, budget: usize) -> (Vec<Kept>, usize) {
+    let rank = |k: &Kept| {
+        if k.why.iter().any(|w| *w != "pinned") {
+            0
+        } else if k.why.is_empty() {
+            2
+        } else {
+            1
+        }
+    };
+    let total = kept.len();
+    let mut order: Vec<usize> = (0..total).collect();
+    order.sort_by_key(|&i| (rank(&kept[i]), i));
+    // The two brackets of the array, and a comma before each entry but the first.
+    let mut used = 2;
+    let mut chosen: Vec<(usize, Kept)> = Vec::new();
+    for i in order {
+        if chosen.len() == max {
+            break;
+        }
+        let mut k = kept[i].clone();
+        if k.version
+            .as_ref()
+            .is_some_and(|v| v.len() > MAX_LISTED_VERSION)
+        {
+            k.version = None;
+            k.version_left_out = true;
+        }
+        let size = serde_json::to_string(&k).map_or(usize::MAX, |t| t.len())
+            + usize::from(!chosen.is_empty());
+        if used + size > budget {
+            break;
+        }
+        used += size;
+        chosen.push((i, k));
+    }
+    chosen.sort_by_key(|(i, _)| *i);
+    let omitted = total - chosen.len();
+    (chosen.into_iter().map(|(_, k)| k).collect(), omitted)
 }
 
 /// What a host knows of the releases it holds, for [`listing`].
@@ -375,6 +430,7 @@ pub fn listing(found: &[(CommitId, SystemTime)], known: &Known<'_>) -> Vec<Kept>
                 commit: commit.clone(),
                 version: retained.and_then(|r| r.versions.get(commit).cloned()),
                 why,
+                version_left_out: false,
             }
         })
         .collect()

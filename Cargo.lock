@@ -3113,6 +3113,7 @@ dependencies = [
  "kbf-host-install",
  "kbf-peer",
  "kbf-proto",
+ "kbf-retain",
  "kbf-testkit",
  "kbf-types",
  "libc",

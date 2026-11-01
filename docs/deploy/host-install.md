@@ -684,7 +684,10 @@ On a Mac, the ssh path's apply removes them once the new daemon is welcomed, kee
 unless the socket has a swap on trial (its marker is there) or another install or switch holds
 the install lock; the audit log gets a `prune` line with what was kept and removed (`pruned`) or
 why nothing could be (`prune_failed`). A confirm whose `last_good` cannot be recorded (the listing or the file cannot
-be read or written, or its 12 digits name two releases) removes nothing, and the log says why.
+be read or written, or its 12 digits name two releases) fails with `state_unavailable` and the
+release stays on trial, so no collection removes anything; the log says why. The confirm asked
+again, once the last good can be recorded, keeps the release. The last good is recorded before the
+trial ends, so a collection run by any program right after the confirm keeps it.
 
 What must stay besides the links is in `retain.json`, beside the installer's state (Linux,
 `/var/lib/kbf-installer/retain.json`) or in the work directory (Mac): `pinned` (a list of
@@ -697,8 +700,9 @@ release that kept versions only in the helper's own state, the helper copies the
 
 `query` lists the kept releases, newest first, as `releases`: one object per release with its
 `commit`, its `version` (null when the host does not know it) and `why` it must stay (`current`,
-`previous`, `on_trial`, `pinned`, `last_good`; left out for one of the newest others). At most 64
-are listed: the ones that must stay first (what runs, what is on trial, the one before, the last
+`previous`, `on_trial`, `pinned`, `last_good`; left out for one of the newest others). A version
+text longer than 128 bytes is left out of its entry, which then has `version_left_out: true`. At
+most 64 are listed, in at most 10 KiB: the ones that must stay first (what runs, what is on trial, the one before, the last
 good, then the pinned ones), then the newest others; `releases_omitted` counts any left out, and
 is absent when none is. When the releases cannot be listed (`retain.json` or `releases/` cannot be
 read), `releases` is left out and `releases_unavailable` is `true`; a host with nothing to list

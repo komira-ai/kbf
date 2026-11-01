@@ -511,3 +511,39 @@ fn a_query_that_lists_the_kept_releases_reads_as_before() {
     assert_eq!(state.node_id.as_deref(), Some("n1"));
     assert!(!state.busy);
 }
+
+/// Catches a helper's query that this agent cannot read whole: 70 releases that must stay, each
+/// with a version text as long as a binary may declare, cut as the helper cuts them and answered
+/// on the socket, are read by the agent's reader within its limit, the host as before.
+#[test]
+fn a_full_listing_of_long_versions_is_read_within_the_answer_limit() {
+    use kbf_host_install::contract::local::{LISTED_BYTES, MAX_LISTED};
+    let d = dir("lc-long");
+    let kept: Vec<kbf_retain::Kept> = (0..70_u32)
+        .map(|n| kbf_retain::Kept {
+            commit: kbf_retain::CommitId::new(&format!("{n:040x}")).unwrap(),
+            version: Some(format!("0.1.{n}+g{n:012x}-1{}", "x".repeat(4000))),
+            why: vec!["pinned", "last_good"],
+            version_left_out: false,
+        })
+        .collect();
+    let (releases, releases_omitted) = kbf_retain::cut(kept, MAX_LISTED, LISTED_BYTES);
+    assert!(releases_omitted > 0 && releases.iter().all(|k| k.version_left_out));
+    let view = QueryView {
+        commit: Some(COMMIT_A.into()),
+        version: Some(VA.into()),
+        node_id: Some("n1".into()),
+        pending: None,
+        last: None,
+        busy: false,
+        releases,
+        releases_omitted,
+        releases_unavailable: false,
+    };
+    let text = line(&Answer::Queried(view)).unwrap();
+    assert!(text.len() < 16 * 1024, "{} bytes", text.len());
+    let (socket, _) = serve(&d, 1, move |_| Some(text.clone()));
+    let state = SocketLocal::new(&socket, limits()).query().unwrap();
+    assert_eq!(state.commit.as_deref(), Some(COMMIT_A));
+    assert_eq!(state.version, Some(version(VA)));
+}

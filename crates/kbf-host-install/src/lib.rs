@@ -123,6 +123,7 @@ pub mod contract {
     /// mode of `kbf-updater`, which reads the answers and writes the requests.
     pub mod local {
         pub use crate::local::answer::{Answer, Code, LastView, PendingView, QueryView};
+        pub use crate::local::core::{LISTED_BYTES, MAX_LISTED};
         pub use crate::local::frontend::config::FrontendConfig;
         pub use crate::local::serve::ServeConfig;
 
