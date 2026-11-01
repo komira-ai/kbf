@@ -863,3 +863,34 @@ fn halts_on_disk_round_trip_and_bad_files_are_errors() {
     let _agent = rig.announcing();
     assert!(rig.logged("a halt on disk is ignored"));
 }
+
+/// Catches: a halt whose file the directory does not take being lost silently, or taken as not
+/// held: the hold is kept in memory and the log says the file was not written.
+#[test]
+fn a_halt_that_cannot_be_recorded_is_logged_and_held() {
+    let rig = Rig::new("hold-halt-no-dir");
+    rig.coordinator.advertise(&["halt-v1"]);
+    rig.cannot_go_back();
+    let agent = rig.announcing_in(rig.dir.join("missing"));
+    rig.take_order(&agent);
+    assert!(rig.logged("the halt could not be recorded on disk"));
+    rig.clock.advance(Duration::from_secs(RETRY));
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 1, "still held in memory");
+}
+
+/// Catches: a lift that fails on the file ending the lift: the hold is lifted in memory and the
+/// log says the file stayed.
+#[test]
+fn a_lift_whose_file_cannot_be_removed_is_logged_and_lifts() {
+    let rig = Rig::new("hold-halt-stuck-file");
+    let agent = halted_under(&rig, Some(3));
+    std::fs::remove_file(rig.dir.join("halt-kbf")).unwrap();
+    std::fs::create_dir_all(rig.dir.join("halt-kbf").join("x")).unwrap();
+    rig.coordinator.set_halts(&[("kbf", 4)]);
+    agent.beat_once();
+    assert!(rig.logged("the halt on disk could not be removed"));
+    rig.clock.advance(Duration::from_secs(RETRY));
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 2);
+}
