@@ -2246,8 +2246,8 @@ derived\tfill:a:p50\t9.99\tms\tstale\ta\nraw\tlast.row\t8\tms\tby hand\n";
     /// row naming it is a finding; a cell citing another table is not ours to look up.
     #[test]
     fn check_follows_data_result_to_the_table() {
-        let html = "<i data-cell=\"a\" data-source=\"x.json#p50\" data-result=\"r.tsv\">1</i>\
-<i data-cell=\"b\" data-source=\"x.json#p50\" data-result=\"r.tsv\">2</i>\
+        let html = "<i data-cell=\"a\" data-source=\"cold-put-instance-a1.json#p50\" data-result=\"r.tsv\">1</i>\
+<i data-cell=\"b\" data-source=\"cold-put-instance-a1.json#p50\" data-result=\"r.tsv\">2</i>\
 <i data-cell=\"c\" data-result=\"phase-b.tsv\">3</i>";
         let m = mappings(&format!(
             "[{},{},{}]",
