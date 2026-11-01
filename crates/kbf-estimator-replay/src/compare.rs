@@ -39,9 +39,10 @@
 //! with its own run id and the same operation and lease. Each invocation's build counts it (it
 //! did wait); the attempt counts, queue wait, kill rates and phases count the attempt
 //! (operation and lease) once per arm, from its first copy, and the CI-job view once per job.
-//! A row that names no operation or no lease (or the zero lease `0.0` of an attempt never
-//! granted one), as in an export that predates them, is its own attempt: such an export keeps
-//! the old counting, one per waiter.
+//! A row that names no operation or no lease, as in an export that predates them, is its own
+//! attempt: such an export keeps the old counting, one per waiter. A lease of `0.0` is a
+//! lease: the export writes the record's fields for every attempt, a record exists only from
+//! a grant, and a store's first lease sequence is 0.
 //!
 //! **Phases**: input fetch, execution and pack (the output upload) of each attempt, from its
 //! run record. A run record says whether a daemon measured them (`measured`, which a row with
@@ -140,25 +141,17 @@ fn percentiles(values: Vec<u64>) -> Percentiles {
     builds::spread(values)
 }
 
-/// The lease an attempt that was never granted one exports (`<epoch>.<seq>` of the zero
-/// record fields). The record keeps no other marker: it is such an attempt's own, not a
-/// lease that two rows share.
-const NO_LEASE: &str = "0.0";
-
 /// `rows` with one row for each attempt within `scope` (the arm when it gives `None`, else
 /// the CI job): a joined operation is exported once per waiting invocation, each copy with
 /// its own run id and the same operation and lease, and the first copy in the scope stands
-/// for the attempt. A row that names no operation or no lease, or the zero lease of an
-/// attempt never granted one (an export that predates them, or a refusal before a grant), is
-/// its own attempt, as it was counted before.
+/// for the attempt. A row that names no operation or no lease (an export that predates them)
+/// is its own attempt, as it was counted before.
 fn once_per_attempt<'a>(rows: &'a [Row], scope: fn(&Row) -> Option<&str>) -> Cow<'a, [Row]> {
     let mut seen = BTreeSet::new();
     let keep: Vec<bool> = rows
         .iter()
         .map(|row| match (&row.operation, &row.lease) {
-            (Some(operation), Some(lease)) if lease != NO_LEASE => {
-                seen.insert((scope(row), operation, lease))
-            }
+            (Some(operation), Some(lease)) => seen.insert((scope(row), operation, lease)),
             _ => true,
         })
         .collect();
