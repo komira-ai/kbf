@@ -335,6 +335,7 @@ impl Farm {
             reports: AtomicUsize::new(0),
             ambient,
             settings,
+            usage_profiles: crate::UsageProfiles::default(),
             driver: Driver::Js(Box::new(js)),
         }
     }

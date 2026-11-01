@@ -175,6 +175,8 @@ pub struct Farm {
     ambient: Ambient,
     /// What the `with_*` builders set.
     settings: Settings,
+    /// The `--usage-profiles` mode, which the start line and the gauge report.
+    usage_profiles: crate::UsageProfiles,
     /// The engine every method reaches the farm's state through.
     driver: Driver,
 }
@@ -323,6 +325,7 @@ impl Farm {
             reports: AtomicUsize::new(0),
             ambient,
             settings: Settings::default(),
+            usage_profiles: crate::UsageProfiles::default(),
             driver: Driver::legacy(State {
                 engine: Engine::new(sched, finished_retention, ambient),
                 side: Side::new(term, ambient),
