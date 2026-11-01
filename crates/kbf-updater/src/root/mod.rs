@@ -33,7 +33,7 @@ pub mod releases;
 pub mod socket;
 
 use std::collections::BTreeMap;
-use std::fs::DirBuilder;
+use std::fs::{self, DirBuilder};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, chown};
 use std::os::unix::net::UnixStream;
@@ -51,7 +51,7 @@ use update_hook::{Params, Verdict};
 use update_rights::declaration::MAX_CEILING_SECS;
 use update_rights::{
     Accounts, Declared, EtcAccounts, Loaded, Policy, Refused, Spawner, Systemd, boot_unit_name,
-    load_dir, run_boot,
+    check_state_dir, load_dir, run_boot,
 };
 
 use self::declare::{Decision, Place};
@@ -540,6 +540,38 @@ impl RootPart {
         }
     }
 
+    /// After a boot, reads every step record under the state directory with
+    /// [`boot::read_as_killed`]: those of the declared services and those of services whose
+    /// declaration the load refused, which an update may have left unfinished all the same. Run
+    /// before the start pass and before the agent is served, so no update of a service is running.
+    /// The services whose record could not be read, and why.
+    pub fn read_after_boot(&self) -> Vec<(String, String)> {
+        let entries = match fs::read_dir(&self.config.state) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) => return vec![(String::new(), e.to_string())],
+        };
+        let mut unread = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    unread.push((String::new(), e.to_string()));
+                    continue;
+                }
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+            if !is_dir || !update_rights::names::is_service_name(&name) {
+                continue;
+            }
+            if let Err(e) = boot::read_as_killed(&RecordStore::new(&entry.path())) {
+                unread.push((name, e.to_string()));
+            }
+        }
+        unread
+    }
+
     /// The start pass of one service: after a boot (`first_since_boot`) a step the boot cut off
     /// is read as killed ([`boot::read_as_killed`]); an update the record holds unfinished is run
     /// to its verdict; then the declaration's boot entry runs, from the release of the last
@@ -610,6 +642,14 @@ impl RootPart {
             .check(Path::new(binary))
             .map_err(|e| ("artifact", e.to_string()))?;
         make_record_dir(&declared).map_err(|e| ("internal", text(e)))?;
+        // As before every step (`launch::HookLauncher`): the record directory is checked again,
+        // on what it is now; one the service's account can write runs nothing.
+        check_state_dir(
+            &declared.declaration().state_dir,
+            declared.service().uid,
+            declared.service_gids(),
+        )
+        .map_err(|e| ("boot", e.to_string()))?;
         self.launcher
             .stop(&boot_unit_name(service, generation))
             .map_err(|e| ("boot", e.to_string()))?;
@@ -712,15 +752,31 @@ fn serve(
         })?;
         root.serve_registrations(&register.socket, gid)?;
     }
-    let first = boot::boot_changed(&state, &*clock);
+    // After a boot every record is read first, the services refused at the load included: a
+    // record the boot cut off is read as killed before any update is resumed. The boot id is
+    // written only once every record was read, so a start that could not read one reads it after
+    // a boot again; a service whose record was not read is not started in this pass.
+    let unread = if boot::boot_changed(&state, &*clock) {
+        root.read_after_boot()
+    } else {
+        Vec::new()
+    };
+    for (service, why) in &unread {
+        eprintln!("kbf-updater root: {service}: the record was not read after the boot: {why}");
+    }
     for service in root.services() {
-        let started = root.start(&service, first);
+        if unread.iter().any(|(name, _)| *name == service) {
+            continue;
+        }
+        let started = root.start(&service, false);
         eprintln!(
             "kbf-updater root: {service}: {}",
             serde_json::to_string(&started).unwrap_or_default()
         );
     }
-    boot::commit_boot(&state, &*clock).map_err(text)?;
+    if unread.is_empty() {
+        boot::commit_boot(&state, &*clock).map_err(text)?;
+    }
     let listener = socket::bind(&flags.socket, agent.uid, agent.gid).map_err(text)?;
     let stop = Stop {
         flag: Arc::new(AtomicBool::new(false)),

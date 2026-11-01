@@ -652,12 +652,13 @@ fn kbf_updater_approve_is_the_update_rights_command() {
     assert!(text.contains("usage: approve"), "{text}");
 }
 
-/// Catches the start of the root part skipping a service, or serving the agent before the start
-/// pass: with a good declaration and a refused one, it serves the registrations, reads the good
-/// service's record (writing the boot id only after that), binds the agent's socket for the
-/// account named and answers the agent until stopped.
+/// Catches a root part that does not start beside a refused declaration: with a good declaration
+/// and a refused one, it serves the registrations, writes the boot id of its start pass before it
+/// answers, binds the agent's socket for the account named and answers the agent until stopped.
+/// (That the start pass runs before the agent is answered: `root_part.rs`,
+/// `the_root_part_rolls_back_a_cutover_a_boot_cut_off_before_it_answers_the_agent`.)
 #[test]
-fn the_root_part_runs_the_start_pass_before_it_answers_the_agent() {
+fn the_root_part_serves_the_registrations_and_the_agent_beside_a_refused_declaration() {
     let world = World::new("serve-start");
     world.declare("svc", &world.tierstore_shaped());
     put(&world.path("updater.d/other.toml"), b"x", 0o666);

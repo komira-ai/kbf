@@ -8,13 +8,15 @@
 mod root_support;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use kbf_step_runner::CrashPoint;
-use kbf_updater::root::RootPart;
-use kbf_updater::root::socket::Answer;
-use root_support::{World, my_uid, property, word};
+use kbf_step_runner::{Clock, CrashPoint};
+use kbf_updater::root::socket::{self, Answer, Request};
+use kbf_updater::root::{RootPart, boot};
+use root_support::{FakeClock, World, my_uid, property, word};
 use update_hook::{Class, Phase, Step, Verdict};
 
 const SUCCEEDED: Verdict = Verdict::Succeeded {
@@ -729,16 +731,181 @@ fn a_killed_update_keeps_the_declaration_it_installed_until_its_verdict() {
     assert!(!world.path("state/svc/declaration.previous").exists());
 }
 
-/// Catches a service run with no dead-man on a host: the root part gives each service's runner a
-/// dead-man thread on the real clock, and an update runs to its verdict beside it.
+/// A clock whose dead-man polls are counted: a sleep of the dead-man's interval is a poll, and
+/// waits a little on the real clock so the dead-man's loop does not spin; any other sleep moves
+/// the fake clock.
+struct PollClock {
+    fake: Arc<FakeClock>,
+    poll_secs: u64,
+    polls: AtomicU64,
+}
+
+impl Clock for PollClock {
+    fn mono_secs(&self) -> u64 {
+        self.fake.mono_secs()
+    }
+
+    fn boot_id(&self) -> String {
+        self.fake.boot_id()
+    }
+
+    fn sleep_secs(&self, secs: u64) {
+        if secs == self.poll_secs {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(10));
+        } else {
+            self.fake.sleep_secs(secs);
+        }
+    }
+}
+
+/// Catches a service run with no dead-man: the root part gives each service's runner a dead-man
+/// thread that polls at the interval it was given, and an update runs to its verdict beside it.
 #[test]
-fn each_service_gets_a_dead_man_on_a_real_clock() {
+fn each_service_gets_a_dead_man_that_polls_at_its_interval() {
     let world = World::new("deadman");
     world.declare("svc", &world.tierstore_shaped());
     world.stage("svc", "1.0.0", None);
+    let clock = Arc::new(PollClock {
+        fake: FakeClock::new(),
+        poll_secs: 3600,
+        polls: AtomicU64::new(0),
+    });
     let mut parts = world.parts(None);
-    parts.clock = Arc::new(kbf_step_runner::SystemClock);
+    parts.clock = clock.clone();
     parts.deadman_poll_secs = Some(3600);
     let root = RootPart::new(world.config(), parts).unwrap();
     assert_eq!(verdict(&root.update("svc", "1.0.0")), SUCCEEDED);
+    // Waits for the dead-man's first poll; a bound on the number of looks, not on time.
+    let polled = (0..3000).any(|_| {
+        let seen = clock.polls.load(Ordering::SeqCst) > 0;
+        if !seen {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        seen
+    });
+    assert!(polled, "no dead-man polled for svc");
+}
+
+/// Catches a boot entry run with a record directory the service's account can write: the check
+/// every step gets before its launch is made before the boot entry too, and nothing is launched.
+#[test]
+fn a_boot_entry_whose_record_directory_the_service_can_write_runs_nothing() {
+    let world = World::new("boot-state");
+    world.declare("svc", &world.tierstore_shaped());
+    world.stage("svc", "1.0.0", None);
+    assert_eq!(
+        verdict(&world.root_part().update("svc", "1.0.0")),
+        SUCCEEDED
+    );
+    let launched = world.launched().len();
+    // Opened to the service's account after the update, before the next start.
+    root_support::dir(&world.hook_dir("svc"), 0o777);
+    let started = world.root_part().start("svc", false);
+    assert_eq!(started.token(), Some("boot"), "{started:?}");
+    assert!(
+        started.error.as_deref().unwrap_or_default().contains("can be written"),
+        "{started:?}"
+    );
+    assert_eq!(world.launched().len(), launched);
+}
+
+/// `kbf-updater root` as a host starts it (`run_config`), over `world`, with the agent's socket in
+/// it: `at_ready` runs when the root part is about to answer the agent, then the agent asks for
+/// the status of `svc` and the root part is stopped. The answer.
+fn serve_once(world: &World, at_ready: impl FnOnce()) -> Answer {
+    let socket = world.path("root.sock");
+    let flags = kbf_updater::root::flags::parse(&[
+        "--socket".to_owned(),
+        socket.display().to_string(),
+        "--socket-user".to_owned(),
+        "me".to_owned(),
+    ])
+    .unwrap();
+    let (sent, answered) = std::sync::mpsc::channel();
+    let (code, text) =
+        kbf_updater::root::run_config(&flags, world.config(), world.parts(None), move |stop| {
+            at_ready();
+            std::thread::spawn(move || {
+                let answer = socket::request(
+                    &socket,
+                    &Request::Status {
+                        service: "svc".to_owned(),
+                    },
+                );
+                stop.stop();
+                sent.send(answer.map_err(|e| e.to_string())).unwrap();
+            });
+        });
+    assert_eq!((code, text.as_str()), (0, ""));
+    answered.recv().unwrap().unwrap()
+}
+
+/// The boot id of the last start pass, as the root part wrote it.
+fn committed_boot_id(world: &World) -> String {
+    fs::read_to_string(world.path("state").join(boot::BOOT_ID_FILE)).unwrap_or_default()
+}
+
+/// Catches a root part that answers the agent before its start pass, or that does not read the
+/// boot the way a host starts it: `kbf-updater root` started after a boot finds the update to
+/// 2.0.0 cut off before its `cutover`, rolls it back and runs the boot entry from 1.0.0, all
+/// before it answers the agent, and only then writes the new boot id.
+#[test]
+fn the_root_part_rolls_back_a_cutover_a_boot_cut_off_before_it_answers_the_agent() {
+    let world = pending_cutover_world("serve-boot");
+    boot::commit_boot(&world.path("state"), &*world.clock).unwrap();
+    let before = world.steps("svc").len();
+    world.clock.reboot("boot-b");
+    let mut at_ready = None;
+    let answer = serve_once(&world, || {
+        at_ready = Some((
+            world.steps("svc")[before..].to_vec(),
+            world.record("svc")["state"].clone(),
+        ));
+    });
+    let (steps, state) = at_ready.unwrap();
+    assert_eq!(steps, ["rollback", "restore"]);
+    assert_eq!(state["state"], "finished", "{state}");
+    assert_eq!(
+        serde_json::from_value::<Verdict>(state["verdict"].clone()).unwrap(),
+        Verdict::Failed {
+            phase: Phase::BeforeCommit,
+            class: Class::Release
+        },
+        "{state}"
+    );
+    assert!(answer.ok, "{answer:?}");
+    assert_eq!(committed_boot_id(&world), "boot-b");
+}
+
+/// Catches a boot rule kept only for the services whose declaration loaded: after a boot the
+/// root part reads the record of a service whose declaration is refused as well, so the
+/// `cutover` the boot cut off is rolled back once the declaration is put right, in the same boot,
+/// and not run forward.
+#[test]
+fn a_cutover_a_boot_cut_off_is_rolled_back_even_when_its_declaration_was_refused_at_boot() {
+    let world = pending_cutover_world("boot-refused");
+    boot::commit_boot(&world.path("state"), &*world.clock).unwrap();
+    let file = world.path("updater.d/svc.toml");
+    let mode = |m: u32| fs::set_permissions(&file, fs::Permissions::from_mode(m)).unwrap();
+    // Open to everyone: the load refuses it.
+    mode(0o666);
+    world.clock.reboot("boot-b");
+    let before = world.steps("svc").len();
+    serve_once(&world, || {});
+    assert_eq!(world.steps("svc").len(), before, "a refused service runs nothing");
+    assert_eq!(world.record("svc")["state"]["state"], "done");
+    assert_eq!(committed_boot_id(&world), "boot-b");
+    // Put right in the same boot; the root part restarted.
+    mode(0o644);
+    let started = world.root_part().start("svc", false);
+    assert_eq!(
+        started.verdict,
+        Some(Verdict::Failed {
+            phase: Phase::BeforeCommit,
+            class: Class::Release
+        }),
+        "{started:?}"
+    );
+    assert_eq!(&world.steps("svc")[before..], ["rollback", "restore"]);
 }
