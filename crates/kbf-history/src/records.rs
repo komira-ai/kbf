@@ -375,6 +375,11 @@ pub struct RunRecord {
     pub booked_millicpus: Option<u64>,
     /// The scheduler's operation the attempt belonged to: every attempt of one operation
     /// (a ladder of memory bookings) carries the same one, so they can be regrouped.
+    /// Unique over one state store: every frontend of the store, on either scheduler core,
+    /// numbers operations from blocks it reserves with a compare-and-set on the store's
+    /// shared counter (`meta/next_op`), so ids do not repeat across frontends or restarts.
+    /// A server with no state store numbers from its own counter, which starts again at a
+    /// restart: its ids are unique within one process only.
     /// Absent: a record written before the field, or a row that named none. Fields 43 on
     /// follow the estimator's usage fields (39 to 42).
     #[prost(uint64, optional, tag = "43")]
@@ -392,6 +397,18 @@ pub struct RunRecord {
     /// The number of distinct files of the input tree; absent as `input_bytes` is.
     #[prost(uint64, optional, tag = "47")]
     pub input_files: Option<u64>,
+    /// The invocation the attempt's request belonged to: the client's `tool_invocation_id`
+    /// of the Execute call that queued or joined the operation. Absent: a record written
+    /// before the field. Fields 48 and 49 follow the submit evidence (43 to 47).
+    #[prost(string, optional, tag = "48")]
+    pub invocation_id: Option<String>,
+    /// The group of invocations (a CI job) this one is part of: its
+    /// `correlated_invocations_id`, when the client sent one. Absent is not empty: no call of the invocation named one, or the
+    /// record predates the field. It is a snapshot taken when the attempt ended (the first
+    /// non-empty value seen by then), while the live read of a run uses the current one: an
+    /// invocation whose early calls sent none can have records without it and later ones with.
+    #[prost(string, optional, tag = "49")]
+    pub correlated_invocations_id: Option<String>,
     /// Where the three phase durations of `timestamps` came from. `Unspecified` is a record
     /// written before the field, which reads as measured. Field 50: fields 48 and 49 are taken
     /// by the invocation ids (#2200).

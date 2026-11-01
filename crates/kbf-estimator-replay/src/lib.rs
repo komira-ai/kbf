@@ -44,6 +44,17 @@
 //! carries no concurrent-lease count, and a run with no pressure reading is counted apart and
 //! never imputed.
 //!
+//! # Per-build numbers
+//!
+//! A row carries the invocation (`tool_invocation_id`, one buck2 command) and, when the
+//! client sent one, the CI job (`correlated_invocations_id`) of the Execute request its
+//! attempt belonged to, as the server's run record holds them ([`row::Row`]). [`builds`]
+//! turns rows into per-build numbers (the server's action span, the queue time total, the
+//! attempt queue wait distribution) and into per-run values shaped for `js-analysis`'s
+//! `RunRecord`. The action span excludes the client's own analysis and local actions: the
+//! paper's build wall comes from the client. A row from a server that predates the ids has
+//! none, and no build is made of it.
+//!
 //! # The two-arm comparison
 //!
 //! `kbf-estimator-replay compare --arm-a DIR --arm-b DIR [--json]` reads two exports and
@@ -58,6 +69,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod builds;
 pub mod cli;
 pub mod compare;
 pub mod export;

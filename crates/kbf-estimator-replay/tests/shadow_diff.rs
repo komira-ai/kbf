@@ -63,6 +63,8 @@ impl Rec {
             operation: None,
             booked_millicpus: None,
             node_cpu_pressure_centi: None,
+            invocation_id: None,
+            correlated_invocations_id: None,
         }
     }
 

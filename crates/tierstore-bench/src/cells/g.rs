@@ -468,7 +468,7 @@ fn cleanup(stored: Vec<Arc<Stored>>, server: FileServer, root: PathBuf) -> Hook 
 /// [`BenchError`] if the tree cannot be set up, the objects cannot be written, the ledger
 /// refuses the cell, the load gate trips or cannot be read, or a file or the request log fails.
 pub async fn run(ctx: &CellContext, plan: &CellPlan) -> Result<Vec<CellResult>, BenchError> {
-    run_with(ctx, plan, Arc::new(ProcLoad), None).await
+    run_with(ctx, plan, Arc::new(ProcLoad::new()), None).await
 }
 
 /// [`run`] with the machine given and the tree cut to `limit` files (of the paper's mean size).
@@ -500,6 +500,7 @@ mod tests {
             in_flight: in_flight.to_vec(),
             object_bytes: vec![],
             open_loop: true,
+            multipart_objects: None,
         }
     }
 

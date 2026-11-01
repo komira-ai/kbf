@@ -274,6 +274,54 @@ pub struct PassResult {
     /// pass realised of the width it was asked for.
     #[serde(default)]
     pub peak_in_flight: u32,
+    /// What the machine that sends the requests looked like while the pass ran: the readings
+    /// taken inside it, and whether the disks had drained when its window opened. Recorded,
+    /// never a reason to stop the pass; absent in results written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_load: Option<PassLoad>,
+}
+
+/// The readings of the load inside one pass. Each is taken over the interval since the previous
+/// reading (the end of the quiet window before the pass for the first), and the pass's own
+/// requests are in all of them: the figures say what the machine did, not whose work it was.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PassLoad {
+    /// How many readings were taken.
+    pub readings: u32,
+    /// The highest share of an interval with some task stalled on CPU, percent.
+    pub peak_psi_cpu_pct: f64,
+    /// The highest share of an interval with some task stalled on IO, percent.
+    pub peak_psi_io_pct: f64,
+    /// The highest utilisation of the busiest disk over an interval, percent.
+    pub peak_disk_util_pct: f64,
+    /// `false` when the wait for the kernel to write out what the pass before left dirty gave up
+    /// at its cap, so the pass was measured on unsettled writeback. Older results say `true`.
+    #[serde(default = "settled")]
+    pub writeback_settled: bool,
+    /// Bytes still dirty or being written (`Dirty` plus `Writeback`) when the wait gave up; none
+    /// when it did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writeback_pending_bytes: Option<u64>,
+}
+
+impl PassLoad {
+    /// No reading yet, and writeback settled.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            readings: 0,
+            peak_psi_cpu_pct: 0.0,
+            peak_psi_io_pct: 0.0,
+            peak_disk_util_pct: 0.0,
+            writeback_settled: true,
+            writeback_pending_bytes: None,
+        }
+    }
+}
+
+/// The default of [`PassLoad::writeback_settled`].
+const fn settled() -> bool {
+    true
 }
 
 /// What the fault proxy forwarded to the store around one pass, by HTTP method. A method with no
@@ -327,6 +375,11 @@ pub struct CellResult {
     /// field existed.
     #[serde(default)]
     pub rate_caps: Option<RateCaps>,
+    /// The counted requests a pass of the arm was set to make: one per object put or read (a
+    /// multipart object is one, its parts are in the request log). What `--multipart-objects`
+    /// changed is read here. Absent in a result written before the field existed.
+    #[serde(default)]
+    pub objects_per_pass: Option<u64>,
 }
 
 impl CellResult {
@@ -503,6 +556,14 @@ mod tests {
                     },
                 )]),
                 peak_in_flight: 7,
+                pass_load: Some(PassLoad {
+                    readings: 3,
+                    peak_psi_cpu_pct: 1.5,
+                    peak_psi_io_pct: 41.0,
+                    peak_disk_util_pct: 100.0,
+                    writeback_settled: true,
+                    writeback_pending_bytes: None,
+                }),
             }],
             notes: vec!["a note".to_owned()],
             cold_state: vec![PassColdState {
@@ -524,6 +585,7 @@ mod tests {
                 hot_rps: 50,
                 list_poll_rps: 2,
             }),
+            objects_per_pass: Some(1000),
         }
     }
 
@@ -576,6 +638,7 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_str(&result().to_json()).unwrap();
         v.as_object_mut().unwrap().remove("cold_state");
         v.as_object_mut().unwrap().remove("rate_caps");
+        v.as_object_mut().unwrap().remove("objects_per_pass");
         v["provenance"].as_object_mut().unwrap().remove("attempt");
         for pass in v["passes"].as_array_mut().unwrap() {
             for field in [
@@ -583,6 +646,7 @@ mod tests {
                 "proxy_requests",
                 "disk_busy",
                 "peak_in_flight",
+                "pass_load",
             ] {
                 pass.as_object_mut().unwrap().remove(field);
             }
@@ -590,16 +654,40 @@ mod tests {
         let old = CellResult::from_json(&v.to_string()).unwrap();
         assert!(old.cold_state.is_empty());
         assert_eq!(old.rate_caps, None);
+        assert_eq!(old.objects_per_pass, None);
         assert_eq!(
             (
                 old.passes[0].proxy_requests.is_none(),
                 old.passes[0].disk_busy.is_empty(),
-                old.passes[0].peak_in_flight
+                old.passes[0].peak_in_flight,
+                old.passes[0].pass_load.is_none()
             ),
-            (true, true, 0)
+            (true, true, 0, true)
         );
         assert_eq!(old.provenance.attempt, 1);
         assert_eq!(old.passes[0].cold_guard, None);
+    }
+
+    /// Catches a pass load written before the writeback fields being refused, or read as unsettled.
+    #[test]
+    fn a_pass_load_without_the_writeback_fields_reads_as_settled() {
+        let mut v: serde_json::Value = serde_json::from_str(&result().to_json()).unwrap();
+        let load = v["passes"][0]["pass_load"].as_object_mut().unwrap();
+        load.remove("writeback_settled");
+        let old = CellResult::from_json(&v.to_string()).unwrap();
+        let load = old.passes[0].pass_load.unwrap();
+        assert_eq!(
+            (load.writeback_settled, load.writeback_pending_bytes),
+            (true, None)
+        );
+        let mut unsettled = result();
+        unsettled.passes[0].pass_load = Some(PassLoad {
+            writeback_settled: false,
+            writeback_pending_bytes: Some(7),
+            ..load
+        });
+        let back = CellResult::from_json(&unsettled.to_json()).unwrap();
+        assert_eq!(back, unsettled);
     }
 
     /// Catches a cold reading whose fields are not flat beside the pass (the shape the report and
