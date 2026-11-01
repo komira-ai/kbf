@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kbf_oidc::{Refusal, Verified, Verifier};
-use kbf_updater::wire::{Heartbeat, Reply, ServiceReply};
+use kbf_updater::wire::{Answer, Heartbeat, Reply, ServiceReply};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
@@ -165,6 +165,14 @@ pub struct Status {
     pub commit: &'static str,
 }
 
+/// The features this coordinator advertises to an agent that announces `agent_features`.
+///
+/// Each name is added in the change that implements what it names (`deferred-v1` here;
+/// `heartbeat-v2` and `halt-v1` follow), so a name is never advertised for behaviour that is
+/// not there. `deferred-v1`: a heartbeat's `deferred` report ends the order, holds no slot and
+/// backs the host off ([`crate::defer`]).
+pub const FEATURES: &[&str] = &["deferred-v1"];
+
 /// The coordinator.
 pub struct Coordinator {
     fleet: Mutex<Fleet>,
@@ -174,6 +182,7 @@ pub struct Coordinator {
     operator_token: String,
     clock: Clock,
     services_dropped: AtomicU64,
+    features: Vec<String>,
 }
 
 impl std::fmt::Debug for Coordinator {
@@ -201,6 +210,7 @@ impl Coordinator {
             operator_token,
             clock,
             services_dropped: AtomicU64::new(0),
+            features: FEATURES.iter().map(|name| (*name).to_owned()).collect(),
         }
     }
 
@@ -209,6 +219,20 @@ impl Coordinator {
     pub fn with_services(mut self, services: Services) -> Self {
         self.services = services;
         self
+    }
+
+    /// The same coordinator advertising `features` instead of [`FEATURES`].
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_features(mut self, features: &[&str]) -> Self {
+        self.features = features.iter().map(|name| (*name).to_owned()).collect();
+        self
+    }
+
+    /// Logs a heartbeat from `who` of which an optional fact was bad and was dropped (`why`
+    /// is the reader's reason): the heartbeat is still answered, without that fact.
+    pub fn note_extras_dropped(&self, who: &Identity, why: &str) {
+        tracing::warn!(node_id = %who.node_id, why, "dropped optional fields of a heartbeat");
     }
 
     /// Counts and logs a heartbeat from `who` whose `services` list was bad and was dropped
@@ -228,7 +252,22 @@ impl Coordinator {
     /// it); services of one priority go `kbf` first, then in the order the host listed them.
     /// The first order is the reply: one update per reply. A host that sent no `services` is
     /// answered about `kbf` alone, in the shape it has always read.
-    pub fn heartbeat(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
+    pub fn heartbeat(&self, who: Identity, beat: Heartbeat) -> Answer {
+        let asked = beat.agent_features.clone();
+        let reply = self.reply_to(who, beat);
+        // Only an agent that announced features gets `features`: an older agent reads the
+        // reply strictly and refuses a field it does not know.
+        let features = (!asked.is_empty()).then(|| {
+            self.features
+                .iter()
+                .filter(|name| asked.contains(name))
+                .cloned()
+                .collect()
+        });
+        Answer { reply, features }
+    }
+
+    fn reply_to(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
         let now = (self.clock)();
         let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         let announced = beat.services.clone().unwrap_or_default();

@@ -67,6 +67,7 @@ impl Extras {
 /// frontend pages cannot differ.
 pub(crate) fn render_farm(out: &mut String, farm: &Farm) {
     crate::scheduler_core::render(out, farm.scheduler_core());
+    crate::usage_profiles::render(out, farm.usage_profiles());
     crate::pack_daemon_metrics::render_farm(out, farm);
     crate::input_cache_metrics::render_farm(out, farm);
     crate::load_metrics::render_farm(out, farm);
