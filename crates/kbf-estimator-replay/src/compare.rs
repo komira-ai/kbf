@@ -52,6 +52,7 @@ use serde_json::{Value, json};
 
 use crate::build_report;
 use crate::builds::{self, BuildStats, GroupBy, RunLabels};
+use crate::phases::{self, PhaseStats};
 use crate::row::Row;
 
 /// What the numbers cannot see. Printed with every report.
@@ -120,6 +121,8 @@ pub struct ArmStats {
     pub out_of_order: u64,
     /// The per-build numbers of rows that name their invocation or build.
     pub builds: BuildStats,
+    /// Fetch, execution and pack per provenance of the phase times.
+    pub phases: PhaseStats,
 }
 
 impl ArmStats {
@@ -195,6 +198,7 @@ pub fn analyze_grouped(rows: &[Row], group: GroupBy) -> ArmStats {
     stats.wall_samples = walls.len() as u64;
     stats.wall = percentiles(walls);
     stats.builds = builds::analyze(rows, group);
+    stats.phases = PhaseStats::default();
     stats
 }
 
@@ -326,6 +330,7 @@ pub fn render_text(a: &ArmStats, b: &ArmStats) -> String {
         "B - A is a difference of two single numbers, not a significance test; the paper's rule needs the 95% Welch CI over runs to exclude 0.\n",
     );
     build_report::rows(&mut out, &a.builds, &b.builds);
+    phases::rows(&mut out, &a.phases, &b.phases);
     out.push_str("Not recorded (not estimated):\n");
     for gap in not_recorded(a, b) {
         let _ = writeln!(out, "  - {gap}");
@@ -355,6 +360,7 @@ fn arm_json(arm: &ArmStats) -> Value {
         "ok_without_end": arm.ok_without_end,
         "out_of_order": arm.out_of_order,
         "builds": build_report::arm_json(&arm.builds),
+        "phases": phases::arm_json(&arm.phases),
     })
 }
 
@@ -396,6 +402,7 @@ pub fn render_json_runs(
             },
             "makespan_us": delta(a.makespan_us, b.makespan_us),
             "builds": build_report::difference_json(&a.builds, &b.builds),
+            "phases": phases::difference_json(&a.phases, &b.phases),
             "kills_per_1000": {
                 "own_limit": rate_delta(
                     a.per_thousand(a.kills.own_limit),

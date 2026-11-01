@@ -296,6 +296,10 @@ fn row_of(v: &Value, nodes: &BTreeMap<String, Node>) -> Result<Row, String> {
         node_cpu_pressure_centi: usage.and_then(|u| u["node_cpu_pressure_centi"].as_u64()),
         invocation_id: str_of(v, "invocation_id").map(str::to_owned),
         correlated_invocations_id: str_of(v, "correlated_invocations_id").map(str::to_owned),
+        phase_times: None,
+        fetch_us: None,
+        execution_us: None,
+        pack_us: None,
     })
 }
 

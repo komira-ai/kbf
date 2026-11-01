@@ -65,6 +65,10 @@ impl Rec {
             node_cpu_pressure_centi: None,
             invocation_id: None,
             correlated_invocations_id: None,
+            phase_times: None,
+            fetch_us: None,
+            execution_us: None,
+            pack_us: None,
         }
     }
 
