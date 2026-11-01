@@ -8,7 +8,7 @@ use update_hook::{Class, Outcome, Scalar, Step};
 
 use super::record::{FILE, SCHEMA};
 use super::testing::{DIGEST, Rig};
-use super::{Setup, main, real, run};
+use super::{Setup, WorldError, main, real, run};
 
 fn s(text: &str) -> String {
     text.to_owned()
@@ -206,13 +206,14 @@ fn a_record_directory_or_record_that_cannot_be_used_ends_the_step() {
 }
 
 /// A world that cannot be built (no certificate, a role without duties) is the environment's
-/// fault, said in the last line; the real wiring of a host without files says which file.
+/// fault, said in the last line; the real wiring of a host without files says which file (one
+/// in the rig's scratch directory that is not there).
 ///
 /// Catches: a step that panics, or fails with no reason, on a host that is not set up.
 #[test]
 fn a_world_that_cannot_be_built_ends_the_step() {
     let rig = Rig::new("hook-run-world");
-    let world = |_: &super::flags::Flags| Err(s("no certificate"));
+    let world = |_: &super::flags::Flags| Err(WorldError::Certificate(s("no certificate")));
     let setup = Setup {
         world: &world,
         before_write: None,
@@ -236,11 +237,36 @@ fn a_world_that_cannot_be_built_ends_the_step() {
         run(&rig.args(Step::Prepare), &setup, &mut out, &mut err),
         Outcome::Failure
     );
-    assert!(
-        String::from_utf8(out)
-            .unwrap()
-            .contains("/etc/kbf/cert.pem")
-    );
+    let line = String::from_utf8(out).unwrap();
+    let cert = rig.dir.join("absent").join("cert.pem");
+    assert!(line.contains(&cert.display().to_string()), "{line}");
+    assert!(line.contains("\"reason\":\"world\""), "{line}");
+}
+
+/// Every path the rig's command line names is in the rig's own scratch directory: no run test
+/// reads (or finds missing) a file of the host's real service directory, so no test's outcome
+/// depends on how the host it runs on is set up.
+///
+/// Catches: a flag that names a host path such as `/etc/kbf/cert.pem`, whose test passes on a
+/// bare machine and fails on a configured host (or the reverse).
+#[test]
+fn the_rigs_command_line_names_no_path_outside_its_scratch_directory() {
+    let rig = Rig::new("hook-run-paths");
+    for step in Step::ALL {
+        let args = rig.args(step);
+        let paths: Vec<&String> = args.iter().filter(|a| a.starts_with('/')).collect();
+        // The record directory, the three certificate files, the params file, and the
+        // artifact of `prepare`.
+        let want = if step == Step::Prepare { 6 } else { 5 };
+        assert_eq!(paths.len(), want, "{step}: {args:?}");
+        for path in paths {
+            assert!(
+                std::path::Path::new(path).starts_with(&rig.dir),
+                "{step}: {path} is outside {}",
+                rig.dir.display()
+            );
+        }
+    }
 }
 
 /// A standard output (and a log) that cannot be written to does not change the exit code.

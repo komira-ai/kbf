@@ -90,20 +90,21 @@ impl Rig {
         ] {
             params.insert(key, Scalar::Text(value));
         }
-        let flags = [
-            "--record-dir",
-            dir.join("record").to_str().expect("a path"),
-            "--channel",
-            "stable",
-            "--client-cert",
-            "/etc/kbf/cert.pem",
-            "--client-key",
-            "/etc/kbf/key.pem",
-            "--ca",
-            "/etc/kbf/ca.pem",
-        ]
-        .map(str::to_owned)
-        .to_vec();
+        // The certificate flags name files that are not there, in the rig's own directory: the
+        // fake world never reads them, and the real wiring finds them missing on every host.
+        let absent = |name: &str| dir.join("absent").join(name).display().to_string();
+        let flags = vec![
+            "--record-dir".to_owned(),
+            dir.join("record").display().to_string(),
+            "--channel".to_owned(),
+            "stable".to_owned(),
+            "--client-cert".to_owned(),
+            absent("cert.pem"),
+            "--client-key".to_owned(),
+            absent("key.pem"),
+            "--ca".to_owned(),
+            absent("ca.pem"),
+        ];
         Rig {
             drain_port: Arc::new(drain.clone()),
             local: FakeLocal::new(&events),
