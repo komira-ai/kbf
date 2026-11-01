@@ -313,7 +313,11 @@ impl Coordinator {
                 .cloned()
                 .collect()
         });
-        Answer { reply, features }
+        Answer {
+            reply,
+            features,
+            halts: Default::default(),
+        }
     }
 
     fn reply_to(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
