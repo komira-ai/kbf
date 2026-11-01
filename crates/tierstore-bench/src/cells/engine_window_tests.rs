@@ -12,6 +12,7 @@ use crate::cells::CellId;
 use crate::cells::coldguard::ColdGuardLimits;
 use crate::cells::engine::{Arm, Env, Pace, Step, result_name, run_cell, work};
 use crate::cells::testkit::{self, MeterScript, Script, counter};
+use crate::coldserver::{ColdServer, decide};
 use crate::coldstate::ColdReading;
 use crate::error::BenchError;
 use crate::requestlog::{RequestLog, RequestRecord};
@@ -85,7 +86,11 @@ fn arm(log: &Arc<RequestLog>, requests: u64, role: Role, latency_us: u64, faulte
 }
 
 fn written(dir: &Path) -> CellResult {
-    let text = std::fs::read_to_string(dir.join(result_name(CellId::ColdPut, "a", 1))).unwrap();
+    written_of(dir, CellId::ColdPut)
+}
+
+fn written_of(dir: &Path, cell: CellId) -> CellResult {
+    let text = std::fs::read_to_string(dir.join(result_name(cell, "a", 1))).unwrap();
     CellResult::from_json(&text).unwrap()
 }
 
@@ -321,22 +326,110 @@ async fn a_hung_cold_store_trips_the_backstop_and_reads_no_counter_after_it() {
     assert_eq!(written(dir.path()).passes[0].cold_window, None);
 }
 
-/// Catches a pass to the hot store being treated as an instance pass: the hot store is the
-/// farm's own, nothing sent to it reaches the cold store, so the pass is the harness's own and
-/// foreign load in its window is judged and stops the run.
+/// An environment whose stores are `stores` and whose cold cluster is `server`.
+fn env_on(
+    dir: &Path,
+    meter: Arc<MeterScript>,
+    stores: &[(Role, &str)],
+    server: ColdServer,
+) -> (Env, Arc<RequestLog>) {
+    let mut ctx = testkit::ctx(dir, stores, Window::Quiet);
+    ctx.config.cold_guard = ColdGuardLimits::default();
+    ctx.cold_meter = Some(meter);
+    ctx.cold_server = server;
+    let log = ctx.log.clone();
+    (Env::new(&ctx, Script::calm()).unwrap(), log)
+}
+
+/// An arm of `requests` requests to the hot store, each written to `log` as a request of the hot
+/// role.
+fn hot_arm(log: &Arc<RequestLog>, requests: u64) -> Arm {
+    let mut hot = arm(log, requests, Role::Hot, 20_000, false);
+    let log = log.clone();
+    hot.work = work(move |_| {
+        let log = log.clone();
+        async move {
+            log.record(&RequestRecord {
+                unix_ms: 5,
+                role: Role::Hot,
+                method: "PUT".to_owned(),
+                bucket: "kbf-fake".to_owned(),
+                key: "k".to_owned(),
+                status: Some(200),
+                latency_us: 20_000,
+                bytes: 10,
+                error_kind: None,
+            })?;
+            Ok(vec![step(Role::Hot, 20_000)])
+        }
+    });
+    hot
+}
+
+const STORES: [(Role, &str); 2] = [
+    (Role::Cold, "http://127.0.0.1:30900"),
+    (Role::Hot, "http://10.0.0.5:30900"),
+];
+
+/// Catches the false trip of a hot-only pass on its own traffic: the hot store is the same
+/// cluster as the cold one at another address (the same deployment id), so its 50 requests are in
+/// the cluster's counter and in the harness's count, and none is foreign.
 #[tokio::test(start_paused = true)]
-async fn a_pass_to_the_hot_store_is_judged() {
-    let dir = temp("tb-window-hot");
+async fn a_hot_pass_on_the_cold_cluster_is_not_foreign() {
+    let dir = temp("tb-window-hot-same");
+    let meter = MeterScript::of(vec![counter(1_000), counter(1_050), counter(1_100)]);
+    let server = decide(true, None, Some(("dep-1", "dep-1")));
+    let (env, log) = env_on(dir.path(), meter, &STORES, server);
+    let results = run_cell(&env, CellId::A1, vec![hot_arm(&log, 50)], 2, None)
+        .await
+        .unwrap();
+    for pass in &results[0].passes {
+        let window = pass.cold_window.clone().unwrap();
+        assert_eq!(
+            (
+                window.minio_requests,
+                window.own_requests,
+                window.foreign_requests
+            ),
+            (50, 50, 0)
+        );
+        assert!(window.judged);
+    }
+}
+
+/// Catches a hot store on another cluster being counted as the harness's own: its requests are in
+/// neither the counter nor the count, and load from elsewhere on the cold cluster still stops the
+/// run.
+#[tokio::test(start_paused = true)]
+async fn a_hot_pass_on_another_cluster_is_not_counted_and_foreign_load_still_trips() {
+    let dir = temp("tb-window-hot-other");
+    let meter = MeterScript::of(vec![counter(1_000), counter(1_000), counter(1_025)]);
+    let server = decide(true, None, Some(("dep-1", "dep-2")));
+    let (env, log) = env_on(dir.path(), meter, &STORES, server);
+    let err = run_cell(&env, CellId::A1, vec![hot_arm(&log, 50)], 3, None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("foreign_requests is 25"), "{err}");
+    let result = written_of(dir.path(), CellId::A1);
+    let first = result.passes[0].cold_window.clone().unwrap();
+    assert_eq!(
+        (first.own_requests, first.foreign_requests, first.judged),
+        (0, 0, true)
+    );
+}
+
+/// Catches a guess about the hot store's cluster: nothing decides it, so the hot pass is
+/// recorded with the reason and not judged, however much the counter grew.
+#[tokio::test(start_paused = true)]
+async fn a_hot_pass_whose_cluster_is_undecided_is_not_judged_and_says_why() {
+    let dir = temp("tb-window-hot-undecided");
     let meter = MeterScript::of(vec![counter(1_000), counter(1_540)]);
-    let (env, log) = env(dir.path(), meter);
-    let err = run_cell(
-        &env,
-        CellId::ColdPut,
-        vec![arm(&log, 40, Role::Hot, 20_000, false)],
-        2,
-        None,
-    )
-    .await
-    .unwrap_err();
-    assert!(err.to_string().contains("foreign_requests is 500"), "{err}");
+    let (env, log) = env_on(dir.path(), meter, &STORES, decide(true, None, None));
+    let results = run_cell(&env, CellId::A1, vec![hot_arm(&log, 40)], 1, None)
+        .await
+        .unwrap();
+    let window = results[0].passes[0].cold_window.clone().unwrap();
+    assert_eq!((window.foreign_requests, window.judged), (540, false));
+    let reason = window.unjudged_reason.unwrap();
+    assert!(reason.contains("could not be told apart"), "{reason}");
 }

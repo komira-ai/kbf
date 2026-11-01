@@ -70,6 +70,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::cells::stats;
+use crate::coldserver::HotServer;
 use crate::coldstate::ColdReading;
 use crate::result::{ColdState, ColdTrip, ColdWindow};
 use crate::role::Role;
@@ -119,6 +120,10 @@ const FAULT_REASON: &str =
 /// Why a pass to a role the guard cannot attribute, and the window after it, are not judged.
 const OTHER_REASON: &str = "a pass sent requests to a role the guard cannot attribute (not hot, cold or instance), or the window after one";
 
+/// Why a pass to the hot store whose cluster is undecided, and the window after it, are not
+/// judged.
+const HOT_REASON: &str = "the hot store's cluster could not be told apart from the cold store's, so its requests may be in the store's counter and not in the tool's count";
+
 /// Whose traffic the requests of a pass were, as far as the harness can tell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Traffic {
@@ -132,6 +137,10 @@ pub enum Traffic {
     /// The pass sent requests to a role the guard cannot attribute (the fault proxy, a test
     /// silo, the generator): kept unjudged, one window, with its own reason.
     Other,
+    /// The pass sent requests to the hot store, and whether the hot store is on the cold
+    /// store's cluster could not be decided: its requests may be in the store's counter and not
+    /// in the harness's count. One window, as `Other`.
+    HotUnknown,
 }
 
 impl Traffic {
@@ -140,7 +149,7 @@ impl Traffic {
     /// the farm's own object store, a bucket of its own, and nothing the bench sends to it is
     /// written to the cold store. Any request to the instance makes it `Instance`, which wins.
     #[must_use]
-    pub fn of(faulted: bool, roles: impl IntoIterator<Item = Role>) -> Self {
+    pub fn of(faulted: bool, roles: impl IntoIterator<Item = Role>, _hot: HotServer) -> Self {
         let (mut instance, mut other) = (false, false);
         for role in roles {
             match role {
@@ -307,6 +316,7 @@ impl ColdGuard {
             Traffic::Faulted => Some(FAULT_REASON),
             Traffic::Instance => Some(INSTANCE_REASON),
             Traffic::Other => Some(OTHER_REASON),
+            Traffic::HotUnknown => Some(HOT_REASON),
         };
         self.instance_seen |= traffic == Traffic::Instance;
         let unjudged_reason = if self.instance_seen {
@@ -891,23 +901,47 @@ mod tests {
     /// the instance is instance traffic, and a role the guard cannot attribute is its own kind.
     #[test]
     fn the_traffic_of_a_pass_is_told_by_the_roles_it_sent_to() {
-        assert_eq!(Traffic::of(false, [Role::Cold]), Traffic::Own);
-        assert_eq!(Traffic::of(false, [Role::Hot]), Traffic::Own);
-        assert_eq!(Traffic::of(false, [Role::Hot, Role::Cold]), Traffic::Own);
-        assert_eq!(Traffic::of(false, []), Traffic::Own);
-        assert_eq!(Traffic::of(false, [Role::Instance]), Traffic::Instance);
         assert_eq!(
-            Traffic::of(false, [Role::Cold, Role::Instance]),
+            Traffic::of(false, [Role::Cold], HotServer::Same),
+            Traffic::Own
+        );
+        assert_eq!(
+            Traffic::of(false, [Role::Hot], HotServer::Same),
+            Traffic::Own
+        );
+        assert_eq!(
+            Traffic::of(false, [Role::Hot, Role::Cold], HotServer::Same),
+            Traffic::Own
+        );
+        assert_eq!(Traffic::of(false, [], HotServer::Same), Traffic::Own);
+        assert_eq!(
+            Traffic::of(false, [Role::Instance], HotServer::Same),
             Traffic::Instance
         );
-        assert_eq!(Traffic::of(true, [Role::Instance]), Traffic::Instance);
-        assert_eq!(Traffic::of(true, [Role::Cold]), Traffic::Faulted);
-        assert_eq!(Traffic::of(false, [Role::Proxy]), Traffic::Other);
         assert_eq!(
-            Traffic::of(false, [Role::Cold, Role::TestSilo]),
+            Traffic::of(false, [Role::Cold, Role::Instance], HotServer::Same),
+            Traffic::Instance
+        );
+        assert_eq!(
+            Traffic::of(true, [Role::Instance], HotServer::Same),
+            Traffic::Instance
+        );
+        assert_eq!(
+            Traffic::of(true, [Role::Cold], HotServer::Same),
+            Traffic::Faulted
+        );
+        assert_eq!(
+            Traffic::of(false, [Role::Proxy], HotServer::Same),
             Traffic::Other
         );
-        assert_eq!(Traffic::of(false, [Role::Generator]), Traffic::Other);
+        assert_eq!(
+            Traffic::of(false, [Role::Cold, Role::TestSilo], HotServer::Same),
+            Traffic::Other
+        );
+        assert_eq!(
+            Traffic::of(false, [Role::Generator], HotServer::Same),
+            Traffic::Other
+        );
     }
 
     /// Catches hot-store passes being unjudged for the rest of the run: after one, a direct pass
@@ -915,7 +949,7 @@ mod tests {
     #[test]
     fn a_pass_to_the_hot_store_does_not_latch_the_instance_rule() {
         let mut guard = opened(ColdGuardLimits::default());
-        let hot = Traffic::of(false, [Role::Hot]);
+        let hot = Traffic::of(false, [Role::Hot], HotServer::Same);
         let (window, trip) = guard.close(read(1_000), 500, hot);
         assert_eq!(trip, None);
         let window = window.unwrap();
@@ -941,6 +975,51 @@ mod tests {
             "{reason}"
         );
         assert!(!reason.contains("copies"), "{reason}");
+        let (second, _) = guard.close(read(2_000), 500, Traffic::Own);
+        assert!(!second.unwrap().judged);
+        let (third, trip) = guard.close(read(2_500), 500, Traffic::Own);
+        assert!(third.unwrap().judged);
+        assert_eq!(trip.unwrap().metric, "foreign_requests");
+    }
+
+    /// Catches a pass to a hot store whose cluster is undecided being judged: it is its own kind,
+    /// whatever else it sent to the cold store; a decided hot store (the same cluster, another,
+    /// or none) is the harness's own traffic, and the instance still wins.
+    #[test]
+    fn a_pass_to_an_undecided_hot_store_is_its_own_kind() {
+        let undecided = HotServer::Undecided;
+        assert_eq!(
+            Traffic::of(false, [Role::Hot], undecided),
+            Traffic::HotUnknown
+        );
+        assert_eq!(
+            Traffic::of(false, [Role::Cold, Role::Hot], undecided),
+            Traffic::HotUnknown
+        );
+        assert_eq!(Traffic::of(false, [Role::Cold], undecided), Traffic::Own);
+        assert_eq!(
+            Traffic::of(false, [Role::Instance, Role::Hot], undecided),
+            Traffic::Instance
+        );
+        for decided in [HotServer::Same, HotServer::Different, HotServer::Absent] {
+            assert_eq!(Traffic::of(false, [Role::Hot], decided), Traffic::Own);
+        }
+    }
+
+    /// Catches the reason of an undecided hot pass being the wrong one: it says the cluster could
+    /// not be told apart, for its window and the next, and does not latch for the run.
+    #[test]
+    fn an_undecided_hot_pass_is_unjudged_with_its_reason() {
+        let mut guard = opened(ColdGuardLimits::default());
+        let (first, trip) = guard.close(read(1_500), 500, Traffic::HotUnknown);
+        assert_eq!(trip, None);
+        let first = first.unwrap();
+        assert!(!first.judged);
+        let reason = first.unjudged_reason.unwrap();
+        assert!(
+            reason.contains("could not be told apart from the cold store's"),
+            "{reason}"
+        );
         let (second, _) = guard.close(read(2_000), 500, Traffic::Own);
         assert!(!second.unwrap().judged);
         let (third, trip) = guard.close(read(2_500), 500, Traffic::Own);

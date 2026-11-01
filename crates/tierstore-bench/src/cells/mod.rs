@@ -149,6 +149,9 @@ pub struct CellContext {
     /// run without the cold admin key (and for the tests that do not need it): the guard then
     /// keeps to the bench's own requests.
     pub cold_meter: Option<Arc<dyn ColdMeter>>,
+    /// The roles whose requests the cold store's request counter counts (see
+    /// [`crate::coldserver`]): their requests are the harness's own count.
+    pub cold_server: crate::coldserver::ColdServer,
 }
 
 /// What the `run` verb asks of a cell; a cell reads the parts it has.

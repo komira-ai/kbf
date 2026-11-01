@@ -294,6 +294,7 @@ pub fn ctx_with_log(
             ..crate::cells::coldguard::ColdGuardLimits::default()
         },
         cold_counter_settle: std::time::Duration::ZERO,
+        cold_cluster_roles: None,
         cold_state_timeout: std::time::Duration::from_secs(30),
         cold_state_max_age: std::time::Duration::from_secs(30),
         rates: RateCaps {
@@ -315,6 +316,7 @@ pub fn ctx_with_log(
         campaign: Campaign { ledger },
         cold_state: Arc::new(NoColdState),
         cold_meter: None,
+        cold_server: crate::coldserver::ColdServer::alone(),
         provenance: Provenance {
             run_id: "test-run".to_owned(),
             ..Provenance::unrecorded()

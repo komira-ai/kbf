@@ -43,6 +43,7 @@ use crate::cells::coldguard::{ColdGuard, Traffic};
 use crate::cells::stats;
 use crate::cells::streamget::{StreamGet, Streamed};
 use crate::cells::{CellContext, CellId};
+use crate::coldserver::ColdServer;
 use crate::coldstate::{ColdMeter, ColdReading, ColdStateSource};
 use crate::config::RunConfig;
 use crate::error::BenchError;
@@ -396,6 +397,7 @@ pub struct Env {
     load: Arc<dyn LoadSource>,
     cold_state: Arc<dyn ColdStateSource>,
     meter: Option<Arc<dyn ColdMeter>>,
+    cold_server: ColdServer,
     guard: Mutex<ColdGuard>,
     cold_cap: Arc<Throttle>,
     hot_cap: Arc<Throttle>,
@@ -424,6 +426,7 @@ impl Env {
             load,
             cold_state: ctx.cold_state.clone(),
             meter: ctx.cold_meter.clone(),
+            cold_server: ctx.cold_server.clone(),
             guard: Mutex::new(ColdGuard::new(ctx.config.cold_guard)),
             cold_cap: Arc::new(Throttle::new(ctx.config.rates.cold_rps)),
             hot_cap: Arc::new(Throttle::new(ctx.config.rates.hot_rps)),
@@ -444,7 +447,7 @@ impl Env {
     async fn read_meter(&self) -> Option<(Result<ColdReading, String>, u64)> {
         let meter = self.meter.as_ref()?;
         let reading = meter.read(self.config.cold_state_timeout).await;
-        Some((reading, self.log.cold_count()))
+        Some((reading, self.log.count_roles(&self.cold_server.roles)))
     }
 
     /// Takes the guard's first reading, once: the trip, if the store is not fit to begin on.
@@ -992,7 +995,11 @@ async fn run_pass(
     // has its trip and the run ends with it. The foreign requests are judged only where every
     // request of the pass was the bench's to the cold role: an instance's own copies to the cold
     // store, and the requests of an arm through the fault proxy, are not told apart from others.
-    let traffic = Traffic::of(arm.faulted, driven.steps.iter().map(|s| s.role));
+    let traffic = Traffic::of(
+        arm.faulted,
+        driven.steps.iter().map(|s| s.role),
+        env.cold_server.hot,
+    );
     let (cold_window, window_trip) = if driven.trip.is_none() && driven.cold_trip.is_none() {
         env.close_window(traffic).await
     } else {

@@ -14,6 +14,7 @@ use crate::cells::armfilter;
 use crate::cells::budget::{Campaign, lock_path};
 use crate::cells::engine::FaultSwitch;
 use crate::cells::{self, CellContext, CellId, CellPlan};
+use crate::coldserver::{self, ColdServer};
 use crate::coldstate::{ColdMeter, ColdStateSource, NoColdState, OpsColdMeter, OpsColdState};
 use crate::config::{ConfigArgs, RunConfig};
 use crate::error::BenchError;
@@ -231,6 +232,7 @@ fn provenance(
     attempt: u32,
     open_loop: bool,
     arms_filter: Option<Vec<String>>,
+    cold_server: Option<ColdServer>,
 ) -> Result<Provenance, BenchError> {
     let path = result_dir.join(preflight::REPORT_FILE);
     let text = std::fs::read(&path).map_err(|source| BenchError::Io { path, source })?;
@@ -241,6 +243,7 @@ fn provenance(
         attempt,
         open_loop,
         arms_filter,
+        cold_server,
         ..report.provenance(run_id, git_sha)
     })
 }
@@ -315,6 +318,7 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
             // Before anything is created: the result directory, the ledger and its lock stay
             // clear of the live tierstore's directories.
             let ops = OpsFile::load(&SystemHost, &config.result_dir)?;
+            let cold_server = coldserver::read(&SystemHost, &ops, &config);
             livedir::check_outside(
                 &[
                     ("result directory", config.result_dir.as_path()),
@@ -335,6 +339,7 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
                 args.attempt,
                 args.open_loop(),
                 args.arms_filter(),
+                Some(cold_server.clone()),
             )?;
             // Before a request is sent: the ledger is begun or found, or the run stops.
             // The lock is held until the arm ends, the run with it.
@@ -358,6 +363,7 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
                 provenance,
                 cold_state: cold_source(&config, &ops),
                 cold_meter: cold_meter(&config, &ops),
+                cold_server,
                 config,
                 log: Arc::new(log),
                 campaign,
@@ -442,11 +448,13 @@ mod tests {
         std::fs::create_dir_all(dir.path()).unwrap();
         let report = serde_json::to_vec(&PreflightReport::default()).unwrap();
         std::fs::write(dir.path().join(preflight::REPORT_FILE), report).unwrap();
-        let of = |open_loop| provenance(dir.path(), "run-1", "abc", 3, open_loop, None).unwrap();
+        let of =
+            |open_loop| provenance(dir.path(), "run-1", "abc", 3, open_loop, None, None).unwrap();
         let (on, off) = (of(true), of(false));
         assert_eq!(on.arms_filter, None);
         let filter = Some(vec!["direct".to_owned()]);
-        let filtered = provenance(dir.path(), "run-1", "abc", 3, true, filter.clone()).unwrap();
+        let filtered =
+            provenance(dir.path(), "run-1", "abc", 3, true, filter.clone(), None).unwrap();
         assert_eq!(filtered.arms_filter, filter);
         assert_eq!((on.open_loop, off.open_loop), (true, false));
         assert_eq!(

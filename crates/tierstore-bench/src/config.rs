@@ -179,6 +179,11 @@ pub struct RunFile {
     /// One entry per store role.
     #[serde(default)]
     pub stores: BTreeMap<Role, StoreFile>,
+    /// The roles whose stores are on the cold store's MinIO cluster (`["hot"]` when the hot store
+    /// is the same cluster at another address). Decides the question for the cold store guard
+    /// without asking either store for its deployment id; see [`crate::coldserver`].
+    #[serde(default)]
+    pub cold_cluster_roles: Option<Vec<Role>>,
 }
 
 /// Caps on the bytes the campaign may write to the cold store, in bytes.
@@ -335,6 +340,8 @@ pub struct RunConfig {
     pub gate: LoadGate,
     /// The cold store guard's limits.
     pub cold_guard: ColdGuardLimits,
+    /// The run file's `cold_cluster_roles`, if it names them.
+    pub cold_cluster_roles: Option<Vec<Role>>,
     /// The wait before each reading of the cold store's request counter.
     pub cold_counter_settle: Duration,
     /// The longest one reading of the cold store's state may take.
@@ -440,6 +447,7 @@ impl RunConfig {
                 max_foreign_requests: args.cold_abort_foreign_requests,
             },
             cold_counter_settle: Duration::from_secs(args.cold_counter_settle_secs),
+            cold_cluster_roles: file.cold_cluster_roles.clone(),
             cold_state_timeout: Duration::from_secs(args.cold_state_timeout_secs),
             cold_state_max_age: Duration::from_secs(args.cold_state_max_age_secs),
             rates: RateCaps {
@@ -570,6 +578,17 @@ mod tests {
                 "access_key_id": "t-hot-id", "secret_access_key": "hot-secret"},
         "cold": {"access_key_id": "t-cold-id", "secret_access_key": "cold-secret",
                  "region": "eu-test-1"}}}"#;
+
+    /// Catches the run file's list of roles on the cold cluster being lost, or defaulted to a
+    /// list: without the key there is none.
+    #[test]
+    fn the_run_file_may_name_the_roles_on_the_cold_cluster() {
+        let cfg = RunConfig::resolve(&args(&[]), None).unwrap();
+        assert_eq!(cfg.cold_cluster_roles, None);
+        let named = file(r#"{"cold_cluster_roles": ["hot"]}"#);
+        let cfg = RunConfig::resolve(&args(&[]), Some(named)).unwrap();
+        assert_eq!(cfg.cold_cluster_roles, Some(vec![Role::Hot]));
+    }
 
     /// Catches a default that drifted from the approved caps and gate (200 GiB campaign, 8 GiB
     /// pass, 20 GiB cell, 100 and 2000 requests per second).

@@ -8,6 +8,7 @@
 //! client made is not. It is the one file of a run that names buckets and keys, so it stays in
 //! the private result directory and is never committed.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -46,7 +47,7 @@ pub struct RequestRecord {
 pub struct RequestLog {
     sink: Mutex<Box<dyn Write + Send>>,
     count: AtomicU64,
-    cold: AtomicU64,
+    by_role: Mutex<BTreeMap<Role, u64>>,
 }
 
 impl RequestLog {
@@ -72,7 +73,7 @@ impl RequestLog {
         Self {
             sink: Mutex::new(Box::new(writer)),
             count: AtomicU64::new(0),
-            cold: AtomicU64::new(0),
+            by_role: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -89,9 +90,12 @@ impl RequestLog {
             .and_then(|()| sink.flush())
             .map_err(BenchError::Log)?;
         self.count.fetch_add(1, Ordering::Relaxed);
-        if record.role == Role::Cold {
-            self.cold.fetch_add(1, Ordering::Relaxed);
-        }
+        *self
+            .by_role
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(record.role)
+            .or_default() += 1;
         Ok(())
     }
 
@@ -101,13 +105,14 @@ impl RequestLog {
         self.count.load(Ordering::Relaxed)
     }
 
-    /// How many of the records written went to the cold role: one per HTTP request this tool
-    /// sent to the cold store, a part of a multipart upload and a retry by the tool's own code
-    /// each counted. The cold store guard subtracts it from the store's own request counter to
-    /// get the requests that came from elsewhere.
+    /// How many of the records written went to one of `roles`: one per HTTP request this tool
+    /// sent to a store of one of them, a part of a multipart upload and a retry by the tool's
+    /// own code each counted. The cold store guard subtracts the count of the roles on the cold
+    /// store's cluster from the cluster's request counter to get the requests from elsewhere.
     #[must_use]
-    pub fn cold_count(&self) -> u64 {
-        self.cold.load(Ordering::Relaxed)
+    pub fn count_roles(&self, roles: &[Role]) -> u64 {
+        let by_role = self.by_role.lock().unwrap_or_else(PoisonError::into_inner);
+        roles.iter().filter_map(|role| by_role.get(role)).sum()
     }
 }
 

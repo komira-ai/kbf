@@ -129,6 +129,10 @@ pub struct Provenance {
     /// a run of every arm, and in a result written before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arms_filter: Option<Vec<String>>,
+    /// The roles whose requests the cold store's request counter counts, and how that was
+    /// decided (see [`crate::coldserver`]); absent in a result written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_server: Option<crate::coldserver::ColdServer>,
 }
 
 /// The open-loop setting of a result that does not name one.
@@ -155,6 +159,7 @@ impl Provenance {
             attempt: first_attempt(),
             open_loop: open_loop_on(),
             arms_filter: None,
+            cold_server: None,
         }
     }
 }
@@ -519,6 +524,11 @@ mod tests {
             attempt: 2,
             open_loop: true,
             arms_filter: Some(vec!["direct".to_owned(), "direct-mp".to_owned()]),
+            cold_server: Some(crate::coldserver::ColdServer {
+                roles: vec![Role::Hot, Role::Cold],
+                hot: crate::coldserver::HotServer::Same,
+                decided_by: crate::coldserver::Basis::DeploymentId,
+            }),
         }
     }
 
@@ -653,6 +663,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("arms_filter");
+        v["provenance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cold_server");
         for pass in v["passes"].as_array_mut().unwrap() {
             for field in [
                 "cold_guard",
@@ -677,6 +691,7 @@ mod tests {
         );
         assert_eq!(old.provenance.attempt, 1);
         assert_eq!(old.provenance.arms_filter, None);
+        assert_eq!(old.provenance.cold_server, None);
         assert_eq!(old.passes[0].cold_guard, None);
         assert_eq!(old.passes[0].cold_window, None);
     }
