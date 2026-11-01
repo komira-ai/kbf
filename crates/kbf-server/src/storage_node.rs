@@ -70,7 +70,7 @@ use kbf_threads::disk::Statvfs;
 use kbf_tls::{TlsFiles, TlsSource};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
-use crate::cold_apply::{ColdPick, Fixed, Registrable};
+use crate::cold_apply::{ColdPick, Fixed, RegisteredOnly, Registrable, explain_prefix};
 use crate::cold_counted::CountedPick;
 use crate::join::{self, Joined, Joiner};
 use crate::listen::Binder;
@@ -417,11 +417,15 @@ impl StorageFlags {
     }
 
     /// Whether the node may hold the keys of a registered cold store: it registers with a
-    /// frontend and its cold store is an `s3://` bucket. Such a node turns off core dumps
-    /// before it starts ([`crate::cold_apply::harden_process`]).
+    /// frontend and its cold store is an `s3://` bucket, or `registered`. Such a node turns
+    /// off core dumps before it starts ([`crate::cold_apply::harden_process`]).
     #[must_use]
     pub fn may_hold_keys(&self) -> bool {
-        self.frontend.is_some() && matches!(self.server.cold_store, Some(StoreUri::S3(_)))
+        self.frontend.is_some()
+            && matches!(
+                self.server.cold_store,
+                Some(StoreUri::S3(_) | StoreUri::Registered)
+            )
     }
 
     /// The `Segments` uploads the node keeps: `--segment-upload-*`.
@@ -648,6 +652,15 @@ where
                 shutdown,
             )
             .await
+        }
+        StoreUri::Registered => {
+            // The registration names the prefix the metadata log keeps its objects under,
+            // so it is fetched before the log opens.
+            let cold = RegisteredOnly::wait(flags).await?;
+            let prefix = cold.prefix_root();
+            over(flags, listener, &stores, (cold, None), &prefix, shutdown)
+                .await
+                .map_err(|error| explain_prefix(error, &prefix))
         }
     }
 }

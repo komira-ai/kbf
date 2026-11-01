@@ -148,6 +148,9 @@ fn s3(args: &Args) -> bool {
 /// S3 store and when `env_pair` (no registration may supply it), the two variables.
 fn cold_keys(n: &mut Needs, args: &Args, env_pair: bool) {
     match &args.cold_store_credentials_file {
+        // A `registered` store takes its keys from the registration only: the start refuses
+        // the file with a message of its own, so the host is not asked to have it.
+        Some(_) if matches!(args.cold_store, Some(StoreUri::Registered)) => {}
         Some(file) => n.secret("--cold-store-credentials-file", file),
         None => n.s3 = s3(args) && env_pair,
     }

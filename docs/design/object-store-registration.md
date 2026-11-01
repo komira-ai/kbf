@@ -118,6 +118,7 @@ Each is an engineering default pending the owner; the question is in section 14.
 | D6 | The secret file is host-local, readable by every frontend of the host, with versioned names. No writer baton and no `not_writer`. One token, loopback gate, no operator and admin split. | Q6 |
 | D7 | Store identity is immutable after the first bind, except through `:repoint` (section 19). | Q7 |
 | D8 | A node with a `--cold-store` flag keeps running on it and reports `identity_mismatch` if the registered identity differs. | Q8 |
+| D9 | `--cold-store registered` names no store: the node waits for the registration, runs on its endpoint, bucket, prefix and keys, and never falls back. Moving a farm to another store is a registration change and a restart of each node. | (the one-store plan) |
 
 ## 5. The control API
 
@@ -257,6 +258,36 @@ so `converged` is false until the node beats again: never a false converged.
 - **Flag precedence.** A node started with `--cold-store` whose identity differs from the
   registered one keeps running on its flag and reports `identity_mismatch`. If the flag
   matches, the registration supplies the keys only.
+- **`--cold-store registered` (D9).** The word is the whole flag: the node holds no URL and no
+  key, and the registration is the one place its store comes from. There is no flag store to
+  compare with, so there is no `identity_mismatch`, and no fallback, so a node with no
+  registration waits and a node whose keys fail the probe stops (`probe_failed` is what the
+  frontend sees of a node that has a store of its own; a registered node has none, so it exits 75
+  and the restart reads what the operator registered next). The node asks before it opens its
+  metadata log, because the log keeps the objects under the registered prefix and refuses to
+  open under another one, so it is no member of the farm while it waits. Nothing else names
+  the store: `--cold-store-credentials-file` is refused at the start, and `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY` and `AWS_ENDPOINT_URL` are not read. It reports
+  the generation it fetched as `ok`; a new generation while it runs is `pending`, and the node
+  takes it at its next start. A changed endpoint is therefore a registration change and a
+  restart of each node, **and it is safe only when the new store already holds every object
+  the node's index names**: the same bucket and prefix, the old endpoint being write-through
+  (for example a write-through cache in front of the same bucket). A node does not check
+  that: an index entry for an object the new store lacks is a read that fails. A changed
+  **bucket is not checked at the start** (the log's `Bootstrap` holds only the prefix), so
+  moving to another bucket, with its objects copied, is the operator's duty. A changed
+  prefix is refused at the start with a message that says so (`PrefixChanged`) and needs an
+  empty `--meta-dir`. While it waits the node says so (`waiting for the registered cold
+  store`, with the frontend) and each failed ask says its attempt, status code and reason;
+  a frontend too old to serve `ColdStore` (`Unimplemented`) is waited for, as is one that is
+  down, while a denied node (`PermissionDenied`, `Unauthenticated`) and a request the
+  frontend calls malformed (`InvalidArgument`, `FailedPrecondition`, `NotFound`) end the start
+  at once, since waiting does not change them. The cold-store HTTP client reads `HTTP_PROXY`,
+  `HTTPS_PROXY` and `ALL_PROXY` from the environment (reqwest's default, for the URL path as
+  for `registered`), and kbf cannot turn that off for one store: the client is built inside
+  the `objstore-s3` crate, which has no such setting. Put the endpoint's host in `NO_PROXY`
+  on a host that sets a proxy. Only a storage node
+  takes the word: the frontend, `all-in-one` and `--history-objects` refuse it.
 - **A bad credential** reaching a node reports `probe_failed`; a node that already had a store
   keeps it.
 - **No fence.** The proxy forwards each stream to one frontend of the pool, so registration
@@ -272,8 +303,8 @@ so `converged` is false until the node beats again: never a false converged.
 - **A newer frontend.** The frontend updates first, so a node meets an N+1 frontend. The node
   ignores unknown fields in `GetStoreConfig` and heartbeat answers, and a generation or
   status it does not understand is reported (`unsupported`), never a crash.
-- **No hot swap.** Rotation reaches a running node at its next start; until then `GET` shows
-  that node `pending`. kbf never restarts itself. A hot swap needs a lock-free load of the
+- **No hot swap.** Rotation reaches a running node at its next start, and so does a new store
+  for a node on `--cold-store registered`; until then `GET` shows that node `pending`. kbf never restarts itself. A hot swap needs a lock-free load of the
   credentials on every request of the S3 path and a performance review, and is not scheduled.
 - **Readiness.** `/readyz` of a node with no store says so by a check name, so an operator
   can tell "no store registered" from "store down" **[V]** in PR E.
@@ -290,13 +321,17 @@ line to touch and moves only `keys.rs`; if the wire unit lands first, #1049 drop
 `cold_store` reader along with `kbf node`. `GetKeys` is replaced, not kept: the client in
 `keys.rs` moves to `GetStoreConfig`, keeping memory-only storage and zeroize.
 
-**[D] Until the deferred open exists, the frontend does write `cold_store`.** A storage node
-cannot open its metadata log without the store's prefix before it registers, so `kbf node`
-still passes `--cold-store`, and `Enroll` and `Renew` answer it from the registration: the URI
+**[D] `kbf node` passes `--cold-store registered`.** The frontend still writes `cold_store`
+into `Enroll` and `Renew` answers, but `kbf node` no longer reads it: a stored URI went stale
+when the farm re-pointed its store, and a node enrolled before the registration had none. The
+node starts with the word `registered` and fetches the registration itself, before it opens its
+metadata log, so it needs no URI from enrolment, and the old refresh of an empty `cold_store`
+at start is gone. The text below says what `cold_store` holds for the nodes that still read it
+(older builds): the URI
 holds the bucket, prefix, endpoint, region and put settings of the `cold` binding and no key
 (`docs/api.md`, enroll section). A node uses the `cold_store` it is sent with its own process credentials, so
 the frontend picks the endpoint that receives the node's signed requests: the same trust as the worker and CAS endpoints it already sends. The node's registration fetch then finds the same identity
-and applies the keys. When the open is deferred, `cold_store` and the node's refresh of it go.
+and applies the keys. `cold_store` goes from `Enroll` and `Renew` once no build reads it.
 
 ## 9. Secrets: where they can leak, and what stops it
 

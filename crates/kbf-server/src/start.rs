@@ -31,6 +31,7 @@ use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
 use kbf_tier::WriteTier;
 
+use crate::config::ConfigError;
 use crate::drain::Drain;
 use crate::key_file::cold_s3_store;
 use crate::local::LocalStore;
@@ -225,6 +226,7 @@ where
             let store = cold_s3_store(uri, file, |name| std::env::var(name).ok())?;
             over(args, &stores, (store, None), &uri.prefix, shutdown).await
         }
+        StoreUri::Registered => Err(ConfigError::ColdRegisteredNotHere.into()),
     }
 }
 
