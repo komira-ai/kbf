@@ -93,10 +93,34 @@ impl Host {
     }
 }
 
+/// A host the coordinator has heard from, whatever it runs: noted for every heartbeat, so a
+/// host is known without a `kbf` beat.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Node {
+    /// What the host runs, from its certificate, by name.
+    pub role: String,
+    /// The features its agent announced.
+    pub features: Vec<String>,
+    /// When it last heartbeated.
+    pub seen: Duration,
+    /// The services its last heartbeat named, with the health it gave each (`kbf`: the top
+    /// level).
+    pub announced: BTreeMap<String, Health>,
+}
+
+impl Node {
+    /// Whether the node has heartbeated within [`DOWN_AFTER`] of `now`.
+    #[must_use]
+    pub fn is_live(&self, now: Duration) -> bool {
+        now.saturating_sub(self.seen) < DOWN_AFTER
+    }
+}
+
 /// Every host the coordinator has heard from since it started.
 #[derive(Clone, Debug)]
 pub struct Fleet {
     started: Duration,
+    nodes: BTreeMap<NodeId, Node>,
     hosts: BTreeMap<String, BTreeMap<NodeId, Host>>,
     orders: BTreeMap<(NodeId, String), Order>,
     /// Healthy beats in a row at one version, per service and host ([`Bake`]).
@@ -110,6 +134,7 @@ impl Fleet {
     pub fn new(started: Duration) -> Self {
         Self {
             started,
+            nodes: BTreeMap::new(),
             hosts: BTreeMap::new(),
             orders: BTreeMap::new(),
             bake: BTreeMap::new(),
@@ -127,6 +152,30 @@ impl Fleet {
     #[must_use]
     pub const fn started(&self) -> Duration {
         self.started
+    }
+
+    /// Notes that the host `id` heartbeated, as `node` says.
+    pub fn note_node(&mut self, id: NodeId, node: Node) {
+        self.nodes.insert(id, node);
+    }
+
+    /// The node `id`, if it has heartbeated.
+    #[must_use]
+    pub fn node(&self, id: &NodeId) -> Option<&Node> {
+        self.nodes.get(id)
+    }
+
+    /// Every node that has heartbeated, by node id.
+    pub fn nodes(&self) -> impl Iterator<Item = (&NodeId, &Node)> {
+        self.nodes.iter()
+    }
+
+    /// Forgets what the host `id` said about `service`, and any order for it.
+    pub fn forget_in(&mut self, service: &str, id: &NodeId) {
+        if let Some(hosts) = self.hosts.get_mut(service) {
+            hosts.remove(id);
+        }
+        self.orders.remove(&(id.clone(), service.to_owned()));
     }
 
     /// Notes a `kbf` heartbeat: [`Self::record_in`] for [`KBF`].

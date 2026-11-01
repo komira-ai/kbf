@@ -29,6 +29,7 @@ use serde::Serialize;
 
 use crate::desired::Desired;
 use crate::fleet::{Fleet, Host};
+use crate::membership::HostCounts;
 use crate::services::ServiceDef;
 
 /// Where the farm stands.
@@ -70,6 +71,10 @@ pub struct Convergence {
     pub state: State,
     /// The counts of every role that has a host, in role order.
     pub roles: Vec<RoleCounts>,
+    /// The hosts that are not counted in `roles`, by why. Left out for a service with no
+    /// selector until there is one to count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hosts: Option<HostCounts>,
     /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]): what a client
     /// compares with a release before it orders one.
     pub commit: &'static str,
@@ -184,6 +189,7 @@ fn converge_with(
             quiet,
             state: State::InProgress,
             roles: Vec::new(),
+            hosts: None,
             commit: crate::BUILD_COMMIT,
         };
     };
@@ -229,6 +235,7 @@ fn converge_with(
         quiet,
         state,
         roles,
+        hosts: None,
         commit: crate::BUILD_COMMIT,
     }
 }
