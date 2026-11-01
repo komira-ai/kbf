@@ -248,8 +248,10 @@ async fn a_canary_goes_first_then_one_storage_host_at_a_time_each_baking() {
 async fn two_failed_hosts_of_six_roll_tierstore_back_and_one_does_not() {
     let rig = rig("ts-rollback");
     rig.set(ONE).await;
-    let _ = round(&rig, 2_000, &[]);
-    let _ = round(&rig, 2_015, &[]);
+    // Converged needs every host to have baked: three healthy beats at the version.
+    for at in [2_000, 2_015, 2_030, 2_045] {
+        let _ = round(&rig, at, &[]);
+    }
     let marks = |rig: &Rig| -> ServiceOps {
         rig.coordinator
             .status(Some(OPERATOR))
@@ -272,11 +274,11 @@ async fn two_failed_hosts_of_six_roll_tierstore_back_and_one_does_not() {
 
     rig.set(TWO).await;
     let bad = |host: &'static str| (host, "1.0", None, Some(failed("2.0")));
-    let _ = round(&rig, 2_030, &[bad("s1")]);
+    let _ = round(&rig, 2_060, &[bad("s1")]);
     assert_eq!(wanted(&rig), version("2.0"), "one failed host of six");
     assert!(marks(&rig).bad.is_empty());
 
-    let _ = round(&rig, 2_045, &[bad("s1"), bad("s2")]);
+    let _ = round(&rig, 2_075, &[bad("s1"), bad("s2")]);
     assert_eq!(wanted(&rig), version("1.0"), "two failed hosts of six");
     assert_eq!(marks(&rig).bad, vec![version("2.0")]);
     let on_disk =
