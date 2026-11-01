@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Arg, ArgMatches};
+use kbf_front::store_metrics::{Counted, StoreMetrics};
 use kbf_front::{PackSettings, Packs};
 use kbf_objstore::Capabilities;
 use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
@@ -329,8 +330,12 @@ impl PackFlags {
             cache: cache.map(Arc::new),
             ..PackSettings::default()
         };
+        let counted = Arc::new(StoreMetrics::packs());
+        let store = Counted::new(store, Arc::clone(&counted));
         let packs = Packs::new(Arc::new(store), index, keys, settings);
-        packs.map_err(PackFlagError::from)
+        packs
+            .map(|packs| packs.with_store_metrics(counted))
+            .map_err(PackFlagError::from)
     }
 }
 
