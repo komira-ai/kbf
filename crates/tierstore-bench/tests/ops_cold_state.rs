@@ -330,7 +330,7 @@ minio_s3_requests_errors_total{api=\"putobject\",server=\"s:9000\"} 100\n";
 
 /// A meter over a host that answers the metrics command with `metrics` and the rest with the
 /// admin info of a store that is not healing.
-fn meter(name: &str, metrics: &'static str) -> (Arc<FakeHost>, OpsColdMeter) {
+fn meter_over(name: &str, metrics: &'static str) -> (Arc<FakeHost>, OpsColdMeter) {
     let (dir, host, config, ops) = base(name);
     host.answer(move |cmd| {
         if cmd.args.iter().any(|a| a == "prometheus") {
@@ -352,7 +352,7 @@ fn meter(name: &str, metrics: &'static str) -> (Arc<FakeHost>, OpsColdMeter) {
 /// admin info's, and the two commands are the read-only ones.
 #[tokio::test]
 async fn the_meter_reads_the_request_counter_and_the_state_with_read_only_commands() {
-    let (host, meter) = meter("tb-cold-meter", METRICS);
+    let (host, meter) = meter_over("tb-cold-meter", METRICS);
     let reading = meter.read(Duration::from_secs(600)).await.unwrap();
     assert_eq!(reading.s3_requests, 12);
     assert!(!reading.state.healing);
@@ -376,7 +376,7 @@ async fn the_meter_reads_the_request_counter_and_the_state_with_read_only_comman
 /// fails, and an answer with no request series, are errors with a reason, not zero.
 #[tokio::test]
 async fn a_counter_that_cannot_be_read_is_an_error_with_a_reason() {
-    let (host, meter) = meter("tb-cold-meter-fails", METRICS);
+    let (host, meter) = meter_over("tb-cold-meter-fails", METRICS);
     host.answer(|_| failed(1, "no route"));
     let err = meter.read(Duration::from_secs(600)).await.unwrap_err();
     assert!(err.contains("mc admin prometheus metrics"), "{err}");
@@ -387,7 +387,7 @@ async fn a_counter_that_cannot_be_read_is_an_error_with_a_reason() {
 }
 
 fn meter_without_series() -> (Arc<FakeHost>, OpsColdMeter) {
-    meter("tb-cold-meter-no-series", "# nothing here\nminio_up 1\n")
+    meter_over("tb-cold-meter-no-series", "# nothing here\nminio_up 1\n")
 }
 
 /// Catches a reading whose second half is skipped when it fails: the state read after the
@@ -395,7 +395,7 @@ fn meter_without_series() -> (Arc<FakeHost>, OpsColdMeter) {
 /// and none gives a half reading.
 #[tokio::test]
 async fn a_failing_state_or_key_is_an_error_not_a_half_reading() {
-    let (host, meter) = meter("tb-cold-meter-info-fails", METRICS);
+    let (host, meter) = meter_over("tb-cold-meter-info-fails", METRICS);
     host.answer(|cmd| {
         if cmd.args.iter().any(|a| a == "prometheus") {
             ok(METRICS)
@@ -406,7 +406,7 @@ async fn a_failing_state_or_key_is_an_error_not_a_half_reading() {
     let err = meter.read(Duration::from_secs(600)).await.unwrap_err();
     assert!(err.contains("mc admin info"), "{err}");
 
-    let (host, meter) = meter("tb-cold-meter-heal-file", METRICS);
+    let (host, meter) = meter_over("tb-cold-meter-heal-file", METRICS);
     host.file("/private-mark/heal.json", "not json");
     let err = meter.read(Duration::from_secs(600)).await.unwrap_err();
     assert!(err.contains("heal status file"), "{err}");
