@@ -42,7 +42,7 @@ pub struct Ended {
     /// When: the event's time.
     pub at: WallTime,
     /// The record's `correlated_invocations_id` when the event was applied, if a call
-    /// named one: the build the invocation is part of.
+    /// named one: the group (a CI job) the invocation is part of.
     pub correlated_invocations_id: Option<String>,
 }
 

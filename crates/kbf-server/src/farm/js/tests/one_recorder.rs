@@ -81,6 +81,25 @@ fn call(recorder: &Recorder, invocation: &str, tag: u8) -> ExecuteCall {
     .expect("a recorded call")
 }
 
+/// Asserts that every attempt of `record` was queued, then granted, started and ended, in
+/// that order wherever the time is set, and that an action's attempts follow one another.
+/// The queue wait (start minus queued) and the wall (end minus start) are read from these.
+fn assert_times_in_order(record: &kbf_invocation::Invocation, core: SchedulerCore) {
+    for row in record.rows() {
+        let mut previous_end = 0;
+        for a in &row.attempts {
+            let times = [Some(a.queued), Some(a.granted), a.started, a.ended];
+            let mut last = previous_end;
+            for t in times.into_iter().flatten() {
+                let t = t.unix_micros();
+                assert!(t >= last, "{core:?}: {a:?} is out of order");
+                last = t;
+            }
+            previous_end = a.ended.map_or(previous_end, |e| e.unix_micros());
+        }
+    }
+}
+
 /// The script, over a farm on `core`: one action runs to its result while a second call
 /// joins it, another is killed under node pressure, given up, run again and finished.
 async fn scenario(core: SchedulerCore) -> Seen {
@@ -153,6 +172,7 @@ async fn scenario(core: SchedulerCore) -> Seen {
             })
             .collect();
         seen.history.push((name, rows));
+        assert_times_in_order(&record, core);
         let m = record.metrics();
         seen.counters.push((
             name,
@@ -179,7 +199,22 @@ async fn scenario(core: SchedulerCore) -> Seen {
                 run.ended_us = set(run.ended_us);
                 run.lease_epoch = 0;
                 run.lease_seq = 0;
-                run.timestamps = None;
+                if let Some(t) = run.timestamps.as_mut() {
+                    for field in [
+                        &mut t.queued_us,
+                        &mut t.granted_us,
+                        &mut t.worker_start_us,
+                        &mut t.input_fetch_start_us,
+                        &mut t.input_fetch_completed_us,
+                        &mut t.execution_start_us,
+                        &mut t.execution_completed_us,
+                        &mut t.output_upload_start_us,
+                        &mut t.output_upload_completed_us,
+                        &mut t.worker_completed_us,
+                    ] {
+                        *field = set(*field);
+                    }
+                }
                 // The stored result carries the times the server stamped on it.
                 if let Some(result) = run.result.as_mut() {
                     result.hash.clear();

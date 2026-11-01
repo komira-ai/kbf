@@ -397,9 +397,11 @@ pub struct RunRecord {
     /// before the field. Fields 48 and 49 follow the submit evidence (43 to 47).
     #[prost(string, optional, tag = "48")]
     pub invocation_id: Option<String>,
-    /// The build the invocation is part of: its `correlated_invocations_id`, when the
+    /// The group of invocations (a CI job) this one is part of: its `correlated_invocations_id`, when the
     /// client sent one. Absent is not empty: no call of the invocation named one, or the
-    /// record predates the field.
+    /// record predates the field. It is a snapshot taken when the attempt ended (the first
+    /// non-empty value seen by then), while the live read of a run uses the current one: an
+    /// invocation whose early calls sent none can have records without it and later ones with.
     #[prost(string, optional, tag = "49")]
     pub correlated_invocations_id: Option<String>,
 }

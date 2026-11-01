@@ -110,8 +110,8 @@ pub struct Row {
     /// predates the field, and an older export line, which has no such key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation_id: Option<String>,
-    /// The build the invocation is part of (`correlated_invocations_id`), when the client
-    /// sent one and the server records it.
+    /// The group of invocations this one is part of (`correlated_invocations_id`, a CI job),
+    /// when the client sent one and the server records it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlated_invocations_id: Option<String>,
 }
