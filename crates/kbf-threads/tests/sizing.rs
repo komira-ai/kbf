@@ -245,18 +245,29 @@ fn the_pools_follow_the_reserve() {
 }
 
 /// Catches leases given the machine (no reserve taken), the reserve taken twice, and the
-/// default not being 8 on the farm node: 88 CPUs minus 8 is 80.
+/// default not being 4 physical cores: 8 logical CPUs on the farm node, whose cores have two
+/// threads (88 minus 8 is 80), and 4 on a Mac, whose cores have one (a 32-core Mac Studio
+/// leases 28, a 28-core one 24).
 #[test]
 fn leases_get_the_cpus_minus_the_reserve() {
     let farm = Topology::new(88, 2);
     let default = resolved(ThreadArgs::default(), farm);
     assert_eq!((default.reserve_cpus(), default.lease_cpus()), (8, 80));
+    for (cores, leased) in [(32, 28), (28, 24)] {
+        let mac = resolved(ThreadArgs::default(), Topology::new(cores, 1));
+        assert_eq!(
+            (mac.reserve_cpus(), mac.lease_cpus()),
+            (4, leased),
+            "{cores} cores"
+        );
+    }
     let given = resolved(args(&["--reserve-cpus=20"]), farm);
     assert_eq!((given.reserve_cpus(), given.lease_cpus()), (20, 68));
     let none = resolved(args(&["--reserve-cpus=0"]), farm);
     assert_eq!((none.reserve_cpus(), none.lease_cpus()), (0, 88));
-    // A machine of fewer than 16 CPUs reserves half, so the default always starts.
-    for (logical, reserve) in [(1, 0), (2, 1), (4, 2), (15, 7), (16, 8)] {
+    // A machine of fewer than 8 CPUs (one thread a core) reserves half, so the default always
+    // starts.
+    for (logical, reserve) in [(1, 0), (2, 1), (4, 2), (7, 3), (8, 4), (16, 4)] {
         let s = resolved(ThreadArgs::default(), Topology::new(logical, 1));
         assert_eq!(
             (s.reserve_cpus(), s.lease_cpus()),

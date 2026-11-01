@@ -219,6 +219,12 @@ pub struct Cache<M, O> {
     ram: ram::Ram,
     /// How long a caller that needs held blobs written waits for them ([`Cache::durable_waiting`]).
     durable_wait: std::time::Duration,
+    /// The reads this node's service serves from the cache, which the scrape renders
+    /// ([`Cache::with_legacy_reads`]); `None` for a cache that is not a storage node's.
+    legacy_reads: Option<Arc<kbf_storage::legacy::LegacyReads>>,
+    /// What the cold store has been asked, which the scrape renders
+    /// ([`Cache::with_cold_store_metrics`]); zeros for a cache whose store is not counted.
+    cold_store: Arc<crate::store_metrics::StoreMetrics>,
     /// How many waits for held blobs have parked, for a test to wait on.
     #[cfg(feature = "testkit")]
     parks: tokio::sync::watch::Sender<usize>,
@@ -289,6 +295,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             held: Held::default(),
             ram: ram::Ram::default(),
             durable_wait: held::DEFAULT_DURABLE_WAIT,
+            legacy_reads: None,
+            cold_store: Arc::new(crate::store_metrics::StoreMetrics::cold()),
             #[cfg(feature = "testkit")]
             parks: tokio::sync::watch::channel(0).0,
             #[cfg(feature = "testkit")]

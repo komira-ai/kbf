@@ -17,7 +17,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
-use kbf_state::BlobDigest;
+use kbf_pack_index::BlobDigest;
 
 use crate::digest::verifies;
 use crate::error::CacheError;
@@ -309,7 +309,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use kbf_state::BlobDigest;
+    use kbf_pack_index::BlobDigest;
 
     use super::State;
 

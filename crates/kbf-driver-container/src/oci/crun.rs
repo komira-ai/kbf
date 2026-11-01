@@ -268,6 +268,37 @@ impl Crun {
         deleted
     }
 
+    /// Ends every `crun run` of the lease in `lease` that is still there, and returns once
+    /// each has ended. A `crun run` is found by its command line (`--root` the lease's
+    /// state directory): the sweep of a restarted daemon is not its parent, so it cannot
+    /// reap it as a lease's own clean does ([`Running::reap`]), and left alone it ends on
+    /// its own after its container is gone and writes into the lease directory on the way
+    /// out, recreating the state directory the sweep removed. Killed, it cannot. Blocking.
+    pub(crate) fn end_runs_blocking(&self, lease: &Path) -> Result<(), String> {
+        let pids = runs_with_root(&state_dir(lease));
+        for pid in &pids {
+            // Already gone, or not ours to signal: the wait below says which.
+            let _ = rustix::process::kill_process(*pid, rustix::process::Signal::KILL);
+        }
+        wait_ended(&pids, RUN_END_LIMIT, RUN_END_PAUSE).map_err(|left| {
+            let shown: Vec<_> = left
+                .iter()
+                .map(|p| {
+                    let raw = p.as_raw_nonzero();
+                    let status = std::fs::read_to_string(format!("/proc/{raw}/status"));
+                    let state = (status.as_deref().unwrap_or_default().lines())
+                        .find(|l| l.starts_with("State:"))
+                        .map_or("", |l| l.trim_start_matches("State:").trim());
+                    format!("{raw} ({state})")
+                })
+                .collect();
+            format!(
+                "crun run (pid {}) still runs {RUN_END_LIMIT:?} after it was killed",
+                shown.join(", ")
+            )
+        })
+    }
+
     /// Runs the helper bundle blocking: for the clean of a lease that has files only a
     /// user namespace can delete.
     pub(crate) fn run_helper_blocking(
@@ -307,6 +338,64 @@ impl Crun {
     }
 }
 
+/// How long a killed `crun run` is waited for, and how often it is looked at. A killed
+/// process ends once it leaves the system call it is in.
+const RUN_END_LIMIT: Duration = Duration::from_secs(5);
+const RUN_END_PAUSE: Duration = Duration::from_millis(2);
+
+/// The processes whose command line has `--root <root>` (or `--root=<root>`): the
+/// `crun` calls on one lease's state directory, whatever their verb.
+fn runs_with_root(root: &Path) -> Vec<rustix::process::Pid> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let root = root.as_os_str().as_bytes();
+    let entries = std::fs::read_dir("/proc").into_iter().flatten().flatten();
+    let pids = entries.filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok());
+    pids.filter_map(rustix::process::Pid::from_raw)
+        .filter(|pid| pid.as_raw_nonzero().get().cast_unsigned() != std::process::id())
+        .filter(|pid| {
+            let argv = std::fs::read(format!("/proc/{}/cmdline", pid.as_raw_nonzero())).ok();
+            argv.is_some_and(|argv| has_root(&argv, root))
+        })
+        .collect()
+}
+
+/// Whether the command line `argv` (arguments separated by NUL) has `--root <root>` or
+/// `--root=<root>`.
+fn has_root(argv: &[u8], root: &[u8]) -> bool {
+    let args: Vec<&[u8]> = argv.split(|b| *b == 0).collect();
+    let mut equals = b"--root=".to_vec();
+    equals.extend_from_slice(root);
+    args.windows(2).any(|w| w[0] == b"--root" && w[1] == root) || args.contains(&equals.as_slice())
+}
+
+/// Whether process `pid` has ended: gone, or a zombie (or dead) waiting to be reaped.
+fn ended(pid: rustix::process::Pid) -> bool {
+    std::fs::read_to_string(format!("/proc/{}/stat", pid.as_raw_nonzero()))
+        .ok()
+        .and_then(|stat| Some(stat.rsplit_once(") ")?.1.starts_with(['Z', 'X', 'x'])))
+        .unwrap_or(true)
+}
+
+/// Polls until every process in `pids` has ended, or `limit` has passed: the ones that
+/// have not, then.
+fn wait_ended(
+    pids: &[rustix::process::Pid],
+    limit: Duration,
+    pause: Duration,
+) -> Result<(), Vec<rustix::process::Pid>> {
+    let deadline = Instant::now() + limit;
+    loop {
+        let left: Vec<_> = pids.iter().copied().filter(|p| !ended(*p)).collect();
+        if left.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(left);
+        }
+        std::thread::sleep(pause);
+    }
+}
+
 /// How long a failed `crun delete` waits for the container's state to be removed by
 /// the `crun run` that owns it. That run is removing it already; the wait ends the moment
 /// the directory is gone.
@@ -341,6 +430,118 @@ mod tests {
         assert_eq!(code_of(ExitStatus::from_raw(0)), 0);
         assert_eq!(code_of(ExitStatus::from_raw(9)), 137);
         assert_eq!(code_of(ExitStatus::from_raw(15)), 143);
+    }
+
+    /// A process that follows `/dev/null` for ever and names `args` after it as files that
+    /// do not exist, so its command line carries them: the shape of a `crun run` on a
+    /// lease's state directory. (The coreutils may be one multi-call binary that reads
+    /// its own name, so the name cannot be set instead.)
+    fn sleeper(args: &[&str]) -> std::process::Child {
+        use std::process::Stdio;
+        std::process::Command::new("tail")
+            .args(["-f", "/dev/null", "--"])
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn")
+    }
+
+    fn pid_of(child: &std::process::Child) -> rustix::process::Pid {
+        rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("pid")).expect("pid")
+    }
+
+    /// Catches a command line read wrongly: `--root` and the path as two arguments or one,
+    /// not a longer path with the same prefix, not the path as another option's value, and
+    /// not the path alone.
+    #[test]
+    fn a_command_line_names_a_root_as_the_option_and_its_value() {
+        let root = b"/scratch/kbf-lease-1-1/crun";
+        assert!(has_root(
+            b"crun\0--root\0/scratch/kbf-lease-1-1/crun\0run\0",
+            root
+        ));
+        assert!(has_root(
+            b"crun\0--root=/scratch/kbf-lease-1-1/crun\0run",
+            root
+        ));
+        assert!(!has_root(
+            b"crun\0--root\0/scratch/kbf-lease-1-1/crun2\0run",
+            root
+        ));
+        assert!(!has_root(
+            b"crun\0--root=/scratch/kbf-lease-1-1/crun2\0run",
+            root
+        ));
+        assert!(!has_root(
+            b"crun\0--log\0/scratch/kbf-lease-1-1/crun\0run",
+            root
+        ));
+        assert!(!has_root(
+            b"crun\0/scratch/kbf-lease-1-1/crun\0--root",
+            root
+        ));
+    }
+
+    /// Catches a sweep that leaves a dead daemon's `crun run` to end on its own (it writes
+    /// into the lease directory on the way out, after the sweep removed it), one that
+    /// returns before the process has ended, and one that kills a `crun` of another lease
+    /// (a longer path of the same prefix) or a process with the path as another option's
+    /// value. A stopped process is the straggler: it is not ended until it is killed.
+    #[test]
+    fn the_runs_of_one_lease_are_killed_and_waited_for_and_no_other() {
+        let dir = Path::new("/scratch/kbf-lease-1-1");
+        let root = state_dir(dir);
+        let root = root.to_str().expect("utf-8");
+        let mut run = sleeper(&["--root", root]);
+        let mut joined = sleeper(&[&format!("--root={root}")]);
+        let mut other = sleeper(&["--root", &format!("{root}2")]);
+        let mut value = sleeper(&["--log", root]);
+        for child in [&run, &joined] {
+            rustix::process::kill_process(pid_of(child), rustix::process::Signal::STOP)
+                .expect("stop");
+        }
+        Crun::new(PathBuf::from("crun"))
+            .end_runs_blocking(dir)
+            .expect("ended");
+        assert!(ended(pid_of(&run)), "a crun run with --root DIR was left");
+        assert!(
+            ended(pid_of(&joined)),
+            "a crun run with --root=DIR was left"
+        );
+        assert!(!ended(pid_of(&other)), "another lease's crun was killed");
+        assert!(
+            !ended(pid_of(&value)),
+            "a process with the path elsewhere was killed"
+        );
+        for child in [&mut run, &mut joined, &mut other, &mut value] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Catches a wait that reports a process that still runs as ended, and one that
+    /// waits for ever: a limit of zero returns after one look.
+    #[test]
+    fn a_process_that_still_runs_after_the_limit_is_reported() {
+        let mut child = sleeper(&[]);
+        let pid = pid_of(&child);
+        let left = wait_ended(&[pid], Duration::ZERO, Duration::from_millis(1));
+        assert_eq!(left, Err(vec![pid]));
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+        assert_eq!(
+            wait_ended(&[pid], Duration::from_secs(5), Duration::from_millis(1)),
+            Ok(())
+        );
+    }
+
+    /// Catches a lease with no `crun run` left (the usual sweep) being an error.
+    #[test]
+    fn a_lease_with_no_run_has_none_to_end() {
+        Crun::new(PathBuf::from("crun"))
+            .end_runs_blocking(Path::new("/scratch/kbf-lease-no-such-lease"))
+            .expect("nothing to end");
     }
 
     /// Catches a `crun` that is aborted (its future dropped, which `Running::force` does

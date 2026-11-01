@@ -38,10 +38,11 @@
 //! - **One cache**: when the hot store is a directory on `--data-dir`'s filesystem, as
 //!   in `kbf all-in-one` (`crate::one_cache`).
 //! - **Stopping**: on the first SIGTERM or SIGINT the daemon half drains
-//!   (`kbf_node::NodeHandle::serve_alongside`): it takes no new lease, lets the running
-//!   ones finish and report, and waits for their acknowledgements, for at most
-//!   `--drain-deadline-secs`; a second signal ends the drain at once and the leases still
-//!   running are abandoned. Only then does the storage half stop (the leases read and
+//!   (`kbf_node::NodeHandle::serve_beside`): it takes no new lease, lets the running
+//!   ones finish and report, and waits for their acknowledgements, however long that
+//!   takes (`--drain-deadline-secs`, if given, only logs a warning with the number of
+//!   leases still running); a second signal is the hard stop: it ends the drain at once
+//!   and the leases still running are abandoned. Only then does the storage half stop (the leases read and
 //!   write their blobs through it) and the process exits 0. A storage half that stops
 //!   serving on its own stops the daemon half at once. The signal handlers are installed
 //!   before anything starts: a signal while the storage half is still starting (its
@@ -192,7 +193,8 @@ fn serve(flags: Flags) -> Result<(), crate::run::Failed> {
     println!("{}", half.start_line());
     let start = starter(&flags, &half, tokio.handle());
     let serving = Box::pin(half.serve());
-    with_draining_daemon(&tokio, serving, stop, start, signals, &flags.daemon)
+    let received = crate::run::forwarded(&tokio, signals);
+    with_draining_daemon(&tokio, serving, stop, start, received, &flags.daemon)
 }
 
 /// Whether the daemon half routes its blobs by the storage map: when the node registers

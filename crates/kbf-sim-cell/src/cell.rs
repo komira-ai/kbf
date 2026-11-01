@@ -505,6 +505,10 @@ impl StateMachine for CellNode {
 impl Node for CellNode {
     type Msg = Msg;
 
+    fn trace_msg(msg: &Msg) -> String {
+        msg.trace_text()
+    }
+
     fn take_outputs(&mut self) -> Vec<Output<Msg>> {
         match self {
             Self::Server(s) => s.take_outputs(),

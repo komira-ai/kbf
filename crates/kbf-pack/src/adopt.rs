@@ -57,8 +57,8 @@ use kbf_objstore::footers::{FooterRead, FooterReads, SegmentFooter, SkipReason, 
 use kbf_objstore::{
     ByteRange, KeyError, KeyPrefix, ListToken, ObjectKey, ObjectStore, ObjectStoreError,
 };
+use kbf_pack_index::{BlobDigest, MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError};
 use kbf_segments::IndexEntry;
-use kbf_state::{BlobDigest, MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError};
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 

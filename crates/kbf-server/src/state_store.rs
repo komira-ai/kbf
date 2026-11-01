@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use kbf_state::postgres::PostgresPackIndex;
-use kbf_state::{PackIndex, PackIndexError, Store};
+use kbf_pack_index::postgres::PostgresPackIndex;
+use kbf_pack_index::{PackIndex, PackIndexError};
+use kbf_state::Store;
 
 use crate::farm::{EpochPolicy, StateError};
 use crate::members::MembershipConfig;

@@ -1,0 +1,1 @@
+{"version":2,"lease":"0000000000000001000000000000002a","action":"33d8589de117bdf22bdc10c48a5908a4bbd88481d54cf7c0c358905e72b79abb/18","exit_code":0,"output_files":[],"output_directories":[],"output_symlinks":[],"timing":{"fetch_ms":12,"run_ms":3456,"pack_ms":7},"usage":{"cpu_usage_us":3300000,"memory_peak_bytes":104857600},"packs":9,"large":[]}

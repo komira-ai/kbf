@@ -8,37 +8,15 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
-# The Postgres backend (`postgres` module). Off by default: the pure scheduler crates and
-# the single-node build carry no database client.
-postgres = ["dep:postgres", "dep:tokio"]
-# The in-memory fake with its deliberate defects, the conformance suite and the Postgres
-# suite factory. Test-only: a production build carries none of it. A crate that tests
-# against the fake enables it in its `[dev-dependencies]` entry for kbf-state.
-test-support = []
-# `postgres::test_database`: a Postgres database of its own for one test, with the schema
-# applied (kbf-testkit makes and drops it). Test-only, like `test-support`; a crate whose tests
-# need it enables it in its `[dev-dependencies]` entry for kbf-state.
-test-database = ["postgres", "dep:kbf-testkit"]
+# Each feature turns on the feature of `js-state` of the same name (see its manifest for
+# what it adds); the names and the meaning are the ones this crate had before the move.
+postgres = ["js-state/postgres"]
+test-support = ["js-state/test-support"]
+test-database = ["js-state/test-database"]
 
 [dependencies]
-# `test-database` only.
-kbf-testkit = { workspace = true, optional = true, features = ["postgres"] }
-postgres = { workspace = true, optional = true }
-rusqlite.workspace = true
-rustix = { workspace = true, features = ["fs"] }
-thiserror.workspace = true
-# `rt` only, to ask whether the calling thread is inside a runtime (postgres/conn.rs).
-tokio = { workspace = true, optional = true, features = ["rt"] }
-# A change feed row of a kind this build does not know is skipped and logged.
-tracing.workspace = true
-
-[dev-dependencies]
-# This crate's own tests (unit tests are built with `cfg(test)`, the files in tests/ are
-# separate crates that see only the features on).
-kbf-state = { workspace = true, features = ["test-database", "test-support"] }
-# A child held between fork and exec, for the tests of what releases the file lock, and the
-# test server's URL (`database::server_url`) for the Postgres tests.
-kbf-testkit = { workspace = true, features = ["postgres"] }
+# The code lives in the jobscheduler repository, at the revision the workspace pins.
+js-state.workspace = true
 
 [lints]
 workspace = true

@@ -6,7 +6,7 @@
 use bytes::Bytes;
 use kbf_front::{CommitError, MAX_COMMIT_BLOBS};
 use kbf_pack::PackerConfig;
-use kbf_state::{BlobDigest, NewPack, PackBlob, PackIndex as _};
+use kbf_pack_index::{BlobDigest, NewPack, PackBlob, PackIndex as _};
 use kbf_types::Digest;
 
 use crate::support::{Rig, blob, index_form};

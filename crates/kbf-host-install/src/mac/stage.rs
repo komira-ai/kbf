@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 use super::channel::{MacChannel, Source};
 use super::fetch::{AssetKind, FetchError, Fetcher, Limits};
 use super::layout::{BINARY, DAEMON_USER, MacHost, UNPRIVILEGED_USER};
-use super::release::{self, PickError};
+use super::release::{self, Origin, PickError};
 use super::tools;
 use crate::config::refusal;
 use crate::host::fail;
@@ -43,17 +43,23 @@ use crate::runner::{Exec, Identity, Runner};
 use crate::trust::Trust;
 use crate::trust::nofollow;
 
-/// The workflow of the repository ([`release::REPO`]) whose attestation is accepted.
-const WORKFLOW: &str = "komira-ai/kbf/.github/workflows/artifacts.yml";
-
-/// The same pair under the name before the repository was renamed: a release attested then
-/// carries it, and a rollback to such a release must verify. Delete both once no such
-/// release is installable.
-const FORMER_REPO: &str = "komira-ai/komira-build-farm";
-const FORMER_WORKFLOW: &str = "komira-ai/komira-build-farm/.github/workflows/artifacts.yml";
-
 /// The Mach-O header of a 64-bit arm64 executable: magic, then cputype.
 const MACHO_ARM64: [u8; 8] = [0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01];
+
+/// The tarball of `commit` in the releases of `origin`.
+fn tarball_of(origin: &Origin, commit: &str) -> String {
+    release::named_asset_on(
+        origin.prefix(),
+        release::PLATFORM,
+        release::TARBALL_EXTENSION,
+        commit,
+    )
+}
+
+/// The attestation bundle of [`tarball_of`].
+fn bundle_of(origin: &Origin, commit: &str) -> String {
+    release::bundle_of(&tarball_of(origin, commit))
+}
 
 /// The release a version picked out: its commit, and the sha256 the channel pins for its
 /// tarball when it pins any.
@@ -103,6 +109,7 @@ fn stage_inner(
     let prefix = release::commit_prefix(version.as_str()).ok_or_else(|| {
         verify_failed("the version carries no commit (+g or +, then 12 hex digits)")
     })?;
+    let origin = &channel.origin;
     let pick = pick_release(host, channel, prefix)?;
     let token = match &channel.source {
         Source::Github {
@@ -129,16 +136,16 @@ fn stage_inner(
     let tuning = &host.tuning;
     let commit = match &channel.source {
         Source::Dir(dir) => {
-            let tarball = stage.join(release::tarball_name(&pick.want));
-            let bundle = stage.join(release::bundle_name(&pick.want));
+            let tarball = stage.join(tarball_of(origin, &pick.want));
+            let bundle = stage.join(bundle_of(origin, &pick.want));
             copy_in(
-                &dir.join(release::tarball_name(&pick.want)),
+                &dir.join(tarball_of(origin, &pick.want)),
                 &tarball,
                 tuning.tarball_max,
             )
             .map_err(|e| verify_failed(format!("tarball: {e}")))?;
             copy_in(
-                &dir.join(release::bundle_name(&pick.want)),
+                &dir.join(bundle_of(origin, &pick.want)),
                 &bundle,
                 tuning.bundle_max,
             )
@@ -147,11 +154,17 @@ fn stage_inner(
         }
         Source::Github { .. } => {
             make_home(&home, nobody)?;
-            fetch_release(host, runner, &pick.want, token.as_deref(), nobody, &home)?
+            fetch_release(
+                (host, runner, origin),
+                &pick.want,
+                token.as_deref(),
+                nobody,
+                &home,
+            )?
         }
     };
-    let tarball = stage.join(release::tarball_name(&commit));
-    let bundle = stage.join(release::bundle_name(&commit));
+    let tarball = stage.join(tarball_of(origin, &commit));
+    let bundle = stage.join(bundle_of(origin, &commit));
 
     // 1. The copy is the pinned one, when the channel pins.
     if let Some(pinned) = &pick.sha256 {
@@ -254,16 +267,27 @@ fn pick_failed(e: PickError, whence: &str, github: bool) -> Outcome {
     }
 }
 
+/// The longest token a channel's file may hold. GitHub's workflow tokens are about 520 bytes
+/// (`ghs_`, an app id, and a signed token in base64url with dots), and it asks that a token be
+/// treated as opaque and its length not assumed.
+const MAX_TOKEN_BYTES: usize = 1024;
+
+/// A mark in the binary that its channel token file takes GitHub's Actions token. The update
+/// rehearsal, which runs the helper of the release before this one, reads the mark to know
+/// whether to give that helper the run's token.
+#[used]
+static LONG_TOKEN_MARKER: &[u8] = crate::LONG_TOKEN_MARKER;
+
 /// The token for the API in `file`, which is root's alone to write: one line of letters,
-/// digits, `_` and `-`.
+/// digits, `_`, `-` and `.`, at most [`MAX_TOKEN_BYTES`] bytes.
 pub(crate) fn read_token(trust: &Trust, file: &Path) -> Result<String, crate::outcome::Refusal> {
     let text = trust.read(file).map_err(refusal)?;
     let token = text.trim();
     let plain = !token.is_empty()
-        && token.len() <= 255
+        && token.len() <= MAX_TOKEN_BYTES
         && token
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
     if plain {
         Ok(token.to_owned())
     } else {
@@ -283,8 +307,7 @@ fn make_home(home: &Path, who: Identity) -> Result<(), Outcome> {
 /// `nobody` owns, then copy its two files once, as root, into the stage. Nothing but
 /// the closed refusals comes out: the fetch changes nothing outside the stage.
 fn fetch_release(
-    host: &MacHost,
-    runner: &dyn Runner,
+    (host, runner, origin): (&MacHost, &dyn Runner, &Origin),
     want: &str,
     token: Option<&str>,
     nobody: Identity,
@@ -296,6 +319,7 @@ fn fetch_release(
     make_home(&scratch, nobody)?;
     let tuning = &host.tuning;
     let fetcher = Fetcher {
+        origin,
         platform: release::PLATFORM,
         asset: AssetKind::Tarball,
         runner,
@@ -324,14 +348,14 @@ fn fetch_release(
     })?;
     let fetch_failed = |_: String| Outcome::Refused(Refusal::FetchFailed);
     copy_in(
-        &scratch.join(release::tarball_name(&commit)),
-        &stage.join(release::tarball_name(&commit)),
+        &scratch.join(tarball_of(origin, &commit)),
+        &stage.join(tarball_of(origin, &commit)),
         tuning.tarball_max,
     )
     .map_err(fetch_failed)?;
     copy_in(
-        &scratch.join(release::bundle_name(&commit)),
-        &stage.join(release::bundle_name(&commit)),
+        &scratch.join(bundle_of(origin, &commit)),
+        &stage.join(bundle_of(origin, &commit)),
         tuning.bundle_max,
     )
     .map_err(fetch_failed)?;
@@ -449,7 +473,7 @@ fn attest(
     home: &Path,
 ) -> Result<(), Outcome> {
     let mut why = String::new();
-    for (repo, workflow) in [(release::REPO, WORKFLOW), (FORMER_REPO, FORMER_WORKFLOW)] {
+    for (repo, workflow) in channel.origin.signers() {
         let attest = tools::Attest {
             gh: &host.gh,
             tarball,

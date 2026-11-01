@@ -189,6 +189,10 @@ pub struct Cgroup {
     /// The CPUs the lease's cgroup could run on.
     #[prost(uint32, optional, tag = "17")]
     pub cpus_effective: Option<u32>,
+    /// The most CPU any one window of node-load readings saw the lease use, thousandths of a
+    /// CPU; `None` when the lease had no full window.
+    #[prost(uint64, optional, tag = "18")]
+    pub peak_window_millicores: Option<u64>,
 }
 
 /// The footprint block the macOS native driver reports for a run. A field that is
@@ -281,7 +285,8 @@ pub struct RunRecord {
     /// The memory kill that ended it, if any.
     #[prost(enumeration = "MemoryKill", tag = "18")]
     pub memory_kill: i32,
-    /// The memory booked for the attempt, bytes.
+    /// The memory booked for the attempt, bytes: the grant its `Start` carried (a record
+    /// written before the grant was kept holds it for a memory kill only).
     #[prost(uint64, tag = "19")]
     pub booked_memory_bytes: u64,
     /// The booking the next attempt gets after a memory kill, bytes.
@@ -363,12 +368,18 @@ pub struct RunRecord {
     /// not read it. Absent is not zero.
     #[prost(uint32, optional, tag = "41")]
     pub node_cpu_pressure_centi: Option<u32>,
-    /// The CPU booked for the lease, in thousandths of a CPU; absent when the daemon
-    /// did not report it.
+    /// The CPU booked for the lease, in thousandths of a CPU: the grant the server sent in
+    /// the `Start`, else the daemon's report; absent for a lease the server never
+    /// started (taken up from the state store) whose daemon reported none.
     #[prost(uint64, optional, tag = "42")]
     pub booked_millicpus: Option<u64>,
     /// The scheduler's operation the attempt belonged to: every attempt of one operation
     /// (a ladder of memory bookings) carries the same one, so they can be regrouped.
+    /// Unique over one state store: every frontend of the store, on either scheduler core,
+    /// numbers operations from blocks it reserves with a compare-and-set on the store's
+    /// shared counter (`meta/next_op`), so ids do not repeat across frontends or restarts.
+    /// A server with no state store numbers from its own counter, which starts again at a
+    /// restart: its ids are unique within one process only.
     /// Absent: a record written before the field, or a row that named none. Fields 43 on
     /// follow the estimator's usage fields (39 to 42).
     #[prost(uint64, optional, tag = "43")]
@@ -386,6 +397,49 @@ pub struct RunRecord {
     /// The number of distinct files of the input tree; absent as `input_bytes` is.
     #[prost(uint64, optional, tag = "47")]
     pub input_files: Option<u64>,
+    /// The invocation the attempt's request belonged to: the client's `tool_invocation_id`
+    /// of the Execute call that queued or joined the operation. Absent: a record written
+    /// before the field. Fields 48 and 49 follow the submit evidence (43 to 47).
+    #[prost(string, optional, tag = "48")]
+    pub invocation_id: Option<String>,
+    /// The group of invocations (a CI job) this one is part of: its
+    /// `correlated_invocations_id`, when the client sent one. Absent is not empty: no call of the invocation named one, or the
+    /// record predates the field. It is a snapshot taken when the attempt ended (the first
+    /// non-empty value seen by then), while the live read of a run uses the current one: an
+    /// invocation whose early calls sent none can have records without it and later ones with.
+    #[prost(string, optional, tag = "49")]
+    pub correlated_invocations_id: Option<String>,
+    /// Where the three phase durations of `timestamps` came from. `Unspecified` is a record
+    /// written before the field, which reads as measured. Field 50: fields 48 and 49 are taken
+    /// by the invocation ids (#2200).
+    #[prost(enumeration = "PhaseTimes", tag = "50")]
+    pub phase_times: i32,
+}
+
+/// Where a run record's `input_fetch`, `execution` and `output_upload` times came from. For
+/// a `TaskClaim` only the three durations are data: never the instants, or the gaps between
+/// them and the server's `worker_start` and `worker_completed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
+#[repr(i32)]
+pub enum PhaseTimes {
+    /// Not recorded: a record written before the field. Read as measured, which is what
+    /// every such record was (a daemon's run, or an executor run with no phase times).
+    Unspecified = 0,
+    /// A daemon measured them.
+    Measured = 1,
+    /// A task claimed them, laid out ending at the frontend's read of its pack.
+    TaskClaim = 2,
+}
+
+impl PhaseTimes {
+    /// The name the read API writes: an unrecorded record is `measured`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Unspecified | Self::Measured => "measured",
+            Self::TaskClaim => "task_claim",
+        }
+    }
 }
 
 /// Where one axis of an attempt's booking came from. A record written before the field

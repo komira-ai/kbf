@@ -11,7 +11,7 @@ use futures::future::BoxFuture;
 use kbf_daemon::cas::Cas as _;
 use kbf_daemon::{PackReads, PackedCas};
 use kbf_pack::{Fetch, ReadError};
-use kbf_state::{BlobDigest, PackIndexError};
+use kbf_pack_index::{BlobDigest, PackIndexError};
 use support::memory::MemoryCas;
 
 /// Packs that fail every call while `failing` is set, and have no blob otherwise.

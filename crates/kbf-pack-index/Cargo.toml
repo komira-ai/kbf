@@ -1,0 +1,40 @@
+[package]
+name = "kbf-pack-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# The Postgres index (`postgres` module) and the migration that makes its tables (`schema`).
+# Off by default: a crate that only reads or records through the `PackIndex` trait carries
+# no database client.
+postgres = ["dep:postgres", "kbf-state/postgres"]
+# The in-memory index, the conformance suite and, with `postgres`, the suite's Postgres
+# factory. Test-only: a production build carries none of it. A crate that tests against the
+# in-memory index enables it in its `[dev-dependencies]` entry for kbf-pack-index.
+test-support = ["kbf-state/test-support"]
+# A test database with the pack tables (`schema::test_database`).
+test-database = ["postgres", "kbf-state/test-database"]
+
+[dependencies]
+# `Clock`, `StoreTime`, `StoreError`; with `postgres`, the connections and the migration runner.
+kbf-state.workspace = true
+postgres = { workspace = true, optional = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+# This crate's own tests (unit tests are built with `cfg(test)`, the files in tests/ are
+# separate crates that see only the features on).
+kbf-pack-index = { workspace = true, features = ["postgres", "test-support", "test-database"] }
+# A Postgres database of its own for one test, and the schema applied to it.
+kbf-state = { workspace = true, features = ["test-database", "test-support"] }
+# The test server's URL (`database::server_url`) for the Postgres tests.
+kbf-testkit = { workspace = true, features = ["postgres"] }
+# The identity of the migration file the tests pin.
+sha2.workspace = true
+
+[lints]
+workspace = true

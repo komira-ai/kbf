@@ -30,6 +30,12 @@
 //!   [`LogCommand::Unknown`];
 //! - an enum value that is unspecified (zero) or unnamed, in a command this binary
 //!   knows: the entry decodes as [`LogCommand::Unknown`] as well;
+//! - a consumable amount whose consumable is unspecified or unnamed: that amount is left
+//!   out of the node's capabilities and the rest of the command decodes as it would
+//!   without it;
+//! - a field absent that a later build added, which reads as its zero: a `Resources` without
+//!   `disk_bytes` (field 6, added after format 1; zero is not written) is a vector that books
+//!   no disk, and the bytes of a vector with none are the bytes it always had;
 //! - the bytes [`encode`] would not have written (an explicit zero, a varint that is not
 //!   minimal, a field repeated or out of order): the value they stand for is decoded.
 //!
@@ -183,6 +189,10 @@ pub enum EncodeError {
     /// A digest names a hash function the format has no value for.
     #[error("a digest names a hash function log format 1 cannot encode")]
     DigestFunction,
+    /// A request's work key is not an action's (its dedup text is not an action digest),
+    /// which is all the format has a message for.
+    #[error("a request's work key is not an action digest, which log format 1 requires")]
+    WorkKey,
     /// A control record is of a kind the format has no message for.
     #[error("a control record is of a kind log format 1 cannot encode")]
     Record,

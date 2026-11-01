@@ -11,7 +11,7 @@
 //!   [`ASSETS`] (binary and platform): `kbf`, `kbf-host-install` and `kbf-updater` for the
 //!   three platforms (a Mac runs the host agent), `kbf-installer` and `kbf-mac-provision` for macOS only (its Linux
 //!   package is the `kbf` package's now; a Mac is provisioned by `kbf-mac-provision`), `kbf-daemon`, `kbf-server`, `kbf-deploy`,
-//!   `kbf-signer` and `tierstore` for Linux, `kbf-deploy` for macOS (a Mac runs
+//!   `kbf-signer` and `kbf-task` (a static musl build) for Linux, `kbf-deploy` for macOS (a Mac runs
 //!   `kbf daemon`; there is no darwin `kbf-daemon`). Each one's SBOM attestation is
 //!   [`crate::attested_assets`]' business, and its provenance bundle
 //!   [`crate::attested_bundles`]'.
@@ -55,9 +55,9 @@
 //!   `--expect-ref "$GITHUB_REF"`, so the file that was attested is the one checked
 //!   (`kbf_package`'s rules).
 //! - **The images.** The same jobs build the frontend's OCI image from the `kbf` of their own
-//!   tarball and the update coordinator's from the `kbf-coordinator` they built, each twice with
-//!   the commit's time and no BuildKit attachments, compare the two files, and make the first an
-//!   asset (`cargo xtask pkg-image-asset --service`, `images`' rules); the verify job checks
+//!   tarball, the update coordinator's from the `kbf-coordinator` and the task runner's from the
+//!   `kbf-task` they built, each twice with the commit's time and no BuildKit attachments,
+//!   compare the two files, and make the first an asset (`cargo xtask pkg-image-asset --service`, `images`' rules); the verify job checks
 //!   each signed one.
 //! - **The installer's Mac package.** The darwin job builds the `kbf-installer` `.pkg`
 //!   (`cargo xtask pkg build`, with the pinned darwin `gh`, the trusted root and an
@@ -68,6 +68,10 @@
 //!   install test runs before the asset; its downloads are pinned. The verify job then
 //!   runs `pkg-macos-asset --verify-only` on the signed `.pkg` with `--expect-ref
 //!   "$GITHUB_REF"`.
+//! - **The darwin `kbf-task` bundle.** The darwin job builds `kbf-task` with the macOS confine, signs it,
+//!   packs it with the pinned `js-bundle` into an OCI image layout and makes that layout an asset
+//!   (`cargo xtask package-task-bundle`, [`ASSETS`]'s `kbf-task-bundle`), a tarball with an SBOM like the
+//!   binaries'. Its steps, pin and docs are held to one shape by `task_bundle`.
 //! - **macOS.** Every binary the darwin job packages is signed by `cargo xtask
 //!   sign-darwin` before it is packaged and checked by `cargo xtask darwin-asset` on
 //!   the tarball after, each in a step that cannot be skipped.
@@ -83,6 +87,7 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-host-install", "darwin-arm64"),
     ("kbf-updater", "darwin-arm64"),
     ("kbf-mac-provision", "darwin-arm64"),
+    ("kbf-task-bundle", "darwin-arm64"),
     ("kbf", "linux-x86_64"),
     ("kbf-daemon", "linux-x86_64"),
     ("kbf-server", "linux-x86_64"),
@@ -90,7 +95,7 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-host-install", "linux-x86_64"),
     ("kbf-updater", "linux-x86_64"),
     ("kbf-signer", "linux-x86_64"),
-    ("tierstore", "linux-x86_64"),
+    ("kbf-task", "linux-x86_64"),
     ("kbf", "linux-arm64"),
     ("kbf-daemon", "linux-arm64"),
     ("kbf-server", "linux-arm64"),
@@ -98,7 +103,7 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-host-install", "linux-arm64"),
     ("kbf-updater", "linux-arm64"),
     ("kbf-signer", "linux-arm64"),
-    ("tierstore", "linux-arm64"),
+    ("kbf-task", "linux-arm64"),
 ];
 
 /// The binaries of [`ASSETS`] that name the commit they were built from (`<binary>
@@ -111,9 +116,10 @@ pub const IDENTIFIED: &[&str] = &["kbf", "kbf-installer"];
 /// as `--source-ref` (`refs/heads/<branch>`).
 pub const PUSH_BRANCHES: &[&str] = &["main"];
 
-/// The one `if:` of the jobs that sign and verify: a push, to one of [`PUSH_BRANCHES`].
-pub const SIGNING_IF: &str =
-    "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
+/// The one `if:` of the jobs that sign and verify: a push, to one of [`PUSH_BRANCHES`], in the
+/// `sign` stage of the pipeline's second call of this workflow (`inputs.stage`; a pull request
+/// or merge-queue run has no `inputs`, so it is never in that stage either).
+pub const SIGNING_IF: &str = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage == 'sign' }}";
 
 /// The platforms whose job builds the `kbf` deb and makes it an asset: the
 /// `cargo xtask pkg-kbf-asset` lines name exactly these.
@@ -185,6 +191,7 @@ pub fn problems(workflow: &str) -> Result<Vec<String>, String> {
     facts::rules(workflow, &mut out)?;
     kbf_package::rules(workflow, &mut out)?;
     images::rules(workflow, &mut out)?;
+    image_sbom::rules(workflow, &mut out)?;
     mac_package(workflow, &mut out)?;
     darwin(workflow, &mut out)?;
     pull_request_gate(workflow, &mut out)?;
@@ -210,7 +217,7 @@ fn pull_request_gate(workflow: &str, out: &mut Vec<String>) -> Result<(), String
 /// The jobs of beta.yml that run on a Mac. A pull request never runs them (the macOS pool is
 /// small and a pull request runs the fast gate only); a push to main
 /// always does, so none may carry an `if:` that skips it.
-pub const MACOS_JOBS: [&str; 2] = ["native-macos", "pkg-macos"];
+pub const MACOS_JOBS: [&str; 1] = ["native-macos"];
 
 /// What is wrong with beta.yml's macOS jobs: a condition on one (which could skip it on a
 /// push), or a `pull_request` trigger on the workflow (which would queue them for a pull
@@ -678,7 +685,7 @@ fn every_component_a_platform_needs_is_in_its_release_set() {
 
 #[test]
 fn the_macos_jobs_run_on_every_push_and_on_no_pull_request() {
-    // Catches: a condition added to native-macos or pkg-macos in beta.yml (a push that
+    // Catches: a condition added to native-macos in beta.yml (a push that
     // skips the only real-Mac test), or a `pull_request` trigger on beta.yml, which
     // would queue the small macOS pool for every pull request.
     let path = ".github/workflows/beta.yml";
@@ -714,6 +721,9 @@ fn the_docs_describe_the_release_set() {
             format!("`kbf-<commit>-{platform}.deb`"),
             format!("`kbf-frontend-image-<commit>-{platform}.oci.tar`"),
             format!("`kbf-coordinator-image-<commit>-{platform}.oci.tar`"),
+            format!("`kbf-task-image-<commit>-{platform}.oci.tar`"),
+            format!("`kbf-task-image-<commit>-{platform}.facts.json`"),
+            format!("`kbf-task-image-<commit>-{platform}.cdx.json`"),
         ] {
             if !doc.contains(&file) {
                 missing.push(format!("docs/artifacts.md does not list {file}"));
@@ -832,6 +842,55 @@ mod rules {
         )
     }
 
+    /// The steps that check the job's `kbf-task`, build its image twice from it, compare the
+    /// builds and make the first an asset.
+    fn task_steps(platform: &str) -> String {
+        let build = |n: u32| {
+            format!(
+                "      - name: Task build {n}\n        run: docker buildx build --builder b --no-cache --platform p --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --file f --output \"type=docker,oci-mediatypes=true,dest=target/task-image-out/{n}.oci.tar,rewrite-timestamp=true\" target/task-image\n"
+            )
+        };
+        format!(
+            "      - name: Task target\n        run: rustup target add \"$STATIC_TARGET\"\n      - name: Task build\n        run: cargo build --locked --release --target \"$STATIC_TARGET\" -p kbf-task --bin kbf-task\n      - name: Task check\n        run: cargo xtask build-commit check \"target/$STATIC_TARGET/release/kbf-task\" \"$GITHUB_SHA\"\n      - name: Task static\n        run: cargo xtask static-elf \"target/$STATIC_TARGET/release/kbf-task\"\n      - name: Task context\n        run: cp \"target/$STATIC_TARGET/release/kbf-task\" target/task-image/kbf-task\n{}{}      - name: Task same\n        run: cmp target/task-image-out/1.oci.tar target/task-image-out/2.oci.tar\n      - name: Task asset\n        run: cargo xtask pkg-image-asset --service task --image target/task-image-out/1.oci.tar --platform {platform} --commit \"$GITHUB_SHA\" --binary \"target/$STATIC_TARGET/release/kbf-task\" --out dist\n",
+            build(1),
+            build(2)
+        )
+    }
+
+    /// The verify job's check of the signed task image of `platform` (no file of the build).
+    fn verify_task_step(platform: &str) -> String {
+        format!(
+            "      - name: Task image {platform}\n        run: cargo xtask pkg-image-asset --verify-only --service task --image \"dist/kbf-task-image-$GITHUB_SHA-{platform}.oci.tar\" --platform {platform} --commit \"$GITHUB_SHA\"\n"
+        )
+    }
+
+    /// The step that fetches syft for `platform` (pinned by version and SHA-256, like every tool
+    /// the jobs fetch), as the Linux jobs have it.
+    fn syft_fetch_step(platform: &str) -> String {
+        let (arch, sha) = match platform {
+            "linux-arm64" => ("arm64", "SYFT_SHA256_AARCH64_LINUX"),
+            _ => ("amd64", "SYFT_SHA256_X86_64_LINUX"),
+        };
+        format!(
+            "      - name: Fetch syft\n        run: cargo xtask fetch --url \"https://github.com/anchore/syft/releases/download/v$SYFT_VERSION/syft_${{SYFT_VERSION}}_linux_{arch}.tar.gz\" --sha256 \"${sha}\" --out \"$RUNNER_TEMP/tools/syft\" --extract tar.gz --member syft\n"
+        )
+    }
+
+    /// The step that makes the CycloneDX SBOM of the task image of `platform` an asset, after the
+    /// image is one.
+    fn task_sbom_step(platform: &str) -> String {
+        format!(
+            "      - name: Task SBOM\n        run: cargo xtask pkg-image-sbom --service task --image \"dist/kbf-task-image-$GITHUB_SHA-{platform}.oci.tar\" --platform {platform} --commit \"$GITHUB_SHA\" --syft \"$RUNNER_TEMP/tools/syft\" --source-date-epoch \"$SOURCE_DATE_EPOCH\"\n"
+        )
+    }
+
+    /// The verify job's check of the SBOM beside the signed task image of `platform`.
+    fn verify_task_sbom_step(platform: &str) -> String {
+        format!(
+            "      - name: Task SBOM {platform}\n        run: cargo xtask pkg-image-sbom --verify-only --service task --image \"dist/kbf-task-image-$GITHUB_SHA-{platform}.oci.tar\" --platform {platform} --commit \"$GITHUB_SHA\"\n"
+        )
+    }
+
     /// The steps that make the Mac `.pkg` an asset, as the darwin job has them (after the
     /// tarball's identity and signature checks, which `good()` writes before).
     fn mac_package_steps() -> String {
@@ -864,7 +923,7 @@ mod rules {
     /// A workflow of the shape the rules read, meeting every one.
     fn good() -> String {
         let mut w = String::from(
-            "on:\n  pull_request:\n  merge_group:\n  workflow_call:\npermissions: {}\nenv:\n  GH_SHA256_AARCH64_DARWIN: abababababababababababababababababababababababababababababababab\njobs:\n",
+            "on:\n  pull_request:\n  merge_group:\n  workflow_call:\npermissions: {}\nenv:\n  GH_SHA256_AARCH64_DARWIN: abababababababababababababababababababababababababababababababab\n  SYFT_SHA256_X86_64_LINUX: cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\n  SYFT_SHA256_AARCH64_LINUX: efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef\njobs:\n",
         );
         for job in BUILD_JOBS {
             w.push_str(&format!(
@@ -894,7 +953,7 @@ mod rules {
                 }
             }
             for name in &mine {
-                if platform == "darwin-arm64" {
+                if platform == "darwin-arm64" && *name != xtask::task_bundle::NAME {
                     w.push_str(&format!(
                         "      - name: Sign {name}\n        run: cargo xtask sign-darwin \"target/$TARGET/release/{name}\" --minos 14.0\n"
                     ));
@@ -908,6 +967,11 @@ mod rules {
             }
             w.push_str(&facts_step(platform));
             for name in &mine {
+                if *name == xtask::task_bundle::NAME {
+                    // Not a binary: the darwin kbf-task bundle has its own verb, and its own rules (`task_bundle`).
+                    w.push_str("      - name: Package the bundle\n        run: cargo xtask package-task-bundle --layout l --sbom s.json --commit \"$GITHUB_SHA\" --out dist\n");
+                    continue;
+                }
                 w.push_str(&format!(
                     "      - name: Package {name}\n        run: cargo xtask package --binary \"target/$TARGET/release/{name}\" --sbom s.json --platform {platform} --commit \"$GITHUB_SHA\" --out dist\n"
                 ));
@@ -926,6 +990,9 @@ mod rules {
                 w.push_str(&kbf_asset_step(platform));
                 w.push_str(&image_steps(platform));
                 w.push_str(&coordinator_steps(platform));
+                w.push_str(&task_steps(platform));
+                w.push_str(&syft_fetch_step(platform));
+                w.push_str(&task_sbom_step(platform));
             }
             if *job == MAC_PACKAGE {
                 w.push_str(&mac_package_steps());
@@ -945,6 +1012,8 @@ mod rules {
                     w.push_str(&verify_kbf_package_step(p));
                     w.push_str(&verify_image_step(p));
                     w.push_str(&verify_coordinator_step(p));
+                    w.push_str(&verify_task_step(p));
+                    w.push_str(&verify_task_sbom_step(p));
                 }
             } else {
                 w.push_str(&verify_mac_package_step());
@@ -1012,9 +1081,9 @@ mod rules {
 
     #[test]
     fn a_macos_job_with_a_condition_or_a_pull_request_trigger_is_refused() {
-        // Catches: an `if:` on either macOS job, and a `pull_request` trigger, each
+        // Catches: an `if:` on the macOS job, and a `pull_request` trigger, each
         // accepted; and a clean push-only workflow refused.
-        let beta = "name: beta\non:\n  push:\n    branches: [main]\njobs:\n  native-macos:\n    runs-on: macos-latest\n  pkg-macos:\n    runs-on: macos-latest\n";
+        let beta = "name: beta\non:\n  push:\n    branches: [main]\njobs:\n  native-macos:\n    runs-on: macos-latest\n";
         assert_eq!(
             macos_problems(beta).expect("readable"),
             Vec::<String>::new()
@@ -1072,6 +1141,8 @@ mod rules {
                 "if: ${{ github.ref == 'refs/heads/main' }}",
                 "if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}",
                 "if: ${{ github.event_name != 'push' }}",
+                "if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}",
+                "if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage != 'sign' }}",
             ] {
                 // The k-th `if:` of the signing jobs, replaced.
                 let w = good();
@@ -1835,12 +1906,15 @@ mod rules {
         }
     }
 
+    mod image_sbom_tests;
     mod images_tests;
     mod kbf_package_tests;
 }
 
 mod facts;
+mod image_sbom;
 mod images;
 #[cfg(test)]
 mod installer;
 mod kbf_package;
+mod task_bundle;

@@ -18,14 +18,29 @@
 //!   pkg-macos-asset` lists ([`attested_assets::packaged_macos_pkgs`]) are held to the same
 //!   two rules, as `dist/kbf-<commit>-<platform>.deb` and `dist/kbf-installer-<commit>-<platform>.pkg`
 //!   and their `.deb.sigstore.json` (`.pkg.sigstore.json`).
-//!   So are the frontend and coordinator images that `cargo xtask pkg-image-asset` lists
+//!   So are the frontend, coordinator and task images that `cargo xtask pkg-image-asset` lists
 //!   ([`attested_assets::packaged_images`]), as `dist/kbf-<service>-image-<commit>-<platform>.oci.tar`
 //!   and its `.oci.tar.sigstore.json`.
 //! - **Its bundle's name.** The step after it sets `BUNDLE` to that step's
 //!   `bundle-path` output and copies it to `dist/<tarball>.sigstore.json` (the action
 //!   leaves it in a temporary directory under a name that is the same for every
-//!   attestation). That `cp` is the only `run:` step the attest job may have: it holds
-//!   `id-token: write` and signs, and any other shell step is named.
+//!   attestation). That `cp` and the two checks of the next point are the only `run:` steps
+//!   the attest job may have: it holds `id-token: write` and signs, and any other shell step
+//!   is named.
+//! - **Signed only what the build published.** The build call's files wait in the run's
+//!   artifact store while jobs that run repository code go by, so before it signs, the attest
+//!   job of a group checks what it downloaded ([`sums_checked`]): first that the sums file
+//!   is the one the build call's sums job published (`/usr/bin/sha256sum --check --strict <<<
+//!   "$SUMS_SHA256  dist/SHA256SUMS"`, with `SUMS_SHA256` the input the pipeline passes from
+//!   that job's output), then that every file is the one the sums list (`/usr/bin/sha256sum --check
+//!   --strict SHA256SUMS` in `dist`; this proves that the files the sums LIST match, not that
+//!   `dist` holds nothing else: the sums job refuses an unlisted file, and the attest steps name
+//!   their files). Both are unconditional `sha256sum` commands run by the workflow's pinned bash
+//!   (the here-string is bash), after the last download and before the first attestation step.
+//!   No repository code runs beside `id-token: write`. The checks must also be able to fail: the
+//!   workflow's `defaults.run.shell` is exactly `bash` and its `env` sets only names of
+//!   [`WORKFLOW_ENV`]; the attest job has no `defaults`, no `env`, and no step with a `shell:`
+//!   (a `shell: true {0}` would make both checks no-ops).
 //! - **Out of the job.** The job uploads `dist/*.sigstore.json` as the artifact
 //!   `bundles-<group>`, in a step that cannot be skipped and fails on no file.
 //! - **Into the verification and the release.** The group's verify job downloads
@@ -113,6 +128,7 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
         let name = match service.as_str() {
             "frontend" => "kbf-frontend-image",
             "coordinator" => "kbf-coordinator-image",
+            "task" => "kbf-task-image",
             other => {
                 return Err(format!(
                     "`pkg-image-asset --service {other}`: not an image of the release set"
@@ -147,6 +163,7 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
             .collect();
         let steps = workflows::job_steps(artifacts, &attest_job)?;
         attested_alone(&attest_job, &steps, &mine, &my_packages, &mut out);
+        sums_checked(artifacts, &attest_job, g, &steps, &mut out)?;
         uploaded(&attest_job, g, &steps, &mut out);
         let verify_job = format!("verify-{g}");
         let verify = workflows::job_steps(artifacts, &verify_job)?;
@@ -266,6 +283,10 @@ fn attested_alone(
         let Some(run) = step.run.as_deref() else {
             continue;
         };
+        if run == SUMS_FILES_RUN || run == SUMS_DIGEST_RUN {
+            // Held to the exact step, its place and its inputs by [`sums_checked`].
+            continue;
+        }
         if !after_provenance.contains(&at) {
             let first: String = run
                 .trim_start()
@@ -280,6 +301,173 @@ fn attested_alone(
             ));
         }
     }
+}
+
+/// The check of the downloaded sums file against the digest the build call's sums job published.
+const SUMS_DIGEST_RUN: &str =
+    "/usr/bin/sha256sum --check --strict <<< \"$SUMS_SHA256  dist/SHA256SUMS\"";
+
+/// The check of every downloaded file against the sums file, run in `dist`.
+const SUMS_FILES_RUN: &str = "/usr/bin/sha256sum --check --strict SHA256SUMS";
+
+/// The workflow input that carries group `g`'s digest: `sums_<group>_sha256`.
+pub fn digest_input(g: &str) -> String {
+    format!("sums_{}_sha256", g.replace('-', "_"))
+}
+
+/// The two checks the attest job `job` (group `g`) makes of what it downloaded before it signs
+/// anything: the sums file against the digest input, then the files against the sums file, each
+/// an unconditional step, both after the last download and before the first attestation step.
+fn sums_checked(
+    artifacts: &str,
+    job: &str,
+    g: &str,
+    steps: &[workflows::Step],
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    shell_cannot_be_swapped(artifacts, job, steps, out)?;
+    let input_name = digest_input(g);
+    let want_env = format!("${{{{ inputs.{input_name} }}}}");
+    let digest = steps
+        .iter()
+        .position(|s| s.run.as_deref().map(str::trim) == Some(SUMS_DIGEST_RUN));
+    let files = steps
+        .iter()
+        .position(|s| s.run.as_deref().map(str::trim) == Some(SUMS_FILES_RUN));
+    match digest {
+        None => out.push(format!(
+            "`{job}` does not run `{SUMS_DIGEST_RUN}`: it would sign sums the build call did not publish"
+        )),
+        Some(at) => {
+            let step = &steps[at];
+            if step.conditional
+                || step.env != [("SUMS_SHA256".to_owned(), want_env.clone())]
+                || step.working_directory.is_some()
+            {
+                out.push(format!(
+                    "the digest check of `{job}` is to be an unconditional step with exactly `env: SUMS_SHA256: {want_env}` and no working directory"
+                ));
+            }
+        }
+    }
+    match files {
+        None => out.push(format!(
+            "`{job}` does not run `{SUMS_FILES_RUN}` in `dist`: it would sign files the sums do not list"
+        )),
+        Some(at) => {
+            let step = &steps[at];
+            if step.conditional
+                || !step.env.is_empty()
+                || step.working_directory.as_deref() != Some("dist")
+            {
+                out.push(format!(
+                    "the file check of `{job}` is to be an unconditional step with `working-directory: dist` and no `env:`"
+                ));
+            }
+        }
+    }
+    let last_download = steps.iter().rposition(|s| uses(s, DOWNLOAD));
+    let first_attest = steps.iter().position(|s| {
+        s.uses
+            .as_deref()
+            .is_some_and(|u| u.starts_with("actions/attest"))
+    });
+    for (what, at) in [("digest", digest), ("file", files)] {
+        let Some(at) = at else { continue };
+        if first_attest.is_some_and(|a| at > a) {
+            out.push(format!(
+                "the {what} check of `{job}` comes after an attestation step: it must run before anything is signed"
+            ));
+        }
+        if last_download.is_some_and(|d| at < d) {
+            out.push(format!(
+                "the {what} check of `{job}` comes before its last download: it would check files that are not the ones signed"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The shell the workflow pins as its default. Written in parts: it is data here, and the
+/// interpreter-budget scan reads a bare program literal in test code as a use of that program.
+const PINNED_SHELL: &str = concat!("b", "a", "s", "h");
+
+/// The names the workflow's top-level `env:` may set: exactly the ones it sets today. An
+/// allow-list, because a deny-list misses a name (`BASH_FUNC_sha256sum%%` makes bash import a
+/// function that shadows the command, and `LD_AUDIT`, `BASH_XTRACEFD` and `POSIXLY_CORRECT` change
+/// how programs run) and every step of the jobs that sign sees these. Adding a name here needs a
+/// security reason: say in the change why it cannot alter how a shell or `sha256sum` runs.
+/// This list is the protection: bash outside posix mode also imports a function named like the
+/// absolute path (`BASH_FUNC_/usr/bin/sha256sum%%`), so calling `/usr/bin/sha256sum` shadows nothing
+/// away by itself.
+const WORKFLOW_ENV: &[&str] = &[
+    "CARGO_TERM_COLOR",
+    "CARGO_INCREMENTAL",
+    "CYCLONEDX_VERSION",
+    "CYCLONEDX_SHA256_AARCH64_DARWIN",
+    "CYCLONEDX_SHA256_X86_64_LINUX",
+    "CYCLONEDX_SHA256_AARCH64_LINUX",
+    "GH_VERSION",
+    "GH_SHA256_X86_64_LINUX",
+    "GH_SHA256_AARCH64_LINUX",
+    "GH_SHA256_AARCH64_DARWIN",
+    "UPGRADE_FROM_TAG",
+    "UPGRADE_FROM_COMMIT",
+    "UPGRADE_FROM_INSTALLER_SHA256_X86_64",
+    "UPGRADE_FROM_KBF_SHA256_X86_64",
+    "UPGRADE_FROM_INSTALLER_SHA256_AARCH64",
+    "UPGRADE_FROM_KBF_SHA256_AARCH64",
+    "JS_BUNDLE_VERSION",
+    "JS_BUNDLE_SHA256_AARCH64_DARWIN",
+    "JS_BUNDLE_SOURCE_DIGEST",
+    "NFPM_VERSION",
+    "NFPM_SHA256_X86_64_LINUX",
+    "NFPM_SHA256_AARCH64_LINUX",
+    "SYFT_VERSION",
+    "SYFT_SHA256_X86_64_LINUX",
+    "SYFT_SHA256_AARCH64_LINUX",
+];
+
+/// The checks of the attest job `job` are `sha256sum` run by the workflow's bash: the workflow's
+/// `defaults.run.shell` is exactly `bash` and its `env` sets only names of [`WORKFLOW_ENV`], and the job
+/// has no `defaults`, no `env` and no step with a `shell:` (`shell: true {0}` runs nothing).
+fn shell_cannot_be_swapped(
+    artifacts: &str,
+    job: &str,
+    steps: &[workflows::Step],
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    let shell = workflows::top_defaults_shell(artifacts)?;
+    if shell.as_deref() != Some(PINNED_SHELL) {
+        out.push(format!(
+            "the workflow's `defaults.run.shell` is {shell:?}, not exactly `{PINNED_SHELL}`: the checks of `{job}` use a here-string and must run under a known shell"
+        ));
+    }
+    for (name, _) in workflows::top_env(artifacts)? {
+        if !WORKFLOW_ENV.contains(&name.as_str()) {
+            out.push(format!(
+                "the workflow's `env` sets `{name}`, which is not in the allow-list `WORKFLOW_ENV`: a variable can change how a shell or `sha256sum` runs, and the checks of `{job}` could be made to pass without checking"
+            ));
+        }
+    }
+    if workflows::job_has_key(artifacts, job, "defaults")? {
+        out.push(format!(
+            "`{job}` has `defaults:`: a job-level `defaults.run.shell` could turn the checks into no-ops"
+        ));
+    }
+    if !workflows::job_env(artifacts, job)?.is_empty() {
+        out.push(format!(
+            "`{job}` has a job-level `env:`: it reaches every step of the job that holds `id-token: write`, and a startup variable would make the checks pass without checking"
+        ));
+    }
+    for step in steps.iter().filter(|s| s.run.is_some()) {
+        if let Some(shell) = &step.shell {
+            out.push(format!(
+                "a `run:` step of `{job}` has `shell: {shell}`: the workflow's pinned bash runs every step of the job that signs"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The step of the attest job `job` (group `g`) that uploads the bundles.

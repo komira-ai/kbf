@@ -7,7 +7,8 @@
 //! Only when the hot store is a directory on the filesystem of `--data-dir`: with no hot
 //! store, local storage keeps nothing on this disk but the cold store (the durable store,
 //! not a cache), and a hot store on another disk is a copy on another disk. Either way
-//! each half then keeps what it keeps without the other, and the start says why.
+//! each half then keeps what it keeps without the other, and the start says why. The same
+//! with `--no-input-cache`: the daemon opens no input cache to be the one.
 
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
@@ -21,6 +22,10 @@ use kbf_storage::local_cache::LocalCache;
 /// one cache when the hot store shares the data directory's disk; the cache, or `None`
 /// (each half as without the other).
 pub(crate) fn share(server: &mut Args, daemon: &mut kbf_node::Cli) -> Option<Arc<LocalCache>> {
+    if daemon.no_input_cache() {
+        tracing::info!("one cache: off (--no-input-cache: the daemon keeps no input cache)");
+        return None;
+    }
     let data = daemon.data_dir();
     let Some(StoreUri::File(hot)) = &server.hot_store else {
         tracing::info!("one cache: off (no hot store directory)");

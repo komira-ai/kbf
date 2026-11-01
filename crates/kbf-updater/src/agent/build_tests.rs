@@ -3,6 +3,7 @@
 //! each role drains, and the exit codes of the mode.
 
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,11 +11,11 @@ use kbf_testkit::dir::TestDir;
 use kbf_types::HostRole;
 
 use super::build::{
-    NO_CREDENTIAL, NoCredential, build, drain_for, frontend_ports, identity_of_files, run_agent,
-    run_config, unix_now,
+    NO_CREDENTIAL, NoCredential, build, cordon_dir, drain_for, frontend_ports, identity_of_files,
+    node_ports, run_agent, run_config, service_ports, unix_now,
 };
 use super::coordinator::{Endpoint, TlsFiles};
-use super::flags::{Config, NodeApi, Timing};
+use super::flags::{Config, NodeApi, ServiceConfig, ServiceDrain, ServiceHealth, Timing};
 use super::local::{Limits, SocketLocal};
 use super::pki::{Pki, write_files};
 use super::run::Stop;
@@ -48,6 +49,7 @@ impl Rig {
             frontend: None,
             enroll_frontend: None,
             state_dir: None,
+            cordon_dir: None,
             daemon_node: None,
             node_api: Some(NodeApi {
                 addr: "127.0.0.1:1".parse().unwrap(),
@@ -57,6 +59,7 @@ impl Rig {
                 heartbeat: Duration::from_millis(20),
                 ..Timing::DEFAULT
             },
+            services: Vec::new(),
         };
         Self { dir, pki, config }
     }
@@ -66,11 +69,11 @@ impl Rig {
 /// is a flag; a file that is not a certificate, holds none, or is no updater's says what is wrong.
 #[test]
 fn the_identity_comes_from_the_certificate() {
-    let rig = Rig::new("bd-identity", HostRole::MacDaemon);
+    let rig = Rig::new("bd-identity", HostRole::MAC_DAEMON);
     let who = identity_of_files(&rig.config.files).unwrap();
     assert_eq!(
         (who.node_id.to_string(), who.role),
-        ("n1".to_owned(), HostRole::MacDaemon)
+        ("n1".to_owned(), HostRole::MAC_DAEMON)
     );
 
     let missing = TlsFiles {
@@ -125,19 +128,19 @@ fn an_agent_is_built_for_every_kind_of_host() {
         "tests run where kbf has releases"
     );
     for role in [
-        HostRole::Storage,
-        HostRole::Daemon,
-        HostRole::MacDaemon,
-        HostRole::Frontend,
+        HostRole::STORAGE,
+        HostRole::DAEMON,
+        HostRole::MAC_DAEMON,
+        HostRole::FRONTEND,
     ] {
-        let rig = Rig::new("bd-built", role);
+        let rig = Rig::new("bd-built", role.clone());
         let agent = build(&rig.config).unwrap_or_else(|e| panic!("{role}: {e}"));
         let status = agent.status();
         assert_eq!(status.version, Version::parse("0").unwrap());
         assert_eq!(status.health, crate::wire::Health::Unhealthy);
     }
 
-    let mut rig = Rig::new("bd-nofiles", HostRole::Daemon);
+    let mut rig = Rig::new("bd-nofiles", HostRole::DAEMON);
     std::fs::write(&rig.config.files.ca, "").unwrap();
     assert!(
         build(&rig.config)
@@ -146,7 +149,7 @@ fn an_agent_is_built_for_every_kind_of_host() {
             .contains("holds no certificate")
     );
 
-    let mut rig2 = Rig::new("bd-notoken", HostRole::Daemon);
+    let mut rig2 = Rig::new("bd-notoken", HostRole::DAEMON);
     rig2.config.node_api.as_mut().unwrap().token_file = rig2.dir.join("absent");
     assert!(build(&rig2.config).err().unwrap().contains("--token-file"));
     rig.config.files.cert = rig.dir.join("absent.pem");
@@ -158,7 +161,7 @@ fn an_agent_is_built_for_every_kind_of_host() {
 /// does and is not taken for done.
 #[test]
 fn every_host_is_drained_through_the_frontend() {
-    let rig = Rig::new("bd-drain", HostRole::Daemon);
+    let rig = Rig::new("bd-drain", HostRole::DAEMON);
     let node = rig.config.node_api.clone().unwrap();
     let api = OperatorApi::new(node.addr, node.token_file)
         .unwrap()
@@ -166,7 +169,10 @@ fn every_host_is_drained_through_the_frontend() {
     for role in [Role::Storage, Role::Daemon, Role::MacDaemon] {
         let drain = drain_for(role, &api);
         let h = host(role);
-        assert!(drain.drain(&h, Duration::from_secs(1)).is_err(), "{role:?}");
+        assert!(
+            drain.drain(&h, Some(Duration::from_secs(1))).is_err(),
+            "{role:?}"
+        );
         assert!(drain.undrain(&h).is_err(), "{role:?}");
     }
 }
@@ -176,7 +182,7 @@ fn every_host_is_drained_through_the_frontend() {
 /// exit 1 with the reason.
 #[test]
 fn the_process_runs_until_stopped_and_says_why_it_cannot_start() {
-    let rig = Rig::new("bd-run", HostRole::Daemon);
+    let rig = Rig::new("bd-run", HostRole::DAEMON);
     let (code, text) = run_config(&rig.config, |stop| {
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
@@ -185,7 +191,7 @@ fn the_process_runs_until_stopped_and_says_why_it_cannot_start() {
     });
     assert_eq!((code, text.as_str()), (0, ""));
 
-    let mut broken = Rig::new("bd-run-broken", HostRole::Frontend);
+    let mut broken = Rig::new("bd-run-broken", HostRole::FRONTEND);
     broken.config.files.cert = broken.dir.join("absent.pem");
     let (code, text) = run_config(&broken.config, |_| unreachable!("not started"));
     assert_eq!(code, 1);
@@ -198,7 +204,7 @@ fn the_process_runs_until_stopped_and_says_why_it_cannot_start() {
 /// `run_agent` hands the caller the handle before it runs.
 #[test]
 fn the_caller_gets_the_stop_handle_before_the_agent_runs() {
-    let rig = Rig::new("bd-ready", HostRole::Storage);
+    let rig = Rig::new("bd-ready", HostRole::STORAGE);
     let agent = build(&rig.config).unwrap();
     let stop_seen = Arc::new(std::sync::Mutex::new(None::<Stop>));
     let slot = Arc::clone(&stop_seen);
@@ -220,7 +226,7 @@ fn the_clock_is_unix_seconds() {
 /// anything is fetched, and drains nothing.
 #[test]
 fn an_agent_without_the_operator_credential_refuses_every_update() {
-    let mut rig = Rig::new("bd-nocred", HostRole::Daemon);
+    let mut rig = Rig::new("bd-nocred", HostRole::DAEMON);
     rig.config.node_api = None;
     assert!(build(&rig.config).is_ok());
     let h = host(Role::Daemon);
@@ -229,7 +235,7 @@ fn an_agent_without_the_operator_credential_refuses_every_update() {
     assert!(none.refusal(&h).unwrap().contains("neither --frontend"));
     assert!(none.check(&h, &v).is_err());
     assert!(none.check_held(&h, &v).is_err());
-    assert!(none.drain(&h, Duration::from_secs(1)).is_err());
+    assert!(none.drain(&h, Some(Duration::from_secs(1))).is_err());
     assert!(none.leases(&h).is_err());
     assert!(none.undrain(&h).is_err());
 }
@@ -284,7 +290,7 @@ fn enrolled_in(dir: &TestDir, pki: &Pki, role: HostRole) -> std::path::PathBuf {
 fn an_agent_with_a_state_directory_renews_what_it_was_enrolled_with() {
     let dir = TestDir::under(std::env::temp_dir(), "bd-state");
     let pki = Pki::new();
-    let state = enrolled_in(&dir, &pki, HostRole::Daemon);
+    let state = enrolled_in(&dir, &pki, HostRole::DAEMON);
     let store = kbf_enroll::store::Store::unopened(&state);
     let config = Config {
         coordinator: Endpoint::parse("localhost:1").unwrap(),
@@ -298,12 +304,14 @@ fn an_agent_with_a_state_directory_renews_what_it_was_enrolled_with() {
         frontend: Some(Endpoint::parse("localhost:1").unwrap()),
         enroll_frontend: Some(Endpoint::parse("localhost:1").unwrap()),
         state_dir: Some(state.clone()),
+        cordon_dir: None,
         node_api: None,
         daemon_node: None,
         timing: Timing {
             heartbeat: Duration::from_millis(20),
             ..Timing::DEFAULT
         },
+        services: Vec::new(),
     };
     let agent = build(&config).expect("an agent");
     assert_eq!(agent.status().health, crate::wire::Health::Unhealthy);
@@ -326,7 +334,7 @@ fn an_agent_with_a_state_directory_renews_what_it_was_enrolled_with() {
 /// the daemon's.
 #[test]
 fn a_frontend_hosts_agent_drains_a_node_only_when_the_host_runs_a_daemon() {
-    let rig = Rig::new("bd-fe-ports", HostRole::Frontend);
+    let rig = Rig::new("bd-fe-ports", HostRole::FRONTEND);
     let local = Arc::new(SocketLocal::new(
         &rig.config.helper_socket,
         Limits::default(),
@@ -335,7 +343,7 @@ fn a_frontend_hosts_agent_drains_a_node_only_when_the_host_runs_a_daemon() {
     let h = host(Role::Frontend);
 
     let (drain, health) = frontend_ports(&rig.config, &identity, &local).unwrap();
-    assert_eq!(drain.drain(&h, Duration::from_secs(1)), Ok(()));
+    assert_eq!(drain.drain(&h, Some(Duration::from_secs(1))), Ok(()));
     assert_eq!(drain.leases(&h), Ok(0));
     assert_eq!(drain.undrain(&h), Ok(()));
     assert_eq!(health.refusal(&h), None);
@@ -343,7 +351,7 @@ fn a_frontend_hosts_agent_drains_a_node_only_when_the_host_runs_a_daemon() {
     let mut with_daemon = rig.config.clone();
     with_daemon.daemon_node = Some("d1".to_owned());
     let (drain, _) = frontend_ports(&with_daemon, &identity, &local).unwrap();
-    assert!(drain.drain(&h, Duration::from_secs(1)).is_err());
+    assert!(drain.drain(&h, Some(Duration::from_secs(1))).is_err());
     // The agent is built.
     assert!(build(&with_daemon).is_ok());
 
@@ -351,12 +359,133 @@ fn a_frontend_hosts_agent_drains_a_node_only_when_the_host_runs_a_daemon() {
     let mut bare = with_daemon.clone();
     bare.node_api = None;
     let (drain, _) = frontend_ports(&bare, &identity, &local).unwrap();
-    assert!(drain.drain(&h, Duration::from_secs(1)).is_err());
+    assert!(drain.drain(&h, Some(Duration::from_secs(1))).is_err());
 
-    for role in [HostRole::Storage, HostRole::Daemon, HostRole::MacDaemon] {
-        let mut other = Rig::new("bd-fe-flag", role);
+    for role in [HostRole::STORAGE, HostRole::DAEMON, HostRole::MAC_DAEMON] {
+        let mut other = Rig::new("bd-fe-flag", role.clone());
         other.config.daemon_node = Some("d1".to_owned());
         let err = build(&other.config).err().unwrap();
         assert!(err.contains("--daemon-node"), "{role}: {err}");
     }
+}
+
+/// A service's ports are what its settings say: with a node drain and node health it drains and
+/// judges through the frontend as `kbf` does (here: an API nobody answers, so every call fails);
+/// with no drain its drain does nothing and cannot fail; with a readiness URL its health is that
+/// URL's.
+#[test]
+fn a_services_ports_follow_its_settings() {
+    let rig = Rig::new("bd-service-ports", HostRole::DAEMON);
+    let identity = identity_of_files(&rig.config.files).unwrap();
+    let h = host(Role::Daemon);
+    let target = Version::parse("0.1.7+gbbbbbbbbbbbb-3").unwrap();
+    let service = |drain, health, socket: &str| ServiceConfig {
+        name: "db".to_owned(),
+        channel: "db-ch".to_owned(),
+        helper_socket: socket.into(),
+        drain,
+        health,
+    };
+
+    let node = service_ports(
+        &rig.config,
+        &identity,
+        &h,
+        &service(ServiceDrain::Node, ServiceHealth::Node, "/run/db.sock"),
+    )
+    .unwrap();
+    assert_eq!((node.name.as_str(), node.channel.as_str()), ("db", "db-ch"));
+    assert!(node.drain.drain(&h, Some(Duration::from_secs(1))).is_err());
+    assert!(node.health.check(&h, &target).is_err());
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut tcp, _) = listener.accept().unwrap();
+        let mut buf = [0_u8; 512];
+        let _ = tcp.read(&mut buf).unwrap();
+        tcp.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
+    });
+    let ready = service_ports(
+        &rig.config,
+        &identity,
+        &h,
+        &service(
+            ServiceDrain::None,
+            ServiceHealth::Ready {
+                addr,
+                path: "/readyz".to_owned(),
+            },
+            "/run/db.sock",
+        ),
+    )
+    .unwrap();
+    assert_eq!(ready.drain.drain(&h, Some(Duration::from_secs(1))), Ok(()));
+    assert_eq!(ready.drain.leases(&h), Ok(0));
+    assert_eq!(ready.drain.undrain(&h), Ok(()));
+    assert_eq!(
+        ready.health.check(&h, &target),
+        Ok(crate::ports::Health::Healthy)
+    );
+    server.join().unwrap();
+    // Its own helper does not exist, and the answer says so.
+    assert!(ready.local.query().is_err());
+
+    // The agent with services is built from the same flags.
+    let mut config = rig.config.clone();
+    config.services = vec![service(
+        ServiceDrain::None,
+        ServiceHealth::Node,
+        "/run/db.sock",
+    )];
+    assert!(build(&config).is_ok());
+}
+
+/// The marks of the agent's cordons are kept in `--cordon-dir`, else the state directory, else
+/// the directory the placed key is in.
+#[test]
+fn the_cordon_marks_go_where_the_flags_say() {
+    let mut rig = Rig::new("bd-cordon", HostRole::DAEMON);
+    assert_eq!(
+        cordon_dir(&rig.config),
+        rig.config.files.key.parent().unwrap()
+    );
+    rig.config.state_dir = Some(PathBuf::from("/state"));
+    assert_eq!(cordon_dir(&rig.config), PathBuf::from("/state"));
+    rig.config.cordon_dir = Some(PathBuf::from("/cordons"));
+    assert_eq!(cordon_dir(&rig.config), PathBuf::from("/cordons"));
+}
+
+/// An agent whose cordon directory it cannot write does not start with a drain it could not
+/// use: the error names `--cordon-dir`, whatever the node is drained through.
+///
+/// Catches: every drain refused at the first update, with nothing at start to say why.
+#[test]
+fn a_cordon_directory_the_agent_cannot_write_stops_the_build_naming_the_flag() {
+    let mut rig = Rig::new("bd-cordon-ro", HostRole::DAEMON);
+    rig.config.cordon_dir = Some(rig.dir.join("missing"));
+    let local = Arc::new(SocketLocal::new(
+        &rig.config.helper_socket,
+        Limits::default(),
+    ));
+    let identity = identity_of_files(&rig.config.files).unwrap();
+    let why = node_ports(&rig.config, &identity, Role::Daemon, "kbf", &local)
+        .err()
+        .expect("refused");
+    assert!(why.contains("--cordon-dir"), "{why}");
+}
+
+/// Catches: a role the agent has no duties for being built into an agent.
+#[test]
+fn a_role_the_agent_has_no_duties_for_is_refused() {
+    let cache: HostRole = "cache".parse().unwrap();
+    assert_eq!(
+        super::build::kind_of(&cache).unwrap_err(),
+        "cache is a host role this agent has no duties for"
+    );
+    assert_eq!(
+        super::build::kind_of(&HostRole::MAC_DAEMON),
+        Ok(Role::MacDaemon)
+    );
 }

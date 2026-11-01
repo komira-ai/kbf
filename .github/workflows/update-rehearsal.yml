@@ -13,6 +13,13 @@
 # frontend and the host's `kbf` are the release before the newest. A pull request that changes
 # the coordinator, the agent's wire, the deploy verb or the OIDC verifier is rehearsed with them.
 #
+# `rehearse-tierstore` (crates/kbf-host-install/tests/update_rehearsal_tierstore.rs): tierstore as
+# a service of the coordinator. This checkout's coordinator runs a services file of kbf's entry and
+# the shipped `tierstore.services.toml`, `cargo xtask deploy-farm --service tierstore` rolls a
+# version over six stand-in storage hosts that announce the service, and kbf's own desired state
+# stays as it was. A pull request that changes the coordinator, the services file, the heartbeat
+# wire or the deploy verb is rehearsed with them. It needs no release and no token.
+#
 # The release runs both before its gamma stage, for the release it has just published
 # (release.yml, `rehearse` and `rehearse-agent`). A GitHub-hosted runner has systemd and
 # passwordless sudo; nothing here runs on any other machine.
@@ -112,5 +119,26 @@ jobs:
         if: ${{ !cancelled() }}
         with:
           name: update-rehearsal-agent-raw-output
+          path: target/update-rehearsal
+          if-no-files-found: error
+
+  rehearse-tierstore:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      # The coordinator of this checkout; the test finds it beside the test binaries.
+      - name: The coordinator of this checkout
+        run: cargo build --locked -p kbf-coordinator
+      - run: cargo xtask sudo-test -p kbf-host-install --test update_rehearsal_tierstore -- --exact deploy_farm_rolls_tierstore_over_the_storage_hosts_and_kbf_is_untouched --nocapture
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: update-rehearsal-tierstore-raw-output
           path: target/update-rehearsal
           if-no-files-found: error

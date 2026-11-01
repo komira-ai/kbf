@@ -17,8 +17,9 @@ use kbf_objstore::{
     ObjectStoreError, PageSize,
 };
 use kbf_pack::{Fetch, PackKeys, ReadError, WriterKind};
-use kbf_state::pack_index::memory::MemoryPackIndex;
-use kbf_state::{BlobDigest, ManualClock, PackIndex};
+use kbf_pack_index::memory::MemoryPackIndex;
+use kbf_pack_index::{BlobDigest, PackIndex};
+use kbf_state::ManualClock;
 use support::memory::MemoryCas;
 
 /// A memory object store that refuses every put while `refuse` is set.

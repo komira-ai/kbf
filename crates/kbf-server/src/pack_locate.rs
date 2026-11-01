@@ -33,13 +33,15 @@
 use std::sync::Arc;
 
 use kbf_front::{CommitError, Packs};
+use kbf_pack_index::{
+    BlobDigest, Location, MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError,
+};
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::pack_index_server::{PackIndex as PackIndexRpc, PackIndexServer};
 use kbf_proto::worker::{
     CommitPackRequest, CommitPackResponse, PackLocateRequest, PackLocateResponse, PackLocation,
     PackedBlob,
 };
-use kbf_state::{BlobDigest, Location, MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError};
 use tonic::{Request, Response, Status};
 
 use crate::blobs::admit;

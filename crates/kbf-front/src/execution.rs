@@ -60,8 +60,8 @@
 //! after its first operation. A WaitExecution on an operation kept finished is answered even
 //! then: its first operation is the done one, and the stream ends there.
 //!
-//! What v0 sends to the scheduler: QoS `ci` for every call (the `x-kbf-qos` header is
-//! not read yet), and every action is hermetic, so it may be joined (a `networked`
+//! What v0 sends to the scheduler: QoS `ci`, or the level the `x-kbf-qos` header names
+//! where [`QosAllow`] grants it ([`crate::qos_header`]), and every action is hermetic, so it may be joined (a `networked`
 //! property does not exist yet). The lease kind is the platform's `kbf-lease` value,
 //! `action` when absent; any other value than `action` or `whole_machine` is
 //! INVALID_ARGUMENT. The booking of an `action` is one core and 4 GiB by default
@@ -136,6 +136,7 @@ use crate::backend::Backend;
 use crate::default_platform::{DefaultPlatform, Quiet};
 use crate::described::Described;
 use crate::metrics::{CacheMetrics, OpenExecute};
+use crate::qos_header::{Chosen, QosAllow};
 use crate::recorder::{ActionLabel, ExecuteCall, Recorder, listing};
 use crate::request_metadata::CallMetadata;
 use crate::wire;
@@ -188,6 +189,11 @@ pub struct Submission {
     /// client named, and the size of the input tree. For the run record only; it is
     /// not part of the scheduler's [`Request`], which the log codec writes.
     pub evidence: Evidence,
+    /// The longest the action may run: its `timeout`, `None` when it names none or names
+    /// zero (the daemon then applies its own default, which the front does not know). The
+    /// scheduler reads it for the drain order and the deadlines of whole-machine requests
+    /// when those are on (`Scheduler::set_max_wall`); it is not part of the [`Request`].
+    pub max_wall: Option<Duration>,
 }
 
 /// Where an operation is, as its callers see it.
@@ -504,6 +510,13 @@ pub struct ExecutionService<D> {
     default_platform: DefaultPlatform,
     /// Holds the log lines of [`Self::default_platform`] to a few a minute.
     defaulted_log: Quiet,
+    /// The levels the `x-kbf-qos` header may name.
+    qos_allow: QosAllow,
+    /// Every `action` lease owns its whole worker ([`Self::with_exclusive_actions`]).
+    exclusive_actions: bool,
+    /// Holds the log lines of a header that asked for a level it was not granted to a
+    /// few a minute.
+    qos_log: Quiet,
 }
 
 /// The gRPC path of Execute, as calls are logged.
@@ -532,7 +545,30 @@ impl<D> ExecutionService<D> {
             default_memory: DEFAULT_RESOURCES.memory_bytes,
             default_platform: DefaultPlatform::NONE,
             defaulted_log: Quiet::default(),
+            qos_allow: QosAllow::DEFAULT,
+            exclusive_actions: false,
+            qos_log: Quiet::default(),
         }
+    }
+
+    /// This service, granting the levels in `allow` to a call whose `x-kbf-qos` header
+    /// names one (instead of [`QosAllow::DEFAULT`]).
+    #[must_use]
+    pub const fn with_qos_allow(mut self, allow: QosAllow) -> Self {
+        self.qos_allow = allow;
+        self
+    }
+
+    /// This service, asking the scheduler that every `action` lease own the whole worker it
+    /// lands on, all its CPUs and all its memory, so that one action runs per worker (instead
+    /// of booking what the platform names or the default). Placement only: the action digest
+    /// is the client's, and `kbf-book-cpus` and `kbf-book-mem-gib` are still read, checked
+    /// and recorded as hints but do not change what is booked. A `whole_machine` or `vm`
+    /// lease is as it was.
+    #[must_use]
+    pub const fn with_exclusive_actions(mut self, on: bool) -> Self {
+        self.exclusive_actions = on;
+        self
     }
 
     /// This service, giving an `action` that names no OS, no architecture and no ISA
@@ -597,6 +633,10 @@ where
         self.cache.metrics().execute.started.add(1);
         let caller = kbf_auth::metadata(&request);
         let call = crate::request_metadata::call_metadata(&request);
+        let chosen = self
+            .qos_allow
+            .choose(&request.metadata().clone().into_headers());
+        self.log_ignored_qos(&chosen);
         let request = request.into_inner();
         let instance = request.instance_name.as_str();
         authorize(&*self.authorizers.execute, &caller, EXECUTE, instance)
@@ -609,7 +649,7 @@ where
             invocation = call.invocation_display()
         );
         let answered = self
-            .execute_authorized(request, &call, &caller, &mut window, &mut open)
+            .execute_authorized(request, &call, &caller, chosen.qos, &mut window, &mut open)
             .instrument(span)
             .await;
         match answered {
@@ -663,6 +703,7 @@ where
         request: ExecuteRequest,
         metadata: &CallMetadata,
         caller: &AuthenticationMetadata,
+        qos: Qos,
         window: &mut Presubmit<'_>,
         open: &mut OpenExecute,
     ) -> Result<Either<Ticket, Response<OperationStream>>, Status> {
@@ -705,7 +746,9 @@ where
             )])))));
         }
         let instance = request.instance_name;
-        let (mut submission, command) = self.submission(instance.clone(), action, window).await?;
+        let (mut submission, command) = self
+            .submission(instance.clone(), action, qos, window)
+            .await?;
         submission.call =
             ExecuteCall::new(&self.recorder, metadata, caller, &instance, action, command);
         submission.described.label = ActionLabel::sent(metadata);
@@ -731,6 +774,7 @@ impl<D> ExecutionService<D> {
         &self,
         instance: String,
         action: Digest,
+        qos: Qos,
         window: &mut Presubmit<'_>,
     ) -> Result<(Submission, Digest), Status> {
         let Some(bytes) = self.read_input(&action).await? else {
@@ -809,12 +853,13 @@ impl<D> ExecutionService<D> {
         }
         let submission = Submission {
             request: Request {
-                key: ActionKey { instance, action },
-                qos: Qos::Ci,
+                key: ActionKey { instance, action }.into(),
+                qos,
                 kind,
                 resources: booked,
                 hermetic: true,
                 do_not_cache: decoded.do_not_cache,
+                whole_worker: self.exclusive_actions && kind == LeaseKind::Action,
                 needs,
             },
             call: None,
@@ -826,6 +871,7 @@ impl<D> ExecutionService<D> {
                 input_bytes,
                 input_files,
             },
+            max_wall: wall_of(&decoded),
         };
         Ok((submission, command_digest))
     }
@@ -863,6 +909,22 @@ impl<D> ExecutionService<D> {
                 default_platform = %self.default_platform,
                 held_back,
                 "platform defaulted: the action named no OS and no architecture"
+            );
+        }
+    }
+
+    /// Logs, at most a few a minute, a call whose `x-kbf-qos` header asked for a level
+    /// it was not granted (or named none): it runs at `ci`, and is not refused.
+    fn log_ignored_qos(&self, chosen: &Chosen) {
+        let Some(asked) = &chosen.ignored else {
+            return;
+        };
+        if let Some(held_back) = self.qos_log.turn() {
+            tracing::warn!(
+                asked = ?asked,
+                granted = %chosen.qos,
+                held_back,
+                "x-kbf-qos ignored: not a level this front end grants (--qos-allowed); running at ci"
             );
         }
     }
@@ -1137,6 +1199,17 @@ fn device_kind(kind: LeaseKind, needs: &kbf_caps::Request) -> Result<(), Status>
         )));
     }
     Ok(())
+}
+
+/// How long `action` may run, from its `timeout`: `None` when it has none, when it is
+/// zero, and when it is negative (the daemon refuses such an action when it runs it).
+fn wall_of(action: &Action) -> Option<Duration> {
+    let timeout = action.timeout.as_ref()?;
+    let wall = Duration::new(
+        u64::try_from(timeout.seconds).ok()?,
+        u32::try_from(timeout.nanos).ok()?,
+    );
+    (!wall.is_zero()).then_some(wall)
 }
 
 /// The lease kind a platform names, or INVALID_ARGUMENT for one not in

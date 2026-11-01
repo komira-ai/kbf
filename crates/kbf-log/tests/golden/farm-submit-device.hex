@@ -1,0 +1,5 @@
+# Log entry `farm-submit-device`: the bytes of one entry of the replicated log, in format 1.
+# Pins: this value decodes from these bytes under every format, and encodes to them.
+# A change to this file needs a reason in the pull request that makes it, and the
+# file is never rewritten to match a new encoding: see tests/golden_corpus.rs.
+1a7e080110021a7822760a740a2b0a0169122608011220030303030303030303030303030303030303030303030303030303030303030318031202080318012204080110022a0d0a0461726368120561726d36342a0f0a0a696f732e6465766963651201312a150a10696f732e6465766963652e636c61737312016330013801

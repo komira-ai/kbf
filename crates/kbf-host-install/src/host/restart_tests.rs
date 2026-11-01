@@ -178,6 +178,7 @@ fn a_failed_restart_carries_the_exit() {
     );
     let signalled = Ok(Exec {
         code: None,
+        signal: None,
         stdout: vec![],
         stderr: b"killed".to_vec(),
     });

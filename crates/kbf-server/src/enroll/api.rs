@@ -345,7 +345,7 @@ fn token_dto(info: &kbf_enroll_registry::TokenInfo) -> TokenInfo {
     TokenInfo {
         id: info.id.to_string(),
         roles: info.roles.iter().map(|r| r.name().to_owned()).collect(),
-        host_role: info.host_role.map(|role| role.name().to_owned()),
+        host_role: info.host_role.as_ref().map(|role| role.name().to_owned()),
         max_uses: info.max_uses,
         uses: info.uses,
         expires_at: info.expires_at,
@@ -389,7 +389,7 @@ fn make_token(api: &EnrollApi, request: TokenCreate) -> Result<TokenCreated, Fai
     let host_role = request
         .host_role
         .as_deref()
-        .map(str::parse::<HostRole>)
+        .map(HostRole::parse_named)
         .transpose()
         .map_err(|e| bad(format!("host_role: {e}")))?;
     let node_id = request

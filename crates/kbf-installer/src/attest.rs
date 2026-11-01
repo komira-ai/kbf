@@ -4,7 +4,8 @@
 //! that needs no network when it is given the bundle and a trusted root) on a file and
 //! the attestation bundle for it, and accepts the file only if the attestation
 //!
-//! - names this repository, signed by the pinned workflow (`artifacts.yml`) through the
+//! - names the host's repository (by default `komira-ai/kbf`), signed by its workflow
+//!   (by default `artifacts.yml`; a release channel of the host-install helper may name another) through the
 //!   GitHub Actions OIDC issuer, on hosted runners only (`--deny-self-hosted-runners`);
 //! - was made for the release's commit (`--source-digest`) on one of the host's allowed
 //!   branches (`--source-ref`);
@@ -156,7 +157,7 @@ impl GhCheck {
             root: host.root().clone(),
             gh: host.gh(),
             trusted_root: host.trusted_root(),
-            signers: vec![Signer::current(), Signer::former()],
+            signers: settings.signers.clone(),
             issuer: ISSUER.to_owned(),
             source_refs: settings.source_refs.clone(),
             run_as: settings.run_as,

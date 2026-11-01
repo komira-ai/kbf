@@ -4,7 +4,8 @@
 //! create and drop databases on. It makes a database of its own.
 
 use kbf_pack_adopt::{Seams, open_postgres};
-use kbf_state::postgres::{PostgresConfig, test_database};
+use kbf_pack_index::schema::test_database;
+use kbf_state::postgres::PostgresConfig;
 
 use crate::support::{BUCKET, Farm, SOCKET_URL, says};
 

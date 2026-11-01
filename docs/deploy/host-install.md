@@ -366,7 +366,8 @@ stage):
    (`gh` hashes the staged copy), the build's source digest to the full 40-digit commit (not the
    version's 12 digits), its source ref to the channel's branch, the signer to
    `komira-ai/kbf`'s `artifacts.yml` workflow (the repository's former name is still accepted,
-   for releases attested under it), and GitHub-hosted runners only;
+   for releases attested under it; a channel may name [another repository and
+   workflow](#a-channel-of-another-repository)), and GitHub-hosted runners only;
 5. the tarball holds exactly one regular file named `kbf`, a Mach-O file for arm64;
 6. the binary carries no `com.apple.quarantine` attribute (it is removed, and proven gone);
 7. `codesign --verify --strict` accepts it and its signature has the hardened runtime;
@@ -374,10 +375,13 @@ stage):
    (`kbf --mode=daemon --config /usr/local/etc/kbf/kbf.toml --check`);
 9. the staged binary is root's, in directories only root can write.
 
-Steps 4 and 8 start their program through `/usr/sbin/chroot -u <uid> -g <gid> -G <gid> / ...`:
-started by `Command::uid` and `gid` alone, a child on macOS keeps the old effective gid (group 0,
-`wheel`) as a supplementary group, and `chroot` sets the one group itself. The real-Mac test
-checks that the child's groups are its own gid and nothing else.
+Steps 4 and 8 start their program with the privilege drop made in the child just before it
+executes (`setgroups` to the one gid, then `setgid`, then `setuid`), in `/`: started by
+`Command::uid` and `gid` alone, a child on macOS keeps the old effective gid (group 0, `wheel`) as
+a supplementary group. A drop through `chroot(8)` is not used: macOS kills a process that calls
+`chroot(2)` and then executes a program (`SIGKILL` at once, even for `/usr/bin/true`). The
+real-Mac tests check that a system program run as `nobody` exits 0 and that the child's groups are
+its own gid and nothing else.
 
 The stage is opened to traverse-only (0711) for steps 4 and 8, which run as other users, and
 is 0700 otherwise. While it is 0711 the users `nobody` and `_kbf` can pass through it but
@@ -476,7 +480,7 @@ on one without, it is to remove its files from `dir`.
 
 A channel with `source = "github"` needs no file delivery and no edit of the allowlist for a new
 release: the install fetches the release itself, as `nobody`, from the GitHub releases of
-`komira-ai/kbf`, and then handles the two files exactly as it handles the files of a `dir`
+`komira-ai/kbf` (or the repository the channel names, [below](#a-channel-of-another-repository)), and then handles the two files exactly as it handles the files of a `dir`
 (copied once into the stage, `sums` checked when set, then the offline attestation check and
 everything after it). The build attestation is still the only trust anchor; the listing and the
 download only bring the bytes. A directory channel stays for a Mac that cannot reach GitHub.
@@ -486,7 +490,7 @@ What the install does, in this order, with the system `curl` (listing) and the p
 directory that `nobody` owns inside the stage, with its own `HOME`:
 
 1. lists the repository's releases with `/usr/bin/curl` from the public REST endpoint
-   `https://api.github.com/repos/komira-ai/kbf/releases?per_page=100&page=N`, with no token. The
+   `https://api.github.com/repos/komira-ai/kbf/releases?per_page=100&page=N` (the channel's repository), with no token. The
    flags are fixed: no configuration file (`-q` first), HTTPS only, no redirect, an HTTP error
    fails the command, a time limit, a size limit, and an empty environment. It is 100 a page, newest first, page
    after page until a page is empty, and at most 30 pages (an empty page ends it; a short one
@@ -498,7 +502,8 @@ directory that `nobody` owns inside the stage, with its own `HOME`:
    `unknown_release`, since not all of it was seen. When the channel has `sums`, the commit is
    the one the sums list, and the listing must hold it;
 3. builds the download itself from the release's tag and the two asset names:
-   `gh release download <tag> --repo komira-ai/kbf --pattern <tarball> --pattern <bundle> --dir <dir>`.
+   `gh release download <tag> --repo komira-ai/kbf --pattern <tarball> --pattern <bundle> --dir <dir>`
+   (the channel's repository again).
    The URLs in the listing (`browser_download_url`, `url`) are never read or followed, and an entry
    whose tag is not letters, digits and `. _ + -` is not used;
 4. runs that download under a time limit (15 minutes) and a limit on what it may write (the
@@ -520,7 +525,7 @@ launchd, and no stage left behind.
   no secret is on the Mac.
 - Optionally, a token for a higher rate limit. A channel may name a `token_file`: a file that is
   root's alone to write (checked like the allowlist) holding a GitHub token, one line of letters,
-  digits, `_` and `-`. It needs no scope: the repository is public. The root process reads it and
+  digits, `_`, `-` and `.`, at most 1024 bytes (a workflow token of GitHub Actions is about 520). It needs no scope: the repository is public. The root process reads it and
   sends it to `curl` as an `Authorization` header in a configuration on `curl`'s standard input
   (never in its arguments, which every user can read), and gives it to `gh release download` as
   `GH_TOKEN`; the attestation check never gets it.
@@ -550,6 +555,53 @@ launchd, and no stage left behind.
 - A channel with `sums` pins the commit and the tarball's hash, and needs an edit of the sums file
   for each new release; the point of this source is a channel without them.
 
+### A channel of another repository
+
+By default a channel takes its releases from `komira-ai/kbf`, trusts the attestation of that
+repository's `artifacts.yml`, and names its files `kbf-<commit>-...`. A channel with
+`source = "github"` may name its own:
+
+```toml
+trusted_workflows = ["owner/other/.github/workflows/release.yml"]   # top level, before the first [channels.*]; empty by default
+
+[channels.other]
+source = "github"
+repository = "owner/other"
+signer_workflow = "owner/other/.github/workflows/release.yml"
+artifact_prefix = "other"                 # optional; "kbf" is the default
+```
+
+- `repository` is `owner/name` (letters, digits and `-` in the owner; letters, digits and
+  `. _ -` in the name). It is the repository the releases are listed from (the URL above), the
+  one `gh release download --repo` reads, and the `--repo` of the attestation check.
+- `signer_workflow` is the workflow whose attestation is believed (`--signer-workflow`): a
+  `.yml` or `.yaml` file directly under that repository's `.github/workflows/`. It comes with
+  `repository`; one without the other is `config_invalid`.
+- `artifact_prefix` replaces `kbf` at the start of the release files' names
+  (`<prefix>-<commit>-<platform>.tar.gz`, `.deb`, `.rpm`, and `<prefix>-frontend-image-<commit>-...`).
+  It is lower-case letters, digits and `-`, and goes only with `source = "github"` and no `sums`
+  (a directory's file names and a sums file are kbf's).
+- A string that is not safe to put in a URL or an argument of `gh` makes the file `config_invalid`
+  when it is read, so no channel of the file is usable. So does an entry of `trusted_workflows`
+  that is not `owner/name/.github/workflows/<file>.yml`.
+- **Any signer other than exactly `komira-ai/kbf` with `.github/workflows/artifacts.yml` is
+  refused when the channel is used**, unless the same file lists that exact workflow in the
+  top-level `trusted_workflows`. This holds for another workflow of `komira-ai/kbf` too (a channel
+  naming its `ci.yml` needs the entry), and an entry for one workflow does not trust the other
+  workflows of its repository. The answer is `channel_not_allowed`, and the words on stderr (the
+  socket's `detail`) name the channel and the workflow. Trusting a workflow to sign what this host
+  installs is the operator's act, on a file that must be root's alone to write like the rest of
+  the allowlist; nothing trusts one by default, and `trusted_workflows` is empty when the key is
+  absent.
+- The other rules of the check do not change: the attestation must come from a GitHub-hosted
+  runner, name the full commit, the channel's branch, and a subject whose sha256 is the file's,
+  and be checked offline by the pinned `gh` and trusted root. The former `komira-ai/komira-build-farm`
+  name is accepted for the `komira-ai/kbf` default pair only; for any other pair `gh` is asked once.
+- Only the signer, the listing and the file names are the channel's. What is checked about the
+  contents (the tarball holds the one `kbf` executable, a package is named `kbf`) is unchanged.
+
+A file without these keys means what it meant before.
+
 ## The local socket
 
 `kbf-host-install --serve` is the program's other door, for the agent mode of `kbf-updater`
@@ -559,7 +611,7 @@ is not changed. It does one host's A/B: put the next release beside the one that
 it on trial, keep it or go back.
 
 ```text
-kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N]
+kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N] [--keep-releases N]
                  [--layout installer|deb|rpm] (--restart-unit UNIT... | --frontend-container)
 ```
 
@@ -569,6 +621,8 @@ kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N]
 - `--socket-user`: the one account that may connect. On Linux it is looked up in `/etc/passwd`,
   on a Mac with `dscl`; root is refused.
 - `--window-secs`: how long a release on trial has to be confirmed, 120 to 1800 (default 600).
+- `--keep-releases`: how many releases the host keeps besides the ones that must stay, 2 to 32
+  (default 4). See [The releases a host keeps](#the-releases-a-host-keeps).
 - `--layout`: how a Linux host keeps its releases. `installer` (the default) is the hand-placed
   layout of `kbf-installer`, described under "On Linux". `deb` and `rpm` are a host whose units
   are the `kbf` package's and run `/usr/bin/kbf`, updated by installing that package ("On a Linux
@@ -596,7 +650,7 @@ the channel as the forced command's (single spaces, no control byte; no path or 
 query
 install kbf=<version> from <channel>
 switch kbf=<version>
-confirm kbf=<version>
+confirm kbf=<version>[ last_good=<version>]
 revert
 ```
 
@@ -604,19 +658,59 @@ revert
 |---|---|
 | `install` | looks `<version>` up in the channel, fetches the release **on the host**, verifies it, and lays it out beside the one that runs. No link moves and nothing restarts. The same version asked again is answered from what is laid out; the version the host runs already is answered at once (`current: true`) and teaches the host its version text |
 | `switch` | puts the laid-out release in place **on trial**: the pending marker, with its deadline, is written before the first link moves; then the links move and the units restart on it. A unit that does not come up puts the host back at once |
-| `confirm` | keeps the release on trial. Asked again after it was answered, the answer is the same |
+| `confirm` | keeps the release on trial, then removes the releases the host no longer keeps. `last_good` names the coordinator's last good release, which the host then keeps whatever its age. Asked again after it was answered, the answer is the same |
 | `revert` | goes back to the release that ran, now |
-| `query` | what runs, what is on trial and until when, how the last update ended, and whether another install, switch or restart is running |
+| `query` | what runs, what is on trial and until when, how the last update ended, whether another install, switch or restart is running, and the releases the host keeps |
 
 Answers: `staged` (`version`, `commit`, `current`), `switched` (`version`, `commit`,
 `deadline_unix`), `confirmed`, `reverted` (`version`, the release the host is back on, when it
-knows its text), `query` (`commit`, `version`, `node_id`, `pending`, `last`, `busy`), and
+knows its text), `query` (`commit`, `version`, `node_id`, `pending`, `last`, `busy`, and
+`releases` when the host keeps release directories), and
 `{"result":"refused","reason":CODE}` (nothing ran) or `{"result":"failed","reason":CODE}` with a
 code from a closed set: `bad_command`, `channel_not_allowed`, `config_invalid`, `config_unsafe`,
 `unknown_release`, `ambiguous_release`, `fetch_failed`, `verify_failed`, `pending`, `not_staged`,
 `nothing_pending`, `no_current`, `busy`, `stage_failed`, `switch_failed`, `revert_failed`,
 `state_unavailable`, `audit_unavailable`, `peer_not_ready`, `runtime_failed`. The detail of a refusal goes to the journal, cleaned,
 never to the line.
+
+### The releases a host keeps
+
+A host with release directories (the `installer` layout, and a Mac's kit) keeps, in `releases/`:
+the release that runs (`current`), the one before it (`previous`), every pinned release, the
+coordinator's last good release, and the `--keep-releases` newest others (by the time each was
+laid out). So going back to any of them needs no download. The rest are removed after a
+`confirm`, and only then: never while a release is on trial, and not by `install` or `switch`.
+On a Mac, the ssh path's apply removes them once the new daemon is welcomed, keeping 4 others,
+unless the socket has a swap on trial (its marker is there) or another install or switch holds
+the install lock; the audit log gets a `prune` line with what was kept and removed (`pruned`) or
+why nothing could be (`prune_failed`). A confirm whose `last_good` cannot be recorded (the listing or the file cannot
+be read or written, or its 12 digits name two releases) fails with `state_unavailable` and the
+release stays on trial, so no collection removes anything; the log says why. The confirm asked
+again, once the last good can be recorded, keeps the release. The last good is recorded before the
+trial ends, so a collection run by any program right after the confirm keeps it.
+
+What must stay besides the links is in `retain.json`, beside the installer's state (Linux,
+`/var/lib/kbf-installer/retain.json`) or in the work directory (Mac): `pinned` (a list of
+commits), `last_good` (a commit) and `versions` (the version text of each release, for the
+listing). Every key is optional and an unknown one is ignored. A file that cannot be parsed
+removes nothing, since it may hold a pin. Each change of it holds `retain.lock` beside it, and a
+prune holds that lock from reading what must stay to the last removal. On a host upgraded from a
+release that kept versions only in the helper's own state, the helper copies them into
+`retain.json` when it starts.
+
+`query` lists the kept releases, newest first, as `releases`: one object per release with its
+`commit`, its `version` (null when the host does not know it) and `why` it must stay (`current`,
+`previous`, `on_trial`, `pinned`, `last_good`; left out for one of the newest others). A version
+text longer than 128 bytes is left out of its entry, which then has `version_left_out: true`. At
+most 64 are listed, in at most 10 KiB: the ones that must stay first (what runs, what is on trial, the one before, the last
+good, then the pinned ones), then the newest others; `releases_omitted` counts any left out, and
+is absent when none is. When the releases cannot be listed (`retain.json` or `releases/` cannot be
+read), `releases` is left out and `releases_unavailable` is `true`; a host with nothing to list
+has neither key. `kbf-deploy host status` prints the whole list.
+
+The agent does not send `last_good` yet: the coordinator does not carry it in its orders. Until it
+does, the coordinator's last good release is kept only as `previous`, a pin, or one of the newest
+others.
 
 ### The revert is this program's
 
@@ -644,7 +738,7 @@ installer's `state.json`, which is also where the pending marker lives (`pending
 the deadline). A host that was set up by hand with `kbf-deploy host install` has all of it; a host
 with no `current` release has nothing to go back to and is refused (`no_current`). The channels
 are in `/etc/kbf/host-install-releases.toml`, in the format of the Mac's allowlist below (a
-channel whose `source = "github"`; the ssh path's `host-install.toml` is the apt channels' and is
+channel whose `source = "github"`, which may name its own [repository and signer](#a-channel-of-another-repository); the ssh path's `host-install.toml` is the apt channels' and is
 not read):
 
 ```toml
@@ -656,7 +750,7 @@ source = "github"
 bundle as the installer's unprivileged user, copies them once into the installer's scratch, and
 runs the installer's verify pipeline over the copy with the pinned `gh` and trusted root
 ([host-releases.md](host-releases.md#what-is-trusted)): the attestation must be of this
-repository's `artifacts.yml` on a hosted runner, for the full commit, on the channel's branch; the
+repository's `artifacts.yml` (or the channel's own [signer](#a-channel-of-another-repository)) on a hosted runner, for the full commit, on the channel's branch; the
 tarball must hold the one executable of this CPU; and the binary run as the unprivileged user must
 say it is that commit. Nothing is fetched when the trust files are not root's. A release whose
 `protocol` or `state_schema` is newer than this program's `kbf-installer` understands is refused
@@ -673,7 +767,7 @@ directory (`/var/lib/kbf-host-install`: `package.json` and `packages/`, root's, 
 
 | request | does |
 |---|---|
-| `install` | fetches the release's `kbf-<commit>-linux-<cpu>.deb` (or `.rpm`), its `.sigstore.json` bundle and the release's `SHA256SUMS` as the installer's unprivileged user, copies them once as root, and checks the copy, offline, before it keeps anything: the sha256 `SHA256SUMS` lists for the file; `gh attestation verify` (this repository's `artifacts.yml` on a hosted runner, for the full commit, on the channel's branch, with the pinned `gh` and trusted root); and the package manager's own reading of the file (`dpkg-deb --field`, `rpm --query --package`): the package `kbf`, for this CPU, at the version asked for. Nothing is installed, restarted or recorded |
+| `install` | fetches the release's `kbf-<commit>-linux-<cpu>.deb` (or `.rpm`), its `.sigstore.json` bundle and the release's `SHA256SUMS` as the installer's unprivileged user, copies them once as root, and checks the copy, offline, before it keeps anything: the sha256 `SHA256SUMS` lists for the file; `gh attestation verify` (this repository's `artifacts.yml`, or the channel's own signer, on a hosted runner, for the full commit, on the channel's branch, with the pinned `gh` and trusted root); and the package manager's own reading of the file (`dpkg-deb --field`, `rpm --query --package`): the package `kbf`, for this CPU, at the version asked for. Nothing is installed, restarted or recorded |
 | `switch` | checks the kept file's sha256 again; reads the installed version from the package database; keeps a verified copy of the package that runs (the one kept already, or the release of that version fetched and checked the same way); writes the trial, with its deadline, naming that copy; then installs the new file (`dpkg --force-confold --install`, or `rpm --upgrade --oldpackage --replacepkgs`: one file, no repository, no dependency resolution) and restarts each `--restart-unit` and waits for it. A package that fails to install, or a unit that does not come up, puts the previous package back at once |
 | `confirm` | ends the trial and forgets every kept file but the new package and the one before it |
 | `revert` | and the deadline: installs the kept copy of the package that ran (fetching and checking it again if the file is gone or changed), ends the trial, restarts the units |
@@ -711,7 +805,7 @@ container ([the example](../../packaging/host-agent/linux/host-install-frontend.
 | `api` | where this host reaches the frontend's operator API (a published port, or the host's own listen address under `network = "host"`), for `/readyz` and `/healthz` |
 | `drain_token_file` | the operator token as a path **inside** the container |
 | `peers` | optional: the other frontends' operator APIs this host can reach |
-| `drain_secs` | optional (default 180, at most 1800): how long a drain is waited for |
+| `drain_secs` | optional, at least 1, no upper limit. Left out (the default), a switch waits for the old container to end however long its builds take. Set, it is how long the switch waits before it gives up; it never stops, removes or replaces a container that still runs. Keep it below about 9 minutes, or expect the updater (whose switch call is limited to 10 minutes) to report the host Unreachable during a longer drain while the switch completes. A file with `drain_secs = 0` still starts the helper; the switch refuses it (`config_invalid`) |
 | `ready_secs` | optional (default 90, 10 to 600): how long a new container has to be ready |
 
 `group_add` is written into the record only when it is set, so that a host that sets none writes
@@ -720,8 +814,8 @@ settle (confirm) or revert any release on trial before the helper is rolled back
 without `group_add`**: that version refuses a record with a key it does not know, and could not run
 the deadline revert.
 
-A switch has to fit `--window-secs`: `drain_secs` + 30 (the stop) + `ready_secs` is checked against
-it (`config_invalid` when it does not).
+The trial window (`--window-secs`) starts when the new container does, so it never counts the
+drain: only `ready_secs` is checked against it (`config_invalid` when `ready_secs` is longer).
 
 **install** fetches the image, its attestation bundle and the release's `SHA256SUMS` as the
 installer's unprivileged user, copies them once into a directory of root's, and checks, before the
@@ -737,23 +831,33 @@ release that fails the check changes nothing: nothing is loaded and nothing is s
 1. it refuses (`peer_not_ready`) if any of `peers` does not answer `/readyz` with 200, before
    anything is written. This program can see only its own host and these peers; without `peers`
    the coordinator's order (one frontend at a time, never the last ready one) is the guard;
-2. the pending marker is written to `frontend.json` with its deadline, the images of both
-   releases and a copy of the configuration;
-3. the restart policy is set to `no` (a drained frontend exits by itself, and must not be brought
+2. the restart policy is set to `no` (a drained frontend exits by itself, and must not be brought
    back as the old release);
-4. the frontend is asked to drain through its own operator API: `docker exec` runs
+3. the frontend is asked to drain through its own operator API: `docker exec` runs
    `/usr/bin/kbf cluster drain --frontend --token-file <drain_token_file>` in the container, where
    the API is on loopback ([api.md](../api.md#get-v1frontenddrain-and-post-v1frontenddrain)):
    `/readyz` answers 503 and the work it has finishes;
-5. it waits until the container has ended (a drained frontend exits when it is idle) or
-   `drain_secs` is out, and then stops it (`docker stop`, 30 s) and removes it;
-6. the new container is made from the new image with **the configuration of step 2, byte for
+4. it waits until the container has ended (a drained frontend exits when it is idle), as long as
+   that takes. With no `drain_secs` there is no deadline. A configured `drain_secs` only ends the
+   waiting: the switch fails (`switch_failed`, "still draining") and **nothing is stopped,
+   removed or replaced**. The old container keeps running and draining with its configured
+   restart policy put back, no marker is written, and the old release is current. Ask for the
+   switch again (the updater's next run does) and it drains again and waits again;
+5. only now is the pending marker written to `frontend.json`, with its deadline, the images of
+   both releases and a copy of the configuration; the ended container is stopped (`docker stop`,
+   30 s, a formality: it has ended) and removed;
+6. the new container is made from the new image with **the configuration of step 5, byte for
    byte**: `docker run --detach --name <name> --restart <restart> [--network] [--user]
-   [--group-add]... [--publish]... [--volume]... <image id> <command>...`;
+   [--group-add]... [--publish]... [--volume]... <image id> <command>...`. The deadline of the
+   trial is put on the marker as soon as it starts: `--window-secs` after the new container
+   started, however long the drain took;
 7. it waits up to `ready_secs` for `/readyz` to answer 200 and `/healthz` to name the release's
    commit.
 
-When any step fails, the container is removed and made again from the **old** image id with the
+A failure before step 5 (the drain request fails, the runtime stops answering) leaves the old
+container as it is and puts its restart policy back. If the helper itself dies during the drain, the
+policy is left off; when the helper starts and finds no marker and a container whose policy is
+off, it sets the configured policy back and logs it. When a step from 5 on fails, the container is removed and made again from the **old** image id with the
 same configuration, waited for the same way (on the old commit), the marker is cleared, and the
 switch answers `failed` (`switch_failed`). If the old container cannot be made again either,
 the answer is `revert_failed` and the marker stays: the deadline, or a `revert`, tries again.

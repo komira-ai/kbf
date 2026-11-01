@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::RejectReason;
 use crate::metrics::{Counter, Families};
 
 /// The bytes reserved for uploads now and the most reserved at once.
@@ -72,9 +73,121 @@ pub struct PackMetrics {
     /// store, a sampled blob is not its digest, the name or the list is not one a daemon may
     /// commit, or the pack was recorded before with other contents.
     pub commit_rejects: Counter,
+    /// Packs a build wrote through a presigned write that were recorded by
+    /// `commit_untrusted_pack`.
+    pub(super) untrusted_commits: Counter,
+    /// Commits of an untrusted pack that were refused, by [`UNTRUSTED_REASONS`].
+    pub(super) untrusted_rejects: [Counter; UNTRUSTED_REASONS.len()],
+    /// Packs a task wrote that `ingest` turned into a result.
+    pub(super) ingests: Counter,
+    /// Packs `ingest` refused, by [`RejectReason`] in the order of its variants.
+    pub(super) ingest_rejects: [Counter; RejectReason::ALL.len()],
+    /// Ingests that the store, the index or the action cache could not answer.
+    pub(super) ingest_unavailable: Counter,
+    /// The packs of the runs `ingest` turned into a result (one for a run of one pack).
+    pub(super) ingest_packs: Counter,
+    /// The bytes of large objects `ingest` stored in the CAS for the runs it turned into a result.
+    pub(super) ingest_large_bytes: Counter,
+    /// Large objects `ingest` also put to `cas/l/<sha256>`, by [`LargeWriteThrough`] in the order of its
+    /// variants.
+    pub(super) ingest_large_writethrough: [Counter; LargeWriteThrough::ALL.len()],
 }
 
+/// How the write-through of one large object to its content-bound key ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LargeWriteThrough {
+    /// The object was written.
+    Ok,
+    /// The store already held the key (a create-only refusal): the key is bound to the bytes, so
+    /// whoever wrote it wrote these.
+    Exists,
+    /// The store failed the write, or held an object of another length under the key; nothing
+    /// was kept under the key by this write.
+    Failed,
+    /// The ingest gave the write up before its end (the CAS write stopped, the bytes were not the
+    /// blob, a retry started the pass over, or the store did not take a window in time): nothing
+    /// was kept under the key. Not a failure of the store.
+    Aborted,
+}
+
+impl LargeWriteThrough {
+    /// Every ending, in the order of the variants.
+    pub const ALL: [Self; 4] = [Self::Ok, Self::Exists, Self::Failed, Self::Aborted];
+
+    /// The `result` label of the ending.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Exists => "exists",
+            Self::Failed => "failed",
+            Self::Aborted => "aborted",
+        }
+    }
+}
+
+/// Why a commit of an untrusted pack was refused: the key is not the one issued, the manifest
+/// cannot be a pack's, the footer is not the manifest, a record is not its digest, the pack is not
+/// in the store as said, or the key was recorded with other contents.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Reason {
+    Forbidden,
+    Shape,
+    Footer,
+    Mismatch,
+    Missing,
+    Conflict,
+}
+
+/// The label of each [`Reason`], in the order of the variants.
+const UNTRUSTED_REASONS: [&str; 6] = [
+    "forbidden",
+    "shape",
+    "footer",
+    "mismatch",
+    "missing",
+    "conflict",
+];
+
 impl PackMetrics {
+    /// The packs `ingest` turned into a result: the action ran, whether or not it was cached.
+    #[must_use]
+    pub fn ingests(&self) -> u64 {
+        self.ingests.get()
+    }
+
+    /// The packs `ingest` refused for `reason`.
+    #[must_use]
+    pub fn ingest_rejects(&self, reason: RejectReason) -> u64 {
+        self.ingest_rejects[reason as usize].get()
+    }
+
+    /// The ingests that the store, the index or the action cache could not answer.
+    #[must_use]
+    pub fn ingest_unavailable(&self) -> u64 {
+        self.ingest_unavailable.get()
+    }
+
+    /// The packs of the runs `ingest` turned into a result: with [`PackMetrics::ingests`], the
+    /// packs per run.
+    #[must_use]
+    pub fn ingest_packs(&self) -> u64 {
+        self.ingest_packs.get()
+    }
+
+    /// The bytes of large objects `ingest` stored in the CAS, for the runs it turned into a
+    /// result.
+    #[must_use]
+    pub fn ingest_large_bytes(&self) -> u64 {
+        self.ingest_large_bytes.get()
+    }
+
+    /// The large objects of ingested runs whose write-through to `cas/l/<sha256>` ended as `how`.
+    #[must_use]
+    pub fn ingest_large_writethrough(&self, how: LargeWriteThrough) -> u64 {
+        self.ingest_large_writethrough[how as usize].get()
+    }
+
     /// The bytes reserved for the uploads in flight now.
     #[must_use]
     pub fn inflight_bytes(&self) -> u64 {
@@ -196,6 +309,77 @@ impl PackMetrics {
             "The most bytes reserved for uploads into packs at once since the start",
             self.inflight_peak_bytes(),
         );
+        families.counter(
+            "kbf_pack_untrusted_commits_total",
+            "Packs a build wrote through a presigned write that were recorded in the pack index",
+            self.untrusted_commits.get(),
+        );
+        families.head(
+            "kbf_pack_untrusted_commit_rejects_total",
+            "counter",
+            "Commits of such a pack refused, nothing recorded, by why",
+        );
+        for (reason, counter) in UNTRUSTED_REASONS.iter().zip(&self.untrusted_rejects) {
+            let line = format!(
+                "kbf_pack_untrusted_commit_rejects_total{{reason=\"{reason}\"}} {}\n",
+                counter.get()
+            );
+            families.0.push_str(&line);
+        }
+        families.counter(
+            "kbf_pack_ingests_total",
+            "Packs a task wrote that were ingested into an action result: the action ran, \
+             whether or not it was cached",
+            self.ingests.get(),
+        );
+        families.head(
+            "kbf_pack_ingest_rejects_total",
+            "counter",
+            "Packs a task wrote that ingest refused, by why",
+        );
+        for (reason, counter) in RejectReason::ALL.iter().zip(&self.ingest_rejects) {
+            let line = format!(
+                "kbf_pack_ingest_rejects_total{{reason=\"{}\"}} {}\n",
+                reason.label(),
+                counter.get()
+            );
+            families.0.push_str(&line);
+        }
+        families.counter(
+            "kbf_pack_ingest_unavailable_total",
+            "Ingests of a task's pack that the object store, the pack index or the action cache \
+             could not answer",
+            self.ingest_unavailable.get(),
+        );
+        families.counter(
+            "kbf_pack_ingest_packs_total",
+            "Packs of the runs a task wrote that were ingested into an action result: divided \
+             by the ingests, the packs per run",
+            self.ingest_packs.get(),
+        );
+        families.counter(
+            "kbf_pack_ingest_large_bytes_total",
+            "Bytes of large objects a task wrote that ingest stored in the CAS, for the runs \
+             it ingested into an action result",
+            self.ingest_large_bytes.get(),
+        );
+        families.head(
+            "kbf_pack_ingest_large_writethrough_total",
+            "counter",
+            "Large objects a task wrote that ingest also put to cas/l/<sha256> in the object \
+             store, by how the put ended (ok, exists, failed, aborted); best effort, never fails an ingest",
+        );
+        for (how, counter) in LargeWriteThrough::ALL
+            .iter()
+            .zip(&self.ingest_large_writethrough)
+        {
+            let line = format!(
+                "kbf_pack_ingest_large_writethrough_total{{result=\"{}\"}} {}\n",
+                how.label(),
+                counter.get()
+            );
+            families.0.push_str(&line);
+        }
         *out = families.0;
     }
 }

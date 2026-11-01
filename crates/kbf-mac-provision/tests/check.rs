@@ -298,7 +298,7 @@ fn a_property_list_that_differs_fails() {
             let t = fs::read_to_string(m.path(PLIST)).unwrap();
             m.write(
                 PLIST,
-                &t.replace("<integer>30</integer>", "<integer>5</integer>"),
+                &t.replace("<integer>2147483647</integer>", "<integer>5</integer>"),
             );
         },
         "is missing or differs from the profile",

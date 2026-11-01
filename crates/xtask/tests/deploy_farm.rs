@@ -1,285 +1,21 @@
 //! `deploy-farm` against a fake coordinator and a fake runner token service on loopback, over
 //! TLS with a CA of the test's own, and the binary for its flags and exit codes.
 
-use std::cell::{Cell, RefCell};
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::io::{self, Write};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde_json::{Value, json};
-use xtask::deploy_farm::{
-    Args, Clock, Error, Plan, Roots, TokenService, check_version, deploy_on, pem_roots, run_with,
-};
+use xtask::deploy_farm::{Args, Error, Plan, Roots, check_version, pem_roots, run_with};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
-const RUNNER_KEY: &str = "runner-key";
 
-/// One request the fake saw.
-#[derive(Clone, Debug)]
-struct Seen {
-    method: String,
-    path: String,
-    authorization: String,
-    body: String,
-}
-
-/// What the fake coordinator answers.
-struct Script {
-    /// The answers of `GET /v1/convergence`, one per read (the first is the baseline); the
-    /// last repeats. A number is a
-    /// status with no body.
-    reads: Vec<Result<Value, u16>>,
-    /// The status of `POST /v1/desired`.
-    post: u16,
-    /// How many of the first POSTs answer 503 before `post` is used.
-    post_503s: usize,
-    /// The status of the runner's token service.
-    token: u16,
-    /// What the token service answers instead of a token, as bytes.
-    token_answer: Option<Vec<u8>>,
-}
-
-impl Script {
-    /// A script whose first answer is the baseline read before the POST (a farm of two
-    /// storage hosts and one daemon, one more daemon down), then `reads`.
-    fn new(reads: Vec<Result<Value, u16>>) -> Self {
-        Self::after(Ok(farm("converged", 0, 0)), reads)
-    }
-
-    /// A script whose baseline read is `baseline`, then `reads`.
-    fn after(baseline: Result<Value, u16>, reads: Vec<Result<Value, u16>>) -> Self {
-        let mut all = vec![baseline];
-        all.extend(reads);
-        Self {
-            reads: all,
-            post: 200,
-            post_503s: 0,
-            token: 200,
-            token_answer: None,
-        }
-    }
-}
-
-struct Fake {
-    base: String,
-    ca: CertificateDer<'static>,
-    ca_pem: String,
-    seen: Arc<Mutex<Vec<Seen>>>,
-}
-
-impl Fake {
-    fn requests(&self, path: &str) -> Vec<Seen> {
-        let seen = self.seen.lock().expect("lock");
-        seen.iter()
-            .filter(|r| r.path.starts_with(path))
-            .cloned()
-            .collect()
-    }
-
-    fn service(&self) -> TokenService {
-        TokenService {
-            url: format!("{}/token?api-version=2.0", self.base),
-            key: RUNNER_KEY.to_owned(),
-        }
-    }
-
-    fn plan(&self) -> Plan {
-        Plan {
-            url: self.base.clone(),
-            audience: self.base.clone(),
-            version: "2.0.0+g000000000002".to_owned(),
-            min_up_storage: 1,
-            min_up_frontend: 1,
-            deadline: Duration::from_secs(30),
-            stall: Duration::from_secs(30),
-            every: Duration::from_secs(1),
-        }
-    }
-}
-
-fn response(status: u16, body: &str) -> Vec<u8> {
-    format!(
-        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
-    .into_bytes()
-}
-
-fn read_request(stream: impl Read) -> Option<Seen> {
-    let mut reader = BufReader::new(stream);
-    let mut first = String::new();
-    reader.read_line(&mut first).ok()?;
-    let mut words = first.split_whitespace();
-    let method = words.next()?.to_owned();
-    let path = words.next()?.to_owned();
-    let (mut length, mut authorization) = (0, String::new());
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).ok()?;
-        let line = line.trim_end();
-        if line.is_empty() {
-            break;
-        }
-        let (name, value) = line.split_once(':')?;
-        match name.to_ascii_lowercase().as_str() {
-            "content-length" => length = value.trim().parse().ok()?,
-            "authorization" => authorization = value.trim().to_owned(),
-            _ => {}
-        }
-    }
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body).ok()?;
-    Some(Seen {
-        method,
-        path,
-        authorization,
-        body: String::from_utf8(body).ok()?,
-    })
-}
-
-/// A TLS server on loopback that answers by `script`.
-fn serve(script: Script) -> Fake {
-    let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
-    params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().expect("key")).expect("CA");
-    let key = KeyPair::generate().expect("key");
-    let cert = CertificateParams::new(vec!["127.0.0.1".to_owned()])
-        .expect("params")
-        .signed_by(&key, &ca)
-        .expect("sign");
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = Arc::new(
-        rustls::ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .expect("versions")
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![cert.der().clone()],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
-            )
-            .expect("server config"),
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let base = format!(
-        "https://127.0.0.1:{}",
-        listener.local_addr().expect("addr").port()
-    );
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let log = Arc::clone(&seen);
-    let tokens = AtomicUsize::new(0);
-    let reads = AtomicUsize::new(0);
-    let posts = AtomicUsize::new(0);
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let conn = rustls::ServerConnection::new(Arc::clone(&config)).expect("conn");
-            let mut tls = rustls::StreamOwned::new(conn, stream.expect("accept"));
-            let Some(request) = read_request(&mut tls) else {
-                continue;
-            };
-            let answer = if request.path.starts_with("/token") {
-                if request.authorization != format!("Bearer {RUNNER_KEY}") || script.token != 200 {
-                    response(script.token.max(401), "{}")
-                } else if let Some(raw) = &script.token_answer {
-                    let mut answer = format!(
-                        "HTTP/1.1 200 X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        raw.len()
-                    )
-                    .into_bytes();
-                    answer.extend_from_slice(raw);
-                    answer
-                } else {
-                    let n = tokens.fetch_add(1, Ordering::SeqCst);
-                    response(200, &json!({"value": format!("tok-{n}")}).to_string())
-                }
-            } else if !request.authorization.starts_with("Bearer tok-") {
-                response(401, r#"{"error":"unauthorized"}"#)
-            } else if request.method == "POST" {
-                if posts.fetch_add(1, Ordering::SeqCst) < script.post_503s {
-                    response(503, "{}")
-                } else {
-                    response(script.post, "{}")
-                }
-            } else if request.path == "/v1/elsewhere" {
-                response(200, &farm("converged", 0, 0).to_string())
-            } else {
-                let at = reads
-                    .fetch_add(1, Ordering::SeqCst)
-                    .min(script.reads.len() - 1);
-                match &script.reads[at] {
-                    Ok(body) => response(200, &body.to_string()),
-                    Err(302) => b"HTTP/1.1 302 X\r\nLocation: /v1/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
-                    Err(status) => response(*status, "{}"),
-                }
-            };
-            log.lock().expect("lock").push(request);
-            let _ = tls.write_all(&answer);
-            tls.conn.send_close_notify();
-            let _ = tls.flush();
-        }
-    });
-    Fake {
-        base,
-        ca: ca.der().clone(),
-        ca_pem: ca.pem(),
-        seen,
-    }
-}
-
-fn farm(state: &str, updating: u64, failed: u64) -> Value {
-    json!({"desired": "2.0.0+g000000000002", "quiet": false, "state": state, "roles": [
-        {"role": "storage", "at_desired": 2, "updating": updating, "failed": failed, "down": 0},
-        {"role": "daemon", "at_desired": 1, "updating": 0, "failed": 0, "down": 1},
-    ]})
-}
-
-/// A virtual clock: `sleep` moves `now` and is recorded, so no test waits for a deadline.
-#[derive(Default)]
-struct Time {
-    now: Cell<Duration>,
-    slept: RefCell<Vec<Duration>>,
-}
-
-impl Time {
-    fn clock(&self) -> Clock<'_> {
-        Clock {
-            now: Box::new(|| self.now.get()),
-            sleep: Box::new(|d| {
-                self.now.set(self.now.get() + d);
-                self.slept.borrow_mut().push(d);
-            }),
-        }
-    }
-}
-
-/// `deploy_on` a fresh virtual clock.
-fn deploy(
-    plan: &Plan,
-    service: &TokenService,
-    roots: &Roots<'_>,
-    out: &mut impl Write,
-) -> Result<(), Error> {
-    deploy_on(plan, service, roots, &Time::default().clock(), out)
-}
-
-fn run(fake: &Fake, plan: &Plan) -> (Result<(), Error>, String) {
-    run_timed(fake, plan, &Time::default())
-}
-
-fn run_timed(fake: &Fake, plan: &Plan, time: &Time) -> (Result<(), Error>, String) {
-    let mut out = Vec::new();
-    let ca = [fake.ca.clone()];
-    let roots = Roots {
-        runner: &ca,
-        coordinator: &ca,
-    };
-    let result = deploy_on(plan, &fake.service(), &roots, &time.clock(), &mut out);
-    (result, String::from_utf8(out).expect("utf8"))
-}
+#[path = "support/deploy_fake.rs"]
+mod deploy_fake;
+use deploy_fake::{
+    Fake, Script, Time, args_for, deploy, fake_ca, farm, run, run_timed, serve, service_args,
+};
 
 #[test]
 fn the_desired_version_is_posted_then_the_farm_is_polled_to_converged() {
@@ -863,27 +599,6 @@ fn a_503_on_the_read_before_the_deploy_is_tried_again() {
     );
 }
 
-fn args_for(fake: &Fake, ca_pem: &str) -> Args {
-    use clap::Parser;
-    #[derive(Parser)]
-    struct Cli {
-        #[command(flatten)]
-        args: Args,
-    }
-    Cli::parse_from([
-        "x",
-        "--url",
-        &fake.base,
-        "--version",
-        "2.0.0+g000000000002",
-        "--ca-pem",
-        ca_pem,
-        "--every-secs",
-        "1",
-    ])
-    .args
-}
-
 #[test]
 fn the_verb_trusts_the_system_roots_or_the_ca_it_is_given() {
     // Proves: with no `--ca-pem` the coordinator is trusted by the system roots given; with one
@@ -986,14 +701,6 @@ fn a_certificate_the_roots_do_not_hold_is_not_trusted() {
         "{result:?}"
     );
     assert!(fake.requests("/v1/desired").is_empty());
-}
-
-/// A CA certificate that signed nothing the fake serves.
-fn fake_ca() -> (Vec<CertificateDer<'static>>, String) {
-    let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
-    params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().expect("key")).expect("CA");
-    (vec![ca.der().clone()], ca.pem())
 }
 
 #[test]
@@ -1213,4 +920,229 @@ fn run_with_refuses_a_tag_version_without_calling_the_coordinator() {
     );
     assert!(result.is_err());
     assert!(fake.requests("/").is_empty(), "a request was sent");
+}
+
+#[test]
+fn another_service_is_posted_by_name_and_waited_on_by_its_own_convergence() {
+    // Proves: with `--service js-server` the POST body is the version and the service name
+    // (the `min_up` keys are kbf's; the service's definition says its own), the baseline
+    // read and every poll ask `/v1/convergence?service=js-server` (never the bare path), a
+    // version text of the service's own form is accepted, and the run ends when that
+    // service's convergence says converged.
+    let seven = |state, updating| {
+        let mut answer = farm(state, updating, 0);
+        answer["desired"] = json!("7");
+        Ok(answer)
+    };
+    let fake = serve(Script::after(
+        seven("converged", 0),
+        vec![seven("in_progress", 1), seven("converged", 0)],
+    ));
+    let args = service_args(&fake, "js-server", "7");
+    let mut out = Vec::new();
+    let ca = [fake.ca.clone()];
+    let lines = run_with(&args, &fake.service(), &ca, &mut out).expect("converged");
+    assert_eq!(lines.len(), 1);
+    let posts = fake.requests("/v1/desired");
+    assert_eq!(posts.len(), 1);
+    let body: Value = serde_json::from_str(&posts[0].body).expect("json");
+    assert_eq!(
+        body,
+        json!({
+            "service": "js-server",
+            "version": "7"
+        })
+    );
+    let reads = fake.requests("/v1/convergence");
+    assert_eq!(reads.len(), 3);
+    assert!(
+        reads
+            .iter()
+            .all(|r| r.path == "/v1/convergence?service=js-server"),
+        "{reads:?}"
+    );
+}
+
+#[test]
+fn kbf_sends_the_request_it_always_sent() {
+    // Proves: `--service kbf`, given or defaulted, posts exactly the bytes deploy-farm
+    // posted before the flag existed (no `service` key) and reads the bare convergence path.
+    let fake = serve(Script::new(vec![Ok(farm("converged", 0, 0))]));
+    let mut args = args_for(&fake, &fake.ca_pem);
+    assert_eq!(args.service, "kbf");
+    args.service = "kbf".to_owned();
+    let mut out = Vec::new();
+    let ca = [fake.ca.clone()];
+    run_with(&args, &fake.service(), &ca, &mut out).expect("converged");
+    assert_eq!(
+        fake.requests("/v1/desired")[0].body,
+        r#"{"min_up":{"frontend":1,"storage":1},"version":"2.0.0+g000000000002"}"#
+    );
+    assert!(
+        fake.requests("/v1/convergence")
+            .iter()
+            .all(|r| r.path == "/v1/convergence")
+    );
+}
+
+#[test]
+fn a_service_name_the_coordinator_would_refuse_is_refused_before_any_call() {
+    // Proves: an empty name, upper case, a slash, a query character, a space and a name over
+    // the coordinator's 64 bytes are refused by the client, so the name can go in the query
+    // unescaped, and nothing is sent; and only kbf's version has to be of kbf's form.
+    let fake = serve(Script::new(vec![]));
+    let ca = [fake.ca.clone()];
+    let long = "a".repeat(65);
+    for name in ["", "JS", "a/b", "a&b", "a b", "a_b", long.as_str()] {
+        let args = service_args(&fake, name, "7");
+        let refused = run_with(&args, &fake.service(), &ca, &mut Vec::new());
+        let Err(xtask::Error::Failed(why)) = refused else {
+            panic!("{name:?} was accepted: {refused:?}");
+        };
+        assert!(why.contains("is not a service name"), "{why}");
+    }
+    let kbf = service_args(&fake, "kbf", "7");
+    let refused = run_with(&kbf, &fake.service(), &ca, &mut Vec::new());
+    assert!(matches!(refused, Err(xtask::Error::Failed(why)) if why.contains("is not the form")));
+    assert!(fake.requests("/token").is_empty());
+    assert!(fake.requests("/v1").is_empty());
+}
+
+/// The baseline read of a farm whose coordinator says it was built from `commit`.
+fn reporting(commit: Option<&str>) -> Result<Value, u16> {
+    let mut read = farm("converged", 0, 0);
+    if let Some(commit) = commit {
+        read["commit"] = json!(commit);
+    }
+    Ok(read)
+}
+
+/// The deploy with `require_coordinator_current` as given, against a coordinator whose
+/// baseline read reports `commit`; the release is `...0002`.
+fn with_coordinator(commit: Option<&str>, require: bool) -> (Fake, Result<(), Error>, String) {
+    let fake = serve(Script::after(
+        reporting(commit),
+        vec![Ok(farm("converged", 0, 0))],
+    ));
+    let mut plan = fake.plan();
+    plan.require_coordinator_current = require;
+    let (result, out) = run(&fake, &plan);
+    (fake, result, out)
+}
+
+#[test]
+fn a_coordinator_on_another_commit_stops_a_deploy_that_requires_it_current_before_the_post() {
+    // Proves: with the requirement on, a coordinator that reports another commit than the
+    // release's fails with both commits and the pointer to the docs, and the desired version
+    // is never posted.
+    let (fake, result, out) = with_coordinator(Some("0123456789ab"), true);
+    let error = result.expect_err(&out);
+    assert_eq!(
+        error,
+        Error::CoordinatorBehind {
+            coordinator: "0123456789ab".to_owned(),
+            release: "000000000002".to_owned(),
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "the coordinator runs 0123456789ab, the release is 000000000002: update the coordinator first (docs/deploy/kbf-updater.md, Updating the coordinator)"
+    );
+    assert!(fake.requests("/v1/desired").is_empty(), "{out}");
+}
+
+#[test]
+fn a_coordinator_on_the_release_commit_proceeds_when_it_is_required_current() {
+    // Proves: the same commit passes the requirement, is said in the log, and the deploy
+    // runs to convergence.
+    let (fake, result, out) = with_coordinator(Some("000000000002"), true);
+    assert_eq!(result, Ok(()), "{out}");
+    assert!(
+        out.contains("the coordinator runs the release's commit 000000000002"),
+        "{out}"
+    );
+    assert_eq!(fake.requests("/v1/desired").len(), 1);
+}
+
+#[test]
+fn a_coordinator_that_reports_no_commit_gets_a_notice_and_the_deploy_proceeds() {
+    // Proves: an older coordinator (no `commit` key) and one built without a checkout
+    // (`unknown`) are noted when the requirement is on, and neither stops the deploy.
+    for reported in [None, Some("unknown")] {
+        let (fake, result, out) = with_coordinator(reported, true);
+        assert_eq!(result, Ok(()), "{reported:?}: {out}");
+        assert!(
+            out.contains("::notice::the coordinator reports no build commit"),
+            "{reported:?}: {out}"
+        );
+        assert_eq!(fake.requests("/v1/desired").len(), 1);
+    }
+}
+
+#[test]
+fn without_the_requirement_a_coordinator_on_another_commit_warns_and_the_deploy_proceeds() {
+    // Proves: with the requirement off a different commit is a GitHub warning annotation
+    // line and the deploy proceeds, and a coordinator that reports no commit adds no notice.
+    let (fake, result, out) = with_coordinator(Some("0123456789ab"), false);
+    assert_eq!(result, Ok(()), "{out}");
+    assert!(
+        out.lines().any(|l| l
+            == "::warning title=coordinator not current::the coordinator runs 0123456789ab, the release is 000000000002: update the coordinator first (docs/deploy/kbf-updater.md, Updating the coordinator)"),
+        "{out}"
+    );
+    assert_eq!(fake.requests("/v1/desired").len(), 1);
+    let (_, result, out) = with_coordinator(None, false);
+    assert_eq!(result, Ok(()), "{out}");
+    assert!(!out.contains("build commit"), "{out}");
+}
+
+#[test]
+fn the_flag_turns_the_requirement_on_and_is_off_by_default() {
+    // Proves: `--require-coordinator-current` reaches the plan, and without it the plan does
+    // not require it.
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: Args,
+    }
+    let fake = serve(Script::new(vec![]));
+    let off = args_for(&fake, "");
+    assert!(!Plan::of(&off).require_coordinator_current);
+    let on = Cli::parse_from([
+        "x",
+        "--url",
+        &fake.base,
+        "--version",
+        "2.0.0+g000000000002",
+        "--require-coordinator-current",
+    ]);
+    assert!(Plan::of(&on.args).require_coordinator_current);
+    // The workflow passes the variable's text: `true` is on; empty (unset) and `false` are off.
+    for (text, want) in [("true", true), ("false", false), ("", false)] {
+        let cli = Cli::parse_from([
+            "x",
+            "--url",
+            &fake.base,
+            "--version",
+            "2.0.0+g000000000002",
+            "--require-coordinator-current",
+            text,
+        ]);
+        assert_eq!(
+            Plan::of(&cli.args).require_coordinator_current,
+            want,
+            "{text:?}"
+        );
+    }
+    let bad = Cli::try_parse_from([
+        "x",
+        "--url",
+        &fake.base,
+        "--version",
+        "2.0.0+g000000000002",
+        "--require-coordinator-current",
+        "yes",
+    ]);
+    assert!(bad.is_err());
 }

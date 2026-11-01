@@ -754,6 +754,137 @@ async fn a_restarted_runtime_removes_what_its_predecessor_left() {
     other.assert_clean(1);
 }
 
+/// The pids of the processes whose command line names `dir`: the `crun run` of each
+/// lease in it, which the daemon that started it is the parent of.
+fn running_against(dir: &Path) -> Vec<u32> {
+    let dir = dir.as_os_str().as_encoded_bytes();
+    let own = std::process::id();
+    let named = |pid: &u32| {
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .is_ok_and(|argv| argv.windows(dir.len()).any(|w| w == dir))
+    };
+    let pids = std::fs::read_dir("/proc")
+        .expect("list /proc")
+        .filter_map(|p| p.ok()?.file_name().to_str()?.parse::<u32>().ok());
+    pids.filter(|pid| *pid != own).filter(named).collect()
+}
+
+/// The parent of process `pid`, if it is still there.
+fn parent_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // After the command name, which may hold spaces: the state, then the parent's pid.
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Every path under `dir`, `dir` itself left out.
+fn listing(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_owned()];
+    while let Some(d) = pending.pop() {
+        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            found.push(entry.path());
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                pending.push(entry.path());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Catches (the "Directory not empty" the hosted runner's crun job met when the test
+/// removed a scratch directory) a `crun run` that outlives the sweep of its lease and
+/// writes into the scratch directory after the sweep removed it. A restarted daemon is not the parent of
+/// the `crun run` its predecessor left, so its sweep deletes the container and the
+/// lease's directory without waiting for that process, which ends on its own afterwards.
+/// The straggler is held stopped (`SIGSTOP`) across the sweep, so it is still there when
+/// the sweep returns unless the sweep ended it, and let go after, so what it writes on
+/// the way out comes after the sweep and its `assert_clean`, as it does when it is only
+/// slow: the scratch directory must hold what the sweep left.
+#[tokio::test]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
+async fn a_crun_run_that_outlives_the_sweep_leaves_nothing_in_the_scratch_directory() {
+    // Several rounds: a sweep that failed on a lease cgroup that stayed busy showed up
+    // once in hosted CI.
+    for round in 0..5 {
+        a_straggler_round(&format!("straggler-{round}")).await;
+    }
+}
+
+async fn a_straggler_round(name: &str) {
+    use rustix::process::{Pid, Signal, kill_process};
+
+    let cell = Cell::new(name);
+    let action = store_action(&cell.cas, &sh("sleep 300"));
+    let work = cell.work(1, action, Resources::default());
+    let runtime = Arc::clone(&cell.runtime);
+    let mut run = Box::pin(async move { runtime.run(work).await });
+    let lease = cell.cgroup.join(cell.name(1));
+    tokio::select! {
+        _ = &mut run => panic!("the run ended"),
+        _ = wait_for_container_cgroup(&lease) => {}
+    }
+    // Never polled or dropped again, as a daemon that was killed.
+    std::mem::forget(run);
+    // Only the `crun run` itself is held: the daemon's child. crun forks the process that
+    // creates the container, which has the same command line and is in the lease's
+    // cgroup; the sweep's cgroup kill ends it. Stopped part-way through the container's
+    // creation it stays in uninterruptible sleep for longer than the sweep waits and keeps
+    // the lease's cgroup busy ("remove cgroup ...: Device or resource busy"), which is not
+    // what this test is about.
+    let own = std::process::id();
+    let stragglers: Vec<u32> = (running_against(&cell.scratch).into_iter())
+        .filter(|pid| parent_of(*pid) == Some(own))
+        .collect();
+    assert!(
+        !stragglers.is_empty(),
+        "no process runs against the scratch directory"
+    );
+    let signal = |sig| {
+        for pid in &stragglers {
+            let pid = Pid::from_raw(i32::try_from(*pid).expect("a pid")).expect("a pid");
+            let _ = kill_process(pid, sig);
+        }
+    };
+    signal(Signal::STOP);
+
+    let before = listing(&cell.scratch);
+    let alone = exclusive();
+    ContainerRuntime::new(cell.config.clone(), Arc::clone(&cell.cas)).expect("restart");
+    drop(alone);
+    cell.assert_clean(1);
+    let alive: Vec<_> = (running_against(&cell.scratch).into_iter())
+        .filter(|p| !support::ended(&p.to_string()))
+        .collect();
+    assert!(alive.is_empty(), "the sweep left pids {alive:?} running");
+    assert!(
+        listing(&cell.scratch).iter().all(|p| before.contains(p)),
+        "the sweep added entries"
+    );
+    let swept = listing(&cell.scratch);
+
+    signal(Signal::CONT);
+    for _ in 0..3000 {
+        if running_against(&cell.scratch)
+            .iter()
+            .all(|p| support::ended(&p.to_string()))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let after = listing(&cell.scratch);
+    assert_eq!(
+        after, swept,
+        "what the straggler left in the scratch directory"
+    );
+}
+
 /// The ids on the `Uid:` and `Gid:` lines of process `pid`'s status (real, effective,
 /// saved, filesystem), each with its line's name.
 fn ids(pid: &str) -> Vec<(&'static str, u32)> {

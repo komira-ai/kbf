@@ -113,6 +113,17 @@ impl<S: ObjectStore> ObjectStore for Scoped<S> {
         }
     }
 
+    fn len(
+        &self,
+        key: &ObjectKey,
+    ) -> impl Future<Output = Result<Option<u64>, ObjectStoreError>> + Send {
+        let checked = check(&self.prefix, key);
+        async move {
+            checked?;
+            self.inner.len(key).await
+        }
+    }
+
     fn delete(&self, key: &ObjectKey) -> impl Future<Output = Result<(), ObjectStoreError>> + Send {
         let checked = check(&self.prefix, key);
         async move {

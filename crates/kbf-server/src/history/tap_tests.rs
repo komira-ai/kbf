@@ -69,6 +69,7 @@ fn ended(id: &str, kind: EndedKind, attempt: Option<usize>) -> Ended {
         attempt,
         kind,
         at: at(50_000_000),
+        correlated_invocations_id: None,
     }
 }
 
@@ -94,8 +95,16 @@ fn record_of(
     attempt: usize,
     kind: EndedKind,
 ) -> (kbf_history::records::RunRecord, Option<[u8; 12]>) {
+    record_for(row, &ended("b", kind, Some(attempt)))
+}
+
+/// What `ended` of `row` gives: the run record the tap offered, and the id it returned.
+fn record_for(
+    row: &ActionRow,
+    ended: &Ended,
+) -> (kbf_history::records::RunRecord, Option<[u8; 12]>) {
     let rig = rig(16);
-    let id = rig.tap.ended(&ended("b", kind, Some(attempt)), row);
+    let id = rig.tap.ended(ended, row);
     let mut events = rig.queue.drain();
     assert_eq!(events.len(), 1, "one record for one attempt");
     let Some(Event::Run {
@@ -154,7 +163,9 @@ fn a_finished_attempt_keeps_what_the_row_and_the_attempt_hold() {
             ..RunUsage::default()
         }),
         booked_memory_bytes: Some(1 << 30),
+        booked_millicpus: None,
         cap_bytes: None,
+        phase_times: Default::default(),
     }));
     let mut r = row(
         vec![
@@ -457,6 +468,56 @@ fn a_memory_kill_keeps_its_booking_cap_and_limit() {
     assert_eq!(rec.memory_kill(), MemoryKill::OwnLimit);
     assert_eq!(rec.reason, "the reason the daemon gave");
     assert_eq!((rec.memory_used_bytes, rec.memory_limit_bytes), (33, 32));
+}
+
+/// Catches: the booking written only for a memory kill (an accepted run's record without
+/// what its lease held), the CPU booking dropped or taken from the wrong place (the daemon's
+/// grant wins, the daemon's report fills in when none is known), and a booking mistaken for a
+/// kill's limit.
+#[test]
+fn an_accepted_run_records_the_booking_its_lease_was_granted() {
+    let ran = |usage: Option<RunUsage>| {
+        Some(Box::new(Run {
+            usage,
+            booked_memory_bytes: Some(6 << 30),
+            booked_millicpus: Some(3_000),
+            ..Run::default()
+        }))
+    };
+    let mut granted = attempt(Some(AttemptEnd::Accepted));
+    granted.run = ran(None);
+    let (rec, _) = record_of(&row(vec![granted], None), 0, EndedKind::Finished);
+    assert_eq!(
+        (rec.booked_memory_bytes, rec.booked_millicpus),
+        (6 << 30, Some(3_000))
+    );
+    assert_eq!(rec.memory_kill(), MemoryKill::None);
+    assert_eq!((rec.memory_used_bytes, rec.memory_limit_bytes), (0, 0));
+    let mut reported = attempt(Some(AttemptEnd::Accepted));
+    reported.run = ran(Some(RunUsage {
+        booked_millicpus: Some(2_000),
+        ..RunUsage::default()
+    }));
+    let (rec, _) = record_of(&row(vec![reported], None), 0, EndedKind::Finished);
+    assert_eq!(
+        rec.booked_millicpus,
+        Some(3_000),
+        "the grant wins, as on the build pages"
+    );
+    let mut adopted = attempt(Some(AttemptEnd::Accepted));
+    adopted.run = Some(Box::new(Run {
+        usage: Some(RunUsage {
+            booked_millicpus: Some(2_000),
+            ..RunUsage::default()
+        }),
+        ..Run::default()
+    }));
+    let (rec, _) = record_of(&row(vec![adopted], None), 0, EndedKind::Finished);
+    assert_eq!(
+        rec.booked_millicpus,
+        Some(2_000),
+        "no grant known: the daemon's report"
+    );
 }
 
 /// Catches: NUMA bytes that do not follow node numbers, or a huge node number sizing a
@@ -1029,3 +1090,42 @@ fn an_absent_peak_and_wall_stay_absent_and_the_lease_counters_are_kept() {
     );
     assert_eq!(c.cpus_effective, Some(16));
 }
+
+/// Catches: the invocation or the build left off the record (the record is found by run
+/// id, so without them a run cannot be put in its build), the build's id written as the
+/// invocation's or the reverse, an absent correlated id written as an empty one (it would
+/// read as a build named ""), and a collision record (`<id>~2`) naming itself instead of
+/// the client's id.
+#[test]
+fn the_record_names_the_invocation_and_the_build_the_end_names() {
+    let r = row(
+        vec![attempt(Some(AttemptEnd::Accepted))],
+        Some(Outcome::Ok { exit_code: 0 }),
+    );
+    let named = Ended {
+        correlated_invocations_id: Some("corr-9".to_owned()),
+        ..ended("b", EndedKind::Finished, Some(0))
+    };
+    let (rec, _) = record_for(&r, &named);
+    assert_eq!(rec.invocation_id.as_deref(), Some("b"));
+    assert_eq!(rec.correlated_invocations_id.as_deref(), Some("corr-9"));
+
+    let tool_only = ended("b", EndedKind::Finished, Some(0));
+    let (rec, _) = record_for(&r, &tool_only);
+    assert_eq!(rec.invocation_id.as_deref(), Some("b"));
+    assert_eq!(rec.correlated_invocations_id, None);
+
+    let second_caller = Ended {
+        key: RecordKey::collision(kbf_invocation::InvocationId::new("b"), 2),
+        ..tool_only
+    };
+    let rig = rig(16);
+    rig.tap.ended(&second_caller, &r);
+    let Some(Event::Run { record, .. }) = rig.queue.drain().pop() else {
+        panic!("a run event");
+    };
+    assert_eq!(record.invocation_id.as_deref(), Some("b"));
+}
+
+#[path = "tap_phase_tests.rs"]
+mod phase;

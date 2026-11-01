@@ -50,8 +50,11 @@ kbf-proto.workspace = true
 # (re-exported here under their old paths). `proxy`: the proxy's side of `setup` (the `[proxy]`
 # table it keeps, and the proxy's flags it takes only to refuse), which `kbf setup` in the `kbf`
 # binary does not have.
+kbf-retain.workspace = true
 kbf-setup = { workspace = true, features = ["proxy"] }
 # `postgres`: the schema's migrations and the client that applies them (`database` module).
+# `schema::embedded` and `latest`: the migrations a release runs (the state store's and the pack index's).
+kbf-pack-index = { workspace = true, features = ["postgres"] }
 kbf-state = { workspace = true, features = ["postgres"] }
 # `ReleasePlatform`: the platform names and the components a host of each needs, which is what
 # a described release is held to (the server's own table, so there is one).

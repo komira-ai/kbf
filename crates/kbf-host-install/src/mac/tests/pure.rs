@@ -497,7 +497,8 @@ fn a_channel_names_a_drop_directory_and_pinned_sums() {
         "refs/heads/release/1"
     );
     assert_eq!(
-        list.channel(&fx.host.trust, &Channel::new("beta").unwrap()),
+        list.channel(&fx.host.trust, &Channel::new("beta").unwrap())
+            .map_err(|e| e.refusal()),
         Err(Refusal::ChannelNotAllowed)
     );
 }
@@ -524,7 +525,8 @@ fn a_channel_may_have_no_sums() {
     .unwrap();
     fs::set_permissions(&fx.sums, fs::Permissions::from_mode(0o666)).unwrap();
     assert_eq!(
-        list.channel(&fx.host.trust, &stable()),
+        list.channel(&fx.host.trust, &stable())
+            .map_err(|e| e.refusal()),
         Err(Refusal::ConfigUnsafe)
     );
 }
@@ -589,12 +591,14 @@ fn the_allowlist_and_the_pinned_sums_must_be_roots() {
     )
     .unwrap();
     assert_eq!(
-        list.channel(&fx.host.trust, &stable()),
+        list.channel(&fx.host.trust, &stable())
+            .map_err(|e| e.refusal()),
         Err(Refusal::ConfigUnsafe)
     );
     fs::remove_file(&fx.sums).unwrap();
     assert_eq!(
-        list.channel(&fx.host.trust, &stable()),
+        list.channel(&fx.host.trust, &stable())
+            .map_err(|e| e.refusal()),
         Err(Refusal::ConfigInvalid)
     );
     fs::remove_file(&fx.host.allowlist).unwrap();
@@ -909,43 +913,56 @@ fn a_release_file_has_its_own_name_bundle_and_commit() {
     let tarball = AssetKind::Tarball;
     let image = AssetKind::FrontendImage;
     assert_eq!(
-        tarball.name_on("linux-arm64", commit),
+        tarball.name_on("kbf", "linux-arm64", commit),
         format!("kbf-{commit}-linux-arm64.tar.gz")
     );
     assert_eq!(
-        image.name_on("linux-arm64", commit),
+        image.name_on("kbf", "linux-arm64", commit),
         format!("kbf-frontend-image-{commit}-linux-arm64.oci.tar")
     );
     assert_eq!(
-        bundle_of(&image.name_on("linux-x86_64", commit)),
+        bundle_of(&image.name_on("kbf", "linux-x86_64", commit)),
         format!("kbf-frontend-image-{commit}-linux-x86_64.oci.tar.sigstore.json")
     );
     assert_eq!(
-        bundle_of(&tarball.name_on("linux-x86_64", commit)),
+        bundle_of(&tarball.name_on("kbf", "linux-x86_64", commit)),
         format!("kbf-{commit}-linux-x86_64.tar.gz.sigstore.json")
     );
 
     assert_eq!(
-        AssetKind::Deb.name_on("linux-arm64", commit),
+        AssetKind::Deb.name_on("kbf", "linux-arm64", commit),
         format!("kbf-{commit}-linux-arm64.deb")
     );
     for kind in [tarball, image, AssetKind::Deb, AssetKind::Rpm] {
-        let name = kind.name_on("linux-arm64", commit);
-        assert_eq!(kind.commit_of_name_on("linux-arm64", &name), Some(commit));
-        assert_eq!(kind.commit_of_name_on("linux-x86_64", &name), None);
+        let name = kind.name_on("kbf", "linux-arm64", commit);
         assert_eq!(
-            kind.commit_of_name_on("linux-arm64", &format!("{name}.sigstore.json")),
+            kind.commit_of_name_on("kbf", "linux-arm64", &name),
+            Some(commit)
+        );
+        assert_eq!(kind.commit_of_name_on("kbf", "linux-x86_64", &name), None);
+        assert_eq!(
+            kind.commit_of_name_on("kbf", "linux-arm64", &format!("{name}.sigstore.json")),
             None
         );
     }
     // One kind's name is not the other's.
-    let image_name = image.name_on("linux-arm64", commit);
-    assert_eq!(tarball.commit_of_name_on("linux-arm64", &image_name), None);
-    let tarball_name = tarball.name_on("linux-arm64", commit);
-    assert_eq!(image.commit_of_name_on("linux-arm64", &tarball_name), None);
+    let image_name = image.name_on("kbf", "linux-arm64", commit);
+    assert_eq!(
+        tarball.commit_of_name_on("kbf", "linux-arm64", &image_name),
+        None
+    );
+    let tarball_name = tarball.name_on("kbf", "linux-arm64", commit);
+    assert_eq!(
+        image.commit_of_name_on("kbf", "linux-arm64", &tarball_name),
+        None
+    );
     // A commit that is not 40 hex digits is none.
     assert_eq!(
-        image.commit_of_name_on("linux-arm64", "kbf-frontend-image-abc-linux-arm64.oci.tar"),
+        image.commit_of_name_on(
+            "kbf",
+            "linux-arm64",
+            "kbf-frontend-image-abc-linux-arm64.oci.tar"
+        ),
         None
     );
 }
@@ -977,4 +994,39 @@ fn the_sums_give_the_sha256_listed_for_one_file() {
             "{bad:?}"
         );
     }
+}
+
+/// A channel's artifact prefix names its files and is read back from them: the prefix is the
+/// whole of the start of the name, the frontend image keeps its `-frontend-image-` word after
+/// it, and the files of another prefix (or of `kbf`) are not this channel's.
+#[test]
+fn the_artifact_prefix_names_and_recognises_the_channels_files() {
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let cases = [
+        (AssetKind::Tarball, "other-{c}-linux-arm64.tar.gz"),
+        (AssetKind::Deb, "other-{c}-linux-arm64.deb"),
+        (AssetKind::Rpm, "other-{c}-linux-arm64.rpm"),
+        (
+            AssetKind::FrontendImage,
+            "other-frontend-image-{c}-linux-arm64.oci.tar",
+        ),
+    ];
+    for (kind, pattern) in cases {
+        let name = pattern.replace("{c}", commit);
+        assert_eq!(kind.name_on("other", "linux-arm64", commit), name);
+        assert_eq!(
+            kind.commit_of_name_on("other", "linux-arm64", &name),
+            Some(commit)
+        );
+        assert_eq!(kind.commit_of_name_on("kbf", "linux-arm64", &name), None);
+        assert_eq!(kind.commit_of_name_on("oth", "linux-arm64", &name), None);
+        let kbfs = kind.name_on("kbf", "linux-arm64", commit);
+        assert!(kbfs.starts_with("kbf-"), "{kbfs}");
+        assert_eq!(kind.commit_of_name_on("other", "linux-arm64", &kbfs), None);
+    }
+    // The default is the name of today.
+    assert_eq!(
+        crate::mac::release::named_asset_on("kbf", "darwin-arm64", "tar.gz", commit),
+        tarball_name(commit)
+    );
 }

@@ -67,13 +67,13 @@ pub(crate) struct FailedActions([u64; 4]);
 
 impl FailedActions {
     /// Counts one failed operation of `class`.
-    pub(super) fn count(&mut self, class: Class) {
+    pub(crate) fn count(&mut self, class: Class) {
         self.0[class.slot()] += 1;
     }
 
     /// The count of `class`.
     #[cfg(test)]
-    pub(super) fn of(&self, class: Class) -> u64 {
+    pub(crate) fn of(&self, class: Class) -> u64 {
         self.0[class.slot()]
     }
 
@@ -99,14 +99,15 @@ impl Farm {
     /// The operations this process settled as failed, per class.
     #[must_use]
     pub(crate) fn failed_actions(&self) -> FailedActions {
-        self.lock().failed
+        js_arm!(self, views::failed_actions());
+        self.lock().side.failed
     }
 }
 
 /// The class an operation finishes in, given its scheduler `outcome` and the report's
 /// `detail` if one was kept; `None` for one that did not fail. Follows
 /// `finished_of`, which decides what the callers are told.
-pub(super) fn class_of(outcome: Outcome, detail: Option<&Detail>) -> Option<Class> {
+pub(crate) fn class_of(outcome: Outcome, detail: Option<&Detail>) -> Option<Class> {
     match (detail, outcome) {
         (Some(Detail::Ran(pending)), _) => (pending.result.exit_code != 0).then_some(Class::Action),
         (_, Outcome::Failed(Failure::Timeout)) => Some(Class::Action),

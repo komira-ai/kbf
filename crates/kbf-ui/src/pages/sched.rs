@@ -46,6 +46,53 @@ pub(crate) struct QueueDoc {
     pub(crate) waiting: Vec<Waiting>,
     pub(crate) avoided: Vec<Avoided>,
     pub(crate) avoided_total: u64,
+    /// Present only when the server runs with `--whole-node-max`.
+    #[serde(default)]
+    pub(crate) whole_node: Option<WholeNode>,
+}
+
+/// The whole-node section of the queue document: the caps' numbers and the whole-machine
+/// requests that wait.
+#[derive(Debug, Deserialize)]
+pub(crate) struct WholeNode {
+    pub(crate) held: u64,
+    pub(crate) marks: u64,
+    pub(crate) draining: u64,
+    pub(crate) ceiling: u64,
+    pub(crate) max_whole_node: u64,
+    pub(crate) capable_hosts: u64,
+    pub(crate) keep_for_ordinary: u64,
+    pub(crate) max_draining: u64,
+    /// Requests by reason, every reason present.
+    pub(crate) waiting: std::collections::BTreeMap<String, u64>,
+    pub(crate) requests: Vec<WholeRequest>,
+    pub(crate) requests_total: u64,
+}
+
+/// One queued whole-machine request: `state` and `reason` always, the rest where the
+/// state has them.
+#[derive(Debug, Deserialize)]
+pub(crate) struct WholeRequest {
+    pub(crate) operation: String,
+    pub(crate) instance: String,
+    pub(crate) state: String,
+    pub(crate) reason: String,
+    pub(crate) may_hold_in_ms: Option<u64>,
+    pub(crate) worker: Option<String>,
+    pub(crate) held_for_ms: Option<u64>,
+    pub(crate) deadline_in_ms: Option<u64>,
+    pub(crate) give_ups: Option<u64>,
+    pub(crate) draining: Option<bool>,
+    pub(crate) barred: Vec<BarredWorker>,
+    pub(crate) unservable: Option<String>,
+}
+
+/// A worker a request gave up and may not hold until its back-off ends.
+#[derive(Debug, Deserialize)]
+pub(crate) struct BarredWorker {
+    pub(crate) worker: String,
+    /// `None` for a bar that has no end.
+    pub(crate) until_in_ms: Option<u64>,
 }
 
 /// The queued operations of one platform and QoS level.

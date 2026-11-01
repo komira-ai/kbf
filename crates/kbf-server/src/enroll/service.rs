@@ -257,7 +257,7 @@ impl EnrollService {
         } else {
             None
         };
-        let mut sign = || core.sign_enroll(&node_id, &csrs, &request.advertise, host_role);
+        let mut sign = || core.sign_enroll(&node_id, &csrs, &request.advertise, host_role.as_ref());
         let enrolled = registry::enroll_txn(
             &*core.store,
             &registry::EnrollRequest {
@@ -385,7 +385,7 @@ impl Core {
     pub(super) fn issue_updater(
         &self,
         node: &NodeId,
-        host_role: HostRole,
+        host_role: &HostRole,
         key: &PublicKey,
     ) -> Result<IssuedRole, RefusalReason> {
         let issued = self
@@ -411,7 +411,7 @@ impl Core {
         node: &NodeId,
         role: Role,
         key: &PublicKey,
-        host_role: Option<HostRole>,
+        host_role: Option<&HostRole>,
         advertise: Option<&str>,
     ) -> Result<IssuedRole, RefusalReason> {
         match role {
@@ -429,7 +429,7 @@ impl Core {
         node: &NodeId,
         csrs: &[(Role, &[u8])],
         advertise: &str,
-        host_role: Option<HostRole>,
+        host_role: Option<&HostRole>,
     ) -> Result<Vec<IssuedRole>, RefusalReason> {
         if node_id_refused(node.as_str(), &self.frontend_names) {
             return Err(RefusalReason::NodeIdNotAllowed);

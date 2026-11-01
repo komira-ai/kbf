@@ -17,6 +17,7 @@ testkit = []
 base64.workspace = true
 bytes.workspace = true
 futures.workspace = true
+hmac.workspace = true
 http-body.workspace = true
 kbf-auth.workspace = true
 kbf-caps.workspace = true
@@ -32,6 +33,7 @@ kbf-route.workspace = true
 kbf-sched.workspace = true
 kbf-segments.workspace = true
 # `PackIndex` and `BlobDigest`: where the packs' blobs are found (`proxy::packed`).
+kbf-pack-index.workspace = true
 kbf-state.workspace = true
 kbf-storage.workspace = true
 kbf-store.workspace = true
@@ -40,17 +42,25 @@ kbf-tls.workspace = true
 kbf-types.workspace = true
 prost.workspace = true
 prost-types.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
+# `server::presign_put`, the signer of the one presigned write of a task's pack (`prepare_run`).
+tierstore = { workspace = true, features = ["server"] }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tonic.workspace = true
 tower-layer.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The client side of `Server::handle`: a request body for the store a locate grant is verified by.
+http-body-util.workspace = true
 kbf-front = { workspace = true, features = ["testkit"] }
 # The loopback S3 service (`s3::fake`) the large-blob tests flush to.
 kbf-objstore = { workspace = true, features = ["testkit"] }
 # The in-memory pack index the pack tests record packs in.
+kbf-pack-index = { workspace = true, features = ["test-support"] }
 kbf-state = { workspace = true, features = ["test-support"] }
 # The REAPI service definitions, read from kbf-proto's vendored files, so the
 # authorization test (tests/auth.rs) covers every method the routes serve.
@@ -59,7 +69,6 @@ protox.workspace = true
 # certificates, the switch that cuts a node off, and the TLS server the nodes serve with.
 kbf-testkit.workspace = true
 rcgen.workspace = true
-serde_json.workspace = true
 tonic = { workspace = true, features = ["tls-ring"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util", "time"] }
 tracing-subscriber.workspace = true

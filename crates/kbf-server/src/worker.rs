@@ -27,7 +27,7 @@
 //!   leaves out that was lost to a restart past its farm reruns answers the
 //!   operation's callers. The pack-read counts it carries, if any, are kept as the node's
 //!   newest for `/metrics` ([`Farm::note_pack_reads`]), and so are its pack-write counts
-//!   ([`Farm::note_pack_writes`]);
+//!   ([`Farm::note_pack_writes`]) and its input cache counts ([`Farm::note_input_cache`]);
 //! - a `Result` the deny list now refuses ends the stream, so it never reaches the
 //!   action cache. Otherwise it is accepted only from the node holding the
 //!   operation's current lease, and only if the action it names (if any) is the one
@@ -103,6 +103,8 @@ pub struct WorkerService {
     protocols: (u32, u32),
     /// Whether `Welcome` says this frontend takes `PackIndex/CommitPack` (`Welcome.pack_commit`).
     pack_commit: bool,
+    /// What `Welcome.placement_load` carries (`--placement-load`).
+    placement_load: Option<bool>,
 }
 
 impl WorkerService {
@@ -124,6 +126,7 @@ impl WorkerService {
             map: MapFeed::NONE,
             protocols: (OLDEST_PROTOCOL_VERSION, PROTOCOL_VERSION),
             pack_commit: false,
+            placement_load: None,
         }
     }
 
@@ -151,6 +154,14 @@ impl WorkerService {
     #[must_use]
     pub const fn with_pack_commit(mut self, on: bool) -> Self {
         self.pack_commit = on;
+        self
+    }
+
+    /// The service telling each daemon, in `Welcome.placement_load`, the mode of
+    /// `--placement-load`. `off` (the default) leaves the field out.
+    #[must_use]
+    pub const fn with_placement_load(mut self, mode: crate::PlacementLoad) -> Self {
+        self.placement_load = mode.welcome();
         self
     }
 
@@ -206,6 +217,7 @@ impl Worker for WorkerService {
             epoch: self.farm.lease_epoch(),
             map: self.map.welcome_map(),
             pack_commit: self.pack_commit,
+            placement_load: self.placement_load,
         }));
         let (outbound, responses) = mpsc::unbounded_channel();
         let capacity = reported.capacity;
@@ -326,12 +338,15 @@ impl Session {
                 // has its counts on `/metrics`.
                 farm.note_pack_reads(worker, stream, beat.pack_reads);
                 farm.note_pack_writes(worker, stream, beat.pack_writes);
+                farm.note_input_cache(worker, stream, beat.input_cache);
+                // The accepted reading goes to the scheduler with the heartbeat.
+                let load = farm.note_node_load(worker, stream, beat.node_load.as_ref());
                 let running = beat
                     .running
                     .iter()
                     .map(|l| LeaseId::new(l.term, l.seq))
                     .collect();
-                farm.heartbeat(worker, stream, beat.seq, running)
+                farm.heartbeat_with_load(worker, stream, beat.seq, running, load)
                     .await
                     .then_some(server_message::Message::HeartbeatAck(HeartbeatAck {
                         seq: beat.seq,
@@ -434,7 +449,8 @@ pub fn phase(hello: &Hello) -> Result<NodePhase, String> {
         Ok(Phase::Quarantined) => NodePhase::Quarantined(reported.reason.clone()),
         Ok(Phase::MemoryPressure) => NodePhase::MemoryPressure,
         Ok(Phase::Draining) => NodePhase::Draining,
-        Err(_) => NodePhase::Quarantined(format!(
+        // `Tainted` is on the wire before this server acts on it: the fallback applies.
+        Ok(Phase::Tainted) | Err(_) => NodePhase::Quarantined(format!(
             "the node reports phase {}, which this server does not know",
             reported.phase
         )),

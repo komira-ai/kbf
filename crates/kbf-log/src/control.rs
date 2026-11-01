@@ -15,9 +15,10 @@ use kbf_caps::{Arch, Consumable, CpuCaps, NodeCaps};
 use kbf_meta::ActionRecord;
 use kbf_proto::kbf::log::v1 as proto;
 use kbf_sched::{DaemonInstance, Request};
+use kbf_types::sched::usage::LeaseCost;
 use kbf_types::{
     ActionKey, ControlRecord, Digest, Failure, FarmTime, LeaseGrant, LeaseId, LeaseKind, LostWhy,
-    OperationId, Outcome, Qos, RefusalRecord, Resources, ResultRecord, WorkerId,
+    OperationId, Outcome, Qos, RefusalRecord, Resources, ResultRecord, WorkKey, WorkerId,
 };
 use proto::farm_input::Input as P;
 
@@ -283,6 +284,7 @@ const fn resources(r: &Resources) -> proto::Resources {
         gpus: r.gpus,
         vms: r.vms,
         leases: r.leases,
+        disk_bytes: r.disk_bytes,
     }
 }
 
@@ -319,12 +321,17 @@ fn node_caps(caps: &NodeCaps) -> proto::NodeCaps {
         consumables: caps
             .consumables
             .iter()
+            // A disk-gib amount is left out, so that binaries that predate enum value 5
+            // can read every log this binary writes. `from_consumable` does read value 5.
+            .filter(|&(&c, _)| c != Consumable::DiskGib)
             .map(|(&c, &amount)| proto::ConsumableAmount {
                 consumable: match c {
                     Consumable::Cpus => proto::Consumable::Cpus,
                     Consumable::MemGib => proto::Consumable::MemGib,
                     Consumable::NvmeGib => proto::Consumable::NvmeGib,
                     Consumable::Gpus => proto::Consumable::Gpus,
+                    // Filtered out above.
+                    Consumable::DiskGib => proto::Consumable::DiskGib,
                 }
                 .into(),
                 amount,
@@ -346,10 +353,11 @@ fn node_caps(caps: &NodeCaps) -> proto::NodeCaps {
 }
 
 fn request(r: &Request) -> Result<proto::Request, EncodeError> {
+    let key = ActionKey::try_from(&r.key).map_err(|_| EncodeError::WorkKey)?;
     Ok(proto::Request {
         key: Some(proto::ActionKey {
-            instance: r.key.instance.clone(),
-            action: Some(digest(&r.key.action)?),
+            instance: key.instance,
+            action: Some(digest(&key.action)?),
         }),
         qos: Some(qos(&r.qos)),
         kind: lease_kind(r.kind).into(),
@@ -389,6 +397,18 @@ const fn lease_id(lease: LeaseId) -> proto::LeaseId {
     }
 }
 
+/// The cost of a lease as the record keeps it.
+const fn lease_cost(cost: LeaseCost) -> proto::LeaseCost {
+    proto::LeaseCost {
+        cpu_millis: cost.cpu_millis,
+        memory_bytes: cost.memory_bytes,
+        limit_bytes: cost.limit_bytes,
+        cold: cost.cold,
+        retry: cost.retry,
+        key_hash: cost.key_hash,
+    }
+}
+
 fn record(r: &ControlRecord) -> Result<proto::ControlRecord, EncodeError> {
     use proto::control_record::Record;
     let record = match r {
@@ -396,6 +416,7 @@ fn record(r: &ControlRecord) -> Result<proto::ControlRecord, EncodeError> {
             lease: Some(lease_id(g.lease)),
             operation: g.operation.0,
             worker: g.worker.as_str().to_owned(),
+            cost: (g.cost != LeaseCost::default()).then(|| lease_cost(g.cost)),
         }),
         ControlRecord::Result(r) => Record::Result(proto::ResultRecord {
             lease: Some(lease_id(r.lease)),
@@ -416,7 +437,9 @@ fn record(r: &ControlRecord) -> Result<proto::ControlRecord, EncodeError> {
 fn outcome(o: &Outcome) -> Result<proto::Outcome, EncodeError> {
     use proto::outcome::Outcome as O;
     let o = match o {
-        Outcome::Completed { action_result } => O::Completed(digest(action_result)?),
+        Outcome::Completed { action_result } => {
+            O::Completed(digest(&Digest::from(*action_result))?)
+        }
         Outcome::Failed(f) => O::Failed(
             match f {
                 Failure::Timeout => proto::Failure::Timeout,
@@ -531,6 +554,7 @@ fn from_resources(
         memory_bytes: r.memory_bytes,
         gpus: r.gpus,
         vms: r.vms,
+        disk_bytes: r.disk_bytes,
         leases: r.leases,
     })
 }
@@ -564,8 +588,8 @@ fn from_node_caps(
         consumables: caps
             .consumables
             .into_iter()
-            .map(from_consumable)
-            .collect::<Result<BTreeMap<_, _>, _>>()?,
+            .filter_map(from_consumable)
+            .collect::<BTreeMap<_, _>>(),
         drivers: caps.drivers.into_iter().collect(),
         devices: caps
             .devices
@@ -580,20 +604,19 @@ fn from_node_caps(
     })
 }
 
-fn from_consumable(c: proto::ConsumableAmount) -> Result<(Consumable, u64), DecodeError> {
+/// An amount of a consumable this binary has a variant for. An amount whose value is
+/// unspecified or unnamed is skipped (`None`), and the rest of the command decodes as it
+/// would without it: a later binary may add a consumable.
+fn from_consumable(c: proto::ConsumableAmount) -> Option<(Consumable, u64)> {
     let consumable = match proto::Consumable::try_from(c.consumable) {
         Ok(proto::Consumable::Cpus) => Consumable::Cpus,
         Ok(proto::Consumable::MemGib) => Consumable::MemGib,
         Ok(proto::Consumable::NvmeGib) => Consumable::NvmeGib,
         Ok(proto::Consumable::Gpus) => Consumable::Gpus,
-        Ok(proto::Consumable::Unspecified) | Err(_) => {
-            return Err(DecodeError::UnknownValue {
-                field: "ConsumableAmount.consumable",
-                value: c.consumable,
-            });
-        }
+        Ok(proto::Consumable::DiskGib) => Consumable::DiskGib,
+        Ok(proto::Consumable::Unspecified) | Err(_) => return None,
     };
-    Ok((consumable, c.amount))
+    Some((consumable, c.amount))
 }
 
 fn from_request(r: proto::Request) -> Result<Request, DecodeError> {
@@ -611,16 +634,17 @@ fn from_request(r: proto::Request) -> Result<Request, DecodeError> {
     };
     let needs = kbf_caps::Request::parse(r.needs.iter().map(|p| (&*p.key, &*p.value)))?;
     Ok(Request {
-        key: ActionKey {
+        key: WorkKey::from(ActionKey {
             instance: key.instance,
             action: required_digest(key.action, "ActionKey.action")?,
-        },
+        }),
         qos: from_qos(r.qos.ok_or(DecodeError::Missing("Request.qos"))?)?,
         kind,
         resources: from_resources(r.resources, "Request.resources")?,
         needs,
         hermetic: r.hermetic,
         do_not_cache: r.do_not_cache,
+        whole_worker: false,
     })
 }
 
@@ -654,6 +678,18 @@ fn required_lease_id(
     lease.map(from_lease_id).ok_or(DecodeError::Missing(field))
 }
 
+/// The cost a lease record holds.
+const fn from_lease_cost(cost: proto::LeaseCost) -> LeaseCost {
+    LeaseCost {
+        cpu_millis: cost.cpu_millis,
+        memory_bytes: cost.memory_bytes,
+        limit_bytes: cost.limit_bytes,
+        cold: cost.cold,
+        retry: cost.retry,
+        key_hash: cost.key_hash,
+    }
+}
+
 fn from_record(r: proto::ControlRecord) -> Result<ControlRecord, DecodeError> {
     use proto::control_record::Record;
     Ok(
@@ -665,6 +701,7 @@ fn from_record(r: proto::ControlRecord) -> Result<ControlRecord, DecodeError> {
                 lease: required_lease_id(g.lease, "LeaseGrant.lease")?,
                 operation: OperationId(g.operation),
                 worker: WorkerId::new(g.worker),
+                cost: g.cost.map(from_lease_cost).unwrap_or_default(),
             }),
             Record::Result(r) => ControlRecord::Result(ResultRecord {
                 lease: required_lease_id(r.lease, "ResultRecord.lease")?,
@@ -684,7 +721,7 @@ fn from_outcome(o: Option<proto::Outcome>, field: &'static str) -> Result<Outcom
     let o = o.ok_or(DecodeError::Missing(field))?;
     match o.outcome.ok_or(DecodeError::UnknownCommand("Outcome"))? {
         O::Completed(d) => Ok(Outcome::Completed {
-            action_result: from_digest(d, "Outcome.completed")?,
+            action_result: from_digest(d, "Outcome.completed")?.into(),
         }),
         O::Failed(f) => Ok(Outcome::Failed(match proto::Failure::try_from(f) {
             Ok(proto::Failure::Timeout) => Failure::Timeout,

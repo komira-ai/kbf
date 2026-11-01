@@ -23,10 +23,12 @@ use crate::mac::apply::{self, Plan};
 use crate::mac::channel::MacAllowlist;
 use crate::mac::kit::{self, Links};
 use crate::mac::layout::{BINARY, MacHost};
+use crate::mac::retain;
 use crate::mac::{self, conf, stage};
 use crate::outcome::{FailureCode, Outcome, Refusal};
 use crate::request::{Channel, Version};
 use crate::runner::Runner;
+use kbf_retain::Kept;
 
 /// What a switch leaves behind until it is confirmed or reverted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,7 +54,7 @@ impl MacBackend {
     }
 
     fn marker_file(&self) -> PathBuf {
-        self.host.work.join("pending.json")
+        self.host.pending_marker()
     }
 
     fn read_marker(&self) -> Result<Option<Marker>, Fault> {
@@ -168,7 +170,7 @@ impl Backend for MacBackend {
             .map_err(|r| Fault::refused(refusal_code(r), "the allowlist"))?;
         let channel = allowlist
             .channel(&host.trust, channel)
-            .map_err(|r| Fault::refused(refusal_code(r), "the allowlist"))?;
+            .map_err(|e| Fault::refused(refusal_code(e.refusal()), e.to_string()))?;
         let staged = stage::stage(host, &*self.runner, &channel, version).map_err(stage_fault)?;
         let plan = Plan {
             commit: staged.commit.clone(),
@@ -229,5 +231,19 @@ impl Backend for MacBackend {
         apply::switch_back(&self.host, &*self.runner, &before)
             .map_err(|tail| Fault::failed(Code::RevertFailed, tail))?;
         self.clear_marker()
+    }
+
+    fn kept(&self) -> Result<Vec<Kept>, Fault> {
+        let on_trial = self.read_marker()?.map(|m| m.commit);
+        retain::kept(&self.host, on_trial.as_deref())
+            .map_err(|why| Fault::failed(Code::StateUnavailable, why))
+    }
+
+    fn retain_file(&self) -> Option<PathBuf> {
+        Some(retain::file(&self.host))
+    }
+
+    fn prune(&self, keep: usize) -> Result<String, Fault> {
+        retain::prune(&self.host, keep).map_err(|why| Fault::failed(Code::StateUnavailable, why))
     }
 }

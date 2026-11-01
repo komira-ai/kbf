@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use kbf_sim::golden::GoldenFile;
 use kbf_sim::{Chance, Event, Faults, Node, NodeId, NodeInput, Output, Sim, TraceHash};
 use kbf_types::{Effect, FarmTime, StateMachine};
 
@@ -15,11 +16,7 @@ const NODES: usize = 5;
 const ROUNDS: u64 = 20;
 const MAX_HOPS: u8 = 3;
 
-#[derive(Clone, Debug)]
-#[expect(
-    dead_code,
-    reason = "origin and round are read only through Debug, in the trace"
-)]
+#[derive(Clone)]
 struct Rumour {
     origin: usize,
     round: u64,
@@ -87,6 +84,13 @@ impl StateMachine for Gossiper {
 impl Node for Gossiper {
     type Msg = Rumour;
 
+    fn trace_msg(msg: &Rumour) -> String {
+        format!(
+            "rumour(origin={} round={} hops={})",
+            msg.origin, msg.round, msg.hops
+        )
+    }
+
     fn take_outputs(&mut self) -> Vec<Output<Rumour>> {
         std::mem::take(&mut self.out)
     }
@@ -145,15 +149,32 @@ fn different_seeds_give_different_traces() {
     assert_eq!(hashes.len(), 8);
 }
 
+fn golden() -> GoldenFile {
+    GoldenFile::new(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/trace-hashes.txt"),
+        "gossip",
+        "cargo test -p kbf-sim -- --ignored regenerate_golden_hashes",
+    )
+}
+
+fn golden_runs() -> Vec<(String, TraceHash)> {
+    (0..4)
+        .map(|seed| (format!("seed-{seed}"), run(seed).0))
+        .collect()
+}
+
 /// Catches: a change in what a seed means across processes, platforms or releases: the
 /// random algorithm or its seed expansion, the order the kernel draws in, the trace
-/// format. CI runs this on x86 and arm64. A deliberate kernel change moves this hash in
-/// the same commit, and old failing seeds must be re-found.
+/// format. CI runs this on x86 and arm64. A kernel change that alters a decision moves
+/// these hashes in the same commit, and old failing seeds must be re-found.
 #[test]
-fn seed_one_is_pinned() {
-    let (hash, _) = run(1);
-    assert_eq!(
-        hash.to_string(),
-        "d8c5ad04d37349dbdf54dd72ad721f94fb56afd02a8a6ff4036a66e4f09b2657"
-    );
+fn seeds_match_their_golden_hashes() {
+    golden().assert_matches(&golden_runs());
+}
+
+/// Rewrites this file's lines of `tests/golden/trace-hashes.txt`.
+#[test]
+#[ignore = "regenerates the golden trace hashes; run it only on purpose"]
+fn regenerate_golden_hashes() {
+    golden().regenerate(&golden_runs()).unwrap();
 }

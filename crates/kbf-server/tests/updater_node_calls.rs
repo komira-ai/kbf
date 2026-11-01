@@ -194,9 +194,17 @@ fn listeners(worker_tls: WorkerTls) -> Listeners {
         tick: Duration::from_secs(3600),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
+        qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        memory_climb: true,
         vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
+        exclusive_actions: false,
+        scheduler_core: kbf_server::SchedulerCore::under_test(),
+        placement_load: kbf_server::PlacementLoad::Off,
+        placement_predictions: kbf_server::PlacementPredictions::Off,
+        usage_profiles: kbf_server::UsageProfiles::Off,
+        whole_node: None,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
@@ -379,7 +387,7 @@ async fn an_updater_drains_checks_and_undrains_its_own_node_with_no_token() {
 
     let (d, h) = (Arc::clone(&drain), host.clone());
     assert_eq!(
-        blocking(move || d.drain(&h, Duration::from_secs(30))).await,
+        blocking(move || d.drain(&h, Some(Duration::from_secs(30)))).await,
         Ok(())
     );
     assert_ne!(state_of(&node_state().await), "serving");

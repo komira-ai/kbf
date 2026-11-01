@@ -1,0 +1,5 @@
+# Log entry `farm-worker-up-predecessor-stopped`: the bytes of one entry of the replicated log, in format 1.
+# Pins: this value decodes from these bytes under every format, and encodes to them.
+# A change to this file needs a reason in the pull request that makes it, and the
+# file is never rewritten to match a new encoding: see tests/golden_corpus.rs.
+1a4d080110021a470a450a01771201691a08080110021803200422310a05080212016112060a016b1201761a060a016d1201782204080410022a016e320f0a0175120a0a05636c6173731201632801

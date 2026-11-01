@@ -9,6 +9,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
 
+use crate::leader::Leader;
 use kbf_daemon::cas::{Cas, CasError, Spool};
 use kbf_daemon::tree::{
     TreeError, check_relative, fetch_message, materialize, materialize_cached, output_paths,
@@ -20,7 +21,6 @@ use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata};
 use kbf_proto::worker::ResourceUsage;
 use kbf_types::LeaseId;
 use prost_types::Timestamp;
-use tokio::process::Child;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
@@ -656,12 +656,11 @@ impl<C: Cas> NativeRuntime<C> {
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr)
-            .process_group(0)
-            .kill_on_drop(true);
+            .process_group(0);
         let record = crate::record::path(&self.config.scratch, &lease_name(work.lease_id));
         let started = Instant::now();
         let Spawned {
-            mut child,
+            child,
             pid: leader,
             // Held until the group has ended (the group's kill ends it too), and
             // dropped after the group: it ends the group if the daemon dies.
@@ -669,6 +668,7 @@ impl<C: Cas> NativeRuntime<C> {
         } = spawn(&mut command, exec, &record, runner.keeper())
             .await
             .map_err(failed(&prepared.program))?;
+        let mut child = Leader::new(child);
         let me = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
         let mut watch = match runner {
             Runner::Daemon => Watch::Tree(
@@ -683,9 +683,13 @@ impl<C: Cas> NativeRuntime<C> {
         let mut tick = tokio::time::interval(self.config.poll);
         // A slow measurement delays the next one rather than bunching them up.
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut reaped = None;
         let ended = loop {
             tokio::select! {
-                status = child.wait() => break Ended::Exited(status),
+                got = child.wait() => {
+                    reaped = got.as_ref().ok().copied();
+                    break Ended::Exited(got.map(|r| r.status));
+                }
                 () = tokio::time::sleep_until(deadline) => break Ended::TimedOut,
                 Ok(by) = &mut *stop => {
                     *killer = Some(by);
@@ -699,6 +703,11 @@ impl<C: Cas> NativeRuntime<C> {
                 }
             }
         };
+        // The reap, if the leader exited, comes before the last read: whatever that read
+        // finds is alive after it, and no part of the reaped total.
+        if let Some(reaped) = reaped {
+            watch.reaped(leader, reaped);
+        }
         // One more read before the processes are ended: what ran since the last poll.
         let _ = watch.measure().await;
         let ignored = watch
@@ -709,6 +718,16 @@ impl<C: Cas> NativeRuntime<C> {
             )
             .await?;
         self.report_ignored_sigterm(work.lease_id, dir, &ignored);
+        // A leader the end reaped (a timeout, a kill): the last read was before it.
+        // (Already reaped there, so the wait gives the answer it kept.)
+        let late = if reaped.is_none() {
+            child.wait().await.ok()
+        } else {
+            None
+        };
+        if let Some(late) = late {
+            watch.reaped(leader, late);
+        }
         *measured = watch.usage(started.elapsed());
         let did_fail = match &ended {
             Ended::Exited(status) => status.as_ref().is_ok_and(|s| !s.success()),
@@ -1282,6 +1301,17 @@ impl Watch {
         }
     }
 
+    /// Records that the action's leader, `leader`, was reaped with `reaped` (its CPU and
+    /// that of the descendants it reaped).
+    fn reaped(&self, leader: i32, reaped: crate::leader::Reaped) {
+        let meter = match self {
+            Self::Tree(group) => &group.meter,
+            #[cfg(target_os = "macos")]
+            Self::Uid(uid) => uid.meter(),
+        };
+        usage::record_reap(meter, leader, reaped);
+    }
+
     /// What the watch read of the action's processes, as the lease's usage after `wall`
     /// ([`usage::report`]).
     fn usage(&self, wall: Duration) -> Option<ResourceUsage> {
@@ -1296,7 +1326,7 @@ impl Watch {
     /// ([`crate::grace`]). The processes that ignored SIGTERM.
     async fn end(
         &mut self,
-        child: &mut Child,
+        child: &mut Leader,
         wait: Duration,
         grace: Duration,
     ) -> Result<Vec<Survivor>, RuntimeError> {
@@ -1388,7 +1418,7 @@ impl Group {
     /// The processes that were alive when the grace ended.
     async fn end(
         &mut self,
-        child: &mut Child,
+        child: &mut Leader,
         wait: Duration,
         grace: Duration,
     ) -> Result<Vec<Survivor>, RuntimeError> {
@@ -2214,12 +2244,15 @@ mod tests {
         let dir = crate::unit_dir("runtime-group-term-fails");
         let record = dir.join("lease-6-6");
         std::fs::write(&record, "x").expect("write");
-        let mut child = tokio::process::Command::new("sleep")
-            .arg("60")
-            .process_group(0)
-            .spawn()
-            .expect("spawn sleep");
-        let leader = i32::try_from(child.id().expect("pid")).expect("pid");
+        use std::os::unix::process::CommandExt as _;
+        let mut child = Leader::new(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .expect("spawn sleep"),
+        );
+        let leader = child.pid();
         let me = i32::try_from(std::process::id()).expect("pid");
         let mut group = Group::reading(Tracker::new(leader, me), record, table_fails_once);
         let survivors = group
@@ -2227,7 +2260,7 @@ mod tests {
             .await
             .expect("ended");
         assert!(survivors.is_empty());
-        let status = child.try_wait().expect("wait").expect("reaped");
+        let status = child.wait().await.expect("reaped").status;
         assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
     }
 
@@ -2302,7 +2335,7 @@ mod tests {
             .expect("spawned once closed");
         assert!(tokio::time::Instant::now() - paused_at >= Duration::from_millis(100));
         assert!(pid > 0);
-        let out = child.wait_with_output().await.expect("wait");
+        let out = child.wait_with_output().expect("wait");
         assert_eq!(out.status.code(), Some(0), "{out:?}");
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),

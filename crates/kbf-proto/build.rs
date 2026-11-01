@@ -44,6 +44,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The registered store's secret must not reach a log through the derived `Debug`:
         // `src/store_config.rs` writes this one by hand.
         .skip_debug([".kbf.enroll.v1.StoreConfig"])
+        // The same message encodes to the same bytes: a hash map writes its entries in the
+        // order of a per-process seed, and the `done/` row of a failed answer holds this
+        // message.
+        .btree_map(".google.rpc.ErrorInfo")
         .compile_fds(descriptors)?;
 
     println!("cargo:rerun-if-changed={}", root.display());

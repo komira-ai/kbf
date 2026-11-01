@@ -171,6 +171,11 @@ fn worker_messages_round_trip() {
             heartbeat_seq: 12,
             valid_for_ms: 14_000,
             device_id: "00008110-000A".to_owned(),
+            job: Some(worker::Job {
+                run_id: "run-1".to_owned(),
+                ..Default::default()
+            }),
+            fence: worker::FencePolicy::RunOn as i32,
         })),
     };
     let back = ServerMessage::decode(start.encode_to_vec().as_slice()).expect("decode");
@@ -195,6 +200,10 @@ fn worker_messages_round_trip() {
             }),
             memory_kill: worker::MemoryKill::NodePressure as i32,
             lost: worker::Lost::Fenced as i32,
+            job_outcome: Some(worker::JobOutcome {
+                run_id: "run-1".to_owned(),
+                ..Default::default()
+            }),
         })),
     };
     let back = DaemonMessage::decode(result.encode_to_vec().as_slice()).expect("decode");
@@ -227,6 +236,8 @@ fn worker_messages_round_trip() {
                 missing_indexed: 11,
                 missing_unasked: 12,
             }),
+            node_load: None,
+            input_cache: None,
         })),
     };
     let back = DaemonMessage::decode(heartbeat.encode_to_vec().as_slice()).expect("decode");

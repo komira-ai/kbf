@@ -11,9 +11,10 @@ use kbf_proto::worker::{ServerMessage, server_message};
 use kbf_sched::fence::{LEASE_GRACE, START_GRACE};
 use kbf_sched::{DaemonInstance, FARM_RERUNS, NOT_STARTED_RERUNS, Request};
 use kbf_server::Farm;
+use kbf_server::api::NO_DRAIN_DEADLINE;
 use kbf_server::farm::{NodeAction, Reported, StreamId};
 use kbf_server::fleet::PlacementView;
-use kbf_types::{ActionKey, Digest, DigestFunction, LeaseKind, Qos, Resources, WorkerId};
+use kbf_types::{ActionKey, Digest, DigestFunction, LeaseId, LeaseKind, Qos, Resources, WorkerId};
 use tokio::sync::mpsc;
 
 type Responses = mpsc::UnboundedReceiver<Result<ServerMessage, tonic::Status>>;
@@ -75,12 +76,14 @@ async fn a_silent_node_past_the_budget_answers_the_callers_on_a_tick() {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [7; 32], 7),
-        },
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),
         needs: kbf_caps::Request::default(),
         hermetic: true,
+        whole_worker: false,
         do_not_cache: false,
     };
     let ticket = farm
@@ -89,6 +92,7 @@ async fn a_silent_node_past_the_budget_answers_the_callers_on_a_tick() {
             call: None,
             described: kbf_front::Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("queued");
     let mut seq = 0;
@@ -158,12 +162,14 @@ async fn a_node_that_drops_every_start_answers_the_callers_that_it_never_started
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [8; 32], 8),
-        },
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),
         needs: kbf_caps::Request::default(),
         hermetic: true,
+        whole_worker: false,
         do_not_cache: false,
     };
     let ticket = farm
@@ -172,6 +178,7 @@ async fn a_node_that_drops_every_start_answers_the_callers_that_it_never_started
             call: None,
             described: kbf_front::Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("queued");
     let mut starts = 0;
@@ -193,30 +200,27 @@ async fn a_node_that_drops_every_start_answers_the_callers_that_it_never_started
     );
 }
 
-/// Catches a tick that does not pause a drain at its deadline (work still running on a
-/// draining node would be reported as drained, and a rollout would cut it off), or one
-/// that loses the pause once it is set: a node holds a lease, is drained for ten
-/// seconds, and goes past the deadline; the tick shows it `DrainPaused` with the lease
-/// still on it, and a second tick leaves it so.
-#[tokio::test(start_paused = true)]
-async fn a_drain_with_a_lease_still_running_pauses_at_its_deadline() {
+/// A farm with one registered node that holds one running lease.
+fn farm_with_a_lease() -> (Farm, StreamId, WorkerId, String) {
     let farm = Farm::new(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
     );
-    let (_stream, rx) = register(&farm, NODES[0]);
+    let (stream, rx) = register(&farm, NODES[0]);
     let mut responses = [rx];
     let request = Request {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [9; 32], 9),
-        },
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),
         needs: kbf_caps::Request::default(),
         hermetic: true,
+        whole_worker: false,
         do_not_cache: false,
     };
     let _ticket = farm
@@ -225,10 +229,30 @@ async fn a_drain_with_a_lease_still_running_pauses_at_its_deadline() {
             call: None,
             described: kbf_front::Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("queued");
     assert_eq!(started(&mut responses), [0]);
     let worker = WorkerId::new(NODES[0]);
+    let held = farm.node_view(&worker).expect("the node").lease_count;
+    assert_eq!(held, 1);
+    let lease = farm
+        .node_detail(&worker)
+        .expect("a read")
+        .expect("the node")
+        .leases
+        .remove(0);
+    (farm, stream, worker, lease)
+}
+
+/// Catches a tick that does not pause a drain at its deadline (work still running on a
+/// draining node would be reported as drained, and a rollout would cut it off), or one
+/// that loses the pause once it is set: a node holds a lease, is drained for ten
+/// seconds, and goes past the deadline; the tick shows it `DrainPaused` with the lease
+/// still on it, and a second tick leaves it so.
+#[tokio::test(start_paused = true)]
+async fn a_drain_with_a_lease_still_running_pauses_at_its_deadline() {
+    let (farm, _stream, worker, _lease) = farm_with_a_lease();
     farm.place(&worker, NodeAction::Drain(Duration::from_secs(10)))
         .expect("known node");
     tokio::time::advance(Duration::from_secs(11)).await;
@@ -240,4 +264,57 @@ async fn a_drain_with_a_lease_still_running_pauses_at_its_deadline() {
         };
         assert_eq!(leases.len(), 1, "{leases:?}");
     }
+}
+
+/// Catches a drain with no deadline that ends at some default one (it was 30 minutes: the
+/// node paused, and a rollout that waited on it was left with a node that never reported
+/// drained), that shows a deadline (a year in the far future) for it, or that does not end
+/// when its lease does: a node whose heartbeats list its lease is drained with no deadline
+/// and goes three hours on; it is still `Draining` with the lease and no deadline, never
+/// `DrainPaused`, and once it falls silent past the grace the lease is given up and the
+/// node is `Drained`.
+#[tokio::test(start_paused = true)]
+async fn a_drain_with_no_deadline_waits_for_its_leases_however_long() {
+    let (farm, stream, worker, lease) = farm_with_a_lease();
+    let (term, seq) = lease.split_once('.').expect("term.seq");
+    let lease_id = LeaseId::new(term.parse().expect("term"), seq.parse().expect("seq"));
+    let placed = farm
+        .place(&worker, NodeAction::Drain(NO_DRAIN_DEADLINE))
+        .expect("known node");
+    assert_eq!(
+        placed.placement,
+        PlacementView::Draining {
+            deadline_unix_ms: None,
+            leases: vec![lease.clone()],
+        }
+    );
+    let step = LEASE_GRACE / 2;
+    let mut waited = Duration::ZERO;
+    let mut beat = 0;
+    while waited < Duration::from_secs(3 * 60 * 60) {
+        tokio::time::advance(step).await;
+        waited += step;
+        beat += 1;
+        assert!(farm.heartbeat(&worker, stream, beat, vec![lease_id]).await);
+        farm.tick().await;
+    }
+    let view = farm.node_view(&worker).expect("the node");
+    assert_eq!(
+        view.placement,
+        PlacementView::Draining {
+            deadline_unix_ms: None,
+            leases: vec![lease],
+        },
+        "still waiting for the lease"
+    );
+    let shown = serde_json::to_value(&view).expect("JSON");
+    assert!(
+        shown["placement"].get("deadline_unix_ms").is_none(),
+        "{shown}"
+    );
+
+    tokio::time::advance(LEASE_GRACE + Duration::from_secs(1)).await;
+    farm.tick().await;
+    let view = farm.node_view(&worker).expect("the node");
+    assert_eq!(view.placement, PlacementView::Drained);
 }

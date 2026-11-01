@@ -4,13 +4,14 @@
 //! them once and checked the copy ([`super::stage`]).
 //!
 //! 1. The releases are listed with the system `curl` from the public REST endpoint
-//!    `https://api.github.com/repos/<repo>/releases`, a page of 100 at a time until a page
+//!    `https://api.github.com/repos/<repo>/releases` (the channel's repository), a page of 100 at a time until a page
 //!    is empty, at most [`MAX_PAGES`] pages. No token is needed (the API allows 60 requests
 //!    an hour per address without one; a runner or a NAT shared with others can have used
 //!    them up, which is [`FetchError::RateLimited`]). Never only the latest: a rollback
 //!    names an old release. Every page is read, because two commits that start with the
 //!    version's 12 hex digits are an ambiguous release and only the whole listing shows it.
-//! 2. A release asset named `kbf-<40 hex>-darwin-arm64.tar.gz` whose commit starts with the
+//! 2. A release asset named `kbf-<40 hex>-darwin-arm64.tar.gz` (`kbf` is the channel's
+//!    artifact prefix) whose commit starts with the
 //!    digits picks the release. None is [`FetchError::Unknown`] (or a failure when the
 //!    listing was cut at the page limit: it was not all seen); two commits are
 //!    [`FetchError::Ambiguous`].
@@ -33,7 +34,7 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::release::{self, REPO};
+use super::release::{self, Origin};
 use crate::runner::{Cmd, Identity, Runner, WriteCap};
 
 /// Releases asked for per page (GitHub's most).
@@ -79,7 +80,7 @@ pub enum AssetKind {
 
 impl AssetKind {
     /// The extension of the file's name. The image's name also has `frontend-image-` before
-    /// the commit, so take its name from [`Self::name_on`].
+    /// the prefix and the commit, so take its name from [`Self::name_on`].
     pub fn extension(self) -> &'static str {
         match self {
             Self::Tarball => release::TARBALL_EXTENSION,
@@ -89,22 +90,31 @@ impl AssetKind {
         }
     }
 
-    /// The name of the file of `commit` for `platform`.
-    pub fn name_on(self, platform: &str, commit: &str) -> String {
+    /// The name of the file of `commit` for `platform`, in a release whose files' names
+    /// start with `prefix` (`kbf`).
+    pub fn name_on(self, prefix: &str, platform: &str, commit: &str) -> String {
         match self {
-            Self::FrontendImage => format!("kbf-frontend-image-{commit}-{platform}.oci.tar"),
-            _ => release::asset_name_on(platform, self.extension(), commit),
+            Self::FrontendImage => {
+                format!("{prefix}-frontend-image-{commit}-{platform}.oci.tar")
+            }
+            _ => release::named_asset_on(prefix, platform, self.extension(), commit),
         }
     }
 
     /// The commit in the file name `name` of this kind for `platform`.
-    pub fn commit_of_name_on<'a>(self, platform: &str, name: &'a str) -> Option<&'a str> {
+    pub fn commit_of_name_on<'a>(
+        self,
+        prefix: &str,
+        platform: &str,
+        name: &'a str,
+    ) -> Option<&'a str> {
         match self {
             Self::FrontendImage => name
-                .strip_prefix("kbf-frontend-image-")
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix("-frontend-image-"))
                 .and_then(|rest| rest.strip_suffix(&format!("-{platform}.oci.tar")))
                 .filter(|commit| release::is_commit(commit)),
-            _ => release::commit_of_asset_on(platform, self.extension(), name),
+            _ => release::commit_of_named_asset_on(prefix, platform, self.extension(), name),
         }
     }
 
@@ -126,13 +136,15 @@ pub struct Limits {
 }
 
 /// The system `curl` that lists and the pinned `gh` that downloads, run as `who` with `home`
-/// as the home of `gh`. `token`, when there is one, is one line of letters, digits, `_` and
-/// `-`.
+/// as the home of `gh`. `token`, when there is one, is one line of letters, digits, `_`, `-`
+/// and `.`, at most 1024 bytes.
 pub struct Fetcher<'a> {
     /// The platform of the release files to take: `darwin-arm64`, `linux-x86_64`, ...
     pub platform: &'a str,
     /// Which of the platform's files to take.
     pub asset: AssetKind,
+    /// The repository the releases are listed from and the start of their files' names.
+    pub origin: &'a Origin,
     pub runner: &'a dyn Runner,
     pub curl: &'a Path,
     pub gh: &'a Path,
@@ -232,7 +244,8 @@ impl Fetcher<'_> {
         }
         args.push("--url".to_owned());
         args.push(format!(
-            "https://api.github.com/repos/{REPO}/releases?per_page={PER_PAGE}&page={page}"
+            "https://api.github.com/repos/{}/releases?per_page={PER_PAGE}&page={page}",
+            self.origin.repository()
         ));
         Cmd {
             program: self.curl.display().to_string(),
@@ -248,10 +261,18 @@ impl Fetcher<'_> {
     /// `gh release download` of the file and the bundle of `commit` (and, for a package, the
     /// release's `SHA256SUMS`) from the release `tag`, into `scratch`.
     pub fn download_cmd(&self, tag: &str, commit: &str, scratch: &Path) -> Cmd {
-        let mut args: Vec<String> = ["release", "download", tag, "--repo", REPO]
-            .map(str::to_owned)
-            .to_vec();
-        let file = self.asset.name_on(self.platform, commit);
+        let mut args: Vec<String> = [
+            "release",
+            "download",
+            tag,
+            "--repo",
+            self.origin.repository(),
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let file = self
+            .asset
+            .name_on(self.origin.prefix(), self.platform, commit);
         let mut names = vec![file.clone(), release::bundle_of(&file)];
         if self.asset.with_sums() {
             names.push(release::SUMS_NAME.to_owned());
@@ -294,7 +315,12 @@ impl Fetcher<'_> {
         let mut complete = false;
         for page in 1..=MAX_PAGES {
             let releases = self.list_page(page)?;
-            note(&mut found, &releases, (self.platform, self.asset), prefix);
+            note(
+                &mut found,
+                &releases,
+                (self.origin.prefix(), self.platform, self.asset),
+                prefix,
+            );
             // Only an empty page ends the listing: a short one is not taken for the end.
             if releases.is_empty() {
                 complete = true;
@@ -331,8 +357,8 @@ impl Fetcher<'_> {
         match self.runner.run(&download) {
             Err(e) => failed(format!("gh release download: {e}")),
             Ok(exec) if !exec.success() => failed(format!(
-                "gh release download: exit status {:?}: {}",
-                exec.code,
+                "gh release download: {}: {}",
+                exec.ended(),
                 exec.stderr_text()
             )),
             Ok(_) => Ok(commit),
@@ -345,11 +371,7 @@ impl Fetcher<'_> {
             Err(e) => return failed(format!("curl: {e}")),
         };
         if !exec.success() {
-            return failed(format!(
-                "curl: exit status {:?}: {}",
-                exec.code,
-                exec.stderr_text()
-            ));
+            return failed(format!("curl: {}: {}", exec.ended(), exec.stderr_text()));
         }
         serde_json::from_slice(page_body(&exec.stdout)?)
             .or_else(|_| failed("the answer is not a listing of releases"))
@@ -472,12 +494,13 @@ fn retry_after(response: &Response<'_>) -> String {
 fn note(
     found: &mut BTreeMap<String, Found>,
     releases: &[Release],
-    (platform, asset_kind): (&str, AssetKind),
+    (name_prefix, platform, asset_kind): (&str, &str, AssetKind),
     prefix: &str,
 ) {
     for release in releases.iter().filter(|r| !r.draft && tag_ok(&r.tag_name)) {
         for asset in &release.assets {
-            let Some(commit) = asset_kind.commit_of_name_on(platform, &asset.name) else {
+            let Some(commit) = asset_kind.commit_of_name_on(name_prefix, platform, &asset.name)
+            else {
                 continue;
             };
             if !commit.starts_with(prefix) {

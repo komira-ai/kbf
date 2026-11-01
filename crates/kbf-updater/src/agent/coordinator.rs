@@ -11,9 +11,10 @@
 //!   0400). Nothing of the host's identity is in the body: the coordinator reads it from the
 //!   certificate, and a certificate that names another node or role than the one the agent
 //!   started as is not used (the drain it does targets the node it started as).
-//! - **What it takes back.** A 200 whose body is exactly a [`Reply`], read strictly and no
-//!   more than [`REPLY_MAX`] bytes. Anything else is an error, and the updater does nothing
-//!   with it but heartbeat again.
+//! - **What it takes back.** A 200 whose body is exactly a [`Reply`] (a [`ServiceReply`] for
+//!   an agent that lists services, an [`Answer`] for one that announces `agent_features`), read
+//!   strictly and no more than [`REPLY_MAX`] bytes.
+//!   Anything else is an error, and the updater does nothing with it but heartbeat again.
 //!
 //! HTTP/1.1 only, `Connection: close`, rustls with the ring provider over a std socket, like
 //! the other clients of this crate: no async runtime.
@@ -31,7 +32,7 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
 use crate::identity::{Identity, identity_of};
 use crate::secret::read_secret;
-use crate::wire::{HEARTBEAT_PATH, Heartbeat, Reply};
+use crate::wire::{Answer, HEARTBEAT_PATH, Heartbeat, Reply, ServiceReply};
 
 /// The most bytes of a reply that are read.
 pub const REPLY_MAX: usize = 16 * 1024;
@@ -73,6 +74,21 @@ pub trait Coordinator: Send + Sync {
     /// # Errors
     /// [`CoordinatorError`].
     fn heartbeat(&self, beat: &Heartbeat) -> Result<Reply, CoordinatorError>;
+
+    /// [`Coordinator::heartbeat`] for a heartbeat that lists `services`: the reply is read as a
+    /// [`ServiceReply`], which may name a service. Only an agent that lists services calls it.
+    ///
+    /// # Errors
+    /// [`CoordinatorError`].
+    fn heartbeat_services(&self, beat: &Heartbeat) -> Result<ServiceReply, CoordinatorError>;
+
+    /// [`Coordinator::heartbeat_services`] for a heartbeat that announces `agent_features`:
+    /// the answer is the service reply and, from a coordinator that knows the field, the
+    /// `features` it supports (an old one sends none). Only an agent that announces calls it.
+    ///
+    /// # Errors
+    /// [`CoordinatorError`].
+    fn heartbeat_answer(&self, beat: &Heartbeat) -> Result<Answer, CoordinatorError>;
 }
 
 /// The files of this host's side of the TLS.
@@ -277,8 +293,12 @@ fn handshake_error(error: &io::Error) -> CoordinatorError {
     }
 }
 
-impl Coordinator for HttpsCoordinator {
-    fn heartbeat(&self, beat: &Heartbeat) -> Result<Reply, CoordinatorError> {
+impl HttpsCoordinator {
+    /// Post `beat` and read the reply as a `T`.
+    fn post<T: serde::de::DeserializeOwned>(
+        &self,
+        beat: &Heartbeat,
+    ) -> Result<T, CoordinatorError> {
         let mut tls = dial(
             &self.endpoint,
             &self.files,
@@ -299,6 +319,20 @@ impl Coordinator for HttpsCoordinator {
         tls.write_all(&body).map_err(down)?;
         tls.flush().map_err(down)?;
         parse_reply(&read_all(&mut tls, self.timeout, REPLY_MAX + 8 * 1024)?)
+    }
+}
+
+impl Coordinator for HttpsCoordinator {
+    fn heartbeat(&self, beat: &Heartbeat) -> Result<Reply, CoordinatorError> {
+        self.post(beat)
+    }
+
+    fn heartbeat_services(&self, beat: &Heartbeat) -> Result<ServiceReply, CoordinatorError> {
+        self.post(beat)
+    }
+
+    fn heartbeat_answer(&self, beat: &Heartbeat) -> Result<Answer, CoordinatorError> {
+        self.post(beat)
     }
 }
 
@@ -351,7 +385,7 @@ pub(crate) fn read_all(
 }
 
 /// The reply in the HTTP response `raw`.
-fn parse_reply(raw: &[u8]) -> Result<Reply, CoordinatorError> {
+fn parse_reply<T: serde::de::DeserializeOwned>(raw: &[u8]) -> Result<T, CoordinatorError> {
     let malformed = |why: &str| CoordinatorError::Malformed(why.to_owned());
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut response = httparse::Response::new(&mut headers);

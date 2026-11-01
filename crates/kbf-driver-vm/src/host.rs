@@ -77,7 +77,7 @@ pub enum HostError {
 
 /// The hypervisor side of the VM driver. Calls block; the driver makes them off the
 /// async threads. Implementations: [`crate::FakeHost`], which runs the real `kbf-guest`
-/// agent on the host for tests, and (planned) the `kbf-vmm` helper on macOS.
+/// agent on the host for tests, and [`crate::MacVmHost`], which runs `kbf-vmm vm-run` through the root helper on macOS.
 pub trait VmHost: Send + Sync + 'static {
     /// The relayed byte stream to a guest's `kbf-guest` agent.
     type Stream: Stream;

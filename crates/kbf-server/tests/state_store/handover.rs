@@ -37,6 +37,7 @@ fn queue(farm: &TestFarm, request: Request) -> kbf_front::Ticket {
         call: None,
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     })
     .expect("queued")
 }
@@ -230,9 +231,12 @@ async fn a_farm_with_no_state_store_follows_no_one() {
     assert_eq!(farm.follow().expect("follow"), 0);
 }
 
-/// Asserts that following the callers of a fenced farm fails, naming the row, when the
-/// `done/` row of an operation they wait on cannot be read, and that the caller is not
-/// answered: a corrupt store is an error, not the absence of an operation.
+/// Asserts what following the callers of a fenced farm does when the `done/` row of an
+/// operation they wait on cannot be read: a corrupt store is never taken for the absence
+/// of an operation. The legacy core fails the follow, naming the row, and leaves the caller
+/// waiting. The js core reads the row's bytes and ends the caller with UNAVAILABLE, which
+/// clients ask again, so that no caller waits for a result that will not come; the follow
+/// itself succeeds, with nobody left waiting.
 #[tokio::test(start_paused = true)]
 async fn following_a_done_row_that_cannot_be_read_is_an_error_naming_the_row() {
     let disk = Disk::new();
@@ -242,6 +246,18 @@ async fn following_a_done_row_that_cannot_be_read_is_an_error_naming_the_row() {
     let key = "done/0000000000000000";
     let row = Txn::new().put(key.to_owned(), vec![0xff], Cond::Any);
     disk.store.txn(row).expect("store").expect("put");
+    if old.scheduler_core() == kbf_server::SchedulerCore::Js {
+        assert_eq!(old.follow().expect("the follow"), 0);
+        let ended = done(&waiting).expect("the caller is answered");
+        assert_eq!(
+            status(&ended),
+            (
+                Code::Unavailable as i32,
+                "the stored result of this operation cannot be read".to_owned()
+            )
+        );
+        return;
+    }
     let refused = old.follow().expect_err("an unreadable done row");
     assert!(refused.to_string().contains(key), "{refused}");
     assert!(done(&waiting).is_none());
@@ -285,7 +301,7 @@ async fn a_cordon_survives_a_restart(backing: Backing) {
     let wall = |view: PlacementView| match view {
         PlacementView::Draining {
             deadline_unix_ms, ..
-        } => deadline_unix_ms,
+        } => deadline_unix_ms.expect("a deadline"),
         other => panic!("{other:?}"),
     };
     after
@@ -377,13 +393,14 @@ async fn a_successors_recorder_has_no_record_of_a_build_but_its_caller_is_answer
     };
     let key = kbf_invocation::RecordKey::owner(kbf_invocation::InvocationId::new("build-1"));
     let asked = request(1);
+    let action = action_of(1);
     let call = kbf_front::ExecuteCall::new(
         &before,
         &metadata,
         &Default::default(),
         "main",
-        asked.key.action,
-        asked.key.action,
+        action,
+        action,
     )
     .expect("a recorded call");
 
@@ -395,6 +412,7 @@ async fn a_successors_recorder_has_no_record_of_a_build_but_its_caller_is_answer
             call: Some(call),
             described: Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("queued");
     let [lease] = starts(&mut inbox)[..] else {

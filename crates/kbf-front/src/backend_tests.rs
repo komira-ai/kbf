@@ -83,6 +83,10 @@ enum Fault {
     ReadFails(Digest),
     /// Every FindMissing fails.
     AskFails,
+    /// A streamed put answers that the claim was withdrawn, whatever it was given.
+    Withdrawn,
+    /// A streamed put answers that it stored another blob than the one claimed.
+    StoredAnother,
 }
 
 /// A [`Storage`] over another, that counts FindMissing calls and gets one thing wrong.
@@ -136,6 +140,13 @@ impl Storage for Spy {
         bytes: futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
         claim: futures::future::BoxFuture<'static, Option<Digest>>,
     ) -> Answer<'_, Option<Digest>> {
+        if matches!(self.fault, Fault::Withdrawn) {
+            return Box::pin(async { Ok(None) });
+        }
+        if matches!(self.fault, Fault::StoredAnother) {
+            let other = blob("another blob").0;
+            return Box::pin(async move { Ok(Some(other)) });
+        }
         self.inner.put_streamed(size, bytes, claim)
     }
 
@@ -271,6 +282,66 @@ async fn a_streamed_put_over_storage_is_found_and_read_back() {
     assert_eq!(stored, Some(digest));
     assert!(spy.find_missing(&[digest]).await.expect("find").is_empty());
     assert_eq!(spy.read_blob(&digest).await.expect("read"), bytes);
+}
+
+/// The pieces of `bytes`, from the first byte each time the source is opened.
+fn pieces_of(bytes: Bytes) -> impl Fn() -> kbf_storage::PieceStream + Send + Sync {
+    use futures::StreamExt as _;
+    move || {
+        let items: Vec<std::io::Result<Bytes>> = vec![Ok(bytes.slice(..4)), Ok(bytes.slice(4..))];
+        futures::stream::iter(items).boxed()
+    }
+}
+
+/// Catches: a streamed put through the backend that does not land the blob (over a cache in this
+/// process and over a storage), that takes bytes that are not the digest named and keeps them, or
+/// that calls a store's answer of a withdrawn claim a success.
+#[tokio::test]
+async fn a_streamed_put_through_a_backend_lands_the_blob_and_refuses_other_bytes() {
+    for remote in [false, true] {
+        let cache = Arc::new(Cache::memory());
+        let (local, through) = both(&cache);
+        let backend = if remote { through } else { local };
+        let (digest, bytes) = blob("a streamed blob");
+
+        backend
+            .put_streamed(&digest, &pieces_of(bytes.clone()))
+            .await
+            .expect("stored");
+        assert!(
+            backend
+                .find_missing(&[digest])
+                .await
+                .expect("asked")
+                .is_empty()
+        );
+        assert_eq!(backend.read_blob(&digest).await.expect("read"), bytes);
+
+        let claimed = blob("a streamed blOb").0;
+        let refused = backend.put_streamed(&claimed, &pieces_of(bytes)).await;
+        assert!(
+            refused.is_err(),
+            "bytes that are not the digest: {refused:?}"
+        );
+        let missing = backend.find_missing(&[claimed]).await.expect("asked");
+        assert_eq!(missing, [claimed], "nothing is kept under the digest");
+    }
+    let cache = Arc::new(Cache::memory());
+    let (backend, _) = spy(&cache, Fault::Withdrawn);
+    let (digest, bytes) = blob("a streamed blob");
+    let error = backend
+        .put_streamed(&digest, &pieces_of(bytes))
+        .await
+        .expect_err("not stored");
+    assert!(matches!(error, StorageError::Internal(_)), "{error:?}");
+
+    let (backend, _) = spy(&cache, Fault::StoredAnother);
+    let (digest, bytes) = blob("a streamed blob");
+    let error = backend
+        .put_streamed(&digest, &pieces_of(bytes))
+        .await
+        .expect_err("another blob stored");
+    assert!(matches!(error, StorageError::Internal(_)), "{error:?}");
 }
 
 /// Catches: the two kinds answering a call differently: the action-cache write (both

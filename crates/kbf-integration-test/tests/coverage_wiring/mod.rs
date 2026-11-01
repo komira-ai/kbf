@@ -3,16 +3,22 @@
 //! must check on pull requests that no floor is lower than the base's. Nothing else
 //! notices when a refactor of the job drops the second step or gives either a
 //! condition: the gate would pass every pull request, and floors could be lowered. The
-//! rules read the workflow; [`wiring`] returns how it does not meet them.
+//! rules read the workflow; [`wiring`] returns how it does not meet them. The split of the
+//! tests into shards, and what the gate takes from them, are the rules of [`shards`].
 
 use super::workflows;
+
+mod shards;
 
 /// The workflow and job that run the gate, and the floors file they name.
 const CI: &str = ".github/workflows/ci.yml";
 const JOB: &str = "test";
 const FLOORS: &str = "coverage-floors";
+/// Where the checkout of the base goes: under the ignored `target/`, so that the repo lints
+/// of a later test run do not list it as an untracked nested repository.
+const BASE_DIR: &str = "target/base-floors";
 /// Where the checkout of the base puts its copy of the floors file.
-const BASE: &str = "base/coverage-floors";
+const BASE: &str = "target/base-floors/coverage-floors";
 
 /// The `with:` input `key` of `step`.
 fn input<'a>(step: &'a workflows::Step, key: &str) -> Option<&'a str> {
@@ -105,16 +111,16 @@ fn wiring(workflow: &str, job: &str, floors_exist: bool) -> Result<(), String> {
     if at(step) <= at(gate) {
         return Err("the no-lowering step comes before the gate step".to_owned());
     }
-    // The base's copy comes from a checkout of the base commit into `base`.
+    // The base's copy comes from a checkout of the base commit into `BASE_DIR`.
     let checkout = steps
         .iter()
         .find(|s| {
             s.uses
                 .as_deref()
                 .is_some_and(|u| u.starts_with("actions/checkout@"))
-                && input(s, "path") == Some("base")
+                && input(s, "path") == Some(BASE_DIR)
         })
-        .ok_or("no actions/checkout step puts the base in `path: base`")?;
+        .ok_or_else(|| format!("no actions/checkout step puts the base in `path: {BASE_DIR}`"))?;
     if !input(checkout, "ref").is_some_and(|r| r.contains("github.event.pull_request.base.sha")) {
         return Err(
             "the base checkout does not take `ref: ${{ github.event.pull_request.base.sha }}`"
@@ -147,6 +153,17 @@ fn wiring(workflow: &str, job: &str, floors_exist: bool) -> Result<(), String> {
 }
 
 #[test]
+fn the_coverage_run_is_sharded_and_merged_whole() {
+    // Catches: a part of a core left out or run twice, a core left out, a shard whose profiles
+    // could overwrite another's or go unchecked, a gate that does not wait for every shard
+    // (so tests would count as never run), and a required check renamed or skippable.
+    let text = std::fs::read_to_string(super::repo_root().join(CI)).expect(CI);
+    assert_eq!(shards::shard_wiring(&text), Ok(()), "{CI}");
+    assert_eq!(shards::gate_wiring(&text), Ok(()), "{CI}");
+    assert_eq!(shards::check_names(&text), Ok(()), "{CI}");
+}
+
+#[test]
 fn the_test_job_gates_coverage_and_floors() {
     // Catches: the gate step skipped by a condition, or the no-lowering step dropped,
     // renamed, run on pushes, or skipped after a failed gate.
@@ -160,8 +177,8 @@ mod rules {
     use super::*;
 
     const GATE: &str = "      - run: cargo run -p kbf-coverage --locked -- --lcov l --root r --floors coverage-floors\n";
-    const CHECKOUT: &str = "      - uses: actions/checkout@abc # v7\n        if: ${{ !cancelled() && github.event_name == 'pull_request' }}\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          path: base\n";
-    const LOWERING: &str = "      - if: ${{ !cancelled() && github.event_name == 'pull_request' }}\n        run: cargo run -p kbf-coverage --locked -- no-lowering --allow-missing-base --base base/coverage-floors --floors coverage-floors\n";
+    const CHECKOUT: &str = "      - uses: actions/checkout@abc # v7\n        if: ${{ !cancelled() && github.event_name == 'pull_request' }}\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          path: target/base-floors\n";
+    const LOWERING: &str = "      - if: ${{ !cancelled() && github.event_name == 'pull_request' }}\n        run: cargo run -p kbf-coverage --locked -- no-lowering --allow-missing-base --base target/base-floors/coverage-floors --floors coverage-floors\n";
     const PR: &str = "github.event_name == 'pull_request'";
 
     fn workflow(steps: &str) -> String {
@@ -219,12 +236,12 @@ mod rules {
                 "the job `test` has no step running `kbf-coverage no-lowering`",
             ),
             (
-                with(LOWERING.replace("--base base/coverage-floors", "--base b")),
-                "the no-lowering step needs `--base base/coverage-floors` and `--floors coverage-floors`",
+                with(LOWERING.replace("--base target/base-floors/coverage-floors", "--base b")),
+                "the no-lowering step needs `--base target/base-floors/coverage-floors` and `--floors coverage-floors`",
             ),
             (
                 with(LOWERING.replace("--floors coverage-floors", "--floors x")),
-                "the no-lowering step needs `--base base/coverage-floors` and `--floors coverage-floors`",
+                "the no-lowering step needs `--base target/base-floors/coverage-floors` and `--floors coverage-floors`",
             ),
             (
                 with(LOWERING.replace("--allow-missing-base ", "")),
@@ -251,14 +268,14 @@ mod rules {
             ),
             (
                 format!("{GATE}{LOWERING}"),
-                "no actions/checkout step puts the base in `path: base`",
+                "no actions/checkout step puts the base in `path: target/base-floors`",
             ),
             (
                 format!(
                     "{GATE}{}{LOWERING}",
-                    CHECKOUT.replace("path: base", "path: other")
+                    CHECKOUT.replace("path: target/base-floors", "path: other")
                 ),
-                "no actions/checkout step puts the base in `path: base`",
+                "no actions/checkout step puts the base in `path: target/base-floors`",
             ),
             (
                 format!(

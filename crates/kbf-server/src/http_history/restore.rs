@@ -21,7 +21,8 @@
 use std::collections::BTreeMap;
 
 use kbf_history::records::{
-    BookSource, HitHow, HitRecord, MemoryKill, RunOutcome, RunRecord, UsageBasis, WireDigest,
+    BookSource, HitHow, HitRecord, MemoryKill, PhaseTimes, RunOutcome, RunRecord, UsageBasis,
+    WireDigest,
 };
 use kbf_invocation::{
     ActionRow, ActionShape, Attempt, AttemptEnd, Evidence, How, Listing, NumaBytes, Outcome,
@@ -258,7 +259,14 @@ fn run(r: &RunRecord) -> Option<Box<Run>> {
             times,
             usage,
             booked_memory_bytes: booked,
+            booked_millicpus: r.booked_millicpus,
             cap_bytes: cap,
+            phase_times: match r.phase_times() {
+                PhaseTimes::TaskClaim => kbf_invocation::PhaseTimes::TaskClaim,
+                PhaseTimes::Measured | PhaseTimes::Unspecified => {
+                    kbf_invocation::PhaseTimes::Measured
+                }
+            },
         })
     })
 }
@@ -301,6 +309,7 @@ fn usage(r: &RunRecord) -> Option<RunUsage> {
             memory_pressure_some_micros: c.memory_pressure_some_us,
             memory_pressure_full_micros: c.memory_pressure_full_us,
             cpus_effective: c.cpus_effective,
+            peak_window_millicores: c.peak_window_millicores,
             numa: c
                 .numa_bytes
                 .iter()

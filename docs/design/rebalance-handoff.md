@@ -363,9 +363,9 @@ All from `feature/arch-v2`.
   `Rebuild::Pending { after }` key with `ListToken::after(&ObjectKey)` and commits
   `RebuildProgress` every batch (`:~176-190`). Foreign keys are counted and skipped (`:~205`).
 - `ObjectStore::list(prefix, after, max_keys) -> ListPage` returns keys ascending
-  (`crates/kbf-objstore/src/lib.rs:~116-123`); token types at `types.rs:~190-230`.
+  (`komira-ai/tierstore:crates/objstore-s3/src/lib.rs:~116-123`); token types at `komira-ai/tierstore:crates/objstore-s3/src/types.rs:~190-230`.
 - S3: ListObjectsV2 with `start-after` and `continuation-token`
-  (`crates/kbf-objstore/src/s3/mod.rs:464-490`; wire tests `tests/s3_wire.rs:236`, `:275`).
+  (`komira-ai/tierstore:crates/objstore-s3/src/s3/mod.rs:671-690`; wire tests `komira-ai/tierstore:crates/objstore-s3/tests/s3_wire.rs:236`, `:275`).
   `file://`: `fs_store.rs:548-600`. Memory: `memory.rs:112`. Conformance:
   `conformance.rs:400-527`.
 

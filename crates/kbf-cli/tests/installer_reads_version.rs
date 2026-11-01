@@ -81,7 +81,7 @@ fn the_build_declares_the_relay_its_installer_needs() {
 /// they meet the server's.
 ///
 /// `state_schema` is weaker. `kbf --version --json` and `supported()` both read
-/// `kbf_state::postgres::schema::latest()` in the same build, so a new migration moves both
+/// `kbf_pack_index::schema::latest()` in the same build, so a new migration moves both
 /// together and that line cannot go red for it. It only catches `supported()` being changed to
 /// a number below `latest()`.
 ///

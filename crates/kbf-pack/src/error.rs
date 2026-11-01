@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use kbf_objstore::{KeyError, ObjectStoreError};
-use kbf_state::{BlobDigest, PackIndexError};
+use kbf_pack_index::{BlobDigest, PackIndexError};
 
 /// Why writing blobs into packs failed.
 #[derive(Debug, thiserror::Error)]

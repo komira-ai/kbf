@@ -26,7 +26,8 @@
 //!
 //! [`limit_cpus`] then writes `actions/cpu.max`: the leases' CPUs, which is the CPUs the
 //! daemon may use minus `--reserve-cpus`. It is a bandwidth limit on all leases together,
-//! not pinning; the daemon and the server keep the rest.
+//! not pinning; the daemon and the server keep the rest. [`unlimit_cpus`] writes `max`
+//! instead, for a farm that places by measured load (`--actions-cpu-max`).
 //!
 //! A daemon whose own cgroup is already a `supervisor` leaf (a second start in the same
 //! unit, without the unit restarting) works on its parent; the steps find their work
@@ -255,6 +256,21 @@ pub(crate) fn limit_cpus_in(
 ) -> Result<(), DelegateError> {
     let quota = cpus.max(1).saturating_mul(CPU_PERIOD_US);
     fs.write(actions, "cpu.max", &format!("{quota} {CPU_PERIOD_US}"))
+        .map_err(io_err(fs, "write", actions, "cpu.max"))
+}
+
+/// Lifts the CPU bandwidth limit of the leases under `actions` (`actions/cpu.max` is
+/// `max`), so that the CPU they use is bounded only by the node and measured CPU can show
+/// an overload (`--actions-cpu-max`). [`limit_cpus`] sets it again.
+///
+/// # Errors
+/// `cpu.max` could not be written (the `cpu` controller is not enabled in `actions`).
+pub fn unlimit_cpus(mount: &Path, actions: &str) -> Result<(), DelegateError> {
+    unlimit_cpus_in(&Mount(mount), actions)
+}
+
+pub(crate) fn unlimit_cpus_in(fs: &dyn CgroupFs, actions: &str) -> Result<(), DelegateError> {
+    fs.write(actions, "cpu.max", &format!("max {CPU_PERIOD_US}"))
         .map_err(io_err(fs, "write", actions, "cpu.max"))
 }
 

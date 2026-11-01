@@ -32,11 +32,11 @@
 //! balancer to see it, and only then begins. [`Drain::phase`] says where it is, and
 //! [`Drain::phases`] tells each change of it as it is made. The two waits of that sequence
 //! (`--drain-lb-wait` and `--drain-deadline`) end by time in a running frontend;
-//! [`Drain::end_lb_wait`] and [`Drain::end_deadline`] end them by hand, so that a test runs
+//! [`Drain::end_lb_wait`] and [`Drain::pass_deadline`] do it by hand, so that a test runs
 //! the sequence by events and not by seconds.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use kbf_front::Closer;
 use serde::Serialize;
@@ -55,7 +55,8 @@ pub enum Phase {
     /// and new Execute calls, until the load balancer's health check has seen the 503.
     LbWait,
     /// New Execute calls are refused, the frontend takes no more work, and every listener
-    /// has been sent GOAWAY; open executions run on until they are done or the deadline.
+    /// has been sent GOAWAY; open executions run on until they are done, however long that
+    /// takes.
     Draining,
     /// The streams that are left are being closed UNAVAILABLE; the process exits next.
     Closing,
@@ -77,6 +78,11 @@ pub struct DrainStatus {
     pub open_executions: u64,
     /// Operations in the scheduler's queue, not yet leased to a worker.
     pub queued_operations: u64,
+    /// The configured `--drain-deadline` has passed with executions open: the drain has
+    /// stopped waiting on a clock and reported, and goes on serving them until they end.
+    /// Left out of the answer until then.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub deadline_passed: bool,
 }
 
 /// The stages that must change together, behind one lock so [`Drain::unrefuse`] cannot
@@ -108,8 +114,25 @@ pub struct Drain {
     phases: watch::Sender<Phase>,
     /// Given by [`Drain::end_lb_wait`].
     lb_wait_over: Stop,
-    /// Given by [`Drain::end_deadline`].
+    /// Given by [`Drain::pass_deadline`].
     deadline_over: Stop,
+    /// The sequence reported open executions at the deadline ([`Drain::deadline_passed`]).
+    deadline_reported: AtomicBool,
+    /// How many [`Hold`]s are alive.
+    holds: watch::Sender<usize>,
+    /// Given when the REAPI listener is done ([`Drain::settled`]).
+    settled: Stop,
+}
+
+/// Keeps a drain from standing down while it is alive ([`Drain::hold`]). Dropping it lets
+/// the drain go on.
+#[derive(Debug)]
+pub struct Hold(Arc<Drain>);
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        self.0.holds.send_modify(|held| *held -= 1);
+    }
 }
 
 impl Drain {
@@ -137,6 +160,9 @@ impl Drain {
             phases: watch::Sender::new(Phase::Serving),
             lb_wait_over: Stop::new(),
             deadline_over: Stop::new(),
+            deadline_reported: AtomicBool::new(false),
+            holds: watch::Sender::new(0),
+            settled: Stop::new(),
         };
         (drain, begun)
     }
@@ -235,19 +261,71 @@ impl Drain {
     /// Ends the load balancer wait of the drain sequence ([`crate::sequence`]) now, as
     /// `--drain-lb-wait` running out does: the sequence goes on to refuse new Execute calls
     /// and send every listener GOAWAY. Given before the sequence reaches its wait, the wait
-    /// is skipped. It ends only that wait; the deadline has [`Drain::end_deadline`].
+    /// is skipped. It ends only that wait; the deadline has [`Drain::pass_deadline`].
     pub fn end_lb_wait(&self) {
         self.lb_wait_over.fire();
     }
 
-    /// Ends the wait of the drain sequence for the open executions now, as
-    /// `--drain-deadline` running out does: the executions still open are ended
-    /// UNAVAILABLE, the sequence stands down and its phase becomes [`Phase::Closing`]. Given
-    /// before the sequence reaches that wait, the wait is skipped. With no execution open the
-    /// wait is over already, and nothing is ended; the sequence logs an ending by hand as it
-    /// logs the deadline running out.
-    pub fn end_deadline(&self) {
+    /// Passes the deadline of the drain sequence now, as `--drain-deadline` running out
+    /// does: with executions open the sequence logs a WARN with their count and sets
+    /// `deadline_passed` in the status, and goes on waiting for them; nothing is ended.
+    /// Given before the sequence reaches its wait, it takes effect there.
+    pub fn pass_deadline(&self) {
         self.deadline_over.fire();
+    }
+
+    /// Whether the deadline has passed with executions open and the sequence is still
+    /// waiting for them.
+    #[must_use]
+    pub fn deadline_passed(&self) -> bool {
+        self.deadline_reported.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn mark_deadline_passed(&self) {
+        self.deadline_reported.store(true, Ordering::SeqCst);
+    }
+
+    /// A hold on the end of the plain drain ([`drain_and_stop`]'s: `kbf-server`, and the
+    /// server half of `kbf all-in-one`; `kbf frontend` ignores it): once the REAPI
+    /// listener is done, which is when every open execution has ended, the serving future
+    /// does not return, and the worker listener goes on answering, until no hold is alive.
+    /// A process that runs a worker daemon beside the server takes one so that the
+    /// daemon's leases keep reaching their results through it until the daemon has
+    /// drained ([`Drain::settled`] says when to begin). It holds nothing against
+    /// [`Drain::close`]: a second stop signal or `--shutdown-timeout-secs` ends the drain
+    /// whatever is held.
+    ///
+    /// [`drain_and_stop`]: crate::serve
+    #[must_use]
+    pub fn hold(self: &Arc<Self>) -> Hold {
+        self.holds.send_modify(|held| *held += 1);
+        Hold(Arc::clone(self))
+    }
+
+    /// Completes once the drain has settled: the REAPI listener is done, so no execution
+    /// is open and none will be taken. Only the plain drain gets there ([`Drain::hold`]).
+    pub async fn settled(&self) {
+        self.settled.fired().await;
+    }
+
+    pub(crate) fn settle(&self) {
+        self.settled.fire();
+    }
+
+    /// Whether a [`Hold`] is alive.
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        *self.holds.borrow() > 0
+    }
+
+    /// Completes once no [`Hold`] is alive, or [`Drain::close`] has been called.
+    pub async fn may_stand_down(&self) {
+        let mut holds = self.holds.subscribe();
+        tokio::select! {
+            // The sender is `self.holds`, alive as long as `self`.
+            _ = holds.wait_for(|held| *held == 0) => {}
+            () = self.closed() => {}
+        }
     }
 
     /// Completes once [`Drain::end_lb_wait`] has been called.
@@ -255,8 +333,8 @@ impl Drain {
         self.lb_wait_over.fired().await;
     }
 
-    /// Completes once [`Drain::end_deadline`] has been called.
-    pub(crate) async fn deadline_ended(&self) {
+    /// Completes once [`Drain::pass_deadline`] has been called.
+    pub(crate) async fn deadline_passed_by_hand(&self) {
         self.deadline_over.fired().await;
     }
 
@@ -760,12 +838,12 @@ mod tests {
     fn the_waits_of_the_sequence_end_when_they_are_ended_by_hand() {
         let (drain, _closing, _readiness, _goaway) = fresh();
         assert!(drain.lb_wait_ended().now_or_never().is_none());
-        assert!(drain.deadline_ended().now_or_never().is_none());
+        assert!(drain.deadline_passed_by_hand().now_or_never().is_none());
         drain.end_lb_wait();
         assert!(drain.lb_wait_ended().now_or_never().is_some());
-        assert!(drain.deadline_ended().now_or_never().is_none());
-        drain.end_deadline();
-        assert!(drain.deadline_ended().now_or_never().is_some());
+        assert!(drain.deadline_passed_by_hand().now_or_never().is_none());
+        drain.pass_deadline();
+        assert!(drain.deadline_passed_by_hand().now_or_never().is_some());
     }
 
     /// Asserts that the sequence marks are what the frontend relies on: only the first

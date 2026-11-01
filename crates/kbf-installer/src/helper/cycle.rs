@@ -64,9 +64,6 @@ pub struct Config {
     pub min_activation_interval_secs: u64,
 }
 
-/// How many releases `gc` keeps besides current, previous, staged and pending.
-pub const GC_KEEP: usize = 1;
-
 /// Something the helper cannot go on from: the host's own files are wrong. A refused
 /// offer or order is not one; it is recorded and reported.
 #[derive(Debug, thiserror::Error)]
@@ -275,7 +272,7 @@ impl<E: Exec> Helper<E> {
                 release::gc(
                     &mut self.exec,
                     &self.host,
-                    GC_KEEP,
+                    crate::retain::DEFAULT_KEEP,
                     &in_use,
                     Mode::Apply,
                     &mut self.log,

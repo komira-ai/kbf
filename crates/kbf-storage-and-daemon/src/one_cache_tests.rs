@@ -64,3 +64,20 @@ fn no_hot_store_or_one_on_another_disk_keeps_two() {
     }
     assert!(!same_disk(&dir, std::path::Path::new("relative")));
 }
+
+/// Catches `--no-input-cache` leaving the halves on one cache: the daemon opens no input
+/// cache then, and the hot store would drop its flushed copies for a cache that is never
+/// there. With the flag and a hot store on the data directory's disk, neither half is given
+/// one.
+#[test]
+fn no_input_cache_keeps_two_caches() {
+    let dir = under_target("no-input-cache");
+    let mut flags = flags(&[
+        format!("--hot-store=file://{}", dir.join("hot").display()),
+        format!("--data-dir={}", dir.join("data").display()),
+        "--no-input-cache".to_owned(),
+    ]);
+    assert!(share(&mut flags.server, &mut flags.daemon).is_none());
+    assert!(flags.server.local_cache.is_none());
+    assert!(!daemon_shares(&flags));
+}

@@ -282,7 +282,8 @@ native-whole-machine`.
   what `actions/` may use: `mem_gib` is the lower of MemTotal and the lowest
   `memory.max` above the leases, `cpus` the lower of the nearest
   `cpuset.cpus.effective` and the lowest `cpu.max` quota on the path. The daemon writes
-  `actions/cpu.max` itself: the CPUs it may use minus `--reserve-cpus` (default 8).
+  `actions/cpu.max` itself: the CPUs it may use minus `--reserve-cpus` (default 4 physical
+  cores: 8 logical CPUs with two threads a core, 4 with one).
   `--lease-placement=numa-node` (default `none`, which pins nothing) puts each lease on
   one NUMA node: the lease cgroup gets that node's CPUs (`cpuset.cpus`) and memory node
   (`cpuset.mems`), and the container's cgroup inherits both. The node is the one with
@@ -824,7 +825,7 @@ answering held the lease, and its slot, with no error.
 **Hashing the outputs.** The container driver reads each output file once, to hash it:
 SHA-256 for the digest, CRC-32C for the footer of the segment it is sent in. The hashing
 runs on `--cpu-threads` threads of their own (default `max(2, reserve/2)`, 4 with the
-default `--reserve-cpus` of 8; shared by all leases and apart
+default `--reserve-cpus` of 8 on a node of two threads a core; shared by all leases and apart
 from the threads that run actions), one read buffer per thread, and the listing of the
 output tree is one task of the blocking pool, not one per file. The upload then reads the
 files again, in ranges, only to send them (`--segment-uploads-in-flight` uploads at once,
@@ -852,12 +853,20 @@ drops a killed run's result and cuts a timeout's to its logs
 | `target`, `target_kind` | the target the action's own `buck-out` paths name (issue #796): `"cell//pkg:name"` from its first output pattern that names one, else from its first program word that does (a test binary buck2 built), and the owner's kind (`target`, `anon` or `bxl`); `-` when they name none (a remotely run test under `buck-out/v2/test/execution/`, run by a program outside `buck-out`). Read from the Command, never from the client |
 | `outcome` | how the scheduler judged the report: `ok`, `oom` (the action's own memory limit), `node-pressure`, `timeout`, `infra`, `invalid`, `missing-input`, `lost-restart`, `lost-fenced` |
 | `lease`, `node` | the lease and the node that ran it: the join to the daemon's `lease phases:` and `transfers:` lines |
+| `booked_millicpus`, `booked_memory_bytes` | what the lease was granted, as its `Start` carried it (thousandths of a CPU, bytes), after the memory ladder and the floors, not the client's request; `-` for a lease the server never started (one taken up from the state store). They end the line, so a reader of the fields above is unaffected; held beside `cpu_usage_us` and `wall_us` they give vCPU-hours held against used |
 
-The fields keep their order; `target_hint` was called `target` before the derived
+The fields keep their order, and a field added is added at the end; `target_hint` was called `target` before the derived
 target took that name. A report the server refuses (its lease is no longer
 current) has no line: that is how a **cancelled** lease ends. Its usage is in the
 daemon's `lease phases:` line, which joins on `lease=` to the server's `lease granted`
 line, and that line names the `key` too. A report without a `ResourceUsage` has no line.
+
+On a node without lease cgroups (macOS) the CPU and memory fields come from the
+`ResourceUsage` footprint block instead: `cpu_usage_us` is the action's user plus system
+CPU time (shown only when both are known), `cpu_user_us` and `cpu_system_us` those two,
+and `mem_peak` the peak physical footprint, which is not a cgroup's `memory.peak`; the
+throttling, `parallelism` and NUMA fields are `-`. A whole-machine lease measures only its
+wall time, so its line has `wall_us` and `-` for every CPU and memory field.
 
 **The shape key.** buck2 sends no per-action identity (`action_mnemonic` and
 `target_id` are empty in its `RequestMetadata`), and the action digest changes with

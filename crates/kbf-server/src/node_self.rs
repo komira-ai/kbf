@@ -46,7 +46,7 @@ use kbf_types::WorkerId;
 use tonic::Code;
 use tonic::service::Routes;
 
-use crate::api::{drain_action, error, json};
+use crate::api::{drain_action, error, json, placed_error};
 use crate::farm::{Farm, NodeAction};
 use crate::identity::{PeerCert, Peers, Presented};
 use crate::members::Members;
@@ -264,7 +264,7 @@ async fn act(
     };
     match calls.farm.place(&node, action) {
         Ok(view) => json(StatusCode::OK, &view),
-        Err(unknown) => error(StatusCode::NOT_FOUND, &unknown.to_string()),
+        Err(refused) => placed_error(&refused),
     }
 }
 

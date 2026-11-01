@@ -21,8 +21,12 @@ pub fn stem(name: &str, platform: &str) -> String {
     format!("{name}-${{{{ github.sha }}}}-{platform}")
 }
 
+/// The services whose image has an SBOM attestation: the task image. The frontend's `kbf` is in
+/// its tarball, which has one, and the coordinator has no SBOM asset yet.
+pub const SBOM_IMAGES: &[&str] = &["task"];
+
 /// The (binary name, platform) of every `cargo xtask package` line in the workflow's
-/// `run:` steps, in file order. An error names a package line it cannot read.
+/// `run:` steps, then of every `cargo xtask package-task-bundle` line, in file order. An error names a package line it cannot read.
 pub fn packaged(workflow: &str) -> Result<Vec<(String, String)>, String> {
     let mut found = Vec::new();
     for step in workflows::run_steps(workflow)? {
@@ -45,6 +49,26 @@ pub fn packaged(workflow: &str) -> Result<Vec<(String, String)>, String> {
             found.push((name.to_owned(), platform.to_owned()));
         }
     }
+    found.extend(packaged_task_bundles(workflow)?);
+    Ok(found)
+}
+
+/// The (name, platform) of every `cargo xtask package-task-bundle` line in the workflow's `run:`
+/// steps, in file order: the signed darwin `kbf-task` as a bundle in an OCI layout, which is a
+/// tarball with an SBOM like the binaries are, named `kbf-task-bundle-<commit>-darwin-arm64`
+/// (`xtask::task_bundle`). The verb takes no `--platform`: the bundle is for a Mac.
+pub fn packaged_task_bundles(workflow: &str) -> Result<Vec<(String, String)>, String> {
+    let mut found = Vec::new();
+    for step in workflows::run_steps(workflow)? {
+        for line in step.script.lines().map(str::trim_start) {
+            if line.starts_with("cargo xtask package-task-bundle ") {
+                found.push((
+                    xtask::task_bundle::NAME.to_owned(),
+                    xtask::task_bundle::PLATFORM.name().to_owned(),
+                ));
+            }
+        }
+    }
     Ok(found)
 }
 
@@ -57,7 +81,7 @@ pub fn packaged_kbf_debs(workflow: &str) -> Result<Vec<String>, String> {
 
 /// The (service, platform) of every `cargo xtask pkg-image-asset` line in the workflow's `run:`
 /// steps that makes an image an asset (it has no `--verify-only`), in file order: `service` is
-/// the word after `--service` (`frontend` or `coordinator`). The asset is
+/// the word after `--service` (`frontend`, `coordinator` or `task`). The asset is
 /// `kbf-<service>-image-<commit>-<platform>.oci.tar`. An error names a line without `--service`
 /// or `--platform`.
 pub fn packaged_images(workflow: &str) -> Result<Vec<(String, String)>, String> {
@@ -195,6 +219,23 @@ pub fn unattested(workflow: &str, attest_jobs: &[&str]) -> Result<Vec<String>, S
         if !attested.contains(&pair) {
             wrong.push(format!(
                 "{name} for {platform} is packaged, but `{attest_job}` has no attest-sbom step with subject-path {} and sbom-path {}",
+                pair.0, pair.1
+            ));
+        }
+        expected.push(pair);
+    }
+    for (service, platform) in packaged_images(workflow)? {
+        if !SBOM_IMAGES.contains(&service.as_str()) {
+            continue;
+        }
+        let stem = stem(&format!("kbf-{service}-image"), &platform);
+        let pair = (
+            format!("dist/{stem}.oci.tar"),
+            format!("dist/{stem}.cdx.json"),
+        );
+        if !attested.contains(&pair) {
+            wrong.push(format!(
+                "the {service} image for {platform} is made an asset, but `{attest_job}` has no attest-sbom step with subject-path {} and sbom-path {}",
                 pair.0, pair.1
             ));
         }
@@ -355,5 +396,111 @@ mod rules {
                 .is_err_and(|e| e.contains("without --binary and --platform")),
             "{got:?}"
         );
+    }
+    /// `w` with a build step making the image of `service` for `platform` an asset, before
+    /// the attest job.
+    fn with_image(w: &str, service: &str, platform: &str) -> String {
+        let step = format!(
+            "      - name: Image {service} {platform}\n        run: cargo xtask pkg-image-asset --service {service} --image target/i.oci.tar --platform {platform} --commit \"$GITHUB_SHA\" --binary b --out dist\n"
+        );
+        w.replacen("  attest:\n", &format!("{step}  attest:\n"), 1)
+    }
+
+    /// An attest-sbom step for the image tarball named `subject` and the SBOM named `sbom`
+    /// (each `<name>-<platform>`, as the workflow spells the commit).
+    fn image_step(subject: &str, sbom: &str) -> String {
+        format!(
+            "      - uses: actions/attest-sbom@{PIN}\n        with:\n          subject-path: dist/{}.oci.tar\n          sbom-path: dist/{}.cdx.json\n",
+            image_stem(subject),
+            image_stem(sbom)
+        )
+    }
+
+    /// `<name>-<commit>-<platform>` for an image named `<name>:<platform>`.
+    fn image_stem(of: &str) -> String {
+        let (name, platform) = of.split_once(':').expect("name:platform");
+        format!("{name}-${{{{ github.sha }}}}-{platform}")
+    }
+
+    const TASK_X86: &str = "kbf-task-image:linux-x86_64";
+    const TASK_ARM: &str = "kbf-task-image:linux-arm64";
+
+    #[test]
+    fn a_task_image_attested_with_its_own_sbom_passes() {
+        // Catches: the lint blind to images (a task image made an asset with no SBOM
+        // attestation passes every pull request and fails the verify job on `main`), or
+        // misreading the step of an image (`.oci.tar` subject, `kbf-task-image` SBOM).
+        let w = with_image(&workflow(&BUILT, &both()), "task", "linux-x86_64");
+        let w = with_image(&w, "task", "linux-arm64");
+        let attest = format!(
+            "{}{}{}",
+            both(),
+            image_step(TASK_X86, TASK_X86),
+            image_step(TASK_ARM, TASK_ARM)
+        );
+        let w = w.replace(&both(), &attest);
+        assert_eq!(unattested(&w, &["attest"]), Ok(vec![]));
+    }
+
+    #[test]
+    fn a_task_image_without_its_attest_step_is_named() {
+        // Catches: the defect the lint exists for, a task image made an asset by a build
+        // job whose SBOM nobody attests: the verify job asks for the attestation and fails
+        // on `main`, which no pull request run notices.
+        let w = with_image(&workflow(&BUILT, &both()), "task", "linux-x86_64");
+        let w = with_image(&w, "task", "linux-arm64");
+        let attest = format!("{}{}", both(), image_step(TASK_X86, TASK_X86));
+        let w = w.replace(&both(), &attest);
+        let wrong = unattested(&w, &["attest"]).expect("readable");
+        assert_eq!(wrong.len(), 1, "{wrong:?}");
+        assert!(
+            wrong[0].starts_with("the task image for linux-arm64 is made an asset"),
+            "{wrong:?}"
+        );
+    }
+
+    #[test]
+    fn an_image_step_naming_the_wrong_sbom_or_an_image_no_job_makes_is_named() {
+        // Catches: the step copied for the arm64 image with only one path edited (the
+        // image attested over the other architecture's SBOM, or over the SBOM of the
+        // `kbf-task` binary, which describes no package of the base), and a step left
+        // behind for an image no job makes.
+        let w = with_image(&workflow(&BUILT, &both()), "task", "linux-x86_64");
+        for sbom in ["kbf-task-image:linux-arm64", "kbf-task:linux-x86_64"] {
+            let attest = format!("{}{}", both(), image_step(TASK_X86, sbom));
+            let wrong = unattested(&w.replace(&both(), &attest), &["attest"]).expect("readable");
+            assert_eq!(wrong.len(), 2, "{sbom}: {wrong:?}");
+            assert!(
+                wrong[0].starts_with("the task image for linux-x86_64 is made an asset"),
+                "{wrong:?}"
+            );
+            assert!(wrong[1].ends_with("a pair no job packages"), "{wrong:?}");
+        }
+        let attest = format!("{}{}", both(), image_step(TASK_ARM, TASK_ARM));
+        let both_steps = format!("{attest}{}", image_step(TASK_X86, TASK_X86));
+        let wrong = unattested(&w.replace(&both(), &both_steps), &["attest"]).expect("readable");
+        assert_eq!(wrong.len(), 1, "{wrong:?}");
+        assert!(wrong[0].ends_with("a pair no job packages"), "{wrong:?}");
+    }
+
+    #[test]
+    fn an_image_that_has_no_sbom_needs_no_step_and_may_not_have_one() {
+        // Catches: the lint demanding an SBOM step for the frontend and coordinator images
+        // (they have none: the frontend's `kbf` has its tarball's, the coordinator's is
+        // not in the release), and accepting a step that attests one.
+        let w = with_image(&workflow(&BUILT, &both()), "frontend", "linux-x86_64");
+        let w = with_image(&w, "coordinator", "linux-x86_64");
+        assert_eq!(unattested(&w, &["attest"]), Ok(vec![]));
+        let attest = format!(
+            "{}{}",
+            both(),
+            image_step(
+                "kbf-frontend-image:linux-x86_64",
+                "kbf-frontend-image:linux-x86_64"
+            )
+        );
+        let wrong = unattested(&w.replace(&both(), &attest), &["attest"]).expect("readable");
+        assert_eq!(wrong.len(), 1, "{wrong:?}");
+        assert!(wrong[0].ends_with("a pair no job packages"), "{wrong:?}");
     }
 }

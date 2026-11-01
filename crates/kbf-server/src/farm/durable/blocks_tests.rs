@@ -30,6 +30,8 @@ pub(super) struct Racing {
     session_scans: AtomicUsize,
     /// Rows whose key starts with one of these cannot be read.
     unreadable: Mutex<Vec<String>>,
+    /// Transactions that name a row whose key starts with one of these are refused.
+    unwritable: Mutex<Vec<String>>,
 }
 
 impl Racing {
@@ -43,6 +45,7 @@ impl Racing {
             lease_scans: AtomicUsize::new(0),
             session_scans: AtomicUsize::new(0),
             unreadable: Mutex::new(Vec::new()),
+            unwritable: Mutex::new(Vec::new()),
         })
     }
 
@@ -73,6 +76,13 @@ impl Racing {
         unreadable.extend(prefix.map(str::to_owned));
     }
 
+    /// Writes to the rows under `prefix` fail from now on, or work again (`None`).
+    pub(super) fn fail_writes(&self, prefix: Option<&str>) {
+        let mut unwritable = self.unwritable.lock().expect("lock");
+        unwritable.clear();
+        unwritable.extend(prefix.map(str::to_owned));
+    }
+
     fn unreadable(&self, key: &str) -> Result<(), StoreError> {
         let unreadable = self.unreadable.lock().expect("lock");
         let failing = unreadable.iter().any(|prefix| key.starts_with(prefix));
@@ -91,6 +101,16 @@ impl Store for Racing {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
         if self.down.load(Ordering::SeqCst) {
             return Err(StoreError::Failed("the store is down".to_owned()));
+        }
+        let refused = self.unwritable.lock().expect("lock");
+        let writes_refused = batch
+            .iter()
+            .flat_map(Txn::ops)
+            .filter_map(|op| op.key_cond())
+            .any(|(key, _)| refused.iter().any(|prefix| key.starts_with(prefix)));
+        drop(refused);
+        if writes_refused {
+            return Err(StoreError::Failed("the row cannot be written".to_owned()));
         }
         let names = |key: &str| {
             let mut ops = batch.iter().flat_map(Txn::ops);
@@ -162,23 +182,30 @@ fn bump(previous: u64, epoch: u64) -> EpochBump {
     EpochBump { previous, epoch }
 }
 
+/// The action `request(tag)` runs.
+pub(super) fn action_key(tag: u8) -> ActionKey {
+    ActionKey::try_from(&request(tag).key).expect("an action's key")
+}
+
 pub(super) fn request(tag: u8) -> Request {
     Request {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
-        },
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),
         hermetic: true,
         do_not_cache: false,
         needs: kbf_caps::Request::default(),
+        whole_worker: false,
     }
 }
 
 fn try_farm_over(store: &Arc<Racing>) -> Result<Farm, StateError> {
-    Farm::new(
+    Farm::new_legacy(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -201,6 +228,7 @@ pub(super) fn submit(farm: &Farm, tag: u8) -> Result<(), Status> {
         call: None,
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     })
     .map(drop)
 }
@@ -624,7 +652,7 @@ fn a_bump_through_a_farm_is_served_by_the_next_start() {
     assert_eq!(farm.lease_epoch(), epoch);
     assert_eq!(counter(&store, EPOCH), epoch + 1);
     assert_eq!(farm_over(&store).lease_epoch(), epoch + 1);
-    let bare = Farm::new(
+    let bare = Farm::new_legacy(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,

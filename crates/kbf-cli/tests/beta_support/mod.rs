@@ -303,6 +303,11 @@ pub(crate) const RED_IN_A_SCENARIO: &[(&str, Option<&str>)] = &[
     ("failed_actions_by_class", None),
     ("lost_blobs_gauge", None),
     ("blob_losses", None),
+    // No B0 scenario takes two members down or restarts one; the gate tests of kbf-harness
+    // turn these red from series fed to them, and kbf-server/tests/storage_health.rs
+    // pins the series they read.
+    ("members_down_at_most_one", None),
+    ("member_restarts", None),
     (
         "scrape_coverage",
         Some("a_frontend_that_stops_answering_fails_the_scrape_coverage_gate"),

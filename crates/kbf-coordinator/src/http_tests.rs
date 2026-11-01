@@ -16,6 +16,13 @@ use crate::http::{
 };
 use crate::testutil::{OPERATOR, Rig, ci_token};
 
+mod extras;
+mod features;
+mod operator;
+mod rollback;
+mod services;
+mod status;
+
 /// How long a body has in the tests that are not about patience.
 const PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -620,4 +627,181 @@ async fn the_convergence_with_an_unreachable_issuer_is_503() {
     let (code, body) = convergence(&rig, Some(&ci_token())).await;
     assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body, json!({"error": "unavailable"}));
+}
+
+/// What a v0.0.18 updater sends: the heartbeat's JSON as it serializes today, with a last
+/// update and no update running. The bytes are pinned, not rebuilt from the type.
+const GOLDEN_BEAT: &str = concat!(
+    r#"{"platform":"linux-x86_64","version":"0.0.18+gabcdefabcdef-2","health":"healthy","#,
+    r#""last_update":{"target":"0.0.18+gabcdefabcdef-2","outcome":"succeeded"},"updating":null}"#
+);
+
+/// The body `cargo xtask deploy-farm` posts to `/v1/desired` today (keys sorted).
+const GOLDEN_DESIRED: &str =
+    r#"{"min_up":{"frontend":1,"storage":2},"version":"0.0.19+g123456abcdef-1"}"#;
+
+async fn raw(
+    rig: &Rig,
+    surface: Surface,
+    peer: &Peer,
+    req: Request<Full<Bytes>>,
+) -> (u16, Vec<u8>) {
+    let response = handle(&rig.coordinator, surface, peer, req, PATIENCE).await;
+    let code = response.status().as_u16();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("a body")
+        .to_bytes();
+    (code, bytes.to_vec())
+}
+
+/// Pins: the wire of the update path stays as it is. A heartbeat of a v0.0.18 updater is
+/// read to the same Heartbeat it was written from, deploy-farm's `POST /v1/desired` body
+/// (no `service`) is accepted and echoed as the state without a `service` key, and the
+/// updater behind gets exactly the bytes `{"reply":"update","version":...}` while a current
+/// one gets exactly `{"reply":"nothing"}`, with the same status line of 200.
+#[tokio::test]
+async fn a_v0_0_18_updater_and_deploy_farm_get_the_bytes_they_always_got() {
+    let rig = Rig::new("http-golden");
+    let who = updater("d1", "daemon");
+    let (code, set) = raw(
+        &rig,
+        Surface::Control,
+        &None,
+        request("POST", DESIRED_PATH, Some(&ci_token()), GOLDEN_DESIRED),
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert_eq!(
+        String::from_utf8(set).expect("text"),
+        r#"{"version":"0.0.19+g123456abcdef-1","max_updating":{"frontend":1,"storage":1,"daemon":2,"mac-daemon":2},"min_up":{"storage":2,"frontend":1}}"#
+    );
+    rig.at(2_000);
+    let (code, behind) = raw(
+        &rig,
+        Surface::Heartbeat,
+        &who,
+        request("POST", HEARTBEAT_PATH, None, GOLDEN_BEAT),
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert_eq!(
+        String::from_utf8(behind).expect("text"),
+        r#"{"reply":"update","version":"0.0.19+g123456abcdef-1"}"#
+    );
+    let current = GOLDEN_BEAT.replace("0.0.18+gabcdefabcdef-2", "0.0.19+g123456abcdef-1");
+    let (code, nothing) = raw(
+        &rig,
+        Surface::Heartbeat,
+        &updater("d2", "daemon"),
+        request("POST", HEARTBEAT_PATH, None, &current),
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert_eq!(
+        String::from_utf8(nothing).expect("text"),
+        r#"{"reply":"nothing"}"#
+    );
+}
+
+/// Pins: `service` in the body. `"service":"kbf"` sets the same state as no `service` (the
+/// status shows it under `desired` and under `services.kbf`, and a host is told to update),
+/// and a service that is not `kbf` is a 400 `bad_request` that changes nothing.
+#[tokio::test]
+async fn the_desired_call_takes_a_service_and_refuses_an_unknown_one() {
+    let rig = Rig::new("http-service");
+    let other = r#"{"service":"other","version":"9.0","min_up":{"storage":1,"frontend":1}}"#;
+    let (code, body) = call(
+        &rig,
+        Surface::Control,
+        &None,
+        request("POST", DESIRED_PATH, Some(&ci_token()), other),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(body, json!({"error": "bad_request"}));
+    let seen = status(&rig).await;
+    assert_eq!(seen["desired"], Value::Null);
+    assert_eq!(seen["services"], json!({}));
+    let named = r#"{"service":"kbf","version":"2.0","min_up":{"storage":1,"frontend":1}}"#;
+    let (code, _) = call(
+        &rig,
+        Surface::Control,
+        &None,
+        request("POST", DESIRED_PATH, Some(&ci_token()), named),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let seen = status(&rig).await;
+    assert_eq!(seen["desired"]["version"], "2.0");
+    assert_eq!(seen["services"]["kbf"], seen["desired"]);
+    rig.at(2_000);
+    let (_, reply) = call(
+        &rig,
+        Surface::Heartbeat,
+        &updater("d1", "daemon"),
+        request("POST", HEARTBEAT_PATH, None, BEAT),
+    )
+    .await;
+    assert_eq!(reply, json!({"reply": "update", "version": "2.0"}));
+}
+
+/// Pins: a token whose entry may not set the service is a 403 `forbidden` that changes
+/// nothing.
+#[tokio::test]
+async fn a_service_the_token_may_not_set_is_a_403() {
+    let mut rig = Rig::new("http-forbidden");
+    let list = format!(
+        "{}services = [\"other\"]\n",
+        kbf_oidc::testkit::config_text(kbf_oidc::testkit::STATIC_ISSUER)
+    );
+    rig.coordinator = Rig::start_with_allow_list(&rig.dir, &rig.clock, &list);
+    let body = r#"{"version":"2.0","min_up":{"storage":1,"frontend":1}}"#;
+    let (code, body) = call(
+        &rig,
+        Surface::Control,
+        &None,
+        request("POST", DESIRED_PATH, Some(&ci_token()), body),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    assert_eq!(body, json!({"error": "forbidden"}));
+    assert_eq!(status(&rig).await["desired"], Value::Null);
+}
+
+/// Catches: the status or the convergence losing a field a client already reads, or not
+/// saying which build answers: a coordinator that has seen no host and holds no desired state
+/// answers with exactly the earlier fields and one more, `commit`, the text `--version`
+/// shows after the `+`.
+#[tokio::test]
+async fn the_status_and_the_convergence_say_the_build_commit_and_keep_their_fields() {
+    let rig = Rig::new("http-commit");
+    let commit = crate::BUILD_COMMIT;
+    assert!(
+        commit == "unknown"
+            || (commit.len() == 12 && commit.bytes().all(|b| b.is_ascii_hexdigit())),
+        "{commit:?}"
+    );
+    assert_eq!(
+        status(&rig).await,
+        json!({"desired": null, "services": {}, "quiet": true, "services_dropped": 0, "hosts": [], "per_service": {"kbf": {"desired": null, "roles": [], "hosts": [], "up": 0, "slots_held": 0, "convergence": {"desired": null, "quiet": true, "state": "in_progress", "roles": [], "commit": commit}}}, "commit": commit})
+    );
+    let (code, body) = convergence(&rig, Some(&ci_token())).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!({
+            "desired": null,
+            "quiet": true,
+            "state": "in_progress",
+            "roles": [],
+            "commit": commit,
+        })
+    );
+    rig.set(STATE).await;
+    let (_, set) = convergence(&rig, Some(&ci_token())).await;
+    assert_eq!(set["commit"], commit);
+    assert_eq!(set["desired"], "2.0");
 }

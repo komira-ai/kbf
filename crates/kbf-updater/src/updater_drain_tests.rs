@@ -130,8 +130,9 @@ fn a_storage_host_is_checked_when_it_lists_a_node_id() {
 }
 
 /// Catches an install that does not wait for the node's leases: the leases are read until
-/// they are zero (3, 2, then 0, one poll apart), and only then is the host installed. The
-/// frontend is asked to drain for the deadline, 600 s, and the roll waited two polls.
+/// they are zero (3, 2, then 0, one poll apart), and only then is the host installed. With no
+/// deadline set the frontend is asked to drain with no deadline of its own, and the roll waited
+/// two polls.
 #[test]
 fn a_drained_daemon_is_installed_only_once_its_leases_are_zero() {
     let rig = Rig::new("drain-leases");
@@ -143,7 +144,7 @@ fn a_drained_daemon_is_installed_only_once_its_leases_are_zero() {
         [
             "query",
             "check",
-            "drain 600",
+            "drain none",
             "leases",
             "leases",
             "leases",
@@ -156,27 +157,66 @@ fn a_drained_daemon_is_installed_only_once_its_leases_are_zero() {
     assert_eq!(rig.elapsed(), Duration::from_secs(10));
 }
 
-/// Catches a drain that waits for ever on a lease that never ends: the node keeps one lease,
-/// and when the 600 s deadline has passed the host is installed anyway, after exactly that
-/// wait and not before.
+/// Catches a drain that gives up on leases that run past the old default of 600 s: with no
+/// deadline set, a node that holds a lease for 1000 s (200 polls) is waited for, nothing is
+/// installed in that time, and the host is installed after the poll that reads 0.
 #[test]
-fn a_drained_daemon_is_installed_when_the_deadline_passes() {
-    let rig = Rig::new("drain-deadline");
-    rig.drain.script_leases("dm", vec![], Ok(1));
+fn with_no_deadline_the_drain_waits_past_600_seconds_and_installs_when_the_leases_end() {
+    let rig = Rig::new("drain-no-deadline");
+    rig.drain.script_leases("dm", vec![Ok(1); 200], Ok(0));
     let roll = roll_dm(&rig);
     assert_eq!(roll.state, RollState::Done);
     let events = dm_events(&rig);
     let installed = events.iter().position(|e| e == "install").expect("install");
-    assert!(
-        events[..installed]
-            .iter()
-            .filter(|e| *e == "leases")
-            .count()
-            > 100
-    );
-    assert_eq!(rig.elapsed(), Duration::from_secs(600));
-    assert_eq!(events.last().map(String::as_str), Some("health"));
+    let looks = events[..installed]
+        .iter()
+        .filter(|e| *e == "leases")
+        .count();
+    assert_eq!(looks, 201);
+    assert_eq!(rig.elapsed(), Duration::from_secs(1000));
     assert!(events.contains(&"undrain".to_owned()));
+}
+
+/// Catches a configured deadline that installs over running work: a node keeps one lease, the
+/// operator's deadline of 600 s passes, and the roll stops at the host with `drain_failed`
+/// saying how many leases were held, that nothing was installed and how to go on; the node is
+/// left drained (named, never undrained), nothing is installed on the host and the next host
+/// is not touched. The wait ended at the deadline, not before.
+#[test]
+fn a_deadline_that_passes_installs_nothing_and_leaves_the_node_drained() {
+    let rig = Rig::new("drain-deadline");
+    rig.drain.script_leases("dm", vec![], Ok(1));
+    let timing = Timing {
+        drain_deadline: Some(Duration::from_secs(600)),
+        ..Timing::default()
+    };
+    let u = rig.open_timed(timing);
+    let started = u
+        .start(&request(
+            "2.0",
+            Hosts::Aliases(vec!["dm".into(), "st2".into()]),
+            "k",
+        ))
+        .expect("start");
+    let roll = u.drive(&started.roll.id).expect("drive");
+    assert_eq!(roll.state, RollState::Failed);
+    let (code, detail) = failure(&roll);
+    assert_eq!(code, ErrorCode::DrainFailed);
+    assert_eq!(
+        detail,
+        format!(
+            "dm still holds 1 leases after the drain deadline of 600 s; nothing was installed \
+             and the leases run on; start a new roll to drain it again and wait again; {NOTE}"
+        )
+    );
+    assert_eq!(dm_phase(&roll), Phase::Failed);
+    let events = dm_events(&rig);
+    assert!(!events.contains(&"install".to_owned()));
+    assert!(!events.contains(&"undrain".to_owned()));
+    assert_eq!(events[2], "drain 600");
+    assert_eq!(rig.elapsed(), Duration::from_secs(600));
+    assert!(rig.log.installs().is_empty());
+    assert!(rig.log.touching("st2").is_empty());
 }
 
 /// Catches a node given back before it runs the target: the host reports the old build

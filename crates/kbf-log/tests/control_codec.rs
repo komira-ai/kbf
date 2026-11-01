@@ -24,10 +24,11 @@ use kbf_log::{
 use kbf_meta::{ActionRecord, Closure};
 use kbf_proto::kbf::log::v1 as proto;
 use kbf_sched::{DaemonInstance, Request};
+use kbf_types::sched::usage::LeaseCost;
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Failure, FarmTime, LeaseGrant, LeaseId,
     LeaseKind, LostWhy, OperationId, Outcome, Qos, QosError, RefusalRecord, Resources,
-    ResultRecord, WorkerId,
+    ResultRecord, WorkKey, WorkerId,
 };
 use prost::Message;
 
@@ -90,7 +91,8 @@ impl Rng {
     fn resources(&mut self) -> Resources {
         let resources = Resources::new(self.number(), self.number())
             .with_gpus(self.number())
-            .with_vms(self.number());
+            .with_vms(self.number())
+            .with_disk_bytes(self.number());
         // A node's lease cap, set half the time: unset (no cap) and zero must round-trip apart.
         if self.below(2) == 0 {
             resources.with_lease_cap(self.number() % 3)
@@ -197,13 +199,15 @@ impl Rng {
             key: ActionKey {
                 instance: self.name(),
                 action: self.digest(),
-            },
+            }
+            .into(),
             qos: self.qos(),
             kind: self.pick(&LeaseKind::ALL),
             resources: self.resources(),
             needs: self.needs(),
             hermetic: self.below(2) == 0,
             do_not_cache: self.below(2) == 0,
+            whole_worker: false,
         }
     }
 
@@ -220,10 +224,25 @@ impl Rng {
         ];
         if self.below(2) == 0 {
             Outcome::Completed {
-                action_result: self.digest(),
+                action_result: self.digest().into(),
             }
         } else {
             Outcome::Failed(self.pick(&failures))
+        }
+    }
+
+    /// A cost of any size, the default one (which a record leaves out) included now and then.
+    fn cost(&mut self) -> LeaseCost {
+        if self.below(4) == 0 {
+            return LeaseCost::default();
+        }
+        LeaseCost {
+            cpu_millis: self.number(),
+            memory_bytes: self.number(),
+            limit_bytes: self.number(),
+            cold: self.below(2) == 0,
+            retry: self.below(2) == 0,
+            key_hash: self.number(),
         }
     }
 
@@ -233,6 +252,7 @@ impl Rng {
                 lease: self.lease(),
                 operation: OperationId(self.number()),
                 worker: self.worker(),
+                cost: self.cost(),
             }),
             1 => ControlRecord::Result(ResultRecord {
                 lease: self.lease(),
@@ -349,6 +369,59 @@ fn generated_control_commands_round_trip() {
     // Not vacuous: every command and every input was generated, many times over.
     assert!(commands.iter().all(|&n| n > 1_000), "{commands:?}");
     assert!(inputs.iter().all(|&n| n > 100), "{inputs:?}");
+}
+
+/// A Capacity input for worker `w` whose x86-64 node holds `consumables`.
+fn capacity_with(consumables: &[(Consumable, u64)]) -> LogCommand {
+    let mut caps = NodeCaps::new(CpuCaps::new(Arch::X86_64, Default::default()));
+    caps.consumables.extend(consumables.iter().copied());
+    batch(FarmInput::Capacity {
+        worker: WorkerId::new("w"),
+        capacity: Resources::default(),
+        caps,
+    })
+}
+
+fn amount(consumable: i32, amount: u64) -> proto::ConsumableAmount {
+    proto::ConsumableAmount { consumable, amount }
+}
+
+fn capacity_of(amounts: Vec<proto::ConsumableAmount>) -> Vec<u8> {
+    capacity(Some(proto::NodeCaps {
+        consumables: amounts,
+        ..pcaps(1, 1)
+    }))
+}
+
+#[test]
+fn a_consumable_amount_with_an_unknown_value_is_skipped_and_the_others_are_kept() {
+    let bytes = capacity_of(vec![amount(1, 3), amount(200, 7), amount(2, 5)]);
+    assert_eq!(
+        dec(&bytes),
+        Ok(capacity_with(&[
+            (Consumable::Cpus, 3),
+            (Consumable::MemGib, 5)
+        ]))
+    );
+}
+
+#[test]
+fn consumable_value_5_decodes_to_disk_gib() {
+    let bytes = capacity_of(vec![amount(5, 9), amount(1, 3)]);
+    assert_eq!(
+        dec(&bytes),
+        Ok(capacity_with(&[
+            (Consumable::DiskGib, 9),
+            (Consumable::Cpus, 3)
+        ]))
+    );
+}
+
+#[test]
+fn encoding_a_capacity_with_disk_gib_writes_the_bytes_of_the_same_capacity_without_it() {
+    let with = capacity_with(&[(Consumable::Cpus, 3), (Consumable::DiskGib, 9)]);
+    let without = capacity_with(&[(Consumable::Cpus, 3)]);
+    assert_eq!(enc(&with), enc(&without));
 }
 
 const fn kind(command: &LogCommand) -> usize {
@@ -491,12 +564,11 @@ const UNKNOWN: Result<LogCommand, DecodeError> = Ok(LogCommand::Unknown);
 /// Asserts that a decoder reads an enum value it does not know, or the unspecified zero
 /// (which is also what an absent field reads as), as an unknown command and not as a
 /// default: every enum the control commands carry, at 0 and at a value `log.proto` does
-/// not name.
+/// not name, except a consumable, whose amount is skipped instead.
 #[test]
 fn an_unspecified_or_unknown_enum_value_decodes_as_unknown() {
     for value in [0, 99] {
         assert_eq!(dec(&capacity(Some(pcaps(value, 1)))), UNKNOWN);
-        assert_eq!(dec(&capacity(Some(pcaps(1, value)))), UNKNOWN);
         assert_eq!(dec(&submit(prequest(builtin(1), value, &[]))), UNKNOWN);
         assert_eq!(dec(&submit(prequest(builtin(value), 1, &[]))), UNKNOWN);
         assert_eq!(dec(&report(failed(value))), UNKNOWN);
@@ -865,6 +937,28 @@ fn a_wall_time_outside_u64_nanoseconds_is_not_written() {
     let past = last + Duration::from_nanos(1);
     assert_eq!(encode(Format::V1, &at(past)), Err(EncodeError::WallTime));
     assert_eq!(dec(&enc(&at(last))), Ok(at(last)));
+}
+
+/// Catches a request whose work key is not an action's being written anyway, as the
+/// action it is not: the format has a message for an instance and a digest only.
+#[test]
+fn a_work_key_that_is_not_an_action_is_not_written() {
+    let request = |dedup: &str| Request {
+        key: WorkKey::new("i", dedup),
+        qos: Qos::Ci,
+        kind: LeaseKind::Action,
+        resources: Resources::new(1, 2),
+        needs: kbf_caps::Request::default(),
+        hermetic: true,
+        do_not_cache: false,
+        whole_worker: false,
+    };
+    assert_eq!(
+        encode(Format::V1, &batch(FarmInput::Submit(request("job 7")))),
+        Err(EncodeError::WorkKey)
+    );
+    let ok = format!("{}/3", "0a".repeat(32));
+    assert!(encode(Format::V1, &batch(FarmInput::Submit(request(&ok)))).is_ok());
 }
 
 /// Catches a control command written or read under a format this build does not know

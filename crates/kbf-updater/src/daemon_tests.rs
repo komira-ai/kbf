@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::api::{ErrorCode, Roll, RollState};
 use crate::daemon::{
     Config, Daemon, build_ports, build_ports_with_exec, drive_loop, parse_flags,
-    parse_operator_url, run_config, start, start_with, stderr_sink,
+    parse_operator_url, run_config, start, start_with, stderr_log, stderr_sink,
 };
 use crate::fakes::{Event, FakeClock, FakeHealth, FakeInstaller, FakeSafeToStop, Log};
 use crate::inventory::{Host, Member, Role};
@@ -228,21 +228,27 @@ fn the_ssh_timeouts_are_optional_flags_in_seconds() {
     }
 }
 
-/// Catches a drain deadline that is not a flag, that defaults to something else than 600 s,
-/// that takes a non-number, or that may be zero (a drain that waits for nothing is no
-/// drain): the flag sets only the deadline.
+/// Catches a drain deadline that is not a flag, that has a default (absent must mean wait however
+/// long it takes), that is capped (a day and a year are both taken), that takes a non-number, or
+/// that may be zero (a drain that waits for nothing is no drain): the flag sets only the deadline.
 #[test]
-fn the_drain_deadline_is_an_optional_flag_of_at_least_a_second() {
-    assert_eq!(parse(&FLAGS).expect("flags").drain_deadline.as_secs(), 600);
+fn the_drain_deadline_is_an_optional_flag_of_at_least_a_second_with_no_cap() {
+    assert_eq!(parse(&FLAGS).expect("flags").drain_deadline, None);
     let with = [&FLAGS[..], &["--drain-deadline-secs", "90"]].concat();
     let cfg = parse(&with).expect("deadline");
     assert_eq!(
         (
-            cfg.drain_deadline.as_secs(),
+            cfg.drain_deadline.map(|d| d.as_secs()),
             cfg.ssh_command_timeout.as_secs()
         ),
-        (90, 900)
+        (Some(90), 900)
     );
+    for large in [86_401_u64, 31_536_000, 1_000_000_000] {
+        let text = large.to_string();
+        let with = [&FLAGS[..], &["--drain-deadline-secs", &text]].concat();
+        let cfg = parse(&with).expect("a large deadline");
+        assert_eq!(cfg.drain_deadline.map(|d| d.as_secs()), Some(large));
+    }
     for bad in ["soon", "-1", "1.5", ""] {
         let with = [&FLAGS[..], &["--drain-deadline-secs", bad]].concat();
         assert_eq!(
@@ -253,7 +259,7 @@ fn the_drain_deadline_is_an_optional_flag_of_at_least_a_second() {
     let zero = [&FLAGS[..], &["--drain-deadline-secs", "0"]].concat();
     assert_eq!(
         parse(&zero).expect_err("zero"),
-        "--drain-deadline-secs must be at least 1"
+        "--drain-deadline-secs must be at least 1 (leave it out to wait however long it takes)"
     );
 }
 
@@ -296,22 +302,29 @@ fn the_apply_poll_and_deadline_are_optional_flags_of_at_least_a_second() {
 }
 
 /// Asserts that the two bounds of a frontend member's drain without a proxy are optional flags
-/// that default to 30 s of readiness of the other members and 1200 s for the member to exit,
-/// take a number of seconds, may not be zero (a window of nothing waits for nothing; a deadline
-/// of nothing fails every drain), and that each sets only itself.
+/// that default to 30 s of readiness of the other members and no deadline for the member to
+/// exit, take a number of seconds (the deadline with no upper bound), may not be zero (a window
+/// of nothing waits for nothing; a deadline of nothing fails every drain), and that each sets
+/// only itself.
 #[test]
 fn the_peer_ready_and_frontend_drain_deadline_are_optional_flags_of_at_least_a_second() {
     let cfg = parse(&FLAGS).expect("flags");
     assert_eq!(cfg.peer_ready.as_secs(), 30);
-    assert_eq!(cfg.frontend_drain_deadline.as_secs(), 1200);
+    assert_eq!(cfg.frontend_drain_deadline, None);
     let with = [&FLAGS[..], &["--peer-ready-secs", "7"]].concat();
     let cfg = parse(&with).expect("peers");
     assert_eq!(cfg.peer_ready.as_secs(), 7);
-    assert_eq!(cfg.frontend_drain_deadline.as_secs(), 1200);
+    assert_eq!(cfg.frontend_drain_deadline, None);
     let with = [&FLAGS[..], &["--frontend-drain-deadline-secs=90"]].concat();
     let cfg = parse(&with).expect("deadline");
     assert_eq!(cfg.peer_ready.as_secs(), 30);
-    assert_eq!(cfg.frontend_drain_deadline.as_secs(), 90);
+    assert_eq!(cfg.frontend_drain_deadline.map(|d| d.as_secs()), Some(90));
+    let with = [&FLAGS[..], &["--frontend-drain-deadline-secs=31536000"]].concat();
+    let cfg = parse(&with).expect("a year");
+    assert_eq!(
+        cfg.frontend_drain_deadline.map(|d| d.as_secs()),
+        Some(31_536_000)
+    );
     for flag in ["--peer-ready-secs", "--frontend-drain-deadline-secs"] {
         for bad in ["soon", "-1", "1.5", ""] {
             let with = [&FLAGS[..], &[flag, bad]].concat();
@@ -321,9 +334,10 @@ fn the_peer_ready_and_frontend_drain_deadline_are_optional_flags_of_at_least_a_s
             );
         }
         let zero = [&FLAGS[..], &[flag, "0"]].concat();
-        assert_eq!(
-            parse(&zero).expect_err("zero"),
-            format!("{flag} must be at least 1")
+        let err = parse(&zero).expect_err("zero");
+        assert!(
+            err.starts_with(&format!("{flag} must be at least 1")),
+            "{err}"
         );
     }
 }
@@ -347,15 +361,17 @@ fn the_flags_set_the_timing_of_the_roll() {
     let t = crate::daemon::timing(&parse(&with).expect("flags"));
     assert_eq!(
         (
-            t.drain_deadline.as_secs(),
+            t.drain_deadline.map(|d| d.as_secs()),
             t.apply_poll.as_secs(),
             t.apply_deadline.as_secs()
         ),
-        (7, 3, 11)
+        (Some(7), 3, 11)
     );
     assert_eq!(t.peer_ready.as_secs(), 13);
-    assert_eq!(t.frontend_drain.as_secs(), 17);
+    assert_eq!(t.frontend_drain.map(|d| d.as_secs()), Some(17));
     assert_eq!(t.poll, Timing::default().poll);
+    let t = crate::daemon::timing(&parse(&FLAGS).expect("flags"));
+    assert_eq!((t.drain_deadline, t.frontend_drain), (None, None));
 }
 
 /// Catches the settings of the installer reaching it unchecked: a key path that is no file, a
@@ -470,11 +486,11 @@ fn config(name: &str, inventory: &str, api: &FakeApi) -> Config {
         channel: "stable".to_owned(),
         ssh_connect_timeout: Duration::from_secs(5),
         ssh_command_timeout: Duration::from_secs(30),
-        drain_deadline: Duration::from_secs(600),
+        drain_deadline: None,
         apply_poll: Duration::from_secs(5),
         apply_deadline: Duration::from_secs(600),
         peer_ready: Duration::from_secs(30),
-        frontend_drain_deadline: Duration::from_secs(1200),
+        frontend_drain_deadline: None,
     }
 }
 
@@ -530,11 +546,11 @@ fn quick() -> Timing {
         healthy_frontend: Duration::from_millis(300),
         healthy_storage: Duration::from_millis(300),
         healthy_daemon: Duration::from_millis(300),
-        drain_deadline: Duration::from_millis(300),
+        drain_deadline: Some(Duration::from_millis(300)),
         apply_poll: Duration::from_millis(10),
         apply_deadline: Duration::from_millis(300),
         peer_ready: Duration::from_millis(30),
-        frontend_drain: Duration::from_millis(300),
+        frontend_drain: Some(Duration::from_millis(300)),
     }
 }
 
@@ -916,4 +932,5 @@ fn the_process_entry_points() {
     assert_eq!((code, out.as_str()), (0, ""));
     assert!(!sock(&cfg).exists(), "the socket is removed on exit");
     stderr_sink()("{\"event\":\"test\"}");
+    stderr_log()("warn: test");
 }

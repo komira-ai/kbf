@@ -106,11 +106,46 @@ pub struct Run {
     pub times: ReapiTimes,
     /// The `ResourceUsage` the report carried, if any.
     pub usage: Option<RunUsage>,
-    /// For a run killed for memory: its memory booking, in bytes.
+    /// The memory the lease was granted, in bytes: the booking its `Start` carried
+    /// (after the ladder and the floors), for every run whose grant the server knows.
+    /// `None` for a lease taken up from the state store, which was never started here.
     pub booked_memory_bytes: Option<u64>,
+    /// The CPU the lease was granted, in thousandths of a CPU, known as
+    /// `booked_memory_bytes` is.
+    pub booked_millicpus: Option<u64>,
     /// For a run killed at its own limit: the memory of the largest node that could
     /// run it when the kill was committed, in bytes.
     pub cap_bytes: Option<u64>,
+    /// Where the three phase durations of `times` came from.
+    pub phase_times: PhaseTimes,
+}
+
+/// Where a run's `input_fetch`, `execution` and `output_upload` times came from.
+///
+/// For a run of the executor only the three durations of a [`TaskClaim`](Self::TaskClaim)
+/// are data: the task claimed them in its manifest and the frontend laid them out back to
+/// back, ending when it read the task's pack. The instants, and the gaps between them and
+/// the server's own times (`worker_start`, `worker_completed`), say nothing about the run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PhaseTimes {
+    /// A daemon measured them. Also what a run reads as when nothing else is known: a
+    /// record written before the marker is a daemon's, or an executor run with no phase
+    /// times at all.
+    #[default]
+    Measured,
+    /// A task claimed them, laid out ending at the frontend's read of its pack.
+    TaskClaim,
+}
+
+impl PhaseTimes {
+    /// The name the read API writes: `measured` or `task_claim`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Measured => "measured",
+            Self::TaskClaim => "task_claim",
+        }
+    }
 }
 
 impl Run {
@@ -197,6 +232,9 @@ pub struct RunUsage {
     pub memory_pressure_full_micros: Option<u64>,
     /// The CPUs the lease's cgroup could run on.
     pub cpus_effective: Option<u32>,
+    /// The most CPU any one window between two node-load readings used by the lease, in
+    /// thousandths of a CPU; `None` for a lease that had no full window.
+    pub peak_window_millicores: Option<u64>,
 }
 
 /// Which instrument measured a run's usage.

@@ -191,13 +191,30 @@ impl Pki {
         })
     }
 
+    /// The updater's certificate of the storage host `node`, as `<node>.pem` and `<node>.key`
+    /// in `dir`, for a stand-in host that is no account's.
+    pub fn storage_host(&self, dir: &Path, node: &str) -> (PathBuf, PathBuf) {
+        Self::write(dir, node, None, |key| {
+            let node_id = node.parse().unwrap();
+            let cert = UpdaterCert {
+                node_id: &node_id,
+                host_role: &HostRole::STORAGE,
+                key,
+            };
+            self.ca
+                .issue_updater(&cert, unix_now(), &mut SystemEntropy)
+                .unwrap()
+                .der
+        })
+    }
+
     /// The updater's certificate for the host `NODE`, which runs storage, owned by `account`.
     pub fn updater(&self, dir: &Path, account: &str) -> (PathBuf, PathBuf) {
         Self::write(dir, "updater", Some(account), |key| {
             let node_id = NODE.parse().unwrap();
             let cert = UpdaterCert {
                 node_id: &node_id,
-                host_role: HostRole::Storage,
+                host_role: &HostRole::STORAGE,
                 key,
             };
             self.ca
@@ -366,6 +383,17 @@ pub fn allow_list(issuer: &str, audience: &str) -> String {
     )
 }
 
+/// [`allow_list`] with the services the release workflow's token may set: `services` as the
+/// allow-list's key writes them.
+pub fn allow_list_services(issuer: &str, audience: &str, services: &[&str]) -> String {
+    let names: Vec<String> = services.iter().map(|s| format!("\"{s}\"")).collect();
+    format!(
+        "{}services = [{}]\n",
+        allow_list(issuer, audience),
+        names.join(", ")
+    )
+}
+
 /// The numeric id of the repository in the allow-list and the tokens.
 pub const REPOSITORY_ID: &str = "4242";
 
@@ -379,10 +407,23 @@ pub fn start_coordinator(
     oidc: &Path,
     trust: &Path,
 ) -> Proc {
+    start_coordinator_with(binary, dir, cert, ca_pem, oidc, trust, &[])
+}
+
+/// [`start_coordinator`] with more flags: `extra` follows the ones every rehearsal gives.
+pub fn start_coordinator_with(
+    binary: &Path,
+    dir: &Path,
+    cert: &(PathBuf, PathBuf),
+    ca_pem: &Path,
+    oidc: &Path,
+    trust: &Path,
+    extra: &[String],
+) -> Proc {
     let token = dir.join("operator-token");
     put(&token, OPERATOR_TOKEN, 0o600, None);
     let path = |p: &Path| p.display().to_string();
-    let args = [
+    let mut args = vec![
         format!("--heartbeat-listen={HEARTBEAT}"),
         format!("--control-listen={CONTROL}"),
         format!("--tls-cert={}", path(&cert.0)),
@@ -392,6 +433,7 @@ pub fn start_coordinator(
         format!("--oidc-config={}", path(oidc)),
         format!("--operator-token-file={}", path(&token)),
     ];
+    args.extend(extra.iter().cloned());
     let trust = path(trust);
     let mut proc = Proc::start("coordinator", binary, &args, &[("SSL_CERT_FILE", &trust)]);
     proc.wait_for(CONTROL);

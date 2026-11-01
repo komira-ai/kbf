@@ -166,7 +166,7 @@ id among equals.
 
 ### 5.4 Booking
 
-On `main` (`crates/kbf-sched/src/devices.rs`), except the daemon's side:
+On `main` (`crates/js-sched/src/devices.rs` (jobscheduler)), except the daemon's side:
 
 - The scheduler keeps, per worker, the ready device ids from its report and the ids
   booked by its leases.
@@ -203,7 +203,7 @@ Two facts on `main` decide the order in which these pieces may ship:
   knowing its device. The guard is the report: only a daemon that reports
   `ios.device` entries can match a device request, and an old daemon never reports
   one. The test for this is "a node whose report has no `ios.device` entry is never
-  placed a device lease" (`crates/kbf-sched/tests/devices.rs`).
+  placed a device lease" (`crates/js-sched/tests/devices.rs` (jobscheduler)).
 
 So: the refusal first (done), then matching and booking together with the refusal
 lifted (done), then daemons.
@@ -523,7 +523,7 @@ booking), the driver watch and the server's side of D3; each is its own pull req
 
 | Claim | Status | Source |
 |---|---|---|
-| On `main` for devices: the sandbox rule of section 6.1, the driver watch's parts of section 7.5, and the server's matching and booking of sections 5.2 to 5.4: `ios.device` report entries are read, one device must satisfy every `ios.device.*` key, the scheduler books it and `Start.device_id` names it. No daemon reports a device, and nothing surveys or talks to one | V | `crates/kbf-driver-native/src/network.rs`, `crates/kbf-caps/src/matching.rs`, `crates/kbf-caps/src/report.rs`, `crates/kbf-sched/src/devices.rs`, `crates/kbf-daemon/src/driver_watch.rs` |
+| On `main` for devices: the sandbox rule of section 6.1, the driver watch's parts of section 7.5, and the server's matching and booking of sections 5.2 to 5.4: `ios.device` report entries are read, one device must satisfy every `ios.device.*` key, the scheduler books it and `Start.device_id` names it. No daemon reports a device, and nothing surveys or talks to one | V | `crates/kbf-driver-native/src/network.rs`, `crates/kbf-caps/src/matching.rs`, `crates/kbf-caps/src/report.rs`, `crates/js-sched/src/devices.rs` (jobscheduler), `crates/kbf-daemon/src/driver_watch.rs` |
 | `gpu` is booked as a count; `Start` carries only CPU and memory; the daemon builds `Work.resources` from those | V | `crates/kbf-types/src/work.rs`, `crates/kbf-proto/proto/kbf/worker/v1/worker.proto`, `crates/kbf-daemon/src/lease.rs` |
 | `Start`'s field numbers 1 to 7 are taken | V | `worker.proto` |
 | An unknown platform property is ignored today | V | [capabilities.md](capabilities.md#unknown-keys) |

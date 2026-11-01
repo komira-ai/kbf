@@ -33,6 +33,7 @@ pub mod check;
 mod client;
 mod daemon;
 mod hook;
+mod msg_text;
 mod replica;
 mod server;
 mod store;

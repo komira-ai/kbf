@@ -13,6 +13,7 @@ These properties change how kbf schedules an action today:
 | `gpu` | a whole number | `0` | Whole GPUs the action needs. |
 | `kbf-book-cpus` | a whole number, at least 1, plain digits | `1` | Whole cores the lease books. |
 | `kbf-book-mem-gib` | a whole number, at least 1, plain digits | `4` (the first rung of `--memory-ladder-gib`) | GiB of memory the lease asks for: the limit it runs under, checked against the node's memory but not reserved (see [below](#kbf-book-cpus-and-kbf-book-mem-gib)). |
+| `kbf-network` | `allow` | absent: no network | Lets the action's Command use the network (see [`kbf-network`](#kbf-network)). |
 | `OSFamily` | `linux`; `darwin`, `macos`, `macosx`, `osx` (any case) | any | The operating system of the worker. |
 | `ISA`, `Arch` | `x86-64`, `x86_64`, `amd64`; `arm-a64`, `arm64`, `aarch64`; an ISA level such as `x86-64-v3` (any case) | any | The CPU architecture, and level, of the worker. |
 
@@ -177,6 +178,27 @@ out. The worker bounds how many actions run at once by their cores, and its
 memory-pressure backstop pauses new starts. An action that asks for the whole host's
 memory (the last rung of the ladder) runs alone on its worker. The memory is the limit the
 action runs under, below.
+
+With the server's `--exclusive-actions` on, every `action` lease books the whole worker
+it lands on instead: all of the worker's cores and all of its memory, as the worker reported
+them when it registered, whichever worker that is. Exactly one action then runs per
+worker, and a second waits for it, even on a worker of many cores. The setting is the
+server's, not the action's, so it does not touch the action digest and the action cache is
+shared with a server that has it off. `kbf-book-cpus` and `kbf-book-mem-gib` are still
+checked (a malformed value is still refused) and still recorded as the client's hints, but
+they no longer change what is booked, and `kbf-lease=whole_machine` and `vm` leases are as
+they were. The lease's memory limit and CPU weight come from the booking, so the action may
+use the worker's whole memory. An action killed for passing its own memory limit has no
+larger booking to climb to: it finishes `FAILED_PRECONDITION` (out of memory) at once, as
+one that already books the largest node does, and its key's memory floor is not raised.
+The setting is not kept in the state store, so a server restart ends it for the operations
+the store holds. An operation that was queued is read back as an ordinary `action`. One that
+was running is recovered holding only the booking the front computed for it (by default one
+core and the first memory rung), not the worker, so the scheduler may place ordinary
+actions beside it; and if that lease is later lost or requeued, the operation runs again as
+an ordinary `action`, climbing the memory ladder, with no claim on a worker. A run that
+needs exactly one action per worker (a benchmark) must not restart the server, and
+a restart during one invalidates it. The setting works on both scheduler cores.
 
 The booking also sets the memory the action may use. The native driver (Macs) kills an
 action whose processes together hold more than 150% of its booked memory plus 512 MiB:
@@ -407,6 +429,74 @@ iOS 26.0 do not together serve `ios.device.class=iPhone` with
 an attribute key without `ios.device=1`, an `ios.device.<attribute>` not in the table,
 `ios.device` with an OS other than macOS, and `ios.device` with `kbf-lease=vm` or
 `whole_machine`. Names are read in any case.
+
+## `kbf-network`
+
+The Command of an action runs without the network: `kbf-task`, the tool that runs it inside
+the job, installs a seccomp filter in the Command's process before it executes, and every
+process the Command starts inherits it. The filter refuses, with `EPERM`, `socket` and
+`socketpair` for every domain but `AF_UNIX` (so `AF_INET`, `AF_INET6`, `AF_NETLINK`,
+`AF_PACKET`, `AF_VSOCK` and the rest), and `io_uring_setup`, `io_uring_enter` and
+`io_uring_register` (a ring can make a socket without calling `socket`). A call under another
+system call ABI is killed with `SIGSYS` (exit code 159). It needs no capability, and it sets
+`no_new_privs`, so a setuid program the Command starts gains nothing. Only `kbf-task`'s own
+fetch of the inputs and upload of the pack use the network.
+
+`kbf-network=allow` turns that off for one action, for a test that needs a real socket or a
+step that fetches from the internet; `kbf-task` writes one line naming the action digest and
+the property to its standard error. Any other value (`Allow`, `true`, an empty one) or the
+property given twice is refused: the action fails without running and `kbf-task` exits 11
+(run-start). The name is read in any case. Like every platform property it is part of the
+action digest, so the same action with and without it are two cache entries.
+
+Two layers keep the Command off the network. First, the Command gets a user and network
+namespace of its own, with its own user and group id inside (`unshare` of
+`CLONE_NEWUSER|CLONE_NEWNET`, a map of its own ids to themselves, `lo` raised): it sees one
+interface, `lo`, and has no route anywhere else. Then the seccomp filter goes in. Which filter
+depends on whether every namespace step succeeded:
+
+| every namespace step succeeded | the filter lets the Command make |
+|---|---|
+| yes | `AF_UNIX`, `AF_INET` and `AF_INET6` sockets: `127.0.0.1` works (a test can start a server and connect to it); a connect to any other address fails with `ENETUNREACH`. `AF_NETLINK`, `AF_PACKET`, every other domain and io_uring are refused |
+| no | `AF_UNIX` sockets only: every `AF_INET` and `AF_INET6` socket is refused with `EPERM`, as are all the others above |
+
+The namespace needs the host to let an unprivileged user namespace keep its capabilities.
+Where an AppArmor setting restricts that (Ubuntu's `apparmor_restrict_unprivileged_userns`,
+which a container profile that allows `userns` lifts) a step fails with `EPERM`; the run goes
+on under the strict filter, and a Command whose maps could not be written sees itself as the
+overflow user (65534). `kbf-task` writes one line per action to standard error saying which
+mode it ran in:
+
+```
+kbf-task: action <digest>: network: netns (loopback only) + seccomp
+kbf-task: action <digest>: network: seccomp only, no inet (netns: <step> <errno>)
+kbf-task: action <digest>: platform property kbf-network=allow: the Command runs with the network
+```
+
+where the step is `unshare`, `setgroups`, `uid_map`, `gid_map` or `loopback`. A Command that
+runs as root (uid 0) gets no namespace, because a namespace that maps only its own id would
+make `chown` to another user, `setuid` and `setgroups` fail for it (`tar`, `dpkg`, `apt`); it
+runs under the strict filter, and the line says `network: seccomp only, no inet (netns:
+skipped for uid 0)`.
+`kbf-task` also makes itself non-dumpable (`PR_SET_DUMPABLE` 0) before it opens a socket, so
+the Command, which runs as the same user, cannot `ptrace` it, take its sockets with
+`pidfd_getfd` or read its memory through `/proc`. This property does not reach the Mac driver, which has its own
+[`network`](#network) property.
+
+On macOS `kbf-task` has no seccomp filter or namespace. It runs the Command alone under
+`/usr/bin/sandbox-exec`, with the profile of `crates/kbf-seatbelt` (the rules the Mac driver's
+`network=off` profile uses): everything is allowed except handing work to `launchd` and writing a
+preference, a Command denied the network gets the `network=off` denial of the table below
+(loopback and Unix sockets only), and for every Command reading the files this tool holds a
+credential or presigned URL in is denied, as are writing it and renaming or removing the
+directories above it (`--grant-token-file`, `--pack-url-file`, `--put-urls-file`). A Command with `kbf-network=allow` gets the profile without the network
+clause. The line for a denied Command is `kbf-task: action <digest>: network: sandbox-exec profile
+(no network but loopback and unix sockets)`. The limits are the driver's: any Unix socket stays
+open, so DNS lookups still go out through the system's resolver, and a connect to the node's own
+non-loopback address was allowed under the denial on the macOS runner. The profile does not limit
+other writes, helper daemons reached by `mach-lookup` and other services on the node stay reachable, and a credential given as a flag value (`--insecure-argv-secrets`) stays in this tool's
+argv. No macOS `kbf-task` is released yet. On a system that is neither Linux nor macOS there is
+no confine, and a Command denied the network is refused there (exit 15).
 
 ## `network`
 

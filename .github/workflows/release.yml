@@ -6,20 +6,21 @@
 #
 # The run is started by one event and nothing else: the completion of a run of the pipeline
 # (`workflow_run`), and only a pipeline run that succeeded, for a push to main of this
-# repository. The pipeline is ci, then artifacts, then beta on those artifacts, each needing the
-# one before, so a release is cut only from a commit all three passed. No tag starts this
+# repository. The pipeline is ci, the source tests of beta.yml and the artifact builds (side by side),
+# the signing of those artifacts after ci, the smoke on the signed artifacts, and a closing job that
+# needs all of them, so a release is
+# cut only from a commit on which every job of every stage passed. No tag starts this
 # workflow (a tag the release bot makes would start a second run, and a hand-pushed `v*` tag
 # starts nothing, since only the release bot may create one), and there is no hand-started dry
 # run: a failed release job is re-run from this run's page. The workflow lint
 # (crates/kbf-integration-test/tests/release_workflow) pins the trigger, the condition every
 # job carries, and the chain below.
 #
-# Why a second workflow. A newer push cancels the pipeline run it replaces, whole (a
-# workflow-level cancel stops every job of the run). The release is the one part that must
-# never be stopped half way, so it is not a job of that run: this workflow has its own
-# concurrency group that never cancels, and nothing but the success of a pipeline run starts it.
-# A pipeline run cancelled at any point starts no release; a release run that has started is
-# never cancelled by a push. `workflow_run` runs the copy of this file on main and holds this
+# Why a second workflow. A pipeline run is cancelled whole when one of its jobs fails (its
+# `watch` job, pipeline.yml), and a release is the one part that must never be stopped half way,
+# so it is not a job of that run: this workflow has its own concurrency group that never
+# cancels, and nothing but the success of a pipeline run starts it. A pipeline run cancelled at
+# any point starts no release; a release run that has started is never cancelled by a push. `workflow_run` runs the copy of this file on main and holds this
 # repository's token and the `release` environment, which is why the lint allows the trigger
 # here and nowhere else, and why every job tests the run that started it: its conclusion, its
 # event, its branch and its repository. A run started by `workflow_run` has the latest commit of
@@ -61,9 +62,9 @@
 #          it proves the farm with a Buck2 build of a small project, remote only, every action
 #          new in this run (cargo xtask prove-farm); it passes with a notice when FARM_ADDRESS
 #          is unset. The one job that holds `id-token: write`, and no write scope. When the
-#          coordinator is reachable only on a Tailscale network, it joins that network first
-#          as an ephemeral node, with the same run token (TS_CLIENT_ID and KBF_COORDINATOR_URL
-#          set; skipped otherwise).
+#          coordinator and the farm are reachable only on a Tailscale network, it joins that
+#          network first as an ephemeral node, with the same run token (TS_CLIENT_ID set and
+#          either KBF_COORDINATOR_URL or FARM_ADDRESS set; skipped otherwise).
 #
 # A run releases one commit; a run of an old commit tags and publishes nothing (the highest
 # release tag must name this commit or an ancestor of it: `release tag` and `release publish`
@@ -316,14 +317,14 @@ jobs:
         if: ${{ steps.previous.outputs.previous != '' }}
         working-directory: previous
         run: sha256sum --check --strict SHA256SUMS
-      # The release before the build jobs recorded version facts has none, and this is the
-      # only check that waives them: the release being made (`release check dist`) never does.
-      # Remove the flag once the release before this one was made with the facts.
+      # The previous release is held to the same rules as this one: the version facts of its `kbf`,
+      # and the facts and the CycloneDX SBOM of its task image, are all listed. No flag waives them
+      # (the workflow lint refuses one on either `release check`).
       - name: Every one is an asset of the previous release's commit, with its bundle
         if: ${{ steps.previous.outputs.previous != '' }}
         env:
           PREVIOUS_COMMIT: ${{ steps.previous.outputs.previous-commit }}
-        run: cargo xtask release check previous --commit "$PREVIOUS_COMMIT" --without-version-facts
+        run: cargo xtask release check previous --commit "$PREVIOUS_COMMIT"
       - name: Verify the previous release's attestations as these were
         if: ${{ steps.previous.outputs.previous != '' }}
         env:
@@ -537,10 +538,13 @@ jobs:
       # (its scripts never see that network), as an ephemeral node. Tailscale's workload identity
       # federation takes this run's OIDC token, so the job still holds no secret. The client id and
       # the audience are the variables TS_CLIENT_ID and TS_AUDIENCE, the trust credential CI jobs
-      # join the network with, as `tag:ci`. With TS_CLIENT_ID or KBF_COORDINATOR_URL unset (a fork,
-      # a repository with no farm or no network) the step is skipped and the verb runs as before.
+      # join the network with, as `tag:ci`. Both the deploy step and the remote-only build after it
+      # reach the farm over that network, so the job joins when TS_CLIENT_ID is set and either
+      # KBF_COORDINATOR_URL or FARM_ADDRESS is; with the deploy step off (no KBF_COORDINATOR_URL)
+      # the build still needs the network. With TS_CLIENT_ID unset, or neither address set (a fork,
+      # a repository with no farm or no network), the step is skipped and the verbs run as before.
       - name: Join the farm's Tailscale network
-        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}
+        if: ${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}
         uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
         with:
           oauth-client-id: ${{ vars.TS_CLIENT_ID }}
@@ -555,7 +559,10 @@ jobs:
           VERSION: ${{ steps.farm-version.outputs.version }}
           MIN_UP_STORAGE: ${{ vars.KBF_MIN_UP_STORAGE || '1' }}
           MIN_UP_FRONTEND: ${{ vars.KBF_MIN_UP_FRONTEND || '1' }}
-        run: cargo xtask deploy-farm --url "$COORDINATOR_URL" --ca-pem "$COORDINATOR_CA" --version "$VERSION" --min-up-storage "$MIN_UP_STORAGE" --min-up-frontend "$MIN_UP_FRONTEND"
+          # `true`: fail before setting anything when the coordinator runs another commit than
+          # this release (docs/deploy/kbf-updater.md, "Updating the coordinator").
+          REQUIRE_CURRENT: ${{ vars.KBF_REQUIRE_COORDINATOR_CURRENT }}
+        run: cargo xtask deploy-farm --url "$COORDINATOR_URL" --ca-pem "$COORDINATOR_CA" --version "$VERSION" --min-up-storage "$MIN_UP_STORAGE" --min-up-frontend "$MIN_UP_FRONTEND" --require-coordinator-current "$REQUIRE_CURRENT"
       # The proof. The farm now runs this release; build a small project (four `/bin/sh -c`
       # actions that depend on each other) against it with remote execution on and local off, and
       # read Buck2's own count of the actions it ran: some remote, none local. The run id and

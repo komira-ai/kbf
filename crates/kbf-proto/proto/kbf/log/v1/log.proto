@@ -432,6 +432,9 @@ message Resources {
   uint64 vms = 4;
   // The most Action leases a node runs at once; unset: no cap.
   optional uint64 leases = 5;
+  // Bytes of scratch disk, added after format 1 (as an additive field): a log written before it
+  // has no field 6, which reads as 0 (books no disk), and 0 is not written.
+  uint64 disk_bytes = 6;
 }
 
 // A key and a value: a request property, or an exact capability a node reports.
@@ -491,6 +494,7 @@ enum Consumable {
   CONSUMABLE_MEM_GIB = 2;
   CONSUMABLE_NVME_GIB = 3;
   CONSUMABLE_GPUS = 4;
+  CONSUMABLE_DISK_GIB = 5;
 }
 
 // One execution request (kbf-sched's Request). `needs` is the capability request as the
@@ -552,6 +556,22 @@ message LeaseGrant {
   LeaseId lease = 1;
   uint64 operation = 2;
   string worker = 3;
+  // What admission charged the lease. Absent when the grant carries the default cost
+  // (a grant written before costs were kept, or one built by hand); a reader without
+  // this field skips it.
+  LeaseCost cost = 4;
+}
+
+// What admission charged one lease, as `LeaseCost` of the scheduler holds it.
+message LeaseCost {
+  uint64 cpu_millis = 1;
+  uint64 memory_bytes = 2;
+  uint64 limit_bytes = 3;
+  bool cold = 4;
+  // The lease is a rerun up the memory ladder. A row written before this field existed
+  // reads false.
+  bool retry = 5;
+  uint64 key_hash = 6;
 }
 
 // A result the scheduler accepted.

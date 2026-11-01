@@ -30,8 +30,11 @@ proxy = ["dep:kbf-proxy"]
 clap.workspace = true
 hex.workspace = true
 kbf-host.workspace = true
+kbf-retain.workspace = true
 kbf-proxy = { workspace = true, optional = true }
 # `postgres`: the schema's migrations and the client that applies them (`database` module).
+# `schema::embedded` and `latest`: the migrations a release runs (the state store's and the pack index's).
+kbf-pack-index = { workspace = true, features = ["postgres"] }
 kbf-state = { workspace = true, features = ["postgres"] }
 serde.workspace = true
 thiserror.workspace = true

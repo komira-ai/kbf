@@ -38,15 +38,16 @@ use kbf_daemon::cache::{Cache, CacheConfig, InputStats};
 use kbf_daemon::cas::{Cas, CasError};
 use kbf_daemon::cpu_pool::{CpuPool, DEFAULT_CPU_THREADS};
 use kbf_daemon::trees::{TreeConfig, TreeLease, Trees};
-use kbf_daemon::{Runtime, RuntimeError, Work, upload_within};
+use kbf_daemon::{NodeLoadError, NodeReading, Runtime, RuntimeError, Work, upload_within};
 use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata, Platform};
-use kbf_proto::worker::ResourceUsage;
+use kbf_proto::worker::{InputCacheCounts, ResourceUsage, TreeCounts};
 use kbf_types::LeaseId;
 use prost_types::Timestamp;
 use tokio::sync::oneshot;
 
+use crate::blocking_steps::{self, create_logs, make_cgroup, oom_outcome, read_start};
 use crate::cgroup::{LeaseCgroup, SwapKill, memory_max, presses_into_swap};
-use crate::cgroup_usage::{CPU_PSI, NUMA_EVERY, NumaSample, Start, resource_usage};
+use crate::cgroup_usage::{CPU_PSI, NUMA_EVERY, NumaSample, Start};
 use crate::container::{
     CONTAINER_OWNER, ContainerLimits, ContainerSpec, DAEMON_OWNER, Dirs, Ended, LEASE_PREFIX,
 };
@@ -54,6 +55,7 @@ use crate::image::{ImageCheckError, ImageRef, PROPERTY};
 use crate::input_phases::{InputPhases, millis};
 use crate::keeper::Keeper;
 use crate::logs::{Logs, STDERR, STDOUT, store_both};
+use crate::node_load::{LoadError, LoadTracker, MonoClock, NodeLoad, process_clock};
 use crate::numa::{Pin, Placement, Placer};
 use crate::oci::{Oci, OciConfig};
 use crate::outputs::{OutputLimits, collect};
@@ -110,6 +112,8 @@ pub struct ContainerConfig {
     /// Places each lease on one NUMA node (`--lease-placement=numa-node`); `None` leaves
     /// them on any CPU the daemon may use.
     pub placer: Option<Arc<Placer>>,
+    /// The actions cgroup's CPU limit per Welcome (`--actions-cpu-max`); `None`: as at start.
+    pub actions_cpu: Option<crate::ActionsCpu>,
 }
 
 /// The node's input cache as the driver is given it: not opened yet.
@@ -169,6 +173,7 @@ impl ContainerConfig {
             cache: None,
             cpu: CpuPool::new(DEFAULT_CPU_THREADS),
             placer: None,
+            actions_cpu: None,
         }
     }
 
@@ -238,6 +243,8 @@ struct Prepared {
     spec: ContainerSpec,
     outputs: Vec<String>,
     timeout: Duration,
+    /// The phases of the input side so far; [`ContainerRuntime::cgroup_up`] adds the last.
+    phases: InputPhases,
 }
 
 /// Runs `action` leases in rootless `crun` containers.
@@ -257,6 +264,8 @@ pub struct ContainerRuntime<C> {
     /// What the last lease's inputs cost, with the cache (a test's counter; each
     /// lease's are logged).
     last_inputs: Mutex<Option<InputStats>>,
+    /// Which leases run, since when, and the readings of the `actions/` cgroup.
+    load: LoadTracker,
 }
 
 impl<C: Cas> ContainerRuntime<C> {
@@ -282,12 +291,42 @@ impl<C: Cas> ContainerRuntime<C> {
             numa_samples: Arc::new(AtomicU64::new(0)),
             cache: None,
             last_inputs: Mutex::new(None),
+            load: LoadTracker::new(process_clock()),
         };
         sweep(&runtime.engine, &runtime.config).map_err(StartError::Sweep)?;
         if let Some(given) = runtime.config.cache.clone() {
             runtime.cache = open_cache(given);
         }
         Ok(runtime)
+    }
+
+    /// The same runtime reading time from `clock`, for tests that cannot wait.
+    #[must_use]
+    pub fn with_clock(mut self, clock: MonoClock) -> Self {
+        self.load = LoadTracker::new(clock);
+        self
+    }
+
+    /// One reading of the `actions/` cgroup (`NodeLoad`), with the leases that ran for the
+    /// whole window since the previous reading and every running lease with its start and
+    /// what its own cgroup holds. The files are read on the blocking pool, and only one
+    /// reading reads them at a time.
+    ///
+    /// # Errors
+    /// A file the reading needs cannot be read or does not parse.
+    pub async fn node_load(&self) -> Result<NodeLoad, LoadError> {
+        let parent = self.config.cgroup_parent.trim_start_matches('/');
+        self.load
+            .reading(self.config.cgroup_root.join(parent))
+            .await
+    }
+
+    /// The most CPU any one window between two readings used by the lease, in
+    /// millicores, once, after its run ended. `None` for a lease that ended before a
+    /// second reading of it.
+    #[must_use]
+    pub fn take_peak_window_millicores(&self, lease_id: LeaseId) -> Option<u64> {
+        self.load.take_peak(lease_id)
     }
 
     /// Whether leases link their inputs from the cache.
@@ -445,25 +484,6 @@ impl<C: Cas> ContainerRuntime<C> {
         self.give_overlay(CONTAINER_OWNER, &lease.dir, &root, &upper, &overlay_work)
             .await?;
         phases.chown_ms = millis(started);
-        let started = Instant::now();
-        // `actions/`'s own OOM count before the lease, to say afterwards whether its
-        // limit killed the lease.
-        lease.backstop_ooms = lease.cgroup.parent_ooms().ok();
-        // The keeper, before anything runs in the cgroup: it kills the cgroup if the
-        // daemon dies.
-        let kill = lease.cgroup.dir().join("cgroup.kill");
-        let placement = (self.config.placer.as_ref()).map(|placer| {
-            placer.place_lease(work.resources.cpu_millis, work.resources.memory_bytes)
-        });
-        phases.numa_node = placement.as_ref().map(Placement::spot);
-        lease.pin = placement.and_then(Placement::into_pin);
-        let keeper = (lease.cgroup.create(work.resources, lease.pin.as_ref()))
-            .and_then(|()| Keeper::watch(&kill))
-            .map_err(|e| failed(lease.cgroup.dir(), &e))?;
-        lease.keeper = Some(keeper);
-        phases.cgroup_ms = millis(started);
-        tracing::info!(lease = %lease.name, "inputs phases: {phases}");
-
         let spec = ContainerSpec {
             name: lease.name.clone(),
             image: image.to_string(),
@@ -487,7 +507,37 @@ impl<C: Cas> ContainerRuntime<C> {
             spec,
             outputs,
             timeout,
+            phases,
         })
+    }
+
+    /// The lease's cgroup and its keeper, made last of the input side: `mkdir`, the
+    /// limits written to the cgroup's files, and a keeper process started and waited for
+    /// until it answers. All of it waits on the kernel or a child, so it runs on the
+    /// blocking pool; and it runs after the kill window of [`Self::prepare`] closes,
+    /// because a blocking task cannot be stopped and a kill that dropped it half done
+    /// would let the clean remove the cgroup before the task made it.
+    async fn cgroup_up(
+        &self,
+        work: &Work,
+        lease: &mut Lease,
+        mut phases: InputPhases,
+    ) -> Result<(), RuntimeError> {
+        let started = Instant::now();
+        // The keeper, before anything runs in the cgroup: it kills the cgroup if the
+        // daemon dies.
+        let placement = (self.config.placer.as_ref()).map(|placer| {
+            placer.place_lease(work.resources.cpu_millis, work.resources.memory_bytes)
+        });
+        phases.numa_node = placement.as_ref().map(Placement::spot);
+        lease.pin = placement.and_then(Placement::into_pin);
+        let made = make_cgroup(lease.cgroup.clone(), work.resources, lease.pin.take()).await;
+        lease.backstop_ooms = made.backstop_ooms;
+        lease.pin = made.pin;
+        lease.keeper = Some(made.keeper.map_err(|e| failed(lease.cgroup.dir(), &e))?);
+        phases.cgroup_ms = millis(started);
+        tracing::info!(lease = %lease.name, "inputs phases: {phases}");
+        Ok(())
     }
 
     /// Steps 1 to 4. `killer` receives the sender of a kill that stopped the work.
@@ -511,6 +561,7 @@ impl<C: Cas> ContainerRuntime<C> {
             spec,
             outputs,
             timeout,
+            phases,
         } = tokio::select! {
             prepared = self.prepare(cas, work, lease) => prepared?,
             Ok(by) = &mut *stop => {
@@ -518,6 +569,7 @@ impl<C: Cas> ContainerRuntime<C> {
                 return Err(RuntimeError::Killed);
             }
         };
+        self.cgroup_up(work, lease, phases).await?;
         clock.input_fetch_completed_timestamp = now();
         // Execution counts from writing the bundle: making the container is part of
         // running the command in one.
@@ -525,8 +577,11 @@ impl<C: Cas> ContainerRuntime<C> {
         // What the lease cgroup's NUMA split is while the action runs, and the usage
         // read at its end (`cgroup_usage`): `run` reads it too when the lease fails.
         lease.ran = Some(Instant::now());
-        lease.started_under =
-            Start::read(&self.config.cpu_pressure_file, work.resources.cpu_millis);
+        let (psi, millicpus) = (
+            self.config.cpu_pressure_file.clone(),
+            work.resources.cpu_millis,
+        );
+        lease.started_under = read_start(psi, millicpus).await;
         lease.numa = NumaSample::counting(Arc::clone(&self.numa_samples));
         lease.created = true;
         self.engine
@@ -541,16 +596,15 @@ impl<C: Cas> ContainerRuntime<C> {
         let mut started = 0;
         let ended = loop {
             started += 1;
-            let stdout =
-                std::fs::File::create(&stdout_path).map_err(|e| failed(&stdout_path, &e))?;
-            let stderr =
-                std::fs::File::create(&stderr_path).map_err(|e| failed(&stderr_path, &e))?;
+            let (stdout, stderr) = create_logs(&stdout_path, &stderr_path).await?;
             let start = self
                 .engine
                 .start(&spec, stdout, stderr)
                 .map_err(RuntimeError::Failed)?;
             // The lease owns the `crun run` from here, so a dropped run's clean reaps it.
             let child = lease.start.insert(start);
+            self.load
+                .started(work.lease_id, lease.cgroup.dir().to_owned());
 
             tokio::select! {
                 // `crun run`'s status is the container's. An error waiting for it is not
@@ -603,7 +657,7 @@ impl<C: Cas> ContainerRuntime<C> {
         // reported no exit or could not be asked: the lease cgroup's counters do not
         // depend on `crun`'s report, so a kill they show is reported as one.
         if matches!(ended, Ok(Ended::Exited(137) | Ended::NotRun(_)) | Err(_)) {
-            match lease.cgroup.oom_outcome(cap, lease.backstop_ooms) {
+            match oom_outcome(lease.cgroup.clone(), cap, lease.backstop_ooms).await {
                 Ok(Some(kill)) => return Err(kill),
                 Ok(None) => {}
                 Err(e) if ended == Ok(Ended::Exited(137)) => {
@@ -622,7 +676,7 @@ impl<C: Cas> ContainerRuntime<C> {
         clock.execution_completed_timestamp = now();
         // What the lease cgroup counted, while it still exists (clean removes it). The
         // result carries it beside the four numbers every runtime reports.
-        let usage = lease.usage();
+        let usage = lease.usage().await;
         clock.auxiliary_metadata = usage.iter().map(ResourceUsage::to_any).collect();
         // The upload counts from the chown, which makes the outputs readable to it.
         clock.output_upload_start_timestamp = now();
@@ -771,6 +825,39 @@ impl<C: Cas> Runtime for ContainerRuntime<C> {
         kind == KIND
     }
 
+    async fn welcomed_placement_load(&self, on: bool) {
+        self.config.welcomed(on).await;
+    }
+
+    fn input_cache(&self) -> Option<InputCacheCounts> {
+        let cached = self.cache.as_ref()?;
+        let trees = self.tree_stats().map(|t| TreeCounts {
+            builds: t.builds,
+            hits: t.hits,
+            evictions: t.evictions,
+        });
+        Some(InputCacheCounts {
+            trees,
+            ..cached.cache.input_counts()
+        })
+    }
+
+    async fn node_load(&self) -> Result<Option<NodeReading>, NodeLoadError> {
+        let load = ContainerRuntime::node_load(self)
+            .await
+            .map_err(|e| NodeLoadError {
+                kind: match &e {
+                    LoadError::Read { file, .. } | LoadError::Malformed { file, .. } => file,
+                },
+                why: e.to_string(),
+            })?;
+        Ok(Some(load.into_reading()))
+    }
+
+    fn take_peak_window_millicores(&self, lease_id: LeaseId) -> Option<u64> {
+        ContainerRuntime::take_peak_window_millicores(self, lease_id)
+    }
+
     async fn run(&self, work: Work) -> Result<ActionResult, RuntimeError> {
         let (stop_tx, mut stop) = oneshot::channel();
         let _registered = Registered::new(self, work.lease_id, stop_tx);
@@ -783,7 +870,7 @@ impl<C: Cas> Runtime for ContainerRuntime<C> {
         // measured too, before the clean removes its cgroup; the daemon asks for it
         // (`Runtime::failed_usage`).
         let measured = if outcome.is_err() {
-            lease.usage()
+            lease.usage().await
         } else {
             None
         };
@@ -842,6 +929,7 @@ impl<'a, C: Cas> Registered<'a, C> {
 
 impl<C> Drop for Registered<'_, C> {
     fn drop(&mut self) {
+        self.runtime.load.ended(self.id);
         self.runtime
             .stops
             .lock()
@@ -868,6 +956,7 @@ fn sweep(engine: &Arc<Oci>, config: &ContainerConfig) -> Result<(), String> {
         tracing::warn!(lease = %name, "removing a lease a previous daemon left");
         let mut lease = Lease::named(engine, config, name);
         lease.created = true;
+        lease.left_by_a_daemon = true;
         if let Err(why) = lease.clean_blocking() {
             errors.push(why);
         }
@@ -902,6 +991,9 @@ struct Lease {
     /// The NUMA node the lease is placed on, with `--lease-placement=numa-node`. Dropped
     /// with the lease, which gives the node its load back.
     pin: Option<Pin>,
+    /// Whether a previous daemon started this lease: a `crun run` of it may still be
+    /// there, and is no child of this process to wait for.
+    left_by_a_daemon: bool,
     /// Whether cleaning is still owed.
     armed: bool,
     /// When the container was about to be created, once the lease got that far.
@@ -935,6 +1027,7 @@ impl Lease {
             keeper: None,
             trees: Vec::new(),
             pin: None,
+            left_by_a_daemon: false,
             armed: true,
             ran: None,
             numa: NumaSample::default(),
@@ -945,10 +1038,12 @@ impl Lease {
     /// What the lease cgroup counted so far, with its best NUMA sample: `None` for a
     /// lease that never got to run its container. Read once (it takes the samples);
     /// the cgroup must still exist.
-    fn usage(&mut self) -> Option<ResourceUsage> {
+    /// The cgroup's files are read on the blocking pool.
+    async fn usage(&mut self) -> Option<ResourceUsage> {
         let ran = self.ran?;
-        let cgroup = std::mem::take(&mut self.numa).finish(self.cgroup.dir());
-        Some(resource_usage(cgroup, ran.elapsed(), self.started_under))
+        let numa = std::mem::take(&mut self.numa);
+        let (dir, started_under) = (self.cgroup.dir().to_owned(), self.started_under);
+        Some(blocking_steps::usage(dir, numa, ran, started_under).await)
     }
 
     /// Steps 5 and 6, off the async threads.
@@ -979,6 +1074,12 @@ impl Lease {
             let _ = self.cgroup.kill();
             if let Err(e) = self.engine.remove(&self.name) {
                 errors.push(e);
+            }
+            // The container is gone, so a `crun run` of it ends on its own, and it would
+            // write into the directory removed below as it does: the state directory,
+            // recreated. This process is not its parent to reap it, so end it here.
+            if self.left_by_a_daemon {
+                errors.extend(self.engine.end_runs(&self.dir).err());
             }
         }
         if let Err(e) = self.cgroup.remove() {

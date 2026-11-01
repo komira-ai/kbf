@@ -101,6 +101,7 @@ impl Inner {
             tracing::warn!("cache: evicting {}: {e}", key.name());
         }
         bump(&self.counters.evictions);
+        (self.counters.evicted_bytes).fetch_add(key.size, Ordering::Relaxed);
         drop(slot);
         true
     }

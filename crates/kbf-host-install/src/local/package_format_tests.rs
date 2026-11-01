@@ -11,6 +11,7 @@ use crate::runner::Exec;
 fn printed(code: i32, stdout: &str) -> Exec {
     Exec {
         code: Some(code),
+        signal: None,
         stdout: stdout.into(),
         stderr: b"complaint".to_vec(),
     }

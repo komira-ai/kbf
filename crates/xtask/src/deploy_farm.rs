@@ -2,6 +2,14 @@
 //! coordinator "desired = this release" and wait until the farm converges
 //! (`docs/deploy/kbf-updater.md`, "Turn on the deploy step").
 //!
+//! `--service NAME` (default `kbf`) names the service the deploy is about. For `kbf` the
+//! requests are exactly those below. For another service the POST body is the version and
+//! `"service": NAME` (the `min_up` keys are kbf's; that service's minimums are its definition's),
+//! the coordinator's commit is not compared with the version, and every convergence read is `GET /v1/convergence?service=NAME`, so
+//! the wait is on that service's own hosts and desired state. `--version` is then that
+//! service's own version text, as its hosts report it: the coordinator compares the text, so
+//! only `kbf`'s form (`<semver>+g<commit12>`) is checked here.
+//!
 //! The steps, each over HTTPS (the runner's token service as the system store trusts it, the
 //! coordinator as the system store does, or, with `--ca-pem`, as that CA alone does: the
 //! coordinator's certificate is the farm CA's, which no system store holds):
@@ -10,7 +18,10 @@
 //!    whose operator has not set the coordinator's address, deploys nothing and fails nothing.
 //! 2. `GET /v1/convergence` once, before anything is changed: the hosts live then (at the
 //!    desired version, updating or failed; not `down`) are the baseline, per role, and are
-//!    printed.
+//!    printed. Its `commit` (the build the coordinator runs) is compared with the release's;
+//!    with `--require-coordinator-current` a different one ends the verb before anything is
+//!    set, a different one without the flag is a `::warning` annotation and the deploy goes
+//!    on, and a coordinator that reports none is noted and trusted.
 //! 3. `POST /v1/desired` with the version and the minimums, authenticated by a GitHub
 //!    Actions OIDC token whose audience is the coordinator (`--audience`, by default the URL).
 //! 4. `GET /v1/convergence` every `--every-secs`, with a fresh token each time (a token is
@@ -102,6 +113,35 @@ pub fn check_version(version: &str) -> Result<(), Error> {
 const DESIRED_PATH: &str = "/v1/desired";
 const CONVERGENCE_PATH: &str = "/v1/convergence";
 
+/// The service the coordinator runs of its own: the default of `--service`.
+const KBF: &str = "kbf";
+
+/// The most bytes of a service name, as the coordinator's wire says (`MAX_SERVICE_NAME` of
+/// `kbf_updater::wire`, which xtask does not depend on).
+const MAX_SERVICE_NAME: usize = 64;
+
+/// Whether `name` is a service name the coordinator accepts: lowercase letters, digits and
+/// `-`, 1 to [`MAX_SERVICE_NAME`] bytes (`kbf_updater::wire::is_service_name`).
+fn service_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_SERVICE_NAME
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// What `args` must satisfy before anything is sent: a service name the coordinator accepts,
+/// and for `kbf` a version of the form its hosts report.
+fn check_args(args: &Args) -> Result<(), Error> {
+    if !service_name_ok(&args.service) {
+        return Err(Error::Service(args.service.clone()));
+    }
+    if args.service == KBF {
+        check_version(&args.version)?;
+    }
+    Ok(())
+}
+
 /// The variables the platform sets for a job that may ask for an OIDC token.
 const TOKEN_URL_VAR: &str = "ACTIONS_ID_TOKEN_REQUEST_URL";
 const TOKEN_KEY_VAR: &str = "ACTIONS_ID_TOKEN_REQUEST_TOKEN";
@@ -118,6 +158,11 @@ pub struct Args {
     /// release tag (`0.0.13`) is not that text and is refused.
     #[arg(long)]
     pub version: String,
+    /// The service to deploy: `kbf` (the default) or another service the coordinator manages.
+    /// For another service `--version` is that service's own version text, as its hosts
+    /// report it.
+    #[arg(long, default_value = "kbf")]
+    pub service: String,
     /// The farm CA certificate (PEM text) the coordinator's certificate must chain to, instead
     /// of the system store's roots. Empty: the system store.
     #[arg(long, default_value = "", allow_hyphen_values = true)]
@@ -134,12 +179,35 @@ pub struct Args {
     /// Seconds between two reads.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub every_secs: u64,
-    /// The storage hosts that must stay up while others update.
+    /// The storage hosts that must stay up while others update. `kbf` only: another service's
+    /// minimums are in its definition, and none is sent.
     #[arg(long, default_value_t = 1)]
     pub min_up_storage: u32,
-    /// The frontends that must stay up while others update.
+    /// The frontends that must stay up while others update. `kbf` only, as above.
     #[arg(long, default_value_t = 1)]
     pub min_up_frontend: u32,
+    /// Fail before anything is changed when the coordinator runs another commit than the
+    /// release's. Use it for a release that changes the coordinator or the wire between it
+    /// and the hosts: the coordinator must be updated first
+    /// (`docs/deploy/kbf-updater.md`, "Updating the coordinator").
+    ///
+    /// Bare, or `true`, turns it on; `false` or empty (an unset workflow variable) leaves it off.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = parse_switch
+    )]
+    pub require_coordinator_current: bool,
+}
+
+/// A switch given as text: `true` is on; `false` and the empty text are off.
+fn parse_switch(text: &str) -> Result<bool, String> {
+    match text {
+        "true" => Ok(true),
+        "" | "false" => Ok(false),
+        other => Err(format!("expected `true` or `false`, got `{other}`")),
+    }
 }
 
 /// Why the deploy did not end converged.
@@ -149,6 +217,8 @@ pub enum Error {
         "{TOKEN_URL_VAR} or {TOKEN_KEY_VAR} is not set: the job needs `permissions: id-token: write`"
     )]
     NoTokenService,
+    #[error("--service {0:?} is not a service name: 1 to 64 lowercase letters, digits and -")]
+    Service(String),
     #[error("--ca-pem holds no certificate")]
     Ca,
     #[error(
@@ -181,6 +251,13 @@ pub enum Error {
         reached: u64,
         version: String,
     },
+    #[error(
+        "the coordinator runs {coordinator}, the release is {release}: update the coordinator first (docs/deploy/kbf-updater.md, Updating the coordinator)"
+    )]
+    CoordinatorBehind {
+        coordinator: String,
+        release: String,
+    },
     #[error("the counts have not changed for {0} seconds")]
     Stalled(u64),
     #[error("the farm has not converged after {0} seconds")]
@@ -193,10 +270,13 @@ pub enum Error {
 #[derive(Clone, Debug)]
 pub struct Plan {
     pub url: String,
+    /// The service the deploy is about; `kbf` for the farm's own.
+    pub service: String,
     pub audience: String,
     pub version: String,
     pub min_up_storage: u32,
     pub min_up_frontend: u32,
+    pub require_coordinator_current: bool,
     pub deadline: Duration,
     pub stall: Duration,
     pub every: Duration,
@@ -208,13 +288,27 @@ impl Plan {
     pub fn of(args: &Args) -> Self {
         Self {
             url: args.url.trim_end_matches('/').to_owned(),
+            service: args.service.clone(),
             audience: args.audience.clone().unwrap_or_else(|| args.url.clone()),
             version: args.version.clone(),
             min_up_storage: args.min_up_storage,
             min_up_frontend: args.min_up_frontend,
+            require_coordinator_current: args.require_coordinator_current,
             deadline: Duration::from_secs(args.deadline_min * 60),
             stall: Duration::from_secs(args.stall_min * 60),
             every: Duration::from_secs(args.every_secs),
+        }
+    }
+}
+
+impl Plan {
+    /// The path of the convergence read: the coordinator's own for `kbf`, else asking for
+    /// the service by name (a name needs no escaping: [`service_name_ok`]).
+    fn convergence_path(&self) -> String {
+        if self.service == KBF {
+            CONVERGENCE_PATH.to_owned()
+        } else {
+            format!("{CONVERGENCE_PATH}?service={}", self.service)
         }
     }
 }
@@ -254,7 +348,7 @@ impl TokenService {
 pub fn run(args: &Args) -> Result<Vec<String>, crate::Error> {
     // Before the notice for an unset URL: a version the hosts could never report is a defect
     // of the caller whether or not a farm is there to be told.
-    check_version(&args.version).map_err(failed)?;
+    check_args(args).map_err(failed)?;
     if args.url.trim().is_empty() {
         return Ok(vec![
             "::notice::the deploy step is off: the repository variable KBF_COORDINATOR_URL is not set"
@@ -281,7 +375,7 @@ pub fn run_with(
     host: &[CertificateDer<'static>],
     out: &mut impl Write,
 ) -> Result<Vec<String>, crate::Error> {
-    check_version(&args.version).map_err(failed)?;
+    check_args(args).map_err(failed)?;
     let plan = Plan::of(args);
     let pinned;
     let roots = Roots {
@@ -371,13 +465,31 @@ pub fn deploy_on(
         service,
         clock,
     };
-    let baseline =
-        Read::of(&client.send_retrying(out, READ_BASELINE, CONVERGENCE_PATH, None, plan)?)?.live();
+    let read_path = plan.convergence_path();
+    let first = Read::of(&client.send_retrying(out, READ_BASELINE, &read_path, None, plan)?)?;
+    if plan.service == KBF {
+        check_coordinator(plan, first.commit.as_deref(), out)?;
+    } else {
+        log(
+            out,
+            &format!(
+                "not checking the coordinator's commit against {}: its version is not a kbf commit",
+                plan.service
+            ),
+        )?;
+    }
+    let baseline = first.live();
     log(out, &baseline_line(&baseline))?;
-    let body = json!({
-        "version": plan.version,
-        "min_up": {"storage": plan.min_up_storage, "frontend": plan.min_up_frontend},
-    });
+    // The `min_up` keys are kbf's contract with CI; any other service's minimums are its
+    // definition's, so it is sent none (the coordinator would drop the keys its roles lack).
+    let body = if plan.service == KBF {
+        json!({
+            "version": plan.version,
+            "min_up": {"storage": plan.min_up_storage, "frontend": plan.min_up_frontend},
+        })
+    } else {
+        json!({"version": plan.version, "service": plan.service})
+    };
     client.send_retrying(out, SET_DESIRED, DESIRED_PATH, Some(&body), plan)?;
     log(out, &format!("desired version {} set", plan.version))?;
 
@@ -385,7 +497,7 @@ pub fn deploy_on(
     let mut changed = started;
     let mut last: Option<(String, Value)> = None;
     loop {
-        match client.send(out, "read the convergence", CONVERGENCE_PATH, None) {
+        match client.send(out, "read the convergence", &read_path, None) {
             Ok(answer) => {
                 let read = Read::of(&answer)?;
                 log(out, &read.table())?;
@@ -415,6 +527,51 @@ pub fn deploy_on(
         }
         (clock.sleep)(plan.every.min(plan.deadline - elapsed));
     }
+}
+
+/// Whether the 12 characters are a commit as `--version` shows it.
+fn is_commit(text: &str) -> bool {
+    text.len() == 12
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The coordinator's own commit against the release's, before anything is set. A coordinator
+/// that reports none (an older build, or one built without a git checkout) is noted and
+/// trusted. With `plan.require_coordinator_current`, a different commit is an error.
+fn check_coordinator(
+    plan: &Plan,
+    reported: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let release = plan.version.rsplit("+g").next().unwrap_or_default();
+    let Some(coordinator) = reported.filter(|c| is_commit(c)) else {
+        let line = "::notice::the coordinator reports no build commit (an older build): not checking that it is current";
+        return if plan.require_coordinator_current {
+            log(out, line)
+        } else {
+            Ok(())
+        };
+    };
+    if coordinator == release {
+        return log(
+            out,
+            &format!("the coordinator runs the release's commit {release}"),
+        );
+    }
+    if plan.require_coordinator_current {
+        return Err(Error::CoordinatorBehind {
+            coordinator: coordinator.to_owned(),
+            release: release.to_owned(),
+        });
+    }
+    log(
+        out,
+        &format!(
+            "::warning title=coordinator not current::the coordinator runs {coordinator}, the release is {release}: update the coordinator first (docs/deploy/kbf-updater.md, Updating the coordinator)"
+        ),
+    )
 }
 
 /// One line of the log, flushed.
@@ -577,6 +734,8 @@ struct Read {
     desired: String,
     quiet: bool,
     roles: Vec<(String, [u64; 4])>,
+    /// The commit the coordinator says it was built from; none from an older build.
+    commit: Option<String>,
 }
 
 impl Read {
@@ -603,6 +762,7 @@ impl Read {
             desired: text("desired").map_or_else(|| "(none)".to_owned(), |t| plain(&t)),
             quiet: answer["quiet"].as_bool().unwrap_or(false),
             roles,
+            commit: text("commit").map(|t| plain(&t)),
         })
     }
 

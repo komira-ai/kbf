@@ -85,7 +85,9 @@ impl<E: Exec> Linux<E> {
         let platform = Self::platform(prepared);
         let gh = self.layout.join(&self.layout.gh());
         let home = scratch.join("home");
+        let origin = &prepared.origin;
         let fetcher = Fetcher {
+            origin,
             asset: AssetKind::FrontendImage,
             platform: &platform,
             runner: &*self.runner,
@@ -105,10 +107,16 @@ impl<E: Exec> Linux<E> {
             .fetch(&prepared.prefix, scratch)
             .map_err(fetch_fault)?;
         let files = Files {
-            image: scratch.join(AssetKind::FrontendImage.name_on(&platform, &commit)),
-            bundle: scratch.join(bundle_of(
-                &AssetKind::FrontendImage.name_on(&platform, &commit),
+            image: scratch.join(AssetKind::FrontendImage.name_on(
+                origin.prefix(),
+                &platform,
+                &commit,
             )),
+            bundle: scratch.join(bundle_of(&AssetKind::FrontendImage.name_on(
+                origin.prefix(),
+                &platform,
+                &commit,
+            ))),
             sums: scratch.join(SUMS_NAME),
         };
         Ok((commit, files))
@@ -150,7 +158,7 @@ impl<E: Exec> Linux<E> {
     ) -> Result<FetchedImage, Fault> {
         let id = commit_id(commit)?;
         let platform = Self::platform(prepared);
-        let name = AssetKind::FrontendImage.name_on(&platform, commit);
+        let name = AssetKind::FrontendImage.name_on(prepared.origin.prefix(), &platform, commit);
         let dir = self.make_check_dir(commit, prepared.who)?;
         let fetch_failed =
             |what: &str, e: io::Error| Fault::refused(Code::FetchFailed, format!("{what}: {e}"));

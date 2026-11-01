@@ -20,6 +20,14 @@ use kbf_meta::Command;
 
 mod execute;
 pub use execute::{ErrorCause, ErrorCounts, ExecuteMetrics, OpenExecute};
+mod whole;
+pub use whole::WholeGauges;
+mod prediction;
+pub use prediction::{PREDICTION_AXES, PREDICTION_BUCKETS, PREDICTION_UNSET, PredictionTotals};
+mod shadow;
+pub use shadow::{SHADOW_SKIPS, ShadowBucket, ShadowLevel, ShadowTotals};
+mod tier;
+pub use tier::TierCounters;
 
 /// What a histogram's values are, which fixes its buckets and how they are printed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,7 +225,7 @@ impl Histogram {
 
     /// The `_bucket`, `_sum` and `_count` lines of family `name`, each with `labels`
     /// (`key="value"` pairs, comma-separated, or empty) before `le`.
-    fn render(&self, out: &mut String, name: &str, labels: &str) {
+    pub(crate) fn render(&self, out: &mut String, name: &str, labels: &str) {
         let sep = if labels.is_empty() { "" } else { "," };
         let mut cumulative = 0;
         let bounds = self.unit.bounds().iter().map(|&b| self.unit.print(b));
@@ -363,113 +371,6 @@ pub const fn command_label(command: &Command) -> usize {
     }
 }
 
-/// The level of the size estimate a finished attempt was compared with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ShadowLevel {
-    /// The summary of the action with its configuration.
-    L1,
-    /// The summary of the action without it.
-    L2,
-    /// No estimate: too few samples, or none.
-    None,
-}
-
-/// How a finished attempt fell against the estimate for its action.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ShadowBucket {
-    /// It used at most 95% of the limit the estimate would have given.
-    Covered,
-    /// It used more than that limit: the estimate would have had it killed.
-    WouldOom,
-    /// Its peak is a lower bound only (it ran against its own limit, or was killed at
-    /// it) or came within 5% of the estimate's limit: no claim either way.
-    Censored,
-    /// There was no estimate.
-    Cold,
-}
-
-const SHADOW_LEVELS: [(ShadowLevel, &str); 3] = [
-    (ShadowLevel::L1, "l1"),
-    (ShadowLevel::L2, "l2"),
-    (ShadowLevel::None, "none"),
-];
-const SHADOW_BUCKETS: [(ShadowBucket, &str); 4] = [
-    (ShadowBucket::Covered, "covered"),
-    (ShadowBucket::WouldOom, "would_oom"),
-    (ShadowBucket::Censored, "censored"),
-    (ShadowBucket::Cold, "cold"),
-];
-
-/// Why the shadow did not show an attempt or an operation to the estimator, as the label
-/// of `kbf_estimator_shadow_skipped_total` spells it.
-pub const SHADOW_SKIPS: [&str; 5] = ["kind", "no_os", "no_booking", "no_basis", "no_subject"];
-
-/// One count for each level and bucket the shadow reports, and for each reason it skipped
-/// something, set by the owner of the tally each time it publishes.
-#[derive(Debug, Default)]
-pub struct ShadowTotals {
-    buckets: [[Level; 4]; 3],
-    skipped: [Level; 5],
-}
-
-impl ShadowTotals {
-    /// Sets the count of the skips of reason number `reason` ([`SHADOW_SKIPS`]).
-    pub fn set_skipped(&self, reason: usize, total: u64) {
-        if let Some(level) = self.skipped.get(reason) {
-            level.set(total);
-        }
-    }
-
-    /// The count of the skips of reason number `reason`.
-    #[must_use]
-    pub fn skipped(&self, reason: usize) -> u64 {
-        self.skipped.get(reason).map_or(0, Level::get)
-    }
-
-    /// Sets the count of `level` and `bucket`.
-    pub fn set(&self, level: ShadowLevel, bucket: ShadowBucket, total: u64) {
-        self.buckets[level as usize][bucket as usize].set(total);
-    }
-
-    /// The count of `level` and `bucket`.
-    #[must_use]
-    pub fn get(&self, level: ShadowLevel, bucket: ShadowBucket) -> u64 {
-        self.buckets[level as usize][bucket as usize].get()
-    }
-
-    fn render(&self, out: &mut Families) {
-        let name = "kbf_estimator_shadow_total";
-        out.head(
-            name,
-            "counter",
-            "Finished attempts compared with the learned-sizes shadow's estimate for their \
-             action, by the estimate's level and how the attempt fell",
-        );
-        for (level, level_name) in SHADOW_LEVELS {
-            for (bucket, bucket_name) in SHADOW_BUCKETS {
-                let _ = writeln!(
-                    out.0,
-                    "{name}{{level=\"{level_name}\",bucket=\"{bucket_name}\"}} {}",
-                    self.get(level, bucket)
-                );
-            }
-        }
-        let name = "kbf_estimator_shadow_skipped_total";
-        out.head(
-            name,
-            "counter",
-            "Attempts and operations the learned-sizes shadow did not show the estimator, by why",
-        );
-        for (reason, label) in SHADOW_SKIPS.iter().enumerate() {
-            let _ = writeln!(
-                out.0,
-                "{name}{{reason=\"{label}\"}} {}",
-                self.skipped(reason)
-            );
-        }
-    }
-}
-
 /// Everything a [`crate::Cache`] measures. The fields are public so a test (or a
 /// caller with its own exposition) can read them; [`CacheMetrics::render`] prints
 /// them all.
@@ -561,9 +462,16 @@ pub struct CacheMetrics {
     pub sched_queued: Level,
     /// Leases granted or running, as of the last scheduler input.
     pub sched_leases: Level,
+    /// The whole-node caps' numbers and the requests waiting by reason; rendered only when
+    /// `--whole-node-max` is on.
+    pub sched_whole: WholeGauges,
     /// Finished attempts the learned-sizes shadow compared with its estimate, by the
     /// level the estimate came from and how the attempt fell (`kbf_estimator_shadow_total`).
     pub estimator_shadow: ShadowTotals,
+    /// The placement predictions: the operations given one, why the others got none, how
+    /// finished runs fell against theirs, and the nodes with a CPU quota under
+    /// `--placement-load on` (`kbf_prediction_*`, `kbf_placement_cpu_limited_nodes`).
+    pub prediction: PredictionTotals,
     /// Write-tier calls queued on or running on the blocking pool.
     pub tier_in_flight: Gauge,
     /// The wait of one write-tier call for a blocking-pool thread.
@@ -632,7 +540,9 @@ impl Default for CacheMetrics {
             sched_lock_wait: Histogram::new(Unit::Seconds),
             sched_queued: Level::default(),
             sched_leases: Level::default(),
+            sched_whole: WholeGauges::default(),
             estimator_shadow: ShadowTotals::default(),
+            prediction: PredictionTotals::default(),
             tier_in_flight: Gauge::default(),
             tier_wait: Histogram::new(Unit::Seconds),
             tier_call: Histogram::new(Unit::Seconds),
@@ -888,7 +798,9 @@ impl CacheMetrics {
             "Leases granted or running, as of the last scheduler input",
             self.sched_leases.get(),
         );
+        self.sched_whole.render(&mut out);
         self.estimator_shadow.render(&mut out);
+        self.prediction.render(&mut out);
         out.gauge(
             "kbf_tier_in_flight",
             "Write-tier calls queued on or running on the blocking pool",
@@ -921,157 +833,6 @@ impl CacheMetrics {
         }
         self.execute.render(&mut out);
         out.0
-    }
-}
-
-/// What a cache with a local write tier counts about it (`docs/design/write-path.md`,
-/// section 6). Rendered by `Cache::render_metrics` with the tier's usage and exposure,
-/// only when a tier is attached.
-#[derive(Debug, Default)]
-pub struct TierCounters {
-    /// Segments staged: synced to a block and committed with `PutStaged`.
-    pub staged: Counter,
-    /// Segments sent to the store because the tier was at its budget.
-    pub full: Counter,
-    /// Segments sent to the store because the tier's disk failed before the commit.
-    pub errors: Counter,
-    /// Objects flushed: PUT, footer read back, `ObjectFlushed` committed.
-    pub flushes: Counter,
-    /// Flush attempts that failed and will be retried.
-    pub flush_failures: Counter,
-    /// Objects whose key held another object and were moved to an object of their own (alert).
-    pub conflicts: Counter,
-    /// Objects with a record that failed its digest on the tier: marked corrupt.
-    pub corrupt: Counter,
-    /// Records the flusher found not to hash to their digests, and dropped instead of
-    /// uploading (alert): the daemon's digests are trusted when an upload is
-    /// acknowledged, and checked here.
-    pub digest_mismatch: Counter,
-    /// Blobs read from the tier's disk (a block or a flushed copy).
-    pub local_reads: Counter,
-    /// Objects staged on the tier and not flushed, as a flusher round found them at its start.
-    pub staged_objects: Level,
-    /// The committed bytes of those objects.
-    pub staged_bytes: Level,
-}
-
-impl TierCounters {
-    /// Counts a segment the tier did not take, by why.
-    pub(crate) fn direct(&self, error: &kbf_tier::TierError) {
-        match error {
-            kbf_tier::TierError::Full { .. } => self.full.add(1),
-            _ => self.errors.add(1),
-        }
-    }
-
-    /// Appends the tier's families to `out`: these counters, then `usage` and
-    /// `unflushed` as gauges.
-    pub fn render(&self, out: &mut String, usage: kbf_tier::Usage, unflushed: kbf_tier::Unflushed) {
-        let mut f = Families(std::mem::take(out));
-        let counters = [
-            (
-                "kbf_write_tier_staged_total",
-                "Segments staged on the write tier: synced, then committed",
-                self.staged.get(),
-            ),
-            (
-                "kbf_write_tier_full_total",
-                "Segments written to the store because the write tier was at its budget",
-                self.full.get(),
-            ),
-            (
-                "kbf_write_tier_errors_total",
-                "Segments written to the store because the write tier's disk failed",
-                self.errors.get(),
-            ),
-            (
-                "kbf_write_tier_flushes_total",
-                "Staged objects flushed to the store",
-                self.flushes.get(),
-            ),
-            (
-                "kbf_write_tier_flush_failures_total",
-                "Flush attempts that failed and are retried after a wait",
-                self.flush_failures.get(),
-            ),
-            (
-                "kbf_write_tier_flush_conflicts_total",
-                "Staged objects whose key in the store held another object (alert)",
-                self.conflicts.get(),
-            ),
-            (
-                "kbf_write_tier_corrupt_total",
-                "Staged objects with a record that failed its digest on the tier's disk",
-                self.corrupt.get(),
-            ),
-            (
-                "kbf_tier_flush_digest_mismatch_total",
-                "Records the flusher dropped because they did not hash to their digest (alert)",
-                self.digest_mismatch.get(),
-            ),
-            (
-                "kbf_write_tier_local_reads_total",
-                "Blobs read from the write tier's disk",
-                self.local_reads.get(),
-            ),
-            (
-                "kbf_write_tier_evicted_total",
-                "Flushed copies evicted since the start",
-                usage.evicted,
-            ),
-        ];
-        for (name, help, value) in counters {
-            f.counter(name, help, value);
-        }
-        let gauges = [
-            (
-                "kbf_write_tier_budget_bytes",
-                "The write tier's budget",
-                usage.budget,
-            ),
-            (
-                "kbf_write_tier_used_bytes",
-                "Bytes counted against the budget: blocks not yet flushed, open uploads' reservations included",
-                usage.used,
-            ),
-            (
-                "kbf_write_tier_flushed_copy_bytes",
-                "Bytes of flushed copies kept on the tier for local reads",
-                usage.flushed,
-            ),
-            (
-                "kbf_write_tier_staged_objects",
-                "Objects staged on the write tier and not flushed, at the start of the last flusher round",
-                self.staged_objects.get(),
-            ),
-            (
-                "kbf_write_tier_staged_bytes",
-                "Committed bytes of the staged objects not flushed, at the start of the last flusher round",
-                self.staged_bytes.get(),
-            ),
-            (
-                "kbf_write_tier_unflushed_bytes",
-                "Acknowledged bytes on the write tier not yet in the object store",
-                unflushed.bytes,
-            ),
-            (
-                "kbf_write_tier_unflushed_blocks",
-                "Blocks holding acknowledged bytes not yet in the object store",
-                unflushed.blocks,
-            ),
-        ];
-        for (name, help, value) in gauges {
-            f.gauge(name, help, value);
-        }
-        let oldest = unflushed.oldest.unwrap_or_default().as_secs_f64();
-        let name = "kbf_write_tier_oldest_unflushed_seconds";
-        f.head(
-            name,
-            "gauge",
-            "Age of the oldest block holding acknowledged bytes not yet in the object store",
-        );
-        let _ = writeln!(f.0, "{name} {oldest}");
-        *out = f.0;
     }
 }
 

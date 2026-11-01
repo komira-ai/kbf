@@ -43,6 +43,7 @@ pub mod fetch;
 pub mod kit;
 pub mod layout;
 pub mod release;
+pub(crate) mod retain;
 pub mod stage;
 pub mod status;
 pub mod tools;
@@ -59,7 +60,7 @@ use crate::locks;
 use crate::outcome::{FailureCode, Outcome, QueryReport, Refusal};
 use crate::request::{BadCommand, Channel, Request, Version};
 use crate::runner::{Runner, SystemRunner};
-use channel::MacAllowlist;
+use channel::{ChannelError, MacAllowlist};
 use layout::MacHost;
 use status::ApplyState;
 
@@ -271,7 +272,10 @@ fn install_front(
     let allowlist = MacAllowlist::load(&host.trust, &host.allowlist).map_err(Outcome::Refused)?;
     let channel = allowlist
         .channel(&host.trust, channel)
-        .map_err(Outcome::Refused)?;
+        .map_err(|e| match e {
+            ChannelError::Refused(refusal) => Outcome::Refused(refusal),
+            other => Outcome::RefusedBecause(other.refusal(), other.to_string()),
+        })?;
     if !audit_ok {
         return Err(fail(
             FailureCode::AuditUnavailable,

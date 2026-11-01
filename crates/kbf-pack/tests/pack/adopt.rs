@@ -13,8 +13,8 @@ use kbf_objstore::{KeyError, ObjectStoreError, PageSize};
 use kbf_pack::{
     AdoptConfig, AdoptError, AdoptMode, AdoptReport, Blob, Fetch, ProblemKind, ReaderConfig,
 };
+use kbf_pack_index::{MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError};
 use kbf_segments::{IndexEntry, crc32c, layout, sha256};
-use kbf_state::{MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError};
 
 use crate::adopt_support::{
     config, deny, five, foreign_record, found, go, log_key, make, node_key, problem, put, saving,

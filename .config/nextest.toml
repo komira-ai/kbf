@@ -12,6 +12,7 @@ install-sh-fixture = { max-threads = 1 }
 # name share a directory (crates/kbf-mac-provision/tests/support/mod.rs).
 mac-provision-scratch = { max-threads = 1 }
 
+# Named overrides go before any override that matches more.
 [[profile.default.overrides]]
 filter = 'package(xtask) & binary(install_sh)'
 test-group = 'install-sh-fixture'
@@ -19,6 +20,86 @@ test-group = 'install-sh-fixture'
 [[profile.default.overrides]]
 filter = 'package(kbf-mac-provision)'
 test-group = 'mac-provision-scratch'
+
+# Hang guards. A test holds no timeout or deadline of its own: a test that waits for ever is
+# ended here, by nextest's slow-timeout with terminate-after (the test is killed and fails once
+# period x terminate-after has passed). These overrides are in the default profile, so they apply
+# to every profile, the pull-request one included. For each setting nextest takes the FIRST
+# matching override, so the specific budgets (longer or shorter) come first and the general one last.
+
+# The slowest test of the full run on main, the 5 GiB round trip of kbf-front::large_blobs,
+# takes about 970 seconds on a hosted runner: its binary gets 30 minutes (450 seconds x 4).
+[[profile.default.overrides]]
+filter = 'binary_id(=kbf-front::large_blobs)'
+slow-timeout = { period = "450s", terminate-after = 4 }
+
+# The backfill tests wait on the put's own signal, with no deadline of their own, so a put that
+# never ends hangs the test: nextest kills it after 30 s x 4 (the whole test takes milliseconds).
+[[profile.default.overrides]]
+filter = 'package(kbf-front) & (binary(large_backfill) | test(/^large_backfill::tests::/))'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# A hang guard, not a bound: this test waits for a run that ends once the daemon has
+# killed it; a daemon that loses the kill leaves it waiting for ever.
+[[profile.default.overrides]]
+filter = 'binary_id(=kbf-daemon) & test(=lease::tests::a_cancel_during_the_first_poll_of_the_run_still_ends_it)'
+slow-timeout = { period = "30s", terminate-after = 1 }
+
+# A fetch test that waits for ever (a rendezvous that never gets its requests together, a pooled
+# connection that is never closed) is killed after two minutes and fails, where it would hang the
+# run. The tests hold no timeout of their own. The filter covers the keep-alive tests too, a child
+# module of `fetch::tests`, and the `--locate` flag tests, which open sockets to fake servers.
+[[profile.default.overrides]]
+filter = 'package(kbf-task) & (test(/^fetch::tests::/) | test(/^task::locate_flags_tests::/))'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# The kbf-task PUT tests against a real tierstore front and a raw stub (tests/put_back_pressure.rs)
+# hold no timeout of their own: a client that waits for ever on a socket is killed after two
+# minutes and fails.
+[[profile.default.overrides]]
+filter = 'package(kbf-task) & binary(put_back_pressure)'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# The kbf-daemon cache tests wait on the cache's own counters and gates (tests/support/cache_kit.rs:
+# wait_for_fill_waits, Gates::wait_started, Gates::wait_reached and the holds in Hooks::at),
+# never on a deadline in the test: a cache that never makes two leases meet, a background thread
+# that never reaches its start gate, or a failed test that leaves a hold held would hang, and this
+# guard ends such a test (2 minutes) instead. Applies to every
+# profile, the pull-request one included. Keep it above any catch-all override: the first
+# matching override wins.
+[[profile.default.overrides]]
+filter = 'package(kbf-daemon) & binary(cache)'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# Hang guard for the step runner's tests that wait on a socket peer or a thread: no test asserts
+# how long it takes, and a test that waits for something that never comes is stopped and fails.
+[[profile.default.overrides]]
+filter = 'package(kbf-step-runner)'
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+# The janitor tests wait on the janitor's own counters, never on a deadline in the test: the loop
+# test on its paused clock until the third sweep, the frontend test on `GET /metrics` until the
+# orphans are counted as deleted. A janitor that never sweeps would leave one waiting for ever, and
+# this guard (2 minutes) ends it instead. Above the general budget: the first match wins.
+[[profile.default.overrides]]
+filter = 'package(kbf-server) & test(/^frontend::janitor::tests::/)'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# The history read tests wait on events (a write asked of the object store, a batch applied to
+# the state store) and hold no timeout of their own: a writer that never writes leaves the test
+# waiting for ever, and it is killed after 120 seconds (30 s x 4) and fails. Above the general budget: the first match wins.
+[[profile.default.overrides]]
+filter = 'binary_id(=kbf-server::history_read)'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# The general budget: every other test, of every package, is ended after eight minutes
+# (120 seconds x 4). The slowest of them in the full run on main takes about 240 seconds
+# (kbf-server::frontend, a_frontend_dialing_a_node_with_another_nodes_certificate_is_refused),
+# half the budget. A block for a narrower set of tests (a longer or shorter budget) goes ABOVE
+# this one, because the first match wins: a later block for the same tests would never apply.
+[[profile.default.overrides]]
+filter = 'all()'
+slow-timeout = { period = "120s", terminate-after = 4 }
 
 # The pull-request profile (`cargo nextest run --profile pr`, and `cargo llvm-cov nextest
 # --profile pr`): the fast gate. A pull request runs every test except the slow ones named
@@ -69,11 +150,6 @@ not (
   | (binary_id(=kbf-integration-test::planned_restart) & test(=a_loaded_node_restarts_planned_down_and_loses_no_action))
   | (binary_id(=kbf-integration-test::repo_lints) & test(=every_interpreter_file_workflow_script_and_shell_spawn_is_in_the_budget))
   | (binary_id(=kbf-raft::sim) & (test(=a_crash_at_every_boundary_recovers) | test(=raft_is_safe_and_live_over_seeds)))
-  | (binary_id(=kbf-sched::f3_fleet) & test(=f3_swarm))
-  | (binary_id(=kbf-sched::f4_fleet) & (test(=f4_1_steady_state) | test(=f4_2_churn) | test(=f4_3_mass_reconnect) | test(=f4_4_operator_storm)))
-  | (binary_id(=kbf-sched::sim_cordon) & test(=cordon_and_drain_hold_over_seeds))
-  | (binary_id(=kbf-sched::sim_f2_failures) & test(=f2_13_leases_of_other_terms_are_never_cancelled))
-  | (binary_id(=kbf-sched::sim_whole_machine) & test(=whole_machine_leases_are_not_starved_by_a_stream_of_actions))
   | (binary_id(=kbf-server::restart) & (test(=a_lease_under_the_raft_log_carries_the_raft_term) | test(=a_restart_over_the_raft_log_does_not_answer_the_old_operation_names) | test(=a_restart_over_the_raft_log_refuses_the_old_process_s_results)))
   | (binary_id(=kbf-server::worker_blobs) & test(=concurrent_writes_on_the_worker_listener_all_finish_under_the_bound))
   | (binary_id(=kbf-server::write_admission) & (test(=concurrent_writes_stay_under_the_bytes_in_flight) | test(=more_waiting_writes_than_a_fixed_window_holds_all_finish)))
@@ -89,3 +165,9 @@ not (
 # Kept as an artifact of the full run so the slow list above can be regenerated from it.
 [profile.default.junit]
 path = "junit.xml"
+
+# The registration client waits for the updater's answer with a deadline it is given: a test that
+# waits for ever on a peer that never answers is stopped after a minute and fails.
+[[profile.default.overrides]]
+filter = 'package(update-register)'
+slow-timeout = { period = "30s", terminate-after = 2 }

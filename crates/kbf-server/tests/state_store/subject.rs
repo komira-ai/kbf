@@ -28,6 +28,7 @@ fn submit_described(farm: &TestFarm) {
         call: None,
         described: described(),
         evidence: Default::default(),
+        max_wall: None,
     })
     .map(drop)
     .expect("submitted");

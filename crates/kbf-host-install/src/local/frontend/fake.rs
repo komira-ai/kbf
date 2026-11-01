@@ -50,8 +50,10 @@ pub(super) struct Inner {
     /// `inspect` fails from this many calls on.
     pub(super) inspect_fails_from: Option<u32>,
     pub(super) inspects: u32,
-    /// A drained container ends after this many looks; never when none.
+    /// A drained container ends after this many looks (one when none).
     pub(super) ends_after: Option<u32>,
+    /// A drained container never ends: it has work that does not finish.
+    pub(super) never_ends: bool,
     pub(super) drain_looks: u32,
     /// Calls that fail: `load`, `set_restart`, `exec`, `stop`, `remove`, `run:<id>`,
     /// `inspect`, `image_id`.
@@ -152,7 +154,7 @@ impl World {
                 inner.sleeps += 1;
                 if inner.container.as_ref().is_some_and(|c| c.draining) {
                     inner.drain_looks += 1;
-                    if inner.ends_after.is_some_and(|n| inner.drain_looks >= n) {
+                    if !inner.never_ends && inner.drain_looks >= inner.ends_after.unwrap_or(1) {
                         inner.container.as_mut().unwrap().running = false;
                     }
                 }
@@ -214,6 +216,7 @@ impl Runtime for World {
             image_id: c.image_id.clone(),
             image_ref: c.image_ref.clone(),
             running: c.running,
+            restart: c.restart.clone(),
         }))
     }
 

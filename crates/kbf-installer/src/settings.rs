@@ -25,7 +25,7 @@ use std::time::Duration;
 use kbf_host::exec::{Entry, Exec, Kind};
 use kbf_host::path::HostPath;
 
-use crate::attest::SourceRef;
+use crate::attest::{Signer, SourceRef};
 use crate::binary::Arch;
 use crate::layout::Layout;
 use crate::refusal::{Refusal, SettingsFault, TrustFault};
@@ -50,6 +50,10 @@ pub struct Settings {
     pub arch: Arch,
     /// How long each tool may take.
     pub timeout: Duration,
+    /// The repositories and workflows an attestation may name, tried in order. Not a
+    /// setting of `installer.conf`: the default is kbf's, and only a release channel of
+    /// the host-install allowlist replaces it.
+    pub signers: Vec<Signer>,
 }
 
 impl Settings {
@@ -60,6 +64,7 @@ impl Settings {
             run_as: nobody(host.platform()),
             arch: Arch::current(),
             timeout: TOOL_TIMEOUT,
+            signers: vec![Signer::current(), Signer::former()],
         }
     }
 

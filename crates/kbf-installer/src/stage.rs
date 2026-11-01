@@ -257,7 +257,7 @@ pub fn supported() -> Supported {
     Supported {
         protocol: 1,
         min_protocol: 1,
-        state_schema: u64::from(kbf_state::postgres::schema::latest()),
+        state_schema: u64::from(kbf_pack_index::schema::latest()),
     }
 }
 
@@ -417,6 +417,12 @@ impl Verifier for Pipeline<'_> {
 
         let names: Vec<String> = order.components.iter().map(|c| c.name.clone()).collect();
         let already_installed = self.install(fetched.partial, order.commit, &names)?;
+        // The version text is for the listing of kept releases only: a file that cannot be
+        // written loses the text, not the release.
+        let _ = crate::retain::Retained::update(&crate::retain::path(self.host), |r| {
+            r.versions
+                .insert(order.commit.clone(), version.version.clone());
+        });
         Ok(Staged {
             commit: order.commit.clone(),
             components: names,

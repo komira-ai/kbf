@@ -10,9 +10,12 @@
 use kbf_types::Resources;
 
 use super::*;
-use crate::fleet::{NodeDetail, NodeView, PhaseView, PlacementView, ResourcesView};
+use crate::farm::cordon_owner;
+use crate::fleet::{
+    NodeDetail, NodeView, Owner, PhaseView, PlacementView, ResourcesView, shown_deadline,
+};
 
-impl State {
+impl Engine {
     /// Whether another frontend of the store holds `worker`: this frontend does not, and the
     /// store has its `owner/` row. A farm with no state store, or one that handed its work
     /// over, holds every node it hears from. `None` when the store cannot be read: that is
@@ -27,6 +30,24 @@ impl State {
             Ok(())
         });
         held
+    }
+
+    /// `detail` of `worker` with the owner of its cordon, if it is out of placement: the
+    /// operator's when the store has no `cordon-owner/` row for it, has a malformed one, or
+    /// cannot be read (a farm with no store has none).
+    pub(in crate::farm) fn with_cordon_owner(
+        &self,
+        detail: NodeDetail,
+        worker: &WorkerId,
+    ) -> NodeDetail {
+        cordon_owner::with_owner(detail, || {
+            let mut owner = Owner::Operator;
+            self.durably("a cordon owner look", |d| {
+                owner = cordon_owner::read(&*d.store, worker)?;
+                Ok(())
+            });
+            owner
+        })
     }
 
     /// `worker`, which another frontend holds, as the state store has it, placed as `cordon`
@@ -54,7 +75,7 @@ impl State {
             Some(StoredCordon::Cordoned) => PlacementView::Cordoned,
             Some(StoredCordon::Draining { .. }) if leases.is_empty() => PlacementView::Drained,
             Some(StoredCordon::Draining { deadline_unix_ms }) => PlacementView::Draining {
-                deadline_unix_ms,
+                deadline_unix_ms: shown_deadline(deadline_unix_ms),
                 leases: leases.clone(),
             },
         };
@@ -75,6 +96,9 @@ impl State {
             capacity: none,
             free: none,
             leases,
+            load: None,
+            input_cache: None,
+            owner: None,
         })
     }
 }

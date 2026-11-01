@@ -97,9 +97,14 @@ fn daemon_account(profile: &Profile) -> (&str, u32) {
     }
 }
 
+/// `ExitTimeOut`, the seconds launchd gives the daemon between SIGTERM and SIGKILL. The
+/// daemon drains on SIGTERM until every lease has ended and launchd has no "infinity", so
+/// this is the largest value its 32-bit integer holds (about 68 years).
+const EXIT_TIME_OUT: u32 = i32::MAX as u32;
+
 /// The property list: the job runs as the role account (no `UserName` or `GroupName`
 /// for `daemon_user=root`: launchd runs it as root), `Interactive` (not throttled),
-/// kept alive, with 30 s to exit, its stderr in [`ERR_LOG`] and 65536 open files. No
+/// kept alive, with no practical limit to exit in (a drain waits for its leases), its stderr in [`ERR_LOG`] and 65536 open files. No
 /// value needs XML escaping: the profile's values hold none of `<`, `>`, `&`.
 pub fn render_plist(profile: &Profile) -> String {
     let mut out = String::from(concat!(
@@ -125,7 +130,9 @@ pub fn render_plist(profile: &Profile) -> String {
     }
     out.push_str("\t<key>RunAtLoad</key>\n\t<true/>\n\t<key>KeepAlive</key>\n\t<true/>\n");
     out.push_str("\t<key>ThrottleInterval</key>\n\t<integer>10</integer>\n");
-    out.push_str("\t<key>ExitTimeOut</key>\n\t<integer>30</integer>\n");
+    out.push_str(&format!(
+        "\t<key>ExitTimeOut</key>\n\t<integer>{EXIT_TIME_OUT}</integer>\n"
+    ));
     out.push_str("\t<key>ProcessType</key>\n\t<string>Interactive</string>\n");
     out.push_str(&format!(
         "\t<key>StandardErrorPath</key>\n\t<string>{ERR_LOG}</string>\n"

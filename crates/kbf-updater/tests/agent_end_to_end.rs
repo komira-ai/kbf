@@ -44,7 +44,7 @@ fn a_daemon_host_updates_with_its_certificate_alone_and_no_token() {
 fn an_update_by(way: Way) {
     let dir = TestDir::under(std::env::temp_dir(), "agent-e2e");
     let pki = Pki::new();
-    let leaf = pki.updater("n1", HostRole::Daemon);
+    let leaf = pki.updater("n1", HostRole::DAEMON);
     pki.write_updater_files(&dir, &leaf);
     let token = dir.join("operator-token");
     if way == Way::Token {
@@ -224,9 +224,22 @@ fn an_update_by(way: Way) {
     for beat in beats.iter() {
         let mut keys: Vec<_> = beat.as_object().unwrap().keys().cloned().collect();
         keys.sort();
+        // `agent_features` is the one new key a kbf-only host sends: it announces what it can
+        // do with a coordinator's answer, and an old coordinator ignores it.
         assert_eq!(
             keys,
-            ["health", "last_update", "platform", "updating", "version"]
+            [
+                "agent_features",
+                "health",
+                "last_update",
+                "platform",
+                "updating",
+                "version"
+            ]
+        );
+        assert_eq!(
+            beat["agent_features"],
+            serde_json::json!(["deferred-v1", "halt-v1"])
         );
         for forbidden in ["n1", "daemon", "node", "role"] {
             assert!(!beat.to_string().contains(forbidden), "{forbidden}: {beat}");

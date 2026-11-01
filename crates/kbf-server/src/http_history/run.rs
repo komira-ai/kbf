@@ -24,7 +24,7 @@ use serde_json::{Map, Value, json};
 
 use super::logs;
 use super::{Durable, Presence};
-use crate::history::run_record;
+use crate::history::{name_build, run_record};
 use crate::http_blobs::{ReadBudget, error, refusal};
 use crate::http_invocations::{InvocationReaders, blob_href, json, pages_off, rfc3339};
 
@@ -180,6 +180,7 @@ pub(super) fn live(state: &RunState, id: RunId) -> Option<RunRecord> {
             .find(|a| a.run_id == Some(bytes))
             .map(|a| {
                 let mut record = run_record(row, a);
+                name_build(&mut record, inv.key(), inv.correlated_invocations_id());
                 record.set_run_id(id);
                 record
             });
@@ -360,6 +361,9 @@ pub(crate) fn render(r: &RunRecord) -> Value {
             put(key, bytes.into());
         }
     }
+    if let Some(cpu) = r.booked_millicpus {
+        put("booked_millicpus", cpu.into());
+    }
     if r.farm_budget != 0 {
         put("farm_runs", r.farm_runs.into());
         put("farm_budget", r.farm_budget.into());
@@ -374,6 +378,14 @@ pub(crate) fn render(r: &RunRecord) -> Value {
     }
     if let Some(operation) = r.operation_id {
         put("operation_id", operation.into());
+    }
+    for (key, id) in [
+        ("invocation_id", &r.invocation_id),
+        ("correlated_invocations_id", &r.correlated_invocations_id),
+    ] {
+        if let Some(id) = id {
+            put(key, id.clone().into());
+        }
     }
     for (key, source) in [
         ("cpu_source", r.cpu_source()),
@@ -394,6 +406,7 @@ pub(crate) fn render(r: &RunRecord) -> Value {
         }
     }
     put("reapi_times", reapi_times(&t));
+    put("phase_times", r.phase_times().name().into());
     if let Some(c) = &r.cgroup {
         put("usage", usage(c));
     }

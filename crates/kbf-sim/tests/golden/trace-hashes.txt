@@ -1,0 +1,17 @@
+# Golden trace hashes: the SHA-256 of the full trace of each seeded simulation run.
+#
+# Do not edit by hand. A change to any hash means a simulation now makes a different
+# decision or writes its trace differently. Regenerate them only on purpose, with the
+# command the failing test prints, and justify each changed line in the pull request.
+# A change that only moves code must leave every hash as it is.
+format 1
+counter/acked-lossy-partitioned/seed-0 dcb45c10542de5011b5975a3381c449e0c0f055f09e5425dab89760426c3715a
+counter/acked-lossy-partitioned/seed-1 1e0a90606685839397d0350dda49be99560ca864428bfb8bb1ff193ad7b24101
+counter/acked-lossy-partitioned/seed-2 f2f0870960d5c0517879d31b15bcc3c0dbc1a2f59487c47526ee979b3539eaef
+counter/fire-and-forget-partitioned/seed-0 748998962bd14beb77b2fce6b93b0511810457e73b24985a519e62cc5133b601
+counter/fire-and-forget-partitioned/seed-1 388bdc133f6a8b6e935493445f8e02a0790477a0fd5f7cf6978b4a14828d4cf0
+counter/fire-and-forget-partitioned/seed-2 2ce6b0f374341d3e81dd716e367e9817b566ed15e8cf56be11745bfca8c5870f
+gossip/seed-0 44d241a16a77c776e92b11bb3809e2fba655ba63bd7adc0e696afb37b795e189
+gossip/seed-1 ae67f8fdc01f5f797e8c9d69bd810ff9d27921a7dc28c61124e8113d4ca1125e
+gossip/seed-2 4a80f0b33c3995690c84ed754b458a85481ac739512b55144dcd5fc37bf4d044
+gossip/seed-3 3e0670d63e274bf388581c832e6d0833fc03e3aaefa9c9b1bae47a589c705098

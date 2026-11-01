@@ -102,7 +102,7 @@ fn a_mac_host_goes_drain_install_poll_health_undrain() {
         [
             "query",
             "check",
-            "drain 600",
+            "drain none",
             "leases",
             "install 2.0",
             "query",
@@ -235,7 +235,7 @@ fn an_older_version_goes_through_the_same_path() {
         [
             "query",
             "check",
-            "drain 600",
+            "drain none",
             "leases",
             "install 1.0",
             "query",
@@ -401,7 +401,7 @@ fn mac_and_linux_hosts_of_one_inventory_do_not_interfere() {
         [
             "query",
             "check",
-            "drain 600",
+            "drain none",
             "leases",
             "install 2.0",
             "health",
@@ -414,7 +414,7 @@ fn mac_and_linux_hosts_of_one_inventory_do_not_interfere() {
         [
             "query",
             "check",
-            "drain 600",
+            "drain none",
             "leases",
             "install 2.0",
             "query",
@@ -454,7 +454,7 @@ fn a_synchronous_answer_from_a_mac_host_is_an_error() {
     );
     assert_eq!(
         words(&rig, "mac"),
-        ["query", "check", "drain 600", "leases", "install 2.0"]
+        ["query", "check", "drain none", "leases", "install 2.0"]
     );
 }
 
@@ -508,7 +508,7 @@ fn a_mac_that_already_runs_the_target_is_not_polled() {
         [
             "query",
             "check",
-            "drain 600",
+            "drain none",
             "leases",
             "install 2.0",
             "health",

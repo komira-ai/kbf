@@ -12,17 +12,18 @@ use bytes::Bytes;
 use kbf_front::{PackSettings, Packs};
 use kbf_objstore::{Capabilities, MemoryStore, ObjectKey, ObjectStore as _};
 use kbf_pack::{PackKeys, WriterKind};
+use kbf_pack_index::memory::MemoryPackIndex;
+use kbf_pack_index::{
+    BlobDigest, Location, MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo,
+    Recorded,
+};
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::pack_index_server::PackIndex as _;
 use kbf_proto::worker::{CommitPackRequest, PackLocateRequest, PackLocation, PackedBlob};
 use kbf_server::Peers;
 use kbf_server::pack_locate::{PackCommits, PackLocateService, commit_served, service};
 use kbf_server::proxy_auth::{Identity, Trust};
-use kbf_state::pack_index::memory::MemoryPackIndex;
-use kbf_state::{
-    BlobDigest, Location, MAX_BATCH, ManualClock, NewPack, PackBlob, PackIndex, PackIndexError,
-    PackInfo, Recorded,
-};
+use kbf_state::ManualClock;
 use kbf_storage::service::PeerRole;
 use tonic::{Code, Request};
 

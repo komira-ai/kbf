@@ -398,7 +398,7 @@ fn setup_creates_the_schema_over_a_real_server() {
         apply: false,
         no_start: true,
     });
-    let latest = kbf_state::postgres::schema::latest();
+    let latest = kbf_pack_index::schema::latest();
     let would = format!("dry run: would create the schema at version {latest}");
     assert!(dry.contains(&would), "{dry}");
     let none = client

@@ -484,6 +484,20 @@ fn a_helper_with_its_own_file_is_bound_to_the_container_it_names() {
         "--frontend-config",
         &dir.join("nope.toml").display().to_string(),
     ]);
+    // A file older programs accepted (drain_secs = 0) still lets the program start and name its
+    // container; the switch is what refuses it.
+    let zero = dir.join("fe-zero.toml");
+    fs::write(
+        &zero,
+        "[frontend]\nname = \"kbf-fe-z\"\nrestart = \"always\"\napi = \"127.0.0.1:28983\"\ndrain_token_file = \"/t\"\ndrain_secs = 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&zero, fs::Permissions::from_mode(0o644)).unwrap();
+    let zeroed = flags(&["--frontend-config", &zero.display().to_string()]);
+    assert_eq!(
+        bound_container(&t, &zeroed),
+        Ok(Some("kbf-fe-z".to_owned()))
+    );
     assert!(
         bound_container(&t, &missing)
             .unwrap_err()
@@ -494,4 +508,64 @@ fn a_helper_with_its_own_file_is_bound_to_the_container_it_names() {
         let err = serve_linux(&missing).unwrap_err();
         assert!(err.contains("nope.toml"), "{err}");
     }
+}
+
+/// Catches a served socket that prunes with another count than `--keep-releases` names: the
+/// confirm a client sends through the socket asks the backend to keep exactly that many.
+#[test]
+fn the_served_confirm_prunes_with_the_count_of_the_flag() {
+    let fx = Fx::new("pr-serve-keep");
+    fx.world.borrow_mut().retain_file = Some(fx.dir.join("retain.json"));
+    // A release on trial, through the same state file the served socket reads.
+    fx.install(super::core_tests::VB);
+    fx.ask(&format!("switch kbf={}", super::core_tests::VB));
+    // The served loop's tick reads the real clock: a trial with no deadline is not reverted.
+    if let Some(pending) = fx.world.borrow_mut().pending.as_mut() {
+        pending.deadline_unix = None;
+    }
+    let run = fx.dir.join("run");
+    fs::create_dir(&run).unwrap();
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = run.join("host.sock");
+    let meta = fs::metadata(&*fx.dir).unwrap();
+    let trust = trust(&fx.dir);
+    let audit = fx.dir.join("audit.log");
+    let place = Place {
+        state_dir: &fx.dir,
+        state_name: "state.json",
+        trust: &trust,
+        ids: (meta.uid(), meta.gid()),
+        audit: &audit,
+    };
+    let backend = Fake {
+        world: Rc::clone(&fx.world),
+        lock: fx.dir.join("lock2"),
+    };
+    let mut config = config(&socket, "u");
+    config.keep_releases = 3;
+    let stop = Arc::new(AtomicBool::new(false));
+    let line = format!("confirm kbf={}\n", super::core_tests::VB);
+    let (asked, halt) = (socket.clone(), Arc::clone(&stop));
+    let client = std::thread::spawn(move || {
+        let mut stream = loop {
+            match UnixStream::connect(&asked) {
+                Ok(stream) => break stream,
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        };
+        stream.write_all(line.as_bytes()).unwrap();
+        let mut text = String::new();
+        stream.read_to_string(&mut text).unwrap();
+        halt.store(true, Ordering::Relaxed);
+        text
+    });
+    serve_with(&config, backend, &place, &stop).unwrap();
+    let answer: Value = serde_json::from_str(&client.join().unwrap()).unwrap();
+    assert_eq!(answer["result"], "confirmed", "{answer}");
+    let prunes: Vec<String> = fx
+        .calls()
+        .into_iter()
+        .filter(|call| call.starts_with("prune"))
+        .collect();
+    assert_eq!(prunes, ["prune 3"]);
 }

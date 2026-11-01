@@ -1,0 +1,30 @@
+# The real-`crun` container driver tests (beta.yml's crun-x86 job: `cargo xtask crun-tests`)
+# on a branch, before it merges. beta.yml runs only after a push to main. A push to a branch
+# named `crun-try/<name>` runs them here, or run this workflow by hand on a branch
+# (`gh workflow run crun-branch.yml --ref <branch>`). A pull request does not run it: a
+# pull request runs the fast gate of ci.yml only.
+name: crun-branch
+
+on:
+  push:
+    branches: ["crun-try/**"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: crun-branch-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  crun-x86:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo xtask crun-tests

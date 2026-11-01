@@ -22,6 +22,8 @@ clap.workspace = true
 crc32fast.workspace = true
 futures.workspace = true
 hex.workspace = true
+# The per-minute binner of each lease's usage (`lease_minutes`); std only.
+js-agent-usage.workspace = true
 kbf-caps.workspace = true
 kbf-map.workspace = true
 kbf-mapsync.workspace = true
@@ -32,6 +34,7 @@ kbf-pack.workspace = true
 kbf-proto.workspace = true
 kbf-route.workspace = true
 # `PackIndex`, which `RemoteIndex` is for the pack reader, and `BlobDigest` (`packed`).
+kbf-pack-index.workspace = true
 kbf-state.workspace = true
 # The node's one cache (`kbf_storage::local_cache`), which the input cache shares with
 # local storage on a node that runs both.
@@ -60,6 +63,7 @@ kbf-meta.workspace = true
 kbf-segments.workspace = true
 kbf-server.workspace = true
 # The in-memory pack index the pack-read tests record packs in.
+kbf-pack-index = { workspace = true, features = ["test-support"] }
 kbf-state = { workspace = true, features = ["test-support"] }
 kbf-store.workspace = true
 # The program the tests' actions run, kbf-testkit's act verbs, through the test binary.

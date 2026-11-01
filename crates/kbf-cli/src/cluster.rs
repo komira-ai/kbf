@@ -6,7 +6,8 @@
 //!   `--frontend`: `GET /v1/frontend/drain` instead, `{draining, phase, open_executions,
 //!   queued_operations}`.
 //! - `kbf cluster drain <node> [--deadline-secs N]`: `POST /v1/nodes/<node>:drain`, the
-//!   node takes no new lease and its leases run on. `kbf cluster drain --frontend`:
+//!   node takes no new lease and its leases run on; without `--deadline-secs` (an empty
+//!   body) the drain has no deadline and waits for them however long they take. `kbf cluster drain --frontend`:
 //!   `POST /v1/frontend/drain`, the frontend goes out of `/readyz` at once, refuses new
 //!   Execute calls after `--drain-lb-wait`, and exits once its open executions are done
 //!   (at most `--drain-deadline`).
@@ -95,8 +96,9 @@ pub enum Verb {
         /// are done. Not undone.
         #[arg(long, conflicts_with = "deadline_secs")]
         frontend: bool,
-        /// How long the node's drain waits for its leases (the server's default, 30
-        /// minutes, if not given).
+        /// How long the node's drain waits for its leases, in seconds, with no upper bound.
+        /// Not given: no deadline, the drain waits however long the leases run. When the
+        /// deadline passes the drain pauses; no lease is cut.
         #[arg(long, value_name = "SECS")]
         deadline_secs: Option<u64>,
         /// The file holding the server's operator API token.

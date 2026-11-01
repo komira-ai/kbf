@@ -27,7 +27,7 @@ use xtask::package::Platform;
 
 mod support;
 use kbf_testkit::dir::TestDir;
-use support::{BUSY_WAIT, output_unbusy};
+use support::output_unbusy;
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
@@ -298,8 +298,8 @@ fn run_in(name: &str, files: Release, args: &[&str], extra_path: Option<&Path>, 
 /// does not inherit a descriptor this process has closed.
 fn copy_fake(to: &Path) {
     std::fs::copy(FAKE, to).expect("copy the fake");
-    let out = output_unbusy(Command::new(to).arg0("uname").arg("-s"), BUSY_WAIT)
-        .expect("the copied fake runs");
+    let out =
+        output_unbusy(Command::new(to).arg0("uname").arg("-s")).expect("the copied fake runs");
     assert!(out.status.success(), "the copied fake: {:?}", out.status);
 }
 
@@ -989,8 +989,7 @@ fn the_fake_uname_and_id_answer_only_what_the_script_asks() {
         std::fs::copy(FAKE, dir.join(tool)).expect("fake");
     }
     let ask = |tool: &str, arg: &str| {
-        let out =
-            output_unbusy(Command::new(dir.join(tool)).arg(arg), BUSY_WAIT).expect("run the fake");
+        let out = output_unbusy(Command::new(dir.join(tool)).arg(arg)).expect("run the fake");
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),

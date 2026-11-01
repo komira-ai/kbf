@@ -14,9 +14,10 @@ use kbf_daemon::PackedCas;
 use kbf_daemon::cas::{Cas, CasError, digest_of, label};
 use kbf_objstore::{Capabilities, MemoryStore};
 use kbf_pack::{Blob, PackKeys, Packer, PackerConfig, Reader, ReaderConfig, WriterKind};
+use kbf_pack_index::memory::MemoryPackIndex;
+use kbf_pack_index::{BlobDigest, PackIndex};
 use kbf_proto::reapi::Digest;
-use kbf_state::pack_index::memory::MemoryPackIndex;
-use kbf_state::{BlobDigest, ManualClock, PackIndex};
+use kbf_state::ManualClock;
 use kbf_types::LeaseId;
 
 /// How a fake plane keeps what it is given: the packs of an object store and an index.

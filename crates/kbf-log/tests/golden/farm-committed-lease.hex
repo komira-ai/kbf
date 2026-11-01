@@ -1,0 +1,5 @@
+# Log entry `farm-committed-lease`: the bytes of one entry of the replicated log, in format 1.
+# Pins: this value decodes from these bytes under every format, and encodes to them.
+# A change to this file needs a reason in the pull request that makes it, and the
+# file is never rewritten to match a new encoding: see tests/golden_corpus.rs.
+1a15080110021a0f2a0d0a0b0a040801100210031a0177

@@ -1,0 +1,62 @@
+[package]
+name = "kbf-task"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kbf-task"
+path = "src/main.rs"
+
+# Helpers for the tests (tests/network.rs), under tests/ like the other crates' helper bins, which
+# the coverage report leaves out; the release builds `--bin kbf-task` only.
+[[bin]]
+name = "socket_probe"
+path = "tests/bin/socket_probe.rs"
+test = false
+
+[[bin]]
+name = "run_under"
+path = "tests/bin/run_under.rs"
+test = false
+
+[dependencies]
+clap.workspace = true
+hex.workspace = true
+kbf-outputs.workspace = true
+kbf-proto.workspace = true
+kbf-seatbelt.workspace = true
+kbf-segments.workspace = true
+kbf-task-pack.workspace = true
+kbf-types.workspace = true
+libc.workspace = true
+prost.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+tokio = { workspace = true, features = ["rt", "fs", "process", "time", "io-util"] }
+
+[dev-dependencies]
+kbf-testkit.workspace = true
+prost-types.workspace = true
+# `tests/put_back_pressure.rs`: the real PUT client against a real tierstore front whose put
+# slots are all taken. A dev-dependency only: no build of the tool has it.
+tierstore = { workspace = true, features = ["server"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync"] }
+
+[features]
+# TEST ONLY. Where no confine is built (a system that is neither Linux nor macOS) a Command denied the
+# network is refused; with this feature it runs with the network and a line says so, so a developer's
+# machine can run the suite (`cargo test -p kbf-task --features unconfined-for-tests`). Off by default; no
+# release build may turn it on: `src/lib.rs` refuses such a build with it and without debug assertions, and
+# the repository lint (`no_darwin_task`) refuses a workflow that names it. No effect on Linux or macOS.
+unconfined-for-tests = []
+
+[lints]
+workspace = true

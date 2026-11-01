@@ -85,9 +85,10 @@ fn unavailable(status: Status) -> StorageError {
 mod tests {
     use kbf_objstore::{Capabilities, MemoryStore};
     use kbf_pack::{PackKeys, WriterKind};
+    use kbf_pack_index::PackIndex;
+    use kbf_pack_index::memory::MemoryPackIndex;
     use kbf_proto::reapi::{OutputDirectory, OutputFile};
-    use kbf_state::pack_index::memory::MemoryPackIndex;
-    use kbf_state::{ManualClock, PackIndex};
+    use kbf_state::ManualClock;
     use tonic::transport::Endpoint;
 
     use super::*;

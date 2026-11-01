@@ -465,6 +465,19 @@ fn only_one_copy_is_kept_and_gc_takes_it_with_its_release() {
     .expect("link");
     save(&rig.layout, &c(C), &c(A)).expect("save in C");
     assert!(rig.backup(C).exists());
+    // `gc` keeps the two newest others; two newer releases push C out of them.
+    for newer in ["1", "2"] {
+        let dir = rig
+            .exec
+            .root
+            .join("var/lib/kbf-installer/releases")
+            .join(newer.repeat(40));
+        fs::create_dir_all(&dir).expect("newer release");
+        fs::File::open(&dir)
+            .expect("open")
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000))
+            .expect("mtime");
+    }
     crate::release::gc(
         &mut rig.exec,
         &rig.layout,

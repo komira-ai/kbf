@@ -11,6 +11,13 @@ publish.workspace = true
 # (docs/design/cluster.md, sections 1 and 5.1). Like kbf-storage-and-daemon it links both the
 # server and the node library (the version stamp is kbf-server's), so it is listed in
 # `JOINERS` in crates/kbf-integration-test/tests/layering.rs.
+[features]
+# kbf-server's test-only feature of the same name (`SchedulerCore::under_test()` names the js
+# core), reachable from `-p kbf-cli --features farm-core-js`. It does not change what the `kbf`
+# binary can run: both scheduler cores are in every build (`--scheduler-core`). No default
+# feature set turns it on.
+farm-core-js = ["kbf-server/farm-core-js"]
+
 [[bin]]
 name = "kbf"
 path = "src/main.rs"
@@ -57,12 +64,17 @@ tracing.workspace = true
 # a start that enrolls reads.
 rustix = { workspace = true, features = ["process", "system"] }
 # The Postgres state schema version, which `kbf --version --json` reports.
+# `schema::embedded` and `latest`: the migrations a release runs (the state store's and the pack index's).
+kbf-pack-index = { workspace = true, features = ["postgres"] }
 kbf-state = { workspace = true, features = ["postgres"] }
 # `kbf setup` (src/setup.rs): the first configuration of a host from the packages. Without the
 # library's `proxy` feature, so this binary links no kbf-proxy: an installer.toml with a
 # `[proxy]` table is `kbf-installer setup`'s to keep (tests/layering.rs in kbf-integration-test
 # checks the tree).
 kbf-setup.workspace = true
+# `kbf update-hook <step>` (src/lib.rs): the hook the generic updater runs for the kbf service,
+# today's update of a host split at the five steps of the hook contract.
+kbf-updater.workspace = true
 # The identity `kbf --version --json` prints (src/version.rs), and the bodies of
 # `kbf cluster` (src/cluster.rs).
 serde_json.workspace = true

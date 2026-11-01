@@ -2,12 +2,14 @@
 //! caller keeps holding `Arc<dyn Storage>` whether the cache is in its process or not.
 //! This is the storage client the frontend (and, over a map, the daemon) uses.
 
+use std::collections::VecDeque;
 use std::iter;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
-use futures::{StreamExt as _, TryStreamExt as _, stream};
+use futures::future::BoxFuture;
+use futures::{FutureExt as _, Stream, StreamExt as _, TryStreamExt as _, stream};
 use kbf_meta::{ActionRecord, ActionWriteError, Closure, Role};
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::google::bytestream::{ReadRequest, WriteRequest};
@@ -33,7 +35,9 @@ use super::{
     DURABLE_HEADER, DURABLE_ONLY, DURABLE_WAIT, MAP_GENERATION_HEADER, MAX_MESSAGE_BYTES,
     UNOWNED_HEADER, wire,
 };
-use crate::{ActionEntry, Answer, PutStream, ReadStream, Storage, StorageError, in_flight};
+use crate::{
+    ActionEntry, Answer, PieceStream, PutStream, ReadStream, Storage, StorageError, in_flight,
+};
 
 /// The largest message of a `Write`'s data.
 const WRITE_CHUNK_BYTES: usize = 1 << 20;
@@ -174,7 +178,7 @@ pub(crate) fn lift(status: &Status, at: Option<(Digest, u64)>) -> StorageError {
 /// The generation a node named when it answered `STALE_MAP`: FAILED_PRECONDITION with the
 /// generation in the [`MAP_GENERATION_HEADER`] entry. FAILED_PRECONDITION alone is also a
 /// refused action-cache write, so the entry is what says it.
-fn stale_generation(status: &Status) -> Option<u64> {
+pub fn stale_generation(status: &Status) -> Option<u64> {
     if status.code() != Code::FailedPrecondition {
         return None;
     }
@@ -221,6 +225,66 @@ pub(super) fn write_messages(
             write_offset: start as i64,
             finish_write: i + 1 == count,
             data: bytes[start..bytes.len().min(start + WRITE_CHUNK_BYTES)].to_vec(),
+        }
+    })
+}
+
+/// The messages of a `Write` of `size` bytes to the resource `name`, taken from `body` as they are
+/// sent: each piece is cut into messages of at most 1 MiB, and the message that completes `size`
+/// bytes has `finish_write`. A body that fails ends the messages without `finish_write`, so the
+/// node stores nothing, and leaves its error in `failed`.
+fn streamed_messages(
+    name: String,
+    size: u64,
+    body: PieceStream,
+    failed: Arc<Mutex<Option<std::io::Error>>>,
+) -> impl Stream<Item = WriteRequest> + Send + 'static {
+    struct Sending {
+        body: PieceStream,
+        queue: VecDeque<Bytes>,
+        name: Option<String>,
+        offset: u64,
+        failed: Arc<Mutex<Option<std::io::Error>>>,
+    }
+    let sending = Sending {
+        body,
+        queue: VecDeque::new(),
+        name: Some(name),
+        offset: 0,
+        failed,
+    };
+    stream::unfold(sending, move |mut sending| async move {
+        loop {
+            if let Some(chunk) = sending.queue.pop_front() {
+                let at = sending.offset;
+                sending.offset += chunk.len() as u64;
+                let request = WriteRequest {
+                    resource_name: sending.name.take().unwrap_or_default(),
+                    write_offset: at as i64,
+                    finish_write: sending.offset == size,
+                    data: chunk.to_vec(),
+                };
+                return Some((request, sending));
+            }
+            match sending.body.next().await {
+                Some(Ok(piece)) => {
+                    let chunks = piece.len().div_ceil(WRITE_CHUNK_BYTES);
+                    for i in 0..chunks {
+                        let start = i * WRITE_CHUNK_BYTES;
+                        let end = piece.len().min(start + WRITE_CHUNK_BYTES);
+                        sending.queue.push_back(piece.slice(start..end));
+                    }
+                }
+                Some(Err(error)) => {
+                    let mut failed = sending
+                        .failed
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    *failed = Some(error);
+                    return None;
+                }
+                None => return None,
+            }
         }
     })
 }
@@ -360,6 +424,64 @@ impl Storage for RemoteStorage {
     /// Always `None`: a streamed write over the wire is [`Storage::put`]'s messages.
     fn stream(&self, _size: u64) -> Option<Box<dyn PutStream>> {
         None
+    }
+
+    /// A blob of `size` bytes sent as `Write` messages of at most 1 MiB taken from `bytes` as they
+    /// are sent, so this process never holds it whole. ByteStream names the digest in the
+    /// resource name, before the first byte, so `claim` must be ready when this is called (a claim
+    /// that is only known once the bytes ended is [`StorageError::Invalid`]); a claim of `None`
+    /// is a withdrawn blob, and nothing is sent. The node checks that the bytes hash to the
+    /// digest and stores nothing if they do not (that refusal is [`StorageError::Invalid`]).
+    ///
+    /// # Errors
+    /// [`StorageError::Invalid`] for a claim that is not ready, a size that is not the claimed
+    /// digest's or 0 (an empty blob is [`Storage::put`]'s), or the node's refusal;
+    /// [`StorageError::Unavailable`] for a body that failed, and for a node that could not be
+    /// reached.
+    fn put_streamed(
+        &self,
+        size: u64,
+        bytes: PieceStream,
+        claim: BoxFuture<'static, Option<Digest>>,
+    ) -> Answer<'_, Option<Digest>> {
+        Box::pin(async move {
+            let Some(claimed) = claim.now_or_never() else {
+                let message = "a remote streamed put needs the digest before the first byte";
+                return Err(StorageError::Invalid(message.to_owned()));
+            };
+            let Some(digest) = claimed else {
+                return Ok(None);
+            };
+            if size == 0 {
+                let message = "an empty blob is not sent as a stream";
+                return Err(StorageError::Invalid(message.to_owned()));
+            }
+            if digest.size_bytes != size {
+                let message = format!("{digest} is not {size} bytes");
+                return Err(StorageError::Invalid(message));
+            }
+            let upload = self.uploads.fetch_add(1, Ordering::Relaxed);
+            let name = format!(
+                "uploads/storage-client-{}-{upload}/blobs/{}/{}",
+                std::process::id(),
+                digest.hash_hex(),
+                digest.size_bytes
+            );
+            let failed = Arc::new(Mutex::new(None));
+            let requests = streamed_messages(name, size, bytes, Arc::clone(&failed));
+            let sent = self.bytestream().write(self.tag(requests)).await;
+            let body = failed.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(error) = body {
+                return Err(StorageError::Unavailable(Arc::new(error)));
+            }
+            let committed = sent.map_err(other)?.into_inner().committed_size;
+            if committed as u64 != size {
+                return Err(StorageError::Internal(format!(
+                    "{digest} was acknowledged as {committed} bytes"
+                )));
+            }
+            Ok(Some(digest))
+        })
     }
 
     fn segments(&self) -> Arc<dyn Segments> {

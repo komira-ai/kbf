@@ -99,7 +99,7 @@ not written yet must `unimplemented!("mac leg: ...")`, so a missing leg is loud.
 
 | helper | crate | why |
 |---|---|---|
-| `NodeView`, `Isolation`, `Proc`; the probes over files (`walk`, `Snapshot`, `clean_since`, `scan`, `files_containing`, `world_writable`, ...); `canary`, `noise`; `Tree`, `Job` | `kbf-testkit` | no protocol and no platform in them, and `kbf-testkit` takes no kbf crate (every crate may depend on it); unit-tested in `kbf-testkit/tests/` |
+| `NodeView`, `Isolation`, `Proc`; the probes over files (`walk`, `Snapshot`, `clean_since`, `scan`, `files_containing`, `world_writable`, ...); `canary`, `noise`; `Tree`, `Job` | `kbf-testkit` (a re-export of `js-testkit`) | no protocol and no platform in them, and `kbf-testkit` takes no kbf crate (every crate may depend on it); unit-tested in `js-testkit/tests/` in the jobscheduler repository |
 | the REAPI channel, `upload_action`, `execute` | `kbf-harness` (`reapi`) | they name `kbf-proto` and `tonic`; shared with `kbf-farm-test`; unit-tested in `kbf-harness/src/reapi_tests.rs` |
 | `LinuxNode`, the `/proc` and cgroup probes (`processes_of`, `open_fds`, ...), `Rig` (one node, the stand-in `crun`'s knobs) | here, `tests/isolation/common/` | Linux-only or specific to this farm; part of a test binary the pull-request gate does not run |
 

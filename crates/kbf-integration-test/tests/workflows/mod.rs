@@ -5,7 +5,7 @@
 //! YAML parser (`saphyr-parser`, through [`yaml`]) and evaluates the document. It
 //! refuses a workflow if:
 //! - `on` names the `pull_request_target` trigger, or the `workflow_run` trigger in any shape
-//!   but the one `release.yml` uses ([`workflow_run`]); both run with the base repository's
+//!   but the one `release.yml` and `pipeline-rerun.yml` use ([`workflow_run`]); both run with the base repository's
 //!   secrets and token. Any form (a string, a list or a mapping, block or flow) is read;
 //! - a job's `runs-on` is not exactly one GitHub-hosted runner label from
 //!   [`HOSTED_LABELS`], written out literally: a string, a one-entry list, or a
@@ -13,9 +13,13 @@
 //!   (`${{ }}`, so a matrix too), a custom label (even one that starts like a hosted
 //!   label, such as `ubuntu-gpu`) or a second label could select a non-hosted runner,
 //!   so each is refused because the lint cannot tell where it lands;
-//! - a job's `permissions` grants anything but `read` or `none`, except the two scopes
+//! - a job's `permissions` grants anything but `read` or `none`, except `actions` ([`ACTIONS_SCOPES`]: the
+//!   pipeline's watch job cancels its own run, and the rerun of its failed jobs), which may be `write` only in a job whose `if:` is exactly
+//!   [`SIGNING_PUSH_ONLY`] or exactly [`RERUN_ONLY`], and the two scopes
 //!   that sign build provenance ([`SIGNING_SCOPES`]: `id-token` and `attestations`),
-//!   which may be `write` only in a job whose `if:` is exactly [`SIGNING_PUSH_ONLY`] (`id-token`
+//!   which may be `write` only in a job whose `if:` is exactly [`SIGNING_PUSH_ONLY`] or exactly
+//!   [`SIGNING_STAGE_ONLY`] (the same push to main, and the called artifacts workflow's `sign`
+//!   stage; a caller job has no `inputs`, so it keeps [`SIGNING_PUSH_ONLY`]) (`id-token`
 //!   also in a job whose `if:` is exactly [`RELEASE_PUSH_ONLY`], for the release's deploy step,
 //!   [`DEPLOY_SCOPE`]), and
 //!   `contents` ([`RELEASE_SCOPES`]), which may be `write` only in a job whose `if:` is
@@ -85,8 +89,9 @@ mod yaml;
 
 mod jobs;
 pub use jobs::{
-    concurrency, job_env, job_environment, job_has_key, job_needs, job_outputs,
-    job_permission_levels, job_uses, push_filters, top_env, trigger_filters,
+    concurrency, job_env, job_environment, job_has_key, job_matrix, job_name, job_needs,
+    job_outputs, job_permission_levels, job_runs_on, job_strings, job_uses, job_with, push_filters,
+    top_defaults_shell, top_env, trigger_filters,
 };
 
 use yaml::{Node, Value};
@@ -156,6 +161,12 @@ const SIGNING_SCOPES: &[&str] = &["id-token", "attestations"];
 const SIGNING_PUSH_ONLY: &str =
     "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
 
+/// The second `if:` spelling under which a job may hold [`SIGNING_SCOPES`] for writing (and
+/// only those, never [`ACTIONS_SCOPES`]): the push to `main` of [`SIGNING_PUSH_ONLY`], in the
+/// `sign` stage of a workflow that is called twice (`inputs.stage`, which a pull request or
+/// merge-queue run does not have: its `inputs` context is empty).
+const SIGNING_STAGE_ONLY: &str = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage == 'sign' }}";
+
 /// The one signing scope a job may also set to `write` under [`RELEASE_PUSH_ONLY`]: the OIDC
 /// token, which the release workflow's deploy step presents to the farm's update coordinator.
 /// It signs nothing (`attestations` stays under [`SIGNING_PUSH_ONLY`]), and the workflow lint of
@@ -175,6 +186,16 @@ const RELEASE_PUSH_ONLY: &str = "${{ github.event.workflow_run.conclusion == 'su
 /// Token scopes a job may set to `write` when it runs only on `main`'s ref: the issues
 /// API, which the advisories workflow uses to open, update and close its one issue.
 const ISSUE_SCOPES: &[&str] = &["issues"];
+
+/// Token scopes a job may set to `write` when it runs only for a push to `main`: the Actions API,
+/// which the pipeline's watch job uses to cancel its own run when another job has failed.
+const ACTIONS_SCOPES: &[&str] = &["actions"];
+
+/// The second `if:` spelling under which a job may hold [`ACTIONS_SCOPES`] for writing (and only
+/// those): the completed pipeline run of a push to `main` of this repository that failed or was
+/// cancelled (the watch cancels a run for a failed job), in its first attempt. `pipeline-rerun.yml`
+/// reruns the failed jobs of that run once; the attempt test is what stops it looping.
+const RERUN_ONLY: &str = "${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}";
 
 /// The one `if:` spelling under which a job may hold [`ISSUE_SCOPES`] for writing: a run
 /// whose ref is `main` (a scheduled run, a push to `main`, a manual run of `main`). A pull
@@ -214,6 +235,9 @@ pub struct Step {
     pub env: Vec<(String, String)>,
     pub conditional: bool,
     pub condition: Option<String>,
+    pub working_directory: Option<String>,
+    /// The step's own `shell:`, if it has one.
+    pub shell: Option<String>,
 }
 
 /// The steps of the job `job` (its key matched ignoring ASCII case) in a workflow
@@ -256,6 +280,8 @@ pub fn job_steps(text: &str, job: &str) -> Result<Vec<Step>, String> {
                 env: strings(m, "env"),
                 conditional: get(m, "if").is_some() || get(m, "continue-on-error").is_some(),
                 condition: text_of(get(m, "if")),
+                working_directory: text_of(get(m, "working-directory")),
+                shell: text_of(get(m, "shell")),
             },
             _ => Step::default(),
         })
@@ -645,7 +671,7 @@ impl Lint<'_> {
     /// A job may narrow its token to `read` or `none` scopes; it may not widen it, but
     /// for [`SIGNING_SCOPES`] set to `write` in a job whose `if:` (`condition`) is
     /// exactly [`SIGNING_PUSH_ONLY`], [`RELEASE_SCOPES`] set to `write` in one whose
-    /// `if:` is exactly [`RELEASE_PUSH_ONLY`], and [`ISSUE_SCOPES`] in one whose `if:`
+    /// `if:` is exactly [`RELEASE_PUSH_ONLY`], [`ISSUE_SCOPES`] in one whose `if:`
     /// is exactly [`ISSUES_MAIN_ONLY`]. Scope names and levels are compared
     /// exactly, so another spelling is refused (the safe side).
     fn job_permissions(&mut self, p: &Node, condition: Option<&str>) {
@@ -665,29 +691,36 @@ impl Lint<'_> {
             if name == DEPLOY_SCOPE && granted == "write" && condition == Some(RELEASE_PUSH_ONLY) {
                 continue;
             }
-            let gate = if SIGNING_SCOPES.contains(&name) {
-                Some(SIGNING_PUSH_ONLY)
+            let gate: &[&str] = if SIGNING_SCOPES.contains(&name) {
+                &[SIGNING_PUSH_ONLY, SIGNING_STAGE_ONLY]
             } else if RELEASE_SCOPES.contains(&name) {
-                Some(RELEASE_PUSH_ONLY)
+                &[RELEASE_PUSH_ONLY]
+            } else if ACTIONS_SCOPES.contains(&name) {
+                &[SIGNING_PUSH_ONLY, RERUN_ONLY]
             } else if ISSUE_SCOPES.contains(&name) {
-                Some(ISSUES_MAIN_ONLY)
+                &[ISSUES_MAIN_ONLY]
             } else {
-                None
+                &[]
             };
-            match gate {
-                Some(only) if granted == "write" && condition != Some(only) => self.refuse(
-                    level,
-                    format_args!(
-                        "`{name}: write` is allowed only in a job whose `if:` is exactly `{only}`"
-                    ),
-                ),
-                Some(_) if granted == "write" => {}
-                _ => self.refuse(
+            if gate.is_empty() || granted != "write" {
+                self.refuse(
                     level,
                     format_args!(
                         "a job's `permissions` may grant only `read` or `none`, got `{name}: {granted}`"
                     ),
-                ),
+                );
+            } else if !condition.is_some_and(|c| gate.contains(&c)) {
+                let list = gate
+                    .iter()
+                    .map(|c| format!("`{c}`"))
+                    .collect::<Vec<_>>()
+                    .join(" or exactly ");
+                self.refuse(
+                    level,
+                    format_args!(
+                        "`{name}: write` is allowed only in a job whose `if:` is exactly {list}"
+                    ),
+                );
             }
         }
     }
@@ -826,7 +859,7 @@ fn is_lower_hex(s: &str, len: usize) -> bool {
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
-fn is_hosted_label(v: &str) -> bool {
+pub fn is_hosted_label(v: &str) -> bool {
     HOSTED_LABELS.contains(&v)
 }
 

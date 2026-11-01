@@ -1,0 +1,149 @@
+# The beta smoke, the one job of the pipeline (pipeline.yml) that tests the files the artifacts
+# stage built: a whole farm of real kbf processes (a frontend, three storage nodes, two
+# daemons; Buck2 dials the frontend's REAPI port) under real Buck2 builds, for five minutes,
+# on a hosted runner (docs/design/kbf-cicd.md, sections 3 and 4; scenario B0,
+# `farm_under_build_load`, crates/kbf-harness). It fails on one failed build, one failed
+# action, one lost blob, a process that exits, or a hang, and it writes `beta-result.json`.
+# The `kbf` of the farm is the one in the linux-x86_64 tarball the artifacts stage built and
+# attested earlier in this same run (downloaded from the run, checked against its SHA256SUMS
+# and for the commit and a release build); the release that follows publishes those same
+# files. Only the driver (`kbf-beta`) and the program the sample project's actions run
+# (`kbf-m2-act`) are built here. The result document records no set hash and says
+# `"attested": false`; the full run of the design, with the update and kill scenarios, is later
+# work, and the job that attests its result is not here either, so this workflow holds no
+# `id-token` or `attestations` permission.
+#
+# It is the only job of the beta stage that reads the run's artifacts, so it is the only one that
+# waits for the artifacts stage: pipeline.yml calls this workflow `needs: [artifacts-sign]` (the files
+# built, then attested and verified after ci), and calls
+# beta.yml (every other job, which builds what it runs) beside ci, with nothing to wait for.
+# This file has `workflow_call` alone, and the lint of beta.yml (beta_succeeds) holds it to the
+# same rules: a green run of both is a passed beta.
+#
+# There is no Envoy in the farm (the no-Envoy ruling): B0 moves behind the kbf-installer's
+# proxy in a later change.
+#
+# Same hosted-runner, pinning and permission rules as ci.yml
+# (crates/kbf-integration-test/tests/repo_lints.rs). The pins of this job's Buck2 and actions are
+# copies of the jobs of beta.yml (module `beta_pins`). The Cargo cache is keyed on the
+# runner, the job, Cargo.lock and rust-toolchain.toml; only a push to main saves it, and
+# only when the exact key missed.
+name: smoke
+
+on:
+  workflow_call:
+
+permissions: {}
+
+# No concurrency group: the pipeline's group (pipeline.yml) is the run's.
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # Incremental artifacts only bloat a cached target directory (as in ci.yml).
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    env:
+      BUCK2_VERSION: 2026-10-01
+      BUCK2_SHA256: 828aba01bf80e8ba50ed27d89be86efe0246b3807c3d040e1ea7b4810a55fb78
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      # kbf-beta (the scenario) and kbf-m2-act (the program the sample project's actions run,
+      # as plain processes: no container runtime here). The kbf of the farm is not built here.
+      - run: cargo build -p kbf-harness -p kbf-integration-test --bins --locked
+      # The files of the artifacts stage of this run (no run id: the same run), not rebuilt.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: assets-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sha256sums
+          path: dist
+      # The assets artifacts carry the SHA256SUMS.<platform> files the sums were made from;
+      # assembling them must give the published SHA256SUMS, and removes them from dist.
+      - name: Set the published SHA256SUMS aside
+        run: mkdir published
+      - run: mv dist/SHA256SUMS published/SHA256SUMS
+      - name: Assemble SHA256SUMS, which must be the published one
+        run: cargo xtask sums assemble dist --expect published/SHA256SUMS
+      - name: Every file is the one SHA256SUMS lists
+        run: cargo xtask verify-assets sums dist
+      - name: The kbf in the tarball names this commit and a release build
+        run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" "$GITHUB_SHA"
+      - name: The farm's bin directory
+        run: mkdir -p "$RUNNER_TEMP/bin"
+      - name: The farm's kbf, out of the tarball
+        run: tar -xzf "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" -C "$RUNNER_TEMP/bin" kbf
+      - name: Load the frontend image, the release asset
+        run: docker image load --input "dist/kbf-frontend-image-$GITHUB_SHA-linux-x86_64.oci.tar"
+      - name: The image's kbf runs in the image
+        run: docker run --rm --entrypoint /usr/bin/kbf "kbf-frontend:$GITHUB_SHA" --version
+      - name: A container of the image, to take its kbf out of
+        run: docker create --name kbf-frontend "kbf-frontend:$GITHUB_SHA"
+      - name: The directory for the image's kbf
+        run: mkdir -p "$RUNNER_TEMP/image-bin"
+      - name: The image's kbf, out of the container
+        run: docker cp kbf-frontend:/usr/bin/kbf "$RUNNER_TEMP/image-bin/kbf"
+      - name: The image's kbf names this commit and a release build
+        run: cargo xtask build-commit check --json "$RUNNER_TEMP/image-bin/kbf" "$GITHUB_SHA"
+      - name: Load the coordinator image, the release asset
+        run: docker image load --input "dist/kbf-coordinator-image-$GITHUB_SHA-linux-x86_64.oci.tar"
+      - name: The image's kbf-coordinator runs in the image
+        run: docker run --rm "kbf-coordinator:$GITHUB_SHA" --version
+      - name: A container of the coordinator image, to take its kbf-coordinator out of
+        run: docker create --name kbf-coordinator "kbf-coordinator:$GITHUB_SHA"
+      - name: The image's kbf-coordinator, out of the container
+        run: docker cp kbf-coordinator:/usr/bin/kbf-coordinator "$RUNNER_TEMP/image-bin/kbf-coordinator"
+      - name: The image's kbf-coordinator names this commit
+        run: cargo xtask build-commit check "$RUNNER_TEMP/image-bin/kbf-coordinator" "$GITHUB_SHA"
+      - name: The program the sample project's actions run, built here
+        run: cp target/debug/kbf-m2-act "$RUNNER_TEMP/bin/kbf-m2-act"
+      - name: Fetch buck2 (pinned version, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst" --sha256 "$BUCK2_SHA256" --out "$RUNNER_TEMP/tools/buck2" --extract zst
+      - run: $RUNNER_TEMP/tools/buck2 --version
+      - name: B0, the farm under build load
+        run: target/debug/kbf-beta b0 --bin-dir "$RUNNER_TEMP/bin" --buck2 "$RUNNER_TEMP/tools/buck2" --project crates/kbf-integration-test/beta/buck2 --work "$RUNNER_TEMP/beta" --duration-secs 300 --concurrency 4 --summary "$GITHUB_STEP_SUMMARY"
+      # The process logs, the scraped series, every build's console output and event log,
+      # and the result document, kept 90 days whether the run passed or not; a re-run of
+      # the same commit keeps its own (the attempt is in the name).
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: beta-b0-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/beta/logs
+            ${{ runner.temp }}/beta/beta-result.json
+          retention-days: 90
+          if-no-files-found: warn
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}

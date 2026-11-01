@@ -28,6 +28,7 @@ use kbf_daemon::RuntimeError;
 use kbf_types::Resources;
 
 use crate::numa::Pin;
+use crate::off_worker::off_worker;
 
 /// Controllers the lease hands to the container's cgroup.
 const SUBTREE: &str = "+cpu +memory +pids";
@@ -206,7 +207,9 @@ pub(crate) async fn presses_into_swap(
     let mut watch = SwapWatch::new(threshold);
     loop {
         tokio::time::sleep(every).await;
-        let Ok(now) = cgroup.pressure() else {
+        // Three file reads that can wait on the kernel: not on an async worker.
+        let reading = cgroup.clone();
+        let Ok(now) = off_worker(move || reading.pressure()).await else {
             continue;
         };
         if watch.kills(now) {
@@ -216,7 +219,7 @@ pub(crate) async fn presses_into_swap(
 }
 
 /// One lease's cgroup.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct LeaseCgroup {
     /// The directory, under the cgroup filesystem's mount.
     dir: PathBuf,
@@ -467,13 +470,43 @@ fn retry_busy(
                 std::thread::sleep(pause);
             }
             Err(e) => {
+                let left = if e.kind() == io::ErrorKind::ResourceBusy {
+                    members(dir)
+                } else {
+                    String::new()
+                };
                 return Err(io::Error::new(
                     e.kind(),
-                    format!("remove cgroup {}: {e}", dir.display()),
+                    format!("remove cgroup {}: {e}{left}", dir.display()),
                 ));
             }
         }
     }
+}
+
+/// What still runs in `dir` or below it, for the error of a cgroup that stayed busy:
+/// each pid with its command name and state.
+fn members(dir: &Path) -> String {
+    let mut out = String::new();
+    let mut pending = vec![dir.to_owned()];
+    while let Some(d) = pending.pop() {
+        let procs = std::fs::read_to_string(d.join("cgroup.procs")).unwrap_or_default();
+        for pid in procs.split_whitespace() {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            let after = stat.split_once(" (").map_or("", |(_, rest)| rest);
+            out.push_str(&format!(
+                "; in {}: pid {pid} ({})",
+                d.display(),
+                after.trim()
+            ));
+        }
+        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                pending.push(entry.path());
+            }
+        }
+    }
+    out
 }
 
 /// One deepest-first pass of `rmdir` over `dir`; a cgroup already gone is fine.
@@ -545,6 +578,27 @@ mod tests {
         };
         let err = retry_busy(&dir, 4, Duration::ZERO, &mut remove).expect_err("denied");
         assert_eq!((calls, err.kind()), (1, io::ErrorKind::PermissionDenied));
+    }
+
+    /// Catches a busy-cgroup report that names only the processes of the cgroup itself: a
+    /// process in a child cgroup keeps the parent busy, so the report must reach it, and
+    /// must name the child it sits in.
+    #[test]
+    fn the_members_of_a_busy_cgroup_include_those_of_its_children() {
+        let dir = scratch("members-below");
+        std::fs::create_dir_all(dir.join("child/grandchild")).expect("mkdir");
+        let pid = std::process::id();
+        std::fs::write(
+            dir.join("child/grandchild/cgroup.procs"),
+            format!("{pid}\n"),
+        )
+        .expect("plant a member");
+        let report = members(&dir);
+        let place = dir.join("child/grandchild");
+        assert!(
+            report.contains(&format!("in {}: pid {pid} (", place.display())),
+            "{report}"
+        );
     }
 
     /// Catches child cgroups left behind (removal must go deepest first), a cgroup

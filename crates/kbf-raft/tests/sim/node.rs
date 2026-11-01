@@ -617,6 +617,45 @@ impl StateMachine for RaftNode {
 impl Node for RaftNode {
     type Msg = Message;
 
+    fn trace_msg(msg: &Message) -> String {
+        let log_id = |id: &LogId| format!("{}.{}", id.term.0, id.index.0);
+        let entry = |e: &Entry| match &e.payload {
+            Payload::Blank => format!("{}:blank", log_id(&e.id)),
+            Payload::Command(bytes) => {
+                let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                format!("{}:command({hex})", log_id(&e.id))
+            }
+        };
+        let kind = match &msg.kind {
+            MessageKind::VoteRequest { last_log } => {
+                format!("vote_request(last={})", log_id(last_log))
+            }
+            MessageKind::VoteResponse { granted } => format!("vote_response(granted={granted})"),
+            MessageKind::AppendRequest {
+                prev,
+                entries,
+                commit,
+            } => {
+                let entries: Vec<String> = entries.iter().map(entry).collect();
+                format!(
+                    "append_request(prev={} entries=[{}] commit={})",
+                    log_id(prev),
+                    entries.join("; "),
+                    commit.0
+                )
+            }
+            MessageKind::AppendResponse { outcome } => match outcome {
+                AppendOutcome::Accepted { matched } => {
+                    format!("append_accepted(matched={})", matched.0)
+                }
+                AppendOutcome::Rejected { at, last } => {
+                    format!("append_rejected(at={} last={})", at.0, last.0)
+                }
+            },
+        };
+        format!("raft(term={} {kind})", msg.term.0)
+    }
+
     fn take_outputs(&mut self) -> Vec<Output<Message>> {
         std::mem::take(&mut self.shared.borrow_mut().out)
     }

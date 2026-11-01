@@ -5,9 +5,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use kbf_objstore::{ByteRange, ObjectStore};
 use kbf_pack::{Blob, Fetch, PackError, Packer, PackerConfig, ReaderConfig, check_create_only};
+use kbf_pack_index::{MAX_BATCH, PackIndex, PackIndexError};
 use kbf_segments::SegmentReader;
 use kbf_segments::layout::footer_len;
-use kbf_state::{MAX_BATCH, PackIndex, PackIndexError};
 
 use crate::support::{FaultyStore, Rig, blob, digests, filler, keys, limits, pack_all, pack_key};
 

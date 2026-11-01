@@ -15,12 +15,13 @@ use std::os::unix::fs::PermissionsExt as _;
 use bytes::Bytes;
 use kbf_objstore::s3::fake::FakeS3;
 use kbf_objstore::{Capabilities, ObjectKey, ObjectStore as _};
+use kbf_pack_index::schema::test_database;
+use kbf_pack_index::{BlobDigest, MAX_BATCH, NewPack, PackBlob, PackIndex};
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::pack_index_client::PackIndexClient;
 use kbf_proto::worker::{CommitPackRequest, PackLocateRequest, PackedBlob};
 use kbf_server::frontend::PackFlags;
-use kbf_state::postgres::{TestDatabase, test_database};
-use kbf_state::{BlobDigest, MAX_BATCH, NewPack, PackBlob, PackIndex};
+use kbf_state::postgres::TestDatabase;
 use tonic::Code;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 

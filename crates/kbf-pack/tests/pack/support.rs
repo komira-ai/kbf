@@ -11,10 +11,11 @@ use kbf_objstore::{
     ObjectStoreError, PageSize,
 };
 use kbf_pack::{Blob, PackKeys, Packed, Packer, PackerConfig, Reader, ReaderConfig, WriterKind};
-use kbf_state::pack_index::memory::MemoryPackIndex;
-use kbf_state::{
-    BlobDigest, Location, ManualClock, NewPack, PackIndex, PackIndexError, PackInfo, Recorded,
+use kbf_pack_index::memory::MemoryPackIndex;
+use kbf_pack_index::{
+    BlobDigest, Location, NewPack, PackIndex, PackIndexError, PackInfo, Recorded,
 };
+use kbf_state::ManualClock;
 
 /// Counts an armed failure down; true while one is left.
 fn fires(armed: &AtomicU32) -> bool {
@@ -51,6 +52,8 @@ pub struct FaultyStore {
     lose_puts: AtomicU32,
     fail_gets: AtomicU32,
     fail_deletes: AtomicU32,
+    deny_deletes: AtomicU32,
+    delete_calls: AtomicU32,
     pass_gets: AtomicU32,
     pass_lists: AtomicU32,
     fail_lists: AtomicU32,
@@ -79,6 +82,8 @@ impl FaultyStore {
             lose_puts: AtomicU32::new(0),
             fail_gets: AtomicU32::new(0),
             fail_deletes: AtomicU32::new(0),
+            deny_deletes: AtomicU32::new(0),
+            delete_calls: AtomicU32::new(0),
             pass_gets: AtomicU32::new(0),
             pass_lists: AtomicU32::new(0),
             fail_lists: AtomicU32::new(0),
@@ -118,6 +123,16 @@ impl FaultyStore {
     /// The next `n` deletes fail.
     pub fn fail_deletes(&self, n: u32) {
         self.fail_deletes.store(n, Ordering::SeqCst);
+    }
+
+    /// From now on every delete is answered `status` (401 or 403) AccessDenied.
+    pub fn deny_deletes(&self, status: u32) {
+        self.deny_deletes.store(status, Ordering::SeqCst);
+    }
+
+    /// The deletes asked of the store so far, refused ones included.
+    pub fn deletes(&self) -> u32 {
+        self.delete_calls.load(Ordering::SeqCst)
     }
 
     /// After the next `ok` listing calls go through, the one after them fails.
@@ -212,6 +227,15 @@ impl ObjectStore for FaultyStore {
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
+        self.delete_calls.fetch_add(1, Ordering::SeqCst);
+        let denied = self.deny_deletes.load(Ordering::SeqCst);
+        if denied != 0 {
+            return Err(ObjectStoreError::Service {
+                status: u16::try_from(denied).unwrap(),
+                code: "AccessDenied".to_owned(),
+                message: "injected".to_owned(),
+            });
+        }
         if fires(&self.fail_deletes) {
             return Err(injected());
         }
@@ -243,6 +267,7 @@ pub struct FlakyIndex {
     fail_find: AtomicU32,
     fail_locate: AtomicU32,
     fail_touch: AtomicU32,
+    fail_unreferenced: AtomicU32,
     held: Mutex<Vec<bool>>,
     finds: Mutex<Vec<usize>>,
     locates: Mutex<Vec<usize>>,
@@ -260,6 +285,7 @@ impl FlakyIndex {
             fail_find: AtomicU32::new(0),
             fail_locate: AtomicU32::new(0),
             fail_touch: AtomicU32::new(0),
+            fail_unreferenced: AtomicU32::new(0),
             held: Mutex::new(Vec::new()),
             finds: Mutex::new(Vec::new()),
             locates: Mutex::new(Vec::new()),
@@ -295,6 +321,11 @@ impl FlakyIndex {
     /// The next `n` touches fail.
     pub fn fail_touch(&self, n: u32) {
         self.fail_touch.store(n, Ordering::SeqCst);
+    }
+
+    /// The next `n` questions of which keys are unreferenced fail.
+    pub fn fail_unreferenced(&self, n: u32) {
+        self.fail_unreferenced.store(n, Ordering::SeqCst);
     }
 
     /// For each record, whether the store held the pack when it was recorded.
@@ -371,6 +402,9 @@ impl PackIndex for FlakyIndex {
     }
 
     fn unreferenced_keys(&self, keys: &[String]) -> Result<Vec<String>, PackIndexError> {
+        if fires(&self.fail_unreferenced) {
+            return Err(PackIndexError::NotMigrated);
+        }
         self.inner.unreferenced_keys(keys)
     }
 }

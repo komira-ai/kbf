@@ -15,10 +15,11 @@ use kbf_daemon::{
 };
 use kbf_objstore::{Capabilities, MemoryStore};
 use kbf_pack::{Fetch, PackKeys, ReadError, WriterKind};
+use kbf_pack_index::memory::MemoryPackIndex;
+use kbf_pack_index::{BlobDigest, PackIndex, PackIndexError};
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{PackReadCounts, PackWriteCounts, daemon_message};
-use kbf_state::pack_index::memory::MemoryPackIndex;
-use kbf_state::{BlobDigest, ManualClock, PackIndex, PackIndexError};
+use kbf_state::ManualClock;
 use support::memory::MemoryCas;
 use support::{Harness, PROMPT};
 

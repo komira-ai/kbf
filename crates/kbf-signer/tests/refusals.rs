@@ -377,7 +377,7 @@ fn an_updater_names_exactly_one_known_host_role() {
         updater(|e| e.params.subject_alt_names = vec![role_uri("updater"), dns("node-a")]),
         refused
     );
-    for bad in ["nope", "Daemon", "", "daemon "] {
+    for bad in ["cache", "nope", "Daemon", "", "daemon "] {
         assert_eq!(
             updater(|e| e.params.subject_alt_names =
                 vec![role_uri("updater"), host_role_uri(bad), dns("node-a")]),

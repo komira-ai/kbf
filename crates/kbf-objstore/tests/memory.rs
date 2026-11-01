@@ -224,3 +224,53 @@ async fn a_range_starting_at_the_end_is_invalid_and_a_missing_key_is_not_found()
         .unwrap();
     assert_eq!(tail, Bytes::from("bc"));
 }
+
+/// Catches: `len` that answers the wrong size (a byte short or long, so a reader of the
+/// object's tail would read the wrong bytes), answers `None` for an empty object, or
+/// keeps the length of an object that was replaced.
+#[tokio::test]
+async fn len_of_an_object_is_its_size() {
+    let store = MemoryStore::new(Capabilities::default());
+    store
+        .put_new(&key("a"), Bytes::from_static(b"abcde"), None)
+        .await
+        .unwrap();
+    store.put_new(&key("e"), Bytes::new(), None).await.unwrap();
+    assert_eq!(store.len(&key("a")).await.unwrap(), Some(5));
+    assert_eq!(store.len(&key("e")).await.unwrap(), Some(0));
+    store
+        .put_new(&key("a"), Bytes::from_static(b"abc"), None)
+        .await
+        .unwrap();
+    assert_eq!(store.len(&key("a")).await.unwrap(), Some(3));
+}
+
+/// Catches: a missing key reported as an error (the caller could not tell an absent
+/// object from a failed store) or as a length, including after a delete.
+#[tokio::test]
+async fn len_of_an_absent_key_is_none() {
+    let store = MemoryStore::new(Capabilities::default());
+    assert_eq!(store.len(&key("a")).await.unwrap(), None);
+    store
+        .put_new(&key("a"), Bytes::from_static(b"x"), None)
+        .await
+        .unwrap();
+    store.delete(&key("a")).await.unwrap();
+    assert_eq!(store.len(&key("a")).await.unwrap(), None);
+}
+
+/// Catches: a default `len` that answers a length (or `None`) for a store that never
+/// looked: a caller would trust it. The default refuses as `Unsupported`.
+#[tokio::test]
+async fn the_default_len_is_unsupported() {
+    let store = NoMayHold(MemoryStore::new(Capabilities::default()));
+    store
+        .put_new(&key("a"), Bytes::from_static(b"x"), None)
+        .await
+        .unwrap();
+    let got = store.len(&key("a")).await;
+    assert!(
+        matches!(got, Err(ObjectStoreError::Unsupported(_))),
+        "{got:?}"
+    );
+}

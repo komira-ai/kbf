@@ -1,0 +1,282 @@
+# memory kills climb the ladder, and pressure kills are farm faults
+> [t=0ms] start
+  farm term=7 lease_epoch=7
+  txn applied rev=1 counters=[]
+    put meta/epoch cond=absent len=8 sha=a3eb8db89fc5123c ttl=-
+  txn applied rev=2 counters=[]
+    put meta/next_op cond=absent len=8 sha=f44b28e2244100cb ttl=-
+  txn applied rev=3 counters=[]
+    put meta/next_seq cond=absent len=8 sha=f44b28e2244100cb ttl=-
+> [t=0ms] register node-big cores=16 gib=64 drivers=container
+  txn applied rev=4 counters=[]
+    put owner/node-big cond=absent len=16 sha=4ff190b4c2c573ec ttl=-
+  txn applied rev=5 counters=[]
+    put session/node-big cond=any len=75 sha=0ee4863be2a3a596 ttl=60000ms
+  msg node-big welcome protocol=1 interval_ms=5000 epoch=7 pack_commit=false
+> [t=0ms] submit link qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket link#1 name=operations/0
+  txn applied rev=9 counters=[]
+    put op/0000000000000000 cond=absent len=75 sha=8136470751ede4ae ttl=-
+    put subject/0000000000000000 cond=absent len=14 sha=8808c1b728bdabd4 ttl=-
+    put queue/0000000000000000 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=absent len=8 sha=af5570f5a1810b7a ttl=-
+  txn applied rev=12 counters=[]
+    check owner/node-big cond=v4
+    del queue/0000000000000000 cond=v8
+    put lease/0000000000000007.0000000000000000 cond=absent len=22 sha=eb85cd0460356168 ttl=-
+    put lease-by-op/0000000000000000 cond=any len=16 sha=e8dd943d366caae7 ttl=-
+  msg node-big lease_offer lease=7/0 kind=action action=link
+  msg node-big start lease=7/0 kind=action action=link millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+  stage link#1 executing
+> [t=0ms] result node-big lease=7/0 action=link ended=own_limit
+  ack lease=7/0 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=17 counters=[]
+    put floor/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=absent len=89 sha=33224d8a465ab30e ttl=-
+    check owner/node-big cond=v4
+    check op/0000000000000000 cond=v6
+    del lease/0000000000000007.0000000000000000 cond=v11
+    del lease-by-op/0000000000000000 cond=any
+    put fate/0000000000000000 cond=absent len=52 sha=4da5be23d50318c5 ttl=-
+    put queue/0000000000000000 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+> [t=0ms] tick
+  txn applied rev=20 counters=[]
+    check owner/node-big cond=v4
+    del queue/0000000000000000 cond=v17
+    put lease/0000000000000007.0000000000000001 cond=absent len=24 sha=95c5ddd29b5eca99 ttl=-
+    put lease-by-op/0000000000000000 cond=any len=16 sha=4ff190b4c2c573ec ttl=-
+  msg node-big lease_offer lease=7/1 kind=action action=link
+  msg node-big start lease=7/1 kind=action action=link millicpus=1000 memory_bytes=4294967296 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+> [t=0ms] result node-big lease=7/1 action=link ended=own_limit
+  ack lease=7/1 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=25 counters=[]
+    put floor/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=v13 len=89 sha=9f9d9b5f51f4368d ttl=-
+    check owner/node-big cond=v4
+    check op/0000000000000000 cond=v6
+    del lease/0000000000000007.0000000000000001 cond=v19
+    del lease-by-op/0000000000000000 cond=any
+    put fate/0000000000000000 cond=v16 len=79 sha=f99ad9cf9f5ea74e ttl=-
+    put queue/0000000000000000 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+> [t=0ms] tick
+  txn applied rev=28 counters=[]
+    check owner/node-big cond=v4
+    del queue/0000000000000000 cond=v25
+    put lease/0000000000000007.0000000000000002 cond=absent len=24 sha=a6d42630c4803296 ttl=-
+    put lease-by-op/0000000000000000 cond=any len=16 sha=8d91efc5106ff3a3 ttl=-
+  msg node-big lease_offer lease=7/2 kind=action action=link
+  msg node-big start lease=7/2 kind=action action=link millicpus=1000 memory_bytes=17179869184 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+> [t=0ms] result node-big lease=7/2 action=link ended=own_limit
+  ack lease=7/2 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=33 counters=[]
+    put floor/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=v21 len=89 sha=26134ad2d313ac3a ttl=-
+    check owner/node-big cond=v4
+    check op/0000000000000000 cond=v6
+    del lease/0000000000000007.0000000000000002 cond=v27
+    del lease-by-op/0000000000000000 cond=any
+    put fate/0000000000000000 cond=v24 len=106 sha=d56e8bc99066dcaa ttl=-
+    put queue/0000000000000000 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+> [t=0ms] tick
+  txn applied rev=36 counters=[]
+    check owner/node-big cond=v4
+    del queue/0000000000000000 cond=v33
+    put lease/0000000000000007.0000000000000003 cond=absent len=24 sha=127c08f09374e8cd ttl=-
+    put lease-by-op/0000000000000000 cond=any len=16 sha=4258d21fa8b08977 ttl=-
+  msg node-big lease_offer lease=7/3 kind=action action=link
+  msg node-big start lease=7/3 kind=action action=link millicpus=1000 memory_bytes=34359738368 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+> [t=0ms] result node-big lease=7/3 action=link ended=own_limit
+  ack lease=7/3 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=41 counters=[]
+    put floor/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=v29 len=89 sha=a4da0ee6c0245026 ttl=-
+    check owner/node-big cond=v4
+    check op/0000000000000000 cond=v6
+    del lease/0000000000000007.0000000000000003 cond=v35
+    del lease-by-op/0000000000000000 cond=any
+    put fate/0000000000000000 cond=v32 len=133 sha=40ed9c5c2f89c240 ttl=-
+    put queue/0000000000000000 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+> [t=0ms] tick
+  txn applied rev=44 counters=[]
+    check owner/node-big cond=v4
+    del queue/0000000000000000 cond=v41
+    put lease/0000000000000007.0000000000000004 cond=absent len=24 sha=742a5b76a01c6efe ttl=-
+    put lease-by-op/0000000000000000 cond=any len=16 sha=811df171d767cf80 ttl=-
+  msg node-big lease_offer lease=7/4 kind=action action=link
+  msg node-big start lease=7/4 kind=action action=link millicpus=1000 memory_bytes=68719476736 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+> [t=0ms] result node-big lease=7/4 action=link ended=own_limit
+  ack lease=7/4 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=55 counters=[]
+    check owner/node-big cond=v4
+    del lease/0000000000000007.0000000000000004 cond=v43
+    del inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=v9
+    put doneof/0000000000000000 cond=any len=45 sha=f0fd36d49c3d8936 ttl=600000ms
+    del op/0000000000000000 cond=any
+    del queue/0000000000000000 cond=any
+    del loss/0000000000000000 cond=any
+    del fate/0000000000000000 cond=any
+    del subject/0000000000000000 cond=any
+    del opkey/0000000000000000 cond=any
+    del lease-by-op/0000000000000000 cond=any
+    put done/0000000000000000 cond=any len=386 sha=47773a3ceb1783f6 ttl=600000ms
+  stage link#1 done failed code=9 message="kbf: the action needs more memory than any node offers: it passed its memory limit with 64 GiB booked on node-big, the largest node for its platform. Runs: 5 (1 GiB on node-big, 4 GiB on node-big, 16 GiB on node-big, 32 GiB on node-big, 64 GiB on node-big)." details=[type.googleapis.com/google.rpc.ErrorInfo]
+> [t=0ms] tick
+> [t=0ms] submit squeezed qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket squeezed#1 name=operations/1
+  txn applied rev=59 counters=[]
+    put op/0000000000000001 cond=absent len=75 sha=05f7624d5bfec4de ttl=-
+    put subject/0000000000000001 cond=absent len=14 sha=61931ae9e2f4970a ttl=-
+    put queue/0000000000000001 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0202020202020202020202020202020202020202020202020202020202020202/2 cond=absent len=8 sha=cd2662154e6d76b2 ttl=-
+  txn applied rev=62 counters=[]
+    check owner/node-big cond=v4
+    del queue/0000000000000001 cond=v58
+    put lease/0000000000000007.0000000000000005 cond=absent len=26 sha=c355d6546682f17a ttl=-
+    put lease-by-op/0000000000000001 cond=any len=16 sha=ce4561620426d04c ttl=-
+  msg node-big lease_offer lease=7/5 kind=action action=squeezed
+  msg node-big start lease=7/5 kind=action action=squeezed millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+  stage squeezed#1 executing
+> [t=0ms] result node-big lease=7/5 action=squeezed ended=node_pressure
+  ack lease=7/5 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=66 counters=[]
+    check owner/node-big cond=v4
+    check op/0000000000000001 cond=v56
+    del lease/0000000000000007.0000000000000005 cond=v61
+    del lease-by-op/0000000000000001 cond=any
+    put fate/0000000000000001 cond=absent len=65 sha=7a883dba8c10b1aa ttl=-
+    put queue/0000000000000001 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+> [t=0ms] tick
+  txn applied rev=69 counters=[]
+    check owner/node-big cond=v4
+    del queue/0000000000000001 cond=v66
+    put lease/0000000000000007.0000000000000006 cond=absent len=26 sha=d7d2c1e67f1fb6e8 ttl=-
+    put lease-by-op/0000000000000001 cond=any len=16 sha=5b022195276afa53 ttl=-
+  msg node-big lease_offer lease=7/6 kind=action action=squeezed
+  msg node-big start lease=7/6 kind=action action=squeezed millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+> [t=0ms] result node-big lease=7/6 action=squeezed ended=node_pressure
+  ack lease=7/6 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=73 counters=[]
+    check owner/node-big cond=v4
+    check op/0000000000000001 cond=v56
+    del lease/0000000000000007.0000000000000006 cond=v68
+    del lease-by-op/0000000000000001 cond=any
+    put fate/0000000000000001 cond=v65 len=95 sha=256b2032b71a2738 ttl=-
+    put queue/0000000000000001 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+> [t=0ms] tick
+  txn applied rev=76 counters=[]
+    check owner/node-big cond=v4
+    del queue/0000000000000001 cond=v73
+    put lease/0000000000000007.0000000000000007 cond=absent len=26 sha=1ea7e0aa887a57a8 ttl=-
+    put lease-by-op/0000000000000001 cond=any len=16 sha=2ada401dd5dd3f8b ttl=-
+  msg node-big lease_offer lease=7/7 kind=action action=squeezed
+  msg node-big start lease=7/7 kind=action action=squeezed millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+> [t=0ms] result node-big lease=7/7 action=squeezed ended=node_pressure
+  ack lease=7/7 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=87 counters=[]
+    check owner/node-big cond=v4
+    del lease/0000000000000007.0000000000000007 cond=v75
+    del inflight/6d61696e/0202020202020202020202020202020202020202020202020202020202020202/2 cond=v59
+    put doneof/0000000000000001 cond=any len=45 sha=a2c1eb6cc2381e02 ttl=600000ms
+    del op/0000000000000001 cond=any
+    del queue/0000000000000001 cond=any
+    del loss/0000000000000001 cond=any
+    del fate/0000000000000001 cond=any
+    del subject/0000000000000001 cond=any
+    del opkey/0000000000000001 cond=any
+    del lease-by-op/0000000000000001 cond=any
+    put done/0000000000000001 cond=any len=320 sha=b6a68603062e8de0 ttl=600000ms
+  stage squeezed#1 done failed code=13 message="kbf farm fault on node-big: the node killed the action for memory while it was under its own limit (node memory pressure), and its reruns are used up. Operator fix: find what else holds memory on the node. Runs: 3 (node-big, node memory pressure; node-big, node memory pressure; node-big, node memory pressure)." details=[]
+> [t=0ms] tick
+> [t=0ms] submit broken qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket broken#1 name=operations/2
+  txn applied rev=91 counters=[]
+    put op/0000000000000002 cond=absent len=75 sha=8dfbccd9809e915d ttl=-
+    put subject/0000000000000002 cond=absent len=14 sha=531b9cbce3528a00 ttl=-
+    put queue/0000000000000002 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0303030303030303030303030303030303030303030303030303030303030303/3 cond=absent len=8 sha=cd04a4754498e06d ttl=-
+  txn applied rev=94 counters=[]
+    check owner/node-big cond=v4
+    del queue/0000000000000002 cond=v90
+    put lease/0000000000000007.0000000000000008 cond=absent len=26 sha=76124bf6b9c62201 ttl=-
+    put lease-by-op/0000000000000002 cond=any len=16 sha=65b5281bf090304a ttl=-
+  msg node-big lease_offer lease=7/8 kind=action action=broken
+  msg node-big start lease=7/8 kind=action action=broken millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+  stage broken#1 executing
+> [t=0ms] result node-big lease=7/8 action=broken ended=infra
+  ack lease=7/8 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=98 counters=[]
+    check owner/node-big cond=v4
+    check op/0000000000000002 cond=v88
+    del lease/0000000000000007.0000000000000008 cond=v93
+    del lease-by-op/0000000000000002 cond=any
+    put fate/0000000000000002 cond=absent len=46 sha=27f6cdfbac30643c ttl=-
+    put queue/0000000000000002 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+> [t=0ms] tick
+  txn applied rev=101 counters=[]
+    check owner/node-big cond=v4
+    del queue/0000000000000002 cond=v98
+    put lease/0000000000000007.0000000000000009 cond=absent len=26 sha=f045110920a49901 ttl=-
+    put lease-by-op/0000000000000002 cond=any len=16 sha=73cfe01d0c04fe76 ttl=-
+  msg node-big lease_offer lease=7/9 kind=action action=broken
+  msg node-big start lease=7/9 kind=action action=broken millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+> [t=0ms] result node-big lease=7/9 action=broken ended=infra
+  ack lease=7/9 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=105 counters=[]
+    check owner/node-big cond=v4
+    check op/0000000000000002 cond=v88
+    del lease/0000000000000007.0000000000000009 cond=v100
+    del lease-by-op/0000000000000002 cond=any
+    put fate/0000000000000002 cond=v97 len=57 sha=853df5d7fa46ee87 ttl=-
+    put queue/0000000000000002 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+> [t=0ms] tick
+  txn applied rev=108 counters=[]
+    check owner/node-big cond=v4
+    del queue/0000000000000002 cond=v105
+    put lease/0000000000000007.000000000000000a cond=absent len=26 sha=7820eddbae472263 ttl=-
+    put lease-by-op/0000000000000002 cond=any len=16 sha=fb444be2942f01ab ttl=-
+  msg node-big lease_offer lease=7/10 kind=action action=broken
+  msg node-big start lease=7/10 kind=action action=broken millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+> [t=0ms] result node-big lease=7/10 action=broken ended=infra
+  ack lease=7/10 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=119 counters=[]
+    check owner/node-big cond=v4
+    del lease/0000000000000007.000000000000000a cond=v107
+    del inflight/6d61696e/0303030303030303030303030303030303030303030303030303030303030303/3 cond=v91
+    put doneof/0000000000000002 cond=any len=45 sha=5c262d9fe0915340 ttl=600000ms
+    del op/0000000000000002 cond=any
+    del queue/0000000000000002 cond=any
+    del loss/0000000000000002 cond=any
+    del fate/0000000000000002 cond=any
+    del subject/0000000000000002 cond=any
+    del opkey/0000000000000002 cond=any
+    del lease-by-op/0000000000000002 cond=any
+    put done/0000000000000002 cond=any len=268 sha=a273a1b9c93c5e55 ttl=600000ms
+  stage broken#1 done failed code=13 message="kbf farm fault on node-big: the farm could not run the action (infra failure), and its reruns are used up. Operator fix: read the node daemon's log for why its driver failed. Runs: 3 (node-big, infra failure; node-big, infra failure; node-big, infra failure)." details=[]
+> [t=0ms] tick
+> [t=0ms] submit garbled qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket garbled#1 name=operations/3
+  txn applied rev=123 counters=[]
+    put op/0000000000000003 cond=absent len=75 sha=814d4f1c2d71036e ttl=-
+    put subject/0000000000000003 cond=absent len=14 sha=61cf617c2335ffde ttl=-
+    put queue/0000000000000003 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0404040404040404040404040404040404040404040404040404040404040404/4 cond=absent len=8 sha=d5688a52d55a02ec ttl=-
+  txn applied rev=126 counters=[]
+    check owner/node-big cond=v4
+    del queue/0000000000000003 cond=v122
+    put lease/0000000000000007.000000000000000b cond=absent len=26 sha=ae15186874be102b ttl=-
+    put lease-by-op/0000000000000003 cond=any len=16 sha=ca75ca059c375ce2 ttl=-
+  msg node-big lease_offer lease=7/11 kind=action action=garbled
+  msg node-big start lease=7/11 kind=action action=garbled millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+  stage garbled#1 executing
+> [t=0ms] result node-big lease=7/11 action=garbled ended=invalid
+  ack lease=7/11 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=137 counters=[]
+    check owner/node-big cond=v4
+    del lease/0000000000000007.000000000000000b cond=v125
+    del inflight/6d61696e/0404040404040404040404040404040404040404040404040404040404040404/4 cond=v123
+    put doneof/0000000000000003 cond=any len=45 sha=03b783ab7b3dc917 ttl=600000ms
+    del op/0000000000000003 cond=any
+    del queue/0000000000000003 cond=any
+    del loss/0000000000000003 cond=any
+    del fate/0000000000000003 cond=any
+    del subject/0000000000000003 cond=any
+    del opkey/0000000000000003 cond=any
+    del lease-by-op/0000000000000003 cond=any
+    put done/0000000000000003 cond=any len=16 sha=e224e82ddbc72f60 ttl=600000ms
+  stage garbled#1 done failed code=3 message="bad input" details=[]
