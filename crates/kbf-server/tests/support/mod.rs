@@ -694,6 +694,7 @@ impl Cell {
             },
             placement_load: kbf_server::PlacementLoad::Off,
             placement_predictions: kbf_server::PlacementPredictions::Off,
+            usage_profiles: kbf_server::UsageProfiles::Off,
             whole_node: None,
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),

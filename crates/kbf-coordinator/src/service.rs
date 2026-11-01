@@ -2,13 +2,13 @@
 //! or read either. No sockets here; [`crate::http`] maps requests onto these calls.
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kbf_oidc::{Refusal, Verified, Verifier};
-use kbf_updater::wire::{Heartbeat, Reply, ServiceReply};
+use kbf_updater::wire::{Answer, Heartbeat, Reply, ServiceReply};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
@@ -17,6 +17,7 @@ use crate::decide::{Decision, Hold, decide_in, decide_why};
 use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
 use crate::fleet::{Fleet, Host};
 use crate::identity::Identity;
+use crate::ops::{self, AuditEntry, OPERATOR, OperateError, OpsState, OpsStore};
 use crate::services::{ServiceDef, Services};
 
 /// The time since the coordinator started.
@@ -156,13 +157,40 @@ pub struct Status {
     /// Heartbeats since the coordinator started whose `services` list was bad and was
     /// dropped: the host was answered as a `kbf`-only host.
     pub services_dropped: u64,
+    /// Heartbeats since the coordinator started whose optional fact was bad and was dropped,
+    /// by the fact's name (`step`, `commit`, ...): one per beat per fact. Absent while none.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub extras_dropped: BTreeMap<&'static str, u64>,
     /// Every host heard from since the coordinator started, by node id.
     pub hosts: Vec<HostStatus>,
     /// Every service the coordinator manages, `kbf` included, by name: its desired state, the
     /// counts of its hosts per role, its hosts, and its convergence.
     pub per_service: BTreeMap<String, ServiceStatus>,
+    /// What operators changed ([`crate::ops`]): exclusions, labels, the audit ring. Left out
+    /// until the first change, so a farm that never uses it reads the status it always did.
+    #[serde(skip_serializing_if = "OpsState::is_empty")]
+    pub ops: OpsState,
     /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]).
     pub commit: &'static str,
+}
+
+/// The features this coordinator advertises to an agent that announces `agent_features`.
+///
+/// Each name is added in the change that implements what it names (`deferred-v1` here;
+/// `heartbeat-v2` and `halt-v1` follow), so a name is never advertised for behaviour that is
+/// not there. `deferred-v1`: a heartbeat's `deferred` report ends the order, holds no slot and
+/// backs the host off ([`crate::defer`]).
+pub const FEATURES: &[&str] = &["deferred-v1"];
+
+/// How long a host's warn about one dropped fact is silent after it was logged.
+const EXTRAS_LOG_EVERY: Duration = Duration::from_secs(3600);
+
+/// The dropped optional facts: a count per fact name, and when each host's fact was last
+/// logged.
+#[derive(Default)]
+struct ExtrasDropped {
+    counts: BTreeMap<&'static str, u64>,
+    logged: HashMap<(String, &'static str), Duration>,
 }
 
 /// The coordinator.
@@ -170,10 +198,13 @@ pub struct Coordinator {
     fleet: Mutex<Fleet>,
     desired: DesiredStore,
     services: Services,
+    ops: OpsStore,
     verifier: Arc<Verifier>,
     operator_token: String,
     clock: Clock,
     services_dropped: AtomicU64,
+    extras: Mutex<ExtrasDropped>,
+    features: Vec<String>,
 }
 
 impl std::fmt::Debug for Coordinator {
@@ -197,10 +228,13 @@ impl Coordinator {
             fleet: Mutex::new(Fleet::new(started)),
             desired,
             services: Services::default(),
+            ops: OpsStore::volatile(),
             verifier,
             operator_token,
             clock,
             services_dropped: AtomicU64::new(0),
+            extras: Mutex::new(ExtrasDropped::default()),
+            features: FEATURES.iter().map(|name| (*name).to_owned()).collect(),
         }
     }
 
@@ -209,6 +243,45 @@ impl Coordinator {
     pub fn with_services(mut self, services: Services) -> Self {
         self.services = services;
         self
+    }
+
+    /// The same coordinator over `ops` instead of a store that keeps nothing.
+    #[must_use]
+    pub fn with_ops(mut self, ops: OpsStore) -> Self {
+        self.ops = ops;
+        self
+    }
+
+    /// The same coordinator advertising `features` instead of [`FEATURES`].
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_features(mut self, features: &[&str]) -> Self {
+        self.features = features.iter().map(|name| (*name).to_owned()).collect();
+        self
+    }
+
+    /// Counts, by name, the optional `facts` of a heartbeat from `who` that were bad and were
+    /// dropped (`why` is the reader's reason), and logs it unless every one of them was logged
+    /// for this host within the last hour. Returns whether it logged. The heartbeat is still
+    /// answered, without those facts.
+    pub fn note_extras_dropped(&self, who: &Identity, why: &str, facts: &[&'static str]) -> bool {
+        let now = (self.clock)();
+        let node = who.node_id.to_string();
+        let mut extras = self.extras.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut due = false;
+        for fact in facts {
+            *extras.counts.entry(fact).or_default() += 1;
+            let last = extras.logged.get(&(node.clone(), *fact)).copied();
+            if last.is_none_or(|at| now.saturating_sub(at) >= EXTRAS_LOG_EVERY) {
+                extras.logged.insert((node.clone(), *fact), now);
+                due = true;
+            }
+        }
+        drop(extras);
+        if due {
+            tracing::warn!(node_id = %who.node_id, why, "dropped optional fields of a heartbeat");
+        }
+        due
     }
 
     /// Counts and logs a heartbeat from `who` whose `services` list was bad and was dropped
@@ -228,7 +301,22 @@ impl Coordinator {
     /// it); services of one priority go `kbf` first, then in the order the host listed them.
     /// The first order is the reply: one update per reply. A host that sent no `services` is
     /// answered about `kbf` alone, in the shape it has always read.
-    pub fn heartbeat(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
+    pub fn heartbeat(&self, who: Identity, beat: Heartbeat) -> Answer {
+        let asked = beat.agent_features.clone();
+        let reply = self.reply_to(who, beat);
+        // Only an agent that announced features gets `features`: an older agent reads the
+        // reply strictly and refuses a field it does not know.
+        let features = (!asked.is_empty()).then(|| {
+            self.features
+                .iter()
+                .filter(|name| asked.contains(name))
+                .cloned()
+                .collect()
+        });
+        Answer { reply, features }
+    }
+
+    fn reply_to(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
         let now = (self.clock)();
         let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         let announced = beat.services.clone().unwrap_or_default();
@@ -331,15 +419,35 @@ impl Coordinator {
         })
     }
 
+    /// Whether `bearer` is the operator token, compared in constant time. CI's token is no
+    /// operator token and the operator token is no CI token.
+    pub fn operator(&self, bearer: Option<&str>) -> Result<(), Unauthorized> {
+        let presented = bearer.ok_or(Unauthorized)?.as_bytes();
+        if bool::from(presented.ct_eq(self.operator_token.as_bytes())) {
+            Ok(())
+        } else {
+            Err(Unauthorized)
+        }
+    }
+
+    /// Does the operator action in `body` (`docs/design/host-updates.md`, section 5), if
+    /// `bearer` is the operator token, and answers the audit entry it made. The token is
+    /// checked here before the body is looked at; the transport checks it
+    /// ([`Self::operator`]) before it reads the body at all.
+    ///
+    /// # Errors
+    /// [`OperateError`].
+    pub fn operate(&self, bearer: Option<&str>, body: &[u8]) -> Result<AuditEntry, OperateError> {
+        self.operator(bearer)?;
+        ops::operate(&self.ops, &self.services, OPERATOR, body)
+    }
+
     /// The status, if `bearer` is the operator token.
     ///
     /// # Errors
     /// [`Unauthorized`].
     pub fn status(&self, bearer: Option<&str>) -> Result<Status, Unauthorized> {
-        let presented = bearer.ok_or(Unauthorized)?.as_bytes();
-        if !bool::from(presented.ct_eq(self.operator_token.as_bytes())) {
-            return Err(Unauthorized);
-        }
+        self.operator(bearer)?;
         let now = (self.clock)();
         let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         let hosts = fleet
@@ -379,10 +487,17 @@ impl Coordinator {
             .collect();
         Ok(Status {
             per_service,
+            ops: self.ops.state(),
             desired: self.desired.get(KBF),
             services: self.desired.all(),
             quiet: fleet.is_quiet(now),
             services_dropped: self.services_dropped.load(Ordering::Relaxed),
+            extras_dropped: self
+                .extras
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .counts
+                .clone(),
             hosts,
             commit: crate::BUILD_COMMIT,
         })

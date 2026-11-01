@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::support::cache_kit::{
     CountingCas, FakeClock, Gates, config, digest, entries, entry_path, file, key, lease,
-    on_disk_sum, stop, tmp_files,
+    on_disk_sum, open_started, stop, tmp_files,
 };
 use crate::support::scratch;
 use kbf_daemon::cache::{Cache, Disabled, Point};
@@ -178,8 +178,10 @@ fn foreign_files_are_counted_and_left_alone() {
 async fn cache_io_errors_never_fail_a_lease() {
     let dir = scratch("cache-io");
     let gates = Gates::new();
-    let cache =
-        Cache::open(config(&dir, 100, Arc::clone(&gates), &FakeClock::at(1000))).expect("open");
+    let cache = open_started(
+        config(&dir, 100, Arc::clone(&gates), &FakeClock::at(1000)),
+        &gates,
+    );
     let cas = CountingCas::default();
     let tmp = dir.join("cache/v1/tmp");
     chmod(&tmp, 0o500);
@@ -697,8 +699,10 @@ async fn a_link_that_finds_the_entry_gone_refills_it() {
 async fn an_entry_deleted_from_outside_is_fetched_again_and_evicted_cleanly() {
     let dir = scratch("cache-deleted");
     let gates = Gates::new();
-    let cache =
-        Cache::open(config(&dir, 100, Arc::clone(&gates), &FakeClock::at(1000))).expect("open");
+    let cache = open_started(
+        config(&dir, 100, Arc::clone(&gates), &FakeClock::at(1000)),
+        &gates,
+    );
     assert_eq!(cache.dir(), dir.join("cache"));
     let cas = CountingCas::default();
     let one = |c: u8| cas.tree(&[file("f", &[c; 100], false)]);

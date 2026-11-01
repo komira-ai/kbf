@@ -55,6 +55,7 @@ pub mod server;
 pub mod ssh_installer;
 pub mod version;
 pub mod wire;
+mod wire_report;
 
 mod timing;
 mod updater;
@@ -88,6 +89,8 @@ mod server_tests;
 #[cfg(test)]
 mod testutil;
 #[cfg(test)]
+mod updater_cordon_tests;
+#[cfg(test)]
 mod updater_drain_tests;
 #[cfg(test)]
 mod updater_followup_tests;
@@ -101,6 +104,14 @@ mod updater_no_proxy_tests;
 mod updater_restart_tests;
 #[cfg(test)]
 mod updater_tests;
+#[cfg(test)]
+mod wire_dropped_facts_tests;
+#[cfg(test)]
+mod wire_features_tests;
+#[cfg(test)]
+mod wire_service_facts_tests;
+#[cfg(test)]
+mod wire_size_tests;
 #[cfg(test)]
 mod wire_tests;
 

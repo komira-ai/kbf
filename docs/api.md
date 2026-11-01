@@ -215,6 +215,7 @@ list:
 | `capacity` | what the node's newest `Hello` said it can run at once |
 | `free` | `capacity` less `booked` on each axis, never below zero |
 | `leases` | the leases it holds, as `term.seq`, in lease order |
+| `owner` | who placed the node out of placement: `operator` or `updater:<unit>`. Present while the node is cordoned, draining or drained, left out while it serves. A cordon with no recorded owner is `operator`, and so is one whose recorded owner cannot be read. No writer records an owner yet, so every cordon reads `operator` |
 
 ### Node load
 
@@ -1613,6 +1614,7 @@ caller goes away before the answer counts as an error.
 | `kbf_execute_dir_cache_present_checked_total` | counter | cached Directories whose digests a check put to FindMissing to confirm the store still holds them (each costs a digest in a call the files already make, not a read) |
 | `kbf_execute_dir_cache_evictions_total`, `kbf_execute_dir_cache_bytes` | counter, gauge | decoded Directories pushed out of the content cache to stay within its byte bound, and the bytes it held at the end of the last check (about 1 MB for a 1000-Directory, 15k-file tree). Evictions climbing with the same trees walked again means the bound is too small for the working set |
 | `kbf_scheduler_core{core}` | gauge | the scheduler core the server runs (`--scheduler-core`): one series per core, 1 for the one running and 0 for the other. Both cores are in every binary; `legacy` is the default |
+| `kbf_usage_profiles_mode{mode}` | gauge | the `--usage-profiles` mode the server runs: one series per mode (`off`, `record`, `on`), 1 for the one running and 0 for the others. `off` is the default. In this build the mode changes nothing else the farm does |
 | `kbf_execute_submit_seconds`, `kbf_sched_lock_wait_seconds` | histogram | the scheduler's submit called from an Execute, and the part of it spent waiting for the scheduler's lock |
 | `kbf_sched_queued`, `kbf_sched_leases` | gauge | operations waiting for a lease, and leases granted or running on all nodes, as of the last submit or scheduler tick (at most a tick old) |
 | `kbf_sched_whole_held`, `kbf_sched_whole_marks`, `kbf_sched_whole_draining`, `kbf_sched_whole_ceiling` | gauge | workers held by a whole-machine lease, held by a queued whole-machine request while they drain, marked workers that still have leases, and the most workers that may be whole now. Printed only with `--whole-node-max`, as of the last submit or scheduler tick |
@@ -1713,6 +1715,7 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_executor_ingests_total` | counter | what the ingest of a task's pack came to, labelled `result`: `ok`, `unavailable`, `stopped` (the ingest panicked or was cancelled) or `rejected_<reason>` for each reason of `kbf_pack_ingest_rejects_total` |
 | `kbf_executor_late_starts_total` | counter | `Start`s dropped because their window ended before the run was posted; the farm runs the action again |
 | `kbf_executor_stray_leases_released_total` | counter | leases released because none of the executor's slots held them (a lost acquire answer, an undelivered release, a lease beyond the pool's size at a restart) |
+| `kbf_executor_phase_seconds` | histogram | how long the phases of an executor run took, labelled `phase`: `prepare`, `start`, `queue`, `task`, `run` and `ingest`; stamped by the executor once per pass, so `queue`, `task` and `run` are good to a pass plus the agent's heartbeat; an unobserved phase is not counted. `docs/deploy/kbf-modes.md` says how to read them |
 
 **What ingest of a run holds and refuses.** A digest is in one place: a record of one pack or one
 large object. A digest that is a record twice, in two packs or twice in one, is `malformed` (a task builds each pack from distinct blobs, so an honest pack has none; the check now runs across packs and before anything is stored). Large objects are streamed into the CAS before the
@@ -2144,7 +2147,13 @@ own route; then the keys added since (none of the keys above changed):
   read: `cpu_usage_us`, `cpu_user_us`, `cpu_system_us`, `cpu_periods`,
   `cpu_throttled`, `throttled_us`, `memory_peak_bytes`; `parallelism`, CPU time over
   wall time; `numa_bytes`, `[{"node", "bytes"}]`). A key not measured is left out,
-  never zero.
+  never zero. `phase_times` says where `input_fetch`, `execution` and `output_upload` of
+  `reapi_times` came from: `measured` (a daemon's own stamps; also what a record written
+  before the field reads as) or `task_claim` (an executor run: the task claimed three
+  durations in its manifest and the frontend laid them out back to back, ending when it read
+  the task's pack). For a `task_claim` only the three durations are data; the instants, and
+  the gaps between them and the server's `worker_start` and `worker_completed`, say nothing
+  about the run. The same key is on an attempt of `/v1/runs/{id}` and of the build pages.
 
 A timed-out run's stdout and stderr (those the CAS holds) are its row's `stdout` and
 `stderr`; its `result` stays `null`, since a partial result is never stored. `/actions/{digest}` adds `outputs` (each `path`, `digest`, `executable`,
