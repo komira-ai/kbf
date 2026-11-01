@@ -25,6 +25,11 @@
 //! labels = { zone = "a" }        # operator-set labels the host must carry
 //! bake_beats = 0                 # default 0, at most 100: healthy beats before a slot frees
 //! canary = { count = 1 }         # optional: only this many hosts go until they have baked
+//! rollback = "manual"            # or "automatic": the coordinator sets the last good version
+//!                                # when a release fails on enough hosts (default manual)
+//! rollback_after_failed = { percent = 25, min_hosts = 2 }  # the larger of the two (default)
+//! min_version = "0.0.18"         # optional: the first version with update hooks; setting the
+//!                                # desired state to it forgets the last good version
 //! defer_backoff = { initial_secs = 300, factor = 2, max_secs = 3600 }   # the defaults
 //!
 //! [service.roles.daemon]
@@ -39,6 +44,7 @@ use std::path::Path;
 
 use kbf_types::HostRole;
 use kbf_updater::secret::read_secret;
+use kbf_updater::version::Version;
 use kbf_updater::wire::{MAX_SERVICE_NAME, MAX_SERVICES, is_service_name};
 use serde::Deserialize;
 
@@ -47,6 +53,7 @@ use crate::canary::Canary;
 use crate::defer::DeferBackoff;
 use crate::desired::{Desired, KBF, KBF_MIN_UP, LEGACY_ROLES, MAX_COUNT, kbf_roles};
 use crate::membership::{RawSelector, Selector};
+use crate::reconcile::{FailThreshold, Rollback};
 
 /// The most bytes of a services file.
 const MAX_FILE_BYTES: u64 = 1 << 20;
@@ -128,6 +135,12 @@ pub struct ServiceDef {
     pub bake_beats: u32,
     /// The hosts that go alone first, if the service has a canary.
     pub canary: Option<Canary>,
+    /// Whether the coordinator rolls the service back by itself.
+    pub rollback: Rollback,
+    /// How many hosts must fail before it does.
+    pub rollback_after_failed: FailThreshold,
+    /// The first version that has update hooks: no rollback goes below it.
+    pub min_version: Option<Version>,
     /// How long a host that deferred an update is left alone ([`crate::defer`]).
     pub defer_backoff: DeferBackoff,
 }
@@ -149,6 +162,9 @@ impl ServiceDef {
             install_when_absent: false,
             bake_beats: 0,
             canary: None,
+            rollback: Rollback::Manual,
+            rollback_after_failed: FailThreshold::default(),
+            min_version: None,
             defer_backoff: DeferBackoff::default(),
         }
     }
@@ -221,6 +237,11 @@ struct RawService {
     #[serde(default)]
     bake_beats: u32,
     canary: Option<RawCanary>,
+    #[serde(default)]
+    rollback: Rollback,
+    #[serde(default)]
+    rollback_after_failed: FailThreshold,
+    min_version: Option<Version>,
     #[serde(default)]
     defer_backoff: DeferBackoff,
 }
@@ -307,6 +328,9 @@ fn service_def(
         install_when_absent,
         bake_beats,
         canary,
+        rollback,
+        rollback_after_failed,
+        min_version,
         defer_backoff,
     } = raw;
     if !is_service_name(&name) {
@@ -340,6 +364,16 @@ fn service_def(
     {
         return invalid(format!("{name}: canary count is not 1 to {MAX_COUNT}"));
     }
+    if !(1..=100).contains(&rollback_after_failed.percent) {
+        return invalid(format!(
+            "{name}: rollback_after_failed percent is not 1 to 100"
+        ));
+    }
+    if !(1..=MAX_COUNT).contains(&rollback_after_failed.min_hosts) {
+        return invalid(format!(
+            "{name}: rollback_after_failed min_hosts is not 1 to {MAX_COUNT}"
+        ));
+    }
     let names = roles
         .keys()
         .map(|r| role_of(r))
@@ -362,6 +396,9 @@ fn service_def(
         install_when_absent,
         bake_beats,
         canary: canary.map(|c| Canary { count: c.count }),
+        rollback,
+        rollback_after_failed,
+        min_version,
         defer_backoff,
     })
 }
