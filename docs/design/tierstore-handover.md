@@ -16,7 +16,7 @@ Two instances run side by side during an update, each on its own private port (s
 cache lock held, and serves read-only. The hook swaps the rule to it. When v-current has exited, the kernel frees the
 lock and v-next takes it by itself and enables writes. Nothing commands that: the hook observes it.
 
-`crates/tierstore/src/server/handover.rs` is not a process hand-over: it hands a put's body from the request to the
+`komira-ai/tierstore:crates/tierstore/src/server/handover.rs` is not a process hand-over: it hands a put's body from the request to the
 backend's task (`hand_over`, `carry`, `received`). Two shapes run from one binary (`Settings::Storage`,
 `Settings::Cache`; `server/config.rs`; `serve_until_signalled` in `server/cli.rs`, `serve_cache_until_signalled` in
 `server/cache_cli.rs`): a **build node** (a `LocalCache` over a directory, no journal or lease, hazard: the shared
@@ -42,10 +42,10 @@ listeners and the lingering drain".
 | slot links | `<state_dir>/slots/<port>` points at a staged release (`/var/lib/updater/releases/tierstore/<digest>/`, root-owned, read-only), or is absent | a retired slot has none; the service executes it and cannot change it. **Conflict to settle**: the service must traverse `state_dir`, which 3.4.1 allows "through group membership" (mode 0750, the service in the group, read only) and the 2.4 example's `0700` does not |
 | lock files, nft tables | build node `<cache>/.lock`, storage node `/var/lib/tierstore/instance.lock`; `kbf_forward_tierstore`, `kbf_guard_tierstore` | the lock is the service's (section 5), no step reads a value from it; tables: `host-updates.md` 4.1.1 |
 | read / write paths | read `/usr/sbin/nft` and `/etc/updater.d/tierstore.toml` (root-owned, 0644); `write_paths = []`, `state_dir` is implicit | no step touches the cache directory or the service's state. Asks of the 2.4 example: add the declaration to `read_paths` (the validator below reads `health_ports` and `units` from it); `/etc/tierstore` and `/usr/libexec/kbf` are not read by any step |
-| timeouts (s), deadline | `prepare` 600, `cutover` 300, `verify` 1000, `rollback` 600, `cleanup` 1300; `verify_deadline_secs` 1600 | `verify`: `promotion_bound_secs` 900 + margin; `prepare`: self-test of the tiers (`--backend-check-wait`); `cleanup`: settle 70 + `--drain-deadline` 900 + lease 5 + margin, and the unit's `TimeoutStopSec` becomes 1100 (960 in `packaging/tierstore/tierstore.service`, which assumes a 10 s wait); the deadline is at least `verify` plus `rollback` |
+| timeouts (s), deadline | `prepare` 600, `cutover` 300, `verify` 1000, `rollback` 600, `cleanup` 1300; `verify_deadline_secs` 1600 | `verify`: `promotion_bound_secs` 900 + margin; `prepare`: self-test of the tiers (`--backend-check-wait`); `cleanup`: settle 70 + `--drain-deadline` 900 + lease 5 + margin, and the unit's `TimeoutStopSec` becomes 1100 (960 in `komira-ai/tierstore:packaging/tierstore/tierstore.service`, which assumes a 10 s wait); the deadline is at least `verify` plus `rollback` |
 | applied by the updater | `promotion_ceiling_secs` 3600, `cleanup_retries` 3; `[hook.params]` `promotion_bound_secs = 900` | the one ceiling and the forward re-runs of `cleanup`; params passed as `--params <file>` with the reserved key `updater.promotion_ceiling_secs` added (section 3, `verify`) |
 
-Slot unit template (flags only, no environment; the rest as today's `packaging/tierstore/tierstore.service`):
+Slot unit template (flags only, no environment; the rest as today's `komira-ai/tierstore:packaging/tierstore/tierstore.service`):
 `ExecStart=<state_dir>/slots/%i/tierstore --listen 0.0.0.0:%i --listen [::]:%i --proxy-id tierstore-%i
 --drain-lb-wait 70s --drain-deadline 15m ...` and `ConditionPathExists=` the same path, so a slot with no link does not
 start. No `[Install]`, as today's unit has none. One template starts both slots, so the settle (`--drain-lb-wait`,
@@ -142,7 +142,7 @@ refused. `--oci-listen` (`oci::OciListener`) has the same single address (questi
 
 ## 5. Cache lock and read-only mode (build node)
 
-**The lock decides the mode** (new; no `flock` or lock file exists under `crates/tierstore/src`). A start tries
+**The lock decides the mode** (new; no `flock` or lock file exists under `komira-ai/tierstore:crates/tierstore/src`). A start tries
 `<path>/.lock` with `flock(LOCK_EX | LOCK_NB)` on a descriptor it keeps open (close-on-exec, no follow, a local file
 system): it gets it and is read-write, or it does not and is **read-only until it does**. No flag: a lone instance after a
 reboot, or a restarted v-current, is read-write at once; a second instance can never write beside the first.

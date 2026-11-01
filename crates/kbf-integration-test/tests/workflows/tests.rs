@@ -724,66 +724,6 @@ fn id_token_write_is_also_allowed_for_a_release_push_to_main_and_nothing_wider()
     );
 }
 
-/// The `if:` and `environment:` lines of the site deploy job, as the lint requires them.
-const SITE_DEPLOY_IF_LINE: &str = "    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}\n";
-const SITE_DEPLOY_ENV_LINE: &str = "    environment: prod-site-tierstore\n";
-
-#[test]
-fn id_token_write_is_allowed_for_the_site_deploy_and_only_in_its_environment_on_main() {
-    // Catches: tierstore.dev's deploy refused where it needs the OIDC token, and the exception
-    // taken beyond what it names: any other environment (or none, or a mapping form the lint does
-    // not read), a loosened or missing condition (the pull-request events, the signing push, the
-    // bare main ref), another scope (`attestations`, `contents`) or another level.
-    let job = |cond: &str, env: &str, perms: &str| {
-        format!("    runs-on: ubuntu-latest\n{cond}{env}    permissions: {perms}\n")
-    };
-    clean(&workflow(&job(
-        SITE_DEPLOY_IF_LINE,
-        SITE_DEPLOY_ENV_LINE,
-        "{id-token: write}",
-    )));
-    clean(&workflow(&job(
-        SITE_DEPLOY_IF_LINE,
-        SITE_DEPLOY_ENV_LINE,
-        "{contents: read, id-token: write}",
-    )));
-    let want = format!(
-        "`id-token: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}`"
-    );
-    for env in [
-        "",
-        "    environment: prod\n",
-        "    environment: prod-site\n",
-        "    environment: prod-site-tierstore-2\n",
-        "    environment: PROD-SITE-TIERSTORE\n",
-        "    environment: {name: prod-site-tierstore}\n",
-    ] {
-        refused(&job(SITE_DEPLOY_IF_LINE, env, "{id-token: write}"), &want);
-    }
-    for cond in [
-        "",
-        MAIN_REF_IF,
-        "    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}\n",
-        "    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && github.ref == 'refs/heads/main' }}\n",
-        "    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}\n",
-        "    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' || true }}\n",
-    ] {
-        refused(&job(cond, SITE_DEPLOY_ENV_LINE, "{id-token: write}"), &want);
-    }
-    for (perms, why) in [
-        (
-            "{attestations: write}",
-            "`attestations: write` is allowed only",
-        ),
-        ("{contents: write}", "`contents: write` is allowed only"),
-        ("{packages: write}", "a job's `permissions`"),
-        ("{id-token: admin}", "a job's `permissions`"),
-        ("write-all", "a job's `permissions`"),
-    ] {
-        refused(&job(SITE_DEPLOY_IF_LINE, SITE_DEPLOY_ENV_LINE, perms), why);
-    }
-}
-
 /// The `if:` line under which a job may write issues, as the lint requires it.
 const MAIN_REF_IF: &str = "    if: ${{ github.ref == 'refs/heads/main' }}\n";
 

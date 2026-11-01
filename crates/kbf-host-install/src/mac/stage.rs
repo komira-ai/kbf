@@ -267,16 +267,27 @@ fn pick_failed(e: PickError, whence: &str, github: bool) -> Outcome {
     }
 }
 
+/// The longest token a channel's file may hold. GitHub's workflow tokens are about 520 bytes
+/// (`ghs_`, an app id, and a signed token in base64url with dots), and it asks that a token be
+/// treated as opaque and its length not assumed.
+const MAX_TOKEN_BYTES: usize = 1024;
+
+/// A mark in the binary that its channel token file takes GitHub's Actions token. The update
+/// rehearsal, which runs the helper of the release before this one, reads the mark to know
+/// whether to give that helper the run's token.
+#[used]
+static LONG_TOKEN_MARKER: &[u8] = crate::LONG_TOKEN_MARKER;
+
 /// The token for the API in `file`, which is root's alone to write: one line of letters,
-/// digits, `_` and `-`.
+/// digits, `_`, `-` and `.`, at most [`MAX_TOKEN_BYTES`] bytes.
 pub(crate) fn read_token(trust: &Trust, file: &Path) -> Result<String, crate::outcome::Refusal> {
     let text = trust.read(file).map_err(refusal)?;
     let token = text.trim();
     let plain = !token.is_empty()
-        && token.len() <= 255
+        && token.len() <= MAX_TOKEN_BYTES
         && token
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
     if plain {
         Ok(token.to_owned())
     } else {

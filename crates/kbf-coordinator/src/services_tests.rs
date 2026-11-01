@@ -1,6 +1,7 @@
 //! Services as data: the file that defines them, and the decision across two services.
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use kbf_types::HostRole;
@@ -85,6 +86,7 @@ fn a_services_file_defines_further_services() {
     let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "services-file");
     let path = dir.path().join("services.toml");
     std::fs::write(&path, TWO).expect("written");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
     assert_eq!(Services::from_file(&path).expect("read"), s);
     let missing = Services::from_file(&dir.path().join("nope.toml")).expect_err("refused");
     assert!(matches!(missing, ServicesError::Read(_)));
@@ -104,10 +106,10 @@ fn a_service_name_may_hold_digits_and_hyphens() {
 }
 
 /// Catches: a services file that is accepted although it cannot work: each refusal names
-/// what is wrong (not TOML or an unknown key, a bad or repeated name, kbf redefined, no roles,
-/// a role that is not a host role, a count over the limit, a role waiting for a role the
-/// service lacks, an `after` that names an unknown or later service, and a CI service that
-/// does not exist).
+/// what is wrong (not TOML or an unknown key, a bad or repeated name, kbf defined after
+/// another service, no roles, a role that is not a host role, a count over the limit, a
+/// role waiting for a role the service lacks, an `after` that names an unknown or later
+/// service, and a CI service that does not exist).
 #[test]
 fn a_services_file_that_cannot_work_is_refused() {
     let role = "[service.roles.daemon]\n";
@@ -128,7 +130,8 @@ fn a_services_file_that_cannot_work_is_refused() {
             "{bad:?}"
         );
     }
-    assert!(refusal(&svc("kbf", "", role)).contains("twice"));
+    let kbf_later = format!("{}{}", svc("a", "", role), svc("kbf", "", role));
+    assert!(refusal(&kbf_later).contains("first entry"));
     let twice = format!("{}{}", svc("a", "", role), svc("a", "", role));
     assert!(refusal(&twice).contains("twice"));
     assert!(refusal(&svc("a", "", "")).contains("no roles"));

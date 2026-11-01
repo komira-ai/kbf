@@ -40,7 +40,7 @@ impl Files {
         put(
             "services.toml",
             "[[service]]\nname = \"other\"\n[service.roles.daemon]\n",
-            0o644,
+            0o600,
         );
         Self { dir, pki }
     }
