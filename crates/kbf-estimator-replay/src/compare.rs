@@ -35,10 +35,12 @@
 //! waits. The table gives p50 and p90 over builds of the first two, and the median over
 //! builds of each build's wait p50 and p90. The correlated id is the first non-empty one the
 //! server had seen when the attempt ended, so the CI-job view can split a build whose early
-//! calls sent none. A joined operation is exported once per waiting invocation: each
-//! invocation's build counts it (it did wait), but the attempt counts, kill rates and the
-//! CI-job view count it once per waiter until the export carries the operation
-//! (komira-ai/kbf#2207).
+//! calls sent none. A joined operation is exported once per waiting invocation, each copy
+//! with its own run id and the same operation and lease. Each invocation's build counts it (it
+//! did wait); the attempt counts, queue wait, kill rates, phases and the CI-job view count the
+//! attempt (operation and lease) once, from its first copy. A row that names no operation or
+//! no lease, as in an export that predates them, is its own attempt: such an export keeps
+//! the old counting, one per waiter.
 //!
 //! **Phases**: input fetch, execution and pack (the output upload) of each attempt, from its
 //! run record. A run record says whether a daemon measured them (`measured`, which a row with
@@ -51,6 +53,7 @@
 //! What the export
 //! cannot say is printed with every report ([`NOT_RECORDED`]); nothing is estimated.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
@@ -136,6 +139,31 @@ fn percentiles(values: Vec<u64>) -> Percentiles {
     builds::spread(values)
 }
 
+/// `rows` with one row for each attempt: a joined operation is exported once per waiting
+/// invocation, each copy with its own run id and the same operation and lease, and the first
+/// copy stands for the attempt. A row that names no operation or no lease (an export that
+/// predates them) is its own attempt, as it was counted before.
+fn once_per_attempt(rows: &[Row]) -> Cow<'_, [Row]> {
+    let mut seen = BTreeSet::new();
+    let keep: Vec<bool> = rows
+        .iter()
+        .map(|row| match (&row.operation, &row.lease) {
+            (Some(operation), Some(lease)) => seen.insert((operation, lease)),
+            _ => true,
+        })
+        .collect();
+    if keep.iter().all(|k| *k) {
+        return Cow::Borrowed(rows);
+    }
+    Cow::Owned(
+        rows.iter()
+            .zip(keep)
+            .filter(|(_, keep)| *keep)
+            .map(|(row, _)| row.clone())
+            .collect(),
+    )
+}
+
 /// The numbers of `rows`.
 pub fn analyze(rows: &[Row]) -> ArmStats {
     analyze_grouped(rows, GroupBy::default())
@@ -143,6 +171,9 @@ pub fn analyze(rows: &[Row]) -> ArmStats {
 
 /// The numbers of `rows`, their builds being what `group` says.
 pub fn analyze_grouped(rows: &[Row], group: GroupBy) -> ArmStats {
+    let all = rows;
+    let once = once_per_attempt(all);
+    let rows: &[Row] = &once;
     let mut stats = ArmStats::default();
     let (mut waits, mut walls) = (Vec::new(), Vec::new());
     let mut first_queued: Option<u64> = None;
@@ -187,7 +218,13 @@ pub fn analyze_grouped(rows: &[Row], group: GroupBy) -> ArmStats {
     stats.queue_wait = percentiles(waits);
     stats.wall_samples = walls.len() as u64;
     stats.wall = percentiles(walls);
-    stats.builds = builds::analyze(rows, group);
+    // Each invocation's build waited on a joined operation, so it keeps its copy; the CI-job
+    // view is one build over several invocations, so it counts the attempt once.
+    let build_rows = match group {
+        GroupBy::Invocation => all,
+        GroupBy::Correlated => rows,
+    };
+    stats.builds = builds::analyze(build_rows, group);
     stats.phases = phases::analyze(rows);
     stats
 }
