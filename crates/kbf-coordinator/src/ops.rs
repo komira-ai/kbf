@@ -37,6 +37,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use kbf_types::NodeId;
 use kbf_updater::version::Version;
+use kbf_updater::wire::UpdateResult;
 use serde::{Deserialize, Serialize};
 
 use crate::desired::{StoreError, io_at, write_whole};
@@ -98,9 +99,12 @@ pub struct Halt {
     pub check: String,
     /// The version it was updating to.
     pub target: Version,
+    /// The `last_update` it reported, whole: what an acknowledgement of it matches.
+    pub report: UpdateResult,
 }
 
-/// A host and the version whose halt report an operator cleared.
+/// A host and the halt report an operator cleared. It matches that report, whole: the same
+/// host reporting another `last_update`, of the same target too, is a different report.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HaltAck {
@@ -108,6 +112,18 @@ pub struct HaltAck {
     pub node_id: String,
     /// The version.
     pub target: Version,
+    /// The `last_update` the host reported.
+    pub report: UpdateResult,
+}
+
+impl From<Halt> for HaltAck {
+    fn from(halt: Halt) -> Self {
+        Self {
+            node_id: halt.node_id,
+            target: halt.target,
+            report: halt.report,
+        }
+    }
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -647,11 +663,7 @@ pub fn operate(
                 let marks = state.services.entry(name).or_default();
                 marks.halt = None;
                 let seen = std::mem::take(&mut marks.halt_seen);
-                let reports = std::iter::once(HaltAck {
-                    node_id: halt.node_id,
-                    target: halt.target,
-                })
-                .chain(seen);
+                let reports = std::iter::once(HaltAck::from(halt)).chain(seen);
                 for report in reports {
                     marks.halt_acked.retain(|ack| ack.node_id != report.node_id);
                     marks.halt_acked.push(report);

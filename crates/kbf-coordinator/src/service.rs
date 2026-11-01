@@ -329,7 +329,7 @@ impl Coordinator {
 
     fn reply_to(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
         let now = (self.clock)();
-        halt::note(&self.ops, &self.services, &who, &beat);
+        let held = halt::note(&self.ops, &self.services, &who, &beat);
         let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         let announced = beat.services.clone().unwrap_or_default();
         let platform = beat.platform;
@@ -352,6 +352,9 @@ impl Coordinator {
         // Stable: services of one priority keep the order above.
         names.sort_by_key(|name| Reverse(self.services.get(name).map_or(0, |def| def.priority)));
         for name in names {
+            if held.iter().any(|service| service == name) {
+                continue;
+            }
             let decision = halt::decide(
                 &self.ops,
                 &self.services,

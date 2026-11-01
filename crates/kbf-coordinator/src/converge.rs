@@ -65,6 +65,27 @@ pub struct RoleCounts {
     pub down: usize,
 }
 
+/// The halt a convergence names: the host, the check and the version.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HaltNote {
+    /// The host that reported it.
+    pub node_id: String,
+    /// The check that failed.
+    pub check: String,
+    /// The version it was updating to.
+    pub target: Version,
+}
+
+impl From<Halt> for HaltNote {
+    fn from(halt: Halt) -> Self {
+        Self {
+            node_id: halt.node_id,
+            check: halt.check,
+            target: halt.target,
+        }
+    }
+}
+
 /// What CI reads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Convergence {
@@ -78,7 +99,7 @@ pub struct Convergence {
     pub roles: Vec<RoleCounts>,
     /// The halt that stands, when the state is `halted`: the host, the check and the version.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub halt: Option<Halt>,
+    pub halt: Option<HaltNote>,
     /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]): what a client
     /// compares with a release before it orders one.
     pub commit: &'static str,
@@ -90,7 +111,7 @@ impl Convergence {
     pub fn halted(self, halt: Halt) -> Self {
         Self {
             state: State::Halted,
-            halt: Some(halt),
+            halt: Some(halt.into()),
             ..self
         }
     }

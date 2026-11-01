@@ -74,6 +74,7 @@ fn reported(last: Option<&UpdateResult>, id: &NodeId) -> Option<Halt> {
             .map_or(UNSPECIFIED, Token::as_str)
             .to_owned(),
         target: last.target.clone(),
+        report: last.clone(),
     })
 }
 
@@ -108,7 +109,7 @@ fn ignored(state: &OpsState, service: &str, halt: &Halt) -> Option<Ignored> {
     let acked = marks.is_some_and(|m| {
         m.halt_acked
             .iter()
-            .any(|a| (&a.node_id, &a.target) == (&halt.node_id, &halt.target))
+            .any(|a| (&a.node_id, &a.report) == (&halt.node_id, &halt.report))
     });
     if acked {
         return Some(Ignored::Acked);
@@ -126,8 +127,14 @@ fn ignored(state: &OpsState, service: &str, halt: &Halt) -> Option<Ignored> {
 /// A service whose update the host is running is skipped: its `last_update` is the one before,
 /// not a report. Otherwise a `last_update` that is not the halt an operator cleared for the
 /// host ends that acknowledgement ([`end_ack`]), and one that is a halt is raised unless it is
-/// ignored.
-pub(crate) fn note(ops: &OpsStore, services: &Services, who: &Identity, beat: &Heartbeat) {
+/// ignored. Answers the services for which an acknowledgement should have ended and could not
+/// be written: the host is ordered nothing of them in this reply.
+pub(crate) fn note(
+    ops: &OpsStore,
+    services: &Services,
+    who: &Identity,
+    beat: &Heartbeat,
+) -> Vec<String> {
     let listed = beat.services.as_deref().unwrap_or_default();
     let top = std::iter::once((KBF, beat.last_update.as_ref(), beat.updating.is_some()));
     let reports = top.chain(listed.iter().map(|one| {
@@ -137,27 +144,33 @@ pub(crate) fn note(ops: &OpsStore, services: &Services, who: &Identity, beat: &H
             one.updating.is_some(),
         )
     }));
+    let mut held = Vec::new();
     for (service, last, updating) in reports {
         if updating || !is_member(services, service, who.role.name()) {
             continue;
         }
         let report = reported(last, &who.node_id);
-        end_ack(ops, service, &who.node_id, report.as_ref());
+        if !end_ack(ops, service, &who.node_id, report.as_ref()) {
+            held.push(service.to_owned());
+        }
         if let Some(halt) = report {
             raise(ops, service, halt);
         }
     }
+    held
 }
 
 /// Ends the acknowledgement the host `id` has for `service`, unless `report`, the halt the
 /// host reports now, is the very one acknowledged: a different `last_update` (another target,
-/// or no halt at all) is a different report, so a halt the host reports from then on is a new
-/// failure, even of the same target. Written after it is in memory, like a halt: it removes
-/// protection.
-fn end_ack(ops: &OpsStore, service: &str, id: &NodeId, report: Option<&Halt>) {
+/// reason or class, or no halt at all) is a different report, so a halt the host reports from
+/// then on is a new failure, even of the same target. Written before it is in memory: it
+/// removes protection, and one that stays on disk would swallow the new failure after a
+/// restart. Answers whether it holds: `false` when the write failed and the acknowledgement
+/// stands, so no order may go out before it is gone.
+fn end_ack(ops: &OpsStore, service: &str, id: &NodeId, report: Option<&Halt>) -> bool {
     let node = id.to_string();
-    let target = report.map(|halt| halt.target.clone());
-    let differs = move |ack: &HaltAck| ack.node_id == node && Some(&ack.target) != target.as_ref();
+    let report = report.map(|halt| halt.report.clone());
+    let differs = move |ack: &HaltAck| ack.node_id == node && Some(&ack.report) != report.as_ref();
     let held = ops.read(|state| {
         state
             .services
@@ -165,19 +178,20 @@ fn end_ack(ops: &OpsStore, service: &str, id: &NodeId, report: Option<&Halt>) {
             .is_some_and(|m| m.halt_acked.iter().any(&differs))
     });
     if !held {
-        return;
+        return true;
     }
     let mut entry = AuditEntry::new(COORDINATOR, "halt_ack_ended");
     entry.service = Some(service.to_owned());
     entry.node_id = Some(id.to_string());
     let name = service.to_owned();
-    let ended = ops.change(Write::AfterMemory, entry, |state| {
+    let ended = ops.change(Write::BeforeMemory, entry, |state| {
         let marks = state.services.entry(name).or_default();
         marks.halt_acked.retain(|ack| !differs(ack));
     });
-    if let Err(why) = ended {
-        tracing::error!(service, %why, "the end of an acknowledgement could not be written");
+    if let Err(why) = &ended {
+        tracing::error!(service, %why, "the end of an acknowledgement could not be written: no order for the host");
     }
+    ended.is_ok()
 }
 
 /// Raises `halt` for `service` unless it is ignored: in memory first, then written. A failed
@@ -224,18 +238,16 @@ fn raise(ops: &OpsStore, service: &str, halt: Halt) {
 }
 
 /// Keeps `report`, made while the halt of `service` stands, for the clear to acknowledge. Kept
-/// once per host and target, with the halt: a report the halt itself holds, or one kept
+/// once per host, with the halt: a report the halt itself holds, or one kept
 /// already, is not kept again.
 fn record(ops: &OpsStore, service: &str, report: Halt) {
-    let ack = HaltAck {
-        node_id: report.node_id,
-        target: report.target,
-    };
+    let check = report.check.clone();
+    let ack = HaltAck::from(report);
     let known = ops.read(|state| {
         state.services.get(service).is_some_and(|m| {
             m.halt
                 .iter()
-                .any(|h| (&h.node_id, &h.target) == (&ack.node_id, &ack.target))
+                .any(|h| (&h.node_id, &h.report) == (&ack.node_id, &ack.report))
                 || m.halt_seen.contains(&ack)
         })
     });
@@ -245,7 +257,7 @@ fn record(ops: &OpsStore, service: &str, report: Halt) {
     let mut entry = AuditEntry::new(COORDINATOR, "halt_report");
     entry.service = Some(service.to_owned());
     entry.node_id = Some(ack.node_id.clone());
-    entry.reason = Some(report.check);
+    entry.reason = Some(check);
     let name = service.to_owned();
     let kept = ops.change(Write::AfterMemory, entry, |state| {
         let seen = &mut state.services.entry(name).or_default().halt_seen;

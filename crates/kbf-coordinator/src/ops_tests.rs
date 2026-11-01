@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use kbf_testkit::dir::TestDir;
+use kbf_updater::wire::{Outcome, Phase, Token, UpdateResult};
 
 use crate::desired::StoreError;
 use crate::ops::{
@@ -19,6 +20,14 @@ fn dir(name: &str) -> TestDir {
 
 fn entry(action: &str) -> AuditEntry {
     AuditEntry::new("operator", action)
+}
+
+/// The `last_update` of a halt of `target`.
+fn halt_report(target: &str) -> UpdateResult {
+    let mut report = UpdateResult::new(version(target), Outcome::Failed);
+    report.phase = Some(Phase::Halt);
+    report.reason = Token::parse("tainted");
+    report
 }
 
 fn exclude(state: &mut OpsState, node: &str) {
@@ -51,18 +60,36 @@ const FULL: &str = r#"{
       "halt": {
         "node_id": "n3",
         "check": "tainted",
-        "target": "2.0"
+        "target": "2.0",
+        "report": {
+          "target": "2.0",
+          "outcome": "failed",
+          "phase": "halt",
+          "reason": "tainted"
+        }
       },
       "halt_acked": [
         {
           "node_id": "n4",
-          "target": "1.5"
+          "target": "1.5",
+          "report": {
+            "target": "1.5",
+            "outcome": "failed",
+            "phase": "halt",
+            "reason": "tainted"
+          }
         }
       ],
       "halt_seen": [
         {
           "node_id": "n5",
-          "target": "2.0"
+          "target": "2.0",
+          "report": {
+            "target": "2.0",
+            "outcome": "failed",
+            "phase": "halt",
+            "reason": "tainted"
+          }
         }
       ],
       "halt_generation": 3,
@@ -109,14 +136,17 @@ fn the_file_reads_and_writes_every_field_of_the_schema() {
                 node_id: "n3".to_owned(),
                 check: "tainted".to_owned(),
                 target: version("2.0"),
+                report: halt_report("2.0"),
             }),
             halt_acked: vec![HaltAck {
                 node_id: "n4".to_owned(),
                 target: version("1.5"),
+                report: halt_report("1.5"),
             }],
             halt_seen: vec![HaltAck {
                 node_id: "n5".to_owned(),
                 target: version("2.0"),
+                report: halt_report("2.0"),
             }],
             halt_generation: 3,
             last_good: Some(version("1.0")),

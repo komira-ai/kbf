@@ -138,6 +138,21 @@ async fn farm_of_two(name: &str, fail: &Arc<AtomicBool>) -> Rig {
     rig
 }
 
+/// `value`, an ops record or a list of them, without the `report` each carries.
+fn brief(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(brief).collect()),
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .filter(|(key, _)| key.as_str() != "report")
+                .map(|(key, field)| (key.clone(), field.clone()))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 fn calm() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
@@ -223,7 +238,7 @@ async fn a_halt_survives_a_restart() {
     let file = std::fs::read_to_string(rig.dir.path().join("desired.json.ops")).expect("file");
     let file: Value = serde_json::from_str(&file).expect("json");
     assert_eq!(
-        file["services"]["kbf"]["halt"],
+        brief(&file["services"]["kbf"]["halt"]),
         json!({"node_id": "s1", "check": "disk_tainted", "target": "2.0"})
     );
 }
@@ -328,7 +343,7 @@ async fn a_new_halt_after_a_clear_halts_again() {
     let state = convergence(&rig, "kbf").await;
     assert_eq!(state["halt"]["node_id"], "s2");
     clear(&rig, "kbf").await;
-    let acked = status(&rig).await["ops"]["services"]["kbf"]["halt_acked"].clone();
+    let acked = brief(&status(&rig).await["ops"]["services"]["kbf"]["halt_acked"]);
     assert_eq!(
         acked,
         json!([
@@ -630,7 +645,7 @@ async fn a_halt_of_another_target_ends_the_ack_of_the_first() {
     )
     .await;
     assert_eq!(convergence(&rig, "kbf").await["halt"]["target"], "3.0");
-    let acked = status(&rig).await["ops"]["services"]["kbf"]["halt_acked"].clone();
+    let acked = brief(&status(&rig).await["ops"]["services"]["kbf"]["halt_acked"]);
     assert_eq!(acked, json!([]));
 }
 
@@ -656,7 +671,7 @@ async fn a_clear_acks_every_halt_report_received_while_halted() {
     assert_ne!(convergence(&rig, "kbf").await["state"], "halted");
     let marks = status(&rig).await["ops"]["services"]["kbf"].clone();
     assert_eq!(
-        marks["halt_acked"],
+        brief(&marks["halt_acked"]),
         json!([
             {"node_id": "s2", "target": "2.0"},
             {"node_id": "s1", "target": "2.0"}
@@ -677,7 +692,7 @@ async fn the_reports_received_while_halted_survive_a_restart() {
     let file = std::fs::read_to_string(rig.dir.path().join("desired.json.ops")).expect("file");
     let file: Value = serde_json::from_str(&file).expect("json");
     assert_eq!(
-        file["services"]["kbf"]["halt_seen"],
+        brief(&file["services"]["kbf"]["halt_seen"]),
         json!([{"node_id": "s1", "target": "2.0"}])
     );
     clear(&rig, "kbf").await;
@@ -701,7 +716,7 @@ async fn three_hosts_halt_one_clear_and_none_re_halts() {
         send(&rig, host, "storage", &beat("1.0", HALT)).await;
         assert_ne!(convergence(&rig, "kbf").await["state"], "halted", "{host}");
     }
-    let acked = status(&rig).await["ops"]["services"]["kbf"]["halt_acked"].clone();
+    let acked = brief(&status(&rig).await["ops"]["services"]["kbf"]["halt_acked"]);
     assert_eq!(
         acked,
         json!([
