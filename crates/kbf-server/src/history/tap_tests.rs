@@ -1103,19 +1103,19 @@ fn the_record_names_the_invocation_and_the_build_the_end_names() {
     );
     let named = Ended {
         correlated_invocations_id: Some("corr-9".to_owned()),
-        ..ended("inv-7", EndedKind::Finished, Some(0))
+        ..ended("b", EndedKind::Finished, Some(0))
     };
     let (rec, _) = record_for(&r, &named);
-    assert_eq!(rec.invocation_id.as_deref(), Some("inv-7"));
+    assert_eq!(rec.invocation_id.as_deref(), Some("b"));
     assert_eq!(rec.correlated_invocations_id.as_deref(), Some("corr-9"));
 
-    let tool_only = ended("inv-7", EndedKind::Finished, Some(0));
+    let tool_only = ended("b", EndedKind::Finished, Some(0));
     let (rec, _) = record_for(&r, &tool_only);
-    assert_eq!(rec.invocation_id.as_deref(), Some("inv-7"));
+    assert_eq!(rec.invocation_id.as_deref(), Some("b"));
     assert_eq!(rec.correlated_invocations_id, None);
 
     let second_caller = Ended {
-        key: RecordKey::collision(kbf_invocation::InvocationId::new("inv-7"), 2),
+        key: RecordKey::collision(kbf_invocation::InvocationId::new("b"), 2),
         ..tool_only
     };
     let rig = rig(16);
@@ -1123,5 +1123,5 @@ fn the_record_names_the_invocation_and_the_build_the_end_names() {
     let Some(Event::Run { record, .. }) = rig.queue.drain().pop() else {
         panic!("a run event");
     };
-    assert_eq!(record.invocation_id.as_deref(), Some("inv-7"));
+    assert_eq!(record.invocation_id.as_deref(), Some("b"));
 }
