@@ -55,6 +55,8 @@ mod desired_role_tests;
 #[cfg(test)]
 mod desired_tests;
 #[cfg(test)]
+mod extras_dropped_tests;
+#[cfg(test)]
 mod http_tests;
 #[cfg(test)]
 mod kbf_definition_tests;
