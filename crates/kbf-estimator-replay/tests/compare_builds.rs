@@ -312,6 +312,44 @@ fn only_rows_with_the_same_operation_and_lease_are_one_attempt() {
     }
 }
 
+/// Catches: the CI-job view built from the arm's deduplicated rows, so that when two waiters
+/// of one joined operation belong to different CI jobs the second job lost the attempt. Each
+/// job counts it once; the arm still counts it once.
+#[test]
+fn a_joined_operation_counts_once_for_each_correlated_job_that_waited() {
+    let mut rows = waiters(&["i1", "i2", "i3"]);
+    rows[0].correlated_invocations_id = Some("job1".into());
+    rows[1].correlated_invocations_id = Some("job2".into());
+    rows[2].correlated_invocations_id = Some("job2".into());
+    assert_eq!(analyze(&rows).attempts, 1, "the arm counts it once");
+    let job = analyze_grouped(&rows, GroupBy::Correlated);
+    assert_eq!(job.attempts, 1);
+    let builds: Vec<(&str, u64)> = job
+        .builds
+        .runs
+        .iter()
+        .map(|r| (r.build.as_str(), r.attempts))
+        .collect();
+    assert_eq!(builds, [("job1", 1), ("job2", 1)]);
+}
+
+/// Catches: attempts that never got a lease (exported as lease `0.0`) merged into one because
+/// they share an operation, so that never_started undercounts the refused or cancelled
+/// retries.
+#[test]
+fn never_leased_attempts_of_one_operation_are_each_an_attempt() {
+    let mut rows = waiters(&["i1", "i2"]);
+    for r in &mut rows {
+        r.lease = Some("0.0".into());
+        r.started_us = None;
+        r.ended_us = None;
+        r.outcome = "cancelled".into();
+    }
+    let arm = analyze(&rows);
+    assert_eq!(arm.attempts, 2);
+    assert_eq!(arm.never_started.get("cancelled"), Some(&2));
+}
+
 /// Catches: the table printing build numbers without saying what the span leaves out.
 #[test]
 fn the_table_says_the_action_span_is_the_servers() {
