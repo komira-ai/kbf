@@ -37,7 +37,7 @@ use std::fmt::Write;
 use serde_json::{Value, json};
 
 use crate::build_report;
-use crate::builds::BuildStats;
+use crate::builds::{self, BuildStats};
 use crate::row::Row;
 
 /// What the numbers cannot see. Printed with every report.
@@ -52,8 +52,9 @@ pub const NOT_RECORDED: [&str; 5] = [
 /// What the numbers of `a` and `b` cannot see: [`NOT_RECORDED`], less the per-build entry
 /// when both arms name their builds.
 pub fn not_recorded(a: &ArmStats, b: &ArmStats) -> Vec<&'static str> {
-    let _ = (a, b);
-    NOT_RECORDED.to_vec()
+    // The per-build entry is the first of the list.
+    let named = a.builds.recorded() && b.builds.recorded();
+    NOT_RECORDED.into_iter().skip(usize::from(named)).collect()
 }
 
 /// A median and a 90th percentile, in microseconds; `None` when there is no sample.
@@ -174,7 +175,7 @@ pub fn analyze(rows: &[Row]) -> ArmStats {
     stats.queue_wait = percentiles(waits);
     stats.wall_samples = walls.len() as u64;
     stats.wall = percentiles(walls);
-    stats.builds = BuildStats::default();
+    stats.builds = builds::analyze(rows);
     stats
 }
 
@@ -339,7 +340,7 @@ fn arm_json(arm: &ArmStats) -> Value {
 }
 
 /// `b - a` as a number, or `null` when either is absent.
-fn delta(a: Option<u64>, b: Option<u64>) -> Value {
+pub(crate) fn delta(a: Option<u64>, b: Option<u64>) -> Value {
     a.zip(b)
         .map_or(Value::Null, |(a, b)| json!(i128::from(b) - i128::from(a)))
 }
