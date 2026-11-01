@@ -17,10 +17,7 @@ fn the_version_line_names_the_stamped_commit() {
 #[test]
 fn an_unstamped_build_says_unknown() {
     assert_eq!(version_text("0.1.0", None), "kbf-updater 0.1.0+unknown");
-    assert_eq!(
-        version_text("0.1.0", Some("")),
-        "kbf-updater 0.1.0+unknown"
-    );
+    assert_eq!(version_text("0.1.0", Some("")), "kbf-updater 0.1.0+unknown");
 }
 
 /// Catches the real line drifting from the format: it starts with the package version and its
