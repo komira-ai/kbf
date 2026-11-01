@@ -771,6 +771,9 @@ fn a_newer_generation_lifts_the_hold() {
     rig.coordinator.set_halts(&[("kbf", 4)]);
     agent.beat_once();
     assert!(rig.logged("lifted"));
+    // The halt was a failed result of the target: the failure back-off is the agent's, and a
+    // lift does not end it.
+    rig.clock.advance(Duration::from_secs(RETRY));
     rig.take_order(&agent);
     assert_eq!(rig.installs(), 2, "the order runs");
 }
@@ -787,6 +790,7 @@ fn a_generation_equal_to_the_one_seen_before_the_halt_does_not_lift() {
     assert_eq!(rig.installs(), 1);
     rig.coordinator.set_halts(&[("kbf", 1)]);
     agent.beat_once();
+    rig.clock.advance(Duration::from_secs(RETRY));
     rig.take_order(&agent);
     assert_eq!(rig.installs(), 2);
 }
