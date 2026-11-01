@@ -625,3 +625,54 @@ async fn a_host_that_lists_kbf_is_read_by_that_entry_and_not_its_placeholder() {
     send(&rig, "s1", "storage", &body).await;
     assert_ne!(convergence(&rig, "kbf").await["state"], "halted");
 }
+
+/// Catches: a clear that clears one report of a service that several hosts halted: host B
+/// halts, host A reports the same failure while the service is halted (ignored, B stands and the
+/// convergence names B), and the operator clears it. A's report is acknowledged with B's, so it
+/// does not halt the service again at once; the agents lift their holds on the same clear. A
+/// repeated report adds nothing to the audit.
+#[tokio::test]
+async fn a_clear_acks_every_halt_report_received_while_halted() {
+    let rig = farm("halt-clear-acks-all").await;
+    send(&rig, "s2", "storage", &beat("1.0", HALT)).await;
+    send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
+    send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
+    send(&rig, "s2", "storage", &beat("1.0", HALT)).await;
+    assert_eq!(convergence(&rig, "kbf").await["halt"]["node_id"], "s2");
+    let audit = status(&rig).await["ops"]["audit"].clone();
+    assert_eq!(audit.as_array().expect("audit").len(), 2);
+
+    clear(&rig, "kbf").await;
+    send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
+    send(&rig, "s2", "storage", &beat("1.0", HALT)).await;
+    assert_ne!(convergence(&rig, "kbf").await["state"], "halted");
+    let marks = status(&rig).await["ops"]["services"]["kbf"].clone();
+    assert_eq!(
+        marks["halt_acked"],
+        json!([
+            {"node_id": "s2", "target": "2.0"},
+            {"node_id": "s1", "target": "2.0"}
+        ])
+    );
+}
+
+/// Catches: the reports received while halted being held in memory only: after a restart the
+/// clear still acknowledges the report of the host that was ignored, and the file holds it with
+/// the halt.
+#[tokio::test]
+async fn the_reports_received_while_halted_survive_a_restart() {
+    let mut rig = farm("halt-seen-restart").await;
+    send(&rig, "s2", "storage", &beat("1.0", HALT)).await;
+    send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
+    rig.restart();
+    rig.at(1_200);
+    let file = std::fs::read_to_string(rig.dir.path().join("desired.json.ops")).expect("file");
+    let file: Value = serde_json::from_str(&file).expect("json");
+    assert_eq!(
+        file["services"]["kbf"]["halt_seen"],
+        json!([{"node_id": "s1", "target": "2.0"}])
+    );
+    clear(&rig, "kbf").await;
+    send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
+    assert_ne!(convergence(&rig, "kbf").await["state"], "halted");
+}
