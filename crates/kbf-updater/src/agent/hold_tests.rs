@@ -845,7 +845,7 @@ fn halts_on_disk_round_trip_and_bad_files_are_errors() {
     assert_eq!(marks.load_halt("kbf"), Ok(None));
     let halt = Halt {
         reason: token("rollback_failed"),
-        generation: 7,
+        generation: Some(7),
     };
     marks.save_halt("kbf", &halt).unwrap();
     assert_eq!(marks.load_halt("kbf"), Ok(Some(halt.clone())));

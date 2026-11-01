@@ -231,14 +231,16 @@ impl Agent {
             match marks.load_halt(slot.unit()) {
                 Ok(halt) => *held(&slot.halted) = halt,
                 Err(e) => {
-                    // A halt is a safety stop: a record that cannot be read holds the unit, as
-                    // under generation 0, so the next clear lifts it.
+                    // A halt is a safety stop: a record that cannot be read holds the unit, with
+                    // its generation unset. The first `halt-v1` reply after start records that
+                    // reply's generation for the unit without lifting; only a later reply with
+                    // a strictly newer one lifts it.
                     self.log(&slot.say(&format!(
                         "error: halt record unreadable, the unit stays held: {e}"
                     )));
                     *held(&slot.halted) = Token::parse(UNREADABLE_HALT).map(|reason| Halt {
                         reason,
-                        generation: 0,
+                        generation: None,
                     });
                 }
             }
@@ -614,7 +616,7 @@ impl Agent {
     fn halt(&self, slot: &Slot, reason: &Token, generation: u64) {
         let halt = Halt {
             reason: reason.clone(),
-            generation,
+            generation: Some(generation),
         };
         if let Err(e) = self
             .marks
@@ -638,7 +640,24 @@ impl Agent {
         for slot in &self.slots {
             let generation = halts.get(slot.unit()).copied().unwrap_or(0);
             let mut halted = held(&slot.halted);
-            if halted.as_ref().is_some_and(|h| generation > h.generation) {
+            let lift = match halted.as_mut() {
+                None => false,
+                // A record that could not be read has no generation: the first reply only
+                // records its generation, so a clear that came before the agent started does
+                // not lift it. Only a later, strictly newer one does.
+                Some(Halt {
+                    generation: unset @ None,
+                    ..
+                }) => {
+                    *unset = Some(generation);
+                    false
+                }
+                Some(Halt {
+                    generation: Some(seen),
+                    ..
+                }) => generation > *seen,
+            };
+            if lift {
                 *halted = None;
                 drop(halted);
                 self.log(&slot.say(&format!(

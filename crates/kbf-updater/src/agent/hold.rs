@@ -141,7 +141,9 @@ impl Deferral {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Halt {
     pub reason: Token,
-    pub generation: u64,
+    /// None: the record could not be read, and the generation is not known yet.
+    #[serde(default)]
+    pub generation: Option<u64>,
 }
 
 /// The deferrals and halts on disk, one file each per unit.
