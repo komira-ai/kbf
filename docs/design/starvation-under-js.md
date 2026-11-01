@@ -251,7 +251,7 @@ The shape below is the first implementation step as built (jobscheduler PR #597,
   (the doc comment at `cost.rs:81-82`): work admitted later cannot extend it. The mark stores
   `tail_end` (the tail-record item, 3.6).
 
-Who calls it, and who feeds the estimates, is open: the maintainers decide, and this note gives a lean. Neither choice changes the rule.
+Who calls it, and who feeds the estimates, is open: the maintainers decide; this note takes no side. Neither choice changes the rule.
 
 - **Path R (rule in `js-whole`, the registry is the live engine).** The tail is read
   by `js-registry`'s `reserve.rs` (the pick at `:403`) and `reserve::may_start`
@@ -275,10 +275,10 @@ Who calls it, and who feeds the estimates, is open: the maintainers decide, and 
   each host as one whole shape with at most one lease, `start.rs:44-47`; `Scheduler` workers hold
   many), and two persistence and hosts-API contracts (D55, `drain_deadline_ms`) moving at once. It is a larger,
   separate decision than starvation.
-- **Engineering's lean:** R now, S later if `js-sched` should place ordinary runs.
-  R reaches the farm's actual reservation with one new function and no new
-  deployment shape; S is justified by what it would do for ordinary runs, not by
-  this issue.
+- **What weighs on the choice.** R reaches the reservation the lease server runs today with one
+  new function and no new deployment shape. S puts one placement engine behind both the lease
+  server and the embedded core, so the rule (and ordinary-run placement) has one home, at the
+  cost of the booking-model change above. This note takes no side.
 
 kbf owns only the flag default, the both-core test, and the wiring of kbf step 0 (passing the
 submission's `max_wall` to the js core). No kbf scheduling code, under either path.
@@ -655,7 +655,6 @@ unchanged beyond 4.11); both engines keep their marks in memory only (2.4).
     Path R on the registry is the ranking (steps 1 and 2 of 3.6), and the backfill share (section 5) is measured on
     `js-sched`. Say so in the PR rather than count a number the gate cannot move.
 15. **Where the rule is placed: Path R or Path S (open; the maintainers decide).** 3.2.
-    Engineering's lean is R now, S later.
 
 ## 5. What it measures (for the evaluation)
 
