@@ -369,4 +369,7 @@ and (with `--result-tsv`) cells that cite the table but have no row in it and `f
 `--results-dir` is the directory the paper's `data-result` names live in; the table must be in it (a
 bare name in another directory is another file). A run drops the `fill:` rows it did not produce, and
 writes the paper and then the table, each through a temporary file renamed over the target.
+If the table write fails after the paper was renamed into place, the paper cites rows the table lacks:
+the error is returned, `--check` (given the table) lists those cells, and a re-run repairs it. A cell that
+becomes blocked or is left with a note loses its old `fill:` row on the next fill, by design.
 The mapping schema and the rules for each figure are in the header of `src/fill.rs`.

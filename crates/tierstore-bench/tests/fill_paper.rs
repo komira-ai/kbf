@@ -377,3 +377,72 @@ fn a_table_outside_the_results_directory_is_refused() {
     assert_eq!(run.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&run.stderr).contains("--results-dir"));
 }
+
+/// Catches a results directory compared as written instead of resolved: a `..` path and a
+/// symlink to the directory the table is in are that directory, and another directory is not.
+#[test]
+fn the_results_directory_is_compared_resolved() {
+    let dir = setup("fill-paper-resolved");
+    let tsv = dir.path().join("paper-results.tsv");
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::os::unix::fs::symlink(dir.path(), dir.path().join("link")).unwrap();
+    let with = |results_dir: &Path| {
+        fill_paper_raw(
+            dir.path(),
+            &[
+                "--in-place",
+                "--result-tsv",
+                tsv.to_str().unwrap(),
+                "--results-dir",
+                results_dir.to_str().unwrap(),
+            ],
+        )
+    };
+    let dotdot = with(&dir.path().join("sub/.."));
+    assert!(
+        dotdot.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dotdot.stderr)
+    );
+    let linked = with(&dir.path().join("link"));
+    assert!(
+        linked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let other = with(&dir.path().join("sub"));
+    assert_eq!(other.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&other.stderr).contains("results directory"));
+}
+
+/// Catches a table write that fails after the paper was written being swallowed or leaving no
+/// trace: the error is returned (exit 2), the paper is in place and cites the table, and `--check`
+/// lists the cell that has no row. The table's name is as long as a name can be, so the
+/// temporary file beside it cannot be created.
+#[test]
+fn a_failed_table_write_leaves_a_paper_that_the_check_reports() {
+    let dir = setup("fill-paper-table-fails");
+    let name = format!("{}.tsv", "a".repeat(246));
+    let table = dir.path().join(&name);
+    std::fs::write(&table, "# old\n").unwrap();
+    let args = |extra: &[&str]| {
+        let mut all = vec!["--result-tsv", table.to_str().unwrap(), "--results-dir"];
+        let d = dir.path().to_str().unwrap().to_owned();
+        let all_d = [d.as_str()];
+        all.extend_from_slice(&all_d);
+        all.extend_from_slice(extra);
+        fill_paper_raw(dir.path(), &all)
+    };
+    let run = args(&["--in-place"]);
+    assert_eq!(run.status.code(), Some(2));
+    let paper = std::fs::read_to_string(dir.path().join("paper.html")).unwrap();
+    assert!(
+        paper.contains(&format!("data-result=\"{name}\"")),
+        "{paper}"
+    );
+    assert_eq!(std::fs::read_to_string(&table).unwrap(), "# old\n");
+    let check = args(&["--check"]);
+    assert_eq!(check.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(stderr.contains("\"put\" has no row naming it"), "{stderr}");
+}
