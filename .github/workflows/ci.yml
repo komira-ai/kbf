@@ -205,6 +205,19 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: cargo check --locked --target x86_64-unknown-linux-musl -p kbf-task --bin kbf-task
+      # The Arm static target, which the release's linux-arm64 job builds: the `cfg(target_arch =
+      # "aarch64")` code of the task runner (its seccomp arch and syscall numbers) and the libc
+      # types that differ on Arm (`c_char` is `u8` there) compile only for it. ring's build needs an
+      # Arm C compiler, which `musl-gcc` is not: Zig's, fetched above, with Zig's own `-target`.
+      - run: rustup target add aarch64-unknown-linux-musl
+        if: ${{ !cancelled() }}
+      - name: Check for aarch64-unknown-linux-musl the binary the release builds for the Arm static target
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_unknown_linux_musl: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-linux-musl
+          AR_aarch64_unknown_linux_musl: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+        run: cargo check --locked --target aarch64-unknown-linux-musl -p kbf-task --bin kbf-task
       # The interpreter budget only shrinks: a pull request may not add a row to it
       # (crates/xtask/src/budget.rs). A pull request is checked out as the merge commit,
       # so HEAD^1 is the base branch it merges into.
@@ -244,8 +257,11 @@ jobs:
   #
   # A line's coverage is not the sum of the shards' lcov reports (llvm-cov counts a line once
   # for each function it is in), so raw profiles are what is added up: each shard names its
-  # profiles for its core and part (the process id alone repeats between machines) and uploads
-  # them; the `test` job below makes the one report of them all. The upload is the LAST step: a
+  # profiles for its core and part (the process id alone repeats between machines), merges them
+  # into one indexed profile (`llvm-profdata merge`: counts add, so it is the same profile a
+  # merge of all the raw ones makes; megabytes where the raw profiles are about 14 GB unpacked
+  # for all shards, 1.8 GB as compressed artifacts, which filled the gate's runner) and uploads
+  # that; the `test` job below makes the one report of them all. The upload is the LAST step: a
   # shard that passes has uploaded, and one that fails has not, which is how `test` sees it.
   # The fast set includes the Postgres tests (a throwaway server per shard, below): no S3,
   # crun, root or Mac test is in it.
@@ -267,22 +283,22 @@ jobs:
           - core: legacy
             part: 1
             parts: 3
-            min_free_gb: 75
+            min_free_gb: 40
             args: --workspace
           - core: legacy
             part: 2
             parts: 3
-            min_free_gb: 75
+            min_free_gb: 40
             args: --workspace
           - core: legacy
             part: 3
             parts: 3
-            min_free_gb: 75
+            min_free_gb: 40
             args: --workspace
           - core: js
             part: 1
             parts: 1
-            min_free_gb: 55
+            min_free_gb: 35
             args: -p kbf-server -p kbf-integration-test -p kbf-daemon -p kbf-node --features kbf-server/farm-core-js
     # A throwaway Postgres server for every test that needs one, the same container as
     # beta.yml's jobs use. KBF_TEST_POSTGRES_URL (below) names it; a test that needs it makes a
@@ -306,6 +322,12 @@ jobs:
       # `cargo llvm-cov nextest` runs the tests with cargo-nextest, one process per test.
       NEXTEST_VERSION: 0.9.146
       NEXTEST_SHA256: 682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428
+      # The instrumented build's debug info is the largest part of its size and coverage does not
+      # read it (the counters and the coverage mapping are not debug info), so the build has none:
+      # no line tables, which the profiles `dev` and `test` of Cargo.toml keep for backtraces.
+      # cargo-llvm-cov builds the `dev` profile and the tests with `test`.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
       PART: ${{ matrix.part }}
       PARTS: ${{ matrix.parts }}
       ARGS: ${{ matrix.args }}
@@ -319,10 +341,9 @@ jobs:
           persist-credentials: false
           # The merge commit and its first parent, the base branch (no-lowering --base-ref).
           fetch-depth: 2
-      # A shard builds one core and holds a third of the legacy profiles, so it fits the free
-      # disk of the image as it is (about 87 GB; the legacy build is about 61 GB), and the removal
-      # of the preinstalled toolchains (1 to 4 minutes) is left to `test`, which holds both builds
-      # and every shard's profiles. The step below refuses early when the room is short.
+      # A shard builds one core and holds a third of the legacy profiles. The steps below make
+      # room (container images, then the preinstalled toolchains, 1 to 4 minutes) and the
+      # disk check after them refuses early when the room is still short.
       - name: Free disk before (report)
         run: df -h /
       # Images the runner preloads and this job never runs; the Postgres service container's
@@ -330,6 +351,13 @@ jobs:
       - name: Remove container images this job does not use
         run: docker image prune --all --force
       - name: Free disk after (report)
+        run: df -h /
+      # Some runners of `ubuntu-latest` have a 72 GB disk with about 19 GB free (the others have
+      # 145 GB with about 90 free): no instrumented build fits there as the image is, so the
+      # preinstalled toolchains this job never uses go here too (the step of `test`).
+      - name: Remove preinstalled toolchains this job does not use
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/powershell /usr/share/swift /usr/local/lib/node_modules
+      - name: Free disk after the toolchains are removed (report)
         run: df -h /
       - run: rustup toolchain install "$COVERAGE_TOOLCHAIN" --profile minimal --component llvm-tools-preview
       # xtask builds with the coverage nightly, the one toolchain this job installs.
@@ -362,12 +390,14 @@ jobs:
       # is for.
       - name: Drop the workspace's coverage artifacts the cache restored
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
-      # The instrumented build (about 59 GB measured for the legacy core), the tests' temporary
-      # files under it and the file store's 5% free-space floor (about 7.5 GB on this disk) need
-      # the room below (`min_free_gb` of the matrix): measured use is about 67 GB for the legacy
-      # core and about 50 GB for the js core, and the values hold a margin over those (75 and
-      # 55; the lint refuses lower ones). Short here means the restored cache or the
-      # image grew: the step says so and stops, instead of about 30 tests failing with "Full".
+      # The instrumented build without debug info and the tests' temporary files and profiles
+      # under it (measured as the fall of the disk's used space: about 26 GB for the legacy
+      # core, about 21 GB for the js core; `target` was 25 and 20 GB), and the file store's 5%
+      # free-space floor (7.25 GB on a 145 GB disk, 3.6 GB on a 72 GB one; 7.5 is taken) need
+      # the room below (`min_free_gb` of the matrix): 33.5 and 28.5 GB, and the values hold a
+      # margin over those (40 and 35; the lint refuses lower ones). Short here means the
+      # restored cache or the image grew: the step says so and stops, instead of about 30 tests
+      # failing with "Full".
       - name: Refuse early when the disk is short for the tests
         run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --path . --min-free-gb "$MIN_FREE_GB"
       # nextest runs a process per test, so a test's line coverage must not rest on another
@@ -385,18 +415,37 @@ jobs:
       - name: Free disk after the tests (report)
         if: ${{ always() }}
         run: df -h /
+      - name: Size of target after the tests (report)
+        if: ${{ always() }}
+        run: du -sh target
       - name: Disk use under target after the tests (report)
         if: ${{ always() }}
-        run: du -xhd 2 target
+        run: du -xhd 3 --threshold=1G target
+      # The shard's raw profiles become ONE indexed profile (a few MB) here, so that `test`
+      # downloads megabytes and not the raw profiles (1.8 GB as artifacts, about 14 GB unpacked),
+      # which filled its runner's disk.
+      # `xtask merge-profiles` runs the coverage toolchain's own `llvm-profdata merge -sparse` (what
+      # cargo-llvm-cov's own merge passes) with no `-failure-mode`: the default (`any`) fails on
+      # a corrupt raw profile, and so fails the shard, whose re-run is the remedy.
+      # `-failure-mode=all` would drop the corrupt file, merge the rest and pass, and the tests
+      # that file recorded would count as never run, a number under the floor with nothing in
+      # the log to say why. The step says what went in and what came out. It has no `if:`: a
+      # shard that cannot merge fails.
+      - name: Merge this shard's raw profiles into one
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask merge-profiles --dir target/llvm-cov-target --extension profraw --prefix kbf-${{ matrix.core }}-${{ matrix.part }}- --out target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-merged.profdata
+      - name: Size of the merged profile (report)
+        run: du -h target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-merged.profdata
+      - name: Free disk after the merge (report)
+        run: df -h /
       # No step runs Postgres tests on their own: they are in the run above, which fails any of
       # them when KBF_TEST_POSTGRES_URL (set for the job) names no server.
       # The last step, with no `if:`, so that this job has succeeded exactly when its profiles
       # are up. `overwrite` lets a re-run of the run upload the names its first run did.
-      - name: Upload this shard's raw profiles
+      - name: Upload this shard's merged profile
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: profraw-${{ matrix.core }}-${{ matrix.part }}
-          path: target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-*.profraw
+          name: profdata-${{ matrix.core }}-${{ matrix.part }}
+          path: target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-merged.profdata
           if-no-files-found: error
           overwrite: true
           retention-days: 5
@@ -408,12 +457,12 @@ jobs:
   # GB with the profiles) to pass between jobs. The same sources, flags and paths build the same
   # binaries on every runner, and a profile counts a function by its name and a hash of its code,
   # so the shards' profiles are read with this job's binaries. It then waits for every shard's
-  # raw profiles (`cargo xtask wait-artifacts`: it fails at once when a shard fails, so `test`
+  # merged profiles (`cargo xtask wait-artifacts`: it fails at once when a shard fails, so `test`
   # fails whenever a shard does, and none can be skipped into a pass; each artifact is named with
   # the text of its shard's job name, so that after a re-run of the run an artifact of the first
-  # attempt counts only for a shard that was not run again), puts them in the one
-  # directory `llvm-cov report` merges every `*.profraw` of, refuses a directory in which a
-  # shard's profiles are missing (`profiles-complete`), and makes ONE report: a line counts once
+  # attempt counts only for a shard that was not run again), refuses a directory in which a
+  # shard's profile is missing (`profiles-complete`), merges them into the one profile
+  # `llvm-cov report` reads, and makes ONE report: a line counts once
   # with the hits of every shard and both cores, which is what the gate reads (kbf-coverage also
   # refuses an lcov that names a source file twice). Then the gate in `coverage-floors`
   # (crates/kbf-coverage): every crate must reach 99.00% of lines and 99.00% of branches, or the
@@ -436,6 +485,9 @@ jobs:
       LLVM_COV_SHA256: b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a
       NEXTEST_VERSION: 0.9.146
       NEXTEST_SHA256: 682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428
+      # As in `test-shard`: the same flags build the same binaries, which the profiles are read with.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -444,8 +496,12 @@ jobs:
           fetch-depth: 2
       # The two builds and the profiles of the shards need the disk the shards' instrumented
       # build needed, so the preinstalled toolchains this job never uses go as they do there.
+      - name: Free disk before the toolchains are removed (report)
+        run: df -h /
       - name: Remove preinstalled toolchains this job does not use
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/powershell /usr/share/swift /usr/local/lib/node_modules
+      - name: Free disk after the toolchains are removed (report)
+        run: df -h /
       - run: rustup toolchain install "$COVERAGE_TOOLCHAIN" --profile minimal --component llvm-tools-preview
       # xtask builds with the coverage nightly, the one toolchain this job installs.
       - name: Install cargo-llvm-cov (pinned version and checksum)
@@ -466,9 +522,10 @@ jobs:
       - name: Drop the workspace's coverage artifacts the cache restored
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
       - run: mkdir -p target/coverage
-      # The two builds (about 72 GB together, measured) need the room below.
-      - name: Refuse early when the disk is short for the builds (80 GiB free)
-        run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --path . --min-free-gb 80
+      # The two builds (about 35 GB together, measured as the fall of the disk's free space) and
+      # the file store's 5% floor (7.5 GB) are 42.5 GB; the figure holds a margin over it.
+      - name: Refuse early when the disk is short for the builds (50 GiB free)
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --path . --min-free-gb 50
       # The build of each core is the command of its shards (the `args` of the matrix of
       # `test-shard`), with every test filtered out. The legacy build is the workspace's; the js
       # build adds the rebuilt kbf-server and its dependents beside it in the same target
@@ -477,23 +534,42 @@ jobs:
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --profile pr -E 'none()' --no-tests=pass
       - name: Build the instrumented tests of the js core (none run)
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest -p kbf-server -p kbf-integration-test -p kbf-daemon -p kbf-node --features kbf-server/farm-core-js --locked --branch --no-report --profile pr -E 'none()' --no-tests=pass
+      - name: Free disk after the builds (report)
+        run: df -h /
       # nextest listed the tests by running each instrumented binary, which wrote a profile; the
       # run's profiles are the shards'.
       - name: Drop the profiles of listing the tests
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --profraw-only
-      - name: Wait for the shards' raw profiles
+      - name: Wait for the shards' merged profiles
         env:
           GH_TOKEN: ${{ github.token }}
-        run: cargo "+$COVERAGE_TOOLCHAIN" xtask wait-artifacts --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" --job-prefix test-shard --artifact "profraw-legacy-1=(legacy-1-of-3)" --artifact "profraw-legacy-2=(legacy-2-of-3)" --artifact "profraw-legacy-3=(legacy-3-of-3)" --artifact "profraw-js-1=(js-1-of-1)"
-      # Into the directory `llvm-cov report` merges every `*.profraw` of.
-      - name: Download the shards' raw profiles
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask wait-artifacts --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" --job-prefix test-shard --artifact "profdata-legacy-1=(legacy-1-of-3)" --artifact "profdata-legacy-2=(legacy-2-of-3)" --artifact "profdata-legacy-3=(legacy-3-of-3)" --artifact "profdata-js-1=(js-1-of-1)"
+      # One merged profile for each shard (a few MB), flat in a directory of its own.
+      - name: Download the shards' merged profiles
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: profraw-*
-          path: target/llvm-cov-target
+          pattern: profdata-*
+          path: target/shard-profdata
           merge-multiple: true
+      - name: Size of the download (report)
+        run: du -sh target/shard-profdata
+      - name: Free disk after the download (report)
+        run: df -h /
       - name: Every shard's profiles are there
-        run: cargo "+$COVERAGE_TOOLCHAIN" xtask profiles-complete --dir target/llvm-cov-target --prefix kbf-legacy-1- --prefix kbf-legacy-2- --prefix kbf-legacy-3- --prefix kbf-js-1-
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask profiles-complete --dir target/shard-profdata --extension profdata --prefix kbf-legacy-1- --prefix kbf-legacy-2- --prefix kbf-legacy-3- --prefix kbf-js-1-
+      # `cargo llvm-cov report` merges the `*.profraw` of target/llvm-cov-target into
+      # `<workspace directory>.profdata` there and reports from it; when no `*.profraw` is there and
+      # that file is, it uses it as it is. So the shards' profiles are merged into that file
+      # (`llvm-profdata` adds the counts of indexed profiles as it adds raw ones, so it is the
+      # profile a merge of all the raw files makes), and the downloads go. A name
+      # cargo-llvm-cov does not look for fails the report ("not found *.profraw files"), it
+      # does not pass over less. No `-failure-mode`: an unreadable profile fails the job.
+      - name: Merge the shards' profiles into the one the report reads
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask merge-profiles --dir target/shard-profdata --extension profdata --workspace-profile-in target/llvm-cov-target
+      - name: Delete the downloaded profiles
+        run: rm -r target/shard-profdata
+      - name: Free disk after the merge (report)
+        run: df -h /
       # `-skip-functions` leaves the per-function records (FN, FNDA) out of the lcov
       # export. With branch coverage on, llvm-cov's lcov exporter segfaults while
       # writing them for kbf-front's async service methods (LLVM 23.1 in this nightly;
@@ -503,6 +579,8 @@ jobs:
         env:
           LLVM_COV_FLAGS: -skip-functions
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov report --branch --lcov --output-path target/coverage/lcov.info
+      - name: Free disk after the report (report)
+        run: df -h /
       # Fails when a crate is under its threshold; floors that could rise are printed in
       # the log and the job summary (`kbf-coverage raise` lifts them) and do not fail.
       - name: Per-crate table and 99% gate

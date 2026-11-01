@@ -11,6 +11,8 @@
 //!   agent at half its life;
 //! - [`service_health`]: a service's readiness URL;
 //! - [`cordon`]: which cordons on the node are the updater's own, kept on disk;
+//! - [`hold`]: `Deferred` and `halt`: the features announced, the deferral kept on disk, the
+//!   heartbeat's size;
 //! - [`status`]: what the heartbeat says;
 //! - [`update`]: one host's A/B, step by step;
 //! - [`run`]: the two threads, and the wiring of the real ports ([`build`]).
@@ -19,6 +21,8 @@ pub mod container_health;
 pub mod coordinator;
 pub mod enroll;
 pub mod flags;
+pub mod hold;
+pub mod hook;
 pub mod local;
 pub mod renew;
 pub mod run;
@@ -29,7 +33,7 @@ pub mod update;
 mod build;
 pub mod cordon;
 
-pub use build::{NO_CREDENTIAL, NoCredential, run_agent, run_config};
+pub use build::{Access, NO_CREDENTIAL, NoCredential, run_agent, run_config};
 pub use run::{Agent, ServicePorts, Stop, World};
 
 #[cfg(test)]
@@ -49,6 +53,8 @@ mod flags_tests;
 #[cfg(test)]
 mod frontend_tests;
 #[cfg(test)]
+mod hold_tests;
+#[cfg(test)]
 mod local_tests;
 #[cfg(test)]
 mod pki;
@@ -59,6 +65,6 @@ mod run_tests;
 #[cfg(test)]
 mod service_tests;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 #[cfg(test)]
 mod update_tests;

@@ -4,6 +4,12 @@
 //! killed for memory at its own limit, the cap. [`of`] reads the report before it is judged (the judging drops a
 //! killed run's result); [`killed`] adds the booking once the scheduler has taken it.
 
+mod recording;
+#[cfg(test)]
+mod recording_tests;
+
+pub(crate) use recording::Recording;
+
 use std::time::SystemTime;
 
 use kbf_invocation::{
@@ -54,6 +60,11 @@ pub(crate) fn of(
         booked_memory_bytes: booked.map(|b| b.memory_bytes),
         booked_millicpus: booked.map(|b| b.cpu_millis),
         cap_bytes: None,
+        phase_times: if kbf_proto::task_claim::is_marked(m) {
+            kbf_invocation::PhaseTimes::TaskClaim
+        } else {
+            kbf_invocation::PhaseTimes::Measured
+        },
     }
 }
 
@@ -245,6 +256,114 @@ mod tests {
             [11, 12, 13, 14, 15, 16, 17].map(Some)
         );
         assert_eq!(u.numa, [NumaBytes { node: 1, bytes: 18 }]);
+    }
+
+    /// The metadata an executor run's result carries: the three phases the task claimed, as the
+    /// frontend lays them (`fetch` 2 s, `run` 5 s, `pack` 1 s, the pack read at second 28).
+    fn claimed_by_task() -> worker::Result {
+        let ts = |n| Some(Timestamp::from(secs(n)));
+        worker::Result {
+            action_result: Some(ActionResult {
+                execution_metadata: Some(ExecutedActionMetadata {
+                    input_fetch_start_timestamp: ts(20),
+                    input_fetch_completed_timestamp: ts(22),
+                    execution_start_timestamp: ts(22),
+                    execution_completed_timestamp: ts(27),
+                    output_upload_start_timestamp: ts(27),
+                    output_upload_completed_timestamp: ts(28),
+                    ..ExecutedActionMetadata::default()
+                }),
+                ..ActionResult::default()
+            }),
+            ..worker::Result::default()
+        }
+    }
+
+    /// Catches an executor run's record missing a time: the task's three phases reach the record
+    /// unchanged beside the server's three (queued, Start sent, result taken in), so the record
+    /// has all nine, as a daemon's run does, and the two ends bracket the task's phases.
+    #[test]
+    fn the_invocation_record_of_an_executor_run_has_all_nine_times() {
+        let stamp = Stamp {
+            queued: secs(10),
+            started: secs(15),
+        };
+        let run = of(&claimed_by_task(), None, stamp, secs(30), None);
+        let times = run.times.named().map(|(_, t)| t);
+        assert_eq!(
+            times,
+            [
+                at(10),
+                at(15),
+                at(20),
+                at(22),
+                at(22),
+                at(27),
+                at(27),
+                at(28),
+                at(30)
+            ]
+        );
+    }
+
+    /// Catches a time made up for a run whose task claimed none: with no metadata the four
+    /// phase pairs of the record are absent, never zero, and the server's three remain.
+    #[test]
+    fn an_executor_run_without_task_timing_has_no_phase_times() {
+        let stamp = Stamp {
+            queued: secs(10),
+            started: secs(15),
+        };
+        let bare = worker::Result {
+            action_result: Some(ActionResult::default()),
+            ..worker::Result::default()
+        };
+        let run = of(&bare, None, stamp, secs(30), None);
+        assert_eq!(
+            run.times,
+            ReapiTimes {
+                queued: at(10),
+                worker_start: at(15),
+                worker_completed: at(30),
+                ..ReapiTimes::default()
+            }
+        );
+    }
+
+    /// Catches the provenance read off the wrong thing: metadata the frontend marked as a
+    /// task's claim is a `TaskClaim` run, a daemon's metadata (its usage entry, no mark) and a
+    /// report with none are `Measured`.
+    #[test]
+    fn an_executor_run_is_task_claim_and_a_daemon_run_is_measured() {
+        let stamp = Stamp {
+            queued: secs(10),
+            started: secs(15),
+        };
+        let mut claimed = claimed_by_task();
+        let metadata = claimed
+            .action_result
+            .as_mut()
+            .and_then(|r| r.execution_metadata.as_mut())
+            .expect("metadata");
+        kbf_proto::task_claim::mark(metadata);
+        let run = of(&claimed, None, stamp, secs(30), None);
+        assert_eq!(run.phase_times, kbf_invocation::PhaseTimes::TaskClaim);
+
+        let daemon = worker::Result {
+            action_result: Some(ActionResult {
+                execution_metadata: Some(ExecutedActionMetadata {
+                    execution_start_timestamp: Some(Timestamp::from(secs(22))),
+                    auxiliary_metadata: vec![ResourceUsage::default().to_any()],
+                    ..ExecutedActionMetadata::default()
+                }),
+                ..ActionResult::default()
+            }),
+            ..worker::Result::default()
+        };
+        let run = of(&daemon, None, stamp, secs(30), None);
+        assert_eq!(run.phase_times, kbf_invocation::PhaseTimes::Measured);
+        let bare = of(&worker::Result::default(), None, stamp, secs(30), None);
+        assert_eq!(bare.phase_times, kbf_invocation::PhaseTimes::Measured);
     }
 
     /// Catches: a report without a result (a killed or lost run) given no times, or

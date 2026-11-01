@@ -32,6 +32,12 @@ fn beat() -> Heartbeat {
         last_update: None,
         updating: None,
         services: None,
+        agent_features: Vec::new(),
+        step: None,
+        commit: None,
+        step_secs: Default::default(),
+        promotion_pending: false,
+        deferred: None,
     }
 }
 
@@ -708,6 +714,11 @@ fn a_heartbeat_with_services_reads_a_reply_that_names_one() {
         health: Health::Healthy,
         last_update: None,
         updating: None,
+        step: None,
+        commit: None,
+        step_secs: Default::default(),
+        promotion_pending: false,
+        deferred: None,
     }]);
     let named = r#"{"reply":"update","service":"db","version":"0.1.7+gbbbbbbbbbbbb-3"}"#;
     let (addr, server) = rig.coordinator(vec![
@@ -748,4 +759,48 @@ fn a_heartbeat_with_services_reads_a_reply_that_names_one() {
         with_services
     );
     assert!(body.contains(r#""services":[{"name":"db""#), "{body}");
+}
+
+/// A heartbeat that announces `agent_features` is posted with them, and its answer is read as
+/// the service reply and the `features` beside it: a coordinator that advertises some, one that
+/// advertises none, and one that predates them (no field). The reader of today refuses the
+/// first two, which is why the coordinator sends `features` only to an agent that announced.
+#[test]
+fn a_heartbeat_that_announces_features_reads_the_features_of_the_answer() {
+    let rig = Rig::new("co-features");
+    let mut announcing = beat();
+    announcing.agent_features = vec!["deferred-v1".to_owned(), "halt-v1".to_owned()];
+    let (addr, server) = rig.coordinator(vec![
+        ok(r#"{"reply":"update","version":"0.1.7+gbbbbbbbbbbbb-3","features":["deferred-v1"]}"#),
+        ok(r#"{"reply":"nothing","features":[]}"#),
+        ok(r#"{"reply":"nothing"}"#),
+        ok(r#"{"reply":"nothing","features":["Bad"]}"#),
+    ]);
+    let client = rig.client(addr);
+    let answer = client.heartbeat_answer(&announcing).unwrap();
+    assert_eq!(
+        answer.reply,
+        ServiceReply::Update {
+            service: None,
+            version: Version::parse("0.1.7+gbbbbbbbbbbbb-3").unwrap()
+        }
+    );
+    assert_eq!(answer.features, Some(vec!["deferred-v1".to_owned()]));
+    assert_eq!(
+        client.heartbeat_answer(&announcing).unwrap().features,
+        Some(Vec::new())
+    );
+    assert_eq!(client.heartbeat_answer(&announcing).unwrap().features, None);
+    assert!(matches!(
+        client.heartbeat_answer(&announcing),
+        Err(CoordinatorError::Malformed(_))
+    ));
+    let seen = server.join().unwrap().remove(0);
+    let text = String::from_utf8(seen.request).unwrap();
+    let body = text.split_once("\r\n\r\n").unwrap().1;
+    assert_eq!(serde_json::from_str::<Heartbeat>(body).unwrap(), announcing);
+    assert!(
+        body.contains(r#""agent_features":["deferred-v1","halt-v1"]"#),
+        "{body}"
+    );
 }

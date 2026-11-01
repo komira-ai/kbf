@@ -168,6 +168,8 @@ pub struct Packs {
     upload_idle_timeout: Duration,
     budget: Budget,
     pub(super) metrics: Arc<PackMetrics>,
+    /// What the packs' object store has been asked ([`Packs::with_store_metrics`]).
+    store_metrics: Arc<crate::store_metrics::StoreMetrics>,
     pub(super) verifying: Arc<VerifyingKeys>,
     clock: Clock,
 }
@@ -217,9 +219,20 @@ impl Packs {
             upload_idle_timeout: settings.upload_idle_timeout.min(MAX_UPLOAD_IDLE_TIMEOUT),
             budget: Budget::new(settings.inflight_bytes, Arc::clone(&metrics)),
             metrics,
+            store_metrics: Arc::new(crate::store_metrics::StoreMetrics::packs()),
             verifying: Arc::default(),
             clock: Arc::new(SystemTime::now),
         })
+    }
+
+    /// These packs rendering `metrics` as the packs' store's families (`kbf_pack_store_*`).
+    /// Give the store the packs are made over the same handle through
+    /// [`Counted`](crate::store_metrics::Counted); packs whose store is not counted render
+    /// the families with zeros.
+    #[must_use]
+    pub fn with_store_metrics(mut self, metrics: Arc<crate::store_metrics::StoreMetrics>) -> Self {
+        self.store_metrics = metrics;
+        self
     }
 
     /// These packs judging the age of a task key by `clock` (the wall clock unless told).
@@ -281,6 +294,7 @@ impl Packs {
     /// Appends the pack families to `out` in the Prometheus text format.
     pub fn render_metrics(&self, out: &mut String) {
         self.metrics.render(out);
+        self.store_metrics.render(out);
     }
 
     /// Appends the pack families of `packs`, if a frontend has them, to `out`; without packs
