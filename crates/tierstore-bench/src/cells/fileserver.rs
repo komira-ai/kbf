@@ -19,8 +19,8 @@ use crate::error::BenchError;
 /// Longest request head the server reads.
 const MAX_HEAD: usize = 8192;
 
-/// Largest body copied behind its head to go out in one write; a larger one is its own write,
-/// which TCP_NODELAY keeps from waiting.
+/// Largest body copied behind its head to go out in one write. The limit bounds the extra copy a
+/// request pays; a larger body is its own write, which TCP_NODELAY keeps from waiting.
 const ONE_WRITE_MAX: usize = 64 * 1024;
 
 /// A running server.
@@ -127,7 +127,8 @@ async fn respond<W: AsyncWrite + Unpin>(
     if body.len() <= ONE_WRITE_MAX {
         // One write, so the answer never waits on the peer's ACK of its own head (Nagle against
         // a delayed ACK is ~40 ms a request).
-        let mut answer = head.into_bytes();
+        let mut answer = Vec::with_capacity(head.len() + body.len());
+        answer.extend_from_slice(head.as_bytes());
         answer.extend_from_slice(body);
         socket.write_all(&answer).await
     } else {
@@ -211,6 +212,19 @@ mod tests {
             out.bytes,
             b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello"
         );
+    }
+
+    /// Catches a large answer that is cut, padded or mis-sized when it goes out as a head write and
+    /// a body write: a body one byte over the one-write limit is two writes, the head and then
+    /// the body, with the right content-length and every byte.
+    #[tokio::test]
+    async fn a_large_answer_is_a_head_write_and_a_body_write() {
+        let body = vec![7u8; ONE_WRITE_MAX + 1];
+        let mut out = Counting::default();
+        respond(&mut out, "200 OK", &body).await.unwrap();
+        assert_eq!(out.writes, 2);
+        let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+        assert_eq!(out.bytes, [head.as_bytes(), &body].concat());
     }
 
     /// Catches a connection served with Nagle on: every connection the server accepts has
