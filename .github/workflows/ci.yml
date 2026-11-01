@@ -205,6 +205,19 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: cargo check --locked --target x86_64-unknown-linux-musl -p kbf-task --bin kbf-task
+      # The Arm static target, which the release's linux-arm64 job builds: the `cfg(target_arch =
+      # "aarch64")` code of the task runner (its seccomp arch and syscall numbers) and the libc
+      # types that differ on Arm (`c_char` is `u8` there) compile only for it. ring's build needs an
+      # Arm C compiler, which `musl-gcc` is not: Zig's, fetched above, with Zig's own `-target`.
+      - run: rustup target add aarch64-unknown-linux-musl
+        if: ${{ !cancelled() }}
+      - name: Check for aarch64-unknown-linux-musl the binary the release builds for the Arm static target
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_unknown_linux_musl: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-linux-musl
+          AR_aarch64_unknown_linux_musl: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+        run: cargo check --locked --target aarch64-unknown-linux-musl -p kbf-task --bin kbf-task
       # The interpreter budget only shrinks: a pull request may not add a row to it
       # (crates/xtask/src/budget.rs). A pull request is checked out as the merge commit,
       # so HEAD^1 is the base branch it merges into.
