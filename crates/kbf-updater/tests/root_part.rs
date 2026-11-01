@@ -799,12 +799,18 @@ fn a_boot_entry_whose_record_directory_the_service_can_write_runs_nothing() {
         SUCCEEDED
     );
     let launched = world.launched().len();
-    // Opened to the service's account after the update, before the next start.
+    // Opened to the service's account once the declarations are loaded, before the boot entry: a
+    // load after this refuses the declaration itself.
+    let root = world.root_part();
     root_support::dir(&world.hook_dir("svc"), 0o777);
-    let started = world.root_part().start("svc", false);
+    let started = root.start("svc", false);
     assert_eq!(started.token(), Some("boot"), "{started:?}");
     assert!(
-        started.error.as_deref().unwrap_or_default().contains("can be written"),
+        started
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("can be written"),
         "{started:?}"
     );
     assert_eq!(world.launched().len(), launched);
@@ -893,7 +899,11 @@ fn a_cutover_a_boot_cut_off_is_rolled_back_even_when_its_declaration_was_refused
     world.clock.reboot("boot-b");
     let before = world.steps("svc").len();
     serve_once(&world, || {});
-    assert_eq!(world.steps("svc").len(), before, "a refused service runs nothing");
+    assert_eq!(
+        world.steps("svc").len(),
+        before,
+        "a refused service runs nothing"
+    );
     assert_eq!(world.record("svc")["state"]["state"], "done");
     assert_eq!(committed_boot_id(&world), "boot-b");
     // Put right in the same boot; the root part restarted.
