@@ -41,6 +41,8 @@
 //!   signing check and a job that runs it leaves its arguments in its log.
 //!   With `XTASK_FAKE_INSTALLER_VERSION=<stamp>` and the one argument `--version` it
 //!   prints `kbf-installer 0.1.0+<stamp>` instead.
+//! - Run as `llvm-profdata merge -sparse -f <list> -o <out>`, it writes the files the list names, joined,
+//!   to `<out>`, and fails when one begins `corrupt`.
 //! - Run as `gh attestation verify <file> <flags>`, it appends its arguments as one line
 //!   to `gh-args` next to it, and verifies the file when `attested` next to it holds
 //!   the line `<SHA-256 of the file> <flags>`: the store of attestations, each the file
@@ -812,6 +814,25 @@ fn uname(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `llvm-profdata merge -sparse -f <list> -o <out>`: writes the bytes of the files `<list>`
+/// names, one after another, to `<out>`; fails, as the tool does on a profile it cannot read,
+/// when one of them begins `corrupt`.
+fn llvm_profdata(args: &[String]) -> ExitCode {
+    assert_eq!(args.len(), 6, "merge -sparse -f <list> -o <out>: {args:?}");
+    assert_eq!(args[..3], ["merge", "-sparse", "-f"], "{args:?}");
+    let mut merged = Vec::new();
+    for name in std::fs::read_to_string(&args[3]).expect("list").lines() {
+        let bytes = std::fs::read(name).expect("input");
+        if bytes.starts_with(b"corrupt") {
+            eprintln!("llvm-profdata: invalid instrumentation profile data: {name}");
+            return ExitCode::FAILURE;
+        }
+        merged.extend_from_slice(&bytes);
+    }
+    std::fs::write(&args[5], merged).expect("out");
+    ExitCode::SUCCESS
+}
+
 /// `id -u` of a user that is not root.
 fn id(args: &[String]) -> ExitCode {
     match args {
@@ -840,6 +861,8 @@ fn main() -> ExitCode {
         syft(&argv0)
     } else if matches!(base, "systemd-sysusers" | "systemd-tmpfiles") {
         systemd(base, &rest)
+    } else if argv0.ends_with("/llvm-profdata") {
+        llvm_profdata(&rest)
     } else if argv0 == "uname" || argv0.ends_with("/uname") {
         uname(&rest)
     } else if argv0 == "id" || argv0.ends_with("/id") {

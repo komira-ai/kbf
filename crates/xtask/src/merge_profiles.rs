@@ -65,19 +65,13 @@ fn inputs(dir: &Path, extension: &str, prefix: &str) -> Result<Vec<(PathBuf, u64
     Ok(found)
 }
 
-/// What the running toolchain's `rustc` prints for `args`.
+/// What the running toolchain's `rustc` prints for `args`. A `rustc` that fails prints nothing,
+/// and the path built from that names no tool, which the merge then fails to start.
 fn rustc(args: &[&str]) -> Result<String, Error> {
     let out = Command::new("rustc")
         .args(args)
         .output()
         .map_err(Error::spawn(format!("rustc {}", args.join(" "))))?;
-    if !out.status.success() {
-        return Err(Error::Failed(format!(
-            "rustc {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
@@ -85,13 +79,10 @@ fn rustc(args: &[&str]) -> Result<String, Error> {
 fn toolchain_llvm_profdata() -> Result<PathBuf, Error> {
     let sysroot = rustc(&["--print", "sysroot"])?;
     let verbose = rustc(&["-vV"])?;
-    let host = verbose
-        .lines()
-        .find_map(|l| l.strip_prefix("host: "))
-        .ok_or_else(|| Error::Failed("`rustc -vV` names no host".to_owned()))?;
+    let host = verbose.lines().find_map(|l| l.strip_prefix("host: "));
     Ok(Path::new(sysroot.trim())
         .join("lib/rustlib")
-        .join(host.trim())
+        .join(host.unwrap_or_default().trim())
         .join("bin/llvm-profdata"))
 }
 
@@ -101,12 +92,11 @@ fn mib(bytes: u64) -> String {
 
 /// The profile to write.
 fn out_path(args: &Args, root: &Path) -> Result<PathBuf, Error> {
-    if let Some(out) = &args.out {
-        return Ok(out.clone());
-    }
-    let dir = args.workspace_profile_in.as_ref().ok_or_else(|| {
-        Error::Usage("merge-profiles needs --out or --workspace-profile-in".to_owned())
-    })?;
+    let Some(dir) = &args.workspace_profile_in else {
+        return args.out.clone().ok_or_else(|| {
+            Error::Usage("merge-profiles needs --out or --workspace-profile-in".to_owned())
+        });
+    };
     let root = root
         .canonicalize()
         .map_err(Error::spawn(format!("resolve {}", root.display())))?;

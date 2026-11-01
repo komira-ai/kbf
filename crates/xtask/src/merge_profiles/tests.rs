@@ -74,6 +74,22 @@ fn a_failed_merge_and_a_missing_output_are_errors() {
     );
 }
 
+/// Catches: a run that names no output passing, and a root with no directory name (`/`) naming
+/// the profile `.profdata`.
+#[test]
+fn an_output_that_cannot_be_named_is_an_error() {
+    let d = scratch("unnamed");
+    let mut a = args(&d, "true");
+    a.out = None;
+    let e = out_path(&a, &d).expect_err("no output named");
+    assert!(e.to_string().contains("needs --out"), "{e}");
+    a.workspace_profile_in = Some(PathBuf::from("p"));
+    let e = out_path(&a, Path::new("/")).expect_err("no directory name");
+    assert!(e.to_string().contains("no directory name"), "{e}");
+    let e = out_path(&a, &d.to_path_buf().join("missing")).expect_err("no such root");
+    assert!(e.to_string().starts_with("resolve "), "{e}");
+}
+
 /// Catches: the toolchain's tool not being found where `rustc` says its sysroot is.
 #[test]
 fn the_toolchain_names_its_llvm_profdata_beside_its_host() {
