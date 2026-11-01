@@ -5,8 +5,8 @@
 mod support;
 
 use kbf_invocation::{
-    CallKind, Ended, EndedKind, Event, ExecuteAnswer, IDLE_AFTER, LeaseEnd, Outcome, Records, Run,
-    WallTime,
+    CallKind, Ended, EndedKind, Event, ExecuteAnswer, IDLE_AFTER, LeaseEnd, Metadata, Outcome,
+    Records, Run, WallTime,
 };
 use kbf_sched::RequeueReason;
 use kbf_types::{Failure, LostWhy, OperationId};
@@ -32,6 +32,7 @@ fn one(key_of: &str, row: usize, attempt: Option<usize>, kind: EndedKind, at: Wa
         attempt,
         kind,
         at,
+        correlated_invocations_id: None,
     }
 }
 
@@ -346,4 +347,39 @@ fn an_attempt_the_bound_left_out_settles_nothing() {
         "the attempt did not fit"
     );
     assert!(got.iter().all(Vec::is_empty), "{got:?}");
+}
+
+/// Catches: an end that does not name the build its record belongs to (the correlated id of
+/// the call that sent one), an empty id passed on as one, and a record whose calls named none given one.
+#[test]
+fn an_end_names_the_correlated_id_its_record_holds() {
+    let with = |inv: &str, correlated: &str| {
+        let mut c = call(inv, t(0), CallKind::Uploaded(1));
+        c.metadata = Metadata {
+            correlated_invocations_id: Some(correlated.to_owned()),
+            ..Metadata::default()
+        };
+        ev(c)
+    };
+    let mut r = Records::new();
+    let got = ended(
+        &mut r,
+        [
+            with("a", "corr-1"),
+            with("b", ""),
+            queued("a", t(1), 1, 1),
+            queued("b", t(1), 2, 2),
+            granted(1, 1, "node-a", t(2)),
+            granted(2, 1, "node-a", t(2)),
+            finished_ok(1, 1, 7, 0, t(3)),
+            finished_ok(2, 1, 8, 0, t(3)),
+        ],
+    );
+    let correlated = |e: &Vec<Ended>| {
+        e.iter()
+            .map(|e| e.correlated_invocations_id.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(correlated(&got[6]), [Some("corr-1".to_owned())]);
+    assert_eq!(correlated(&got[7]), [None], "an empty id is none");
 }

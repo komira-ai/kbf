@@ -165,6 +165,9 @@ pub struct CellPlan {
     /// Whether the put cells add their open-loop arms (`run --open-loop`). The other cells have
     /// none and ignore it.
     pub open_loop: bool,
+    /// At most this many objects per pass of the multipart arms of `cold-put` (`run
+    /// --multipart-objects`), a cap on the plan's count; `None` keeps the plan's. The other arms and cells ignore it.
+    pub multipart_objects: Option<u64>,
 }
 
 /// Runs one cell.
@@ -247,6 +250,7 @@ mod tests {
             in_flight: vec![1],
             object_bytes: vec![],
             open_loop: true,
+            multipart_objects: None,
         };
         let bare = testkit::ctx(dir.path(), &[], Window::Busy);
         for (id, name) in [

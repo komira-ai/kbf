@@ -440,6 +440,11 @@ pub struct CellResult {
     /// field existed.
     #[serde(default)]
     pub rate_caps: Option<RateCaps>,
+    /// The counted requests a pass of the arm was set to make: one per object put or read (a
+    /// multipart object is one, its parts are in the request log). What `--multipart-objects`
+    /// changed is read here. Absent in a result written before the field existed.
+    #[serde(default)]
+    pub objects_per_pass: Option<u64>,
 }
 
 impl CellResult {
@@ -662,6 +667,7 @@ mod tests {
                 hot_rps: 50,
                 list_poll_rps: 2,
             }),
+            objects_per_pass: Some(1000),
         }
     }
 
@@ -714,6 +720,7 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_str(&result().to_json()).unwrap();
         v.as_object_mut().unwrap().remove("cold_state");
         v.as_object_mut().unwrap().remove("rate_caps");
+        v.as_object_mut().unwrap().remove("objects_per_pass");
         v["provenance"].as_object_mut().unwrap().remove("attempt");
         v["provenance"]
             .as_object_mut()
@@ -738,6 +745,7 @@ mod tests {
         let old = CellResult::from_json(&v.to_string()).unwrap();
         assert!(old.cold_state.is_empty());
         assert_eq!(old.rate_caps, None);
+        assert_eq!(old.objects_per_pass, None);
         assert_eq!(
             (
                 old.passes[0].proxy_requests.is_none(),
