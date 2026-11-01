@@ -203,15 +203,15 @@ fn the_calls_of_the_hook_equal_the_calls_of_todays_update_on_every_path() {
 // ---- the drain deadline ----
 
 /// A drain deadline that passes with a lease still held: `prepare` has looked at the leases
-/// every 5 s from 0 to the deadline (13 times for 60 s), has switched nothing, exits 75 with
-/// `retry_after_secs` the retry time (900 s) and the reason `drain_bound`, and the node is left
-/// drained. The updater's table then runs `rollback`, which gives back the cordon this update
-/// placed and reports the deferral.
+/// every 5 s from 0 to the deadline (13 times for 60 s), has switched nothing, gives back the
+/// cordon this update placed, and exits 75 with `retry_after_secs` the retry time (900 s), the
+/// reason `drain_bound` and the environment's class (a deferral is about the host's moment).
 ///
 /// Catches: a deadline that exits 1 (the update then counts as failed, not deferred), a node
-/// given back by `prepare` itself, one that is never given back, a retry time left out.
+/// left drained for the updater's rollback to give back, a retry time left out, a deferral
+/// counted against the release.
 #[test]
-fn a_drain_deadline_exits_75_with_the_node_left_drained() {
+fn a_drain_deadline_gives_the_cordon_back_and_exits_75() {
     let mut rig = Rig::new("hook-deadline");
     rig.flags.extend([s("--drain-deadline-secs"), s("60")]);
     *rig.drain.leases.lock().unwrap() = [2].into();
@@ -220,15 +220,19 @@ fn a_drain_deadline_exits_75_with_the_node_left_drained() {
     assert_eq!(ran.report.retry_after_secs, Some(900));
     assert_eq!(ran.reason(), "drain_bound");
     assert!(ran.report.reversible);
-    assert_eq!(ran.report.class, Class::Release);
+    assert_eq!(ran.report.class, Class::Environment);
     assert!(ran.logged("still holds 2 leases after the drain deadline of 60 s"));
-    assert!(rig.drain.is_drained(), "the node is left drained");
+    assert!(
+        !rig.drain.is_drained(),
+        "the cordon this update placed is lifted"
+    );
     let mut want = vec![s("local:query"), install(), s("placed"), s("drain n1 60")];
     want.extend(std::iter::repeat_n(s("leases"), 13));
+    want.push(s("undrain"));
     assert_eq!(rig.calls(), want);
     let record = rig.record().expect("a record");
     assert_eq!(record.placement, Some(super::record::Was::In));
-    assert!(record.drain_begun && !record.prepared);
+    assert!(record.drain_begun && record.given_back && !record.prepared);
 }
 
 /// The deadline through the updater's table: `prepare` 75, `rollback` 0, the verdict `Deferred`

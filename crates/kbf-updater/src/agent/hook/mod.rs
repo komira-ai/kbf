@@ -53,6 +53,8 @@ mod run_tests;
 mod steps_tests;
 #[cfg(test)]
 mod testing;
+#[cfg(test)]
+mod window_tests;
 
 /// What a step acts on: this host, and the ports to the helper, the frontend and the clock.
 pub struct HookWorld {

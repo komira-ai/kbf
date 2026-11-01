@@ -585,4 +585,26 @@ fn update_hook_answers_with_the_contracts_last_line() {
     assert_eq!(code, Some(1));
     assert!(out.contains("\"reason\":\"record_unusable\""), "{out}");
     assert!(!missing.exists());
+
+    // A record directory that is there: the real ports are wired next, and a host with no
+    // certificate files ends the step as the environment's fault, naming the file.
+    let (code, out, _) = run(&[
+        kbf_cli::UPDATE_HOOK,
+        "--record-dir",
+        &dir.display().to_string(),
+        "--channel",
+        "stable",
+        "--client-cert",
+        "/unused/cert.pem",
+        "--client-key",
+        "/unused/key.pem",
+        "--ca",
+        "/unused/ca.pem",
+        "verify",
+        "--params",
+        &params.display().to_string(),
+    ]);
+    assert_eq!(code, Some(1));
+    assert!(out.contains("\"reason\":\"world\""), "{out}");
+    assert!(out.contains("/unused/cert.pem"), "{out}");
 }

@@ -904,16 +904,27 @@ fn a_refused_confirm_is_reverted_by_the_step_that_made_it() {
     let record = rig.record().expect("a record");
     assert!(record.rolled_back && !record.confirm_begun && !record.confirmed);
     assert_eq!(rig.run(Step::Cleanup).reason(), "rolled_back");
+    // The updater runs `rollback` after a cleanup that says it is reversible: the revert is
+    // done, so nothing is called twice and the step succeeds.
+    let calls = rig.calls().len();
+    assert_eq!(rig.run(Step::Rollback).outcome, Outcome::Success);
+    assert_eq!(rig.calls().len(), calls);
+    assert_eq!(rig.events.count("local:revert"), 1);
+    assert_eq!(rig.events.count("undrain"), 1);
 
     // The revert itself fails: the update is not over, and the next try goes the same road.
     let rig = Rig::new("hook-confirm-refused-revert-fails");
     upto(&rig, Step::Verify);
-    rig.local.world().confirm = Err(LocalError::Unreachable(s("socket")));
+    rig.local.world().confirm = Err(LocalError::Failed(s("state_unavailable")));
     rig.local.world().revert = Err(LocalError::Failed(s("revert_failed")));
     let ran = rig.run(Step::Cleanup);
     assert_eq!(
         (ran.reason(), ran.report.class),
-        ("confirm_refused", Class::Environment)
+        ("confirm_refused", Class::Release)
+    );
+    assert!(
+        ran.report.reversible,
+        "the updater's rollback goes on from here"
     );
     assert!(!rig.record().expect("a record").rolled_back);
 }
@@ -931,6 +942,10 @@ fn an_undrain_that_fails_after_the_confirm_is_the_only_thing_tried_again() {
     assert_eq!(
         (ran.outcome, ran.reason()),
         (Outcome::Failure, "undrain_failed")
+    );
+    assert!(
+        !ran.report.reversible,
+        "after the commit a failure is not reversible"
     );
     assert!(rig.record().expect("a record").confirmed);
     *rig.drain.undrain_error.lock().unwrap() = None;

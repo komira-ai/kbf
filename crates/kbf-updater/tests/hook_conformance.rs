@@ -90,6 +90,9 @@ impl FakeService for FakeHost {
         if drained && !self.operator_drained {
             left.push("cordon".to_owned());
         }
+        if sandbox.world().join("mark").exists() {
+            left.push("mark".to_owned());
+        }
         Ok(left)
     }
 }

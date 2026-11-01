@@ -81,6 +81,20 @@ impl Paths {
         fs::read_to_string(self.faults.join(step)).ok()
     }
 
+    /// A kill point, then the file removed if it is there.
+    fn remove(&self, name: &str) -> io::Result<()> {
+        gate::point();
+        match fs::remove_file(self.world.join(name)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    /// The mark of a cordon this update's drain made, as the agent's cordon marks are.
+    fn marked(&self) -> bool {
+        self.world.join("mark").exists()
+    }
+
     fn drained(&self) -> bool {
         fs::read_to_string(self.world.join("node")).is_ok_and(|text| text.trim() == "drained")
     }
@@ -166,17 +180,22 @@ struct FakeDrain(Arc<Paths>);
 
 impl Drain for FakeDrain {
     fn placed(&self, _host: &Host) -> Result<Placed, PortError> {
-        Ok(if self.0.drained() {
+        // A node with our mark reads as in placement (the cordon is ours); an unmarked node
+        // that is drained was drained by an operator.
+        Ok(if self.0.drained() && !self.0.marked() {
             Placed::Out
         } else {
             Placed::In
         })
     }
 
+    /// The mark goes first, and only on a node that serves: an operator's drain gets none.
     fn drain(&self, _host: &Host, _deadline: Option<Duration>) -> Result<(), PortError> {
-        self.0
-            .put("node", "drained")
-            .map_err(|e| PortError::other(e.to_string()))
+        let other = |e: io::Error| PortError::other(e.to_string());
+        if !self.0.drained() {
+            self.0.put("mark", "ours").map_err(other)?;
+        }
+        self.0.put("node", "drained").map_err(other)
     }
 
     fn leases(&self, _host: &Host) -> Result<usize, PortError> {
@@ -186,9 +205,9 @@ impl Drain for FakeDrain {
     }
 
     fn undrain(&self, _host: &Host) -> Result<(), PortError> {
-        self.0
-            .put("node", "serving")
-            .map_err(|e| PortError::other(e.to_string()))
+        let other = |e: io::Error| PortError::other(e.to_string());
+        self.0.put("node", "serving").map_err(other)?;
+        self.0.remove("mark").map_err(other)
     }
 }
 
