@@ -361,8 +361,32 @@ the instance on, no window of the run is judged for foreign requests; the passes
 through the fault proxy and the window after one are not judged either. Those windows are
 recorded with `judged` false and the reason in `unjudged_reason` (the drives, healing, the
 counter and the error share are still judged). A missed foreign load is accepted; a trip on the
-run's own instance traffic is not. A run that wants its direct arms judged keeps them in a run
-of their own, without instance arms. A run with no cold admin key (heal status file mode) has no
+run's own instance traffic is not. A pass to the hot store alone is the tool's own traffic and is judged (the hot store is the
+farm's object store, a bucket of its own, and nothing sent to it is written to the cold store); a
+pass to a role the tool cannot attribute (the fault proxy, a test silo, the generator) is not
+judged, nor is the window after it, and its reason says so.
+
+*Running the direct arms judged.* `cold-put` interleaves its `direct`, `direct-mp` and `instance`
+arms in one run, so after the first instance pass the direct arms are all `judged: false`.
+`run --arms direct,direct-mp` restricts every selected cell to those arm families (an arm label
+is its family, then its size, width and mode: `direct-mp-4kib-c1-healthy` is of family
+`direct-mp`; the families are `direct`, `direct-mp`, `instance` of `cold-put`, `direct`,
+`instance` of `cold-read`, `hot`, `instance` of `a1`; cells B, C and G have none and cannot be
+filtered). A family no selected cell has is refused before anything is sent, and so is a filter
+that leaves a selected cell no arm, naming the cell. So run the direct arms in a run of their
+own, before the instance run, with the same `--attempt`, back to back in one window:
+
+```
+run --cell cold-put --arms direct,direct-mp --run-id w1-direct --attempt 1 ...
+run --cell cold-put --arms instance         --run-id w1-instance --attempt 1 ...
+```
+
+The filter is in `provenance.arms_filter` of every result (absent for a run of every arm) and
+`report` prints it. `report` pairs an `instance` arm with the `direct-mp` arm of the same size,
+width and mode and the same attempt, also when they are in result files of two runs; it then
+says the arms came from two runs, not interleaved, which is a weaker comparison than an
+interleaved one: a drift of the cold store between the runs is not controlled for. Arms of
+different attempts are not paired. A run with no cold admin key (heal status file mode) has no
 counter: the guard then keeps to the error share and the backstop, and the health reading is the
 one before each pass.
 

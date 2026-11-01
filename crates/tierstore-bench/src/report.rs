@@ -332,6 +332,9 @@ fn fmt_against(value: u64, base: u64) -> String {
 /// instance. The single PUT (`direct`) is not a partner. `None` if no arm has a partner.
 fn put_comparison(of_cell: &[&CellResult], rows: &Rows) -> Option<String> {
     let mut table = String::new();
+    // The pairs whose two arms are of different runs: the names, and the runs of each side.
+    let (mut crossed, mut floor_runs, mut instance_runs) =
+        (Vec::new(), BTreeSet::new(), BTreeSet::new());
     for instance in of_cell {
         let Some(rest) = instance.arm.strip_prefix("instance-") else {
             continue;
@@ -343,6 +346,11 @@ fn put_comparison(of_cell: &[&CellResult], rows: &Rows) -> Option<String> {
         else {
             continue;
         };
+        if floor.provenance.run_id != instance.provenance.run_id {
+            crossed.push(rest.to_owned());
+            floor_runs.insert(floor.provenance.run_id.as_str());
+            instance_runs.insert(instance.provenance.run_id.as_str());
+        }
         let name = if instance.provenance.attempt == 1 {
             rest.to_owned()
         } else {
@@ -374,9 +382,20 @@ fn put_comparison(of_cell: &[&CellResult], rows: &Rows) -> Option<String> {
             .expect("a string takes text");
         }
     }
+    let note = if crossed.is_empty() {
+        String::new()
+    } else {
+        let runs = |set: &BTreeSet<&str>| set.iter().copied().collect::<Vec<_>>().join(", ");
+        format!(
+            "- the arms of {} came from two runs ({} and {}), not interleaved pass by pass: the direct-mp arm of one run is set beside the instance arm of another of the same attempt, so a drift of the cold store between the runs is not controlled for\n\n",
+            crossed.join(", "),
+            runs(&floor_runs),
+            runs(&instance_runs)
+        )
+    };
     (!table.is_empty()).then(|| {
         format!(
-            "### cold-put: instance against direct-mp\n\n| arm | window | direct-mp p50 | instance p50 | instance against direct-mp | direct-mp p95 | instance p95 | instance against direct-mp |\n|---|---|---|---|---|---|---|---|\n{table}\n"
+            "### cold-put: instance against direct-mp\n\n| arm | window | direct-mp p50 | instance p50 | instance against direct-mp | direct-mp p95 | instance p95 | instance against direct-mp |\n|---|---|---|---|---|---|---|---|\n{table}\n{note}"
         )
     })
 }
@@ -511,6 +530,16 @@ fn format_report(results: &[CellResult], rows: &Rows) -> String {
             out.push_str(&table);
         }
         writeln!(out, "{}", caps_line(&of_cell)).expect("a string takes text");
+        let filters: BTreeSet<(&str, String)> = of_cell
+            .iter()
+            .filter_map(|r| {
+                let filter = r.provenance.arms_filter.as_ref()?;
+                Some((r.provenance.run_id.as_str(), filter.join(", ")))
+            })
+            .collect();
+        for (run, filter) in filters {
+            writeln!(out, "- run {run} ran only the arms: {filter}").expect("a string takes text");
+        }
         let mut said = BTreeSet::new();
         for result in &of_cell {
             for note in &result.notes {

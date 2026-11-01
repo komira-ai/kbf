@@ -37,7 +37,10 @@
 //!   instance's own. An instance pass (a request to another role than the cold one) makes the
 //!   instance copy to the cold store, for minutes after the pass, and the bench reads no signal
 //!   of when the copies end; so from the first instance pass of a run on, no window is judged.
-//!   An arm through the fault proxy, and the window after it, are not judged either. Those
+//!   A pass to the hot store alone is the harness's own: the hot store is the farm's object store,
+//!   a bucket of its own, and nothing sent to it is written to the cold store. An arm through the
+//!   fault proxy, a pass to a role the guard cannot attribute, and the window after either are
+//!   not judged. Those
 //!   windows are recorded with `judged` false and the reason in `unjudged_reason`. A missed
 //!   foreign load is accepted; a trip on the run's own instance traffic is not.
 //! - The count is exact enough that neither of these can trip a quiet pass on its own traffic:
@@ -113,6 +116,9 @@ const INSTANCE_REASON: &str = "instance copies may be pending: the bench reads n
 const FAULT_REASON: &str =
     "fault proxy pass, or the window after one: its requests are not told apart from others";
 
+/// Why a pass to a role the guard cannot attribute, and the window after it, are not judged.
+const OTHER_REASON: &str = "a pass sent requests to a role the guard cannot attribute (not hot, cold or instance), or the window after one";
+
 /// Whose traffic the requests of a pass were, as far as the harness can tell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Traffic {
@@ -135,9 +141,18 @@ impl Traffic {
     /// written to the cold store. Any request to the instance makes it `Instance`, which wins.
     #[must_use]
     pub fn of(faulted: bool, roles: impl IntoIterator<Item = Role>) -> Self {
-        let all_cold = roles.into_iter().all(|role| role == Role::Cold);
-        if !all_cold {
+        let (mut instance, mut other) = (false, false);
+        for role in roles {
+            match role {
+                Role::Cold | Role::Hot => {}
+                Role::Instance => instance = true,
+                _ => other = true,
+            }
+        }
+        if instance {
             Self::Instance
+        } else if other {
+            Self::Other
         } else if faulted {
             Self::Faulted
         } else {
@@ -163,7 +178,7 @@ pub struct ColdGuard {
     baseline: Option<Mark>,
     /// Whether the window that ended at the last reading could be judged; the one after it
     /// cannot be if it could not (an instance's copies go on after its pass).
-    prev_judgeable: bool,
+    prev_reason: Option<&'static str>,
     /// Whether an instance pass has run: from then on no window is judged (see [`Traffic`]).
     instance_seen: bool,
 }
@@ -176,7 +191,7 @@ impl ColdGuard {
             limits,
             window: VecDeque::new(),
             baseline: None,
-            prev_judgeable: true,
+            prev_reason: None,
             instance_seen: false,
         }
     }
@@ -276,7 +291,6 @@ impl ColdGuard {
         own_requests: u64,
         traffic: Traffic,
     ) -> (Option<ColdWindow>, Option<ColdTrip>) {
-        let judgeable = traffic == Traffic::Own;
         let reading = match reading {
             Ok(reading) => reading,
             Err(why) => return (None, Some(self.unreadable(&why))),
@@ -288,16 +302,20 @@ impl ColdGuard {
         let Some(base) = self.baseline.replace(now) else {
             return (None, self.unhealthy(&reading.state));
         };
+        let own_reason = match traffic {
+            Traffic::Own => None,
+            Traffic::Faulted => Some(FAULT_REASON),
+            Traffic::Instance => Some(INSTANCE_REASON),
+            Traffic::Other => Some(OTHER_REASON),
+        };
         self.instance_seen |= traffic == Traffic::Instance;
-        let judged = judgeable && self.prev_judgeable && !self.instance_seen;
         let unjudged_reason = if self.instance_seen {
             Some(INSTANCE_REASON)
-        } else if judged {
-            None
         } else {
-            Some(FAULT_REASON)
+            own_reason.or(self.prev_reason)
         };
-        self.prev_judgeable = judgeable;
+        let judged = unjudged_reason.is_none();
+        self.prev_reason = own_reason;
         let Some(minio_requests) = now.s3_requests.checked_sub(base.s3_requests) else {
             let detail = format!(
                 "the store's S3 request counter went from {} to {} (a restart?), so the pass cannot be shown quiet",

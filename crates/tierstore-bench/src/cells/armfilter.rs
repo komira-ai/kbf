@@ -17,28 +17,52 @@
 //! - A filter that leaves a selected cell with no arm is refused, naming the cell ([`select`]).
 //! - Arms keep the order the cell built them in.
 
-use crate::cells::CellId;
 use crate::cells::engine::Arm;
+use crate::cells::{CellId, a1, cold_put, cold_read};
 use crate::error::BenchError;
 
 /// The family of an arm label: its leading segments up to the first that starts with a digit
 /// (the size, or the count of a cell that starts with one); empty if the label starts with one.
 #[must_use]
-pub fn family(_label: &str) -> String {
-    todo!("the family of a label")
+pub fn family(label: &str) -> String {
+    let leading = |segment: &&str| !segment.starts_with(|c: char| c.is_ascii_digit());
+    label
+        .split('-')
+        .take_while(leading)
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// The families of the arms `cell` builds.
 #[must_use]
-pub fn families(_cell: CellId) -> Vec<&'static str> {
-    Vec::new()
+pub fn families(cell: CellId) -> Vec<&'static str> {
+    match cell {
+        CellId::ColdPut => cold_put::PATHS.iter().map(|p| p.name).collect(),
+        CellId::ColdRead => cold_read::PATHS.iter().map(|p| p.name).collect(),
+        CellId::A1 => a1::PATHS.iter().map(|p| p.name).collect(),
+        CellId::B | CellId::C | CellId::G => Vec::new(),
+    }
 }
 
 /// Refuses a filter with an item that none of `cells` has as a family.
 ///
 /// # Errors
 /// [`BenchError::Setup`] naming the item and the families the cells have.
-pub fn check(_cells: &[CellId], _filter: &[String]) -> Result<(), BenchError> {
+pub fn check(cells: &[CellId], filter: &[String]) -> Result<(), BenchError> {
+    let known: Vec<&str> = cells.iter().flat_map(|cell| families(*cell)).collect();
+    for item in filter {
+        if item.is_empty() {
+            return Err(BenchError::Setup(
+                "--arms: an empty family in the list".to_owned(),
+            ));
+        }
+        if !known.contains(&item.as_str()) {
+            return Err(BenchError::Setup(format!(
+                "--arms: no selected cell has the arm family {item:?} (the families of the selected cells: {})",
+                known.join(", ")
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -47,11 +71,25 @@ pub fn check(_cells: &[CellId], _filter: &[String]) -> Result<(), BenchError> {
 /// # Errors
 /// [`BenchError::Setup`] naming the cell if the filter leaves it no arm.
 pub fn select(
-    _cell: CellId,
+    cell: CellId,
     arms: Vec<Arm>,
-    _filter: Option<&[String]>,
+    filter: Option<&[String]>,
 ) -> Result<Vec<Arm>, BenchError> {
-    Ok(arms)
+    let Some(filter) = filter else {
+        return Ok(arms);
+    };
+    let kept: Vec<Arm> = arms
+        .into_iter()
+        .filter(|arm| filter.contains(&family(&arm.label)))
+        .collect();
+    if kept.is_empty() {
+        return Err(BenchError::Setup(format!(
+            "--arms {}: leaves the cell {} no arm",
+            filter.join(","),
+            cell.as_str()
+        )));
+    }
+    Ok(kept)
 }
 
 #[cfg(test)]
