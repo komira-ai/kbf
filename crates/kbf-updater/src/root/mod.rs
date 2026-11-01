@@ -546,9 +546,9 @@ impl RootPart {
     /// before the start pass and before the agent is served, so no update of a service is running.
     /// The services whose record could not be read, and why.
     pub fn read_after_boot(&self) -> Vec<(String, String)> {
+        // The state directory is made when the root part is (`RootPart::new`).
         let entries = match fs::read_dir(&self.config.state) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Vec::new(),
             Err(e) => return vec![(String::new(), e.to_string())],
         };
         let mut unread = Vec::new();
