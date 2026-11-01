@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use js_types::HostId;
 use js_usage::{
-    KeyProfile, KeySource, Limits, LoadIn, NodeMinute, Observation, ProfileCurves, ProfileKey,
-    RunEnd, SinkCounters, UsageFault, UsageSink,
+    Admitted, KeyProfile, KeySource, Limits, LoadIn, NodeMinute, Observation, ProfileCurves,
+    ProfileKey, RunEnd, SinkCounters, UsageFault, UsageSink,
 };
 use kbf_types::ActionKey;
 
@@ -74,7 +74,9 @@ impl UsageSink for KbfUsageSink {
             .sink
             .run_ended(&end.key, &end.series, now_minute / MINUTES_PER_DAY)
             .map_err(fault)?;
-        let _ = admitted;
+        if admitted != Admitted::Yes {
+            self.declined.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -152,6 +154,7 @@ impl RunKeys {
     pub fn bind(&self, run_id: &str, action: ActionKey) -> bool {
         let mut runs = self.lock();
         if runs.len() >= MAX_SHAPES && !runs.contains_key(run_id) {
+            self.refused.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         runs.insert(run_id.to_owned(), action);

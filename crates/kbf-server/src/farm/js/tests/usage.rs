@@ -226,9 +226,10 @@ impl Rig {
             .await
     }
 
-    /// The beats that carry no load, which hand a result to the hub once its grace is over.
+    /// The beats that carry no load: the first carries the result accepted so far to the hub,
+    /// and the hub hands the run to the profile after the grace beats that follow it.
     async fn grace(&mut self) {
-        for _ in 0..js_usage::GRACE_BEATS {
+        for _ in 0..=js_usage::GRACE_BEATS {
             self.seq += 1;
             let acknowledged = self
                 .farm
@@ -570,4 +571,19 @@ async fn the_usage_families_are_on_a_scrape_only_when_the_farm_records() {
     let text = scrape(&record.farm);
     assert!(text.contains("kbf_usage_runs_learned_total 3\n"), "{text}");
     assert!(text.contains("kbf_usage_profile_keys 1\n"), "{text}");
+}
+
+/// Catches the farm's tick and its shutdown not reaching the usage side: a tick runs the
+/// usage tick (once, for the first call), the final flush is taken by the store, and a farm
+/// that records nothing ticks and finishes as it always did.
+#[tokio::test(start_paused = true)]
+async fn the_farms_tick_and_shutdown_reach_the_usage_side() {
+    let (record, _s1) = rig(UsageProfiles::Record);
+    record.farm.tick().await;
+    record.farm.tick().await;
+    assert_eq!(record.stats().ticks, 1);
+    assert!(record.farm.finish_usage().await);
+    let (off, _s2) = rig(UsageProfiles::Off);
+    off.farm.tick().await;
+    assert!(off.farm.finish_usage().await);
 }

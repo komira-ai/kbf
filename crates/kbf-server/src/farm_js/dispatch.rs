@@ -277,9 +277,8 @@ pub(crate) struct Ran {
     pub(crate) clean: bool,
 }
 
-/// [`report`], leaving in `ran` what the lease ran and how it ended, for a `Result` that
-/// names a lease the core holds for `worker`. It is set before the core is asked, so it is
-/// read only when the answer is an accepted one.
+/// [`report`], leaving in `ran` what the lease ran and how it ended when the core accepted the
+/// `Result` now (not for a refused one, nor one whose record the store has not taken yet).
 ///
 /// # Errors
 /// The core's admission refuses the host.
@@ -342,7 +341,6 @@ pub(crate) async fn report_noting(
     });
     let (outcome, detail) = answer::outcome(cache, read, lease, ran_on, result).await;
     let clean = matches!(outcome, Outcome::Completed { .. });
-    *ran = keyed.map(|action| Ran { action, clean });
     let report = Report {
         operation,
         lease,
@@ -357,7 +355,10 @@ pub(crate) async fn report_noting(
     let taken = core.report(now(), worker, report, park).await;
     // None: the ack is sent when the store has taken the record, or never.
     let (accepted, reason) = match taken {
-        Taken::Accepted => (true, ResultAckReason::Accepted),
+        Taken::Accepted => {
+            *ran = keyed.map(|action| Ran { action, clean });
+            (true, ResultAckReason::Accepted)
+        }
         Taken::Refused(reason) => (false, acked(reason)),
         Taken::Held | Taken::Dropped => return Ok(None),
     };

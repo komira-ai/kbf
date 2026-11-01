@@ -183,9 +183,7 @@ pub(crate) async fn report(
     .ok()
     .flatten();
     // A result the core took is a run the usage side follows to its worker's next beat.
-    if let (Some(usage), Some(Ran { action, clean })) = (&js.usage, ran)
-        && acked.as_ref().is_some_and(|ack| ack.accepted)
-    {
+    if let Some((Ran { action, clean }, usage)) = ran.zip(js.usage.as_ref()) {
         usage.accepted(worker, lease, action, clean, wall_minute(js.ambient));
     }
     // The summaries a kill changed are written now, after the core has let go of its lock.

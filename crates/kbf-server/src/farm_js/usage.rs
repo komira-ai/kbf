@@ -34,13 +34,6 @@
 //! pool. A panic in the hub is caught and counted as a fault; a beat or a result is never
 //! refused because of usage.
 
-// The behaviour of the methods of `Usage` arrives in the next commit.
-#![expect(
-    dead_code,
-    unused_imports,
-    reason = "the behaviour of Usage arrives in the next commit"
-)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -253,7 +246,9 @@ impl Usage {
     /// for. An action the estimator has no key for (its request does not pin the OS, or its
     /// subject is unknown) has none, and its runs are not learned.
     pub(crate) fn note_action(&self, action: &ActionKey, platform: &Platform, subject: &Subject) {
-        let _ = (action, platform, subject);
+        if let Ok(key) = estimator_key(&action.instance, platform, subject) {
+            self.shapes.insert(action.clone(), profile_name(&key));
+        }
     }
 
     /// Takes note that the farm accepted the result of `lease`, which ran `action`, from
@@ -268,7 +263,23 @@ impl Usage {
         clean: bool,
         now_minute: u64,
     ) {
-        let _ = (worker, lease, action, clean, now_minute);
+        let run_id = run_id(lease);
+        if !self.keys.bind(&run_id, action.clone()) {
+            return;
+        }
+        let finish = if clean {
+            Finish::Clean
+        } else {
+            Finish::Unclean
+        };
+        let waiting = Waiting {
+            lease: js_types::LeaseId::new(lease.term, lease.seq),
+            run_id,
+            action,
+            finish,
+            minute: now_minute,
+        };
+        self.lock().entry(worker.clone()).or_default().push(waiting);
     }
 
     /// The one place a run is forgotten: its key, and the profile name of its action. Called
@@ -291,7 +302,41 @@ impl Usage {
         held: &BTreeSet<js_types::LeaseId>,
         now_minute: u64,
     ) {
-        let _ = (worker, epoch, load, held, now_minute);
+        let carried = self.lock().remove(worker).unwrap_or_default();
+        let results: Vec<AcceptedResult<'_>> = carried
+            .iter()
+            .map(|run| AcceptedResult {
+                lease: run.lease,
+                run_id: &run.run_id,
+                finish: run.finish,
+            })
+            .collect();
+        let load = match load.map(LoadIn::try_from) {
+            None => BeatLoad::Absent,
+            Some(Ok(load)) => BeatLoad::Read {
+                load,
+                records_dropped: 0,
+            },
+            Some(Err(_)) => BeatLoad::Rejected,
+        };
+        let host = self.names.host_name(worker);
+        let beat = Beat {
+            host: &host,
+            epoch,
+            load,
+            results: &results,
+        };
+        let held = |lease: &js_types::LeaseId, _: &js_types::HostId| held.contains(lease);
+        if catch_unwind(AssertUnwindSafe(|| {
+            self.hub.on_beat(beat, now_minute, &held);
+        }))
+        .is_err()
+        {
+            self.hub.note_fault();
+        }
+        // After the hub read the results: it asks for their keys in `on_beat`.
+        drop(results);
+        self.finish_runs(carried);
     }
 
     /// [`Usage::beat_blocking`] on the blocking pool.
@@ -314,7 +359,28 @@ impl Usage {
     /// [`FLUSH_EVERY_MINUTES`] minutes, which also tells the curves the day), and the runs
     /// whose worker has not beaten for a day are let go. Blocks on the store.
     pub(crate) fn tick_blocking(&self, now_minute: u64) {
-        let _ = now_minute;
+        self.ticks.fetch_add(1, Ordering::Relaxed);
+        if catch_unwind(AssertUnwindSafe(|| {
+            self.hub.tick(now_minute);
+        }))
+        .is_err()
+        {
+            self.hub.note_fault();
+        }
+        let gone: Vec<Waiting> = {
+            let mut waiting = self.lock();
+            let mut gone = Vec::new();
+            for runs in waiting.values_mut() {
+                let (old, kept): (Vec<_>, Vec<_>) = std::mem::take(runs)
+                    .into_iter()
+                    .partition(|run| now_minute.saturating_sub(run.minute) > TRACK_IDLE_MINUTES);
+                *runs = kept;
+                gone.extend(old);
+            }
+            waiting.retain(|_, runs| !runs.is_empty());
+            gone
+        };
+        self.finish_runs(gone);
     }
 
     /// [`Usage::tick_blocking`] on the blocking pool, once for each [`FLUSH_EVERY_MINUTES`]
@@ -331,8 +397,13 @@ impl Usage {
 
     /// The flush at shutdown, whatever the schedule says; whether the store took it.
     pub(crate) fn finish_blocking(&self, now_minute: u64) -> bool {
-        let _ = now_minute;
-        true
+        catch_unwind(AssertUnwindSafe(|| {
+            self.hub.finish(now_minute).closed.is_ok()
+        }))
+        .unwrap_or_else(|_| {
+            self.hub.note_fault();
+            false
+        })
     }
 
     /// [`Usage::finish_blocking`] on the blocking pool.
@@ -344,7 +415,13 @@ impl Usage {
 
     /// Lets go of every result no beat has read: the farm hands its work over, and the
     /// beats of its workers go to another frontend.
-    pub(crate) fn drop_all(&self) {}
+    pub(crate) fn drop_all(&self) {
+        let all: Vec<Waiting> = std::mem::take(&mut *self.lock())
+            .into_values()
+            .flatten()
+            .collect();
+        self.finish_runs(all);
+    }
 
     /// What is held and counted.
     pub(crate) fn stats(&self) -> UsageStats {
