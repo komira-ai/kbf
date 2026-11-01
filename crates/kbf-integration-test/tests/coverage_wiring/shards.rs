@@ -276,12 +276,14 @@ pub fn shard_wiring(workflow: &str) -> Result<(), String> {
             "the merge step of `{SHARD}` has an `if:` or `continue-on-error`, so a shard could upload without its profiles merged"
         ));
     }
-    let mw = words(merge_text);
-    if flag(&mw, "--dir") != Some(PROFILES)
-        || flag(&mw, "--extension") != Some("profraw")
-        || flag(&mw, "--prefix") != Some(FILE_PREFIX)
-        || flag(&mw, "--out") != Some(&format!("{PROFILES}/{FILE_PREFIX}merged.profdata"))
-    {
+    // Text, not words: the prefix and the name hold `${{ matrix.<key> }}`, which has spaces.
+    let wants = [
+        format!("--dir {PROFILES} "),
+        "--extension profraw ".to_owned(),
+        format!("--prefix {FILE_PREFIX} "),
+        format!("--out {PROFILES}/{FILE_PREFIX}merged.profdata"),
+    ];
+    if wants.iter().any(|w| !merge_text.contains(w.as_str())) {
         return Err(format!(
             "the merge step of `{SHARD}` must merge the shard's own `{FILE_PREFIX}*.profraw` files of `{PROFILES}` into `{PROFILES}/{FILE_PREFIX}merged.profdata`"
         ));
