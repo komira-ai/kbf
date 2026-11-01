@@ -390,6 +390,37 @@ async fn a_hello_before_the_poll_takes_up_the_lease_of_an_operation_held_queued(
     assert_eq!(done_with(&ticket), "test");
 }
 
+/// Asserts that a daemon's `Hello` to a frontend that gave the node's lease up, whose requeue
+/// the store has not taken, leaves the operation queued there with its callers and takes up
+/// no lease for it: the lease row still names the node, but the operation is this frontend's
+/// own, requeued.
+#[tokio::test(start_paused = true)]
+async fn a_hello_does_not_take_up_the_lease_of_an_operation_whose_requeue_is_unsettled() {
+    let store = Racing::new();
+    let farm = farm_over(&store);
+    let _first = register(&farm, "node-a");
+    let ticket = caller(&farm, 1);
+    assert_eq!((rows(&store, "lease/"), rows(&store, "queue/")), (1, 0));
+    store.set_down(true);
+    tokio::time::advance(kbf_sched::fence::LEASE_GRACE + Duration::from_secs(1)).await;
+    farm.tick().await;
+    store.set_down(false);
+    assert_eq!(farm.queued_operations(), 1, "the lease was not given up");
+
+    let _second = register(&farm, "node-a");
+
+    assert_eq!(farm.queued_operations(), 1, "the operation left the queue");
+    assert_eq!(unfinished(&farm).len(), 1);
+    assert!(
+        farm.lease_views(None).leases.is_empty(),
+        "a lease was taken up"
+    );
+    assert!(
+        !matches!(*ticket.stage.borrow(), Stage::Done(_)),
+        "the caller was answered from a handoff"
+    );
+}
+
 /// Asserts that a result the store refuses as stale (the lease row is gone) does not leave
 /// its callers waiting on this frontend: they are answered with the result another frontend
 /// recorded.
