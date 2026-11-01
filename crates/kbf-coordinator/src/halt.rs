@@ -51,8 +51,9 @@ use kbf_updater::wire::{Heartbeat, Outcome, Phase, Token, UpdateResult};
 
 use crate::decide::{Decision, Hold, decide_marked};
 use crate::desired::{Desired, KBF};
-use crate::fleet::Fleet;
+use crate::fleet::{Fleet, Node};
 use crate::identity::Identity;
+use crate::membership::{self, Standing};
 use crate::ops::{AuditEntry, Halt, HaltAck, OpsState, OpsStore, Write};
 use crate::services::Services;
 
@@ -83,13 +84,6 @@ fn reported(last: Option<&UpdateResult>, id: &NodeId) -> Option<Halt> {
         target: last.target.clone(),
         report: Some(last.clone()),
     })
-}
-
-/// Whether the service `service` is defined and runs on hosts of `role`.
-pub(crate) fn is_member(services: &Services, service: &str, role: &str) -> bool {
-    services
-        .get(service)
-        .is_some_and(|def| def.roles.contains_key(role))
 }
 
 /// Why `halt`, reported for `service`, is not raised.
@@ -143,7 +137,10 @@ pub(crate) fn note(
     services: &Services,
     who: &Identity,
     beat: &Heartbeat,
+    node: &Node,
+    now: Duration,
 ) -> Vec<String> {
+    let state = ops.state();
     let listed = beat.services.as_deref().unwrap_or_default();
     let top = std::iter::once((KBF, beat.last_update.as_ref(), beat.updating.is_some()));
     let reports = top.chain(listed.iter().map(|one| {
@@ -155,7 +152,10 @@ pub(crate) fn note(
     }));
     let mut held = Vec::new();
     for (service, last, updating) in reports {
-        if updating || !is_member(services, service, who.role.name()) {
+        let counted = services.get(service).is_some_and(|def| {
+            membership::standing(def, &who.node_id, node, &state, now) == Standing::Counted
+        });
+        if updating || !counted {
             continue;
         }
         let report = reported(last, &who.node_id);

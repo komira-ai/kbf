@@ -345,10 +345,7 @@ impl Coordinator {
 
     fn reply_to(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
         let now = (self.clock)();
-        let held = halt::note(&self.ops, &self.services, &who, &beat);
-        let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         let announced = beat.services.clone().unwrap_or_default();
-        let platform = beat.platform;
         let node = Node {
             role: who.role.name().to_owned(),
             features: beat.agent_features.clone(),
@@ -357,6 +354,9 @@ impl Coordinator {
                 .chain(announced.iter().map(|one| (one.name.clone(), one.health)))
                 .collect(),
         };
+        let held = halt::note(&self.ops, &self.services, &who, &beat, &node, now);
+        let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
+        let platform = beat.platform;
         let ops = self.ops.state();
         let counted =
             |def: &ServiceDef| standing(def, &who.node_id, &node, &ops, now) == Standing::Counted;
