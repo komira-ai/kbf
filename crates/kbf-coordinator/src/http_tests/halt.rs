@@ -566,3 +566,44 @@ async fn a_restarted_coordinator_still_announces_the_generation() {
     send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
     assert_ne!(convergence(&rig, "kbf").await["state"], "halted");
 }
+
+/// Catches: an acknowledgement that outlives the report it cleared: the host is repaired, comes
+/// back with no memory of the failed update (its beat has no `last_update`), is ordered the same
+/// target again and fails it in the halt phase again. That is a new failure, and the service
+/// halts again, naming the new report. The same report repeated before the host is repaired
+/// stays acknowledged.
+#[tokio::test]
+async fn the_same_host_failing_the_same_target_again_after_a_clear_halts_again() {
+    let rig = farm("halt-same-target-again").await;
+    send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
+    clear(&rig, "kbf").await;
+    send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
+    assert_ne!(convergence(&rig, "kbf").await["state"], "halted");
+
+    // The host restarts: no `last_update`, and it is ordered the target again.
+    let ordered = send(&rig, "s1", "storage", &beat("1.0", "")).await;
+    assert_eq!(ordered, json!({"reply": "update", "version": "2.0"}));
+    send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
+    let state = convergence(&rig, "kbf").await;
+    assert_eq!(state["state"], "halted");
+    assert_eq!(
+        state["halt"],
+        json!({"node_id": "s1", "check": "disk_tainted", "target": "2.0"})
+    );
+}
+
+/// Catches: an acknowledgement that survives the host starting a new update: a beat that says
+/// the host is updating ends the acknowledgement, even if it still carries the old report, and
+/// the report that comes after a failed attempt halts again. While the host updates, the old
+/// report is not read as a new failure.
+#[tokio::test]
+async fn an_ack_ends_when_the_host_starts_an_update() {
+    let rig = farm("halt-ack-updating").await;
+    send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
+    clear(&rig, "kbf").await;
+    let updating = beat("1.0", &format!(r#","updating":"2.0"{HALT}"#));
+    send(&rig, "s1", "storage", &updating).await;
+    assert_ne!(convergence(&rig, "kbf").await["state"], "halted");
+    send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
+    assert_eq!(convergence(&rig, "kbf").await["state"], "halted");
+}
