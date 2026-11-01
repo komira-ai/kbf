@@ -32,7 +32,7 @@ fn def() -> crate::services::ServiceDef {
 
 /// The shipped file is a definition of tierstore that the services file parser accepts and
 /// that says each of the values the rollout rests on: the storage role, one host at a time,
-/// five others up, a canary of one, a bake of three beats, automatic rollback at the default
+/// four others up, a canary of one, a bake of three beats, automatic rollback at the default
 /// threshold, and a host that never registered is not ordered. A change to the shipped data
 /// shows here.
 #[test]
@@ -46,7 +46,7 @@ fn the_shipped_definition_says_what_the_rollout_rests_on() {
             &"storage".to_owned(),
             &RoleDef {
                 max_updating: Some(1),
-                min_up: Some(5),
+                min_up: Some(4),
                 never_last: false,
                 after: Vec::new(),
             }
@@ -150,9 +150,19 @@ fn round(
     at: u64,
     shown: &[(&str, &str, Option<&str>, Option<UpdateResult>)],
 ) -> (Vec<String>, ServiceReply) {
+    round_without(rig, at, shown, &[])
+}
+
+/// [`round`], with the storage hosts in `silent` not beating.
+fn round_without(
+    rig: &Rig,
+    at: u64,
+    shown: &[(&str, &str, Option<&str>, Option<UpdateResult>)],
+    silent: &[&str],
+) -> (Vec<String>, ServiceReply) {
     rig.at(at);
     let mut ordered = Vec::new();
-    for host in STORAGE {
+    for host in STORAGE.into_iter().filter(|h| !silent.contains(h)) {
         let (running, updating, last) = shown
             .iter()
             .find(|(h, ..)| *h == host)
@@ -194,7 +204,7 @@ fn going(host: &str) -> (&str, &str, Option<&str>, Option<UpdateResult>) {
 async fn a_canary_goes_first_then_one_storage_host_at_a_time_each_baking() {
     let rig = rig("ts-roll");
     rig.set(TWO).await;
-    // Every host is heard once before any can be ordered: five others must be up.
+    // Every host is heard once before any can be ordered: four others must be up.
     let _ = round(&rig, 2_000, &[]);
 
     let (ordered, daemon) = round(&rig, 2_015, &[]);
@@ -239,6 +249,19 @@ async fn a_canary_goes_first_then_one_storage_host_at_a_time_each_baking() {
         .collect();
     assert_eq!(roles.len(), 1);
     assert_eq!(roles[0]["role"], "storage");
+}
+
+/// One storage host of six that does not beat (drained, or out for a measurement) does not
+/// hold the roll: the canary goes on the five that do, four of which stay up while it updates.
+#[tokio::test]
+async fn one_storage_host_out_does_not_hold_the_roll() {
+    let rig = rig("ts-one-out");
+    rig.set(TWO).await;
+    let _ = round_without(&rig, 2_000, &[], &["s6"]);
+
+    let (ordered, daemon) = round_without(&rig, 2_015, &[], &["s6"]);
+    assert_eq!(ordered, ["s1"], "the canary goes with s6 out");
+    assert_eq!(daemon, ServiceReply::Nothing);
 }
 
 /// Two of six storage hosts failing a release after the commit roll tierstore back by

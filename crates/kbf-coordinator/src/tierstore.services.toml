@@ -3,8 +3,8 @@
 # (after kbf's own entry if the file replaces it), it makes tierstore a service the
 # coordinator rolls to the hosts of the storage role.
 #
-# Six storage hosts is the farm this is written for: one updates at a time, and the other
-# five must be up. The first host goes alone, and no other starts until it has beaten
+# Six storage hosts is the farm this is written for: one updates at a time, and four of the
+# other five must stay up. The first host goes alone, and no other starts until it has beaten
 # healthy three times at the new version. A release that fails after its commit on two
 # hosts is rolled back by the coordinator to the last version that converged and baked.
 
@@ -21,4 +21,4 @@ roles = ["storage"]
 
 [service.roles.storage]
 max_updating = 1
-min_up = 5
+min_up = 4
