@@ -361,10 +361,22 @@ the instance on, no window of the run is judged for foreign requests; the passes
 through the fault proxy and the window after one are not judged either. Those windows are
 recorded with `judged` false and the reason in `unjudged_reason` (the drives, healing, the
 counter and the error share are still judged). A missed foreign load is accepted; a trip on the
-run's own instance traffic is not. A pass to the hot store alone is the tool's own traffic and is judged (the hot store is the
-farm's object store, a bucket of its own, and nothing sent to it is written to the cold store); a
-pass to a role the tool cannot attribute (the fault proxy, a test silo, the generator) is not
-judged, nor is the window after it, and its reason says so.
+run's own instance traffic is not. The store's request counter counts every server of the cold MinIO cluster, and the hot store is
+very likely the same cluster at another address (a NodePort answers on every node; the cold
+store is `127.0.0.1` on one node and another node's address elsewhere), so the tool counts its
+own requests per *cluster*, not per role, and decides which roles are on the cold store's
+cluster by its identity, never by comparing addresses: first the run file's `cold_cluster_roles`
+(for example `["hot"]`), which overrides everything; otherwise the deployment id that `mc admin
+info` reports for the hot and for the cold store (the ops file needs the admin key of each);
+equal ids are one cluster, different ids two. The roles counted and how it was decided are in
+`provenance.cold_server`. Requests of the hot role are in the own count when the hot store is on
+the cold store's cluster and not when it is another; either way a pass to the hot store alone is
+the tool's own traffic and is judged. If nothing decides it (no list, no admin key for the hot
+store, an answer without an id) the pass to the hot store and the window after it are not
+judged, and the reason says "the hot store's cluster could not be told apart from the cold
+store's". The instance's requests to MinIO are its copies and are never counted as the tool's.
+A pass to a role the tool cannot attribute (the fault proxy, a test silo, the generator) is
+not judged either, nor is the window after it, and its reason says so.
 
 *Running the direct arms judged.* `cold-put` interleaves its `direct`, `direct-mp` and `instance`
 arms in one run, so after the first instance pass the direct arms are all `judged: false`.

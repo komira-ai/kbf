@@ -37,11 +37,13 @@
 //!   instance's own. An instance pass (a request to another role than the cold one) makes the
 //!   instance copy to the cold store, for minutes after the pass, and the bench reads no signal
 //!   of when the copies end; so from the first instance pass of a run on, no window is judged.
-//!   A pass to the hot store alone is the harness's own: the hot store is the farm's object store,
-//!   a bucket of its own, and nothing sent to it is written to the cold store. An arm through the
-//!   fault proxy, a pass to a role the guard cannot attribute, and the window after either are
-//!   not judged. Those
-//!   windows are recorded with `judged` false and the reason in `unjudged_reason`. A missed
+//!   A pass to the hot store alone is the harness's own, once the hot store's cluster is decided
+//!   ([`crate::coldserver`]): the counter counts every server of the cold MinIO cluster, and the
+//!   hot store is very likely the same cluster at another address, so hot requests are counted in
+//!   the own count when it is the same cluster and not when it is another; nothing sent to the
+//!   hot store is written to the cold store. If nothing decides it, the pass and the window after
+//!   it are not judged. So are an arm through the fault proxy, a pass to a role the guard cannot
+//!   attribute, and the window after either. Those windows are recorded with `judged` false and the reason in `unjudged_reason`. A missed
 //!   foreign load is accepted; a trip on the run's own instance traffic is not.
 //! - The count is exact enough that neither of these can trip a quiet pass on its own traffic:
 //!   `objstore-s3` resends a ranged read up to `READ_RETRIES` (2) times inside one logged call,
@@ -145,15 +147,19 @@ pub enum Traffic {
 
 impl Traffic {
     /// The traffic of a pass that sent requests to `roles`, through the fault proxy if
-    /// `faulted`. Cold requests are the harness's own. So are requests to the hot store: it is
-    /// the farm's own object store, a bucket of its own, and nothing the bench sends to it is
-    /// written to the cold store. Any request to the instance makes it `Instance`, which wins.
+    /// `faulted`. Cold requests are the harness's own. So are requests to the hot store when its
+    /// cluster is decided (`hot`): the same cluster as the cold store's, whose requests are then
+    /// in the cluster's counter and in the harness's count (see [`crate::coldserver`]), or
+    /// another, whose requests are in neither; nothing the bench sends to the hot store is
+    /// written to the cold store. If it is not decided the pass is `HotUnknown`. Any request to
+    /// the instance makes it `Instance`, which wins.
     #[must_use]
-    pub fn of(faulted: bool, roles: impl IntoIterator<Item = Role>, _hot: HotServer) -> Self {
-        let (mut instance, mut other) = (false, false);
+    pub fn of(faulted: bool, roles: impl IntoIterator<Item = Role>, hot: HotServer) -> Self {
+        let (mut instance, mut other, mut hot_unknown) = (false, false, false);
         for role in roles {
             match role {
-                Role::Cold | Role::Hot => {}
+                Role::Cold => {}
+                Role::Hot => hot_unknown |= hot == HotServer::Undecided,
                 Role::Instance => instance = true,
                 _ => other = true,
             }
@@ -162,6 +168,8 @@ impl Traffic {
             Self::Instance
         } else if other {
             Self::Other
+        } else if hot_unknown {
+            Self::HotUnknown
         } else if faulted {
             Self::Faulted
         } else {

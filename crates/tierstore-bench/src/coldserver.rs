@@ -19,6 +19,8 @@
 //! The instance's own requests to MinIO are its copies and are never counted as the harness's:
 //! the instance role is not in the list, whatever the run file says.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -82,12 +84,32 @@ impl ColdServer {
 /// list of roles sharing the cold cluster, and the deployment ids of the cold and the hot store
 /// (`None` where not read).
 #[must_use]
-pub fn decide(
-    _has_hot: bool,
-    _explicit: Option<&[Role]>,
-    _ids: Option<(&str, &str)>,
-) -> ColdServer {
-    ColdServer::alone()
+pub fn decide(has_hot: bool, explicit: Option<&[Role]>, ids: Option<(&str, &str)>) -> ColdServer {
+    let mut roles = BTreeSet::from([Role::Cold]);
+    roles.extend(explicit.unwrap_or_default().iter().copied());
+    roles.remove(&Role::Instance);
+    let (hot, decided_by) = match (has_hot, explicit, ids) {
+        (false, ..) => (HotServer::Absent, Basis::None),
+        (true, Some(_), _) => (same_or_not(roles.contains(&Role::Hot)), Basis::RunFile),
+        (true, None, Some((cold, hot))) => (same_or_not(cold == hot), Basis::DeploymentId),
+        (true, None, None) => (HotServer::Undecided, Basis::None),
+    };
+    if hot == HotServer::Same {
+        roles.insert(Role::Hot);
+    }
+    ColdServer {
+        roles: roles.into_iter().collect(),
+        hot,
+        decided_by,
+    }
+}
+
+fn same_or_not(same: bool) -> HotServer {
+    if same {
+        HotServer::Same
+    } else {
+        HotServer::Different
+    }
 }
 
 /// The deployment id in an `mc admin info` answer.

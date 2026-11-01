@@ -368,7 +368,7 @@ fn hot_arm(log: &Arc<RequestLog>, requests: u64) -> Arm {
 
 const STORES: [(Role, &str); 2] = [
     (Role::Cold, "http://127.0.0.1:30900"),
-    (Role::Hot, "http://10.0.0.5:30900"),
+    (Role::Hot, "http://192.0.2.5:30900"),
 ];
 
 /// Catches the false trip of a hot-only pass on its own traffic: the hot store is the same
