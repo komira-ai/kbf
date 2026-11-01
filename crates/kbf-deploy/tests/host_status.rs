@@ -473,3 +473,20 @@ fn bad_arguments_exit_two() {
         assert_eq!(ran.stdout, "");
     }
 }
+
+/// Behaviour: a symlink at the token path is refused with exit 2 even when its target is a
+/// token file of yours with mode 0600, and the coordinator is not contacted.
+#[test]
+fn a_symlink_at_the_token_path_is_refused() {
+    let dir = scratch("symlink");
+    let target = token_file(dir.path(), 0o600);
+    let link = dir.path().join("link.token");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let fake = coordinator();
+    let ran = against(&fake, &link, "dm1", &[]);
+    assert_eq!(ran.code, Some(2), "{}", ran.stderr);
+    assert!(ran.stderr.contains("--operator-token-file"), "{}", ran.stderr);
+    assert_eq!(ran.stdout, "");
+    ran.assert_no_token();
+    assert!(fake.heads.lock().expect("lock").is_empty());
+}
