@@ -10,7 +10,7 @@
 //! operator's action) it is asked for directly.
 //!
 //! Left to the host, because the core has no hook for them: the `action usage:` line of a
-//! report, the invocation record's measurement of it ([`KbfAdapter::record_ran`]) and the
+//! report, the invocation record's measurement of it ([`Recording::ran`](crate::run_record::Recording::ran)) and the
 //! node memory pressure line (all made after the feed in the farm's own driver, from the
 //! answer the feed returned), and the scheduler gauges of `/metrics`.
 
@@ -282,7 +282,7 @@ pub async fn report(
     let (sent, recorded) = core.with(|view, adapter| {
         (
             adapter.sent(view, operation, lease),
-            adapter.is_recorded(operation),
+            adapter.recording.is_recorded(operation),
         )
     });
     let Some(Sent {

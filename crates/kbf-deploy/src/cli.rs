@@ -28,6 +28,8 @@
 //! kbf-deploy pilot server-install --config FILE --uninstall [--apply]
 //! kbf-deploy pilot buckconfig --config FILE --worktree DIR [--remove] [--apply]
 //! kbf-deploy log (--log-dir DIR | --hot-store DIR) [--lines N]
+//! kbf-deploy host-status --coordinator URL|HOST:PORT --operator-token-file FILE --node ID
+//!                        [--service NAME] [--ca-pem PEM] [--json]
 //! ```
 //!
 //! Bad flags exit 2 for every subcommand. The `minio` subcommands change a host: without
@@ -49,6 +51,10 @@
 //! durable log, across `kbf-server.log` and its rotated files, oldest first, and exits 0,
 //! or 2 refused (`REFUSED: ...` on stderr: no such directory, or no log in it)
 //! ([`crate::log`]).
+//! `host-status` only reads: it prints one host's row from the coordinator's `GET
+//! /v1/status`, and exits 0 found, 1 the node is not in the status or the coordinator could
+//! not be asked (connection, TLS or HTTP), or 2 refused (`REFUSED: ...` on stderr: bad
+//! arguments or a bad token file) ([`crate::host_status`]).
 //! `minio buckets` reads the MinIO admin key pair from `MINIO_ROOT_USER` and
 //! `MINIO_ROOT_PASSWORD` in the environment (secrets are never flags: argv is
 //! world-readable).
@@ -118,6 +124,9 @@ enum Kit {
     /// The last lines of a kbf-server's durable log, across its rotated files, oldest
     /// first. Only reads.
     Log(log::LogArgs),
+    /// One host's row from the coordinator's status: version, health, update, hold. Only
+    /// reads.
+    HostStatus(crate::host_status::HostStatusArgs),
 }
 
 #[derive(Subcommand)]
@@ -425,6 +434,7 @@ pub fn run_at<E: Exec>(
         Kit::Linux(l) => return linux_kit(l, exec, out, err),
         Kit::Mdm(m) => return mdm_kit(m, exec, now, out, err),
         Kit::Log(a) => return log::run(&a, out, err),
+        Kit::HostStatus(a) => return crate::host_status::run(&a, exec.euid(), out, err),
         Kit::Pilot(p) => {
             return pilot::cli::run(p, exec, env, now, out, err, &pilot::cli::sleep_a_second);
         }

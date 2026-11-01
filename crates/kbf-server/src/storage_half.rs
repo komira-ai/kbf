@@ -171,6 +171,7 @@ where
 {
     let listener = flags.listener()?;
     let stores = flags.server.stores(&Statvfs)?;
+    flags.server.check_cold_key_file()?;
     for line in stores.describe() {
         tracing::info!("{line}");
     }
@@ -182,7 +183,11 @@ where
             over(flags, listener, &stores, opened, FILE_PREFIX_ROOT, shutdown).await
         }
         StoreUri::S3(uri) => {
-            let cold = Registrable::new(uri, flags.env)?;
+            let cold = Registrable::new(
+                uri,
+                flags.server.cold_store_credentials_file.as_deref(),
+                flags.env,
+            )?;
             over(
                 flags,
                 listener,

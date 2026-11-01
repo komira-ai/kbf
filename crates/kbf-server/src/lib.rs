@@ -106,6 +106,7 @@ pub mod http_sched;
 pub mod identity;
 mod input_cache_metrics;
 pub mod join;
+mod key_file;
 pub mod learned;
 mod listen;
 mod load_metrics;
@@ -185,6 +186,7 @@ pub use farm::{
     OWNER_CACHE_TTL, SESSION_RENEWAL, StateError,
 };
 pub use health::Readiness;
+pub use http_history::run_json;
 pub use identity::{DenyList, DenyListError, Peers};
 pub use kbf_sched::MemoryLadder;
 pub use kbf_tls::{TlsError, TlsFiles, TlsSource};

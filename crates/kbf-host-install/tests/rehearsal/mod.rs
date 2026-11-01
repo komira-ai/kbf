@@ -77,12 +77,36 @@ pub fn capture(name: &str, out: &Output) {
     .unwrap();
 }
 
+/// Like [`run`], and when `cmd` fails while the journal of `units` shows GitHub refused the
+/// helper for its quota, the failure says so ([`rate_limit_note`]).
+pub fn run_explaining(name: &str, cmd: &mut Command, units: &[&str]) -> String {
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("{name}: did not start: {e}"));
+    capture(name, &out);
+    if !out.status.success()
+        && let Some(note) = rate_limit_note(&journal(units))
+    {
+        panic!(
+            "{name} failed ({:?}): {}",
+            out.status.code(),
+            explained(name, &note, &String::from_utf8_lossy(&out.stderr))
+        );
+    }
+    check(name, &out)
+}
+
 /// Runs `cmd`, keeps its output as `name`, and requires it to succeed.
 pub fn run(name: &str, cmd: &mut Command) -> String {
     let out = cmd
         .output()
         .unwrap_or_else(|e| panic!("{name}: did not start: {e}"));
     capture(name, &out);
+    check(name, &out)
+}
+
+/// `out`'s stdout, when the command succeeded; a panic with its output when it did not.
+fn check(name: &str, out: &Output) -> String {
     assert!(
         out.status.success(),
         "{name} failed ({:?}): {}{}",
@@ -152,6 +176,35 @@ pub fn download(token: &str, tag: &str, dir: &Path, names: &[String]) {
             "{tag}: {name} is not checked OK: {checked}"
         );
     }
+}
+
+/// What the helper's journal says when GitHub refuses its release listing.
+pub const RATE_LIMITED: &str = "rate limited by GitHub";
+
+/// How many of the last lines of a command's stderr go after the note.
+const STDERR_LINES: usize = 40;
+
+/// The plain words for a failure whose journal shows GitHub refused the helper for its quota;
+/// `None` for any other journal.
+///
+/// The wording is of what the journal says, not of whether the channel had a token: GitHub's
+/// API quota for this request, whichever address or token it was counted against.
+pub fn rate_limit_note(journal: &str) -> Option<String> {
+    journal.contains(RATE_LIMITED).then(|| {
+        "GitHub's API quota refused the helper's release listing (counted against the runner's \
+         address when the channel had no token, against the run's token when it had one). \
+         This says nothing of the release. Re-run the job."
+            .to_owned()
+    })
+}
+
+/// The failure message of a command whose journal showed the quota refusal: the note, then
+/// the last [`STDERR_LINES`] lines of the command's `stderr`, so that an earlier refusal in
+/// the journal cannot hide a different cause the command itself reports.
+pub fn explained(name: &str, note: &str, stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().collect();
+    let tail = lines[lines.len().saturating_sub(STDERR_LINES)..].join("\n");
+    format!("{name} failed: {note}\n---- last lines of {name}'s stderr\n{tail}")
 }
 
 /// The units' journal so far.
@@ -490,4 +543,42 @@ fn takes_actions_token(path: &Path) -> bool {
 pub fn start_helper() {
     systemctl("start_helper", &["start", HELPER_UNIT]);
     until(HELPER_UNIT, || Path::new(SOCKET).exists());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches a rate-limited helper reported as a bare "deploy_farm failed", and a journal
+    /// that mentions nothing of the quota being blamed on it.
+    #[test]
+    fn a_refused_listing_is_explained_and_other_journals_are_not() {
+        let refused = "kbf-host-install: stage: fetch_failed: rate limited by GitHub, retry after \
+                       2026-11-01T05:45:24Z or set token_file\n";
+        let note = rate_limit_note(refused).expect("a note for a rate-limited helper");
+        assert!(!note.contains("takes no"), "{note}");
+        assert!(note.contains("Re-run the job"), "{note}");
+        assert_eq!(
+            rate_limit_note("kbf-host-install: stage: verify_failed\n"),
+            None
+        );
+        assert_eq!(rate_limit_note(""), None);
+    }
+
+    /// Catches the note replacing the command's own report: a different real cause must stay
+    /// in the message, and a long stderr is cut to its last lines.
+    #[test]
+    fn the_explanation_keeps_the_end_of_the_commands_stderr() {
+        let stderr: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let text = explained("deploy_farm", "NOTE", &stderr);
+        assert!(text.contains("NOTE"), "{text}");
+        assert!(text.contains("line 99"), "{text}");
+        assert!(text.contains("line 60"), "{text}");
+        assert!(
+            !text.contains("line 59\n") && !text.ends_with("line 59"),
+            "{text}"
+        );
+        assert!(!text.contains("line 0\n"), "{text}");
+        assert!(explained("x", "N", "").contains("N"));
+    }
 }

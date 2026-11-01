@@ -226,7 +226,7 @@ fn arm(label: String, in_flight: u32, misses: &Arc<Misses>) -> Arm {
 /// [`BenchError`] if the instance is not configured, the objects cannot be written, the ledger
 /// refuses the cell, the load gate trips or cannot be read, or a file or the request log fails.
 pub async fn run(ctx: &CellContext, plan: &CellPlan) -> Result<Vec<CellResult>, BenchError> {
-    run_with(ctx, plan, Arc::new(ProcLoad), None).await
+    run_with(ctx, plan, Arc::new(ProcLoad::new()), None).await
 }
 
 /// [`run`] with the machine given and the objects of a pass capped at `limit`.
@@ -261,6 +261,7 @@ mod tests {
             in_flight: in_flight.to_vec(),
             object_bytes: sizes.to_vec(),
             open_loop: true,
+            multipart_objects: None,
         }
     }
 
@@ -455,10 +456,9 @@ mod tests {
     #[tokio::test]
     async fn an_instance_that_will_not_take_the_objects_stops_the_run() {
         let dir = temp("tb-b-dead");
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead = format!("http://{}", closed.local_addr().unwrap());
-        drop(closed);
-        let ctx = testkit::ctx(dir.path(), &[(Role::Instance, &dead)], Window::Busy);
+        let dead_store = testkit::DeadStore::start().await;
+        let dead = dead_store.endpoint();
+        let ctx = testkit::ctx(dir.path(), &[(Role::Instance, dead)], Window::Busy);
         let err = run_with(&ctx, &plan(&[1], &[4096]), Script::calm(), Some(2))
             .await
             .unwrap_err();

@@ -92,6 +92,7 @@ use crate::{Args, ConfigError, RaftMetaLog, SERVER_VERSION, StartFailure, interr
 /// ([`kbf_threads::PoolArgs`]): where its bytes are and how they are written.
 pub const ALLOWED: &[&str] = &[
     "cold_store",
+    "cold_store_credentials_file",
     "hot_store",
     "hot_store_max_bytes",
     "hot_store_abandon",
@@ -614,6 +615,7 @@ where
 {
     let listener = flags.listener()?;
     let stores = flags.server.stores(&Statvfs)?;
+    flags.server.check_cold_key_file()?;
     for line in stores.describe() {
         tracing::info!("{line}");
     }
@@ -632,7 +634,11 @@ where
             .await
         }
         StoreUri::S3(uri) => {
-            let cold = Registrable::new(uri, flags.env)?;
+            let cold = Registrable::new(
+                uri,
+                flags.server.cold_store_credentials_file.as_deref(),
+                flags.env,
+            )?;
             over(
                 flags,
                 listener,

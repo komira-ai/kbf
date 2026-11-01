@@ -439,3 +439,67 @@ fn the_client_is_built_from_a_private_token_and_a_ca_that_is_a_certificate() {
         .to_string();
     assert!(why.contains("--executor-lease-url"), "{why}");
 }
+
+/// [`JS`] without the insecure flag, and with `more`.
+fn js_without_insecure(more: &[&str]) -> Result<FrontendFlags, String> {
+    let mut all: Vec<&str> = JS
+        .iter()
+        .copied()
+        .filter(|flag| *flag != "--executor-insecure-argv-secrets")
+        .collect();
+    all.extend(more);
+    parsed(argv(&all))
+}
+
+fn delivery_of(flags: FrontendFlags) -> crate::executor::Delivery {
+    flags.executor.js.expect("js-agent").config.delivery
+}
+
+/// Catches a default that is not today's: with no `--executor-secret-delivery` the secrets
+/// travel as arguments, and the insecure flag is still what allows it.
+#[test]
+fn argv_is_the_default_delivery_and_still_needs_the_insecure_flag() {
+    let flags = js_with(&[]).expect("flags");
+    assert_eq!(delivery_of(flags), crate::executor::Delivery::InsecureArgv);
+    let flags = js_with(&["--executor-secret-delivery=argv"]).expect("flags");
+    assert_eq!(delivery_of(flags), crate::executor::Delivery::InsecureArgv);
+    let why = js_without_insecure(&["--executor-secret-delivery=argv"]).expect_err("refused");
+    assert!(why.contains("--executor-insecure-argv-secrets"), "{why}");
+}
+
+/// Catches `files` demanding the opt-in that exists for secrets in arguments: it parses
+/// without the insecure flag and holds the delivery and nothing in `insecure_argv_secrets`.
+#[test]
+fn files_mode_needs_no_insecure_flag() {
+    let flags = js_without_insecure(&["--executor-secret-delivery=files"]).expect("flags");
+    let config = flags.executor.js.expect("js-agent").config;
+    assert_eq!(config.delivery, crate::executor::Delivery::Files);
+    assert!(!config.insecure_argv_secrets);
+}
+
+/// Catches the contradiction being accepted: the operator says the secrets go as files and also
+/// that they may go as arguments.
+#[test]
+fn files_mode_refuses_the_insecure_flag() {
+    let why = refused(&["--executor-secret-delivery=files"]);
+    assert!(why.contains("--executor-secret-delivery"), "{why}");
+    assert!(why.contains("--executor-insecure-argv-secrets"), "{why}");
+}
+
+/// Catches a value that is neither delivery being read as one of them.
+#[test]
+fn an_unknown_delivery_is_refused() {
+    let why = js_without_insecure(&["--executor-secret-delivery=env"]).expect_err("refused");
+    assert!(why.contains("--executor-secret-delivery"), "{why}");
+}
+
+/// Catches a delivery that would do nothing being accepted: with `--executor kbf-daemon` no
+/// task command line is built, so `files` is refused, naming the flag; the default `argv`
+/// stays accepted (it is what every unit that names nothing has).
+#[test]
+fn the_daemon_executor_refuses_the_files_delivery() {
+    let why = parsed(argv(&["--executor-secret-delivery=files"])).expect_err("refused");
+    assert!(why.contains("--executor-secret-delivery"), "{why}");
+    let flags = parsed(argv(&["--executor-secret-delivery=argv"])).expect("flags");
+    assert_eq!(flags.executor.kind, ExecutorKind::KbfDaemon);
+}
