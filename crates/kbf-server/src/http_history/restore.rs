@@ -260,6 +260,7 @@ fn run(r: &RunRecord) -> Option<Box<Run>> {
             booked_memory_bytes: booked,
             booked_millicpus: r.booked_millicpus,
             cap_bytes: cap,
+            phase_times: kbf_invocation::PhaseTimes::Measured,
         })
     })
 }

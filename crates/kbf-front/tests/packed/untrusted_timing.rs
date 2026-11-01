@@ -20,6 +20,13 @@ fn before(ms: u128) -> Option<Timestamp> {
     Some(Timestamp::from(now() - back))
 }
 
+/// The metadata with nothing but the mark that says its phase times are a task's claim.
+fn marked() -> ExecutedActionMetadata {
+    let mut metadata = ExecutedActionMetadata::default();
+    kbf_proto::task_claim::mark(&mut metadata);
+    metadata
+}
+
 /// What the frontend rebuilt from a pack whose manifest claims `timing`, and the action cache's
 /// copy of it.
 async fn ingested(timing: Timing) -> (ActionResult, ActionResult) {
@@ -57,7 +64,7 @@ async fn rebuilt_carries_the_manifests_durations_as_a_claim() {
         execution_completed_timestamp: before(56),
         output_upload_start_timestamp: before(56),
         output_upload_completed_timestamp: before(0),
-        ..ExecutedActionMetadata::default()
+        ..marked()
     };
     assert_eq!(got.execution_metadata, Some(want));
     let honest = Farm::new().await.result(0);
@@ -99,7 +106,7 @@ async fn a_phase_the_task_did_not_time_is_absent_not_zero_width() {
     let want = ExecutedActionMetadata {
         execution_start_timestamp: before(500),
         execution_completed_timestamp: before(0),
-        ..ExecutedActionMetadata::default()
+        ..marked()
     };
     assert_eq!(got.execution_metadata, Some(want));
 }
@@ -119,6 +126,7 @@ async fn the_largest_claim_a_manifest_holds_does_not_overflow() {
     let (got, _) = ingested(timing).await;
 
     let metadata = got.execution_metadata.expect("a claim");
+    assert!(kbf_proto::task_claim::is_marked(&metadata));
     assert_eq!(metadata.output_upload_completed_timestamp, before(0));
     assert_eq!(metadata.output_upload_start_timestamp, before(one));
     assert_eq!(metadata.execution_completed_timestamp, before(one));

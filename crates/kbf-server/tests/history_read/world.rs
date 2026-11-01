@@ -315,6 +315,7 @@ pub fn measured(t: u64) -> Run {
         booked_memory_bytes: None,
         booked_millicpus: None,
         cap_bytes: None,
+        phase_times: Default::default(),
     }
 }
 

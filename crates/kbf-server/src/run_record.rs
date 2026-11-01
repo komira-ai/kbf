@@ -54,6 +54,7 @@ pub(crate) fn of(
         booked_memory_bytes: booked.map(|b| b.memory_bytes),
         booked_millicpus: booked.map(|b| b.cpu_millis),
         cap_bytes: None,
+        phase_times: kbf_invocation::PhaseTimes::Measured,
     }
 }
 
@@ -317,6 +318,42 @@ mod tests {
                 ..ReapiTimes::default()
             }
         );
+    }
+
+    /// Catches the provenance read off the wrong thing: metadata the frontend marked as a
+    /// task's claim is a `TaskClaim` run, a daemon's metadata (its usage entry, no mark) and a
+    /// report with none are `Measured`.
+    #[test]
+    fn an_executor_run_is_task_claim_and_a_daemon_run_is_measured() {
+        let stamp = Stamp {
+            queued: secs(10),
+            started: secs(15),
+        };
+        let mut claimed = claimed_by_task();
+        let metadata = claimed
+            .action_result
+            .as_mut()
+            .and_then(|r| r.execution_metadata.as_mut())
+            .expect("metadata");
+        kbf_proto::task_claim::mark(metadata);
+        let run = of(&claimed, None, stamp, secs(30), None);
+        assert_eq!(run.phase_times, kbf_invocation::PhaseTimes::TaskClaim);
+
+        let daemon = worker::Result {
+            action_result: Some(ActionResult {
+                execution_metadata: Some(ExecutedActionMetadata {
+                    execution_start_timestamp: Some(Timestamp::from(secs(22))),
+                    auxiliary_metadata: vec![ResourceUsage::default().to_any()],
+                    ..ExecutedActionMetadata::default()
+                }),
+                ..ActionResult::default()
+            }),
+            ..worker::Result::default()
+        };
+        let run = of(&daemon, None, stamp, secs(30), None);
+        assert_eq!(run.phase_times, kbf_invocation::PhaseTimes::Measured);
+        let bare = of(&worker::Result::default(), None, stamp, secs(30), None);
+        assert_eq!(bare.phase_times, kbf_invocation::PhaseTimes::Measured);
     }
 
     /// Catches: a report without a result (a killed or lost run) given no times, or
