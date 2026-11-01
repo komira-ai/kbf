@@ -1144,6 +1144,9 @@ mod tests {
             }),
             gate_tripped: None,
             cold_guard: None,
+            proxy_requests: None,
+            disk_busy: BTreeMap::new(),
+            peak_in_flight: 0,
         }
     }
 
@@ -1161,6 +1164,7 @@ mod tests {
                 .collect(),
             notes: Vec::new(),
             cold_state: Vec::new(),
+            rate_caps: None,
         }
     }
 
