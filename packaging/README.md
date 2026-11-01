@@ -42,3 +42,14 @@
   one acts only as its own node, but it can hold its role's update slot or report a dead host
   healthy, and an old version reported by any daemon, storage or Mac host holds back the
   frontends. Replace the farm CA or let the certificate expire to end it.
+- `host-agent/`: the files an operator places for a host's update agent (`host-agent/README.md`).
+  Beside the agent and the helper there is now the root part of the generic host updater,
+  `kbf-updater root` (`host-agent/linux/kbf-updater-root.service`), which runs the update hooks
+  declared in `/etc/updater.d` through the step runner, each step a transient unit with its
+  declared rights, and serves the registration socket. The kbf declaration it reads is
+  `host-agent/linux/updater.d/kbf.toml` (`kbf update-hook`, as root, with the agent's own flags),
+  installed root-owned and closed to others by `host-agent/linux/install-declaration.txt`;
+  `crates/kbf-updater/tests/agent_packaging.rs` and `crates/update-rights/tests/shipped.rs` check
+  both. Until the step that fetches and verifies a release for the root part exists, the agent
+  still updates kbf through the helper's verbs and its static `--service` flags (the interim
+  path, docs/design/host-updates.md 4.3 "As built" and section 8, step 10).

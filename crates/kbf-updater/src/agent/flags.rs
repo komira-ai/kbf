@@ -207,7 +207,7 @@ pub struct NodeApi {
 ///
 /// # Errors
 /// An argument that is no known flag, a flag with no value, a flag given twice.
-pub(super) fn collect<'k>(
+pub(crate) fn collect<'k>(
     args: &[String],
     known: &[&'k str],
 ) -> Result<BTreeMap<&'k str, String>, String> {

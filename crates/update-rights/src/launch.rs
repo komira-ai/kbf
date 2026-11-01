@@ -22,6 +22,14 @@
 //! stop the unit of the run it replaces. `--wait --collect --pipe` makes `systemd-run` wait
 //! for the unit, remove it even when it failed, carry the hook's standard output through and
 //! exit with the hook's exit status.
+//!
+//! The boot entry of a declaration (`boot`, section 3.5) runs through the same path
+//! ([`boot_command`], [`run_boot`]): a transient unit `updater-<service>-boot-<generation>` with the
+//! same properties, except that its capabilities are the hook-wide `capabilities` and never a
+//! step's (it is not one of the five steps and has no `step_capabilities` key), and its bound is the
+//! `rollback` bound (the declaration has no bound of its own for it, and what it does at boot is a
+//! restore). It is run as `<release>/<binary> <hook_args> <boot>`, with no artifact and no params
+//! file.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -34,6 +42,7 @@ use update_hook::{Invocation, Outcome, Report, Step};
 
 use crate::declaration::{Declaration, Refusal};
 use crate::load::{Declared, recheck_targets};
+use crate::names::Capability;
 
 /// Where `systemd-run` is.
 pub const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
@@ -56,6 +65,15 @@ pub const FIXED_PROPERTIES: [&str; 10] = [
 /// order, so a rerun after a crash has a name of its own and the old one can be found.
 pub fn unit_name(service: &str, step: Step, generation: u64) -> String {
     format!("updater-{service}-{step}-{generation}")
+}
+
+/// The word of the boot entry's unit, where a step's unit has the step.
+pub const BOOT_UNIT_WORD: &str = "boot";
+
+/// The unit that runs the boot entry of `service`: `updater-<service>-boot-<generation>`. No step
+/// is named `boot`, so it is never a step's unit.
+pub fn boot_unit_name(service: &str, generation: u64) -> String {
+    format!("updater-{service}-{BOOT_UNIT_WORD}-{generation}")
 }
 
 /// One run of one step.
@@ -150,7 +168,28 @@ fn words(items: impl Iterator<Item = impl Display>) -> String {
 /// The `Name=value` properties of a step, in the order they are given.
 pub fn properties(declaration: &Declaration, step: Step) -> Vec<String> {
     let hook = &declaration.hook;
-    let capabilities = words(hook.capabilities_for(step).iter());
+    properties_with(
+        declaration,
+        hook.capabilities_for(step),
+        hook.timeout_secs.get(step),
+    )
+}
+
+/// The `Name=value` properties of the boot entry: those of a step, with the hook-wide
+/// `capabilities` (never a step's) and the `rollback` bound.
+pub fn boot_properties(declaration: &Declaration) -> Vec<String> {
+    let hook = &declaration.hook;
+    properties_with(declaration, &hook.capabilities, hook.timeout_secs.rollback)
+}
+
+/// The properties of one run that holds `capabilities` and is bounded by `timeout_secs`.
+fn properties_with(
+    declaration: &Declaration,
+    capabilities: &BTreeSet<Capability>,
+    timeout_secs: u64,
+) -> Vec<String> {
+    let hook = &declaration.hook;
+    let capabilities = words(capabilities.iter());
     let families = if hook.address_families.is_empty() {
         String::new()
     } else {
@@ -178,7 +217,7 @@ pub fn properties(declaration: &Declaration, step: Step) -> Vec<String> {
             .iter()
             .map(|(name, value)| format!("Environment={name}={value}")),
     );
-    properties.push(format!("RuntimeMaxSec={}", hook.timeout_secs.get(step)));
+    properties.push(format!("RuntimeMaxSec={timeout_secs}"));
     properties.extend(
         FIXED_PROPERTIES
             .iter()
@@ -202,21 +241,65 @@ pub fn command(launch: &Launch<'_>) -> Result<SystemdRun, LaunchError> {
         params: launch.params.map(Path::to_owned),
     };
     let unit = unit_name(&declaration.name, launch.step, launch.generation);
+    Ok(systemd_run(
+        declaration,
+        &unit,
+        properties(declaration, launch.step),
+        launch.release,
+        invocation.to_args(),
+    ))
+}
+
+/// `systemd-run` of the unit `unit` with `properties`, running the hook of `release` with its
+/// declared arguments and then `tail`.
+fn systemd_run(
+    declaration: &Declaration,
+    unit: &str,
+    properties: Vec<String>,
+    release: &Path,
+    tail: Vec<OsString>,
+) -> SystemdRun {
     let mut args: Vec<OsString> = ["--system", "--quiet", "--wait", "--collect", "--pipe"]
         .into_iter()
         .map(OsString::from)
         .collect();
     args.push(format!("--unit={unit}").into());
     args.extend(
-        properties(declaration, launch.step)
+        properties
             .into_iter()
             .map(|property| OsString::from(format!("--property={property}"))),
     );
     args.push("--".into());
-    args.push(launch.release.join(&declaration.binary).into());
+    args.push(release.join(&declaration.binary).into());
     args.extend(declaration.hook_args.iter().map(OsString::from));
-    args.extend(invocation.to_args());
-    Ok(SystemdRun { args })
+    args.extend(tail);
+    SystemdRun { args }
+}
+
+/// The `systemd-run` command of the boot entry of a loaded declaration, run from the verified
+/// release `release`: `<release>/<binary> <hook_args> <boot>` in the unit
+/// `updater-<service>-boot-<generation>`, with [`boot_properties`]. `None` when the declaration
+/// names no boot entry.
+pub fn boot_command(
+    declared: &Declared,
+    generation: u64,
+    release: &Path,
+) -> Result<Option<SystemdRun>, LaunchError> {
+    let declaration = &declared.declaration;
+    let Some(boot) = &declaration.boot else {
+        return Ok(None);
+    };
+    if !release.is_absolute() {
+        return Err(LaunchError::RelativeRelease(release.to_owned()));
+    }
+    let unit = boot_unit_name(&declaration.name, generation);
+    Ok(Some(systemd_run(
+        declaration,
+        &unit,
+        boot_properties(declaration),
+        release,
+        vec![OsString::from(boot)],
+    )))
 }
 
 /// What `systemd-run` did.
@@ -297,10 +380,39 @@ pub fn run_step(spawner: &dyn Spawner, launch: &Launch<'_>) -> Result<StepRun, R
         .map_err(RunError::Recheck)?;
     let command = command(launch)?;
     let finished = spawner.run(&command)?;
-    Ok(StepRun {
-        unit: unit_name(&launch.declaration.name, launch.step, launch.generation),
+    Ok(read_run(
+        unit_name(&launch.declaration.name, launch.step, launch.generation),
+        &finished,
+    ))
+}
+
+/// Runs the boot entry of `declared` from the verified release `release` and reads how it ended,
+/// as [`run_step`] reads a step: the targets are checked again first, and the exit status and
+/// the last line are read the same way. `Ok(None)` when the declaration names no boot entry;
+/// nothing is spawned then.
+pub fn run_boot(
+    spawner: &dyn Spawner,
+    declared: &Declared,
+    generation: u64,
+    release: &Path,
+) -> Result<Option<StepRun>, RunError> {
+    let Some(command) = boot_command(declared, generation, release)? else {
+        return Ok(None);
+    };
+    declared.recheck().map_err(RunError::Recheck)?;
+    let finished = spawner.run(&command)?;
+    Ok(Some(read_run(
+        boot_unit_name(&declared.declaration.name, generation),
+        &finished,
+    )))
+}
+
+/// How a run in `unit` ended, as the updater reads it.
+fn read_run(unit: String, finished: &Finished) -> StepRun {
+    StepRun {
+        unit,
         outcome: Outcome::from_exit(finished.code),
         report: Report::read(&String::from_utf8_lossy(&finished.stdout)),
         stderr: String::from_utf8_lossy(&finished.stderr).into_owned(),
-    })
+    }
 }

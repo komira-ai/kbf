@@ -7,6 +7,13 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# A hook for the tests of the root part (tests/root_part.rs): it logs the step it is run for in
+# its record directory and exits as a file there says. Not shipped.
+[[bin]]
+name = "kbf-updater-test-hook"
+path = "tests/bin/test_hook.rs"
+test = false
+
 # The optional package that rolls a new kbf version over the hosts of a farm, one host at a
 # time, behind a local socket. This crate is the core: the API model, the host
 # inventory, the roll state machine over ports (safe-to-stop, install, health, clock) and
@@ -33,6 +40,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 # The hook contract (`kbf update-hook`, `agent::hook`): the steps, the exit codes and the last line.
 update-hook.workspace = true
+# The root part of the generic updater (`kbf-updater root`, `root`): the declarations, the gate
+# on a declaration that asks for more, and the transient units that run a step with its rights.
+update-rights.workspace = true
+# The root part's step runner: the step record, resume, the dead-man, the registration socket.
+kbf-step-runner = { path = "../kbf-step-runner" }
 # `kbf-updater enroll` and the renewal call `kbf-enroll`, which is async; each runs a
 # current-thread runtime of its own, on a thread of its own. Nothing else here is async.
 tokio = { workspace = true, features = ["net", "rt", "time"] }

@@ -1,0 +1,43 @@
+# /etc/updater.d/kbf.toml   root:root, mode 0644 (install-declaration.txt): the declaration of the
+# kbf hook, `kbf update-hook <step>` (docs/design/host-updates.md, 2.4 and 4.3). The root part of
+# the host updater (kbf-updater-root.service) runs it from a verified kbf release with exactly
+# these rights. Edit the farm's names (the channel, the frontend) to the agent's.
+#
+# Top-level keys come first: in TOML a key after a table header belongs to that table.
+#
+# No `boot` entry: the kbf units have an [Install] section and start on their own at boot (3.5).
+name   = "kbf"
+binary = "kbf"
+# The hook's flags are the agent's own (kbf-updater-agent.service: --channel, --frontend, and its
+# --state-dir, the enrollment's, as --enrollment-dir), plus --record-dir, the state_dir below.
+# The cordon marks stay in the record directory (the default of --cordon-dir), which only root
+# can write, not in the agent's directory, which the agent's account can.
+hook_args = ["update-hook", "--record-dir=/var/lib/updater/hooks/kbf", "--channel=stable", "--enrollment-dir=/var/lib/kbf-updater", "--frontend=frontend.farm.example:8981"]
+signer = { repository = "komira-ai/kbf", workflow = "artifacts.yml" }
+uid    = "kbf"
+# verify (the health wait, --health-timeout-secs 300, and a margin) and rollback together.
+verify_deadline_secs = 960
+cleanup_retries      = 3
+state_dir            = "/var/lib/updater/hooks/kbf"
+
+[hook]
+# Root, as the helper is today (kbf-host-local.service, 4.3): approved once per host (3.3).
+user  = "root"
+group = "root"
+# Root holds nothing beyond this: the helper's socket (/run/kbf-host-install/local.sock) is mode
+# 0600 and the agent's, and so is the enrollment's key the hook reaches the frontend with.
+capabilities = ["CAP_DAC_OVERRIDE"]
+read_paths   = ["/run/kbf-host-install", "/var/lib/kbf-updater"]
+write_paths  = []
+# The unit the helper restarts on the hook's `cutover` (its --restart-unit).
+units        = ["kbf-daemon.service"]
+address_families = ["AF_UNIX", "AF_INET", "AF_INET6"]
+environment  = { }
+
+[hook.timeout_secs]
+# A drain waits for the node's leases however long they run (4.3): the longest bound there is.
+prepare  = 86400
+cutover  = 600
+verify   = 360
+rollback = 600
+cleanup  = 600
