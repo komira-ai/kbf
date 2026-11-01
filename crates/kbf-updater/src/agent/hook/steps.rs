@@ -73,11 +73,13 @@ impl Done {
         )
     }
 
-    /// The host is busy: nothing irreversible happened, try again after `retry_after_secs`.
+    /// The host is busy: nothing irreversible happened, try again after `retry_after_secs`. A
+    /// deferral is about the host's moment, not the release: the environment's class.
     fn deferred(reason: &str, retry_after_secs: u64, detail: impl Display) -> Done {
         Done::with(
             Outcome::Deferred,
             Report {
+                class: Class::Environment,
                 reason: Some(reason.to_owned()),
                 retry_after_secs: Some(retry_after_secs),
                 detail: Some(detail.to_string()),
@@ -326,17 +328,31 @@ impl<'a> Hook<'a> {
     /// drained (its leases run on).
     fn drain(&mut self) -> Result<(), Done> {
         let world = self.world;
-        if self.mine().and_then(|rec| rec.placement).is_none() {
+        // The placement is read before the drain. A record that has it already is a resume: a
+        // node recorded as in placement is read again, because an operator may have drained it
+        // since (the cordon marks of the drain tell a node drained by this updater, which reads
+        // as in placement, from one that is not). A node recorded as out stays out.
+        let recorded = self.mine().and_then(|rec| rec.placement);
+        if recorded != Some(Was::Out) {
             let placed = world.drain.placed(&world.host).map_err(|e| {
                 self.stopped(Done::failed("node_unreadable", Class::Environment, e))
             })?;
-            self.update(|rec| rec.placement = Some(placed.into()))?;
+            if recorded.is_none() || Was::from(placed) == Was::Out {
+                self.update(|rec| rec.placement = Some(placed.into()))?;
+            }
         }
         // The mark goes first: a step killed in the drain finds it, and `rollback` gives the
-        // node back.
-        self.update(|rec| rec.drain_begun = true)?;
+        // node back. A drain begun again is a drain to give back again.
+        self.update(|rec| {
+            rec.drain_begun = true;
+            rec.given_back = false;
+        })?;
         if let Err(e) = world.drain.drain(&world.host, self.timing.drain_deadline) {
-            self.update(|rec| rec.drain_begun = false)?;
+            // An answer that was lost may be a drain that landed: the mark stays. A refusal, or
+            // a call that never reached the frontend, clears it.
+            if !e.is_unreachable() || e.is_refused() {
+                self.update(|rec| rec.drain_begun = false)?;
+            }
             return Err(self.stopped(Done::failed(
                 "drain_failed",
                 Class::Environment,
@@ -355,10 +371,13 @@ impl<'a> Hook<'a> {
             if let Some(deadline) = self.timing.drain_deadline.filter(|d| waited >= *d) {
                 let why = format!(
                     "the node still holds {leases} leases after the drain deadline of {} s; \
-                     nothing was switched, the leases run on and the node is left drained",
+                     nothing was switched and the leases run on",
                     deadline.as_secs()
                 );
                 self.log(format!("update to {}: {why}", self.target));
+                // What this update placed is lifted before the deferral (3.6): the deferral
+                // must not depend on a later step.
+                self.give_back()?;
                 return Err(Done::deferred(
                     "drain_bound",
                     self.timing.retry.as_secs(),
@@ -581,7 +600,21 @@ impl<'a> Hook<'a> {
 
     // ---- cleanup ----
 
+    /// A failure of `cleanup` after the commit, or with a confirm that may have landed, says it
+    /// is not reversible; the failure of a confirm the helper refused, which was reverted,
+    /// says it is, and the updater's `rollback` that follows finds nothing left to do.
     fn cleanup(&mut self) -> Flow {
+        let flow = self.cleanup_steps();
+        match flow {
+            Err(mut done) if self.mine().is_some_and(|r| r.confirmed || r.confirm_begun) => {
+                done.report.reversible = false;
+                Err(done)
+            }
+            other => other,
+        }
+    }
+
+    fn cleanup_steps(&mut self) -> Flow {
         let rec = self.require()?;
         if !rec.verified {
             return Err(Done::failed(
@@ -612,6 +645,11 @@ impl<'a> Hook<'a> {
                 "update to {}: the confirm failed: {e}",
                 self.target
             ));
+            if matches!(e, LocalError::Unreachable(_)) {
+                // The answer was lost: the confirm may have landed, so the release is not put
+                // back. The mark stays, and a step run again looks at the helper.
+                return Err(Done::helper("confirm_unknown", &e));
+            }
             self.update(|rec| rec.confirm_begun = false)?;
             if self.back_on_a().is_ok() {
                 self.update(|rec| rec.rolled_back = true)?;

@@ -13,8 +13,8 @@
 //! - [`real`]: the real ports, built from those flags.
 //!
 //! A step prints one JSON line last on standard output ([`update_hook::Report`]) and exits `0`,
-//! `1`, `75` (the node still holds leases after `--drain-deadline-secs`: nothing was switched
-//! and the node is left drained, `retry_after_secs` is `--retry-secs`) or `76` (never: no check
+//! `1`, `75` (the node still holds leases after `--drain-deadline-secs`: nothing was switched,
+//! the cordon this update placed is lifted, `retry_after_secs` is `--retry-secs`) or `76` (never: no check
 //! of this hook is one no version can repair). The log goes to standard error.
 
 pub mod flags;
