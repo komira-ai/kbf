@@ -361,7 +361,7 @@ fn held_stop() -> Held {
 /// Catches the outcome of a stop under way being lost when the step ends meanwhile (the arming
 /// was dropped, so the stop's error had nowhere to go and the runner read the exit of a step it
 /// could not stop): `disarm` waits for the stop and gives its error; a stop that works gives
-/// none. Nothing here waits for a time: the stop has begun, and is seen to have begun, before
+/// none; a tick meanwhile does not stop the unit again. Nothing here waits for a time: the stop has begun, and is seen to have begun, before
 /// the disarm is made.
 #[test]
 fn a_stop_under_way_when_the_step_ends_is_waited_for() {
@@ -383,6 +383,8 @@ fn a_stop_under_way_when_the_step_ends_is_waited_for() {
         };
         has_begun.recv().unwrap();
         assert!(watch.stopping());
+        // A tick while the stop is under way does not stop the unit a second time.
+        assert!(!man.tick().unwrap());
         let disarming = {
             let watch = watch.clone();
             std::thread::spawn(move || watch.disarm())
