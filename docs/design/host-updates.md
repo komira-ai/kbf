@@ -130,19 +130,12 @@ min_version            = "..."          # the first release that carries a hook;
 [hook]
 user  = "tierstore-update"              # not `uid`: the hook's account owns the record, the service cannot write it (3.4.1)
 group = "tierstore-update"
-capabilities = []                       # hook-wide grant; the fallback for a step with no entry below
+capabilities = ["CAP_NET_ADMIN"]       # hook-wide: every step and the boot entry run nft (netlink listing needs it)
 read_paths   = ["/usr/libexec/kbf", "/usr/sbin/nft", "/etc/tierstore"]
 write_paths  = []                       # state_dir is writable implicitly; the cache directory is not touched by any step
 units        = ["tierstore@9301.service", "tierstore@9302.service"]   # the only units the hook may start and stop (never mask: 3.4)
 address_families = ["AF_UNIX", "AF_INET", "AF_INET6", "AF_NETLINK"]
 environment  = { }                      # only these variables; nothing is inherited
-
-[hook.step_capabilities]                # per step: held only in the steps that need it (the tierstore owner's list)
-prepare  = ["CAP_NET_ADMIN"]
-cutover  = ["CAP_NET_ADMIN"]
-verify   = []
-rollback = ["CAP_NET_ADMIN"]
-cleanup  = []
 
 [hook.timeout_secs]                     # per step; the updater kills a step that passes its bound
 prepare  = 600
@@ -155,6 +148,8 @@ cleanup  = 1300
 promotion_bound_secs = 900              # how long verify waits for v-next to take the cache lock before it reports promotion_pending
 # a service with a cordon puts its lease and cap here, e.g. cordon_lease_secs = 300, cordon_max_secs = 13500
 ```
+
+The per-step table `hook.step_capabilities` exists to narrow a hook-wide grant for steps that need less; a step with no entry holds the hook-wide set. The tierstore example uses no table because all five steps call `nft`.
 
 `[hook.params]` is an opaque table: the updater validates only that it is a table of scalars, writes it once per update to a file in a directory the updater owns (root-only, kept until the update ends or is abandoned) and passes the path as `--params <file>` to every step (configuration is flags, not environment). The file also carries reserved keys under the prefix `updater.`, written by the updater and never set by a declaration; a `[hook.params]` that sets any `updater.*` key is refused at load:
 
@@ -258,7 +253,7 @@ The updater runs each step as a **transient systemd unit** with the properties i
 | declaration | systemd property |
 |---|---|
 | `hook.user`, `hook.group` | `User=`, `Group=` |
-| `hook.step_capabilities.<step>`, falling back to `hook.capabilities` | `AmbientCapabilities=` and `CapabilityBoundingSet=` set to exactly the list for that step; `NoNewPrivileges=yes`. A capability is held only in the steps that need it (`CAP_NET_ADMIN` in tierstore's `prepare`, `cutover` and `rollback`, not in `verify` or `cleanup`) |
+| `hook.step_capabilities.<step>`, falling back to `hook.capabilities` | `AmbientCapabilities=` and `CapabilityBoundingSet=` set to exactly the list for that step; `NoNewPrivileges=yes`. A step with no `step_capabilities` entry holds the hook-wide `capabilities`; the table narrows the grant for steps that need less (tierstore needs none: all five steps and the boot entry call `nft`, so it declares `CAP_NET_ADMIN` hook-wide) |
 | `hook.read_paths`, `hook.write_paths` | `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `ReadOnlyPaths=`, `ReadWritePaths=` |
 | `hook.address_families` | `RestrictAddressFamilies=` |
 | `hook.environment` | `Environment=` of exactly those, and no inherited environment |
@@ -287,7 +282,7 @@ Before each step the root part writes and fsyncs a **step record**: `{schema, se
 - **After a crash** of the updater, the root part or the host, the updater reads the record. A step that is `running` is **run again**, but never while the previous run may still be alive: hook steps run as transient units that outlive an updater crash, so the unit is named deterministically (`updater-<service>-<step>-<generation>`), and **resume first stops that unit and waits for it to end**, records that it did, and only then starts the step again. A hook also takes an **exclusive lock on its record directory for the whole step**, so a second copy would refuse. "Safe to run twice" means one after the other; the conformance suite adds a concurrency case (start a step, kill the updater, resume, assert a single writer). Before it kills a step for its bound, the updater reads the step's own `done` marker in the hook's record; a hook that finished and was killed anyway is read as finished. A `stop_begun`-style marker set with the signal never sent counts as irreversible and as `after_commit` toward the fleet count: conservative, and it is the hook's record that says so. A step that is `done` is not run again. The record keeps a failed `cleanup`'s report (its exit code and last line), so a crash between that failure and the `rollback` it calls for resumes into the `rollback`, not into another `cleanup`. The next step is the one after the last `done`. A step record under a different boot id is treated as running.
 - **The dead-man.** The root part enforces the deadlines itself, on a thread of its own, whatever the unprivileged part is doing: a step that passes its bound is killed and recorded as failed; after `cutover` succeeds, if `verify` has not succeeded by `verify_deadline_secs` it runs `rollback`. So a host whose unprivileged updater is gone is still brought back, which is the property today's helper has (`local/core.rs:173`).
 - **Resume and the first step.** If the artifact digest in the record no longer matches the staged directory, the update stops as a `halt` and pages; nothing from the directory runs.
-- **Boot.** Nothing in the updater starts a service's units. A declaration may name a boot-time entry point (`boot = "restore"`) which the root part runs at its own start, before the units, with the same rights and step record; for tierstore it re-applies the rule for the active port and starts the active slot, and when the step record says a step is pending it follows the table of 3.2 (a pending `cutover` is rolled back). Services whose units have an `[Install]` (the kbf units) need none.
+- **Boot.** Nothing in the updater starts a service's units. A declaration may name a boot-time entry point (`boot = "restore"`) which the root part runs at its own start, before the units, with the same rights and step record; for tierstore it re-applies the rule for the active port and starts the active slot, and when the step record says a step is pending it follows the table of 3.2 (a pending `cutover` is rolled back). The boot entry point is not one of the five steps and has no `step_capabilities` key: it runs with the hook-wide `capabilities`, through the same rights path as a step (transient unit, `AmbientCapabilities=` = `CapabilityBoundingSet=` = that list, `NoNewPrivileges=yes`). Services whose units have an `[Install]` (the kbf units) need none.
 - **Updating the updater itself.** The updater and its root part are part of the kbf release and are updated by the kbf daemon's hook as today, but never inside the trial they guard: after `verify` of the kbf update has succeeded, a follow-on step stages the new binary beside the old, finishes the current step record, replies and exits cleanly, and systemd starts the new binary; an `OnFailure=` fallback unit flips the binary link back to the previous one after `StartLimitBurst` failed starts, and the test plants a binary that exits at start. A hook that needs a newer updater than the one running declares it (`min_updater_protocol`); the update is `Deferred` with the reason `updater_old` until the follow-on step has run.
 
 ### 3.6 Cordons and drains
@@ -355,8 +350,8 @@ fixed set of modes and markers, and sets state, so a re-run after a crash conver
 | `rollback` | swap back, stop v-next; valid only before `cleanup` writes `stopping`; after that `1` with `reversible:false`, which is `Failed(after_commit)` | stop of a stopped unit and a repeated swap are no-ops |
 | `cleanup` | **the commit point**: without `verified` it exits `1` and stops nothing; with it, write `stopping` (every exit then says `reversible:false`), remove the old slot's link first (its unit's `ConditionPathExists=` then keeps a crash `Restart=` or a manual start from bringing it back; the running process keeps its exec), then stop v-current (70 s settle, drain, exit), then clear `previous`; no mask; re-run forward up to `cleanup_retries` | each part is set-to-state |
 
-Declaration: `hook.user` `tierstore-update`, not the service's account; `CAP_NET_ADMIN` in `prepare`, `cutover`,
-`rollback` only (`hook.step_capabilities`); `AF_NETLINK`; units `tierstore@9301`, `tierstore@9302` from one template
+Declaration: `hook.user` `tierstore-update`, not the service's account; `CAP_NET_ADMIN` hook-wide (`hook.capabilities`; every step and the
+boot entry call `nft`, and listing over netlink needs it); `AF_NETLINK`; units `tierstore@9301`, `tierstore@9302` from one template
 (`%i` is the port, `--drain-lb-wait 70s`, `--proxy-id tierstore-%i`, `ExecStart` under `state_dir/slots`, `ConditionPathExists=` on its slot link under `state_dir/slots`); lock
 `<cache>/.lock` or `/var/lib/tierstore/instance.lock`; tables `kbf_forward_tierstore`, `kbf_guard_tierstore`; timeouts
 600, 300, 1000, 600, 1300 s, deadline 1600, ceiling 3600, `promotion_bound_secs` 900. At boot the declaration's

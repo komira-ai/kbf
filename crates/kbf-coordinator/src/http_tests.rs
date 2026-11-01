@@ -19,6 +19,7 @@ use crate::testutil::{OPERATOR, Rig, ci_token};
 mod extras;
 mod features;
 mod operator;
+mod rollback;
 mod services;
 mod status;
 

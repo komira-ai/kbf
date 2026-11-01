@@ -2168,6 +2168,7 @@ dependencies = [
  "thiserror",
  "time",
  "toml",
+ "update-rights",
 ]
 
 [[package]]
@@ -2707,6 +2708,8 @@ dependencies = [
  "hyper-util",
  "js-server-core",
  "js-store",
+ "js-types",
+ "js-usage",
  "kbf-auth",
  "kbf-ca",
  "kbf-caps",
@@ -5257,6 +5260,21 @@ dependencies = [
  "serde_json",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "update-rights"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "libc",
+ "rustix",
+ "serde",
+ "sha2 0.11.0",
+ "thiserror",
+ "toml",
+ "update-hook",
+ "update-rights",
 ]
 
 [[package]]

@@ -26,6 +26,10 @@ mod one_recorder;
 
 mod placement;
 
+mod usage;
+
+mod usage_on;
+
 mod views;
 
 fn farm() -> Farm {
@@ -104,6 +108,7 @@ fn the_cores_configuration_carries_every_setting_of_the_farm() {
         Duration::from_secs(5),
         Duration::from_secs(6),
         &settings,
+        None,
     );
     assert_eq!(config.term, 11);
     assert_eq!(config.unservable_wait, Duration::from_secs(5));
@@ -117,7 +122,13 @@ fn the_cores_configuration_carries_every_setting_of_the_farm() {
         config.load.is_some(),
         "the placement mode is given explicitly"
     );
-    let bare = open::farm_config(11, Duration::ZERO, Duration::ZERO, &Settings::default());
+    let bare = open::farm_config(
+        11,
+        Duration::ZERO,
+        Duration::ZERO,
+        &Settings::default(),
+        None,
+    );
     assert!(bare.whole_node.is_none());
 }
 
