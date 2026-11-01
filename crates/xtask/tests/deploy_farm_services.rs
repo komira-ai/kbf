@@ -84,7 +84,10 @@ fn the_coordinator_commit_is_not_compared_with_another_services_version() {
 fn kbf_is_still_refused_by_a_coordinator_on_another_commit() {
     let mut baseline = farm("converged", 0, 0);
     baseline["commit"] = json!("0123456789ab");
-    let fake = serve(Script::new(vec![Ok(baseline)]));
+    let fake = serve(Script::after(
+        Ok(baseline),
+        vec![Ok(farm("converged", 0, 0))],
+    ));
     let mut plan = fake.plan();
     plan.require_coordinator_current = true;
     let (result, _) = run(&fake, &plan);
