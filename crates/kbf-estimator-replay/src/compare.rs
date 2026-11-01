@@ -26,6 +26,20 @@
 //! a latest end before the earliest queue time gives no makespan (absent, counted once as
 //! out of order).
 //!
+//! **Per build** ([`crate::builds`] has the definitions): a build is one `tool_invocation_id`
+//! (one buck2 command), or one `correlated_invocations_id` (a CI job) with
+//! [`GroupBy::Correlated`]. Each build gives the server's *build action span* (latest end less
+//! earliest queue of its attempts; it excludes the client's own analysis and local actions,
+//! and the paper's build wall comes from the client), its *queue time total* in
+//! attempt-seconds (a cost metric, not a queue wait) and p50 and p90 of its attempt queue
+//! waits. The table gives p50 and p90 over builds of the first two, and the median over
+//! builds of each build's wait p50 and p90. The correlated id is the first non-empty one the
+//! server had seen when the attempt ended, so the CI-job view can split a build whose early
+//! calls sent none. A joined operation is exported once per waiting invocation: each
+//! invocation's build counts it (it did wait), but the attempt counts, kill rates and the
+//! CI-job view count it once per waiter until the export carries the operation
+//! (komira-ai/kbf#2207).
+//!
 //! B - A is a difference of two single numbers, not a significance test; the paper's rule
 //! needs the 95% Welch CI over runs to exclude 0.
 //! What the export
@@ -37,7 +51,7 @@ use std::fmt::Write;
 use serde_json::{Value, json};
 
 use crate::build_report;
-use crate::builds::{BuildStats, GroupBy, RunLabels};
+use crate::builds::{self, BuildStats, GroupBy, RunLabels};
 use crate::row::Row;
 
 /// What the numbers cannot see. Printed with every report.
@@ -180,8 +194,7 @@ pub fn analyze_grouped(rows: &[Row], group: GroupBy) -> ArmStats {
     stats.queue_wait = percentiles(waits);
     stats.wall_samples = walls.len() as u64;
     stats.wall = percentiles(walls);
-    let _ = group;
-    stats.builds = BuildStats::default();
+    stats.builds = builds::analyze(rows, group);
     stats
 }
 
@@ -367,8 +380,9 @@ pub fn render_json_runs(
     b: &ArmStats,
     labels: Option<(&RunLabels, &RunLabels)>,
 ) -> String {
-    let _ = labels;
-    let doc = json!({
+    let runs = labels
+        .map(|(la, lb)| json!({"a": a.builds.run_records(la), "b": b.builds.run_records(lb)}));
+    let mut doc = json!({
         "arms": {"a": arm_json(a), "b": arm_json(b)},
         "difference": {
             "attempts": delta(Some(a.attempts), Some(b.attempts)),
@@ -395,5 +409,8 @@ pub fn render_json_runs(
         },
         "not_recorded": not_recorded(a, b),
     });
+    if let Some(runs) = runs {
+        doc["runs"] = runs;
+    }
     format!("{doc:#}\n")
 }
