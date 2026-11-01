@@ -35,6 +35,7 @@ mod host;
 mod load;
 mod metrics;
 mod outcome;
+mod phases;
 mod pool;
 mod runs;
 mod task;

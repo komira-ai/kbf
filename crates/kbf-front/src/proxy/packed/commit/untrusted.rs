@@ -43,6 +43,7 @@ use super::{CommitError, MAX_COMMIT_BLOBS, Packs, offload, recording_failed};
 use crate::proxy::packed::metrics::Reason;
 
 mod large;
+mod metadata;
 mod mint;
 mod set;
 mod task;

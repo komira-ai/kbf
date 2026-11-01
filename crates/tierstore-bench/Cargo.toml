@@ -49,6 +49,8 @@ kbf-testkit.workspace = true
 # (`tests/ops_support`): requests as text, upstreams that answer by hand. A paused clock for the
 # throttle and the open-loop pacing tests.
 tokio = { workspace = true, features = ["io-util", "net", "test-util"] }
+# A socket bound and not listening, for the port probe test (`tests/ops_parts.rs`).
+rustix = { workspace = true, features = ["net"] }
 
 [lints]
 workspace = true
