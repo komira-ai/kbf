@@ -940,7 +940,7 @@ mod tests {
             reason.contains("role the guard cannot attribute"),
             "{reason}"
         );
-        assert!(!reason.contains("instance"), "{reason}");
+        assert!(!reason.contains("copies"), "{reason}");
         let (second, _) = guard.close(read(2_000), 500, Traffic::Own);
         assert!(!second.unwrap().judged);
         let (third, trip) = guard.close(read(2_500), 500, Traffic::Own);

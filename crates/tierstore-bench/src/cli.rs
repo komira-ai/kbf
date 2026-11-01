@@ -36,8 +36,10 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// The verbs.
+/// The verbs. `Run` has the most flags and is the one verb that is parsed once and moved once,
+/// so the size of the others is not worth an indirection in every match on it.
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     /// Read-only checks before anything is written; writes the before-snapshot.
     Preflight(ConfigArgs),
