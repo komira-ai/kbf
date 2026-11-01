@@ -406,6 +406,7 @@ pub(crate) fn render(r: &RunRecord) -> Value {
         }
     }
     put("reapi_times", reapi_times(&t));
+    put("phase_times", r.phase_times().name().into());
     if let Some(c) = &r.cgroup {
         put("usage", usage(c));
     }

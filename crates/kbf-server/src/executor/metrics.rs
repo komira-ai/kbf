@@ -12,6 +12,7 @@ use kbf_proto::worker::{self, Lost, MemoryKill};
 use tonic::Code;
 
 use crate::executor::RejectReason;
+use crate::executor::phases::{Phase, PhaseHistograms};
 
 /// How a run ended, as the farm was told.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +127,7 @@ pub struct Metrics {
     ingests: [AtomicU64; 12],
     late_starts: AtomicU64,
     strays_released: AtomicU64,
+    phases: PhaseHistograms,
 }
 
 impl Metrics {
@@ -148,6 +150,11 @@ impl Metrics {
 
     pub(crate) fn late_start(&self) {
         self.late_starts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One `phase` of a run took `took`.
+    pub(crate) fn phase_took(&self, phase: Phase, took: std::time::Duration) {
+        self.phases.observe(phase, took);
     }
 
     pub(crate) fn stray_released(&self) {
@@ -212,6 +219,7 @@ impl Metrics {
                 count.load(Ordering::Relaxed)
             );
         }
+        self.phases.render(out);
     }
 }
 
