@@ -22,13 +22,16 @@ const KBF_VERSION: &str = "0.0.1";
 
 /// One stand-in host.
 pub struct Host {
-    node: String,
+    pub node: String,
     cert: PathBuf,
     key: PathBuf,
     /// The version of the service it says it runs.
     pub running: String,
     updating: Option<String>,
-    last_update: Option<Value>,
+    /// How the last update ended, as the host reports it.
+    pub last_update: Option<Value>,
+    /// The version of every order for the service the host has been given, in order.
+    pub orders: Vec<String>,
 }
 
 impl Host {
@@ -41,6 +44,7 @@ impl Host {
             running: running.to_owned(),
             updating: None,
             last_update: None,
+            orders: Vec::new(),
         }
     }
 
@@ -70,6 +74,9 @@ impl Host {
             &format!("beat_{}", self.node),
             Command::new("curl")
                 .args(["--silent", "--show-error", "--fail-with-body", "-X", "POST"])
+                // A bound on the one request, so a wedged coordinator fails the call with
+                // curl's diagnostic.
+                .args(["--max-time", "30"])
                 .args(["-H", "Content-Type: application/json"])
                 .arg("--cacert")
                 .arg(ca)
@@ -91,6 +98,7 @@ impl Host {
             self.last_update = Some(json!({"target": target, "outcome": outcome}));
         } else if answer["reply"] == "update" && answer["service"] == SERVICE {
             self.updating = answer["version"].as_str().map(str::to_owned);
+            self.orders.extend(self.updating.clone());
         }
     }
 }
@@ -98,14 +106,26 @@ impl Host {
 /// The hosts of the rehearsal's farm.
 pub struct Fleet {
     pub hosts: Vec<Host>,
+    /// The most hosts that were updating at the end of any round so far.
+    pub peak_updating: usize,
 }
 
 impl Fleet {
-    /// Every host beats once, in order.
+    /// A fleet of `hosts`.
+    pub fn new(hosts: Vec<Host>) -> Self {
+        Self {
+            hosts,
+            peak_updating: 0,
+        }
+    }
+
+    /// Every host beats once, in order, and the number updating after the round is noted.
     pub fn round(&mut self, ca: &Path, refuses: Option<&str>) {
         for host in &mut self.hosts {
             host.beat(ca, refuses);
         }
+        let updating = self.hosts.iter().filter(|h| h.updating.is_some()).count();
+        self.peak_updating = self.peak_updating.max(updating);
     }
 
     /// The versions the hosts run, in order.
