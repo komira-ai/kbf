@@ -70,7 +70,7 @@ use kbf_threads::disk::Statvfs;
 use kbf_tls::{TlsFiles, TlsSource};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
-use crate::cold_apply::{ColdPick, Fixed, RegisteredOnly, Registrable};
+use crate::cold_apply::{ColdPick, Fixed, RegisteredOnly, Registrable, explain_prefix};
 use crate::cold_counted::CountedPick;
 use crate::join::{self, Joined, Joiner};
 use crate::listen::Binder;
@@ -658,7 +658,9 @@ where
             // so it is fetched before the log opens.
             let cold = RegisteredOnly::wait(flags).await?;
             let prefix = cold.prefix_root();
-            over(flags, listener, &stores, (cold, None), &prefix, shutdown).await
+            over(flags, listener, &stores, (cold, None), &prefix, shutdown)
+                .await
+                .map_err(|error| explain_prefix(error, &prefix))
         }
     }
 }

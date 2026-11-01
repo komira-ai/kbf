@@ -244,7 +244,16 @@ the registration. A node started with `--cold-store registered` (what `kbf node`
 no store: it waits for the registration and runs on its endpoint, bucket, prefix and keys, and
 `--cold-store-credentials-file` and the `AWS_*` variables are not read. A node reads the
 registration at its start, so rotating a key, or registering another endpoint for a node on
-`registered`, reaches a running node at its next restart. [api.md](../api.md) has the
+`registered`, reaches a running node at its next restart. Switching the endpoint is safe only
+when the new store already holds every object the node's index names: the same bucket and
+prefix, with the old endpoint write-through (a write-through cache in front of the same
+bucket, say). The node does not check that, and it does not check the bucket at all (its log
+holds only the prefix), so a changed bucket is the operator's to get right; a changed prefix
+is refused at the start and needs an empty `--meta-dir`. While a registered node waits for a
+registration it logs each failed ask with its attempt, status code and reason, and keeps
+waiting for a frontend that is down or too old to serve the registration. The S3 client
+honours `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`; list the store's host in `NO_PROXY` where
+a proxy is set. [api.md](../api.md) has the
 bodies, the error codes and the rotation steps.
 
 ## Free-space floors

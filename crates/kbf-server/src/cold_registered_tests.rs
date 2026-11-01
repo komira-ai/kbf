@@ -2,6 +2,7 @@
 //! until a store is named, waits out a frontend that cannot answer, and stops at a refusal.
 //! The clock is paused, so a wait is a turn of the runtime, never a delay of the test.
 
+use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use kbf_objstore::s3::fake::FakeS3;
 use kbf_objstore::{ByteRange, ObjectKey, ObjectStore as _};
 use tonic::transport::Endpoint;
 
-use super::{ColdApplyError, ColdPick, Fetch, RegisteredOnly, registration_with};
+use super::{ColdApplyError, ColdPick, Fetch, RegisteredOnly, explain_prefix, registration_with};
 use crate::join::{Identity, Joined, Joiner, RETRY_BASE};
 
 fn named(generation: u64) -> GetStoreConfigResponse {
@@ -248,4 +249,44 @@ async fn after_an_old_frontend_the_node_runs_on_the_registered_store() {
         .await
         .expect("a write signed with the registered pair");
     store.get_range(&key, range).await.expect("read back");
+}
+
+fn mismatch(log_root: &str, committed: bool) -> Box<dyn std::error::Error> {
+    use kbf_log::{Bootstrap, FarmLogId};
+    let id = FarmLogId::new(NonZeroU64::new(7).expect("non-zero"));
+    let bootstrap = |root: &str| Bootstrap {
+        log_id: id,
+        store_prefix: format!("{root}{id}/"),
+    };
+    crate::RaftLogError::Mismatch {
+        committed: committed.then(|| bootstrap(log_root)),
+        expected: bootstrap("expected/"),
+    }
+    .into()
+}
+
+/// Catches a prefix change told as the log's own message, or one told when the prefix did not
+/// change (defects: every `Mismatch` explained as a prefix change; none explained): a log made
+/// under `farm-a/` met with `farm-b/` is `PrefixChanged` naming both roots, a log whose record
+/// disagrees under the same root, a log with no committed bootstrap, and a failure that is not
+/// the log's, are all returned as they were.
+#[test]
+fn only_a_changed_prefix_is_told_as_one() {
+    let told = explain_prefix(mismatch("farm-a/", true), "farm-b/");
+    let Some(ColdApplyError::PrefixChanged { registered, logged }) = told.downcast_ref() else {
+        panic!("not told as a prefix change: {told}");
+    };
+    assert_eq!(
+        (registered.as_str(), logged.as_str()),
+        ("farm-b/", "farm-a/")
+    );
+
+    for same in [mismatch("farm-a/", true), mismatch("farm-a/", false)] {
+        let kept = explain_prefix(same, "farm-a/");
+        assert!(kept.is::<crate::RaftLogError>(), "{kept}");
+    }
+    let none = explain_prefix(mismatch("farm-a/", false), "farm-b/");
+    assert!(none.is::<crate::RaftLogError>(), "{none}");
+    let other = explain_prefix(ColdApplyError::NoFrontend.into(), "farm-b/");
+    assert!(other.is::<ColdApplyError>());
 }

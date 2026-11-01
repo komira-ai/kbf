@@ -185,6 +185,26 @@ pub enum ColdApplyError {
         "the frontend refused the registered cold store ({0:?}); this node has no key pair of its own"
     )]
     Refused(Code),
+    /// The frontend refused a node on `--cold-store registered`, which has no other store to
+    /// run on.
+    #[error(
+        "the frontend refused the registered cold store ({0:?}); a node on --cold-store \
+         registered has no other store to run on"
+    )]
+    RegisteredRefused(Code),
+    /// A node on `--cold-store registered` whose metadata log was made under another prefix
+    /// than the registration names now.
+    #[error(
+        "the registered cold store's prefix is {registered:?}, but this node's metadata log \
+         was made under {logged:?}: a log keeps the objects under the prefix it was made \
+         with, so a changed prefix needs an empty --meta-dir (and the objects copied)"
+    )]
+    PrefixChanged {
+        /// The prefix the registration names.
+        registered: String,
+        /// The prefix the log was made under.
+        logged: String,
+    },
     /// `--cold-store registered` without `--frontend`: nothing to ask for the store.
     #[error(
         "--cold-store registered needs --frontend: the store is the one the frontend registers"
@@ -225,28 +245,69 @@ pub async fn fetch_with<'a>(
     pause: &dyn Fn(u32) -> Duration,
     attempts: Option<u32>,
 ) -> Result<GetStoreConfigResponse, Status> {
+    fetch_while(call, pause, attempts, retriable).await
+}
+
+/// [`fetch_with`], trying again after a failure when `retry` says its code is worth it.
+async fn fetch_while<'a>(
+    call: &mut dyn FnMut() -> Fetch<'a>,
+    pause: &dyn Fn(u32) -> Duration,
+    attempts: Option<u32>,
+    retry: fn(Code) -> bool,
+) -> Result<GetStoreConfigResponse, Status> {
     let mut failures = 0_u32;
     loop {
         let status = match call().await {
             Ok(answer) => return Ok(answer),
-            Err(status) if !retriable(status.code()) => return Err(status),
+            Err(status) if !retry(status.code()) => return Err(status),
             Err(status) => status,
         };
         failures = failures.saturating_add(1);
         if attempts.is_some_and(|spent| failures >= spent) {
             return Err(status);
         }
-        tracing::warn!("fetching the registered cold store failed; trying again");
+        tracing::warn!(
+            attempt = failures,
+            code = ?status.code(),
+            error = %reason(&status),
+            "fetching the registered cold store failed; trying again"
+        );
         tokio::time::sleep(pause(failures - 1)).await;
     }
+}
+
+/// What went wrong in `status`: its message and the chain of errors under it (a transport
+/// failure keeps the connect, TLS or DNS error there), so a down frontend, a refused
+/// certificate and a wrong address read differently. Holds no key: a status of the
+/// frontend's is fixed text, and a transport error names an address and a cause.
+fn reason(status: &Status) -> String {
+    let mut text = status.message().to_owned();
+    let mut source = std::error::Error::source(status);
+    while let Some(error) = source {
+        text.push_str(": ");
+        text.push_str(&error.to_string());
+        source = error.source();
+    }
+    text
+}
+
+/// Whether a node with no store of its own tries again after `code`: what [`retriable`] says,
+/// and `Unimplemented`, a frontend too old to serve `ColdStore` (the frontend is updated
+/// first, so a rolling upgrade meets one). Waiting is what `registered` means. The codes
+/// that stay fatal are the node's own standing, which a later ask does not change:
+/// `PermissionDenied` and `Unauthenticated` (its certificate is denied or not accepted),
+/// `InvalidArgument` and `FailedPrecondition` (a request this build makes wrongly), `NotFound`.
+fn retriable_registered(code: Code) -> bool {
+    retriable(code) || code == Code::Unimplemented
 }
 
 /// Waits for the store a node started with `--cold-store registered` runs on: calls `call`
 /// until an answer names a store, waiting `pause(n)` after each failure the frontend or the
 /// path to it is to blame for ([`fetch_with`]) and after each answer that names none
 /// (nothing registered, or taken back since the generation was announced). Goes on for
-/// ever: a node with no store of its own has nothing else to do. Not generic, as
-/// [`fetch_with`] is not.
+/// ever: a node with no store of its own has nothing else to do. A failure is warned with its
+/// attempt, code and reason ([`fetch_while`]). Not generic, as [`fetch_with`] is not. Retries
+/// what [`retriable_registered`] says.
 ///
 /// # Errors
 /// The status of a refusal that waiting does not change (the node is denied).
@@ -256,13 +317,17 @@ pub async fn registration_with<'a>(
 ) -> Result<(u64, StoreConfig), Status> {
     let mut empty = 0_u32;
     loop {
-        let reply = fetch_with(call, pause, None).await?;
+        let reply = fetch_while(call, pause, None, retriable_registered).await?;
         let generation = reply.generation;
         if let Some(config) = reply.config {
             return Ok((generation, config));
         }
-        tracing::warn!("no cold store is registered yet; waiting for one");
         empty = empty.saturating_add(1);
+        tracing::warn!(
+            attempt = empty,
+            generation,
+            "no cold store is registered yet; waiting for one"
+        );
         tokio::time::sleep(pause(empty - 1)).await;
     }
 }
@@ -511,12 +576,16 @@ impl RegisteredOnly {
         let joiner = flags
             .joiner(flags.listen, node)?
             .ok_or(ColdApplyError::NoFrontend)?;
+        tracing::info!(
+            frontend = flags.frontend.as_deref().unwrap_or_default(),
+            "waiting for the registered cold store"
+        );
         let (generation, config) = registration_with(
             &mut || Box::pin(joiner.fetch_store_config(0)),
             &|failures| joiner.pause(failures),
         )
         .await
-        .map_err(|status| ColdApplyError::Refused(status.code()))?;
+        .map_err(|status| ColdApplyError::RegisteredRefused(status.code()))?;
         Ok(Self { generation, config })
     }
 
@@ -525,6 +594,32 @@ impl RegisteredOnly {
     pub(crate) fn prefix_root(&self) -> String {
         prefix_of(&self.config.prefix)
     }
+}
+
+/// `error`, the failure of a start of a node on `--cold-store registered`, told as
+/// [`ColdApplyError::PrefixChanged`] when it is the metadata log refusing the prefix
+/// `registered` names (the log's `Bootstrap` holds the prefix it was made under).
+pub(crate) fn explain_prefix(error: Box<dyn Error>, registered: &str) -> Box<dyn Error> {
+    let Some(crate::RaftLogError::Mismatch {
+        committed: Some(committed),
+        ..
+    }) = error.downcast_ref::<crate::RaftLogError>()
+    else {
+        return error;
+    };
+    // The log's own prefix is `<root><log id>/`; the registration names the root.
+    let own = committed.store_prefix.as_str();
+    let logged = own
+        .strip_suffix(&format!("{}/", committed.log_id))
+        .unwrap_or(own);
+    if logged == registered {
+        return error;
+    }
+    ColdApplyError::PrefixChanged {
+        registered: registered.to_owned(),
+        logged: logged.to_owned(),
+    }
+    .into()
 }
 
 impl ColdPick for RegisteredOnly {

@@ -269,8 +269,23 @@ so `converged` is false until the node beats again: never a false converged.
   `AWS_SECRET_ACCESS_KEY` and `AWS_ENDPOINT_URL` are not read. It reports
   the generation it fetched as `ok`; a new generation while it runs is `pending`, and the node
   takes it at its next start. A changed endpoint is therefore a registration change and a
-  restart of each node; a changed bucket or prefix needs the data copied (and, for the prefix,
-  an empty `--meta-dir`, since the log was created under the old one). Only a storage node
+  restart of each node, **and it is safe only when the new store already holds every object
+  the node's index names**: the same bucket and prefix, the old endpoint being write-through
+  (for example a write-through cache in front of the same bucket). A node does not check
+  that: an index entry for an object the new store lacks is a read that fails. A changed
+  **bucket is not checked at the start** (the log's `Bootstrap` holds only the prefix), so
+  moving to another bucket, with its objects copied, is the operator's duty. A changed
+  prefix is refused at the start with a message that says so (`PrefixChanged`) and needs an
+  empty `--meta-dir`. While it waits the node says so (`waiting for the registered cold
+  store`, with the frontend) and each failed ask says its attempt, status code and reason;
+  a frontend too old to serve `ColdStore` (`Unimplemented`) is waited for, as is one that is
+  down, while a denied node (`PermissionDenied`, `Unauthenticated`) and a request the
+  frontend calls malformed (`InvalidArgument`, `FailedPrecondition`, `NotFound`) end the start
+  at once, since waiting does not change them. The cold-store HTTP client reads `HTTP_PROXY`,
+  `HTTPS_PROXY` and `ALL_PROXY` from the environment (reqwest's default, for the URL path as
+  for `registered`), and kbf cannot turn that off for one store: the client is built inside
+  the `objstore-s3` crate, which has no such setting. Put the endpoint's host in `NO_PROXY`
+  on a host that sets a proxy. Only a storage node
   takes the word: the frontend, `all-in-one` and `--history-objects` refuse it.
 - **A bad credential** reaching a node reports `probe_failed`; a node that already had a store
   keeps it.
