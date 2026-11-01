@@ -46,7 +46,7 @@ pub enum Command {
     /// Create the test buckets, scoped accounts and quotas (a dry run unless `--apply`).
     Provision(ProvisionArgs),
     /// Run cells.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Serve the fault proxy in front of a store.
     FaultProxy(ProxyArgs),
     /// Check, against the before-snapshot, that nothing the run made is left and nothing live
@@ -54,6 +54,8 @@ pub enum Command {
     VerifyTeardown(TeardownArgs),
     /// Print one table from the results of a result directory.
     Report(ReportArgs),
+    /// Write the measured numbers into the paper's HTML, or check that they are all there.
+    FillPaper(crate::fill::FillArgs),
 }
 
 /// Flags of `provision`.
@@ -104,6 +106,13 @@ pub struct RunArgs {
     /// and the report and the provenance of every result say so.
     #[arg(long, value_enum, default_value_t = Switch::On, value_name = "on|off")]
     pub open_loop: Switch,
+    /// At most this many objects per pass for the multipart arms of `cold-put` (`direct-mp`,
+    /// `instance`): a cap on the plan's count (1,000 up to 1 MiB), never a raise. Each multipart object is three requests to the
+    /// store, so a slow cold store may not fit the plan's count in a window. The other arms
+    /// (`direct`, the open-loop arms, the other cells) keep theirs. An arm with fewer than 1,000
+    /// objects per pass reports no p99, and its result says so.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    pub multipart_objects: Option<u64>,
     /// Names the run in every result and in the keys it writes (role names and digits; no host).
     #[arg(long)]
     pub run_id: String,
@@ -146,6 +155,18 @@ impl RunArgs {
     #[must_use]
     pub fn open_loop(&self) -> bool {
         self.open_loop == Switch::On
+    }
+
+    /// What the flags ask of a cell.
+    #[must_use]
+    pub fn plan(&self) -> CellPlan {
+        CellPlan {
+            passes: self.passes,
+            in_flight: self.in_flight.clone(),
+            object_bytes: self.object_bytes.clone(),
+            open_loop: self.open_loop(),
+            multipart_objects: self.multipart_objects,
+        }
     }
 
     /// The switch of the fault proxy `--fault-control` names, with `--fault-ttl-secs`.
@@ -270,6 +291,7 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
                 .map(|_| ())
         }
         Command::Run(args) => {
+            let args = *args;
             let config = RunConfig::load(&args.config)?;
             // Before anything is created: the result directory, the ledger and its lock stay
             // clear of the live tierstore's directories.
@@ -305,13 +327,7 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
             let faults = args
                 .fault_switch()
                 .map(|switch| Arc::new(switch) as Arc<dyn FaultSwitch>);
-            let open_loop = args.open_loop();
-            let plan = CellPlan {
-                passes: args.passes,
-                in_flight: args.in_flight,
-                object_bytes: args.object_bytes,
-                open_loop,
-            };
+            let plan = args.plan();
             let ctx = CellContext {
                 provenance,
                 cold_state: cold_source(&config, &ops),
@@ -346,6 +362,7 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
             print!("{table}");
             Ok(())
         }
+        Command::FillPaper(args) => Ok(crate::fill::run(&args)?),
     }
 }
 
@@ -372,7 +389,7 @@ mod tests {
         ];
         argv.extend_from_slice(extra);
         match Cli::try_parse_from(argv)?.command {
-            Command::Run(args) => Ok(args),
+            Command::Run(args) => Ok(*args),
             other => panic!("not the run verb: {other:?}"),
         }
     }
@@ -389,6 +406,18 @@ mod tests {
             assert!(run_args(&["--open-loop", bad]).is_err(), "{bad:?}");
         }
         assert!(run_args(&["--open-loop"]).is_err());
+    }
+
+    /// Catches `--multipart-objects` that changes the plan of a run without it, that does not
+    /// reach the plan of a run with it, or that takes zero or a word.
+    #[test]
+    fn multipart_objects_is_absent_by_default_and_reaches_the_plan() {
+        assert_eq!(run_args(&[]).unwrap().plan().multipart_objects, None);
+        let args = run_args(&["--multipart-objects", "50"]).unwrap();
+        assert_eq!(args.plan().multipart_objects, Some(50));
+        for bad in ["0", "-1", "many", ""] {
+            assert!(run_args(&["--multipart-objects", bad]).is_err(), "{bad:?}");
+        }
     }
 
     /// Catches the provenance of a run not carrying the setting the run was given: it is what the

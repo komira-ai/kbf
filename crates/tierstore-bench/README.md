@@ -191,6 +191,17 @@ the default caps where the same run with the arms does not. The other cells have
 and ignore the flag. The setting is recorded as `open_loop` in the provenance of every result (a
 result that predates the field was run with the arms on) and the report names it in its header.
 
+`run --multipart-objects N` (default: not set, the plan's count) caps the objects per pass (at most
+N, never more than the plan's count for that size) of the multipart arms of `cold-put`, `direct-mp`
+and `instance`, in their closed-loop arms of every size
+and width. A multipart object is three requests to the store (create, part, complete), and a slow
+cold store (about 1.25 s a request on a disk-backed one) cannot do the plan's 1,000 objects a pass
+of an arm in a measurement window. The `direct` arm, the open-loop arms (use `--open-loop off` with
+the flag) and the fault arms' own counts are not changed, and the ledger is asked for the bytes of
+the objects the arms put. A p99 is reported only from 1,000 requests: an arm with fewer reports a
+null `p99_us` in every pass and says why in its notes. Every result records the objects per pass its
+arm used as `objects_per_pass` (absent in a result written before the field existed).
+
 Tierstore at v0.0.37 has no cold-only mode (`--hot` is a required flag). So the cold cells label
 their paths in the arm names and the result notes say which they are:
 
@@ -360,3 +371,27 @@ with their time to failure, p50 and p95 with a bootstrap interval, p99 where it 
 slowest, and the rate; labelled as measurements of a test instance on test buckets. Under each
 table: the cell's notes, the `v1` label or the reason it is refused for each arm, the passes cut
 by the load gate or the cold store guard, and the notes of the passes.
+
+## fill-paper
+
+`tierstore-bench fill-paper --paper P.html --cells cells.json --result-dir DIR --result-tsv R.tsv --results-dir RDIR --out OUT.html`
+writes the measured numbers into the paper: each element carrying `data-cell="<id>"` gets the
+formatted value of the mapped result, `data-source="<file>#<metric>"`, `data-label`
+(`test instance` or `farm`) and `data-result="R.tsv"`, and loses `tbd` from its class list; a cell
+with `data-blocked` or `data-basis` is never written, and the rest of the HTML is copied byte for
+byte. `R.tsv` (the name must be lower-case letters, digits, `.`, `-` and `_`) is created or
+updated with one row per printed number: `derived`, `fill:<cell>:<metric>`, the number as
+printed, its unit, how it was taken (source file, pass indexes, the rule and the arithmetic) and
+the cell. Comments and rows of other ids are kept, so a second run gives the same bytes in the
+paper and the table. A cell whose `data-result` is another `.tsv` was filled by hand and is
+refused, not rewritten. A result file is `<cell>-<arm>-a<N>.json`; of several attempts of an arm
+the latest that gives a figure is used. `--in-place` replaces `--out`; `--check` writes nothing and exits 2 listing
+placeholders without a mapping, mappings without a result, filled values whose source is gone
+and (with `--result-tsv`) cells that cite the table but have no row in it and `fill:` rows no cell cites.
+`--results-dir` is the directory the paper's `data-result` names live in; the table must be in it (a
+bare name in another directory is another file). A run drops the `fill:` rows it did not produce, and
+writes the paper and then the table, each through a temporary file renamed over the target.
+If the table write fails after the paper was renamed into place, the paper cites rows the table lacks:
+the error is returned, `--check` (given the table) lists those cells, and a re-run repairs it. A cell that
+becomes blocked or is left with a note loses its old `fill:` row on the next fill, by design.
+The mapping schema and the rules for each figure are in the header of `src/fill.rs`.

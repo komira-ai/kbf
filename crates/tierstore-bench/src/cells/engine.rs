@@ -935,7 +935,12 @@ pub async fn run_cell(
     let cleaned = cleaned?;
     let finished_unix_ms = unix_ms();
     let mut results = Vec::new();
+    let planned: BTreeMap<&str, u64> = arms
+        .iter()
+        .map(|a| (a.label.as_str(), a.requests))
+        .collect();
     for (label, got) in acc {
+        let objects_per_pass = planned.get(label.as_str()).copied();
         let mut notes = got.notes;
         notes.push(format!(
             "arms interleaved, the order of each pass: {}",
@@ -953,6 +958,7 @@ pub async fn run_cell(
             notes,
             cold_state: got.cold_state,
             rate_caps: Some(env.config.rates),
+            objects_per_pass,
         };
         write_new(&env.result_path(cell, &result.arm), &result.to_json())?;
         results.push(result);
