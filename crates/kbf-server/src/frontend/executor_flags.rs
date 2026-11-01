@@ -47,6 +47,7 @@ const ARCH: &str = "executor_arch";
 const WORK_DIR: &str = "executor_work_dir";
 const PLAIN_PUT: &str = "executor_allow_plain_http_put";
 const PLAIN_GRANT: &str = "executor_allow_plain_http_grant";
+const LOCATE: &str = "executor_locate";
 const INSECURE: &str = "executor_insecure_argv_secrets";
 const BASE_IMAGE: &str = "executor_base_image";
 const KBF_IMAGE: &str = "executor_kbf_image";
@@ -235,6 +236,17 @@ pub(super) fn args() -> Vec<Arg> {
              refused without it. Used only with `--executor js-agent`",
         ),
         switch(
+            LOCATE,
+            "executor-locate",
+            "Has the task tool ask the read listener where each input is kept (`GET /locate`) \
+             and read it straight from that store, with the read grants the answer carries, \
+             and from the listener any input whose direct read fails; every byte is still \
+             checked against its digest. Off by default: the task reads every input through \
+             the listener. With no grants in the answer it reads from the listener as without \
+             the flag. An `http://` store needs `--executor-allow-plain-http-grant`. Used \
+             only with `--executor js-agent`, and refused with `--executor kbf-daemon`",
+        ),
+        switch(
             INSECURE,
             "executor-insecure-argv-secrets",
             "Says the secrets of a task (the presigned write url, the read token) may travel as \
@@ -374,6 +386,13 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
                 "--executor-insecure-argv-secrets is ignored: it is for --executor js-agent, and this frontend runs placed actions on daemons"
             );
         }
+        if m.get_flag(LOCATE) {
+            return Err(
+                "--executor-locate is for --executor js-agent: daemons build no task command \
+                 line, so with --executor kbf-daemon it would do nothing"
+                    .to_owned(),
+            );
+        }
         return Ok(ExecutorFlags::default());
     }
     let missing: Vec<&str> = REQUIRED
@@ -446,6 +465,7 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     }
     config.allow_plain_http_put = m.get_flag(PLAIN_PUT);
     config.allow_plain_http_grant = m.get_flag(PLAIN_GRANT);
+    config.locate = m.get_flag(LOCATE);
     config.insecure_argv_secrets = m.get_flag(INSECURE);
     config.run_margin = secs(MARGIN);
     config.lease_ttl = secs(TTL);

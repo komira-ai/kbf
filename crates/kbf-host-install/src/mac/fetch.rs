@@ -136,8 +136,8 @@ pub struct Limits {
 }
 
 /// The system `curl` that lists and the pinned `gh` that downloads, run as `who` with `home`
-/// as the home of `gh`. `token`, when there is one, is one line of letters, digits, `_` and
-/// `-`.
+/// as the home of `gh`. `token`, when there is one, is one line of letters, digits, `_`, `-`
+/// and `.`, at most 1024 bytes.
 pub struct Fetcher<'a> {
     /// The platform of the release files to take: `darwin-arm64`, `linux-x86_64`, ...
     pub platform: &'a str,

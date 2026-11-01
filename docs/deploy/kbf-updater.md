@@ -77,6 +77,17 @@ the node back without installing, uncordon it (`POST /v1/nodes/{id}:uncordon`, o
 given back by hand is noticed by the agent, see `--cordon-dir`.)
 The node drain at the frontend is the frontend's cordon and is not changed by this.
 
+The SSH roll gives back only a node whose cordon carries the roll's mark, and the frontend's cordon
+has no owner, so two limits follow; kbf#2166 (the cordon-owner issue) tracks the fix:
+
+- An operator who drains a node during the roll, after the roll's mark is written, has that drain
+  lifted at the give-back: the mark says the cordon is the roll's, and the frontend cannot tell two
+  drains apart.
+- When the frontend does not know the node yet at the drain, the roll drains it with no mark, and
+  the node is left out after the roll. The roll logs one warn line for it (`<node>: left out after
+  the roll: its cordon is not marked as this roll's ...; uncordon it by hand if it should serve`),
+  as it does for a node an operator drained before the roll; there is no other alert.
+
 ## What a roll does with a frontend pool member
 
 A farm whose frontends sit behind a load balancer of its own (Envoy, a cloud balancer, anything
@@ -492,7 +503,7 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    workflow that may call. An entry's `services = [...]` (default `["kbf"]`) lists the services a
    token it admits may set, and a token never gets another entry's services: setting a service the
    admitting entry does not list is a 403 `forbidden` that changes nothing. The single table above
-   is one entry that lets CI set `kbf` only. The services must be defined (`kbf` is built in; others
+   is one entry that lets CI set `kbf` only. The services must be defined (`kbf` is shipped with the coordinator; others
    come from `--services-file`, which no longer takes `ci_services`: such a file is refused).
    Entries must name the same issuer, and two entries may not share a `repository_id` and a
    `job_workflow_ref`; such a file is refused at load.
@@ -555,6 +566,8 @@ says which form it needs, before it calls the coordinator. Anything else that se
 coordinator's desired version (a `POST /v1/desired` by hand) needs the same form, or no host
 will converge on it.
 
+`--services-file` is read once at start, under the rule of `--operator-token-file`: a regular file (not a symlink) owned by the coordinator's user with mode `0600` or `0400`, at most 1 MiB; a file that fails it stops the start. Treat it as secret-grade: a file whose first entry is named `kbf` replaces the shipped kbf definition, and can set `max_updating` up to 10000, `min_up = 0`, drop `never_last` and every `after`, so whoever controls the file controls kbf's rollout safety. A replaced kbf must be the first entry, wait for no service and have a role, and its desired state still names `min_up` for storage and frontend.
+
 The coordinator keeps its desired state per service name, and `kbf` is the only service it accepts unless `--services-file` defines more ([the design](../design/updates.md)): `POST /v1/desired` takes an optional `service` (absent means `kbf`; a name no file defines is a 400), and `GET /v1/status` adds `services` beside the unchanged `desired`, `services_dropped`, the number of heartbeats whose `services` list was bad and was dropped (the host is answered as a `kbf`-only host), and `per_service` (below). While `kbf` is the only service, the `--state-file` holds the single state in the form earlier coordinators wrote, so a downgrade to one of them starts on the same file; a file in the map form (`{"services": {...}}`), which a coordinator with a second service writes, is refused by an earlier build, and the operator then restores the file from before or writes `kbf`'s state alone in it.
 
 `cargo xtask deploy-farm` (one `run:` line):
@@ -602,7 +615,16 @@ declares is a 404 `not_found`; a query that is not exactly `service=NAME` is a 4
 allow-list accepts may read any service's convergence; the read changes nothing. `GET /v1/status` adds, after its
 existing keys, `per_service`: for every managed service (`kbf` included) by name,
 `{"desired": <its desired state or null>, "roles": [{"role", "at_desired", "updating",
-"failed", "down"}]}`, the counts being those of `GET /v1/convergence` for the service.
+"failed", "down"}], "hosts": [...], "up": N, "slots_held": N, "convergence": {...}}`, the counts
+being those of `GET /v1/convergence` for the service. `hosts` is every host that heartbeated the
+service, by node id: the fields of the top-level `hosts` entries, with `up` and `holds_slot`
+counted for this service (a host ordered to update `other` holds `other`'s slot and is not up for
+it, while it holds nothing under `kbf`), and `hold`: the rule that keeps the coordinator from
+ordering the host now (`quiet`, `updating`, `busy_elsewhere`, `up_to_date`, `failed_here`,
+`no_slot`, `waiting_for_role`, `waiting_for_service`, `min_up`, `not_a_member`, `no_desired`, `no_definition`; these spellings are public), or
+`null` when it would be ordered at its next heartbeat. `up` and `slots_held` count those hosts,
+and `convergence` is the answer of `GET /v1/convergence?service=NAME`. The top-level keys, and the
+top-level `hosts`, which are `kbf`'s, are unchanged.
 
 `cargo xtask deploy-farm --service NAME` (default `kbf`) deploys another service the same way.
 For `kbf` the requests are the ones listed above. For another service the POST body also has

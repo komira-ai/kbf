@@ -140,7 +140,7 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server}
 
 pub use self::executor_flags::{ExecutorFlags, JsAgentFlags};
 pub use self::janitor::{Janitor, JanitorFlagError, JanitorFlags, JanitorMetrics};
-pub use self::job_read::{JobReadError, JobReadFlags, JobTls};
+pub use self::job_read::{JobReadError, JobReadFlags, JobTls, StoreGrantFlags};
 pub use self::pack_flags::{PackFlagError, PackFlags};
 pub use self::task_flags::{TaskFlagError, TaskFlags};
 use crate::drain::Drain;
@@ -209,6 +209,7 @@ pub const ALLOWED: &[&str] = &[
     "exclusive_actions",
     "placement_load",
     "placement_predictions",
+    "usage_profiles",
     "whole_node_max",
     "whole_node_max_draining",
     "whole_node_keep_for_ordinary",

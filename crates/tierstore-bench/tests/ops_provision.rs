@@ -12,7 +12,7 @@ use tierstore_bench::error::BenchError;
 use tierstore_bench::preflight::mc::Mc;
 use tierstore_bench::preflight::ops::KeyPair;
 use tierstore_bench::provision::state::{STATE_FILE, State};
-use tierstore_bench::provision::{Mode, STEPS_FILE, policy_document, run, run_with};
+use tierstore_bench::provision::{Mode, STEPS_FILE, Supply, policy_document, run, run_with};
 use tierstore_bench::role::Role;
 
 use ops_support::*;
@@ -412,19 +412,25 @@ async fn bad_inputs_stop_the_verb_before_any_command() {
 async fn run_reads_the_ops_file_of_the_result_directory() {
     let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tb-prov-run");
     let config = run_config(dir.path(), "http://host-mark:9000", None);
-    let err = run(&config, Mode::DryRun).await.unwrap_err();
+    let err = run(&config, Mode::DryRun, Supply::Create)
+        .await
+        .unwrap_err();
     assert!(matches!(err, BenchError::Io { .. }), "{err:?}");
     assert!(err.to_string().contains("ops.json"));
 
     fs::write(dir.path().join("ops.json"), "{}").unwrap();
-    let err = run(&config, Mode::DryRun).await.unwrap_err();
+    let err = run(&config, Mode::DryRun, Supply::Create)
+        .await
+        .unwrap_err();
     assert!(
         err.to_string().starts_with("ops.json is not an ops file"),
         "{err}"
     );
 
     fs::write(dir.path().join("ops.json"), ops_json().to_string()).unwrap();
-    let err = run(&config, Mode::DryRun).await.unwrap_err();
+    let err = run(&config, Mode::DryRun, Supply::Create)
+        .await
+        .unwrap_err();
     assert!(matches!(err, BenchError::Io { .. }), "{err:?}");
 }
 

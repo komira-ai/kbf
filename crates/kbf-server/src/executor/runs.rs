@@ -380,6 +380,7 @@ impl HostWorker {
             work_dir: ctx.cfg.work_dir.as_deref(),
             allow_plain_http_put: ctx.cfg.allow_plain_http_put,
             allow_plain_http_grant: ctx.cfg.allow_plain_http_grant,
+            locate: ctx.cfg.locate,
         };
         let limits = RunLimits {
             cpu_millis: w.millicpus.max(1),
