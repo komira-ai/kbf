@@ -9,7 +9,8 @@
 //! the last one is answered (the sum of the requests' times, for a multipart put).
 //!
 //! The counts and sizes are the plan's; an operator narrows them with `--object-bytes` and
-//! `--in-flight`, and leaves out the open-loop arms with `--open-loop off`. The ledger refuses
+//! `--in-flight`, leaves out the open-loop arms with `--open-loop off`, and sets the count of a
+//! multipart path's closed-loop arms with `--multipart-objects`. The ledger refuses
 //! what does not fit the caps, and is asked about the arms built, so a plan without the open-loop
 //! arms costs without them.
 
@@ -18,6 +19,7 @@ use std::sync::Arc;
 use crate::cells::content;
 use crate::cells::engine::{Arm, Cap, Env, FaultSwitch, Pace, Step, hook, slug, work};
 use crate::cells::modes::{Mode, put_modes, width_ok};
+use crate::cells::stats;
 use crate::cells::{CellId, CellPlan};
 use crate::error::BenchError;
 use crate::proxy::FaultMode;
@@ -75,8 +77,10 @@ pub fn requests_for(size: u64, in_flight: u32) -> u64 {
 /// requests on.
 #[must_use]
 pub fn p99_note(requests: u64) -> Option<String> {
-    let _ = requests;
-    None
+    let least = u64::try_from(stats::P99_MIN_N).unwrap_or(u64::MAX);
+    (requests < least).then(|| {
+        format!("p99 not reported: {requests} objects per pass, fewer than the 1,000 a p99 needs")
+    })
 }
 
 /// The open-loop arms: `(size, requests per second, seconds)`.
@@ -128,7 +132,7 @@ impl Putter {
 }
 
 /// The notes every arm of a put cell carries, for the path and the mode.
-fn notes(cell: CellId, path: &PutPath, mode: &Mode, size: u64) -> Vec<String> {
+fn notes(cell: CellId, path: &PutPath, mode: &Mode, size: u64, requests: u64) -> Vec<String> {
     let how = match (path.multipart, path.role) {
         (true, Role::Instance) => {
             "a multipart upload through the instance: its parts go straight to the cold tier and do not touch the hot tier. The instance has no cold-only mode at the pinned tag, so it runs with a hot tier of its own on the same host (two-tier mode); this arm measures the cold path of it"
@@ -145,14 +149,16 @@ fn notes(cell: CellId, path: &PutPath, mode: &Mode, size: u64) -> Vec<String> {
         || "none: the cold store as it is".to_owned(),
         |f| format!("{f:?} through the fault proxy (the arm of mode proxy-pass is its control)"),
     );
-    vec![
+    let mut notes = vec![
         format!("{}: put-to-ack by {}, {how}", cell.as_str(), path.name),
         format!("test instance and test buckets; fault: {fault}"),
         format!(
             "every object of the arm has the same {} seeded bytes; keys are unique per pass",
             size_label(size)
         ),
-    ]
+    ];
+    notes.extend(p99_note(requests));
+    notes
 }
 
 /// The arms of a put cell: every path the run configures, at every size, in flight and mode.
@@ -196,8 +202,15 @@ pub fn arms(
                     .in_flight
                     .map_or_else(|| plan.in_flight.clone(), |n| vec![n]);
                 for &in_flight in flights.iter().filter(|&&n| width_ok(n, size)) {
+                    // `--multipart-objects` replaces the plan's count of a multipart path; the
+                    // fault modes' own counts are small already and stay.
+                    let planned = |size, in_flight| {
+                        plan.multipart_objects
+                            .filter(|_| path.multipart)
+                            .unwrap_or_else(|| requests_for(size, in_flight))
+                    };
                     let requests = mode
-                        .requests(size, in_flight, requests_for)
+                        .requests(size, in_flight, planned)
                         .min(limit.unwrap_or(u64::MAX));
                     let label = slug(&format!(
                         "{}-{}-c{in_flight}-{}",
@@ -217,7 +230,7 @@ pub fn arms(
                         Pace::Closed,
                         in_flight,
                         requests,
-                        notes(cell, path, &mode, size),
+                        notes(cell, path, &mode, size, requests),
                         putter,
                         mode.fault.zip(faults.clone()),
                     ));
@@ -240,7 +253,7 @@ pub fn arms(
                         body: body.clone(),
                         prefix: format!("{}/{}", env.prefix(), label),
                     };
-                    let mut notes = notes(cell, path, &mode, size);
+                    let mut notes = notes(cell, path, &mode, size, requests);
                     notes.push(format!(
                         "open loop: {per_sec} puts per second for {secs} s; a put that goes out late has its delay in its latency"
                     ));

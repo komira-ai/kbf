@@ -163,7 +163,7 @@ impl RunArgs {
             in_flight: self.in_flight.clone(),
             object_bytes: self.object_bytes.clone(),
             open_loop: self.open_loop(),
-            multipart_objects: None,
+            multipart_objects: self.multipart_objects,
         }
     }
 

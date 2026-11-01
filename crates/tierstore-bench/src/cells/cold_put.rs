@@ -21,6 +21,16 @@
 //! open loop at a fixed rate so a stall is not coordinated omission, and the proxy in pass mode
 //! as the control of every faulted arm. The arms are built by [`crate::cells::putcell`].
 //!
+//! Objects per pass: 1,000 up to 1 MiB (see [`putcell::requests_for`]). A multipart object is three
+//! requests to the store (create, part, complete), so on a slow cold store the plan's count of the
+//! two multipart arms may not fit a window; `--multipart-objects N` sets their count per pass
+//! (`direct-mp` and `instance`, in the closed-loop arms of every size and width) and leaves the
+//! `direct` arm, the open-loop arms and the fault arms' own counts as they are. Without the flag
+//! nothing changes. The ledger is asked for, and charged, the bytes of the objects the arm puts. A
+//! p99 needs 1,000 requests, so an arm with fewer reports none (`p99_us` is null in each of its
+//! passes) and says so in its notes, and each result records the objects per pass its arm used
+//! (`objects_per_pass`).
+//!
 //! Writes under `tierstore-bench/<run id>/` of the test bucket, counts the bytes against the
 //! ledger and deletes what it wrote after each pass. A stopped cold store is a result (the failed
 //! requests and the time to them), not an error of the run. The fault arms need a
