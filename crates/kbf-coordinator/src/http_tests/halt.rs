@@ -711,3 +711,48 @@ async fn three_hosts_halt_one_clear_and_none_re_halts() {
         ])
     );
 }
+
+/// Catches: an order sent after an acknowledgement that could not be made durable: the host is
+/// repaired and restarts (its beat carries no report), which ends the acknowledgement, but the
+/// write fails, so the host is ordered nothing (a crash after such an order would leave the
+/// acknowledgement on disk and the order forgotten). Once the write works the host is ordered
+/// the update, and a halt it then reports is a new failure that halts the service again.
+#[tokio::test]
+async fn an_order_is_not_sent_when_its_halt_ack_cannot_be_dropped() {
+    let fail = calm();
+    let rig = farm_of_two("halt-ack-drop-unwritable", &fail).await;
+    send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
+    clear(&rig, "kbf").await;
+    fail.store(true, Ordering::SeqCst);
+    let nothing = json!({"reply": "nothing"});
+    assert_eq!(send(&rig, "s1", "storage", &beat("1.0", "")).await, nothing);
+    assert_eq!(send(&rig, "s1", "storage", &beat("1.0", "")).await, nothing);
+    fail.store(false, Ordering::SeqCst);
+    let ordered = send(&rig, "s1", "storage", &beat("1.0", "")).await;
+    assert_eq!(ordered, json!({"reply": "update", "version": "2.0"}));
+    send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
+    assert_eq!(convergence(&rig, "kbf").await["state"], "halted");
+}
+
+/// Catches: an acknowledgement that matches a (host, target) pair and not the report: the same
+/// host failing the same target in the halt phase for another reason, with another class, is
+/// a different `last_update`, so it halts the service again. The report an operator cleared,
+/// repeated byte for byte, stays acknowledged.
+#[tokio::test]
+async fn an_ack_matches_the_whole_report_not_the_host_and_target() {
+    let rig = farm("halt-ack-whole-report").await;
+    send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
+    clear(&rig, "kbf").await;
+    send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
+    assert_ne!(convergence(&rig, "kbf").await["state"], "halted");
+    let other = HALT.replace("disk_tainted", "other_check");
+    send(&rig, "s1", "storage", &beat("1.0", &other)).await;
+    assert_eq!(
+        convergence(&rig, "kbf").await["halt"]["check"],
+        "other_check"
+    );
+    clear(&rig, "kbf").await;
+    let classed = HALT.replace(r#""reason""#, r#""class":"environment","reason""#);
+    send(&rig, "s1", "storage", &beat("1.0", &classed)).await;
+    assert_eq!(convergence(&rig, "kbf").await["state"], "halted");
+}
