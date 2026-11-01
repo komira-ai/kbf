@@ -159,3 +159,26 @@ fn a_confirm_that_may_have_landed_keeps_its_mark_and_is_not_reverted() {
     assert_eq!(rig.events.count(&format!("local:confirm {VB}")), 2);
     assert!(!rig.drain.is_drained());
 }
+
+/// A mark of an earlier update's drain is on the disk, and an operator has since cordoned the
+/// node over it: the node is the operator's, the update drains and waits as for any node, and
+/// it never gives the node back, though the mark said the cordon was the updater's.
+///
+/// Catches: a stale own-cordon mark that makes this update uncordon a node an operator holds.
+#[test]
+fn a_stale_mark_over_an_operators_cordon_does_not_make_the_node_the_updates() {
+    let (rig, node) = with_cordon("hook-stale-mark");
+    rig.drain_port
+        .drain(
+            &crate::agent::testing::host(crate::inventory::Role::Daemon),
+            None,
+        )
+        .expect("the earlier update's drain");
+    node.operator_cordons();
+    *node.undrain_error.lock().unwrap() = Some(PortError::other("called"));
+    for step in [Step::Prepare, Step::Cutover, Step::Verify, Step::Cleanup] {
+        assert_eq!(rig.run(step).outcome, Outcome::Success, "{step}");
+    }
+    assert!(!node.is_serving(), "still the operator's");
+    assert_eq!(rig.record().expect("a record").placement, Some(Was::Out));
+}
