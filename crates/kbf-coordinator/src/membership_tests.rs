@@ -10,9 +10,9 @@ use crate::service::FEATURES;
 use crate::services::{Services, ServicesError};
 use crate::testutil::{OPERATOR, Rig, beat, id};
 
-const V2: &str = "heartbeat-v2";
+pub(crate) const V2: &str = "heartbeat-v2";
 
-const DAEMONS: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n\
+pub(crate) const DAEMONS: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n\
     [service.selector]\nroles = [\"daemon\"]\n";
 
 const DAEMONS_OF_TWO_ROLES: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n\
@@ -20,7 +20,7 @@ const DAEMONS_OF_TWO_ROLES: &str = "[[service]]\nname = \"other\"\n[service.role
 
 const NO_SELECTOR: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n";
 
-const ZONE_A: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n\
+pub(crate) const ZONE_A: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n\
     [service.selector]\nlabels = { zone = \"a\" }\n";
 
 const TWO: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n\
@@ -33,7 +33,7 @@ const KBF_ZONE_B: &str = "[[service]]\nname = \"kbf\"\n[service.roles.daemon]\n\
     [[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n";
 
 /// A rig past the quiet start over the services of `text`, each but kbf desired at 3.0.
-async fn rig(name: &str, text: &str, services: &[&str]) -> Rig {
+pub(crate) async fn rig(name: &str, text: &str, services: &[&str]) -> Rig {
     let mut rig = Rig::new(name);
     let names: Vec<String> = ["kbf"]
         .iter()
@@ -57,7 +57,7 @@ async fn rig(name: &str, text: &str, services: &[&str]) -> Rig {
     rig
 }
 
-fn who(name: &str) -> Identity {
+pub(crate) fn who(name: &str) -> Identity {
     Identity {
         node_id: id(name),
         role: HostRole::DAEMON,
@@ -91,13 +91,13 @@ fn send(rig: &Rig, name: &str, v2: bool, services: &[(&str, &str, &str)]) -> Ser
         .reply
 }
 
-fn operate(rig: &Rig, body: &str) {
+pub(crate) fn operate(rig: &Rig, body: &str) {
     rig.coordinator
         .operate(Some(OPERATOR), body.as_bytes())
         .expect("an operator action");
 }
 
-fn labels(rig: &Rig, node: &str, set: &str) {
+pub(crate) fn labels(rig: &Rig, node: &str, set: &str) {
     operate(
         rig,
         &format!(r#"{{"action":"set_labels","node_id":"{node}","labels":{set}}}"#),
