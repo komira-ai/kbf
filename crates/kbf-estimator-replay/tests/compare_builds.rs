@@ -333,11 +333,13 @@ fn a_joined_operation_counts_once_for_each_correlated_job_that_waited() {
     assert_eq!(builds, [("job1", 1), ("job2", 1)]);
 }
 
-/// Catches: attempts that never got a lease (exported as lease `0.0`) merged into one because
-/// they share an operation, so that never_started undercounts the refused or cancelled
-/// retries.
+/// Catches: a granted lease whose term and sequence are both 0 (the first lease of a store
+/// that starts its sequence at 0, under a term of 0) read as "no lease", so that every
+/// waiter of the joined operation counted its copy as an attempt of its own. The export
+/// writes the record's lease fields for every attempt, so `0.0` is a lease like any other;
+/// only a row with no `lease` at all (an export that predates the key) is its own attempt.
 #[test]
-fn never_leased_attempts_of_one_operation_are_each_an_attempt() {
+fn a_granted_lease_zero_zero_is_one_attempt_for_all_its_waiters() {
     let mut rows = waiters(&["i1", "i2"]);
     for r in &mut rows {
         r.lease = Some("0.0".into());
@@ -346,8 +348,17 @@ fn never_leased_attempts_of_one_operation_are_each_an_attempt() {
         r.outcome = "cancelled".into();
     }
     let arm = analyze(&rows);
-    assert_eq!(arm.attempts, 2);
-    assert_eq!(arm.never_started.get("cancelled"), Some(&2));
+    assert_eq!(arm.attempts, 1);
+    assert_eq!(arm.never_started.get("cancelled"), Some(&1));
+    let job = analyze_grouped(&rows, GroupBy::Correlated);
+    assert_eq!(job.attempts, 1);
+    assert_eq!(arm.builds.runs.len(), 2, "each invocation did wait");
+    for r in &mut rows {
+        r.lease = None;
+    }
+    let old = analyze(&rows);
+    assert_eq!(old.attempts, 2, "no lease key: each row is its own");
+    assert_eq!(old.never_started.get("cancelled"), Some(&2));
 }
 
 /// Catches: the table printing build numbers without saying what the span leaves out.
