@@ -24,8 +24,8 @@ pub const MAX_RAW_CHARS: usize = 200;
 pub struct Entry {
     /// RFC 3339, UTC.
     pub time: String,
-    /// `install`, `restart`, `query` or `apply` (the Mac's apply job); none when the request
-    /// was not understood.
+    /// `install`, `restart`, `query`, `apply` (the Mac's apply job) or `prune` (what that job
+    /// removed after it, or why it could not); none when the request was not understood.
     pub verb: Option<&'static str>,
     pub version: Option<String>,
     pub channel: Option<String>,
@@ -33,7 +33,7 @@ pub struct Entry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
     /// `installed`, `already_installed`, `restarted`, `apply_started`, `applied` (the end of
-    /// an apply job), `query`, `refused` or `failed`.
+    /// an apply job), `pruned` or `prune_failed` (its prune), `query`, `refused` or `failed`.
     pub outcome: &'static str,
     /// The closed reason code of a refusal or a failure.
     pub reason: Option<&'static str>,

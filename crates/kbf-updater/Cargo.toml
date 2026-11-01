@@ -43,6 +43,8 @@ kbf-ca.workspace = true
 rcgen.workspace = true
 # The contract test feeds the real answer types of the forced command to the ssh installer.
 kbf-host-install = { path = "../kbf-host-install" }
+# The releases a helper lists in its query, cut as the helper cuts them (local_tests.rs).
+kbf-retain.workspace = true
 kbf-testkit.workspace = true
 
 # `kbf update-hook` over a fake host kept in a directory, the program the conformance harness

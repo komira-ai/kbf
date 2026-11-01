@@ -62,7 +62,11 @@ pub(crate) mod package_tests;
 #[cfg(test)]
 mod production_tests;
 #[cfg(test)]
+mod request_retain_tests;
+#[cfg(test)]
 mod request_tests;
+#[cfg(test)]
+mod serve_keep_tests;
 #[cfg(test)]
 mod serve_tests;
 #[cfg(test)]
