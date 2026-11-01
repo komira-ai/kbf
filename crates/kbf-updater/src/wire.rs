@@ -28,6 +28,9 @@ use crate::wire_report::{features_text, is_false, lenient, or_default, step_secs
 pub const HEARTBEAT_PATH: &str = "/v1/heartbeat";
 
 /// The most bytes of a heartbeat the coordinator reads.
+///
+/// A beat with every optional fact at its bounds, for `kbf` and sixteen services, can exceed
+/// it (`wire_size_tests`); the agent trims optional facts first to keep a beat under it.
 pub const MAX_HEARTBEAT_BYTES: usize = 16 * 1024;
 
 /// Whether the host serves what it should.
@@ -278,6 +281,10 @@ pub struct HeartbeatRead {
     /// Why one of the optional facts (`agent_features`, `step`, `commit`, `step_secs`,
     /// `promotion_pending`, `deferred`) was dropped, if one was.
     pub extras_dropped: Option<String>,
+    /// The names of the facts `extras_dropped` is about, sorted, each once: `step`, `commit`,
+    /// `step_secs`, `promotion_pending`, `deferred` or `agent_features`, whether the bad one
+    /// was at the top level or in a service entry.
+    pub extras_dropped_facts: Vec<&'static str>,
 }
 
 /// Reads a heartbeat, keeping a host whose `services` list, or one of its optional facts, is
@@ -297,6 +304,7 @@ pub fn read_heartbeat(bytes: &[u8]) -> Result<HeartbeatRead, serde_json::Error> 
             beat,
             services_dropped: None,
             extras_dropped: None,
+            extras_dropped_facts: Vec::new(),
         }),
         Err(why) => {
             let Some(read) = without_droppable(bytes) else {
@@ -341,15 +349,15 @@ struct HeartbeatLoose {
 
 /// One droppable value read as `T`: its default, and the reason, when it is bad.
 fn loose<T: Default + serde::de::DeserializeOwned>(
-    name: &str,
+    name: &'static str,
     value: Option<serde_json::Value>,
-    why: &mut Vec<String>,
+    why: &mut Vec<(&'static str, String)>,
 ) -> T {
     let Some(value) = value else {
         return T::default();
     };
     serde_json::from_value(value).unwrap_or_else(|e| {
-        why.push(format!("{name}: {e}"));
+        why.push((name, format!("{name}: {e}")));
         T::default()
     })
 }
@@ -358,7 +366,7 @@ fn loose<T: Default + serde::de::DeserializeOwned>(
 /// read, and records it in `why` as `services[<name>].<fact>: <error>`. The structural rules
 /// of the list (names, duplicates, `kbf`, the count) are left to [`services_text`], so a bad
 /// fact costs that fact and never the host's services.
-fn scrub_service_facts(value: &mut serde_json::Value, why: &mut Vec<String>) {
+fn scrub_service_facts(value: &mut serde_json::Value, why: &mut Vec<(&'static str, String)>) {
     let Some(entries) = value.as_array_mut() else {
         return;
     };
@@ -390,7 +398,7 @@ fn scrub_service_facts(value: &mut serde_json::Value, why: &mut Vec<String>) {
             };
             if let Some(error) = read {
                 object.remove(fact);
-                why.push(format!("services[{name}].{fact}: {error}"));
+                why.push((fact, format!("services[{name}].{fact}: {error}")));
             }
         }
     }
@@ -417,20 +425,25 @@ fn without_droppable(bytes: &[u8]) -> Option<HeartbeatRead> {
         updating: rest.updating,
         services,
         agent_features: features_text(rest.agent_features.unwrap_or_default())
-            .map_err(|e| extras.push(format!("agent_features: {e}")))
+            .map_err(|e| extras.push(("agent_features", format!("agent_features: {e}"))))
             .unwrap_or_default(),
         step: loose("step", rest.step, &mut extras),
         commit: loose("commit", rest.commit, &mut extras),
         step_secs: step_secs_text(rest.step_secs.unwrap_or_default())
-            .map_err(|e| extras.push(format!("step_secs: {e}")))
+            .map_err(|e| extras.push(("step_secs", format!("step_secs: {e}"))))
             .unwrap_or_default(),
         promotion_pending: loose("promotion_pending", rest.promotion_pending, &mut extras),
         deferred: loose("deferred", rest.deferred, &mut extras),
     };
+    let mut facts: Vec<&'static str> = extras.iter().map(|(fact, _)| *fact).collect();
+    facts.sort_unstable();
+    facts.dedup();
+    let why: Vec<&str> = extras.iter().map(|(_, why)| why.as_str()).collect();
     Some(HeartbeatRead {
         beat,
         services_dropped: (!services_why.is_empty()).then(|| services_why.join("; ")),
-        extras_dropped: (!extras.is_empty()).then(|| extras.join("; ")),
+        extras_dropped: (!why.is_empty()).then(|| why.join("; ")),
+        extras_dropped_facts: facts,
     })
 }
 

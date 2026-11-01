@@ -200,8 +200,34 @@ their paths in the arm names and the result notes say which they are:
 | `cold-read` | `direct`, `instance`, each with a `.ttfb` arm | a streamed read of objects only the cold tier holds: time to the last byte, and to the first |
 | `g` | `instance`, `direct-cold`, `direct-hot`, `loopback-http`, `local-disk` | a read of the 18,105-file, 344,233,431-byte synthetic tree at each width, with the baselines |
 | `a1` | `instance`, `hot` | put-to-ack of a plain put, acknowledged from the hot tier |
-| `b` | `<size>-c<n>` and `.ttfb`, `.second`, `.cold-direct` | a read of a hot miss with copy-back, the second read, and the direct read |
+| `b` | `<size>-c<n>` and `.ttfb`, `.second`, `.cold-direct` | a read of a hot miss with copy-back, the second read, and the direct read; per object the instance's reads come first and the direct read of the cold bucket last, so the miss is not timed against a store the harness has just read from |
 | `c` | `<N>x<size>-c<n>-<mode>` | copy lag of a burst, found by one prefix LIST of the cold bucket every `1 / --list-poll-rps` seconds (2 a second unless set) |
+
+Besides latencies every result records what a reader needs to tell a measurement from a cap or a
+busy machine:
+
+- `rate_caps`: the cold, hot and LIST-poll request caps of the run (`--cold-rps`, `--hot-rps`,
+  `--list-poll-rps`). A cell whose requests wait at a cap measures the cap; `report` names the caps
+  under the table of every cell.
+- per pass, `peak_in_flight`: the most requests in flight at the start of one request, which is the
+  width the pass realised (at 16 asked and a cap of 20 requests a second it is far below 16).
+- per pass, `disk_busy`: for each whole disk of the machine that sends the requests, the
+  milliseconds it spent doing IO during the pass (`io_ticks` of `/proc/diskstats`) and that over the
+  pass's wall time, over the driven window only (the cleanup hook is not in it). It is this
+  machine's disks; a cold store on another host has to be read there. `dm-*` and `md*` devices
+  (LVM, RAID) are in `/sys/block`, so a stacked volume is listed beside its physical disk; busy time
+  is per device, so nothing is summed.
+- per pass of an arm that has the fault proxy in its path, `proxy_requests`: the requests the proxy
+  forwarded by HTTP method (the proxy's own `requests_by_method` counter) while the pass sent its
+  requests (`during`) and while the arm's cleanup hook ran (`cleanup`: the bench's own cleanup,
+  plus any background traffic that happened to land then; background traffic is not separated, and
+  an arm with no cleanup hook has about none). Old results call the field `after`. The report gives
+  them per request.
+
+`report` also sets each `instance` put arm of `cold-put` beside the `direct-mp` arm of the same
+size, width and mode (both are multipart uploads); the single PUT `direct` is not its partner. The
+number of measured requests of an arm is `(passes - 1) x requests per pass`: 10,000 requests at
+1,000 a pass is `--passes 11`.
 
 The rules (also in `cells/mod.rs`): pass 0 of every arm is a discarded warm-up, arms are
 interleaved across passes, the load gate is read before a pass and every few completions in it
