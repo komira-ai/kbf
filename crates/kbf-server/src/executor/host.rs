@@ -344,9 +344,11 @@ impl HostWorker {
         }
     }
 
-    /// The host refused a start because its scratch quota is out of order: it takes no more
-    /// work, and is held out for [`Config::held_out_for`] from `now`.
-    pub(super) fn quota_unavailable(&mut self, ctx: &Ctx<'_>, now: Instant) {
+    /// The host refused a start for a fault of its own that it recovers from by itself (a
+    /// scratch quota out of order, a files root that is gone): it takes no more work, and is
+    /// held out for [`Config::held_out_for`] from `now`, so the lease server cannot hand it
+    /// out again at once.
+    pub(super) fn hold_out(&mut self, ctx: &Ctx<'_>, now: Instant) {
         self.begin_drain(ctx, Drain::Quota(now + ctx.cfg.held_out_for()));
     }
 

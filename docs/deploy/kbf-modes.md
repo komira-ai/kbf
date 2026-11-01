@@ -137,10 +137,19 @@ lease server (`--executor-lease-url`, `https://`, or `http://` to loopback only;
 URL), `--executor-frontend-id` (the `kbf-frontend` label on the frontend's leases, by which a
 restarted frontend finds and releases them; it must be different for each frontend, so a
 `kbf.toml` is not copied to a second frontend with it), the packs (`--pack-store-endpoint`, through which
-the pack a task writes is read, hashed and turned into the action's result) and
-`--executor-insecure-argv-secrets`: the lease server's job has no secret field yet, so the
-presigned write url and the read token travel as arguments of the run, where the action can
-read them. The executor runs on exactly one frontend: it looks for another frontend's leases on
+the pack a task writes is read, hashed and turned into the action's result) and the delivery
+of the secrets, `--executor-secret-delivery`. With `argv`, the default, the presigned write url
+and the read token travel as arguments of the run, where the action can read them, and
+`--executor-insecure-argv-secrets` says the operator accepts it. With `files` each is a file of
+the run, which the lease server mounts read-only at `/run/js-files`, and the task tool is given
+the paths (`--pack-url-file`, `--grant-token-file`): no argument holds a secret,
+`--executor-insecure-argv-secrets` is refused with it, and the lease asks for hosts that report
+`run-files=true`. There is no fall back to arguments: a pool whose agents do not report
+`run-files` holds no host, and no run is sent. A start the lease server refuses with
+`files-unsupported`, or an agent that ends a start with that detail, holds that host out for the
+quota hold (the lease stays booked and idle, so it is not leased again at once) and the action is
+rerun elsewhere; `invalid-file`, from either, ends the action as invalid. `files` is refused with `--executor kbf-daemon`, which builds no command
+line. The executor runs on exactly one frontend: it looks for another frontend's leases on
 the lease server before its first pass and every minute after, and a frontend that finds one
 older than its own (or finds one before it has any) stops with an error naming it. Each lease
 also carries the process that made it: a frontend that starts and finds leases of another
