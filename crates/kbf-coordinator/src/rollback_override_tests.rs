@@ -158,6 +158,7 @@ fn an_acked_failure_does_not_count_and_a_stale_ack_is_dropped() {
             &desired("2.0", 0, 0),
             &stale,
             &fleet,
+            &OpsState::default(),
             secs(2_000)
         ),
         vec![Change::DropAck("d0".to_owned())]
@@ -318,6 +319,7 @@ fn a_min_version_that_is_the_same_release_by_number_is_the_floor() {
             &desired("0.1.10+gabc-8", 0, 0),
             &last_good("0.1.9"),
             &farm(6, 0, phase, class),
+            &OpsState::default(),
             secs(2_000)
         ),
         vec![Change::ClearLastGood]
