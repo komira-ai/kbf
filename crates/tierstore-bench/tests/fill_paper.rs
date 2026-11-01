@@ -100,6 +100,15 @@ fn a_fill_needs_a_result_table_with_a_plain_name() {
     );
     assert_eq!(run.status.code(), Some(2));
     assert!(!bad.exists());
+    // A table path that is a directory cannot be read: exit 2, nothing written.
+    let as_dir = dir.path().join("dir.tsv");
+    std::fs::create_dir(&as_dir).unwrap();
+    let run = fill_paper_raw(
+        dir.path(),
+        &["--in-place", "--result-tsv", as_dir.to_str().unwrap()],
+    );
+    assert_eq!(run.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&run.stderr).contains("dir.tsv"));
     assert_eq!(
         std::fs::read_to_string(dir.path().join("paper.html")).unwrap(),
         PAPER

@@ -5,8 +5,13 @@
 //! holds the numbers. [`fill`] replaces the content of each marked element with the formatted
 //! value and records where it came from in `data-source="<file>#<metric>"` and `data-label`
 //! (`test instance` or `farm`). Everything outside the replaced element contents and the
-//! attributes this module owns (`data-source`, `data-label`, `data-note`) is copied byte for byte:
+//! attributes this module owns (`data-source`, `data-label`, `data-result`, `data-note`, and
+//! `tbd` in `class`) is copied byte for byte:
 //! the HTML is scanned, never re-serialised.
+//!
+//! Each filled value has a row in the result table ([`ResultTsv`]), whose name `data-result`
+//! carries: kind `derived`, id `fill:<cell>:<metric>`, the number as printed, its unit, how it was
+//! taken and the cell. A cell whose `data-result` is a table this run does not write is refused.
 //!
 //! The mapping, a JSON array of
 //! `{id, cell, metric, unit, condition, size, blocked}` (`size` and `blocked` optional, `label`
@@ -77,6 +82,9 @@ pub enum FillError {
     /// `--check` found problems; the text lists them.
     #[error("check failed:\n{0}")]
     Check(String),
+    /// A line of the result table is not a row.
+    #[error("result table: {0}")]
+    Table(String),
     /// The name of the result table cannot be a `data-result`.
     #[error(
         "result table name {0:?}: lower-case letters, digits, `.`, `-` and `_`, ending in .tsv"
@@ -139,7 +147,11 @@ pub fn run(args: &FillArgs) -> Result<(), FillError> {
                 "--check writes nothing: no --out or --in-place",
             ));
         }
-        let findings = check(&html, &mappings, &results, None)?;
+        let table = match &args.result_tsv {
+            Some(path) => Some(ResultTsv::parse(&table_name(path), &read(path)?)?),
+            None => None,
+        };
+        let findings = check(&html, &mappings, &results, table.as_ref())?;
         return if findings.is_empty() {
             println!("fill-paper: check passed");
             Ok(())
@@ -153,7 +165,27 @@ pub fn run(args: &FillArgs) -> Result<(), FillError> {
         (Some(out), false) => out,
         (None, true) => &args.paper,
     };
-    let (text, report) = fill(&html, &mappings, &results, &mut ResultTsv::new("x.tsv")?)?;
+    let Some(table_path) = &args.result_tsv else {
+        return Err(FillError::Usage(
+            "give --result-tsv FILE, the table of rows behind the numbers",
+        ));
+    };
+    let name = table_name(table_path);
+    let mut table = match std::fs::read_to_string(table_path) {
+        Ok(text) => ResultTsv::parse(&name, &text)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ResultTsv::new(&name)?,
+        Err(source) => {
+            return Err(FillError::Io {
+                path: table_path.clone(),
+                source,
+            });
+        }
+    };
+    let (text, report) = fill(&html, &mappings, &results, &mut table)?;
+    std::fs::write(table_path, table.render()).map_err(|source| FillError::Io {
+        path: table_path.clone(),
+        source,
+    })?;
     std::fs::write(target, text).map_err(|source| FillError::Io {
         path: target.clone(),
         source,
@@ -165,7 +197,27 @@ pub fn run(args: &FillArgs) -> Result<(), FillError> {
     Ok(())
 }
 
-/// The result table: the rows that back the numbers `fill-paper` prints.
+/// Whether `name` is a plain table name for a `data-result`: lower-case letters, digits, `.`,
+/// `-` and `_`, ending in `.tsv`, no `..` (the rule of the paper's completion check).
+fn tsv_name_ok(name: &str) -> bool {
+    name.len() > ".tsv".len()
+        && name.ends_with(".tsv")
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c))
+}
+
+/// The comment lines a new table starts with.
+const TSV_HEADER: [&str; 2] = [
+    "# Rows behind the numbers tierstore-bench fill-paper printed. Columns: kind, id, value, unit, how the value was taken, cells.",
+    "# A row with an id of the form fill:<cell>:<metric> is rewritten by the next run; every other line is left as it is.",
+];
+
+/// The result table: the rows that back the numbers `fill-paper` prints. A row is
+/// `kind`, `id`, `value`, `unit`, `how` and `cells`, tab-separated; `cells` names the cell that
+/// prints the value. `fill-paper` owns the rows whose id is `fill:<cell>:<metric>`: it updates
+/// them in place or appends them; comments and other rows are kept as they are.
 #[derive(Clone, Debug)]
 pub struct ResultTsv {
     name: String,
@@ -173,24 +225,48 @@ pub struct ResultTsv {
 }
 
 impl ResultTsv {
-    /// An empty table called `name`.
+    /// An empty table called `name`, with a header.
     ///
     /// # Errors
     /// [`FillError::TsvName`] if `name` cannot be a `data-result`.
     pub fn new(name: &str) -> Result<ResultTsv, FillError> {
+        if !tsv_name_ok(name) {
+            return Err(FillError::TsvName(name.to_owned()));
+        }
         Ok(ResultTsv {
             name: name.to_owned(),
-            lines: Vec::new(),
+            lines: TSV_HEADER.iter().map(|l| (*l).to_owned()).collect(),
         })
     }
 
     /// The table `name` as it is on disk.
     ///
     /// # Errors
-    /// [`FillError::TsvName`] if `name` cannot be a `data-result`.
+    /// [`FillError::TsvName`] if `name` cannot be a `data-result`; [`FillError::Table`] if a
+    /// line that is not a comment has fewer than three columns or a value that is not a number.
     pub fn parse(name: &str, text: &str) -> Result<ResultTsv, FillError> {
-        let _ = text;
-        ResultTsv::new(name)
+        let mut table = ResultTsv::new(name)?;
+        table.lines.clear();
+        for (n, line) in text.lines().enumerate() {
+            if !(line.is_empty() || line.starts_with('#')) {
+                let columns: Vec<&str> = line.split('\t').collect();
+                if columns.len() < 3 {
+                    return Err(FillError::Table(format!(
+                        "line {}: fewer than 3 tab-separated columns",
+                        n + 1
+                    )));
+                }
+                if columns[2].parse::<f64>().is_err() {
+                    return Err(FillError::Table(format!(
+                        "line {}: value {:?} is not a number",
+                        n + 1,
+                        columns[2]
+                    )));
+                }
+            }
+            table.lines.push(line.to_owned());
+        }
+        Ok(table)
     }
 
     /// The file name, as `data-result` writes it.
@@ -199,11 +275,41 @@ impl ResultTsv {
         &self.name
     }
 
-    /// The file text.
+    /// The file text: every line ends in a newline.
     #[must_use]
     pub fn render(&self) -> String {
-        self.lines.concat()
+        self.lines.iter().map(|l| format!("{l}\n")).collect()
     }
+
+    /// Replaces the row with the id of `row` in place, or appends it.
+    fn upsert(&mut self, row: String) {
+        let id = row.split('\t').nth(1).unwrap_or_default().to_owned();
+        let at = self
+            .lines
+            .iter()
+            .position(|l| !l.starts_with('#') && l.split('\t').nth(1) == Some(id.as_str()));
+        match at {
+            Some(k) => self.lines[k] = row,
+            None => self.lines.push(row),
+        }
+    }
+
+    /// Whether a row names `cell` in its last column.
+    fn names(&self, cell: &str) -> bool {
+        self.lines.iter().any(|l| {
+            !l.starts_with('#')
+                && l.split('\t')
+                    .nth(5)
+                    .is_some_and(|cells| cells.split(',').any(|c| c.trim() == cell))
+        })
+    }
+}
+
+/// The file name of the table at `path`, as `data-result` writes it.
+fn table_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 fn read(path: &Path) -> Result<String, FillError> {
@@ -590,8 +696,23 @@ impl Results {
     }
 }
 
+/// A figure of a result with the passes it was taken from and the rule that took it.
+struct Measured {
+    /// In base units.
+    value: f64,
+    /// The pass indexes the value is made of, ascending.
+    passes: Vec<u32>,
+    /// How the passes were combined.
+    rule: &'static str,
+}
+
 /// The value of `metric` in `result`, in base units; `Err` says why there is none.
 fn measure(result: &CellResult, metric: Metric) -> Result<f64, String> {
+    measure_with(result, metric).map(|m| m.value)
+}
+
+/// [`measure`] with the passes and the rule.
+fn measure_with(result: &CellResult, metric: Metric) -> Result<Measured, String> {
     let healing: BTreeSet<u32> = result
         .cold_state
         .iter()
@@ -613,21 +734,41 @@ fn measure(result: &CellResult, metric: Metric) -> Result<f64, String> {
             "no pass counts (warm-up, gate-aborted, cold-guard-aborted or healing only)".to_owned(),
         );
     }
-    let latency = |pick: fn(&PassResult) -> Option<u64>, passes: &[&PassResult]| {
-        let mut values: Vec<u64> = passes.iter().filter_map(|p| pick(p)).collect();
-        values.sort_unstable();
-        values.get(values.len().wrapping_sub(1) / 2).copied()
-    };
     #[allow(clippy::cast_precision_loss)]
     let as_f = |v: u64| v as f64;
-    let figure = match metric {
-        Metric::P50 => latency(|p| p.percentiles.map(|q| q.p50_us), &counted).map(as_f),
-        Metric::P95 => latency(|p| p.percentiles.map(|q| q.p95_us), &counted).map(as_f),
-        Metric::Max => counted
+    // The median (the lower middle of an even count) of the per-pass values, with the passes
+    // that had one.
+    let median = |pick: fn(&PassResult) -> Option<u64>, passes: &[&PassResult]| {
+        let mut values: Vec<(u64, u32)> = passes
             .iter()
-            .filter_map(|p| p.percentiles.map(|q| q.max_us))
-            .max()
-            .map(as_f),
+            .filter_map(|p| pick(p).map(|v| (v, p.pass)))
+            .collect();
+        values.sort_unstable();
+        let mid = values.get(values.len().wrapping_sub(1) / 2).copied()?;
+        let mut used: Vec<u32> = values.iter().map(|(_, pass)| *pass).collect();
+        used.sort_unstable();
+        Some((as_f(mid.0), used))
+    };
+    let all: Vec<u32> = counted.iter().map(|p| p.pass).collect();
+    let figure = match metric {
+        Metric::P50 => median(|p| p.percentiles.map(|q| q.p50_us), &counted)
+            .map(|(v, used)| (v, used, "median of the per-pass p50")),
+        Metric::P95 => median(|p| p.percentiles.map(|q| q.p95_us), &counted)
+            .map(|(v, used)| (v, used, "median of the per-pass p95")),
+        Metric::Max => {
+            let mut with: Vec<(u64, u32)> = counted
+                .iter()
+                .filter_map(|p| p.percentiles.map(|q| (q.max_us, p.pass)))
+                .collect();
+            with.sort_unstable_by_key(|(_, pass)| *pass);
+            with.iter().map(|(v, _)| *v).max().map(|v| {
+                (
+                    as_f(v),
+                    with.iter().map(|(_, p)| *p).collect(),
+                    "largest per-pass max",
+                )
+            })
+        }
         Metric::P99 => {
             let quiet: Vec<&PassResult> = counted
                 .iter()
@@ -640,19 +781,45 @@ fn measure(result: &CellResult, metric: Metric) -> Result<f64, String> {
                     "p99 needs {P99_MIN_REQUESTS} quiet requests, the result has {n}"
                 ));
             }
-            latency(|p| p.percentiles.and_then(|q| q.p99_us), &quiet).map(as_f)
+            median(|p| p.percentiles.and_then(|q| q.p99_us), &quiet)
+                .map(|(v, used)| (v, used, "median of the per-pass p99 of the quiet passes"))
         }
-        Metric::Requests => Some(as_f(counted.iter().map(|p| p.requests).sum())),
-        Metric::Failures => Some(as_f(counted.iter().map(|p| p.failures).sum())),
-        Metric::Bytes => Some(as_f(counted.iter().map(|p| p.bytes).sum())),
-        Metric::Elapsed => latency(|p| Some(p.elapsed_us), &counted).map(as_f),
+        Metric::Requests => Some((
+            as_f(counted.iter().map(|p| p.requests).sum()),
+            all,
+            "sum over the passes",
+        )),
+        Metric::Failures => Some((
+            as_f(counted.iter().map(|p| p.failures).sum()),
+            all,
+            "sum over the passes",
+        )),
+        Metric::Bytes => Some((
+            as_f(counted.iter().map(|p| p.bytes).sum()),
+            all,
+            "sum over the passes",
+        )),
+        Metric::Elapsed => median(|p| Some(p.elapsed_us), &counted)
+            .map(|(v, used)| (v, used, "median of the per-pass wall time")),
         Metric::Throughput => {
             let us: u64 = counted.iter().map(|p| p.elapsed_us).sum();
             let bytes: u64 = counted.iter().map(|p| p.bytes).sum();
-            (us > 0).then(|| as_f(bytes) * 1_000_000.0 / as_f(us))
+            (us > 0).then(|| {
+                (
+                    as_f(bytes) * 1_000_000.0 / as_f(us),
+                    all,
+                    "sum of bytes over sum of wall time",
+                )
+            })
         }
     };
-    figure.ok_or_else(|| format!("no pass has a {}", metric.name()))
+    figure
+        .map(|(value, passes, rule)| Measured {
+            value,
+            passes,
+            rule,
+        })
+        .ok_or_else(|| format!("no pass has a {}", metric.name()))
 }
 
 /// `1234.6` as `1,235`, `12.34` as `12.3`, `1.234` as `1.23`: three significant figures at
@@ -685,13 +852,22 @@ fn format_value(value: f64, unit: Unit) -> String {
     grouped
 }
 
+/// The number of a formatted value as the paper prints it: the thousands commas dropped, the
+/// unit left out.
+fn printed_number(text: &str) -> String {
+    text.chars()
+        .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | ','))
+        .filter(|c| *c != ',')
+        .collect()
+}
+
 /// What a mapping gives for the results: the text, where from and the label.
 struct Found {
     text: String,
-    /// The result file the figure was taken from.
-    file: String,
     source: String,
     label: String,
+    /// The row that backs the printed number.
+    row: String,
 }
 
 /// The figure a mapping asks for, or why there is none.
@@ -712,13 +888,33 @@ fn evaluate(mapping: &Mapping, results: &Results) -> Result<Found, String> {
     let mut why = Vec::new();
     for (file, result) in tries {
         for (metric, unit) in &mapping.metrics {
-            match measure(result, *metric) {
-                Ok(v) => {
+            match measure_with(result, *metric) {
+                Ok(m) => {
+                    let text = format_value(m.value / unit.divisor, *unit);
+                    let source = format!("{file}#{}", metric.name());
+                    let passes: Vec<String> = m.passes.iter().map(u32::to_string).collect();
+                    let how = format!(
+                        "{source}; passes {}; {}; {} {} divided by {} and rounded as printed",
+                        passes.join(","),
+                        m.rule,
+                        m.value,
+                        units_of(*metric)[0].name,
+                        unit.divisor,
+                    );
+                    let row = [
+                        "derived",
+                        &format!("fill:{}:{}", mapping.id, metric.name()),
+                        &printed_number(&text),
+                        unit.name,
+                        &how,
+                        &mapping.id,
+                    ]
+                    .join("\t");
                     return Ok(Found {
-                        text: format_value(v / unit.divisor, *unit),
-                        file: file.to_owned(),
-                        source: format!("{file}#{}", metric.name()),
+                        text,
+                        source,
                         label: mapping.label(&result.arm),
+                        row,
                     });
                 }
                 Err(e) if several => why.push(format!("{file}: {e}")),
@@ -1057,7 +1253,7 @@ pub fn fill(
     html: &str,
     mappings: &[Mapping],
     results: &Results,
-    _tsv: &mut ResultTsv,
+    tsv: &mut ResultTsv,
 ) -> Result<(String, FillReport), FillError> {
     let tokens = tokenize(html)?;
     let known = by_id(mappings);
@@ -1085,14 +1281,26 @@ pub fn fill(
         match evaluate(mapping, results) {
             Ok(Found {
                 text,
-                file,
                 source,
                 label,
+                row,
             }) => {
+                // A table this run did not write belongs to whoever filled the cell.
+                if let Some(found) = ph.tag.attr("data-result").and_then(|a| a.value.as_deref())
+                    && found.ends_with(".tsv")
+                    && found != tsv.name()
+                {
+                    return Err(FillError::Foreign {
+                        cell: ph.id,
+                        found: found.to_owned(),
+                        ours: tsv.name().to_owned(),
+                    });
+                }
+                tsv.upsert(row);
                 let mut set = vec![
                     ("data-source", source),
                     ("data-label", label),
-                    ("data-result", file),
+                    ("data-result", tsv.name().to_owned()),
                 ];
                 let mut remove = vec!["data-note"];
                 // A filled cell is no longer a placeholder: `tbd` leaves its class list.
@@ -1133,7 +1341,7 @@ pub fn check(
     html: &str,
     mappings: &[Mapping],
     results: &Results,
-    _tsv: Option<&ResultTsv>,
+    tsv: Option<&ResultTsv>,
 ) -> Result<Vec<String>, FillError> {
     let tokens = tokenize(html)?;
     let known = by_id(mappings);
@@ -1160,14 +1368,16 @@ pub fn check(
                 ));
             }
         }
-        // Only a result file is looked up: the paper's hand-filled cells name a table of their own.
-        if let Some(file) = tag.attr("data-result").and_then(|a| a.value.as_deref())
-            && file.ends_with(".json")
-            && !results.files.contains_key(file)
+        // Only the table being written is looked up: the paper's hand-filled cells name a table
+        // of their own.
+        if let (Some(table), Some(name), Some(cell)) = (
+            tsv,
+            tag.attr("data-result").and_then(|a| a.value.as_deref()),
+            tag.attr("data-cell").and_then(|a| a.value.as_deref()),
+        ) && name == table.name()
+            && !table.names(cell)
         {
-            findings.push(format!(
-                "{who:?} names the result file {file:?}, which is not in the result directory"
-            ));
+            findings.push(format!("{who:?} has no row naming it in {name}"));
         }
     }
     Ok(findings)
@@ -1895,8 +2105,10 @@ derived\tfill:a:p50\t9.99\tms\tstale\ta\nraw\tlast.row\t8\tms\tby hand\n";
             assert!(matches!(err, FillError::TsvName(_)), "{bad}: {err}");
             assert!(ResultTsv::parse(bad, "").is_err(), "{bad}");
         }
-        let err = ResultTsv::parse("r.tsv", "raw\tonly\n").unwrap_err();
-        assert!(err.to_string().contains("line 1"), "{err}");
+        let err = ResultTsv::parse("r.tsv", "# c\nraw\tonly\n").unwrap_err();
+        assert!(err.to_string().contains("line 2"), "{err}");
+        let err = ResultTsv::parse("r.tsv", "raw\tx\tmany\n").unwrap_err();
+        assert!(err.to_string().contains("not a number"), "{err}");
     }
 
     /// Catches a hand-filled cell (a result table this run did not write) being rewritten, and
