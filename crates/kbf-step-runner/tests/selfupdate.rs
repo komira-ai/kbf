@@ -12,7 +12,7 @@ use std::process::Command;
 use kbf_step_runner::selfupdate::{
     FollowOn, Layout, START_LIMIT_BURST, fallback_unit, follow_on, main_dropin,
 };
-use kbf_step_runner::{Finished, Staged};
+use kbf_step_runner::{ArtifactError, Finished, Staged};
 use support::Scratch;
 use update_hook::{Class, Phase, Verdict};
 
@@ -248,4 +248,118 @@ fn the_units_run_the_fallback_after_the_burst() {
         fallback_unit(&layout, "kbf-updater.service"),
         "[Unit]\nDescription=Put the previous updater binary back after the new one failed to start\n\n[Service]\nType=oneshot\nExecStart=/usr/libexec/kbf-updater/previous self-update-fallback --dir /usr/libexec/kbf-updater\nExecStartPost=/usr/bin/systemctl reset-failed kbf-updater.service\nExecStartPost=/usr/bin/systemctl start --no-block kbf-updater.service\n"
     );
+}
+
+fn links(layout: &Layout) -> (Option<String>, Option<String>) {
+    (layout.current().unwrap(), layout.previous().unwrap())
+}
+
+fn version_text(layout: &Layout, version: &str) -> String {
+    fs::read_to_string(layout.dir().join("versions").join(version)).unwrap()
+}
+
+/// Catches a version the unit runs, or falls back to, being staged over (a crash between that
+/// staging and the switch left the fallback replaced by a binary nothing had verified): staging
+/// the version `current` or `previous` points at is refused and its file is left as it was; a
+/// version neither names may be staged again.
+#[test]
+fn the_versions_current_and_previous_point_at_are_not_staged_over() {
+    let s = Scratch::new("su-live");
+    let layout = Layout::new(&s.path().join("bin"));
+    layout.stage("v1", &binary(s.path(), "a", "a")).unwrap();
+    layout.stage("v2", &binary(s.path(), "b", "b")).unwrap();
+    layout.switch("v1").unwrap();
+    layout.switch("v2").unwrap();
+    let other = binary(s.path(), "c", "c");
+    for live in ["v1", "v2"] {
+        let err = layout.stage(live, &other).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{live}");
+        assert!(err.to_string().contains("current"), "{err}");
+        assert!(!layout.dir().join(format!("versions/{live}.tmp")).exists());
+    }
+    assert_eq!(version_text(&layout, "v1"), "a");
+    assert_eq!(version_text(&layout, "v2"), "b");
+    assert_eq!(links(&layout), (Some("v2".into()), Some("v1".into())));
+    layout.stage("v3", &other).unwrap();
+    layout.stage("v3", &binary(s.path(), "d", "d")).unwrap();
+    assert_eq!(version_text(&layout, "v3"), "d");
+}
+
+/// Catches a flip back to a binary that is not there (the unit would then run nothing): with
+/// `versions/<previous>` missing, `flip_back` is an error and `current` is not changed.
+#[test]
+fn flipping_back_to_a_missing_binary_is_refused() {
+    let s = Scratch::new("su-flip-missing");
+    let layout = Layout::new(&s.path().join("bin"));
+    layout.stage("v1", &binary(s.path(), "a", "a")).unwrap();
+    layout.stage("v2", &binary(s.path(), "b", "b")).unwrap();
+    layout.switch("v1").unwrap();
+    layout.switch("v2").unwrap();
+    fs::remove_file(layout.dir().join("versions/v1")).unwrap();
+    let err = layout.flip_back().unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    assert_eq!(links(&layout), (Some("v2".into()), Some("v1".into())));
+    assert_eq!(fs::read_to_string(layout.current_path()).unwrap(), "b");
+}
+
+/// Catches a follow-on that stages a file nothing verified: the binary is taken from the release
+/// only through `Staged::check`, so a release changed since it was sealed, and a binary path
+/// that leaves the tree, stage nothing and move no link.
+#[test]
+fn the_follow_on_stages_only_a_binary_of_the_verified_release() {
+    let s = Scratch::new("su-follow-verified");
+    let layout = Layout::new(&s.path().join("bin"));
+    layout.stage("v1", &binary(s.path(), "a", "a")).unwrap();
+    layout.switch("v1").unwrap();
+
+    let changed = release(s.path(), "v2", &binary(s.path(), "b", "b"));
+    fs::write(changed.dir().join(UPDATER), "swapped").unwrap();
+    let err = follow_on(&ok(), &layout, "v1", "v2", &changed, Path::new(UPDATER)).unwrap_err();
+    assert!(matches!(err, ArtifactError::Changed { .. }), "{err:?}");
+
+    let sound = release(s.path(), "v3", &binary(s.path(), "c", "c"));
+    let outside = system_binary("true");
+    for path in [Path::new("../release-v2/bin/updater"), outside.as_path()] {
+        let err = follow_on(&ok(), &layout, "v1", "v3", &sound, path).unwrap_err();
+        assert!(matches!(err, ArtifactError::BadHookPath(_)), "{err:?}");
+    }
+    assert!(!layout.dir().join("versions/v2").exists());
+    assert!(!layout.dir().join("versions/v3").exists());
+    assert_eq!(links(&layout), (Some("v1".into()), None));
+}
+
+/// Catches a follow-on to a version already in place copying over it, or never getting there: when
+/// `current` or `previous` already names the version (a repeat after a crash, or a return to the
+/// binary before), it is switched to without being staged again if its file holds the verified
+/// binary's bytes, and refused with nothing changed if it does not.
+#[test]
+fn the_follow_on_to_a_version_in_place_stages_nothing() {
+    let s = Scratch::new("su-follow-in-place");
+    let layout = Layout::new(&s.path().join("bin"));
+    let a = binary(s.path(), "a", "a");
+    layout.stage("v1", &a).unwrap();
+    layout.switch("v1").unwrap();
+    let updater = Path::new(UPDATER);
+    let v2 = release(s.path(), "v2", &binary(s.path(), "b", "b"));
+    assert_eq!(
+        follow_on(&ok(), &layout, "v1", "v2", &v2, updater).unwrap(),
+        FollowOn::Restart
+    );
+    // Back to the binary before, which `previous` names.
+    let v1 = release(s.path(), "v1", &a);
+    assert_eq!(
+        follow_on(&ok(), &layout, "v2", "v1", &v1, updater).unwrap(),
+        FollowOn::Restart
+    );
+    assert_eq!(links(&layout), (Some("v1".into()), Some("v2".into())));
+    assert_eq!(version_text(&layout, "v1"), "a");
+    // A release that calls itself v2 with other bytes than the v2 in place.
+    let not_v2 = release(s.path(), "not-v2", &binary(s.path(), "z", "z"));
+    let err = follow_on(&ok(), &layout, "v1", "v2", &not_v2, updater).unwrap_err();
+    assert!(
+        matches!(&err, ArtifactError::Io(e) if e.kind() == io::ErrorKind::AlreadyExists),
+        "{err:?}"
+    );
+    assert_eq!(version_text(&layout, "v2"), "b");
+    assert_eq!(links(&layout), (Some("v1".into()), Some("v2".into())));
 }

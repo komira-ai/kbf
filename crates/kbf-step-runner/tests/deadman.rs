@@ -2,7 +2,7 @@
 
 mod support;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kbf_step_runner::{Clock, DeadMan, LaunchError, StepCall, StepExit, StepLauncher, Watch};
@@ -221,4 +221,90 @@ fn a_stop_does_not_disarm_the_step_armed_while_it_ran() {
     clock.advance(100);
     assert!(man.tick().unwrap());
     assert_eq!(*launcher.stops.lock().unwrap(), ["unit-r", "unit-r"]);
+}
+
+/// Catches a stop that failed being forgotten once the step ends: the runner learns from
+/// `disarm` that the dead-man could not stop the step at its bound; a stop that worked at a later
+/// try, or a step that was never due, leaves nothing to report.
+#[test]
+fn a_failed_stop_is_reported_when_the_step_is_disarmed() {
+    let fake = Fake::new();
+    let clock = FakeClock::new();
+    let (watch, man) = deadman(&fake, &clock);
+    watch.arm("unit-a", clock.mono_secs());
+    fake.fail_stops(1);
+    assert!(man.tick().is_err());
+    let error = watch.disarm().expect("the failed stop is reported");
+    assert!(error.contains("systemd refused"), "{error}");
+
+    watch.arm("unit-b", clock.mono_secs());
+    fake.fail_stops(1);
+    assert!(man.tick().is_err());
+    assert!(man.tick().unwrap());
+    assert_eq!(watch.disarm(), None);
+
+    watch.arm("unit-c", clock.mono_secs() + 100);
+    assert!(!man.tick().unwrap());
+    assert_eq!(watch.disarm(), None);
+    assert_eq!(fake.stops(), ["unit-a", "unit-b", "unit-b"]);
+}
+
+/// A launcher whose stop fails while the step it was asked to stop ends on its own.
+struct FailsAsTheStepEnds {
+    watch: Arc<Watch>,
+}
+
+impl StepLauncher for FailsAsTheStepEnds {
+    fn run(&self, _: &StepCall<'_>) -> Result<StepExit, LaunchError> {
+        unreachable!("the dead-man only stops")
+    }
+
+    fn stop(&self, _: &str) -> Result<(), LaunchError> {
+        let _ = self.watch.disarm();
+        Err(LaunchError::Launcher("refused".to_owned()))
+    }
+}
+
+/// A fake clock that asks the dead-man's loop to end at its `n`-th sleep.
+struct EndsAt {
+    clock: Arc<FakeClock>,
+    stop: Arc<AtomicBool>,
+    sleeps_left: AtomicU32,
+}
+
+impl Clock for EndsAt {
+    fn mono_secs(&self) -> u64 {
+        self.clock.mono_secs()
+    }
+
+    fn boot_id(&self) -> String {
+        self.clock.boot_id()
+    }
+
+    fn sleep_secs(&self, secs: u64) {
+        self.clock.sleep_secs(secs);
+        if self.sleeps_left.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.stop.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Catches the error of a stop being wiped by the next tick that has nothing to stop (the error
+/// was then never seen): it stays in the watch until a stop works.
+#[test]
+fn the_error_of_a_stop_outlives_the_ticks_after_it() {
+    let watch = Watch::new();
+    let stop = Arc::new(AtomicBool::new(false));
+    let clock = Arc::new(EndsAt {
+        clock: FakeClock::new(),
+        stop: stop.clone(),
+        sleeps_left: AtomicU32::new(2),
+    });
+    watch.arm("unit-e", clock.mono_secs());
+    let launcher = Arc::new(FailsAsTheStepEnds {
+        watch: watch.clone(),
+    });
+    DeadMan::new(watch.clone(), launcher, clock).run(&stop, 1);
+    let error = watch.last_error().expect("the error is kept");
+    assert!(error.contains("refused"), "{error}");
 }

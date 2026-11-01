@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use kbf_step_runner::register::{
@@ -230,6 +230,15 @@ fn what_is_not_a_registration_is_malformed() {
     client.shutdown(Shutdown::Write).unwrap();
     assert_eq!(answer(&client)["error"], "malformed");
     served.join().unwrap().unwrap();
+    // A field the message does not have (a command, say) is not passed over.
+    let (client, served) = rig.connect();
+    let reply = say(
+        &client,
+        "{\"name\":\"svc\",\"version\":\"2.0.0\",\"exec\":\"reboot\"}\n",
+    );
+    drop(client);
+    served.join().unwrap().unwrap();
+    assert_eq!(reply["error"], "malformed", "{reply}");
     assert_eq!(rig.registry.report("svc", None), Reported::Absent);
     for refusal in [
         Refused::Malformed,
@@ -644,4 +653,125 @@ fn transient_accept_errors_are_retried() {
     assert_eq!(ended.kind(), std::io::ErrorKind::PermissionDenied);
     assert_eq!(say(&client, &registration("2.0.0", None))["ok"], true);
     assert_eq!(rig.registry.report("svc", Some("2.0.0")), Reported::Healthy);
+}
+
+fn reg(version: &str, health: Option<(&str, &str)>) -> Registration {
+    serde_json::from_str(registration(version, health).trim()).unwrap()
+}
+
+/// Catches a read that failed being taken for the end of the line: the peer goes away leaving
+/// bytes it never read, which the kernel reports to the server as a reset after the part of the
+/// line that came; that is an error of the connection, not a line to answer.
+#[test]
+fn a_read_error_is_an_error_not_the_end_of_the_line() {
+    let rig = Rig::new("reg-read-error", me());
+    let (client, served) = UnixStream::pair().unwrap();
+    (&served).write_all(b"never read").unwrap();
+    (&client).write_all(b"{\"name\":").unwrap();
+    drop(client);
+    let err = rig.server.serve_connection(served).unwrap_err();
+    assert!(
+        matches!(&err, RegistryError::Io(e) if e.kind() == std::io::ErrorKind::ConnectionReset),
+        "{err:?}"
+    );
+    assert_eq!(rig.registry.report("svc", None), Reported::Absent);
+}
+
+/// Catches a read that came back for want of time being an error: a socket that has nothing to
+/// read and does not wait answers as a read past the deadline does, and the line is `malformed`.
+#[test]
+fn a_read_that_runs_out_of_time_is_malformed() {
+    let rig = Rig::new("reg-read-timeout", me());
+    let (client, served) = UnixStream::pair().unwrap();
+    served.set_nonblocking(true).unwrap();
+    rig.server.serve_connection(served).unwrap();
+    assert_eq!(answer(&client)["error"], "malformed");
+    assert_eq!(rig.registry.report("svc", None), Reported::Absent);
+}
+
+/// Catches the write of the registrations made under the registry's lock (a slow disk then held
+/// up every read): while a registration is being written, a read answers, and does not yet
+/// believe the registration; once written it is believed. The disk is a writer that waits for
+/// the test, so nothing here waits for a time.
+#[test]
+fn a_slow_write_does_not_hold_up_a_read() {
+    let scratch = Scratch::new("reg-slow-write");
+    let (entered, writing) = mpsc::channel::<()>();
+    let (go_on, finish) = mpsc::channel::<()>();
+    let finish = Mutex::new(finish);
+    let writer = move |dir: &Path, bytes: &[u8]| -> std::io::Result<()> {
+        entered.send(()).unwrap();
+        finish.lock().unwrap().recv().unwrap();
+        fs::write(dir.join(REGISTRATIONS_FILE), bytes)
+    };
+    let registry = Registry::load(scratch.path(), FakeClock::new(), &declared(me()))
+        .unwrap()
+        .with_writer(Box::new(writer));
+    let registry = Arc::new(registry);
+    let registering = {
+        let registry = registry.clone();
+        let health = Some(("127.0.0.1:9301", "/ready"));
+        std::thread::spawn(move || registry.register(me(), &reg("2.0.0", health), &grant(me())))
+    };
+    writing.recv().unwrap();
+    assert_eq!(registry.report("svc", Some("2.0.0")), Reported::Absent);
+    assert_eq!(registry.health_addr("svc"), None);
+    go_on.send(()).unwrap();
+    registering.join().unwrap().unwrap();
+    assert_eq!(registry.report("svc", Some("2.0.0")), Reported::Healthy);
+    assert!(registry.health_addr("svc").is_some());
+    // The close is written the same way.
+    go_on.send(()).unwrap();
+    registry.closed("svc", 1).unwrap();
+    writing.recv().unwrap();
+    assert_eq!(
+        registry.report("svc", Some("2.0.0")),
+        Reported::Unhealthy(Why::Stopped)
+    );
+}
+
+/// Catches a registration loaded from disk being believed under the grant it was made with: a
+/// service whose declaration went, that is now declared for another user, or whose health port
+/// is no longer granted is dropped at load; one whose time-to-live changed is held to the new
+/// one.
+#[test]
+fn a_loaded_registration_is_held_to_the_declarations_of_now() {
+    let rig = Rig::new("reg-revalidate", me());
+    let health = Some(("127.0.0.1:9301", "/ready"));
+    rig.registry
+        .register(me(), &reg("2.0.0", health), &grant(me()))
+        .unwrap();
+    let state = rig.scratch.path().join("state");
+    let load = |table: Table| Registry::load(&state, rig.clock.clone(), &table).unwrap();
+    let only = |grant: Grant| Table(Mutex::new(BTreeMap::from([("svc".to_owned(), grant)])));
+
+    let mut narrower = grant(me());
+    narrower.health_ports = vec![9302];
+    for (why, table) in [
+        ("declaration gone", nothing()),
+        ("another user", declared(me().wrapping_add(1))),
+        ("health port no longer granted", only(narrower)),
+    ] {
+        let after = load(table);
+        assert_eq!(
+            after.report("svc", Some("2.0.0")),
+            Reported::Absent,
+            "{why}"
+        );
+        assert_eq!(after.health_addr("svc"), None, "{why}");
+    }
+
+    let mut shorter = grant(me());
+    shorter.registration_ttl_secs = 10;
+    let after = load(only(shorter));
+    assert_eq!(after.report("svc", Some("2.0.0")), Reported::Healthy);
+    assert!(after.health_addr("svc").is_some());
+    rig.clock.advance(10);
+    assert_eq!(
+        after.report("svc", Some("2.0.0")),
+        Reported::Unhealthy(Why::Stopped)
+    );
+    // The same grant keeps it, as it was.
+    let after = load(declared(me()));
+    assert_eq!(after.report("svc", Some("2.0.0")), Reported::Healthy);
 }
