@@ -243,7 +243,14 @@ fn an_empty_world_is_refused_and_changes_nothing_in_the_working_directory() {
     };
     let before = listing();
     let faults = scratch.0.join("faults");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_kbf-updater-hook-fake"))
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_kbf-updater-hook-fake"));
+    command.env_clear();
+    // As the harness does: a coverage build of the fake writes its profile where this names,
+    // and not into its working directory.
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    let output = command
         .args(["update-hook", "--world", "", "--faults"])
         .arg(&faults)
         .args(["--record-dir", "record", "--channel", "stable"])
@@ -260,7 +267,6 @@ fn an_empty_world_is_refused_and_changes_nothing_in_the_working_directory() {
         .arg("--params")
         .arg(&params_file)
         .current_dir(&cwd)
-        .env_clear()
         .output()
         .expect("the fake runs");
     assert_eq!(output.status.code(), Some(1));
