@@ -40,7 +40,7 @@ already has:
   `cache/upload.rs`; tierstore `limits.md`]
 - **The standing tail lists only when an epoch is owed.** `fill::round` makes a pass only when the epoch the frontend sent
   is above what the node acknowledged; a pass is 2 to 8 listings (`settle`, `PASSES` = 8) of the whole `<root>cas/`
-  prefix, with no cursor. Joins (and drains, per the design document) bump the epoch, and a node's restart owes one pass;
+  prefix, with no cursor. Joins bump the epoch (drains would, per the design document; not at main), and a node's restart owes one pass;
   at main there is no listing otherwise. List cost is **owed epochs x passes per epoch x objects in the prefix**, and the
   prefix only grows because nothing deletes segments. [code: `crates/kbf-server/src/fill.rs` `round`, `settle`,
   `registered`; `crates/kbf-front/src/cache/tail.rs`; `crates/kbf-server/src/members/fence.rs`;
