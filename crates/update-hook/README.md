@@ -76,6 +76,10 @@ a missing line.
 **Every step is safe to run twice**, acts on the hook's own durable record rather than on the order it
 was called in, and takes an exclusive `flock` on its record directory for the whole step (a second
 copy exits `1` and changes nothing). `cleanup` refuses to run unless the record says `verify` succeeded.
+A `cleanup` that fails is retried and then Failed(after_commit), unless its line states
+`"reversible": true`: then nothing has committed, the updater runs `rollback`, and the host's result
+is the rollback's. A line that states `false`, or leaves `reversible` out (an old hook), is never
+rolled back; `Report::reversible_stated` tells the two apart from a stated `true`.
 
 **What runs next** is `update_hook::next`, a pure function of the step, how it ended and a small
 `Context`; the tests pin every row of the table in the design document.
