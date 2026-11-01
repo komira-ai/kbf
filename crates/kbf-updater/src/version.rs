@@ -278,7 +278,7 @@ mod tests {
             [1],
             "trailing zeros are no number"
         );
-        assert_eq!(v("1.0.0.0").release_numbers(), [1]);
+        assert_eq!(v(&format!("1{}", ".0".repeat(3))).release_numbers(), [1]);
         assert_eq!(v("0").release_numbers(), Vec::<u64>::new());
     }
 
