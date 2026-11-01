@@ -237,11 +237,14 @@ frontend must be started with `--object-store-secrets-dir DIR`, `--api-listen`,
 
 `kbf cluster object-store ...` calls the same routes. Every route needs the bearer token,
 reads included, and the calls must come from the frontend host (see Planned restarts).
-The registration only supplies keys: a node still names its store with
-`--cold-store`, and the registered store must be the same endpoint, bucket and prefix, or
-the node keeps its flag and reports `identity_mismatch`. A node with a `file://` cold store
-never takes the registration. A node reads the registration at its start, so rotating a key
-reaches a running node at its next restart. [api.md](../api.md) has the
+A node that names its store with an `s3://` `--cold-store` takes only the keys from the
+registration: the registered store must be the same endpoint, bucket and prefix, or the node
+keeps its flag and reports `identity_mismatch`. A node with a `file://` cold store never takes
+the registration. A node started with `--cold-store registered` (what `kbf node` passes) names
+no store: it waits for the registration and runs on its endpoint, bucket, prefix and keys, and
+`--cold-store-credentials-file` and the `AWS_*` variables are not read. A node reads the
+registration at its start, so rotating a key, or registering another endpoint for a node on
+`registered`, reaches a running node at its next restart. [api.md](../api.md) has the
 bodies, the error codes and the rotation steps.
 
 ## Free-space floors

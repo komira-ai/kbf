@@ -49,7 +49,7 @@ use kbf_storage::repair::Repairs;
 use kbf_storage::service::InProcess;
 use kbf_threads::disk::Statvfs;
 
-use crate::cold_apply::{ColdPick, Fixed, Registrable};
+use crate::cold_apply::{ColdPick, Fixed, RegisteredOnly, Registrable};
 use crate::cold_counted::CountedPick;
 use crate::listen::Binder;
 use crate::metrics::bind_node_sockets;
@@ -197,6 +197,13 @@ where
                 shutdown,
             )
             .await
+        }
+        StoreUri::Registered => {
+            // The registration names the prefix the metadata log keeps its objects under,
+            // so it is fetched before the log opens.
+            let cold = RegisteredOnly::wait(flags).await?;
+            let prefix = cold.prefix_root();
+            over(flags, listener, &stores, (cold, None), &prefix, shutdown).await
         }
     }
 }

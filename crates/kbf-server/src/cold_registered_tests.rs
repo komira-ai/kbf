@@ -8,7 +8,7 @@ use std::time::Duration;
 use kbf_proto::kbf::enroll::v1::{GetStoreConfigResponse, StoreConfig};
 use tonic::{Code, Status};
 
-use super::{Fetch, registration_with};
+use super::{ColdApplyError, ColdPick, Fetch, RegisteredOnly, registration_with};
 
 fn named(generation: u64) -> GetStoreConfigResponse {
     GetStoreConfigResponse {
@@ -105,4 +105,39 @@ async fn a_refusal_ends_the_wait_for_a_registration() {
         .expect_err("refused");
     assert_eq!(refused.code(), Code::PermissionDenied);
     assert_eq!(calls(&counted), 1);
+}
+
+fn only(prefix: &str) -> RegisteredOnly {
+    let mut config = named(3).config.expect("a store");
+    prefix.clone_into(&mut config.prefix);
+    RegisteredOnly {
+        generation: 3,
+        config,
+    }
+}
+
+/// Catches a registered store that is run with no frontend (defect: `alone` opens a store):
+/// it has none of its own, so it is refused, and says what it needs.
+#[test]
+fn a_registered_store_has_nothing_to_run_on_without_a_frontend() {
+    let Err(refused) = only("kbf/").alone() else {
+        panic!("a registered store opened with no frontend");
+    };
+    assert!(
+        matches!(
+            refused.downcast_ref::<ColdApplyError>(),
+            Some(ColdApplyError::NoFrontend)
+        ),
+        "{refused}"
+    );
+}
+
+/// Catches a log opened under another prefix than the registered one (defects: the prefix
+/// taken as written, or the default for a registered one): the log's objects go under the
+/// registered prefix as a store URI spells its own, ending in `/`, `kbf/` when empty.
+#[test]
+fn the_log_of_a_registered_node_keeps_its_objects_under_the_registered_prefix() {
+    assert_eq!(only("farm-a/").prefix_root(), "farm-a/");
+    assert_eq!(only("farm-a").prefix_root(), "farm-a/");
+    assert_eq!(only("").prefix_root(), "kbf/");
 }

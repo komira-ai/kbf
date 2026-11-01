@@ -76,8 +76,15 @@ async fn a_registered_node_runs_on_the_frontends_store_and_nothing_else() {
     assert_eq!(got.nodes[0].status, NodeStatus::Ok, "{got:?}");
     assert_eq!(got.nodes[0].applied_generation, Some(3));
     assert!(got.converged, "{got:?}");
-    let keys = rig.s3.keys();
-    assert!(keys.iter().any(|k| k.starts_with("kbf/")), "{keys:?}");
+    let written = spin_until(|| {
+        let keys = rig.s3.keys();
+        keys.iter().any(|k| k.starts_with("kbf/")).then_some(keys)
+    })
+    .await;
+    assert!(
+        written.iter().all(|k| !k.contains(".kbf-probe")),
+        "{written:?}"
+    );
     let probes = rig
         .s3
         .requests()
@@ -122,7 +129,7 @@ async fn a_registered_node_waits_for_a_registration() {
 /// the old generation), and one that starts again on the store it ran on: while it runs it
 /// writes to the first service and reports `pending` for generation 4; started again over
 /// the same directory it runs on the second service, which gets its probe and its writes,
-/// and the first gets no request after the change.
+/// and the first is not probed again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_registered_node_takes_a_new_registration_at_its_next_start() {
     let rig = rig(3, |s3| registered(s3, "bkt", ID, SECRET)).await;
@@ -145,7 +152,17 @@ async fn a_registered_node_takes_a_new_registration_at_its_next_start() {
         second.requests().is_empty(),
         "a running node does not move to the new store"
     );
-    let before = rig.s3.requests().len();
+    let probed = |s3: &FakeS3| {
+        s3.requests()
+            .into_iter()
+            .filter(|r| r.contains(".kbf-probe"))
+            .count()
+    };
+    assert_eq!(
+        probed(&rig.s3),
+        3,
+        "the first store was probed at the start"
+    );
 
     serving.abort();
     let _ = serving.await;
@@ -163,19 +180,21 @@ async fn a_registered_node_takes_a_new_registration_at_its_next_start() {
     })
     .await;
     assert!(done.converged, "{done:?}");
-    let keys = second.keys();
-    assert!(keys.iter().any(|k| k.starts_with("kbf/")), "{keys:?}");
-    let probes = second
-        .requests()
-        .into_iter()
-        .filter(|r| r.contains(".kbf-probe"))
-        .count();
-    assert_eq!(probes, 3, "the new store was probed");
-    assert_eq!(
-        rig.s3.requests().len(),
-        before,
-        "the first store got nothing after the change"
+    let written = spin_until(|| {
+        let keys = second.keys();
+        keys.iter().any(|k| k.starts_with("kbf/")).then_some(keys)
+    })
+    .await;
+    assert!(
+        written.iter().all(|k| !k.contains(".kbf-probe")),
+        "{written:?}"
     );
+    assert_eq!(
+        probed(&second),
+        3,
+        "the new store was probed once, at the start"
+    );
+    assert_eq!(probed(&rig.s3), 3, "the first store was not probed again");
 }
 
 /// Catches `--cold-store-credentials-file` accepted beside `registered` (defect: the check

@@ -635,7 +635,11 @@ The cold store is the durable home of every blob: a `file://` directory on one h
   opens its cache on the answer. It holds the key in memory only, with core dumps off. The
   registered store must be the store the node's `--cold-store` names (endpoint, bucket and
   prefix), or the node keeps its own and reports `identity_mismatch`. The keys are probed
-  before the cache opens on them.
+  before the cache opens on them. `kbf node` passes `--cold-store registered` instead of that
+  URI, so the store is whatever the frontend has registered at each start: the node waits for a
+  registration, runs on its endpoint, bucket, prefix and keys, and never falls back. Moving the
+  farm to another endpoint is a new registration and a restart of each node. With `registered`
+  `--cold-store-credentials-file` is refused and the `AWS_*` variables are not read.
 - **A rotation reaches a node at its next start.** There is no hot swap; until then the
   frontend shows the node as `pending`.
 - **A node's own key pair is a file.** `--cold-store-credentials-file PATH` names a JSON file,

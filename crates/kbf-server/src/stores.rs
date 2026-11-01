@@ -13,7 +13,9 @@
 //!   `<hot store directory>/meta` when the hot store is a directory, else in
 //!   `--meta-dir`; an explicit `--meta-dir` wins over the hot store's directory.
 //!
-//! A store URI is `file:///absolute/path` or `s3://bucket[/prefix][?query]`. A memory
+//! A store URI is `file:///absolute/path` or `s3://bucket[/prefix][?query]`; for a storage
+//! node's `--cold-store` also the word `registered`, which names no store at all: the node
+//! takes the one the frontend registers. A memory
 //! store is a `file://` path on a tmpfs; there is no `memory:` scheme. An S3 URI's query
 //! carries what is not the bucket: `endpoint=http://host:port` (required),
 //! `region=` (default `us-east-1`), `conditional-put=true` (the store refuses to
@@ -76,6 +78,9 @@ pub(crate) fn region_or_default(region: &str) -> String {
     }
 }
 
+/// The word `--cold-store` takes for "the store the frontend registers".
+pub const REGISTERED: &str = "registered";
+
 /// A store the server can be pointed at.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreUri {
@@ -83,6 +88,10 @@ pub enum StoreUri {
     File(PathBuf),
     /// An S3 bucket.
     S3(S3Uri),
+    /// No store of its own: the one the frontend's registration names, which a storage
+    /// node takes at its start ([`crate::cold_apply`]). Only `--cold-store` of a storage
+    /// node takes it.
+    Registered,
 }
 
 /// An `s3://` store URI, parsed.
@@ -167,6 +176,9 @@ impl FromStr for StoreUri {
     type Err = StoreUriError;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text == REGISTERED {
+            return Ok(Self::Registered);
+        }
         let (scheme, rest) = text
             .split_once("://")
             .ok_or_else(|| StoreUriError::NoScheme(text.to_owned()))?;
@@ -197,7 +209,7 @@ impl StoreUri {
     pub fn as_s3(&self) -> Option<&S3Uri> {
         match self {
             Self::S3(s3) => Some(s3),
-            Self::File(_) => None,
+            Self::File(_) | Self::Registered => None,
         }
     }
 }
@@ -310,6 +322,7 @@ impl fmt::Display for StoreUri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::File(path) => write!(f, "file://{}", path.display()),
+            Self::Registered => f.write_str(REGISTERED),
             Self::S3(s3) => write!(
                 f,
                 "s3://{}/{}?endpoint={}&region={}&conditional-put={}&min-put-rate={}",
@@ -410,7 +423,7 @@ impl StoreFlags<'_> {
         let cold = self.cold.ok_or(StoresError::NoColdStore)?.clone();
         let hot = match self.hot {
             None => None,
-            Some(StoreUri::S3(_)) => {
+            Some(StoreUri::S3(_) | StoreUri::Registered) => {
                 return Err(StoresError::HotNotLocal(
                     self.hot.map(ToString::to_string).unwrap_or_default(),
                 ));

@@ -3,7 +3,8 @@
 //! opens its cache, it asks the frontend for the registered store and its keys, probes
 //! them, and opens the cache on them, or keeps the store its own flags name and says why.
 //!
-//! **What the node does**, for an `s3://` `--cold-store` with `--frontend`:
+//! **What the node does**, for an `s3://` `--cold-store` with `--frontend` (and, below, for
+//! `registered`):
 //! - The frontend's answer to the registration names a generation
 //!   ([`Joined::objstore_generation`]); 0 is "nothing registered", and the node starts on
 //!   the store its flags and its `AWS_*` key pair name, as it always did.
@@ -27,6 +28,26 @@
 //!   so a lowered generation is never ignored: the node's next start fetches whatever the
 //!   frontend holds.
 //!
+//! **`--cold-store registered`.** The word names no store: the node holds no URL and no key
+//! of its own, and the registration is the only place its store comes from.
+//! - Before it opens its metadata log, which keeps the objects under the registered
+//!   prefix, the node asks for the registration over its storage certificate
+//!   ([`registration_with`]) and waits, with the backoff of a fetch, until a generation
+//!   above 0 names a store. It is no member of the farm, and touches no store, while it
+//!   waits. A refusal that waiting does not change (the node is denied) ends the start.
+//! - It runs on the registered endpoint, bucket, prefix and keys. There is no
+//!   [`same_store`] comparison: there is no flag store. The registered keys are probed as
+//!   above; a failed probe stops the start with [`ColdApplyError::Probe`] (exit 75, the
+//!   operator registers a working pair and the restart reads it), and the node never falls
+//!   back to a key pair from the environment or a file: neither is read, and
+//!   `--cold-store-credentials-file` is refused.
+//! - It reports [`Applied::running`] for the generation it fetched, so the frontend shows
+//!   the node `ok` at that generation in `kbf cluster object-store status`. A registration
+//!   that changes while it runs is `pending`, as for any node, and the node takes it at its
+//!   next start: that restart is how a farm moves to another store. A log keeps the key
+//!   prefix it was created with ([`crate::RaftMetaLog`]), so a registration that changes
+//!   the prefix is refused by the log at that start; it needs an empty `--meta-dir`.
+//!
 //! **What it does not do.** There is no hot swap: a running node keeps the store it
 //! opened. A rotation reaches it at its next start, and until then the frontend shows it
 //! `pending`. A node with a key pair of its own and no registration fails nothing: a
@@ -43,8 +64,10 @@ use std::future::Future;
 use std::io;
 use std::num::NonZeroU64;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
+use kbf_mapsync::MapHolder;
 use kbf_objstore::probe::{ProbeStep, probe};
 use kbf_objstore::s3::{Credentials, S3Store};
 use kbf_objstore::{KeyPrefix, ObjectStore};
@@ -54,7 +77,9 @@ use tonic::{Code, Status};
 
 use crate::config::{ConfigError, s3_store_keyed};
 use crate::join::{Joined, Joiner};
-use crate::stores::{DEFAULT_S3_PREFIX, S3Uri};
+use crate::node_map::NodeMap;
+use crate::storage_node::StorageFlags;
+use crate::stores::{DEFAULT_MIN_PUT_RATE, DEFAULT_REGION, DEFAULT_S3_PREFIX, S3Uri};
 
 /// How many times a node that has a key pair of its own asks for the registration before
 /// it starts on that key pair.
@@ -160,6 +185,11 @@ pub enum ColdApplyError {
         "the frontend refused the registered cold store ({0:?}); this node has no key pair of its own"
     )]
     Refused(Code),
+    /// `--cold-store registered` without `--frontend`: nothing to ask for the store.
+    #[error(
+        "--cold-store registered needs --frontend: the store is the one the frontend registers"
+    )]
+    NoFrontend,
     /// Core dumps could not be turned off, and the node may hold keys.
     #[error("turning off core dumps: {0}")]
     Harden(#[from] io::Error),
@@ -211,16 +241,30 @@ pub async fn fetch_with<'a>(
     }
 }
 
-/// Waits for the store a node started with `--cold-store registered` runs on.
+/// Waits for the store a node started with `--cold-store registered` runs on: calls `call`
+/// until an answer names a store, waiting `pause(n)` after each failure the frontend or the
+/// path to it is to blame for ([`fetch_with`]) and after each answer that names none
+/// (nothing registered, or taken back since the generation was announced). Goes on for
+/// ever: a node with no store of its own has nothing else to do. Not generic, as
+/// [`fetch_with`] is not.
 ///
 /// # Errors
-/// A refusal that waiting does not change.
+/// The status of a refusal that waiting does not change (the node is denied).
 pub async fn registration_with<'a>(
     call: &mut dyn FnMut() -> Fetch<'a>,
     pause: &dyn Fn(u32) -> Duration,
 ) -> Result<(u64, StoreConfig), Status> {
-    let _ = (call, pause);
-    Err(Status::unimplemented("not yet"))
+    let mut empty = 0_u32;
+    loop {
+        let reply = fetch_with(call, pause, None).await?;
+        let generation = reply.generation;
+        if let Some(config) = reply.config {
+            return Ok((generation, config));
+        }
+        tracing::warn!("no cold store is registered yet; waiting for one");
+        empty = empty.saturating_add(1);
+        tokio::time::sleep(pause(empty - 1)).await;
+    }
 }
 
 /// Whether `config` names the store `flag` does: the same endpoint, bucket and prefix.
@@ -430,6 +474,77 @@ impl ColdPick for Registrable {
                 tracing::warn!("the registered cold store's keys were not used");
                 let failed = Applied::kept(generation, ApplyStatus::ProbeFailed);
                 self.keep_or(failed, refusal(why))
+            }
+        }
+    }
+}
+
+/// The address and put settings a store starts from when nothing else names them: those of a
+/// store URI that gives none.
+fn defaults() -> S3Uri {
+    S3Uri {
+        bucket: String::new(),
+        prefix: DEFAULT_S3_PREFIX.to_owned(),
+        endpoint: String::new(),
+        region: DEFAULT_REGION.to_owned(),
+        conditional_put: false,
+        min_put_rate: DEFAULT_MIN_PUT_RATE,
+    }
+}
+
+/// `--cold-store registered`: the registration, fetched before the node's log opens, and the
+/// only store the node can run on.
+pub(crate) struct RegisteredOnly {
+    generation: u64,
+    config: StoreConfig,
+}
+
+impl RegisteredOnly {
+    /// Asks `flags`' frontend for the registration until it names a store
+    /// ([`registration_with`]).
+    ///
+    /// # Errors
+    /// [`ColdApplyError::NoFrontend`]; the joiner cannot be made (a TLS file is refused);
+    /// [`ColdApplyError::Refused`] when the frontend denies the node.
+    pub(crate) async fn wait(flags: &StorageFlags) -> Result<Self, Box<dyn Error>> {
+        let node = Arc::new(NodeMap::new(Arc::new(MapHolder::new())));
+        let joiner = flags
+            .joiner(flags.listen, node)?
+            .ok_or(ColdApplyError::NoFrontend)?;
+        let (generation, config) = registration_with(
+            &mut || Box::pin(joiner.fetch_store_config(0)),
+            &|failures| joiner.pause(failures),
+        )
+        .await
+        .map_err(|status| ColdApplyError::Refused(status.code()))?;
+        Ok(Self { generation, config })
+    }
+
+    /// The key prefix the node's log keeps its objects under: the registered prefix, as a
+    /// store URI spells its own.
+    pub(crate) fn prefix_root(&self) -> String {
+        prefix_of(&self.config.prefix)
+    }
+}
+
+impl ColdPick for RegisteredOnly {
+    type Store = S3Store;
+
+    fn alone(self) -> Result<S3Store, Box<dyn Error>> {
+        Err(ColdApplyError::NoFrontend.into())
+    }
+
+    async fn registered(
+        self,
+        _: &Joiner,
+        joined: &Joined,
+    ) -> Result<(S3Store, Applied), Box<dyn Error>> {
+        let nonce = format!("{}-{}", joined.member_id, joined.boot);
+        match registered_store(&defaults(), &self.config, &nonce).await {
+            Ok(store) => Ok((store, Applied::running(self.generation))),
+            Err(why) => {
+                tracing::warn!("the registered cold store's keys were not used");
+                Err(refusal(why).into())
             }
         }
     }
