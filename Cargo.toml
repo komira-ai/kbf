@@ -281,8 +281,8 @@ kbf-unitfile = { path = "crates/kbf-unitfile" }
 kbf-update = { path = "crates/kbf-update" }
 kbf-updater = { path = "crates/kbf-updater" }
 kbf-usage = { path = "crates/kbf-usage" }
-# The hook contract (steps, exit codes, report line, params), with no dependency on another workspace
-# crate (kbf-integration-test keeps it so).
+# The contract between a host updater and a service's update hook, and the harness that proves a
+# hook keeps it; it depends on no other workspace crate (kbf-integration-test keeps it so).
 update-hook = { path = "crates/update-hook" }
 # The declaration loader, the widening comparer, the approval record and the transient-unit launcher
 # of the host updater; depends on update-hook alone (kbf-integration-test keeps it so).

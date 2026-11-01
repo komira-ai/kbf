@@ -80,3 +80,33 @@ fn a_line_with_a_key_the_reader_does_not_know_still_parses() {
     let line = OLD_LINE.replace(r#""queued_us":7"#, r#""queued_us":7,"future":1"#);
     assert_eq!(Row::parse(&line).unwrap().queued_us, 7);
 }
+
+/// Catches: the lease dropped from the row (a joined operation's copies could not be told
+/// from retries), a run that names none given one, and the column lost in the file.
+#[test]
+fn a_run_keeps_its_lease_and_the_row_round_trips_it() {
+    let mut routes = farm();
+    let mut leased = run("r1", "n1", OCT_1 + 5_000_000, "ok", usage(GIB, 60_000_000));
+    leased["lease"] = "3.11".into();
+    put(&mut routes, "/v1/runs/r1", &leased);
+    let fake = Fake::new(routes);
+    let window = Window::parse(SINCE, UNTIL).unwrap();
+    let done = export(&ReadOnly::new(&fake), window).unwrap();
+    let lease = |id: &str| {
+        done.rows
+            .iter()
+            .find(|r| r.run_id == id)
+            .unwrap()
+            .lease
+            .clone()
+    };
+    assert_eq!(lease("r1").as_deref(), Some("3.11"));
+    assert_eq!(lease("r3"), None);
+    let old = Row::parse(OLD_LINE).unwrap();
+    assert!(!old.line().contains("lease"), "absent is not written");
+    let full = Row {
+        lease: Some("3.11".into()),
+        ..old
+    };
+    assert_eq!(Row::parse(&full.line()).unwrap(), full);
+}

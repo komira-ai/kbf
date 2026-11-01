@@ -26,35 +26,65 @@
 //! a latest end before the earliest queue time gives no makespan (absent, counted once as
 //! out of order).
 //!
+//! **Per build** ([`crate::builds`] has the definitions): a build is one `tool_invocation_id`
+//! (one buck2 command), or one `correlated_invocations_id` (a CI job) with
+//! [`GroupBy::Correlated`]. Each build gives the server's *build action span* (latest end less
+//! earliest queue of its attempts; it excludes the client's own analysis and local actions,
+//! and the paper's build wall comes from the client), its *queue time total* in
+//! attempt-seconds (a cost metric, not a queue wait) and p50 and p90 of its attempt queue
+//! waits. The table gives p50 and p90 over builds of the first two, and the median over
+//! builds of each build's wait p50 and p90. The correlated id is the first non-empty one the
+//! server had seen when the attempt ended, so the CI-job view can split a build whose early
+//! calls sent none. A joined operation is exported once per waiting invocation, each copy
+//! with its own run id and the same operation and lease. Each invocation's build counts it (it
+//! did wait); the attempt counts, queue wait, kill rates and phases count the attempt
+//! (operation and lease) once per arm, from its first copy, and the CI-job view once per job.
+//! A row that names no operation or no lease, as in an export that predates them, is its own
+//! attempt: such an export keeps the old counting, one per waiter. A lease of `0.0` is a
+//! lease: the export writes the record's fields for every attempt, a record exists only from
+//! a grant, and a store's first lease sequence is 0.
+//!
+//! **Phases**: input fetch, execution and pack (the output upload) of each attempt, from its
+//! run record. A run record says whether a daemon measured them (`measured`, which a row with
+//! no marker is read as) or a task claimed them (`task_claim`). The two are never pooled: each
+//! phase's p50 and p90 is printed once per provenance, a row with a marker this tool does not
+//! know is counted apart and in no number, and a provenance with no sample prints `-`.
+//!
 //! B - A is a difference of two single numbers, not a significance test; the paper's rule
 //! needs the 95% Welch CI over runs to exclude 0.
 //! What the export
 //! cannot say is printed with every report ([`NOT_RECORDED`]); nothing is estimated.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 use serde_json::{Value, json};
 
+use crate::build_report;
+use crate::builds::{self, BuildStats, GroupBy, RunLabels, Spread};
+use crate::phases::{self, PhaseStats};
 use crate::row::Row;
 
 /// What the numbers cannot see. Printed with every report.
 pub const NOT_RECORDED: [&str; 5] = [
-    "Per-build wall and queue wait: a row carries no invocation id, so only per-attempt numbers exist.",
+    "Per-build action span and queue time: a row carries no invocation id, so only per-attempt numbers exist.",
     "Attempts the history does not hold (no invocation id, aged out of retention) are in no number.",
     "An attempt with no end (lost, or in flight at the export) has no wall and cannot move the makespan's end; the makespan is the export's window of recorded times, not a build's.",
     "The queue wait of an attempt that never started is not recorded; it is counted by outcome, never given a wait.",
     "The row does not say which scheduler core or flags ran it: an arm is whatever export was given.",
 ];
 
-/// A median and a 90th percentile, in microseconds; `None` when there is no sample.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Percentiles {
-    /// Median (nearest rank).
-    pub p50: Option<u64>,
-    /// 90th percentile (nearest rank).
-    pub p90: Option<u64>,
+/// What the numbers of `a` and `b` cannot see: [`NOT_RECORDED`], less the per-build entry
+/// when both arms name their builds.
+pub fn not_recorded(a: &ArmStats, b: &ArmStats) -> Vec<&'static str> {
+    // The per-build entry is the first of the list.
+    let named = a.builds.recorded() && b.builds.recorded();
+    NOT_RECORDED.into_iter().skip(usize::from(named)).collect()
 }
+
+/// A median and a 90th percentile, in microseconds; `None` when there is no sample.
+pub type Percentiles = Spread;
 
 /// Attempts killed for memory, by kind.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -94,6 +124,10 @@ pub struct ArmStats {
     /// plus one when the latest end is before the earliest queue time. Such rows are
     /// excluded from wall and wait but still set the makespan end.
     pub out_of_order: u64,
+    /// The per-build numbers of rows that name their invocation or build.
+    pub builds: BuildStats,
+    /// Fetch, execution and pack per provenance of the phase times.
+    pub phases: PhaseStats,
 }
 
 impl ArmStats {
@@ -103,22 +137,46 @@ impl ArmStats {
     }
 }
 
-/// The value at percentile `p` (1 to 100) of `sorted`, by nearest rank.
-fn nearest(sorted: &[u64], p: u64) -> Option<u64> {
-    let rank = (p * sorted.len() as u64).div_ceil(100).max(1);
-    sorted.get((rank - 1) as usize).copied()
+fn percentiles(values: Vec<u64>) -> Percentiles {
+    builds::spread(values)
 }
 
-fn percentiles(mut values: Vec<u64>) -> Percentiles {
-    values.sort_unstable();
-    Percentiles {
-        p50: nearest(&values, 50),
-        p90: nearest(&values, 90),
+/// `rows` with one row for each attempt within `scope` (the arm when it gives `None`, else
+/// the CI job): a joined operation is exported once per waiting invocation, each copy with
+/// its own run id and the same operation and lease, and the first copy in the scope stands
+/// for the attempt. A row that names no operation or no lease (an export that predates them)
+/// is its own attempt, as it was counted before.
+fn once_per_attempt<'a>(rows: &'a [Row], scope: fn(&Row) -> Option<&str>) -> Cow<'a, [Row]> {
+    let mut seen = BTreeSet::new();
+    let keep: Vec<bool> = rows
+        .iter()
+        .map(|row| match (&row.operation, &row.lease) {
+            (Some(operation), Some(lease)) => seen.insert((scope(row), operation, lease)),
+            _ => true,
+        })
+        .collect();
+    if keep.iter().all(|k| *k) {
+        return Cow::Borrowed(rows);
     }
+    Cow::Owned(
+        rows.iter()
+            .zip(keep)
+            .filter(|(_, keep)| *keep)
+            .map(|(row, _)| row.clone())
+            .collect(),
+    )
 }
 
 /// The numbers of `rows`.
 pub fn analyze(rows: &[Row]) -> ArmStats {
+    analyze_grouped(rows, GroupBy::default())
+}
+
+/// The numbers of `rows`, their builds being what `group` says.
+pub fn analyze_grouped(rows: &[Row], group: GroupBy) -> ArmStats {
+    let all = rows;
+    let once = once_per_attempt(all, |_| None);
+    let rows: &[Row] = &once;
     let mut stats = ArmStats::default();
     let (mut waits, mut walls) = (Vec::new(), Vec::new());
     let mut first_queued: Option<u64> = None;
@@ -163,6 +221,19 @@ pub fn analyze(rows: &[Row]) -> ArmStats {
     stats.queue_wait = percentiles(waits);
     stats.wall_samples = walls.len() as u64;
     stats.wall = percentiles(walls);
+    // Each invocation's build waited on a joined operation, so it keeps its copy; the CI-job
+    // view is one build over several invocations, so it counts the attempt once for each job
+    // that waited on it.
+    let per_job;
+    let build_rows = match group {
+        GroupBy::Invocation => all,
+        GroupBy::Correlated => {
+            per_job = once_per_attempt(all, |r| r.correlated_invocations_id.as_deref());
+            &per_job
+        }
+    };
+    stats.builds = builds::analyze(build_rows, group);
+    stats.phases = phases::analyze(rows);
     stats
 }
 
@@ -170,7 +241,7 @@ const LABEL_WIDTH: usize = 34;
 const CELL_WIDTH: usize = 14;
 
 /// One table row: the label, then A, B and B less A, right-aligned.
-fn line(out: &mut String, label: &str, cells: [String; 3]) {
+pub(crate) fn line(out: &mut String, label: &str, cells: [String; 3]) {
     let _ = write!(out, "{label:<LABEL_WIDTH$}");
     for cell in cells {
         let _ = write!(out, "{cell:>CELL_WIDTH$}");
@@ -179,18 +250,18 @@ fn line(out: &mut String, label: &str, cells: [String; 3]) {
 }
 
 /// Seconds with three decimals (half up) of a signed microsecond value.
-fn secs(us: i128) -> String {
+pub(crate) fn secs(us: i128) -> String {
     let ms = (us.abs() + 500) / 1000;
     let sign = if us < 0 && ms > 0 { "-" } else { "" };
     format!("{sign}{}.{:03}", ms / 1000, ms % 1000)
 }
 
-fn count_row(out: &mut String, label: &str, a: u64, b: u64) {
+pub(crate) fn count_row(out: &mut String, label: &str, a: u64, b: u64) {
     let diff = i128::from(b) - i128::from(a);
     line(out, label, [a.to_string(), b.to_string(), diff.to_string()]);
 }
 
-fn duration_row(out: &mut String, label: &str, a: Option<u64>, b: Option<u64>) {
+pub(crate) fn duration_row(out: &mut String, label: &str, a: Option<u64>, b: Option<u64>) {
     let cell = |v: Option<u64>| v.map_or_else(|| "-".to_owned(), |v| secs(i128::from(v)));
     let diff = a
         .zip(b)
@@ -293,8 +364,10 @@ pub fn render_text(a: &ArmStats, b: &ArmStats) -> String {
     out.push_str(
         "B - A is a difference of two single numbers, not a significance test; the paper's rule needs the 95% Welch CI over runs to exclude 0.\n",
     );
+    build_report::rows(&mut out, &a.builds, &b.builds);
+    phases::rows(&mut out, &a.phases, &b.phases);
     out.push_str("Not recorded (not estimated):\n");
-    for gap in NOT_RECORDED {
+    for gap in not_recorded(a, b) {
         let _ = writeln!(out, "  - {gap}");
     }
     out
@@ -321,11 +394,13 @@ fn arm_json(arm: &ArmStats) -> Value {
         },
         "ok_without_end": arm.ok_without_end,
         "out_of_order": arm.out_of_order,
+        "builds": build_report::arm_json(&arm.builds),
+        "phases": phases::arm_json(&arm.phases),
     })
 }
 
 /// `b - a` as a number, or `null` when either is absent.
-fn delta(a: Option<u64>, b: Option<u64>) -> Value {
+pub(crate) fn delta(a: Option<u64>, b: Option<u64>) -> Value {
     a.zip(b)
         .map_or(Value::Null, |(a, b)| json!(i128::from(b) - i128::from(a)))
 }
@@ -336,7 +411,19 @@ fn rate_delta(a: Option<f64>, b: Option<f64>) -> Value {
 
 /// The two arms as one JSON document (times in microseconds, `null` for absent).
 pub fn render_json(a: &ArmStats, b: &ArmStats) -> String {
-    let doc = json!({
+    render_json_runs(a, b, None)
+}
+
+/// [`render_json`], with one `RunRecord`-shaped object per build under `runs` when `labels`
+/// (arm A's and arm B's) are given.
+pub fn render_json_runs(
+    a: &ArmStats,
+    b: &ArmStats,
+    labels: Option<(&RunLabels, &RunLabels)>,
+) -> String {
+    let runs = labels
+        .map(|(la, lb)| json!({"a": a.builds.run_records(la), "b": b.builds.run_records(lb)}));
+    let mut doc = json!({
         "arms": {"a": arm_json(a), "b": arm_json(b)},
         "difference": {
             "attempts": delta(Some(a.attempts), Some(b.attempts)),
@@ -349,6 +436,8 @@ pub fn render_json(a: &ArmStats, b: &ArmStats) -> String {
                 "p90": delta(a.wall.p90, b.wall.p90),
             },
             "makespan_us": delta(a.makespan_us, b.makespan_us),
+            "builds": build_report::difference_json(&a.builds, &b.builds),
+            "phases": phases::difference_json(&a.phases, &b.phases),
             "kills_per_1000": {
                 "own_limit": rate_delta(
                     a.per_thousand(a.kills.own_limit),
@@ -360,7 +449,10 @@ pub fn render_json(a: &ArmStats, b: &ArmStats) -> String {
                 ),
             },
         },
-        "not_recorded": NOT_RECORDED,
+        "not_recorded": not_recorded(a, b),
     });
+    if let Some(runs) = runs {
+        doc["runs"] = runs;
+    }
     format!("{doc:#}\n")
 }

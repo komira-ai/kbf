@@ -304,6 +304,11 @@ pub fn config_template(mode: &str) -> Option<String> {
         .map(|m| config::template(m.name, &own_command(m.entry), &refused_own(m.entry)))
 }
 
+/// The word after `kbf` that runs one step of the update hook of the kbf service
+/// (`kbf update-hook <step>`, `kbf_updater::agent::hook`): the generic updater runs it with the
+/// flags of the declaration before the step. Like `kbf cluster`, it is not a mode.
+pub const UPDATE_HOOK: &str = "update-hook";
+
 /// The word after `kbf` that calls the operator API ([`cluster`]) instead of starting a
 /// mode. It is not in [`names::MODES`], so the mode list stays exact.
 pub const CLUSTER: &str = "cluster";
@@ -874,6 +879,9 @@ pub fn main() -> ExitCode {
     if version::asked(&args) {
         print!("{}", version::line());
         return ExitCode::SUCCESS;
+    }
+    if args.get(1).is_some_and(|word| word == UPDATE_HOOK) {
+        return kbf_updater::agent::hook::main(args.into_iter().skip(2).collect());
     }
     if args.get(1).is_some_and(|word| word == CLUSTER) {
         return match parse_cluster(&args) {
