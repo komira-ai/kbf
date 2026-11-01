@@ -884,6 +884,54 @@ fn the_root_part_rolls_back_a_cutover_a_boot_cut_off_before_it_answers_the_agent
     assert_eq!(committed_boot_id(&world), "boot-b");
 }
 
+/// Catches a boot id written over a record the start pass could not read, or a service started
+/// from such a record: after a boot, a record that does not parse holds the boot id back and its
+/// service is not started; once it is put right the next start reads it after the boot and
+/// writes the boot id, and a start in the same boot after that leaves the boot id as it is.
+#[test]
+fn the_boot_id_is_written_only_once_every_record_was_read() {
+    let world = World::new("boot-unread");
+    world.declare("svc", &world.tierstore_shaped());
+    let state = world.path("state");
+    root_support::dir(&state, 0o700);
+    boot::commit_boot(&state, &*world.clock).unwrap();
+    root_support::dir(&state.join("svc"), 0o700);
+    let record = state.join("svc/step-record.json");
+    root_support::put(&record, b"{", 0o600);
+    // Neither a directory nor a service's name: not a record of anyone.
+    root_support::dir(&state.join(".scratch"), 0o700);
+    world.clock.reboot("boot-b");
+    serve_once(&world, || {});
+    assert_eq!(committed_boot_id(&world), "boot-a");
+    assert_eq!(
+        fs::read(&record).unwrap(),
+        b"{",
+        "the record is left as it was"
+    );
+    fs::remove_file(&record).unwrap();
+    serve_once(&world, || {});
+    assert_eq!(committed_boot_id(&world), "boot-b");
+    // A start in the same boot reads nothing as cut off and leaves the boot id as it is.
+    let after = serve_once(&world, || {});
+    assert!(after.ok, "{after:?}");
+    assert_eq!(committed_boot_id(&world), "boot-b");
+}
+
+/// Catches a state directory the root part cannot list read as one with no record in it: the
+/// read after a boot reports it, so the boot id is not written.
+#[test]
+fn a_state_directory_that_cannot_be_listed_is_reported_by_the_read_after_a_boot() {
+    let world = World::new("boot-unlisted");
+    world.declare("svc", &world.tierstore_shaped());
+    let root = world.root_part();
+    let state = world.path("state");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
+    let unread = root.read_after_boot();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(unread.len(), 1, "{unread:?}");
+    assert_eq!(unread[0].0, "", "{unread:?}");
+}
+
 /// Catches a boot rule kept only for the services whose declaration loaded: after a boot the
 /// root part reads the record of a service whose declaration is refused as well, so the
 /// `cutover` the boot cut off is rolled back once the declaration is put right, in the same boot,
