@@ -506,7 +506,7 @@ async fn halts_go_only_to_an_agent_that_announced_halt_v1() {
         send_raw(&rig, "d1", "daemon", &beat("2.0", "")).await,
         r#"{"reply":"nothing"}"#
     );
-    let other = beat("2.0", r#","agent_features":["deferred-v1"]"#);
+    let other = beat("2.0", r#","agent_features":["unknown-v9"]"#);
     assert_eq!(
         send_raw(&rig, "d1", "daemon", &other).await,
         r#"{"reply":"nothing","features":[]}"#
