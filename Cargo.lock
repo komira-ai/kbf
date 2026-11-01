@@ -5279,6 +5279,7 @@ dependencies = [
 name = "update-register"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde_json",
  "thiserror",
 ]

@@ -21,10 +21,12 @@
 //! the service stopped. A service that restarts registers again.
 //!
 //! [`register`] blocks until the updater has answered, and gives up with [`Error::NoAnswer`] when
-//! [`ANSWER_DEADLINE_SECS`] have passed, so that a stalled updater cannot hold a service from
-//! starting. Connecting has no bound: a unix socket whose listener is not accepting and whose
-//! backlog is full blocks `connect`, and `std` has no connect timeout; a caller that cannot
-//! wait registers from a thread of its own.
+//! [`ANSWER_DEADLINE_SECS`] have passed, so that a dead or hung updater cannot hold a service from
+//! starting. The deadline is one, for the whole call: it runs from before the connect, and the
+//! connect (to a listener that is not accepting and whose backlog is full, which would otherwise
+//! wait for ever), the write of the line and each read of the answer wait only for what is left
+//! of it. A service that registers on its start path therefore waits at most the deadline (10 s)
+//! when the updater hangs; one that cannot wait that long registers from a thread of its own.
 
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
@@ -37,16 +39,16 @@ use serde_json::{Value, json};
 /// The longest registration line the updater reads, newline included.
 pub const MAX_LINE: usize = 4096;
 
-/// How long `register` waits for the updater's answer, in all: the updater's own limit on a
-/// line, so an updater that answers at all does so within it.
+/// How long `register` waits, in all, from before it connects until it has the updater's answer:
+/// the updater's own limit on a line, so an updater that answers at all does so within it.
 pub const ANSWER_DEADLINE_SECS: u64 = 10;
 
 /// The most of an answer that is read; an answer is one short line.
 const MAX_ANSWER: usize = 512;
 
-/// The smallest timeout a socket takes: a zero one is refused (`InvalidInput`) by `std`, and the
-/// system call reads it as no timeout at all. A deadline of zero, or one that has passed, is this.
-const SMALLEST_TIMEOUT: Duration = Duration::from_micros(1);
+/// Where the client reads the time. `register` reads `Instant::now`; the tests read a clock they
+/// move, so that the deadline is passed by the test and not by waiting.
+type Clock<'a> = &'a dyn Fn() -> Instant;
 
 /// Where a service's health answers: the updater issues a `GET` of `path` on `addr` and reads
 /// a 2xx as ready. The address must be loopback and its port one the declaration grants.
@@ -126,7 +128,9 @@ pub enum Error {
     TooLong { len: usize },
     #[error("talking to the updater failed: {0}")]
     Io(#[from] io::Error),
-    #[error("the updater closed the connection without answering")]
+    /// The updater closed the connection, or the deadline passed (connecting, writing the line or
+    /// waiting for the answer), without an answer.
+    #[error("the updater closed the connection or let the deadline pass without answering")]
     NoAnswer,
     #[error("the updater's answer is not understood: {0:?}")]
     BadAnswer(String),
@@ -152,49 +156,151 @@ pub fn register(
     version: &str,
     health: Option<&Health>,
 ) -> Result<Registration, Error> {
-    let stream = UnixStream::connect(socket).map_err(|source| Error::Connect {
-        path: socket.to_path_buf(),
-        source,
-    })?;
-    register_on(
-        stream,
+    register_within(
+        socket,
         name,
         version,
         health,
         Duration::from_secs(ANSWER_DEADLINE_SECS),
+        &Instant::now,
     )
 }
 
-/// `register` over a connection made, with `deadline` for the whole answer (and for the write).
+/// `register` with `deadline` for the whole call, the connect included, on the clock `now`.
+fn register_within(
+    socket: &Path,
+    name: &str,
+    version: &str,
+    health: Option<&Health>,
+    deadline: Duration,
+    now: Clock<'_>,
+) -> Result<Registration, Error> {
+    let end = now() + deadline;
+    let wait = remaining(end, now).ok_or(Error::NoAnswer)?;
+    // A connect that waited out the deadline (a full backlog) is the updater not answering; any
+    // other failure (no socket, nobody listening, no permission) is the path not being reachable.
+    let stream = connect(socket, wait).map_err(|source| {
+        if timed_out(&source) {
+            Error::NoAnswer
+        } else {
+            Error::Connect {
+                path: socket.to_path_buf(),
+                source,
+            }
+        }
+    })?;
+    register_on(stream, name, version, health, end, now)
+}
+
+/// Connects to `path`, waiting at most `wait` for a listener whose backlog is full.
+///
+/// `std` has no connect timeout, and Linux makes a unix socket's connect to a full backlog wait
+/// for as long as the socket's send timeout says, for ever by default. So the socket is made here
+/// and given `wait` as its send timeout before it connects: the connect then fails with
+/// `WouldBlock` once `wait` has passed. The socket is owned from the moment it exists, so an
+/// error drops it and no descriptor is left; no thread is started.
+#[cfg(target_os = "linux")]
+fn connect(path: &Path, wait: Duration) -> io::Result<UnixStream> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    // The checks of `std`'s own connect: no NUL in the path, and room for the one that ends it.
+    std::os::unix::net::SocketAddr::from_pathname(path)?;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: `sockaddr_un` is plain data, for which all zeroes is a valid value.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (to, from) in addr.sun_path.iter_mut().zip(bytes) {
+        *to = *from as libc::c_char;
+    }
+    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    // SAFETY: a plain system call with constant arguments.
+    let fd =
+        cvt(unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) })?;
+    // SAFETY: `fd` was just returned by `socket` and nothing else owns it.
+    let stream = UnixStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    stream.set_write_timeout(Some(wait))?;
+    // SAFETY: `addr` is a `sockaddr_un` that lives across the call, and `len` (at most its size,
+    // which `from_pathname` checked) is the length of the address in it, terminating NUL included.
+    cvt(unsafe {
+        libc::connect(
+            stream.as_raw_fd(),
+            (&raw const addr).cast::<libc::sockaddr>(),
+            len as libc::socklen_t,
+        )
+    })?;
+    Ok(stream)
+}
+
+/// Elsewhere `std`'s connect: the BSD-derived kernels refuse a connection to a full backlog
+/// rather than wait for room in it.
+#[cfg(not(target_os = "linux"))]
+fn connect(path: &Path, _wait: Duration) -> io::Result<UnixStream> {
+    UnixStream::connect(path)
+}
+
+/// A system call's result: -1 is the error in `errno`.
+#[cfg(target_os = "linux")]
+fn cvt(result: libc::c_int) -> io::Result<libc::c_int> {
+    match result {
+        -1 => Err(io::Error::last_os_error()),
+        fd => Ok(fd),
+    }
+}
+
+/// `register` over a connection made, until `end` on the clock `now`, for the write and for the
+/// whole answer.
 fn register_on(
     stream: UnixStream,
     name: &str,
     version: &str,
     health: Option<&Health>,
-    deadline: Duration,
+    end: Instant,
+    now: Clock<'_>,
 ) -> Result<Registration, Error> {
     let line = encode(name, version, health);
     if line.len() > MAX_LINE {
         return Err(Error::TooLong { len: line.len() });
     }
-    let end = Instant::now() + deadline;
-    stream.set_write_timeout(Some(left(end)))?;
     // An updater that is full answers and closes without reading the line, so the write can
     // fail while the answer is waiting: the answer is read first and says why.
-    let sent = (&stream).write_all(&line);
-    match (answer(&stream, end), sent) {
+    let sent = send(&stream, &line, end, now);
+    match (answer(&stream, end, now), sent) {
         (Ok(()), Ok(())) => Ok(Registration {
             _connection: stream,
         }),
+        // The deadline passed while the line was going: that is the updater not answering, as
+        // when it passes during the connect or the answer.
+        (Err(Error::NoAnswer), Err(e)) if timed_out(&e) => Err(Error::NoAnswer),
         (Ok(()), Err(e)) | (Err(Error::NoAnswer), Err(e)) => Err(Error::Io(e)),
         (Err(e), _) => Err(e),
     }
 }
 
-/// The time left until `end`, and never zero.
-fn left(end: Instant) -> Duration {
-    end.saturating_duration_since(Instant::now())
-        .max(SMALLEST_TIMEOUT)
+/// Writes `line` before `end`, waiting only for what is left: the timeout is set from the clock
+/// once, and the line, at most `MAX_LINE` bytes, goes in one write unless that wait runs out
+/// (`write_all` retries a write a signal interrupted). A deadline that has passed is `TimedOut`, and
+/// a write that waited out what was left is `WouldBlock`.
+fn send(stream: &UnixStream, line: &[u8], end: Instant, now: Clock<'_>) -> io::Result<()> {
+    let wait = remaining(end, now).ok_or(io::ErrorKind::TimedOut)?;
+    stream.set_write_timeout(Some(wait))?;
+    (&*stream).write_all(line)
+}
+
+/// The time left until `end` on the clock `now`, or `None` once there is none: a zero timeout
+/// would be refused by `std` (and read as no timeout at all by the system call).
+fn remaining(end: Instant, now: Clock<'_>) -> Option<Duration> {
+    end.checked_duration_since(now())
+        .filter(|left| !left.is_zero())
+}
+
+/// Whether an I/O error is a wait that ran out: a socket timeout reports `WouldBlock` (or
+/// `TimedOut`), and `send` reports a deadline already passed as `TimedOut`.
+fn timed_out(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 /// The registration line: one JSON object and a newline.
@@ -205,31 +311,25 @@ fn encode(name: &str, version: &str, health: Option<&Health>) -> Vec<u8> {
     line.into_bytes()
 }
 
-/// Reads the updater's answer, one line, until `end`: `{"ok":true,"error":null}` or
-/// `{"ok":false,"error":"<token>"}`.
+/// Reads the updater's answer, one line, until `end` on the clock `now`: `{"ok":true,"error":null}`
+/// or `{"ok":false,"error":"<token>"}`.
 ///
 /// Nothing at all is [`Error::NoAnswer`], and so is the deadline passing. Something that is not
 /// one whole line the client understands is [`Error::BadAnswer`], a line cut short before its
 /// newline included: the updater writes the newline with the rest, so a success that lacks it was
-/// cut by a connection that died, and is not believed. Each read waits only for what is left of
-/// the deadline, and an answer is read to at most `MAX_ANSWER` bytes, so the deadline holds for
-/// the whole answer to within one short read.
-fn answer(stream: &UnixStream, end: Instant) -> Result<(), Error> {
+/// cut by a connection that died, and is not believed. The clock is read before each read, which
+/// waits only for what is left, and a read with nothing left is not made: a peer that sends the
+/// answer a byte at a time cannot hold the client past the deadline.
+fn answer(stream: &UnixStream, end: Instant, now: Clock<'_>) -> Result<(), Error> {
     let mut text = Vec::new();
     let mut chunk = [0u8; 128];
     while !text.contains(&b'\n') && text.len() < MAX_ANSWER {
-        stream.set_read_timeout(Some(left(end)))?;
+        let wait = remaining(end, now).ok_or(Error::NoAnswer)?;
+        stream.set_read_timeout(Some(wait))?;
         match (&*stream).read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => text.extend_from_slice(&chunk[..n]),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Err(Error::NoAnswer);
-            }
+            Err(e) if timed_out(&e) => return Err(Error::NoAnswer),
             Err(e) => return Err(e.into()),
         }
     }
