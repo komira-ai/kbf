@@ -44,8 +44,10 @@ the work moves in the longer term, and it is listed as an option, not as part of
 ### 2.2 The hot store and the cold store
 
 - `--cold-store` is required: `file:///dir` (`FsStore`) or `s3://bucket[/prefix]?endpoint=http://host:port`
-  (`S3Store`; query keys `endpoint`, `region`, `conditional-put`, `min-put-rate`; the key pair is the standard
-  `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`). [code: `crates/kbf-server/src/stores.rs` `StoreUri`, `S3Uri`]
+  (`S3Store`; query keys `endpoint`, `region`, `conditional-put`, `min-put-rate`). The key pair is either the standard
+  `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, or a key file named with `--cold-store-credentials-file`, a flag that
+  is on main since kbf#2177 (a node with its own endpoint needs its own keys, 5.7). [code: `crates/kbf-server/src/stores.rs`
+  `StoreUri`, `S3Uri`; the flag is the storage owner's report of kbf#2177, not re-read here]
 - `--hot-store` is optional: the write tier (`kbf-tier`). A segment is staged as a block file in the hot directory,
   synced with `fdatasync`, and acknowledged (on a chain, once both owners hold it); the flusher later PUTs it to the
   cold store as a multipart upload, reads the footer back, and commits `ObjectFlushed`. Flushed blocks stay on the
@@ -69,9 +71,25 @@ the work moves in the longer term, and it is listed as an option, not as part of
   `crates/kbf-server/src/storage_node.rs` (the flush gate chosen near line 717), `crates/kbf-server/src/fill.rs`]. So
   the cold store already receives each blob from both owners. `docs/design/architecture-v2.md` section 8 ("One
   flusher") describes the intended rule, not the running one.
-- **The cold store is also listed continuously.** Besides the rebuild, a standing tail (`Cache::tail_pass`, run from
-  `fill.rs`) lists `<root>cas/` on every pass and adopts other members' objects; it skips the old
-  `<root><log id>/cas/` prefix. [code: `crates/kbf-front/src/cache/tail.rs`, `crates/kbf-server/src/fill.rs`]
+- **The cold store is listed when a tail pass is owed, not continuously.** A standing tail (`Cache::tail_pass`) lists
+  `<root>cas/`, reads the footer of each object it has not handled, and adopts only digests the index lacks; it never
+  reads an object of its own member, and skips the old `<root><log id>/cas/` prefix. There is **no cursor**: every pass
+  lists the whole prefix, because uploads finish out of sequence. [code: `crates/kbf-front/src/cache/tail.rs`]
+  `fill::run` ticks, but `fill::round` makes a pass only when `FillState::owed()` is set, that is when the epoch the
+  frontend's heartbeat answer carried (`learn`) is above the epoch the node acknowledged (`tail_epoch_done`). An owed
+  epoch is served by `settle`: at least two passes (the second is the guard) and at most `PASSES` = 8, stopping at the
+  first pass after the first that is quiet. [code: `crates/kbf-server/src/fill.rs` `owed`, `round`, `settle`, `PASSES`,
+  `registered`] With no epoch bump and no restart there is **no listing at all**.
+- **When an epoch is bumped.** The frontend's counter `meta/tail_epoch` is written only by a frontend started with the
+  handoff setting (`Members::with_handoff`), and then (a) when a joining member's flush barrier clears, and again if the
+  placement fingerprint or a write owner's boot changes while it joins [code: `crates/kbf-server/src/members/fence.rs`
+  `advance_one`, `fence_step`], and (b) per the design, when a draining member has flushed (`A to B` in
+  `docs/design/rebalance-handoff.md`; not traced in code here, UNVERIFIED). So the cadence is the cadence of joins and
+  drains, and in steady state it is zero. A node's own **restart or registration** also owes a pass:
+  `FillState::registered` sets the acknowledged epoch to 0, and the learned epoch is above 0 once the farm has ever
+  bumped. A restarted tail also starts empty (`TailState` is volatile), so it reads the footer of every object that is not
+  its own member's once. [code: `fill.rs` `registered`; `tail.rs` `TailState`] Which frontends in the running farm are
+  started with the handoff setting is a deployment fact not read here: UNVERIFIED.
 - **No retention on the segment path.** Segments are written with `put_new(..., None)` and `put_stream`, neither with
   a retention date; the only pass-throughs of `retain_until` are the history store's, and its writers pass `None`. A
   store without Object Lock must refuse a date (`FsStore` does). [code: `write_group.rs`, `cache/direct.rs`,
@@ -103,7 +121,8 @@ the work moves in the longer term, and it is listed as an option, not as part of
   becoming "does not exist". [code: `crates/kbf-front/src/cache/read.rs`, `cache/flush.rs`, `crates/kbf-segments`,
   `docs/design/storage.md` "Three answers, not two"]
 - **Rebuild.** A new owner lists the store in key order and adopts segments from their footers (`AdoptSegment`,
-  `RebuildProgress`, `RebuildDone`). It needs `list` with a start-after cursor. [code:
+  `RebuildProgress`, `RebuildDone`). It needs `list` with a start-after cursor; it runs for a registered node whose log
+  has no `RebuildDone`, and resumes from its progress record. [code:
   `crates/kbf-front/src/cache/rebuild.rs`, `crates/kbf-server/src/rebuild.rs`]
 
 ### 2.4 Who calls the storage half, and over what
@@ -184,7 +203,7 @@ nodes flushed, in place, without copying or deleting anything. Pack keys are `ca
 | Re-hash of every record at flush | **moves to receive time** | With no tier, `PutRange` hashes SHA-256 and CRC-32C on receipt and `Commit` refuses an unhashed record; a segment the tier did not take is hashed before the PUT. Stronger than the flush-time check, which is there because with a tier the daemon's digests are trusted at acknowledgement. Cost: ingress CPU, unmeasured. [code: `crates/kbf-front/src/segments.rs`, `cache/upload.rs`, `cache/flush.rs`] |
 | Flushed-copy read cache on the hot disk | **tierstore hot tier** (promotion) | Whole-object promotion; amplification, 5.4. |
 | Hot-store eviction | **tierstore water marks** | `file://` eviction in `evict.rs` is unrelated and stays. |
-| Rebuild by footers and the standing tail | stays in kbf, listing whatever `--cold-store` is | Both list the endpoint, under `keys.root` (rebuild) and `<root>cas/` (tail, every pass). tierstore's list cost and what its listing covers decide this row, 5.8. |
+| Rebuild by footers and the standing tail | stays in kbf, listing whatever `--cold-store` is | Both list the endpoint, under `keys.root` (rebuild, once, with a cursor) and `<root>cas/` (tail, with no cursor, 2 to 8 listings for each epoch owed). Cost is owed epochs times passes per epoch times objects in the prefix; 5.8. |
 | `may_hold`, `get_range` exactness | stays in kbf; tierstore must satisfy | `S3Store` refuses a ranged read not answered with the exact range. |
 | CAS index, action cache, closure check, `Touch`, retention, three answers | **stays in kbf** | No S3 shape. |
 | Raft metadata log on the hot disk | **stays in kbf** | Lives in `<hot store>/meta` when the hot store is a directory; with no hot store it needs `--meta-dir` [code: `stores.rs`]. |
@@ -251,9 +270,14 @@ collected (the `Collect` result returns each removed blob's location, so dead sp
 `docs/design/storage.md` Retention]), the node deletes the object through a tierstore **GC key** whose prefix is that
 node's own writer prefix (`<root>cas/<member>/`; a GC key has exactly one prefix). The GC key lists, heads and deletes and
 never reads a body. A delete in tierstore removes both tiers' copies. The trap is the standing tail: it adopts other
-members' objects into a node's index (section 2.2), so an owner that deletes a segment another node adopted leaves that
-node's locations dangling, to be marked `Missing`. The collector must either learn of adoptions or be allowed to delete
-only after a delay longer than every node's tail interval. This is new work with no code today; it does not gate the
+members' objects into a node's index, so an owner that deletes a segment another node adopted leaves that node's
+locations dangling, to be marked `Missing`. The trap is narrower than it first looks: a pass never reads an object of its
+own member, and adopts only digests the index does not already hold (section 2.2), so a segment is adopted by another
+node only for blobs that node lacked, which with both owners writing every blob is the case after a join, a wiped log or a
+lost write. There is **no tail interval** to wait out: passes happen when an epoch is owed (2.2), at a cadence of joins and
+drains plus restarts. So a delay-based collector must cover that cadence plus one full settle (up to eight listings and
+the footer reads), and cannot be a fixed small constant; otherwise the collector must learn of adoptions (open item E).
+This is new work with no code today; it does not gate the
 migration, but it gates the cold bucket staying bounded, and needs a design of its own.
 
 ### 5.6 Credentials
@@ -279,14 +303,16 @@ register the tierstore identity only if tierstore later runs as one shared endpo
 
 ### 5.8 The standing tail and the list cost
 
-The tail lists `<root>cas/` on every pass, from every node, over the whole prefix, and nothing deletes segments (section
-2.3), so the listing only grows. Behind tierstore each pass is a tierstore list (tierstore's listing honours
-`start-after` and hides `_journal/` and `_tiering/`). Two things are not known and are tierstore's to state: whether its
-listing covers objects that are only in the hot tier, and its cost for a listing of this size. If the listing is
-cold-only, a node adopts another's objects only after they are copied, which delays the tail, and a rebuild after a
-wiped log misses the node's own uncopied objects. If it merges both, the listing is the stronger one. The pass interval
-and the list requests per second are to be measured at baseline (section 7); a list rate that tierstore cannot sustain is
-a reason to change the tail, not to avoid tierstore. [proposed]
+The tail is owed, not scheduled (section 2.2). Its listing cost is **owed epochs x passes per epoch x objects in the
+prefix**, plus one footer read for every object that is not the node's own on the first pass after a restart. Passes per
+epoch are 2 to 8 (`settle`), each a full listing with no cursor. In steady state, with no join, drain or restart, the
+cost is zero. Nothing deletes segments (section 2.3), so objects in the prefix only grow, and each owed epoch costs more
+than the last. The unit to record at baseline is therefore listings per owed epoch and their wall time at the current
+object count, not a rate. Behind tierstore each listing is a tierstore list; its cost, and whether it covers objects that
+are only in the hot tier, are tierstore's to state (open item F). The consequence for correctness is in section 6: if the
+listing misses uncopied objects, a node can acknowledge an epoch without them in its index. How often the frontend bumps
+the epoch in the running farm is UNVERIFIED (it needs the frontend's handoff setting and its join and drain history); the
+code gives only the triggers. [proposed]
 
 ## 6. Migration, one node at a time
 
@@ -300,11 +326,11 @@ Preconditions: tierstore's v1 paper has shipped; the conformance, listing and ba
    step 2. [proposed; code: `crates/kbf-objstore/src/conformance.rs`]
 1. **Baseline on today's farm.** List the production bucket (the only way to know which key families it holds: node
    layout, epoch layout, packs), and record input-fetch latency, cold GETs per build, cold PUT bytes per uploaded byte,
-   and tail list requests (section 7). kbf has no cold GET counter today, so the baseline comes from the bucket's own
+   and the listings per owed tail epoch with their wall time (section 7). kbf has no cold GET counter today, so the baseline comes from the bucket's own
    request counts plus a client-side timer. [proposed]
 2. **Canary node, shape A.** Install tierstore on the node. Point the node's `--cold-store` at it, with its own key file,
    bucket and prefix unchanged. Keep `--hot-store`. Soak: no new `ObjectUnreachable` marks, flush success unchanged, no
-   tierstore `read_errors`, tail passes completing, copy lag bounded.
+   tierstore `read_errors`, a restart of the node completing its owed tail pass, copy lag bounded.
 3. **Canary node, shape B.** Unset `--hot-store`, set `--meta-dir`, restart. Same watch, plus put-to-ack and ingress CPU
    against the baseline.
 4. **The other nodes, one at a time, shape B**, each after the previous node has run a full build set clean.
@@ -316,17 +342,21 @@ not yet copied is absent from the bucket, and a kbf pointed at the bucket would 
 unreachable in its Raft log, and fail the read UNAVAILABLE until the blob is uploaded again. Tierstore's drain gives up
 the lease and exits; it does not promise a finished copy. [code: tierstore `operations.md` "Drain and restart"; kbf marks
 `Missing` per `docs/design/storage.md` "Reads"] So rollback needs the copy lag, which `/metricz` does not export today.
-The standing tail adds a second, milder effect: pointed at the bucket, a node's tail sees only copied objects, so it
-adopts other members' newest objects later. Shape B back to A: set `--hot-store` again; the staged table starts empty and
-no staged block exists to lose.
+The tail adds a second effect: pointed at the bucket, a node's passes see only copied objects (see "Mixed farm"). Shape B
+back to A: set `--hot-store` again; the staged table starts empty and no staged block exists to lose.
 
 **Mixed farm.** Each node's index is its own Raft log and other nodes read a node's blobs through the owner, not through
-the bucket, so a farm with some nodes on tierstore and some on the bucket serves correctly. The places where nodes read
-each other's objects from the cold store are the rebuild, the not-yet-built handoff (`docs/design/rebalance-handoff.md`)
-and the **standing tail, which runs on every pass**. So the rule is not "avoid rebuilds": while a node's tierstore holds
-uncopied objects, other nodes' tails (listing the bucket directly) cannot see them, and a node that rebuilds from its
-tierstore sees objects the others cannot. Neither is a loss: objects become visible when copied. Do not start a handoff
-while any tierstore has copy lag. [proposed]
+the bucket, so a farm with some nodes on tierstore and some on the bucket serves correctly. Nodes read each other's
+objects from the cold store in the rebuild and in the tail pass, and the **handoff fence relies on those passes**: a
+join or drain is confirmed only when every member has acknowledged the epoch, and a node acknowledges after a pass that
+began after it learned the epoch (`docs/design/rebalance-handoff.md`; `fill::round`). A pass lists whatever that node's
+`--cold-store` is. If the listing cannot see an uncopied object (a node listing the bucket while another node's tierstore
+still holds the object only on flash, or a tierstore listing that is cold-only), the pass completes, the epoch is
+acknowledged, and the fence is confirmed **without that object in the index**: the fence then covers less than it says.
+Pointing rebuild or tail at tierstore instead of the bucket changes what the fence covers in the same way. So the rule
+stands, with its reason: **do not start a join or drain, which bumps the epoch, while any tierstore in the farm has copy
+lag**, and do not rely on a restart's owed pass for an object still on flash. Between epochs nothing is lost: objects
+become visible when copied, and the next owed pass adopts them. [proposed]
 
 ## 7. Measurements this enables
 
@@ -341,7 +371,7 @@ For the tierstore paper and for the go/no-go gates:
 | Put-to-ack and copy lag | `tierstore-bench` cells; copy lag needs a gauge (section 8, item F) | the flush is timed only as write-tier calls |
 | Cold PUT bytes per uploaded byte | bucket bytes written over bytes uploaded; today about two (both owners flush), and B must not raise it | derived, not measured |
 | Ingress CPU under B | `--cpu-threads` use during uploads, before and after | n/a |
-| Tail list rate and cost | list requests per second per node and their latency at baseline and behind tierstore | n/a |
+| Tail listing cost | listings per owed epoch (2 to 8), their wall time and the footer reads of a restart, at the current object count, at baseline and behind tierstore | n/a |
 
 Method: the same build set against the same commit, at least a cold run and a warm run per node shape, recorded with the
 bench's result JSON. [proposed]
@@ -361,8 +391,12 @@ Still to settle:
 - **C. `identity_mismatch` handling.** Whether the frontend or operator API treats a mismatched node specially. Not read.
 - **D. Retention callers.** The search for callers of `retain_until` is a grep result, not a proof of none.
 - **E. Collector and adoption.** How a per-node collector learns that another node adopted its segment (5.5).
-- **F. For the tierstore side**, to be raised there: export the copy lag on `/metricz` (rollback gate); a latency
-  histogram per operation; whether the front's listing covers hot-only objects; list cost on a prefix of this size.
+- **F. To confirm in tierstore, not kbf** (to be raised there): the copy lag on `/metricz` (rollback gate); a latency
+  histogram per operation; whether a listing through the front shows objects that are only in the hot tier; the cost of
+  a listing on a large prefix (the tail lists the whole prefix, 2 to 8 times per owed epoch); how the GC key behaves
+  (listing, head and delete under its one prefix, and a delete of an object in both tiers); how drain interacts with
+  an unfinished copy; `start-after` paging in the front; and that `_journal/` and `_tiering/` stay hidden from
+  listings.
 
 ## 9. Decisions, with a recommendation each
 
@@ -379,8 +413,8 @@ Still to settle:
    assume `<name>/<log id>/...`.
 5. **Registration.** Recommend: a migrated node runs on its flag with its own keys and a known `identity_mismatch`;
    confirm first (open item C) that this is not treated as a fault. Do not use a shared endpoint string as a workaround.
-6. **Garbage collection.** Recommend a separate design: per-node collector over a per-node GC key, with a delay or an
-   adoption record for the standing tail. Not a gate for the canary; a gate for any claim that the cold store stays
+6. **Garbage collection.** Recommend a separate design: per-node collector over a per-node GC key, with a delay that covers the epoch cadence plus one settle, or an
+   adoption record for the tail. Not a gate for the canary; a gate for any claim that the cold store stays
    bounded.
 7. **Integrity.** Recommend no check is removed; kbf's ingress and read-time digest checks stay the proof, because
    tierstore does not hash a storage node's objects.
@@ -392,5 +426,5 @@ Still to settle:
 10. **Range amplification.** Recommend measuring first (section 7); do not change the segment size or ask tierstore for
     ranged promotion before the number exists.
 11. **Rollback and listing gates.** Recommend tierstore exports the copy lag and states what its listing covers before
-    the canary; without the first, rollback of a node depends on a manual listing; without the second, the tail and
-    the rebuild behave differently from the bucket in a way no one has looked at.
+    the canary; without the first, rollback of a node depends on a manual listing; without the second, the tail, the rebuild and the handoff fence
+    cover different objects than the bucket does, in a way no one has looked at.
