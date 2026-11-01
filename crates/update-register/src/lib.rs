@@ -219,7 +219,7 @@ fn connect(path: &Path, wait: Duration) -> io::Result<UnixStream> {
         cvt(unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) })?;
     // SAFETY: `fd` was just returned by `socket` and nothing else owns it.
     let stream = UnixStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
-    let _ = wait;
+    stream.set_write_timeout(Some(wait))?;
     // SAFETY: `addr` is a `sockaddr_un` that lives across the call, and `len` (at most its size,
     // which `from_pathname` checked) is the length of the address in it, terminating NUL included.
     cvt(unsafe {
@@ -271,6 +271,7 @@ fn register_on(
         }),
         // The deadline passed while the line was going: that is the updater not answering, as
         // when it passes during the connect or the answer.
+        (Err(Error::NoAnswer), Err(e)) if timed_out(&e) => Err(Error::NoAnswer),
         (Ok(()), Err(e)) | (Err(Error::NoAnswer), Err(e)) => Err(Error::Io(e)),
         (Err(e), _) => Err(e),
     }
@@ -322,9 +323,9 @@ fn encode(name: &str, version: &str, health: Option<&Health>) -> Vec<u8> {
 fn answer(stream: &UnixStream, end: Instant, now: Clock<'_>) -> Result<(), Error> {
     let mut text = Vec::new();
     let mut chunk = [0u8; 128];
-    let wait = remaining(end, now).ok_or(Error::NoAnswer)?;
-    stream.set_read_timeout(Some(wait))?;
     while !text.contains(&b'\n') && text.len() < MAX_ANSWER {
+        let wait = remaining(end, now).ok_or(Error::NoAnswer)?;
+        stream.set_read_timeout(Some(wait))?;
         match (&*stream).read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => text.extend_from_slice(&chunk[..n]),
