@@ -12,6 +12,7 @@ use std::sync::{Mutex, PoisonError};
 
 use crate::error::BenchError;
 use crate::gate::LoadSample;
+use crate::result::DiskBusy;
 
 /// The one-minute load average of the text of `/proc/loadavg`.
 #[must_use]
@@ -58,6 +59,44 @@ pub fn busiest_disk_pct(
     // At most a few days of milliseconds: exactly representable.
     let pct = busiest_ms as f64 * 100.0 / wall_ms.max(1) as f64;
     pct.min(100.0)
+}
+
+/// The busy time of each counted disk now, by device name, from the `/proc` at `proc_root` and
+/// the `/sys/block` at `sys_block`.
+///
+/// # Errors
+/// [`BenchError::Io`] if `diskstats` cannot be read.
+pub fn disk_busy_snapshot(
+    proc_root: &Path,
+    sys_block: &Path,
+) -> Result<BTreeMap<String, u64>, BenchError> {
+    let path = proc_root.join("diskstats");
+    let text = std::fs::read_to_string(&path).map_err(|source| BenchError::Io { path, source })?;
+    Ok(parse_diskstats(&text)
+        .into_iter()
+        .filter(|(name, _)| counted(sys_block, name))
+        .collect())
+}
+
+/// What each disk of `after` that is also in `before` did over a pass of `elapsed_us`: its busy
+/// time and that over the wall time, percent, at most 100.
+#[must_use]
+pub fn disk_busy_over(
+    before: &BTreeMap<String, u64>,
+    after: &BTreeMap<String, u64>,
+    elapsed_us: u64,
+) -> BTreeMap<String, DiskBusy> {
+    // A pass shorter than a millisecond is read as one, so the share is never a division by 0.
+    let wall_ms = (elapsed_us / 1000).max(1);
+    after
+        .iter()
+        .filter_map(|(name, ticks)| {
+            let busy_ms = ticks.saturating_sub(*before.get(name)?);
+            // At most a few days of milliseconds: exactly representable.
+            let util_pct = (busy_ms as f64 * 100.0 / wall_ms as f64).min(100.0);
+            Some((name.clone(), DiskBusy { busy_ms, util_pct }))
+        })
+        .collect()
 }
 
 /// Whether the busy time of `name` is counted: not a loop, ram or zram device, and a whole disk,
@@ -162,6 +201,44 @@ mod tests {
         assert_eq!(parse_psi_some_avg10(PSI), Some(1.5));
         let stats = parse_diskstats("8 0 sda 1 2 3 4 5 6 7 8 9 4000 11\nshort line\n");
         assert_eq!(stats, vec![("sda".to_owned(), 4000)]);
+    }
+
+    /// Catches a snapshot that counts a loop device or a partition, or reads the wrong field: the
+    /// busy time is field 13 of the whole disks that `/sys/block` lists.
+    #[test]
+    fn the_snapshot_lists_the_busy_time_of_whole_disks_only() {
+        let dir = TestDir::under(std::env::temp_dir(), "tb-procload-snap");
+        let (proc_root, sys_block) = machine(&dir, 1_000);
+        let snapshot = disk_busy_snapshot(&proc_root, &sys_block).unwrap();
+        assert_eq!(snapshot, BTreeMap::from([("sda".to_owned(), 1_000)]));
+        let err = disk_busy_snapshot(&dir.path().join("absent"), &sys_block).unwrap_err();
+        assert!(matches!(err, BenchError::Io { .. }), "{err}");
+    }
+
+    /// Catches the busy time of a pass taken from the whole counter instead of its change, the
+    /// share taken over the wrong wall time, a share over 100, a disk that appeared during the
+    /// pass being reported from a baseline it never had, and a counter that went back being
+    /// reported as a huge busy time.
+    #[test]
+    fn the_busy_time_of_a_pass_is_the_change_of_each_counter_over_its_wall_time() {
+        let map = |pairs: &[(&str, u64)]| -> BTreeMap<String, u64> {
+            pairs.iter().map(|(d, ms)| ((*d).to_owned(), *ms)).collect()
+        };
+        let before = map(&[("sda", 1_000), ("sdb", 5), ("sdd", 900)]);
+        let after = map(&[("sda", 1_500), ("sdb", 5), ("sdc", 9), ("sdd", 100)]);
+        let over = disk_busy_over(&before, &after, 2_000_000);
+        assert_eq!(over.keys().collect::<Vec<_>>(), ["sda", "sdb", "sdd"]);
+        assert_eq!((over["sda"].busy_ms, over["sda"].util_pct), (500, 25.0));
+        assert_eq!((over["sdb"].busy_ms, over["sdb"].util_pct), (0, 0.0));
+        assert_eq!((over["sdd"].busy_ms, over["sdd"].util_pct), (0, 0.0));
+
+        let saturated = disk_busy_over(&before, &map(&[("sda", 9_000)]), 2_000_000);
+        assert_eq!(
+            (saturated["sda"].busy_ms, saturated["sda"].util_pct),
+            (8_000, 100.0)
+        );
+        let instant = disk_busy_over(&before, &map(&[("sda", 1_005)]), 0);
+        assert_eq!(instant["sda"].util_pct, 100.0);
     }
 
     /// Catches text that is not `/proc` being read as zero: each parser says no.

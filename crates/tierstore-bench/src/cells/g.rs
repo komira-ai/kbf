@@ -435,6 +435,7 @@ fn arm(
             )]))
         })),
         faulted: false,
+        proxy: None,
         notes,
     }
 }
