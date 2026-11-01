@@ -1149,6 +1149,98 @@ mod tests {
         assert!(!alone.contains("instance against direct-mp"), "{alone}");
     }
 
+    /// The cold-put results of `instance-4kib-c1-healthy` and `direct-mp-4kib-c1-healthy`, each
+    /// of the run and attempt given, with samples.
+    fn two_arms(instance: (&str, u32), floor: (&str, u32)) -> String {
+        let quiet = |arm: &str, (run, attempt): (&str, u32)| {
+            let mut r = result(
+                arm,
+                vec![
+                    pass(0, Window::Quiet, 3, None),
+                    pass(1, Window::Quiet, 3, None),
+                ],
+                &[],
+            );
+            r.provenance.run_id = run.to_owned();
+            r.provenance.attempt = attempt;
+            r
+        };
+        let on = |rows: Rows, attempt: u32| -> Rows {
+            rows.into_iter()
+                .map(|((c, a, _, p), v)| ((c, a, attempt, p), v))
+                .collect()
+        };
+        let data = merged(vec![
+            on(
+                rows("direct-mp-4kib-c1-healthy", 1, &[1000, 2000, 3000], "200"),
+                floor.1,
+            ),
+            on(
+                rows("instance-4kib-c1-healthy", 1, &[3000, 4000, 5000], "200"),
+                instance.1,
+            ),
+        ]);
+        let results = [
+            quiet("direct-mp-4kib-c1-healthy", floor),
+            quiet("instance-4kib-c1-healthy", instance),
+        ];
+        format_report(&results, &data)
+    }
+
+    /// Catches an instance arm and a direct-mp arm of two runs (the direct arms run alone with
+    /// `--arms`) going unpaired, or paired without saying so: the same attempt pairs them across
+    /// result files and the report says the arms came from two runs, not interleaved; arms of
+    /// one run carry no such note.
+    #[test]
+    fn arms_of_two_runs_with_one_attempt_are_paired_and_the_report_says_so() {
+        let text = two_arms(("run-I", 1), ("run-D", 1));
+        assert!(
+            text.contains("### cold-put: instance against direct-mp"),
+            "{text}"
+        );
+        assert!(
+            text.contains("came from two runs (run-D and run-I), not interleaved"),
+            "{text}"
+        );
+        let one = two_arms(("run-I", 1), ("run-I", 1));
+        assert!(
+            one.contains("### cold-put: instance against direct-mp"),
+            "{one}"
+        );
+        assert!(!one.contains("two runs"), "{one}");
+    }
+
+    /// Catches arms of two attempts being paired: a different attempt is not a partner, and no
+    /// comparison and no note are made.
+    #[test]
+    fn arms_of_two_attempts_are_not_paired() {
+        let text = two_arms(("run-I", 2), ("run-D", 1));
+        assert!(!text.contains("instance against direct-mp"), "{text}");
+        assert!(!text.contains("two runs"), "{text}");
+    }
+
+    /// Catches a filtered run going unsaid: the report names the families a run was restricted
+    /// to, once per run.
+    #[test]
+    fn the_arms_filter_of_a_run_is_printed() {
+        let mut r = result(
+            "direct-4kib-c1-healthy",
+            vec![pass(1, Window::Quiet, 3, None)],
+            &[],
+        );
+        r.provenance.arms_filter = Some(vec!["direct".to_owned(), "direct-mp".to_owned()]);
+        let text = format_report(&[r], &Rows::new());
+        assert!(
+            text.contains("- run run-7 ran only the arms: direct, direct-mp"),
+            "{text}"
+        );
+        let all = format_report(
+            &[result("a", vec![pass(1, Window::Quiet, 3, None)], &[])],
+            &Rows::new(),
+        );
+        assert!(!all.contains("ran only"), "{all}");
+    }
+
     /// Catches the requests the proxy forwarded being left out of the report, summed over the
     /// warm-up pass, or not divided by the requests of the arm: the measured passes' counts by
     /// method, per request, those during the pass and those during its cleanup hook apart.

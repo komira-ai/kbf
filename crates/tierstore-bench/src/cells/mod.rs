@@ -57,6 +57,7 @@ pub mod b;
 pub mod budget;
 pub mod c;
 pub mod cold_put;
+pub mod armfilter;
 pub mod cold_read;
 pub mod coldguard;
 pub mod content;

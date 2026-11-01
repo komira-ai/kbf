@@ -37,6 +37,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
+use crate::cells::armfilter;
 use crate::cells::budget::{Ledger, Throttle};
 use crate::cells::coldguard::{ColdGuard, Traffic};
 use crate::cells::stats;
@@ -825,6 +826,7 @@ pub async fn run_cell(
     passes: u32,
     cleanup: Option<Hook>,
 ) -> Result<Vec<CellResult>, BenchError> {
+    let arms = armfilter::select(cell, arms, env.provenance.arms_filter.as_deref())?;
     env.refuse_existing(cell, &arms)?;
     let (worst_pass, cell_total) = admission_cost(&arms, passes);
     env.admit(worst_pass, cell_total)?;
@@ -990,13 +992,7 @@ async fn run_pass(
     // has its trip and the run ends with it. The foreign requests are judged only where every
     // request of the pass was the bench's to the cold role: an instance's own copies to the cold
     // store, and the requests of an arm through the fault proxy, are not told apart from others.
-    let traffic = if !driven.steps.iter().all(|s| s.role == Role::Cold) {
-        Traffic::Instance
-    } else if arm.faulted {
-        Traffic::Faulted
-    } else {
-        Traffic::Own
-    };
+    let traffic = Traffic::of(arm.faulted, driven.steps.iter().map(|s| s.role));
     let (cold_window, window_trip) = if driven.trip.is_none() && driven.cold_trip.is_none() {
         env.close_window(traffic).await
     } else {

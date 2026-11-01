@@ -320,3 +320,23 @@ async fn a_hung_cold_store_trips_the_backstop_and_reads_no_counter_after_it() {
     assert_eq!(meter.reads(), 1);
     assert_eq!(written(dir.path()).passes[0].cold_window, None);
 }
+
+/// Catches a pass to the hot store being treated as an instance pass: the hot store is the
+/// farm's own, nothing sent to it reaches the cold store, so the pass is the harness's own and
+/// foreign load in its window is judged and stops the run.
+#[tokio::test(start_paused = true)]
+async fn a_pass_to_the_hot_store_is_judged() {
+    let dir = temp("tb-window-hot");
+    let meter = MeterScript::of(vec![counter(1_000), counter(1_540)]);
+    let (env, log) = env(dir.path(), meter);
+    let err = run_cell(
+        &env,
+        CellId::ColdPut,
+        vec![arm(&log, 40, Role::Hot, 20_000, false)],
+        2,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("foreign_requests is 500"), "{err}");
+}

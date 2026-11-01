@@ -69,6 +69,7 @@ use tokio::time::Instant;
 use crate::cells::stats;
 use crate::coldstate::ColdReading;
 use crate::result::{ColdState, ColdTrip, ColdWindow};
+use crate::role::Role;
 
 /// Fewer requests than this in the window and the guard does not judge.
 pub const MIN_REQUESTS: usize = 20;
@@ -122,6 +123,27 @@ pub enum Traffic {
     /// The pass sent requests to the instance (or another role), which copies to the cold store
     /// on its own, for a time the harness does not read.
     Instance,
+    /// The pass sent requests to a role the guard cannot attribute (the fault proxy, a test
+    /// silo, the generator): kept unjudged, one window, with its own reason.
+    Other,
+}
+
+impl Traffic {
+    /// The traffic of a pass that sent requests to `roles`, through the fault proxy if
+    /// `faulted`. Cold requests are the harness's own. So are requests to the hot store: it is
+    /// the farm's own object store, a bucket of its own, and nothing the bench sends to it is
+    /// written to the cold store. Any request to the instance makes it `Instance`, which wins.
+    #[must_use]
+    pub fn of(faulted: bool, roles: impl IntoIterator<Item = Role>) -> Self {
+        let all_cold = roles.into_iter().all(|role| role == Role::Cold);
+        if !all_cold {
+            Self::Instance
+        } else if faulted {
+            Self::Faulted
+        } else {
+            Self::Own
+        }
+    }
 }
 
 /// What was read at one end of a window.
@@ -843,5 +865,68 @@ mod tests {
             let window = window.unwrap();
             assert_eq!((window.judged, window.unjudged_reason), (true, None));
         }
+    }
+
+    /// Catches a pass to the hot store only latching the instance rule (and saying "instance
+    /// copies" of a pass that had none): the hot store is the farm's own, nothing sent to it is
+    /// written to the cold store, so cold and hot requests are the harness's own, any request to
+    /// the instance is instance traffic, and a role the guard cannot attribute is its own kind.
+    #[test]
+    fn the_traffic_of_a_pass_is_told_by_the_roles_it_sent_to() {
+        assert_eq!(Traffic::of(false, [Role::Cold]), Traffic::Own);
+        assert_eq!(Traffic::of(false, [Role::Hot]), Traffic::Own);
+        assert_eq!(Traffic::of(false, [Role::Hot, Role::Cold]), Traffic::Own);
+        assert_eq!(Traffic::of(false, []), Traffic::Own);
+        assert_eq!(Traffic::of(false, [Role::Instance]), Traffic::Instance);
+        assert_eq!(
+            Traffic::of(false, [Role::Cold, Role::Instance]),
+            Traffic::Instance
+        );
+        assert_eq!(Traffic::of(true, [Role::Instance]), Traffic::Instance);
+        assert_eq!(Traffic::of(true, [Role::Cold]), Traffic::Faulted);
+        assert_eq!(Traffic::of(false, [Role::Proxy]), Traffic::Other);
+        assert_eq!(
+            Traffic::of(false, [Role::Cold, Role::TestSilo]),
+            Traffic::Other
+        );
+        assert_eq!(Traffic::of(false, [Role::Generator]), Traffic::Other);
+    }
+
+    /// Catches hot-store passes being unjudged for the rest of the run: after one, a direct pass
+    /// is judged and trips on foreign load.
+    #[test]
+    fn a_pass_to_the_hot_store_does_not_latch_the_instance_rule() {
+        let mut guard = opened(ColdGuardLimits::default());
+        let hot = Traffic::of(false, [Role::Hot]);
+        let (window, trip) = guard.close(read(1_000), 500, hot);
+        assert_eq!(trip, None);
+        let window = window.unwrap();
+        assert_eq!((window.judged, window.unjudged_reason), (true, None));
+        let (window, trip) = guard.close(read(1_500), 500, Traffic::Own);
+        assert!(window.unwrap().judged);
+        assert_eq!(trip.unwrap().metric, "foreign_requests");
+    }
+
+    /// Catches a pass to a role the guard cannot attribute being judged, or being called an
+    /// instance pass: its window and the next are recorded and not judged, with a reason that
+    /// names the role, and the rule does not latch for the run.
+    #[test]
+    fn a_pass_to_an_unattributable_role_is_unjudged_for_one_window_with_its_own_reason() {
+        let mut guard = opened(ColdGuardLimits::default());
+        let (first, trip) = guard.close(read(1_500), 500, Traffic::Other);
+        assert_eq!(trip, None);
+        let first = first.unwrap();
+        assert!(!first.judged);
+        let reason = first.unjudged_reason.unwrap();
+        assert!(
+            reason.contains("role the guard cannot attribute"),
+            "{reason}"
+        );
+        assert!(!reason.contains("instance"), "{reason}");
+        let (second, _) = guard.close(read(2_000), 500, Traffic::Own);
+        assert!(!second.unwrap().judged);
+        let (third, trip) = guard.close(read(2_500), 500, Traffic::Own);
+        assert!(third.unwrap().judged);
+        assert_eq!(trip.unwrap().metric, "foreign_requests");
     }
 }

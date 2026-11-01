@@ -125,6 +125,10 @@ pub struct Provenance {
     /// set off). A result written before the field existed was a run with them on.
     #[serde(default = "open_loop_on")]
     pub open_loop: bool,
+    /// The arm families the run was restricted to (`run --arms`), in the order given; absent for
+    /// a run of every arm, and in a result written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arms_filter: Option<Vec<String>>,
 }
 
 /// The open-loop setting of a result that does not name one.
@@ -150,6 +154,7 @@ impl Provenance {
             hardware: BTreeMap::new(),
             attempt: first_attempt(),
             open_loop: open_loop_on(),
+            arms_filter: None,
         }
     }
 }
@@ -513,6 +518,7 @@ mod tests {
             )]),
             attempt: 2,
             open_loop: true,
+            arms_filter: Some(vec!["direct".to_owned(), "direct-mp".to_owned()]),
         }
     }
 
@@ -643,6 +649,10 @@ mod tests {
         v.as_object_mut().unwrap().remove("cold_state");
         v.as_object_mut().unwrap().remove("rate_caps");
         v["provenance"].as_object_mut().unwrap().remove("attempt");
+        v["provenance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("arms_filter");
         for pass in v["passes"].as_array_mut().unwrap() {
             for field in [
                 "cold_guard",
@@ -666,6 +676,7 @@ mod tests {
             (true, true, 0)
         );
         assert_eq!(old.provenance.attempt, 1);
+        assert_eq!(old.provenance.arms_filter, None);
         assert_eq!(old.passes[0].cold_guard, None);
         assert_eq!(old.passes[0].cold_window, None);
     }
