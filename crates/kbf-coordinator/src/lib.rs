@@ -37,6 +37,7 @@ pub mod fleet;
 pub mod http;
 pub mod identity;
 pub mod listen;
+pub mod membership;
 pub mod ops;
 pub mod reconcile;
 pub mod service;
@@ -74,6 +75,8 @@ mod http_tests;
 mod kbf_definition_tests;
 #[cfg(test)]
 mod kbf_review_tests;
+#[cfg(test)]
+mod membership_tests;
 #[cfg(test)]
 mod ops_tests;
 #[cfg(test)]
