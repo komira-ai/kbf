@@ -1,9 +1,10 @@
-//! What the farm on the js core learns from the runs it hears of (`--usage-profiles record`):
-//! the hub of `js-usage` over this server's state store, fed from the heartbeats and the
-//! results the farm takes, after the core has let go of its lock.
+//! What the farm on the js core learns from the runs it hears of (`--usage-profiles record`
+//! and `on`): the hub of `js-usage` over this server's state store, fed from the heartbeats and
+//! the results the farm takes, after the core has let go of its lock.
 //!
-//! The farm tells the hub three things, and nothing here changes where work goes (the curves
-//! are not given to the core):
+//! The farm tells the hub three things. What it learns changes where work goes only under `on`,
+//! which gives the core the curves ([`Usage::curves`], read by
+//! [`farm_config`](crate::farm_js::open::farm_config)); `record` learns and gives the core none:
 //!
 //! - **a profile name for each action** ([`Usage::note_action`]): when an operation is
 //!   submitted or taken up from the store, the estimator's key of its action, as the profile
@@ -46,8 +47,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use js_usage::{
-    AcceptedResult, Beat, BeatLoad, FLUSH_EVERY_MINUTES, Finish, Limits, LoadIn, ProfileError,
-    TRACK_IDLE_MINUTES, UsageCounters, UsageHub, UsageSink,
+    AcceptedResult, Beat, BeatLoad, FLUSH_EVERY_MINUTES, Finish, Limits, LoadIn, ProfileCurves,
+    ProfileError, TRACK_IDLE_MINUTES, UsageCounters, UsageHub, UsageSink,
 };
 use kbf_state::Store;
 use kbf_types::sched::usage::NodeLoad;
@@ -481,6 +482,12 @@ impl Usage {
             results_held: self.results_held.load(Ordering::Relaxed),
             results_dropped: self.results_dropped.load(Ordering::Relaxed),
         }
+    }
+
+    /// The curves the scheduler reads, which this usage side keeps current as runs end. Every
+    /// call gives the same source.
+    pub(crate) fn curves(&self) -> Arc<ProfileCurves> {
+        self.sink.curves()
     }
 
     /// The profile store's sink.

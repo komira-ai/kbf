@@ -193,12 +193,17 @@ struct Opening<'a> {
 }
 
 impl Opening<'_> {
+    /// The core's configuration. Under `--usage-profiles on` it carries the curves of this
+    /// opening's usage side, the one the farm keeps ([`JsFarm::rebuild`] and
+    /// [`JsFarm::keep_in`] open the usage side once and give the same one to the core and to the
+    /// farm), so the core reads what the farm feeds.
     fn config(&self) -> js_server_core::Config {
         open::farm_config(
             self.term,
             self.unservable_wait,
             self.finished_retention,
             self.settings,
+            self.usage.as_deref(),
         )
     }
 
