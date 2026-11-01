@@ -194,6 +194,12 @@ impl From<RegistryError> for Failure {
             RegistryError::InUse => {
                 Self::new(S::CONFLICT, "in_use", "a binding uses this connection")
             }
+            RegistryError::NotBound => Self::new(
+                S::CONFLICT,
+                "not_bound",
+                "the role cold is not bound to this connection: only the bound connection \
+                 can be re-pointed",
+            ),
             RegistryError::IdentityChange => Self::new(
                 S::CONFLICT,
                 "identity_change",

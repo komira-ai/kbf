@@ -499,6 +499,7 @@ fn rows_under_odd_keys_or_codes_are_corrupt_not_skipped() {
             subject: "x".into(),
             outcome,
             generation: 1,
+            detail: String::new(),
         }
         .encode_to_vec()
     };

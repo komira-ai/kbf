@@ -133,6 +133,7 @@ fn a_binding_body_and_the_answers_round_trip() {
         subject: "c1".to_owned(),
         outcome: AuditOutcome::Unchanged,
         generation: 4,
+        detail: None,
     };
     let text = serde_json::to_string(&entry).unwrap();
     assert_eq!(

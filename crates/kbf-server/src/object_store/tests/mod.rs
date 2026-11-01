@@ -4,6 +4,7 @@
 mod crash;
 mod files;
 mod leaks;
+mod repoint;
 mod rules;
 mod view;
 

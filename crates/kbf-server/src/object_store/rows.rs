@@ -85,6 +85,9 @@ pub(super) struct AuditRow {
     pub outcome: i32,
     #[prost(uint64, tag = "5")]
     pub generation: u64,
+    /// What the action changed, when its subject does not say (a repoint); empty if not.
+    #[prost(string, tag = "6")]
+    pub detail: String,
 }
 
 pub(super) fn action_code(action: AuditAction) -> i32 {
@@ -93,6 +96,7 @@ pub(super) fn action_code(action: AuditAction) -> i32 {
         AuditAction::DeleteConnection => 2,
         AuditAction::PutBinding => 3,
         AuditAction::DeleteBinding => 4,
+        AuditAction::Repoint => 5,
     }
 }
 
@@ -102,6 +106,7 @@ pub(super) fn action_of(code: i32) -> Result<AuditAction, RegistryError> {
         2 => AuditAction::DeleteConnection,
         3 => AuditAction::PutBinding,
         4 => AuditAction::DeleteBinding,
+        5 => AuditAction::Repoint,
         _ => return Err(RegistryError::Corrupt("audit")),
     })
 }

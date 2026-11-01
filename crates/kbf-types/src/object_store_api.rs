@@ -318,6 +318,8 @@ pub enum AuditAction {
     PutBinding,
     /// `DELETE /bindings/{role}`.
     DeleteBinding,
+    /// `POST /connections/{name}:repoint`.
+    Repoint,
 }
 
 /// How a mutation ended.
@@ -350,6 +352,10 @@ pub struct AuditEntry {
     pub outcome: AuditOutcome,
     /// The registry generation after the call.
     pub generation: u64,
+    /// What the call changed, when the action says more than its subject does (a
+    /// repoint: the old and the new store identity). Absent for the other actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// `POST .../connections/{name}:verify`: the probe, with nothing changed.
@@ -372,6 +378,61 @@ pub struct BindingPutAnswer {
     pub changed: bool,
     /// The probe of the bucket, when one ran.
     pub verified: Option<Verified>,
+}
+
+/// Which store a binding names: the endpoint of its connection, its bucket and its prefix.
+/// Nodes that run on the registration compare it with their own store, so a change of it
+/// moves them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreIdentity {
+    /// `http://host[:port]`.
+    pub endpoint: String,
+    /// The bucket.
+    pub bucket: String,
+    /// The key prefix; empty for none.
+    pub prefix: String,
+}
+
+impl fmt::Display for StoreIdentity {
+    /// `endpoint bucket/prefix`, as the audit log's detail spells it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}/{}", self.endpoint, self.bucket, self.prefix)
+    }
+}
+
+/// `POST /v1/object-stores/connections/{name}:repoint`: move the store the `cold` binding
+/// names, on purpose. There is no `verify` field: a repoint is always probed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepointRequest {
+    /// The new endpoint, `http://host[:port]`.
+    pub endpoint: String,
+    /// The new bucket; the binding's current one when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    /// The new key prefix; the binding's current one when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// The generation the operator last read: required, and the call is refused if the
+    /// registry has moved on.
+    pub expect_generation: u64,
+}
+
+/// The answer to a repoint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepointAnswer {
+    /// The connection.
+    pub name: ConnectionName,
+    /// The registry generation after the call (unchanged when `changed` is false).
+    pub generation: u64,
+    /// Whether the identity changed; a repoint to the current one changes nothing.
+    pub changed: bool,
+    /// The identity before the call.
+    pub from: StoreIdentity,
+    /// The identity after it.
+    pub to: StoreIdentity,
+    /// The probe of the new store.
+    pub verified: Verified,
 }
 
 /// The answer to a DELETE.

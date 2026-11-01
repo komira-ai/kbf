@@ -10,5 +10,6 @@ mod connections;
 mod gate;
 mod harness;
 mod leaks;
+mod repoint;
 mod status;
 mod verify;
