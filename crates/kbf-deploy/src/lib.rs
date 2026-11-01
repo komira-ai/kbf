@@ -38,6 +38,7 @@
 pub mod cli;
 pub mod config;
 pub mod host;
+pub mod host_status;
 pub mod https;
 pub mod linux;
 pub mod log;
