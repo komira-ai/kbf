@@ -1,7 +1,7 @@
 # Storage after `kbf storage-and-daemon`: what tierstore replaces
 
-Status: DESIGN, for the maintainers and the kbf storage owner. Nothing here is built. Co-owned: the questions in
-section 8 are the storage owner's to answer before any step of section 6 starts.
+Status: DESIGN, for the maintainers and the kbf storage owner. Nothing here is built. The storage owner reviewed the first
+version against the code; their answers are folded into the facts, and section 8 lists only what is still open.
 
 Every claim is tagged. **[code]** names the file and function (kbf paths are in this repository at the commit this
 branch starts from; tierstore paths are in the tierstore repository at its main). **[proposed]** is a suggestion that
@@ -55,9 +55,33 @@ the work moves in the longer term, and it is listed as an option, not as part of
   `--hot-store-max-bytes`. [code: `stores.rs` `HOT_STORE_SHARE_PERCENT`]
 - **Key layout.** Segment keys are `<prefix><log id>/cas/<epoch>/<seq>` for a node that names its objects by a
   writer epoch of its log, and `<root>cas/<member>/<boot>/<seq>` (no log id; `<root>` is the prefix without the log
-  id) for a node registered with a frontend, which is the farm shape. Both layouts are read. [code:
-  `crates/kbf-server/src/storage_node.rs` module docs "Object names"; `docs/design/storage.md` "Writes"] A prefix of
-  the form `<name>/<log id>/...` therefore describes the unregistered naming; see question Q1.
+  id) for a node registered with a frontend, which is the farm shape; member, boot and sequence are 16 hex digits.
+  Both layouts are written by `ObjectKeys::key` and read by `ObjectKeys::object`; the daemon `Segments` path allocates
+  keys through the same `ObjectKeys`. [code: `crates/kbf-front/src/cache/write_group.rs` `ObjectKeys::key`,
+  `ObjectKeys::object`, `Writer::allocate`, `object_key`; `crates/kbf-server/src/storage_node.rs` module docs "Object
+  names"] A prefix of the form `<name>/<log id>/...` therefore describes the unregistered naming only. Pack keys
+  (`cas/d|f|b|l/...`) are a separate family [code: `crates/kbf-pack/src/keys.rs`]. What the production bucket actually
+  holds is not in the code: it needs a listing (decision 4).
+- **Both owners write cold today.** `Plan::Primary` stores a blob locally and at the replica
+  (`crates/kbf-storage/src/replicate/chain.rs`), and each owner seals its own segment and calls `put_new(key, body,
+  None)` under its own key (`write_group.rs`). `OneFlusher` exists (`crates/kbf-storage/src/flush/mod.rs`), but a
+  registered node is given `FlushesAll`, true for every digest, and the code says `OneFlusher` is not installed [code:
+  `crates/kbf-server/src/storage_node.rs` (the flush gate chosen near line 717), `crates/kbf-server/src/fill.rs`]. So
+  the cold store already receives each blob from both owners. `docs/design/architecture-v2.md` section 8 ("One
+  flusher") describes the intended rule, not the running one.
+- **The cold store is also listed continuously.** Besides the rebuild, a standing tail (`Cache::tail_pass`, run from
+  `fill.rs`) lists `<root>cas/` on every pass and adopts other members' objects; it skips the old
+  `<root><log id>/cas/` prefix. [code: `crates/kbf-front/src/cache/tail.rs`, `crates/kbf-server/src/fill.rs`]
+- **No retention on the segment path.** Segments are written with `put_new(..., None)` and `put_stream`, neither with
+  a retention date; the only pass-throughs of `retain_until` are the history store's, and its writers pass `None`. A
+  store without Object Lock must refuse a date (`FsStore` does). [code: `write_group.rs`, `cache/direct.rs`,
+  `cache/flush.rs`, `crates/kbf-history/src/scoped.rs`, `writer.rs`, `crates/kbf-objstore/src/fs_store.rs`] This is a
+  search result, not a proof of zero callers.
+- **Cold-store identity.** A `file://` cold store is `Fixed` and reports `identity_mismatch` if the frontend announces
+  a registration. An `s3://` store, tierstore included, is `Registrable`: the node fetches the registered config and
+  requires `same_store` (endpoint, bucket and prefix equal). On a mismatch it keeps its flag store and reports
+  `identity_mismatch`, or errors if it has no key pair; "the registration supplies keys, never a different store".
+  [code: `crates/kbf-server/src/cold_apply.rs`, `storage_node.rs`, `storage_half.rs`]
 - `S3Store` is `objstore_s3` re-exported: the same client crate that tierstore uses for its own S3 tiers. [code:
   `crates/kbf-objstore/src/lib.rs` `pub use objstore_s3`; tierstore `crates/objstore-s3/src/lib.rs`]
 
@@ -74,7 +98,7 @@ the work moves in the longer term, and it is listed as an option, not as part of
 - **Digest checks.** On write, every blob is hashed against the digest the client sent before it is packed
   (`VerifiedBlob`). On read, `Cache::read_blob` fetches the blob's exact range and checks its SHA-256; a failure marks
   the object `Corrupt` and the read fails UNAVAILABLE, never serving the bytes; a missing object or range marks it
-  `Missing`. The flusher re-hashes every record of a staged block before it writes the footer. The segment reader
+  `Missing`. The flusher re-hashes every record of a staged block before it writes the footer (with a tier, the daemon's digests are trusted at acknowledgement; with none, `PutRange` hashes on receipt and `Commit` refuses an unhashed record). The segment reader
   checks length, CRC-32C and SHA-256. Three answers (`Present`, `Unavailable`, `Absent`) keep "could not read" from
   becoming "does not exist". [code: `crates/kbf-front/src/cache/read.rs`, `cache/flush.rs`, `crates/kbf-segments`,
   `docs/design/storage.md` "Three answers, not two"]
@@ -87,15 +111,14 @@ the work moves in the longer term, and it is listed as an option, not as part of
 | Caller | Calls | Protocol | Code |
 |---|---|---|---|
 | Frontend (clients' REAPI traffic, Execute's input check) | `FindMissingBlobs`, `ByteStream.Read` and `Write`, `kbf.storage.v1.ActionStore` `Get`, `Prepare`, `Commit` | gRPC over mutual TLS; the certificate's role (`urn:kbf:role:<name>`) is checked per endpoint; every call carries the map generation, `STALE_MAP` on a stale one | `crates/kbf-storage/src/service/mod.rs`, `admission.rs`; `crates/kbf-peer` |
-| Daemon (input fetch, output upload) | `ByteStream.Read`, `FindMissingBlobs`, `kbf.worker.v1.Segments` `Begin`, `PutRange`, `Commit` to the owners the map names; in-process calls (`InProcess`) on `storage-and-daemon` | the same gRPC; in process with no socket on the combined node | `crates/kbf-transfer`, `crates/kbf-route`, `crates/kbf-storage/src/service/in_process.rs` |
+| Daemon (input fetch, output upload) | `ByteStream.Read`, `FindMissingBlobs` to the owners the map names; in-process calls (`InProcess`) on `storage-and-daemon`. The storage service serves `kbf.worker.v1.Segments` (`Begin`, `PutRange`, `Commit`), but the routed client has no segment upload yet, so a remote daemon's outputs do not use it today | the same gRPC; in process with no socket on the combined node, which uses the cache's own path | `crates/kbf-transfer/src/routed.rs`, `crates/kbf-route`, `crates/kbf-storage/src/service/in_process.rs`, `segments.rs` |
 | Peer storage nodes | chain replication of a write to the second owner; read repair; repair journal | gRPC over mutual TLS | `crates/kbf-storage/src/replicate`, `repair` |
 | Frontend (registration) | map, membership, deny list, cold-store registration (`ColdStore/GetStoreConfig`) | gRPC on the worker listener | `docs/design/architecture-v2.md` section 6 |
 | Tasks (job-read path) | `GET /locate`, reads of large blobs under `cas/l/<hex>` in tierstore with a signed read grant | HTTP, S3 GET with `x-tierstore-grant` | `crates/kbf-task/src/locate.rs`, `crates/kbf-front/src/job_read/locate.rs`, `large_backfill.rs` |
 
 Placement is rendezvous hashing over the digest and the members, the top R (two) being the owners; the primary
-forwards a write to the replica and acknowledges when both hold it on the hot tier; the rank-1 owner alone flushes
-(`OneFlusher`). [code: `docs/design/architecture-v2.md` section 8 and `crates/kbf-storage/src/flush`,
-`replicate/chain.rs`] No client other than another storage node ever reads the cold store directly, except the packs
+forwards a write to the replica and acknowledges when both hold it on the hot tier; both owners flush (section 2.2).
+[code: `crates/kbf-storage/src/replicate/chain.rs`, `crates/kbf-server/src/fill.rs`] No client other than another storage node ever reads the cold store directly, except the packs
 below.
 
 ### 2.5 The pack path already uses an S3 bucket and tierstore
@@ -155,21 +178,21 @@ nodes flushed, in place, without copying or deleting anything. Pack keys are `ca
 
 | Storage function today | After | Notes |
 |---|---|---|
-| Cold store (`S3Store` to the bucket) | **tierstore** | `--cold-store s3://<bucket>/<prefix>?endpoint=<tierstore>` [proposed]. Same client crate on both sides [code]. |
-| Write tier: staged blocks, `fdatasync` ack | **tierstore hot tier** (shape B) or stacked above it (shape A) | Section 5. Not a one-for-one swap: see durability, section 5.2. |
-| Flusher: seal, multipart PUT, footer read-back, `ObjectFlushed` | **tierstore reconciler** copies hot to cold; kbf keeps the footer read-back | With no write tier, kbf writes a segment with `put_new` or `put_stream` and reads the footer back [code: `docs/design/storage.md` Writes step 4]. `ObjectFlushed` and the staged table become unused on that node. |
-| Re-hash of every record at flush | **stays in kbf** | tierstore does not hash a storage node's objects. Without the tier the hash happens at ingress (`VerifiedBlob`) and at read; see section 5.3. |
-| Flushed-copy read cache on the hot disk | **tierstore hot tier** (promotion) | Whole-object promotion; amplification, section 5.4. |
+| Cold store (`S3Store` to the bucket) | **tierstore** | `--cold-store s3://<bucket>/<prefix>?endpoint=<tierstore>` [proposed]. Same client crate on both sides [code]. An `s3://` store is `Registrable`; a different endpoint is a permanent `identity_mismatch` (section 2.2, 5.7). |
+| Write tier: staged blocks, `fdatasync` ack | **tierstore hot tier** (shape B) or stacked above it (shape A) | Section 5. |
+| Flusher: seal, multipart PUT, footer read-back, `ObjectFlushed` | **tierstore reconciler** copies hot to cold; kbf keeps the footer read-back | With no write tier, kbf writes a segment with `put_new` or `put_stream` and reads the footer back [code: `docs/design/storage.md` Writes step 4]. `ObjectFlushed` and the staged table are unused on that node. Both owners already flush today (section 2.2), so this does not change who writes cold. |
+| Re-hash of every record at flush | **moves to receive time** | With no tier, `PutRange` hashes SHA-256 and CRC-32C on receipt and `Commit` refuses an unhashed record; a segment the tier did not take is hashed before the PUT. Stronger than the flush-time check, which is there because with a tier the daemon's digests are trusted at acknowledgement. Cost: ingress CPU, unmeasured. [code: `crates/kbf-front/src/segments.rs`, `cache/upload.rs`, `cache/flush.rs`] |
+| Flushed-copy read cache on the hot disk | **tierstore hot tier** (promotion) | Whole-object promotion; amplification, 5.4. |
 | Hot-store eviction | **tierstore water marks** | `file://` eviction in `evict.rs` is unrelated and stays. |
-| Cold `list`, rebuild by footers | stays in kbf, served by tierstore's listing | Must pass the conformance suite, section 6, step 0. |
-| `may_hold`, `get_range` exactness | stays in kbf; tierstore must satisfy | `S3Store` refuses a ranged read not answered with the exact range [code: `storage.md` S3Store]. |
+| Rebuild by footers and the standing tail | stays in kbf, listing whatever `--cold-store` is | Both list the endpoint, under `keys.root` (rebuild) and `<root>cas/` (tail, every pass). tierstore's list cost and what its listing covers decide this row, 5.8. |
+| `may_hold`, `get_range` exactness | stays in kbf; tierstore must satisfy | `S3Store` refuses a ranged read not answered with the exact range. |
 | CAS index, action cache, closure check, `Touch`, retention, three answers | **stays in kbf** | No S3 shape. |
-| Raft metadata log on the hot disk | **stays in kbf** | Today it lives in `<hot store>/meta` when the hot store is a directory; with no hot store it needs `--meta-dir` [code: `stores.rs`]. |
+| Raft metadata log on the hot disk | **stays in kbf** | Lives in `<hot store>/meta` when the hot store is a directory; with no hot store it needs `--meta-dir` [code: `stores.rs`]. |
 | Map, HRW placement, chain replication, repair, handoff, read repair | **stays in kbf** | Node-level replication, which tierstore does not do. |
 | Peers and mutual TLS roles, deny list | **stays in kbf** | tierstore has no mTLS; node to local tierstore is loopback with a key. |
 | Collection of dead segments | **new, in kbf, through tierstore's GC key** | Nothing exists today (section 2.3). |
-| Cold-store registration (`ColdStore/GetStoreConfig`) | **question** | One farm-wide store identity vs a node-local endpoint, Q4. |
-| Object Lock retention (`put_new(retain_until)`) | **dropped on this store** | tierstore documents no Object Lock; a store without it must refuse a retention date, so no caller may pass one. Q5. |
+| Cold-store registration | **stays; a node-local endpoint opts out of it** | 5.7. |
+| Object Lock retention | **not needed** | The segment path passes no date (section 2.2). |
 | Packs, `cas/l/`, task grants | **same tierstore, other prefixes** | No change to their code. |
 
 ## 5. Proposal
@@ -178,34 +201,40 @@ nodes flushed, in place, without copying or deleting anything. Pack keys are `ca
 
 - **Shape A: tierstore as the cold store, kbf hot store unchanged.** Per node, `tierstore` runs beside `kbf` with a
   flash `dir:` hot tier and the MinIO bucket as its cold tier; the node's `--cold-store` endpoint is the local tierstore.
-  The prefix and bucket are unchanged, so every existing segment stays readable under the same key and nothing moves.
-  A segment is written twice on flash (kbf block, then tierstore journal and object) and copied to cold once.
+  The bucket and prefix are unchanged, so every existing segment stays readable under the same key and nothing moves.
+  A segment is written twice on flash (kbf block, then tierstore journal and object) and copied to cold once per owner.
   [proposed]
 - **Shape B: tierstore as the whole tier.** As A, with `--hot-store` unset on that node: the write tier, flusher and
   staged table are not used, and a segment is written once to flash by tierstore. [proposed]
 
-Recommendation: A first, on one node, to learn whether tierstore is a correct and fast `ObjectStore` for the existing
-reads and flushes; B only when the three questions of 5.2 to 5.4 are answered with measurements. A is reversible by one
-flag; B changes what an acknowledgement means.
+Recommendation: A for a short soak on the canary node only, to learn whether tierstore is a correct and fast
+`ObjectStore` under the existing reads, listings and flushes; then B on that node, and B directly on the rest. Shape B is
+not worse than today on the two points that first looked like blockers (5.2, 5.3), so the case for staying on A is the
+double flash write, which is a cost, not a risk. A is reversible by one flag; B changes what an acknowledgement means
+and is reversible by one flag too (section 6).
 
-### 5.2 Durability before the copy (the decision B turns on)
+### 5.2 Cold bytes and durability
 
-With the kbf write tier, a write is acknowledged when **both owners** have fdatasynced it (with `--ram-ack-bytes` at 0).
-[code: `docs/design/architecture-v2.md` section 8, "Writes: chain replication"] With tierstore alone, an acknowledgement is
-**one** flash journal; the loss of that disk before the copy loses the object. [code: tierstore `limits.md`] The chain
-still sends the blob to the replica, so under B each owner would write the blob into its own segment through its own
-tierstore, and the pre-copy durability stays two nodes. The price is that the "one flusher" rule (`OneFlusher`, so the
-cold store gets one copy) is a property of the write tier; whether it holds without one is the storage owner's to say
-(Q2). If it does not, cold bytes double, and with no collector (section 2.3) the doubling is permanent.
+Cold bytes are already doubled: both owners PUT their own segment, with the write tier on (section 2.2). Shape B does not
+add to that, so the baseline it is compared with doubles too. Pre-copy durability under B: tierstore's acknowledgement is
+one flash journal, and losing that disk before the copy loses the object [code: tierstore `limits.md`]; the chain still
+sends the blob to the replica, and each owner writes it through its own tierstore, so two nodes hold it before either
+copy. What the chain's acknowledgement waits for with no write tier (each owner's segment PUT acknowledged by its
+tierstore, or only the primary's) is not read from the code here and is the one durability point that still needs the
+storage owner's confirmation (question A below). Latency: with a write tier the acknowledgement is an `fdatasync`; without
+one it is the write group's linger plus a PUT plus tierstore's journal linger (20 ms by default); put-to-ack is the
+measurement that decides whether that is acceptable (section 7). [proposed]
 
-### 5.3 Integrity stays in kbf
+### 5.3 Integrity stays in kbf, and the daemon upload check gets stronger under B
 
 tierstore checks the checksums a client sends on a write and does not hash a storage node's objects on a read or in the
 background. So the end-to-end proof is kbf's: ingress `VerifiedBlob`, and the SHA-256 of the exact range on every read,
-with `Corrupt` and `Missing` marks. No check is removed by this design. Under B the flusher's re-hash of staged records
-disappears; the equivalent is that ingress hashing already ran when the upload was accepted (the flusher's comment says
-the daemon's digests are trusted at acknowledgement and checked at flush, so the daemon-supplied `Segments` path is the
-one that loses a check; Q3).
+with `Corrupt` and `Missing` marks. No check is removed. The flusher's re-hash of staged records exists because, with a
+tier, a daemon's digests are trusted when the upload is acknowledged; with no tier, `PutRange` hashes on receipt and
+`Commit` refuses an unhashed record, so a bad digest is refused at once instead of becoming a loss mark at flush time
+(section 4). The price is hashing on the ingress path (`--cpu-threads`), to be measured (section 7). The remote daemon's
+`Segments` path is not used for outputs yet, so the check that moves today is the in-process and cache-upload path. [code:
+`crates/kbf-front/src/segments.rs`, `crates/kbf-transfer/src/routed.rs`]
 
 ### 5.4 Range reads against whole-object promotion
 
@@ -216,56 +245,88 @@ inputs sit in segments, which only a measurement can say (section 7). [proposed]
 
 ### 5.5 Garbage collection
 
-[proposed] A collector in kbf, run by the node that owns the metadata (the rank-1 flusher for its own objects): when a
-segment's every blob has been collected (the `Collect` result already returns each removed blob's location, so
-"dead space" is known [code: `docs/design/storage.md` Retention]), delete the object through a tierstore **GC key** whose
-prefix is the farm's object prefix. The GC key lists, heads and deletes and never reads a body, which fits a collector
-that decides from its own index. A delete in tierstore removes both tiers' copies. Compaction of sparse segments and the
-condemn delay stay as `docs/design/storage.md` plans them. This is new work with no code today; it does not gate the
-migration, but it gates the cold bucket staying bounded, and it needs a design of its own.
+[proposed] A collector in kbf. Collection is per node by structure: `Cache::collect` runs in one process against that
+process's single-voter metadata log, and no document states a farm-wide collector. When every blob of a segment has been
+collected (the `Collect` result returns each removed blob's location, so dead space is known [code:
+`docs/design/storage.md` Retention]), the node deletes the object through a tierstore **GC key** whose prefix is that
+node's own writer prefix (`<root>cas/<member>/`; a GC key has exactly one prefix). The GC key lists, heads and deletes and
+never reads a body. A delete in tierstore removes both tiers' copies. The trap is the standing tail: it adopts other
+members' objects into a node's index (section 2.2), so an owner that deletes a segment another node adopted leaves that
+node's locations dangling, to be marked `Missing`. The collector must either learn of adoptions or be allowed to delete
+only after a delay longer than every node's tail interval. This is new work with no code today; it does not gate the
+migration, but it gates the cold bucket staying bounded, and needs a design of its own.
 
 ### 5.6 Credentials
 
 [proposed] The node's key to its local tierstore is a **scoped key** (read and write under the farm prefix, no delete
-prefix); the collector holds the GC key; the cold tier's credential is tierstore's own (`--cold-credentials-file`) and
-leaves kbf. This narrows what a storage node holds compared with a bucket key. kbf takes the pair from `AWS_*`, which
-the configuration rules allow for provider-standard credentials. The "credential gap on `storage-and-daemon`" in
+prefix), given with `--cold-store-credentials-file` (a flag the storage owner reports as on main); the collector holds a
+GC key; the cold tier's credential is tierstore's own (`--cold-credentials-file`) and leaves kbf. This narrows what a
+storage node holds compared with a bucket key. The "credential gap on `storage-and-daemon`" in
 `docs/design/architecture-v2.md` section 9 is unchanged: the key must still be unreadable by the actions' uid.
+
+### 5.7 How a node is pointed at tierstore (registration)
+
+The farm-wide registered cold-store identity names the bucket endpoint. A node whose `--cold-store` is an `s3://` URI
+fetches that registration and requires `same_store` (endpoint, bucket and prefix equal). A node-local tierstore endpoint
+differs, so the node keeps its flag store, reports `identity_mismatch` for as long as it runs that way, and needs its own
+keys. Consequences [proposed]: (a) a migrated node is permanently reported as mismatched; whether the frontend, the
+operator API or an alert treats that as a fault has not been read and must be checked before the canary; (b) the
+registration can never be used to roll a store change across the farm, so the flag is the only switch, which is the
+rollback path anyway; (c) the alternative is one endpoint string for the whole farm that each node resolves to its own
+tierstore, which makes identities equal and hides the difference from the registration; it is not recommended, because the
+registration then vouches for a store it does not describe. Recommended: accept the mismatch on migrated nodes, and
+register the tierstore identity only if tierstore later runs as one shared endpoint.
+
+### 5.8 The standing tail and the list cost
+
+The tail lists `<root>cas/` on every pass, from every node, over the whole prefix, and nothing deletes segments (section
+2.3), so the listing only grows. Behind tierstore each pass is a tierstore list (tierstore's listing honours
+`start-after` and hides `_journal/` and `_tiering/`). Two things are not known and are tierstore's to state: whether its
+listing covers objects that are only in the hot tier, and its cost for a listing of this size. If the listing is
+cold-only, a node adopts another's objects only after they are copied, which delays the tail, and a rebuild after a
+wiped log misses the node's own uncopied objects. If it merges both, the listing is the stronger one. The pass interval
+and the list requests per second are to be measured at baseline (section 7); a list rate that tierstore cannot sustain is
+a reason to change the tail, not to avoid tierstore. [proposed]
 
 ## 6. Migration, one node at a time
 
-Preconditions: tierstore's v1 paper has shipped; the conformance and baseline of steps 0 and 1 are recorded.
+Preconditions: tierstore's v1 paper has shipped; the conformance, listing and baseline of steps 0 and 1 are recorded; the
+`identity_mismatch` question of 5.7 is answered.
 
 0. **Conformance, no farm change.** Run `kbf_objstore::conformance::run` (the `s3_conformance` example) against a
-   tierstore with a `dir:` hot tier and an `s3:` cold tier, with Object Lock off. It must pass the base contract and
-   the `conditional_put` capability, including ranged reads at the boundaries and list paging. A failure is tierstore's
-   to fix or kbf's to relax, decided before step 2. [proposed; code: `crates/kbf-objstore/src/conformance.rs`]
-1. **Baseline on today's farm.** Record input-fetch latency and cold GETs per build with nothing changed (section 7).
-   kbf has no cold GET counter today, so the baseline comes from the bucket's own request counts plus a client-side
-   timer. [proposed]
-2. **Shape A on one node (the canary).** Install tierstore on the node (its unit and update hook are its own). Point
-   that node's `--cold-store` at it, bucket and prefix unchanged. Keep `--hot-store`. Watch for a day under real
-   builds: kbf `Missing`/`Corrupt` marks (`ObjectUnreachable`), flush retries, tierstore `read_errors`, copy lag.
-3. **Gate to continue.** No new unreachable marks; flush success unchanged; baseline numbers not worse. Then the same
-   for the next node, one at a time, canary first.
-4. **Shape B on one node.** Only after Q2 and Q3 have answers and the duplicate-cold-bytes measurement is in. Unset
-   `--hot-store`, set `--meta-dir`, restart. Same watch.
+   tierstore with a `dir:` hot tier and an `s3:` cold tier. It must pass the base contract and the `conditional_put`
+   capability, including ranged reads at the boundaries and list paging. In addition, put an object only in the hot tier
+   and list: record whether the listing shows it. A failure is tierstore's to fix or kbf's to relax, decided before
+   step 2. [proposed; code: `crates/kbf-objstore/src/conformance.rs`]
+1. **Baseline on today's farm.** List the production bucket (the only way to know which key families it holds: node
+   layout, epoch layout, packs), and record input-fetch latency, cold GETs per build, cold PUT bytes per uploaded byte,
+   and tail list requests (section 7). kbf has no cold GET counter today, so the baseline comes from the bucket's own
+   request counts plus a client-side timer. [proposed]
+2. **Canary node, shape A.** Install tierstore on the node. Point the node's `--cold-store` at it, with its own key file,
+   bucket and prefix unchanged. Keep `--hot-store`. Soak: no new `ObjectUnreachable` marks, flush success unchanged, no
+   tierstore `read_errors`, tail passes completing, copy lag bounded.
+3. **Canary node, shape B.** Unset `--hot-store`, set `--meta-dir`, restart. Same watch, plus put-to-ack and ingress CPU
+   against the baseline.
+4. **The other nodes, one at a time, shape B**, each after the previous node has run a full build set clean.
 5. **Collector** (section 5.5) lands independently.
 
-**Rollback, per node.** Shape A to the old state is: stop the node's kbf, keep its tierstore running until its copy
-lag is zero, point `--cold-store` back at the bucket, start kbf. The copy lag is the trap: an object acknowledged by
-tierstore and not yet copied is absent from the bucket, and a kbf pointed at the bucket would read `Missing`, mark the
-object unreachable in its Raft log, and fail the read UNAVAILABLE until the blob is uploaded again. tierstore's drain
-gives up the lease and exits; it does not promise a finished copy. [code: `operations.md` "Drain and restart"; kbf marks
-`Missing` per `docs/design/storage.md` "Reads"] So rollback needs a way to read the copy lag, which `/metricz` does
-not export today (Section 8, to tierstore). Shape B to A: set `--hot-store` again; staged-table state starts empty. A
-node that wrote under B has no staged blocks to lose.
+**Rollback, per node.** To the old state: stop the node's kbf, keep its tierstore running until its copy lag is zero,
+point `--cold-store` back at the bucket, start kbf. The copy lag is the trap: an object tierstore acknowledged and has
+not yet copied is absent from the bucket, and a kbf pointed at the bucket would read `Missing`, mark the object
+unreachable in its Raft log, and fail the read UNAVAILABLE until the blob is uploaded again. Tierstore's drain gives up
+the lease and exits; it does not promise a finished copy. [code: tierstore `operations.md` "Drain and restart"; kbf marks
+`Missing` per `docs/design/storage.md` "Reads"] So rollback needs the copy lag, which `/metricz` does not export today.
+The standing tail adds a second, milder effect: pointed at the bucket, a node's tail sees only copied objects, so it
+adopts other members' newest objects later. Shape B back to A: set `--hot-store` again; the staged table starts empty and
+no staged block exists to lose.
 
-Mixed farm. Each node's index is its own Raft log and other nodes read a node's blobs through it, not through the
-bucket, so a farm with some nodes on tierstore and some on the bucket serves correctly. The place where nodes read each
-other's objects from the bucket is rebuild and the not-yet-built cold-store-first handoff
-(`docs/design/rebalance-handoff.md`); do not run a rebuild or a handoff while a node's tierstore holds uncopied objects.
-[proposed]
+**Mixed farm.** Each node's index is its own Raft log and other nodes read a node's blobs through the owner, not through
+the bucket, so a farm with some nodes on tierstore and some on the bucket serves correctly. The places where nodes read
+each other's objects from the cold store are the rebuild, the not-yet-built handoff (`docs/design/rebalance-handoff.md`)
+and the **standing tail, which runs on every pass**. So the rule is not "avoid rebuilds": while a node's tierstore holds
+uncopied objects, other nodes' tails (listing the bucket directly) cannot see them, and a node that rebuilds from its
+tierstore sees objects the others cannot. Neither is a loss: objects become visible when copied. Do not start a handoff
+while any tierstore has copy lag. [proposed]
 
 ## 7. Measurements this enables
 
@@ -277,56 +338,59 @@ For the tierstore paper and for the go/no-go gates:
 | Cold bytes read per blob byte served | `tierstore_bytes_read_total{tier="cold"}` over `tierstore_bytes_served_total`; shows the range amplification of 5.4 | n/a |
 | Hot hit rate | hits over reads, per tier, per node | n/a |
 | Input fetch p50 and p99 | **client side**: a histogram in `kbf-transfer` per blob or batch read (new), since neither kbf nor tierstore exports a latency histogram; `tierstore-bench` cold-read and tree-read cells for the isolated number | not measured |
-| Put-to-ack and copy lag | `tierstore-bench` cells; copy lag needs a gauge (section 8) | the flush is timed only as write-tier calls |
-| Duplicate cold bytes under B | bucket bytes written per uploaded byte, before and after | n/a |
+| Put-to-ack and copy lag | `tierstore-bench` cells; copy lag needs a gauge (section 8, item F) | the flush is timed only as write-tier calls |
+| Cold PUT bytes per uploaded byte | bucket bytes written over bytes uploaded; today about two (both owners flush), and B must not raise it | derived, not measured |
+| Ingress CPU under B | `--cpu-threads` use during uploads, before and after | n/a |
+| Tail list rate and cost | list requests per second per node and their latency at baseline and behind tierstore | n/a |
 
 Method: the same build set against the same commit, at least a cold run and a warm run per node shape, recorded with the
 bench's result JSON. [proposed]
 
-## 8. Questions
+## 8. What is still open
 
-For the kbf storage owner:
+Answered by the storage owner's review and folded into the facts above: the key layouts (2.2), that both owners flush
+(2.2), the move of the digest check to receive time (4, 5.3), that `Fixed` is `file://` only and a tierstore store is
+`Registrable` (2.2, 5.7), that the segment path passes no retention (2.2), what rebuild and the tail list (2.2, 5.8), and
+that collection is per node by structure (5.5).
 
-- **Q1.** The farm shape names objects `<root>cas/<member>/<boot>/<seq>` with no log id; the form
-  `<prefix>/<log id>/...` is the unregistered one. Which does the farm's bucket hold, and is anything keyed by log id
-  that a prefix change would strand?
-- **Q2.** Without a write tier, does the chain still make both owners write the blob into their own segment (double cold
-  PUT), or is there a path that gives the rank-1 owner alone the flush? Is there any S3 deletion planned that would reclaim
-  the doubled bytes?
-- **Q3.** Which acknowledgement checks does the daemon `Segments` upload path rely on the flusher's re-hash for, and what
-  replaces it under B?
-- **Q4.** A node whose `--cold-store` is a fixed flag: does it ignore the farm-wide cold-store registration
-  (`cold_apply.rs` `ColdPick::Fixed` against `Registrable`)? A node-local loopback endpoint cannot be a farm-wide
-  registered identity.
-- **Q5.** Is `put_new(retain_until)` called anywhere on the segment path? tierstore documents no Object Lock.
-- **Q6.** Rebuild after a wiped metadata directory lists the store: should a node on tierstore list tierstore (both tiers
-  merged) or the bucket (cold only, missing uncopied objects)? Is a listing that omits uncopied objects acceptable?
-- **Q7.** Is a farm-wide collector owned by the Raft leader's node or per node? Segments are per writer, so per node
-  seems natural, but the idle node's objects then never collect.
+Still to settle:
 
-For the tierstore side (to be raised there, not decided here): export the copy lag on `/metricz` (rollback gate); a
-latency histogram per op; confirm that a listing through the front covers hot-only objects.
+- **A. Chain acknowledgement without a write tier.** Does the primary's acknowledgement wait for the replica's segment
+  PUT, or only for the replica holding the blob in its cache? (5.2)
+- **B. Ingress CPU under B.** Unmeasured (section 7).
+- **C. `identity_mismatch` handling.** Whether the frontend or operator API treats a mismatched node specially. Not read.
+- **D. Retention callers.** The search for callers of `retain_until` is a grep result, not a proof of none.
+- **E. Collector and adoption.** How a per-node collector learns that another node adopted its segment (5.5).
+- **F. For the tierstore side**, to be raised there: export the copy lag on `/metricz` (rollback gate); a latency
+  histogram per operation; whether the front's listing covers hot-only objects; list cost on a prefix of this size.
 
 ## 9. Decisions, with a recommendation each
 
-1. **What "storage moves to tierstore" means.** Recommend: tierstore replaces the object layer and, later, the write
-   tier of the storage node; the storage node stays a kbf process. Reject replacing the node outright: the index, the
-   action cache, the closure check and the map have no equivalent in an S3 server.
-2. **First shape.** Recommend A (keep `--hot-store`), canary node, then one node at a time. B only after Q2, Q3 and the
-   duplicate-bytes measurement.
-3. **When.** Recommend steps 0 and 1 (conformance, baseline) now, step 2 after tierstore's v1 paper ships, as proposed.
-4. **Key layout.** Recommend no change: same bucket, same prefix, so no data moves and rollback has nothing to
-   rewrite. Revisit only if Q1 shows the layout wrong.
-5. **Garbage collection.** Recommend a separate design for a collector over a tierstore GC key; not a gate for step 2,
-   a gate for any claim that the cold store stays bounded.
-6. **Integrity.** Recommend no check is removed; kbf's ingress and read-time digest checks stay the proof, because
+1. **What "storage moves to tierstore" means.** Recommend: tierstore replaces the object layer and the write tier of the
+   storage node; the storage node stays a kbf process. Reject replacing the node outright: the index, the action cache,
+   the closure check and the map have no equivalent in an S3 server.
+2. **Shapes and order.** Recommend: a short shape A soak on the canary node, then shape B on it, then shape B on the
+   other nodes one at a time. B is not worse than today on cold bytes (already doubled) or on the daemon upload check
+   (stronger); it stays gated on put-to-ack and ingress CPU against the baseline.
+3. **When.** Recommend steps 0 and 1 (conformance, listing, baseline) now, step 2 after tierstore's v1 paper ships, as
+   proposed.
+4. **Key layout.** Recommend no change: same bucket, same prefix, so no data moves and rollback has nothing to rewrite.
+   First list the production bucket to learn which key families it holds (node layout, epoch layout, packs); do not
+   assume `<name>/<log id>/...`.
+5. **Registration.** Recommend: a migrated node runs on its flag with its own keys and a known `identity_mismatch`;
+   confirm first (open item C) that this is not treated as a fault. Do not use a shared endpoint string as a workaround.
+6. **Garbage collection.** Recommend a separate design: per-node collector over a per-node GC key, with a delay or an
+   adoption record for the standing tail. Not a gate for the canary; a gate for any claim that the cold store stays
+   bounded.
+7. **Integrity.** Recommend no check is removed; kbf's ingress and read-time digest checks stay the proof, because
    tierstore does not hash a storage node's objects.
-7. **Credentials.** Recommend a scoped key per node for the local tierstore, a GC key for the collector only, and the
-   cold credential held by tierstore alone.
-8. **Packs.** Recommend pointing the pack store at the same tierstore under its own prefixes, and treating the pack
-   path, not the storage node, as the long-term home for blob bytes; that migration (action cache entries, closure
-   check) is a separate design.
-9. **Range amplification.** Recommend measuring first (section 7); do not change the segment size or ask tierstore for
-   ranged promotion before the number exists.
-10. **Rollback gate.** Recommend tierstore exports the copy lag before step 2; without it, rollback of a node depends
-    on a manual listing.
+8. **Credentials.** Recommend a scoped key per node for the local tierstore via `--cold-store-credentials-file`, a
+   per-node GC key for the collector only, and the cold credential held by tierstore alone.
+9. **Packs.** Recommend pointing the pack store at the same tierstore under its own prefixes, and treating the pack path,
+   not the storage node, as the long-term home for blob bytes; that migration (action cache entries, closure check) is a
+   separate design.
+10. **Range amplification.** Recommend measuring first (section 7); do not change the segment size or ask tierstore for
+    ranged promotion before the number exists.
+11. **Rollback and listing gates.** Recommend tierstore exports the copy lag and states what its listing covers before
+    the canary; without the first, rollback of a node depends on a manual listing; without the second, the tail and
+    the rebuild behave differently from the bucket in a way no one has looked at.
