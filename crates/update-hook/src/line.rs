@@ -14,11 +14,11 @@
 
 use std::io::{self, Write};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// Whom a failure is blamed on (it decides whether the fleet rolls back).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Class {
     /// The new version is wrong. The default, and what a step that dies without the line is.

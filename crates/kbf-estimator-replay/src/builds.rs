@@ -169,7 +169,7 @@ fn nearest(sorted: &[u64], p: u64) -> Option<u64> {
     sorted.get((rank - 1) as usize).copied()
 }
 
-fn spread(mut values: Vec<u64>) -> Spread {
+pub(crate) fn spread(mut values: Vec<u64>) -> Spread {
     values.sort_unstable();
     Spread {
         p50: nearest(&values, 50),

@@ -2,9 +2,11 @@
 //! admission by load. `off`, the default, learns nothing; `record` is for learning and
 //! storing; `on` is for learning, storing and handing the curves to the scheduler.
 //!
-//! In this build `record` learns and stores the profiles from the runs the farm hears of
-//! ([`crate::farm_js::usage`]) and `on` does the same: neither gives the scheduler a curve
-//! yet, so no value changes where work goes. `off` does none of it and writes no row. A value
+//! `record` learns and stores the profiles from the runs the farm hears of
+//! ([`crate::farm_js::usage`]) and gives the scheduler no curve, so it places as `off` does. `on`
+//! learns and stores the same and gives the scheduler the curves, so an action with a
+//! prediction and a curve is charged by the curve and `on` can place work where `record` would
+//! queue it. `off` does none of it and writes no row. A value
 //! other than `off` also moves the start line ([`UsageProfiles::start_line`]) and the gauge
 //! `kbf_usage_profiles_mode{mode}` ([`render`]). The mode itself is [`kbf_usage::UsageMode`]; this type is its flag spelling.
 

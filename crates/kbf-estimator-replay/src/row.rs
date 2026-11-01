@@ -114,6 +114,27 @@ pub struct Row {
     /// when the client sent one and the server records it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlated_invocations_id: Option<String>,
+    /// Where the phase durations below came from: `measured` (a daemon measured them) or
+    /// `task_claim` (the task claimed them). Absent from a server that predates the marker,
+    /// which reads as `measured`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_times: Option<String>,
+    /// Input fetch, in microseconds: `input_fetch_completed - input_fetch_start`, when the
+    /// run record has both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_us: Option<u64>,
+    /// Execution, in microseconds: `execution_completed - execution_start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_us: Option<u64>,
+    /// Packing (the output upload), in microseconds:
+    /// `output_upload_completed - output_upload_start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_us: Option<u64>,
+    /// The lease the attempt ran under, `<epoch>.<seq>`, when the server says. With the
+    /// operation it names one attempt, which a joined operation exports once per waiting
+    /// invocation (each copy with its own run id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<String>,
 }
 
 impl Row {

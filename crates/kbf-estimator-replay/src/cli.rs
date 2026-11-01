@@ -11,6 +11,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use kbf_server::api_client::OperatorClient;
 
+use crate::builds::{GroupBy, RunLabels};
 use crate::compare;
 use crate::export::{Export, Window, export};
 use crate::readonly::{Api, ReadOnly, Transport};
@@ -38,8 +39,9 @@ enum Command {
     /// For each successful run, how much slower it was than the same key on a quiet host;
     /// prints a table, or JSON with every run.
     Slowdown(SlowdownArgs),
-    /// Prints queue wait, wall, makespan and kills per 1,000 attempts for two exports, and
-    /// the difference. Read-only.
+    /// Prints queue wait, wall, makespan and kills per 1,000 attempts for two exports, with
+    /// per-build numbers (build action span (server): excludes the client's own analysis and
+    /// local actions; queue time total; attempt queue wait) and the difference. Read-only.
     Compare(CompareArgs),
 }
 
@@ -54,6 +56,34 @@ struct CompareArgs {
     /// Print one JSON document instead of the table.
     #[arg(long)]
     json: bool,
+    /// What a build is for the per-build numbers: one `tool_invocation_id` (one buck2
+    /// command, what buck2's Build ID joins to) or one `correlated_invocations_id` (a CI
+    /// job). The server keeps the first non-empty correlated id seen when an attempt ended,
+    /// so `correlated` can split a build whose early calls sent none.
+    #[arg(long, value_enum, default_value_t = GroupArg::Invocation)]
+    group_by: GroupArg,
+    /// With `--json`, the `setting` of every per-run record (`RunRecord`).
+    #[arg(long)]
+    setting: Option<String>,
+    /// With `--json`, the `arm` of arm A's per-run records.
+    #[arg(long)]
+    label_a: Option<String>,
+    /// With `--json`, the `arm` of arm B's per-run records.
+    #[arg(long)]
+    label_b: Option<String>,
+    /// With `--json`, the `seed` of every per-run record.
+    #[arg(long)]
+    seed: Option<u64>,
+    /// With `--json`, the `commit` of every per-run record.
+    #[arg(long)]
+    commit: Option<String>,
+}
+
+/// `--group-by`.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum GroupArg {
+    Invocation,
+    Correlated,
 }
 
 #[derive(Debug, clap::Args)]
@@ -168,14 +198,33 @@ where
 }
 
 fn compare_to(args: &CompareArgs, out: &mut impl Write) -> Result<(), String> {
+    let group = match args.group_by {
+        GroupArg::Invocation => GroupBy::Invocation,
+        GroupArg::Correlated => GroupBy::Correlated,
+    };
     let arm = |path: &Path| {
         trace::read_rows(path)
-            .map(|rows| compare::analyze(&rows))
+            .map(|rows| compare::analyze_grouped(&rows, group))
             .map_err(|e| format!("{}: {e}", path.display()))
     };
     let (a, b) = (arm(&args.arm_a)?, arm(&args.arm_b)?);
+    let given = [
+        args.setting.is_some(),
+        args.label_a.is_some(),
+        args.label_b.is_some(),
+        args.seed.is_some(),
+        args.commit.is_some(),
+    ];
+    if !args.json && given.contains(&true) {
+        return Err(
+            "--setting, --label-a, --label-b, --seed and --commit label the per-run \
+                    records of --json, and the table has none"
+                .to_owned(),
+        );
+    }
     let text = if args.json {
-        compare::render_json(&a, &b)
+        let labels = run_labels(args, &a, &b)?;
+        compare::render_json_runs(&a, &b, labels.as_ref().map(|(la, lb)| (la, lb)))
     } else {
         format!(
             "A: {}\nB: {}\n{}",
@@ -185,6 +234,64 @@ fn compare_to(args: &CompareArgs, out: &mut impl Write) -> Result<(), String> {
         )
     };
     out.write_all(text.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// The labels of the two arms' per-run records, when either arm has builds to write; an
+/// error when a label an arm with builds needs is missing, when one is empty, or when the
+/// two arm labels are equal (js-analysis would get one run twice).
+fn run_labels(
+    args: &CompareArgs,
+    a: &compare::ArmStats,
+    b: &compare::ArmStats,
+) -> Result<Option<(RunLabels, RunLabels)>, String> {
+    let (need_a, need_b) = (a.builds.recorded(), b.builds.recorded());
+    if ![need_a, need_b].contains(&true) {
+        return Ok(None);
+    }
+    let missing: Vec<&str> = [
+        ("--setting", true, args.setting.is_some()),
+        ("--label-a", need_a, args.label_a.is_some()),
+        ("--label-b", need_b, args.label_b.is_some()),
+        ("--seed", true, args.seed.is_some()),
+        ("--commit", true, args.commit.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(flag, needed, given)| (needed && !given).then_some(flag))
+    .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "--json writes one run record per build, and an export does not know their \
+             labels: give {}",
+            missing.join(", ")
+        ));
+    }
+    let empty: Vec<&str> = [
+        ("--setting", &args.setting),
+        ("--label-a", &args.label_a),
+        ("--label-b", &args.label_b),
+        ("--commit", &args.commit),
+    ]
+    .into_iter()
+    .filter_map(|(flag, value)| (value.as_deref() == Some("")).then_some(flag))
+    .collect();
+    if !empty.is_empty() {
+        return Err(format!("{} must not be empty", empty.join(", ")));
+    }
+    if args.label_a.is_some() && args.label_a == args.label_b {
+        return Err(
+            "--label-a and --label-b are equal: two arms with one name would put the same \
+             run twice into js-analysis"
+                .to_owned(),
+        );
+    }
+    let text = |v: &Option<String>| v.clone().unwrap_or_default();
+    let labels = |arm: &Option<String>| RunLabels {
+        setting: text(&args.setting),
+        arm: text(arm),
+        seed: args.seed.unwrap_or_default(),
+        commit: text(&args.commit),
+    };
+    Ok(Some((labels(&args.label_a), labels(&args.label_b))))
 }
 
 fn slowdown_to(args: &SlowdownArgs, out: &mut impl Write) -> Result<(), String> {
