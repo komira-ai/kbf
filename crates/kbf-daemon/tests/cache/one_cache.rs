@@ -13,7 +13,8 @@ use kbf_storage::local_cache::Fill;
 use tokio::io::AsyncWriteExt as _;
 
 use crate::support::cache_kit::{
-    CountingCas, FakeClock, Gates, config, digest, entries, file, key, lease, stop, tmp_files,
+    CountingCas, FakeClock, Gates, config, digest, entries, file, key, lease, open_started, stop,
+    tmp_files,
 };
 use crate::support::scratch;
 
@@ -42,10 +43,9 @@ async fn entries_make_room_for_local_storage() {
     let (local, storage) = one_cache();
     let mut config = config(&dir, 300, Arc::clone(&gates), &clock);
     config.local = Some(Arc::clone(&local));
-    let cache = Cache::open(config).expect("open");
     // The start-up drain reads local storage's bytes when it runs; let it finish before
     // they change, or it may evict beside the `evict` below and the counts tear.
-    gates.wait_started();
+    let cache = open_started(config, &gates);
     let cas = CountingCas::default();
     for tag in 1..=3_u8 {
         clock.advance(10);
@@ -91,7 +91,7 @@ async fn a_pinned_input_is_never_evicted_for_local_storage() {
     let (local, storage) = one_cache();
     let mut config = config(&dir, 300, Arc::clone(&gates), &clock);
     config.local = Some(local);
-    let cache = Cache::open(config).expect("open");
+    let cache = open_started(config, &gates);
     let cas = CountingCas::default();
     for tag in 1..=2_u8 {
         clock.advance(10);

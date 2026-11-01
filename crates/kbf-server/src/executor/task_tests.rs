@@ -212,3 +212,131 @@ fn the_arguments_never_print_a_secret() {
     assert!(!shown.contains("sig=zz"), "{shown}");
     assert!(shown.contains("<redacted>"));
 }
+
+const PACK_URL: &str = "https://store.test/cas/b/7-3/ab-0?X-Sig=plant-put-8831";
+const READ_TOKEN: &str = "plant-read-token-5527";
+
+/// The two secrets of a run, distinct and recognisable in any output.
+fn planted() -> (Digest, Secret, Secret) {
+    (digest(), Secret::new(READ_TOKEN), Secret::new(PACK_URL))
+}
+
+/// Catches a secret left in the command line under `files`: neither the presigned url nor the
+/// token, whole or by a distinctive part, may be in any argument; the `Debug` of the arguments,
+/// of the files and of the files' list never holds them either.
+#[test]
+fn files_delivery_puts_no_secret_in_any_argument() {
+    let (action, grant, url) = planted();
+    let task = TaskArgs {
+        work_dir: Some("/work"),
+        allow_plain_http_put: true,
+        allow_plain_http_grant: true,
+        ..args(&action, &grant, &url, false)
+    };
+    let argv = task.argv(Delivery::Files);
+    let files = task.files(Delivery::Files);
+    for arg in &argv {
+        assert!(!arg.contains("plant-put-8831"), "the url is in {arg:?}");
+        assert!(!arg.contains("store.test"), "the url is in {arg:?}");
+        assert!(!arg.contains("plant-read-token"), "the token is in {arg:?}");
+    }
+    for flag in ["--pack-url", "--grant-token", "--insecure-argv-secrets"] {
+        assert!(!argv.iter().any(|a| a == flag), "{flag} is in {argv:?}");
+    }
+    let shown = format!("{task:?} {files:?}");
+    assert!(!shown.contains("plant-put-8831"), "{shown}");
+    assert!(!shown.contains("plant-read-token"), "{shown}");
+}
+
+/// Catches argument paths that do not lead to the files: each path is the directory the lease
+/// server mounts (`/run/js-files`) and the name of a file of the run, and the file holds
+/// exactly the presigned url, or exactly the token, and nothing else.
+#[test]
+fn files_delivery_names_the_two_files_the_tool_reads() {
+    let (action, grant, url) = planted();
+    let task = args(&action, &grant, &url, false);
+    let argv = task.argv(Delivery::Files);
+    let files = task.files(Delivery::Files);
+    assert_eq!(files.len(), 2, "{files:?}");
+    let contents = |flag: &str| {
+        let at = argv.iter().position(|a| a == flag).expect("the flag");
+        let path = argv.get(at + 1).expect("a path");
+        let name = path.strip_prefix("/run/js-files/").expect("the mount");
+        let file = files.iter().find(|f| f.name == name).expect("a file");
+        file.contents.clone()
+    };
+    assert_eq!(contents("--pack-url-file"), PACK_URL);
+    assert_eq!(contents("--grant-token-file"), READ_TOKEN);
+}
+
+/// Catches an argument order that drifts: the flags of `files` take the place of the secret
+/// flags, and everything else, before and after them, is where it is under `argv`.
+#[test]
+fn files_delivery_keeps_the_order_of_the_arguments() {
+    let (action, grant, url) = planted();
+    let task = TaskArgs {
+        work_dir: Some("/work"),
+        allow_plain_http_put: true,
+        allow_plain_http_grant: true,
+        locate: true,
+        ..args(&action, &grant, &url, false)
+    };
+    assert_eq!(
+        task.argv(Delivery::Files),
+        [
+            "--action",
+            &format!("{}/12", "ab".repeat(32)),
+            "--lease",
+            "7-3",
+            "--grant-url",
+            "https://grant.test:9400",
+            "--deadline-ms",
+            "90000",
+            "--pack-url-file",
+            "/run/js-files/pack-url",
+            "--grant-token-file",
+            "/run/js-files/grant-token",
+            "--work-dir",
+            "/work",
+            "--allow-plain-http-put",
+            "--allow-plain-http-grant",
+            "--locate",
+        ]
+    );
+}
+
+/// Catches the default delivery changing: the argument vector of today, byte for byte, with
+/// every optional flag, and no file for the lease server.
+#[test]
+fn argv_delivery_is_unchanged() {
+    let (action, grant, url) = planted();
+    let task = TaskArgs {
+        work_dir: Some("/work"),
+        allow_plain_http_put: true,
+        allow_plain_http_grant: true,
+        ..args(&action, &grant, &url, false)
+    };
+    assert_eq!(
+        task.argv(Delivery::InsecureArgv),
+        [
+            "--action",
+            &format!("{}/12", "ab".repeat(32)),
+            "--lease",
+            "7-3",
+            "--grant-url",
+            "https://grant.test:9400",
+            "--deadline-ms",
+            "90000",
+            "--insecure-argv-secrets",
+            "--pack-url",
+            PACK_URL,
+            "--grant-token",
+            READ_TOKEN,
+            "--work-dir",
+            "/work",
+            "--allow-plain-http-put",
+            "--allow-plain-http-grant",
+        ]
+    );
+    assert!(task.files(Delivery::InsecureArgv).is_empty());
+}
