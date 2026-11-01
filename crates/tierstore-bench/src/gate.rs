@@ -20,7 +20,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::error::BenchError;
-use crate::procload::{QuietTiming, Reader, wait_for_writeback};
+use crate::procload::{QuietTiming, Reader, Writeback, wait_for_writeback};
 
 /// The limits. A sample above any one of them trips the gate.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -137,13 +137,13 @@ impl LoadSample {
     /// not yet written to disk is under a threshold, so that the pass that just ended has landed;
     /// if the cap comes first the window is read as it is. Then the disk and the pressure are
     /// measured over a quiet window that begins then (see [`Reader::read_quiet`]). Blocks for
-    /// both waits.
+    /// both waits. With the sample, what the wait for the disks found.
     ///
     /// # Errors
     /// [`BenchError`] if the machine has no such files or they are not `/proc` text.
-    pub fn read_quiet(timing: &QuietTiming) -> Result<Self, BenchError> {
+    pub fn read_quiet(timing: &QuietTiming) -> Result<(Self, Writeback), BenchError> {
         let (proc_root, sys_block) = (Path::new("/proc"), Path::new("/sys/block"));
-        wait_for_writeback(
+        let writeback = wait_for_writeback(
             proc_root,
             timing.writeback_below_kib,
             u64::try_from(timing.writeback_cap.as_millis()).unwrap_or(u64::MAX),
@@ -153,10 +153,11 @@ impl LoadSample {
                 now_ms()
             },
         )?;
-        READER.read_quiet(proc_root, sys_block, now_ms(), || {
+        let sample = READER.read_quiet(proc_root, sys_block, now_ms(), || {
             std::thread::sleep(timing.settle);
             now_ms()
-        })
+        })?;
+        Ok((sample, writeback))
     }
 }
 
@@ -292,7 +293,7 @@ mod tests {
             poll: std::time::Duration::ZERO,
             ..QuietTiming::DEFAULT
         };
-        assert!(LoadSample::read_quiet(&now).unwrap().loadavg_1m >= 0.0);
+        assert!(LoadSample::read_quiet(&now).unwrap().0.loadavg_1m >= 0.0);
         assert!(LoadSample::read_interval().unwrap().loadavg_1m >= 0.0);
     }
 }

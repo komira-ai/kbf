@@ -120,8 +120,8 @@ pub trait LoadSource: Send + Sync {
     ///
     /// # Errors
     /// As [`LoadSource::sample`].
-    fn quiet_sample(&self) -> Result<LoadSample, BenchError> {
-        self.sample()
+    fn quiet_sample(&self) -> Result<QuietSample, BenchError> {
+        self.sample().map(QuietSample::from)
     }
     /// Milliseconds each whole disk of the machine has spent doing IO so far, by device name;
     /// empty for a source that cannot say.
@@ -130,6 +130,43 @@ pub trait LoadSource: Send + Sync {
     /// [`BenchError`] if the machine cannot be read.
     fn disk_busy_ms(&self) -> Result<BTreeMap<String, u64>, BenchError> {
         Ok(BTreeMap::new())
+    }
+}
+
+/// A reading before a pass, and whether the wait for the disks to drain before it gave up.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuietSample {
+    /// The sample over the quiet window.
+    pub load: LoadSample,
+    /// `Dirty` plus `Writeback`, KiB, when the wait gave up at its cap; none when it did not.
+    pub unsettled_kib: Option<u64>,
+}
+
+impl From<LoadSample> for QuietSample {
+    fn from(load: LoadSample) -> Self {
+        Self {
+            load,
+            unsettled_kib: None,
+        }
+    }
+}
+
+/// What the gate before a pass found.
+pub struct QuietGate {
+    /// The first limit the window was over, if one.
+    pub trip: Option<Trip>,
+    /// As [`QuietSample::unsettled_kib`].
+    pub unsettled_kib: Option<u64>,
+}
+
+/// The reading that a blocking thread gave back. A source that panicked panics the run, as it
+/// would had it read in place (stub of the scaffold: a cancelled thread panics here too).
+fn read_joined(
+    joined: Result<Result<QuietSample, BenchError>, tokio::task::JoinError>,
+) -> Result<QuietSample, BenchError> {
+    match joined {
+        Ok(quiet) => quiet,
+        Err(gone) => std::panic::resume_unwind(gone.into_panic()),
     }
 }
 
@@ -168,8 +205,9 @@ impl LoadSource for ProcLoad {
         LoadSample::read_interval()
     }
 
-    fn quiet_sample(&self) -> Result<LoadSample, BenchError> {
-        LoadSample::read_quiet(&self.timing)
+    fn quiet_sample(&self) -> Result<QuietSample, BenchError> {
+        // Stub of the scaffold: the wait's finding is not carried yet.
+        LoadSample::read_quiet(&self.timing).map(|(load, _)| QuietSample::from(load))
     }
 
     fn disk_busy_ms(&self) -> Result<BTreeMap<String, u64>, BenchError> {
@@ -525,15 +563,14 @@ impl Env {
     ///
     /// # Errors
     /// [`BenchError`] if the machine cannot be read.
-    pub async fn gate_quiet(&self) -> Result<Option<Trip>, BenchError> {
+    pub async fn gate_quiet(&self) -> Result<QuietGate, BenchError> {
         let load = Arc::clone(&self.load);
         let read = tokio::task::spawn_blocking(move || load.quiet_sample()).await;
-        let sample = match read {
-            Ok(sample) => sample?,
-            // A source that panicked: the run panics too, as it would had it read in place.
-            Err(gone) => std::panic::resume_unwind(gone.into_panic()),
-        };
-        Ok(self.config.gate.check_run(&sample).err())
+        let quiet = read_joined(read)?;
+        Ok(QuietGate {
+            trip: self.config.gate.check_run(&quiet.load).err(),
+            unsettled_kib: quiet.unsettled_kib,
+        })
     }
 
     /// Shows the cold store guard the cold requests among `steps`, which finished now, and judges
@@ -775,12 +812,16 @@ fn peak_of(sofar: Option<PassLoad>, sample: &LoadSample) -> PassLoad {
         peak_psi_cpu_pct: 0.0,
         peak_psi_io_pct: 0.0,
         peak_disk_util_pct: 0.0,
+        writeback_settled: true,
+        writeback_pending_bytes: None,
     });
     PassLoad {
         readings: before.readings.saturating_add(1),
         peak_psi_cpu_pct: before.peak_psi_cpu_pct.max(sample.psi_cpu_avg10),
         peak_psi_io_pct: before.peak_psi_io_pct.max(sample.psi_io_avg10),
         peak_disk_util_pct: before.peak_disk_util_pct.max(sample.disk_util_pct),
+        writeback_settled: before.writeback_settled,
+        writeback_pending_bytes: before.writeback_pending_bytes,
     }
 }
 
@@ -984,7 +1025,8 @@ async fn run_pass(
     pass: u32,
     acc: &mut BTreeMap<String, Acc>,
 ) -> Result<Option<Stop>, BenchError> {
-    if let Some(trip) = env.gate_quiet().await? {
+    let quiet = env.gate_quiet().await?;
+    if let Some(trip) = quiet.trip {
         let empty = pass_result(pass, Window::Busy, Duration::ZERO, Some(&trip), None, &[]);
         acc.entry(arm.label.clone()).or_default().passes.push(empty);
         return Ok(Some(Stop::Gate(trip)));
@@ -1358,6 +1400,8 @@ mod tests {
                 peak_psi_cpu_pct: 4.0,
                 peak_psi_io_pct: 50.0,
                 peak_disk_util_pct: 100.0,
+                writeback_settled: true,
+                writeback_pending_bytes: None,
             })
         );
     }
@@ -1389,9 +1433,9 @@ mod tests {
             self.during.sample()
         }
 
-        fn quiet_sample(&self) -> Result<LoadSample, BenchError> {
+        fn quiet_sample(&self) -> Result<QuietSample, BenchError> {
             self.quiet_reads.fetch_add(1, Ordering::SeqCst);
-            Ok(self.quiet)
+            Ok(self.quiet.into())
         }
     }
 
@@ -1461,7 +1505,7 @@ mod tests {
             poll: Duration::ZERO,
             ..QuietTiming::DEFAULT
         });
-        assert!(load.quiet_sample().unwrap().loadavg_1m >= 0.0);
+        assert!(load.quiet_sample().unwrap().load.loadavg_1m >= 0.0);
         assert!(load.interval_sample().unwrap().loadavg_1m >= 0.0);
         assert!(load.sample().unwrap().loadavg_1m >= 0.0);
         let _ = ProcLoad::default();
@@ -1475,7 +1519,7 @@ mod tests {
             Ok(calm())
         }
 
-        fn quiet_sample(&self) -> Result<LoadSample, BenchError> {
+        fn quiet_sample(&self) -> Result<QuietSample, BenchError> {
             panic!("the reader of the machine is broken");
         }
     }
@@ -1489,6 +1533,75 @@ mod tests {
         let env = env(dir.path(), Window::Quiet, Arc::new(Panicking));
         let seen = Arc::new(Mutex::new(vec![]));
         let _ = run_cell(&env, CellId::ColdPut, vec![arm("a", 4, 2, &seen)], 1, None).await;
+    }
+
+    /// A machine whose wait for the disks always gave up at its cap, 5000 KiB still dirty.
+    struct Unsettled;
+
+    impl LoadSource for Unsettled {
+        fn sample(&self) -> Result<LoadSample, BenchError> {
+            Ok(calm())
+        }
+
+        fn quiet_sample(&self) -> Result<QuietSample, BenchError> {
+            Ok(QuietSample {
+                load: calm(),
+                unsettled_kib: Some(5000),
+            })
+        }
+    }
+
+    /// Catches a measurement on unsettled writeback that does not show in the result: every pass
+    /// that opened its window with the cap reached says so, with the bytes still pending; and a
+    /// machine that drained says it did, with no figure.
+    #[tokio::test]
+    async fn a_pass_measured_on_unsettled_writeback_says_so() {
+        let dir = temp("tb-engine-unsettled");
+        let stuck_env = env(dir.path(), Window::Quiet, Arc::new(Unsettled));
+        let seen = Arc::new(Mutex::new(vec![]));
+        let results = run_cell(
+            &stuck_env,
+            CellId::ColdPut,
+            vec![arm("a", 4, 2, &seen)],
+            2,
+            None,
+        )
+        .await
+        .unwrap();
+        for pass in &results[0].passes {
+            let load = pass.pass_load.unwrap();
+            assert_eq!(
+                (load.writeback_settled, load.writeback_pending_bytes),
+                (false, Some(5000 * 1024))
+            );
+        }
+        let dir = temp("tb-engine-settled");
+        let calm_env = env(dir.path(), Window::Quiet, Script::calm());
+        let results = run_cell(
+            &calm_env,
+            CellId::ColdPut,
+            vec![arm("a", 4, 2, &seen)],
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        let load = results[0].passes[0].pass_load.unwrap();
+        assert_eq!(
+            (load.writeback_settled, load.writeback_pending_bytes),
+            (true, None)
+        );
+    }
+
+    /// Catches a reading thread that was cancelled (the runtime shutting down) taken for a panic
+    /// of the source, which would panic the run a second time: it is an error that says so.
+    #[tokio::test]
+    async fn a_cancelled_reading_is_an_error_and_not_a_panic() {
+        let handle = tokio::spawn(std::future::pending::<Result<QuietSample, BenchError>>());
+        handle.abort();
+        let err = read_joined(handle.await).unwrap_err();
+        assert!(matches!(err, BenchError::Request(_)), "{err}");
+        assert!(err.to_string().contains("cancelled"), "{err}");
     }
 
     /// Catches a gate that cannot be read being taken for a calm machine.

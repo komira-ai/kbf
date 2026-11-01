@@ -330,9 +330,22 @@ pub fn parse_dirty_writeback_kib(text: &str) -> Option<u64> {
     Some(figure("Dirty:")?.saturating_add(figure("Writeback:")?))
 }
 
+/// What [`wait_for_writeback`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Writeback {
+    /// The memory not yet written was under the threshold.
+    Drained,
+    /// The cap came first; `kib` was still dirty or being written at the last read.
+    Unsettled {
+        /// `Dirty` plus `Writeback`, KiB.
+        kib: u64,
+    },
+}
+
 /// Waits until the memory not yet written to disk (`Dirty` plus `Writeback`) is under `below_kib`,
-/// or until `cap_ms` have passed since `start_ms`; `true` if it drained, `false` if the cap came
-/// first, and the caller then reads the window as it is. `poll` lets time pass and gives the
+/// or until `cap_ms` have passed since `start_ms`; [`Writeback::Drained`] if it drained,
+/// [`Writeback::Unsettled`] with the figure at the last read if the cap came first, and the
+/// caller then reads the window as it is. `poll` lets time pass and gives the
 /// caller's monotonic clock in milliseconds; it is not called when the memory is drained at the
 /// first read.
 ///
@@ -348,15 +361,16 @@ pub fn wait_for_writeback(
     cap_ms: u64,
     start_ms: u64,
     mut poll: impl FnMut() -> u64,
-) -> Result<bool, BenchError> {
+) -> Result<Writeback, BenchError> {
     loop {
         let pending =
             parse_dirty_writeback_kib(&read_text(proc_root, "meminfo")?).ok_or_else(unreadable)?;
         if pending < below_kib {
-            return Ok(true);
+            return Ok(Writeback::Drained);
         }
         if poll().saturating_sub(start_ms) >= cap_ms {
-            return Ok(false);
+            // Stub of the scaffold: the figure is not carried yet.
+            return Ok(Writeback::Unsettled { kib: 0 });
         }
     }
 }
@@ -723,7 +737,7 @@ mod tests {
             now
         })
         .unwrap();
-        assert!(drained);
+        assert_eq!(drained, Writeback::Drained);
         assert_eq!(polls, 3);
     }
 
@@ -742,11 +756,11 @@ mod tests {
             now
         })
         .unwrap();
-        assert!(!drained);
+        assert_eq!(drained, Writeback::Unsettled { kib: 90_000 });
         assert_eq!(polls, 5);
         meminfo(&proc_root, 0, 0);
         let drained = wait_for_writeback(&proc_root, 4_096, 45_000, 0, || unreachable!()).unwrap();
-        assert!(drained);
+        assert_eq!(drained, Writeback::Drained);
     }
 
     /// Catches a wait that takes a machine it cannot read for a drained one.
