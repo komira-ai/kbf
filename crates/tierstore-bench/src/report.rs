@@ -604,6 +604,7 @@ mod tests {
             proxy_requests: None,
             disk_busy: BTreeMap::new(),
             peak_in_flight: 0,
+            pass_load: None,
         }
     }
 
@@ -1144,6 +1145,7 @@ mod tests {
                 },
             )]),
             peak_in_flight: peak,
+            pass_load: None,
             ..pass(index, Window::Quiet, 10, None)
         };
         let r = result(

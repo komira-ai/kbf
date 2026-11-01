@@ -105,6 +105,15 @@ pub trait LoadSource: Send + Sync {
     /// [`BenchError`] if the machine cannot be read; the run stops, since a gate that cannot see
     /// is not a gate.
     fn sample(&self) -> Result<LoadSample, BenchError>;
+    /// The sample inside a pass: pressure and disk time over the interval since the previous
+    /// reading, which the run records and does not judge. A source with no such interval says
+    /// [`LoadSource::sample`].
+    ///
+    /// # Errors
+    /// As [`LoadSource::sample`].
+    fn interval_sample(&self) -> Result<LoadSample, BenchError> {
+        self.sample()
+    }
     /// The sample before a pass, over a quiet window of its own, so that the pass that just ran
     /// is not read as the machine's load. A source with no window says [`LoadSource::sample`].
     ///
@@ -792,6 +801,7 @@ fn pass_result(
         proxy_requests: None,
         disk_busy: BTreeMap::new(),
         peak_in_flight: steps.iter().map(|s| s.in_flight).max().unwrap_or(0),
+        pass_load: None,
     }
 }
 
@@ -1063,6 +1073,7 @@ mod tests {
 
     use super::*;
     use crate::cells::testkit::{self, Script, busy, calm, loaded};
+    use crate::result::PassLoad;
 
     fn temp(name: &str) -> kbf_testkit::dir::TestDir {
         kbf_testkit::dir::TestDir::under(std::env::temp_dir(), name)
@@ -1269,11 +1280,11 @@ mod tests {
         assert_eq!(result.passes[0].requests, 0);
     }
 
-    /// Catches a gate that is not read during a pass: a machine that turns busy after two
-    /// completions cuts the pass short, marks its samples busy though the run said quiet, ends
-    /// the run, and still runs the arm's after hook.
+    /// Catches a pass cut for what the machine did while it ran: a machine that turns busy after
+    /// two completions neither cuts the pass nor ends the run, its samples stay quiet, the arm's
+    /// after hook runs for every pass, and the pass records the peak it saw.
     #[tokio::test]
-    async fn a_machine_that_turns_busy_in_a_pass_cuts_it_and_ends_the_run() {
+    async fn a_machine_that_turns_busy_in_a_pass_is_recorded_and_not_cut() {
         let dir = temp("tb-engine-gate-during");
         let load = Script::of(vec![Some(calm()), Some(calm()), Some(busy())]);
         let env = env(dir.path(), Window::Quiet, load);
@@ -1288,23 +1299,52 @@ mod tests {
                 Ok(vec![])
             }
         }));
-        let err = run_cell(&env, CellId::ColdPut, vec![a], 3, None)
+        let results = run_cell(&env, CellId::ColdPut, vec![a], 3, None)
             .await
-            .unwrap_err();
-        assert!(matches!(err, BenchError::Gate(_)), "{err}");
-        assert_eq!(
-            err.to_string(),
-            "load gate: psi_cpu_avg10 is 99, over the limit 10"
+            .unwrap();
+        let passes = &results[0].passes;
+        assert_eq!(passes.len(), 3);
+        assert!(
+            passes
+                .iter()
+                .all(|p| p.requests == 8 && p.gate_tripped.is_none())
         );
-        let written = std::fs::read_to_string(dir.path().join("cold-put-a-a1.json")).unwrap();
-        let result = CellResult::from_json(&written).unwrap();
-        assert_eq!(result.passes.len(), 1);
-        let pass = &result.passes[0];
-        assert!(pass.requests < 8, "{}", pass.requests);
-        assert!(pass.requests >= 4, "{}", pass.requests);
-        assert_eq!(pass.window, Window::Busy);
-        assert_eq!(after_ran.load(Ordering::SeqCst), 1);
-        assert!(csv_rows(dir.path()).iter().all(|r| r[6] == "busy"));
+        assert!(passes.iter().all(|p| p.window == Window::Quiet));
+        assert_eq!(after_ran.load(Ordering::SeqCst), 3);
+        let load = passes[0].pass_load.unwrap();
+        assert_eq!((load.readings, load.peak_psi_cpu_pct), (4, 99.0));
+        assert!(csv_rows(dir.path()).iter().all(|r| r[6] == "quiet"));
+    }
+
+    /// Catches a pass stopped for its own disk and IO pressure, and a pass that does not say what
+    /// the machine did: the readings inside it are hot on the disk and on IO, the pass runs, and
+    /// the result holds the count and the peak of each figure.
+    #[tokio::test]
+    async fn the_disk_and_io_pressure_inside_a_pass_are_recorded_not_judged() {
+        let dir = temp("tb-engine-gate-pass-load");
+        let pressed = LoadSample {
+            psi_cpu_avg10: 4.0,
+            psi_io_avg10: 50.0,
+            disk_util_pct: 100.0,
+            ..calm()
+        };
+        let load = Split::new(Script::of(vec![Some(pressed), Some(calm())]), calm());
+        let env = env(dir.path(), Window::Quiet, load);
+        let seen = Arc::new(Mutex::new(vec![]));
+        let results = run_cell(&env, CellId::ColdPut, vec![arm("a", 4, 2, &seen)], 1, None)
+            .await
+            .unwrap();
+        let pass = &results[0].passes[0];
+        assert_eq!((pass.requests, pass.window), (4, Window::Quiet));
+        assert_eq!(
+            pass.pass_load,
+            Some(PassLoad {
+                readings: 4,
+                peak_psi_cpu_pct: 4.0,
+                peak_psi_io_pct: 50.0,
+                peak_disk_util_pct: 100.0,
+            })
+        );
     }
 
     /// A machine whose reading during a pass (`sample`) and whose reading in the quiet window
@@ -1327,6 +1367,10 @@ mod tests {
 
     impl LoadSource for Split {
         fn sample(&self) -> Result<LoadSample, BenchError> {
+            self.during.sample()
+        }
+
+        fn interval_sample(&self) -> Result<LoadSample, BenchError> {
             self.during.sample()
         }
 
@@ -1559,11 +1603,8 @@ mod tests {
         let seen = Arc::new(Mutex::new(vec![]));
         let mut a = arm("a", 8, 1, &seen);
         a.pace = Pace::Open { per_sec: 1 };
-        let err = run_cell(&env, CellId::A1, vec![a], 2, None)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, BenchError::Gate(_)));
-        assert_eq!(seen.lock().unwrap().len(), 6);
+        run_cell(&env, CellId::A1, vec![a], 2, None).await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 16);
     }
 
     /// Catches a delay that is not added to the latency of an open-loop request that went out

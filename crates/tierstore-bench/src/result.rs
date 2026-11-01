@@ -274,6 +274,25 @@ pub struct PassResult {
     /// pass realised of the width it was asked for.
     #[serde(default)]
     pub peak_in_flight: u32,
+    /// What the machine that sends the requests looked like while the pass ran: the readings
+    /// taken inside it. Recorded, never a reason to stop the pass; `None` when none was taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_load: Option<PassLoad>,
+}
+
+/// The readings of the load inside one pass. Each is taken over the interval since the previous
+/// reading (the end of the quiet window before the pass for the first), and the pass's own
+/// requests are in all of them: the figures say what the machine did, not whose work it was.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PassLoad {
+    /// How many readings were taken.
+    pub readings: u32,
+    /// The highest share of an interval with some task stalled on CPU, percent.
+    pub peak_psi_cpu_pct: f64,
+    /// The highest share of an interval with some task stalled on IO, percent.
+    pub peak_psi_io_pct: f64,
+    /// The highest utilisation of the busiest disk over an interval, percent.
+    pub peak_disk_util_pct: f64,
 }
 
 /// What the fault proxy forwarded to the store around one pass, by HTTP method. A method with no
@@ -503,6 +522,12 @@ mod tests {
                     },
                 )]),
                 peak_in_flight: 7,
+                pass_load: Some(PassLoad {
+                    readings: 3,
+                    peak_psi_cpu_pct: 1.5,
+                    peak_psi_io_pct: 41.0,
+                    peak_disk_util_pct: 100.0,
+                }),
             }],
             notes: vec!["a note".to_owned()],
             cold_state: vec![PassColdState {
@@ -583,6 +608,7 @@ mod tests {
                 "proxy_requests",
                 "disk_busy",
                 "peak_in_flight",
+                "pass_load",
             ] {
                 pass.as_object_mut().unwrap().remove(field);
             }
@@ -594,9 +620,10 @@ mod tests {
             (
                 old.passes[0].proxy_requests.is_none(),
                 old.passes[0].disk_busy.is_empty(),
-                old.passes[0].peak_in_flight
+                old.passes[0].peak_in_flight,
+                old.passes[0].pass_load.is_none()
             ),
-            (true, true, 0)
+            (true, true, 0, true)
         );
         assert_eq!(old.provenance.attempt, 1);
         assert_eq!(old.passes[0].cold_guard, None);
