@@ -406,8 +406,8 @@ pub struct Args {
     /// (`placement_load.rs`; none is a flag): besides the reading it applies the guard that
     /// keeps the flat memory charged to a node within its memory, and scores nodes by balance.
     /// It also sets a learned time profile charged per minute and an expected-life charge that
-    /// ends a new lease at its key's expected life plus two minutes; both are idle, since the
-    /// farm gives the scheduler no learned profile and no curve source. The memory guard counts
+    /// ends a new lease at its key's expected life plus two minutes; both read curves, which the
+    /// scheduler has only under `--usage-profiles on` and is idle without. The memory guard counts
     /// only leases that carry a memory (a retry up the memory ladder, a VM) unless
     /// `--placement-predictions on` gives leases one
     // The text above states the default; the help golden cannot hold the whitespace-only
@@ -449,13 +449,18 @@ pub struct Args {
     )]
     pub placement_predictions: crate::PlacementPredictions,
     /// Whether the farm learns what its leases use, for the scheduler's admission by load.
-    /// `off`, the default, learns nothing. `record` and `on` need `--scheduler-core js` and
-    /// `--state-store`; `on` also needs `--placement-load on` and `--placement-predictions on`,
-    /// since the scheduler reads a curve only for an action that has a prediction. In this
-    /// build a value other than `off` changes only the start line `usage profiles: <mode>` and
-    /// the gauge `kbf_usage_profiles_mode{mode}`, 1 for the mode and 0 for the others: nothing
-    /// is learned or stored yet. A server given a combination that breaks one of these refuses
-    /// to start
+    /// `off`, the default, learns nothing and writes no row. `record` and `on` need
+    /// `--scheduler-core js` and `--state-store`, and learn a profile of each action shape from
+    /// the runs the farm hears of, which they store; `on` also needs `--placement-load on` and
+    /// `--placement-predictions on`, since the scheduler reads a curve only for an action that
+    /// has a prediction. `record` places as `off` does. `on` gives the scheduler the curves, so
+    /// that an action with a prediction and a curve is charged by the curve (its cores per
+    /// minute, its remaining maximum memory, an expected life) instead of flat, which can place
+    /// work where `record` would queue it; an action with no prediction, or whose key has not
+    /// been run for over 60 days, is charged flat. A value other than `off` also changes the start line
+    /// `usage profiles: <mode>` and the gauge `kbf_usage_profiles_mode{mode}`, 1 for the mode
+    /// and 0 for the others. A server given a combination that breaks one of these refuses to
+    /// start
     // The text above states the default; the help golden cannot hold the whitespace-only
     // line clap prints before a `[default: ...]` line.
     #[arg(
