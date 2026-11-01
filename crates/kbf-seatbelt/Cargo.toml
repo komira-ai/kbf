@@ -1,0 +1,15 @@
+[package]
+name = "kbf-seatbelt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# No dependencies: the text of a macOS Seatbelt (`sandbox-exec`) profile, built from plain values,
+# so the daemon's driver and the task runner write their profiles with the same rules and
+# Linux CI can test them.
+
+[lints]
+workspace = true

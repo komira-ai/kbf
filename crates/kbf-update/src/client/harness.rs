@@ -11,10 +11,6 @@ use super::*;
 use crate::fixtures::{PLATFORM, offer_of, scratch};
 use crate::helper::SCHEMA;
 
-/// How long a test waits for something that is about to happen. Not a measurement: only
-/// a hung test is cut off by it.
-pub(super) const PROMPT: Duration = Duration::from_secs(30);
-
 pub(super) struct Rig {
     pub(super) handle: Handle,
     pub(super) rx: watch::Receiver<Status>,

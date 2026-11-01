@@ -183,14 +183,15 @@ async fn shadow_books_the_default_and_logs_what_it_would_book() {
     said(0, "fallback=Missing default_mib=4096");
     said(1, "fallback=Cold default_mib=4096");
     // From the third the estimator answers with the booking itself (it lowers from five).
+    // These runs read no CPU, so the CPU is the estimator's cold cost, two cores.
     said(
         2,
-        "level=l2 memory_mib=4096 cpu_millis=1000 default_mib=4096",
+        "level=l2 memory_mib=4096 cpu_millis=2000 default_mib=4096",
     );
     said(4, "level=l2 memory_mib=4096");
     said(
         5,
-        "level=l2 memory_mib=1024 cpu_millis=1000 default_mib=4096 floor_mib=0",
+        "level=l2 memory_mib=1024 cpu_millis=2000 default_mib=4096 floor_mib=0",
     );
     // The farm publishes its counts on its tick.
     cell.tick().await;
@@ -541,6 +542,32 @@ async fn a_kill_that_ends_the_operation_is_written_at_once() {
     );
     done(&mut ops).await;
     assert!(!rows(&store).is_empty(), "the kill is in the store");
+}
+
+/// Catches `--learned-sizes on` with `--no-memory-climb` leaving a floor for a kill that
+/// raised nothing: the combination is allowed, and an own-limit kill that ends the operation
+/// at the first rung writes no floor, so the next submission of the key books the first rung
+/// again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn learned_sizes_on_with_no_climb_leaves_no_floor() {
+    log();
+    let (_store, state) = state();
+    let cell = Cell::start_no_climb(LearnedSizes::On, ladder(), Some(state)).await;
+    let mut daemon = cell.daemon("node-fixed", 8, 64).await;
+    let blob = job("compile fixed kill", "a", LINUX);
+    cell.upload(&blob.blobs()).await;
+    let mut ops = cell.execute(&blob.action).await;
+    let start = daemon.start().await;
+    assert_eq!(start.memory_bytes, 4 * GIB);
+    assert!(
+        daemon
+            .report(killed(start.lease_id, 5 * GIB))
+            .await
+            .accepted
+    );
+    done(&mut ops).await;
+    let _again = cell.execute(&blob.action).await;
+    assert_eq!(daemon.start().await.memory_bytes, 4 * GIB);
 }
 
 /// Catches: a kill by the node (not by the action's own limit) teaching the estimator a

@@ -207,6 +207,11 @@ impl Cell {
     pub fn write_behind(&self) {
         self.farm().write_behind_now();
     }
+
+    /// What the farm's scheduler has counted about node-load readings, among other things.
+    pub fn load_counters(&self) -> kbf_sched::LoadCounters {
+        self.farm().load_counters()
+    }
 }
 
 impl Drop for Cell {
@@ -272,6 +277,7 @@ impl Cell {
             None,
             default_platform,
             kbf_server::LearnedSizes::Off,
+            true,
         )
         .await
     }
@@ -292,6 +298,35 @@ impl Cell {
             retention,
             ladder,
             StreamLimits::DEFAULT,
+        )
+        .await
+    }
+
+    /// A cell that books `ladder`'s first rung and never climbs it (`--no-memory-climb`), on
+    /// the legacy core whichever core the tests run on, with learned sizes `mode`, keeping its
+    /// scheduler's state in `state` if given.
+    pub async fn start_no_climb(
+        mode: kbf_server::LearnedSizes,
+        ladder: MemoryLadder,
+        state: Option<kbf_server::StateStore>,
+    ) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve_with_map(
+            cache,
+            store,
+            None,
+            None,
+            wait,
+            retention,
+            ladder,
+            StreamLimits::DEFAULT,
+            None,
+            state,
+            kbf_front::DefaultPlatform::NONE,
+            mode,
+            false,
         )
         .await
     }
@@ -319,6 +354,7 @@ impl Cell {
             state,
             kbf_front::DefaultPlatform::NONE,
             mode,
+            true,
         )
         .await
     }
@@ -360,6 +396,7 @@ impl Cell {
             None,
             kbf_front::DefaultPlatform::NONE,
             kbf_server::LearnedSizes::Off,
+            true,
         )
         .await
     }
@@ -389,6 +426,7 @@ impl Cell {
             Some(state),
             kbf_front::DefaultPlatform::NONE,
             kbf_server::LearnedSizes::Off,
+            true,
         )
         .await
     }
@@ -416,6 +454,7 @@ impl Cell {
             Some(state),
             kbf_front::DefaultPlatform::NONE,
             kbf_server::LearnedSizes::Off,
+            true,
         )
         .await
     }
@@ -609,6 +648,7 @@ impl Cell {
             None,
             kbf_front::DefaultPlatform::NONE,
             kbf_server::LearnedSizes::Off,
+            true,
         )
         .await
     }
@@ -628,6 +668,7 @@ impl Cell {
         state: Option<kbf_server::StateStore>,
         default_platform: kbf_front::DefaultPlatform,
         learned: kbf_server::LearnedSizes,
+        climb: bool,
     ) -> Self {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -639,9 +680,22 @@ impl Cell {
             tick: Duration::from_millis(50),
             unservable_wait: wait,
             default_platform,
+            qos_allowed: kbf_front::QosAllow::DEFAULT,
             memory_ladder: ladder,
+            memory_climb: climb,
             vm_host_floor: kbf_server::HostFloor::default(),
             learned_sizes: learned,
+            exclusive_actions: false,
+            // The js core cannot be told not to climb (the server refuses the flag with it).
+            scheduler_core: if climb {
+                kbf_server::SchedulerCore::under_test()
+            } else {
+                kbf_server::SchedulerCore::Legacy
+            },
+            placement_load: kbf_server::PlacementLoad::Off,
+            placement_predictions: kbf_server::PlacementPredictions::Off,
+            usage_profiles: kbf_server::UsageProfiles::Off,
+            whole_node: None,
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),
             streams: kbf_server::StreamTiming::default(),
@@ -1126,6 +1180,21 @@ impl FakeDaemon {
         .await
     }
 
+    /// The leases of every `Cancel` already received and kept, in order, without waiting.
+    /// The server queues a heartbeat's cancels before its acknowledgement, so after
+    /// `beat_*_acked` these are all that heartbeat caused.
+    pub fn cancels_received(&mut self) -> Vec<LeaseId> {
+        let mut leases = Vec::new();
+        self.kept.retain(|m| match m {
+            server_message::Message::Cancel(c) => {
+                leases.push(c.lease_id.expect("a lease id"));
+                false
+            }
+            _ => true,
+        });
+        leases
+    }
+
     /// Asserts no Offer or Start arrives within [`QUIET`].
     pub async fn no_work(&mut self) {
         let work = self
@@ -1163,6 +1232,32 @@ impl FakeDaemon {
         self.expect("HeartbeatAck", ack_of(seq)).await;
     }
 
+    /// Sends a heartbeat listing nothing and carrying the node load `load`, and waits for its
+    /// acknowledgement for as long as [`PROMPT`], a bound on failure only.
+    pub async fn beat_loaded_acked(&mut self, load: Option<kbf_proto::worker::NodeLoad>) {
+        self.beat_running_loaded_acked(&[], load).await;
+    }
+
+    /// [`Self::beat_loaded_acked`] listing `running` too.
+    pub async fn beat_running_loaded_acked(
+        &mut self,
+        running: &[LeaseId],
+        load: Option<kbf_proto::worker::NodeLoad>,
+    ) {
+        self.seq += 1;
+        let seq = self.seq;
+        self.send(daemon_message::Message::Heartbeat(Heartbeat {
+            seq,
+            report_hash: Vec::new(),
+            running: running.to_vec(),
+            pack_reads: None,
+            pack_writes: None,
+            node_load: load,
+            input_cache: None,
+        }));
+        self.expect("HeartbeatAck", ack_of(seq)).await;
+    }
+
     /// Sends a heartbeat with the next sequence number; the number.
     fn beat(&mut self, running: &[LeaseId], pack_reads: Option<PackReadCounts>) -> u64 {
         self.beat_with(running, pack_reads, None)
@@ -1183,6 +1278,8 @@ impl FakeDaemon {
             running: running.to_vec(),
             pack_reads,
             pack_writes,
+            node_load: None,
+            input_cache: None,
         }));
         seq
     }
@@ -1217,6 +1314,7 @@ pub fn ran(lease: Option<LeaseId>, result: &ActionResult) -> kbf_proto::worker::
         action_digest: None,
         memory_kill: 0,
         lost: 0,
+        job_outcome: None,
     }
 }
 
@@ -1253,6 +1351,7 @@ pub fn failed(lease: Option<LeaseId>, code: Code) -> kbf_proto::worker::Result {
         action_digest: None,
         memory_kill: 0,
         lost: 0,
+        job_outcome: None,
     }
 }
 

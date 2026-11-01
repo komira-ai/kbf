@@ -57,6 +57,8 @@ jobs:
       # The real tests, as root (they bootstrap launchd jobs and drop privileges); the
       # crate's own unit tests run in ci.yml.
       - run: cargo xtask sudo-test -p kbf-host-install --test real_mac -- --nocapture
+      # The runner's drop to nobody, a system program started through it and the ids it leaves.
+      - run: cargo xtask sudo-test -p kbf-host-install --test real_drop -- --nocapture
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:

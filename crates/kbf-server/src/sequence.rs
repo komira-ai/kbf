@@ -15,13 +15,15 @@
 //!    placed on its nodes, so the other frontends take what it holds queued), and sends GOAWAY on
 //!    every listener: REAPI, worker and operator API. The REAPI and worker listeners stop
 //!    accepting; the operator API goes on answering so that the drain can be read.
-//! 4. It waits until no execution is open, at most [`DrainTiming::deadline`]
-//!    (`--drain-deadline`, 15 minutes by default), so a stop always ends. The streams of
+//! 4. It waits until no execution is open, however long that takes. A
+//!    [`DrainTiming::deadline`] (`--drain-deadline`, none by default) that passes with
+//!    executions open does not end the wait or any stream: it logs a WARN with the count and
+//!    sets `deadline_passed` in the drain status, and the wait goes on. The streams of
 //!    operations that were never started and that no worker on this frontend can run (every
 //!    capable worker is cordoned by an operator, or there is none), with no other frontend
 //!    of the store to take them (no daemon of another frontend could run them: the
 //!    `session/` rows, read at each intake poll), end UNAVAILABLE as step 3 begins, at the
-//!    end of the load balancer wait, and do not wait: they would fail at the deadline anyway. Every other stream waits, as Buck2
+//!    end of the load balancer wait, and do not wait: nothing here could ever run them. Every other stream waits, as Buck2
 //!    does not recover one that ends, including the stream of an operation that waits only
 //!    for the nodes this drain cordoned itself (step 3): the other frontends take it. The
 //!    operations stay queued for the other frontends. An execution that runs on a node of
@@ -34,10 +36,12 @@
 //!    there was a stream to close, ends the drain ([`Drain::sequence_ended`]); the serving
 //!    future returns and the process exits 0.
 //!
-//! A second stop signal ([`Drain::close`]) skips the waits of steps 2 and 4. The drain is
-//! not undone: the process exits, and a new one is started in its place. The two waits can
-//! also be ended one at a time, by hand, as their time running out ends them
-//! ([`Drain::end_lb_wait`], [`Drain::end_deadline`]): a test runs the sequence by the
+//! A second stop signal ([`Drain::close`]) skips the waits of steps 2 and 4, as does
+//! `--shutdown-timeout-secs` running out on a stop signal (default none): these are the
+//! operator's hard stops, and the only way a drain ends streams. The drain is not undone:
+//! the process exits, and a new one is started in its place. The load balancer wait can
+//! also be ended by hand, as its time running out ends it ([`Drain::end_lb_wait`]), and the
+//! deadline passed by hand ([`Drain::pass_deadline`]): a test runs the sequence by the
 //! phases it reports ([`Drain::phases`]) and not by seconds.
 //!
 //! A frontend without a state store has no other frontend to hand its work to and keeps the
@@ -68,18 +72,19 @@ pub struct DrainTiming {
     /// interval times its unhealthy threshold, and the time its routes take to change. 0
     /// goes on at once.
     pub lb_wait: Duration,
-    /// The longest the drain waits for the open executions after it refuses new ones; the
-    /// ones still open then are ended UNAVAILABLE. Streams of operations that can never
-    /// start do not wait.
-    pub deadline: Duration,
+    /// When set, how long after the drain refuses new executions it reports the ones still
+    /// open (a WARN, and `deadline_passed` in the drain status). It only stops the waiting
+    /// there: nothing is ended, and the drain goes on until they are done. `None`, the
+    /// default, reports nothing. Streams of operations that can never start do not wait.
+    pub deadline: Option<Duration>,
 }
 
 impl Default for DrainTiming {
-    /// 10 seconds of load balancer wait and 15 minutes of deadline.
+    /// 10 seconds of load balancer wait and no deadline.
     fn default() -> Self {
         Self {
             lb_wait: Duration::from_secs(10),
-            deadline: Duration::from_secs(15 * 60),
+            deadline: None,
         }
     }
 }
@@ -142,26 +147,45 @@ impl Sequence {
         drain.begin();
         self.stand.worker.fire();
         self.api.fire();
-        let idle = tokio::time::timeout(timing.deadline, async {
+        let idle = async {
             tokio::select! {
                 () = self.until_idle() => {}
                 () = drain.closed() => {}
             }
-        });
-        // Biased: with no execution open the wait is over, whether or not the deadline was
-        // ended by hand too, and nothing is cut.
-        let cut = tokio::select! {
-            biased;
-            ended = idle => ended.is_err(),
-            () = drain.deadline_ended() => true,
         };
-        if cut {
-            let open = self.stand.farm.open_executions();
-            tracing::warn!(
-                open,
-                deadline = ?timing.deadline,
-                "the drain deadline passed with executions open: closing their streams"
-            );
+        tokio::pin!(idle);
+        let passed = async {
+            tokio::select! {
+                () = async {
+                    match timing.deadline {
+                        Some(deadline) => tokio::time::sleep(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
+                () = drain.deadline_passed_by_hand() => {}
+            }
+        };
+        // Biased: with no execution open the wait is over, whether or not the deadline has
+        // passed too.
+        tokio::select! {
+            biased;
+            () = &mut idle => {}
+            () = passed => {
+                // The deadline only stops the waiting and says so: nothing is closed or
+                // released over the open executions, which finish or are ended by a second
+                // signal or `--shutdown-timeout-secs`.
+                let open = self.stand.farm.open_executions();
+                if open > 0 {
+                    drain.mark_deadline_passed();
+                    tracing::warn!(
+                        open,
+                        deadline = ?timing.deadline,
+                        "the drain deadline passed with executions open: still serving them, \
+                         waiting for them to end"
+                    );
+                }
+                idle.await;
+            }
         }
 
         tracing::info!("draining: standing down, closing the streams that are left");

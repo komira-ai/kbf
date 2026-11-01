@@ -14,7 +14,7 @@
 //! api = "127.0.0.1:8982"                     # where this host reaches the operator API
 //! drain_token_file = "/etc/kbf/operator.token"  # a path inside the container
 //! peers = ["203.0.113.11:8982"]              # optional: the other frontends' operator APIs
-//! drain_secs = 180                           # optional
+//! drain_secs = 3600                          # optional: no deadline when absent
 //! ready_secs = 90                            # optional
 //! ```
 //!
@@ -35,13 +35,11 @@ use crate::trust::Trust;
 /// Where the file is.
 pub const CONFIG: &str = "/etc/kbf/host-install-frontend.toml";
 
-/// How long a drain is waited for, unless the file says.
-pub const DEFAULT_DRAIN_SECS: u64 = 180;
-
 /// How long a container has to be ready, unless the file says.
 pub const DEFAULT_READY_SECS: u64 = 90;
 
-/// How long `docker stop` lets the process finish after it is told to.
+/// How long `docker stop` lets the process finish after it is told to: the container has
+/// already ended by then (the drain finished), so this is never what ends a drain.
 pub const STOP_SECS: u64 = 30;
 
 /// What a container is made of, and nothing about where it is reached.
@@ -110,7 +108,9 @@ pub struct FrontendConfig {
     pub drain_token_file: String,
     /// The operator APIs of the other frontends, which must be ready before this one stops.
     pub peers: Vec<SocketAddr>,
-    pub drain_secs: u64,
+    /// How long a drain is waited for before the switch stops (and cuts nothing). None: the
+    /// drain is waited for until the old container has ended, however long that takes.
+    pub drain_secs: Option<u64>,
     pub ready_secs: u64,
 }
 
@@ -231,6 +231,23 @@ impl FrontendConfig {
     /// # Errors
     /// Why it is not a usable file.
     pub fn parse(text: &str) -> Result<Self, String> {
+        Self::parse_with(text, true)
+    }
+
+    /// Like [`FrontendConfig::load`], for the start of the program: a `drain_secs` of 0, which
+    /// older programs accepted, is let through, so that an upgrade does not stop the program
+    /// from starting. The switch reads the file with [`FrontendConfig::load`] and refuses it.
+    ///
+    /// # Errors
+    /// As [`FrontendConfig::load`], but for `drain_secs = 0`.
+    pub fn load_for_start(trust: &Trust, path: &Path) -> Result<Self, String> {
+        let text = trust
+            .read(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Self::parse_with(&text, false).map_err(|why| format!("{}: {why}", path.display()))
+    }
+
+    fn parse_with(text: &str, strict: bool) -> Result<Self, String> {
         let file: File = toml::from_str(text).map_err(|e| e.message().to_owned())?;
         let entry = file.frontend;
         let group_add = entry
@@ -252,10 +269,10 @@ impl FrontendConfig {
         if !entry.drain_token_file.starts_with('/') || !plain(&entry.drain_token_file) {
             return Err("drain_token_file is not an absolute path".to_owned());
         }
-        let drain_secs = entry.drain_secs.unwrap_or(DEFAULT_DRAIN_SECS);
-        if drain_secs > 1800 {
-            return Err("drain_secs is more than 1800".to_owned());
+        if strict && entry.drain_secs == Some(0) {
+            return Err("drain_secs is 0; leave it out to wait for the drain".to_owned());
         }
+        let drain_secs = entry.drain_secs;
         let ready_secs = entry.ready_secs.unwrap_or(DEFAULT_READY_SECS);
         if !(10..=600).contains(&ready_secs) {
             return Err("ready_secs is not from 10 to 600".to_owned());
@@ -273,11 +290,5 @@ impl FrontendConfig {
             drain_secs,
             ready_secs,
         })
-    }
-
-    /// The most a switch takes before it is on the new container or back on the old one:
-    /// the drain, the stop, and a wait for readiness. It has to fit the window of a trial.
-    pub fn switch_secs(&self) -> u64 {
-        self.drain_secs + STOP_SECS + self.ready_secs
     }
 }

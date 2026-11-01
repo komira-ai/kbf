@@ -51,7 +51,7 @@ use kbf_meta::{
 use kbf_sched::{DaemonInstance, Event as SchedEvent, Input, OpState, Request, Scheduler};
 use kbf_server::RaftMetaLog;
 use kbf_server::action_usage::Subject;
-use kbf_server::machine::{FarmMachine, Platform, Sent, Waiter};
+use kbf_server::machine::{Booked, FarmMachine, Platform, Sent, Waiter};
 use kbf_server::stamp::Stamp;
 use kbf_sim::{Event, NodeId, NodeInput, Output};
 use kbf_store::{Fault, FaultFs};
@@ -252,12 +252,13 @@ fn wall(t: FarmTime) -> SystemTime {
 /// The request every action makes: one core and 1 GiB, hermetic.
 fn request(action: Digest) -> Request {
     Request {
-        key: key(action),
+        key: key(action).into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),
         needs: kbf_caps::Request::default(),
         hermetic: true,
+        whole_worker: false,
         do_not_cache: false,
     }
 }
@@ -385,7 +386,9 @@ impl Server {
         };
         let up = Up {
             lease_epoch: leadership.log_id.get(),
-            sched: Scheduler::new(leadership.term).recording_requeues(),
+            sched: Scheduler::new(leadership.term)
+                .with_load_config(kbf_server::PlacementLoad::Off.config())
+                .recording_requeues(),
             machine: FarmMachine::new(leadership.term),
             log,
             stopped: false,
@@ -544,7 +547,10 @@ impl Up {
     fn start_lease(&mut self, now: FarmTime, start: &StartLease, cx: &mut Cx<'_>) {
         let worker = &start.worker;
         let process = cx.seen.starts;
-        let runs = cx.seen.started.entry(start.key.action).or_default();
+        let action = ActionKey::try_from(&start.key)
+            .expect("the cell submits the keys of actions")
+            .action;
+        let runs = cx.seen.started.entry(action).or_default();
         runs.insert(process);
         let stream = self.streams.get(worker).copied().unwrap_or_default();
         cx.send(
@@ -553,7 +559,7 @@ impl Up {
                 stream,
                 lease: start.lease,
                 operation: start.operation,
-                action: start.key.action,
+                action,
             },
         );
         let queued = self
@@ -564,11 +570,15 @@ impl Up {
             .map_or(wall(now), |w| w.queued);
         let sent = Sent {
             operation: start.operation,
-            action: start.key.action,
+            action,
             stamp: Stamp {
                 queued,
                 started: wall(now),
             },
+            booked: Some(Booked {
+                cpu_millis: start.resources.cpu_millis,
+                memory_bytes: start.resources.memory_bytes,
+            }),
         };
         self.machine.start(start.lease, sent);
     }
@@ -636,6 +646,7 @@ impl Up {
         let event = SchedEvent::Heartbeat {
             worker: worker.clone(),
             running: running.clone(),
+            load: None,
         };
         self.feed(now, event, cx);
         let cancels: Vec<LeaseId> = self.sched.not_held(&worker, &running).collect();
@@ -711,7 +722,7 @@ impl Up {
         if let (Outcome::Completed { action_result }, Some(action)) = (answer.outcome, action) {
             cx.seen.won.insert(action);
             let record = ActionRecord {
-                result: action_result,
+                result: action_result.into(),
                 closure: Closure::new(),
             };
             let put = Command::PutAction {

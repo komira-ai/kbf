@@ -1,10 +1,11 @@
-# The pull-request gate: two jobs, `lint` and `test`. GitHub-hosted runners only; the repository
+# The pull-request gate: the required checks `lint` and `test` plus `task-macos`; `test` is the coverage gate, and the
+# tests it measures run beside it in the matrix job `test-shard`. GitHub-hosted runners only; the repository
 # lints in crates/kbf-integration-test/tests/repo_lints.rs hold every workflow to that, to commit-SHA pinned
 # actions from the set the repository's Actions policy allows (actions/* and
 # tailscale/github-action), and to a top-level `permissions: {}`.
 #
 # A pull request runs only this. The rest of the suite (the slow tests, the Arm run, the
-# jobs that need a service, root, crun or a Mac, the packages and the beta smoke) runs on a
+# jobs that need a service, root, crun or a Mac, but `task-macos`, the packages and the beta smoke) runs on a
 # push to main, in beta.yml. On a push to main this workflow is the first stage of the one
 # pipeline (pipeline.yml calls it, `workflow_call`), so the merged result meets the same gate
 # and the Cargo cache below is saved. It no longer has a push trigger of its own: a push to
@@ -49,6 +50,9 @@ jobs:
     env:
       DENY_VERSION: 0.20.2
       DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+      # The x86_64-linux tarball of ziglang.org/download/index.json.
+      ZIG_VERSION: 0.14.1
+      ZIG_SHA256: 24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -76,13 +80,6 @@ jobs:
         if: ${{ !cancelled() }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
         if: ${{ !cancelled() }}
-      # The object store library with its `s3` feature alone (the adapter over the S3 client of
-      # kbf-objstore). The workspace run above has the feature on as well, since the crate's own
-      # tests turn `server` on and `server` enables `s3`; the library alone is built here, since
-      # its tests would turn `server` on in this build too, so the code that is compiled only
-      # without `server` is linted.
-      - run: cargo clippy -p tierstore --features s3 --lib --locked -- -D warnings
-        if: ${{ !cancelled() }}
       # The setup library without its `proxy` feature, as the `kbf` binary links it. The workspace
       # run above has the feature on (the installer is in the workspace), so the code that is
       # compiled only without it is built and linted here, with the library and the binary alone.
@@ -96,6 +93,131 @@ jobs:
         if: ${{ !cancelled() }}
       - run: cargo test -p kbf-setup --lib --locked no_proxy_tests
         if: ${{ !cancelled() }}
+      # The server's test-only `farm-core-js` feature (the tests' default scheduler core is the
+      # js one, off in every build above): the tests that only it compiles are linted. Alone in
+      # the command, so that no other package turns the feature on. The tests run on both cores
+      # in the `test` job's two coverage runs.
+      - run: cargo clippy -p kbf-server --all-targets --features farm-core-js --locked -- -D warnings
+        if: ${{ !cancelled() }}
+      # The crates the Mac jobs build (beta.yml's native-macos and pkg-macos, artifacts.yml's
+      # darwin-arm64), checked for aarch64-apple-darwin on this Linux runner. A Linux-only item
+      # in code macOS compiles is then red on the pull request, not on the Mac job of the push to
+      # main an hour later (a `use` of a Linux-only module in kbf-node failed native-macos on eight
+      # main pushes in a row). `cargo check` does not link, so no macOS SDK is needed; the build
+      # scripts that compile C for the target (ring, the bundled SQLite of libsqlite3-sys) use
+      # Zig's C compiler and archiver, which carry macOS's libc headers: the cc crate reads
+      # `CC_<target>` and `AR_<target>` as a program and its leading arguments. Zig is the release
+      # tarball, checked against its SHA-256 before use and unpacked whole (its compiler needs its
+      # lib directory) into the runner's temporary directory.
+      - name: Fetch Zig (pinned version and checksum), the C compiler for aarch64-apple-darwin
+        if: ${{ !cancelled() }}
+        run: cargo xtask fetch --url "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" --sha256 "$ZIG_SHA256" --out "$RUNNER_TEMP/zig.tar.xz"
+      - run: tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+        if: ${{ !cancelled() }}
+      - run: rustup target add aarch64-apple-darwin
+        if: ${{ !cancelled() }}
+      # The targets the macOS jobs of every workflow compile (beta.yml's native-macos,
+      # artifacts.yml's darwin-arm64, mac-provision.yml, host-install-mac.yml, vmm-probe.yml), as
+      # they name them: a crate's other test targets (kbf-cli's harness tests, for one) are
+      # Linux-only and never built on a Mac. Linking and doc tests are not checked: `cargo check`
+      # compiles each crate and stops. The cc crate's own flags include
+      # `--target=arm64-apple-macosx`, which Zig refuses (its compiler-family probe runs the
+      # program without `cc`, so it takes Zig for clang); without them (CRATE_CC_NO_DEFAULTS) Zig
+      # gets its own `-target` and each build script's flags.
+      # The crates a Mac job tests whole: every test target, and the libraries' unit tests.
+      - name: Check for aarch64-apple-darwin the tests of the crates the Mac jobs test whole
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+          # The oldest macOS the binaries support, as artifacts.yml builds them.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo check --locked --target aarch64-apple-darwin --tests --features kbf-setup/proxy -p kbf-outputs -p kbf-driver-native -p kbf-node -p kbf-mac-session -p kbf-installer -p kbf-setup -p kbf-guest -p kbf-mac-provision -p kbf-vmm
+      # The binaries the Mac jobs build and run (`cargo xtask` included) and the darwin artifacts are.
+      - name: Check for aarch64-apple-darwin the binaries the Mac jobs build
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+          # The oldest macOS the binaries support, as artifacts.yml builds them.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo check --locked --target aarch64-apple-darwin --bins -p kbf-node -p kbf-cli -p kbf-deploy -p kbf-installer -p kbf-host-install -p kbf-updater -p kbf-mac-provision -p kbf-guest -p kbf-vmm -p xtask
+      # The test targets the Mac jobs name one by one.
+      - name: Check for aarch64-apple-darwin the test targets the Mac jobs name
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+          # The oldest macOS the binaries support, as artifacts.yml builds them.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo check --locked --target aarch64-apple-darwin -p kbf-cli -p kbf-daemon-test -p xtask -p kbf-host-install --test macos_daemon --test mac_pool_spike --test pkg_macos --test real_mac --test real_drop
+      # kbf-daemon's library with its unit tests (the test profile), and the tests native-macos runs.
+      - name: Check for aarch64-apple-darwin the kbf-daemon library's tests and the tests native-macos runs
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+          # The oldest macOS the binaries support, as artifacts.yml builds them.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo check --locked --target aarch64-apple-darwin --profile test -p kbf-daemon --lib --test suspend --test keeper --test cache_clone --test trees_clone
+      # The kbf binary alone, as artifacts.yml builds it: without the proxy feature of kbf-setup,
+      # which the steps above turn on for kbf-installer and so for every crate built beside it.
+      - name: Check for aarch64-apple-darwin the kbf binary without the proxy feature
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+          # The oldest macOS the binaries support, as artifacts.yml builds them.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo check --locked --target aarch64-apple-darwin -p kbf-cli --bin kbf
+      # The task runner's macOS confine (the Command under `sandbox-exec`) compiles only for a Mac
+      # target: check it on this runner too, so a macOS-only error is red here before the Mac job runs.
+      # Nothing here builds or ships it.
+      - name: Check for aarch64-apple-darwin the task runner, whose confine is for macOS
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo check --locked --target aarch64-apple-darwin --tests -p kbf-task
+      # kbf-task is the one binary the release builds for a static musl target
+      # (artifacts.yml, linux-x86_64 and linux-arm64: it runs in any Linux image). The other
+      # jobs here check glibc, where libc's type aliases differ (`libc::Ioctl` is `c_ulong` on
+      # glibc and `c_int` on musl), so a glibc-only type compiled on the pull request and broke
+      # the release build after the merge. The same musl C compiler as the release job, for ring's
+      # build script; `cargo check` does not link. The Arm target has the same libc types.
+      - name: Refresh the package lists for the musl C compiler
+        if: ${{ !cancelled() }}
+        run: sudo apt-get update
+      - name: Install the musl C compiler ring's build uses for the static target
+        if: ${{ !cancelled() }}
+        run: sudo apt-get install --yes --no-install-recommends musl-tools
+      - run: rustup target add x86_64-unknown-linux-musl
+        if: ${{ !cancelled() }}
+      - name: Check for x86_64-unknown-linux-musl the binary the release builds for the static target
+        if: ${{ !cancelled() }}
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo check --locked --target x86_64-unknown-linux-musl -p kbf-task --bin kbf-task
+      # The Arm static target, which the release's linux-arm64 job builds: the `cfg(target_arch =
+      # "aarch64")` code of the task runner (its seccomp arch and syscall numbers) and the libc
+      # types that differ on Arm (`c_char` is `u8` there) compile only for it. ring's build needs an
+      # Arm C compiler, which `musl-gcc` is not: Zig's, fetched above, with Zig's own `-target`.
+      - run: rustup target add aarch64-unknown-linux-musl
+        if: ${{ !cancelled() }}
+      - name: Check for aarch64-unknown-linux-musl the binary the release builds for the Arm static target
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_unknown_linux_musl: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-linux-musl
+          AR_aarch64_unknown_linux_musl: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+        run: cargo check --locked --target aarch64-unknown-linux-musl -p kbf-task --bin kbf-task
       # The interpreter budget only shrinks: a pull request may not add a row to it
       # (crates/xtask/src/budget.rs). A pull request is checked out as the merge commit,
       # so HEAD^1 is the base branch it merges into.
@@ -120,25 +242,67 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
-  # The fast tests and their coverage: the `pr` profile of .config/nextest.toml (every test
-  # but the slow ones, which beta.yml runs) under cargo-llvm-cov, then the gate in
-  # `coverage-floors` (crates/kbf-coverage): every crate must reach 99.00% of lines and
-  # 99.00% of branches, or the floor its line in that file lists for it (the crates under
-  # 99% today, each with an open issue). A floor may only rise: the last step fails a pull
-  # request whose file lowers one. The fast set includes the Postgres tests (a throwaway
-  # server, below): no S3, crun, root or Mac test is in it.
-  # Branch coverage (`--branch`, rustc's `-Zcoverage-options=branch`) is unstable, so this
-  # job alone builds with a pinned nightly; every other job stays on the toolchain in
+  # One shard of the fast tests and their coverage: the `pr` profile of .config/nextest.toml
+  # (every test but the slow ones, which beta.yml runs) under cargo-llvm-cov, the shard being one
+  # part of one core's tests (`--partition count:<part>/<parts>`). Two cores are tested, as one
+  # run did in turn before: `legacy` (the workspace, the scheduler's default core) and `js` (the
+  # four packages that link kbf-server code, on the js core: its test-only `farm-core-js`
+  # feature makes `SchedulerCore::under_test()` return it; kbf-front has no kbf-server
+  # dependency and kbf-farm-test links none, so neither is selected). The matrix lists every shard: a core's
+  # entries are parts 1 to `parts` of its tests, each once (tests/coverage_wiring reads it).
+  # A shard builds only its own core's instrumented tests: the two builds
+  # share the dependencies, and the js build (the feature rebuilds kbf-server and what depends
+  # on it) is a small part of the legacy one, so a shard that built both would pay for the
+  # second build for nothing.
+  #
+  # A line's coverage is not the sum of the shards' lcov reports (llvm-cov counts a line once
+  # for each function it is in), so raw profiles are what is added up: each shard names its
+  # profiles for its core and part (the process id alone repeats between machines), merges them
+  # into one indexed profile (`llvm-profdata merge`: counts add, so it is the same profile a
+  # merge of all the raw ones makes; megabytes where the raw profiles are about 14 GB unpacked
+  # for all shards, 1.8 GB as compressed artifacts, which filled the gate's runner) and uploads
+  # that; the `test` job below makes the one report of them all. The upload is the LAST step: a
+  # shard that passes has uploaded, and one that fails has not, which is how `test` sees it.
+  # The fast set includes the Postgres tests (a throwaway server per shard, below): no S3,
+  # crun, root or Mac test is in it.
+  # Branch coverage (`--branch`, rustc's `-Zcoverage-options=branch`) is unstable, so these
+  # jobs build with a pinned nightly; every other job stays on the toolchain in
   # rust-toolchain.toml. The nightly may warn where stable does not, so `-D warnings` is off
   # here (clippy, in the lint job, enforces it). cargo-llvm-cov is the release binary,
   # checked against its SHA-256 before use.
-  test:
+  test-shard:
+    name: test-shard (${{ matrix.core }}-${{ matrix.part }}-of-${{ matrix.parts }})
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # Every shard runs to its end, so a run reports the failures of all of them at once.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - core: legacy
+            part: 1
+            parts: 3
+            min_free_gb: 40
+            args: --workspace
+          - core: legacy
+            part: 2
+            parts: 3
+            min_free_gb: 40
+            args: --workspace
+          - core: legacy
+            part: 3
+            parts: 3
+            min_free_gb: 40
+            args: --workspace
+          - core: js
+            part: 1
+            parts: 1
+            min_free_gb: 35
+            args: -p kbf-server -p kbf-integration-test -p kbf-daemon -p kbf-node --features kbf-server/farm-core-js
     # A throwaway Postgres server for every test that needs one, the same container as
     # beta.yml's jobs use. KBF_TEST_POSTGRES_URL (below) names it; a test that needs it makes a
-    # database (kbf-testkit's `database`) or a schema of its own on it and drops it, and fails,
+    # database (js-testkit's `database`, which kbf-testkit re-exports) or a schema of its own on it and drops it, and fails,
     # not skips, without the variable.
     services:
       postgres:
@@ -158,25 +322,42 @@ jobs:
       # `cargo llvm-cov nextest` runs the tests with cargo-nextest, one process per test.
       NEXTEST_VERSION: 0.9.146
       NEXTEST_SHA256: 682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428
+      # The instrumented build's debug info is the largest part of its size and coverage does not
+      # read it (the counters and the coverage mapping are not debug info), so the build has none:
+      # no line tables, which the profiles `dev` and `test` of Cargo.toml keep for backtraces.
+      # cargo-llvm-cov builds the `dev` profile and the tests with `test`.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      PART: ${{ matrix.part }}
+      PARTS: ${{ matrix.parts }}
+      ARGS: ${{ matrix.args }}
+      MIN_FREE_GB: ${{ matrix.min_free_gb }}
+      # The file name of a raw profile. It begins `kbf-<core>-<part>-`, which `test` checks
+      # for every shard (`cargo xtask profiles-complete`) before it reports.
+      LLVM_PROFILE_FILE_NAME: kbf-${{ matrix.core }}-${{ matrix.part }}-%p-%4m.profraw
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           # The merge commit and its first parent, the base branch (no-lowering --base-ref).
           fetch-depth: 2
-      # The restored target/, the instrumented workspace build and its profiles outgrew a
-      # hosted runner's free disk (runs died with "No space left on device", or the runner
-      # was lost mid-test). Remove toolchains the image preinstalls that this job never
-      # uses; the Postgres service container's image is not touched.
+      # A shard builds one core and holds a third of the legacy profiles. The steps below make
+      # room (container images, then the preinstalled toolchains, 1 to 4 minutes) and the
+      # disk check after them refuses early when the room is still short.
       - name: Free disk before (report)
         run: df -h /
-      - name: Remove preinstalled toolchains this job does not use
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/powershell /usr/share/swift /usr/local/lib/node_modules
       # Images the runner preloads and this job never runs; the Postgres service container's
       # image is in use, so the prune keeps it.
       - name: Remove container images this job does not use
         run: docker image prune --all --force
       - name: Free disk after (report)
+        run: df -h /
+      # Some runners of `ubuntu-latest` have a 72 GB disk with about 19 GB free (the others have
+      # 145 GB with about 90 free): no instrumented build fits there as the image is, so the
+      # preinstalled toolchains this job never uses go here too (the step of `test`).
+      - name: Remove preinstalled toolchains this job does not use
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/powershell /usr/share/swift /usr/local/lib/node_modules
+      - name: Free disk after the toolchains are removed (report)
         run: df -h /
       - run: rustup toolchain install "$COVERAGE_TOOLCHAIN" --profile minimal --component llvm-tools-preview
       # xtask builds with the coverage nightly, the one toolchain this job installs.
@@ -191,9 +372,8 @@ jobs:
       # that build and the instrumented one (59 GB): 120 GB free before the tests, 5.6 GB after,
       # under the 5% floor of the file store, and about 30 tests failed with
       # "Unavailable(Store(Transport(Full ...". The key below is this job's own, so no other
-      # job's cache is restored here.
+      # job's cache is restored here. The shards only restore it: `test` saves it on a push.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: cargo-cache
         with:
           path: |
             ~/.cargo/registry
@@ -210,78 +390,258 @@ jobs:
       # is for.
       - name: Drop the workspace's coverage artifacts the cache restored
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
-      # The cache also restored target/debug, a plain (not instrumented) build of the workspace
-      # that this job does not run: the tests build into target/llvm-cov-target, and only the
-      # coverage gate (`cargo run -p kbf-coverage`, a few crates) builds plain, after the tests.
-      # Carried from run to run it had grown to 53 GB of a 145 GB runner, which left the tests
-      # under the stores' 5% free-space floor ('the store stopped taking the streamed blob').
-      # Dropping it before the tests gives them that room, and the cache saved after this run
-      # holds only what the job builds.
-      - name: Drop the plain debug build the cache restored
-        run: rm -rf target/debug
+      # The instrumented build without debug info and the tests' temporary files and profiles
+      # under it (measured as the fall of the disk's used space: about 26 GB for the legacy
+      # core, about 21 GB for the js core; `target` was 25 and 20 GB), and the file store's 5%
+      # free-space floor (7.25 GB on a 145 GB disk, 3.6 GB on a 72 GB one; 7.5 is taken) need
+      # the room below (`min_free_gb` of the matrix): 33.5 and 28.5 GB, and the values hold a
+      # margin over those (40 and 35; the lint refuses lower ones). Short here means the
+      # restored cache or the image grew: the step says so and stops, instead of about 30 tests
+      # failing with "Full".
+      - name: Refuse early when the disk is short for the tests
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --path . --min-free-gb "$MIN_FREE_GB"
       # nextest runs a process per test, so a test's line coverage must not rest on another
       # test of the process: a `tracing` macro evaluates its fields only when a subscriber is
       # registered, so a test that runs one installs its own (`tracing::subscriber::set_default`
       # or `with_default`). Equal numbers to `cargo test` depend on it.
-      # `-skip-functions` leaves the per-function records (FN, FNDA) out of the lcov
-      # export. With branch coverage on, llvm-cov's lcov exporter segfaults while
-      # writing them for kbf-front's async service methods (LLVM 23.1 in this nightly;
-      # it looks like LLVM issue 220574). Lines and branches, all the gate reads, are
-      # unaffected: their totals match llvm-cov's own text report.
-      - run: mkdir -p target/coverage
-      # `--features tierstore/s3` puts the object store library's S3 backend (off by default; the
-      # crate's own tests turn it on through `server`) into the run whichever way they are built,
-      # so its tests count toward the 99% of tierstore.
-      # The instrumented build (about 59 GB measured), the tests' temporary files under it and
-      # the file store's 5% free-space floor (about 7.5 GB on this disk) need the room below.
-      # Short here means the restored cache or the image grew: the step says so and stops,
-      # instead of about 30 tests failing with "Full".
-      - name: Refuse early when the disk is short for the tests (80 GiB free)
-        run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --path . --min-free-gb 80
-      - name: Run the fast tests under coverage
-        env:
-          LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --features tierstore/s3 --locked --branch --no-report --no-fail-fast --profile pr
+      # `--partition` is a flag of `cargo nextest run`, which cargo-llvm-cov passes on as it does
+      # any flag it does not know. `count` deals the tests out in turn, so the parts are the same
+      # size whatever the tests are named. `$ARGS` is the core's package selection: it must be
+      # split into words here, so it is not quoted.
+      - name: Run this part of the core's fast tests under coverage
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest $ARGS --locked --branch --no-report --no-fail-fast --profile pr "--partition=count:$PART/$PARTS"
       # What the test run left on the disk, so a run that ran the runner out of room says
       # which directories grew (the instrumented build, the tests' own temporary files).
       - name: Free disk after the tests (report)
         if: ${{ always() }}
         run: df -h /
+      - name: Size of target after the tests (report)
+        if: ${{ always() }}
+        run: du -sh target
       - name: Disk use under target after the tests (report)
         if: ${{ always() }}
-        run: du -xhd 2 target
-      # No step below runs Postgres tests on their own: they are in the run above, which
-      # fails any of them when KBF_TEST_POSTGRES_URL (set for the job) names no server.
-      - name: Report
+        run: du -xhd 3 --threshold=1G target
+      # The shard's raw profiles become ONE indexed profile (a few MB) here, so that `test`
+      # downloads megabytes and not the raw profiles (1.8 GB as artifacts, about 14 GB unpacked),
+      # which filled its runner's disk.
+      # `xtask merge-profiles` runs the coverage toolchain's own `llvm-profdata merge -sparse` (what
+      # cargo-llvm-cov's own merge passes) with no `-failure-mode`: the default (`any`) fails on
+      # a corrupt raw profile, and so fails the shard, whose re-run is the remedy.
+      # `-failure-mode=all` would drop the corrupt file, merge the rest and pass, and the tests
+      # that file recorded would count as never run, a number under the floor with nothing in
+      # the log to say why. The step says what went in and what came out. It has no `if:`: a
+      # shard that cannot merge fails.
+      - name: Merge this shard's raw profiles into one
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask merge-profiles --dir target/llvm-cov-target --extension profraw --prefix kbf-${{ matrix.core }}-${{ matrix.part }}- --out target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-merged.profdata
+      - name: Size of the merged profile (report)
+        run: du -h target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-merged.profdata
+      - name: Free disk after the merge (report)
+        run: df -h /
+      # No step runs Postgres tests on their own: they are in the run above, which fails any of
+      # them when KBF_TEST_POSTGRES_URL (set for the job) names no server.
+      # The last step, with no `if:`, so that this job has succeeded exactly when its profiles
+      # are up. `overwrite` lets a re-run of the run upload the names its first run did.
+      - name: Upload this shard's merged profile
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: profdata-${{ matrix.core }}-${{ matrix.part }}
+          path: target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-merged.profdata
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 5
+
+  # The gate, under the name `test` that the required check has always had. It builds the
+  # instrumented tests of both cores itself, without running them (`-E 'none()'`: every test
+  # filtered out, so that nextest only builds and lists them), while the shards run: only a
+  # machine that has the instrumented binaries can read a raw profile, and they are too large (70
+  # GB with the profiles) to pass between jobs. The same sources, flags and paths build the same
+  # binaries on every runner, and a profile counts a function by its name and a hash of its code,
+  # so the shards' profiles are read with this job's binaries. It then waits for every shard's
+  # merged profiles (`cargo xtask wait-artifacts`: it fails at once when a shard fails, so `test`
+  # fails whenever a shard does, and none can be skipped into a pass; each artifact is named with
+  # the text of its shard's job name, so that after a re-run of the run an artifact of the first
+  # attempt counts only for a shard that was not run again), refuses a directory in which a
+  # shard's profile is missing (`profiles-complete`), merges them into the one profile
+  # `llvm-cov report` reads, and makes ONE report: a line counts once
+  # with the hits of every shard and both cores, which is what the gate reads (kbf-coverage also
+  # refuses an lcov that names a source file twice). Then the gate in `coverage-floors`
+  # (crates/kbf-coverage): every crate must reach 99.00% of lines and 99.00% of branches, or the
+  # floor its line in that file lists for it (the crates under 99% today, each with an open
+  # issue). A floor may only rise: the last step fails a pull request whose file lowers one.
+  # It lists the shards and their artifacts itself, because the run's jobs are not its `needs`
+  # (a `needs` would start it after them, and the build above would be the last thing the run
+  # waits for); tests/coverage_wiring requires the lists to be the matrix of `test-shard`.
+  # It keeps the Cargo cache: only a push saves it, and only when the exact key missed.
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # `cargo xtask wait-artifacts` lists the run's jobs and artifacts.
+      actions: read
+    env:
+      RUSTFLAGS: ""
+      COVERAGE_TOOLCHAIN: nightly-2026-10-01
+      LLVM_COV_VERSION: 0.9.1
+      LLVM_COV_SHA256: b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a
+      NEXTEST_VERSION: 0.9.146
+      NEXTEST_SHA256: 682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428
+      # As in `test-shard`: the same flags build the same binaries, which the profiles are read with.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The merge commit and its first parent, the base branch (no-lowering --base-ref).
+          fetch-depth: 2
+      # The two builds and the profiles of the shards need the disk the shards' instrumented
+      # build needed, so the preinstalled toolchains this job never uses go as they do there.
+      - name: Free disk before the toolchains are removed (report)
+        run: df -h /
+      - name: Remove preinstalled toolchains this job does not use
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/powershell /usr/share/swift /usr/local/lib/node_modules
+      - name: Free disk after the toolchains are removed (report)
+        run: df -h /
+      - run: rustup toolchain install "$COVERAGE_TOOLCHAIN" --profile minimal --component llvm-tools-preview
+      # xtask builds with the coverage nightly, the one toolchain this job installs.
+      - name: Install cargo-llvm-cov (pinned version and checksum)
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask fetch --url "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v$LLVM_COV_VERSION/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz" --sha256 "$LLVM_COV_SHA256" --out "$HOME/.cargo/bin/cargo-llvm-cov" --extract tar.gz --member cargo-llvm-cov
+      - run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --version
+      - name: Install cargo-nextest (pinned version and checksum)
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask fetch --url "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/cargo-nextest-$NEXTEST_VERSION-x86_64-unknown-linux-gnu.tar.gz" --sha256 "$NEXTEST_SHA256" --out "$HOME/.cargo/bin/cargo-nextest" --extract tar.gz --member cargo-nextest
+      # The shards' cache (see there), restored under the key this job saves on a push.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-coverage-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-coverage-${{ runner.os }}-${{ runner.arch }}-
+      - name: Drop the workspace's coverage artifacts the cache restored
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
+      - run: mkdir -p target/coverage
+      # The two builds (about 35 GB together, measured as the fall of the disk's free space) and
+      # the file store's 5% floor (7.5 GB) are 42.5 GB; the figure holds a margin over it.
+      - name: Refuse early when the disk is short for the builds (50 GiB free)
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --path . --min-free-gb 50
+      # The build of each core is the command of its shards (the `args` of the matrix of
+      # `test-shard`), with every test filtered out. The legacy build is the workspace's; the js
+      # build adds the rebuilt kbf-server and its dependents beside it in the same target
+      # directory, as the two runs of one job did.
+      - name: Build the instrumented tests of the legacy core (none run)
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --profile pr -E 'none()' --no-tests=pass
+      - name: Build the instrumented tests of the js core (none run)
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest -p kbf-server -p kbf-integration-test -p kbf-daemon -p kbf-node --features kbf-server/farm-core-js --locked --branch --no-report --profile pr -E 'none()' --no-tests=pass
+      - name: Free disk after the builds (report)
+        run: df -h /
+      # nextest listed the tests by running each instrumented binary, which wrote a profile; the
+      # run's profiles are the shards'.
+      - name: Drop the profiles of listing the tests
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --profraw-only
+      - name: Wait for the shards' merged profiles
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask wait-artifacts --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" --job-prefix test-shard --artifact "profdata-legacy-1=(legacy-1-of-3)" --artifact "profdata-legacy-2=(legacy-2-of-3)" --artifact "profdata-legacy-3=(legacy-3-of-3)" --artifact "profdata-js-1=(js-1-of-1)"
+      # One merged profile for each shard (a few MB), flat in a directory of its own.
+      - name: Download the shards' merged profiles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: profdata-*
+          path: target/shard-profdata
+          merge-multiple: true
+      - name: Size of the download (report)
+        run: du -sh target/shard-profdata
+      - name: Free disk after the download (report)
+        run: df -h /
+      - name: Every shard's profiles are there
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask profiles-complete --dir target/shard-profdata --extension profdata --prefix kbf-legacy-1- --prefix kbf-legacy-2- --prefix kbf-legacy-3- --prefix kbf-js-1-
+      # `cargo llvm-cov report` merges the `*.profraw` of target/llvm-cov-target into
+      # `<workspace directory>.profdata` there and reports from it; when no `*.profraw` is there and
+      # that file is, it uses it as it is. So the shards' profiles are merged into that file
+      # (`llvm-profdata` adds the counts of indexed profiles as it adds raw ones, so it is the
+      # profile a merge of all the raw files makes), and the downloads go. A name
+      # cargo-llvm-cov does not look for fails the report ("not found *.profraw files"), it
+      # does not pass over less. No `-failure-mode`: an unreadable profile fails the job.
+      - name: Merge the shards' profiles into the one the report reads
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask merge-profiles --dir target/shard-profdata --extension profdata --workspace-profile-in target/llvm-cov-target
+      - name: Delete the downloaded profiles
+        run: rm -r target/shard-profdata
+      - name: Free disk after the merge (report)
+        run: df -h /
+      # `-skip-functions` leaves the per-function records (FN, FNDA) out of the lcov
+      # export. With branch coverage on, llvm-cov's lcov exporter segfaults while
+      # writing them for kbf-front's async service methods (LLVM 23.1 in this nightly;
+      # it looks like LLVM issue 220574). Lines and branches, all the gate reads, are
+      # unaffected: their totals match llvm-cov's own text report.
+      - name: Report (every shard and both cores merged)
         env:
           LLVM_COV_FLAGS: -skip-functions
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov report --branch --lcov --output-path target/coverage/lcov.info
+      - name: Free disk after the report (report)
+        run: df -h /
       # Fails when a crate is under its threshold; floors that could rise are printed in
       # the log and the job summary (`kbf-coverage raise` lifts them) and do not fail.
       - name: Per-crate table and 99% gate
         run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- --lcov target/coverage/lcov.info --root "$GITHUB_WORKSPACE" --floors coverage-floors --summary-file "$GITHUB_STEP_SUMMARY"
-      # The base's floors file, checked out beside this one; a base without one (the change
-      # that adds the file) has nothing to compare, and the step says so.
+      # The base's floors file, checked out under the ignored `target/` (a checkout at the root
+      # would be an untracked nested repository that the repo lints try to read); a base without
+      # one (the change that adds the file) has nothing to compare, and the step says so.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         with:
           ref: ${{ github.event.pull_request.base.sha }}
-          path: base
+          path: target/base-floors
           sparse-checkout: coverage-floors
           sparse-checkout-cone-mode: false
           persist-credentials: false
       - name: Floors are not lower than the base's
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
-        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- no-lowering --allow-missing-base --base-ref HEAD^1 --base base/coverage-floors --floors coverage-floors
+        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- no-lowering --allow-missing-base --base-ref HEAD^1 --base target/base-floors/coverage-floors --floors coverage-floors
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
           name: coverage
           path: target/coverage/lcov.info
           if-no-files-found: error
-      # and the cache it saves holds none of this run's workspace coverage artifacts either
+      # The instrumented build is cleaned before the cache is saved, so the cache holds none of
+      # this run's workspace coverage artifacts.
       - if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  # The task runner's tests on a hosted Mac, without its test-only feature: they run the Command
+  # under the macOS confine for real (a denied Command's connect is refused, a credential file is
+  # unreadable, an allowed Command runs). Tests only: no binary of it is built for release here.
+  task-macos:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      - run: sw_vers
+      - run: cargo test -p kbf-task --locked --no-fail-fast
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:

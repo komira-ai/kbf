@@ -19,6 +19,7 @@ fn caller(farm: &TestFarm, tag: u8) -> kbf_front::Ticket {
         call: None,
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     };
     farm.submit(submission).expect("submitted")
 }
@@ -120,7 +121,7 @@ pub(super) async fn a_lost_grant_race_forgets_the_placement_and_the_operation_ru
     assert!(held(&a).is_empty(), "the lost placement was kept");
     assert_eq!(a.lease_views(Some(&node_a)).leases.len(), 0);
     assert_eq!(a.queued_operations(), 0, "the loser kept the operation");
-    assert_eq!(a.lost_races(), 1);
+    assert_eq!(lost_races(&a), 1);
     assert_eq!(disk.rows("lease/"), 1);
 
     assert!(finished_by(&b, &node_b, won).await);
@@ -265,7 +266,7 @@ pub(super) async fn a_drain_deadline_is_on_the_stores_clock_and_applied_by_the_o
     let ends = |view: PlacementView| match view {
         PlacementView::Draining {
             deadline_unix_ms, ..
-        } => deadline_unix_ms,
+        } => deadline_unix_ms.expect("a deadline"),
         other => panic!("{other:?}"),
     };
     let wall = b.wall_now().as_millis();

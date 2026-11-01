@@ -204,6 +204,8 @@ pub struct MemberReport {
     pub id: MemberId,
     /// Its state in the map.
     pub state: MemberState,
+    /// Its boot counter: larger at every registration of the member.
+    pub boot: u64,
     /// Whether it is `Down` because an operator planned a restart
     /// ([`Members::plan_down`]).
     pub planned: Planned,
@@ -245,6 +247,8 @@ pub struct NodeHealth {
     pub id: MemberId,
     /// Its state in the map.
     pub state: MemberState,
+    /// Its boot counter: larger at every registration of the member.
+    pub boot: u64,
     /// Whether it is `Down` because an operator planned a restart.
     pub planned_down: bool,
     /// The copies it owes.
@@ -348,6 +352,7 @@ fn node_health(member: &MemberReport, now: StoreTime, freshness: Duration) -> No
     NodeHealth {
         id: member.id,
         state: member.state,
+        boot: member.boot,
         planned_down: member.planned.in_force(now),
         repair_debts: said.and_then(|said| match said.debts {
             Debts::Known(debts) => Some(debts),
@@ -719,6 +724,23 @@ const UNDER_REPLICATED_HELP: &str = "Blobs held by one storage member that no se
 const KNOWN_HELP: &str = "1 when the count of under-replicated blobs is known, 0 when it is unknown (a member is \
      not ACTIVE, is silent, or does not know its debts, or the membership cannot be read)";
 
+const NOT_ACTIVE_HELP: &str = "Registered storage members that are not ACTIVE (joining, catching up, draining, down, or a \
+     state this build does not name). Exported only while the membership can be read: absent \
+     is unknown, never 0";
+const MEMBER_STATE_HELP: &str = "Each registered storage member's state: one sample per member and state name, 1 for the \
+     state it is in and 0 for the others";
+const MEMBER_BOOT_HELP: &str = "The boot counter of each registered storage member's current registration: larger at \
+     every restart of that member, so a rise between scrapes is one restart";
+/// The names [`MemberState::name`] gives, each one a `state` label value.
+const STATE_NAMES: [&str; 6] = [
+    "joining",
+    "catching_up",
+    "active",
+    "draining",
+    "down",
+    "unknown",
+];
+
 const MEMBER_DEBTS_HELP: &str = "Copies one storage member owes: the open records of its repair journal. One sample per \
      member, present only while that member's report is fresh and says it knows";
 const MEMBER_WRITES_HELP: &str = "Writes one storage member has open now (a Write call it is taking in, or an action-cache \
@@ -728,7 +750,9 @@ const MEMBER_WRITES_HELP: &str = "Writes one storage member has open now (a Writ
 /// Appends the families to `out`: `kbf_storage_health_known` always,
 /// `kbf_under_replicated_blobs` only while the number is known (a gauge of 0 for an
 /// unknown number is the lie this exists to prevent), and a sample per member of
-/// `kbf_member_repair_debts` and `kbf_member_open_writes` for each value that is known.
+/// `kbf_member_repair_debts` and `kbf_member_open_writes` for each value that is known,
+/// `kbf_members_not_active` while the membership can be read, and a `kbf_member_state` (one-hot
+/// over the state names) and `kbf_member_boot` sample per member.
 pub fn render(out: &mut String, health: Option<&StorageHealth>) {
     let known = health.and_then(|health| health.under_replicated_blobs);
     if let Some(blobs) = known {
@@ -746,7 +770,20 @@ pub fn render(out: &mut String, health: Option<&StorageHealth>) {
          kbf_storage_health_known {}",
         u8::from(known.is_some())
     );
+    if let Some(health) = health {
+        let _ = writeln!(
+            out,
+            "# HELP kbf_members_not_active {NOT_ACTIVE_HELP}\n\
+             # TYPE kbf_members_not_active gauge\n\
+             kbf_members_not_active {}",
+            health.not_active.len()
+        );
+    }
     let nodes = health.map_or(&[][..], |health| &health.nodes[..]);
+    member_states(out, nodes);
+    member_family(out, "kbf_member_boot", MEMBER_BOOT_HELP, nodes, |n| {
+        Some(n.boot)
+    });
     member_family(
         out,
         "kbf_member_repair_debts",
@@ -761,6 +798,28 @@ pub fn render(out: &mut String, health: Option<&StorageHealth>) {
         nodes,
         |n| n.open_writes,
     );
+}
+
+/// `kbf_member_state{member,state}`: for each member one sample per state name, 1 for the
+/// state it is in and 0 for the others; none at all (not even the header) with no member.
+fn member_states(out: &mut String, nodes: &[NodeHealth]) {
+    if nodes.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "# HELP kbf_member_state {MEMBER_STATE_HELP}\n# TYPE kbf_member_state gauge"
+    );
+    for node in nodes {
+        for state in STATE_NAMES {
+            let _ = writeln!(
+                out,
+                "kbf_member_state{{member=\"{}\",state=\"{state}\"}} {}",
+                node.id.0,
+                u8::from(node.state.name() == state)
+            );
+        }
+    }
 }
 
 /// One gauge family with a sample for each member that `value` gives a number for; none

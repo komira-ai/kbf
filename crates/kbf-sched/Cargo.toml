@@ -8,12 +8,9 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-kbf-caps.workspace = true
-kbf-estimator.workspace = true
-kbf-types.workspace = true
-
-[dev-dependencies]
-kbf-sim.workspace = true
+# The code lives in the jobscheduler repository, at the revision the workspace pins.
+js-sched.workspace = true
+js-whole.workspace = true
 
 [lints]
 workspace = true

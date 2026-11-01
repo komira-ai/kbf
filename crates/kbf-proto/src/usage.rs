@@ -39,6 +39,36 @@ impl ResourceUsage {
     }
 }
 
+impl ResourceUsage {
+    /// The fields of a log line for this usage ([`CgroupUsage::log_fields`] names them):
+    /// the lease's cgroup counters if it has them; else, for a macOS lease that read its
+    /// processes, the CPU time, its parts and the peak footprint in the fields they
+    /// match (`mem_peak` is then a footprint, not a cgroup's `memory.peak`: the line's
+    /// `node=` says which kind of node it was), the rest `-`; else every field `-`.
+    #[must_use]
+    pub fn log_fields(&self) -> String {
+        let wall = self.wall_micros;
+        if let Some(cgroup) = &self.cgroup {
+            return cgroup.log_fields(wall);
+        }
+        let Some(footprint) = &self.footprint else {
+            return no_cgroup_fields();
+        };
+        let cpu = footprint
+            .cpu_user_micros
+            .zip(footprint.cpu_system_micros)
+            .map(|(user, system)| user.saturating_add(system));
+        CgroupUsage {
+            cpu_usage_micros: cpu,
+            cpu_user_micros: footprint.cpu_user_micros,
+            cpu_system_micros: footprint.cpu_system_micros,
+            memory_peak_bytes: footprint.peak_footprint_bytes,
+            ..CgroupUsage::default()
+        }
+        .log_fields(wall)
+    }
+}
+
 impl CgroupUsage {
     /// CPU time over wall time: how many CPUs the action kept busy on average, in
     /// hundredths (150 is 1.50). `None` without the cgroup's CPU time or without a

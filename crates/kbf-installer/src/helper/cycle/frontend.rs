@@ -74,6 +74,8 @@ impl Refused {
 impl<E: Exec> Helper<E> {
     /// Carry out one of the proxy's orders; what came of it goes into `memory`.
     pub(super) fn frontend(&mut self, step: FrontendStep, order: &Order, memory: &mut Memory) {
+        // Releases are collected after a confirm only: a dropped stage is no confirm.
+        let confirm = matches!(step, FrontendStep::Confirm);
         let result = match step {
             FrontendStep::Update => self.stage_release(order, memory),
             FrontendStep::Confirm => self.flip(order),
@@ -83,7 +85,7 @@ impl<E: Exec> Helper<E> {
             Ok(done) => {
                 memory.event = done.event;
                 memory.refusal = done.note;
-                self.gc_due |= done.kept;
+                self.gc_due |= done.kept && confirm;
                 if done.kept {
                     self.raise_floor();
                 }

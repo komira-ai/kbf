@@ -16,17 +16,17 @@ use kbf_types::{ActionKey, DigestFunction};
 
 use super::*;
 
-const DONE_OF: &str = "doneof/";
+pub(super) const DONE_OF: &str = "doneof/";
 
 /// The version byte of a `doneof/` row.
 const VERSION: u8 = 1;
 
-pub(super) fn doneof_key(operation: OperationId) -> String {
+pub(crate) fn doneof_key(operation: OperationId) -> String {
     format!("{DONE_OF}{:016x}", operation.0)
 }
 
 /// `key` as the value of a `doneof/` row.
-pub(super) fn encode(key: &ActionKey) -> Vec<u8> {
+pub(crate) fn encode(key: &ActionKey) -> Vec<u8> {
     let mut row = vec![VERSION];
     row.extend(key.action.size_bytes.to_be_bytes());
     row.extend(key.action.hash);
@@ -35,7 +35,7 @@ pub(super) fn encode(key: &ActionKey) -> Vec<u8> {
 }
 
 /// The action a `doneof/` row holds, or what is wrong with the row.
-pub(super) fn decode(row: &[u8]) -> Result<ActionKey, &'static str> {
+pub(crate) fn decode(row: &[u8]) -> Result<ActionKey, &'static str> {
     let [VERSION, rest @ ..] = row else {
         return Err("not a version 1 action row");
     };
@@ -67,9 +67,9 @@ impl Durable {
         let Some(row) = self.store.get(&key)? else {
             return Ok(txn);
         };
-        let request = request_row(&key, &row)?;
-        let (row, ttl) = (encode(&request.key), ending.ttl());
-        Ok(txn.put_ttl(doneof_key(operation), row, ttl, Cond::Any))
+        let request = self.request_row(&key, &row)?;
+        let action = action_of_request(&key, &request)?;
+        Ok(self.ext.ended(txn, operation, &action, ending.ttl()))
     }
 
     /// The action `operation` runs or ran, and where it stands, for a client that asks for it
@@ -100,13 +100,9 @@ impl Durable {
     fn action_of(&self, operation: OperationId) -> Result<Option<ActionKey>, StateError> {
         let unfinished = op_key(operation);
         if let Some(row) = self.store.get(&unfinished)? {
-            return Ok(Some(request_row(&unfinished, &row)?.key));
+            let request = self.request_row(&unfinished, &row)?;
+            return action_of_request(&unfinished, &request).map(Some);
         }
-        let key = doneof_key(operation);
-        let Some(row) = self.store.get(&key)? else {
-            return Ok(None);
-        };
-        let decoded = decode(&row.value);
-        decoded.map(Some).map_err(|why| corrupt(&key, why))
+        self.ext.action_of(&*self.store, operation)
     }
 }

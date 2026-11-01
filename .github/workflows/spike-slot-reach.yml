@@ -219,7 +219,7 @@ jobs:
   # The assertion that a pool user holds nothing a lease left
   # (crates/kbf-driver-native/tests/slot_assert.rs): a clean user is green at every look,
   # and each probe is red on the state planted for it and green after the clean. The same
-  # command as the native-macos-assert job of beta.yml runs after a push to main.
+  # command as the slot_assert step of beta.yml's native-macos job runs after a push to main.
   slot-assert:
     runs-on: macos-latest
     timeout-minutes: 45

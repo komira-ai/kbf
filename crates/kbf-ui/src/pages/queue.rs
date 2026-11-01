@@ -2,6 +2,7 @@
 //! oldest age, the queue per platform and QoS level, the operations no live worker can
 //! run with the scheduler's reason, and the operations placement keeps off some nodes.
 
+use self::whole::whole_node;
 use super::sched::{Avoided, Group, QueueDoc, Waiting, age, code, memory_note, node_link};
 use super::started::{self, HEALTH};
 use super::{definitions, failed};
@@ -45,24 +46,27 @@ pub(crate) async fn queue<S: Source>(source: &S) -> Answer {
         by_platform(h, &doc.by_platform);
         waiting(h, &doc.waiting);
         avoided(h, &doc.avoided, doc.avoided_total);
+        if let Some(whole) = &doc.whole_node {
+            whole_node(h, whole);
+        }
     });
     Answer::html(200, body)
 }
 
-fn heading(h: &mut Html, text: &str) {
+pub(super) fn heading(h: &mut Html, text: &str) {
     h.el("h2", &[], |h| {
         h.text(text);
     });
 }
 
-fn hint(h: &mut Html, text: &str) {
+pub(super) fn hint(h: &mut Html, text: &str) {
     h.el("p", &[attr("class", "hint")], |h| {
         h.text(text);
     });
 }
 
 /// A table with `columns` as its headers and `rows` written by `body`.
-fn table(h: &mut Html, columns: &[&str], body: impl FnOnce(&mut Html)) {
+pub(super) fn table(h: &mut Html, columns: &[&str], body: impl FnOnce(&mut Html)) {
     h.el("div", &[attr("class", "scroll")], |h| {
         h.el("table", &[attr("class", "rows")], |h| {
             h.el("thead", &[], |h| {
@@ -79,7 +83,7 @@ fn table(h: &mut Html, columns: &[&str], body: impl FnOnce(&mut Html)) {
     });
 }
 
-fn cell(h: &mut Html, text: &str) {
+pub(super) fn cell(h: &mut Html, text: &str) {
     h.el("td", &[], |h| {
         h.text(text);
     });
@@ -164,6 +168,8 @@ fn avoided(h: &mut Html, rows: &[Avoided], total: u64) {
         );
     }
 }
+
+mod whole;
 
 #[cfg(test)]
 mod tests;

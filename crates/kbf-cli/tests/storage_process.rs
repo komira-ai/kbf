@@ -56,7 +56,7 @@ fn start(dir: &Path, extra: &[&str]) -> Node {
     std::fs::create_dir_all(dir).expect("directory");
     let cold = format!("--cold-store=file://{}", dir.join("cold").display());
     let meta = format!("--meta-dir={}", dir.join("meta").display());
-    let mut flags = vec![cold.as_str(), meta.as_str()];
+    let mut flags = vec![cold.as_str(), "--cold-store-floor-bytes=1", meta.as_str()];
     flags.extend_from_slice(extra);
     spawn(dir, &flags, &[])
 }
@@ -214,7 +214,7 @@ fn the_s3_and_hot_store_shapes_start_and_stop_on_sigterm() {
     let cold = format!("--cold-store=file://{}", dir.join("cold").display());
     let hot = format!("--hot-store=file://{}", dir.join("hot").display());
     std::fs::create_dir_all(dir.join("hot")).expect("hot directory");
-    let mut tiered = spawn(&dir, &[&cold, &hot], &[]);
+    let mut tiered = spawn(&dir, &[&cold, "--cold-store-floor-bytes=1", &hot], &[]);
     assert!(tiered.stop().is_some_and(|status| status.success()));
 }
 
@@ -236,6 +236,7 @@ fn plain_text_off_loopback_is_a_refused_start() {
             .args([
                 "storage",
                 &cold,
+                "--cold-store-floor-bytes=1",
                 &meta,
                 &format!("--storage-listen={listen}"),
             ])

@@ -1,7 +1,8 @@
 use kbf_types::HostRole;
 use kbf_updater::wire::{Heartbeat, Outcome};
 
-use crate::converge::{Convergence, RoleCounts, State, converge};
+use crate::converge::{Convergence, RoleCounts, State, converge, converge_service, role_counts};
+use crate::services::Services;
 use crate::testutil::{beat, desired, fleet, last, secs, unhealthy, updating};
 
 const NOW: u64 = 1_000;
@@ -22,21 +23,21 @@ fn a_farm_all_at_the_desired_version_has_converged() {
     let c = read(
         Some(("2.0", 1, 1)),
         &[
-            ("fe1", HostRole::Frontend, beat("2.0")),
-            ("st1", HostRole::Storage, beat("2.0")),
-            ("st2", HostRole::Storage, beat("2.0")),
-            ("d1", HostRole::Daemon, beat("2.0")),
+            ("fe1", HostRole::FRONTEND, beat("2.0")),
+            ("st1", HostRole::STORAGE, beat("2.0")),
+            ("st2", HostRole::STORAGE, beat("2.0")),
+            ("d1", HostRole::DAEMON, beat("2.0")),
         ],
     );
     assert_eq!(c.state, State::Converged);
     assert_eq!(c.desired.as_ref().expect("desired").as_str(), "2.0");
     assert!(!c.quiet);
-    let names: Vec<&str> = c.roles.iter().map(|r| r.role).collect();
+    let names: Vec<&str> = c.roles.iter().map(|r| r.role.as_str()).collect();
     assert_eq!(names, ["frontend", "storage", "daemon"]);
     assert_eq!(
         *role(&c, "storage"),
         RoleCounts {
-            role: "storage",
+            role: "storage".to_owned(),
             at_desired: 2,
             updating: 0,
             failed: 0,
@@ -52,8 +53,8 @@ fn a_host_behind_or_updating_keeps_the_farm_in_progress() {
     let behind = read(
         Some(("2.0", 0, 0)),
         &[
-            ("d1", HostRole::Daemon, beat("2.0")),
-            ("d2", HostRole::Daemon, beat("1.0")),
+            ("d1", HostRole::DAEMON, beat("2.0")),
+            ("d2", HostRole::DAEMON, beat("1.0")),
         ],
     );
     assert_eq!(behind.state, State::InProgress);
@@ -61,8 +62,8 @@ fn a_host_behind_or_updating_keeps_the_farm_in_progress() {
     let mid = read(
         Some(("2.0", 0, 0)),
         &[
-            ("d1", HostRole::Daemon, beat("2.0")),
-            ("d2", HostRole::Daemon, updating(beat("1.0"), "2.0")),
+            ("d1", HostRole::DAEMON, beat("2.0")),
+            ("d2", HostRole::DAEMON, updating(beat("1.0"), "2.0")),
         ],
     );
     assert_eq!(mid.state, State::InProgress);
@@ -70,7 +71,7 @@ fn a_host_behind_or_updating_keeps_the_farm_in_progress() {
     // A host that says it is updating while already on the version is not converged either.
     let odd = read(
         Some(("2.0", 0, 0)),
-        &[("d1", HostRole::Daemon, updating(beat("2.0"), "2.0"))],
+        &[("d1", HostRole::DAEMON, updating(beat("2.0"), "2.0"))],
     );
     assert_eq!(odd.state, State::InProgress);
 }
@@ -85,10 +86,10 @@ fn a_failed_update_to_the_desired_version_blocks_and_to_an_older_one_does_not() 
         &[
             (
                 "d1",
-                HostRole::Daemon,
+                HostRole::DAEMON,
                 last(beat("1.0"), "2.0", Outcome::Failed),
             ),
-            ("d2", HostRole::Daemon, updating(beat("1.0"), "2.0")),
+            ("d2", HostRole::DAEMON, updating(beat("1.0"), "2.0")),
         ],
     );
     assert_eq!(blocked.state, State::Blocked);
@@ -99,13 +100,13 @@ fn a_failed_update_to_the_desired_version_blocks_and_to_an_older_one_does_not() 
         &[
             (
                 "d1",
-                HostRole::Daemon,
+                HostRole::DAEMON,
                 last(beat("1.0"), "1.5", Outcome::Failed),
             ),
-            ("d2", HostRole::Daemon, beat("2.0")),
+            ("d2", HostRole::DAEMON, beat("2.0")),
             (
                 "d3",
-                HostRole::Daemon,
+                HostRole::DAEMON,
                 last(beat("1.0"), "1.5", Outcome::Succeeded),
             ),
         ],
@@ -119,12 +120,12 @@ fn a_failed_update_to_the_desired_version_blocks_and_to_an_older_one_does_not() 
         &[
             (
                 "d1",
-                HostRole::Daemon,
+                HostRole::DAEMON,
                 last(beat("2.0"), "2.0", Outcome::Failed),
             ),
             (
                 "d2",
-                HostRole::Daemon,
+                HostRole::DAEMON,
                 last(beat("2.0"), "2.0", Outcome::Succeeded),
             ),
         ],
@@ -136,7 +137,7 @@ fn a_failed_update_to_the_desired_version_blocks_and_to_an_older_one_does_not() 
         Some(("2.0", 0, 0)),
         &[(
             "d1",
-            HostRole::Daemon,
+            HostRole::DAEMON,
             updating(last(beat("1.0"), "2.0", Outcome::Failed), "2.0"),
         )],
     );
@@ -153,19 +154,19 @@ fn a_silent_host_is_down_and_nothing_else() {
     let mut f = fleet(
         secs(NOW),
         &[
-            ("d1", HostRole::Daemon, beat("2.0")),
-            ("d2", HostRole::Daemon, beat("2.0")),
+            ("d1", HostRole::DAEMON, beat("2.0")),
+            ("d2", HostRole::DAEMON, beat("2.0")),
         ],
     );
     f.record(
         crate::testutil::id("d3"),
-        HostRole::Daemon,
+        HostRole::DAEMON,
         last(beat("1.0"), "2.0", Outcome::Failed),
         secs(NOW - 100),
     );
     f.record(
         crate::testutil::id("d4"),
-        HostRole::Daemon,
+        HostRole::DAEMON,
         beat("2.0"),
         secs(NOW - 100),
     );
@@ -174,7 +175,7 @@ fn a_silent_host_is_down_and_nothing_else() {
     assert_eq!(
         *role(&c, "daemon"),
         RoleCounts {
-            role: "daemon",
+            role: "daemon".to_owned(),
             at_desired: 2,
             updating: 0,
             failed: 0,
@@ -186,7 +187,7 @@ fn a_silent_host_is_down_and_nothing_else() {
     assert_eq!(alone.state, State::InProgress);
     let silent_only = converge(
         Some(&d),
-        &fleet(secs(0), &[("d1", HostRole::Daemon, beat("2.0"))]),
+        &fleet(secs(0), &[("d1", HostRole::DAEMON, beat("2.0"))]),
         secs(NOW),
     );
     assert_eq!(silent_only.state, State::InProgress);
@@ -197,7 +198,7 @@ fn a_silent_host_is_down_and_nothing_else() {
 /// minimums, the farm is in progress; with the minimums met it converges.
 #[test]
 fn a_restarted_coordinator_does_not_report_a_vacuous_convergence() {
-    let hosts = [("st1", HostRole::Storage, beat("2.0"))];
+    let hosts = [("st1", HostRole::STORAGE, beat("2.0"))];
     let d = desired("2.0", 1, 0);
     let f = fleet(secs(10), &hosts);
     let quiet = converge(Some(&d), &f, secs(20));
@@ -212,7 +213,70 @@ fn a_restarted_coordinator_does_not_report_a_vacuous_convergence() {
     // A storage host at the version but unhealthy is not up.
     let sick = read(
         Some(("2.0", 1, 0)),
-        &[("st1", HostRole::Storage, unhealthy(beat("2.0")))],
+        &[("st1", HostRole::STORAGE, unhealthy(beat("2.0")))],
     );
     assert_eq!(sick.state, State::InProgress);
+}
+
+const TWO_DAEMONS: &str = "[[service]]\nname = \"agent\"\n[service.roles.daemon]\nmin_up = 2\n";
+
+/// A fleet whose hosts all heartbeated `service` at second 990: `kbf` hosts are not in it.
+fn fleet_of(service: &str, hosts: &[(&str, HostRole, Heartbeat)]) -> crate::fleet::Fleet {
+    let mut f = fleet(secs(990), &[("kbf1", HostRole::STORAGE, beat("9.0"))]);
+    for (name, role, b) in hosts {
+        f.record_in(
+            service,
+            crate::testutil::id(name),
+            role.clone(),
+            b.clone(),
+            secs(990),
+        );
+    }
+    f
+}
+
+/// Behaviour: a service's convergence reads its own hosts and its own desired state, never
+/// kbf's: a kbf host at another version does not count, the role counts are the service's,
+/// the service's required hosts up come from its role definition, and a failed update to
+/// the service's desired version blocks it.
+#[test]
+fn a_service_converges_on_its_own_hosts_and_its_own_minimums() {
+    let services = Services::parse(TWO_DAEMONS).expect("services");
+    let def = services.get("agent").expect("agent");
+    let d = desired("3.0", 0, 0);
+    let one = fleet_of("agent", &[("d1", HostRole::DAEMON, beat("3.0"))]);
+    let short = converge_service(def, Some(&d), &one, secs(NOW));
+    assert_eq!(short.state, State::InProgress, "two daemons must be up");
+    assert_eq!(short.desired.as_ref().expect("desired").as_str(), "3.0");
+    assert_eq!(role(&short, "daemon").at_desired, 1);
+    assert_eq!(short.roles.len(), 1, "the kbf storage host is not counted");
+    let two = fleet_of(
+        "agent",
+        &[
+            ("d1", HostRole::DAEMON, beat("3.0")),
+            ("d2", HostRole::DAEMON, beat("3.0")),
+        ],
+    );
+    assert_eq!(
+        converge_service(def, Some(&d), &two, secs(NOW)).state,
+        State::Converged
+    );
+    let stuck = fleet_of(
+        "agent",
+        &[
+            ("d1", HostRole::DAEMON, beat("3.0")),
+            (
+                "d2",
+                HostRole::DAEMON,
+                last(beat("2.0"), "3.0", Outcome::Failed),
+            ),
+        ],
+    );
+    assert_eq!(
+        converge_service(def, Some(&d), &stuck, secs(NOW)).state,
+        State::Blocked
+    );
+    let none = converge_service(def, None, &two, secs(NOW));
+    assert_eq!((none.desired, none.state), (None, State::InProgress));
+    assert!(role_counts(def, None, &two, secs(NOW)).is_empty());
 }

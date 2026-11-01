@@ -316,19 +316,24 @@ it out on its own health check and its connections' GOAWAY (the order and each p
 3. New Execute calls are refused `UNAVAILABLE` (Buck2 retries them), the frontend takes no
    more queued work from the state store and places none on its nodes, and the REAPI,
    worker and operator API listeners are sent GOAWAY.
-4. The frontend waits until no execution is open, at most `--drain-deadline` seconds
-   (default 900, at least 1).
+4. The frontend waits until no execution is open, however long that takes. There is no
+   default deadline. `--drain-deadline` (seconds, at least 1, no upper bound) only reports:
+   when it passes with executions open, the frontend logs a WARN with their count and sets
+   `deadline_passed` in `GET /v1/frontend/drain`, and goes on waiting with the process up and
+   every stream open, whether a stop signal or `POST /v1/frontend/drain` began the drain.
 5. The worker streams that are left end `UNAVAILABLE` (daemons dial another frontend through
-   the load balancer, which keeps their leases), the streams still open end `UNAVAILABLE`,
-   and the process exits 0. It is not undone: what starts in its place is a new process.
+   the load balancer, which keeps their leases), and the process exits 0. Only a forced stop
+   (below) leaves client streams open at this step, and ends them `UNAVAILABLE`. It is not undone: what starts in its place is a new process.
 
-A build whose action runs longer than the deadline fails when the deadline comes (Buck2
-never re-attaches). Update in a quiet window, or raise `--drain-deadline` above the longest
-action. The stop timeout of whatever runs the process must be longer than the two waits and
-is never what ends the drain: `TimeoutStopSec=infinity` for the unit (below); for a Docker
-container `stop_grace_period`, and for a pod `terminationGracePeriodSeconds`, set to
-`--drain-lb-wait` plus `--drain-deadline` plus 5 minutes (a pod needs no `preStop` sleep: the
-wait is the frontend's own, from the SIGTERM). A frontend that is the only one has nothing
+No build is cut by the drain: an action that runs for hours is waited for, and the frontend
+stays up until it ends. The way to force a stop, which fails the builds still open (Buck2
+never re-attaches), is a second SIGTERM or SIGINT, or an explicit `--shutdown-timeout-secs`
+(default 0, none) when a signal began the drain. The stop timeout of whatever runs the
+process must be longer than the load balancer wait and the longest action, and is never
+what ends the drain: `TimeoutStopSec=infinity` for the unit (below); for a Docker container
+`stop_grace_period`, and for a pod `terminationGracePeriodSeconds`, set to `--drain-lb-wait`
+plus the longest action plus 5 minutes (a pod needs no `preStop` sleep: the wait is the
+frontend's own, from the SIGTERM). A frontend that is the only one has nothing
 to hand its work to: its queued operations that have not started wait with the rest.
 
 ### Stopping a frontend: TimeoutStopSec=infinity
@@ -338,10 +343,13 @@ refuses new Execute calls, which Buck2 retries elsewhere, and keeps every open E
 WaitExecution stream until its action is done, except a stream whose operation was never
 started, that no worker on this frontend can run and that no other frontend can take,
 which ends UNAVAILABLE when the drain begins: Buck2 retries only
-the opening of a call, so an ended stream fails that action); `--shutdown-timeout-secs` is 0, no
-deadline, by default, and a frontend over a state store is bounded by `--drain-deadline`. A
-`--shutdown-timeout-secs` above 0 ends a drain that a signal began when it runs out, as a
-second signal does, even if that is before the wait or the deadline: leave it at 0.
+the opening of a call, so an ended stream fails that action; the daemon half of `all-in-one`
+drains after its server half has no execution open and the process exits when its leases have
+ended and been acknowledged, see [kbf-modes.md](kbf-modes.md#stopping-and-draining)); `--shutdown-timeout-secs` is 0, no
+deadline, by default, and a frontend over a state store has no other bound: its
+`--drain-deadline`, when set, only reports. A `--shutdown-timeout-secs` above 0 ends a drain
+that a signal began when it runs out, as a second signal does, and fails the builds still
+open: it is the operator's hard stop, so leave it at 0 unless a stop must be forced.
 Buck2 never recovers a stream that breaks mid-action, so a stop that ends the drain
 fails every build in flight. systemd kills a unit with SIGKILL when `TimeoutStopSec=`
 runs out, 90 s (`DefaultTimeoutStopSec=`) when the unit gives none. So both units have
@@ -350,16 +358,18 @@ runs out, 90 s (`DefaultTimeoutStopSec=`) when the unit gives none. So both unit
 90 s default would cut them), and rule `stop` of the package test refuses either
 missing or changed: it reads `TimeoutSec=` too (it sets the stop timeout as well; the
 last of the two wins) and the drop-ins. It asks for the word `infinity`: `0` means no
-timeout to systemd as well, but reads as "at once" to a person. A daemon is not held for ever:
-it drains on SIGTERM up to `--drain-deadline-secs` (600 by default), then stops, so its
-unit has `KillSignal=SIGTERM` and a finite `TimeoutStopSec=660` (the deadline plus 60 s);
-a hung daemon still lets a reboot through.
+timeout to systemd as well, but reads as "at once" to a person. The daemon unit is the same:
+it drains on SIGTERM until every lease has ended, however long that takes (a drain never
+ends because time ran out; `--drain-deadline-secs`, if set, only logs a warning with the
+number of leases still running), so it has `KillSignal=SIGTERM` and
+`TimeoutStopSec=infinity`. A second SIGTERM, or `systemctl kill`, is the operator's hard
+stop for a drain that must end now.
 
 The three units that run the daemon (`daemon`, `storage-and-daemon`, `all-in-one`) also
 set `KillMode=mixed`. The actions run in sub-cgroups of the unit, and the default
 `control-group` sends SIGTERM to every process in it, so a stop would end them within
-seconds and defeat the drain. With `mixed` SIGTERM goes to the daemon alone; if the
-drain deadline passes, the daemon ends the leases still running itself, and systemd
+seconds and defeat the drain. With `mixed` SIGTERM goes to the daemon alone, which waits
+for the leases; a second signal makes it end the leases still running itself, and systemd
 sends SIGKILL only to what remains after the main process has exited.
 
 ### storage-and-daemon and the cold store's key

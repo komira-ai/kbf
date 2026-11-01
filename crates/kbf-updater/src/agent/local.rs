@@ -24,12 +24,21 @@ use crate::wire::Outcome;
 /// The most bytes of an answer that are read.
 const ANSWER_MAX: u64 = 16 * 1024;
 
-/// How long each kind of request may take: an install fetches and verifies a release, a switch
+/// How long each kind of request may take: an install fetches and verifies a release, a revert
 /// restarts the units and waits for them, the rest are a file or two.
+///
+/// A switch has no limit by default. The helper drains the host's frontend before it switches
+/// and waits for the drain however long it takes, and it serves one request at a time, so the
+/// agent can neither poll it nor cut the wait short without reading a switch that is still
+/// going as a helper that is gone. A helper that dies closes the socket, which ends the read
+/// at once as [`LocalError::Unreachable`]; only a helper that is alive and silent is waited
+/// for, and the switch's own steps (stop, start, readiness) are bounded by the helper.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub install: Duration,
-    pub switch: Duration,
+    /// `None`: wait for the answer as long as the helper is there.
+    pub switch: Option<Duration>,
+    pub revert: Duration,
     pub other: Duration,
 }
 
@@ -37,7 +46,8 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             install: Duration::from_secs(20 * 60),
-            switch: Duration::from_secs(10 * 60),
+            switch: None,
+            revert: Duration::from_secs(10 * 60),
             other: Duration::from_secs(60),
         }
     }
@@ -171,12 +181,17 @@ impl SocketLocal {
 
     /// One request, one answer line, parsed. `refused` and `failed` lines are the errors of
     /// the same names.
-    fn call(&self, request: &str, limit: Duration, expect: &str) -> Result<Line, LocalError> {
+    fn call(
+        &self,
+        request: &str,
+        limit: Option<Duration>,
+        expect: &str,
+    ) -> Result<Line, LocalError> {
         let mut stream = UnixStream::connect(&self.socket)
             .map_err(|e| LocalError::Unreachable(format!("{}: {e}", self.socket.display())))?;
         let io = |e: std::io::Error| LocalError::Unreachable(e.to_string());
-        stream.set_read_timeout(Some(limit)).map_err(io)?;
-        stream.set_write_timeout(Some(limit)).map_err(io)?;
+        stream.set_read_timeout(limit).map_err(io)?;
+        stream.set_write_timeout(limit).map_err(io)?;
         stream
             .write_all(format!("{request}\n").as_bytes())
             .map_err(io)?;
@@ -209,7 +224,7 @@ fn version_of(text: Option<&str>) -> Result<Option<Version>, LocalError> {
 
 impl Local for SocketLocal {
     fn query(&self) -> Result<HostState, LocalError> {
-        let line = self.call("query", self.limits.other, "query")?;
+        let line = self.call("query", Some(self.limits.other), "query")?;
         let pending = line
             .pending
             .map(|p| {
@@ -247,7 +262,7 @@ impl Local for SocketLocal {
 
     fn install(&self, version: &Version, channel: &str) -> Result<Staged, LocalError> {
         let request = format!("install kbf={} from {channel}", version.as_str());
-        let line = self.call(&request, self.limits.install, "staged")?;
+        let line = self.call(&request, Some(self.limits.install), "staged")?;
         match (line.commit, line.current) {
             (Some(commit), Some(current)) if line.version.as_deref() == Some(version.as_str()) => {
                 Ok(Staged { commit, current })
@@ -269,7 +284,7 @@ impl Local for SocketLocal {
 
     fn confirm(&self, version: &Version) -> Result<(), LocalError> {
         let request = format!("confirm kbf={}", version.as_str());
-        let line = self.call(&request, self.limits.other, "confirmed")?;
+        let line = self.call(&request, Some(self.limits.other), "confirmed")?;
         if line.version.as_deref() == Some(version.as_str()) {
             Ok(())
         } else {
@@ -280,7 +295,7 @@ impl Local for SocketLocal {
     }
 
     fn revert(&self) -> Result<(), LocalError> {
-        self.call("revert", self.limits.switch, "reverted")
+        self.call("revert", Some(self.limits.revert), "reverted")
             .map(drop)
     }
 }

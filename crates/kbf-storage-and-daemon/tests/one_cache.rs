@@ -500,6 +500,7 @@ async fn server_half(
         "--api-listen=127.0.0.1:0".to_owned(),
         format!("--write-own-segment-bytes={own}"),
         format!("--cold-store=file://{}", dir.join("cold").display()),
+        "--cold-store-floor-bytes=1".to_owned(),
         format!("--hot-store=file://{}", dir.join("hot").display()),
     ];
     let mut args = kbf_server::Args::try_parse_from(argv).expect("flags");

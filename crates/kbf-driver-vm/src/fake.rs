@@ -542,7 +542,7 @@ fn read_token(path: &Path) -> io::Result<[u8; TOKEN_LEN]> {
 
 /// Copies the directory `from` to `to`, which must not exist: directories and regular
 /// files only, as an image holds.
-fn copy_dir(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn copy_dir(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::create_dir(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;

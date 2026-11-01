@@ -504,7 +504,11 @@ mod tests {
         Crun::new(PathBuf::from("crun"))
             .end_runs_blocking(dir)
             .expect("ended");
-        assert!(ended(pid_of(&run)) && ended(pid_of(&joined)));
+        assert!(ended(pid_of(&run)), "a crun run with --root DIR was left");
+        assert!(
+            ended(pid_of(&joined)),
+            "a crun run with --root=DIR was left"
+        );
         assert!(!ended(pid_of(&other)), "another lease's crun was killed");
         assert!(
             !ended(pid_of(&value)),

@@ -1,0 +1,66 @@
+# POST /batch on the job-facing read listener: golden fixture of framing v1.
+#
+# A client test can replay it: each `case` has a request body (JSON, sent with
+# `POST /batch`, `Content-Type: application/json`, `Authorization: Bearer <grant>`) and
+# either the 200 response body, as hex (one frame per digest in request order: 1 byte
+# status, 8 bytes big-endian length, then the bytes; whitespace between frames is only for
+# reading), or the refusal of the whole request (`refused <status> <reason>`, the body being
+# the reason and a newline).
+#
+# Status bytes: 00 ok, 01 not_found, 02 out_of_scope, 03 too_large (one blob over 4194304
+# bytes, use GET), 04 store_unavailable. The length is the blob's size when ok, else 0.
+#
+# The world: an Action whose input tree holds every blob below but the `outside` one.
+#   blob <name> <class> <content as hex>   in-scope: held and readable; absent: in scope,
+#                                          not held; outside: held, not in scope; fails: in
+#                                          scope, held, and the store fails when it is read
+#   sized <name> <sha256 hex> <size>       in scope, held by no one (for sizes only)
+# The test checks every `request` against the digests of the blobs it names.
+
+# alpha = 8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8/5
+# beta = f947eb43d2a14729a8f564f8bec96876da19350e88f62674f8c644f67ee1a922/23
+# empty = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/0
+# gone = 283bb9deef02e6843abfb538efa1eca70801bd8a701c3f98191e123496339247/4
+# secret = 618ee6d4bf4c8f7b72bb15e86fac48abbb3558a4889d5a3cb8c51c75e124df43/22
+# flaky = bdbb9deb8e394404f4c85bcd0c3f0f0ccacb8947febb8dfdb961fb11224a9f67/5
+# huge = 5e580eee1a39851ef636172a5b2939d4a51eeeeaa62dd4e01128d5ab0dc008ea/5242880
+# big_a = 825ec27969966d8f88e76c3b0018ce15963275eceeda0adb1778d80f9a09e762/3145728
+# big_b = 005bcc1d79262bf7b72ac6a274e134584dba11e21d735f81e8eb07d5ae63c79e/3145728
+# half_a = 59a1cc713c06a4242565184136f55f54b16fc31a505d9c3390918ff861000ac0/2097152
+# half_b = e8d8c6a6cb9c03e702c63e27dff0758e745ed314adbff3b3317969d46e34d525/2097152
+
+blob alpha in-scope 616c706861
+blob beta in-scope 626574612c20696e2061207375626469726563746f7279
+blob empty in-scope
+blob gone absent 676f6e65
+blob secret outside 616e6f746865722074656e616e742773206279746573
+blob flaky fails 666c616b79
+sized huge 5e580eee1a39851ef636172a5b2939d4a51eeeeaa62dd4e01128d5ab0dc008ea 5242880
+sized big_a 825ec27969966d8f88e76c3b0018ce15963275eceeda0adb1778d80f9a09e762 3145728
+sized big_b 005bcc1d79262bf7b72ac6a274e134584dba11e21d735f81e8eb07d5ae63c79e 3145728
+sized half_a 59a1cc713c06a4242565184136f55f54b16fc31a505d9c3390918ff861000ac0 2097152
+sized half_b e8d8c6a6cb9c03e702c63e27dff0758e745ed314adbff3b3317969d46e34d525 2097152
+
+case duplicates_are_answered_each_time_in_request_order
+request {"digests":["f947eb43d2a14729a8f564f8bec96876da19350e88f62674f8c644f67ee1a922/23","8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8/5","f947eb43d2a14729a8f564f8bec96876da19350e88f62674f8c644f67ee1a922/23","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/0"]}
+response 000000000000000017626574612c20696e2061207375626469726563746f7279 000000000000000005616c706861 000000000000000017626574612c20696e2061207375626469726563746f7279 000000000000000000
+
+case every_status
+request {"digests":["8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8/5","283bb9deef02e6843abfb538efa1eca70801bd8a701c3f98191e123496339247/4","618ee6d4bf4c8f7b72bb15e86fac48abbb3558a4889d5a3cb8c51c75e124df43/22","5e580eee1a39851ef636172a5b2939d4a51eeeeaa62dd4e01128d5ab0dc008ea/5242880","bdbb9deb8e394404f4c85bcd0c3f0f0ccacb8947febb8dfdb961fb11224a9f67/5","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/0"]}
+response 000000000000000005616c706861 010000000000000000 020000000000000000 030000000000000000 040000000000000000 000000000000000000
+
+case sizes_at_the_sum_bound_are_read
+request {"digests":["59a1cc713c06a4242565184136f55f54b16fc31a505d9c3390918ff861000ac0/2097152","e8d8c6a6cb9c03e702c63e27dff0758e745ed314adbff3b3317969d46e34d525/2097152"]}
+response 010000000000000000 010000000000000000
+
+case sizes_over_the_sum_bound_are_refused
+request {"digests":["825ec27969966d8f88e76c3b0018ce15963275eceeda0adb1778d80f9a09e762/3145728","005bcc1d79262bf7b72ac6a274e134584dba11e21d735f81e8eb07d5ae63c79e/3145728"]}
+refused 413 too_large
+
+case a_body_that_is_not_json_is_refused
+request {"digests":
+refused 400 malformed
+
+case an_empty_list_is_refused
+request {"digests":[]}
+refused 400 malformed

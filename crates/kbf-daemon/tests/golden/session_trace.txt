@@ -1,0 +1,13 @@
+daemon> Hello node=node-1 protocol=1 phase=serving instance_len=32 build=true capabilities=true
+server> Welcome version=1 interval=100ms
+daemon> NodeStatus xcodes=0 images=0
+daemon> Heartbeat seq=1 running=[] report_hash_is_hellos=true pack_reads=false pack_writes=false
+daemon> Heartbeat seq=2 running=[] report_hash_is_hellos=true pack_reads=false pack_writes=false
+daemon> Heartbeat seq=3 running=[] report_hash_is_hellos=true pack_reads=false pack_writes=false
+server> Start lease=1.1 kind=action
+daemon> Result lease=1.1 code=0 action_echoed=true
+server> ResultAck lease=1.1 accepted=true
+event> HelloSent
+event> Welcomed { heartbeat_interval: 100ms }
+event> LeaseEnded lease=1.1 driver=fake ok=true
+event> ResultAcknowledged { lease: LeaseId { term: 1, seq: 1 }, accepted: true, reason: Unspecified }

@@ -1,0 +1,146 @@
+# a restart over the same store keeps what it acknowledged
+> [t=0ms] start
+  farm term=7 lease_epoch=7
+  txn applied rev=1 counters=[]
+    put meta/epoch cond=absent len=8 sha=a3eb8db89fc5123c ttl=-
+  txn applied rev=2 counters=[]
+    put meta/next_op cond=absent len=8 sha=f44b28e2244100cb ttl=-
+  txn applied rev=3 counters=[]
+    put meta/next_seq cond=absent len=8 sha=f44b28e2244100cb ttl=-
+> [t=0ms] register node-a cores=2 gib=8 drivers=container
+  txn applied rev=4 counters=[]
+    put owner/node-a cond=absent len=16 sha=4ff190b4c2c573ec ttl=-
+  txn applied rev=5 counters=[]
+    put session/node-a cond=any len=70 sha=1c2132ea24a810fa ttl=60000ms
+  msg node-a welcome protocol=1 interval_ms=5000 epoch=7 pack_commit=false
+> [t=0ms] submit finished qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket finished#1 name=operations/0
+  txn applied rev=9 counters=[]
+    put op/0000000000000000 cond=absent len=75 sha=8136470751ede4ae ttl=-
+    put subject/0000000000000000 cond=absent len=14 sha=7d9f776bbde14949 ttl=-
+    put queue/0000000000000000 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=absent len=8 sha=af5570f5a1810b7a ttl=-
+  txn applied rev=12 counters=[]
+    check owner/node-a cond=v4
+    del queue/0000000000000000 cond=v8
+    put lease/0000000000000007.0000000000000000 cond=absent len=20 sha=3c9486d0aaad3084 ttl=-
+    put lease-by-op/0000000000000000 cond=any len=16 sha=e8dd943d366caae7 ttl=-
+  msg node-a lease_offer lease=7/0 kind=action action=finished
+  msg node-a start lease=7/0 kind=action action=finished millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+  stage finished#1 executing
+> [t=0ms] submit running qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket running#1 name=operations/1
+  txn applied rev=16 counters=[]
+    put op/0000000000000001 cond=absent len=75 sha=05f7624d5bfec4de ttl=-
+    put subject/0000000000000001 cond=absent len=14 sha=706108dd5c5401a9 ttl=-
+    put queue/0000000000000001 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0202020202020202020202020202020202020202020202020202020202020202/2 cond=absent len=8 sha=cd2662154e6d76b2 ttl=-
+  txn applied rev=19 counters=[]
+    check owner/node-a cond=v4
+    del queue/0000000000000001 cond=v15
+    put lease/0000000000000007.0000000000000001 cond=absent len=24 sha=a8c79304565db161 ttl=-
+    put lease-by-op/0000000000000001 cond=any len=16 sha=4ff190b4c2c573ec ttl=-
+  msg node-a lease_offer lease=7/1 kind=action action=running
+  msg node-a start lease=7/1 kind=action action=running millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+  stage running#1 executing
+> [t=0ms] submit undelivered qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket undelivered#1 name=operations/2
+  txn applied rev=23 counters=[]
+    put op/0000000000000002 cond=absent len=75 sha=8dfbccd9809e915d ttl=-
+    put subject/0000000000000002 cond=absent len=14 sha=b7033a26837acd09 ttl=-
+    put queue/0000000000000002 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0303030303030303030303030303030303030303030303030303030303030303/3 cond=absent len=8 sha=cd04a4754498e06d ttl=-
+  stage undelivered#1 queued
+> [t=0ms] result node-a lease=7/0 action=finished ended=ran(exit=0)
+  ack lease=7/0 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=34 counters=[]
+    check owner/node-a cond=v4
+    del lease/0000000000000007.0000000000000000 cond=v11
+    del inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=v9
+    put doneof/0000000000000000 cond=any len=45 sha=f0fd36d49c3d8936 ttl=600000ms
+    del op/0000000000000000 cond=any
+    del queue/0000000000000000 cond=any
+    del loss/0000000000000000 cond=any
+    del fate/0000000000000000 cond=any
+    del subject/0000000000000000 cond=any
+    del opkey/0000000000000000 cond=any
+    del lease-by-op/0000000000000000 cond=any
+    put done/0000000000000000 cond=any len=59 sha=a6c14fb1f40e9834 ttl=600000ms
+  cache finished exit=0
+  stage finished#1 done ran exit=0 stdout="output of finished" worker="node-a" queued_ms=1900000000000 started_ms=1900000000000 completed_ms=1900000000000
+> [t=0ms] tick
+  txn applied rev=37 counters=[]
+    check owner/node-a cond=v4
+    del queue/0000000000000002 cond=v22
+    put lease/0000000000000007.0000000000000002 cond=absent len=24 sha=fe01d5e424c18e9e ttl=-
+    put lease-by-op/0000000000000002 cond=any len=16 sha=8d91efc5106ff3a3 ttl=-
+  msg node-a lease_offer lease=7/2 kind=action action=undelivered
+  msg node-a start lease=7/2 kind=action action=undelivered millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+  stage undelivered#1 executing
+> [t=0ms] restart epoch=keep
+  farm term=7 lease_epoch=7
+  txn applied rev=38 counters=[]
+    put meta/next_op cond=v2 len=8 sha=7df7e25947701db9 ttl=-
+  txn applied rev=39 counters=[]
+    put meta/next_seq cond=v3 len=8 sha=7df7e25947701db9 ttl=-
+> [t=0ms] wait operations/0 as finished-again
+  stage finished-again done ran exit=0 stdout="output of finished" worker="node-a" queued_ms=1900000000000 started_ms=1900000000000 completed_ms=1900000000000
+> [t=0ms] wait operations/1 as running-again
+  stage running-again executing
+> [t=0ms] register node-a cores=2 gib=8 drivers=container
+  txn applied rev=40 counters=[]
+    put owner/node-a cond=v4 len=16 sha=8d91efc5106ff3a3 ttl=-
+  txn applied rev=41 counters=[]
+    put session/node-a cond=any len=70 sha=1c2132ea24a810fa ttl=60000ms
+  msg node-a welcome protocol=1 interval_ms=5000 epoch=7 pack_commit=false
+> [t=0ms] heartbeat node-a seq=1 running=[7/1]
+  acknowledged=true
+  txn applied rev=45 counters=[]
+    check owner/node-a cond=v40
+    check op/0000000000000002 cond=v20
+    del lease/0000000000000007.0000000000000002 cond=v36
+    del lease-by-op/0000000000000002 cond=any
+    put loss/0000000000000002 cond=absent len=8 sha=cd2662154e6d76b2 ttl=-
+    put queue/0000000000000002 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+  txn applied rev=48 counters=[]
+    check owner/node-a cond=v40
+    del queue/0000000000000002 cond=v45
+    put lease/0000000000000007.0000000000000400 cond=absent len=25 sha=6240e76c58054e4a ttl=-
+    put lease-by-op/0000000000000002 cond=any len=16 sha=2a74510e4d9f1a11 ttl=-
+  msg node-a lease_offer lease=7/1024 kind=action action=undelivered
+  msg node-a start lease=7/1024 kind=action action=undelivered millicpus=1000 memory_bytes=1073741824 heartbeat_seq=1 valid_for_ms=14000 device="" job=false fence=0
+> [t=0ms] result node-a lease=7/2 action=undelivered ended=ran(exit=0)
+  ack lease=7/2 accepted=false reason=RESULT_ACK_REASON_STALE
+> [t=0ms] result node-a lease=7/1024 action=undelivered ended=ran(exit=0)
+  ack lease=7/1024 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=59 counters=[]
+    check owner/node-a cond=v40
+    del lease/0000000000000007.0000000000000400 cond=v47
+    del inflight/6d61696e/0303030303030303030303030303030303030303030303030303030303030303/3 cond=v23
+    put doneof/0000000000000002 cond=any len=45 sha=5c262d9fe0915340 ttl=600000ms
+    del op/0000000000000002 cond=any
+    del queue/0000000000000002 cond=any
+    del loss/0000000000000002 cond=any
+    del fate/0000000000000002 cond=any
+    del subject/0000000000000002 cond=any
+    del opkey/0000000000000002 cond=any
+    del lease-by-op/0000000000000002 cond=any
+    put done/0000000000000002 cond=any len=62 sha=79b099ac991739ad ttl=600000ms
+  cache undelivered exit=0
+> [t=0ms] result node-a lease=7/1 action=running ended=ran(exit=0)
+  ack lease=7/1 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=70 counters=[]
+    check owner/node-a cond=v40
+    del lease/0000000000000007.0000000000000001 cond=v18
+    del inflight/6d61696e/0202020202020202020202020202020202020202020202020202020202020202/2 cond=v16
+    put doneof/0000000000000001 cond=any len=45 sha=a2c1eb6cc2381e02 ttl=600000ms
+    del op/0000000000000001 cond=any
+    del queue/0000000000000001 cond=any
+    del loss/0000000000000001 cond=any
+    del fate/0000000000000001 cond=any
+    del subject/0000000000000001 cond=any
+    del opkey/0000000000000001 cond=any
+    del lease-by-op/0000000000000001 cond=any
+    put done/0000000000000001 cond=any len=62 sha=b0cb30eeca195cb1 ttl=600000ms
+  cache running exit=0
+> [t=0ms] tick

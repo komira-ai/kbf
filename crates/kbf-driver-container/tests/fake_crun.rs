@@ -9,6 +9,7 @@ mod fake_clock;
 mod fake_directory_blobs;
 mod fake_memory;
 mod fake_missing_blobs;
+mod fake_node_load;
 mod fake_oci;
 mod fake_usage;
 mod support;

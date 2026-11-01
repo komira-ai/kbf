@@ -24,6 +24,7 @@ fn caller(farm: &TestFarm, tag: u8) -> kbf_front::Ticket {
         call: None,
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     };
     farm.submit(submission).expect("submitted")
 }
@@ -173,7 +174,7 @@ pub(super) async fn a_refusal_loses_to_a_grant_made_by_another_frontend(backing:
     wait_out_the_unservable_wait().await;
     first.tick().await;
 
-    assert_eq!(first.lost_races(), 1, "the refusal was written");
+    assert_eq!(lost_races(&first), 1, "the refusal was written");
     assert_eq!((disk.rows("op/"), disk.rows("lease/")), (1, 1));
     assert_eq!(disk.rows("done/"), 0);
     assert!(finished_by(&second, &node_b, lease).await);

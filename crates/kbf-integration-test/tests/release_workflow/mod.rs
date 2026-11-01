@@ -96,9 +96,11 @@ const BUCK2_FETCH: &str = "cargo xtask fetch --url \"https://github.com/facebook
 /// The action `gamma` joins a Tailscale network with, pinned by commit.
 const TS_ACTION: &str = "tailscale/github-action@";
 
-/// The one condition of the network join: the trust credential's client id and the
-/// coordinator's address are both set (either unset, the step is skipped).
-const TS_IF: &str = "${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}";
+/// The one condition of the network join: the trust credential's client id is set and so is
+/// one of the farm's addresses, the coordinator's (the deploy step) or the build endpoint's (the
+/// remote-only build after it); otherwise the step is skipped.
+const TS_IF: &str =
+    "${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}";
 
 /// The inputs of the network join, all of them: workload identity federation with the run's
 /// token (the CI trust credential, `TS_CLIENT_ID` and `TS_AUDIENCE`, as `tag:ci`), so no
@@ -380,6 +382,7 @@ pub fn problems(release: &str) -> Result<Vec<String>, String> {
     notes_job(release, &mut out)?;
     publish_job(release, &mut out)?;
     bump_job(release, &mut out)?;
+    rehearse_job(release, &mut out)?;
     gamma_job(release, &mut out)?;
     // The shared rules, as the workflow lint reads them (pins, runners, permissions).
     out.extend(
@@ -993,6 +996,48 @@ fn tag_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// The token file the rehearsal's helper reads its channel's token from (the test copies it to a
+/// file root owns): the run's own token, in a file its owner alone can read, written from the
+/// environment so the token is never in a command line.
+fn rehearse_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
+    let job = REHEARSE;
+    let file = "/var/tmp/kbf-update-rehearsal.token";
+    let steps = workflows::job_steps(release, job)?;
+    for step in &steps {
+        if step.run.as_deref().is_some_and(|r| r.contains("${{")) {
+            out.push(format!(
+                "the job `{job}` puts a `${{{{ }}}}` value in a command: the token and the tag reach a step by `env:` and are read as variables"
+            ));
+        }
+    }
+    let makes = steps.iter().any(|s| {
+        s.run.as_deref().map(str::trim_end) == Some(&format!("install -m 0600 /dev/null {file}"))
+    });
+    if !makes {
+        out.push(format!(
+            "the job `{job}` makes its token file with a mode other than 0600: `install -m 0600 /dev/null {file}`, before the token is written"
+        ));
+    }
+    let writes = steps.iter().find(|s| {
+        s.run
+            .as_deref()
+            .is_some_and(|r| r.trim_end() == format!("printf '%s' \"$GH_TOKEN\" > {file}"))
+    });
+    match writes {
+        None => out.push(format!(
+            "the job `{job}` does not write its token file from `GH_TOKEN`: the helper lists releases under the run's token, not anonymously"
+        )),
+        Some(step) => {
+            if step.env != [("GH_TOKEN".to_owned(), "${{ github.token }}".to_owned())] {
+                out.push(format!(
+                    "the job `{job}` writes a token that is not `github.token`: the run's own read-only token, no secret"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn bump_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     let job = "bump";
     let steps = workflows::job_steps(release, job)?;
@@ -1410,24 +1455,22 @@ fn notes_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// The flag that holds a `release check` to no version facts of its `kbf` tarballs.
+/// The flag a `release check` once took to go without version facts, image facts and image
+/// SBOMs. It no longer exists.
 const WITHOUT_FACTS: &str = "--without-version-facts";
 
-/// The release being made is checked with the version facts of its `kbf` (`release check
-/// dist` has no waiver), and the previous release, made before the build jobs recorded
-/// them, is checked without (`release check previous` has it): else the first release
-/// with facts would fail on the one before it, or a set without them would go out.
+/// Neither `release check` is given a waiver: the release being made and the release before it
+/// both hold the version facts of their `kbf` and the facts and SBOM of their task image. The
+/// release before this one is v0.0.41 or later, which has all three, so a waiver would only
+/// let a set without them go out unnoticed.
 fn version_facts(steps: &[workflows::Step], out: &mut Vec<String>) {
-    for (dir, waived) in [(DIST, false), (PREVIOUS_DIR, true)] {
+    for dir in [DIST, PREVIOUS_DIR] {
         let prefix = format!("cargo xtask release check {dir} ");
         let Some((_, _, words)) = command(steps, &prefix) else {
             continue;
         };
-        if waived && !words.contains(&WITHOUT_FACTS) {
-            out.push(format!("`release check {dir}` is not given `{WITHOUT_FACTS}`: the release before the version facts were recorded has none, so the first release with them would fail on it"));
-        }
-        if !waived && words.contains(&WITHOUT_FACTS) {
-            out.push(format!("`release check {dir}` is given `{WITHOUT_FACTS}`: the release being made must hold the version facts of its kbf"));
+        if words.contains(&WITHOUT_FACTS) {
+            out.push(format!("`release check {dir}` is given `{WITHOUT_FACTS}`: no release check waives the version facts, the image facts or the image SBOM"));
         }
     }
 }

@@ -7,6 +7,21 @@
 //! finds the host where its work began and never earlier.
 //! The first failure stops the roll and no later host is asked about, let alone touched.
 //!
+//! A drain never cuts work. A daemon host's node is waited for until it holds no lease, however
+//! long that takes; a [`Timing::drain_deadline`] the operator set only stops the waiting, with
+//! `drain_failed`, the node left drained and nothing installed. A frontend pool member's
+//! drain ([`Timing::frontend_drain`]) is the same: waited for until the member has exited,
+//! and a deadline fails the roll with the member left draining.
+//!
+//! A node is given back only if the roll drained it. The frontend's cordon carries no owner, so
+//! the drain port ([`crate::agent::cordon::OwnCordon`] in the daemon, marks in the state
+//! directory beside `roll.json`) keeps a mark for each node the roll cordons: before the drain
+//! call, and until an undrain worked. The node's placement is read before the drain (an
+//! unreadable one drains nothing) and again before the give-back; a node with the roll's mark
+//! reads as in placement, on this attempt, on a retry roll and after a restart, and one without
+//! it that is out was drained by an operator and is left out. The host is then not asked to be
+//! serving. A mark of a node seen serving is dropped.
+//!
 //! A frontend that is a member of a pool of frontends (an inventory line with `instance=` and
 //! `base=`) takes a turn of its own, in `updater_no_proxy.rs`, whatever load balancer is in
 //! front of the pool: every other member must have answered `/readyz` 200 for a while, the
@@ -44,7 +59,7 @@
 //! updater is poisoned: every operation answers `state_lost` until [`Updater::reload`] (or a
 //! new process) has read `roll.json` again and so knows what the disk says.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::api::{
@@ -53,9 +68,10 @@ use crate::api::{
 use crate::inventory::{Host, Inventory, Role};
 use crate::ports::{
     Apply, Clock, Drain, FrontendControl, Health, HealthCheck, InstallAnswer, Installed, Installer,
-    PortError, SafeToStop, Stop,
+    Placed, PortError, SafeToStop, Stop,
 };
 use crate::record::{FORMAT, Record, RollStore, StoreError, roll_id};
+use crate::server::AuditSink;
 use crate::timing::Timing;
 use crate::version::Version;
 
@@ -149,6 +165,8 @@ pub struct Updater {
     store: RollStore,
     ports: Ports,
     timing: Timing,
+    /// Where the roll's warnings go; nowhere until [`Updater::with_log`].
+    log: AuditSink,
     state: Mutex<State>,
 }
 
@@ -196,6 +214,7 @@ impl Updater {
             store,
             ports,
             timing,
+            log: Arc::new(|_| {}),
             state: Mutex::new(State {
                 rec,
                 driving: false,
@@ -203,6 +222,22 @@ impl Updater {
                 poisoned: false,
             }),
         })
+    }
+
+    /// Send the roll's warnings (a node it leaves out, with the reason) to `log`.
+    pub fn with_log(mut self, log: AuditSink) -> Updater {
+        self.log = log;
+        self
+    }
+
+    /// Say that the roll leaves `host`'s node out, because its cordon is not the roll's.
+    fn warn_left_out(&self, host: &Host) {
+        let node = host.node_id.as_deref().unwrap_or(&host.alias);
+        (self.log)(&format!(
+            "warn: {node}: left out after the roll: its cordon is not marked as this roll's (an \
+             operator's, or placement was unknown at the drain); uncordon it by hand if it \
+             should serve"
+        ));
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, State> {
@@ -488,7 +523,7 @@ impl Updater {
     /// the wait with a fresh bound, and a `failed` host is never resumed past.
     ///
     /// A daemon host's node is drained at the end of `checking` and given back after the host
-    /// is healthy. From `installing` on the roll holds it, whether this process drained it or
+    /// is healthy, if the roll drained it (an operator's cordon is left). From `installing` on the roll holds it, whether this process drained it or
     /// the one before a restart did: every failure on the way names the node and leaves it
     /// drained, for an operator to look at.
     fn step(&self, idx: usize, target: &Version) -> Result<(), Halt> {
@@ -531,8 +566,9 @@ impl Updater {
         self.install_and_wait(idx, host, target, phase, held)
             .map_err(|halt| if held { left_drained(host, halt) } else { halt })?;
         if held {
-            self.undrain(host)?;
-            self.wait_healthy(host, target, false)?;
+            // A node the roll did not drain stays out, so the host is not asked to be serving.
+            let given_back = self.undrain(host)?;
+            self.wait_healthy(host, target, !given_back)?;
         }
         self.mark(idx, Phase::Done, false)?;
         Ok(())
@@ -621,9 +657,11 @@ impl Updater {
         }
     }
 
-    /// Drain the host's node and wait until it holds no lease, or until the drain deadline
-    /// has passed (its leases then run on and the install goes ahead). A failure leaves the
-    /// node as the frontend has it, which may be drained.
+    /// Drain the host's node and wait until it holds no lease, however long that takes, or
+    /// until the drain deadline, if the operator set one, has passed. At the deadline nothing is
+    /// installed: the roll stops with the node left drained and its leases running, and a new
+    /// roll drains the node again and waits again. A failure leaves the node as the frontend
+    /// has it, which may be drained.
     fn drain(&self, host: &Host) -> Result<(), Halt> {
         let fail = |why: &str, e: PortError| {
             left_drained(
@@ -632,6 +670,15 @@ impl Updater {
             )
         };
         let deadline = self.timing.drain_deadline;
+        // Read first, so that a node whose placement cannot be read is not cordoned at all:
+        // the give-back reads it again, and the drain's marks are what tell the roll's own
+        // cordon (on this attempt, on a retry, after a restart) from an operator's.
+        self.ports.drain.placed(host).map_err(|e| {
+            Halt::Fail(
+                ErrorCode::DrainFailed,
+                format!("the node's placement could not be read: {e}"),
+            )
+        })?;
         self.ports
             .drain
             .drain(host, deadline)
@@ -643,21 +690,54 @@ impl Updater {
                 .drain
                 .leases(host)
                 .map_err(|e| fail("the node's leases could not be read", e))?;
-            if held == 0 || self.since(start) >= deadline {
+            if held == 0 {
                 return Ok(());
+            }
+            if let Some(deadline) = deadline.filter(|d| self.since(start) >= *d) {
+                return Err(left_drained(
+                    host,
+                    Halt::Fail(
+                        ErrorCode::DrainFailed,
+                        format!(
+                            "{} still holds {held} leases after the drain deadline of {} s; \
+                             nothing was installed and the leases run on; start a new roll to \
+                             drain it again and wait again",
+                            host.alias,
+                            deadline.as_secs()
+                        ),
+                    ),
+                ));
             }
             self.ports.clock.sleep(self.timing.poll);
         }
     }
 
-    /// Give the host's node back, now that the host runs the target.
-    fn undrain(&self, host: &Host) -> Result<(), Halt> {
-        self.ports.drain.undrain(host).map_err(|e| {
+    /// Give the host's node back, now that the host runs the target, if the roll drained it:
+    /// true when it was given back. The drain port reads a node as in placement when it is,
+    /// or when it holds the roll's own mark for it (see [`Drain::placed`]); a node it reads as
+    /// out is an operator's, and is left out.
+    fn undrain(&self, host: &Host) -> Result<bool, Halt> {
+        let fail = |why: &str, e: PortError| {
             left_drained(
                 host,
-                Halt::Fail(ErrorCode::UndrainFailed, format!("the undrain failed: {e}")),
+                Halt::Fail(ErrorCode::UndrainFailed, format!("{why}: {e}")),
             )
-        })
+        };
+        let placed = self.ports.drain.placed(host).map_err(|e| {
+            fail(
+                "the node's placement could not be read, so it is not given back",
+                e,
+            )
+        })?;
+        if placed == Placed::Out {
+            self.warn_left_out(host);
+            return Ok(false);
+        }
+        self.ports
+            .drain
+            .undrain(host)
+            .map_err(|e| fail("the undrain failed", e))?;
+        Ok(true)
     }
 
     fn now(&self) -> Duration {

@@ -472,7 +472,7 @@ fn signing_scopes_need_a_job_that_runs_only_for_a_push() {
             assert_eq!(
                 scan(&workflow(&body)),
                 vec![format!(
-                    "line {}: `{scope}: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}`",
+                    "line {}: `{scope}: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}` or exactly `{SIGNING_STAGE_ONLY}`",
                     if cond.is_empty() { 7 } else { 8 }
                 )],
                 "{body}"
@@ -496,6 +496,94 @@ fn a_main_push_job_still_gets_no_other_write_scope() {
             "a job's `permissions`",
         );
     }
+}
+
+#[test]
+fn actions_write_needs_a_job_that_runs_only_for_a_push_to_main() {
+    // Catches: `actions: write` (cancel or re-run any run of the repository) allowed in a job a
+    // pull request or the merge queue runs, or refused where the pipeline's watch job needs it;
+    // and the same exception read as unlocking another scope or a level other than `write`.
+    clean(&workflow(&format!(
+        "    runs-on: ubuntu-latest\n{SIGNING_PUSH_IF}    permissions: {{contents: read, actions: write}}\n"
+    )));
+    for cond in [
+        "",
+        "    if: ${{ github.event_name == 'push' }}\n",
+        "    if: ${{ github.ref == 'refs/heads/main' }}\n",
+        "    if: ${{ github.event_name != 'pull_request' }}\n",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' || true }}\n",
+    ] {
+        let body =
+            format!("    runs-on: ubuntu-latest\n{cond}    permissions: {{actions: write}}\n");
+        assert_eq!(
+            scan(&workflow(&body)),
+            vec![format!(
+                "line {}: `actions: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}` or exactly `{RERUN_ONLY}`",
+                if cond.is_empty() { 7 } else { 8 }
+            )],
+            "{body}"
+        );
+    }
+    for p in ["{Actions: write}", "{actions: admin}", "write-all"] {
+        refused(
+            &format!("    runs-on: ubuntu-latest\n{SIGNING_PUSH_IF}    permissions: {p}\n"),
+            "a job's `permissions`",
+        );
+    }
+}
+
+/// The `if:` line under which a job of a twice-called workflow may sign: a push to main, in the sign stage.
+const SIGNING_STAGE_IF: &str = "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage == 'sign' }}\n";
+
+#[test]
+fn signing_scopes_are_also_allowed_in_the_sign_stage_of_a_push_to_main_and_nothing_wider() {
+    // Catches: the sign-stage `if:` refused where artifacts.yml's attest jobs need it; the
+    // exception taken for `actions: write` (the watch job's scope stays on the plain push
+    // condition); and a loosened spelling accepted: the stage test alone, the stage test with
+    // another ref or event, a different stage, `!=` for `==`, or a trailing `|| true`.
+    let signing = "{contents: read, id-token: write, attestations: write}";
+    clean(&workflow(&format!(
+        "    runs-on: ubuntu-latest\n{SIGNING_STAGE_IF}    permissions: {signing}\n"
+    )));
+    for cond in [
+        "    if: ${{ inputs.stage == 'sign' }}\n",
+        "    if: ${{ github.event_name == 'push' && inputs.stage == 'sign' }}\n",
+        "    if: ${{ github.ref == 'refs/heads/main' && inputs.stage == 'sign' }}\n",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage == 'build' }}\n",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage != 'sign' }}\n",
+        "    if: ${{ github.event_name == 'pull_request' && github.ref == 'refs/heads/main' && inputs.stage == 'sign' }}\n",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/feature/x' && inputs.stage == 'sign' }}\n",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage == 'sign' || true }}\n",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' || inputs.stage == 'sign' }}\n",
+    ] {
+        for scope in ["id-token", "attestations"] {
+            let body =
+                format!("    runs-on: ubuntu-latest\n{cond}    permissions: {{{scope}: write}}\n");
+            let found = scan(&workflow(&body));
+            assert!(
+                found.iter().any(|m| m.contains(&format!(
+                    "`{scope}: write` is allowed only in a job whose `if:` is exactly"
+                ))),
+                "{body}\n-> {found:?}"
+            );
+        }
+    }
+    refused(
+        &format!(
+            "    runs-on: ubuntu-latest\n{SIGNING_STAGE_IF}    permissions: {{actions: write}}\n"
+        ),
+        &format!(
+            "`actions: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}`"
+        ),
+    );
+    refused(
+        &format!(
+            "    runs-on: ubuntu-latest\n{SIGNING_STAGE_IF}    permissions: {{contents: write}}\n"
+        ),
+        &format!(
+            "`contents: write` is allowed only in a job whose `if:` is exactly `{RELEASE_PUSH_ONLY}`"
+        ),
+    );
 }
 
 /// The `if:` line under which a job may sign provenance: a push to main.
@@ -586,7 +674,6 @@ fn a_release_tag_job_gets_no_other_write_scope() {
     );
     for p in [
         "{packages: write}",
-        "{actions: write}",
         "{Contents: write}",
         "{contents: admin}",
         "write-all",
@@ -596,6 +683,11 @@ fn a_release_tag_job_gets_no_other_write_scope() {
             "a job's `permissions`",
         );
     }
+    // `actions: write` is the watch job's scope, gated on a push to main, not on a release.
+    refused(
+        &format!("    runs-on: ubuntu-latest\n{TAG_PUSH_IF}    permissions: {{actions: write}}\n"),
+        &format!("is exactly `{SIGNING_PUSH_ONLY}`"),
+    );
 }
 
 #[test]
@@ -886,4 +978,132 @@ fn unreadable_bytes_are_refused_and_a_bom_is_dropped() {
         .chain(w.encode_utf16().flat_map(u16::to_le_bytes))
         .collect();
     assert!(decode(&utf16).is_err());
+}
+
+/// A job `a` with the given `strategy:` lines under it.
+fn with_strategy(strategy: &str) -> String {
+    workflow(&format!(
+        "    runs-on: ubuntu-latest\n    strategy:\n{strategy}    steps:\n      - run: echo\n"
+    ))
+}
+
+#[test]
+fn a_matrix_of_include_entries_is_read_in_order() {
+    // Catches: a reader that drops an entry, reorders keys or reads a number as no value.
+    let text = with_strategy(
+        "      fail-fast: false\n      matrix:\n        include:\n          - core: legacy\n            part: 1\n            args: -p a --features x/y\n          - { core: js, part: 2 }\n",
+    );
+    let got = job_matrix(&text, "a").expect("matrix");
+    let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+    assert_eq!(
+        got,
+        vec![
+            vec![
+                pair("core", "legacy"),
+                pair("part", "1"),
+                pair("args", "-p a --features x/y")
+            ],
+            vec![pair("core", "js"), pair("part", "2")],
+        ]
+    );
+}
+
+#[test]
+fn a_matrix_of_another_shape_is_an_error_not_an_empty_answer() {
+    // Catches: a rewritten matrix (axes, no list, an empty list, a nested value) that the
+    // reader would take for no entries, so a lint over it passed by reading nothing.
+    let cases = [
+        (
+            "    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n",
+            "the job `a` has no `strategy` mapping",
+        ),
+        (
+            "      fail-fast: false\n",
+            "the `strategy` of job `a` has no `matrix` mapping",
+        ),
+        (
+            "      matrix:\n        core: [legacy, js]\n        include:\n          - core: x\n",
+            "the matrix of job `a` has a key besides `include`",
+        ),
+        (
+            "      matrix:\n        include: x\n",
+            "the matrix of job `a` has no `include` list",
+        ),
+        (
+            "      matrix:\n        include: []\n",
+            "the matrix of job `a` has no entry",
+        ),
+        (
+            "      matrix:\n        include:\n          - [a, b]\n",
+            "a matrix entry of job `a` is not a mapping",
+        ),
+        (
+            "      matrix:\n        include:\n          - core: [a]\n",
+            "a matrix entry of job `a` has a value that is not a scalar",
+        ),
+    ];
+    for (strategy, want) in cases {
+        let text = if want.contains("no `strategy`") {
+            workflow(strategy)
+        } else {
+            with_strategy(strategy)
+        };
+        let e = job_matrix(&text, "a").expect_err(want);
+        assert!(e.contains(want), "want `{want}`, got `{e}`");
+    }
+    assert!(
+        job_matrix(
+            &with_strategy("      matrix:\n        include:\n          - a: 1\n"),
+            "b"
+        )
+        .is_err()
+    );
+}
+
+/// The `if:` line under which a job may rerun the failed jobs of a pipeline run (`pipeline-rerun.yml`).
+const RERUN_IF: &str = "    if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}\n";
+
+#[test]
+fn actions_write_is_also_allowed_for_the_first_attempt_of_a_failed_pipeline_run_and_nothing_wider()
+{
+    // Catches: the rerun workflow's `actions: write` refused; the exception loosened so that it
+    // runs for any attempt (a rerun loop), a run that was not a push to main, another branch or
+    // repository, or a green run; and the exception taken for any other write scope.
+    assert_eq!(format!("    if: {RERUN_ONLY}\n"), RERUN_IF);
+    clean(&workflow(&format!(
+        "    runs-on: ubuntu-latest\n{RERUN_IF}    permissions: {{contents: read, actions: write}}\n"
+    )));
+    for cond in [
+        "if: ${{ github.event.workflow_run.conclusion == 'failure' }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 2 && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion != 'success') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}",
+        "if: ${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 }}",
+        "if: ${{ github.ref == 'refs/heads/main' }}",
+    ] {
+        let body = format!(
+            "    runs-on: ubuntu-latest\n    {cond}\n    permissions: {{actions: write}}\n"
+        );
+        let found = scan(&workflow(&body));
+        assert!(
+            found
+                .iter()
+                .any(|m| m
+                    .contains("`actions: write` is allowed only in a job whose `if:` is exactly")),
+            "{body}\n-> {found:?}"
+        );
+    }
+    for scope in ["contents", "id-token", "attestations", "issues"] {
+        let body =
+            format!("    runs-on: ubuntu-latest\n{RERUN_IF}    permissions: {{{scope}: write}}\n");
+        let found = scan(&workflow(&body));
+        assert!(
+            found
+                .iter()
+                .any(|m| m.contains(&format!("`{scope}: write` is allowed only"))),
+            "{body}\n-> {found:?}"
+        );
+    }
 }

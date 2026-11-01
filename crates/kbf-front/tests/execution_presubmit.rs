@@ -94,10 +94,11 @@ impl Dispatch for Queue {
             .unwrap_or_else(PoisonError::into_inner);
         let name = format!("operations/{}", held.len());
         held.push(tx);
+        let key = kbf_types::ActionKey::try_from(&submission.request.key).expect("an action's key");
         Ok(Ticket {
             name,
-            instance: submission.request.key.instance,
-            action: submission.request.key.action,
+            instance: key.instance,
+            action: key.action,
             stage,
         })
     }

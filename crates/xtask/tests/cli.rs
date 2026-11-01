@@ -430,6 +430,10 @@ fn the_darwin_verbs_fail_off_macos() {
             &["darwin-asset", "x.tar.gz", "kbf-daemon"][..],
             "darwin-asset",
         ),
+        (
+            &["pkg-macos-install-test", "--package", "x"][..],
+            "pkg-macos-install-test",
+        ),
     ] {
         let (code, out, err) = outcome(Command::new(XTASK).args(args).output().expect("run"));
         assert_eq!((code, out.as_str()), (Some(1), ""), "{args:?}");
@@ -800,5 +804,135 @@ fn pkg_image_asset_wants_the_reference_of_its_service_and_no_other() {
     let (code, _, err) = run(&["--binary", &file, "--out", &out], "coordinator");
     assert_eq!(code, Some(1), "{err}");
     assert!(err.contains("not an OCI image tar"), "{err}");
+    // `--verify-only` makes the other checks alone: no reference is wanted, and the image is
+    // still read (a non-image is refused), for the coordinator's image and the task's.
+    for service in ["coordinator", "task"] {
+        let (code, _, err) = run(&["--verify-only"], service);
+        assert_eq!(code, Some(1), "{service}: {err}");
+        assert!(err.contains("not an OCI image tar"), "{service}: {err}");
+    }
+    // The task image is held to --binary as the coordinator's is.
+    let (code, _, err) = run(&["--kbf-tarball", &file, "--out", &out], "task");
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("the task image is checked against --binary"),
+        "{err}"
+    );
+    let (code, _, err) = run(&["--binary", &file, "--out", &out], "task");
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("not an OCI image tar"), "{err}");
     assert!(!root.join("dist").join("SHA256SUMS.linux-x86_64").exists());
+}
+
+#[test]
+fn stage_task_tree_makes_the_tree_and_refuses_a_binary_of_another_name() {
+    // Asserts: the verb prints its line and leaves `kbf-task` alone in a new directory; a
+    // binary of another name is an exit 1 that makes no directory.
+    let root = scratch("stage-task-tree");
+    let bin = root.join("kbf-task");
+    std::fs::write(&bin, b"signed").expect("binary");
+    let tree = root.join("tmp/tree");
+    let path = |p: &Path| p.to_str().expect("utf8").to_owned();
+    let (code, out, err) = outcome(
+        xtask(
+            &root,
+            &[
+                "stage-task-tree",
+                "--binary",
+                &path(&bin),
+                "--out",
+                &path(&tree),
+            ],
+        )
+        .output()
+        .expect("run"),
+    );
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(
+        out,
+        format!(
+            "staged {} as {}\n",
+            bin.display(),
+            tree.join("kbf-task").display()
+        )
+    );
+    assert_eq!(
+        std::fs::read(tree.join("kbf-task")).expect("staged"),
+        b"signed"
+    );
+
+    let other = root.join("kbf-other");
+    std::fs::write(&other, b"x").expect("other");
+    let again = root.join("tmp/other");
+    let (code, _, err) = outcome(
+        xtask(
+            &root,
+            &[
+                "stage-task-tree",
+                "--binary",
+                &path(&other),
+                "--out",
+                &path(&again),
+            ],
+        )
+        .output()
+        .expect("run"),
+    );
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("is not a file named kbf-task"), "{err}");
+    assert!(!again.exists());
+}
+
+#[test]
+fn package_task_bundle_refuses_a_directory_that_is_not_a_bundle_and_writes_nothing() {
+    // Asserts: the verb's flags reach the check: an empty layout directory is an exit 1 that
+    // names the missing files, and no asset or sums file is made in --out.
+    let root = scratch("package-task-bundle");
+    let layout = root.join("layout");
+    std::fs::create_dir_all(&layout).expect("layout");
+    let sbom = root.join("sbom.cdx.json");
+    std::fs::write(&sbom, b"{}").expect("sbom");
+    let out = root.join("dist");
+    let path = |p: &Path| p.to_str().expect("utf8").to_owned();
+    let (code, _, err) = outcome(
+        xtask(
+            &root,
+            &[
+                "package-task-bundle",
+                "--layout",
+                &path(&layout),
+                "--sbom",
+                &path(&sbom),
+                "--commit",
+                HEAD,
+                "--out",
+                &path(&out),
+            ],
+        )
+        .output()
+        .expect("run"),
+    );
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("oci-layout is missing"), "{err}");
+    assert!(!out.exists());
+}
+
+#[test]
+fn the_lines_a_workflow_runs_are_checked_by_the_parser_without_running_them() {
+    // Asserts: `check_args` accepts the two task-bundle command lines of the release workflow, and
+    // refuses a misspelt flag and a missing required flag with the parser's message.
+    let ok = [
+        "stage-task-tree --binary target/x/release/kbf-task --out tmp/task-tree",
+        "package-task-bundle --layout tmp/b --sbom s.json --commit abc --out dist",
+    ];
+    for line in ok {
+        let words: Vec<&str> = line.split(' ').collect();
+        assert_eq!(xtask::check_args(&words), Ok(()), "{line}");
+    }
+    let misspelt: Vec<&str> = "stage-task-tree --binaries x --out y".split(' ').collect();
+    let err = xtask::check_args(&misspelt).expect_err("misspelt flag");
+    assert!(err.contains("--binaries"), "{err}");
+    let missing: Vec<&str> = "package-task-bundle --layout l".split(' ').collect();
+    let err = xtask::check_args(&missing).expect_err("missing flags");
+    assert!(err.contains("--sbom"), "{err}");
 }

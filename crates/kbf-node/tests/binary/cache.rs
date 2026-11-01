@@ -110,6 +110,36 @@ fn a_container_node_opens_its_cache_and_trees_under_the_data_dir() {
     }
 }
 
+/// `--no-input-cache` at the daemon's level. Catches the flag accepted and ignored (the
+/// cache opened and `cache/` made anyway), a half-applied flag that still opens the
+/// trees store, and a start that does not say why there is no cache: a container daemon
+/// given it makes `leases` and nothing else under `--data-dir`, and logs `cache: off:`
+/// and `trees: off` naming the flag.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the container driver is Linux-only"
+)]
+fn a_container_node_with_no_input_cache_makes_neither_cache_nor_trees() {
+    #[cfg(target_os = "linux")]
+    {
+        let data = tls("no-input-cache-data");
+        let (mut flags, bin, _held) = container("no-input-cache", &data);
+        flags.push("--no-input-cache".to_owned());
+        let (status, log) = runs_until_sigterm_logged("no-input-cache", &flags, Some(&bin));
+        assert!(status.success(), "{status}: {log:#?}");
+        assert!(
+            logged(&log, &["cache: off:--no-input-cache", "trees: off"]),
+            "{log:#?}"
+        );
+        assert!(!logged(&log, &["link mode"]), "{log:#?}");
+        assert!(data.join("leases").is_dir(), "no lease directory");
+        for absent in ["cache", "trees"] {
+            assert!(!data.join(absent).exists(), "the daemon made {absent}");
+        }
+    }
+}
+
 /// C-19. Catches the native driver on Linux using a cache its own actions could write
 /// (the "enable the cache on Linux native" defect), or making the cache or trees
 /// directories: under `--data-dir` it makes `leases` and nothing else, and logs that

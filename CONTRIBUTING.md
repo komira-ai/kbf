@@ -103,7 +103,7 @@ The tests that need Postgres fail, and are not skipped, when no server is named.
 `KBF_TEST_POSTGRES_URL` to the URL of a server and a superuser role (the tests create and
 drop databases and roles), for example `postgres://postgres@localhost:5432/postgres`; the
 Postgres service container of `.github/workflows/ci.yml` is one. Each such test makes a
-database or a schema of its own on it (`kbf-testkit`'s `database` module makes the database)
+database or a schema of its own on it (the `database` module of `js-testkit`, which `kbf-testkit` re-exports, makes the database)
 and drops it when the test ends, so tests run in parallel and never share rows.
 
 ## No new shell or Python
@@ -155,6 +155,16 @@ The pull-request gate is 99.00% of lines and 99.00% of branches in every crate,
 measured on the fast tests (the `pr` profile of `.config/nextest.toml`) by the
 `test` job. The target is 100%, and reviewers hold the rest: a pull request
 covers the code it adds or changes.
+
+The fast tests run in shards, in the matrix job `test-shard`: the scheduler's
+legacy core on the workspace in three parts and the js core on the four packages
+that link the server in one, each part a `nextest --partition count:<part>/<parts>`
+of that core's tests. The `test` job builds both cores' instrumented tests itself
+(without running them), waits for every shard's raw profiles, checks that each
+shard's profiles are there, makes one report of them all and gates it, so a crate's
+coverage is that of all the tests of both cores together, as when one job ran them
+in turn. The matrix is the list of shards: a core's entries are its parts 1 to N,
+each once (`crates/kbf-integration-test/tests/coverage_wiring` holds that).
 
 The job runs `kbf-coverage` against [coverage-floors](coverage-floors) and fails
 a crate whose line or branch coverage is under its threshold: 99.00%, or, for a

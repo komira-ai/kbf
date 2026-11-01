@@ -54,7 +54,8 @@ prost.workspace = true
 rcgen.workspace = true
 # inotify, which counts the opens of each output file (tests/one_read.rs).
 rustix = { workspace = true, features = ["fs"] }
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "time"] }
+# Paused time for the stop signals' fan-out (src/all_in_one_tests.rs).
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "test-util", "time"] }
 # The scratch directories every test owns and removes (TestDir).
 kbf-testkit.workspace = true
 

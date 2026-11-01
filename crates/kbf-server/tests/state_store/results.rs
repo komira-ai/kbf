@@ -17,6 +17,7 @@ fn caller(farm: &TestFarm, tag: u8) -> kbf_front::Ticket {
         call: None,
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     };
     farm.submit(submission).expect("submitted")
 }
@@ -100,7 +101,7 @@ pub(super) async fn a_name_in_the_new_form_is_answered_by_every_frontend_at_ever
         let queued = farm.wait(&name).expect("queued in the store");
         assert_eq!(shown(&queued), Stage::Queued);
         assert_eq!(queued.instance, "main");
-        assert_eq!(queued.action, request(1).key.action);
+        assert_eq!(queued.action, action_of(1));
     }
     let (_, mut inbox) = register(&b);
     b.intake();
@@ -141,7 +142,7 @@ pub(super) async fn an_old_form_name_is_answered_by_the_issuing_frontend(backing
 
     assert_eq!(waited.name, old);
     assert_eq!(waited.instance, "main");
-    assert_eq!(waited.action, request(1).key.action);
+    assert_eq!(waited.action, action_of(1));
     // No worker is connected, so the caller is told why it waits; the old name shows the
     // stage of that caller, not one of its own.
     assert_eq!(

@@ -2,8 +2,9 @@
 //! its own, booted from a fresh clone of a golden image and destroyed with the clone
 //! when the lease ends (`docs/design/macos-vms.md` section 6). The hypervisor side is
 //! the [`VmHost`] trait; [`FakeHost`] implements it with no hypervisor, running the real
-//! `kbf-guest` agent on the host, and the macOS host (the `kbf-vmm` helper on
-//! Virtualization.framework) is planned. The daemon does not offer this driver yet.
+//! `kbf-guest` agent on the host, and the macOS host ([`MacVmHost`], which runs `kbf-vmm
+//! vm-run` through the root helper) is built over a [`VmSession`]. The daemon does not
+//! offer this driver yet.
 //!
 //! One lease, in order:
 //! 1. **Prepare.** The Action and Command are fetched. An action that asks for the
@@ -48,10 +49,11 @@
 //! ([`kbf_daemon::RuntimeError::Invalid`]).
 //!
 //! At start ([`VmDriver::new`]) everything in the lease and clone directories is
-//! removed: a daemon that crashed left it. Its VMs end with it: the planned `kbf-vmm`
-//! helper serves a VM over its stdin and stdout and ends at their end.
+//! removed: a daemon that crashed left it. Its VMs end with it: `kbf-vmm vm-run` serves a VM over
+//! its stdin and stdout and force-stops the VM at the end of its stdin; the macOS host
+//! also ends the runs it recorded ([`mac`]).
 //!
-//! Not yet: the macOS host, the daemon flags that turn the driver on, auxiliary storage
+//! Not yet: the relay from the macOS host to the guest agent, the daemon flags that turn the driver on, auxiliary storage
 //! per clone, the guest's resource usage in the result, and how an action inside the
 //! guest names the outputs share (`kbf-guest`'s request carries no path for it).
 
@@ -60,6 +62,7 @@ pub mod config;
 mod driver;
 mod fake;
 pub mod host;
+pub mod mac;
 #[cfg(test)]
 mod tests;
 
@@ -72,6 +75,7 @@ pub use config::VmConfig;
 pub use driver::{DRIVER, KIND, VmDriver};
 pub use fake::{CloneGate, FakeHost, FakeStream, MACOS_VM_LIMIT};
 pub use host::{HostError, MachineId, NetworkDevice, Share, VmHost, VmSpec};
+pub use mac::{MacConfig, MacVmHost, VmSession};
 
 /// The file in the inputs share holding the per-boot token, as hex: the name
 /// `kbf-guest serve --token-file` is given.

@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::inventory::{Host, Role};
 use crate::ports::{
     Apply, Clock, Drain, DrainStatus, FrontendControl, Health, HealthCheck, InstallAnswer,
-    Installed, Installer, PortError, Report, SafeToStop, Stop, Verdict,
+    Installed, Installer, Placed, PortError, Report, SafeToStop, Stop, Verdict,
 };
 use crate::version::Version;
 
@@ -28,7 +28,7 @@ pub enum Event {
     Query(String),
     Health(String),
     /// A node drain was asked for, with the deadline in seconds.
-    Drain(String, u64),
+    Drain(String, Option<u64>),
     /// The node's leases were read.
     Leases(String),
     Undrain(String),
@@ -53,7 +53,10 @@ impl Event {
             Event::Install(_, version) => format!("install {version}"),
             Event::Query(_) => "query".to_owned(),
             Event::Health(_) => "health".to_owned(),
-            Event::Drain(_, secs) => format!("drain {secs}"),
+            Event::Drain(_, secs) => match secs {
+                Some(secs) => format!("drain {secs}"),
+                None => "drain none".to_owned(),
+            },
             Event::Leases(_) => "leases".to_owned(),
             Event::Undrain(_) => "undrain".to_owned(),
             Event::Commit(_) => "commit".to_owned(),
@@ -414,6 +417,7 @@ pub struct FakeDrain {
     drains: Arc<Script<Result<(), PortError>>>,
     leases: Arc<Script<Result<usize, PortError>>>,
     undrains: Arc<Script<Result<(), PortError>>>,
+    placed: Arc<Script<Result<Placed, PortError>>>,
 }
 
 impl FakeDrain {
@@ -423,7 +427,24 @@ impl FakeDrain {
             drains: Arc::new(Script::new(Ok(()))),
             leases: Arc::new(Script::new(Ok(0))),
             undrains: Arc::new(Script::new(Ok(()))),
+            placed: Arc::new(Script::new(Ok(Placed::In))),
         }
+    }
+
+    /// What reading the node's placement says, in order, then `then` for ever after. A read is
+    /// not in the [`Log`]. Unscripted, a node is in placement.
+    pub fn script_placed(
+        &self,
+        alias: &str,
+        first: Vec<Result<Placed, PortError>>,
+        then: Result<Placed, PortError>,
+    ) {
+        self.placed.set(alias, first, then);
+    }
+
+    /// An operator drained the node before the roll came: every read says it is out.
+    pub fn operator_drained(&self, alias: &str) {
+        self.script_placed(alias, vec![], Ok(Placed::Out));
     }
 
     pub fn script_drain(
@@ -456,9 +477,15 @@ impl FakeDrain {
 }
 
 impl Drain for FakeDrain {
-    fn drain(&self, host: &Host, deadline: Duration) -> Result<(), PortError> {
-        self.log
-            .push(Event::Drain(host.alias.clone(), deadline.as_secs()));
+    fn placed(&self, host: &Host) -> Result<Placed, PortError> {
+        self.placed.next(&host.alias)
+    }
+
+    fn drain(&self, host: &Host, deadline: Option<Duration>) -> Result<(), PortError> {
+        self.log.push(Event::Drain(
+            host.alias.clone(),
+            deadline.map(|d| d.as_secs()),
+        ));
         self.drains.next(&host.alias)
     }
 
@@ -775,7 +802,7 @@ mod tests {
             Event::Install(a(), "2.0".into()),
             Event::Query(a()),
             Event::Health(a()),
-            Event::Drain(a(), 600),
+            Event::Drain(a(), Some(600)),
             Event::Leases(a()),
             Event::Undrain(a()),
             Event::Commit(a()),

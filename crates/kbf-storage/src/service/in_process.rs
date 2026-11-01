@@ -51,6 +51,7 @@ use tonic::{Request, Response, Status};
 
 use super::client::{lift, write_messages};
 use super::{StorageService, catch_up};
+use crate::legacy::Path;
 use crate::{ActionEntry, Answer, PutStream, ReadStream, Storage, StorageError};
 
 /// A node's [`StorageService`], called in-process ([`StorageService::in_process`]). Cheap
@@ -176,7 +177,9 @@ impl Storage for Called {
             let service = self.judged().await?;
             let catching_up = service.catching_up();
             let read = service.storage.read_blob(digest).await;
-            read.map_err(|e| read_error(catching_up, e, digest))
+            let read = read.map_err(|e| read_error(catching_up, e, digest))?;
+            service.count_blob_read(digest, Path::CasInProcess);
+            Ok(read)
         })
     }
 
@@ -190,7 +193,9 @@ impl Storage for Called {
             let service = self.judged().await?;
             let catching_up = service.catching_up();
             let read = service.storage.read_range(digest, offset, limit).await;
-            read.map_err(|e| read_error(catching_up, e, digest))
+            let read = read.map_err(|e| read_error(catching_up, e, digest))?;
+            service.count_blob_read(digest, Path::CasInProcess);
+            Ok(read)
         })
     }
 
@@ -234,7 +239,12 @@ impl Storage for Called {
             let entry = service.storage.action_entry(action).await?;
             match catch_up::entry_miss(catching_up, entry.is_some(), action) {
                 Some(status) => Err(lift(&status, None)),
-                None => Ok(entry),
+                None => {
+                    if entry.is_some() {
+                        service.legacy_reads.count(Path::AcInProcess);
+                    }
+                    Ok(entry)
+                }
             }
         })
     }
@@ -315,6 +325,8 @@ impl Segments for Judged {
         request: Request<ReadRangeRequest>,
     ) -> Result<Response<ReadRangeResponse>, Status> {
         self.this.service.check_map(self.generation).await?;
-        self.this.service.segments.read_range(request).await
+        let read = self.this.service.segments.read_range(request).await?;
+        self.this.service.legacy_reads.count(Path::CasSegments);
+        Ok(read)
     }
 }

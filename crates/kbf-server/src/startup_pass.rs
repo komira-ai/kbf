@@ -95,7 +95,6 @@ pub(crate) fn spawn<M: MetaLog, O: ObjectStore + 'static>(
 mod tests {
     use std::io;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Mutex, PoisonError};
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -112,10 +111,14 @@ mod tests {
 
     use super::*;
     use crate::start::assemble;
+    use crate::test_log::{capture, capture_until};
     use crate::{Args, RaftMetaLog};
 
-    /// How long the test waits for the server to bind, or for the pass to finish.
+    /// How long the test waits for the server to bind.
     const BOUND: Duration = Duration::from_secs(10);
+
+    /// What every line the pass ends with says.
+    const PASS_LINES: &str = "pass over the cold store directory";
 
     fn object_key(prefix: &KeyPrefix, seq: u64) -> ObjectKey {
         prefix
@@ -149,8 +152,7 @@ mod tests {
     /// the Raft log, as the log is (it is never raised), and logs what it did.
     #[tokio::test(flavor = "current_thread")]
     async fn serves_before_pass_finishes() {
-        let logs = Capture::waiting_for(PASS_LINES);
-        let _default = logs.subscribe();
+        let logs = capture_until(PASS_LINES);
         let root = crate::test_dir::scratch_dir("kbf-server-pass");
         let (blobs, raft) = (root.join("blobs"), root.join("raft"));
         let args = Args::parse_from([
@@ -238,8 +240,7 @@ mod tests {
     /// same.
     #[tokio::test(flavor = "current_thread")]
     async fn the_pass_forgets_lost_objects_on_a_log_never_raised() {
-        let logs = Capture::waiting_for(PASS_LINES);
-        let _default = logs.subscribe();
+        let logs = capture_until(PASS_LINES);
         let root = crate::test_dir::scratch_dir("kbf-server-pass-no-raise");
         let files = FsStore::open(&root.join("blobs"), Floor::Bytes(1)).expect("open the store");
         let meta = RaftMetaLog::open_dir(&root.join("raft"), Retention::default(), "kbf/")
@@ -294,8 +295,7 @@ mod tests {
     /// is the log it commits to.
     #[tokio::test(flavor = "current_thread")]
     async fn the_pass_forgets_lost_objects_on_a_log_an_earlier_build_raised() {
-        let logs = Capture::waiting_for(PASS_LINES);
-        let _default = logs.subscribe();
+        let logs = capture_until(PASS_LINES);
         let root = crate::test_dir::scratch_dir("kbf-server-pass-earlier-raise");
         let files = FsStore::open(&root.join("blobs"), Floor::Bytes(1)).expect("open the store");
         let meta = RaftMetaLog::open_dir(&root.join("raft"), Retention::default(), "kbf/")
@@ -341,67 +341,12 @@ mod tests {
         drop((cache, files));
     }
 
-    /// What every line the pass ends with says.
-    const PASS_LINES: &[u8] = b"pass over the cold store directory";
-
-    /// Log lines written by the test's subscriber, and a wake-up when a line holding
-    /// the text waited for is written.
-    #[derive(Clone)]
-    struct Capture(Arc<Mutex<Vec<u8>>>, Arc<tokio::sync::Notify>, &'static [u8]);
-
-    impl Capture {
-        fn waiting_for(text: &'static [u8]) -> Self {
-            Self(Arc::default(), Arc::default(), text)
-        }
-
-        /// Sends this thread's log lines here until the guard drops.
-        fn subscribe(&self) -> tracing::subscriber::DefaultGuard {
-            let writer = self.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(move || writer.clone())
-                .with_ansi(false)
-                .finish();
-            tracing::subscriber::set_default(subscriber)
-        }
-
-        /// Waits, at most `BOUND`, for a line holding the text.
-        async fn ended(&self) {
-            let ended = tokio::time::timeout(BOUND, self.1.notified()).await;
-            ended.expect("no line holding the text waited for");
-        }
-
-        fn text(&self) -> String {
-            let bytes = self
-                .0
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            String::from_utf8(bytes).expect("UTF-8 logs")
-        }
-    }
-
-    impl io::Write for Capture {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-            held.extend_from_slice(bytes);
-            if bytes.windows(self.2.len()).any(|w| w == self.2) {
-                self.1.notify_one();
-            }
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
     /// Asserts that a pass that fails is logged and ends: a shard of the store that cannot
     /// be listed (its directory is gone) fails the pass, which logs that it failed, with
     /// the cause, and its task ends without a panic.
     #[tokio::test(flavor = "current_thread")]
     async fn a_failed_pass_is_logged() {
-        let mut logs = Capture::waiting_for(PASS_LINES);
-        let _default = logs.subscribe();
+        let logs = capture();
         let root = crate::test_dir::scratch_dir("kbf-server-pass-fails");
         let files = FsStore::open(&root.join("blobs"), Floor::Bytes(1)).expect("open the store");
         // A Raft log, as in the server: one instantiation of the task covers both arms.
@@ -422,7 +367,6 @@ mod tests {
             .await
             .expect("the pass task ends without a panic");
 
-        io::Write::flush(&mut logs).expect("flush");
         let text = logs.text();
         assert!(text.contains(PASS_FAILED), "{text}");
         assert!(text.contains("No such file or directory"), "{text}");
@@ -489,8 +433,7 @@ mod tests {
     /// round is done.
     #[tokio::test(flavor = "current_thread")]
     async fn the_evictor_runs_after_the_pass() {
-        let logs = Capture::waiting_for(b"evicted the least recently used objects");
-        let _default = logs.subscribe();
+        let logs = capture_until("evicted the least recently used objects");
         let (_root, files, cache) = short_of_room("evictor", Arc::default()).await;
         let key = cache
             .object_key(ObjectId::new(Epoch::new(1), 2))
@@ -529,8 +472,7 @@ mod tests {
         use kbf_meta::NodeWriter;
         use kbf_storage::service::CatchUp;
 
-        let logs = Capture::waiting_for(PASS_LINES);
-        let _default = logs.subscribe();
+        let logs = capture_until(PASS_LINES);
         let root = crate::test_dir::scratch_dir("kbf-server-pass-rebuild");
         let files = FsStore::open(&root.join("blobs"), Floor::Bytes(1)).expect("open the store");
         let old_keys = ObjectKeys {
@@ -593,8 +535,7 @@ mod tests {
     /// nothing is forgotten and the file stays.
     #[tokio::test(flavor = "current_thread")]
     async fn a_failed_eviction_round_is_logged() {
-        let logs = Capture::waiting_for(ROUND_FAILED.as_bytes());
-        let _default = logs.subscribe();
+        let logs = capture_until(ROUND_FAILED);
         let broken = Arc::new(AtomicBool::new(false));
         let (_root, files, cache) = short_of_room("evict-fails", Arc::clone(&broken)).await;
         let key = cache

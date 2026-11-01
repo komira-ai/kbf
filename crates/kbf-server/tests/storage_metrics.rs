@@ -32,6 +32,7 @@ fn flags(dir: &Path, more: &[&str]) -> StorageFlags {
         "storage".to_owned(),
         "--storage-listen=127.0.0.1:0".to_owned(),
         format!("--cold-store=file://{}", dir.join("cold").display()),
+        "--cold-store-floor-bytes=1".to_owned(),
         format!("--meta-dir={}", dir.join("meta").display()),
     ];
     argv.extend(more.iter().map(|m| (*m).to_owned()));
@@ -156,6 +157,140 @@ async fn the_storage_half_serves_the_same_series() {
     let off = self::flags(&off_dir, &[]);
     let half = storage_half::start(&off, never).await.expect("starts");
     assert_eq!(half.metrics, None);
+}
+
+/// Catches: a storage half whose cache is opened on an uncounted cold store (the families
+/// stay at zero while the node writes), including a half whose families are missing before
+/// its first write: every op has a line at start, and a blob put through the handle moves the
+/// put count to at least one and the bytes written to at least the blob's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_storage_half_counts_what_its_cache_asks_of_the_cold_store() {
+    let half_dir = dir("cold-counts");
+    let flags = flags(&half_dir, &["--metrics-listen=127.0.0.1:0"]);
+    let half = storage_half::start(&flags, never).await.expect("starts");
+    let (addr, storage) = (half.metrics.expect("metrics"), half.storage());
+    tokio::spawn(half.serve());
+    let body = get(addr, "/metrics").await.2;
+    for op in ["get", "head", "put", "delete", "list"] {
+        let series = format!("kbf_cold_store_requests_total{{op=\"{op}\"}}");
+        assert!(
+            body.lines().any(|l| l.starts_with(&series)),
+            "{series} in\n{body}"
+        );
+    }
+    let blob = Bytes::from_static(b"a blob the node writes to its cold store");
+    storage.put(blob.clone()).await.expect("put");
+    let body = get(addr, "/metrics").await.2;
+    let put = sample(&body, "kbf_cold_store_requests_total{op=\"put\"}");
+    assert!(put.is_some_and(|put| put >= 1.0), "{body}");
+    let written = sample(&body, "kbf_cold_store_bytes_total{dir=\"write\"}");
+    assert!(written.is_some_and(|w| w >= blob.len() as f64), "{body}");
+}
+
+/// Catches: a storage node (`kbf storage`) whose cache is opened on an uncounted cold store (the families
+/// stay at zero while the node writes), including a node whose families are missing before
+/// its first write: every op has a line at start, and a blob put through the handle moves the
+/// put count to at least one and the bytes written to at least the blob's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_storage_node_counts_what_its_cache_asks_of_the_cold_store() {
+    let node_dir = dir("node-cold-counts");
+    let flags = flags(&node_dir, &["--metrics-listen=127.0.0.1:0"]);
+    let node = start_storage(&flags, never).await.expect("starts");
+    let (addr, served) = (node.metrics.expect("metrics"), node.addr);
+    tokio::spawn(node.serve());
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{served}"))
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    let storage = RemoteStorage::new(channel, 0);
+    let body = get(addr, "/metrics").await.2;
+    for op in ["get", "head", "put", "delete", "list"] {
+        let series = format!("kbf_cold_store_requests_total{{op=\"{op}\"}}");
+        assert!(
+            body.lines().any(|l| l.starts_with(&series)),
+            "{series} in\n{body}"
+        );
+    }
+    let blob = Bytes::from_static(b"a blob the node writes to its cold store");
+    storage.put(blob.clone()).await.expect("put");
+    let body = get(addr, "/metrics").await.2;
+    let put = sample(&body, "kbf_cold_store_requests_total{op=\"put\"}");
+    assert!(put.is_some_and(|put| put >= 1.0), "{body}");
+    let written = sample(&body, "kbf_cold_store_bytes_total{dir=\"write\"}");
+    assert!(written.is_some_and(|w| w >= blob.len() as f64), "{body}");
+}
+
+/// The five rows of `kbf_storage_legacy_read_total` in a scrape, in the order bytestream,
+/// segments, cas in-process, action store, ac in-process.
+fn legacy_rows(body: &str) -> Vec<u64> {
+    [
+        r#"{kind="cas",source="bytestream"}"#,
+        r#"{kind="cas",source="segments"}"#,
+        r#"{kind="cas",source="in_process"}"#,
+        r#"{kind="ac",source="action_store"}"#,
+        r#"{kind="ac",source="in_process"}"#,
+    ]
+    .iter()
+    .map(|labels| {
+        let name = format!("kbf_storage_legacy_read_total{labels}");
+        sample(body, &name).unwrap_or_else(|| panic!("no {name} in\n{body}")) as u64
+    })
+    .collect()
+}
+
+/// Catches a legacy-read counter that is not the one the node's scrape renders (a fresh
+/// handle given to the service, or to the daemon half's storage, would leave the scrape at
+/// 0), and a daemon half of a node without a frontend that reads around the counter. The
+/// node is the storage half of `kbf storage-and-daemon`, started as the binary starts it:
+/// a blob read over gRPC moves `cas/bytestream` to 1 and nothing else; the same blob read
+/// through the handle the daemon half uses moves `cas/in_process` to 1; a read of a blob
+/// the node lacks moves neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_scrape_counts_the_reads_over_the_wire_and_the_daemon_halfs() {
+    let half_dir = dir("legacy-reads");
+    let flags = flags(&half_dir, &["--metrics-listen=127.0.0.1:0"]);
+    let half = storage_half::start(&flags, never).await.expect("starts");
+    let (metrics, addr, storage) = (half.metrics.expect("metrics"), half.addr, half.storage());
+    tokio::spawn(half.serve());
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    let remote = RemoteStorage::new(channel, 0);
+    let body = Bytes::from_static(b"a blob the node holds");
+    let digest = remote.put(body.clone()).await.expect("put");
+    assert_eq!(legacy_rows(&get(metrics, "/metrics").await.2), [0; 5]);
+
+    assert_eq!(remote.read_blob(&digest).await.expect("read"), body);
+    assert_eq!(
+        legacy_rows(&get(metrics, "/metrics").await.2),
+        [1, 0, 0, 0, 0]
+    );
+
+    assert_eq!(storage.read_blob(&digest).await.expect("read"), body);
+    assert_eq!(
+        legacy_rows(&get(metrics, "/metrics").await.2),
+        [1, 0, 1, 0, 0]
+    );
+
+    // The daemon half of a node without a frontend reads through a `LocalStore` over it.
+    let local = kbf_server::LocalStore::over(std::sync::Arc::clone(&storage));
+    assert_eq!(local.read_blob(&digest).await.expect("read"), body.to_vec());
+    assert_eq!(
+        legacy_rows(&get(metrics, "/metrics").await.2),
+        [1, 0, 2, 0, 0]
+    );
+
+    let absent = kbf_segments::sha256(b"a blob nobody put");
+    assert!(remote.read_blob(&absent).await.is_err());
+    assert!(storage.read_blob(&absent).await.is_err());
+    assert!(local.read_blob(&absent).await.is_err());
+    assert_eq!(
+        legacy_rows(&get(metrics, "/metrics").await.2),
+        [1, 0, 2, 0, 0]
+    );
 }
 
 /// The value of the sample `name` in a scrape.

@@ -39,6 +39,12 @@
 //!   exact kill of an action it runs as a pool user, and its keeper's.
 //! - [`LocalRuntime`]: **tests only**, runs actions as plain child processes.
 //! - [`Daemon`]: the session loop, with the contact clock and lease manager inside.
+//! - [`LeaseCore`] (`core`): the lease state the session loop drives (leases, contact,
+//!   start window, unacknowledged Results, epoch) and [`Event`], what it tells an observer.
+//! - [`SessionExtras`] (`extras`): the hooks of the session loop that name more than
+//!   leases; [`NoExtras`] answers none.
+//! - [`KbfExtras`] (`kbf_extras`): a kbf node's answers (storage map, pack counters, driver
+//!   report, session phase, memory backstop); the builders on `Daemon<KbfExtras>` set them.
 //!
 //! The `kbf-daemon` binary lives in the `kbf-node` crate: it picks its drivers
 //! (`--driver fake|container|native`, once per runtime), and the drivers depend on this
@@ -53,12 +59,18 @@ pub mod clock;
 pub mod config;
 pub mod connect;
 mod contact;
+mod core;
 pub mod cpu_pool;
 mod daemon;
+mod drain;
 pub mod driver_watch;
+mod extras;
+mod kbf_extras;
 pub mod keeper;
 mod lease;
+mod lease_minutes;
 mod lease_panic;
+mod lease_peak;
 #[cfg(target_os = "linux")]
 mod local;
 mod map;
@@ -90,6 +102,7 @@ mod window;
 /// checkout (issue #170). `build.rs` embeds the commit.
 pub const DAEMON_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT"));
 
+pub use crate::core::{Event, LeaseCore, superseded};
 pub use cas::{Cas, CasError};
 pub use clock::{Clock, Moment, SystemClock};
 pub use config::{
@@ -97,8 +110,10 @@ pub use config::{
 };
 pub use contact::{Acked, Contact};
 pub use cpu_pool::CpuPool;
-pub use daemon::{Daemon, Event, PROTOCOL_VERSION, SessionError, superseded};
+pub use daemon::{Daemon, PROTOCOL_VERSION, SessionError};
 pub use driver_watch::{DriverPart, DriverWatch};
+pub use extras::{ExtraWake, NoExtras, SessionExtras};
+pub use kbf_extras::KbfExtras;
 pub use kbf_mapsync::MapHolder;
 pub use kbf_route::{DEFAULT_HOLD, Liveness};
 #[cfg(target_os = "linux")]
@@ -113,7 +128,10 @@ pub use plane::{
 };
 pub use remote_index::RemoteIndex;
 pub use report::{Capacity, NodeReport};
-pub use runtime::{FakeRuntime, Runtime, RuntimeError, UPLOAD_DEADLINE, Work, upload_within};
+pub use runtime::{
+    FakeRuntime, LeaseReading, LeaseUsage, NodeLoadError, NodeReading, Runtime, RuntimeError,
+    UPLOAD_DEADLINE, Work, upload_within,
+};
 pub use runtimes::{KindServedTwice, Runtimes};
 pub use status::DriverReport;
 

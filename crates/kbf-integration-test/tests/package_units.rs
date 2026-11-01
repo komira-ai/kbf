@@ -508,8 +508,9 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         }
     }
 
-    // Catches a stop that SIGKILLs a drain (every build in flight fails), and a daemon
-    // that holds a stop for ever (it drains only to its deadline) or stops before it.
+    // Catches a stop that SIGKILLs a drain (every build in flight fails, and the daemon's
+    // leases are abandoned): every mode unit waits for its drain without end, the daemon's
+    // too (it has no default drain deadline).
     let timeout = unit
         .directives()
         .iter()
@@ -519,34 +520,14 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         })
         .map(|d| trim(&d.value));
     let signal = unit.get_in("Service", "KillSignal").map(trim);
-    if mode == "daemon" {
-        // The default of `--drain-deadline-secs` (kbf-node, `Cli::drain_deadline_secs`);
-        // kbf-integration-test does not depend on kbf-node, so the number is repeated here.
-        const DRAIN_DEADLINE_SECS: u64 = 600;
-        match timeout.map(|t| t.parse::<u64>()) {
-            Some(Ok(secs)) if secs > DRAIN_DEADLINE_SECS => {}
-            _ => v(
-                "stop",
-                format!(
-                    "TimeoutStopSec= is {timeout:?} on a daemon, not a finite number of \
-                     seconds above its {DRAIN_DEADLINE_SECS} s drain deadline (0 and \
-                     infinity mean no timeout, a smaller one SIGKILLs the drain)"
-                ),
-            ),
-        }
-        if !matches!(signal, Some("SIGTERM" | "TERM" | "15")) {
-            v("stop", format!("KillSignal= is {signal:?}, not SIGTERM"));
-        }
-    } else {
-        if timeout != Some("infinity") {
-            v(
-                "stop",
-                format!("TimeoutStopSec= is {timeout:?}, not infinity"),
-            );
-        }
-        if !matches!(signal, Some("SIGTERM" | "TERM" | "15")) {
-            v("stop", format!("KillSignal= is {signal:?}, not SIGTERM"));
-        }
+    if timeout != Some("infinity") {
+        v(
+            "stop",
+            format!("TimeoutStopSec= is {timeout:?}, not infinity"),
+        );
+    }
+    if !matches!(signal, Some("SIGTERM" | "TERM" | "15")) {
+        v("stop", format!("KillSignal= is {signal:?}, not SIGTERM"));
     }
 
     // Catches a node unit that signals the actions with the daemon: with KillMode=
@@ -1035,8 +1016,8 @@ const DEFECTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-daemon.service",
-        "\nTimeoutStopSec=660\n",
         "\nTimeoutStopSec=infinity\n",
+        "\nTimeoutStopSec=660\n",
         "stop",
     ),
     (
@@ -1446,15 +1427,15 @@ fn a_boot_check_other_than_kbfs_for_the_units_mode_fails_the_gate_check_of_every
     assert_eq!(checked, 5, "a mode unit was not checked");
 }
 
-/// Catches a daemon stop timeout the rule lets through that cuts a drain short or holds a
-/// stop for ever: none, `infinity`, `0`, the deadline itself (600), and a word that is not
-/// seconds are refused; 601 and the shipped 660 are accepted. Refusing 660 would fail
-/// the real unit; accepting 600 SIGKILLs a drain that runs its whole deadline.
+/// Catches a daemon stop timeout the rule lets through that cuts a drain short: any
+/// number of seconds (the old 660, 90, and one far above any drain), `0`, a word that is
+/// not `infinity`, and none at all are refused; `infinity` is accepted. The daemon drains
+/// until its leases end, so a finite timeout SIGKILLs them.
 #[test]
-fn a_daemon_stop_timeout_must_exceed_the_drain_deadline() {
+fn a_daemon_stop_timeout_must_be_infinity() {
     let name = "kbf-daemon.service";
     let text = read(name);
-    let shipped = "\nTimeoutStopSec=660\n";
+    let shipped = "\nTimeoutStopSec=infinity\n";
     assert!(text.contains(shipped));
     let stop = |broken: &str| {
         violations(name, broken)
@@ -1462,11 +1443,8 @@ fn a_daemon_stop_timeout_must_exceed_the_drain_deadline() {
             .filter(|f| f.starts_with("stop:"))
             .count()
     };
-    for ok in ["660", "601"] {
-        let t = text.replacen(shipped, &format!("\nTimeoutStopSec={ok}\n"), 1);
-        assert_eq!(stop(&t), 0, "{ok} was refused");
-    }
-    for bad in ["infinity", "0", "600", "90", "11min"] {
+    assert_eq!(stop(&text), 0, "the shipped unit was refused");
+    for bad in ["660", "90", "86400", "0", "11min"] {
         let t = text.replacen(shipped, &format!("\nTimeoutStopSec={bad}\n"), 1);
         assert_eq!(stop(&t), 1, "{bad} was accepted");
     }

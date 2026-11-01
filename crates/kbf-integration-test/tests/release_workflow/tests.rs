@@ -1189,27 +1189,25 @@ fn a_binary_runs_only_after_its_files_are_attested() {
 }
 
 #[test]
-fn only_the_previous_releases_check_waives_the_version_facts() {
-    // Catches: the first release with version facts failing on the release before it (which
-    // has none) so that nothing is published, and the other way round: a waiver on the check
-    // of the release being made, so a set without the facts of its kbf goes out.
-    // Catches: the flag dropped from `previous`; the flag added to `dist`.
-    red(
-        &plant(
-            "notes",
-            "release check previous --commit \"$PREVIOUS_COMMIT\" --without-version-facts",
+fn no_release_check_is_given_a_waiver() {
+    // Catches: a waiver left on the check of the previous release (a previous release without
+    // the version facts of its kbf, or the facts and the SBOM of its task image, would pass and
+    // be read for its identity), and one added to the check of the release being made (a set
+    // without them would go out). The real workflow is the control: `the_real_release_workflow_meets_every_rule`
+    // holds it clean.
+    for (verb, plain) in [
+        (
             "release check previous --commit \"$PREVIOUS_COMMIT\"",
+            "previous",
         ),
-        "`release check previous` is not given `--without-version-facts`",
-    );
-    red(
-        &plant(
-            "notes",
-            "release check dist --commit \"$COMMIT\"",
-            "release check dist --commit \"$COMMIT\" --without-version-facts",
-        ),
-        "`release check dist` is given `--without-version-facts`",
-    );
+        ("release check dist --commit \"$COMMIT\"", "dist"),
+    ] {
+        let planted = format!("{verb} --without-version-facts");
+        red(
+            &plant("notes", verb, &planted),
+            &format!("`release check {plain}` is given `--without-version-facts`"),
+        );
+    }
 }
 
 #[test]
@@ -1550,7 +1548,7 @@ fn the_network_join_of_gamma_uses_the_run_token_and_variables_only() {
     red(
         &plant(
             "gamma",
-            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}\n",
             "        if: ${{ vars.OTHER != '' }}\n",
         ),
         "is under `if:`",
@@ -1558,7 +1556,7 @@ fn the_network_join_of_gamma_uses_the_run_token_and_variables_only() {
     red(
         &plant(
             "gamma",
-            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}\n",
             "",
         ),
         "not under exactly `if:",
@@ -1588,8 +1586,8 @@ fn the_network_join_of_gamma_uses_the_run_token_and_variables_only() {
     red(
         &plant(
             "gamma",
-            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n",
-            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n        env:\n          TS_AUTHKEY: ${{ vars.TS_KEY }}\n",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}\n",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}\n        env:\n          TS_AUTHKEY: ${{ vars.TS_KEY }}\n",
         ),
         "has an `env:`",
     );
@@ -1784,4 +1782,57 @@ fn the_buck2_fetch_step_takes_its_pins_from_the_job_env_alone() {
             "Buck2 fetch step of `gamma` has an `env:`",
         );
     }
+}
+
+#[test]
+fn the_rehearsal_token_is_the_runs_own_in_a_private_file_and_never_in_a_command() {
+    // Catches: the rehearsal's helper listing releases without the run's token (the shared
+    // address's anonymous quota refuses it), the token taken from a secret, written to a file
+    // others can read, or put in a command line.
+    let token = "printf '%s' \"$GH_TOKEN\" > /var/tmp/kbf-update-rehearsal.token";
+    red(
+        &plant(
+            REHEARSE,
+            token,
+            "printf '%s' \"${{ github.token }}\" > /var/tmp/kbf-update-rehearsal.token",
+        ),
+        "the job `rehearse` puts a `${{ }}` value in a command",
+    );
+    red(
+        &plant(
+            REHEARSE,
+            "GH_TOKEN: ${{ github.token }}",
+            "GH_TOKEN: ${{ secrets.SOME_TOKEN }}",
+        ),
+        "the job `rehearse` writes a token that is not `github.token`",
+    );
+    red(
+        &plant(
+            REHEARSE,
+            "install -m 0600 /dev/null /var/tmp/kbf-update-rehearsal.token",
+            "install -m 0644 /dev/null /var/tmp/kbf-update-rehearsal.token",
+        ),
+        "the job `rehearse` makes its token file with a mode other than 0600",
+    );
+    red(
+        &plant(REHEARSE, token, "echo done"),
+        "the job `rehearse` does not write its token file from `GH_TOKEN`",
+    );
+}
+
+#[test]
+fn the_rehearsal_names_the_token_file_in_the_channel_the_helper_reads() {
+    // Catches: the rehearsal's channel dropping `token_file` again, so the helper's release
+    // listing is anonymous and shares a hosted runner's quota. The test cannot run in a pull
+    // request (it needs root and systemd); this reads its source.
+    let path = "crates/kbf-host-install/tests/rehearsal/mod.rs";
+    let source = std::fs::read_to_string(crate::repo_root().join(path)).expect(path);
+    assert!(
+        source.contains("source = \\\"github\\\"\\ntoken_file = "),
+        "{path}: the channel does not name a `token_file`"
+    );
+    assert!(
+        !source.contains("no token. (The helper"),
+        "{path}: still says the channel names no token"
+    );
 }

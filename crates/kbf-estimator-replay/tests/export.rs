@@ -13,6 +13,37 @@ fn window() -> Window {
     Window::parse(SINCE, UNTIL).unwrap()
 }
 
+/// Catches: a server that now writes the lease's grant on every attempt (`booked_memory_bytes`
+/// on an accepted run, and `booked_millicpus` beside `usage`) failing the walk, either key
+/// ignored, or a run without them given a made-up booking.
+#[test]
+fn a_run_that_names_its_grant_keeps_both_axes() {
+    let mut routes = farm();
+    let mut granted = run(
+        "r1",
+        "n1",
+        OCT_1 + 5_000_000,
+        "ok",
+        usage(3 * GIB, 60_000_000),
+    );
+    granted["booked_memory_bytes"] = (6 * GIB).into();
+    granted["booked_millicpus"] = 2500.into();
+    put(&mut routes, "/v1/runs/r1", &granted);
+    let fake = Fake::new(routes);
+    let done = export(&ReadOnly::new(&fake), window()).unwrap();
+    let r1 = done.rows.iter().find(|r| r.run_id == "r1").unwrap();
+    assert_eq!(
+        (r1.booked_memory_bytes, r1.booked_millicpus),
+        (Some(6 * GIB), Some(2500))
+    );
+    let mac = done.rows.iter().find(|r| r.run_id == "r3").unwrap();
+    assert_eq!(
+        mac.booked_millicpus,
+        Some(1000),
+        "the usage block's key still reads"
+    );
+}
+
 /// Catches: a walk that stops after the first page of an invocation's actions (r3, r4 lost),
 /// one that does not encode an id into the path (`b/2` would reach another route), one that
 /// reads a run twice because two builds list it, one that drops a run another route does
@@ -74,6 +105,13 @@ fn a_window_becomes_its_attempts_in_queue_order() {
             operation: None,
             booked_millicpus: None,
             node_cpu_pressure_centi: None,
+            invocation_id: None,
+            correlated_invocations_id: None,
+            phase_times: None,
+            fetch_us: None,
+            execution_us: None,
+            pack_us: None,
+            lease: None,
         }
     );
 
@@ -105,7 +143,7 @@ fn a_window_becomes_its_attempts_in_queue_order() {
     let r3 = &done.rows[3];
     assert_eq!(r3.platform, "macos");
     assert_eq!(r3.basis.as_deref(), Some("mac_footprint"));
-    assert_eq!(r3.operation.as_deref(), Some("op-9"));
+    assert_eq!(r3.operation.as_deref(), Some("9"));
     assert_eq!(r3.booked_millicpus, Some(1000));
     assert_eq!(r3.node_cpu_pressure_centi, Some(1234));
     let u = r3.cgroup.as_ref().unwrap();

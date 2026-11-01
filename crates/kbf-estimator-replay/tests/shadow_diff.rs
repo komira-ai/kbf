@@ -63,6 +63,13 @@ impl Rec {
             operation: None,
             booked_millicpus: None,
             node_cpu_pressure_centi: None,
+            invocation_id: None,
+            correlated_invocations_id: None,
+            phase_times: None,
+            fetch_us: None,
+            execution_us: None,
+            pack_us: None,
+            lease: None,
         }
     }
 
@@ -177,7 +184,8 @@ fn server_attempt(rec: &Rec) -> Attempt {
         Outcome::Failed(Failure::OutOfMemory)
     } else {
         Outcome::Completed {
-            action_result: kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [1; 32], 1),
+            action_result: kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [1; 32], 1)
+                .into(),
         }
     };
     let (basis, mut run) = run_of(outcome, Some(&rec.usage()), rec.booked).expect("a run");

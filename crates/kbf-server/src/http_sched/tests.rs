@@ -3,14 +3,23 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::Request;
 use kbf_front::Cache;
-use kbf_sched::{Avoided, LeasePhase, QueueGroup, WaitingGroup};
-use kbf_types::{Digest, DigestFunction, FarmTime, OperationId, Qos};
+use kbf_sched::{Avoided, LeasePhase, QueueGroup, Unservable, WaitingGroup};
+use kbf_types::{ActionKey, Digest, DigestFunction, FarmTime, OperationId, Qos, WorkKey};
 use tower_service::Service;
 
 use super::*;
 
 fn digest(n: u8) -> Digest {
     Digest::new(DigestFunction::Sha256, [n; 32], u64::from(n))
+}
+
+/// The key of action `digest(n)` on instance `main`.
+fn key(n: u8) -> WorkKey {
+    ActionKey {
+        instance: "main".to_owned(),
+        action: digest(n),
+    }
+    .into()
 }
 
 fn query(q: &str) -> Result<Query, String> {
@@ -93,8 +102,7 @@ fn view() -> LeaseView {
     LeaseView {
         lease: LeaseId::new(7, 3),
         operation: OperationId(12),
-        instance: "main".to_owned(),
-        action: digest(9),
+        key: key(9),
         node: kbf_types::WorkerId::new("node-a"),
         platform: "os=linux".to_owned(),
         qos: Qos::Ci,
@@ -151,7 +159,7 @@ fn the_queue_body_has_the_documented_shape() {
         avoided_total: 0,
     };
     assert_eq!(
-        queue_body(&empty),
+        queue_body(&empty, None),
         json!({
             "depth": 0, "oldest_age_ms": null, "by_platform": [], "waiting": [],
             "avoided": [], "avoided_total": 0,
@@ -168,21 +176,26 @@ fn the_queue_body_has_the_documented_shape() {
         }],
         waiting: vec![WaitingGroup {
             reason: "none of the 2 live workers satisfies the action's platform".to_owned(),
+            cause: Unservable::PlatformMismatch {
+                serving: 2,
+                some_cannot_serve: false,
+                kind: kbf_types::LeaseKind::Action,
+                closest: kbf_types::WorkerId::new("a"),
+                lacks: vec!["os=macos".to_owned()],
+            },
             count: 4,
             example: OperationId(3),
-            example_instance: "main".to_owned(),
-            example_action: digest(1),
+            example_key: key(1),
         }],
         avoided: vec![Avoided {
             operation: OperationId(4),
-            instance: "main".to_owned(),
-            action: digest(2),
+            key: key(2),
             nodes: vec![kbf_types::WorkerId::new("a"), kbf_types::WorkerId::new("b")],
         }],
         avoided_total: 250,
     };
     assert_eq!(
-        queue_body(&full),
+        queue_body(&full, None),
         json!({
             "depth": 5,
             "oldest_age_ms": 61_500,

@@ -90,7 +90,7 @@ fn a_result_from_a_worker_that_does_not_hold_the_lease_is_refused() {
     let mut s = server(Vec::new());
     let lease = started(&mut s);
     let done = Outcome::Completed {
-        action_result: crate::output_of(&crate::action(0)),
+        action_result: crate::output_of(&crate::action(0)).into(),
     };
     let sent = report(&mut s, "daemon-1", lease, done);
     assert_eq!(sent.len(), 1, "{sent:?}");

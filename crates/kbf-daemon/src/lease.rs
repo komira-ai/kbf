@@ -34,7 +34,7 @@ use kbf_proto::reapi::{ActionResult, ExecutedActionMetadata};
 use kbf_proto::worker::{self, Lost, MemoryKill, ResourceUsage, Start};
 use kbf_types::{LeaseId, LostWhy, Resources};
 use prost::Message;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::lease_panic::contained;
 use crate::phases::LeasePhases;
@@ -52,7 +52,7 @@ pub(crate) type Done = (
 
 /// The leases a daemon is running.
 pub(crate) struct Leases {
-    runtimes: Runtimes,
+    pub(crate) runtimes: Runtimes,
     running: BTreeMap<LeaseId, Running>,
     /// Running leases being killed on the server's `Cancel`.
     cancelled: BTreeSet<LeaseId>,
@@ -64,6 +64,12 @@ pub(crate) struct Leases {
 /// A running lease: the runtime it runs on. Its run reports through `done`.
 struct Running {
     runtime: Arc<dyn AnyRuntime>,
+    /// Becomes true once the run has been polled for the first time, which is where a
+    /// runtime registers what its `kill` stops.
+    begun: watch::Receiver<bool>,
+    /// Test seam: notified when a kill of this lease is about to wait for the first poll.
+    #[cfg(test)]
+    waiting: Arc<tokio::sync::Notify>,
 }
 
 impl Leases {
@@ -112,12 +118,14 @@ impl Leases {
         };
         let done = self.done.clone();
         let run = Arc::clone(&runtime);
+        let (begin, begun) = watch::channel(false);
         tokio::spawn(async move {
             let started = Instant::now();
-            let outcome = contained(run.as_ref(), id, work).await;
+            let mut outcome =
+                begun_after_first_poll(contained(run.as_ref(), id, work), begin).await;
             // An error carries no result, so no usage: the runtime is asked for it. An
             // out-of-memory kill (the lease's own limit, or the node's) is marked.
-            let usage = outcome.as_ref().err().and_then(|_| run.failed_usage(id));
+            let usage = crate::lease_peak::usage_with_peak(run.as_ref(), id, &mut outcome);
             let oom = matches!(
                 outcome,
                 Err(RuntimeError::OutOfMemory { .. } | RuntimeError::BusyNode(_))
@@ -129,7 +137,15 @@ impl Leases {
             let _ = done.send((id, outcome, usage, phases));
         });
         tracing::info!(lease = %id, driver = runtime.driver(), "lease started");
-        self.running.insert(id, Running { runtime });
+        self.running.insert(
+            id,
+            Running {
+                runtime,
+                begun,
+                #[cfg(test)]
+                waiting: Arc::default(),
+            },
+        );
         None
     }
 
@@ -143,8 +159,7 @@ impl Leases {
         if !self.cancelled.insert(id) {
             return false;
         }
-        let runtime = Arc::clone(&running.runtime);
-        tokio::spawn(async move { runtime.kill(id).await });
+        kill_once_begun(id, running);
         tracing::warn!(lease = %id, "lease cancelled: the server no longer holds it here");
         true
     }
@@ -211,13 +226,46 @@ impl Leases {
         let mut fenced = Vec::new();
         for (id, running) in &self.running {
             if self.fenced.insert(*id) {
-                let (id, runtime) = (*id, Arc::clone(&running.runtime));
-                tokio::spawn(async move { runtime.kill(id).await });
-                fenced.push(id);
+                kill_once_begun(*id, running);
+                fenced.push(*id);
             }
         }
         fenced
     }
+}
+
+/// `run`, which says on `begin` once it has been polled the first time. A runtime
+/// registers what its `kill` stops before its first `.await` ([`crate::Runtime::kill`]).
+async fn begun_after_first_poll<F: std::future::Future>(
+    run: F,
+    begin: watch::Sender<bool>,
+) -> F::Output {
+    let mut run = std::pin::pin!(run);
+    std::future::poll_fn(|cx| {
+        let polled = run.as_mut().poll(cx);
+        begin.send_replace(true);
+        polled
+    })
+    .await
+}
+
+/// Starts killing lease `id`, which `running` holds, and returns at once. The kill is
+/// sent once the run has been polled for the first time: a lease is listed as running
+/// from its Start, but the run's task may not have been polled yet, a runtime does
+/// nothing for a lease it does not run, and a kill sent that early is lost and the run
+/// goes on (kbf#2013).
+fn kill_once_begun(id: LeaseId, running: &Running) {
+    let runtime = Arc::clone(&running.runtime);
+    let mut begun = running.begun.clone();
+    #[cfg(test)]
+    let waiting = Arc::clone(&running.waiting);
+    tokio::spawn(async move {
+        #[cfg(test)]
+        waiting.notify_one();
+        // An error is the run's task gone before its first poll: nothing to wait for.
+        let _ = begun.wait_for(|begun| *begun).await;
+        runtime.kill(id).await;
+    });
 }
 
 /// What kind of failure `error` is, for the `lease failed` line: the variant, since a
@@ -274,6 +322,7 @@ pub(crate) fn result_of(
             action_digest: None,
             memory_kill: worker::MemoryKill::Unspecified as i32,
             lost: worker::Lost::Unspecified as i32,
+            job_outcome: None,
         },
         Err(RuntimeError::Killed) => failure(id, Code::Aborted, "killed"),
         Err(RuntimeError::Failed(why)) => failure(id, Code::Internal, why),
@@ -350,6 +399,7 @@ fn missing(id: LeaseId, blob: &str) -> worker::Result {
         // A missing input is not a memory kill, nor lost.
         memory_kill: worker::MemoryKill::Unspecified as i32,
         lost: worker::Lost::Unspecified as i32,
+        job_outcome: None,
     }
 }
 
@@ -368,6 +418,7 @@ pub(crate) fn failure(id: LeaseId, code: Code, message: impl Into<String>) -> wo
         // that are.
         memory_kill: worker::MemoryKill::Unspecified as i32,
         lost: worker::Lost::Unspecified as i32,
+        job_outcome: None,
     }
 }
 
@@ -579,6 +630,84 @@ mod tests {
             "a finished lease is still cancelled"
         );
         assert!(!leases.cancel(id()), "a finished lease");
+    }
+
+    /// A runtime whose first poll of `run` blocks its thread until released, as a run
+    /// that does work before it can be stopped. It says when that poll has begun, and
+    /// when `kill` is called.
+    struct Gated {
+        entered: tokio::sync::Notify,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        kill_called: tokio::sync::Notify,
+        stops: std::sync::Mutex<BTreeMap<LeaseId, tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl Runtime for Gated {
+        fn driver(&self) -> &'static str {
+            "gated"
+        }
+
+        fn serves(&self, _kind: &str) -> bool {
+            true
+        }
+
+        async fn run(&self, work: Work) -> Result<ActionResult, RuntimeError> {
+            self.entered.notify_one();
+            self.release.lock().expect("lock").recv().expect("released");
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.stops.lock().expect("lock").insert(work.lease_id, tx);
+            let _ = rx.await;
+            Err(RuntimeError::Killed)
+        }
+
+        async fn kill(&self, lease_id: LeaseId) {
+            self.kill_called.notify_one();
+            if let Some(stop) = self.stops.lock().expect("lock").remove(&lease_id) {
+                let _ = stop.send(());
+            }
+        }
+    }
+
+    /// Catches a `Cancel` of a lease that is listed as running while its run is still on
+    /// its first poll, before its runtime can stop it: the runtime does nothing for a
+    /// lease it does not run, so a kill sent then is lost, the run goes on, and a
+    /// draining daemon waits on it for ever (kbf#2013). The run's first poll is held
+    /// until either the kill has reached the runtime (the bug: asserted not to happen) or
+    /// the cancel is waiting for that poll (the seam `Running::waiting`); no wait here
+    /// depends on time. The run must then end, killed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_during_the_first_poll_of_the_run_still_ends_it() {
+        let (release, held) = std::sync::mpsc::channel();
+        let runtime = Arc::new(Gated {
+            entered: tokio::sync::Notify::new(),
+            release: std::sync::Mutex::new(held),
+            kill_called: tokio::sync::Notify::new(),
+            stops: std::sync::Mutex::new(BTreeMap::new()),
+        });
+        let (done, mut done_rx) = mpsc::unbounded_channel();
+        let mut leases = Leases::new(Runtimes::new(Arc::clone(&runtime)), done);
+        let start = Start {
+            lease_id: Some(proto_lease_id(id())),
+            kind: "action".to_owned(),
+            action_digest: Some(Digest::default()),
+            ..Start::default()
+        };
+        assert_eq!(leases.start(start), None);
+        runtime.entered.notified().await;
+        let waiting = Arc::clone(&leases.running[&id()].waiting);
+        assert!(leases.cancel(id()));
+        let killed_early = tokio::select! {
+            () = runtime.kill_called.notified() => true,
+            () = waiting.notified() => false,
+        };
+        release.send(()).expect("the run waits");
+        assert!(
+            !killed_early,
+            "the kill reached the runtime while the run's first poll was still held"
+        );
+        let (ended, outcome, usage, phases) = done_rx.recv().await.expect("the run ends");
+        let result = leases.finished(ended, outcome, usage, &phases);
+        assert_eq!(code(&result), Code::Aborted as i32);
     }
 
     /// Asks every callsite again whether the subscriber just installed wants it.

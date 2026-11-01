@@ -104,6 +104,11 @@ pub use kbf::worker::v1 as worker;
 
 mod map;
 pub use map::MapDecodeError;
+mod node_load;
+pub use node_load::{
+    LoadDrops, MAX_LOAD_LEASES, MAX_LOAD_MINUTES, MAX_MEMORY_BYTES, TAIL_MINUTE, Vetted,
+};
 mod store_config;
+pub mod task_claim;
 mod usage;
 pub use usage::no_cgroup_fields;

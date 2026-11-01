@@ -37,6 +37,7 @@ fn flags(more: &[String]) -> StorageFlags {
 fn file_stores(dir: &Path) -> Vec<String> {
     vec![
         format!("--cold-store=file://{}", dir.join("cold").display()),
+        "--cold-store-floor-bytes=1".to_owned(),
         format!("--hot-store=file://{}", dir.join("hot").display()),
     ]
 }

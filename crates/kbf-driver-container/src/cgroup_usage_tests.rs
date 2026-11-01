@@ -251,6 +251,7 @@ fn the_cpu_pressure_is_the_some_avg10_in_hundredths_of_a_percent() {
     assert_eq!(some_avg10_centi("some avg10=x avg60=5.00\n"), None);
     assert_eq!(some_avg10_centi("some avg10=-1.00\n"), None);
     assert_eq!(some_avg10_centi("some avg10=.50\n"), None);
+    assert_eq!(some_avg10_centi("some avg10=1.5x avg60=0.00\n"), None);
     assert_eq!(some_avg10_centi("some avg10=99999999999.00\n"), None);
     assert_eq!(some_avg10_centi(""), None);
 }

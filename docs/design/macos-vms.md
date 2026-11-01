@@ -482,8 +482,17 @@ process (the test binary, in the crate's tests) over a Unix socket pair, copies 
 directory as its "clone", keeps the limit of two running VMs, and can delay or withhold a
 guest's readiness, crash a VM, silence a guest before its `Ready` or once its command
 has started, and fail a stop. The daemon does not
-offer the driver yet (no `--driver vm`), and no host on Virtualization.framework exists.
-Per lease, as built:
+offer the driver yet (no `--driver vm`). `MacVmHost` (`src/mac/`) is the macOS `VmHost`,
+built over a `VmSession` (the root helper's socket and the kernel; a fake in tests); no
+daemon flag builds it yet. It runs each VM as `kbf-vmm vm-run --spec <file>` through the
+helper's `role-run`, as the standing VM user: stdin is a pipe the daemon holds the only
+write end of (the end of the pipe, or the daemon's death, force-stops the VM), stdout a pipe
+of JSON events the host reads. Two lock files count the VMs on the Mac (the third start is
+refused before any call to the helper), a run record `{pgid, start, boot}` is written for
+each run so the next daemon's start ends a run that outlived it (`role-reap`), and `stop`
+closes the pipe, waits, then has the helper end the group. Not built: the relay from the host to the
+guest agent (`vm-run` has none yet, so `connect` fails on a Mac) and a fresh machine
+identifier per clone. Per lease, as built:
 
 - The lease gets a lease directory (`leases/<lease>/`) and a clone
   (`clones/<lease>/`) under the driver's scratch root. Before the clone, the clones'
@@ -725,7 +734,7 @@ only if the `ibtool`/`actool` probe passes.
 | `kbf-front` | lease kind `vm`, VM bounds on `kbf-book-cpus` and `kbf-book-mem-gib` | ~150 |
 | `kbf-server` | read `vm.slots` | ~80 |
 | `kbf-daemon`, `kbf-node` | a runtime that dispatches by kind across several drivers; VM flags (image directory, boot timeout) | ~370 |
-| `kbf-driver-vm` (new) | section 6; on `main`: the driver over the `VmHost` trait and a fake host ([What `main` has](#what-main-has)); the macOS host is not built | ~3,000 with tests |
+| `kbf-driver-vm` (new) | section 6; on `main`: the driver over the `VmHost` trait, a fake host and the macOS host over a session ([What `main` has](#what-main-has)); no relay to the guest yet | ~3,000 with tests |
 | `kbf-vmm`, `kbf-guest` (new) | the VM helper, run as a dedicated non-admin uid (needs `kbf-mac-session run`, [fleet-updates.md](fleet-updates.md) phase P1), and the guest agent | ~1,000 |
 | `kbf-segments`, `kbf-front` | chunked upload, if images ship through the CAS | ~400 |
 | `kbf-integration-test` | the freshness test on VMs | ~150 |

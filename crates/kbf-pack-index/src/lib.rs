@@ -262,6 +262,16 @@ impl NewPack {
                 "a blob reaches past the end of the pack",
             ));
         }
+        // A blob of no bytes shares none (the frontend's own packs hold the empty blob).
+        let mut placed: Vec<(u64, u64)> = blobs
+            .iter()
+            .filter(|blob| blob.digest.size > 0)
+            .map(|blob| (blob.offset, blob.offset + blob.digest.size))
+            .collect();
+        placed.sort_unstable();
+        if placed.windows(2).any(|pair| pair[1].0 < pair[0].1) {
+            return Err(PackIndexError::Invalid("two blobs of the pack overlap"));
+        }
         Ok(blobs)
     }
 }

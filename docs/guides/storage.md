@@ -218,8 +218,9 @@ the store of record: nothing sits behind it, so an object it evicts is gone.
 signs requests with SigV4 and uses path-style addressing. Put the endpoint in the URI query
 (`endpoint=` is required). Other query keys are `region` (default `us-east-1`),
 `conditional-put=true` for a store that refuses to overwrite a key, and
-`min-put-rate=BYTES_PER_SEC`. The key pair comes from `AWS_ACCESS_KEY_ID` and
-`AWS_SECRET_ACCESS_KEY`, never from the URI. An object over 16 MiB is uploaded as a
+`min-put-rate=BYTES_PER_SEC`. The key pair comes from the JSON file of
+`--cold-store-credentials-file` (mode 0600 or 0400), never from the URI; `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` still work when no file is named, deprecated. An object over 16 MiB is uploaded as a
 multipart upload and aborted on any failure. The store must be reached over `http`;
 `https://` endpoints are refused in this build.
 
@@ -236,11 +237,23 @@ frontend must be started with `--object-store-secrets-dir DIR`, `--api-listen`,
 
 `kbf cluster object-store ...` calls the same routes. Every route needs the bearer token,
 reads included, and the calls must come from the frontend host (see Planned restarts).
-The registration only supplies keys: a node still names its store with
-`--cold-store`, and the registered store must be the same endpoint, bucket and prefix, or
-the node keeps its flag and reports `identity_mismatch`. A node with a `file://` cold store
-never takes the registration. A node reads the registration at its start, so rotating a key
-reaches a running node at its next restart. [api.md](../api.md) has the
+A node that names its store with an `s3://` `--cold-store` takes only the keys from the
+registration: the registered store must be the same endpoint, bucket and prefix, or the node
+keeps its flag and reports `identity_mismatch`. A node with a `file://` cold store never takes
+the registration. A node started with `--cold-store registered` (what `kbf node` passes) names
+no store: it waits for the registration and runs on its endpoint, bucket, prefix and keys, and
+`--cold-store-credentials-file` and the `AWS_*` variables are not read. A node reads the
+registration at its start, so rotating a key, or registering another endpoint for a node on
+`registered`, reaches a running node at its next restart. Switching the endpoint is safe only
+when the new store already holds every object the node's index names: the same bucket and
+prefix, with the old endpoint write-through (a write-through cache in front of the same
+bucket, say). The node does not check that, and it does not check the bucket at all (its log
+holds only the prefix), so a changed bucket is the operator's to get right; a changed prefix
+is refused at the start and needs an empty `--meta-dir`. While a registered node waits for a
+registration it logs each failed ask with its attempt, status code and reason, and keeps
+waiting for a frontend that is down or too old to serve the registration. The S3 client
+honours `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`; list the store's host in `NO_PROXY` where
+a proxy is set. [api.md](../api.md) has the
 bodies, the error codes and the rotation steps.
 
 ## Free-space floors

@@ -8,12 +8,13 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-kbf-types.workspace = true
-rand_chacha.workspace = true
-sha2.workspace = true
+# The code lives in the jobscheduler repository, at the revision the workspace pins.
+js-sim.workspace = true
 
 [dev-dependencies]
-kbf-testkit.workspace = true
+# The tests drive nodes written against `kbf_types`, whose scheduler vocabulary is the one
+# `js-sim` takes.
+kbf-types.workspace = true
 
 [lints]
 workspace = true

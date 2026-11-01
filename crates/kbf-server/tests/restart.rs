@@ -170,6 +170,10 @@ async fn run_y(after: &Client, y: &Job) -> (String, FakeDaemon, Streaming<Operat
 /// old process answers X's name first, so a term cached process-wide by the first
 /// lookup is the old one).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(
+    feature = "farm-core-js",
+    ignore = "known-different-on-js: operation names of the old form operations/<term>-<waiter> are not answered"
+)]
 async fn a_restarted_server_does_not_answer_its_predecessor_s_operation_names() {
     let before = Cell::start().await;
     let mut old = before.daemon("node-a", 4, 8).await;
@@ -201,6 +205,10 @@ async fn a_restarted_server_does_not_answer_its_predecessor_s_operation_names() 
 /// number. Also catches a parser that checks a stale process-wide term: the first
 /// lookup is on the old process.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(
+    feature = "farm-core-js",
+    ignore = "known-different-on-js: operation names of the old form operations/<term>-<waiter> are not answered"
+)]
 async fn a_finished_operation_s_name_stays_unknown_after_a_restart() {
     let before = Cell::start_with(kbf_sched::UNSERVABLE_WAIT, Duration::ZERO).await;
     let mut old = before.daemon("node-a", 4, 8).await;

@@ -34,9 +34,16 @@
 //   estimator reads. Each is absent from a peer that predates it, and absent means no
 //   report (a reader never reads absent as zero); a peer that predates them skips the
 //   unknown fields.
+// - Heartbeat.node_load and CgroupUsage.peak_window_millicores: the actions cgroup's load
+//   and a lease's busiest CPU window; and the lease clocks and closed minutes of NodeLoad
+//   (lease_clocks, minutes). Each is absent from a peer that predates it, and absent means
+//   no report; a peer that predates them skips the unknown fields.
 // - ResultAck.reason: why a Result was or was not accepted. A daemon that predates it
 //   reads `accepted`; a server that predates it leaves the reason unspecified, which a
 //   daemon takes as "acknowledged: forget the Result".
+// - Start.job, Start.fence, Result.job_outcome and PHASE_TAINTED: a run of a container job
+//   and the policy for a lapse of contact. Nothing reads them yet; a peer that predates
+//   them skips the fields, and reads the phase as a quarantine.
 //
 // A Result carries no attempt number: the lease id is the attempt. A lease id is unique
 // per grant and a re-grant of the same operation gets a new one, so a Result of an
@@ -185,6 +192,10 @@ enum Phase {
   // the node in contact as usual; it is not lost and nothing is requeued. A server that
   // does not know this value reads it as a quarantine, which also takes no lease.
   PHASE_DRAINING = 5;
+  // A job run left the node unsafe for further work (`reason` says what): it takes no
+  // lease until the taint is cleared. A server that does not know this value reads it as
+  // a quarantine, which also takes no lease.
+  PHASE_TAINTED = 6;
 }
 
 message NodePhase {
@@ -293,6 +304,15 @@ message Welcome {
   // A daemon should send CommitPack only to a frontend that says so; false (also from a
   // frontend that predates the field) leaves the daemon on the member path.
   bool pack_commit = 5;
+  // True when the farm places by the load the nodes measure (docs/design/worker-protocol.md,
+  // "Placement by measured load"): the daemon then lifts the CPU bandwidth limit of its actions
+  // cgroup (`cpu.max` = `max`), so that the CPU it measures can show overload. Absent when the
+  // server does not place by measured load (also from a server that predates the field): the
+  // daemon then keeps the limit of its reserve (`--reserve-cpus`). A server sends it as true or
+  // not at all; a daemon takes false as absent. A daemon applies it at every Welcome, so a
+  // reconnect to a server with another mode changes the limit; `--actions-cpu-max on|off`
+  // overrides it.
+  optional bool placement_load = 6;
 }
 
 // The storage map changed. Sent on the session each time the frontend's map changes,
@@ -349,6 +369,113 @@ message Heartbeat {
   // when the daemon writes packs (`--pack-write`): a daemon that does not, or one built
   // before the field, sends none, and a server built before it skips the field.
   PackWriteCounts pack_writes = 5;
+  // What the node's `actions/` cgroup is doing now. Present when the daemon's runtime
+  // reads it and the read succeeded: a runtime that does not, a failed read, or a daemon
+  // built before the field sends none, and a server built before it skips the field.
+  NodeLoad node_load = 6;
+  // What the node's input cache has done since the daemon process started. Present only when
+  // the daemon's runtime has an input cache that opened: a runtime without one (also with the
+  // cache off), or a daemon built before the field, sends none, and a server built before it
+  // skips the field. Absent is not zero.
+  InputCacheCounts input_cache = 7;
+}
+
+// The counts of a daemon's input cache, cumulative since the daemon process started (they
+// start again from 0 when it restarts, as a counter may). The unit is the cache entry (one
+// blob, by digest and executable bit), not the file name a lease places it under.
+message InputCacheCounts {
+  // Entries written into the cache from the content store, and their bytes. An entry copied
+  // from its executable or plain sibling, or adopted from disk, is not a fill.
+  uint64 fills = 1;
+  uint64 fill_bytes = 2;
+  // Entries a lease found in the cache and used, and their bytes. A lease that waited for
+  // another's fill and then used the entry counts a hit; the lease that filled it does not.
+  uint64 hits = 3;
+  uint64 hit_bytes = 4;
+  // Entries removed to keep the byte budget or the free-space floor, and their bytes. An entry
+  // removed because it failed its check is not one.
+  uint64 evictions = 5;
+  uint64 evicted_bytes = 6;
+  // The node's shared tree store, when it has one.
+  TreeCounts trees = 7;
+}
+
+// The counts of a daemon's shared tree store, cumulative since the daemon process started.
+message TreeCounts {
+  // Trees built from cache entries.
+  uint64 builds = 1;
+  // Acquires that found the tree built.
+  uint64 hits = 2;
+  // Trees evicted.
+  uint64 evictions = 3;
+}
+
+// One reading of the cgroup that holds the node's actions. Every counter is cumulative
+// in the daemon process's own clock, so a reader takes differences between readings of
+// one daemon process (`seq` restarts at 1 with the process).
+message NodeLoad {
+  // 1 for the first reading of this daemon process, plus one for each after.
+  uint64 seq = 1;
+  // The daemon's monotonic clock at the read of the CPU counter, in microseconds. Only
+  // differences of its readings mean anything.
+  uint64 mono_usec = 2;
+  // Cumulative CPU time of the cgroup (`cpu.stat` usage_usec), in microseconds. It still
+  // holds the CPU of descendants removed since.
+  uint64 cpu_usage_usec = 3;
+  // The memory the cgroup holds that cannot be reclaimed cheaply: `memory.current` minus
+  // the inactive file pages of `memory.stat`, in bytes.
+  uint64 memory_working_set_bytes = 4;
+  // The leases that ran for the whole window since the previous reading. Empty for the
+  // first reading. At most 96, in the order of `lease_clocks`.
+  repeated LeaseId covered = 5;
+  // Whether the cgroup has a CPU quota (`cpu.max`).
+  bool actions_cpu_limited = 6;
+  // `cpu.stat` throttled_usec, in microseconds. Telemetry only. Absent when the cgroup
+  // has no such counter: absent is not zero.
+  optional uint64 cpu_throttled_usec = 7;
+  // The cumulative `total=` of the `some` line of `cpu.pressure`, in microseconds.
+  // Telemetry only. Absent without pressure stall information.
+  optional uint64 cpu_pressure_some_total_usec = 8;
+  // When each lease the runtime is running started, on this reading's own clock
+  // (`mono_usec`): the lease's container start, after its inputs and image. At most 96,
+  // oldest start first. Empty from a daemon that predates the field, from a runtime with
+  // no leases, or when the reading could not list them.
+  repeated LeaseClock lease_clocks = 9;
+  // Closed minutes of leases, counted from each lease's own start, oldest minute first,
+  // at most 64 a heartbeat. A minute is absent when it was observed for less than 30 s,
+  // never zero. Minute 63 means "63 or later": the daemon folds every later minute into
+  // it with the larger value of each field. Two scopes of repeat: within one load, a
+  // repeat of (lease, minute) is dropped on receipt and the first one stays; across
+  // heartbeats (a minute sent again because a heartbeat was not acknowledged before the
+  // stream ended, and every later fold into minute 63), a receiver merges by
+  // (lease, minute) with the larger value of each field.
+  repeated LeaseMinute minutes = 10;
+  // The active file pages of `memory.stat` (`active_file`), in bytes: page cache the
+  // kernel has not marked reclaimable, which a working set counts. 0 when the file has
+  // no such line.
+  uint64 memory_active_file_bytes = 11;
+}
+
+// When a lease started, on the clock of the NodeLoad that carries it.
+message LeaseClock {
+  LeaseId lease = 1;
+  // The daemon's monotonic clock, in microseconds, when the lease's container started.
+  // Not after NodeLoad.mono_usec.
+  uint64 started_mono_usec = 2;
+}
+
+// What one lease used in one minute of its life.
+message LeaseMinute {
+  LeaseId lease = 1;
+  // 0 to 63: the minute since the lease's start.
+  uint32 minute = 2;
+  // Mean CPU over the span observed, thousandths of a CPU. Not above the peak.
+  uint32 cpu_mean_millis = 3;
+  // The busiest sampling window of the minute, thousandths of a CPU.
+  uint32 cpu_peak_window_millis = 4;
+  // The largest working set seen in the minute (`memory.current` less `inactive_file`),
+  // bytes.
+  uint64 ws_max_bytes = 5;
 }
 
 // The counts of a daemon's pack reads, cumulative since the daemon process started (they
@@ -472,6 +599,105 @@ message Start {
   // so a daemon that predates this field, and would drop it, is never sent one. A
   // booked device is the lease's alone until the lease ends.
   string device_id = 8;
+  // The job to run, when `kind` is `job`; unset for every other kind. Field 9 is final: it
+  // is never renumbered or reused, and a change adds a new field. A receiver that predates
+  // it skips it (so the server places a `job` only on a daemon whose Hello lists a driver
+  // that serves the kind).
+  Job job = 9;
+  // What the daemon does with the run when it loses contact with the server. Field 10 is
+  // final (see `job`). Unspecified, and any value this receiver does not know, is read as
+  // FENCE_POLICY_SELF_FENCE: the unsafe direction is the one that lets a run outlive its
+  // retry, so an unknown value never chooses it.
+  FencePolicy fence = 10;
+}
+
+// What a daemon does with a run when its contact with the server lapses.
+enum FencePolicy {
+  // Not said (a server that predates the field): read as SELF_FENCE.
+  FENCE_POLICY_UNSPECIFIED = 0;
+  // The run stops at the self-fence time after the newest acknowledged heartbeat was
+  // sent; the scheduler gives the lease up and runs it elsewhere no sooner than the lease
+  // grace after that.
+  FENCE_POLICY_SELF_FENCE = 1;
+  // The run goes on through a lapse of contact. Only for a run that is hermetic or declared
+  // idempotent, because the scheduler may run it again beside the first.
+  FENCE_POLICY_RUN_ON = 2;
+}
+
+// One job a daemon runs in a container (`Start.kind` = `job`). Field numbers are final.
+//
+// Two owners. The scheduler reads and writes `run_id`, `limits` and `gpu_indices` and
+// carries every other field as bytes it never interprets; the daemon validates all of them.
+// The booking is `Start.millicpus` and `Start.memory_bytes`, which the scheduler derives
+// from its own sizing, not from the submitter; a daemon refuses a Start whose booking is
+// zero or above `limits` (see Result.job_outcome, rule 1).
+message Job {
+  // Names the run across attempts; the Result echoes it. At most 128 bytes.
+  string run_id = 1;
+  // An OCI image reference. It may be a mutable tag: the daemon resolves it once at start,
+  // runs the digest, and reports it in JobOutcome.image_digest.
+  string image = 2;
+  // The container's argument vector, in order.
+  repeated string args = 3;
+  // The hard ceilings of the run. Unset, or a zero cpu_millis, memory_bytes or wall_ms, is
+  // refused by the daemon with no run started.
+  JobLimits limits = 4;
+  // The GPUs the scheduler picked on this node, as indices into the daemon's own device
+  // report. Each below 256, no duplicates (the daemon checks). A decoder reads packed and
+  // unpacked forms alike.
+  repeated uint32 gpu_indices = 5;
+  // The host directories made visible in the container.
+  repeated Mount mounts = 6;
+  // Unspecified is contained. The daemon refuses a value it does not know, and refuses
+  // ISOLATION_HOST unless its operator allowed it: a message from the server never chooses
+  // to run without a container.
+  Isolation isolation = 7;
+  // Free-form name and value pairs, sorted by name by the sender; names unique. A repeated
+  // pair, not a map, so equal labels encode to equal bytes. At most 64, a name at most 128
+  // bytes and a value at most 1024 (the daemon checks).
+  repeated Label labels = 8;
+  // The working directory inside the container; empty is the image's own.
+  string cwd = 9;
+}
+
+// The hard ceilings of a job: what the kernel enforces, not what the scheduler booked.
+message JobLimits {
+  // CPU, in thousandths of a CPU. The container's hard cpu.max.
+  uint64 cpu_millis = 1;
+  // Memory, in bytes. The container's memory.max; Start.memory_bytes (the booking) stays
+  // its soft limit, memory.high.
+  uint64 memory_bytes = 2;
+  // The most processes; absent is unbounded, a present value must be above 0.
+  optional uint64 pids = 3;
+  // How long one attempt may run, in milliseconds, before the daemon stops it and reports
+  // JOB_EXIT_TIMED_OUT.
+  uint64 wall_ms = 4;
+}
+
+// One host directory a job sees.
+message Mount {
+  // A name in the daemon's own table of roots, never a path.
+  string root_name = 1;
+  // The path below that root; the daemon refuses an absolute path and `..`.
+  string rel = 2;
+  // True for read-write. Absent is read-only, so a dropped flag never grants write.
+  bool writable = 3;
+}
+
+// A job's isolation.
+enum Isolation {
+  // Not said: contained.
+  ISOLATION_UNSPECIFIED = 0;
+  // In a container.
+  ISOLATION_CONTAINED = 1;
+  // On the host, without a container. Refused unless the daemon's operator allowed it.
+  ISOLATION_HOST = 2;
+}
+
+// A name and a value.
+message Label {
+  string name = 1;
+  string value = 2;
 }
 
 // The server no longer holds this lease on the daemon (it gave the lease up and the
@@ -517,6 +743,81 @@ message Result {
   // 6.5). The daemon sends it with UNAVAILABLE, which a server that predates this
   // field takes as the farm's failure. Unspecified: not lost.
   Lost lost = 6;
+  // The outcome of a `job` lease. Field 7 is final: never renumbered or reused. It is a
+  // plain field, not a oneof with action_result, so a reader of an earlier shape still
+  // sees both as before. The rules:
+  // 1. A job the daemon refuses before it ran anything (the Job fails validation, limits
+  //    are unset or zero, the booking is zero or above the limits, ISOLATION_HOST is not
+  //    allowed, an unknown isolation, or no driver serves the kind) is a Result whose
+  //    status is not OK and which has no job_outcome. Nothing ran; the server may place it
+  //    elsewhere or fail it.
+  // 2. JOB_EXIT_FAILED_TO_START is only for a run the runtime attempted (image pull or
+  //    resolve, create, start) and failed: status OK, job_outcome set, `detail` says why.
+  // 3. Status OK means the daemon handled the run to an end. For a job it carries
+  //    job_outcome and never action_result (nor action_digest); for any other kind the
+  //    reverse. A server drops, as a protocol error, a Result with job_outcome on a lease
+  //    that is not a job, or with status OK and none on a job lease, and one whose
+  //    job_outcome.run_id is not the run_id of the lease's Start.job.
+  // 4. Exactly one of exit_code and term_signal is set for JOB_EXIT_SUCCEEDED and
+  //    JOB_EXIT_FAILED; JOB_EXIT_KILLED_* set term_signal when it is known and never
+  //    exit_code; JOB_EXIT_TIMED_OUT, _OUT_OF_MEMORY, _FAILED_TO_START and _UNSPECIFIED
+  //    set neither.
+  // 5. A job lost to a fence or a daemon restart is reported as before (`lost`, status
+  //    UNAVAILABLE) with no job_outcome, and never sets memory_kill.
+  JobOutcome job_outcome = 7;
+}
+
+// How a job ended. See Result.job_outcome for when it is sent.
+message JobOutcome {
+  // The Start.job.run_id this answers.
+  string run_id = 1;
+  JobExit exit = 2;
+  // The process exited with this code. A clean exit 0 is present; absent is "did not
+  // exit". Set exactly one of this and term_signal where Result.job_outcome says so.
+  optional int32 exit_code = 3;
+  // The process died on this signal. When the runtime reports a signal death as exit
+  // 128+n, the daemon sets term_signal = n and leaves exit_code unset; a process that
+  // itself calls exit(137) is exit_code = 137. When the runtime cannot tell, exit_code
+  // stands and this is unset: never both.
+  optional int32 term_signal = 4;
+  // A short refusal code or reason, at most 1024 bytes; never data from the job's peers.
+  string detail = 5;
+  // The job's stdout and stderr, already in the CAS. Unset when it wrote none or never ran.
+  build.bazel.remote.execution.v2.Digest stdout_digest = 6;
+  build.bazel.remote.execution.v2.Digest stderr_digest = 7;
+  // Set when the daemon found the node unsafe after this run (for example the container
+  // could not be removed). The node's PHASE_TAINTED says the same for placement; on a run
+  // that has no job_outcome (fenced, lost) the phase alone says it.
+  JobTaint taint = 8;
+  // What the run used.
+  ResourceUsage usage = 9;
+  // The image the run used, resolved to `sha256:<hex>`; empty if never resolved.
+  string image_digest = 10;
+}
+
+// Why a node is tainted by a job run.
+message JobTaint {
+  string reason = 1;
+  // The check that found it, when one did.
+  optional string check = 2;
+}
+
+// How a job ended.
+enum JobExit {
+  // The daemon cannot say. A server reads it as a failure, never as success; it is also
+  // what a receiver reads for a value it does not know.
+  JOB_EXIT_UNSPECIFIED = 0;
+  JOB_EXIT_SUCCEEDED = 1;
+  JOB_EXIT_FAILED = 2;
+  // Stopped because the server cancelled or preempted the lease.
+  JOB_EXIT_KILLED_BY_SERVER = 3;
+  // Stopped at JobLimits.wall_ms.
+  JOB_EXIT_TIMED_OUT = 4;
+  JOB_EXIT_OUT_OF_MEMORY = 5;
+  // The runtime attempted to start it and could not (Result.job_outcome, rule 2).
+  JOB_EXIT_FAILED_TO_START = 6;
+  // Signalled by something other than the daemon: the node's OOM killer, an operator.
+  JOB_EXIT_KILLED_EXTERNAL = 7;
 }
 
 // How the farm lost a lease's run.
@@ -700,6 +1001,10 @@ message CgroupUsage {
   // How many CPUs the lease's cgroup could run on (`cpuset.cpus.effective`): fewer than
   // the node's for a lease placed on one NUMA node. Absent when not readable.
   optional uint32 cpus_effective = 16;
+  // The most CPU any one window between two node-load readings used by the lease, in
+  // thousandths of a CPU. Absent when the lease ended before it had a full window, or the
+  // runtime takes no readings.
+  optional uint64 peak_window_millicores = 17;
 }
 
 // Bytes of one NUMA node.

@@ -6,10 +6,10 @@ use kbf_proto::reapi::ActionResult;
 use kbf_types::{Answer, Digest, DigestFunction, LeaseId, OperationId, Refusal};
 
 use super::*;
-use crate::farm::Pending;
+use crate::farm::report::Pending;
 
 fn farm() -> Farm {
-    Farm::new(
+    Farm::new_legacy(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -97,7 +97,7 @@ fn each_class_counts_into_its_own_series() {
 #[test]
 fn an_operation_is_classed_by_what_its_callers_are_told() {
     let completed = Outcome::Completed {
-        action_result: digest(),
+        action_result: digest().into(),
     };
     assert_eq!(class_of(completed, Some(&ran(0))), None);
     assert_eq!(class_of(completed, Some(&ran(2))), Some(Class::Action));
@@ -146,7 +146,7 @@ fn a_parked_result_is_counted_by_its_exit_code() {
     let farm = farm();
     for (n, exit) in [(1, 0), (2, 3)] {
         let mut lease_answer = answer(Outcome::Completed {
-            action_result: digest(),
+            action_result: digest().into(),
         });
         lease_answer.lease = LeaseId::new(1, n);
         lease_answer.operation = OperationId(n);

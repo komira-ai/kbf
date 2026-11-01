@@ -627,12 +627,81 @@ fn a_caller_that_sends_nothing_is_dropped() {
     );
 }
 
+/// Catches: a deadline looked at only before a read that needs more bytes, so that a
+/// frame whose last byte arrives after the deadline is parsed and answered. The whole
+/// frame is queued in one write before the helper reads; its clock reads 0 ms for the
+/// start and for each of the two looks before a read (header, body), then 1000 ms, the
+/// request being due at 400 ms. The reads all find their bytes at once, so only a look
+/// after the frame is complete can refuse it, and it must be refused at the deadline,
+/// not parsed ("bad request: expected value").
+#[test]
+fn a_request_completed_after_its_deadline_is_refused_at_the_deadline() {
+    assert_eq!(
+        reply_to_a_frame_completed_at(1000),
+        Reply::Refused {
+            reason: "bad request: the deadline passed".to_owned()
+        }
+    );
+}
+
+/// Catches: a deadline that is not yet passed when the clock reads exactly the
+/// deadline (`>` where `>=` is meant). The clock reads 400 ms, the whole of the
+/// 400 ms allowed, after the frame is complete.
+#[test]
+fn a_request_completed_exactly_at_its_deadline_is_refused() {
+    assert_eq!(
+        reply_to_a_frame_completed_at(400),
+        Reply::Refused {
+            reason: "bad request: the deadline passed".to_owned()
+        }
+    );
+}
+
+/// The helper's answer to a whole frame queued in one write, with a 400 ms deadline
+/// and a clock that reads 0 ms until the frame is read and `after_ms` once it is.
+fn reply_to_a_frame_completed_at(after_ms: u64) -> Reply {
+    use std::io::Write as _;
+    trace();
+    let dir = scratch(&format!("server-late-frame-{after_ms}"));
+    let helper = quiet_helper(&dir);
+    let (caller_end, helper_end) = UnixStream::pair().unwrap();
+    let check = Scripted::fixed(Ok(()));
+    // Not a request: a frame that is parsed fails to parse, so an answer other than
+    // the deadline's shows the frame was read as if on time.
+    let mut frame = vec![0, 0, 0, 20];
+    frame.extend_from_slice(&[b'x'; 20]);
+    (&caller_end).write_all(&frame).unwrap();
+    let looks = AtomicUsize::new(0);
+    connection_on(
+        &helper_end,
+        &helper,
+        check.as_ref(),
+        Duration::from_millis(400),
+        &|| {
+            let at = looks.fetch_add(1, Ordering::SeqCst);
+            Duration::from_millis(if at < 3 { 0 } else { after_ms })
+        },
+    );
+    let hello = proto::recv::<Reply>(caller_end.as_fd(), 0)
+        .unwrap()
+        .unwrap()
+        .0;
+    assert!(matches!(hello, Reply::Hello { .. }), "{hello:?}");
+    proto::recv::<Reply>(caller_end.as_fd(), 0)
+        .unwrap()
+        .unwrap()
+        .0
+}
+
 /// Catches: a timeout per read only, under which a caller that sends one byte at a
 /// time, each within the timeout, holds a thread for as long as it likes. The caller
 /// sends the 24 bytes of a frame, and each byte moves the connection's clock on by
-/// 100 ms; the request is due 400 ms after the hello, so it is refused at the deadline
-/// however the bytes and the reads interleave, and a per-read timeout would instead
-/// read the whole frame and answer "bad request".
+/// 100 ms, from the helper's first reading of the clock; the request is due 400 ms
+/// after that. The reads may split the bytes any way (one byte each, or all 24 at
+/// once after the clock has run far past the deadline), and in every split the
+/// request is refused at the deadline: either a look before a read finds it passed,
+/// or the look after the frame is complete does. A per-read timeout would instead
+/// read the whole frame and answer "bad request: expected value".
 #[test]
 fn a_caller_that_drips_its_request_is_dropped_at_the_deadline() {
     use std::io::Write as _;
@@ -645,8 +714,9 @@ fn a_caller_that_drips_its_request_is_dropped_at_the_deadline() {
     let check = Scripted::fixed(Ok(()));
     let clock = Arc::new(AtomicU64::new(0));
     let helper_clock = clock.clone();
-    // Told at the helper's first reading of the clock, which starts the 400 ms: the
-    // caller sends nothing before that, so the deadline cannot start late.
+    // Told after the helper's first reading of the clock, which starts the 400 ms: the
+    // caller moves the clock and sends nothing before that, so the deadline cannot
+    // start late.
     let (started, started_rx) = std::sync::mpsc::channel();
     let served = std::thread::spawn(move || {
         connection_on(
@@ -655,8 +725,11 @@ fn a_caller_that_drips_its_request_is_dropped_at_the_deadline() {
             check.as_ref(),
             Duration::from_millis(400),
             &|| {
+                // Read, then tell: the caller moves the clock only after this
+                // reading, so the deadline starts at 0 whatever the interleaving.
+                let reading = Duration::from_millis(helper_clock.load(Ordering::SeqCst));
                 let _ = started.send(());
-                Duration::from_millis(helper_clock.load(Ordering::SeqCst))
+                reading
             },
         );
     });

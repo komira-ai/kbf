@@ -358,6 +358,7 @@ pub struct Sim {
 pub fn exec(code: i32, stdout: &str, stderr: &str) -> io::Result<Exec> {
     Ok(Exec {
         code: Some(code),
+        signal: None,
         stdout: stdout.into(),
         stderr: stderr.into(),
     })
@@ -565,6 +566,14 @@ impl Sim {
                 io::ErrorKind::TimedOut,
                 "ran past its limit",
             ));
+        }
+        if self.is_broken("list-signal") {
+            return Ok(Exec {
+                code: None,
+                signal: Some(13),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
         }
         if self.is_broken("list-net") {
             return exec(1, "", "error connecting to api.github.com");

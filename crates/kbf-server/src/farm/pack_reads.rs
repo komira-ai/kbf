@@ -20,21 +20,24 @@ impl Farm {
         stream: StreamId,
         counts: Option<PackReadCounts>,
     ) {
+        js_arm!(self, views::note_pack_reads(worker, stream, counts));
         let mut state = self.lock();
-        if !state.is_current(worker, stream) {
+        if !state.side.is_current(worker, stream) {
             return;
         }
         match counts {
-            Some(counts) => state.pack_reads.insert(worker.clone(), counts),
-            None => state.pack_reads.remove(worker),
+            Some(counts) => state.side.pack_reads.insert(worker.clone(), counts),
+            None => state.side.pack_reads.remove(worker),
         };
     }
 
     /// The newest pack-read counts of every node that sent any, in node-id order.
     #[must_use]
     pub fn pack_reads(&self) -> Vec<(WorkerId, PackReadCounts)> {
+        js_arm!(self, views::pack_reads());
         let state = self.lock();
         state
+            .side
             .pack_reads
             .iter()
             .map(|(worker, counts)| (worker.clone(), *counts))

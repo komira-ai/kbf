@@ -1,9 +1,11 @@
 //! The registry's storage: the write order, the generation, the audit, the secret files.
 //! Each test names the defect it catches.
 
+mod audit_unknown;
 mod crash;
 mod files;
 mod leaks;
+mod repoint;
 mod rules;
 mod view;
 

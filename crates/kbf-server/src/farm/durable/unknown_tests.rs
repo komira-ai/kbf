@@ -1,49 +1,11 @@
 //! Rows a later binary wrote, read back as a start reads them: a row that holds a command
 //! this binary does not know is skipped, and the rows it can read load.
 
-use std::io;
-use std::sync::Mutex;
-
 use kbf_state::fake::{Fake, Flaw};
 use kbf_types::{ActionKey, DigestFunction, LeaseKind, Qos, Resources};
 
 use super::*;
-
-/// Log lines written by the test's subscriber on this thread.
-#[derive(Clone, Default)]
-struct Lines(Arc<Mutex<Vec<u8>>>);
-
-impl Lines {
-    /// The log of this thread, until the guard drops. Other tests reach the same callsites
-    /// with no subscriber and can leave their interest cached as never, so the cache is
-    /// rebuilt once ours is installed.
-    fn subscribe(&self) -> tracing::subscriber::DefaultGuard {
-        let writer = self.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        tracing_core::callsite::rebuild_interest_cache();
-        guard
-    }
-
-    fn text(&self) -> String {
-        let bytes = self.0.lock().expect("lock").clone();
-        String::from_utf8(bytes).expect("UTF-8 logs")
-    }
-}
-
-impl io::Write for Lines {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().expect("lock").extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
+use crate::test_log::capture;
 
 const OP_KNOWN: &str = "op/0000000000000001";
 const OP_UNKNOWN: &str = "op/0000000000000002";
@@ -81,13 +43,15 @@ fn request(tag: u8) -> Request {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
-        },
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),
         hermetic: true,
         do_not_cache: false,
         needs: kbf_caps::Request::default(),
+        whole_worker: false,
     }
 }
 
@@ -96,6 +60,7 @@ fn grant() -> LeaseGrant {
         lease: LeaseId::new(5, 0),
         operation: OperationId(1),
         worker: WorkerId::new("node-a"),
+        cost: Default::default(),
     }
 }
 
@@ -155,8 +120,7 @@ fn a_request_joins_an_operation_past_an_unknown_lease_row() {
     let record = FarmInput::Committed(ControlRecord::Lease(grant()));
     put(&store, LEASE_KNOWN, encode(record).expect("encode"));
     put(&store, LEASE_UNKNOWN, unknown());
-    let lines = Lines::default();
-    let _guard = lines.subscribe();
+    let lines = capture();
     let joined = durable.submit(OperationId(2), &request(1), &subject());
     let Ok(Submitted::Joined(op)) = joined else {
         panic!("the request did not join");
@@ -165,6 +129,11 @@ fn a_request_joins_an_operation_past_an_unknown_lease_row() {
     assert_eq!(op.lease, Some(grant()));
     let text = lines.text();
     assert!(!text.contains(LEASE_UNKNOWN), "{text}");
+    // Positive control: a start, over the same rows, logs the row in this same capture, so
+    // the absence above is not an empty capture.
+    durable.load().expect("the rows load");
+    let text = lines.text();
+    assert!(text.contains(LEASE_UNKNOWN), "{text}");
 }
 
 /// Asserts that a start logs the key of a row it skips, and that the search for the
@@ -175,8 +144,7 @@ fn only_a_start_logs_the_rows_it_skips() {
     let store = store();
     let durable = open(&store);
     put(&store, LEASE_UNKNOWN, unknown());
-    let lines = Lines::default();
-    let _guard = lines.subscribe();
+    let lines = capture();
     durable
         .held_by(&grant().worker)
         .expect("the search reads the rows");

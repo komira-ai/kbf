@@ -24,15 +24,18 @@
 //! Exits non-zero when the node cannot be detected or the configuration cannot be
 //! loaded; otherwise runs until SIGTERM or SIGINT, then drains: it takes no new lease,
 //! lets the running ones finish and report, waits for their acknowledgements and exits
-//! zero. A second signal, or `--drain-deadline-secs` after the first, stops it at once;
-//! leases still running then are abandoned (their processes killed, their directories
-//! removed) and the scheduler places them again.
+//! zero, however long the leases take: a drain never ends because time ran out. A second
+//! signal is the operator's hard stop; leases still running then are abandoned (their
+//! processes killed, their directories removed) and the scheduler places them again.
+//! `--drain-deadline-secs`, if given, only makes the daemon warn, once, with the number of
+//! leases still running, that many seconds after the first signal; it keeps waiting.
 //!
 //! Everything the daemon keeps on disk is under one directory, `--data-dir` (default
 //! `/var/lib/kbf`; `data_dir`): `leases/`, and under the container driver and the
 //! native driver on macOS the input cache it links (container) or clones (native) each
 //! lease's input files from, and the shared input trees. Their budgets
-//! come from the filesystem, not from flags; `--data-max-bytes` only lowers them.
+//! come from the filesystem, not from flags; `--data-max-bytes` only lowers them, and
+//! `--no-input-cache` switches the cache and the trees off.
 //!
 //! With `--pack-read` (off by default; `pack_read`) the data plane of `kbf daemon` and of the
 //! daemon half of `kbf storage-and-daemon` with a frontend reads blobs from the packs of the
@@ -174,6 +177,8 @@ pub struct Cli {
     /// its memory when that is less, and the CPUs of their cpuset.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     actions_memory_max_gib: Option<u64>,
+    #[command(flatten)]
+    actions_cpu: actions_cpu::ActionsCpuArgs,
     /// Written to the daemon's `supervisor` leaf's `memory.min` at start, in MiB
     /// (container, without `--cgroup-parent`): memory the kernel does not reclaim from
     /// the daemon while it uses no more, so builds short of memory never take it. The
@@ -225,11 +230,16 @@ pub struct Cli {
     memory_pressure_pause_percent: f64,
     /// On the first SIGTERM or SIGINT the daemon drains: it takes no new lease, lets
     /// the running ones finish and report, waits for their acknowledgements, then exits
-    /// 0. A second signal, or this many seconds after the first, stops it at once and
-    /// abandons the leases still running. Used by `kbf daemon` and `kbf
-    /// storage-and-daemon`; `kbf all-in-one` stops its daemon half with the server half.
-    #[arg(long, default_value_t = 600)]
-    drain_deadline_secs: u64,
+    /// 0, however long that takes. A second signal stops it at once and abandons the
+    /// leases still running. Left out, the drain has no deadline. Given, this many
+    /// seconds after the first signal the daemon logs a warning with the number of
+    /// leases still running and keeps waiting; the value has no upper bound, and 0
+    /// warns at once. It never abandons a lease. Used by `kbf daemon`, `kbf
+    /// storage-and-daemon` and `kbf all-in-one`, whose daemon half drains once its server
+    /// half has no execution open, while the server half goes on serving it; a second
+    /// signal stops both.
+    #[arg(long, value_name = "SECONDS")]
+    drain_deadline_secs: Option<u64>,
     /// Where the kernel reports memory pressure stall information. For tests only.
     #[arg(long, hide = true, default_value = kbf_daemon::pressure::MEMORY_PSI)]
     psi_memory_file: PathBuf,
@@ -459,8 +469,9 @@ fn sizes_on(
 pub struct NodeHandle {
     tokio: tokio::runtime::Runtime,
     daemon: Daemon,
-    /// `--drain-deadline-secs`.
-    drain_deadline: Duration,
+    /// `--drain-deadline-secs`, when to warn that leases still run; `None` waits without
+    /// a word.
+    drain_deadline: Option<Duration>,
     /// The storage network check of a daemon that keeps the frontend's map.
     reach: Option<ReachCheck>,
 }
@@ -546,12 +557,18 @@ impl NodeHandle {
     ) -> Result<(), Error> {
         let (sender, received) = tokio::sync::mpsc::unbounded_channel();
         self.tokio.spawn(forward(signals, sender));
-        self.drain_on(received, other)
+        self.serve_beside(received, other)
     }
 
-    /// Drains on the first of `received` and ends at the second, at the drain deadline,
-    /// or when `other` completes, whichever is first ([`Daemon::run_draining`]).
-    fn drain_on(
+    /// [`Self::serve_alongside`] on stop signals the caller reads itself: drains on the
+    /// first `()` of `received` and ends at the second, when the drain is complete, or
+    /// when `other` completes, whichever is first ([`Daemon::run_draining`]); the drain
+    /// deadline does not end it. A process that hands each signal to another half too
+    /// (`kbf all-in-one`) reads the signals once and feeds this.
+    ///
+    /// # Errors
+    /// As [`Self::serve_alongside`].
+    pub fn serve_beside(
         self,
         received: tokio::sync::mpsc::UnboundedReceiver<()>,
         other: impl Future<Output = ()>,
@@ -677,7 +694,7 @@ fn start_over<C: Cas>(
     Ok(NodeHandle {
         tokio,
         daemon,
-        drain_deadline: Duration::from_secs(cli.drain_deadline_secs),
+        drain_deadline: cli.drain_deadline_secs.map(Duration::from_secs),
         reach: None,
     })
 }
@@ -888,6 +905,7 @@ fn node_over<C: Cas>(
         )
         .into());
     }
+    cli.actions_cpu.refuse(&cli.drivers)?;
     let mut node = Node::new(plane);
     for driver in drivers(cli) {
         match driver {
@@ -1202,7 +1220,8 @@ mod container {
         };
         // The leases' share of the CPUs: all the daemon may use but `--reserve-cpus`.
         // A limit on the actions cgroup, not a pinning: any CPU, at most this many.
-        kbf_driver_container::limit_cpus(mount, &parent, super::sizes(cli)?.lease_cpus() as u64)?;
+        let lease_cpus = super::sizes(cli)?.lease_cpus() as u64;
+        kbf_driver_container::limit_cpus(mount, &parent, lease_cpus)?;
         let capacity = kbf_driver_container::capacity(mount, &parent)?;
         tracing::info!(
             "leases may use {} CPUs and {} of memory (cgroup {parent})",
@@ -1224,6 +1243,8 @@ mod container {
         };
         let mut config = ContainerConfig::new(scratch, parent);
         config.placer = placer;
+        // Applied by each Welcome from here on; the limit above stands until the first.
+        config.actions_cpu = Some(cli.actions_cpu.config(lease_cpus));
         config.oci.runtime = cli.oci_runtime.clone();
         config.oci.id_files = files;
         config.cgroup_root = mount.clone();
@@ -1303,6 +1324,7 @@ mod container {
     }
 }
 
+mod actions_cpu;
 mod data_dir;
 mod instance;
 mod pack_read;
@@ -1412,6 +1434,27 @@ mod tests {
             "--node-id=mac-1",
         ];
         Cli::try_parse_from(base.iter().chain(extra))
+    }
+
+    /// Catches a drain deadline that comes back as a default (the old 600 s), one that is
+    /// capped, and a 0 that is refused (a live `kbf.toml` may hold it) or read as "no
+    /// deadline" (it was "stop at once"): absent is `None`, any number is kept as given,
+    /// and 0 is `Some(0)`, a warning at once.
+    #[test]
+    fn the_drain_deadline_is_absent_by_default_and_has_no_cap() {
+        let deadline = |extra: &[&str]| {
+            parse(&[&["--driver=native"], extra].concat())
+                .expect("flags")
+                .drain_deadline_secs
+        };
+        assert_eq!(deadline(&[]), None);
+        assert_eq!(deadline(&["--drain-deadline-secs=600"]), Some(600));
+        assert_eq!(deadline(&["--drain-deadline-secs=0"]), Some(0));
+        assert_eq!(
+            deadline(&["--drain-deadline-secs=315360000"]),
+            Some(315_360_000)
+        );
+        assert!(parse(&["--driver=native", "--drain-deadline-secs=-1"]).is_err());
     }
 
     /// Catches: native flags that do not reach the driver's configuration (the
@@ -2277,6 +2320,16 @@ mod tests {
         let broken = Cli::try_parse_from(broken).expect("flags");
         let why = start_over(&broken, None, plane).err().expect("refused");
         assert!(why.to_string().contains("only --driver container"), "{why}");
+        // `--actions-cpu-max` other than `auto` needs the container driver too.
+        for mode in ["on", "off"] {
+            let mut broken = base.clone();
+            broken.push(format!("--actions-cpu-max={mode}"));
+            let broken = Cli::try_parse_from(broken).expect("flags");
+            let why = start_over(&broken, None, plane).err().expect("refused");
+            let why = why.to_string();
+            assert!(why.contains(&format!("--actions-cpu-max={mode}")), "{why}");
+            assert!(why.contains("only --driver container"), "{why}");
+        }
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
@@ -2373,7 +2426,7 @@ mod tests {
     }
 
     /// Catches a daemon beside another half that does not drain on the first signal
-    /// (`drain_on` running the daemon with `run`, which ignores signals), and one that
+    /// (`serve_beside` running the daemon with `run`, which ignores signals), and one that
     /// keeps running when the half beside it has stopped. An idle node with a signal
     /// waiting returns at once, and so does one whose other half has stopped, with no
     /// signal; each runs on a thread the test waits on for 5 s, so a defect fails here
@@ -2409,7 +2462,7 @@ mod tests {
                         std::future::pending::<()>().await;
                     }
                 };
-                ended.send(node.drain_on(received, other).is_ok()).ok();
+                ended.send(node.serve_beside(received, other).is_ok()).ok();
                 drop(signals);
             });
             result.recv_timeout(Duration::from_secs(5))
