@@ -1981,14 +1981,14 @@ mod tests {
     fn rows(tsv: &ResultTsv) -> Vec<Vec<String>> {
         tsv.render()
             .lines()
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter(|l| l.contains('\t'))
             .map(|l| l.split('\t').map(str::to_owned).collect())
             .collect()
     }
 
     /// The numbers a text prints: runs of digits and points, a thousands comma removed.
     fn printed(text: &str) -> Vec<String> {
-        text.split(|c: char| !(c.is_ascii_digit() || c == '.' || c == ','))
+        text.split(|c: char| !matches!(c, '0'..='9' | '.' | ','))
             .filter(|t| t.starts_with(|c: char| c.is_ascii_digit()))
             .map(|t| t.replace(',', ""))
             .collect()
@@ -2028,10 +2028,8 @@ mod tests {
         assert_eq!(b[5], "b");
         assert!(b[4].contains("sum"), "{b:?}");
         // The number each cell prints is the value of its row.
-        assert!(
-            out.contains(">2.00 ms</i>") && out.contains(">2.00 MB/s</i>"),
-            "{out}"
-        );
+        assert!(out.contains(">2.00 ms</i>"), "{out}");
+        assert!(out.contains(">2.00 MB/s</i>"), "{out}");
         assert_eq!(printed("1,235 ms"), ["1235"]);
     }
 
@@ -2075,21 +2073,22 @@ mod tests {
     /// a changed number updates its row in place instead of adding one.
     #[test]
     fn the_table_keeps_other_rows_and_updates_its_own_in_place() {
-        let old = "# kept comment\nraw\thand.row\t7\tms\tmeasured by hand\tz\n\
+        let old = "# kept comment\n\nraw\thand.row\t7\tms\tmeasured by hand\tz\n\
 derived\tfill:a:p50\t9.99\tms\tstale\ta\nraw\tlast.row\t8\tms\tby hand\n";
         let mut t = ResultTsv::parse("r.tsv", old).unwrap();
         let html = "<i data-cell=\"a\">?</i>";
         super::fill(html, &one("a", "p50", "ms", "instance"), &results(), &mut t).unwrap();
         let text = t.render();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 4, "{text}");
+        assert_eq!(lines.len(), 5, "{text}");
         assert_eq!(lines[0], "# kept comment");
-        assert_eq!(lines[1], "raw\thand.row\t7\tms\tmeasured by hand\tz");
+        assert_eq!(lines[1], "");
+        assert_eq!(lines[2], "raw\thand.row\t7\tms\tmeasured by hand\tz");
         assert!(
-            lines[2].starts_with("derived\tfill:a:p50\t2.00\tms\t"),
+            lines[3].starts_with("derived\tfill:a:p50\t2.00\tms\t"),
             "{text}"
         );
-        assert_eq!(lines[3], "raw\tlast.row\t8\tms\tby hand");
+        assert_eq!(lines[4], "raw\tlast.row\t8\tms\tby hand");
         assert!(text.ends_with('\n'));
     }
 
@@ -2122,20 +2121,17 @@ derived\tfill:a:p50\t9.99\tms\tstale\ta\nraw\tlast.row\t8\tms\tby hand\n";
         let err = super::fill(hand, &m, &results(), &mut tsv()).unwrap_err();
         let text = err.to_string();
         assert!(matches!(err, FillError::Foreign { .. }), "{text}");
-        assert!(
-            text.contains("\"a\"") && text.contains("hand.tsv") && text.contains("r.tsv"),
-            "{text}"
-        );
+        assert!(text.contains("\"a\""), "{text}");
+        assert!(text.contains("hand.tsv"), "{text}");
+        assert!(text.contains("r.tsv"), "{text}");
         let mut t = tsv();
         let ours = "<i data-cell=\"a\" data-result=\"r.tsv\">old</i>";
         let (out, _) = super::fill(ours, &m, &results(), &mut t).unwrap();
         assert!(out.ends_with(">2.00 ms</i>"), "{out}");
         let json = "<i data-cell=\"a\" data-result=\"cold-put-x-a1.json\">old</i>";
         let (out, _) = super::fill(json, &m, &results(), &mut tsv()).unwrap();
-        assert!(
-            out.contains("data-result=\"r.tsv\"") && out.ends_with(">2.00 ms</i>"),
-            "{out}"
-        );
+        assert!(out.contains("data-result=\"r.tsv\""), "{out}");
+        assert!(out.ends_with(">2.00 ms</i>"), "{out}");
         let (out, report) = super::fill(hand, &[], &results(), &mut tsv()).unwrap();
         assert_eq!((out.as_str(), report.unmapped), (hand, 1));
         // A mapped hand-filled cell with no figure is left as it is, not refused.

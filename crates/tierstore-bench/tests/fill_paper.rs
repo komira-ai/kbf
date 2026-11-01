@@ -173,6 +173,7 @@ fn contradictory_flags_are_refused_and_write_nothing() {
         &[][..],
         &["--out", o, "--in-place"],
         &["--check", "--out", o],
+        &["--check", "--in-place"],
     ] {
         let run = fill_paper(dir.path(), extra);
         assert_eq!(run.status.code(), Some(2), "{extra:?}");
