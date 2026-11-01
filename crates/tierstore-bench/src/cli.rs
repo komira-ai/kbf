@@ -54,6 +54,8 @@ pub enum Command {
     VerifyTeardown(TeardownArgs),
     /// Print one table from the results of a result directory.
     Report(ReportArgs),
+    /// Write the measured numbers into the paper's HTML, or check that they are all there.
+    FillPaper(crate::fill::FillArgs),
 }
 
 /// Flags of `provision`.
@@ -360,6 +362,7 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
             print!("{table}");
             Ok(())
         }
+        Command::FillPaper(args) => Ok(crate::fill::run(&args)?),
     }
 }
 
