@@ -530,36 +530,90 @@ pub fn seen() -> Option<Seen> {
     node().map(|n| Seen::of(&n))
 }
 
-/// A look at the node every tenth of a second, from [`Watch::start`] until [`Watch::stop`],
-/// that keeps each look which differs from the one before.
+/// What the frontend's log records of the node `NODE`, one entry per line that names it.
+///
+/// The frontend writes these lines itself as it acts, in the order it acts: `operator action`
+/// when a node is cordoned, drained or given back (on the operator API and on the worker
+/// listener the agent uses alike; a drain the frontend answers "no such node" writes none),
+/// and `worker registered` when a daemon's stream registers the node. The `operator action`
+/// line is the legacy scheduler core's, the default; the js core does not write it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeEvent {
+    /// A daemon registered as the node.
+    Registered,
+    /// The node was cordoned without a drain.
+    Cordon,
+    /// The node was drained.
+    Drain,
+    /// The node was given back to placement.
+    Uncordon,
+}
+
+/// The events of `NODE` in `log`, the frontend's standard output and error, in order. The
+/// colour codes of a terminal log are dropped first.
+pub fn node_events(log: &str) -> Vec<NodeEvent> {
+    let node = format!("worker={NODE}");
+    log.lines()
+        .map(without_colour)
+        .filter(|line| line.split_whitespace().any(|w| w == node))
+        .filter_map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            if line.contains("worker registered") {
+                Some(NodeEvent::Registered)
+            } else if !line.contains("operator action") {
+                None
+            } else if words.iter().any(|w| w.starts_with("action=Drain(")) {
+                Some(NodeEvent::Drain)
+            } else if words.contains(&"action=Uncordon") {
+                Some(NodeEvent::Uncordon)
+            } else if words.contains(&"action=Cordon") {
+                Some(NodeEvent::Cordon)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// `line` without its ANSI escape sequences (`ESC [ ... <letter>`).
+fn without_colour(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The frontend's own record of the node from [`Watch::start`] on: the part of its log written
+/// since then, read when the watch stops. Nothing is sampled, so no event is missed however
+/// briefly the node was in a state.
 pub struct Watch {
-    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    thread: std::thread::JoinHandle<Vec<Seen>>,
+    log: PathBuf,
+    from: usize,
 }
 
 impl Watch {
-    pub fn start() -> Self {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let done = std::sync::Arc::new(AtomicBool::new(false));
-        let flag = std::sync::Arc::clone(&done);
-        let thread = std::thread::spawn(move || {
-            let mut log: Vec<Seen> = Vec::new();
-            while !flag.load(Ordering::Acquire) {
-                if let Some(now) = seen()
-                    && log.last() != Some(&now)
-                {
-                    log.push(now);
-                }
-                sleep(Duration::from_millis(100));
-            }
-            log
-        });
-        Self { done, thread }
+    /// Starts at the end of `log` as it is now.
+    pub fn start(log: &Path) -> Self {
+        let from = fs::read(log).unwrap().len();
+        Self {
+            log: log.to_owned(),
+            from,
+        }
     }
 
-    /// Ends the watch: every distinct look, in order.
-    pub fn stop(self) -> Vec<Seen> {
-        self.done.store(true, std::sync::atomic::Ordering::Release);
-        self.thread.join().unwrap()
+    /// The node's events the log gained since [`Watch::start`], in order.
+    pub fn stop(self) -> Vec<NodeEvent> {
+        let log = fs::read(&self.log).unwrap();
+        node_events(&String::from_utf8_lossy(&log[self.from..]))
     }
 }

@@ -20,8 +20,8 @@
 //!   unit `packaging/host-agent/linux/kbf-updater-agent.service` runs it, as `kbf-updater`, with
 //!   its certificate placed (`--client-cert`, `--client-key`, `--ca`; `--cordon-dir` is the unit's
 //!   state directory, as the packaged unit's comment says for placed certificates), the
-//!   simplest of the supported ways: enrolling needs a token and the frontend's enroll listener for a result that
-//!   is the same files;
+//!   simplest of the supported ways: enrolling needs a token and the frontend's enroll listener
+//!   for a result that is the same files;
 //! - release N's helper and `kbf` on the host, as in the first rehearsal;
 //! - release N's `kbf --mode=storage-and-daemon`, as the farm's nodes run it: the storage node and
 //!   the node daemon in one process, under a unit with `Delegate=yes`, as the account the
@@ -46,14 +46,17 @@
 //! health, confirm, undrain) through the helper; `deploy-farm` ending 0 proves the coordinator
 //! reported the farm converged on the version `farm-version` printed.
 //!
-//! The drain is watched from the frontend's side: the operator API's view of the node is read
-//! every tenth of a second while `deploy-farm` runs, and each change is kept. Before the update
-//! the node is `serving`, connected, on release N's daemon. During it the node is cordoned
-//! (`cordoned`, `draining`, `drained`) while the daemon that is registered still reports
-//! release N, so the agent drained it before the switch started release N+1's daemon, and its
-//! placement does not return to `serving` before that daemon has registered. After the confirm
-//! the node is `serving` and connected on N+1's daemon, which proves the undrain reached the
-//! frontend and the node came back from the restart.
+//! The drain is read from the frontend's side, after the fact: the frontend logs each action on
+//! a node (`operator action`, on the operator API and on the worker listener the agent uses
+//! alike) and each registration of a daemon (`worker registered`) as it makes it, so the part
+//! of its log written while `deploy-farm` runs is the order of events, with no sampling and no
+//! timing. Before the update the node is `serving`, connected, on release N's daemon. During it
+//! the frontend records one drain, before any daemon registers again; then a daemon registers
+//! while the node is drained (the switch restarted it); then one undrain, after which no
+//! daemon registers. After the confirm the node is `serving` and connected on N+1's daemon, so
+//! the daemon that registered while drained is N+1's: the agent drained the node before the
+//! switch, and gave it back only once N+1's daemon was up. A drain the frontend answers "no
+//! such node" (a host without a daemon half) records nothing and fails the rehearsal.
 //!
 //! What is not covered: no action runs on the node, so a drain that has to wait for a lease
 //! (and an action cut by the switch, or rerun) is not rehearsed; the node holds no lease when
@@ -63,8 +66,9 @@
 //!
 //! It needs Linux, systemd, root, `crun` (and `uidmap`) and the network, so it is `#[ignore]`d
 //! and runs through `cargo xtask sudo-test -p kbf-host-install --test update_rehearsal_agent` on
-//! a GitHub-hosted runner, after the job built `kbf-coordinator` and installed `crun`. The setup it shares with the first rehearsal
-//! is in `rehearsal/mod.rs`; the farm is in `rehearsal/farm.rs`.
+//! a GitHub-hosted runner, after the job built `kbf-coordinator` and installed `crun`. The setup
+//! it shares with the first rehearsal is in `rehearsal/mod.rs`; the farm is in
+//! `rehearsal/farm.rs`.
 
 #![cfg(target_os = "linux")]
 
@@ -162,6 +166,52 @@ fn members_active_on(commit: &str) -> bool {
         && list
             .iter()
             .all(|m| m["state"] == "active" && m["build_commit"] == commit)
+}
+
+/// Whether the frontend's record of the node through the update, from just before
+/// `deploy-farm` until the node serves on release N+1, shows the agent's drain and undrain
+/// around the restart of the node's daemon:
+///
+/// - one drain, before any daemon registered again: the daemon registered at the drain is the
+///   one seen serving on release N before `deploy-farm`, so the drain came before the switch;
+/// - a daemon registered after the drain and before the undrain: the switch restarted the node
+///   while it was out of placement;
+/// - one undrain, and no registration after it: the daemon the node serves on at the end
+///   (release N+1's, which the caller checks) is the one that registered while drained, so the
+///   node came back only once N+1's daemon was up;
+/// - no cordon besides the drain.
+///
+/// Before the host ran a daemon, the frontend answered the agent's drain "no such node" and
+/// recorded no drain at all, which fails here.
+fn drained_around_the_restart(events: &[farm::NodeEvent]) -> Result<(), String> {
+    use farm::NodeEvent::{Cordon, Drain, Registered, Uncordon};
+    let count = |e: &farm::NodeEvent| events.iter().filter(|x| *x == e).count();
+    if count(&Cordon) != 0 {
+        return Err("the node was cordoned besides the agent's drain".into());
+    }
+    let drain = match (count(&Drain), events.iter().position(|e| *e == Drain)) {
+        (1, Some(at)) => at,
+        (0, _) => return Err("the frontend recorded no drain of the node".into()),
+        (n, _) => return Err(format!("the node was drained {n} times, not once")),
+    };
+    let undrain = match (count(&Uncordon), events.iter().position(|e| *e == Uncordon)) {
+        (1, Some(at)) => at,
+        (0, _) => return Err("the frontend recorded no undrain of the node".into()),
+        (n, _) => return Err(format!("the node was given back {n} times, not once")),
+    };
+    if events[..drain].contains(&Registered) {
+        return Err("a daemon registered again before the drain".into());
+    }
+    if undrain < drain {
+        return Err("the node was given back before it was drained".into());
+    }
+    if !events[drain..undrain].contains(&Registered) {
+        return Err("no daemon registered while the node was drained".into());
+    }
+    if events[undrain..].contains(&Registered) {
+        return Err("a daemon registered after the node was given back".into());
+    }
+    Ok(())
 }
 
 /// Waits until `ready` holds, as long as [`PATIENCE`] allows, and stops early when one of the
@@ -421,7 +471,15 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
         desired, r.version,
         "farm-version and the version facts agree"
     );
-    let watch = farm::Watch::start();
+    // The record is the legacy scheduler core's (the frontend's default): the js core places
+    // a node without the `operator action` line.
+    let started = fs::read_to_string(&frontend.log).unwrap();
+    assert!(
+        !started.contains("scheduler core: js"),
+        "the frontend runs the js scheduler core, which does not log the node's drain and \
+         undrain the rehearsal reads"
+    );
+    let watch = farm::Watch::start(&frontend.log);
     let deployed = deploy("deploy_farm", &desired);
     assert!(
         deployed.contains("baseline: hosts live before the deploy: storage 1"),
@@ -432,47 +490,18 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
         "{deployed}"
     );
 
-    // The node, as the frontend showed it through the update.
+    // The node after the update: serving and connected, on release N+1's daemon.
     wait(
         "the node serving and connected on release N+1",
         &mut [&mut frontend, &mut coordinator],
         || farm::seen().is_some_and(|n| n.serving() && n.connected && n.runs(new)),
     );
-    let mut looks = watch.stop();
-    // The look the wait just made, which the watch may not have kept yet.
-    if let Some(last) = farm::seen().filter(|n| looks.last() != Some(n)) {
-        looks.push(last);
+    // What the frontend did to the node meanwhile, in the order it did it.
+    let events = watch.stop();
+    println!("the node, as the frontend's log records it: {events:?}");
+    if let Err(why) = drained_around_the_restart(&events) {
+        panic!("{why}: {events:?}");
     }
-    println!("the node, as the frontend showed it: {looks:#?}");
-    let cordoned = looks
-        .iter()
-        .position(|n| !n.serving())
-        .unwrap_or_else(|| panic!("the node was never out of placement: {looks:#?}"));
-    assert!(
-        looks[..cordoned].iter().all(|n| n.serving() && n.runs(old)),
-        "before the drain the node serves on release N: {looks:#?}"
-    );
-    // The drain came first: the daemon that is registered while the node is out of placement is
-    // release N's, so release N+1's had not started.
-    assert!(
-        looks[cordoned].runs(old),
-        "the node was drained while release N's daemon was registered: {looks:#?}"
-    );
-    // Back in placement only on N+1's daemon: the undrain came after the confirm.
-    let back = looks
-        .iter()
-        .rposition(|n| !n.serving())
-        .map_or(cordoned, |i| i + 1);
-    assert!(
-        looks
-            .get(back)
-            .is_some_and(|n| n.serving() && n.connected && n.runs(new)),
-        "the node came back into placement on release N+1's daemon: {looks:#?}"
-    );
-    assert!(
-        looks[cordoned..back].iter().all(|n| !n.serving()),
-        "the node stayed out of placement until then: {looks:#?}"
-    );
 
     // The host runs N+1, and the coordinator's word for it is the agent's.
     let done = farm::host_status(&ca_file).unwrap();
@@ -562,5 +591,139 @@ fn the_rehearsals_agent_can_write_the_directory_of_its_cordons() {
         writable.iter().any(|w| cordons.starts_with(w)),
         "{} is not inside the unit's StateDirectory or ReadWritePaths ({writable:?})",
         cordons.display()
+    );
+}
+
+/// The lines `kbf --mode=frontend` writes for the node, as its terminal log has them (with
+/// colour), around other lines and another node's.
+fn frontend_line(message: &str, fields: &str) -> String {
+    format!(
+        "\u{1b}[2m2026-01-01T00:00:00.000000Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \
+         \u{1b}[2mkbf_server::farm\u{1b}[0m\u{1b}[2m:\u{1b}[0m {message} {fields}"
+    )
+}
+
+fn colour_field(name: &str, value: &str) -> String {
+    format!("\u{1b}[3m{name}\u{1b}[0m\u{1b}[2m=\u{1b}[0m{value}")
+}
+
+fn registered(node: &str) -> String {
+    frontend_line(
+        "worker registered",
+        &format!(
+            "{} {}",
+            colour_field("worker", node),
+            colour_field("capacity", "Capacity { cpu_millis: 4000 }")
+        ),
+    )
+}
+
+fn action(node: &str, action: &str) -> String {
+    frontend_line(
+        "operator action",
+        &format!(
+            "{} {}",
+            colour_field("worker", node),
+            colour_field("action", action)
+        ),
+    )
+}
+
+/// The frontend's log of an update the agent drained and gave back: the events of the node
+/// alone, in order, whatever the colour codes and the other lines.
+#[test]
+fn the_watch_reads_the_nodes_drain_and_undrain_from_the_frontends_log() {
+    use farm::NodeEvent::{Drain, Registered, Uncordon};
+    let log = [
+        registered(farm::NODE),
+        frontend_line("storage member active", "member=1"),
+        action(farm::NODE, "Drain(1800s)"),
+        action("host-10", "Drain(1800s)"),
+        frontend_line("worker stream ended", &colour_field("worker", farm::NODE)),
+        registered(farm::NODE),
+        registered("host-10"),
+        action(farm::NODE, "Uncordon"),
+        // A line cut off mid-write.
+        "\u{1b}[2m2026-01-01T00:0".to_owned(),
+    ]
+    .join("\n");
+    let events = farm::node_events(&log);
+    assert_eq!(events, [Registered, Drain, Registered, Uncordon]);
+    assert_eq!(
+        drained_around_the_restart(&events[1..]),
+        Ok(()),
+        "{events:?}"
+    );
+}
+
+/// A log without colour (a file the frontend writes with `--log-dir`) reads the same.
+#[test]
+fn the_watch_reads_a_log_without_colour() {
+    let log = format!(
+        "2026-01-01T00:00:00Z  INFO kbf_server::farm: operator action worker={} action=Drain(30s)\n\
+         2026-01-01T00:00:01Z  INFO kbf_server::worker: worker registered worker={} capacity=x\n\
+         2026-01-01T00:00:02Z  INFO kbf_server::farm: operator action worker={} action=Uncordon\n\
+         2026-01-01T00:00:03Z  INFO kbf_server::farm: operator action worker={} action=Cordon\n",
+        farm::NODE,
+        farm::NODE,
+        farm::NODE,
+        farm::NODE,
+    );
+    use farm::NodeEvent::{Cordon, Drain, Registered, Uncordon};
+    assert_eq!(
+        farm::node_events(&log),
+        [Drain, Registered, Uncordon, Cordon]
+    );
+}
+
+/// The record of each way the update can fail to drain the node around its restart is refused,
+/// with the reason.
+#[test]
+fn a_record_without_the_drain_around_the_restart_is_refused() {
+    use farm::NodeEvent::{Cordon, Drain, Registered, Uncordon};
+    let cases: [(&[farm::NodeEvent], &str); 8] = [
+        // The host before it ran a daemon: the drain was answered "no such node", so the
+        // frontend recorded nothing, and the storage node's restart registers no daemon.
+        (&[], "no drain"),
+        (&[Registered], "no drain"),
+        (&[Drain, Registered], "no undrain"),
+        (
+            &[Registered, Drain, Registered, Uncordon],
+            "before the drain",
+        ),
+        (
+            &[Drain, Uncordon],
+            "no daemon registered while the node was drained",
+        ),
+        (&[Drain, Uncordon, Registered], "no daemon registered while"),
+        (
+            &[Drain, Registered, Uncordon, Registered],
+            "after the node was given back",
+        ),
+        (&[Drain, Registered, Uncordon, Cordon], "cordoned besides"),
+    ];
+    for (events, why) in cases {
+        let refused = drained_around_the_restart(events).expect_err(&format!("{events:?}"));
+        assert!(refused.contains(why), "{events:?}: {refused}");
+    }
+    assert!(
+        drained_around_the_restart(&[Drain, Registered, Drain, Uncordon])
+            .unwrap_err()
+            .contains("drained 2 times")
+    );
+    assert!(
+        drained_around_the_restart(&[Uncordon, Drain, Registered, Uncordon])
+            .unwrap_err()
+            .contains("given back 2 times")
+    );
+    assert!(
+        drained_around_the_restart(&[Registered, Uncordon, Drain])
+            .unwrap_err()
+            .contains("a daemon registered again before the drain")
+    );
+    assert!(
+        drained_around_the_restart(&[Uncordon, Drain])
+            .unwrap_err()
+            .contains("given back before it was drained")
     );
 }
