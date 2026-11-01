@@ -1,37 +1,30 @@
 //! The fake host's own tests: its flags, its ports over the files of a directory, and the hook's
 //! steps run over it in this process, the way the conformance harness runs them as processes.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use kbf_updater::agent::local::{Local, LocalError};
-use kbf_updater::inventory::Role;
-use kbf_updater::ports::{Clock, Drain, Health, HealthCheck, Placed};
-use kbf_updater::version::Version;
 use update_hook::{Outcome, Params, Report, Scalar, Step};
 
-use super::{
+use super::fake::{
     DEADLINE, FakeClock, FakeDrain, FakeHealth, FakeLocal, Own, OwnError, Paths, fake_run, host,
-    own_flags,
+    main, own_flags,
 };
+use crate::agent::local::{Local, LocalError};
+use crate::inventory::Role;
+use crate::ports::{Clock, Drain, Health, HealthCheck, Placed};
+use crate::testutil;
+use crate::version::Version;
 
 const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// A fresh directory under the workspace's `target/`, with the fake host's `world/`,
-/// `faults/`, `record/` and `artifact/` in it; the host runs `1.0.0` and its node serves.
+/// A fresh scratch directory with the fake host's `world/`, `faults/`, `record/` and
+/// `artifact/` in it; the host runs `1.0.0` and its node serves.
 fn scratch(name: &str) -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/updater-scratch")
-        .join(format!(
-            "hook-fake-{name}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::SeqCst)
-        ));
-    let _ = fs::remove_dir_all(&dir);
+    let dir = testutil::scratch(&format!("hook-fake-{name}"));
     for sub in ["world", "faults", "record", "artifact"] {
         fs::create_dir_all(dir.join(sub)).expect("a scratch directory");
     }
@@ -168,6 +161,89 @@ fn the_fakes_own_flags_come_first_and_the_rest_is_the_hooks() {
     assert_eq!(
         own_flags(&words(&["--world", "w", "--faults", "f", "--faults", "g"])).unwrap_err(),
         OwnError::Twice { flag: "--faults" }
+    );
+}
+
+/// A directory flag with an empty value, or with another flag where its value should be, is
+/// refused by name: an empty path would make the fake act on the working directory, and a
+/// flag taken as a path would swallow the flag.
+///
+/// Catches: `--world ""` accepted (the host's files then land in the working directory), or
+/// `--world --faults f` read as a world named `--faults`.
+#[test]
+fn a_directory_flag_that_is_empty_or_another_flag_is_refused() {
+    assert_eq!(
+        own_flags(&words(&["--world", "", "--faults", "f", "prepare"])).unwrap_err(),
+        OwnError::Empty { flag: "--world" }
+    );
+    assert_eq!(
+        own_flags(&words(&["--world", "w", "--faults", "", "prepare"])).unwrap_err(),
+        OwnError::Empty { flag: "--faults" }
+    );
+    assert_eq!(
+        own_flags(&words(&["--world", "--faults", "f", "prepare"])).unwrap_err(),
+        OwnError::NoValue { flag: "--world" }
+    );
+    assert_eq!(
+        own_flags(&words(&["--world", "w", "--faults", "--record-dir", "r"])).unwrap_err(),
+        OwnError::NoValue { flag: "--faults" }
+    );
+}
+
+/// Run as the harness would, with an empty `--world` and a step that would write the host
+/// (`prepare` drains the node): the step is refused with `bad_arguments` naming the flag, and
+/// the working directory is exactly as it was.
+///
+/// Catches: a refusal that comes after the fake has already written `node`, `mark` or
+/// `helper.json` into the working directory.
+#[test]
+fn an_empty_world_changes_nothing_in_the_working_directory() {
+    let listing = || {
+        let mut names: Vec<_> = fs::read_dir(".")
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = listing();
+    let dir = scratch("empty-world");
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let args = words(&[
+        "update-hook",
+        "--world",
+        "",
+        "--faults",
+        &dir.join("faults").display().to_string(),
+        "--record-dir",
+        &dir.join("record").display().to_string(),
+        "prepare",
+    ]);
+    assert_eq!(fake_run(&args, &mut out, &mut err), Outcome::Failure);
+    let report = Report::from_stdout(&String::from_utf8(out).unwrap()).unwrap();
+    assert_eq!(report.reason.as_deref(), Some("bad_arguments"));
+    assert!(
+        report
+            .detail
+            .unwrap()
+            .contains("--world must name a directory")
+    );
+    assert_eq!(listing(), before);
+    for name in ["node", "mark", "helper.json", "node.tmp", "mark.tmp"] {
+        assert!(!Path::new(name).exists(), "{name}");
+    }
+    assert!(fs::read_dir(dir.join("record")).unwrap().next().is_none());
+}
+
+/// The program's entry: a command line it cannot use exits 1, as the hook's does.
+///
+/// Catches: an entry that panics, or exits 0, on a command line without the fake's flags.
+#[test]
+fn the_entry_exits_1_on_a_command_line_it_cannot_use() {
+    let code = main(&[OsString::from("update-hook"), OsString::from("prepare")]);
+    assert_eq!(
+        format!("{code:?}"),
+        format!("{:?}", std::process::ExitCode::from(1))
     );
 }
 

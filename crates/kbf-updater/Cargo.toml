@@ -47,11 +47,12 @@ kbf-testkit.workspace = true
 
 # `kbf update-hook` over a fake host kept in a directory, the program the conformance harness
 # runs (tests/hook_conformance.rs). Not shipped: the release jobs package kbf-updater alone.
-# Under src/, and with its own tests, so that its code counts in the crate's coverage (a file
-# under a `tests` directory, or a binary with `test = false`, is left out of it).
+# Its code is the library's (`agent::hook::fake`), tested and measured with it; the binary only
+# forwards to it (a file under a `tests` directory, or a binary with `test = false`, would be
+# left out of the coverage).
 [[bin]]
 name = "kbf-updater-hook-fake"
-path = "src/bin/kbf-updater-hook-fake/main.rs"
+path = "src/bin/kbf-updater-hook-fake.rs"
 
 [lints]
 workspace = true

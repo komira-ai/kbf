@@ -17,6 +17,7 @@
 //! the cordon this update placed is lifted, `retry_after_secs` is `--retry-secs`) or `76` (never: no check
 //! of this hook is one no version can repair). The log goes to standard error.
 
+pub mod fake;
 pub mod flags;
 pub mod real;
 pub mod record;
@@ -37,6 +38,8 @@ use crate::inventory::Host;
 use crate::ports::{Clock, Drain, HealthCheck};
 use crate::version::Version;
 
+#[cfg(test)]
+mod fake_tests;
 #[cfg(test)]
 mod flags_tests;
 #[cfg(test)]

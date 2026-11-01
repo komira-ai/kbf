@@ -1,5 +1,7 @@
 //! `kbf-updater-hook-fake`: `kbf update-hook` over a fake host, the program the conformance
-//! harness runs (tests/hook_conformance.rs). Not shipped.
+//! harness runs (tests/hook_conformance.rs). Not shipped, and no part of `kbf update-hook`:
+//! the binary (`src/bin/kbf-updater-hook-fake.rs`) forwards to [`main`] here, so that this code
+//! is measured and tested with the library.
 //!
 //! ```text
 //! kbf-updater-hook-fake [update-hook] --world DIR --faults DIR <the flags of kbf update-hook>
@@ -30,25 +32,25 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_updater::agent::hook::steps::Done;
-use kbf_updater::agent::hook::{HookWorld, Setup, run};
-use kbf_updater::agent::local::{HostState, Local, LocalError, Staged, Trial};
-use kbf_updater::inventory::{Host, Role};
-use kbf_updater::ports::{Clock, Drain, Health, HealthCheck, Placed, PortError};
-use kbf_updater::version::Version;
-use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
 use update_hook::conformance::gate;
 use update_hook::{Class, Outcome};
 
-#[cfg(test)]
-mod fake_tests;
+use super::flags::Flags;
+use super::steps::Done;
+use super::{HookWorld, Setup, run};
+use crate::agent::local::{HostState, Local, LocalError, Staged, Trial};
+use crate::inventory::{Host, Role};
+use crate::ports::{Clock, Drain, Health, HealthCheck, Placed, PortError};
+use crate::version::Version;
 
 /// The commit the helper reports for a release.
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
 /// The deadline the helper gives a trial.
-const DEADLINE: u64 = 10_600;
+pub(super) const DEADLINE: u64 = 10_600;
 
 /// Unix seconds, always.
 const NOW: u64 = 10_000;
@@ -63,9 +65,9 @@ struct HelperFile {
     pending: bool,
 }
 
-struct Paths {
-    world: PathBuf,
-    faults: PathBuf,
+pub(super) struct Paths {
+    pub(super) world: PathBuf,
+    pub(super) faults: PathBuf,
 }
 
 impl Paths {
@@ -116,7 +118,7 @@ fn failed(what: &str, e: io::Error) -> LocalError {
     LocalError::Failed(format!("{what}: {e}"))
 }
 
-struct FakeLocal(Arc<Paths>);
+pub(super) struct FakeLocal(pub(super) Arc<Paths>);
 
 impl Local for FakeLocal {
     fn query(&self) -> Result<HostState, LocalError> {
@@ -188,7 +190,7 @@ impl Local for FakeLocal {
     }
 }
 
-struct FakeDrain(Arc<Paths>);
+pub(super) struct FakeDrain(pub(super) Arc<Paths>);
 
 impl Drain for FakeDrain {
     fn placed(&self, _host: &Host) -> Result<Placed, PortError> {
@@ -223,7 +225,7 @@ impl Drain for FakeDrain {
     }
 }
 
-struct FakeHealth(Arc<Paths>);
+pub(super) struct FakeHealth(pub(super) Arc<Paths>);
 
 impl HealthCheck for FakeHealth {
     fn refusal(&self, _host: &Host) -> Option<String> {
@@ -250,7 +252,7 @@ impl HealthCheck for FakeHealth {
 
 /// A clock that only moves when it sleeps.
 #[derive(Default)]
-struct FakeClock(Mutex<Duration>);
+pub(super) struct FakeClock(Mutex<Duration>);
 
 impl Clock for FakeClock {
     fn now(&self) -> Duration {
@@ -270,26 +272,30 @@ impl Clock for FakeClock {
 
 /// Why this program's own flags were refused.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
-enum OwnError {
+pub(super) enum OwnError {
     #[error("{flag} is required")]
     Required { flag: &'static str },
+    /// No value, or another flag where the value should be.
     #[error("{flag} needs a value")]
     NoValue { flag: &'static str },
+    /// An empty value, which would name the working directory.
+    #[error("{flag} must name a directory, not be empty")]
+    Empty { flag: &'static str },
     #[error("{flag} is given twice")]
     Twice { flag: &'static str },
 }
 
 /// This program's own flags, the first words of its command line.
 #[derive(Debug, PartialEq, Eq)]
-struct Own {
+pub(super) struct Own {
     /// The fake host's directory.
-    world: PathBuf,
+    pub(super) world: PathBuf,
     /// The directory of the faults, one file per step.
-    faults: PathBuf,
+    pub(super) faults: PathBuf,
 }
 
 /// `--world` and `--faults`, each once, from the front of `args`; the rest is the hook's.
-fn own_flags(args: &[String]) -> Result<(Own, &[String]), OwnError> {
+pub(super) fn own_flags(args: &[String]) -> Result<(Own, &[String]), OwnError> {
     let (mut world, mut faults) = (None, None);
     let mut at = 0;
     while let Some(word) = args.get(at) {
@@ -298,7 +304,13 @@ fn own_flags(args: &[String]) -> Result<(Own, &[String]), OwnError> {
             "--faults" => ("--faults", &mut faults),
             _ => break,
         };
-        let value = args.get(at + 1).ok_or(OwnError::NoValue { flag })?;
+        let value = args
+            .get(at + 1)
+            .filter(|value| !value.starts_with("--"))
+            .ok_or(OwnError::NoValue { flag })?;
+        if value.is_empty() {
+            return Err(OwnError::Empty { flag });
+        }
         if slot.replace(PathBuf::from(value)).is_some() {
             return Err(OwnError::Twice { flag });
         }
@@ -310,7 +322,7 @@ fn own_flags(args: &[String]) -> Result<(Own, &[String]), OwnError> {
 }
 
 /// The host this program plays: node `n1`, a daemon's.
-fn host() -> Host {
+pub(super) fn host() -> Host {
     Host {
         alias: "n1".to_owned(),
         address: "localhost".to_owned(),
@@ -322,7 +334,11 @@ fn host() -> Host {
 }
 
 /// One run: `args` are the words after the program's name.
-fn fake_run(args: &[String], out: &mut dyn io::Write, err: &mut dyn io::Write) -> Outcome {
+pub(super) fn fake_run(
+    args: &[String],
+    out: &mut dyn io::Write,
+    err: &mut dyn io::Write,
+) -> Outcome {
     // The harness runs `<this program> update-hook <flags> <step> ...`.
     let args = args
         .strip_prefix(&["update-hook".to_owned()])
@@ -339,7 +355,7 @@ fn fake_run(args: &[String], out: &mut dyn io::Write, err: &mut dyn io::Write) -
         world: own.world,
         faults: own.faults,
     });
-    let world = |_: &kbf_updater::agent::hook::flags::Flags| {
+    let world = |_: &Flags| {
         Ok(HookWorld {
             host: host(),
             local: Arc::new(FakeLocal(paths.clone())),
@@ -356,10 +372,13 @@ fn fake_run(args: &[String], out: &mut dyn io::Write, err: &mut dyn io::Write) -
     run(rest, &setup, out, err)
 }
 
-fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args_os()
-        .skip(1)
-        .map(|word: OsString| word.to_string_lossy().into_owned())
+/// The program: `args` are the words after its name. The last line goes to standard output,
+/// the log to standard error, and what comes back is the exit code.
+#[must_use]
+pub fn main(args: &[OsString]) -> ExitCode {
+    let args: Vec<String> = args
+        .iter()
+        .map(|word| word.to_string_lossy().into_owned())
         .collect();
     let mut out = io::stdout().lock();
     let outcome = fake_run(&args, &mut out, &mut io::stderr().lock());
