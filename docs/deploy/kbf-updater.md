@@ -628,10 +628,10 @@ service, by node id: the fields of the top-level `hosts` entries, with `up` and 
 counted for this service (a host ordered to update `other` holds `other`'s slot and is not up for
 it, while it holds nothing under `kbf`), and `hold`: the rule that keeps the coordinator from
 ordering the host now (`quiet`, `updating`, `busy_elsewhere`, `up_to_date`, `failed_here`,
-`no_slot`, `baking`, `canary_wait`, `waiting_for_role`, `waiting_for_service`, `min_up`, `not_a_member`, `no_desired`, `no_definition`; these spellings are public), or
+`deferred`, `no_slot`, `baking`, `canary_wait`, `waiting_for_role`, `waiting_for_service`, `min_up`, `not_a_member`, `no_desired`, `no_definition`; these spellings are public), or
 `null` when it would be ordered at its next heartbeat. `up` and `slots_held` count those hosts,
 and `convergence` is the answer of `GET /v1/convergence?service=NAME`. The top-level keys, and the
-top-level `hosts`, which are `kbf`'s, are unchanged. Two holds are for the rollout fields above: `baking` means every slot of the host's role is held and at least one holder is a host at the desired version that has not finished baking, and `canary_wait` means the service's canary gate is closed and the host is not one of the canaries.
+top-level `hosts`, which are `kbf`'s, are unchanged. Two holds are for the rollout fields above: `baking` means every slot of the host's role is held and at least one holder is a host at the desired version that has not finished baking, and `canary_wait` means the service's canary gate is closed and the host is not one of the canaries. `deferred` means the host declined the update to the desired version and its wait (`defer_backoff`, never shorter than the host's own `retry_after`) has not ended.
 
 `cargo xtask deploy-farm --service NAME` (default `kbf`) deploys another service the same way.
 For `kbf` the requests are the ones listed above. For another service the POST body also has
