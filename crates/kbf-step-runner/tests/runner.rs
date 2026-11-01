@@ -500,22 +500,21 @@ fn an_order_with_unusable_names_is_refused() {
         assert!(matches!(err, RunError::BadOrder(_)), "{name}");
         assert!(err.to_string().contains("not valid"));
     }
-    use std::os::unix::ffi::OsStringExt;
-    let odd = PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff]));
+    use std::os::unix::ffi::OsStrExt;
+    let odd = rig
+        .scratch
+        .path()
+        .join(std::ffi::OsStr::from_bytes(&[0xff]));
+    fs::create_dir(&odd).unwrap();
+    let odd = Staged::seal(&odd).unwrap();
     let mut order = rig.order();
-    order.staged = Staged {
-        dir: odd.clone(),
-        digest: "x".to_owned(),
-    };
+    order.staged = odd.clone();
     assert!(matches!(
         rig.runner().run(&order),
         Err(RunError::BadOrder(_))
     ));
     let mut order = rig.order();
-    order.previous = Some(Staged {
-        dir: odd,
-        digest: "x".to_owned(),
-    });
+    order.previous = Some(odd);
     assert!(matches!(
         rig.runner().run(&order),
         Err(RunError::BadOrder(_))
@@ -805,13 +804,13 @@ fn only_the_same_order_resumes_an_unfinished_update() {
     o.target_version = "2.0.1".to_owned();
     others.push(o);
     let mut o = rig.order();
-    o.staged.digest = "0".repeat(64);
+    o.staged = Staged::seal(&rig.old_dir).unwrap();
     others.push(o);
     let mut o = rig.order();
     o.previous = None;
     others.push(o);
     let mut o = rig.order();
-    o.previous.as_mut().unwrap().digest = "0".repeat(64);
+    o.previous = Some(Staged::seal(&rig.new_dir).unwrap());
     others.push(o);
     for other in others {
         let err = rig.runner().run(&other).unwrap_err();
@@ -1016,7 +1015,7 @@ fn every_steps_params_file_names_the_verified_artifact() {
     let rig = Rig::new("run-params-digest");
     rig.fake.say(Step::Verify, &[FAIL]);
     let order = rig.order();
-    assert_ne!(order.artifact_digest, order.staged.digest);
+    assert_ne!(order.artifact_digest, order.staged.digest());
     rig.runner().run(&order).unwrap();
     let runs = rig.fake.runs();
     assert_eq!(runs.len(), 4);

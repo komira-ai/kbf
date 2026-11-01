@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use kbf_step_runner::register::{
@@ -23,7 +23,22 @@ fn me() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
+/// The group the test runs as: the group of the directories it makes.
+fn my_group() -> u32 {
+    rustix::process::getegid().as_raw()
+}
+
 struct Table(Mutex<BTreeMap<String, Grant>>);
+
+/// `svc` declared for `uid`.
+fn declared(uid: u32) -> Table {
+    Table(Mutex::new(BTreeMap::from([("svc".to_owned(), grant(uid))])))
+}
+
+/// Nothing declared.
+fn nothing() -> Table {
+    Table(Mutex::new(BTreeMap::new()))
+}
 
 impl Declared for Table {
     fn grant(&self, name: &str) -> Option<Grant> {
@@ -45,6 +60,7 @@ struct Rig {
     registry: Arc<Registry>,
     server: Arc<Server>,
     sock: PathBuf,
+    table: Arc<Table>,
 }
 
 impl Rig {
@@ -60,11 +76,11 @@ impl Rig {
         fs::create_dir_all(&state).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).unwrap();
         let clock = FakeClock::new();
-        let registry = Arc::new(Registry::load(&state, clock.clone()).unwrap());
-        let table = Table(Mutex::new(BTreeMap::from([("svc".to_owned(), grant(uid))])));
+        let table = Arc::new(declared(uid));
+        let registry = Arc::new(Registry::load(&state, clock.clone(), &*table).unwrap());
         let sock = dir.join("s");
         let mut server =
-            Server::bind(&sock, me(), None, registry.clone(), Arc::new(table)).unwrap();
+            Server::bind(&sock, me(), my_group(), registry.clone(), table.clone()).unwrap();
         if let Some(cap) = cap {
             server = server.with_max_connections(cap);
         }
@@ -75,6 +91,7 @@ impl Rig {
             registry,
             server,
             sock,
+            table,
         }
     }
 
@@ -213,6 +230,15 @@ fn what_is_not_a_registration_is_malformed() {
     client.shutdown(Shutdown::Write).unwrap();
     assert_eq!(answer(&client)["error"], "malformed");
     served.join().unwrap().unwrap();
+    // A field the message does not have (a command, say) is not passed over.
+    let (client, served) = rig.connect();
+    let reply = say(
+        &client,
+        "{\"name\":\"svc\",\"version\":\"2.0.0\",\"exec\":\"reboot\"}\n",
+    );
+    drop(client);
+    served.join().unwrap().unwrap();
+    assert_eq!(reply["error"], "malformed", "{reply}");
     assert_eq!(rig.registry.report("svc", None), Reported::Absent);
     for refusal in [
         Refused::Malformed,
@@ -279,7 +305,7 @@ fn a_registration_is_kept_across_a_restart_until_its_ttl() {
     // The service is connected while the updater restarts.
 
     let state = rig.scratch.path().join("state");
-    let after = Arc::new(Registry::load(&state, rig.clock.clone()).unwrap());
+    let after = Arc::new(Registry::load(&state, rig.clock.clone(), &*rig.table).unwrap());
     assert_eq!(after.report("svc", Some("2.0.0")), Reported::Healthy);
     assert_eq!(
         after.health_addr("svc").map(|h| h.addr),
@@ -309,14 +335,16 @@ fn a_registration_is_kept_across_a_restart_until_its_ttl() {
 fn a_damaged_registrations_file_is_an_error() {
     let dir = Scratch::new("reg-damaged");
     let clock = FakeClock::new();
-    assert!(Registry::load(dir.path(), clock.clone()).is_ok());
+    assert!(Registry::load(dir.path(), clock.clone(), &nothing()).is_ok());
     fs::write(dir.path().join(REGISTRATIONS_FILE), "{").unwrap();
-    let err = Registry::load(dir.path(), clock.clone()).err().unwrap();
+    let err = Registry::load(dir.path(), clock.clone(), &nothing())
+        .err()
+        .unwrap();
     assert!(matches!(err, RegistryError::Corrupt(_)));
     assert!(err.to_string().contains("not readable"));
     fs::remove_file(dir.path().join(REGISTRATIONS_FILE)).unwrap();
     fs::create_dir(dir.path().join(REGISTRATIONS_FILE)).unwrap();
-    let err = Registry::load(dir.path(), clock).err().unwrap();
+    let err = Registry::load(dir.path(), clock, &nothing()).err().unwrap();
     assert!(matches!(err, RegistryError::Io(_)));
 }
 
@@ -367,10 +395,11 @@ fn the_socket_directory_is_checked() {
     let state = scratch.path().join("state");
     fs::create_dir_all(&state).unwrap();
     let clock = FakeClock::new();
-    let registry = Arc::new(Registry::load(&state, clock).unwrap());
-    let table: Arc<dyn Declared> = Arc::new(Table(Mutex::new(BTreeMap::new())));
-    let bind =
-        |path: &Path, owner: u32| Server::bind(path, owner, None, registry.clone(), table.clone());
+    let registry = Arc::new(Registry::load(&state, clock, &nothing()).unwrap());
+    let table: Arc<dyn Declared> = Arc::new(nothing());
+    let bind = |path: &Path, owner: u32| {
+        Server::bind(path, owner, my_group(), registry.clone(), table.clone())
+    };
 
     let open = scratch.path().join("open");
     fs::create_dir(&open).unwrap();
@@ -429,7 +458,7 @@ fn the_socket_directory_is_checked() {
     ));
 }
 
-/// Catches a group that is not applied to the socket: with a group given the socket is owned by it.
+/// Catches a group that is not applied to the socket: the socket is owned by the register group.
 #[test]
 fn the_socket_takes_the_given_group() {
     let scratch = Scratch::new("reg-group");
@@ -438,10 +467,10 @@ fn the_socket_takes_the_given_group() {
     fs::create_dir_all(&state).unwrap();
     fs::create_dir_all(&run).unwrap();
     fs::set_permissions(&run, fs::Permissions::from_mode(0o750)).unwrap();
-    let registry = Arc::new(Registry::load(&state, FakeClock::new()).unwrap());
-    let table: Arc<dyn Declared> = Arc::new(Table(Mutex::new(BTreeMap::new())));
-    let gid = rustix::process::getegid().as_raw();
-    let _server = Server::bind(&run.join("s"), me(), Some(gid), registry, table).unwrap();
+    let registry = Arc::new(Registry::load(&state, FakeClock::new(), &nothing()).unwrap());
+    let table: Arc<dyn Declared> = Arc::new(nothing());
+    let gid = my_group();
+    let _server = Server::bind(&run.join("s"), me(), gid, registry, table).unwrap();
     use std::os::unix::fs::MetadataExt;
     assert_eq!(fs::metadata(run.join("s")).unwrap().gid(), gid);
 }
@@ -508,7 +537,8 @@ fn a_stopped_service_is_still_stopped_after_a_restart() {
     say(&client, &registration("2.0.0", None));
     drop(client);
     served.join().unwrap().unwrap();
-    let after = Registry::load(&rig.scratch.path().join("state"), rig.clock.clone()).unwrap();
+    let state = rig.scratch.path().join("state");
+    let after = Registry::load(&state, rig.clock.clone(), &*rig.table).unwrap();
     assert_eq!(
         after.report("svc", Some("2.0.0")),
         Reported::Unhealthy(Why::Stopped)
@@ -546,12 +576,9 @@ fn one_user_cannot_hold_every_connection() {
     let server = Server::bind(
         &rig.scratch.path().join("run").join("p"),
         me(),
-        None,
+        my_group(),
         rig.registry.clone(),
-        Arc::new(Table(Mutex::new(BTreeMap::from([(
-            "svc".to_owned(),
-            grant(me()),
-        )])))),
+        Arc::new(declared(me())),
     )
     .unwrap()
     .with_max_per_uid(1);
@@ -626,4 +653,290 @@ fn transient_accept_errors_are_retried() {
     assert_eq!(ended.kind(), std::io::ErrorKind::PermissionDenied);
     assert_eq!(say(&client, &registration("2.0.0", None))["ok"], true);
     assert_eq!(rig.registry.report("svc", Some("2.0.0")), Reported::Healthy);
+}
+
+fn reg(version: &str, health: Option<(&str, &str)>) -> Registration {
+    serde_json::from_str(registration(version, health).trim()).unwrap()
+}
+
+/// Catches a read that failed being taken for the end of the line: the peer goes away leaving
+/// bytes it never read, which the kernel reports to the server as a reset after the part of the
+/// line that came; that is an error of the connection, not a line to answer.
+#[test]
+fn a_read_error_is_an_error_not_the_end_of_the_line() {
+    let rig = Rig::new("reg-read-error", me());
+    let (client, served) = UnixStream::pair().unwrap();
+    (&served).write_all(b"never read").unwrap();
+    (&client).write_all(b"{\"name\":").unwrap();
+    drop(client);
+    let err = rig.server.serve_connection(served).unwrap_err();
+    assert!(
+        matches!(&err, RegistryError::Io(e) if e.kind() == std::io::ErrorKind::ConnectionReset),
+        "{err:?}"
+    );
+    assert_eq!(rig.registry.report("svc", None), Reported::Absent);
+}
+
+/// Catches a read that came back for want of time being an error: a socket that has nothing to
+/// read and does not wait answers as a read past the deadline does, and the line is `malformed`.
+#[test]
+fn a_read_that_runs_out_of_time_is_malformed() {
+    let rig = Rig::new("reg-read-timeout", me());
+    let (client, served) = UnixStream::pair().unwrap();
+    served.set_nonblocking(true).unwrap();
+    rig.server.serve_connection(served).unwrap();
+    assert_eq!(answer(&client)["error"], "malformed");
+    assert_eq!(rig.registry.report("svc", None), Reported::Absent);
+}
+
+/// Catches the write of the registrations made under the registry's lock (a slow disk then held
+/// up every read): while a registration is being written, a read answers, and does not yet
+/// believe the registration; once written it is believed. The disk is a writer that waits for
+/// the test, so nothing here waits for a time.
+#[test]
+fn a_slow_write_does_not_hold_up_a_read() {
+    let scratch = Scratch::new("reg-slow-write");
+    let (entered, writing) = mpsc::channel::<()>();
+    let (go_on, finish) = mpsc::channel::<()>();
+    let finish = Mutex::new(finish);
+    let writer = move |dir: &Path, bytes: &[u8]| -> std::io::Result<()> {
+        entered.send(()).unwrap();
+        finish.lock().unwrap().recv().unwrap();
+        fs::write(dir.join(REGISTRATIONS_FILE), bytes)
+    };
+    let registry = Registry::load(scratch.path(), FakeClock::new(), &declared(me()))
+        .unwrap()
+        .with_writer(Box::new(writer));
+    let registry = Arc::new(registry);
+    let registering = {
+        let registry = registry.clone();
+        let health = Some(("127.0.0.1:9301", "/ready"));
+        std::thread::spawn(move || registry.register(me(), &reg("2.0.0", health), &grant(me())))
+    };
+    writing.recv().unwrap();
+    assert_eq!(registry.report("svc", Some("2.0.0")), Reported::Absent);
+    assert_eq!(registry.health_addr("svc"), None);
+    go_on.send(()).unwrap();
+    registering.join().unwrap().unwrap();
+    assert_eq!(registry.report("svc", Some("2.0.0")), Reported::Healthy);
+    assert!(registry.health_addr("svc").is_some());
+    // The close is written the same way.
+    go_on.send(()).unwrap();
+    registry.closed("svc", 1).unwrap();
+    writing.recv().unwrap();
+    assert_eq!(
+        registry.report("svc", Some("2.0.0")),
+        Reported::Unhealthy(Why::Stopped)
+    );
+}
+
+/// Catches a registration loaded from disk being believed under the grant it was made with: a
+/// service whose declaration went, that is now declared for another user, or whose health port
+/// is no longer granted is dropped at load; one whose time-to-live changed is held to the new
+/// one.
+#[test]
+fn a_loaded_registration_is_held_to_the_declarations_of_now() {
+    let rig = Rig::new("reg-revalidate", me());
+    let health = Some(("127.0.0.1:9301", "/ready"));
+    rig.registry
+        .register(me(), &reg("2.0.0", health), &grant(me()))
+        .unwrap();
+    let state = rig.scratch.path().join("state");
+    let load = |table: Table| Registry::load(&state, rig.clock.clone(), &table).unwrap();
+    let only = |grant: Grant| Table(Mutex::new(BTreeMap::from([("svc".to_owned(), grant)])));
+
+    let mut narrower = grant(me());
+    narrower.health_ports = vec![9302];
+    for (why, table) in [
+        ("declaration gone", nothing()),
+        ("another user", declared(me().wrapping_add(1))),
+        ("health port no longer granted", only(narrower)),
+    ] {
+        let after = load(table);
+        assert_eq!(
+            after.report("svc", Some("2.0.0")),
+            Reported::Absent,
+            "{why}"
+        );
+        assert_eq!(after.health_addr("svc"), None, "{why}");
+    }
+
+    let mut shorter = grant(me());
+    shorter.registration_ttl_secs = 10;
+    let after = load(only(shorter));
+    assert_eq!(after.report("svc", Some("2.0.0")), Reported::Healthy);
+    assert!(after.health_addr("svc").is_some());
+    rig.clock.advance(10);
+    assert_eq!(
+        after.report("svc", Some("2.0.0")),
+        Reported::Unhealthy(Why::Stopped)
+    );
+    // The same grant keeps it, as it was.
+    let after = load(declared(me()));
+    assert_eq!(after.report("svc", Some("2.0.0")), Reported::Healthy);
+}
+
+/// `svc` and `other`, both declared for the test's user.
+fn two_declared() -> Table {
+    Table(Mutex::new(BTreeMap::from([
+        ("svc".to_owned(), grant(me())),
+        ("other".to_owned(), grant(me())),
+    ])))
+}
+
+/// A registry whose disk is held by the test: each write sends its bytes on `writes` and waits
+/// for its outcome on `outcome`; an `Ok` is then written to disk.
+struct HeldDisk {
+    registry: Arc<Registry>,
+    writes: mpsc::Receiver<Vec<u8>>,
+    outcome: mpsc::Sender<std::io::Result<()>>,
+}
+
+fn held_registry(dir: &Path) -> HeldDisk {
+    let (entered, writes) = mpsc::channel::<Vec<u8>>();
+    let (outcome, outcomes) = mpsc::channel::<std::io::Result<()>>();
+    let outcomes = Mutex::new(outcomes);
+    let writer = move |dir: &Path, bytes: &[u8]| -> std::io::Result<()> {
+        entered.send(bytes.to_vec()).unwrap();
+        outcomes.lock().unwrap().recv().unwrap()?;
+        fs::write(dir.join(REGISTRATIONS_FILE), bytes)
+    };
+    let registry = Registry::load(dir, FakeClock::new(), &two_declared())
+        .unwrap()
+        .with_writer(Box::new(writer));
+    HeldDisk {
+        registry: Arc::new(registry),
+        writes,
+        outcome,
+    }
+}
+
+/// Registers `name` at `version` on a thread of its own.
+fn register_in_thread(
+    registry: &Arc<Registry>,
+    name: &str,
+    version: &str,
+) -> JoinHandle<Result<u64, RegistryError>> {
+    let registry = registry.clone();
+    let mut registration = reg(version, None);
+    registration.name = name.to_owned();
+    std::thread::spawn(move || registry.register(me(), &registration, &grant(me())))
+}
+
+/// The names and versions written in `bytes`, with whether each is written stopped.
+fn written(bytes: &[u8]) -> Vec<(String, String, bool)> {
+    let saved: Vec<serde_json::Value> = serde_json::from_slice(bytes).unwrap();
+    saved
+        .iter()
+        .map(|s| {
+            let text = |key: &str| s[key].as_str().unwrap().to_owned();
+            (text("name"), text("version"), s["stopped"] == true)
+        })
+        .collect()
+}
+
+/// Catches a close that waits for the disk before it is believed: while the write of another
+/// service's registration is held, the close of a registered service is reported `stopped` at
+/// once, and both changes are on disk once the writes have ended, the close's last. Nothing
+/// here waits for a time: the test waits for the report to change, which, with the close
+/// waiting behind the held write, it never would.
+#[test]
+fn a_close_is_believed_while_another_write_is_held() {
+    let scratch = Scratch::new("reg-close-held");
+    let HeldDisk {
+        registry,
+        writes,
+        outcome,
+    } = held_registry(scratch.path());
+    let first = register_in_thread(&registry, "svc", "2.0.0");
+    writes.recv().unwrap();
+    outcome.send(Ok(())).unwrap();
+    let conn = first.join().unwrap().unwrap();
+    assert_eq!(registry.report("svc", Some("2.0.0")), Reported::Healthy);
+
+    let other = register_in_thread(&registry, "other", "1.0.0");
+    let held = writes.recv().unwrap();
+    assert_eq!(written(&held).len(), 2);
+    let closing = {
+        let registry = registry.clone();
+        std::thread::spawn(move || registry.closed("svc", conn))
+    };
+    while registry.report("svc", Some("2.0.0")) != Reported::Unhealthy(Why::Stopped) {
+        std::thread::yield_now();
+    }
+    assert_eq!(registry.report("other", None), Reported::Absent);
+    outcome.send(Ok(())).unwrap();
+    other.join().unwrap().unwrap();
+    let last = writes.recv().unwrap();
+    outcome.send(Ok(())).unwrap();
+    closing.join().unwrap().unwrap();
+    assert_eq!(
+        written(&last),
+        [
+            ("other".to_owned(), "1.0.0".to_owned(), false),
+            ("svc".to_owned(), "2.0.0".to_owned(), true),
+        ]
+    );
+    let after = Registry::load(scratch.path(), FakeClock::new(), &two_declared()).unwrap();
+    assert_eq!(after.report("svc", None), Reported::Unhealthy(Why::Stopped));
+    assert_eq!(after.report("other", Some("1.0.0")), Reported::Healthy);
+}
+
+/// Catches writes that are not one at a time, a failed write that is believed, and a close of
+/// an older connection that stops its replacement: a replacement of `svc` whose write fails
+/// leaves the registration before it, on disk and in reports; a registration of `other` that
+/// waited behind it writes `svc` as it stood; a later replacement of `svc` is not stopped by the
+/// close of the connection it replaced; and what was acknowledged is what a reload finds.
+#[test]
+fn competing_changes_keep_what_was_acknowledged() {
+    let scratch = Scratch::new("reg-compete");
+    let HeldDisk {
+        registry,
+        writes,
+        outcome,
+    } = held_registry(scratch.path());
+    let first = register_in_thread(&registry, "svc", "1.0.0");
+    writes.recv().unwrap();
+    outcome.send(Ok(())).unwrap();
+    let old_conn = first.join().unwrap().unwrap();
+
+    let replacing = register_in_thread(&registry, "svc", "2.0.0");
+    let held = writes.recv().unwrap();
+    assert_eq!(
+        written(&held),
+        [("svc".to_owned(), "2.0.0".to_owned(), false)]
+    );
+    let other = register_in_thread(&registry, "other", "1.0.0");
+    outcome
+        .send(Err(std::io::Error::other("the disk is full")))
+        .unwrap();
+    assert!(matches!(
+        replacing.join().unwrap(),
+        Err(RegistryError::Io(_))
+    ));
+    assert_eq!(registry.report("svc", Some("1.0.0")), Reported::Healthy);
+    let next = writes.recv().unwrap();
+    assert_eq!(
+        written(&next),
+        [
+            ("other".to_owned(), "1.0.0".to_owned(), false),
+            ("svc".to_owned(), "1.0.0".to_owned(), false),
+        ]
+    );
+    outcome.send(Ok(())).unwrap();
+    other.join().unwrap().unwrap();
+
+    let again = register_in_thread(&registry, "svc", "3.0.0");
+    writes.recv().unwrap();
+    outcome.send(Ok(())).unwrap();
+    let new_conn = again.join().unwrap().unwrap();
+    assert_ne!(new_conn, old_conn);
+    // The close of the replaced connection changes nothing and writes nothing.
+    registry.closed("svc", old_conn).unwrap();
+    assert_eq!(registry.report("svc", Some("3.0.0")), Reported::Healthy);
+    assert!(writes.try_recv().is_err());
+
+    let after = Registry::load(scratch.path(), FakeClock::new(), &two_declared()).unwrap();
+    assert_eq!(after.report("svc", Some("3.0.0")), Reported::Healthy);
+    assert_eq!(after.report("other", Some("1.0.0")), Reported::Healthy);
 }

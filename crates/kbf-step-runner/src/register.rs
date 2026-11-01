@@ -26,15 +26,16 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::artifact::host_owner;
 use crate::clock::Clock;
 use crate::record::write_atomic;
 
@@ -42,6 +43,9 @@ use crate::record::write_atomic;
 pub const REGISTRATIONS_FILE: &str = "registrations.json";
 /// Starts the thread of a connection.
 pub type Spawn = Box<dyn Fn(Box<dyn FnOnce() + Send>) -> io::Result<()> + Send + Sync>;
+/// Writes the registrations (the bytes of [`REGISTRATIONS_FILE`]) into the state directory,
+/// durably.
+pub type Writer = Box<dyn Fn(&Path, &[u8]) -> io::Result<()> + Send + Sync>;
 /// The connections a server serves at once unless told otherwise.
 pub const MAX_CONNECTIONS: usize = 64;
 /// The connections of one user served at once unless told otherwise.
@@ -60,8 +64,10 @@ pub struct HealthAddr {
     pub path: String,
 }
 
-/// The message of a service: liveness and version.
+/// The message of a service: liveness and version. Nothing else: a field it does not have (a
+/// command, a path) makes the line `malformed` rather than being passed over.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Registration {
     pub name: String,
     pub version: String,
@@ -125,10 +131,17 @@ pub enum RegistryError {
     Corrupt(String),
     #[error(transparent)]
     Io(#[from] io::Error),
-    #[error("the socket directory {0:?} is not a directory of the expected owner closed to others")]
+    /// The socket's directory, or a directory above it, is not as [`check_socket_dir`] needs.
+    #[error(
+        "{0:?} is not a safe place for the socket directory: the directory must be a real one of the expected owner and register group closed to others, in real directories of root or that owner that neither group nor others can write"
+    )]
     SocketDir(PathBuf),
     #[error("a registration server already answers on {0:?}")]
     AlreadyServing(PathBuf),
+    #[error(
+        "{0:?} is in the way of the registration socket: it is not a stale socket of the updater"
+    )]
+    InTheWay(PathBuf),
 }
 
 /// What the updater reports for a service.
@@ -191,11 +204,25 @@ pub struct Registry {
     dir: PathBuf,
     clock: Arc<dyn Clock>,
     inner: Mutex<Inner>,
+    /// Held by a change from the moment it reads the registrations until its write has ended, so
+    /// that changes are written one at a time and each write holds every change before it. A read
+    /// never takes it, and the registrations' own lock is not held while the disk is written. A
+    /// close marks its entry stopped before it takes this lock, so the stop is believed at once.
+    writing: Mutex<()>,
+    writer: Writer,
 }
 
 impl Registry {
     /// Loads the registrations of `dir`; every one is `unconfirmed` until its service connects.
-    pub fn load(dir: &Path, clock: Arc<dyn Clock>) -> Result<Registry, RegistryError> {
+    ///
+    /// A registration is held to the declarations as they are now, not as they were when it was
+    /// written: one whose service no longer has a grant, whose grant names another user, or whose
+    /// health address the grant no longer allows is dropped, and the time-to-live is the grant's.
+    pub fn load(
+        dir: &Path,
+        clock: Arc<dyn Clock>,
+        declared: &dyn Declared,
+    ) -> Result<Registry, RegistryError> {
         let since = clock.mono_secs();
         let mut inner = Inner::default();
         match fs::read(dir.join(REGISTRATIONS_FILE)) {
@@ -203,13 +230,22 @@ impl Registry {
                 let saved: Vec<Saved> = serde_json::from_slice(&bytes)
                     .map_err(|e| RegistryError::Corrupt(e.to_string()))?;
                 for s in saved {
+                    let Some(grant) = declared.grant(&s.name) else {
+                        continue;
+                    };
+                    let health = s.health.as_ref();
+                    let allowed = health.is_none_or(|h| check_health(h, &grant).is_ok());
+                    // One comparison: the user the grant names, and a health address it allows.
+                    if (s.uid == grant.uid, allowed) != (true, true) {
+                        continue;
+                    }
                     inner.entries.insert(
                         s.name,
                         Entry {
                             uid: s.uid,
                             version: s.version,
                             health: s.health,
-                            ttl_secs: s.ttl_secs,
+                            ttl_secs: grant.registration_ttl_secs,
                             presence: if s.stopped {
                                 Presence::Stopped
                             } else {
@@ -227,15 +263,32 @@ impl Registry {
             dir: dir.to_path_buf(),
             clock,
             inner: Mutex::new(inner),
+            writing: Mutex::new(()),
+            writer: Box::new(|dir: &Path, bytes: &[u8]| {
+                write_atomic(dir, REGISTRATIONS_FILE, bytes)
+            }),
         })
+    }
+
+    /// The same registry, writing through `writer` (a test makes the disk slow or failing).
+    pub fn with_writer(mut self, writer: Writer) -> Registry {
+        self.writer = writer;
+        self
     }
 
     fn inner(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn writing(&self) -> MutexGuard<'_, ()> {
+        self.writing.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Accepts a registration from a peer of user id `peer_uid`; returns the id of the
     /// connection that now holds it. A second registration of a name replaces the first.
+    ///
+    /// The registration is believed only once it is written: until then a read reports what
+    /// stood before, and a registration that cannot be written is never believed.
     pub fn register(
         &self,
         peer_uid: u32,
@@ -248,61 +301,63 @@ impl Registry {
         if let Some(health) = &registration.health {
             check_health(health, grant)?;
         }
-        let mut inner = self.inner();
-        inner.next_conn += 1;
-        let conn = inner.next_conn;
-        let before = inner.entries.insert(
-            registration.name.clone(),
-            Entry {
-                uid: grant.uid,
-                version: registration.version.clone(),
-                health: registration.health.clone(),
-                ttl_secs: grant.registration_ttl_secs,
-                presence: Presence::Live,
-                conn,
-            },
-        );
-        if let Err(e) = self.persist(&inner) {
-            // Not kept, so not believed: the registration that stood is back, or none.
-            inner.entries.remove(&registration.name);
-            inner
+        let mut entry = Entry {
+            uid: grant.uid,
+            version: registration.version.clone(),
+            health: registration.health.clone(),
+            ttl_secs: grant.registration_ttl_secs,
+            presence: Presence::Live,
+            conn: 0,
+        };
+        let _writing = self.writing();
+        let bytes = {
+            let inner = self.inner();
+            entry.conn = inner.next_conn + 1;
+            let mut after: BTreeMap<&str, &Entry> = inner
                 .entries
-                .extend(before.map(|old| (registration.name.clone(), old)));
-            return Err(e);
-        }
+                .iter()
+                .map(|(name, e)| (name.as_str(), e))
+                .collect();
+            after.insert(&registration.name, &entry);
+            saved_bytes(after)?
+        };
+        self.write(&bytes)?;
+        let conn = entry.conn;
+        let mut inner = self.inner();
+        inner.next_conn = conn;
+        inner.entries.insert(registration.name.clone(), entry);
         Ok(conn)
     }
 
-    /// Writes the registrations, durably; a service whose connection closed is written stopped.
-    fn persist(&self, inner: &Inner) -> Result<(), RegistryError> {
-        let saved: Vec<Saved> = inner
-            .entries
-            .iter()
-            .map(|(name, e)| Saved {
-                name: name.clone(),
-                uid: e.uid,
-                version: e.version.clone(),
-                health: e.health.clone(),
-                ttl_secs: e.ttl_secs,
-                stopped: e.presence == Presence::Stopped,
-            })
-            .collect();
-        let bytes =
-            serde_json::to_vec(&saved).map_err(|e| RegistryError::Corrupt(e.to_string()))?;
-        Ok(write_atomic(&self.dir, REGISTRATIONS_FILE, &bytes)?)
+    /// Writes the registrations, durably, outside the registrations' lock.
+    fn write(&self, bytes: &[u8]) -> Result<(), RegistryError> {
+        Ok((self.writer)(&self.dir, bytes)?)
     }
 
     /// The connection `conn` closed: its service is stopped, unless a later registration of
     /// the same name has replaced it.
-    /// The stop is written, so a registration loaded after a restart is stopped too.
+    ///
+    /// The stop is believed at once, before the write and whatever another change is writing
+    /// meanwhile (reporting a service stopped believes nothing it said), and then written, so a
+    /// registration loaded after a restart is stopped too. A stop that cannot be written is
+    /// still believed here; the error says it was not written.
     pub fn closed(&self, name: &str, conn: u64) -> Result<(), RegistryError> {
-        let mut inner = self.inner();
-        let held = inner.entries.get_mut(name).filter(|e| e.conn == conn);
-        let Some(entry) = held else {
-            return Ok(());
+        {
+            let mut inner = self.inner();
+            let held = inner.entries.get_mut(name).filter(|e| e.conn == conn);
+            let Some(entry) = held else {
+                return Ok(());
+            };
+            entry.presence = Presence::Stopped;
+        }
+        // Written as every change is, one at a time, from the registrations as they are once
+        // the changes before it have been written.
+        let _writing = self.writing();
+        let bytes = {
+            let inner = self.inner();
+            saved_bytes(inner.entries.iter().map(|(name, e)| (name.as_str(), e)))?
         };
-        entry.presence = Presence::Stopped;
-        self.persist(&inner)
+        self.write(&bytes)
     }
 
     /// What to report for `name`, whose staged version is `expected`.
@@ -333,6 +388,24 @@ impl Registry {
     pub fn health_addr(&self, name: &str) -> Option<HealthAddr> {
         self.inner().entries.get(name)?.health.clone()
     }
+}
+
+/// The registrations as they are written; a service whose connection closed is written stopped.
+fn saved_bytes<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a Entry)>,
+) -> Result<Vec<u8>, RegistryError> {
+    let saved: Vec<Saved> = entries
+        .into_iter()
+        .map(|(name, e)| Saved {
+            name: name.to_owned(),
+            uid: e.uid,
+            version: e.version.clone(),
+            health: e.health.clone(),
+            ttl_secs: e.ttl_secs,
+            stopped: e.presence == Presence::Stopped,
+        })
+        .collect();
+    serde_json::to_vec(&saved).map_err(|e| RegistryError::Corrupt(e.to_string()))
 }
 
 fn check_health(health: &HealthAddr, grant: &Grant) -> Result<(), Refused> {
@@ -401,34 +474,34 @@ impl Drop for Slot {
 impl Server {
     /// Binds the socket at `path`.
     ///
-    /// Its directory must be a real directory owned by `dir_owner` and closed to others (mode
-    /// without any `o` bit); in production it is root's, group `updater-register`, mode 0750.
-    /// The socket is made mode 0660 and, when `group` is given, owned by that group. A stale
-    /// socket file (nobody answers) is replaced; one that answers is [`RegistryError::AlreadyServing`].
+    /// Its directory is checked with [`check_socket_dir`]: in production it is root's, group
+    /// `updater-register` (`group`), mode 0750. The socket is made mode 0660 and owned by `group`.
+    /// A stale socket of the updater (nobody answers) is replaced; one that answers is
+    /// [`RegistryError::AlreadyServing`], and anything else at the path (a file, a directory, a
+    /// link: a connect to those is refused as to a stale socket) is [`RegistryError::InTheWay`]
+    /// and left as it is.
     pub fn bind(
         path: &Path,
-        dir_owner: u32,
-        group: Option<u32>,
+        owner: u32,
+        group: u32,
         registry: Arc<Registry>,
         declared: Arc<dyn Declared>,
     ) -> Result<Server, RegistryError> {
         let dir = path.parent().unwrap_or(Path::new("/"));
-        let meta = fs::symlink_metadata(dir)?;
-        if !meta.is_dir() || meta.uid() != dir_owner || meta.mode() & 0o027 != 0 {
-            return Err(RegistryError::SocketDir(dir.to_path_buf()));
-        }
+        check_socket_dir(dir, owner, group, &host_owner)?;
         match UnixStream::connect(path) {
             Ok(_) => return Err(RegistryError::AlreadyServing(path.to_path_buf())),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => fs::remove_file(path)?,
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                let me = rustix::process::geteuid().as_raw();
+                remove_stale_socket(path, me, &host_owner)?;
+            }
             Err(e) => return Err(e.into()),
         }
         let listener = UnixListener::bind(path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o660))?;
-        if let Some(gid) = group {
-            rustix::fs::chown(path, None, Some(rustix::fs::Gid::from_raw(gid)))
-                .map_err(io::Error::from)?;
-        }
+        rustix::fs::chown(path, None, Some(rustix::fs::Gid::from_raw(group)))
+            .map_err(io::Error::from)?;
         Ok(Server {
             listener,
             registry,
@@ -546,8 +619,13 @@ impl Server {
                 return Ok(None);
             }
             stream.set_read_timeout(Some(left))?;
-            // A read that fails (the time ran out, the peer vanished) is the end of the line.
-            let n = from.read(&mut chunk).unwrap_or(0);
+            // A read that comes back for want of time is the deadline; any other error is the
+            // connection's, not the end of the line.
+            let n = match from.read(&mut chunk) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(e) => return Err(e),
+            };
             line.extend_from_slice(&chunk[..n]);
             if line.len() > MAX_LINE {
                 return Ok(None);
@@ -612,6 +690,75 @@ impl Server {
         let conn = self.registry.register(peer, &registration, &grant)?;
         Ok((registration.name, conn))
     }
+}
+
+/// Checks the place of the registration socket, reading the owner of a directory (user id,
+/// group id) from `read` (a test reads root's directories without being root).
+///
+/// `dir`, the socket's directory, is a real directory (not a link) owned by `owner` with the
+/// register group `group`, writable by neither its group nor others and closed to others (no bit
+/// of `0o027`): the group is the one a service joins to reach the socket, so a directory of
+/// another group would let another set of users in. `dir` is absolute and made of plain names,
+/// and every directory above it is a real directory owned by root or `owner` that neither its
+/// group nor others can write, as for a staged release ([`crate::Staged::check`]): who can write
+/// a directory above could put another directory in its place.
+pub fn check_socket_dir(
+    dir: &Path,
+    owner: u32,
+    group: u32,
+    read: &dyn Fn(&fs::Metadata) -> (u32, u32),
+) -> Result<(), RegistryError> {
+    let plain = dir
+        .components()
+        .skip(1)
+        .all(|part| matches!(part, Component::Normal(_)));
+    if !dir.is_absolute() || !plain {
+        return Err(RegistryError::SocketDir(dir.to_path_buf()));
+    }
+    let last = dir.components().count();
+    let mut at = PathBuf::new();
+    for (n, part) in dir.components().enumerate() {
+        at.push(part);
+        let meta = fs::symlink_metadata(&at)?;
+        let (uid, gid) = read(&meta);
+        // One comparison each; a link is not a directory here, so a linked component fails it.
+        let sound = if n + 1 == last {
+            (
+                meta.is_dir(),
+                (uid, gid) == (owner, group),
+                meta.mode() & 0o027 == 0,
+            )
+        } else {
+            (
+                meta.is_dir(),
+                [0, owner].contains(&uid),
+                meta.mode() & 0o022 == 0,
+            )
+        };
+        if sound != (true, true, true) {
+            return Err(RegistryError::SocketDir(at));
+        }
+    }
+    Ok(())
+}
+
+/// Removes what is at the socket's path, where nobody answers, if it is a socket (not a link
+/// to one) owned by `updater`, the user the updater runs as, reading the owner of the path (user
+/// id, group id) from `read` (a test presents a socket of another user without being root).
+/// Anything else is [`RegistryError::InTheWay`] and left as it is: a regular file or a
+/// directory, and a socket of another user, which is not the updater's to remove.
+pub fn remove_stale_socket(
+    path: &Path,
+    updater: u32,
+    read: &dyn Fn(&fs::Metadata) -> (u32, u32),
+) -> Result<(), RegistryError> {
+    let meta = fs::symlink_metadata(path)?;
+    let (uid, _) = read(&meta);
+    // One comparison: a socket, not a link to one, and the updater's.
+    if (meta.file_type().is_socket(), uid == updater) != (true, true) {
+        return Err(RegistryError::InTheWay(path.to_path_buf()));
+    }
+    Ok(fs::remove_file(path)?)
 }
 
 fn reply(stream: &UnixStream, error: Option<&'static str>) -> Result<(), RegistryError> {
