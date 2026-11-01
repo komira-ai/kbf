@@ -463,10 +463,8 @@ fn a_deadline_already_passed_does_not_connect() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_listener_whose_backlog_is_full_is_given_up_on() {
-    let dir = std::env::temp_dir().join(format!("update-register-{}-full", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let sock = dir.join("register.sock");
-    let _ = std::fs::remove_file(&sock);
+    let dir = SocketDir::new();
+    let sock = dir.0.join("register.sock");
     let listener = UnixListener::bind(&sock).unwrap();
     // SAFETY: a plain system call on a descriptor `listener` owns for the whole call.
     assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
@@ -486,7 +484,35 @@ fn a_listener_whose_backlog_is_full_is_given_up_on() {
     let _accepted = listener.accept().unwrap();
     let more = listener.accept().unwrap_err();
     assert_eq!(more.kind(), std::io::ErrorKind::WouldBlock);
-    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A directory of its own for a test's socket, removed when it is dropped, whether the test
+/// passes or panics. It is what `kbf_testkit::dir::TestDir` gives, which this crate cannot use
+/// (it may depend on no other crate of this workspace): `mkdtemp` makes a name no other run
+/// holds, under the system temporary directory.
+#[cfg(target_os = "linux")]
+struct SocketDir(PathBuf);
+
+#[cfg(target_os = "linux")]
+impl SocketDir {
+    fn new() -> Self {
+        use std::os::unix::ffi::OsStringExt;
+        let mut template = std::env::temp_dir().into_os_string().into_vec();
+        template.extend_from_slice(b"/update-register-XXXXXX\0");
+        // SAFETY: `template` is a NUL-terminated buffer that lives across the call, which
+        // rewrites only its six trailing `X`s.
+        let made = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+        assert!(!made.is_null(), "{}", std::io::Error::last_os_error());
+        template.pop();
+        SocketDir(PathBuf::from(std::ffi::OsString::from_vec(template)))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SocketDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// The other errors read as sentences too.
