@@ -76,6 +76,7 @@ mod pipeline_workflow;
 mod release_artifacts;
 mod release_workflow;
 mod scratch_dirs;
+mod seed_build;
 mod store_floor;
 mod test_spawns;
 mod test_wording;
