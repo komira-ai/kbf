@@ -186,7 +186,7 @@ jobs:
       # `kbf` is built by itself: built in one command with the installer, cargo builds the setup
       # library once for both, with the installer's `proxy` feature, and `kbf` would link the proxy
       # (crates/kbf-integration-test/tests/layering.rs checks the tree of `-p kbf-cli` alone).
-      - cargo build --locked --release --target "$TARGET" -p kbf-cli --bin kbf
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-cli --bin kbf
       - name: Build the host-side binaries, stamping kbf-updater with its commit
         # `kbf-updater --version` prints this commit (crates/kbf-updater/src/lib.rs).
         run: KBF_BUILD_COMMIT="${GITHUB_SHA::12}" cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-installer -p kbf-host-install -p kbf-updater -p kbf-mac-provision --bin kbf-deploy --bin kbf-installer --bin kbf-host-install --bin kbf-updater --bin kbf-mac-provision
@@ -276,7 +276,7 @@ jobs:
       # that layout. It is a bundle only: a bare kbf-task tarball for darwin is not an asset
       # (crates/kbf-integration-test/tests/no_darwin_task.rs).
       - name: Build kbf-task for darwin, with the macOS confine
-        cargo build --locked --release --target "$TARGET" -p kbf-task --bin kbf-task
+        run: cargo build --locked --release --target "$TARGET" -p kbf-task --bin kbf-task
       - name: Sign kbf-task ad hoc with the hardened runtime, and check it
         run: cargo xtask sign-darwin "target/$TARGET/release/kbf-task" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
       - name: The signed kbf-task names the commit
@@ -361,14 +361,14 @@ jobs:
         run: cargo xtask fetch --url "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz" --sha256 "$CYCLONEDX_SHA256_X86_64_LINUX" --out "$HOME/.cargo/bin/cargo-cyclonedx" --extract tar.xz --member "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
       - run: cargo cyclonedx --version
       # `kbf` is built without the installer (see the darwin job): its `kbf setup` links no proxy.
-      - cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-cli --bins
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-cli --bins
       - name: Build the host-side binaries, stamping kbf-updater with its commit
         # `kbf-updater --version` prints this commit (crates/kbf-updater/src/lib.rs).
         run: KBF_BUILD_COMMIT="${GITHUB_SHA::12}" cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-host-install -p kbf-updater -p kbf-coordinator -p kbf-signer --bins
       - name: Build kbf-task for the static target
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
-        cargo build --locked --release --target "$STATIC_TARGET" -p kbf-task --bin kbf-task
+        run: cargo build --locked --release --target "$STATIC_TARGET" -p kbf-task --bin kbf-task
       - run: cargo xtask build-commit check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
       - name: kbf-coordinator names the commit
         run: cargo xtask build-commit check "target/$TARGET/release/kbf-coordinator" "$GITHUB_SHA"
@@ -578,14 +578,14 @@ jobs:
         run: cargo xtask fetch --url "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz" --sha256 "$CYCLONEDX_SHA256_AARCH64_LINUX" --out "$HOME/.cargo/bin/cargo-cyclonedx" --extract tar.xz --member "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
       - run: cargo cyclonedx --version
       # `kbf` is built without the installer (see the darwin job): its `kbf setup` links no proxy.
-      - cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-cli --bins
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-cli --bins
       - name: Build the host-side binaries, stamping kbf-updater with its commit
         # `kbf-updater --version` prints this commit (crates/kbf-updater/src/lib.rs).
         run: KBF_BUILD_COMMIT="${GITHUB_SHA::12}" cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-host-install -p kbf-updater -p kbf-coordinator -p kbf-signer --bins
       - name: Build kbf-task for the static target
         env:
           CC_aarch64_unknown_linux_musl: musl-gcc
-        cargo build --locked --release --target "$STATIC_TARGET" -p kbf-task --bin kbf-task
+        run: cargo build --locked --release --target "$STATIC_TARGET" -p kbf-task --bin kbf-task
       - run: cargo xtask build-commit check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
       - name: kbf-coordinator names the commit
         run: cargo xtask build-commit check "target/$TARGET/release/kbf-coordinator" "$GITHUB_SHA"
