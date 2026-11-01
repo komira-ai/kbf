@@ -878,7 +878,9 @@ What an operator sees with `js`:
   "Results across frontends": `legacy` still answers it for a caller its own process holds). After a rollback to `legacy` a client that holds an
   `operations/<id>` name from `js` still finds it on a farm over a state store: `legacy`
   answers that form from the same `op/`, `queue/` and `done/` rows. A farm with no state
-  store (tests only) answers no name of that form.
+  store (`kbf-server` without `--state-store`, which keeps the scheduler's state in memory and
+  loses it on a restart) answers only the `operations/<id>` names of operations the core
+  holds, and nothing from a store.
 - **Node load.** `--placement-load` is read on this core as on `legacy`. The farm accepts
   the load a daemon reports on its heartbeat by the same rule, keeps it in memory, shows it in
   the node's detail, and hands each accepted reading to the scheduler, which was built with

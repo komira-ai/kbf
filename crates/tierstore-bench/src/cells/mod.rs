@@ -63,6 +63,8 @@ pub mod content;
 pub mod engine;
 #[cfg(test)]
 mod engine_gaps_tests;
+#[cfg(test)]
+mod engine_record_tests;
 pub mod fileserver;
 pub mod g;
 pub mod modes;

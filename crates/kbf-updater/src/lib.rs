@@ -105,11 +105,15 @@ mod updater_restart_tests;
 #[cfg(test)]
 mod updater_tests;
 #[cfg(test)]
+mod wire_dropped_facts_tests;
+#[cfg(test)]
 mod wire_features_tests;
 #[cfg(test)]
 mod wire_halts_tests;
 #[cfg(test)]
 mod wire_service_facts_tests;
+#[cfg(test)]
+mod wire_size_tests;
 #[cfg(test)]
 mod wire_tests;
 

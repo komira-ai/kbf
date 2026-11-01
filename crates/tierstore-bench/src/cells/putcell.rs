@@ -285,6 +285,7 @@ fn arm(
         .as_ref()
         .is_some_and(|(mode, _)| *mode != FaultMode::Pass);
     let switch = fault.map(|(_, switch)| switch);
+    let proxy = switch.clone();
     Arm {
         label,
         pace,
@@ -309,6 +310,7 @@ fn arm(
         })),
         faulted,
         notes,
+        proxy,
     }
 }
 
