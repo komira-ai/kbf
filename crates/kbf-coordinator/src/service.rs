@@ -232,6 +232,13 @@ impl Coordinator {
         self
     }
 
+    /// The same coordinator over `ops` instead of a store that keeps nothing.
+    #[must_use]
+    pub fn with_ops(mut self, ops: OpsStore) -> Self {
+        self.ops = ops;
+        self
+    }
+
     /// The same coordinator advertising `features` instead of [`FEATURES`].
     #[cfg(test)]
     #[must_use]
@@ -244,13 +251,6 @@ impl Coordinator {
     /// is the reader's reason): the heartbeat is still answered, without that fact.
     pub fn note_extras_dropped(&self, who: &Identity, why: &str) {
         tracing::warn!(node_id = %who.node_id, why, "dropped optional fields of a heartbeat");
-    }
-
-    /// The same coordinator over `ops` instead of a store that keeps nothing.
-    #[must_use]
-    pub fn with_ops(mut self, ops: OpsStore) -> Self {
-        self.ops = ops;
-        self
     }
 
     /// Counts and logs a heartbeat from `who` whose `services` list was bad and was dropped
@@ -408,7 +408,7 @@ impl Coordinator {
 
     /// Whether `bearer` is the operator token, compared in constant time. CI's token is no
     /// operator token and the operator token is no CI token.
-    fn operator(&self, bearer: Option<&str>) -> Result<(), Unauthorized> {
+    pub fn operator(&self, bearer: Option<&str>) -> Result<(), Unauthorized> {
         let presented = bearer.ok_or(Unauthorized)?.as_bytes();
         if bool::from(presented.ct_eq(self.operator_token.as_bytes())) {
             Ok(())
@@ -419,7 +419,8 @@ impl Coordinator {
 
     /// Does the operator action in `body` (`docs/design/host-updates.md`, section 5), if
     /// `bearer` is the operator token, and answers the audit entry it made. The token is
-    /// checked before the body is looked at.
+    /// checked here before the body is looked at; the transport checks it
+    /// ([`Self::operator`]) before it reads the body at all.
     ///
     /// # Errors
     /// [`OperateError`].

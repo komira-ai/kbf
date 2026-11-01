@@ -22,6 +22,9 @@
 //! Every change carries an [`AuditEntry`]: the store numbers it, keeps the last
 //! [`AUDIT_RING`] in the file and logs it on the target `kbf_coordinator::audit`.
 //!
+//! The caps on the counts (`MAX_HOSTS`, `MAX_EXCLUDED`) are checked under the same lock as the
+//! write ([`OpsStore::try_change`]), on the state the change is applied to.
+//!
 //! The writers are the operator actions ([`operate`]) and [`crate::reconcile`], which records
 //! the last good version and marks a version bad (a raise, so in memory first) and clears the
 //! mark when CI sets that version by hand. The decision reads the bad versions
@@ -359,12 +362,32 @@ impl OpsStore {
     pub fn change(
         &self,
         write: Write,
-        mut entry: AuditEntry,
+        entry: AuditEntry,
         edit: impl FnOnce(&mut OpsState),
     ) -> Result<AuditEntry, OpsError> {
+        self.try_change(write, entry, |state| {
+            edit(state);
+            Ok::<(), OpsError>(())
+        })
+    }
+
+    /// [`Self::change`] with an edit that may refuse. The edit runs under the lock that
+    /// serialises writes, on the state the change is applied to, so a limit it checks (a cap
+    /// on a count) holds however many callers there are. When it refuses, its error is
+    /// returned and nothing else happens: the state, the ring and its numbering and the file
+    /// are as they were, and nothing is logged.
+    ///
+    /// # Errors
+    /// The edit's own error, or [`OpsError`] as for [`Self::change`].
+    pub fn try_change<E: From<OpsError>>(
+        &self,
+        write: Write,
+        mut entry: AuditEntry,
+        edit: impl FnOnce(&mut OpsState) -> Result<(), E>,
+    ) -> Result<AuditEntry, E> {
         let _writer = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
         let mut next = self.state();
-        edit(&mut next);
+        edit(&mut next)?;
         entry.seq = next.audit.last().map_or(1, |last| last.seq + 1);
         next.audit.push(entry.clone());
         let surplus = next.audit.len().saturating_sub(AUDIT_RING);
@@ -413,8 +436,39 @@ enum Action {
     /// Replaces the labels of a host (none removes them all).
     SetLabels {
         node_id: String,
+        #[serde(deserialize_with = "labels_once")]
         labels: BTreeMap<String, String>,
     },
+}
+
+/// A map of labels in which no key is given twice.
+fn labels_once<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    struct Once;
+
+    impl<'de> serde::de::Visitor<'de> for Once {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an object of labels")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut labels = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, String>()? {
+                if labels.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom("a label key is given twice"));
+                }
+            }
+            Ok(labels)
+        }
+    }
+
+    deserializer.deserialize_map(Once)
 }
 
 /// Why an operator action was not done.
@@ -426,6 +480,17 @@ pub enum OperateError {
     /// The body is no action this coordinator accepts; the text says which part.
     #[error("{0}")]
     Invalid(&'static str),
+    /// The file already holds the most of something it keeps; the constant that sets the
+    /// most is named.
+    #[error(
+        "the ops file holds at most {max} {what}: remove some, or raise the constant in ops.rs"
+    )]
+    Capped {
+        /// What there is too much of, with the constant.
+        what: &'static str,
+        /// The most.
+        max: usize,
+    },
     /// The ops file could not be written.
     #[error(transparent)]
     Store(#[from] OpsError),
@@ -492,12 +557,21 @@ pub fn operate(
             entry.service = Some(exclusion.service.clone());
             entry.node_id = Some(exclusion.node_id.clone());
             entry.reason = Some(exclusion.reason.clone());
-            store.change(Write::BeforeMemory, entry, |state| {
+            store.try_change(Write::BeforeMemory, entry, |state| {
+                let before = state.excluded.len();
                 state.excluded.retain(|e| {
                     (e.service.as_str(), e.node_id.as_str())
                         != (exclusion.service.as_str(), exclusion.node_id.as_str())
                 });
+                let known = state.excluded.len() < before;
+                if !known && before >= MAX_EXCLUDED {
+                    return Err(OperateError::Capped {
+                        what: "exclusions (MAX_EXCLUDED)",
+                        max: MAX_EXCLUDED,
+                    });
+                }
                 state.excluded.push(exclusion);
+                Ok(())
             })?
         }
         Action::Include {
@@ -523,12 +597,20 @@ pub fn operate(
             }
             let mut entry = AuditEntry::new(by, "set_labels");
             entry.node_id = Some(id.clone());
-            store.change(Write::BeforeMemory, entry, |state| {
+            store.try_change(Write::BeforeMemory, entry, |state| {
                 if labels.is_empty() {
                     state.hosts.remove(&id);
                 } else {
+                    let grows = !state.hosts.contains_key(&id);
+                    if grows && state.hosts.len() >= MAX_HOSTS {
+                        return Err(OperateError::Capped {
+                            what: "hosts with labels (MAX_HOSTS)",
+                            max: MAX_HOSTS,
+                        });
+                    }
                     state.hosts.insert(id, HostOps { labels });
                 }
+                Ok(())
             })?
         }
     })
