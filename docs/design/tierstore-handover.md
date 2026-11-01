@@ -1,5 +1,7 @@
 # tierstore update hook: port-forward hand-over
 
+> **Superseded.** The authority is komira-ai/tierstore's `docs/design/tierstore-handover.md`; where they differ, that copy wins. This copy is kept for the anchors other documents link to, and it differs in places (unit masking, link and stop order, idle-link removal on rollback); [host-updates.md](host-updates.md) "hooks never mask units" holds over any text here.
+
 Status: DESIGN, for the maintainers. Nothing here is built. Checked against `main` at the commit this branch starts
 from; each claim about today's code names the file and function.
 
