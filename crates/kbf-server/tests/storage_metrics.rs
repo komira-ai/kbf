@@ -187,6 +187,40 @@ async fn the_storage_half_counts_what_its_cache_asks_of_the_cold_store() {
     assert!(written.is_some_and(|w| w >= blob.len() as f64), "{body}");
 }
 
+/// Catches: a storage node (`kbf storage`) whose cache is opened on an uncounted cold store (the families
+/// stay at zero while the node writes), including a node whose families are missing before
+/// its first write: every op has a line at start, and a blob put through the handle moves the
+/// put count to at least one and the bytes written to at least the blob's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_storage_node_counts_what_its_cache_asks_of_the_cold_store() {
+    let node_dir = dir("node-cold-counts");
+    let flags = flags(&node_dir, &["--metrics-listen=127.0.0.1:0"]);
+    let node = start_storage(&flags, never).await.expect("starts");
+    let (addr, served) = (node.metrics.expect("metrics"), node.addr);
+    tokio::spawn(node.serve());
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{served}"))
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    let storage = RemoteStorage::new(channel, 0);
+    let body = get(addr, "/metrics").await.2;
+    for op in ["get", "head", "put", "delete", "list"] {
+        let series = format!("kbf_cold_store_requests_total{{op=\"{op}\"}}");
+        assert!(
+            body.lines().any(|l| l.starts_with(&series)),
+            "{series} in\n{body}"
+        );
+    }
+    let blob = Bytes::from_static(b"a blob the node writes to its cold store");
+    storage.put(blob.clone()).await.expect("put");
+    let body = get(addr, "/metrics").await.2;
+    let put = sample(&body, "kbf_cold_store_requests_total{op=\"put\"}");
+    assert!(put.is_some_and(|put| put >= 1.0), "{body}");
+    let written = sample(&body, "kbf_cold_store_bytes_total{dir=\"write\"}");
+    assert!(written.is_some_and(|w| w >= blob.len() as f64), "{body}");
+}
+
 /// The five rows of `kbf_storage_legacy_read_total` in a scrape, in the order bytestream,
 /// segments, cas in-process, action store, ac in-process.
 fn legacy_rows(body: &str) -> Vec<u64> {
