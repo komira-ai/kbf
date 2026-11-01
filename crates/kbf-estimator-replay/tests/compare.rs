@@ -232,6 +232,52 @@ fn times_out_of_order_are_counted_and_not_used() {
     assert_eq!(stats.makespan_us, Some(20 * S));
 }
 
+/// Catches an end before the earliest queue time printed as a makespan of 0: a row queued
+/// at 100 s, never started, ended at 50 s has no makespan, and the arm counts the pair as
+/// out of order. The cell is `-` and the JSON value `null`.
+#[test]
+fn an_end_before_the_first_queue_time_gives_no_makespan() {
+    let rows = vec![row("late", 100, None, Some(50), "lost", "none")];
+    let stats = analyze(&rows);
+    assert_eq!(stats.makespan_us, None);
+    assert_eq!(stats.out_of_order, 1);
+    let text = render_text(&stats, &stats);
+    assert_eq!(cells(&text, "makespan (s)"), ["-", "-", "-"]);
+    assert_eq!(cells(&text, "times out of order"), ["1", "1", "0"]);
+    let json: serde_json::Value = serde_json::from_str(&render_json(&stats, &stats)).unwrap();
+    assert!(json["arms"]["a"]["makespan_us"].is_null());
+    assert!(json["difference"]["makespan_us"].is_null());
+    assert_eq!(json["arms"]["a"]["out_of_order"], 1);
+}
+
+/// Catches a difference that rounds to zero printed as `-0.000`: B waited 0.4 ms less than
+/// A, which is 0.000 s to the millisecond and has no sign.
+#[test]
+fn a_difference_that_rounds_to_zero_has_no_sign() {
+    let mut a = ok("a", 1, 10);
+    a.started_us = a.started_us.map(|s| s + 400);
+    a.ended_us = a.ended_us.map(|e| e + 400);
+    let b = ok("b", 1, 10);
+    let text = render_text(&analyze(&[a]), &analyze(&[b]));
+    assert_eq!(
+        cells(&text, "queue wait p50 (s)"),
+        ["1.000", "1.000", "0.000"]
+    );
+}
+
+/// Catches a report that reads as a significance test: the text says the difference is of
+/// two single numbers and what the paper's rule needs.
+#[test]
+fn the_report_says_the_difference_is_not_a_significance_test() {
+    let text = render_text(&ArmStats::default(), &ArmStats::default());
+    assert!(
+        text.contains(
+            "B - A is a difference of two single numbers, not a significance test; the paper's rule needs the 95% Welch CI over runs to exclude 0."
+        ),
+        "{text}"
+    );
+}
+
 /// Catches an empty arm printed as zeros, a difference computed against an absent number,
 /// and an empty arm that stops the report: absent is `-`, in text and `null` in JSON.
 #[test]
