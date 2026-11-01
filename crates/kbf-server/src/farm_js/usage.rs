@@ -101,6 +101,8 @@ pub(crate) struct UsageStats {
     pub(crate) waiting: usize,
     /// How many ticks ran.
     pub(crate) ticks: u64,
+    /// Actions whose profile name the index forgot to make room, oldest first.
+    pub(crate) shapes_evicted: u64,
     /// Results the core took whose record the store had not written yet.
     pub(crate) results_held: u64,
     /// Results the core took and dropped unwritten, over its cap.
@@ -111,7 +113,7 @@ impl UsageStats {
     /// Appends the usage families to `out`.
     pub(crate) fn render(&self, out: &mut String) {
         let counters = &self.counters;
-        let rows: [(&str, &str, &str, u64); 12] = [
+        let rows: [(&str, &str, &str, u64); 13] = [
             (
                 "kbf_usage_runs_learned_total",
                 "counter",
@@ -165,6 +167,12 @@ impl UsageStats {
                 "counter",
                 "Ticks of the usage side",
                 self.ticks,
+            ),
+            (
+                "kbf_usage_shapes_evicted_total",
+                "counter",
+                "Actions whose profile name was forgotten to make room, oldest first",
+                self.shapes_evicted,
             ),
             (
                 "kbf_usage_profile_keys",
@@ -469,6 +477,7 @@ impl Usage {
             held_runs: self.keys.len(),
             waiting: self.lock().values().map(Vec::len).sum(),
             ticks: self.ticks.load(Ordering::Relaxed),
+            shapes_evicted: self.shapes.evicted(),
             results_held: self.results_held.load(Ordering::Relaxed),
             results_dropped: self.results_dropped.load(Ordering::Relaxed),
         }

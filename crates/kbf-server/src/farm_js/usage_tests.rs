@@ -236,6 +236,7 @@ fn the_usage_families_render_the_counts() {
         held_runs: 11,
         waiting: 12,
         ticks: 13,
+        shapes_evicted: 16,
         results_held: 14,
         results_dropped: 15,
     };
@@ -251,6 +252,7 @@ fn the_usage_families_render_the_counts() {
         ("kbf_usage_minutes_unheld_total", "counter", 5),
         ("kbf_usage_faults_total", "counter", 6),
         ("kbf_usage_ticks_total", "counter", 13),
+        ("kbf_usage_shapes_evicted_total", "counter", 16),
         ("kbf_usage_profile_keys", "gauge", 9),
         ("kbf_usage_profile_bytes", "gauge", 10),
         ("kbf_usage_runs_held", "gauge", 11),
@@ -264,7 +266,7 @@ fn the_usage_families_render_the_counts() {
         assert!(out.contains(&expected), "{expected} not in {out}");
     }
     assert!(out.contains("# TYPE kbf_usage_results_not_taken_total counter\n"));
-    assert_eq!(out.matches("# HELP").count(), 13);
+    assert_eq!(out.matches("# HELP").count(), 14);
 }
 
 /// Pins what the adapter does with a row that kept no subject (it arrives green): an
