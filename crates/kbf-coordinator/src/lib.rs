@@ -97,3 +97,5 @@ mod services_tests;
 mod status_service_tests;
 #[cfg(test)]
 mod testutil;
+#[cfg(test)]
+mod tierstore_service_tests;
