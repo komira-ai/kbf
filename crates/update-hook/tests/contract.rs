@@ -1212,6 +1212,73 @@ fn a_failed_cleanup_that_states_reversible_true_is_rolled_back() {
     );
 }
 
+/// The whole sequence after a failed `cleanup` that states `reversible: true`: the rollback runs
+/// and, when it succeeds, the host's result is Failed(before_commit) with the cleanup's class.
+/// That phase is not `after_commit` or `gate_release`, the two the coordinator counts toward
+/// `rollback_after_failed`. (Behaviour that already held; this pins the sequence, not only the
+/// first move.)
+#[test]
+fn a_cleanup_rolled_back_and_repaired_is_failed_before_the_commit_and_not_counted() {
+    for class in [RELEASE, ENV] {
+        let Next::Rollback { then } = next(
+            Step::Cleanup,
+            Outcome::Failure,
+            &stated(class, true),
+            &ctx(false, true, false),
+        ) else {
+            panic!("a rollback was expected");
+        };
+        let after = Context {
+            then: Some(then),
+            ..Context::default()
+        };
+        let result = next(Step::Rollback, Outcome::Success, &Report::default(), &after);
+        assert_eq!(result, Next::Report(failed(Phase::BeforeCommit, class)));
+        assert!(!matches!(
+            result,
+            Next::Report(Verdict::Failed {
+                phase: Phase::AfterCommit | Phase::GateRelease,
+                ..
+            })
+        ));
+    }
+}
+
+/// The same sequence when the rollback fails: nothing had committed and the host cannot be
+/// repaired, so the result is a halt. (Behaviour that already held.)
+#[test]
+fn a_cleanup_rolled_back_whose_rollback_fails_is_a_halt() {
+    let Next::Rollback { then } = next(
+        Step::Cleanup,
+        Outcome::Failure,
+        &stated(RELEASE, true),
+        &ctx(false, true, false),
+    ) else {
+        panic!("a rollback was expected");
+    };
+    let after = Context {
+        then: Some(then),
+        ..Context::default()
+    };
+    assert_eq!(
+        next(Step::Rollback, Outcome::Failure, &Report::default(), &after),
+        Next::Report(Verdict::Halt)
+    );
+}
+
+/// A `reversible: null` reads as stated false on the strict and the lenient path alike (the rule
+/// for a malformed `reversible`: a step that might have committed is treated as committed).
+#[test]
+fn a_null_reversible_reads_as_stated_false_on_both_paths() {
+    let strict = Report::from_stdout("{\"reversible\":null}").unwrap();
+    let (lenient, warnings) = Report::read_with_warnings("{\"reversible\":null}");
+    assert_eq!((strict.reversible, strict.reversible_stated), (false, true));
+    assert_eq!(strict, lenient);
+    assert_eq!(warnings.len(), 1);
+    // a wrongly typed value is still refused by the strict reader
+    assert!(Report::from_stdout("{\"reversible\":\"no\"}").is_err());
+}
+
 /// A `cleanup` that fails and states `reversible: false` keeps the path of the table: run it
 /// again while retries last, then Failed(after_commit); never a rollback.
 #[test]

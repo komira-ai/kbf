@@ -143,9 +143,9 @@ pub fn next(step: Step, outcome: Outcome, report: &Report, ctx: &Context) -> Nex
             Next::Report(failed(Phase::AfterCommit))
         }
         (Step::Rollback, Outcome::Failure | Outcome::Deferred) => Next::Report(Verdict::Halt),
-        // A cleanup that fails and states `reversible: true` committed nothing: roll back, and the
-        // host's result is the rollback's: Failed(before_commit) with the cleanup's class. One that states false, or leaves the field out (an old
-        // hook), keeps the path below.
+        // A cleanup that fails and states `reversible: true` committed nothing: roll back, and
+        // the host's result is the rollback's: Failed(before_commit) with the cleanup's class.
+        // One that states false, or leaves the field out (an old hook), keeps the path below.
         (Step::Cleanup, Outcome::Failure) if report.reversible_stated && !committed => {
             rollback_then(failed(before_or_after))
         }
