@@ -1,4 +1,5 @@
-//! `profiles-complete`: refuses a directory of raw coverage profiles in which a shard's
+//! `profiles-complete`: refuses a directory of coverage profiles (`.profraw`, or with
+//! `--extension profdata` the shards' merged `.profdata`) in which a shard's
 //! profiles are missing.
 //!
 //! The coverage run of `ci.yml` runs its tests in shards; each shard names its raw profiles
@@ -28,10 +29,14 @@ pub struct Args {
     /// The file-name prefix of one shard's profiles; once for each shard.
     #[arg(long = "prefix", required = true)]
     pub prefixes: Vec<String>,
+    /// The extension of the files to check: `profraw` (a shard's raw profiles) or `profdata`
+    /// (the one file each shard merged them into, which is what `test` downloads).
+    #[arg(long, default_value = "profraw")]
+    pub extension: String,
 }
 
-/// The `.profraw` files of `dir` as `(name, bytes)`, in name order.
-fn profiles(dir: &Path) -> Result<Vec<(String, u64)>, Error> {
+/// The files of `dir` with the extension (`.profraw` by default) as `(name, bytes)`, in name order.
+fn profiles(dir: &Path, extension: &str) -> Result<Vec<(String, u64)>, Error> {
     let what = || format!("read {}", dir.display());
     let spawn = |e: std::io::Error| Error::Spawn {
         what: what(),
@@ -42,7 +47,7 @@ fn profiles(dir: &Path) -> Result<Vec<(String, u64)>, Error> {
         let entry = entry.map_err(spawn)?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let meta = entry.metadata().map_err(spawn)?;
-        if meta.is_file() && name.ends_with(".profraw") {
+        if meta.is_file() && name.ends_with(&format!(".{extension}")) {
             found.push((name, meta.len()));
         }
     }
@@ -52,7 +57,7 @@ fn profiles(dir: &Path) -> Result<Vec<(String, u64)>, Error> {
 
 /// Check the directory: one line for each shard saying how many profiles it has, or why not.
 pub fn run(args: &Args) -> Result<Vec<String>, Error> {
-    let files = profiles(&args.dir)?;
+    let files = profiles(&args.dir, &args.extension)?;
     let mut problems = Vec::new();
     let mut lines = Vec::new();
     for prefix in &args.prefixes {
@@ -63,12 +68,14 @@ pub fn run(args: &Args) -> Result<Vec<String>, Error> {
         let bytes: u64 = own.iter().map(|(_, len)| len).sum();
         if own.is_empty() {
             problems.push(format!(
-                "no raw profile in {} begins `{prefix}`: that shard's profiles did not arrive",
+                "no `.{}` file in {} begins `{prefix}`: that shard's profiles did not arrive",
+                args.extension,
                 args.dir.display()
             ));
         } else if bytes == 0 {
             problems.push(format!(
-                "every raw profile that begins `{prefix}` is empty ({} file(s))",
+                "every `.{}` file that begins `{prefix}` is empty ({} file(s))",
+                args.extension,
                 own.len()
             ));
         } else {
@@ -86,8 +93,9 @@ pub fn run(args: &Args) -> Result<Vec<String>, Error> {
     if !stray.is_empty() {
         let shown: Vec<&str> = stray.iter().copied().take(SHOWN).collect();
         problems.push(format!(
-            "{} raw profile(s) begin with none of the shards' prefixes, e.g. {}",
+            "{} `.{}` file(s) begin with none of the shards' prefixes, e.g. {}",
             stray.len(),
+            args.extension,
             shown.join(", ")
         ));
     }

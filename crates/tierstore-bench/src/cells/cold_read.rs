@@ -410,7 +410,7 @@ fn cleanup(sets: Vec<Arc<ObjectSet>>, faults: Option<Arc<dyn FaultSwitch>>) -> H
 /// ledger refuses the cell, the load gate trips or cannot be read, or a file or the request log
 /// fails.
 pub async fn run(ctx: &CellContext, plan: &CellPlan) -> Result<Vec<CellResult>, BenchError> {
-    run_with(ctx, plan, Arc::new(ProcLoad), None, None).await
+    run_with(ctx, plan, Arc::new(ProcLoad::new()), None, None).await
 }
 
 /// [`run`] with the machine, the fault proxy and a cap on the requests of a pass (and the
