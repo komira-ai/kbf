@@ -13,7 +13,7 @@ already has:
 --cold-store-credentials-file <the node's scoped key>
 ```
 
-- tierstore's own cold tier stays the existing MinIO bucket; its hot tier is local flash. tierstore listens on loopback
+- tierstore's own cold tier stays the existing MinIO bucket, with a local read cache on flash and no hot tier. tierstore listens on loopback
   and on the node address; the node address is for metrics scraping only. [proposed]
 - The storage node stays a kbf process and keeps the index, the action cache, the closure check, the digest checks, the
   placement map and the chain. Nothing in kbf's storage logic changes: the cold store is already an `ObjectStore`
@@ -27,14 +27,12 @@ already has:
 
 - **Identity.** An `s3://` cold store is Registrable: it fetches the farm-wide registration and compares endpoint, bucket
   and prefix with its flag (`same_store`). [code: `crates/kbf-server/src/cold_apply.rs`; `storage_node.rs`,
-  `storage_half.rs`] Two ways to run it, with these consequences:
-  - *Registration is not the loopback string* (recommended). Each node runs on its flag with a permanent
-    `identity_mismatch` and needs its own keys through `--cold-store-credentials-file` (on main), not `AWS_*`. Whether the
-    frontend or operator API treats a mismatched node as a fault was not read.
-  - *`http://127.0.0.1:9300` is registered farm-wide.* Every node matches the same string while pointing at a
-    **different** tierstore. That is correct only because of an invariant the design relies on: **every node's tierstore
-    fronts the same cold bucket and prefix.** The registration then describes a store no single address names, and a node
-    whose tierstore is pointed elsewhere would match and not be noticed.
+  `storage_half.rs`] **Decision: register `http://127.0.0.1:9300` farm-wide (bucket `kbf-cas`, prefix `av2dev1/`).** Every
+  node then matches the same string while pointing at its own, different tierstore. That is safe only because of an
+  invariant the design relies on: **every node's tierstore fronts the same cold bucket and prefix.** A node whose
+  tierstore were pointed elsewhere would match and not be noticed. (The other way, not registering the string, leaves
+  each node on its flag with a permanent `identity_mismatch`, and nothing is lost by it but a standing warning.)
+  `--cold-store-credentials-file` (on main) gives the node its scoped key, not `AWS_*`.
 - **Integrity checks stay in kbf.** tierstore does not hash a storage node's objects. kbf hashes a blob against its digest
   on write (`VerifiedBlob`), checks the SHA-256 of the exact range on every read (marking the object `Corrupt` or
   `Missing`, never serving the bytes), and on the daemon `Segments` path `PutRange` hashes on receipt and `Commit`
@@ -47,12 +45,15 @@ already has:
   prefix only grows because nothing deletes segments. [code: `crates/kbf-server/src/fill.rs` `round`, `settle`,
   `registered`; `crates/kbf-front/src/cache/tail.rs`; `crates/kbf-server/src/members/fence.rs`;
   `docs/design/rebalance-handoff.md`]
-- **Visibility and copy lag.** An object node A wrote and its tierstore has not yet copied to MinIO is only in A's hot
-  tier, so it is invisible to node B's tierstore. kbf reads it through its own location index, which is fine; but B's
-  rebuild, or its tail pass at an owed handoff epoch, does not list it, and the join or drain fence is confirmed on those
-  acknowledgements, so it can be confirmed without that object in the index. **Rule: no join or handoff while any node's
-  copy lag is above 0.** This depends on tierstore exporting the copy lag, which `/metricz` does not do today. [code:
-  tierstore `limits.md`, `metrics.md`; `fill.rs`; `rebalance-handoff.md`]
+- **Visibility: tierstore writes through.** With tierstore v0.3.0 configured with `[server]`, `[cold_store]` (the
+  existing bucket) and `[local_cache]`, and no hot tier, a create-only PUT is answered only after the upstream has
+  acknowledged it; the local copy is made afterwards, is best effort, and a skipped copy still succeeds. Multipart parts
+  and the completion pass straight through. So the cold store holds every object before kbf sees its PUT succeed, no
+  copy lag exists, and node B's rebuild or tail pass lists what node A wrote. [code: tierstore at tag v0.3.0,
+  `crates/tierstore/src/server/local_cache/keep.rs` (module doc steps 1 to 4, `put_through`) and
+  `local_cache/mod.rs` (`part_through`, `complete_through`)] **The design relies on tierstore running with no hot tier;
+  the write-back tiered mode must not be configured, and a config with a hot tier would void this paragraph** (an
+  acknowledged object could then be only on flash).
 
 ## 3. Migration, one node at a time
 
@@ -61,8 +62,8 @@ already has:
 3. Run the held repoint script (writes the key file and the new `--cold-store`, restarts kbf). [proposed]
 4. Check from the attempt-5 measurement that tierstore lookups are at least 95% of kbf's cold-store GETs; the
    denominator is `kbf_cold_store_requests_total{op}` (kbf#2191, merged), counted per node. [proposed]
-5. Rollback is the repoint script with the old flag, after the node's tierstore shows no copy lag: an uncopied object
-   read from the bucket directly would be marked `Missing`. [proposed]
+5. Rollback is the repoint script with the old flag. Nothing waits for a copy: tierstore wrote every object through to the
+   bucket before kbf saw its PUT succeed. [proposed]
 
 ## 4. Later, only if measured need (not decisions)
 
@@ -76,6 +77,6 @@ already has:
 - Object Lock in tierstore. Not needed: the segment path passes no retention date (a search result, not a proof).
 - Open questions: (A) what the chain's acknowledgement waits for with no write tier; (B) ingress CPU without a tier;
   (C) how the frontend treats a mismatched node; (D) callers of `retain_until`; (E) how a collector learns of adoptions;
-  (F) for tierstore: copy lag on `/metricz`, a latency histogram, hot-only objects in listings, list cost on a large
+  (F) for tierstore: a latency histogram, list cost on a large
   prefix, GC-key behaviour, drain with an unfinished copy, `start-after` paging, and `_journal/` and `_tiering/` hidden
   from listings.
