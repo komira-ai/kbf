@@ -3,7 +3,7 @@
 mod support;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 use kbf_step_runner::{Clock, DeadMan, LaunchError, StepCall, StepExit, StepLauncher, Watch};
 use support::{Fake, FakeClock, Reply, Rig};
@@ -107,11 +107,11 @@ fn thread_run(fail: bool) -> (Arc<Watch>, Arc<StopEnds>) {
 fn the_thread_stops_the_step_on_its_own() {
     let (watch, launcher) = thread_run(false);
     assert_eq!(*launcher.stops.lock().unwrap(), ["unit-t"]);
-    assert_eq!(watch.last_error(), None);
+    assert!(watch.last_error().is_none());
 
     let (watch, launcher) = thread_run(true);
     assert_eq!(*launcher.stops.lock().unwrap(), ["unit-t"]);
-    assert!(watch.last_error().unwrap().contains("refused"));
+    assert!(watch.last_error().unwrap().to_string().contains("refused"));
 }
 
 /// Catches a verify window that is not enforced by the root part: with `verify` allowed 1000 s
@@ -235,39 +235,41 @@ fn a_failed_stop_is_reported_when_the_step_is_disarmed() {
     fake.fail_stops(1);
     assert!(man.tick().is_err());
     let error = watch.disarm().expect("the failed stop is reported");
-    assert!(error.contains("systemd refused"), "{error}");
+    assert!(
+        matches!(&*error, LaunchError::Launcher(why) if why == "systemd refused"),
+        "{error:?}"
+    );
 
     watch.arm("unit-b", clock.mono_secs());
     fake.fail_stops(1);
     assert!(man.tick().is_err());
     assert!(man.tick().unwrap());
-    assert_eq!(watch.disarm(), None);
+    assert!(watch.disarm().is_none());
 
     watch.arm("unit-c", clock.mono_secs() + 100);
     assert!(!man.tick().unwrap());
-    assert_eq!(watch.disarm(), None);
+    assert!(watch.disarm().is_none());
     assert_eq!(fake.stops(), ["unit-a", "unit-b", "unit-b"]);
 }
 
-/// A launcher whose stop fails while the step it was asked to stop ends on its own.
-struct FailsAsTheStepEnds {
-    watch: Arc<Watch>,
-}
+/// A launcher whose stop always fails.
+struct FailsToStop;
 
-impl StepLauncher for FailsAsTheStepEnds {
+impl StepLauncher for FailsToStop {
     fn run(&self, _: &StepCall<'_>) -> Result<StepExit, LaunchError> {
         unreachable!("the dead-man only stops")
     }
 
     fn stop(&self, _: &str) -> Result<(), LaunchError> {
-        let _ = self.watch.disarm();
         Err(LaunchError::Launcher("refused".to_owned()))
     }
 }
 
-/// A fake clock that asks the dead-man's loop to end at its `n`-th sleep.
+/// A fake clock that disarms the watch at its first sleep (the step ended after the failed
+/// stop) and asks the dead-man's loop to end at its `n`-th.
 struct EndsAt {
     clock: Arc<FakeClock>,
+    watch: Arc<Watch>,
     stop: Arc<AtomicBool>,
     sleeps_left: AtomicU32,
 }
@@ -283,6 +285,7 @@ impl Clock for EndsAt {
 
     fn sleep_secs(&self, secs: u64) {
         self.clock.sleep_secs(secs);
+        let _ = self.watch.disarm();
         if self.sleeps_left.fetch_sub(1, Ordering::SeqCst) == 1 {
             self.stop.store(true, Ordering::Release);
         }
@@ -290,21 +293,105 @@ impl Clock for EndsAt {
 }
 
 /// Catches the error of a stop being wiped by the next tick that has nothing to stop (the error
-/// was then never seen): it stays in the watch until a stop works.
+/// was then never seen): it stays in the watch, as the launcher's error, until a stop works.
 #[test]
 fn the_error_of_a_stop_outlives_the_ticks_after_it() {
     let watch = Watch::new();
     let stop = Arc::new(AtomicBool::new(false));
     let clock = Arc::new(EndsAt {
         clock: FakeClock::new(),
+        watch: watch.clone(),
         stop: stop.clone(),
         sleeps_left: AtomicU32::new(2),
     });
     watch.arm("unit-e", clock.mono_secs());
-    let launcher = Arc::new(FailsAsTheStepEnds {
-        watch: watch.clone(),
-    });
-    DeadMan::new(watch.clone(), launcher, clock).run(&stop, 1);
+    DeadMan::new(watch.clone(), Arc::new(FailsToStop), clock).run(&stop, 1);
     let error = watch.last_error().expect("the error is kept");
-    assert!(error.contains("refused"), "{error}");
+    assert!(
+        matches!(&*error, LaunchError::Launcher(why) if why == "refused"),
+        "{error:?}"
+    );
+}
+
+/// A launcher whose stop says when it has begun and ends, with the error it is handed, only
+/// when the test lets it.
+struct HeldStop {
+    begun: mpsc::Sender<()>,
+    outcome: Mutex<mpsc::Receiver<Result<(), LaunchError>>>,
+}
+
+impl StepLauncher for HeldStop {
+    fn run(&self, _: &StepCall<'_>) -> Result<StepExit, LaunchError> {
+        unreachable!("the dead-man only stops")
+    }
+
+    fn stop(&self, _: &str) -> Result<(), LaunchError> {
+        self.begun.send(()).unwrap();
+        self.outcome.lock().unwrap().recv().unwrap()
+    }
+}
+
+/// A dead-man over a [`HeldStop`].
+struct Held {
+    watch: Arc<Watch>,
+    man: Arc<DeadMan>,
+    /// A message when the stop has begun.
+    has_begun: mpsc::Receiver<()>,
+    /// The outcome the stop ends with.
+    finish: mpsc::Sender<Result<(), LaunchError>>,
+}
+
+fn held_stop() -> Held {
+    let (begun, has_begun) = mpsc::channel();
+    let (finish, outcome) = mpsc::channel();
+    let watch = Watch::new();
+    let launcher = Arc::new(HeldStop {
+        begun,
+        outcome: Mutex::new(outcome),
+    });
+    let man = Arc::new(DeadMan::new(watch.clone(), launcher, FakeClock::new()));
+    Held {
+        watch,
+        man,
+        has_begun,
+        finish,
+    }
+}
+
+/// Catches the outcome of a stop under way being lost when the step ends meanwhile (the arming
+/// was dropped, so the stop's error had nowhere to go and the runner read the exit of a step it
+/// could not stop): `disarm` waits for the stop and gives its error; a stop that works gives
+/// none. Nothing here waits for a time: the stop has begun, and is seen to have begun, before
+/// the disarm is made.
+#[test]
+fn a_stop_under_way_when_the_step_ends_is_waited_for() {
+    for (outcome, reported) in [
+        (Err(LaunchError::Launcher("refused".to_owned())), true),
+        (Ok(()), false),
+    ] {
+        let Held {
+            watch,
+            man,
+            has_begun,
+            finish,
+        } = held_stop();
+        watch.arm("unit-h", 0);
+        assert!(!watch.stopping());
+        let ticking = {
+            let man = man.clone();
+            std::thread::spawn(move || man.tick())
+        };
+        has_begun.recv().unwrap();
+        assert!(watch.stopping());
+        let disarming = {
+            let watch = watch.clone();
+            std::thread::spawn(move || watch.disarm())
+        };
+        finish.send(outcome).unwrap();
+        let error = disarming.join().unwrap();
+        assert_eq!(error.is_some(), reported, "{error:?}");
+        assert_eq!(ticking.join().unwrap().is_err(), reported);
+        assert!(!watch.stopping());
+        assert!(watch.disarm().is_none());
+    }
 }

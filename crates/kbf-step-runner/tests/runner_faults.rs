@@ -7,11 +7,14 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 
 use kbf_step_runner::record::State;
-use kbf_step_runner::{ArtifactError, DeadMan, Finished, Loaded, RunError};
+use kbf_step_runner::{
+    ArtifactError, DeadMan, Finished, LaunchError, Loaded, RunError, StepCall, StepExit,
+    StepLauncher, StepRunner,
+};
 use support::Rig;
 use update_hook::{Step, Verdict};
 
@@ -143,6 +146,100 @@ fn a_step_the_dead_man_could_not_stop_is_left_running() {
         rig.fake.stops(),
         ["updater-svc-cutover-1", "updater-svc-cutover-1"]
     );
+    assert_eq!(
+        rig.fake.steps(),
+        [
+            Step::Prepare,
+            Step::Cutover,
+            Step::Cutover,
+            Step::Verify,
+            Step::Cleanup
+        ]
+    );
+}
+
+/// The rig's launcher, but the first stop says when it has begun and ends only when the test
+/// hands it its outcome.
+struct HeldFirstStop {
+    fake: Arc<support::Fake>,
+    held: AtomicBool,
+    begun: mpsc::Sender<()>,
+    outcome: Mutex<mpsc::Receiver<Result<(), LaunchError>>>,
+}
+
+impl StepLauncher for HeldFirstStop {
+    fn run(&self, call: &StepCall<'_>) -> Result<StepExit, LaunchError> {
+        self.fake.run(call)
+    }
+
+    fn stop(&self, unit: &str) -> Result<(), LaunchError> {
+        if self.held.swap(false, Ordering::SeqCst) {
+            self.begun.send(()).unwrap();
+            return self.outcome.lock().unwrap().recv().unwrap();
+        }
+        self.fake.stop(unit)
+    }
+}
+
+/// Catches the outcome of a stop that is under way when the step ends being lost: the step's
+/// run returns while the dead-man is still in its stop, which then fails. The runner waits for
+/// that stop, stops with `Unstopped`, leaves the step running in the record and runs no step
+/// after it; the next run stops the unit by name and runs the step again.
+#[test]
+fn a_stop_that_fails_after_the_step_ended_still_stops_the_runner() {
+    let rig = Rig::new("runf-stop-under-way");
+    let (begun, has_begun) = mpsc::channel();
+    let (finish, outcome) = mpsc::channel();
+    let launcher = Arc::new(HeldFirstStop {
+        fake: rig.fake.clone(),
+        held: AtomicBool::new(true),
+        begun,
+        outcome: Mutex::new(outcome),
+    });
+    let runner = StepRunner::new(launcher.clone(), rig.clock.clone(), rig.store());
+    let man = Arc::new(DeadMan::new(runner.watch(), launcher, rig.clock.clone()));
+    let ticking = Arc::new(Mutex::new(None));
+    let has_begun = Mutex::new(has_begun);
+    let finish = Mutex::new(Some(finish));
+    let first = Arc::new(AtomicBool::new(true));
+    let (clock, seen, tick_slot, once) = (
+        rig.clock.clone(),
+        man.clone(),
+        ticking.clone(),
+        first.clone(),
+    );
+    rig.fake.on_run(move |call| {
+        if call.invocation.step != Step::Cutover || !once.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        clock.advance(call.timeout_secs);
+        let man = seen.clone();
+        *tick_slot.lock().unwrap() = Some(std::thread::spawn(move || man.tick()));
+        // The stop has begun; it fails once the step has returned its exit.
+        has_begun.lock().unwrap().recv().unwrap();
+        let finish = finish.lock().unwrap().take().unwrap();
+        std::thread::spawn(move || {
+            let refused = LaunchError::Launcher("systemd refused".to_owned());
+            finish.send(Err(refused)).unwrap();
+        });
+    });
+    let err = runner.run(&rig.order()).unwrap_err();
+    assert!(
+        matches!(&err, RunError::Unstopped { unit, error }
+            if unit == "updater-svc-cutover-1"
+                && matches!(&**error, LaunchError::Launcher(why) if why == "systemd refused")),
+        "{err:?}"
+    );
+    let ticked = ticking.lock().unwrap().take().unwrap().join().unwrap();
+    assert!(ticked.is_err());
+    assert!(!first.load(Ordering::SeqCst));
+    assert!(matches!(at(&rig), (Step::Cutover, State::Running { .. })));
+    assert_eq!(rig.fake.steps(), [Step::Prepare, Step::Cutover]);
+    assert!(rig.fake.stops().is_empty());
+
+    let got = runner.run(&rig.order()).unwrap();
+    assert_eq!(got.verdict, succeeded());
+    assert_eq!(rig.fake.stops(), ["updater-svc-cutover-1"]);
     assert_eq!(
         rig.fake.steps(),
         [

@@ -206,7 +206,8 @@ pub struct Registry {
     inner: Mutex<Inner>,
     /// Held by a change from the moment it reads the registrations until its write has ended, so
     /// that changes are written one at a time and each write holds every change before it. A read
-    /// never takes it, and the registrations' own lock is not held while the disk is written.
+    /// never takes it, and the registrations' own lock is not held while the disk is written. A
+    /// close marks its entry stopped before it takes this lock, so the stop is believed at once.
     writing: Mutex<()>,
     writer: Writer,
 }
@@ -335,17 +336,25 @@ impl Registry {
 
     /// The connection `conn` closed: its service is stopped, unless a later registration of
     /// the same name has replaced it.
-    /// The stop is believed at once (reporting a service stopped believes nothing it said) and
-    /// written, so a registration loaded after a restart is stopped too.
+    ///
+    /// The stop is believed at once, before the write and whatever another change is writing
+    /// meanwhile (reporting a service stopped believes nothing it said), and then written, so a
+    /// registration loaded after a restart is stopped too. A stop that cannot be written is
+    /// still believed here; the error says it was not written.
     pub fn closed(&self, name: &str, conn: u64) -> Result<(), RegistryError> {
-        let _writing = self.writing();
-        let bytes = {
+        {
             let mut inner = self.inner();
             let held = inner.entries.get_mut(name).filter(|e| e.conn == conn);
             let Some(entry) = held else {
                 return Ok(());
             };
             entry.presence = Presence::Stopped;
+        }
+        // Written as every change is, one at a time, from the registrations as they are once
+        // the changes before it have been written.
+        let _writing = self.writing();
+        let bytes = {
+            let inner = self.inner();
             saved_bytes(inner.entries.iter().map(|(name, e)| (name.as_str(), e)))?
         };
         self.write(&bytes)
@@ -483,7 +492,10 @@ impl Server {
         match UnixStream::connect(path) {
             Ok(_) => return Err(RegistryError::AlreadyServing(path.to_path_buf())),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => remove_stale(path)?,
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                let me = rustix::process::geteuid().as_raw();
+                remove_stale_socket(path, me, &host_owner)?;
+            }
             Err(e) => return Err(e.into()),
         }
         let listener = UnixListener::bind(path)?;
@@ -730,13 +742,20 @@ pub fn check_socket_dir(
     Ok(())
 }
 
-/// Removes what is at the socket's path when nobody answers there, if it is a socket of the
-/// updater (the running user); anything else is left as it is.
-fn remove_stale(path: &Path) -> Result<(), RegistryError> {
+/// Removes what is at the socket's path, where nobody answers, if it is a socket (not a link
+/// to one) owned by `updater`, the user the updater runs as, reading the owner of the path (user
+/// id, group id) from `read` (a test presents a socket of another user without being root).
+/// Anything else is [`RegistryError::InTheWay`] and left as it is: a regular file or a
+/// directory, and a socket of another user, which is not the updater's to remove.
+pub fn remove_stale_socket(
+    path: &Path,
+    updater: u32,
+    read: &dyn Fn(&fs::Metadata) -> (u32, u32),
+) -> Result<(), RegistryError> {
     let meta = fs::symlink_metadata(path)?;
-    let me = rustix::process::geteuid().as_raw();
+    let (uid, _) = read(&meta);
     // One comparison: a socket, not a link to one, and the updater's.
-    if (meta.file_type().is_socket(), meta.uid() == me) != (true, true) {
+    if (meta.file_type().is_socket(), uid == updater) != (true, true) {
         return Err(RegistryError::InTheWay(path.to_path_buf()));
     }
     Ok(fs::remove_file(path)?)

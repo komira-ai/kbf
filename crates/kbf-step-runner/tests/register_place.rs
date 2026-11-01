@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kbf_step_runner::register::{
-    Declared, Grant, Registry, RegistryError, Server, check_socket_dir,
+    Declared, Grant, Registry, RegistryError, Server, check_socket_dir, remove_stale_socket,
 };
 use support::{FakeClock, Scratch};
 
@@ -223,4 +223,33 @@ fn only_a_stale_socket_of_the_updater_is_removed() {
     drop(UnixListener::bind(&sock).unwrap());
     let _server = place.bind(&sock, my_group()).unwrap();
     assert!(std::os::unix::net::UnixStream::connect(&sock).is_ok());
+}
+
+/// Catches a stale socket being removed whoever owns it: a socket that nobody answers on but
+/// that belongs to another user (another local principal's, or one the updater does not run as)
+/// is left in place, the same inode, and the start fails; the updater's own is removed. The
+/// owner is read through the test's reader, so no second user is needed.
+#[test]
+fn a_stale_socket_of_another_user_is_left_in_place() {
+    let place = Place::new("regp-stale-foreign");
+    let sock = place.run.join("s");
+    drop(UnixListener::bind(&sock).unwrap());
+    let ino = fs::symlink_metadata(&sock).unwrap().ino();
+    let as_is = |m: &fs::Metadata| (m.uid(), m.gid());
+    let foreign = |m: &fs::Metadata| (m.uid().wrapping_add(1), m.gid());
+    for (updater, read) in [
+        (me(), &foreign as &dyn Fn(&fs::Metadata) -> (u32, u32)),
+        (me().wrapping_add(1), &as_is),
+    ] {
+        let err = remove_stale_socket(&sock, updater, read).unwrap_err();
+        assert!(
+            matches!(&err, RegistryError::InTheWay(p) if p == &sock),
+            "{err:?}"
+        );
+        let meta = fs::symlink_metadata(&sock).unwrap();
+        assert_eq!(meta.ino(), ino);
+        assert!(std::os::unix::fs::FileTypeExt::is_socket(&meta.file_type()));
+    }
+    remove_stale_socket(&sock, me(), &as_is).unwrap();
+    assert!(fs::symlink_metadata(&sock).is_err());
 }

@@ -89,6 +89,8 @@ pub trait StepLauncher: Send + Sync {
     /// `SIGKILL` to the whole unit after `TimeoutStopSec=` (with the default `KillMode=` of the
     /// control group), and the launcher sets that bound on the unit. An error is kept by the
     /// dead-man, the stop is tried again at its next tick, and a step that ends before any stop
-    /// worked stops the runner with [`crate::RunError::Unstopped`].
+    /// worked stops the runner with [`crate::RunError::Unstopped`]. A step whose [`Self::run`]
+    /// returns while this is under way is not read until this has returned, so the time this
+    /// takes is also the time the runner waits.
     fn stop(&self, unit: &str) -> Result<(), LaunchError>;
 }

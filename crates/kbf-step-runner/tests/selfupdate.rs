@@ -5,7 +5,7 @@ mod support;
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -63,7 +63,7 @@ fn staging_adds_a_version_and_moves_no_link() {
     );
     assert_eq!(layout.current().unwrap(), None);
     assert_eq!(layout.previous().unwrap(), None);
-    assert!(!layout.dir().join("versions/1.2.3.tmp").exists());
+    assert!(!layout.dir().join("versions/.1.2.3.stage").exists());
     for bad in ["", ".hidden", "a/b", "a b", "../x", "é"] {
         let err = layout.stage(bad, &src).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
@@ -275,7 +275,12 @@ fn the_versions_current_and_previous_point_at_are_not_staged_over() {
         let err = layout.stage(live, &other).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{live}");
         assert!(err.to_string().contains("current"), "{err}");
-        assert!(!layout.dir().join(format!("versions/{live}.tmp")).exists());
+        assert!(
+            !layout
+                .dir()
+                .join(format!("versions/.{live}.stage"))
+                .exists()
+        );
     }
     assert_eq!(version_text(&layout, "v1"), "a");
     assert_eq!(version_text(&layout, "v2"), "b");
@@ -362,4 +367,124 @@ fn the_follow_on_to_a_version_in_place_stages_nothing() {
     );
     assert_eq!(version_text(&layout, "v2"), "b");
     assert_eq!(links(&layout), (Some("v1".into()), Some("v2".into())));
+}
+
+/// The file of a version, its inode and its bytes, to see that it was not written over.
+fn file_of(layout: &Layout, version: &str) -> (u64, String) {
+    use std::os::unix::fs::MetadataExt;
+    let path = layout.dir().join("versions").join(version);
+    let ino = fs::symlink_metadata(&path).unwrap().ino();
+    (ino, fs::read_to_string(&path).unwrap())
+}
+
+/// Catches a staging copy made under a name a version can have: `v1.tmp` is a valid version,
+/// and when it is the one `current` or `previous` points at, staging `v1` wrote its copy over
+/// that file and renamed it away, leaving the link dangling. The copy is made under a name no
+/// version has, so the live binary and both links stay as they were; a copy a crash left is
+/// replaced, and a directory in its place is an error.
+#[test]
+fn staging_one_version_never_writes_over_another() {
+    for live in ["current", "previous"] {
+        let s = Scratch::new(&format!("su-stage-name-{live}"));
+        let layout = Layout::new(&s.path().join("bin"));
+        layout.stage("v1.tmp", &binary(s.path(), "a", "a")).unwrap();
+        layout.stage("v0", &binary(s.path(), "z", "z")).unwrap();
+        layout.switch("v1.tmp").unwrap();
+        if live == "previous" {
+            layout.switch("v0").unwrap();
+        }
+        let before = (links(&layout), file_of(&layout, "v1.tmp"));
+        layout.stage("v1", &binary(s.path(), "b", "b")).unwrap();
+        assert_eq!(
+            (links(&layout), file_of(&layout, "v1.tmp")),
+            before,
+            "{live}"
+        );
+        assert_eq!(version_text(&layout, "v1"), "b");
+        assert_eq!(fs::read_to_string(layout.dir().join(live)).unwrap(), "a");
+    }
+
+    let s = Scratch::new("su-stage-leftover");
+    let layout = Layout::new(&s.path().join("bin"));
+    fs::create_dir_all(layout.dir().join("versions")).unwrap();
+    let leftover = layout.dir().join("versions/.v2.stage");
+    fs::write(&leftover, "half a binary").unwrap();
+    layout.stage("v2", &binary(s.path(), "b", "b")).unwrap();
+    assert_eq!(version_text(&layout, "v2"), "b");
+    assert!(!leftover.exists());
+    fs::create_dir(layout.dir().join("versions/.v3.stage")).unwrap();
+    assert!(layout.stage("v3", &binary(s.path(), "c", "c")).is_err());
+    assert!(!layout.dir().join("versions/v3").exists());
+}
+
+/// Catches a fallback that is not a binary being taken for one: with `versions/<previous>` a
+/// dangling link, a link to a binary, a directory or a file without an execute bit, `flip_back`
+/// and `switch` are errors and change no link; and a missing fallback is an error even when
+/// `current` already points at it (the fallback unit would otherwise report a flip it cannot
+/// run as nothing to do).
+#[test]
+fn a_fallback_that_is_not_an_executable_file_is_refused() {
+    let s = Scratch::new("su-flip-odd");
+    let layout = Layout::new(&s.path().join("bin"));
+    let a = binary(s.path(), "a", "a");
+    layout.stage("v1", &a).unwrap();
+    layout.stage("v2", &binary(s.path(), "b", "b")).unwrap();
+    layout.switch("v1").unwrap();
+    layout.switch("v2").unwrap();
+    let v1 = layout.dir().join("versions/v1");
+    let plain = s.path().join("plain");
+    fs::write(&plain, "p").unwrap();
+    type Make = Box<dyn Fn(&Path)>;
+    let odd: [(&str, Make); 4] = [
+        (
+            "a dangling link",
+            Box::new(|p: &Path| symlink("nowhere", p).unwrap()),
+        ),
+        (
+            "a link to a binary",
+            Box::new(move |p: &Path| symlink(&a, p).unwrap()),
+        ),
+        (
+            "a directory",
+            Box::new(|p: &Path| fs::create_dir(p).unwrap()),
+        ),
+        (
+            "a file nobody may execute",
+            Box::new(move |p: &Path| {
+                fs::copy(&plain, p).unwrap();
+                fs::set_permissions(p, fs::Permissions::from_mode(0o644)).unwrap();
+            }),
+        ),
+    ];
+    for (what, make) in odd {
+        fs::remove_file(&v1)
+            .or_else(|_| fs::remove_dir(&v1))
+            .unwrap();
+        make(&v1);
+        let err = layout.flip_back().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{what}");
+        assert_eq!(
+            links(&layout),
+            (Some("v2".into()), Some("v1".into())),
+            "{what}"
+        );
+        assert!(layout.switch("v1").is_err(), "{what}");
+        assert_eq!(
+            links(&layout),
+            (Some("v2".into()), Some("v1".into())),
+            "{what}"
+        );
+    }
+
+    // `current` and `previous` both name v3, whose file is gone.
+    let s = Scratch::new("su-flip-same-missing");
+    let layout = Layout::new(&s.path().join("bin"));
+    layout.stage("v3", &binary(s.path(), "c", "c")).unwrap();
+    layout.switch("v3").unwrap();
+    symlink("versions/v3", layout.dir().join("previous")).unwrap();
+    assert_eq!(links(&layout), (Some("v3".into()), Some("v3".into())));
+    fs::remove_file(layout.dir().join("versions/v3")).unwrap();
+    let err = layout.flip_back().unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    assert_eq!(links(&layout), (Some("v3".into()), Some("v3".into())));
 }

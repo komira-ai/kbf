@@ -132,9 +132,13 @@ pub enum RunError {
     Unreadable(ArtifactError),
     /// The dead-man could not stop the step at its bound, and the step ended later: it is left
     /// `running` in the record, so that [`StepRunner::run`] again stops its unit by name before
-    /// anything else and runs the step again.
+    /// anything else and runs the step again. `error` is the launcher's, as its stop gave it.
     #[error("the dead-man could not stop {unit} at its bound ({error}); the step is left running")]
-    Unstopped { unit: String, error: String },
+    Unstopped {
+        unit: String,
+        #[source]
+        error: Arc<LaunchError>,
+    },
 }
 
 /// A test's way to make the check of the staged release fail with an I/O error before a step:
