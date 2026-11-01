@@ -3100,6 +3100,7 @@ dependencies = [
  "kbf-host-install",
  "kbf-peer",
  "kbf-proto",
+ "kbf-step-runner",
  "kbf-testkit",
  "kbf-types",
  "libc",
@@ -3110,6 +3111,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "update-hook",
+ "update-rights",
 ]
 
 [[package]]

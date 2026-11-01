@@ -1,0 +1,40 @@
+# kbf-updater in its root part (docs/design/host-updates.md, 3.4 and 3.5): the half of the host
+# updater that runs the update hooks declared in /etc/updater.d, each step a transient systemd
+# unit with exactly the rights its declaration names, and keeps the step record of every update.
+# It answers the agent's account alone, over a socket of mode 0600 (--socket-user), and serves
+# the registration socket of the services (--register-socket, in /run/updater, made by
+# kbf-updater-root.conf, for the group updater-register of kbf-updater.conf).
+#
+# At its start it reads the step record of every declared service (a step a boot cut off is
+# rolled back as the contract's table says) and runs each declaration's boot entry, before it
+# answers the agent.
+#
+# Root, on purpose, and with no User= (kbf-host-local.service says why): it starts transient
+# units, installs a verified declaration into /etc/updater.d through the approval gate, and keeps
+# its state under /var/lib/updater, which it makes itself (the state 0700, the releases and the
+# hooks' record directories reachable).
+[Unit]
+Description=kbf-updater root part, the host updater's runner of update hooks
+Documentation=https://github.com/komira-ai/kbf/blob/main/docs/design/host-updates.md
+After=local-fs.target systemd-tmpfiles-setup.service
+Before=kbf-updater-agent.service
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/kbf/kbf-updater root --socket /run/kbf-updater-root/root.sock --socket-user kbf-updater --register-socket /run/updater/register.sock --register-group updater-register
+RuntimeDirectory=kbf-updater-root
+RuntimeDirectoryMode=0755
+# A step record is on disk, so a restart, like a reboot, finds an update where it was.
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
