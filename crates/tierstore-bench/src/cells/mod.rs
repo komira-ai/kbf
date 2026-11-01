@@ -15,10 +15,9 @@
 //!   timed, logged and held to the rate cap.
 //! - Pass 0 of each arm is a warm-up: it is run, reported with `discarded: true`, and left out of
 //!   every figure. Arms are interleaved across passes and the order is recorded in `notes`.
-//! - The cell reads a [`crate::gate::LoadSample`] before each pass and every few completions in
-//!   it, and checks it against `ctx.config.gate`; a trip ends the pass (`gate_tripped`), marks its
-//!   samples `Window::Busy` whatever the run's window, and ends the run. The cell `c` reads it
-//!   before a burst only.
+//! - The cell reads a [`crate::gate::LoadSample`] before each pass, over a quiet window, and
+//!   checks it against `ctx.config.gate`; a trip ends the run (`gate_tripped` on the empty pass).
+//!   Inside a pass the load is recorded (`pass_load`) and not judged.
 //! - Bytes written to the cold store are counted against `ctx.config.bytes`; a cell is refused
 //!   before it sends anything when its cost is more than what is left, and a request-rate cap
 //!   (`ctx.config.rates`) holds whatever a cell asks for.
@@ -155,6 +154,9 @@ pub struct CellPlan {
     /// Whether the put cells add their open-loop arms (`run --open-loop`). The other cells have
     /// none and ignore it.
     pub open_loop: bool,
+    /// At most this many objects per pass of the multipart arms of `cold-put` (`run
+    /// --multipart-objects`), a cap on the plan's count; `None` keeps the plan's. The other arms and cells ignore it.
+    pub multipart_objects: Option<u64>,
 }
 
 /// Runs one cell.
@@ -181,7 +183,7 @@ pub async fn run_with_faults(
     plan: &CellPlan,
     faults: Option<Arc<dyn FaultSwitch>>,
 ) -> Result<Vec<CellResult>, BenchError> {
-    let load = || Arc::new(ProcLoad);
+    let load = || Arc::new(ProcLoad::new());
     match id {
         CellId::ColdPut => cold_put::run_with(ctx, plan, load(), faults, None).await,
         CellId::ColdRead => cold_read::run_with(ctx, plan, load(), faults, None).await,
@@ -237,6 +239,7 @@ mod tests {
             in_flight: vec![1],
             object_bytes: vec![],
             open_loop: true,
+            multipart_objects: None,
         };
         let bare = testkit::ctx(dir.path(), &[], Window::Busy);
         for (id, name) in [

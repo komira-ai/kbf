@@ -356,7 +356,7 @@ fn arm(label: String, mode: &str, burst: &Arc<Burst>) -> Arm {
 /// the load gate trips or cannot be read, or a file or the request log fails.
 pub async fn run(ctx: &CellContext, plan: &CellPlan) -> Result<Vec<CellResult>, BenchError> {
     let poll = polling(ctx.config.rates.list_poll_rps);
-    run_with(ctx, plan, Arc::new(ProcLoad), None, poll, None).await
+    run_with(ctx, plan, Arc::new(ProcLoad::new()), None, poll, None).await
 }
 
 /// [`run`] with the machine, the fault proxy, the poll and a cap on the objects of a burst given.
@@ -394,6 +394,7 @@ mod tests {
             in_flight: in_flight.to_vec(),
             object_bytes: sizes.to_vec(),
             open_loop: true,
+            multipart_objects: None,
         }
     }
 

@@ -105,6 +105,15 @@ pub struct Row {
     /// The node's CPU pressure when the lease started, in hundredths of a percent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_cpu_pressure_centi: Option<u64>,
+    /// The invocation the attempt's request belonged to (the client's
+    /// `tool_invocation_id`), when the server records it; absent from a server that
+    /// predates the field, and an older export line, which has no such key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_id: Option<String>,
+    /// The group of invocations this one is part of (`correlated_invocations_id`, a CI job),
+    /// when the client sent one and the server records it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlated_invocations_id: Option<String>,
 }
 
 impl Row {
