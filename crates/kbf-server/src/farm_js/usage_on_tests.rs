@@ -79,6 +79,16 @@ struct Scene {
     a: Node,
     b: Node,
     profile: ProfileKey,
+    /// What the scheduler had counted when the warming was done.
+    warmed: LoadCounters,
+}
+
+/// What the scheduler counted since the shape was warmed.
+#[derive(Debug, PartialEq, Eq)]
+struct Since {
+    admitted: u64,
+    admitted_fallback: u64,
+    blocked: u64,
 }
 
 impl Scene {
@@ -126,12 +136,14 @@ impl Scene {
             .shapes()
             .get(&action(1))
             .expect("the warmed shape has a profile name");
+        let warmed = counters(&rig);
         Self {
             rig,
             usage,
             a,
             b,
             profile,
+            warmed,
         }
     }
 
@@ -186,6 +198,15 @@ impl Scene {
     fn counted(&self) -> LoadCounters {
         counters(&self.rig)
     }
+
+    fn since(&self) -> Since {
+        let now = self.counted();
+        Since {
+            admitted: now.admitted - self.warmed.admitted,
+            admitted_fallback: now.admitted_fallback - self.warmed.admitted_fallback,
+            blocked: now.blocked - self.warmed.blocked,
+        }
+    }
 }
 
 /// The value of the exported family `name` for `counters`.
@@ -212,7 +233,7 @@ async fn a_learned_curve_changes_the_placement() {
     on.submit();
     assert_eq!(on.started(), (true, false), "placed where the curve fits");
     assert_eq!(on.queued(), 0);
-    assert_eq!(on.counted().admitted, 1);
+    assert_eq!(on.since().admitted, 1);
 
     let mut record = Scene::new(UsageMode::Record, PlacementPredictions::On).await;
     record.learn();
@@ -220,8 +241,8 @@ async fn a_learned_curve_changes_the_placement() {
     record.submit();
     assert_eq!(record.started(), (false, false), "charged flat, no node");
     assert_eq!(record.queued(), 1, "the action waits");
-    assert_eq!(record.counted().admitted, 0);
-    assert!(record.counted().blocked > 0, "the load held it back");
+    assert_eq!(record.since().admitted, 0);
+    assert!(record.since().blocked > 0, "the load held it back");
 }
 
 /// Catches the counters not seeing the curve: under `on` the admission is charged by the
@@ -253,8 +274,9 @@ async fn the_curve_counters_move() {
     unread.learn();
     unread.submit();
     let counted = unread.counted();
-    assert_eq!(counted.admitted, 1);
-    assert_eq!(counted.admitted_fallback, 1);
+    let since = unread.since();
+    assert_eq!(since.admitted, 1);
+    assert_eq!(since.admitted_fallback, 1);
     assert_eq!(exported(&counted, "kbf_sched_load_curve_flat_total"), 1);
     assert_eq!(exported(&counted, "kbf_sched_load_profile_cpu_total"), 0);
 }
@@ -270,8 +292,8 @@ async fn an_action_without_a_prediction_is_charged_flat_under_on() {
     on.measure(FITS_THE_CURVE, FITS_NEITHER).await;
     on.submit();
     assert_eq!(on.started(), (true, false), "one core fits at 2600 m");
+    assert_eq!(on.since().admitted, 1);
     let counted = on.counted();
-    assert_eq!(counted.admitted, 1);
     assert_eq!(counted.profile_cpu, 0);
     assert_eq!(counted.profile_memory, 0);
     assert_eq!(
@@ -308,12 +330,17 @@ async fn on_with_no_profiles_equals_record() {
         let mut scene = Scene::new(mode, PlacementPredictions::On).await;
         scene.measure(500, 1_500).await;
         scene.submit();
-        traces.push((scene.started(), scene.queued(), scene.counted()));
+        traces.push((
+            scene.started(),
+            scene.queued(),
+            scene.since(),
+            scene.counted(),
+        ));
     }
     assert_eq!(traces[0], traces[1]);
     assert_eq!(traces[0].0, (true, false), "the idle node took it");
     assert_eq!(traces[0].2.admitted, 1);
-    assert_eq!(traces[0].2.profile_cpu, 0, "no curve was read");
+    assert_eq!(traces[0].3.profile_cpu, 0, "no curve was read");
 }
 
 /// Catches the configuration giving the scheduler curves in a mode that must not, or a
