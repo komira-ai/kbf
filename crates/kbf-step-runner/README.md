@@ -45,7 +45,8 @@ last line, the params table, the next-step table) are those of `update-hook`.
 What the launcher must do (the `StepLauncher` docs): clear a unit name before it starts a step
 under it again (`systemctl reset-failed`, or `CollectMode=inactive-or-failed`), since a step that
 is tried again keeps its unit name; bound its `stop` and escalate to `SIGKILL`; and set
-`RuntimeMaxSec=` to the step's bound, since a killed updater takes the dead-man with it.
+`RuntimeMaxSec=` to the step's bound (`TimeoutStartSec=` for a `Type=oneshot` unit, on which
+`RuntimeMaxSec=` does nothing), since a killed updater takes the dead-man with it.
 
 What is not here: the unprivileged agent that talks to the coordinator, the registration client crate
 (step 4a), the declaration loader and approval, the transient-unit launcher (step 3), and wiring a

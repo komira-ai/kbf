@@ -73,7 +73,9 @@ pub enum LaunchError {
 ///   the dead-man is a thread of the root part: if the root part is killed (`SIGKILL`, the OOM
 ///   killer, a crash), the unit it started runs without a bound until the updater is back and
 ///   resumes. The launcher sets `RuntimeMaxSec=` to [`StepCall::timeout_secs`] on the unit, so
-///   that systemd ends the step at its bound whatever becomes of the updater.
+///   that systemd ends the step at its bound whatever becomes of the updater. `RuntimeMaxSec=`
+///   has no effect on a `Type=oneshot` service: a launcher that starts the step as one bounds
+///   it with `TimeoutStartSec=` instead.
 pub trait StepLauncher: Send + Sync {
     /// Runs the step and waits for it to end. A step killed by its bound is a [`StepExit`] with
     /// no code.

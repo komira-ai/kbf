@@ -19,6 +19,11 @@
 //! dead-man waits in [`StepLauncher::stop`] for as long as it takes, so the launcher bounds its
 //! stop; and if the root part itself is killed, the dead-man dies with it, so the launcher also
 //! bounds the unit itself (see [`StepLauncher`]).
+//!
+//! One window is left: a stop that is under way when the step ends and the runner disarms (the
+//! step ended on its own just as its second came) is kept in [`Watch::last_error`] only if it
+//! fails, not on the arming, which is gone. The step has ended by then, so no unit is left
+//! running; the runner reads its exit as it came.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
