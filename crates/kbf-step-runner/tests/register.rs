@@ -23,7 +23,22 @@ fn me() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
+/// The group the test runs as: the group of the directories it makes.
+fn my_group() -> u32 {
+    rustix::process::getegid().as_raw()
+}
+
 struct Table(Mutex<BTreeMap<String, Grant>>);
+
+/// `svc` declared for `uid`.
+fn declared(uid: u32) -> Table {
+    Table(Mutex::new(BTreeMap::from([("svc".to_owned(), grant(uid))])))
+}
+
+/// Nothing declared.
+fn nothing() -> Table {
+    Table(Mutex::new(BTreeMap::new()))
+}
 
 impl Declared for Table {
     fn grant(&self, name: &str) -> Option<Grant> {
@@ -45,6 +60,7 @@ struct Rig {
     registry: Arc<Registry>,
     server: Arc<Server>,
     sock: PathBuf,
+    table: Arc<Table>,
 }
 
 impl Rig {
@@ -60,11 +76,11 @@ impl Rig {
         fs::create_dir_all(&state).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).unwrap();
         let clock = FakeClock::new();
-        let registry = Arc::new(Registry::load(&state, clock.clone()).unwrap());
-        let table = Table(Mutex::new(BTreeMap::from([("svc".to_owned(), grant(uid))])));
+        let table = Arc::new(declared(uid));
+        let registry = Arc::new(Registry::load(&state, clock.clone(), &*table).unwrap());
         let sock = dir.join("s");
         let mut server =
-            Server::bind(&sock, me(), None, registry.clone(), Arc::new(table)).unwrap();
+            Server::bind(&sock, me(), my_group(), registry.clone(), table.clone()).unwrap();
         if let Some(cap) = cap {
             server = server.with_max_connections(cap);
         }
@@ -75,6 +91,7 @@ impl Rig {
             registry,
             server,
             sock,
+            table,
         }
     }
 
@@ -279,7 +296,7 @@ fn a_registration_is_kept_across_a_restart_until_its_ttl() {
     // The service is connected while the updater restarts.
 
     let state = rig.scratch.path().join("state");
-    let after = Arc::new(Registry::load(&state, rig.clock.clone()).unwrap());
+    let after = Arc::new(Registry::load(&state, rig.clock.clone(), &*rig.table).unwrap());
     assert_eq!(after.report("svc", Some("2.0.0")), Reported::Healthy);
     assert_eq!(
         after.health_addr("svc").map(|h| h.addr),
@@ -309,14 +326,16 @@ fn a_registration_is_kept_across_a_restart_until_its_ttl() {
 fn a_damaged_registrations_file_is_an_error() {
     let dir = Scratch::new("reg-damaged");
     let clock = FakeClock::new();
-    assert!(Registry::load(dir.path(), clock.clone()).is_ok());
+    assert!(Registry::load(dir.path(), clock.clone(), &nothing()).is_ok());
     fs::write(dir.path().join(REGISTRATIONS_FILE), "{").unwrap();
-    let err = Registry::load(dir.path(), clock.clone()).err().unwrap();
+    let err = Registry::load(dir.path(), clock.clone(), &nothing())
+        .err()
+        .unwrap();
     assert!(matches!(err, RegistryError::Corrupt(_)));
     assert!(err.to_string().contains("not readable"));
     fs::remove_file(dir.path().join(REGISTRATIONS_FILE)).unwrap();
     fs::create_dir(dir.path().join(REGISTRATIONS_FILE)).unwrap();
-    let err = Registry::load(dir.path(), clock).err().unwrap();
+    let err = Registry::load(dir.path(), clock, &nothing()).err().unwrap();
     assert!(matches!(err, RegistryError::Io(_)));
 }
 
@@ -367,10 +386,11 @@ fn the_socket_directory_is_checked() {
     let state = scratch.path().join("state");
     fs::create_dir_all(&state).unwrap();
     let clock = FakeClock::new();
-    let registry = Arc::new(Registry::load(&state, clock).unwrap());
-    let table: Arc<dyn Declared> = Arc::new(Table(Mutex::new(BTreeMap::new())));
-    let bind =
-        |path: &Path, owner: u32| Server::bind(path, owner, None, registry.clone(), table.clone());
+    let registry = Arc::new(Registry::load(&state, clock, &nothing()).unwrap());
+    let table: Arc<dyn Declared> = Arc::new(nothing());
+    let bind = |path: &Path, owner: u32| {
+        Server::bind(path, owner, my_group(), registry.clone(), table.clone())
+    };
 
     let open = scratch.path().join("open");
     fs::create_dir(&open).unwrap();
@@ -429,7 +449,7 @@ fn the_socket_directory_is_checked() {
     ));
 }
 
-/// Catches a group that is not applied to the socket: with a group given the socket is owned by it.
+/// Catches a group that is not applied to the socket: the socket is owned by the register group.
 #[test]
 fn the_socket_takes_the_given_group() {
     let scratch = Scratch::new("reg-group");
@@ -438,10 +458,10 @@ fn the_socket_takes_the_given_group() {
     fs::create_dir_all(&state).unwrap();
     fs::create_dir_all(&run).unwrap();
     fs::set_permissions(&run, fs::Permissions::from_mode(0o750)).unwrap();
-    let registry = Arc::new(Registry::load(&state, FakeClock::new()).unwrap());
-    let table: Arc<dyn Declared> = Arc::new(Table(Mutex::new(BTreeMap::new())));
-    let gid = rustix::process::getegid().as_raw();
-    let _server = Server::bind(&run.join("s"), me(), Some(gid), registry, table).unwrap();
+    let registry = Arc::new(Registry::load(&state, FakeClock::new(), &nothing()).unwrap());
+    let table: Arc<dyn Declared> = Arc::new(nothing());
+    let gid = my_group();
+    let _server = Server::bind(&run.join("s"), me(), gid, registry, table).unwrap();
     use std::os::unix::fs::MetadataExt;
     assert_eq!(fs::metadata(run.join("s")).unwrap().gid(), gid);
 }
@@ -508,7 +528,8 @@ fn a_stopped_service_is_still_stopped_after_a_restart() {
     say(&client, &registration("2.0.0", None));
     drop(client);
     served.join().unwrap().unwrap();
-    let after = Registry::load(&rig.scratch.path().join("state"), rig.clock.clone()).unwrap();
+    let state = rig.scratch.path().join("state");
+    let after = Registry::load(&state, rig.clock.clone(), &*rig.table).unwrap();
     assert_eq!(
         after.report("svc", Some("2.0.0")),
         Reported::Unhealthy(Why::Stopped)
@@ -546,12 +567,9 @@ fn one_user_cannot_hold_every_connection() {
     let server = Server::bind(
         &rig.scratch.path().join("run").join("p"),
         me(),
-        None,
+        my_group(),
         rig.registry.clone(),
-        Arc::new(Table(Mutex::new(BTreeMap::from([(
-            "svc".to_owned(),
-            grant(me()),
-        )])))),
+        Arc::new(declared(me())),
     )
     .unwrap()
     .with_max_per_uid(1);

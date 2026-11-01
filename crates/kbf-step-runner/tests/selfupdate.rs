@@ -9,10 +9,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use kbf_step_runner::Finished;
 use kbf_step_runner::selfupdate::{
     FollowOn, Layout, START_LIMIT_BURST, fallback_unit, follow_on, main_dropin,
 };
+use kbf_step_runner::{Finished, Staged};
 use support::Scratch;
 use update_hook::{Class, Phase, Verdict};
 
@@ -20,6 +20,17 @@ fn binary(dir: &Path, name: &str, text: &str) -> PathBuf {
     let path = dir.join(name);
     fs::write(&path, text).unwrap();
     path
+}
+
+/// The updater binary of a release, in its own staged tree.
+const UPDATER: &str = "bin/updater";
+
+/// A release tree under `dir` whose updater binary is a copy of `from`, sealed.
+fn release(dir: &Path, name: &str, from: &Path) -> Staged {
+    let tree = dir.join(format!("release-{name}"));
+    fs::create_dir_all(tree.join("bin")).unwrap();
+    fs::copy(from, tree.join(UPDATER)).unwrap();
+    Staged::seal(&tree).unwrap()
 }
 
 fn done(verdict: Verdict) -> Finished {
@@ -135,7 +146,8 @@ fn the_follow_on_restarts_only_after_a_success_that_changes_the_binary() {
     let s = Scratch::new("su-follow");
     let layout = Layout::new(&s.path().join("bin"));
     let v1 = binary(s.path(), "a", "a");
-    let v2 = binary(s.path(), "b", "b");
+    let v2 = release(s.path(), "v2", &binary(s.path(), "b", "b"));
+    let updater = Path::new(UPDATER);
     layout.stage("v1", &v1).unwrap();
     layout.switch("v1").unwrap();
 
@@ -150,23 +162,23 @@ fn the_follow_on_restarts_only_after_a_success_that_changes_the_binary() {
         Verdict::Halt,
     ] {
         assert_eq!(
-            follow_on(&done(verdict), &layout, "v1", "v2", &v2).unwrap(),
+            follow_on(&done(verdict), &layout, "v1", "v2", &v2, updater).unwrap(),
             FollowOn::NotNeeded
         );
         assert_eq!(layout.current().unwrap(), Some("v1".to_owned()));
     }
     assert_eq!(
-        follow_on(&ok(), &layout, "v2", "v2", &v2).unwrap(),
+        follow_on(&ok(), &layout, "v2", "v2", &v2, updater).unwrap(),
         FollowOn::NotNeeded
     );
     assert!(!layout.dir().join("versions/v2").exists());
 
     assert_eq!(
-        follow_on(&ok(), &layout, "v1", "v2", &v2).unwrap(),
+        follow_on(&ok(), &layout, "v1", "v2", &v2, updater).unwrap(),
         FollowOn::Restart
     );
     assert_eq!(
-        follow_on(&ok(), &layout, "v1", "v2", &v2).unwrap(),
+        follow_on(&ok(), &layout, "v1", "v2", &v2, updater).unwrap(),
         FollowOn::Restart
     );
     assert_eq!(
@@ -177,10 +189,10 @@ fn the_follow_on_restarts_only_after_a_success_that_changes_the_binary() {
         promotion_pending: true,
     });
     assert_eq!(
-        follow_on(&pending, &layout, "v2", "v2", &v2).unwrap(),
+        follow_on(&pending, &layout, "v2", "v2", &v2, updater).unwrap(),
         FollowOn::NotNeeded
     );
-    assert!(follow_on(&ok(), &layout, "v2", "v3", &s.path().join("absent")).is_err());
+    assert!(follow_on(&ok(), &layout, "v2", "v3", &v2, Path::new("bin/absent")).is_err());
 }
 
 fn system_binary(name: &str) -> PathBuf {
@@ -203,9 +215,9 @@ fn a_binary_that_exits_at_start_is_replaced_by_the_previous() {
     let ran = Command::new(layout.current_path()).status().unwrap();
     assert!(ran.success());
 
-    let new = system_binary("false");
+    let new = release(s.path(), "bad", &system_binary("false"));
     assert_eq!(
-        follow_on(&ok(), &layout, "good", "bad", &new).unwrap(),
+        follow_on(&ok(), &layout, "good", "bad", &new, Path::new(UPDATER)).unwrap(),
         FollowOn::Restart
     );
     for _ in 0..START_LIMIT_BURST {

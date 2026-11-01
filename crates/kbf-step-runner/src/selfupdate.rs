@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 
 use update_hook::Verdict;
 
+use crate::artifact::{ArtifactError, Staged};
 use crate::runner::Finished;
 
 /// The failed starts after which the fallback runs.
@@ -165,11 +166,8 @@ fn check_version(version: &str) -> io::Result<()> {
 }
 
 /// The follow-on step of an update that finished: when it succeeded and this updater (version
-/// `running`) is not `version`, stages `new_binary` as `version` and switches to it.
-///
-/// **The caller verifies `new_binary` first**: this copies and links whatever file it is given.
-/// It must be the updater binary of the release the updater verified (digest and attestation),
-/// taken from a staged tree checked with `Staged::check`.
+/// `running`) is not `version`, stages the updater binary `binary` of the verified release
+/// `release` as `version` and switches to it.
 ///
 /// The record of the update is finished before this is called ([`crate::StepRunner::run`]
 /// returned), so the restart interrupts nothing. It is safe to call again after a crash: the
@@ -180,12 +178,14 @@ pub fn follow_on(
     layout: &Layout,
     running: &str,
     version: &str,
-    new_binary: &Path,
-) -> io::Result<FollowOn> {
+    release: &Staged,
+    binary: &Path,
+) -> Result<FollowOn, ArtifactError> {
     if !matches!(finished.verdict, Verdict::Succeeded { .. }) || running == version {
         return Ok(FollowOn::NotNeeded);
     }
-    layout.stage(version, new_binary)?;
+    let new_binary = release.dir().join(binary);
+    layout.stage(version, &new_binary)?;
     layout.switch(version)?;
     Ok(FollowOn::Restart)
 }

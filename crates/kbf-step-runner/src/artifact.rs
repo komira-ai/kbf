@@ -34,22 +34,51 @@ pub enum ArtifactError {
 }
 
 /// A staged release and its digest.
+///
+/// Its fields are private: a `Staged` is made only by [`Staged::seal`], so every one names a
+/// tree as it was when it was sealed, and what runs from it is reached through
+/// [`Staged::check`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Staged {
     /// The absolute path of the tree.
-    pub dir: PathBuf,
+    dir: PathBuf,
     /// The lower-case hex sha256 of the tree ([`tree_digest`]) at the time it was verified.
-    pub digest: String,
+    digest: String,
 }
 
 impl Staged {
     /// The tree at `dir` as it is now. Called by the step that verified the release, once, right
     /// after the verification and before anything else touches the tree.
     pub fn seal(dir: &Path) -> Result<Staged, ArtifactError> {
+        Staged::seal_with(dir, &host_owner)
+    }
+
+    /// [`Staged::seal`], reading the owner of an entry (user id, group id) from `owner` as
+    /// [`tree_digest_with`] does, so that a test can seal a tree as another user would own it.
+    ///
+    /// `dir` must be absolute and made of plain names ([`ArtifactError::Untrusted`] otherwise):
+    /// the checks of its ancestors would else be made on something else than the tree that runs.
+    pub fn seal_with(
+        dir: &Path,
+        owner: &dyn Fn(&fs::Metadata) -> (u32, u32),
+    ) -> Result<Staged, ArtifactError> {
+        if !dir.is_absolute() || !dir.components().skip(1).all(is_plain) {
+            return Err(ArtifactError::Untrusted(dir.to_path_buf()));
+        }
         Ok(Staged {
             dir: dir.to_path_buf(),
-            digest: tree_digest(dir)?,
+            digest: tree_digest_with(dir, owner)?,
         })
+    }
+
+    /// The absolute path of the tree.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The lower-case hex sha256 of the tree at the time it was sealed.
+    pub fn digest(&self) -> &str {
+        &self.digest
     }
 
     /// Checks the tree still has its digest and returns the hook executable inside it.
@@ -107,20 +136,18 @@ impl Staged {
     }
 }
 
-fn host_owner(meta: &fs::Metadata) -> (u32, u32) {
+pub(crate) fn host_owner(meta: &fs::Metadata) -> (u32, u32) {
     (meta.uid(), meta.gid())
 }
 
 /// The tree and every directory above it are real directories (not links) owned by a trusted
-/// user and not writable by group or others; the path is absolute and made of plain names.
+/// user and not writable by group or others. The path is absolute and made of plain names:
+/// [`Staged::seal_with`] makes no other.
 fn check_place(
     dir: &Path,
     trusted: &[u32],
     owner: &dyn Fn(&fs::Metadata) -> (u32, u32),
 ) -> Result<(), ArtifactError> {
-    if !dir.is_absolute() || !dir.components().skip(1).all(is_plain) {
-        return Err(ArtifactError::Untrusted(dir.to_path_buf()));
-    }
     let mut at = PathBuf::new();
     for part in dir.components() {
         at.push(part);

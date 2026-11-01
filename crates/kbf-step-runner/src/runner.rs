@@ -7,6 +7,7 @@
 //! leaves a record that [`StepRunner::run`] picks up: a step found `running` has its unit
 //! stopped by name and is run again, a step found `done` is not.
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -122,7 +123,23 @@ pub enum RunError {
     Busy { service: String, target: String },
     #[error("the step record has schema {0}, newer than this updater writes")]
     RecordNewer(u64),
+    /// The staged release could not be read (out of descriptors, an I/O error): nothing ran and
+    /// the step is still `pending` in the record. Calling [`StepRunner::run`] again checks the
+    /// release again.
+    #[error(
+        "the staged release cannot be read now; nothing ran and the step is still pending: {0}"
+    )]
+    Unreadable(ArtifactError),
+    /// The dead-man could not stop the step at its bound, and the step ended later: it is left
+    /// `running` in the record, so that [`StepRunner::run`] again stops its unit by name before
+    /// anything else and runs the step again.
+    #[error("the dead-man could not stop {unit} at its bound ({error}); the step is left running")]
+    Unstopped { unit: String, error: String },
 }
+
+/// A test's way to make the check of the staged release fail with an I/O error before a step:
+/// `Some` for the step whose check fails. It can only make a check fail, never pass.
+pub type CheckFault = Arc<dyn Fn(Step) -> Option<io::Error> + Send + Sync>;
 
 enum Ran {
     Exit(StepExit),
@@ -135,6 +152,7 @@ pub struct StepRunner {
     clock: Arc<dyn Clock>,
     store: RecordStore,
     watch: Arc<Watch>,
+    fault: Option<CheckFault>,
 }
 
 impl StepRunner {
@@ -148,7 +166,15 @@ impl StepRunner {
             clock,
             store,
             watch: Watch::new(),
+            fault: None,
         }
+    }
+
+    /// The same runner, its check of the staged release failed wherever `fault` says: the seam of
+    /// the tests of a release that cannot be read for a moment.
+    pub fn with_check_fault(mut self, fault: CheckFault) -> StepRunner {
+        self.fault = Some(fault);
+        self
     }
 
     /// What the dead-man watches: give it to [`crate::DeadMan::new`].
@@ -202,11 +228,11 @@ impl StepRunner {
     /// starts the next generation: the verdict of a finished update is read with
     /// [`StepRunner::last_result`].
     pub fn run(&self, order: &UpdateOrder) -> Result<Finished, RunError> {
-        let staged = path_str(&order.staged.dir)?;
+        let staged = path_str(order.staged.dir())?;
         let previous = order
             .previous
             .as_ref()
-            .map(|p| path_str(&p.dir))
+            .map(|p| path_str(p.dir()))
             .transpose()?;
         if order.service.is_empty()
             || !order
@@ -302,9 +328,9 @@ impl StepRunner {
             schema: SCHEMA,
             service: order.service.clone(),
             target_version: order.target_version.clone(),
-            artifact_digest: order.staged.digest.clone(),
+            artifact_digest: order.staged.digest().to_owned(),
             tarball_digest: order.artifact_digest.clone(),
-            previous_digest: order.previous.as_ref().map(|p| p.digest.clone()),
+            previous_digest: order.previous.as_ref().map(|p| p.digest().to_owned()),
             generation,
             params: self.store.params_path(),
             step: Step::Prepare,
@@ -344,7 +370,11 @@ impl StepRunner {
             HookSel::New => &order.staged,
             HookSel::Previous => order.previous.as_ref().unwrap_or(&order.staged),
         };
-        let ran = match release.check(&order.hook_binary) {
+        let checked = match self.fault.as_ref().and_then(|fault| fault(rec.step)) {
+            Some(error) => Err(ArtifactError::Io(error)),
+            None => release.check(&order.hook_binary),
+        };
+        let ran = match checked {
             Ok(executable) => self.launch(order, rec, &executable)?,
             // The hook cannot be started: a failed step, and for `rollback` the one case to go
             // to the previous release's hook (3.3).
@@ -404,7 +434,7 @@ impl StepRunner {
         };
         self.store.save(rec)?;
         let unit = rec.unit(rec.step);
-        let artifact = (rec.step == Step::Prepare).then(|| order.staged.dir.clone());
+        let artifact = (rec.step == Step::Prepare).then(|| order.staged.dir().to_path_buf());
         self.watch.arm(&unit, deadline_secs);
         let result = self.launcher.run(&StepCall {
             service: &order.service,
@@ -572,9 +602,9 @@ fn wait_secs(asked: Option<u64>, default: u64) -> u64 {
 fn same_update(rec: &Record, order: &UpdateOrder) -> bool {
     rec.service == order.service
         && rec.target_version == order.target_version
-        && rec.artifact_digest == order.staged.digest
+        && rec.artifact_digest == order.staged.digest()
         && rec.tarball_digest == order.artifact_digest
-        && rec.previous_digest == order.previous.as_ref().map(|p| p.digest.clone())
+        && rec.previous_digest.as_deref() == order.previous.as_ref().map(Staged::digest)
 }
 
 fn path_str(path: &Path) -> Result<&str, RunError> {

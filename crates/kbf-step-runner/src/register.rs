@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::artifact::host_owner;
 use crate::clock::Clock;
 use crate::record::write_atomic;
 
@@ -42,6 +43,9 @@ use crate::record::write_atomic;
 pub const REGISTRATIONS_FILE: &str = "registrations.json";
 /// Starts the thread of a connection.
 pub type Spawn = Box<dyn Fn(Box<dyn FnOnce() + Send>) -> io::Result<()> + Send + Sync>;
+/// Writes the registrations (the bytes of [`REGISTRATIONS_FILE`]) into the state directory,
+/// durably.
+pub type Writer = Box<dyn Fn(&Path, &[u8]) -> io::Result<()> + Send + Sync>;
 /// The connections a server serves at once unless told otherwise.
 pub const MAX_CONNECTIONS: usize = 64;
 /// The connections of one user served at once unless told otherwise.
@@ -129,6 +133,10 @@ pub enum RegistryError {
     SocketDir(PathBuf),
     #[error("a registration server already answers on {0:?}")]
     AlreadyServing(PathBuf),
+    #[error(
+        "{0:?} is in the way of the registration socket: it is not a stale socket of the updater"
+    )]
+    InTheWay(PathBuf),
 }
 
 /// What the updater reports for a service.
@@ -191,11 +199,16 @@ pub struct Registry {
     dir: PathBuf,
     clock: Arc<dyn Clock>,
     inner: Mutex<Inner>,
+    writer: Writer,
 }
 
 impl Registry {
     /// Loads the registrations of `dir`; every one is `unconfirmed` until its service connects.
-    pub fn load(dir: &Path, clock: Arc<dyn Clock>) -> Result<Registry, RegistryError> {
+    pub fn load(
+        dir: &Path,
+        clock: Arc<dyn Clock>,
+        _declared: &dyn Declared,
+    ) -> Result<Registry, RegistryError> {
         let since = clock.mono_secs();
         let mut inner = Inner::default();
         match fs::read(dir.join(REGISTRATIONS_FILE)) {
@@ -227,7 +240,14 @@ impl Registry {
             dir: dir.to_path_buf(),
             clock,
             inner: Mutex::new(inner),
+            writer: Box::new(|dir, bytes| write_atomic(dir, REGISTRATIONS_FILE, bytes)),
         })
+    }
+
+    /// The same registry, writing through `writer` (a test makes the disk slow or failing).
+    pub fn with_writer(mut self, writer: Writer) -> Registry {
+        self.writer = writer;
+        self
     }
 
     fn inner(&self) -> MutexGuard<'_, Inner> {
@@ -289,7 +309,7 @@ impl Registry {
             .collect();
         let bytes =
             serde_json::to_vec(&saved).map_err(|e| RegistryError::Corrupt(e.to_string()))?;
-        Ok(write_atomic(&self.dir, REGISTRATIONS_FILE, &bytes)?)
+        Ok((self.writer)(&self.dir, &bytes)?)
     }
 
     /// The connection `conn` closed: its service is stopped, unless a later registration of
@@ -401,22 +421,18 @@ impl Drop for Slot {
 impl Server {
     /// Binds the socket at `path`.
     ///
-    /// Its directory must be a real directory owned by `dir_owner` and closed to others (mode
-    /// without any `o` bit); in production it is root's, group `updater-register`, mode 0750.
-    /// The socket is made mode 0660 and, when `group` is given, owned by that group. A stale
+    /// Its directory is checked with [`check_socket_dir`]: in production it is root's, group
+    /// `updater-register`, mode 0750. The socket is made mode 0660 and owned by `group`. A stale
     /// socket file (nobody answers) is replaced; one that answers is [`RegistryError::AlreadyServing`].
     pub fn bind(
         path: &Path,
-        dir_owner: u32,
-        group: Option<u32>,
+        owner: u32,
+        group: u32,
         registry: Arc<Registry>,
         declared: Arc<dyn Declared>,
     ) -> Result<Server, RegistryError> {
         let dir = path.parent().unwrap_or(Path::new("/"));
-        let meta = fs::symlink_metadata(dir)?;
-        if !meta.is_dir() || meta.uid() != dir_owner || meta.mode() & 0o027 != 0 {
-            return Err(RegistryError::SocketDir(dir.to_path_buf()));
-        }
+        check_socket_dir(dir, owner, group, &host_owner)?;
         match UnixStream::connect(path) {
             Ok(_) => return Err(RegistryError::AlreadyServing(path.to_path_buf())),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -425,10 +441,8 @@ impl Server {
         }
         let listener = UnixListener::bind(path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o660))?;
-        if let Some(gid) = group {
-            rustix::fs::chown(path, None, Some(rustix::fs::Gid::from_raw(gid)))
-                .map_err(io::Error::from)?;
-        }
+        rustix::fs::chown(path, None, Some(rustix::fs::Gid::from_raw(group)))
+            .map_err(io::Error::from)?;
         Ok(Server {
             listener,
             registry,
@@ -612,6 +626,22 @@ impl Server {
         let conn = self.registry.register(peer, &registration, &grant)?;
         Ok((registration.name, conn))
     }
+}
+
+/// Checks the directory of the registration socket: a real directory owned by `owner` and
+/// closed to others (mode without any `o` bit), reading the owner of a directory (user id, group
+/// id) from `read`.
+pub fn check_socket_dir(
+    dir: &Path,
+    owner: u32,
+    _group: u32,
+    read: &dyn Fn(&fs::Metadata) -> (u32, u32),
+) -> Result<(), RegistryError> {
+    let meta = fs::symlink_metadata(dir)?;
+    if !meta.is_dir() || read(&meta).0 != owner || meta.mode() & 0o027 != 0 {
+        return Err(RegistryError::SocketDir(dir.to_path_buf()));
+    }
+    Ok(())
 }
 
 fn reply(stream: &UnixStream, error: Option<&'static str>) -> Result<(), RegistryError> {

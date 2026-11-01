@@ -63,9 +63,11 @@ impl Watch {
         });
     }
 
-    /// The step ended.
-    pub fn disarm(&self) {
+    /// The step ended. `Some` with the error of the dead-man's stop when the step passed its
+    /// bound and the dead-man could not stop it.
+    pub fn disarm(&self) -> Option<String> {
         self.state().active = None;
+        None
     }
 
     /// The last error of stopping a unit, `None` when the last stop worked.
