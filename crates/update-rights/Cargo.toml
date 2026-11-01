@@ -34,5 +34,14 @@ name = "update-rights-probe"
 path = "tests/bin/probe_hook.rs"
 test = false
 
+[features]
+# `Declared::by_hand`, for the tests of this crate: a loaded declaration made without a directory.
+# Off for everything else, so a `Declared` comes only from `load_dir`.
+test-support = []
+
+[dev-dependencies]
+# Its own tests turn on `test-support`.
+update-rights = { path = ".", features = ["test-support"] }
+
 [lints]
 workspace = true

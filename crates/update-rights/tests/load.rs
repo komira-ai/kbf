@@ -157,11 +157,11 @@ fn a_good_directory_loads_every_service() {
         ["other", "tierstore"]
     );
     let declared = &loaded.services["tierstore"];
-    assert_eq!(declared.digest, Digest::of(tierstore.text().as_bytes()));
-    assert_eq!(declared.file, path);
-    assert_eq!(declared.service, UserIds { uid: 990, gid: 990 });
-    assert_eq!(declared.service_gids, [994, 990]);
-    assert_eq!(declared.declaration.name, "tierstore");
+    assert_eq!(declared.digest(), &Digest::of(tierstore.text().as_bytes()));
+    assert_eq!(declared.file(), path);
+    assert_eq!(declared.service(), UserIds { uid: 990, gid: 990 });
+    assert_eq!(declared.service_gids(), [994, 990]);
+    assert_eq!(declared.declaration().name, "tierstore");
 }
 
 /// Catches files that are not declarations being read as declarations: the approval record
@@ -956,25 +956,17 @@ impl Spawner for Silent {
 fn a_loaded_declaration_whose_hook_has_uid_zero_is_held_to_the_root_rules_however_it_is_called() {
     let host = Host::new("uid-zero");
     let mut spec = Spec::new("tierstore");
-    host.put(&spec);
     spec.read = vec![host.scratch.path().join("data").display().to_string()];
-    let mut declared = {
-        let loaded = host.load();
-        loaded.services["tierstore"].clone()
-    };
-    declared.declaration.hook.read_paths = spec.read.iter().cloned().collect();
+    let declaration = update_rights::Declaration::parse(&spec.text()).unwrap();
     let release = host.scratch.path();
 
-    declared.hook = UserIds {
-        uid: 65534,
-        gid: 65534,
-    };
+    let declared = support::declared(declaration.clone(), 65534, &["tierstore"]);
     assert_eq!(declared.recheck(), Ok(()));
     let ordinary = Launch::of(&declared, Step::Verify, 1, release, None);
     assert!(!ordinary.root_hook());
     run_step(&Silent, &ordinary).expect("an ordinary hook");
 
-    declared.hook = UserIds { uid: 0, gid: 0 };
+    let declared = support::declared(declaration, 0, &["tierstore"]);
     assert!(matches!(declared.recheck(), Err(Refusal::Ancestor { .. })));
     let root = Launch::of(&declared, Step::Verify, 1, release, None);
     assert!(root.root_hook());

@@ -152,16 +152,5 @@ pub fn declared(
     hook_uid: u32,
     names: &[&str],
 ) -> update_rights::Declared {
-    update_rights::Declared {
-        declaration,
-        digest: update_rights::Digest::of(b"by hand"),
-        file: PathBuf::from("by-hand.toml"),
-        service: update_rights::UserIds { uid: 990, gid: 990 },
-        hook: update_rights::UserIds {
-            uid: hook_uid,
-            gid: hook_uid,
-        },
-        service_gids: vec![990],
-        names: names.iter().map(|name| (*name).to_owned()).collect(),
-    }
+    update_rights::Declared::by_hand(declaration, hook_uid, names)
 }

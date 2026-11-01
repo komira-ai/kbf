@@ -41,21 +41,71 @@ pub struct Policy<'a> {
 /// A declaration that passed every rule.
 #[derive(Clone, Debug)]
 pub struct Declared {
-    pub declaration: Declaration,
-    /// The digest of the exact bytes of the file: what `approve` names.
-    pub digest: Digest,
-    pub file: PathBuf,
-    pub service: UserIds,
-    /// The ids of the hook's account.
-    pub hook: UserIds,
-    /// The service account's primary group and the groups that list it.
-    pub service_gids: Vec<u32>,
-    /// The names of every declared service of the host at the load, this one included: what a root
-    /// hook's write paths are held apart from, at the load and again at each launch.
-    pub names: BTreeSet<String>,
+    pub(crate) declaration: Declaration,
+    pub(crate) digest: Digest,
+    pub(crate) file: PathBuf,
+    pub(crate) service: UserIds,
+    pub(crate) hook: UserIds,
+    pub(crate) service_gids: Vec<u32>,
+    pub(crate) names: BTreeSet<String>,
 }
 
 impl Declared {
+    /// The declaration.
+    pub fn declaration(&self) -> &Declaration {
+        &self.declaration
+    }
+
+    /// The digest of the exact bytes of the file: what `approve` names.
+    pub fn digest(&self) -> &Digest {
+        &self.digest
+    }
+
+    pub fn file(&self) -> &Path {
+        &self.file
+    }
+
+    /// The ids of the service's account.
+    pub fn service(&self) -> UserIds {
+        self.service
+    }
+
+    /// The ids of the hook's account, as the loader resolved them.
+    pub fn hook(&self) -> UserIds {
+        self.hook
+    }
+
+    /// The service account's primary group and the groups that list it.
+    pub fn service_gids(&self) -> &[u32] {
+        &self.service_gids
+    }
+
+    /// The names of every declared service of the host at the load, this one included: what a root
+    /// hook's write paths are held apart from, at the load and again at each launch.
+    pub fn names(&self) -> &BTreeSet<String> {
+        &self.names
+    }
+
+    /// A loaded declaration made by hand, for tests: the hook's account has the uid `hook_uid` and the
+    /// host declares these `names`. Only with the `test-support` feature, which this crate's own tests
+    /// turn on; a `Declared` otherwise comes only from [`load_dir`], so no code can launch from one
+    /// with names or a uid the loader did not resolve.
+    #[cfg(feature = "test-support")]
+    pub fn by_hand(declaration: Declaration, hook_uid: u32, names: &[&str]) -> Declared {
+        Declared {
+            declaration,
+            digest: Digest::of(b"by hand"),
+            file: PathBuf::from("by-hand.toml"),
+            service: UserIds { uid: 990, gid: 990 },
+            hook: UserIds {
+                uid: hook_uid,
+                gid: hook_uid,
+            },
+            service_gids: vec![990],
+            names: names.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
     /// [`recheck_targets`] for this declaration, with the uid of the hook account the loader
     /// resolved: the one way to recheck that cannot be told the wrong answer.
     pub fn recheck(&self) -> Result<(), Refusal> {

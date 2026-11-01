@@ -1133,8 +1133,11 @@ fn a_root_hook_cannot_write_in_another_services_directory_through_a_link() {
     spec.user = "root".to_owned();
     spec.group = "root".to_owned();
     spec.write = vec![link.display().to_string()];
-    let mut declared = rig.declared(&spec, &["ok", "--"]);
-    declared.names.insert("probe-trespass-b".to_owned());
+    let declared = update_rights::Declared::by_hand(
+        rig.declaration(&spec, &["ok", "--"]),
+        0,
+        &["probe-trespass", "probe-trespass-b"],
+    );
     assert_eq!(
         declared.recheck(),
         Ok(()),
