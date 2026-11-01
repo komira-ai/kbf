@@ -75,6 +75,41 @@ fn the_submit_evidence_fields_are_43_to_47_and_older_records_read_absent() {
 }
 
 #[test]
+fn the_invocation_fields_are_48_and_49_and_older_records_read_absent() {
+    // Catches: a field renumbered onto another (the wire would read one id as another), a
+    // record written before the fields failing to decode or reading an id, `optional` lost
+    // (an absent id written as an empty string, so a build named "" appears), and an
+    // empty id lost on the way (a present empty value is not an absent one).
+    use prost::Message as _;
+    let r = RunRecord {
+        invocation_id: Some("a".to_owned()),
+        correlated_invocations_id: Some("b".to_owned()),
+        ..RunRecord::default()
+    };
+    // Tag 48, length-delimited: key 386 (0x82 0x03); 49: key 394 (0x8a 0x03).
+    assert_eq!(
+        r.encode_to_vec(),
+        [0x82, 0x03, 0x01, b'a', 0x8a, 0x03, 0x01, b'b']
+    );
+    assert_eq!(RunRecord::decode(r.encode_to_vec().as_slice()).unwrap(), r);
+    let empty = RunRecord {
+        invocation_id: Some(String::new()),
+        ..RunRecord::default()
+    };
+    assert_eq!(empty.encode_to_vec(), [0x82, 0x03, 0x00]);
+    let older = RunRecord {
+        seq: 3,
+        ..RunRecord::default()
+    };
+    assert_eq!(older.encode_to_vec(), [0x18, 0x03]);
+    let read = RunRecord::decode(older.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(
+        (read.invocation_id, read.correlated_invocations_id),
+        (None, None)
+    );
+}
+
+#[test]
 fn a_digest_prefix_is_its_first_eight_bytes() {
     // Catches: a little-endian prefix, which would not match the 16 hex digits the
     // digest is shown with.

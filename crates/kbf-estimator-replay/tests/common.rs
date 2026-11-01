@@ -296,6 +296,8 @@ pub fn attempt(digest: &str, queued_s: u64, run_s: u64, outcome: &str, peak: Opt
         operation: None,
         booked_millicpus: None,
         node_cpu_pressure_centi: None,
+        invocation_id: None,
+        correlated_invocations_id: None,
     }
 }
 

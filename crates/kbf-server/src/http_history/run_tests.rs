@@ -76,6 +76,8 @@ fn a_run_says_what_the_record_has_and_leaves_out_what_it_has_not() {
         "presubmit_us",
         "usage",
         "operation_id",
+        "invocation_id",
+        "correlated_invocations_id",
         "cpu_source",
         "memory_source",
         "input_bytes",
@@ -97,6 +99,23 @@ fn a_run_says_what_the_record_has_and_leaves_out_what_it_has_not() {
     assert_eq!(v["ended"], "1970-01-01T00:00:03.000000Z");
     assert_eq!(v["class"], "lost");
     assert!(v.get("exit_code").is_none(), "a lost run has no exit code");
+}
+
+/// Catches: the invocation or the build dropped from the run's answer, written under
+/// another key, or written as `null` or "" for a run whose record names none (a
+/// reader would take that for a build named "").
+#[test]
+fn a_run_says_its_invocation_and_build_when_the_record_names_them() {
+    let mut r = base();
+    r.invocation_id = Some("inv-1".to_owned());
+    r.correlated_invocations_id = Some("corr-1".to_owned());
+    let v = render(&r);
+    assert_eq!(v["invocation_id"], "inv-1");
+    assert_eq!(v["correlated_invocations_id"], "corr-1");
+    r.correlated_invocations_id = None;
+    let v = render(&r);
+    assert_eq!(v["invocation_id"], "inv-1");
+    assert!(v.get("correlated_invocations_id").is_none(), "{v}");
 }
 
 /// Catches: the CPU booking of a run left out of its answer, written as 0 when the record
@@ -416,7 +435,10 @@ mod recorder_side {
             owner: Owner::default(),
             instance: "main".to_owned(),
             at: at(1),
-            metadata: Metadata::default(),
+            metadata: Metadata {
+                correlated_invocations_id: Some("corr-held".to_owned()),
+                ..Metadata::default()
+            },
             kind: CallKind::Execute {
                 action,
                 answer: ExecuteAnswer::Queued {
@@ -477,6 +499,11 @@ mod recorder_side {
         assert_eq!(record.run_id(), id);
         assert_eq!(record.instance, "main");
         assert_eq!(record.node, "node-a");
+        assert_eq!(record.invocation_id.as_deref(), Some("held"));
+        assert_eq!(
+            record.correlated_invocations_id.as_deref(),
+            Some("corr-held")
+        );
         // An id nothing minted.
         assert!(live(&state, RunId::from_bytes([2; 12])).is_none());
         for (what, held, row) in [
