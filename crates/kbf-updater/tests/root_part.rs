@@ -698,6 +698,37 @@ fn a_start_does_what_a_verdict_left_undone() {
     assert!(!world.path("state/svc/declaration.previous").exists());
 }
 
+/// Catches a declaration put back under an update the runner has begun: a root part killed after
+/// the first write of the step record leaves the declaration the release carried installed, and
+/// the next start runs that update to its verdict under it and keeps it.
+#[test]
+fn a_killed_update_keeps_the_declaration_it_installed_until_its_verdict() {
+    let world = World::new("killed-carried");
+    let active = world.tierstore_shaped();
+    world.declare("svc", &active);
+    let narrower = active.replace("prepare = 600", "prepare = 500");
+    world.stage("svc", "2.0.0", Some(&narrower));
+    let killed = world
+        .root_part_gated(Arc::new(|point: CrashPoint| {
+            point == CrashPoint::AfterWrite(1)
+        }))
+        .update("svc", "2.0.0");
+    assert_eq!(killed.token(), Some("runner"), "{killed:?}");
+    assert_ne!(world.record("svc")["state"]["state"], "finished");
+    assert_eq!(
+        fs::read_to_string(world.path("updater.d/svc.toml")).unwrap(),
+        narrower
+    );
+    let started = world.root_part().start("svc", false);
+    assert!(started.ok, "{started:?}");
+    assert_eq!(verdict(&started), SUCCEEDED);
+    assert_eq!(
+        fs::read_to_string(world.path("updater.d/svc.toml")).unwrap(),
+        narrower
+    );
+    assert!(!world.path("state/svc/declaration.previous").exists());
+}
+
 /// Catches a service run with no dead-man on a host: the root part gives each service's runner a
 /// dead-man thread on the real clock, and an update runs to its verdict beside it.
 #[test]

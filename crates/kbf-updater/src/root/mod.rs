@@ -222,6 +222,15 @@ fn resumed(declared: &Declared, rec: &Record) -> Result<UpdateOrder, Refusal> {
     )
 }
 
+/// The generation of the step record in `dir`, `None` when there is none or it cannot be read:
+/// a run that changed it has begun an update.
+fn record_generation(dir: &Path) -> Option<u64> {
+    match RecordStore::new(dir).load() {
+        Ok(Stored::Current(rec)) => Some(rec.generation),
+        _ => None,
+    }
+}
+
 /// The token of a run that ended without a verdict.
 fn run_refusal(e: RunError) -> Refusal {
     let busy = matches!(e, RunError::Busy { .. });
@@ -425,10 +434,13 @@ impl RootPart {
                 ..Answer::default()
             });
         }
+        let before = record_generation(&unit.dir);
         let ran = self.run_order(service, version, &releases, release, &unit);
-        if ran.is_err() & installed {
-            // Nothing ran to a verdict under the declaration this order installed (it fails a rule
+        if ran.is_err() & installed && record_generation(&unit.dir) == before {
+            // The runner began nothing under the declaration this order installed (it fails a rule
             // of the load, or the runner refused the order): the one that was active goes back.
+            // Once the runner has begun the update's record, the declaration stays: the start pass
+            // runs that update to its verdict under it and does what the verdict leaves.
             let _ = declare::restore(&self.place(&unit.dir), service);
             let _ = self.reload();
         }
