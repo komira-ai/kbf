@@ -23,7 +23,7 @@
 //!   frontend could not write (it lost the race, or the node moved to another frontend)
 //!   follow it the same way. They are kept for the finished retention after, as the callers
 //!   of an operation this frontend finished are. A recorded call among them is ended in the
-//!   invocation record when the result is shown ([`State::record_followed`]), with no lease
+//!   invocation record when the result is shown ([`Recording::followed`](crate::run_record::Recording::followed)), with no lease
 //!   and no listing of the result.
 //! - **Joiners.** The callers of a request that joined an operation leased on a node another
 //!   frontend owns are followed the same way from the start ([`Held::Elsewhere`]): the

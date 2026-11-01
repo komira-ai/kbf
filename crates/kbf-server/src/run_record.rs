@@ -4,6 +4,12 @@
 //! killed for memory at its own limit, the cap. [`of`] reads the report before it is judged (the judging drops a
 //! killed run's result); [`killed`] adds the booking once the scheduler has taken it.
 
+mod recording;
+#[cfg(test)]
+mod recording_tests;
+
+pub(crate) use recording::Recording;
+
 use std::time::SystemTime;
 
 use kbf_invocation::{
