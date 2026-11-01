@@ -403,7 +403,7 @@ async fn only_a_failed_update_in_the_halt_phase_halts() {
 }
 
 /// Catches: a second report replacing the halt that stands: the host that halted first stays
-/// the one the convergence names.
+/// the one the convergence names, and the second report is only kept for the clear (audited).
 #[tokio::test]
 async fn a_second_halt_report_does_not_replace_the_standing_one() {
     let rig = farm("halt-first-stands").await;
@@ -414,7 +414,13 @@ async fn a_second_halt_report_does_not_replace_the_standing_one() {
     assert_eq!(halt["node_id"], "s1");
     assert_eq!(halt["check"], "disk_tainted");
     let audit = status(&rig).await["ops"]["audit"].clone();
-    assert_eq!(audit.as_array().expect("audit").len(), 1);
+    let actions: Vec<&str> = audit
+        .as_array()
+        .expect("audit")
+        .iter()
+        .map(|e| e["action"].as_str().expect("action"))
+        .collect();
+    assert_eq!(actions, ["halt", "halt_report"]);
 }
 
 /// Catches: a halt from a host an operator took out of the service, or from one whose role the
