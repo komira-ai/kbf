@@ -140,7 +140,9 @@ pub const OTHER_BUILD_VERBS: &[&str] = &["b", "rustc", "install", "zigbuild", "a
 /// What no scalar of a seed job, nor the workflow's `env:`, may name, compared ignoring ASCII
 /// case: another build system, a remote-execution or remote-cache setting, a farm's gRPC
 /// address, or another rustc (`RUSTC`, `CARGO_BUILD_RUSTC`, a wrapper, a line that writes one
-/// to `$GITHUB_ENV`: no seed job names rustc at all) or a cache that hands its work elsewhere.
+/// to `$GITHUB_ENV`: no seed job names rustc at all), a cache that hands its work elsewhere, or
+/// another target directory (`CARGO_TARGET_DIR`, `--target-dir`), which would leave the build
+/// credited here out of the `target/` the packaging steps read.
 pub const NOT_PLAIN: &[&str] = &[
     "buck2",
     "buck-out",
@@ -158,6 +160,8 @@ pub const NOT_PLAIN: &[&str] = &[
     "grpcs://",
     "rustc",
     "sccache",
+    "target_dir",
+    "target-dir",
 ];
 
 /// The directory a seed job packages its release files into (`cargo xtask package dist ...`,
@@ -180,6 +184,7 @@ const ARTIFACTS_USES: &str = "./.github/workflows/artifacts.yml";
 const RELEASE_VERIFY: &str = "verify";
 const RELEASE_PUBLISH: &str = "publish";
 const PIPELINE_RUN_ID: &str = "${{ github.event.workflow_run.id }}";
+const THIS_REPOSITORY: &str = "${{ github.repository }}";
 
 /// The workflow texts the rules read: `artifacts.yml`, `pipeline.yml`, `release.yml`, and
 /// every other workflow the pipeline calls, by its `uses:` path.
@@ -496,7 +501,8 @@ fn matches(pattern: &str, name: &str) -> bool {
 /// matches it, merged (`merge-multiple: true`: otherwise each artifact lands in a directory of
 /// its own), or a `name:` that is exactly it (one lookup, no wildcard), not both; no
 /// `artifact-ids:`, which the action reads first; extracted into `dist` (`path:`, and no
-/// `skip-decompress: true`, which would leave the zip).
+/// `skip-decompress: true`, which would leave the zip); from this repository (no `repository:`
+/// but [`THIS_REPOSITORY`]).
 fn downloads(steps: &[Step], name: &str, run_id: Option<&str>) -> bool {
     let is = |s: &Step, key: &str, value: &str| input(s, key).map(str::trim) == Some(value);
     steps.iter().any(|s| {
@@ -512,6 +518,7 @@ fn downloads(steps: &[Step], name: &str, run_id: Option<&str>) -> bool {
             && !s.conditional
             && input(s, "artifact-ids").is_none()
             && input(s, "run-id") == run_id
+            && input(s, "repository").is_none_or(|r| r.trim() == THIS_REPOSITORY)
             && into_dist
             && input(s, "skip-decompress").is_none_or(|v| v.trim() == "false")
             && reads

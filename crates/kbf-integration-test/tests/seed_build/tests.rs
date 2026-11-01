@@ -970,3 +970,93 @@ fn a_download_that_does_not_put_the_seed_files_in_dist_is_refused() {
     );
     assert!(found.is_empty(), "{found:#?}");
 }
+
+#[test]
+fn a_seed_build_into_another_target_directory_is_refused() {
+    // Catches: a seed job's build sent to another target directory (`CARGO_TARGET_DIR` in a
+    // step's, the job's or the workflow's `env:`, written to `$GITHUB_ENV`, or `--target-dir`),
+    // so the plain build credited here is not the one in `target/` that packaging reads.
+    for (job, build) in KBF_BUILDS {
+        let line = build.trim_start_matches("- run: ").trim_end();
+        for to in [
+            format!("- env:\n          CARGO_TARGET_DIR: /opt/kbf/target\n        run: {line}\n"),
+            format!(
+                "- env:\n          CARGO_BUILD_TARGET_DIR: /opt/kbf/target\n        run: {line}\n"
+            ),
+            format!(
+                "- run: echo \"CARGO_TARGET_DIR=/opt/kbf/target\" >> \"$GITHUB_ENV\"\n      {build}"
+            ),
+            format!("- run: {line} --target-dir /opt/kbf/target\n"),
+        ] {
+            red(
+                &spoil_artifacts(job, build, &to),
+                &format!("the seed job `{job}` names `target"),
+            );
+        }
+    }
+    let mut w = real();
+    w.artifacts = w.artifacts.replacen(
+        "env:\n  CARGO_TERM_COLOR: always\n",
+        "env:\n  CARGO_TERM_COLOR: always\n  CARGO_TARGET_DIR: /opt/kbf/target\n",
+        1,
+    );
+    assert_ne!(w.artifacts, read(ARTIFACTS), "the workflow env is spoiled");
+    for job in SEED_JOBS {
+        red(
+            &w.problems(),
+            &format!("the seed job `{job}` names `target_dir`"),
+        );
+    }
+    let mut w = real();
+    w.artifacts = in_job(
+        &w.artifacts,
+        "linux-arm64",
+        "    runs-on: ubuntu-24.04-arm\n",
+        "    runs-on: ubuntu-24.04-arm\n    env:\n      CARGO_TARGET_DIR: /opt/kbf/target\n",
+    );
+    red(
+        &w.problems(),
+        "the seed job `linux-arm64` names `target_dir`",
+    );
+}
+
+#[test]
+fn a_download_from_another_repository_is_refused() {
+    // Catches: an attest or release download of the seed files pointed at another
+    // repository (`repository:`), whose artifacts are not this repository's seed build.
+    let pipeline_run = "          run-id: ${{ github.event.workflow_run.id }}\n";
+    let from = format!(
+        "          pattern: assets-*\n          path: dist\n          merge-multiple: true\n{pipeline_run}"
+    );
+    for repository in ["someone/kbf-farm", "komira-ai/kbf-builds"] {
+        let mut w = real();
+        w.release = in_job(
+            &w.release,
+            RELEASE_VERIFY,
+            &from,
+            &format!("{from}          repository: {repository}\n"),
+        );
+        red(
+            &w.problems(),
+            "the release's `verify` does not download `assets-linux-x86_64`",
+        );
+        red(
+            &spoil_artifacts(
+                "attest-linux",
+                "          pattern: assets-linux-*\n",
+                &format!("          pattern: assets-linux-*\n          repository: {repository}\n"),
+            ),
+            "the attest job `attest-linux` does not download `assets-linux-x86_64`",
+        );
+    }
+    // This repository, named, is the same download.
+    let mut w = real();
+    w.release = in_job(
+        &w.release,
+        RELEASE_VERIFY,
+        &from,
+        &format!("{from}          repository: ${{{{ github.repository }}}}\n"),
+    );
+    let found = w.problems();
+    assert!(found.is_empty(), "{found:#?}");
+}
