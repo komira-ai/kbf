@@ -36,7 +36,9 @@
 //!   name an expression starts); nor does such a job run a local action or call a workflow
 //!   this lint did not read. An attest job downloads each seed job's artifact, and the
 //!   release's `verify` job downloads every seed job's artifact from the pipeline run that
-//!   started it, each in an unconditional step that names it by one `pattern:` or `name:`.
+//!   started it, each in an unconditional step that names it by one `pattern:` (merged) or
+//!   `name:` and extracts it into `dist`. The seed upload is `actions/upload-artifact` itself,
+//!   not a sub-action such as `merge`, which re-uploads artifacts that exist instead of `dist`.
 //! - **The release needs them.** In `artifacts.yml` each seed job is needed by the sums job
 //!   of its platform group and by `sums` ([`SEED_GROUPS`]: the sums the attest job holds its
 //!   files to, by the digest the pipeline passes, which `pipeline_workflow` pins), and each
@@ -159,7 +161,8 @@ pub const NOT_PLAIN: &[&str] = &[
 ];
 
 /// The directory a seed job packages its release files into (`cargo xtask package dist ...`,
-/// `release_artifacts`' rules), as its upload may name it.
+/// `release_artifacts`' rules), as its upload may name it, and the one the attest jobs and the
+/// release's verify extract them into and check.
 pub const UPLOAD_PATHS: &[&str] = &["dist", "dist/"];
 
 /// The prefix of the artifacts that carry a release's files.
@@ -296,7 +299,7 @@ fn seed_job(text: &str, job: &str, out: &mut Vec<String>) -> Result<(), String> 
     let want = format!("{ASSETS_PREFIX}{job}");
     let uploads: Vec<&Step> = steps
         .iter()
-        .filter(|s| is_upload(s) && upload_name(s) == want)
+        .filter(|s| is_root_upload(s) && upload_name(s) == want)
         .collect();
     match uploads.as_slice() {
         [one] if !one.conditional => {
@@ -427,6 +430,15 @@ fn is_upload(step: &Step) -> bool {
     runs_action(step, "actions/upload-artifact")
 }
 
+/// Whether `step` runs `actions/upload-artifact` itself, the action that uploads the job's
+/// files (its sub-actions, such as `merge`, re-upload artifacts that already exist).
+fn is_root_upload(step: &Step) -> bool {
+    step.uses.as_deref().is_some_and(|u| {
+        u.split_once('@')
+            .is_some_and(|(name, _)| name.eq_ignore_ascii_case("actions/upload-artifact"))
+    })
+}
+
 /// Whether `step` downloads workflow artifacts.
 fn is_download(step: &Step) -> bool {
     runs_action(step, "actions/download-artifact")
@@ -480,19 +492,28 @@ fn matches(pattern: &str, name: &str) -> bool {
 }
 
 /// Whether an unconditional download step of `steps` reads the artifact `name`, with `run-id`
-/// `run_id` (none: this run's), by a `pattern:` that matches it or a `name:` that is exactly it
-/// (one lookup, no wildcard), not both, and no `artifact-ids:`, which the action reads first.
+/// `run_id` (none: this run's), into the files the checks after it read: by a `pattern:` that
+/// matches it, merged (`merge-multiple: true`: otherwise each artifact lands in a directory of
+/// its own), or a `name:` that is exactly it (one lookup, no wildcard), not both; no
+/// `artifact-ids:`, which the action reads first; extracted into `dist` (`path:`, and no
+/// `skip-decompress: true`, which would leave the zip).
 fn downloads(steps: &[Step], name: &str, run_id: Option<&str>) -> bool {
+    let is = |s: &Step, key: &str, value: &str| input(s, key).map(str::trim) == Some(value);
     steps.iter().any(|s| {
         let reads = match (input(s, "pattern"), input(s, "name")) {
-            (Some(p), None) => matches(p.trim(), name),
+            (Some(p), None) => matches(p.trim(), name) && is(s, "merge-multiple", "true"),
             (None, Some(n)) => n.trim() == name,
             _ => false,
         };
+        let into_dist = input(s, "path")
+            .map(str::trim)
+            .is_some_and(|p| UPLOAD_PATHS.contains(&p));
         is_download(s)
             && !s.conditional
             && input(s, "artifact-ids").is_none()
             && input(s, "run-id") == run_id
+            && into_dist
+            && input(s, "skip-decompress").is_none_or(|v| v.trim() == "false")
             && reads
     })
 }

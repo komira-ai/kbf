@@ -894,3 +894,79 @@ fn a_seed_upload_of_another_name_case_or_directory_is_refused() {
         );
     }
 }
+
+#[test]
+fn a_seed_upload_by_a_sub_action_is_refused() {
+    // Catches: a seed upload replaced by `actions/upload-artifact/merge` with the same inputs,
+    // which re-uploads artifacts that already exist, not the job's `dist`.
+    let uses =
+        "- uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1\n";
+    for job in SEED_JOBS {
+        red(
+            &spoil_artifacts(
+                job,
+                uses,
+                &uses.replace("upload-artifact@", "upload-artifact/merge@"),
+            ),
+            &format!("the seed job `{job}` does not upload its files as `assets-{job}` (exactly)"),
+        );
+    }
+}
+
+#[test]
+fn a_download_that_does_not_put_the_seed_files_in_dist_is_refused() {
+    // Catches: an attest or release download of the seed files sent to another directory,
+    // unmerged (each artifact in a directory of its own) or left as zips, so the checks that
+    // read `dist` no longer read the seed files.
+    let merged = "          path: dist\n          merge-multiple: true\n";
+    for to in [
+        "          path: other\n          merge-multiple: true\n",
+        "          path: dist\n          merge-multiple: false\n",
+        "          path: dist\n",
+        "          path: dist\n          merge-multiple: true\n          skip-decompress: true\n",
+    ] {
+        for (job, want) in [
+            (
+                "attest-linux",
+                "the attest job `attest-linux` does not download `assets-linux-x86_64`",
+            ),
+            (
+                "attest-darwin-arm64",
+                "the attest job `attest-darwin-arm64` does not download `assets-darwin-arm64`",
+            ),
+        ] {
+            let mut w = real();
+            let (all, start, end) = job_span(&w.artifacts, job);
+            let region = all[start..end].concat();
+            let first = region
+                .find(merged)
+                .unwrap_or_else(|| panic!("{job} merges into dist"));
+            let spoiled = format!(
+                "{}{to}{}",
+                &region[..first],
+                &region[first + merged.len()..]
+            );
+            w.artifacts = [all[..start].concat(), spoiled, all[end..].concat()].concat();
+            red(&w.problems(), want);
+        }
+        let mut w = real();
+        let from = format!("          pattern: assets-*\n{merged}");
+        w.release = in_job(
+            &w.release,
+            RELEASE_VERIFY,
+            &from,
+            &format!("          pattern: assets-*\n{to}"),
+        );
+        red(
+            &w.problems(),
+            "the release's `verify` does not download `assets-darwin-arm64`",
+        );
+    }
+    // `skip-decompress: false` is the default, and still extracts.
+    let found = spoil_artifacts(
+        "attest-darwin-arm64",
+        "          pattern: assets-darwin-arm64\n",
+        "          pattern: assets-darwin-arm64\n          skip-decompress: false\n",
+    );
+    assert!(found.is_empty(), "{found:#?}");
+}
