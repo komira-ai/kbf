@@ -14,17 +14,21 @@
 //!    version older than the one the hosts run, under the same rules);
 //! 4. the host did not fail an update to this very version (it is not told again; setting
 //!    another version lifts it);
-//! 5. the service's canary gate, if it has one, is open to the host ([`crate::canary`]);
-//! 6. the service runs on the host's role, and the role has room: fewer hosts of the role
+//! 5. the host did not decline an update to this version within its wait
+//!    ([`crate::defer`]; a deferral is not a failure, holds no slot, and a new desired
+//!    version lifts it);
+//! 6. the service's canary gate, if it has one, is open to the host ([`crate::canary`]; a
+//!    host that is deferring is not chosen as a canary);
+//! 7. the service runs on the host's role, and the role has room: fewer hosts of the role
 //!    hold a slot than `max_updating` allows (a
 //!    host holds a slot while updating, while its promotion is pending, after a failed update
 //!    until it heartbeats healthy, from the order the coordinator gave it until the host
 //!    reports it or the order ages out, [`crate::fleet::ORDER_AGE`], and, at the desired
 //!    version, until it has beaten healthy `bake_beats` times, [`crate::bake`]);
-//! 7. the role waits for the roles its definition names (`kbf`: a frontend waits for every
+//! 8. the role waits for the roles its definition names (`kbf`: a frontend waits for every
 //!    live storage, daemon and Mac host) and the service for the services in its `after`: each
 //!    live host of those runs that service's desired version and is done updating;
-//! 8. the hosts that would still be up without this one number at least the minimum: the
+//! 9. the hosts that would still be up without this one number at least the minimum: the
 //!    role's `min_up` (`kbf`: `min_up.storage` for a storage host, `min_up.frontend` for a
 //!    frontend), and at least one if the role is never the last (`kbf`: frontends), whatever
 //!    the setting says. A host is up when it is live, healthy, not
@@ -100,6 +104,8 @@ pub enum Hold {
     UpToDate,
     /// The host failed an update to the desired version.
     FailedHere,
+    /// The host declined an update to the desired version and its wait is not over.
+    Deferred,
     /// Every slot of the host's role is held.
     NoSlot,
     /// A role of the service that this one waits for has hosts behind or updating.
@@ -190,6 +196,12 @@ fn first_hold(
         (fleet.is_busy_besides(service, id, now), Hold::BusyElsewhere),
         (host.beat.version == desired.version, Hold::UpToDate),
         (failed_here, Hold::FailedHere),
+        (
+            fleet
+                .deferred_until(service, id, &desired.version, &def.defer_backoff)
+                .is_some_and(|until| now < until),
+            Hold::Deferred,
+        ),
         (
             canary::closed_to(def, desired, fleet, id, host, now),
             Hold::CanaryWait,

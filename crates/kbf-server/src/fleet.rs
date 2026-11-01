@@ -110,6 +110,37 @@ pub struct NodeDetail {
     /// not zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_cache: Option<InputCacheView>,
+    /// Who placed the node out of placement, when it is (cordoned, draining or drained).
+    /// Left out when the node is serving. A cordon with no recorded owner, which is every
+    /// cordon today, is the operator's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<Owner>,
+}
+
+/// Who owns a node's cordon, as the state store keeps it (`cordon-owner/<node>`, see
+/// `farm::cordon_owner`). Shown as `operator` or `updater:<unit>`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Owner {
+    /// An operator placed the node, or nothing records who did.
+    #[default]
+    Operator,
+    /// The host updater placed the node, for the update of the named unit.
+    Updater(String),
+}
+
+impl std::fmt::Display for Owner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Operator => f.write_str("operator"),
+            Self::Updater(unit) => write!(f, "updater:{unit}"),
+        }
+    }
+}
+
+impl Serialize for Owner {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
 }
 
 /// The counts of a node's input cache (`docs/api.md`, "Input cache counts"): cumulative since

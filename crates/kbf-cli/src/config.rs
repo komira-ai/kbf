@@ -119,6 +119,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "state-store",
             "state-store-wait-secs",
             "unservable-wait-secs",
+            "usage-profiles",
             "vm-host-floor-cpus",
             "vm-host-floor-mem-gib",
             "whole-node-allow-last-capable",

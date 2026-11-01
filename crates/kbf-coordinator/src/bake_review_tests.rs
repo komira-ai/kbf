@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use kbf_types::HostRole;
+use kbf_updater::wire::{DeferredReport, Token};
 
 use crate::bake_canary_tests::{all, beats, definition, go, held, secs, services, why};
 use crate::decide::{Decision, Hold, decide_why};
@@ -132,4 +133,31 @@ fn a_canary_that_cannot_go_yet_holds_everyone_else_on_canary_wait() {
     assert_eq!(why(&waiting, &f, "s1", 100), go());
     assert_eq!(why(&waiting, &f, "a1", 100), held(Hold::WaitingForRole));
     assert_eq!(why(&waiting, &f, "a2", 100), held(Hold::CanaryWait));
+}
+
+/// A host that declined the update is no canary while its wait lasts: the next host is the
+/// canary, the deferring host says `deferred`, and when the wait is over it is the first
+/// candidate again.
+#[test]
+fn a_deferring_host_is_not_chosen_as_the_canary() {
+    let s = services("canary = { count = 1 }", 3, 0);
+    let mut declined = beat("1.0");
+    declined.deferred = Some(DeferredReport {
+        target: version("2.0"),
+        reason: Token::parse("drain_bound").expect("a token"),
+        retry_after_secs: 300,
+    });
+    let mut f = Fleet::new(Duration::ZERO);
+    beats(&mut f, "a", &declined, 100);
+    for host in ["b", "c"] {
+        beats(&mut f, host, &beat("1.0"), 100);
+    }
+    assert_eq!(why(&s, &f, "a", 100), held(Hold::Deferred));
+    assert_eq!(why(&s, &f, "b", 100), go());
+    assert_eq!(why(&s, &f, "c", 100), held(Hold::CanaryWait));
+    for host in ["a", "b", "c"] {
+        beats(&mut f, host, &beat("1.0"), 5_000);
+    }
+    assert_eq!(why(&s, &f, "a", 5_000), go());
+    assert_eq!(why(&s, &f, "b", 5_000), held(Hold::CanaryWait));
 }
