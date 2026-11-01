@@ -375,6 +375,11 @@ pub struct RunRecord {
     pub booked_millicpus: Option<u64>,
     /// The scheduler's operation the attempt belonged to: every attempt of one operation
     /// (a ladder of memory bookings) carries the same one, so they can be regrouped.
+    /// Unique over one state store: every frontend of the store, on either scheduler core,
+    /// numbers operations from blocks it reserves with a compare-and-set on the store's
+    /// shared counter (`meta/next_op`), so ids do not repeat across frontends or restarts.
+    /// A server with no state store numbers from its own counter, which starts again at a
+    /// restart: its ids are unique within one process only.
     /// Absent: a record written before the field, or a row that named none. Fields 43 on
     /// follow the estimator's usage fields (39 to 42).
     #[prost(uint64, optional, tag = "43")]
