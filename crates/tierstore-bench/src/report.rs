@@ -637,6 +637,7 @@ mod tests {
             notes: notes.iter().map(|n| (*n).to_owned()).collect(),
             cold_state: vec![],
             rate_caps: None,
+            objects_per_pass: None,
         }
     }
 

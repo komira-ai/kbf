@@ -12,7 +12,9 @@
 //! and only attempts with a run record (calls with no invocation id leave none); a build's
 //! actions are read from its record, which is in memory for `--invocation-memory` or in
 //! history for the retention class; node capacity is a point in time; the API writes 0 for
-//! an unmeasured peak or wall, which the row records as absent.
+//! an unmeasured peak or wall, which the row records as absent; the invocation and build ids
+//! come from the run record (`invocation_id`, `correlated_invocations_id`), so a server that
+//! predates them gives rows without, and the walk's own invocation is never put in their place.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -295,6 +297,8 @@ fn row_of(v: &Value, nodes: &BTreeMap<String, Node>) -> Result<Row, String> {
             .as_u64()
             .or_else(|| usage.and_then(|u| u["booked_millicpus"].as_u64())),
         node_cpu_pressure_centi: usage.and_then(|u| u["node_cpu_pressure_centi"].as_u64()),
+        invocation_id: str_of(v, "invocation_id").map(str::to_owned),
+        correlated_invocations_id: str_of(v, "correlated_invocations_id").map(str::to_owned),
     })
 }
 
