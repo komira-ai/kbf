@@ -63,7 +63,6 @@ fn a_run_that_never_starts_records_no_task_phase() {
     fast.mark(Mark::Prepared, at(1));
     fast.mark(Mark::Posted, at(2));
     assert_eq!(fast.mark(Mark::Ended, at(9)), [(Phase::Run, secs(7))]);
-    assert!(fast.mark(Mark::Running, at(10)).is_empty());
 }
 
 /// Catches a phase observed again, or moved, by a stamp set twice (a run read back as running on

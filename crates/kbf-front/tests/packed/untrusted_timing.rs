@@ -14,8 +14,10 @@ use prost_types::Timestamp;
 use crate::untrusted_task::{Farm, now};
 
 /// The timestamp `ms` before the frontend read the pack.
-fn before(ms: u64) -> Option<Timestamp> {
-    Some(Timestamp::from(now() - Duration::from_millis(ms)))
+fn before(ms: u128) -> Option<Timestamp> {
+    let (secs, millis) = (ms / 1_000, ms % 1_000);
+    let back = Duration::new(secs as u64, millis as u32 * 1_000_000);
+    Some(Timestamp::from(now() - back))
 }
 
 /// What the frontend rebuilt from a pack whose manifest claims `timing`, and the action cache's
@@ -108,6 +110,7 @@ async fn a_phase_the_task_did_not_time_is_absent_not_zero_width() {
 #[tokio::test]
 async fn the_largest_claim_a_manifest_holds_does_not_overflow() {
     let most = i64::MAX as u64;
+    let (one, two, three) = (u128::from(most), 2 * u128::from(most), 3 * u128::from(most));
     let timing = Timing {
         fetch_ms: most,
         run_ms: most,
@@ -117,9 +120,9 @@ async fn the_largest_claim_a_manifest_holds_does_not_overflow() {
 
     let metadata = got.execution_metadata.expect("a claim");
     assert_eq!(metadata.output_upload_completed_timestamp, before(0));
-    assert_eq!(metadata.output_upload_start_timestamp, before(most));
-    assert_eq!(metadata.execution_completed_timestamp, before(most));
-    assert_eq!(metadata.execution_start_timestamp, before(2 * most));
-    assert_eq!(metadata.input_fetch_completed_timestamp, before(2 * most));
-    assert_eq!(metadata.input_fetch_start_timestamp, before(3 * most));
+    assert_eq!(metadata.output_upload_start_timestamp, before(one));
+    assert_eq!(metadata.execution_completed_timestamp, before(one));
+    assert_eq!(metadata.execution_start_timestamp, before(two));
+    assert_eq!(metadata.input_fetch_completed_timestamp, before(two));
+    assert_eq!(metadata.input_fetch_start_timestamp, before(three));
 }
