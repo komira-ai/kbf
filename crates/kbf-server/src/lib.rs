@@ -184,6 +184,7 @@ pub use farm::{
     OWNER_CACHE_TTL, SESSION_RENEWAL, StateError,
 };
 pub use health::Readiness;
+pub use http_history::run_json;
 pub use identity::{DenyList, DenyListError, Peers};
 pub use kbf_sched::MemoryLadder;
 pub use kbf_tls::{TlsError, TlsFiles, TlsSource};
