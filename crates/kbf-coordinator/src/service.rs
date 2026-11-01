@@ -8,17 +8,19 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kbf_oidc::{Refusal, Verified, Verifier};
-use kbf_updater::wire::{Answer, Heartbeat, Reply, ServiceReply};
+use kbf_updater::wire::{Answer, Heartbeat, ServiceReply};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
+use crate::acks::{clear_bad, release_ack};
 use crate::converge::{Convergence, RoleCounts, converge_kbf, converge_service, role_counts};
-use crate::decide::{Decision, Hold, decide_in, decide_why};
+use crate::decide::{Decision, Hold, decide_marked};
 use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
 use crate::fleet::{Fleet, Host, Node};
 use crate::identity::Identity;
 use crate::membership::{Member, Standing, account, deferred_count, members, standing};
-use crate::ops::{self, AuditEntry, OPERATOR, OperateError, OpsState, OpsStore};
+use crate::ops::{self, AuditEntry, OPERATOR, OperateError, OpsError, OpsState, OpsStore};
+use crate::reconcile::reconcile;
 use crate::services::{ServiceDef, Services};
 
 /// The time since the coordinator started.
@@ -43,6 +45,9 @@ pub enum SetError {
     /// The state file could not be written.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// The ops file could not be written (the bad mark of the version could not be cleared).
+    #[error(transparent)]
+    Ops(#[from] OpsError),
     /// The allow-list entry that admitted the token does not name this service.
     #[error("the token may not set this service")]
     Forbidden,
@@ -362,15 +367,33 @@ impl Coordinator {
             }
         }
         fleet.note_node(who.node_id.clone(), node);
-        let desired = self.desired.all();
         let mut names: Vec<&str> = std::iter::once(KBF)
             .chain(announced.iter().map(|one| one.name.as_str()))
             .collect();
         // Stable: services of one priority keep the order above.
         names.sort_by_key(|name| Reverse(self.services.get(name).map_or(0, |def| def.priority)));
+        // The hosts' words are in: record the last good versions and roll back what failed,
+        // before the orders below read the desired states.
+        for def in names.iter().filter_map(|name| self.services.get(name)) {
+            reconcile(def, &self.ops, &self.desired, &fleet, now);
+        }
+        let desired = self.desired.all();
         for name in names {
-            let reply = decide_in(&self.services, &desired, name, &fleet, &who.node_id, now);
-            if let Reply::Update { version } = reply {
+            let marks = self.ops.marks(name);
+            let decision = decide_marked(
+                &self.services,
+                &desired,
+                &marks.bad,
+                name,
+                &fleet,
+                &who.node_id,
+                now,
+            );
+            if let Decision::Update { version } = decision {
+                // The host's ack goes from the file before the order exists.
+                if !release_ack(&self.ops, name, &who.node_id) {
+                    continue;
+                }
                 fleet.order(name, who.node_id.clone(), version.clone(), now);
                 return ServiceReply::Update {
                     service: (name != KBF).then(|| name.to_owned()),
@@ -430,6 +453,13 @@ impl Coordinator {
                 "refused a desired state: the allow-list entry does not name the service"
             );
             return Err(SetError::Forbidden);
+        }
+        // CI naming a version by hand lifts its mark. The mark goes first: a set that fails
+        // after it leaves nothing blocked, and the reverse would leave a wanted version that
+        // the next beat rolls back.
+        {
+            let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
+            clear_bad(&self.ops, &fleet, &service, &desired.version)?;
         }
         self.desired.set(&service, desired.clone())?;
         tracing::info!(
@@ -510,12 +540,24 @@ impl Coordinator {
             .defs()
             .map(|def| {
                 let desired = self.desired.get(&def.name);
+                let bad = ops
+                    .services
+                    .get(&def.name)
+                    .map_or(&[][..], |marks| marks.bad.as_slice());
                 let roles = role_counts(def, desired.as_ref(), &fleet, now);
                 let hosts: Vec<ServiceHostStatus> = fleet
                     .hosts_of(&def.name)
                     .map(|(id, host)| ServiceHostStatus {
                         host: host_status(&fleet, &def.name, id, host, now),
-                        hold: match decide_why(&self.services, &all, &def.name, &fleet, id, now) {
+                        hold: match decide_marked(
+                            &self.services,
+                            &all,
+                            bad,
+                            &def.name,
+                            &fleet,
+                            id,
+                            now,
+                        ) {
                             Decision::Update { .. } => None,
                             Decision::Hold(why) => Some(why),
                         },
@@ -603,7 +645,7 @@ fn host_status(
 /// Where the hosts of `def` stand: the one answer both `GET /v1/convergence` and the status
 /// give. `kbf` is counted with the minimums of its desired state, as it always has been; any
 /// other service with what its definition requires of each role.
-fn convergence_of(
+pub(crate) fn convergence_of(
     def: &ServiceDef,
     desired: Option<&Desired>,
     fleet: &Fleet,
