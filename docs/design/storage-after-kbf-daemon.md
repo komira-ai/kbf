@@ -47,7 +47,7 @@ the work moves in the longer term, and it is listed as an option, not as part of
   (`S3Store`; query keys `endpoint`, `region`, `conditional-put`, `min-put-rate`). The key pair is either the standard
   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, or a key file named with `--cold-store-credentials-file`, a flag that
   is on main since kbf#2177 (a node with its own endpoint needs its own keys, 5.7). [code: `crates/kbf-server/src/stores.rs`
-  `StoreUri`, `S3Uri`; the flag is the storage owner's report of kbf#2177, not re-read here]
+  `StoreUri`, `S3Uri`; `crates/kbf-cli/src/config.rs`, `crates/kbf-server/src/key_file`]
 - `--hot-store` is optional: the write tier (`kbf-tier`). A segment is staged as a block file in the hot directory,
   synced with `fdatasync`, and acknowledged (on a chain, once both owners hold it); the flusher later PUTs it to the
   cold store as a multipart upload, reads the footer back, and commits `ObjectFlushed`. Flushed blocks stay on the
@@ -77,15 +77,18 @@ the work moves in the longer term, and it is listed as an option, not as part of
   lists the whole prefix, because uploads finish out of sequence. [code: `crates/kbf-front/src/cache/tail.rs`]
   `fill::run` ticks, but `fill::round` makes a pass only when `FillState::owed()` is set, that is when the epoch the
   frontend's heartbeat answer carried (`learn`) is above the epoch the node acknowledged (`tail_epoch_done`). An owed
-  epoch is served by `settle`: at least two passes (the second is the guard) and at most `PASSES` = 8, stopping at the
-  first pass after the first that is quiet. [code: `crates/kbf-server/src/fill.rs` `owed`, `round`, `settle`, `PASSES`,
+  epoch is served by `settle` in attempts: each attempt makes at least two passes (the second is the guard) and at most
+  `PASSES` = 8, stopping at the first pass after the first that is quiet. An attempt that never goes quiet within 8, or
+  whose placement fingerprint moved, acknowledges nothing, and the next tick starts a new attempt, so under churn the
+  cost of one owed epoch has no upper bound. [code: `crates/kbf-server/src/fill.rs` `owed`, `round`, `settle`, `PASSES`,
   `registered`] With no epoch bump and no restart there is **no listing at all**.
 - **When an epoch is bumped.** The frontend's counter `meta/tail_epoch` is written only by a frontend started with the
   handoff setting (`Members::with_handoff`), and then (a) when a joining member's flush barrier clears, and again if the
   placement fingerprint or a write owner's boot changes while it joins [code: `crates/kbf-server/src/members/fence.rs`
-  `advance_one`, `fence_step`], and (b) per the design, when a draining member has flushed (`A to B` in
-  `docs/design/rebalance-handoff.md`; not traced in code here, UNVERIFIED). So the cadence is the cadence of joins and
-  drains, and in steady state it is zero. A node's own **restart or registration** also owes a pass:
+  `advance_one`, `fence_step`]. The design also bumps it when a draining member has flushed (`A to B` in
+  `docs/design/rebalance-handoff.md`), but that is not implemented at main: `advance` scans only the marks of joining
+  members, and no drain mark or drain fence exists in kbf-server. So only joins bump the epoch, and in steady state the
+  cadence is zero. A node's own **restart or registration** also owes a pass:
   `FillState::registered` sets the acknowledged epoch to 0, and the learned epoch is above 0 once the farm has ever
   bumped. A restarted tail also starts empty (`TailState` is volatile), so it reads the footer of every object that is not
   its own member's once. [code: `fill.rs` `registered`; `tail.rs` `TailState`] Which frontends in the running farm are
@@ -203,7 +206,7 @@ nodes flushed, in place, without copying or deleting anything. Pack keys are `ca
 | Re-hash of every record at flush | **moves to receive time** | With no tier, `PutRange` hashes SHA-256 and CRC-32C on receipt and `Commit` refuses an unhashed record; a segment the tier did not take is hashed before the PUT. Stronger than the flush-time check, which is there because with a tier the daemon's digests are trusted at acknowledgement. Cost: ingress CPU, unmeasured. [code: `crates/kbf-front/src/segments.rs`, `cache/upload.rs`, `cache/flush.rs`] |
 | Flushed-copy read cache on the hot disk | **tierstore hot tier** (promotion) | Whole-object promotion; amplification, 5.4. |
 | Hot-store eviction | **tierstore water marks** | `file://` eviction in `evict.rs` is unrelated and stays. |
-| Rebuild by footers and the standing tail | stays in kbf, listing whatever `--cold-store` is | Both list the endpoint, under `keys.root` (rebuild, once, with a cursor) and `<root>cas/` (tail, with no cursor, 2 to 8 listings for each epoch owed). Cost is owed epochs times passes per epoch times objects in the prefix; 5.8. |
+| Rebuild by footers and the standing tail | stays in kbf, listing whatever `--cold-store` is | Both list the endpoint, under `keys.root` (rebuild, once, with a cursor) and `<root>cas/` (tail, with no cursor, 2 to 8 listings per attempt for each epoch owed, an unsettled attempt repeated). Cost is owed epochs times passes per epoch times objects in the prefix; 5.8. |
 | `may_hold`, `get_range` exactness | stays in kbf; tierstore must satisfy | `S3Store` refuses a ranged read not answered with the exact range. |
 | CAS index, action cache, closure check, `Touch`, retention, three answers | **stays in kbf** | No S3 shape. |
 | Raft metadata log on the hot disk | **stays in kbf** | Lives in `<hot store>/meta` when the hot store is a directory; with no hot store it needs `--meta-dir` [code: `stores.rs`]. |
@@ -274,16 +277,16 @@ members' objects into a node's index, so an owner that deletes a segment another
 locations dangling, to be marked `Missing`. The trap is narrower than it first looks: a pass never reads an object of its
 own member, and adopts only digests the index does not already hold (section 2.2), so a segment is adopted by another
 node only for blobs that node lacked, which with both owners writing every blob is the case after a join, a wiped log or a
-lost write. There is **no tail interval** to wait out: passes happen when an epoch is owed (2.2), at a cadence of joins and
-drains plus restarts. So a delay-based collector must cover that cadence plus one full settle (up to eight listings and
-the footer reads), and cannot be a fixed small constant; otherwise the collector must learn of adoptions (open item E).
+lost write. There is **no tail interval** to wait out: passes happen when an epoch is owed (2.2), at a cadence of joins
+plus restarts (drains do not bump the epoch at main, 2.2). So a delay-based collector must cover that cadence plus a
+settle that acknowledges (at least two listings, with no upper bound under churn, and the footer reads), and cannot be a fixed small constant; otherwise the collector must learn of adoptions (open item E).
 This is new work with no code today; it does not gate the
 migration, but it gates the cold bucket staying bounded, and needs a design of its own.
 
 ### 5.6 Credentials
 
 [proposed] The node's key to its local tierstore is a **scoped key** (read and write under the farm prefix, no delete
-prefix), given with `--cold-store-credentials-file` (a flag the storage owner reports as on main); the collector holds a
+prefix), given with `--cold-store-credentials-file` (on main since kbf#2177); the collector holds a
 GC key; the cold tier's credential is tierstore's own (`--cold-credentials-file`) and leaves kbf. This narrows what a
 storage node holds compared with a bucket key. The "credential gap on `storage-and-daemon`" in
 `docs/design/architecture-v2.md` section 9 is unchanged: the key must still be unreadable by the actions' uid.
@@ -303,15 +306,15 @@ register the tierstore identity only if tierstore later runs as one shared endpo
 
 ### 5.8 The standing tail and the list cost
 
-The tail is owed, not scheduled (section 2.2). Its listing cost is **owed epochs x passes per epoch x objects in the
-prefix**, plus one footer read for every object that is not the node's own on the first pass after a restart. Passes per
-epoch are 2 to 8 (`settle`), each a full listing with no cursor. In steady state, with no join, drain or restart, the
-cost is zero. Nothing deletes segments (section 2.3), so objects in the prefix only grow, and each owed epoch costs more
+The tail is owed, not scheduled (section 2.2). Its listing cost is **owed epochs x passes per epoch (summed over its attempts) x objects in the
+prefix**, plus one footer read for every object that is not the node's own on the first pass after a restart. Passes are
+2 to 8 per attempt (`settle`), each a full listing with no cursor, and an attempt that does not settle is repeated, so
+churn during an epoch multiplies the cost. In steady state, with no join or restart, the cost is zero. Nothing deletes segments (section 2.3), so objects in the prefix only grow, and each owed epoch costs more
 than the last. The unit to record at baseline is therefore listings per owed epoch and their wall time at the current
 object count, not a rate. Behind tierstore each listing is a tierstore list; its cost, and whether it covers objects that
 are only in the hot tier, are tierstore's to state (open item F). The consequence for correctness is in section 6: if the
 listing misses uncopied objects, a node can acknowledge an epoch without them in its index. How often the frontend bumps
-the epoch in the running farm is UNVERIFIED (it needs the frontend's handoff setting and its join and drain history); the
+the epoch in the running farm is UNVERIFIED (it needs the frontend's handoff setting and its join history); the
 code gives only the triggers. [proposed]
 
 ## 6. Migration, one node at a time
@@ -348,14 +351,14 @@ back to A: set `--hot-store` again; the staged table starts empty and no staged 
 **Mixed farm.** Each node's index is its own Raft log and other nodes read a node's blobs through the owner, not through
 the bucket, so a farm with some nodes on tierstore and some on the bucket serves correctly. Nodes read each other's
 objects from the cold store in the rebuild and in the tail pass, and the **handoff fence relies on those passes**: a
-join or drain is confirmed only when every member has acknowledged the epoch, and a node acknowledges after a pass that
+join (and, in the design, a drain) is confirmed only when every member has acknowledged the epoch, and a node acknowledges after a pass that
 began after it learned the epoch (`docs/design/rebalance-handoff.md`; `fill::round`). A pass lists whatever that node's
 `--cold-store` is. If the listing cannot see an uncopied object (a node listing the bucket while another node's tierstore
 still holds the object only on flash, or a tierstore listing that is cold-only), the pass completes, the epoch is
 acknowledged, and the fence is confirmed **without that object in the index**: the fence then covers less than it says.
 Pointing rebuild or tail at tierstore instead of the bucket changes what the fence covers in the same way. So the rule
-stands, with its reason: **do not start a join or drain, which bumps the epoch, while any tierstore in the farm has copy
-lag**, and do not rely on a restart's owed pass for an object still on flash. Between epochs nothing is lost: objects
+stands, with its reason: **do not start a join, which bumps the epoch, while any tierstore in the farm has copy lag**, and
+the same for a drain once drains bump the epoch as the design describes (at main they do not, 2.2), and do not rely on a restart's owed pass for an object still on flash. Between epochs nothing is lost: objects
 become visible when copied, and the next owed pass adopts them. [proposed]
 
 ## 7. Measurements this enables
