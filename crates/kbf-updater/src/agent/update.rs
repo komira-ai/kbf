@@ -148,7 +148,8 @@ impl Update<'_> {
         // disk), and as out if an operator did. If it cannot be read, nothing says it is ours.
         let placed = self.ports.drain.placed(self.host).unwrap_or_else(|e| {
             self.log(&format!(
-                "update to {target}: the node could not be read, so it is not given back: {e}"
+                "update to {target}: the node could not be read, so it is not given back; uncordon it \
+                 by hand if it should serve: {e}"
             ));
             Placed::Out
         });

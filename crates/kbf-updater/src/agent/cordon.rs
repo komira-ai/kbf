@@ -18,16 +18,20 @@
 //!   marked node and finds it serving (in [`Drain::placed`], and in [`Drain::observe`], which
 //!   the agent calls for every unit at start and at each idle heartbeat), the cordon was given
 //!   back by hand and every mark of the node is removed. A frontend that cannot be asked
-//!   leaves the marks. The frontend's node read carries nothing that names one cordon (no
-//!   generation, no time), so a cordon given back and made again by an operator between two
+//!   leaves the marks and fails the read. The frontend's node read carries nothing that names
+//!   one cordon (no generation, no time), so a cordon given back and made again by an operator between two
 //!   looks is not told from the updater's.
+//! - **Only a drain is ours.** The updater drains; it never makes a plain cordon. A marked node
+//!   the frontend reads as cordoned (not draining, drained or paused) was cordoned by an
+//!   operator, over the updater's drain or after it was given back, and its marks are removed:
+//!   it reads as [`Placed::Out`].
 //! - **One mark per unit.** An undrain removes its own mark and uncordons only when no mark of
 //!   another unit remains, so one unit finishing does not give back a node another is still
 //!   rolling on.
 //! - **No node, no mark.** A host the frontend knows no node for (a storage host with no daemon)
 //!   is drained as nothing and marked as nothing.
 //!
-//! What this does not know: a cordon an operator adds to a node the updater has drained is
+//! What this does not know: a drain an operator makes of a node the updater has drained is
 //! still the updater's, and a node drained by an agent that predates the marks reads as an
 //! operator's.
 
@@ -39,7 +43,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::inventory::{Host, valid_node_id};
-use crate::ports::{Drain, Placed, PortError};
+use crate::ports::{Drain, Placed, PortError, Seen};
 
 const MARK: &[u8] = b"cordoned by kbf-updater\n";
 
@@ -161,28 +165,49 @@ impl OwnCordon {
 
 impl Drain for OwnCordon {
     /// A marked node reads as in placement: the cordon on it is ours, unless the frontend says
-    /// it serves, which means the cordon was given back and every mark of it is removed. A
-    /// frontend that cannot be asked leaves the marks, and the node ours.
+    /// it serves (given back: its marks are removed) or cordoned (an operator's: marks removed,
+    /// node out). A frontend that cannot be asked fails the read and leaves the marks.
     fn placed(&self, host: &Host) -> Result<Placed, PortError> {
         let marks = self.marks(host)?;
-        let read = self.inner.placed(host);
         if marks.is_empty() {
-            return read;
+            return self.inner.placed(host);
         }
-        if read == Ok(Placed::In) {
-            marks.iter().try_for_each(|mark| self.clear(mark))?;
+        match self.inner.seen_if_known(host) {
+            // Still in a drain: the cordon is ours.
+            Ok(Some(Seen::Draining)) => Ok(Placed::In),
+            // The frontend cannot say, so nothing says the cordon is still ours: the marks stay
+            // and the caller fails, leaving the node drained.
+            Err(e) => Err(e),
+            // The updater only drains. A plain cordon was put there by an operator, over our
+            // drain or after it was given back: the node is theirs.
+            Ok(Some(Seen::Cordoned)) => {
+                marks.iter().try_for_each(|mark| self.clear(mark))?;
+                Ok(Placed::Out)
+            }
+            // Given back by hand, or no node here.
+            Ok(Some(Seen::Serving) | None) => {
+                marks.iter().try_for_each(|mark| self.clear(mark))?;
+                Ok(Placed::In)
+            }
         }
-        Ok(Placed::In)
     }
 
     fn placed_if_known(&self, host: &Host) -> Result<Option<Placed>, PortError> {
         self.inner.placed_if_known(host)
     }
 
+    fn seen_if_known(&self, host: &Host) -> Result<Option<Seen>, PortError> {
+        self.inner.seen_if_known(host)
+    }
+
     /// The mark is written before the drain call, and kept if the call fails (the frontend
     /// may have applied it). A node already out and unmarked is an operator's, and a node the
     /// frontend does not know is nobody's: no mark.
     fn drain(&self, host: &Host, deadline: Option<Duration>) -> Result<(), PortError> {
+        // Marks of a cordon that has changed hands are dropped before they count.
+        if !self.marks(host)?.is_empty() {
+            self.placed(host)?;
+        }
         if let Some(mark) = self.mark(host)
             && !Self::is_set(&mark)?
             && (!self.marks(host)?.is_empty()
