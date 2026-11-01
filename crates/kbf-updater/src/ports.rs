@@ -213,6 +213,18 @@ pub enum Placed {
     Out,
 }
 
+/// How the frontend holds a node out of placement, as far as telling the updater's own cordon
+/// from an operator's needs: the updater's cordon is always a drain, never a plain cordon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Seen {
+    /// In placement.
+    Serving,
+    /// Out of placement as a plain cordon (no drain): an operator's, never the updater's.
+    Cordoned,
+    /// Out of placement in a drain (draining, drained or paused at its deadline).
+    Draining,
+}
+
 /// Taking a daemon host's node out of placement at the frontend, and giving it back.
 pub trait Drain: Send + Sync {
     /// Whether the node of `host` is in placement now, or was put out by this caller. A caller
@@ -236,6 +248,14 @@ pub trait Drain: Send + Sync {
     /// has no such case.
     fn placed_if_known(&self, host: &Host) -> Result<Option<Placed>, PortError> {
         self.placed(host).map(Some)
+    }
+    /// As [`Drain::placed_if_known`], but telling a plain cordon from a drain. The default
+    /// reads a node that is out as draining.
+    fn seen_if_known(&self, host: &Host) -> Result<Option<Seen>, PortError> {
+        Ok(self.placed_if_known(host)?.map(|placed| match placed {
+            Placed::In => Seen::Serving,
+            Placed::Out => Seen::Draining,
+        }))
     }
     /// Look at the node the caller cordoned earlier, outside any update, so that a drain that
     /// remembers its own cordon can forget one that is gone. The default does nothing.
