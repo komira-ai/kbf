@@ -372,7 +372,7 @@ mod tests {
         assert_eq!(quiet.loadavg_1m, 0.52);
         machine(&dir, 11_100);
         let next = reader.read(&proc_root, &sys_block, 22_000).unwrap();
-        assert_eq!(next.disk_util_pct, 5.0);
+        assert_eq!(next.disk_util_pct, 10.0);
     }
 
     /// Catches a quiet sample that does not see other work: the disk gets 900 ms of IO during

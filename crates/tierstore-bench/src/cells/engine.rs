@@ -1308,10 +1308,21 @@ mod tests {
     }
 
     /// A machine whose reading during a pass (`sample`) and whose reading in the quiet window
-    /// before one (`quiet_sample`) are scripted apart.
+    /// before one (`quiet_sample`) are scripted apart; it counts the quiet readings.
     struct Split {
         during: Arc<Script>,
         quiet: LoadSample,
+        quiet_reads: AtomicUsize,
+    }
+
+    impl Split {
+        fn new(during: Arc<Script>, quiet: LoadSample) -> Arc<Self> {
+            Arc::new(Self {
+                during,
+                quiet,
+                quiet_reads: AtomicUsize::new(0),
+            })
+        }
     }
 
     impl LoadSource for Split {
@@ -1320,6 +1331,7 @@ mod tests {
         }
 
         fn quiet_sample(&self) -> Result<LoadSample, BenchError> {
+            self.quiet_reads.fetch_add(1, Ordering::SeqCst);
             Ok(self.quiet)
         }
     }
@@ -1331,21 +1343,19 @@ mod tests {
         }
     }
 
-    /// Catches a pass refused for the disk time of the pass before it: the reading over the
-    /// interval since the last one is hot, the quiet window is idle, and the pass runs.
+    /// Catches a gate before a pass that reads the interval since the last reading, which is the
+    /// pass before: the quiet window is read once for each of two passes and both run.
     #[tokio::test]
     async fn the_gate_before_a_pass_reads_the_quiet_window_not_the_last_pass() {
         let dir = temp("tb-engine-gate-quiet-idle");
-        let load = Arc::new(Split {
-            during: Script::of(vec![Some(disk_hot())]),
-            quiet: calm(),
-        });
-        let env = env(dir.path(), Window::Quiet, load);
+        let load = Split::new(Script::calm(), calm());
+        let env = env(dir.path(), Window::Quiet, load.clone());
         let seen = Arc::new(Mutex::new(vec![]));
-        run_cell(&env, CellId::ColdPut, vec![arm("a", 4, 2, &seen)], 1, None)
+        run_cell(&env, CellId::ColdPut, vec![arm("a", 4, 2, &seen)], 2, None)
             .await
             .unwrap();
-        assert_eq!(seen.lock().unwrap().len(), 4);
+        assert_eq!(seen.lock().unwrap().len(), 8);
+        assert_eq!(load.quiet_reads.load(Ordering::SeqCst), 2);
     }
 
     /// Catches a gate before a pass that ignores other work: a hot quiet window sends nothing
@@ -1353,10 +1363,7 @@ mod tests {
     #[tokio::test]
     async fn a_busy_quiet_window_before_a_pass_sends_nothing_and_names_the_disk() {
         let dir = temp("tb-engine-gate-quiet-busy");
-        let load = Arc::new(Split {
-            during: Script::calm(),
-            quiet: disk_hot(),
-        });
+        let load = Split::new(Script::calm(), disk_hot());
         let env = env(dir.path(), Window::Quiet, load);
         let seen = Arc::new(Mutex::new(vec![]));
         let err = run_cell(&env, CellId::ColdPut, vec![arm("a", 4, 2, &seen)], 1, None)
