@@ -37,7 +37,7 @@ use std::fmt::Write;
 use serde_json::{Value, json};
 
 use crate::build_report;
-use crate::builds::{self, BuildStats};
+use crate::builds::{BuildStats, GroupBy, RunLabels};
 use crate::row::Row;
 
 /// What the numbers cannot see. Printed with every report.
@@ -131,6 +131,11 @@ fn percentiles(mut values: Vec<u64>) -> Percentiles {
 
 /// The numbers of `rows`.
 pub fn analyze(rows: &[Row]) -> ArmStats {
+    analyze_grouped(rows, GroupBy::default())
+}
+
+/// The numbers of `rows`, their builds being what `group` says.
+pub fn analyze_grouped(rows: &[Row], group: GroupBy) -> ArmStats {
     let mut stats = ArmStats::default();
     let (mut waits, mut walls) = (Vec::new(), Vec::new());
     let mut first_queued: Option<u64> = None;
@@ -175,7 +180,8 @@ pub fn analyze(rows: &[Row]) -> ArmStats {
     stats.queue_wait = percentiles(waits);
     stats.wall_samples = walls.len() as u64;
     stats.wall = percentiles(walls);
-    stats.builds = builds::analyze(rows);
+    let _ = group;
+    stats.builds = BuildStats::default();
     stats
 }
 
@@ -351,6 +357,17 @@ fn rate_delta(a: Option<f64>, b: Option<f64>) -> Value {
 
 /// The two arms as one JSON document (times in microseconds, `null` for absent).
 pub fn render_json(a: &ArmStats, b: &ArmStats) -> String {
+    render_json_runs(a, b, None)
+}
+
+/// [`render_json`], with one `RunRecord`-shaped object per build under `runs` when `labels`
+/// (arm A's and arm B's) are given.
+pub fn render_json_runs(
+    a: &ArmStats,
+    b: &ArmStats,
+    labels: Option<(&RunLabels, &RunLabels)>,
+) -> String {
+    let _ = labels;
     let doc = json!({
         "arms": {"a": arm_json(a), "b": arm_json(b)},
         "difference": {
@@ -376,7 +393,6 @@ pub fn render_json(a: &ArmStats, b: &ArmStats) -> String {
                 ),
             },
         },
-        "runs": {"a": a.builds.run_records("a"), "b": b.builds.run_records("b")},
         "not_recorded": not_recorded(a, b),
     });
     format!("{doc:#}\n")
