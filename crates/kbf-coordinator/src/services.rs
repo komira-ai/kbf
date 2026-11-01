@@ -52,8 +52,8 @@ use crate::bake::MAX_BAKE_BEATS;
 use crate::canary::Canary;
 use crate::defer::DeferBackoff;
 use crate::desired::{Desired, KBF, KBF_MIN_UP, LEGACY_ROLES, MAX_COUNT, kbf_roles};
-use crate::reconcile::{FailThreshold, Rollback};
 use crate::membership::{RawSelector, Selector};
+use crate::reconcile::{FailThreshold, Rollback};
 
 /// The most bytes of a services file.
 const MAX_FILE_BYTES: u64 = 1 << 20;
