@@ -21,12 +21,11 @@
 
 use std::fs::{File, OpenOptions};
 use std::future::Future;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use kbf_types::Resources;
-use rustix::fs::{CWD, FileType, Mode, OFlags};
+use rustix::fs::{CWD, FileType, Mode};
 
 use crate::blocking_steps::{create_logs, make_cgroup, oom_outcome, read_start, usage};
 use crate::cgroup::{LeaseCgroup, presses_into_swap};
@@ -74,7 +73,7 @@ fn workers_stay_free_while_calls_wait<F, Fut>(
 /// As [`workers_stay_free_while_calls_wait`], for a call that still has the pipes `then`
 /// to open after `blocked`: opening a pipe for writing returns once the test has opened
 /// it for reading, so a call that only opens `blocked` is done when the test meets it.
-/// The call waits on the last of `then` instead, which nobody reads until the end.
+/// The call waits on the first of `then` instead, which nobody meets until the end.
 fn workers_stay_free_after<F, Fut>(
     name: &str,
     blocked: &str,
@@ -139,19 +138,13 @@ fn workers_stay_free_after<F, Fut>(
         std::fs::rename(&plain, dir.join(blocked)).expect("replace");
     }
     drop(held);
-    // Open the pipes the calls wait on at their end, without waiting for a writer.
-    let released: Vec<File> = dirs
-        .iter()
-        .flat_map(|dir| then.iter().map(move |later| dir.join(later)))
-        .map(|path| {
-            OpenOptions::new()
-                .read(true)
-                .custom_flags(OFlags::NONBLOCK.bits() as i32)
-                .open(path)
-                .expect("the pipe opens for reading")
-        })
-        .collect();
-    drop(released);
+    // Meet every call on the pipes it still has to open: each open returns once the call
+    // has opened its end, so no call is left waiting on a pipe when the runtime drops.
+    for dir in &dirs {
+        for later in then {
+            drop(meet(&dir.join(later)));
+        }
+    }
     for task in &tasks {
         task.abort();
     }
