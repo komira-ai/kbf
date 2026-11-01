@@ -82,6 +82,7 @@ mod build_commit;
 #[doc(hidden)]
 pub mod build_seq;
 pub mod cold_apply;
+mod cold_counted;
 pub mod config;
 pub mod drain;
 pub mod enroll;
@@ -105,6 +106,7 @@ pub mod http_sched;
 pub mod identity;
 mod input_cache_metrics;
 pub mod join;
+mod key_file;
 pub mod learned;
 mod listen;
 mod load_metrics;
@@ -169,6 +171,7 @@ mod timeout;
 pub mod token;
 pub mod ui_mount;
 pub mod update_status;
+pub mod usage_profiles;
 pub mod verbs;
 pub mod vitals;
 pub mod whole_node;
@@ -184,6 +187,7 @@ pub use farm::{
     OWNER_CACHE_TTL, SESSION_RENEWAL, StateError,
 };
 pub use health::Readiness;
+pub use http_history::run_json;
 pub use identity::{DenyList, DenyListError, Peers};
 pub use kbf_sched::MemoryLadder;
 pub use kbf_tls::{TlsError, TlsFiles, TlsSource};
@@ -209,6 +213,7 @@ pub use state_store::{
 };
 pub use streams::{StreamArgs, StreamLimits};
 pub use ui_mount::bind_server_with_options;
+pub use usage_profiles::UsageProfiles;
 pub use whole_node::WholeNodeFlags;
 pub use worker::HostFloor;
 pub use worker::WorkerService;

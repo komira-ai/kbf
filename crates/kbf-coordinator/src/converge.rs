@@ -12,9 +12,10 @@
 //!   it. It stays so until the host is fixed or another version is set (the coordinator
 //!   does not tell it again, `decide`).
 //! - `converged`: past the quiet start, at least one live host, every live host at the
-//!   desired version and none updating or failed, and at least `min_up` hosts of the
-//!   storage and of the frontend role up. The last two keep a coordinator that has just
-//!   restarted, and has heard from few hosts, from reporting a farm converged.
+//!   desired version, none updating or failed or still baking or waiting for a promotion,
+//!   and at least `min_up` hosts of the storage and of the frontend role up. The last two
+//!   keep a coordinator that has just restarted, and has heard from few hosts, from
+//!   reporting a farm converged.
 //! - `in_progress`: everything else.
 //!
 //! How long a farm has gone without progress is the caller's to judge: it needs the time of
@@ -28,6 +29,7 @@ use serde::Serialize;
 
 use crate::desired::Desired;
 use crate::fleet::{Fleet, Host};
+use crate::membership::HostCounts;
 use crate::services::ServiceDef;
 
 /// Where the farm stands.
@@ -69,6 +71,10 @@ pub struct Convergence {
     pub state: State,
     /// The counts of every role that has a host, in role order.
     pub roles: Vec<RoleCounts>,
+    /// The hosts that are not counted in `roles`, by why. Left out for a service with no
+    /// selector until there is one to count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hosts: Option<HostCounts>,
     /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]): what a client
     /// compares with a release before it orders one.
     pub commit: &'static str,
@@ -183,6 +189,7 @@ fn converge_with(
             quiet,
             state: State::InProgress,
             roles: Vec::new(),
+            hosts: None,
             commit: crate::BUILD_COMMIT,
         };
     };
@@ -194,6 +201,13 @@ fn converge_with(
         .count();
     let at_desired: usize = roles.iter().map(|c| c.at_desired).sum();
     let clear = roles.iter().all(|c| c.updating == 0 && c.failed == 0);
+    // A host still baking, or waiting for its promotion, is not yet a host that took the
+    // version.
+    let settled = fleet.hosts_of(service).all(|(id, h)| {
+        !h.is_live(now)
+            || !(h.beat.promotion_pending
+                || fleet.is_baking(service, id, h, &desired.version, def.bake_beats, now))
+    });
     let up = |role: &str| {
         fleet
             .hosts_of(service)
@@ -206,6 +220,7 @@ fn converge_with(
         && live > 0
         && at_desired == live
         && clear
+        && settled
         && def
             .role_names()
             .into_iter()
@@ -220,6 +235,7 @@ fn converge_with(
         quiet,
         state,
         roles,
+        hosts: None,
         commit: crate::BUILD_COMMIT,
     }
 }

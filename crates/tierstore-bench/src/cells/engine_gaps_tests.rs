@@ -72,6 +72,7 @@ fn arm(label: &str, requests: u64, sent: &Arc<AtomicU64>) -> Arm {
         before: None,
         after: None,
         faulted: false,
+        proxy: None,
         notes: vec![],
     }
 }

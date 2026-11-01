@@ -34,6 +34,7 @@ use super::driver::{Driver, Settings};
 use super::{EpochPolicy, Farm};
 use crate::action_usage::Shapes;
 use crate::farm_js::open::{self, KbfObserver};
+use crate::farm_js::usage::Usage;
 use crate::farm_js::{KbfAdapter, Wall};
 use crate::learned::{Learned, LearnedSizes};
 use crate::state_store::StateStore;
@@ -131,6 +132,36 @@ pub(crate) struct JsFarm {
     /// core does not say. A fenced core feeds nothing, so it refuses every `Result` as
     /// stale, the current lease's too.
     pub(crate) fenced: AtomicBool,
+    /// What the farm learns from the runs it hears of, when `--usage-profiles` is not `off`
+    /// and the farm has a state store.
+    pub(crate) usage: Option<Arc<Usage>>,
+}
+
+/// The wall minute `ambient` says it is.
+pub(crate) fn wall_minute(ambient: Ambient) -> u64 {
+    let since = ambient
+        .wall()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    since.as_secs() / 60
+}
+
+/// The usage side `settings` ask for over `store`: none for `off` or no store. A store whose
+/// profiles cannot be read at the start leaves the farm without it, logged: learning is not
+/// worth a farm that does not start.
+fn open_usage(
+    store: Option<&Arc<dyn Store>>,
+    settings: &Settings,
+    ambient: Ambient,
+) -> Option<Arc<Usage>> {
+    let store = store.filter(|_| settings.usage.learns())?;
+    match Usage::open(Arc::clone(store), wall_minute(ambient)) {
+        Ok(usage) => Some(Arc::new(usage)),
+        Err(error) => {
+            tracing::error!(%error, "the usage profiles cannot be read: the farm runs without recording them");
+            None
+        }
+    }
 }
 
 impl std::fmt::Debug for JsFarm {
@@ -157,15 +188,22 @@ struct Opening<'a> {
     now: FarmTime,
     /// The wall-clock time the farm was built at, in milliseconds since the Unix epoch.
     epoch_unix_ms: u64,
+    /// What the adapter tells the profile name of each action.
+    usage: Option<Arc<Usage>>,
 }
 
 impl Opening<'_> {
+    /// The core's configuration. Under `--usage-profiles on` it carries the curves of this
+    /// opening's usage side, the one the farm keeps ([`JsFarm::rebuild`] and
+    /// [`JsFarm::keep_in`] open the usage side once and give the same one to the core and to the
+    /// farm), so the core reads what the farm feeds.
     fn config(&self) -> js_server_core::Config {
         open::farm_config(
             self.term,
             self.unservable_wait,
             self.finished_retention,
             self.settings,
+            self.usage.as_deref(),
         )
     }
 
@@ -185,6 +223,7 @@ impl Opening<'_> {
         let wall: Wall = Arc::new(move || ambient.wall());
         KbfAdapter::new(self.term, self.cache.clone(), store, wall)
             .recording(self.settings.recorder.clone())
+            .noting_usage(self.usage.clone())
             .learning_with(self.learned(), stored)
     }
 
@@ -215,7 +254,12 @@ impl JsFarm {
         FarmTime::from_millis(millis)
     }
 
-    fn opening<'a>(&'a self, settings: &'a Settings, term: u64) -> Opening<'a> {
+    fn opening<'a>(
+        &'a self,
+        settings: &'a Settings,
+        term: u64,
+        usage: Option<Arc<Usage>>,
+    ) -> Opening<'a> {
         Opening {
             cache: &self.cache,
             settings,
@@ -225,19 +269,24 @@ impl JsFarm {
             term,
             now: self.now(),
             epoch_unix_ms: self.epoch_unix_ms,
+            usage,
         }
     }
 
     /// Builds the core again from `settings`, over the store it opened if it has one (whose
     /// epoch it keeps). What the core holds is lost, so a builder runs before the farm serves.
     pub(crate) fn rebuild(&mut self, settings: &Settings) {
-        let opening = self.opening(settings, self.term);
+        let usage = open_usage(self.store.as_ref(), settings, self.ambient);
+        let opening = self.opening(settings, self.term, usage.clone());
         let built = match &self.store {
             Some(store) => opening.over(Arc::clone(store), EpochPolicy::Keep),
             None => Ok(opening.bare()),
         };
         match built {
-            Ok(core) => self.core = core,
+            Ok(core) => {
+                self.core = core;
+                self.usage = usage;
+            }
             // The store opened a moment ago cannot be read: the core as it was keeps serving.
             Err(error) => {
                 tracing::error!(%error, "the js core was not built again with the new settings");
@@ -251,7 +300,7 @@ impl JsFarm {
     /// and lose what it holds only in memory: the records held back, which the cap counts.
     /// The core takes the cap by value, so a bare core stands in for it meanwhile.
     pub(crate) fn set_held_cap(&mut self, settings: &Settings) {
-        let stand_in = self.opening(settings, self.term).bare();
+        let stand_in = self.opening(settings, self.term, None).bare();
         let core = std::mem::replace(&mut self.core, stand_in);
         self.core = core.with_held_cap(settings.held_cap);
         self.settings = settings.clone();
@@ -272,11 +321,13 @@ impl JsFarm {
         let Some(StateStore { store, epoch, .. }) = state else {
             return Ok(None);
         };
+        let usage = open_usage(Some(&store), settings, self.ambient);
         let core = self
-            .opening(settings, self.ambient.term())
+            .opening(settings, self.ambient.term(), usage.clone())
             .over(Arc::clone(&store), epoch)?;
         let opened = core.epoch();
         self.core = core;
+        self.usage = usage;
         self.store = Some(store);
         self.term = opened.unwrap_or(self.term);
         Ok(opened)
@@ -306,6 +357,7 @@ impl Farm {
             term,
             now: FarmTime::from_millis(0),
             epoch_unix_ms,
+            usage: None,
         }
         .bare();
         let js = JsFarm {
@@ -324,6 +376,7 @@ impl Farm {
             reports: AtomicUsize::new(0),
             learning_gate: crate::farm_js::Gate::default(),
             fenced: AtomicBool::new(false),
+            usage: None,
         };
         Self {
             cache,
@@ -336,6 +389,7 @@ impl Farm {
             refusals: crate::worker_refusals::Refusals::default(),
             ambient,
             settings,
+            usage_profiles: crate::UsageProfiles::default(),
             driver: Driver::Js(Box::new(js)),
         }
     }

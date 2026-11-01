@@ -95,6 +95,8 @@ impl PreflightReport {
             hardware: self.hardware.clone(),
             attempt: 1,
             open_loop: true,
+            arms_filter: None,
+            cold_server: None,
         }
     }
 }

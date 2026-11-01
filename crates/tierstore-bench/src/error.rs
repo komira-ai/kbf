@@ -36,6 +36,9 @@ pub enum BenchError {
     /// proves nothing.
     #[error("request log: {0}")]
     Log(#[source] std::io::Error),
+    /// `fill-paper` stopped or its check found problems.
+    #[error(transparent)]
+    Fill(#[from] crate::fill::FillError),
     /// The fault proxy was given an upstream or a mode it will not serve.
     #[error("fault proxy: {0}")]
     Proxy(String),

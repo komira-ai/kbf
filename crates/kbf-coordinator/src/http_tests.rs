@@ -16,11 +16,14 @@ use crate::http::{
 };
 use crate::testutil::{OPERATOR, Rig, ci_token};
 
-/// How long a body has in the tests that are not about patience.
+mod extras;
 mod features;
+mod operator;
+mod rollback;
 mod services;
 mod status;
 
+/// How long a body has in the tests that are not about patience.
 const PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
 const STATE: &str = r#"{"version":"2.0","min_up":{"storage":1,"frontend":1}}"#;

@@ -7,8 +7,8 @@
 mod pages;
 
 use kbf_invocation::{
-    ActionShape, Event, LeaseEnd, NumaBytes, Outcome, ReapiTimes, Run, RunUsage, Target,
-    TargetKind, Text,
+    ActionShape, Event, LeaseEnd, NumaBytes, Outcome, PhaseTimes, ReapiTimes, Run, RunUsage,
+    Target, TargetKind, Text,
 };
 use kbf_sched::RequeueReason;
 use kbf_types::{Digest, Failure, OperationId};
@@ -98,6 +98,7 @@ async fn an_attempt_answers_what_its_run_measured() {
         booked_memory_bytes: Some(GIB),
         booked_millicpus: None,
         cap_bytes: Some(2 * GIB),
+        ..Run::default()
     };
     let last = Run {
         booked_memory_bytes: Some(2 * GIB),
@@ -684,5 +685,26 @@ async fn a_row_waiting_after_a_requeue_has_no_wall_time_yet() {
     }
     let sorted = server.ok("/v1/invocations/r/actions?sort=wall_ms").await;
     assert_eq!(listed(&sorted), [text(&done)]);
+    server.stop().await;
+}
+
+/// Catches an attempt that does not say where its phase times came from: the run of a task's
+/// claim is `task_claim`, a daemon's is `measured`, and a lease with no run has no marker.
+#[tokio::test]
+async fn an_attempt_names_where_its_phase_times_came_from() {
+    let server = Server::with(OPEN);
+    let (claimed, daemon) = (digest(1), digest(2));
+    let claim = Run {
+        phase_times: PhaseTimes::TaskClaim,
+        ..executed(10, 20)
+    };
+    let mut events = one_run("b", claimed, 1, (0, 50), claim);
+    events.extend(one_run("b", daemon, 2, (60, 90), executed(70, 80)));
+    server.feed(events).await;
+    let base = "/v1/invocations/b/actions";
+    let first = server.ok(&format!("{base}/{}", text(&claimed))).await;
+    assert_eq!(first["attempts"][0]["phase_times"], "task_claim");
+    let second = server.ok(&format!("{base}/{}", text(&daemon))).await;
+    assert_eq!(second["attempts"][0]["phase_times"], "measured");
     server.stop().await;
 }

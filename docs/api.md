@@ -215,6 +215,7 @@ list:
 | `capacity` | what the node's newest `Hello` said it can run at once |
 | `free` | `capacity` less `booked` on each axis, never below zero |
 | `leases` | the leases it holds, as `term.seq`, in lease order |
+| `owner` | who placed the node out of placement: `operator` or `updater:<unit>`. Present while the node is cordoned, draining or drained, left out while it serves. A cordon with no recorded owner is `operator`, and so is one whose recorded owner cannot be read. No writer records an owner yet, so every cordon reads `operator` |
 
 ### Node load
 
@@ -1277,6 +1278,7 @@ and a lost race is `409 conflict`, never a lost write.
 | `GET /v1/object-stores/connections/{name}` | one connection, never a secret |
 | `DELETE /v1/object-stores/connections/{name}` | `{generation}`; `409 in_use` while a binding names it |
 | `POST /v1/object-stores/connections/{name}:verify` | probe the store, change nothing |
+| `POST /v1/object-stores/connections/{name}:repoint` | move the bound store (endpoint, bucket, prefix); probed first, always |
 | `PUT /v1/object-stores/bindings/{role}` | bind `cold`; `201` created, `200` changed or unchanged |
 | `DELETE /v1/object-stores/bindings/{role}` | `{generation}`; `409 in_use` once a node has applied it |
 | `GET /v1/object-stores` | the desired state and the nodes' convergence |
@@ -1313,7 +1315,7 @@ secret_access_key, conditional_put?, min_put_rate?, expect_generation?, verify?}
 verify?}`; `verify` (default `true`) probes the bucket with the connection's stored key
 first. `422 unknown_connection`, `invalid_bucket`, `invalid_prefix` and `probe_failed` write
 nothing. The store identity `(endpoint, bucket, prefix)` is immutable once bound
-(`409 identity_change`): moving to another store is a migration this API has no verb for.
+(`409 identity_change`): `:repoint` below is the only call that moves it.
 Answer: `{role, generation, changed, verified}`.
 
 **`POST .../connections/{name}:verify`** takes nothing, or `{bucket?, prefix?}`; without a
@@ -1324,6 +1326,21 @@ probe_failed` with `verified` (`{ok, put, get, delete, conditional_put}`): the s
 the store's words. The probe proves that *this frontend* can reach the store with this key;
 the frontend connects to an endpoint an operator typed, so it is bounded (20 seconds in all)
 and operator-only behind the token.
+
+**`POST .../connections/{name}:repoint`** takes `{endpoint, bucket?, prefix?,
+expect_generation}` and moves the store the role `cold` names: the endpoint of the connection
+and the bucket and prefix of the binding, with the generation bumped, in one write. Bucket and
+prefix default to the binding's. `expect_generation` is required (`400 bad_body` without it;
+`409 generation_mismatch` when stale), and there is no `verify` field: the new store is probed
+with the connection's registered key first, and a failed probe answers `422 probe_failed` and
+changes nothing. The connection must be the bound one (`409 not_bound`; `404
+no_such_connection`); `422 tls_unsupported`, `invalid_endpoint`, `invalid_bucket` and
+`invalid_prefix` are as for a bind. Answer: `{name, generation, changed, from, to, verified}`
+with `from` and `to` being `{endpoint, bucket, prefix}`; a repoint to the current identity is
+`changed: false` and keeps the generation. The audit row names the connection and carries
+`detail` with the old and the new identity. Only nodes started with `--cold-store registered`
+follow a repoint, at their next start; a node that names a store URL keeps its
+`identity_mismatch` behaviour.
 
 **`GET /v1/object-stores`** answers `{generation, connections, bindings, convergence}`;
 `convergence` is `{converged, expected, applied, unsupported, nodes: [{id, state,
@@ -1345,9 +1362,10 @@ applied_generation, status, last_seen_secs}]}`.
   `pending` for every node until heartbeats arrive.
 
 **`GET /v1/object-stores/audit`** answers `{entries: [{seq, at, action, subject, outcome,
-generation}]}`, newest first. A row names what was touched and what happened, never a body
+generation, detail?}]}`, newest first. A row names what was touched and what happened, never a body
 field; the actor is always "the API token", the gate knows no finer identity. Only writes
-leave rows (a refused call, a failed probe and `:verify` leave none), an unchanged repeat leaves
+leave rows (a refused call, a failed probe and `:verify` leave none; `detail` is set on
+`repoint` rows only), an unchanged repeat leaves
 one with `outcome` `unchanged`.
 
 **Errors** are `{"error": "...", "code": "..."}` (a `probe_failed` also has `verified`). The
@@ -1358,7 +1376,7 @@ text names no value of the request: a body that does not parse says where, not w
 | 400 | `bad_name`, `bad_body`, `bad_query` |
 | 401, 403, 415 | `unauthorized`, `forbidden`, `unsupported_media_type` (the gate's) |
 | 404 | `not_enabled`, `no_such_connection`, `no_such_binding`, `unknown_action` |
-| 409 | `identity_change`, `in_use`, `generation_mismatch`, `conflict` |
+| 409 | `identity_change`, `not_bound`, `in_use`, `generation_mismatch`, `conflict` |
 | 413 | `payload_too_large` |
 | 422 | `invalid_field`, `tls_unsupported`, `invalid_endpoint`, `invalid_bucket`, `invalid_prefix`, `role_not_supported`, `unknown_connection`, `no_bucket`, `probe_failed` |
 | 500 | `secret_missing` (the file a row names is missing or not 0600: fail closed, PUT again to repair), `secret_io`, `corrupt_rows`, `internal` |
@@ -1408,6 +1426,7 @@ passes the whole gate; `--api ADDR` names the listener (default `127.0.0.1:8982`
 | `object-store bind --connection NAME --bucket B [--role cold] [--prefix P] [--expect-generation N] [--no-verify]` | `PUT /v1/object-stores/bindings/cold` |
 | `object-store unbind [--role cold]` | `DELETE /v1/object-stores/bindings/cold` |
 | `object-store verify NAME [--bucket B] [--prefix P]` | `POST /v1/object-stores/connections/NAME:verify` |
+| `object-store repoint --connection NAME --endpoint URL [--bucket B] [--prefix P] --expect-generation N` | `POST /v1/object-stores/connections/NAME:repoint` |
 
 The secret key is never a flag or an environment variable: `connection put` reads it from
 standard input (`--secret-stdin`) or from a file (`--secret-file F`) that must be a regular
@@ -1603,6 +1622,11 @@ caller goes away before the answer counts as an error.
 | `kbf_segment_commit_seconds` | histogram | one segment's `PutBlobs` commit to the metadata log, including any wait behind commits queued ahead of it |
 | `kbf_segment_blobs`, `kbf_segment_bytes` | histogram | blobs, and bytes (footer included), per segment written |
 | `kbf_object_get_seconds` | histogram | one range GET of a blob being read (ByteStream Read, GetActionResult, a BatchReadBlobs run); footer reads are not in it |
+| `kbf_cold_store_requests_total{op}` | counter | requests the cache makes to the cold object store, by `op` (`get` a ranged read, `head` a length lookup, `put`, `delete`, `list` one page), counted when the call starts; every op has a line from the first scrape. The series are the same on every process: no key, bucket or host is a label |
+| `kbf_cold_store_errors_total{op}` | counter | those requests the store answered with an error |
+| `kbf_cold_store_bytes_total{dir}` | counter | bytes the cold store returned (`dir="read"`, the bytes of the answers, not the range asked for) and accepted (`dir="write"`, writes that succeeded) |
+| `kbf_cold_store_request_seconds{op}` | histogram | seconds from a request to the cold store to its answer, by `op`, in fixed buckets from 1 ms to 60 s. For a window of a run, the delta of `kbf_cold_store_requests_total{op="get"}` is the number of cold GETs the window made |
+| `kbf_pack_store_requests_total{op}`, `kbf_pack_store_errors_total{op}`, `kbf_pack_store_bytes_total{dir}`, `kbf_pack_store_request_seconds{op}` | counter, counter, counter, histogram | the same four families for the object store the frontend's packs are written to and read from; present on a frontend that has packs |
 | `kbf_meta_commit_seconds{command}` | histogram | every metadata-log commit the cache makes, by command (`put_blobs`, `touch`, `put_action`, `object_unreachable`, `tick`, `collect`, ...): with the Raft metadata log, the Raft log's commit latency |
 | `kbf_meta_query_seconds` | histogram | every metadata-log query the cache makes |
 | `kbf_execute_presubmit_seconds` | histogram | an Execute from the handler's start to its first stream item (the first `QUEUED` operation cannot be sent sooner): authorization, the action-cache lookup, the action and command reads, the input-tree walk and the scheduler's submit. Failed and abandoned calls are observed too |
@@ -1613,6 +1637,9 @@ caller goes away before the answer counts as an error.
 | `kbf_execute_dir_cache_present_checked_total` | counter | cached Directories whose digests a check put to FindMissing to confirm the store still holds them (each costs a digest in a call the files already make, not a read) |
 | `kbf_execute_dir_cache_evictions_total`, `kbf_execute_dir_cache_bytes` | counter, gauge | decoded Directories pushed out of the content cache to stay within its byte bound, and the bytes it held at the end of the last check (about 1 MB for a 1000-Directory, 15k-file tree). Evictions climbing with the same trees walked again means the bound is too small for the working set |
 | `kbf_scheduler_core{core}` | gauge | the scheduler core the server runs (`--scheduler-core`): one series per core, 1 for the one running and 0 for the other. Both cores are in every binary; `legacy` is the default |
+| `kbf_usage_profiles_mode{mode}` | gauge | the `--usage-profiles` mode the server runs: one series per mode (`off`, `record`, `on`), 1 for the one running and 0 for the others. `off` is the default. `off` learns nothing and writes no row; `record` and `on` learn profiles from the runs the farm hears of (the `kbf_usage_*` families below); `record` gives the scheduler no curve and places as `off` does, `on` gives it the curves, so an action with a prediction and a curve is charged by the curve (`kbf_sched_load_profile_cpu_total` and `kbf_sched_load_profile_memory_total` count those, `kbf_sched_load_curve_flat_total` the actions whose key had a curve that was not used) |
+| `kbf_usage_runs_learned_total`, `kbf_usage_runs_declined_total`, `kbf_usage_runs_without_key_total`, `kbf_usage_runs_without_series_total`, `kbf_usage_binds_refused_total`, `kbf_usage_loads_rejected_total`, `kbf_usage_minutes_unheld_total`, `kbf_usage_faults_total`, `kbf_usage_ticks_total`, `kbf_usage_shapes_evicted_total` | counters | what the usage side counted since the server started, present only with `--usage-profiles record` or `on`: clean runs handed to the profile store, runs the store declined (too few minutes, counted learned as well), clean runs whose action had no profile name (an unclean run is never counted there) or no minutes on file, results the core took whose record was held back or dropped (`kbf_usage_results_not_taken_total{reason}`, not followed), runs not followed because the table of runs was full, heartbeat loads discarded as invalid, lease minutes from a node that does not hold the lease, store calls that failed or whose work panicked, ticks, and actions whose profile name the index forgot to make room (oldest first; a later run of such an action is a run without a key) |
+| `kbf_usage_profile_keys`, `kbf_usage_profile_bytes`, `kbf_usage_runs_held` | gauges | the keys with a stored profile, the bytes of the stored profiles, and the runs whose result the farm accepted that no heartbeat has carried to the usage side yet |
 | `kbf_execute_submit_seconds`, `kbf_sched_lock_wait_seconds` | histogram | the scheduler's submit called from an Execute, and the part of it spent waiting for the scheduler's lock |
 | `kbf_sched_queued`, `kbf_sched_leases` | gauge | operations waiting for a lease, and leases granted or running on all nodes, as of the last submit or scheduler tick (at most a tick old) |
 | `kbf_sched_whole_held`, `kbf_sched_whole_marks`, `kbf_sched_whole_draining`, `kbf_sched_whole_ceiling` | gauge | workers held by a whole-machine lease, held by a queued whole-machine request while they drain, marked workers that still have leases, and the most workers that may be whole now. Printed only with `--whole-node-max`, as of the last submit or scheduler tick |
@@ -1713,6 +1740,7 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_executor_ingests_total` | counter | what the ingest of a task's pack came to, labelled `result`: `ok`, `unavailable`, `stopped` (the ingest panicked or was cancelled) or `rejected_<reason>` for each reason of `kbf_pack_ingest_rejects_total` |
 | `kbf_executor_late_starts_total` | counter | `Start`s dropped because their window ended before the run was posted; the farm runs the action again |
 | `kbf_executor_stray_leases_released_total` | counter | leases released because none of the executor's slots held them (a lost acquire answer, an undelivered release, a lease beyond the pool's size at a restart) |
+| `kbf_executor_phase_seconds` | histogram | how long the phases of an executor run took, labelled `phase`: `prepare`, `start`, `queue`, `task`, `run` and `ingest`; stamped by the executor once per pass, so `queue`, `task` and `run` are good to a pass plus the agent's heartbeat; an unobserved phase is not counted. `docs/deploy/kbf-modes.md` says how to read them |
 
 **What ingest of a run holds and refuses.** A digest is in one place: a record of one pack or one
 large object. A digest that is a record twice, in two packs or twice in one, is `malformed` (a task builds each pack from distinct blobs, so an honest pack has none; the check now runs across packs and before anything is stored). Large objects are streamed into the CAS before the
@@ -1743,6 +1771,7 @@ under `--job-plain-http`, where the listener has no TLS files.
 |---|---|---|
 | `kbf_job_read_requests_total` | counter | requests answered, labelled `outcome`: `ok` (200), `unauthorized` (401: no grant, a malformed, forged, expired or revoked one), `forbidden` (403: a digest outside the grant's scope, or an Action with no readable inputs), `not_found` (404: a blob that is not held, or a path that is not `/<hex>/<size>`), `too_large` (413: a blob over 64 MiB, not read), `method_not_allowed` (405) and `unavailable` (503: the store could not answer) |
 | `kbf_job_read_bytes_total` | counter | blob bytes served to jobs |
+| `kbf_job_read_seconds{op}` | histogram | seconds from a job's blob read (`op="get"`, `GET /<hex>/<size>`) or batch (`op="batch"`) to its answer, in fixed buckets from 1 ms to 60 s: one observation per answered request, refusals included; `/locate`, a refused method and a path that names no blob are not in it. A blob too large to read whole is answered when its stream starts, not when its last byte is sent |
 
 **Pack reads by daemons.** A daemon started with `--pack-read` ([kbf-modes.md](deploy/kbf-modes.md))
 puts the counts of its pack reads in every heartbeat, and the frontend its worker stream is on
@@ -2152,7 +2181,13 @@ own route; then the keys added since (none of the keys above changed):
   read: `cpu_usage_us`, `cpu_user_us`, `cpu_system_us`, `cpu_periods`,
   `cpu_throttled`, `throttled_us`, `memory_peak_bytes`; `parallelism`, CPU time over
   wall time; `numa_bytes`, `[{"node", "bytes"}]`). A key not measured is left out,
-  never zero.
+  never zero. `phase_times` says where `input_fetch`, `execution` and `output_upload` of
+  `reapi_times` came from: `measured` (a daemon's own stamps; also what a record written
+  before the field reads as) or `task_claim` (an executor run: the task claimed three
+  durations in its manifest and the frontend laid them out back to back, ending when it read
+  the task's pack). For a `task_claim` only the three durations are data; the instants, and
+  the gaps between them and the server's `worker_start` and `worker_completed`, say nothing
+  about the run. The same key is on an attempt of `/v1/runs/{id}` and of the build pages.
 
 A timed-out run's stdout and stderr (those the CAS holds) are its row's `stdout` and
 `stderr`; its `result` stays `null`, since a partial result is never stored. `/actions/{digest}` adds `outputs` (each `path`, `digest`, `executable`,
