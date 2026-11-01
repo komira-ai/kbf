@@ -156,6 +156,7 @@ fn a_finished_attempt_keeps_what_the_row_and_the_attempt_hold() {
         booked_memory_bytes: Some(1 << 30),
         booked_millicpus: None,
         cap_bytes: None,
+        phase_times: Default::default(),
     }));
     let mut r = row(
         vec![
@@ -1080,3 +1081,6 @@ fn an_absent_peak_and_wall_stay_absent_and_the_lease_counters_are_kept() {
     );
     assert_eq!(c.cpus_effective, Some(16));
 }
+
+#[path = "tap_phase_tests.rs"]
+mod phase;
