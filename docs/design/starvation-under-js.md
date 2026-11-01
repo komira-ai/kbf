@@ -236,7 +236,7 @@ once, in `js_whole::cost`**, as pure functions, and both engines' ranking reads 
   with no bound is unknown (3.5).
 - `drain_cost` sorts by tail, then fewest leases, then name. `tail()` and `fits_in_tail` take
   `margin` and `ceiling` as arguments (3.3, 3.5), not as scheduler settings; the callers pass them.
-- `DrainCost` carries the tail's end (`tail_end`, absolute time) **[proposed]**, so that a mark can
+- `DrainCost` carries the tail's end (`tail_end`, absolute time) **[proposed]**, added in step 1 (3.6), so that a mark can
   store it when it is made (3.6, the tail-record item).
 - `fits_in_tail(candidate estimated end, host tail, now)` is the backfill test (rule 3 of
   3.1): true only when the candidate's estimated end is no later than the host's start
@@ -289,7 +289,7 @@ submission's `max_wall` to the js core). No kbf scheduling code, under either pa
   and close backfill. A lease's **remaining time** is
   `max(min(estimated end, enforced end) - now, margin)`: the cap at the enforced end never
   takes it below `margin`, because a lease past its enforced end still holds the worker
-  until the next lease tick releases it. `margin` is a js setting (default one minute). Per core: js-lease releases a lease
+  until the next lease tick releases it. `margin` is supplied to `tail()` by the caller (js-sched keeps it as a setting, default one minute). Per core: js-lease releases a lease
   past its wall at its next tick; the embedded core has no tick, and there the floor
   holds until the kbf action timeout ends the lease. A learned estimate that proves too short
   therefore keeps the worker from looking free. This rule is part of `tail()` in
@@ -371,8 +371,8 @@ how long the curve is charged is not read; the js-sched step reads it first.
   (treated as unknown; a clamped bound would not be enforced, and its overrun would run
   to the real timeout), and a lease with no declared bound is unknown. For the pick,
   unknown counts as `ceiling`; for backfill, unknown is refused. In `js_whole::cost` an
-  estimate is also clamped to its lease's bound (3.2). `ceiling` is **new
-  configuration in js-sched**, fed by kbf (js-sched does not depend on js-lease, and
+  estimate is also clamped to its lease's bound (3.2). `ceiling` is supplied to `tail()` by the caller; in js-sched it is **new
+  configuration**, fed by kbf (js-sched does not depend on js-lease, and
   the embedded farm has no lease table). On the lease server the wall ceiling already
   exists (`server.max_lease_wall`, refused above, `crates/js-lease-server/src/lib.rs:94`) and the
   same value is passed to the cost function. It should carry the same value as the wall
@@ -418,7 +418,16 @@ how long the curve is charged is not read; the js-sched step reads it first.
    the bound). **This step keeps today's values for input with no
    estimate:** both call sites pass `margin = 0` (an overdue lease reads zero remaining, `cost.rs:39`) and
    `ceiling = u64::MAX` (an unbounded lease ends at `u64::MAX`, `whole.rs:289`), so every ranking equals
-   today's, and a test asserts it over the existing `cost.rs` cases. The deliberate
+   today's. Three tests in `cost.rs`: (i) an unbounded case, which the existing tests lack: host A with a `u64::MAX` end
+   bound and host B with a finite one; B ranks first and A's `wait_ms` is `u64::MAX - now`.
+   (ii) An equivalence test, which is a **characterization test**: it runs every existing
+   case through `drain_cost`-by-tail with `(0, u64::MAX)` and requires output identical to the current
+   function, `DrainCost.wait_ms` included. It is green on today's code once it compiles, so its red is the compile
+   failure until `tail()` exists; what it catches afterwards is a default other than `0` / `u64::MAX` (a
+   `margin` of 1 turns the overdue case into a tie broken by lease count). (iii) `DrainCost` gains `tail_end` (the absolute
+   end of the tail, `now + wait_ms`, saturating) in this step, with a test of its value; `DrainCost` is a `pub`
+   struct deriving `PartialEq, Eq` (`cost.rs:19-26`) with one construction site, `cost.rs:33`, so no other
+   crate's literal changes. The deliberate
    changes, a `margin` floor above zero and an unknown bound counted as the real ceiling, arrive with
    the step that passes real values (step 2 for the registry, the `js-sched` step for the embedded core),
    tied to tests (g) and (d). The existing goldens (the hosts-API field and the D55 record rows; D55, W6
@@ -474,7 +483,7 @@ the registry's start and wait path moves onto it; 2 to 4 are not built.
   `drain_after_ms` as a wait), only after the enforced bound (M1), the re-pick (M2) and
   the overdue rule (M4) are green in that engine: the give-up was also the escape from a
   wrong pick. Compatibility in 4.11. The registry's give-up stays in this work (4.12).
-- **Record the tail at mark time** (small, any path): the mark stores `DrainCost.tail_end`
+- **Record the tail at mark time** (small, any path, after step 1): the mark stores `DrainCost.tail_end` (added in step 1)
    with the estimated end that produced it, and the request's later start, so the wait versus the
    tail estimate, the backfill share and the estimate error (section 5) can be computed. Nothing records these
    today (2.4).
