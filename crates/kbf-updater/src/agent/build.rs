@@ -364,7 +364,8 @@ pub fn build(cfg: &Config) -> Result<Agent, String> {
         world,
         Status::unknown(platform, unknown),
     )
-    .with_services(services))
+    .with_services(services)
+    .with_host_updates(cordon_dir(cfg)))
 }
 
 /// The ports of `service`: its own helper socket, the node's drain

@@ -225,7 +225,7 @@ impl Histogram {
 
     /// The `_bucket`, `_sum` and `_count` lines of family `name`, each with `labels`
     /// (`key="value"` pairs, comma-separated, or empty) before `le`.
-    fn render(&self, out: &mut String, name: &str, labels: &str) {
+    pub(crate) fn render(&self, out: &mut String, name: &str, labels: &str) {
         let sep = if labels.is_empty() { "" } else { "," };
         let mut cumulative = 0;
         let bounds = self.unit.bounds().iter().map(|&b| self.unit.print(b));

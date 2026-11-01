@@ -82,6 +82,7 @@ mod build_commit;
 #[doc(hidden)]
 pub mod build_seq;
 pub mod cold_apply;
+mod cold_counted;
 pub mod config;
 pub mod drain;
 pub mod enroll;
