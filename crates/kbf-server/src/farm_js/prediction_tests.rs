@@ -68,7 +68,7 @@ fn rig(load: PlacementLoad, predictions: PlacementPredictions) -> Rig {
 }
 
 /// The request of action `tag`: a core and 4 GiB, as the booked rule charges it.
-fn request(tag: u8) -> Request {
+pub(super) fn request(tag: u8) -> Request {
     Request {
         key: ActionKey {
             instance: "main".to_owned(),
@@ -100,7 +100,7 @@ fn submit_with(rig: &Rig, request: Request, evidence: Evidence) -> kbf_front::Ti
     dispatch::submit(&rig.core, at(0), &Shapes::default(), submission).expect("queued")
 }
 
-fn submit(rig: &Rig, tag: u8) -> kbf_front::Ticket {
+pub(super) fn submit(rig: &Rig, tag: u8) -> kbf_front::Ticket {
     submit_with(rig, request(tag), Evidence::default())
 }
 
@@ -161,7 +161,7 @@ async fn report(rig: &Rig, worker: &str, result: worker::Result) {
 /// row for the shape.
 const WARM: u8 = 6;
 
-async fn warm(rig: &Rig, node: &mut Wire, name: &str) {
+pub(super) async fn warm(rig: &Rig, node: &mut Wire, name: &str) {
     for tag in 1..=WARM {
         let _ticket = submit(rig, tag);
         let lease = *starts(&node.sent()).first().expect("started");
@@ -170,7 +170,7 @@ async fn warm(rig: &Rig, node: &mut Wire, name: &str) {
 }
 
 /// The cost the scheduler holds for `lease`.
-fn cost(rig: &Rig, lease: LeaseId) -> LeaseCost {
+pub(super) fn cost(rig: &Rig, lease: LeaseId) -> LeaseCost {
     rig.core
         .with(|view, _| view.sched().lease_cost(lease))
         .expect("the scheduler holds the lease")

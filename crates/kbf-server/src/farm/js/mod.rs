@@ -199,6 +199,7 @@ impl Opening<'_> {
             self.unservable_wait,
             self.finished_retention,
             self.settings,
+            self.usage.as_deref(),
         )
     }
 

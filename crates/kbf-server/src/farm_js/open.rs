@@ -55,6 +55,7 @@ pub(crate) fn farm_config(
     unservable_wait: Duration,
     finished_retention: Duration,
     settings: &crate::farm::Settings,
+    _usage: Option<&super::usage::Usage>,
 ) -> Config {
     let config = self::config(
         term,

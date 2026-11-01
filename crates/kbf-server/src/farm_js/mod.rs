@@ -74,4 +74,6 @@ mod report_hooks_tests;
 #[cfg(test)]
 mod testing;
 #[cfg(test)]
+mod usage_on_tests;
+#[cfg(test)]
 mod usage_tests;
